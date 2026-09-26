@@ -63,7 +63,7 @@ def test_vm_stats_include_compressed_and_speculative():
     if stats is None:
         pytest.skip("host_statistics64 unavailable")
     assert {"free", "active", "inactive", "wired"} <= set(stats)
-    for key in ("speculative", "compressed"):
+    for key in ("speculative", "compressed", "external"):
         assert stats[key] >= 0
 
 
@@ -108,6 +108,7 @@ def test_vm_stats_retries_with_kernel_requested_count():
         "wired": 40 * 4096,
         "speculative": 0,
         "compressed": 0,
+        "external": 0,
     }
 
 

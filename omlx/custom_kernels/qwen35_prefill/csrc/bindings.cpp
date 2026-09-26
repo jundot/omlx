@@ -472,6 +472,7 @@ NB_MODULE(_ext, m) {
       "bits"_a,
       "act_mode"_a = 0,
       "variant"_a = 800,
+      "packed"_a = false,
       "stream"_a = nb::none());
   m.def(
       "qwen35_oq_a8_decode_weights",
@@ -486,5 +487,19 @@ NB_MODULE(_ext, m) {
       "x_sorted"_a,
       "inv_order"_a,
       "scores"_a,
+      "stream"_a = nb::none());
+  m.def(
+      "qwen35_gather_qmm_rhs_nax_ready",
+      &omlx::qwen35_prefill_kernels::qwen35_gather_qmm_rhs_nax_ready);
+  m.def(
+      "qwen35_gather_qmm_rhs_t",
+      &omlx::qwen35_prefill_kernels::qwen35_gather_qmm_rhs_t,
+      "x"_a,
+      "weight"_a,
+      "scales"_a,
+      "biases"_a,
+      "indices"_a,
+      "bits"_a,
+      "group_size"_a,
       "stream"_a = nb::none());
 }

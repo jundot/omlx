@@ -5805,12 +5805,10 @@
             },
 
             // Description text shown next to the Memory guard tier dropdown.
-            // safe / balanced / aggressive get a "free + inactive + N% of
-            // active (via macOS reclaim_method)" sentence. custom shows the
-            // user-supplied ceiling.
+            // Each tier says how much memory it leaves for other apps; the
+            // server computes it (ProcessMemoryEnforcer) for this Mac.
             get memoryGuardTierDescription() {
                 const tier = this.globalSettings.memory?.memory_guard_tier || 'balanced';
-                const tierLabel = window.t('settings.resource.guard_tier.' + tier);
                 if (tier === 'custom') {
                     const gb = Number(
                         this.globalSettings.memory?.memory_guard_custom_ceiling_gb || 0
@@ -5819,90 +5817,54 @@
                         .t('settings.resource.guard_tier.description_custom')
                         .replace('{custom_gb}', gb);
                 }
-                const pct = { safe: 20, balanced: 50, aggressive: 80 }[tier] ?? 50;
-                const method = window.t(
-                    'settings.resource.guard_tier.reclaim_method.' + tier
-                );
+                const preview = this.globalSettings.system?.memory_guard_preview?.[tier];
+                const reserveGB = Number((preview?.reserve_bytes || 0) / 1024 ** 3).toFixed(1);
                 return window
-                    .t('settings.resource.guard_tier.description_template')
-                    .replace('{tier}', tierLabel)
-                    .replace('{active_pct}', pct)
-                    .replace('{reclaim_method}', method);
+                    .t('settings.resource.guard_tier.description.' + tier)
+                    .replace('{reserve}', `${reserveGB} GB`);
             },
 
-            // Breakdown line. For ratio tiers: `Free X, inactive Y, active Z
-            // × N% = R → ceiling C`. For custom: `Custom ceiling X GB →
-            // effective ceiling C` (after clamp by static / metal cap).
+            // Breakdown line from the server preview. For reserve tiers:
+            // `Free X + inactive Y (+ Z of other apps' memory) - reserve R ->
+            // ceiling C`. For custom: `Custom ceiling X GB -> effective
+            // ceiling C` after the server's static / Metal clamp.
             get memoryGuardBreakdownHTML() {
                 const sys = this.globalSettings.system || {};
                 const GB = 1024 ** 3;
                 const tier = this.globalSettings.memory?.memory_guard_tier || 'balanced';
-                const fmt = (gb) => Number(gb).toFixed(1);
-                const bold = (gb) => `<strong>${fmt(gb)} GB</strong>`;
-
-                // Static / metal cap for the final clamp shown to the user.
-                // The small-system threshold must track
-                // ProcessMemoryEnforcer._SMALL_SYSTEM_THRESHOLD (24 GB): under
-                // it the server reserves a flat 4 GB regardless of tier. This
-                // read 16 and so understated the static ceiling by up to 4 GB
-                // on every 16-23 GB Mac.
-                const totalGB = (sys.total_memory_bytes || 0) / GB;
-                const staticReserveGB =
-                    tier === 'custom'
-                        ? 2
-                        : totalGB < 24
-                            ? 4
-                            : { safe: 8, balanced: 6, aggressive: 4 }[tier] ?? 6;
-                const staticCeiling = Math.max(0, totalGB - staticReserveGB);
-                const metalCapGB = (sys.iogpu_wired_limit_bytes || 0) / GB;
-
-                // Helper: is the kernel iogpu.wired_limit_mb the smallest
-                // of the three candidates? When yes we swap "→ ceiling" for
-                // "/ effective ceiling X (kernel limit)" so the user knows
-                // why the value isn't what their tier math suggested.
-                const kernelBinds = (candidates, finalCeiling) =>
-                    metalCapGB > 0 &&
-                    Math.abs(metalCapGB - finalCeiling) < 1e-6 &&
-                    candidates.every((c) => c >= metalCapGB - 1e-6);
+                const preview = sys.memory_guard_preview?.[tier];
+                if (!preview) return '';
+                const bold = (bytes) => `<strong>${Number(bytes / GB).toFixed(1)} GB</strong>`;
 
                 if (tier === 'custom') {
-                    const custom = Number(
-                        this.globalSettings.memory?.memory_guard_custom_ceiling_gb || 0
-                    );
-                    const candidates = [custom, staticCeiling];
-                    if (metalCapGB > 0) candidates.push(metalCapGB);
-                    const ceiling = Math.max(0, Math.min(...candidates));
-                    const tmpl = kernelBinds([custom, staticCeiling], ceiling)
-                        ? 'settings.resource.guard_tier.breakdown_custom_kernel_limit'
-                        : 'settings.resource.guard_tier.breakdown_custom';
+                    const custom =
+                        Number(this.globalSettings.memory?.memory_guard_custom_ceiling_gb || 0) * GB;
+                    const limits = [preview.static_bytes, preview.metal_cap_bytes].filter((v) => v > 0);
+                    const ceiling = Math.max(0, Math.min(custom, ...limits));
+                    const kernelBinds =
+                        preview.metal_cap_bytes > 0 &&
+                        ceiling === preview.metal_cap_bytes &&
+                        ceiling < custom;
                     return window
-                        .t(tmpl)
+                        .t(
+                            kernelBinds
+                                ? 'settings.resource.guard_tier.breakdown_custom_kernel_limit'
+                                : 'settings.resource.guard_tier.breakdown_custom'
+                        )
                         .replace('{custom_gb}', bold(custom))
                         .replace('{ceiling}', bold(ceiling));
                 }
 
-                const freeGB = (sys.free_memory_bytes || 0) / GB;
-                const inactiveGB = (sys.inactive_memory_bytes || 0) / GB;
-                const activeGB = (sys.active_memory_bytes || 0) / GB;
-                const ratio = { safe: 0.2, balanced: 0.5, aggressive: 0.8 }[tier] ?? 0.5;
-                const pct = Math.round(ratio * 100);
-                const reclaim = activeGB * ratio;
-                const omlxGB = (sys.omlx_phys_footprint_bytes || 0) / GB;
-                const dynamicCeiling = omlxGB + freeGB + inactiveGB + reclaim;
-                const candidates = [dynamicCeiling, staticCeiling];
-                if (metalCapGB > 0) candidates.push(metalCapGB);
-                const ceiling = Math.max(0, Math.min(...candidates));
-                const tmpl = kernelBinds([dynamicCeiling, staticCeiling], ceiling)
+                const key = preview.binding === 'metal_cap'
                     ? 'settings.resource.guard_tier.breakdown_kernel_limit'
                     : 'settings.resource.guard_tier.breakdown';
                 return window
-                    .t(tmpl)
-                    .replace('{free}', bold(freeGB))
-                    .replace('{inactive}', bold(inactiveGB))
-                    .replace('{active}', bold(activeGB))
-                    .replace(/{active_pct}/g, pct)
-                    .replace('{reclaim}', bold(reclaim))
-                    .replace('{ceiling}', bold(ceiling));
+                    .t(key)
+                    .replace('{free}', bold(preview.free_bytes))
+                    .replace('{inactive}', bold(preview.inactive_bytes))
+                    .replace('{other}', bold(preview.other_apps_bytes))
+                    .replace('{reserve}', bold(preview.reserve_bytes))
+                    .replace('{ceiling}', bold(preview.ceiling_bytes));
             },
 
             // Computed hot cache size in GB (for manual input)

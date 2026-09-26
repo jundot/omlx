@@ -410,11 +410,11 @@ final class PerformanceScreenVM {
         switch canonicalMemoryGuardTier(memoryGuardTier) {
         case "safe":
             return String(localized: "performance.memory.guard_tier.safe.sub",
-                          defaultValue: "Most conservative. Leaves more headroom before scheduling memory-heavy prefill.",
+                          defaultValue: "Keeps about 20% of RAM (6-16 GB) free so heavier apps can run alongside oMLX.",
                           comment: "Description for safe memory guard tier")
         case "aggressive":
             return String(localized: "performance.memory.guard_tier.aggressive.sub",
-                          defaultValue: "Uses more memory before throttling. Best when the Mac has ample headroom.",
+                          defaultValue: "Leaves only 2% of RAM (1.5-4 GB) for macOS and may compress other apps' memory, so oMLX can use nearly all RAM.",
                           comment: "Description for aggressive memory guard tier")
         case "custom":
             return String(localized: "performance.memory.guard_tier.custom.sub",
@@ -422,18 +422,16 @@ final class PerformanceScreenVM {
                           comment: "Description for custom memory guard tier")
         default:
             return String(localized: "performance.memory.guard_tier.balanced.sub",
-                          defaultValue: "Default tier. Balances throughput with process memory safety.",
+                          defaultValue: "Keeps about 8% of RAM (3-8 GB) free for everyday apps while oMLX runs.",
                           comment: "Description for balanced memory guard tier")
         }
     }
 
     // MARK: - Effective ceiling preview
     //
-    // The server's hard ceiling is min(static, dynamic, metal_cap) —
-    // ProcessMemoryEnforcer._get_ceiling_breakdown. Without a preview a
-    // Custom ceiling above the Metal cap looks accepted here but the guard
-    // aborts requests at the clamped value with no hint why (#1463). The
-    // math below mirrors dashboard.js so both admin surfaces agree.
+    // The server computes each tier's ceiling with the enforcer's own math
+    // (system.memory_guard_preview), so this screen and the web dashboard
+    // only render it. Custom is clamped here because its value is a draft.
 
     private static let bytesPerGB = 1073741824.0
 
@@ -441,39 +439,19 @@ final class PerformanceScreenVM {
     /// so the preview updates as the user edits, before Apply.
     var memoryGuardBreakdown: String? {
         guard prefillMemoryGuard, let sys = systemInfo else { return nil }
-        let totalGB = Double(sys.totalMemoryBytes ?? 0) / Self.bytesPerGB
-        guard totalGB > 0 else { return nil }
         let tier = canonicalMemoryGuardTier(memoryGuardTier)
-        let metalCapGB = Double(sys.iogpuWiredLimitBytes ?? 0) / Self.bytesPerGB
+        guard let preview = sys.memoryGuardPreview?[tier] else { return nil }
 
-        // Static reserve must track _STATIC_RESERVE_LARGE and the 24 GB
-        // small-system threshold in process_memory_enforcer.py.
-        let staticReserveGB: Double
-        if tier == "custom" {
-            staticReserveGB = 2
-        } else if totalGB < 24 {
-            staticReserveGB = 4
-        } else {
-            staticReserveGB = tier == "safe" ? 8 : tier == "aggressive" ? 4 : 6
-        }
-        let staticCeilingGB = max(0, totalGB - staticReserveGB)
-
+        func gb(_ bytes: Int64?) -> Double { Double(bytes ?? 0) / Self.bytesPerGB }
         func fmt(_ v: Double) -> String { String(format: "%.1f", v) }
-        func clamp(_ dynamicGB: Double) -> (ceiling: Double, kernelBinds: Bool) {
-            var candidates = [dynamicGB, staticCeilingGB]
-            if metalCapGB > 0 { candidates.append(metalCapGB) }
-            let ceiling = max(0, candidates.min() ?? 0)
-            let binds = metalCapGB > 0 && abs(metalCapGB - ceiling) < 1e-6
-                && dynamicGB >= metalCapGB - 1e-6
-                && staticCeilingGB >= metalCapGB - 1e-6
-            return (ceiling, binds)
-        }
 
         if tier == "custom" {
             let customGB = parsedMemoryGuardCustomCeiling
             guard customGB > 0 else { return nil }
-            let (ceiling, kernelBinds) = clamp(customGB)
-            if kernelBinds {
+            let limits = [gb(preview.staticBytes), gb(preview.metalCapBytes)].filter { $0 > 0 }
+            let ceiling = max(0, ([customGB] + limits).min() ?? 0)
+            let metalCapGB = gb(preview.metalCapBytes)
+            if metalCapGB > 0 && abs(ceiling - metalCapGB) < 1e-6 && ceiling < customGB {
                 return String(localized: "performance.memory.ceiling_preview.custom_kernel",
                               defaultValue: "Custom ceiling \(fmt(customGB)) GB → effective ceiling \(fmt(ceiling)) GB (kernel Metal limit)",
                               comment: "Ceiling preview when the custom memory guard value is clamped by the kernel Metal limit")
@@ -483,23 +461,19 @@ final class PerformanceScreenVM {
                           comment: "Ceiling preview for the custom memory guard tier")
         }
 
-        let freeGB = Double(sys.freeMemoryBytes ?? 0) / Self.bytesPerGB
-        let inactiveGB = Double(sys.inactiveMemoryBytes ?? 0) / Self.bytesPerGB
-        let activeGB = Double(sys.activeMemoryBytes ?? 0) / Self.bytesPerGB
-        guard freeGB + inactiveGB + activeGB > 0 else { return nil }
-        let ratio = tier == "safe" ? 0.2 : tier == "aggressive" ? 0.8 : 0.5
-        let reclaimGB = activeGB * ratio
-        let omlxGB = Double(sys.omlxPhysFootprintBytes ?? 0) / Self.bytesPerGB
-        let pct = Int((ratio * 100).rounded())
-        let (ceiling, kernelBinds) = clamp(omlxGB + freeGB + inactiveGB + reclaimGB)
-        if kernelBinds {
-            return String(localized: "performance.memory.ceiling_preview.tier_kernel",
-                          defaultValue: "Free \(fmt(freeGB)) GB + inactive \(fmt(inactiveGB)) GB + (active \(fmt(activeGB)) GB × \(pct)% = \(fmt(reclaimGB)) GB) → effective ceiling \(fmt(ceiling)) GB (kernel Metal limit)",
-                          comment: "Ceiling preview when the adaptive tier ceiling is clamped by the kernel Metal limit")
+        let free = fmt(gb(preview.freeBytes))
+        let inactive = fmt(gb(preview.inactiveBytes))
+        let other = fmt(gb(preview.otherAppsBytes))
+        let reserve = fmt(gb(preview.reserveBytes))
+        let ceiling = fmt(gb(preview.ceilingBytes))
+        if preview.binding == "metal_cap" {
+            return String(localized: "performance.memory.ceiling_preview.reserve_tier_kernel",
+                          defaultValue: "Free \(free) GB + inactive \(inactive) GB + other apps' compressible \(other) GB − reserve \(reserve) GB → effective ceiling \(ceiling) GB (kernel Metal limit)",
+                          comment: "Ceiling preview when the reserve tier ceiling is clamped by the kernel Metal limit")
         }
-        return String(localized: "performance.memory.ceiling_preview.tier",
-                      defaultValue: "Free \(fmt(freeGB)) GB + inactive \(fmt(inactiveGB)) GB + (active \(fmt(activeGB)) GB × \(pct)% = \(fmt(reclaimGB)) GB) → ceiling \(fmt(ceiling)) GB",
-                      comment: "Ceiling preview for the adaptive memory guard tiers")
+        return String(localized: "performance.memory.ceiling_preview.reserve_tier",
+                      defaultValue: "Free \(free) GB + inactive \(inactive) GB + other apps' compressible \(other) GB − reserve \(reserve) GB → ceiling \(ceiling) GB",
+                      comment: "Ceiling preview for the reserve memory guard tiers")
     }
 
     /// Red warning when the effective Metal cap sits below what oMLX asked

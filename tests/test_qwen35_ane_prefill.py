@@ -10,6 +10,7 @@ import pytest
 
 import omlx.patches.qwen35_ane_prefill as ane_patch
 from omlx.custom_kernels.qwen35_prefill import fast
+from omlx.patches import qwen35_packed_linear
 
 
 def test_ane_compile_bindings_release_the_python_gil():
@@ -186,6 +187,39 @@ class _Q6GDN(nn.Module):
 def test_q6_mlp_and_gdn_are_eligible_for_ane_hybrid_prefill():
     assert ane_patch._eligible_pair(_Q6MLP())
     assert ane_patch._eligible_gdn(_Q6GDN())
+
+
+def _q4_bf16(input_dims, output_dims):
+    linear = nn.QuantizedLinear(
+        input_dims, output_dims, bias=False, group_size=64, bits=4
+    )
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+    return linear
+
+
+def test_packed_projections_are_ineligible_instead_of_raising():
+    # Packing leaves GDN b/a (narrower than a tile) stock beside packed qkv/z.
+    gdn = SimpleNamespace(
+        in_proj_qkv=_q4_bf16(256, 256),
+        in_proj_z=_q4_bf16(256, 128),
+        in_proj_b=_q4_bf16(256, 48),
+        in_proj_a=_q4_bf16(256, 48),
+    )
+    mlp = SimpleNamespace(
+        gate_proj=_q4_bf16(256, 256),
+        up_proj=_q4_bf16(256, 256),
+        down_proj=_q4_bf16(256, 256),
+    )
+    assert ane_patch._eligible_gdn(gdn)
+    assert ane_patch._eligible_pair(mlp)
+
+    qwen35_packed_linear._pack_layer(SimpleNamespace(linear_attn=gdn, mlp=mlp))
+
+    assert isinstance(gdn.in_proj_qkv, qwen35_packed_linear.PackedLinear)
+    assert type(gdn.in_proj_b) is nn.QuantizedLinear
+    assert not ane_patch._eligible_gdn(gdn)
+    assert not ane_patch._eligible_pair(mlp)
 
 
 @pytest.mark.parametrize(

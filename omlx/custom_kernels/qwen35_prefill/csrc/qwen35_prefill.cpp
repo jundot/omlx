@@ -831,6 +831,90 @@ class Qwen35MoeWeightedSumPrimitive : public Primitive {
   }
 };
 
+constexpr int kGatherRhsTile = 64;
+
+std::string gather_qmm_rhs_kernel_name(Dtype dtype, int group_size, int bits) {
+  std::string kname;
+  concatenate(
+      kname,
+      "qwen35_gather_qmm_rhs_t_nax_",
+      qwen_type_name(dtype),
+      "_gs_",
+      group_size,
+      "_b_",
+      bits,
+      "_bm_64_bn_64_bk_64_wm_2_wn_2");
+  return kname;
+}
+
+// x[rows, K] @ w[indices[row]].T for expert-sorted indices, in one dispatch
+// regardless of the row count (see qwen35_moe_gather_nax.metal).
+class Qwen35GatherQmmRhsTPrimitive : public Primitive {
+ public:
+  Qwen35GatherQmmRhsTPrimitive(Stream stream, int bits, int group_size)
+      : Primitive(stream), bits_(bits), group_size_(group_size) {}
+
+  void eval_cpu(
+      const std::vector<array>& /* inputs */,
+      std::vector<array>& /* outputs */) override {
+    throw std::runtime_error("Qwen35GatherQmmRhsTPrimitive has no CPU path.");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    auto& s = stream();
+    auto& d = metal::device(s.device);
+    auto& out = outputs[0];
+
+    const auto& x = inputs[0];
+    const auto& weight = inputs[1];
+    const auto& scales = inputs[2];
+    const auto& biases = inputs[3];
+    const auto& indices = inputs[4];
+
+    out.set_data(allocator::malloc(out.nbytes()));
+
+    const int K = x.shape(-1);
+    const int N = weight.shape(1);
+    const int M = static_cast<int>(indices.size());
+
+    auto lib = d.get_library(kNaxMetallibName, current_binary_dir());
+    auto kernel = d.get_kernel(
+        gather_qmm_rhs_kernel_name(x.dtype(), group_size_, bits_), lib);
+    auto& compute_encoder = metal::get_command_encoder(s);
+    compute_encoder.set_compute_pipeline_state(kernel);
+    compute_encoder.set_input_array(x, 0);
+    compute_encoder.set_input_array(weight, 1);
+    compute_encoder.set_input_array(scales, 2);
+    compute_encoder.set_input_array(biases, 3);
+    compute_encoder.set_input_array(indices, 4);
+    compute_encoder.set_output_array(out, 5);
+    compute_encoder.set_bytes(M, 6);
+    compute_encoder.set_bytes(N, 7);
+    compute_encoder.set_bytes(K, 8);
+
+    MTL::Size grid_dims(
+        N / kGatherRhsTile, (M + kGatherRhsTile - 1) / kGatherRhsTile, 1);
+    MTL::Size group_dims(32, 2, 2);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  }
+
+  DEFINE_NAME(Qwen35GatherQmmRhsTPrimitive)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& rhs = static_cast<const Qwen35GatherQmmRhsTPrimitive&>(other);
+    return bits_ == rhs.bits_ && group_size_ == rhs.group_size_;
+  }
+  auto state() const {
+    return std::make_tuple(bits_, group_size_);
+  }
+
+ private:
+  int bits_;
+  int group_size_;
+};
+
 } // namespace
 
 bool is_nax_available() {
@@ -1183,6 +1267,98 @@ array qwen35_moe_weighted_sum(
       std::move(out_shape),
       x_sorted.dtype(),
       std::make_shared<Qwen35MoeWeightedSumPrimitive>(stream),
+      std::move(inputs));
+}
+
+bool qwen35_gather_qmm_rhs_nax_ready() {
+  // Load one pipeline eagerly so callers can pick their fallback at graph
+  // construction time; there is no classic kernel to degrade to at eval.
+  static bool ready = []() {
+    if (!is_nax_available() || !nax_qmm_kernels_built()) {
+      return false;
+    }
+    try {
+      auto& d = metal::device(Device::gpu);
+      auto lib = d.get_library(kNaxMetallibName, current_binary_dir());
+      d.get_kernel(gather_qmm_rhs_kernel_name(bfloat16, 64, 5), lib);
+      return true;
+    } catch (const std::exception&) {
+      return false;
+    }
+  }();
+  return ready;
+}
+
+array qwen35_gather_qmm_rhs_t(
+    const array& x,
+    const array& weight,
+    const array& scales,
+    const array& biases,
+    const array& indices,
+    int bits,
+    int group_size,
+    StreamOrDevice s) {
+  auto fail = [&](const char* why) {
+    std::ostringstream msg;
+    msg << "[omlx_qwen35_prefill.qwen35_gather_qmm_rhs_t] " << why << ": x "
+        << x.shape() << " " << x.dtype() << ", weight " << weight.shape()
+        << ", scales " << scales.shape() << ", indices " << indices.shape()
+        << " " << indices.dtype() << ", bits " << bits << ", group_size "
+        << group_size << ".";
+    throw std::invalid_argument(msg.str());
+  };
+  if (!qwen35_gather_qmm_rhs_nax_ready()) {
+    fail("NAX gather kernel unavailable");
+  }
+  if (bits != 4 && bits != 5 && bits != 6 && bits != 8) {
+    fail("unsupported bits");
+  }
+  if (group_size != 64 && group_size != 128) {
+    fail("unsupported group size");
+  }
+  if (x.dtype() != float16 && x.dtype() != bfloat16) {
+    fail("expected float16 or bfloat16 x");
+  }
+  if (weight.dtype() != uint32 || scales.dtype() != x.dtype() ||
+      biases.dtype() != x.dtype() || indices.dtype() != uint32) {
+    fail("unexpected dtype");
+  }
+  if (x.ndim() < 2 || weight.ndim() != 3 || scales.ndim() != 3 ||
+      indices.ndim() != 1 || biases.shape() != scales.shape()) {
+    fail("unexpected rank");
+  }
+  const int K = x.shape(-1);
+  const int N = weight.shape(1);
+  if (K <= 0 || N <= 0 || K % kGatherRhsTile != 0 ||
+      N % kGatherRhsTile != 0 || K % group_size != 0) {
+    fail("K and N must be multiples of 64 and of the group size");
+  }
+  if (x.size() / K != indices.size() || indices.size() == 0 ||
+      indices.size() > static_cast<size_t>(INT32_MAX)) {
+    fail("x rows must match the index count");
+  }
+  if (!qwen_q_affine_packed_shape_matches(weight.shape(2), K, bits) ||
+      scales.shape(0) != weight.shape(0) || scales.shape(1) != N ||
+      scales.shape(2) != K / group_size) {
+    fail("incompatible weight, scale, or bias shape");
+  }
+  if (!row_contiguous(x) || !row_contiguous(weight) ||
+      !row_contiguous(scales) || !row_contiguous(biases) ||
+      !row_contiguous(indices)) {
+    fail("inputs must be row contiguous");
+  }
+
+  auto stream = to_stream(s);
+  if (stream.device == Device::cpu) {
+    fail("GPU stream required");
+  }
+  Shape out_shape = x.shape();
+  out_shape.back() = N;
+  std::vector<array> inputs = {x, weight, scales, biases, indices};
+  return array(
+      std::move(out_shape),
+      x.dtype(),
+      std::make_shared<Qwen35GatherQmmRhsTPrimitive>(stream, bits, group_size),
       std::move(inputs));
 }
 

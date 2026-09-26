@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 
 # MLX 0.32.2 runs fp32 GPU matmuls at TF32 precision on M5-class tensor units;
 # the fp32 parity tests assert 2e-5, which TF32 cannot hold. Test session only.
@@ -252,3 +253,29 @@ def _reset_decode_activity_registry():
     get_decode_activity().clear()
     yield
     get_decode_activity().clear()
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_metal_release_accounting(monkeypatch):
+    """Keep the graphics footprint and its release-lag history test-local.
+
+    Tests feed synthetic phys_footprint values. The test process's real
+    graphics ledger and earlier tests' samples would otherwise split or
+    discount them unpredictably. Tests of the split patch these explicitly.
+    """
+    for name in (
+        "omlx.scheduler",
+        "omlx.process_memory_enforcer",
+        "omlx.utils.metal_sync",
+    ):
+        module = sys.modules.get(name)
+        if module is not None and hasattr(module, "get_graphics_footprint"):
+            monkeypatch.setattr(module, "get_graphics_footprint", lambda: 0)
+    metal_sync = sys.modules.get("omlx.utils.metal_sync")
+    if metal_sync is not None:
+        metal_sync._residuals.clear()
+        metal_sync._last_unreleased = (0.0, 0)
+    yield
+    if metal_sync is not None:
+        metal_sync._residuals.clear()
+        metal_sync._last_unreleased = (0.0, 0)

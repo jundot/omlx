@@ -28,43 +28,37 @@ _NATIVE_QSA_MAIN_DISABLED = False
 _NATIVE_QSA_MAIN_PROVEN = False
 
 
-def _nax_gpu() -> bool:
-    try:
-        from omlx.custom_kernels.nax import is_nax_available
-
-        return bool(is_nax_available())
-    except Exception:
-        return False
-
-
-def _min_rows(env: str, nax_default: int) -> int:
+def _min_rows(env: str, default: int) -> int:
     raw = os.environ.get(env, "").strip()
     if raw:
         try:
             return max(0, int(raw))
         except ValueError:
             pass
-    return nax_default if _nax_gpu() else 0
+    return default
 
 
+# Measured on M5 (NAX) and M3 Ultra alike. On M3 Ultra Flash-Next at 64k the
+# thresholds took Lightning MTP from 48 to 63-65 tok/s and decode from 50.8 to
+# 52.3 tok/s.
 @functools.lru_cache(maxsize=None)
 def _native_score_min_rows() -> int:
     """Query rows from which the native indexer-score kernel engages; below it the
-    MLX ops are faster on NAX GPUs (0.27 vs 0.36-0.77 ms per layer at 1-16 rows)."""
+    MLX ops are faster (NAX: 0.27 vs 0.36-0.77 ms per layer at 1-16 rows)."""
     return _min_rows("OMLX_QWEN4_QSA_NATIVE_SCORE_MIN_ROWS", 32)
 
 
 @functools.lru_cache(maxsize=None)
 def _native_topk_min_rows() -> int:
     """Query rows from which the native top-k engages; argpartition ties or wins
-    below it on NAX GPUs (0.26-0.31 vs 0.26 ms per layer at one row)."""
+    below it (NAX: 0.26-0.31 vs 0.26 ms per layer at one row)."""
     return _min_rows("OMLX_QWEN4_QSA_NATIVE_TOPK_MIN_ROWS", 8)
 
 
 @functools.lru_cache(maxsize=None)
 def _native_main_min_rows() -> int:
     """Query rows from which the native sparse GQA kernel engages; the gathered SDPA
-    is faster below it on NAX GPUs (0.7 vs 1.6 ms per layer at verify width)."""
+    is faster below it (NAX: 0.7 vs 1.6 ms per layer at verify width)."""
     return _min_rows("OMLX_QWEN4_QSA_NATIVE_MAIN_MIN_ROWS", 24)
 
 

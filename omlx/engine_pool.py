@@ -58,6 +58,7 @@ from .model_settings import (
     validate_ane_prefill,
 )
 from .scheduler import SchedulerConfig
+from .utils.metal_sync import unreleased_graphics_bytes
 from .utils.model_loading import dflash_batched_requested, dflash_batched_supported
 from .utils.proc_memory import get_phys_footprint
 
@@ -183,6 +184,17 @@ def _qwen35_cpu_share_estimated_bytes(
         extra += gdn_layers * gdn_rows * hidden * _FP16_BYTES
 
     return int(extra * _CPU_SHARE_MATERIALIZATION_HEADROOM)
+
+
+# Re-reads of a dynamic-bound ceiling before a load is refused (1s in total).
+_ADMISSION_CEILING_RECHECKS = 4
+_ADMISSION_CEILING_RECHECK_S = 0.25
+
+
+def _settled_phys_footprint() -> int:
+    """phys_footprint minus freed Metal buffers the kernel still charges."""
+    mlx_bytes = int(mx.get_active_memory()) + int(mx.get_cache_memory())
+    return max(0, get_phys_footprint() - unreleased_graphics_bytes(mlx_bytes))
 
 
 @dataclass
@@ -474,6 +486,25 @@ class EnginePool:
         rows = int(getattr(self._scheduler_config, "max_num_seqs", 8) or 8)
         return weights + rows * 48 * 1024 * 1024
 
+    def _resident_leaves_no_prompt_room(self, estimate: object, ceiling: int) -> bool:
+        """Whether a resident load would sit above the prompt admission line.
+
+        The scheduler admits prompts against ceiling x tier headroom, so a
+        resident load between that line and the ceiling cannot serve a
+        prompt. The checkpoint (the resident estimate without its 5% margin)
+        stands in for the footprint, so a load that can still serve stays
+        resident.
+        """
+        enforcer = getattr(self, "_process_memory_enforcer", None)
+        headroom = getattr(enforcer, "_prefill_headroom_safety", None)
+        if not isinstance(headroom, (int, float)) or not 0 < headroom < 1:
+            return False
+        if ceiling <= 0 or not getattr(estimate, "supported", False):
+            return False
+        line = int(ceiling * headroom)
+        footprint = int(estimate.resident_bytes / 1.05)
+        return footprint > line >= estimate.mmap_bytes
+
     def _qwen4_ple_offload_status(
         self,
         entry: EngineEntry,
@@ -529,12 +560,15 @@ class EnginePool:
                 ceiling = self._fallback_admission_ceiling()
             if ceiling <= 0:
                 ceiling = self._current_ceiling()
-        forced = estimate.force_ssd_offload(ceiling)
+        forced = estimate.force_ssd_offload(
+            ceiling
+        ) or self._resident_leaves_no_prompt_room(estimate, ceiling)
         if forced:
             logger.warning(
-                "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB exceeds the "
-                "%.1fGB memory ceiling (mmap needs %.1fGB). Decode will be "
-                "roughly 2.5x slower than a resident load.",
+                "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB leaves no "
+                "room to serve prompts under the %.1fGB memory ceiling (mmap "
+                "needs %.1fGB). Decode will be roughly 2.5x slower than a "
+                "resident load.",
                 entry.model_id,
                 estimate.resident_bytes / 1e9,
                 ceiling / 1e9,
@@ -617,11 +651,14 @@ class EnginePool:
                 ceiling = self._fallback_admission_ceiling()
             if ceiling <= 0:
                 ceiling = self._current_ceiling()
-        forced = estimate.force_ssd_offload(ceiling)
+        forced = estimate.force_ssd_offload(
+            ceiling
+        ) or self._resident_leaves_no_prompt_room(estimate, ceiling)
         if forced:
             logger.warning(
-                "DeepSeek V4.1 Engram forced to SSD for %s: resident %.1fGB exceeds the "
-                "%.1fGB memory ceiling (mmap needs %.1fGB).",
+                "DeepSeek V4.1 Engram forced to SSD for %s: resident %.1fGB leaves "
+                "no room to serve prompts under the %.1fGB memory ceiling (mmap "
+                "needs %.1fGB).",
                 entry.model_id,
                 estimate.resident_bytes / 1e9,
                 ceiling / 1e9,
@@ -741,6 +778,24 @@ class EnginePool:
         except Exception:  # noqa: BLE001
             return 0
 
+    def _dynamic_ceiling_binds(self) -> bool:
+        """Whether the free-memory-derived ceiling is the binding component."""
+        enforcer = getattr(self, "_process_memory_enforcer", None)
+        getter = getattr(enforcer, "get_ceiling_breakdown", None)
+        if not callable(getter):
+            return False
+        if getattr(enforcer, "memory_guard_tier", "") == "custom":
+            return False
+        try:
+            breakdown = getter()
+            dynamic = int(breakdown["dynamic"])
+            others = [
+                int(breakdown[k]) for k in ("static", "metal_cap") if breakdown[k] > 0
+            ]
+        except Exception:  # noqa: BLE001
+            return False
+        return 0 < dynamic < min(others, default=dynamic + 1)
+
     def _ceiling_binding_and_advice(
         self, *, ceiling: int, current: int, tail: str
     ) -> tuple[str | None, str | None]:
@@ -770,6 +825,8 @@ class EnginePool:
             static = int(breakdown["static"])
             dynamic = int(breakdown["dynamic"])
             metal_cap = int(breakdown["metal_cap"])
+            raw_getter = getattr(enforcer, "_get_effective_metal_cap_bytes", None)
+            metal_cap_raw = int(raw_getter()) if callable(raw_getter) else 0
         except Exception:  # noqa: BLE001
             return None, None
         if max(static, dynamic, metal_cap) <= 0:
@@ -782,6 +839,7 @@ class EnginePool:
             current=current,
             fmt=format_size,
             tail=tail,
+            metal_cap_raw=metal_cap_raw,
         )
 
     def _wake_process_memory_enforcer(self, *, active: bool = False) -> None:
@@ -1969,6 +2027,7 @@ class EnginePool:
                 soft_target = self._admission_soft_target()
                 evict_target = min(soft_target, ceiling) if soft_target > 0 else ceiling
                 evicted_any = unloaded_for_admission
+                ceiling_rechecks = 0
                 while True:
                     # Consult the tracked accumulator alongside live memory:
                     # after a model settles or idles, mx.get_active_memory() and
@@ -1979,7 +2038,7 @@ class EnginePool:
                     # committing past the ceiling (#1623).
                     current = max(
                         mx.get_active_memory(),
-                        get_phys_footprint(),
+                        _settled_phys_footprint(),
                         self._current_model_memory,
                     )
                     projected = current + admission_size
@@ -2059,6 +2118,23 @@ class EnginePool:
                             f"evict; the system may swap heavily."
                         )
                         break
+
+                    if (
+                        ceiling_rechecks < _ADMISSION_CEILING_RECHECKS
+                        and self._dynamic_ceiling_binds()
+                    ):
+                        # Pages of a model unloaded just before this load
+                        # reach the free list up to ~0.2s after the process
+                        # footprint drops, so the dynamic ceiling can read
+                        # low for that long. Re-read it before refusing.
+                        ceiling_rechecks += 1
+                        await asyncio.sleep(_ADMISSION_CEILING_RECHECK_S)
+                        ceiling = max(ceiling, self._current_ceiling())
+                        soft_target = max(soft_target, self._admission_soft_target())
+                        evict_target = (
+                            min(soft_target, ceiling) if soft_target > 0 else ceiling
+                        )
+                        continue
 
                     # Still over budget under the applicable baseline. Use
                     # ModelTooLargeError when the model alone exceeds the
@@ -2352,7 +2428,7 @@ class EnginePool:
 
             while True:
                 active = mx.get_active_memory()
-                footprint = get_phys_footprint()
+                footprint = _settled_phys_footprint()
                 current = max(active, footprint, self._current_model_memory)
                 if current + predicted <= target:
                     # Use the same sample for admission and its decision log.
@@ -2385,7 +2461,7 @@ class EnginePool:
                             exclude_model_id, request_id
                         )
                         # Re-measure regardless of the reported delta: the
-                        # helper measures a process-wide footprint, so
+                        # helper reads the process-wide MLX pool, so
                         # concurrent allocation on another engine can mask a
                         # real reclaim as 0 bytes freed. The loop re-checks
                         # the target with a fresh reading; reclaim_attempted
@@ -2471,7 +2547,7 @@ class EnginePool:
         enforcer).
 
         Returns:
-            Bytes handed back to the OS (``get_phys_footprint`` delta, >= 0).
+            Pool bytes MLX handed back to the OS (>= 0).
         """
         entry = self._entries.get(model_id)
         engine = entry.engine if entry is not None else None
@@ -2488,14 +2564,17 @@ class EnginePool:
             # shape without the scheduler helper: skip -- reject as before.
             return 0
 
-        def _reclaim_on_engine_thread() -> None:
+        def _reclaim_on_engine_thread() -> int:
             gc.collect()
+            pooled = int(mx.get_cache_memory())
             reclaim()
+            return max(0, pooled - int(mx.get_cache_memory()))
 
-        before = get_phys_footprint()
         loop = asyncio.get_running_loop()
         try:
-            await loop.run_in_executor(executor, _reclaim_on_engine_thread)
+            # The footprint keeps charging the released pool for a while, so
+            # report the pool bytes MLX actually returned.
+            freed = await loop.run_in_executor(executor, _reclaim_on_engine_thread)
         except Exception as e:
             logger.warning(
                 "Pooled-buffer reclaim failed for prefill request %s: %s",
@@ -2503,7 +2582,6 @@ class EnginePool:
                 e,
             )
             return 0
-        freed = max(0, before - get_phys_footprint())
         if freed > 0:
             logger.info(
                 "Reclaimed %s of pooled Metal buffers for prefill request %s "

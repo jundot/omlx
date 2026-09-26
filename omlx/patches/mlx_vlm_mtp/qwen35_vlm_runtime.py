@@ -456,6 +456,10 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
             return [KVCache() for _ in self.mtp.layers]
         return []
 
+    # Logits are lm_head(mtp(...)); draft chains may score candidates themselves.
+    mtp_forward._omlx_lm_head_logits = True
+    # The head reads only its own cache, so it can draft before the backbone commit.
+    mtp_forward._omlx_head_cache_only = True
     cls.__init__ = __init__
     cls.__call__ = __call__
     cls.mtp_forward = mtp_forward
