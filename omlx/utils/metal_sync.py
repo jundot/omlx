@@ -16,12 +16,15 @@ given, resolved on the calling thread.
 """
 
 import threading
+import time
+from collections import deque
 from contextlib import suppress
 
 import mlx.core as mx
 from mlx_lm.generate import generation_stream
 
 from .fatal import exit_if_gpu_submissions_ignored
+from .proc_memory import get_graphics_footprint
 
 # Module-level alias so callers can fall back to mlx-lm's default stream
 # when no per-engine stream is provided.
@@ -82,3 +85,80 @@ def _sync_and_clear_cache(stream=None):
         except RuntimeError as exc:
             exit_if_gpu_submissions_ignored(exc)
             raise
+
+
+# The kernel footprint keeps charging freed Metal buffers until the driver
+# finishes releasing them: 0.1-0.3s on macOS 27, over 1s on some macOS 26
+# builds. MLX releases buffers on mx.clear_cache, when a pool trim makes room
+# under its memory limit, and on free past the cache limit, so the lag is
+# measured instead of tracked per release: the graphics footprint above MLX's
+# own bytes, less the settled level of other Metal memory.
+_RESIDUAL_WINDOW_S = 10.0
+_FRESH_RESULT_S = 2.0
+_residuals: deque[tuple[float, int]] = deque()
+_last_unreleased: tuple[float, int] = (0.0, 0)
+_residual_lock = threading.Lock()
+
+
+def unreleased_graphics_bytes(mlx_bytes: int, *, fresh: bool = True) -> int:
+    """Freed Metal bytes the kernel footprint still charges.
+
+    ``mlx_bytes`` is MLX active + pool, which drops the moment MLX releases a
+    buffer. The recent minimum of graphics footprint minus ``mlx_bytes`` is
+    Metal memory outside MLX; anything above it is pending driver release.
+
+    ``fresh=False`` marks a cached, possibly stale MLX sample (the enforcer
+    thread must not call MLX): it reuses the last fresh result instead of
+    deriving one from mismatched readings.
+    """
+    global _last_unreleased
+    now = time.monotonic()
+    if not fresh:
+        with _residual_lock:
+            at, value = _last_unreleased
+        return value if now - at <= _FRESH_RESULT_S else 0
+    graphics = get_graphics_footprint()
+    if graphics <= 0:
+        return 0
+    residual = graphics - max(0, int(mlx_bytes))
+    with _residual_lock:
+        _residuals.append((now, residual))
+        while _residuals and now - _residuals[0][0] > _RESIDUAL_WINDOW_S:
+            _residuals.popleft()
+        settled = max(0, min(value for _, value in _residuals))
+        unreleased = max(0, residual - settled)
+        _last_unreleased = (now, unreleased)
+    return unreleased
+
+
+# Per-owner MLX memory limits requested by in-flight prefill chunks. MLX's
+# limit is process-wide, so the tightest request wins and the original limit
+# returns when no chunk holds one.
+_limit_lock = threading.Lock()
+_chunk_memory_limits: dict[int, int] = {}
+_default_memory_limit: int | None = None
+
+
+def set_chunk_memory_limit(owner: int, limit: int | None) -> None:
+    """Apply or drop one owner's MLX memory limit.
+
+    Above the limit, MLX stops encoding ahead of the GPU until in-flight
+    command buffers retire and free their intermediates, and it trims the
+    buffer pool before growing it. It never refuses an allocation, so this
+    bounds a lazy prefill graph's peak without failing the chunk.
+    """
+    global _default_memory_limit
+    with _limit_lock:
+        if limit is None:
+            if _chunk_memory_limits.pop(owner, None) is None:
+                return
+        else:
+            _chunk_memory_limits[owner] = max(1, int(limit))
+        if _chunk_memory_limits:
+            effective = min(_chunk_memory_limits.values())
+            previous = mx.set_memory_limit(effective)
+            if _default_memory_limit is None:
+                _default_memory_limit = previous
+        elif _default_memory_limit is not None:
+            mx.set_memory_limit(_default_memory_limit)
+            _default_memory_limit = None

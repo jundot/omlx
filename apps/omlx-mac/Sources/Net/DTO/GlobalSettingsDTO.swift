@@ -128,6 +128,21 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         /// What oMLX asked Metal to allow at start (static ceiling clamped
         /// below physical RAM). Kernel cap below this = red warning.
         let omlxWiredLimitRequestBytes: Int64?
+        /// Ceiling each memory guard tier would set right now, keyed by tier.
+        var memoryGuardPreview: [String: MemoryGuardTierPreview]? = nil
+    }
+
+    /// One tier of `system.memory_guard_preview` (server-side enforcer math).
+    struct MemoryGuardTierPreview: Codable, Equatable, Sendable {
+        let reserveBytes: Int64?
+        let freeBytes: Int64?
+        let inactiveBytes: Int64?
+        let otherAppsBytes: Int64?
+        let staticBytes: Int64?
+        let dynamicBytes: Int64?
+        let metalCapBytes: Int64?
+        let ceilingBytes: Int64?
+        let binding: String?
     }
 
     /// Mirrors `omlx.settings.HuggingFaceSettings`. Empty string means

@@ -204,8 +204,10 @@ def _eligible_affine_linear(
     if weight is None or scales is None or biases is None or weight.ndim != 2:
         return False
     input_dim = int(weight.shape[1]) * 32 // bits
+    # dtype is None when the sibling it came from was repacked without scales.
     return bool(
-        dtype in (mx.float16, mx.bfloat16)
+        isinstance(dtype, mx.Dtype)
+        and dtype in (mx.float16, mx.bfloat16)
         and getattr(linear, "bits", None) == bits
         and getattr(linear, "group_size", None) == group_size
         and getattr(linear, "mode", None) == "affine"

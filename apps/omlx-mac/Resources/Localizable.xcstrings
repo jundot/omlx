@@ -10870,19 +10870,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Uses more memory before throttling. Best when the Mac has ample headroom."
+            "value" : "Leaves only 2% of RAM (1.5-4 GB) for macOS and may compress other apps' memory, so oMLX can use nearly all RAM."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Использует больше памяти перед throttling. Лучше, когда у Mac большой запас."
+            "value" : "Оставляет macOS только 2% RAM (1,5-4 ГБ) и может сжимать память других приложений, чтобы oMLX использовал почти всю RAM."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "在节流前使用更多内存。适用于 Mac 有充足余量时。"
+            "value" : "只为 macOS 保留 2% 内存（1.5-4 GB），并可压缩其他应用的内存，让 oMLX 几乎可以使用全部内存。"
           }
         }
       }
@@ -10918,19 +10918,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Default tier. Balances throughput with process memory safety."
+            "value" : "Keeps about 8% of RAM (3-8 GB) free for everyday apps while oMLX runs."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Уровень по умолчанию. Балансирует throughput и безопасность памяти процесса."
+            "value" : "Оставляет свободными около 8% RAM (3-8 ГБ) для обычных приложений, пока работает oMLX."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "默认层级。在吞吐量与进程内存安全之间取得平衡。"
+            "value" : "保留约 8% 内存（3-8 GB）空闲，供 oMLX 运行时的日常应用使用。"
           }
         }
       }
@@ -11014,19 +11014,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Most conservative. Leaves more headroom before scheduling memory-heavy prefill."
+            "value" : "Keeps about 20% of RAM (6-16 GB) free so heavier apps can run alongside oMLX."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Самый консервативный. Оставляет больше запаса перед планированием ресурсоёмкого префилла."
+            "value" : "Оставляет свободными около 20% RAM (6-16 ГБ), чтобы рядом с oMLX могли работать тяжёлые приложения."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "最保守。在调度内存密集型预填充前保留更多余量。"
+            "value" : "保留约 20% 内存（6-16 GB）空闲，让较重的应用也能与 oMLX 同时运行。"
           }
         }
       }

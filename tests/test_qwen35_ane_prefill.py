@@ -188,6 +188,18 @@ def test_q6_mlp_and_gdn_are_eligible_for_ane_hybrid_prefill():
     assert ane_patch._eligible_gdn(_Q6GDN())
 
 
+def test_gdn_with_a_repacked_qkv_is_ineligible_not_an_error():
+    """qkv/z repacked without scales leave b/a quantized with no dtype."""
+
+    class _Packed(nn.Module):
+        pass
+
+    gdn = _Q6GDN()
+    gdn.in_proj_qkv = _Packed()
+    gdn.in_proj_z = _Packed()
+    assert ane_patch._eligible_gdn(gdn) is False
+
+
 @pytest.mark.parametrize(
     ("bits", "symbol"),
     [

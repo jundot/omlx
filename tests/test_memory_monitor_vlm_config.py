@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import mlx.core as mx
+import pytest
 
 from omlx.memory_monitor import (
     _SDPA_FALLBACK_SCORE_DTYPE_SIZE,
@@ -334,6 +335,55 @@ class TestMlaKvMemoryEstimate:
             11 * (512 + 128 / 4) * 2
         )
 
+    def test_absorbed_mla_plain_kv_cache_prices_latent(self):
+        """DeepSeek-V3-style MLA keeps latent + RoPE key in a plain KVCache."""
+        from mlx_lm.models.cache import ArraysCache, KVCache
+
+        config = type(
+            "DeepseekV3Config", (), {"kv_lora_rank": 512, "qk_rope_head_dim": 64}
+        )()
+        caches = [KVCache() for _ in range(61)] + [ArraysCache(2)]
+
+        assert (
+            estimate_mla_kv_bytes_per_token(config, caches, 2, latent_kv_cache=True)
+            == 61 * (512 + 64) * 2
+        )
+        # Expanded MLA caches full K/V, so the uniform formula still applies.
+        assert estimate_mla_kv_bytes_per_token(config, caches, 2) is None
+
+    def test_scheduler_detects_absorbed_mla_from_modules(self):
+        from mlx_lm.models.cache import KVCache
+
+        class _Attention:
+            embed_q = object()
+            unembed_out = object()
+
+        config = type(
+            "DeepseekV3Config",
+            (),
+            {
+                "kv_lora_rank": 512,
+                "qk_rope_head_dim": 64,
+                "num_hidden_layers": 61,
+                "num_attention_heads": 128,
+                "num_key_value_heads": 128,
+                "hidden_size": 7168,
+            },
+        )()
+        sched = _make_scheduler()
+        sched.memory_monitor = MagicMock()
+        sched.model = MagicMock()
+        sched.model.config = config
+        sched.model.make_cache.return_value = [KVCache() for _ in range(61)]
+        sched.model.modules.return_value = [object(), _Attention()]
+        del sched.model.args
+        sched._mla_latent_model = None
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        assert kwargs["kv_bytes_per_token"] == 61 * (512 + 64) * 2
+
     def test_scheduler_passes_mla_kv_override_to_monitor(self):
         sched = _make_scheduler()
         sched.memory_monitor = MagicMock()
@@ -382,6 +432,23 @@ class TestSetModelInfoTurboQuantDtype:
         kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
         expected = 4.0 / 8.0 + 2.0 / 128
         assert abs(kwargs["dtype_size"] - expected) < 1e-9
+        # Prefill holds fp16 KV until conversion, then both copies.
+        assert abs(kwargs["prefill_dtype_size"] - (2.0 + expected)) < 1e-9
+
+    def test_turboquant_prefill_kv_is_priced_at_full_width(self):
+        monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+        quantized = 4.0 / 8.0 + 2.0 / 128
+        monitor.set_model_info(
+            num_layers=40,
+            num_kv_heads=8,
+            head_dim=128,
+            dtype_size=quantized,
+            prefill_dtype_size=2.0 + quantized,
+        )
+        per_token_fp16 = 40 * 8 * 128 * 2 * 2
+        assert monitor.estimate_prompt_kv_bytes(1000) == pytest.approx(
+            1000 * per_token_fp16 * (2.0 + quantized) / 2.0
+        )
 
     def test_turboquant_4bit_default_skip_last_keeps_one_full_dtype_layer(self):
         sched = self._make_sched_with_config(_PlainLMConfig())

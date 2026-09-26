@@ -49,6 +49,7 @@ def describe_ceiling_binding(
     current: int,
     fmt: Callable[[int], str],
     tail: Optional[Union[str, list[str]]] = None,
+    metal_cap_raw: int = 0,
 ) -> tuple[str, str]:
     """Name the binding component ceiling and the remedy that actually moves it.
 
@@ -70,6 +71,8 @@ def describe_ceiling_binding(
     component was supplied. ``advice`` is capitalized and carries no
     trailing punctuation; ``tail`` appends one or more call-site remedies
     ("reduce context length" for prefill, "use a smaller model" for a load).
+    ``metal_cap`` is compared in total-usage units; ``metal_cap_raw`` is the
+    kernel Metal cap named in the advice (defaults to ``metal_cap``).
     """
     components = {
         name: value
@@ -110,7 +113,7 @@ def describe_ceiling_binding(
     elif "metal_cap" in binding:
         remedies.append(
             f"raise kernel iogpu.wired_limit_mb in Terminal "
-            f"(currently caps Metal at {fmt(metal_cap)})"
+            f"(currently caps Metal at {fmt(metal_cap_raw or metal_cap)})"
         )
     else:
         remedies.append(f"raise memory_guard_tier ({MEMORY_GUARD_TIER_LADDER})")
