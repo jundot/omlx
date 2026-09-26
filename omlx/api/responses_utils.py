@@ -14,6 +14,8 @@ from .responses_models import (
     InputTokensDetails,
     OutputContent,
     OutputItem,
+    ResponseObject,
+    ResponsesRequest,
     ResponsesTool,
     ResponseUsage,
 )
@@ -580,6 +582,60 @@ def build_response_usage(
         total_tokens=input_tokens + output_tokens,
         input_tokens_details=InputTokensDetails(cached_tokens=cached_tokens),
         output_tokens_details=OutputTokensDetails(reasoning_tokens=reasoning_tokens),
+    )
+
+
+def build_response_object(
+    request: ResponsesRequest,
+    *,
+    response_id: str,
+    created_at: int,
+    output_items: List[Any],
+    usage: Optional[ResponseUsage],
+    truncated: bool,
+    temperature: Optional[float],
+    top_p: Optional[float],
+    store: bool,
+    status: Optional[str] = None,
+) -> ResponseObject:
+    """Build the one response envelope both response paths serialize.
+
+    A single builder keeps the non-streaming body, the streaming terminal event
+    and the streaming opening snapshot from drifting apart in which request
+    fields they echo. The streaming caller still serializes with
+    ``exclude_none``, so its null-valued fields stay omitted: that predates this
+    builder and the streaming integration tests pin it.
+
+    ``store`` is the *effective* value the server acted on
+    (``_should_store_response``), not the raw request field: a client that sends
+    nothing still gets ``store: true`` back, because that is what happened.
+    Making it required keeps a caller from echoing the request by accident.
+
+    ``status`` overrides the truncation-derived status so ``response.created``
+    and ``response.in_progress`` come from the same builder as the terminal
+    event.
+    """
+    return ResponseObject(
+        id=response_id,
+        created_at=created_at,
+        model=request.model,
+        status=status or ("incomplete" if truncated else "completed"),
+        output=output_items,
+        usage=usage,
+        tools=request.tools or [],
+        tool_choice=request.tool_choice or "auto",
+        temperature=temperature,
+        top_p=top_p,
+        max_output_tokens=request.max_output_tokens,
+        previous_response_id=request.previous_response_id,
+        incomplete_details={"reason": "max_output_tokens"} if truncated else None,
+        instructions=request.instructions,
+        store=store,
+        parallel_tool_calls=request.parallel_tool_calls,
+        reasoning=request.reasoning,
+        text=request.text,
+        metadata=request.metadata or {},
+        truncation=request.truncation or "disabled",
     )
 
 

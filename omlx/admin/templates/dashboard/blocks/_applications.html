@@ -1,5 +1,5 @@
 <!-- Applications -->
-<div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+<div class="card overflow-hidden">
     <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
         <div class="flex items-center gap-3">
             <i data-lucide="layout-grid" class="w-4 h-4 text-neutral-500"></i>
@@ -28,7 +28,7 @@
         </div>
 
         <!-- Codex -->
-        <div class="flex items-start gap-4 px-6 py-4 group">
+        <div class="flex items-center gap-4 px-6 py-4 group">
             <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">
                 <img src="/admin/static/img/integrations/codex.png" alt="{{ t('status.integrations.codex') }}" class="w-full h-full object-cover">
             </div>
@@ -36,7 +36,7 @@
                 <div class="text-sm font-semibold text-neutral-800">{{ t('status.integrations.codex') }}</div>
                 <div class="space-y-1.5">
                     <div class="flex items-center gap-2 min-w-0">
-                        <span class="w-10 text-[10px] font-bold uppercase tracking-wider text-neutral-400 flex-shrink-0">CLI</span>
+                        <span class="w-10 text-[12px] font-bold uppercase tracking-wider text-neutral-400 flex-shrink-0">CLI</span>
                         <code class="text-xs text-neutral-500 font-mono truncate flex-1" x-text="codexCommand"></code>
                         <button x-data="{ copied: false }"
                                 @click="copyToClipboard(codexCommand); copied = true; setTimeout(() => copied = false, 2000)"
@@ -48,7 +48,7 @@
                         </button>
                     </div>
                     <div class="flex items-center gap-2 min-w-0">
-                        <span class="w-10 text-[10px] font-bold uppercase tracking-wider text-neutral-400 flex-shrink-0">{{ t('status.integrations.app') }}</span>
+                        <span class="w-10 text-[12px] font-bold uppercase tracking-wider text-neutral-400 flex-shrink-0">{{ t('status.integrations.app') }}</span>
                         <code class="text-xs text-neutral-500 font-mono truncate flex-1" x-text="codexAppCommand"></code>
                         <button x-data="{ copied: false }"
                                 @click="copyToClipboard(codexAppCommand); copied = true; setTimeout(() => copied = false, 2000)"

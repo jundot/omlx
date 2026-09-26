@@ -1,5 +1,5 @@
 <!-- Runtime Cache Observability / 运行时缓存可观测性 -->
-<div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+<div class="card overflow-hidden">
     <div class="lg:hidden flex flex-col gap-3 px-4 py-4 bg-neutral-100 border-b border-neutral-200">
         <div class="flex items-center gap-3 min-w-0">
             <i data-lucide="database" class="w-4 h-4 text-neutral-500 shrink-0"></i>
@@ -24,7 +24,7 @@
                     <div x-show="showClearHotCacheConfirm" x-cloak class="flex items-center gap-1.5">
                         <span class="text-xs text-red-600">{{ t('status.runtime_cache.clear_memory_confirm') }}</span>
                         <button @click="clearHotCache()"
-                                class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
+                                class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:brightness-95 rounded-lg transition-all">
                             {{ t('status.clear_yes') }}
                         </button>
                         <button @click="showClearHotCacheConfirm = false"
@@ -41,7 +41,7 @@
                          :style="'width: ' + runtimeSsdCachePercent + '%'"></div>
                 </div>
                 <span class="text-xs font-medium text-neutral-500 min-w-0 break-words"
-                      x-text="formatSizeBytes(stats.runtime_cache?.total_size_bytes || 0) + ' / ' + formatSizeBytes(stats.runtime_cache?.disk_max_bytes || 0) + ' · ' + formatNumber(stats.runtime_cache?.total_num_files || 0) + ' files'"></span>
+                      x-text="formatSizeBytes(stats.runtime_cache?.total_size_bytes || 0) + ' / ' + formatSizeBytes(stats.runtime_cache?.disk_max_bytes || 0) + ' · ' + window.t('status.runtime_cache.files_count').replace('{count}', window.formatCount(stats.runtime_cache?.total_num_files || 0))"></span>
                 <div class="flex items-center gap-1.5">
                     <button x-show="!showClearSsdCacheConfirm && (stats.runtime_cache?.total_num_files || 0) > 0"
                             @click="showClearSsdCacheConfirm = true"
@@ -52,7 +52,7 @@
                     <div x-show="showClearSsdCacheConfirm" x-cloak class="flex items-center gap-1.5">
                         <span class="text-xs text-red-600" x-text="window.t('status.clear_ssd_cache_confirm')"></span>
                         <button @click="clearSsdCache()"
-                                class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
+                                class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:brightness-95 rounded-lg transition-all">
                             {{ t('status.clear_yes') }}
                         </button>
                         <button @click="showClearSsdCacheConfirm = false"
@@ -89,7 +89,7 @@
                     <div x-show="showClearHotCacheConfirm" x-cloak class="flex items-center gap-1.5">
                         <span class="text-xs text-red-600">{{ t('status.runtime_cache.clear_memory_confirm') }}</span>
                         <button @click="clearHotCache()"
-                                class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
+                                class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:brightness-95 rounded-lg transition-all">
                             {{ t('status.clear_yes') }}
                         </button>
                         <button @click="showClearHotCacheConfirm = false"
@@ -109,7 +109,7 @@
                          :style="'width: ' + runtimeSsdCachePercent + '%'"></div>
                 </div>
                 <span class="text-xs font-medium text-neutral-500 whitespace-nowrap"
-                      x-text="formatSizeBytes(stats.runtime_cache?.total_size_bytes || 0) + ' / ' + formatSizeBytes(stats.runtime_cache?.disk_max_bytes || 0) + ' · ' + formatNumber(stats.runtime_cache?.total_num_files || 0) + ' files'"></span>
+                      x-text="formatSizeBytes(stats.runtime_cache?.total_size_bytes || 0) + ' / ' + formatSizeBytes(stats.runtime_cache?.disk_max_bytes || 0) + ' · ' + window.t('status.runtime_cache.files_count').replace('{count}', window.formatCount(stats.runtime_cache?.total_num_files || 0))"></span>
             </div>
             <div class="flex items-center gap-1.5">
                 <button x-show="!showClearSsdCacheConfirm && (stats.runtime_cache?.total_num_files || 0) > 0"
@@ -121,7 +121,7 @@
                 <div x-show="showClearSsdCacheConfirm" x-cloak class="flex items-center gap-1.5">
                     <span class="text-xs text-red-600" x-text="window.t('status.clear_ssd_cache_confirm')"></span>
                     <button @click="clearSsdCache()"
-                            class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
+                            class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:brightness-95 rounded-lg transition-all">
                         {{ t('status.clear_yes') }}
                     </button>
                     <button @click="showClearSsdCacheConfirm = false"
@@ -160,22 +160,22 @@
              :class="stats.runtime_cache?.hot_cache_max_bytes > 0 ? 'grid-cols-2 sm:grid-cols-4' : 'grid-cols-2'"
              class="grid gap-3 border border-neutral-100 rounded-lg p-3">
             <div>
-                <p class="text-[11px] text-neutral-400 mb-0.5">{{ t('status.runtime_cache.prefix_hit_rate') }}</p>
+                <p class="text-[12px] text-neutral-400 mb-0.5">{{ t('status.runtime_cache.prefix_hit_rate') }}</p>
                 <p class="text-lg font-bold text-neutral-900"
                    x-text="((c.prefix_hit_rate || 0) * 100).toFixed(1) + '%'"></p>
             </div>
             <div x-show="stats.runtime_cache?.hot_cache_max_bytes > 0">
-                <p class="text-[11px] text-neutral-400 mb-0.5">{{ t('status.runtime_cache.memory_hit_rate') }}</p>
+                <p class="text-[12px] text-neutral-400 mb-0.5">{{ t('status.runtime_cache.memory_hit_rate') }}</p>
                 <p class="text-lg font-bold text-neutral-900"
                    x-text="((c.ssd_hot_rate || 0) * 100).toFixed(1) + '%'"></p>
             </div>
             <div>
-                <p class="text-[11px] text-neutral-400 mb-0.5">{{ t('status.runtime_cache.prefix_evictions') }}</p>
+                <p class="text-[12px] text-neutral-400 mb-0.5">{{ t('status.runtime_cache.prefix_evictions') }}</p>
                 <p class="text-lg font-bold text-neutral-900"
                    x-text="(c.evictions || 0).toLocaleString()"></p>
             </div>
             <div x-show="stats.runtime_cache?.hot_cache_max_bytes > 0">
-                <p class="text-[11px] text-neutral-400 mb-0.5">{{ t('status.runtime_cache.memory_evictions') }}</p>
+                <p class="text-[12px] text-neutral-400 mb-0.5">{{ t('status.runtime_cache.memory_evictions') }}</p>
                 <p class="text-lg font-bold text-neutral-900"
                    x-text="(c.hot_cache_evictions || 0).toLocaleString()"></p>
             </div>
@@ -202,20 +202,20 @@
                             <td class="px-3 py-2 font-medium">
                                 <span x-text="m.id"></span>
                                 <span x-show="m.cache_tier === 'rank-prompt-snapshot'" x-cloak
-                                      class="ml-1.5 px-1.5 py-0.5 text-[10px] font-semibold rounded bg-violet-50 text-violet-600 border border-violet-200"
+                                      class="ml-1.5 chip chip--neutral"
                                       x-text="window.t('cluster.badge.label')"></span>
                             </td>
                             <template x-if="m.cache_tier === 'rank-prompt-snapshot'">
                                 <td class="px-3 py-2 text-right text-neutral-500"
                                     :colspan="stats.runtime_cache?.hot_cache_max_bytes > 0 ? 7 : 5"
-                                    x-text="window.t('cluster.badge.rank_cache') + ': ' + (((m.rank_prompt_cache?.hit_rate || 0) * 100).toFixed(1) + '%') + ' · ' + formatNumber(m.rank_prompt_cache?.entries || 0) + ' ' + window.t('cluster.badge.rank_cache_entries') + ' · ' + formatSizeBytes(m.rank_prompt_cache?.bytes || 0)"></td>
+                                    x-text="window.t('cluster.badge.rank_cache') + ': ' + (((m.rank_prompt_cache?.hit_rate || 0) * 100).toFixed(1) + '%') + ' · ' + window.formatCount(m.rank_prompt_cache?.entries || 0) + ' ' + window.t('cluster.badge.rank_cache_entries') + ' · ' + formatSizeBytes(m.rank_prompt_cache?.bytes || 0)"></td>
                             </template>
                             <template x-if="m.cache_tier !== 'rank-prompt-snapshot'">
                                 <td class="px-3 py-2 text-right" x-text="m.block_size ? (m.block_size + ' tks') : '-' "></td>
                             </template>
                             <template x-if="m.cache_tier !== 'rank-prompt-snapshot'">
                                 <td class="px-3 py-2 text-right">
-                                    <span x-show="!m.has_sub_block_cache" x-text="formatNumber(m.indexed_blocks || 0) + ' blocks'"></span>
+                                    <span x-show="!m.has_sub_block_cache" x-text="window.t('status.runtime_cache.blocks_count').replace('{count}', window.formatCount(m.indexed_blocks || 0))"></span>
                                     <span x-show="m.has_sub_block_cache" class="font-medium text-amber-600" x-text="m.indexed_blocks_display + ' tks'"></span>
                                 </td>
                             </template>
@@ -229,7 +229,7 @@
                                 </td>
                             </template>
                             <template x-if="m.cache_tier !== 'rank-prompt-snapshot'">
-                                <td class="px-3 py-2 text-right" x-text="formatNumber(m.num_files || 0)"></td>
+                                <td class="px-3 py-2 text-right" x-text="window.formatCount(m.num_files || 0)"></td>
                             </template>
                             <template x-if="m.cache_tier !== 'rank-prompt-snapshot'">
                                 <td class="px-3 py-2 text-right" x-text="formatSizeBytes(m.total_size_bytes || 0)"></td>
@@ -246,7 +246,7 @@
             </table>
         </div>
 
-        <div class="text-[11px] text-neutral-500">
+        <div class="text-[12px] text-neutral-500">
             {{ t('status.runtime_cache.subblock_note') }}
         </div>
     </div>

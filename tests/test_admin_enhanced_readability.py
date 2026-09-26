@@ -8,9 +8,10 @@ the three behaviors the upstream reviewer asked for:
                     so it wins over theme variable declarations defined inside it.
 2. KaTeX excluded - no rule sets ``.katex { font-size: ... }`` (formula scaling
                     (1.21em) must stay untouched).
-3. Font-size floor - Tailwind arbitrary-value classes use the ESCAPED selector
-                    form (``.text-\[10px\]``) so they actually match the compiled
-                    CSS, lifting sub-12px text to 12px.
+3. Font-size floor - the floor is the scale's, so it is generated into
+                    ``static/css/tokens.css`` (escaped selectors, applied to
+                    everyone); what this file pins in the readability block is
+                    the two relative-sized icon buttons it still lifts.
 
 Plus invariants: gray helper text -> primary, red kept, model-card gray text is
 also lifted to primary, no blanket disabled-text override, and the i18n key
@@ -28,6 +29,7 @@ TEMPLATES = ROOT / "omlx/admin/templates"
 I18N = ROOT / "omlx/admin/i18n"
 
 BASE = (TEMPLATES / "base.html").read_text(encoding="utf-8")
+TOKENS_CSS = (ROOT / "omlx/admin/static/css/tokens.css").read_text(encoding="utf-8")
 CHAT = (TEMPLATES / "chat.html").read_text(encoding="utf-8")
 DASHBOARD_NAV = (TEMPLATES / "dashboard/_navbar.html").read_text(encoding="utf-8")
 DASHBOARD_JS = (ROOT / "omlx/admin/static/js/dashboard.js").read_text(encoding="utf-8")
@@ -55,12 +57,19 @@ def test_no_katex_font_size_override():
     assert bad is None, f"KaTeX font-size override present: {bad.group(0)}"
 
 
-def test_font_size_floor_uses_escaped_selectors():
-    assert ".text-\\[10px\\]" in BASE, "escaped .text-[10px] selector missing"
-    assert ".text-\\[11px\\]" in BASE, "escaped .text-[11px] selector missing"
-    assert ".text-\\[9px\\]" in BASE, "escaped .text-[9px] selector missing"
-    assert ".svg-allow-warning" in BASE
-    assert ".model-card-content pre code" in BASE
+def test_font_size_floor_lives_in_the_token_layer():
+    """The floor is the scale's, not a readability switch's: it applies to
+    everyone, so it is generated from tokens.json into tokens.css and base.html
+    no longer repeats it. What stays here is only the pair of relative-sized
+    icon buttons the toggle lifts."""
+    for selector in (".text-\\[9px\\]", ".text-\\[10px\\]", ".text-\\[11px\\]"):
+        assert selector in TOKENS_CSS, f"{selector} missing from the generated floor"
+    assert '[style*="font-size: 10px"]' in TOKENS_CSS
+    assert '[style*="font-size: 11px"]' in TOKENS_CSS
+    assert "font-size: var(--fs-aux) !important" in TOKENS_CSS
+    assert "[data-enhanced-readability] .text-\\[10px\\]" not in BASE, (
+        "the floor is duplicated in base.html again"
+    )
     assert ".code-copy-btn" in BASE
     assert ".svg-render-btn" in BASE
     assert "font-size: 12px !important" in BASE
@@ -87,7 +96,9 @@ def test_model_card_gray_text_maps_to_primary():
     # #475569, a common model-card gray) is lifted to primary via the gray-hex
     # mapping. Explicitly-colored markdown (links/code) is untouched because
     # those colors are not in the gray-hex list.
-    assert ".model-card-content" in BASE
+    assert "[data-enhanced-readability] .model-card-content" not in BASE, (
+        "the model card is exempt from the readability mapping again"
+    )
     assert '[style*="color: #475569"]' in BASE  # gray now mapped -> primary
     assert "Model card markdown keeps ORIGINAL" not in BASE
 

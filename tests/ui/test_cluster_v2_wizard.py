@@ -541,7 +541,9 @@ process.stdout.write(JSON.stringify(samples));
     assert loading["runtimeState"] == "loading"
     assert loading["active"] is None
     assert loading["label"] == "Loading"
-    assert "blue" in loading["tone"]
+    # The console accent is neutral; an in-progress tone is still its own
+    # tone, it just is not painted blue any more.
+    assert loading["tone"]
 
     ready = result["runtime_ready.json"]
     assert ready["runtimeState"] == "ready"
@@ -989,8 +991,8 @@ process.stdout.write(JSON.stringify({
     assert result["active"] == {
         "ids": [41, 42],
         "phases": ["prefill", "decode"],
-        "prefill": ["812 tok/s", "905 tok/s"],
-        "decode": ["—", "44.3 tok/s"],
+        "prefill": ["812 Tok/s", "905 Tok/s"],
+        "decode": ["—", "44.3 Tok/s"],
         "count": "2 active",
     }
     assert result["completed"] == {
@@ -1589,16 +1591,18 @@ def test_strategy_picker_renders_between_models_and_roles():
     template = _read(TEMPLATE)
 
     assert "data-cluster-v2-strategy-picker" in template
-    # Same segmented-control pattern as the role picker (neutral-900 active).
+    # Same segmented-control pattern as the role picker, on the console's one
+    # accent: a strategy chip that is on is the tinted one.
     picker = template.split("data-cluster-v2-strategy-picker", 1)[1].split(
         "data-cluster-v2-node-roles", 1
     )[0]
-    assert "bg-neutral-900 text-white" in picker
+    assert "bg-accent text-accent-fg" in picker
     assert ':data-cluster-v2-strategy="option.key"' in picker
-    # Green "Recommended" pill, exactly one at a time.
+    # Green "Recommended" label, exactly one at a time — the one label box, its
+    # colour a token (`.chip--green`) rather than a palette literal.
     assert "data-cluster-v2-strategy-recommended" in picker
     assert (
-        "bg-green-50 border-green-200 text-green-700" in picker
+        "chip chip--green" in picker
     )
     assert "recommendedStrategy() === option.key" in picker
     # Disabled options explain themselves.

@@ -1,5 +1,5 @@
 <!-- Claude Code with oMLX -->
-<div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+<div class="card overflow-hidden">
     <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
         <div class="flex items-center gap-3">
             <i data-lucide="terminal" class="w-4 h-4 text-neutral-500"></i>
@@ -7,17 +7,16 @@
         </div>
     </div>
     <div class="px-6 py-5">
-        <div class="flex flex-col sm:flex-row gap-4 items-start">
+        <div class="flex flex-col sm:flex-row gap-4 sm:items-center">
             <!-- Left: Mode Toggle -->
             <div class="w-full sm:w-48 sm:flex-shrink-0">
                 <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('status.claude_code.mode') }}</label>
                 <div class="flex items-center gap-3">
-                    <button type="button"
+                    <button type="button" role="switch"
+                            :aria-checked="globalSettings.claude_code.mode === 'local' ? 'true' : 'false'"
                             @click="globalSettings.claude_code.mode = (globalSettings.claude_code.mode === 'cloud' ? 'local' : 'cloud'); saveClaudeCodeSettings()"
-                            :class="globalSettings.claude_code.mode === 'local' ? 'bg-neutral-900' : 'bg-neutral-200'"
-                            class="relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full transition-colors duration-200">
-                        <span :class="globalSettings.claude_code.mode === 'local' ? 'translate-x-5' : 'translate-x-0'"
-                              class="inline-block h-5 w-5 transform rounded-full bg-white shadow mt-0.5 ml-0.5 transition duration-200"></span>
+                            class="switch" :class="globalSettings.claude_code.mode === 'local' ? 'switch--on' : ''">
+                        <span class="switch__knob"></span>
                     </button>
                     <span class="text-sm font-medium text-neutral-700" x-text="globalSettings.claude_code.mode === 'cloud' ? window.t('status.claude_code.mode_cloud') : window.t('status.claude_code.mode_local')"></span>
                 </div>
