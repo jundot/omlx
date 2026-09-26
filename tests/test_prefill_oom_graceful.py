@@ -1306,6 +1306,38 @@ def test_requeue_budget_exhausts_to_clean_error():
     assert req.prefill_oom_retries == 2
 
 
+def test_requeue_clears_the_specprefill_marker_only_for_its_own_request():
+    """The requeued request's own RoPE marker is cleared.
+
+    `_cleanup_specprefill` calls `cleanup_rope` only on an id match, so the
+    marker has to go when the request it names is the one being requeued.
+    """
+    ns = _requeue_ctx()
+    req = _fake_request()
+    ns._specprefill_active_request_id = req.request_id
+    Scheduler._requeue_or_fail_prefill(
+        ns, req, RuntimeError("Memory limit exceeded during prefill")
+    )
+    assert ns._specprefill_active_request_id is None
+
+
+def test_requeue_leaves_another_requests_specprefill_marker_alone():
+    """A second request's live SpecPrefill marker survives this requeue.
+
+    Clearing it unconditionally strands the wrapper: `_cleanup_specprefill`
+    would no longer match when the owning request finishes, so `cleanup_rope`
+    never runs and the offset RoPE stays installed on the shared model. The
+    admission gate that defers a second SpecPrefill request reads the same
+    marker, so a second one would then be admitted over a live wrapper (#766).
+    """
+    ns = _requeue_ctx()
+    ns._specprefill_active_request_id = "other-request"
+    Scheduler._requeue_or_fail_prefill(
+        ns, _fake_request(), RuntimeError("Memory limit exceeded during prefill")
+    )
+    assert ns._specprefill_active_request_id == "other-request"
+
+
 # --------------------------------------------------------------------------
 # Scheduler._snap_chunk_size
 # --------------------------------------------------------------------------
