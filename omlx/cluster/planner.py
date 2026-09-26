@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import struct
 import subprocess
@@ -261,6 +262,7 @@ class NodeBudget:
     # the per-rank plan for the same reason as ``role``: mlx.launch sends one
     # common argv to every host.
     memory_guard_tier: str = "balanced"
+    memory_guard_custom_ceiling_gb: float = 0.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "role", normalize_node_role(self.role))
@@ -269,6 +271,12 @@ class NodeBudget:
             "memory_guard_tier",
             normalize_memory_guard_tier(self.memory_guard_tier),
         )
+        custom_ceiling_gb = float(self.memory_guard_custom_ceiling_gb)
+        if not math.isfinite(custom_ceiling_gb) or custom_ceiling_gb < 0:
+            raise ValueError(
+                "memory guard custom ceiling must be finite and non-negative"
+            )
+        object.__setattr__(self, "memory_guard_custom_ceiling_gb", custom_ceiling_gb)
         if not self.node_id:
             raise ValueError("node_id is required")
         if self.capacity_bytes <= 0:
@@ -328,6 +336,7 @@ class PipelineAssignment:
     # the guard reads as headless.
     role: str = ""
     memory_guard_tier: str = "balanced"
+    memory_guard_custom_ceiling_gb: float = 0.0
     tensor_parallel_rank: int = 0
     tensor_parallel_size: int = 1
     sharded_weight_bytes: int = 0
@@ -356,6 +365,12 @@ class PipelineAssignment:
             "memory_guard_tier",
             normalize_memory_guard_tier(self.memory_guard_tier),
         )
+        custom_ceiling_gb = float(self.memory_guard_custom_ceiling_gb)
+        if not math.isfinite(custom_ceiling_gb) or custom_ceiling_gb < 0:
+            raise ValueError(
+                "memory guard custom ceiling must be finite and non-negative"
+            )
+        object.__setattr__(self, "memory_guard_custom_ceiling_gb", custom_ceiling_gb)
 
     @property
     def layer_count(self) -> int:
@@ -394,6 +409,7 @@ class PipelineAssignment:
             "utilization": self.utilization,
             "role": self.role,
             "memory_guard_tier": self.memory_guard_tier,
+            "memory_guard_custom_ceiling_gb": self.memory_guard_custom_ceiling_gb,
             "tensor_parallel_rank": self.tensor_parallel_rank,
             "tensor_parallel_size": self.tensor_parallel_size,
             "sharded_weight_bytes": self.sharded_weight_bytes,
@@ -1657,6 +1673,7 @@ def _finish_pipeline_plan(
                 manual_memory_limit=node.manual_memory_limit,
                 role=node.role,
                 memory_guard_tier=node.memory_guard_tier,
+                memory_guard_custom_ceiling_gb=node.memory_guard_custom_ceiling_gb,
                 kv_cache_bytes=kv_bytes,
                 kv_bytes_per_token=_kv_bytes_per_token_for_stage(model, end - start),
                 max_context_tokens=_max_context_for_stage(
@@ -1705,6 +1722,7 @@ def _finish_pipeline_plan(
                 # workstation plan look identical to every staleness check.
                 "role": item.role,
                 "memory_guard_tier": item.memory_guard_tier,
+                "memory_guard_custom_ceiling_gb": item.memory_guard_custom_ceiling_gb,
             }
             for item in assignments
         ],
@@ -2106,6 +2124,7 @@ def plan_hybrid(
                     manual_memory_limit=node.manual_memory_limit,
                     role=node.role,
                     memory_guard_tier=node.memory_guard_tier,
+                    memory_guard_custom_ceiling_gb=node.memory_guard_custom_ceiling_gb,
                     tensor_parallel_rank=tp_rank,
                     tensor_parallel_size=tensor_parallel_size,
                     kv_cache_bytes=kv_bytes,
