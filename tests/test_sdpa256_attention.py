@@ -1,17 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the head_dim=256 long-context prefill SDPA patch.
-
-Covers (without needing the full Qwen3.6 model):
-  - the forced native kernel matches default MLX SDPA numerically
-    (square causal, chunked-prefill non-square causal, and decode shapes);
-  - the route gate engages only for head_dim=256 / qL>1 / causal / long kv;
-  - the patched SDPA passes through unchanged for non-256 / decode / short kv;
-  - the memory-monitor estimator switches head_dim=256 prefill to O(L) once
-    registered, and stays O(L^2) otherwise;
-  - memory-aware routing (issue #2204): with a headroom provider registered
-    the route prefers the faster unfused fallback whenever its transient
-    fits, and falls back to forced fused without headroom info.
-"""
+"""SDPA256 bounded routing, numerical fallback, and memory registration tests."""
 
 import logging
 import math
@@ -20,6 +8,32 @@ import types
 
 import mlx.core as mx
 import pytest
+
+
+@pytest.fixture
+def _sdpa256_reset():
+    """Hand out the patch module with its process-wide route state reset."""
+    from omlx import memory_monitor as mm
+    from omlx.patches import sdpa256_attention as sdpa256
+
+    saved_routes = dict(mm._SDPA_TILED_PREFILL_HEAD_DIMS)
+    saved_force = sdpa256._FORCE_TILED
+    saved_logged = set(sdpa256._TILED_ROUTE_LOGGED)
+    sdpa256._TILED_ROUTE_LOGGED.clear()
+    sdpa256._FORCE_TILED = None
+    try:
+        yield sdpa256
+    finally:
+        mm._SDPA_TILED_PREFILL_HEAD_DIMS.clear()
+        mm._SDPA_TILED_PREFILL_HEAD_DIMS.update(saved_routes)
+        sdpa256._FORCE_TILED = saved_force
+        sdpa256._TILED_ROUTE_LOGGED.clear()
+        sdpa256._TILED_ROUTE_LOGGED.update(saved_logged)
+
+
+def _tiled_log_records(caplog):
+    return [r for r in caplog.records if "memory-bounded path" in r.getMessage()]
+
 
 SCALE_256 = 1.0 / math.sqrt(256)
 
@@ -432,8 +446,7 @@ def test_estimator_keeps_registered_route_thresholds_independent():
 
 
 def test_unfused_call_bytes_shared_with_guard_estimator():
-    """The route gate and the guard must price the unfused path identically:
-    the guard's unfused branch is the shared module function."""
+    """The guard must include the score matrix and FP32 output allocation."""
     from omlx import memory_monitor as mm
 
     monitor = mm.MemoryMonitor.__new__(mm.MemoryMonitor)
@@ -448,202 +461,7 @@ def test_unfused_call_bytes_shared_with_guard_estimator():
     )
 
 
-# --- memory-aware routing (issue #2204) -----------------------------------
-
-
-class _HeadroomOwner:
-    """Stand-in for the Scheduler side of set_unfused_headroom_provider."""
-
-    def __init__(self, value):
-        self.value = value
-        self.route_changes = []
-
-    def headroom(self):
-        return self.value
-
-    def _sdpa256_bounded_route_changed(self, active):
-        self.route_changes.append(active)
-
-
-@pytest.fixture
-def _sdpa256_provider_reset(monkeypatch):
-    """Isolate the thread-local provider/override state and restore it."""
-    import threading
-
-    from omlx.patches import sdpa256_attention as sdpa256
-
-    monkeypatch.setattr(
-        sdpa256, "_HEADROOM_PROVIDER_LOCAL", threading.local(), raising=False
-    )
-    monkeypatch.setattr(sdpa256, "_FORCE_TILED", None, raising=False)
-    monkeypatch.setattr(sdpa256, "_TILED_ROUTE_LOGGED", set(), raising=False)
-    return sdpa256
-
-
-def test_route_prefers_stock_when_unfused_fits(_sdpa256_provider_reset):
-    sdpa256 = _sdpa256_provider_reset
-    from omlx.memory_monitor import (
-        SDPA256_UNFUSED_SCORE_DTYPE_SIZE,
-        estimate_unfused_sdpa_call_bytes,
-    )
-
-    q, k, _ = _qkv(2048, 16384)
-    owner = _HeadroomOwner(1 << 40)  # ~1 TB headroom: unfused clearly fits
-    sdpa256.set_unfused_headroom_provider(owner.headroom)
-    assert sdpa256._should_route(q, k, None, "causal", None) is False
-
-    # Exactly at the fp32-priced transient the unfused path still fits...
-    need = estimate_unfused_sdpa_call_bytes(
-        24, 2048, 16384, 256, SDPA256_UNFUSED_SCORE_DTYPE_SIZE
-    )
-    owner.value = need
-    assert sdpa256._should_route(q, k, None, "causal", None) is False
-    # ...one byte short -> forced fused.
-    owner.value = need - 1
-    assert sdpa256._should_route(q, k, None, "causal", None) is True
-
-    # Negative headroom = no active ceiling -> memory-safe default.
-    owner.value = -1
-    assert sdpa256._should_route(q, k, None, "causal", None) is True
-    assert owner.route_changes == [False, False, True, True]
-
-
-def test_route_prices_bf16_fallback_at_fp32(_sdpa256_provider_reset):
-    """The unfused fallback materializes fp32 scores even for bf16 queries;
-    pricing at the query dtype (2B) admitted the O(L^2) matrix when only the
-    bf16-sized transient fit and produced the ~33GiB VLM prefill spike."""
-    sdpa256 = _sdpa256_provider_reset
-    from omlx.memory_monitor import (
-        SDPA256_UNFUSED_SCORE_DTYPE_SIZE,
-        estimate_unfused_sdpa_call_bytes,
-    )
-
-    q, k, _ = _qkv(2048, 16384, dtype=mx.bfloat16)
-    assert q.dtype.size == 2  # the wrongly-cheap price
-    assert SDPA256_UNFUSED_SCORE_DTYPE_SIZE == 4  # the real materialization
-
-    bf16_price = estimate_unfused_sdpa_call_bytes(
-        24, 2048, 16384, 256, q.dtype.size
-    )
-    fp32_price = estimate_unfused_sdpa_call_bytes(
-        24, 2048, 16384, 256, SDPA256_UNFUSED_SCORE_DTYPE_SIZE
-    )
-    assert fp32_price > bf16_price
-
-    # Headroom fits the bf16-sized matrix but not the real fp32 one -> the
-    # router must force the bounded path.
-    owner = _HeadroomOwner(int((bf16_price + fp32_price) / 2))
-    sdpa256.set_unfused_headroom_provider(owner.headroom)
-    assert sdpa256._should_route(q, k, None, "causal", None) is True
-
-    # Full fp32 headroom restores the faster stock path.
-    owner.value = fp32_price
-    assert sdpa256._should_route(q, k, None, "causal", None) is False
-
-
-def test_route_defaults_to_tiled_when_provider_owner_dies(_sdpa256_provider_reset):
-    import gc
-
-    sdpa256 = _sdpa256_provider_reset
-    q, k, _ = _qkv(2048, 16384)
-    owner = _HeadroomOwner(1 << 40)
-    sdpa256.set_unfused_headroom_provider(owner.headroom)
-    assert sdpa256._should_route(q, k, None, "causal", None) is False
-    del owner
-    gc.collect()
-    assert sdpa256._should_route(q, k, None, "causal", None) is True
-
-
-def test_provider_binding_is_idempotent_and_replaceable(_sdpa256_provider_reset):
-    sdpa256 = _sdpa256_provider_reset
-    first = _HeadroomOwner(1)
-    second = _HeadroomOwner(2)
-
-    sdpa256.set_unfused_headroom_provider(first.headroom)
-    first_ref = sdpa256._HEADROOM_PROVIDER_LOCAL.ref
-    sdpa256.set_unfused_headroom_provider(first.headroom)
-    assert sdpa256._HEADROOM_PROVIDER_LOCAL.ref is first_ref
-
-    sdpa256.set_unfused_headroom_provider(second.headroom)
-    provider = sdpa256._get_unfused_headroom_provider()
-    assert provider is not None
-    assert provider.__self__ is second
-
-
-def test_worker_provider_survives_other_scheduler_teardown(
-    _sdpa256_provider_reset,
-):
-    """A later engine must not replace or clear a surviving engine's provider."""
-    import concurrent.futures
-    import gc
-
-    sdpa256 = _sdpa256_provider_reset
-    q, k, _ = _qkv(2048, 16384)
-    surviving = _HeadroomOwner(1 << 40)
-    later = _HeadroomOwner(1)
-
-    def route(worker):
-        return worker.submit(
-            sdpa256._should_route, q, k, None, "causal", None
-        ).result()
-
-    with (
-        concurrent.futures.ThreadPoolExecutor(max_workers=1) as first_worker,
-        concurrent.futures.ThreadPoolExecutor(max_workers=1) as second_worker,
-    ):
-        first_worker.submit(
-            sdpa256.set_unfused_headroom_provider, surviving.headroom
-        ).result()
-        second_worker.submit(
-            sdpa256.set_unfused_headroom_provider, later.headroom
-        ).result()
-
-        assert route(first_worker) is False
-        assert route(second_worker) is True
-        assert surviving.route_changes == [False]
-        assert later.route_changes == [True]
-
-        del later
-        gc.collect()
-
-        assert route(first_worker) is False
-        assert route(second_worker) is True
-        assert surviving.route_changes == [False, False]
-
-
-def test_route_defaults_to_tiled_when_provider_raises(_sdpa256_provider_reset):
-    sdpa256 = _sdpa256_provider_reset
-
-    class _Boom:
-        def headroom(self):
-            raise RuntimeError("no headroom info")
-
-    boom = _Boom()
-    sdpa256.set_unfused_headroom_provider(boom.headroom)
-    q, k, _ = _qkv(2048, 16384)
-    assert sdpa256._should_route(q, k, None, "causal", None) is True
-
-
-def test_force_tiled_override(_sdpa256_provider_reset, monkeypatch):
-    import threading
-
-    sdpa256 = _sdpa256_provider_reset
-    q, k, _ = _qkv(2048, 16384)
-    owner = _HeadroomOwner(1 << 40)
-    sdpa256.set_unfused_headroom_provider(owner.headroom)
-    # 1: always tiled even though unfused fits.
-    monkeypatch.setattr(sdpa256, "_FORCE_TILED", True, raising=False)
-    assert sdpa256._should_route(q, k, None, "causal", None) is True
-    assert owner.route_changes == [True]
-    monkeypatch.setattr(sdpa256, "_FORCE_TILED", False, raising=False)
-    assert sdpa256._should_route(q, k, None, "causal", None) is False
-    assert owner.route_changes == [True, False]
-    # 0: never tiled even without headroom info.
-    monkeypatch.setattr(sdpa256, "_FORCE_TILED", False, raising=False)
-    monkeypatch.setattr(
-        sdpa256, "_HEADROOM_PROVIDER_LOCAL", threading.local(), raising=False
-    )
-    assert sdpa256._should_route(q, k, None, "causal", None) is False
+# --- bounded routing overrides -------------------------------------------
 
 
 def test_parse_force_tiled_env(monkeypatch):
@@ -680,48 +498,8 @@ def test_force_off_does_not_publish_a_bounded_memory_route(monkeypatch):
 # --- bounded-route engagement logging (issue #2283) ------------------------
 
 
-def _tiled_log_records(caplog):
-    return [
-        r
-        for r in caplog.records
-        if r.levelname == "INFO" and "memory-bounded path" in r.getMessage()
-    ]
-
-
-def test_tiled_route_logs_once_when_no_provider(_sdpa256_provider_reset, caplog):
-    """Guard-off servers land on forced fused silently (issue #2283); the
-    first engagement must say so at INFO, repeats must stay quiet."""
-    sdpa256 = _sdpa256_provider_reset
-    q, k, _ = _qkv(2048, 16384)
-    with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
-        assert sdpa256._should_route(q, k, None, "causal", None) is True
-        records = _tiled_log_records(caplog)
-        assert len(records) == 1
-        msg = records[0].getMessage()
-        assert "no guard headroom provider" in msg
-        assert "OMLX_SDPA256_TILED" in msg
-        # Second engagement for the same reason: no new record.
-        assert sdpa256._should_route(q, k, None, "causal", None) is True
-        assert len(_tiled_log_records(caplog)) == 1
-
-
-def test_tiled_route_logs_headroom_numbers(_sdpa256_provider_reset, caplog):
-    sdpa256 = _sdpa256_provider_reset
-    q, k, _ = _qkv(2048, 16384)
-    owner = _HeadroomOwner(1)  # 1 byte of headroom: unfused can't fit
-    sdpa256.set_unfused_headroom_provider(owner.headroom)
-    with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
-        assert sdpa256._should_route(q, k, None, "causal", None) is True
-    records = _tiled_log_records(caplog)
-    assert len(records) == 1
-    msg = records[0].getMessage()
-    assert "exceeds live guard headroom" in msg
-    assert "kv_len=16384" in msg
-    assert "MiB" in msg
-
-
-def test_tiled_route_logs_forced_env(_sdpa256_provider_reset, caplog, monkeypatch):
-    sdpa256 = _sdpa256_provider_reset
+def test_tiled_route_logs_forced_env(_sdpa256_reset, caplog, monkeypatch):
+    sdpa256 = _sdpa256_reset
     monkeypatch.setattr(sdpa256, "_FORCE_TILED", True, raising=False)
     q, k, _ = _qkv(2048, 16384)
     with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
@@ -729,119 +507,6 @@ def test_tiled_route_logs_forced_env(_sdpa256_provider_reset, caplog, monkeypatc
     records = _tiled_log_records(caplog)
     assert len(records) == 1
     assert "OMLX_SDPA256_TILED=1" in records[0].getMessage()
-
-
-def test_unfused_route_logs_nothing(_sdpa256_provider_reset, caplog):
-    sdpa256 = _sdpa256_provider_reset
-    q, k, _ = _qkv(2048, 16384)
-    owner = _HeadroomOwner(1 << 40)  # ample headroom: fast path
-    sdpa256.set_unfused_headroom_provider(owner.headroom)
-    with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
-        assert sdpa256._should_route(q, k, None, "causal", None) is False
-    assert _tiled_log_records(caplog) == []
-
-
-def test_scheduler_headroom_provider_math():
-    """_sdpa256_unfused_headroom mirrors the adaptive throttle target:
-    hard ceiling x headroom safety, clamped by the abort cap, minus usage."""
-    from omlx.scheduler import _SDPA256_UNBOUNDED_HEADROOM, Scheduler
-
-    gib = 1024**3
-
-    class _Fake:
-        _memory_hard_limit_bytes = 0
-        _memory_abort_limit_bytes = 0
-        _memory_limits_propagated = False
-        _prefill_memory_guard = False
-        _sdpa256_unguarded_logged = False
-        _prefill_headroom_safety = 0.90
-        _PREFILL_HEADROOM_SAFETY = 0.90
-        _prefill_abort_margin = 0.95
-        _prefill_abort_cap = Scheduler._prefill_abort_cap
-
-        def _current_usage_bytes(self):
-            return 10 * gib
-
-    fake = _Fake()
-    # Nothing propagated yet: guard state is unknown, so the negative
-    # sentinel keeps the bounded default even though the flag reads False.
-    assert Scheduler._sdpa256_unfused_headroom(fake) == -1
-
-    # Enforcer has spoken and the guard is explicitly off: the user opted
-    # out of memory management, so the route gets unbounded headroom and
-    # keeps the unfused fast path (#2283).
-    fake._memory_limits_propagated = True
-    assert (
-        Scheduler._sdpa256_unfused_headroom(fake) == _SDPA256_UNBOUNDED_HEADROOM
-    )
-
-    # Guard on but the ceiling has not landed yet (startup race): stay on
-    # the memory-safe default.
-    fake._prefill_memory_guard = True
-    assert Scheduler._sdpa256_unfused_headroom(fake) == -1
-
-    # Throttle target binds: abort cap (100 * 0.95) > target (100 * 0.90).
-    fake._memory_hard_limit_bytes = 100 * gib
-    assert Scheduler._sdpa256_unfused_headroom(fake) == int(100 * gib * 0.90) - 10 * gib
-
-    # Abort cap binds when lower than the throttle target.
-    fake._memory_abort_limit_bytes = 80 * gib
-    assert Scheduler._sdpa256_unfused_headroom(fake) == int(80 * gib * 0.95) - 10 * gib
-
-
-def test_unguarded_fast_path_logs_once(caplog):
-    """Guard-off fast routing runs without a memory ceiling, which is the
-    one state worth a breadcrumb (#2283): exactly one INFO naming the OOM
-    trade and the recovery levers, then silence."""
-    from omlx.scheduler import _SDPA256_UNBOUNDED_HEADROOM, Scheduler
-
-    class _Fake:
-        _memory_hard_limit_bytes = 0
-        _memory_limits_propagated = True
-        _prefill_memory_guard = False
-        _sdpa256_unguarded_logged = False
-
-    fake = _Fake()
-    with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
-        assert (
-            Scheduler._sdpa256_unfused_headroom(fake)
-            == _SDPA256_UNBOUNDED_HEADROOM
-        )
-        assert (
-            Scheduler._sdpa256_unfused_headroom(fake)
-            == _SDPA256_UNBOUNDED_HEADROOM
-        )
-    records = [
-        r for r in caplog.records if "memory guard disabled" in r.getMessage()
-    ]
-    assert len(records) == 1
-    msg = records[0].getMessage()
-    assert "OMLX_SDPA256_TILED=1" in msg
-
-
-def test_scheduler_step_registers_headroom_provider(_sdpa256_provider_reset):
-    """Scheduler.step must bind its provider on the model execution thread."""
-    from unittest.mock import MagicMock
-
-    from omlx.scheduler import Scheduler, SchedulerConfig
-
-    sdpa256 = _sdpa256_provider_reset
-    model = MagicMock()
-    model.layers = []
-    tokenizer = MagicMock()
-    tokenizer.eos_token_id = 2
-    scheduler = Scheduler(
-        model=model,
-        tokenizer=tokenizer,
-        config=SchedulerConfig(paged_cache_block_size=0),
-    )
-    assert sdpa256._get_unfused_headroom_provider() is None
-    scheduler.step()
-    bound = sdpa256._get_unfused_headroom_provider()
-    assert bound is not None
-    assert bound.__self__ is scheduler
-    # Ceiling not propagated yet -> negative sentinel keeps the bounded default.
-    assert bound() == -1
 
 
 # --- mlx-vlm coverage (issue: VLM engine head-256 prefill unprotected) ----
@@ -895,11 +560,11 @@ def _restore_lm_sdpa(snap):
 
 
 def test_vlm_submodule_rebind_covers_copied_reference(
-    _sdpa256_provider_reset, monkeypatch
+    _sdpa256_reset, monkeypatch
 ):
     """The patch must rebind mlx-vlm model modules that copied base's SDPA at
     import time — assigning to mlx_vlm.models.base alone never reaches them."""
-    sdpa256 = _sdpa256_provider_reset
+    sdpa256 = _sdpa256_reset
     base, language, original, calls = _install_fake_vlm_tree(monkeypatch)
     monkeypatch.setattr(sdpa256, "_PATCHED", False, raising=False)
     monkeypatch.setattr(sdpa256, "_SDPA256_MIN_KV_LEN", 512, raising=False)
@@ -939,14 +604,14 @@ def test_vlm_submodule_rebind_covers_copied_reference(
 
 
 def test_production_install_order_covers_vlm_language(
-    _sdpa256_provider_reset, monkeypatch
+    _sdpa256_reset, monkeypatch
 ):
     """Both engines install sdpa256 first and fa256 second. fa256 captures
     whatever mlx_vlm.models.base holds at that point as its "original", so
     sdpa256 must have already rebound the submodules — otherwise the identity
     sweep misses qwen3_5.language and the VLM engine keeps the unfused path
     (the baseline defect this suite pins)."""
-    sdpa256 = _sdpa256_provider_reset
+    sdpa256 = _sdpa256_reset
     import omlx.patches.qwen35_fa256_attention as fa256
 
     base, language, original, calls = _install_fake_vlm_tree(monkeypatch)

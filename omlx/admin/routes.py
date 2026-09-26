@@ -17,6 +17,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -318,7 +319,9 @@ class ModelSettingsRequest(BaseModel):
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # MTP draft tokens per cycle for legacy MTP (None = adaptive default).
-    mtp_num_draft_tokens: int | None = None
+    mtp_adaptive_max_depth: int | None = None
+    # Fixed Lightning MTP draft depth (None = adaptive).
+    mtp_fixed_depth: int | None = None
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool | None = None
     turboquant_kv_bits: float | None = None
@@ -599,6 +602,7 @@ class GlobalSettingsRequest(BaseModel):
     auto_start_on_launch: bool | None = None
     burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
     preserve_mid_system_cache: bool | None = None
+    qwen4_gdn_decode_wide_proj: bool | None = None
     distributed_inference_enabled: bool | None = None
     max_audio_upload_size: str | None = None
 
@@ -2867,17 +2871,19 @@ async def update_model_settings(
             if request.thinking_budget_tokens and request.thinking_budget_tokens > 0
             else None
         )
-    if "mtp_num_draft_tokens" in sent:
-        value = request.mtp_num_draft_tokens
+    for name in ("mtp_adaptive_max_depth", "mtp_fixed_depth"):
+        if name not in sent:
+            continue
+        value = getattr(request, name)
         if value is not None and not 1 <= value <= MAX_LIGHTNING_MTP_DRAFT_TOKENS:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "mtp_num_draft_tokens must be between 1 and "
+                    f"{name} must be between 1 and "
                     f"{MAX_LIGHTNING_MTP_DRAFT_TOKENS} (or null)."
                 ),
             )
-        current_settings.mtp_num_draft_tokens = value
+        setattr(current_settings, name, value)
     if "preserve_thinking" in sent:
         current_settings.preserve_thinking = request.preserve_thinking
     if "cache_reasoning_output" in sent:
@@ -3924,13 +3930,14 @@ def _feature_problem(
         ok, reason = _mtp_compat_for_model(info)
         if not ok:
             return reason or "Lightning MTP is not available for this model"
-        depth = snapshot.get("mtp_num_draft_tokens")
-        if depth is not None and (
-            isinstance(depth, bool)
-            or not isinstance(depth, int)
-            or not 1 <= depth <= MAX_LIGHTNING_MTP_DRAFT_TOKENS
-        ):
-            snapshot.pop("mtp_num_draft_tokens", None)
+        for key in ("mtp_adaptive_max_depth", "mtp_fixed_depth"):
+            depth = snapshot.get(key)
+            if depth is not None and (
+                isinstance(depth, bool)
+                or not isinstance(depth, int)
+                or not 1 <= depth <= MAX_LIGHTNING_MTP_DRAFT_TOKENS
+            ):
+                snapshot.pop(key, None)
         return None
     if name in ("turboquant", "index_cache"):
         is_paro, reason = _paroquant_compat_for_model(info)
@@ -4567,6 +4574,7 @@ def _global_settings_response(global_settings):
             "sse_keepalive_mode": global_settings.server.sse_keepalive_mode,
             "auto_start_on_launch": global_settings.server.auto_start_on_launch,
             "burst_decode_mode": global_settings.server.burst_decode_mode,
+            "qwen4_gdn_decode_wide_proj": global_settings.server.qwen4_gdn_decode_wide_proj,
             "preserve_mid_system_cache": getattr(
                 global_settings.server,
                 "preserve_mid_system_cache",
@@ -4867,6 +4875,18 @@ async def update_global_settings(
     if request.auto_start_on_launch is not None:
         global_settings.server.auto_start_on_launch = request.auto_start_on_launch
         runtime_applied.append("auto_start_on_launch")
+    if request.qwen4_gdn_decode_wide_proj is not None:
+        global_settings.server.qwen4_gdn_decode_wide_proj = (
+            request.qwen4_gdn_decode_wide_proj
+        )
+        from ..server import _server_state
+
+        pool = _server_state.engine_pool
+        if pool is not None:
+            pool._scheduler_config.qwen4_gdn_decode_wide_proj = (
+                request.qwen4_gdn_decode_wide_proj
+            )
+
     if request.preserve_mid_system_cache is not None:
         global_settings.server.preserve_mid_system_cache = (
             request.preserve_mid_system_cache
@@ -6087,6 +6107,43 @@ def _distributed_runtime_cache_stats(engine) -> dict | None:
     }
 
 
+def _scan_offline_gdn_sidecars(
+    cache_dir: Path, *, clear: bool = False
+) -> tuple[int, int]:
+    count = total_bytes = 0
+    try:
+        root_fd = os.open(
+            cache_dir / "_gdn_sidecars", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        )
+    except FileNotFoundError:
+        return count, total_bytes
+    except OSError as exc:
+        logger.warning("Could not open GDN sidecar directory: %s", exc)
+        return count, total_bytes
+
+    try:
+        # Keep deletion relative to open directories, even if a parent is replaced.
+        for _, _, files, directory_fd in os.fwalk(".", dir_fd=root_fd):
+            for name in files:
+                if not name.endswith(".safetensors"):
+                    continue
+                try:
+                    info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    if not stat.S_ISREG(info.st_mode):
+                        continue
+                    if clear:
+                        os.unlink(name, dir_fd=directory_fd)
+                    count += 1
+                    total_bytes += info.st_size
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    logger.warning("Could not process GDN sidecar %s: %s", name, exc)
+    finally:
+        os.close(root_fd)
+    return count, total_bytes
+
+
 def _build_runtime_cache_observability(
     global_settings,
     model_filter: str = "",
@@ -6411,8 +6468,9 @@ def _build_runtime_cache_observability(
                     for f in subdir_path.glob("*.safetensors"):
                         num_files += 1
                         total_bytes += f.stat().st_size
-            payload["total_num_files"] = num_files
-            payload["total_size_bytes"] = total_bytes
+            sidecar_count, sidecar_bytes = _scan_offline_gdn_sidecars(cache_dir)
+            payload["total_num_files"] = num_files + sidecar_count
+            payload["total_size_bytes"] = total_bytes + sidecar_bytes
         except Exception as exc:
             logger.warning("Failed to scan SSD cache directory: %s", exc)
 
@@ -6986,6 +7044,8 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
                                 total_deleted += 1
                             except OSError:
                                 pass
+                sidecar_count, _ = _scan_offline_gdn_sidecars(cache_dir, clear=True)
+                total_deleted += sidecar_count
             except Exception as exc:
                 logger.warning("Failed to clean SSD cache directory: %s", exc)
 

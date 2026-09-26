@@ -740,6 +740,8 @@ def _run_rank(
         "decode_worker_path_map",
         lambda _plan: {},
     )
+    # Likewise its stage links: none, so ranks keep MLX's own send and receive.
+    monkeypatch.setattr(inference_worker, "decode_worker_stage_links", lambda _plan: ())
 
     def fake_guard_rank_load(item, *, rank, **kwargs):
         record["order"].append("guard")

@@ -3699,9 +3699,9 @@ class TestSchedulerBoundarySnapshots:
 
         RotatingStub = type("RotatingKVCache", (), {})
         snapshot_cache = [RotatingStub()]
-        scheduler._on_prefill_boundary_snapshot(
-            request.request_id, snapshot_cache, 3, source="prefill_tail"
-        )
+        with patch("omlx.scheduler._mtp_priming.capture_tail_boundary") as capture:
+            scheduler._emit_prefill_tail_snapshot(request, snapshot_cache, 3)
+        capture.assert_called_once_with(mock_model, request.request_id, 3)
         # Other sources stay on the grid.
         scheduler._on_prefill_boundary_snapshot(
             request.request_id, [RotatingStub()], 5, source="completion"
@@ -4119,8 +4119,9 @@ class TestSchedulerArraysCacheBlockAlignment:
         finally:
             scheduler.shutdown()
 
-    def test_qwen4_wide_prefill_aligns_block_size_to_4096(
-        self, mock_tokenizer, tmp_path
+    @pytest.mark.parametrize("model_type", ["qwen4_exp_text", "glm5_next"])
+    def test_sparse_hybrid_wide_prefill_aligns_block_size_to_4096(
+        self, mock_tokenizer, tmp_path, model_type
     ):
         with (
             patch("omlx.settings.get_system_memory", return_value=256 * 1024**3),
@@ -4135,7 +4136,7 @@ class TestSchedulerArraysCacheBlockAlignment:
             ),
         ):
             scheduler = Scheduler(
-                model=self._hybrid_model(model_type="qwen4_exp_text"),
+                model=self._hybrid_model(model_type=model_type),
                 tokenizer=mock_tokenizer,
                 config=SchedulerConfig(
                     paged_ssd_cache_dir=str(tmp_path),
@@ -4154,10 +4155,12 @@ class TestSchedulerArraysCacheBlockAlignment:
         ("native_available", "symbol_available"),
         [(False, False), (True, False)],
     )
-    def test_qwen4_keeps_2048_without_sparse_native_path(
+    @pytest.mark.parametrize("model_type", ["qwen4_exp_text", "glm5_next"])
+    def test_sparse_hybrid_keeps_2048_without_sparse_native_path(
         self,
         mock_tokenizer,
         tmp_path,
+        model_type,
         native_available,
         symbol_available,
     ):
@@ -4174,7 +4177,7 @@ class TestSchedulerArraysCacheBlockAlignment:
             ),
         ):
             scheduler = Scheduler(
-                model=self._hybrid_model(model_type="qwen4_exp_text"),
+                model=self._hybrid_model(model_type=model_type),
                 tokenizer=mock_tokenizer,
                 config=SchedulerConfig(
                     paged_ssd_cache_dir=str(tmp_path),
@@ -4186,6 +4189,47 @@ class TestSchedulerArraysCacheBlockAlignment:
             assert scheduler._qwen35_prefill_floor == 0
             assert scheduler._prefill_step_size_for_progress(0, 4096) == 2048
             assert scheduler.config.paged_cache_block_size == 2048
+        finally:
+            scheduler.shutdown()
+
+    @pytest.mark.parametrize("paged", [True, False])
+    def test_qwen4_long_prompt_uses_wide_block_grid(
+        self, mock_tokenizer, tmp_path, paged
+    ):
+        with (
+            patch("omlx.settings.get_system_memory", return_value=128 * 1024**3),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=True),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                return_value=True,
+            ),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                return_value=True,
+            ),
+        ):
+            scheduler = Scheduler(
+                model=self._hybrid_model(model_type="qwen4_exp_text"),
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    prefill_step_size=2048,
+                    paged_ssd_cache_dir=str(tmp_path) if paged else None,
+                    paged_cache_block_size=256,
+                ),
+            )
+
+        try:
+            step = scheduler._prefill_step_size_for_progress
+            assert scheduler._qwen4_wide_prefill_step == 8192
+            assert step(0, 16384) == 2048
+            # Prompts shorter than one narrow plus one wide chunk stay narrow.
+            assert step(2048, 8191) == 2048
+            if paged:
+                # The block clamp ends each wide request on the 8192 grid.
+                assert scheduler.config.paged_cache_block_size == 8192
+                assert step(2048, 14336) == 8192
+            else:
+                assert step(2048, 14336) == 6144
         finally:
             scheduler.shutdown()
 

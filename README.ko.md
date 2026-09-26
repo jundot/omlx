@@ -432,5 +432,5 @@ apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Apple Silicon을 위한 임베딩 모델 지원
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Apple Silicon에서의 블록 디퓨전 speculative decoding
 - [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP의 verify-shape Metal 커널은 Youssof Altoukhi의 MTPLX를 기반으로 하며, depth-k 파이프라인도 여기서 영감을 받았습니다
-- [mlx-serve](https://github.com/ddalcu/mlx-serve) - fused GDN verify prework 커널은 mlx-serve가 포팅한 mlxfast-challenge의 qwen35_packed_gdn_prework 커널을 바탕으로 수정되었습니다
+- [mlx-serve](https://github.com/ddalcu/mlx-serve) - fused GDN verify prework 커널은 mlx-serve가 포팅한 mlxfast-challenge의 qwen35_packed_gdn_prework 커널을 바탕으로 수정되었고, Qwen4의 fused GDN decode·prefill 커널은 mlx-serve의 MIT 라이선스 `transformer.zig`를 바탕으로 수정되었습니다
 - [SiliconScope](https://github.com/kennss/SiliconScope) - 메뉴 바 통계의 디자인과 렌더링 방식은 Kennt Kim의 SiliconScope에서 가져왔으며, 에너지 효율적인 리렌더 게이팅도 여기서 영감을 받았습니다

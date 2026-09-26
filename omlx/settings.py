@@ -199,6 +199,7 @@ class ServerSettings:
     auto_start_on_launch: bool = True
     burst_decode_mode: str = DEFAULT_BURST_DECODE_MODE
     preserve_mid_system_cache: bool = True
+    qwen4_gdn_decode_wide_proj: bool = False
     distributed_inference_enabled: bool = False
     # Human-readable size, same grammar as cache limits ("100MB", "1GB").
     max_audio_upload_size: str = "100MB"
@@ -239,6 +240,7 @@ class ServerSettings:
             auto_start_on_launch=data.get("auto_start_on_launch", True),
             burst_decode_mode=data.get("burst_decode_mode", DEFAULT_BURST_DECODE_MODE),
             preserve_mid_system_cache=data.get("preserve_mid_system_cache", True),
+            qwen4_gdn_decode_wide_proj=data.get("qwen4_gdn_decode_wide_proj", False),
             distributed_inference_enabled=data.get(
                 "distributed_inference_enabled",
                 False,
@@ -1881,6 +1883,7 @@ class GlobalSettings:
         )
 
         return SchedulerConfig(
+            qwen4_gdn_decode_wide_proj=self.server.qwen4_gdn_decode_wide_proj,
             max_num_seqs=self.scheduler.max_concurrent_requests,
             completion_batch_size=self.scheduler.max_concurrent_requests,
             embedding_batch_size=self.scheduler.embedding_batch_size,

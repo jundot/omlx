@@ -848,9 +848,10 @@ class LanguageModel(DSparkMixin, nn.Module):
 
             self.mtp = make_stages(config)
         self._hasher = None
-        from ..mlx_lm_mtp import get_mtp_depth, is_mtp_active
+        from ..mlx_lm_mtp import get_mtp_depth, is_mtp_active, is_mtp_depth_fixed
 
         self.configure_mtp(config.preserve_mtp and is_mtp_active(), get_mtp_depth())
+        self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
 
     def make_dspark_cache(self):
         from .dspark import make_cache

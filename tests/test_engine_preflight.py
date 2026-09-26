@@ -134,6 +134,7 @@ def _build_engine_with_stub_scheduler(engine_cls, scheduler):
     """
     engine = engine_cls.__new__(engine_cls)
     engine._loaded = True
+    engine._model_name = "test-model"
     engine._enable_thinking = None
     engine._prefill_eviction_callback = None
 

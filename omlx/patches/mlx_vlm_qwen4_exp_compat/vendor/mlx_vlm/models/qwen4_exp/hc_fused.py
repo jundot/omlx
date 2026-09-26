@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Three Metal kernels for small Qwen4 hyper-connection inputs.
+"""Metal kernels for Qwen4 hyper-connection inputs.
 
-Fuses per-stream RMS norm, down/inject projections with activation, and the up
-projection with stream mixing. Supports at most 16 BF16 rows, four streams,
-and affine group-size-64 projections with 4/5/6/8-bit weights. FP32 epilogues
+Decode (at most 16 BF16 rows) fuses per-stream RMS norm, down/inject
+projections with activation, and the up projection with stream mixing.
+Prefill keeps the down/up projections on the MLX matmul path and fuses only
+the stream norm and the mixing/inject epilogue. Both need four streams and
+affine group-size-64 projections with 4/5/6/8-bit weights. FP32 epilogues
 can round differently from the canonical BF16 operations.
 
 Each kernel specialization is evaluated once to catch lazy compilation errors.
@@ -221,6 +223,61 @@ _U_SOURCE = r"""
 """
 
 
+# Prefill epilogue for one row per threadgroup:
+# - mixed = mean over streams of sigmoid(up) * normed, with BF16 rounding after
+#   each gate, product and partial sum.
+# - inj = 2 * sigmoid(normed . inject / HC) from the quantized four-row bank.
+_TI_SOURCE = r"""
+    const uint row = threadgroup_position_in_grid.z;
+    const uint t = thread_index_in_threadgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const device T* up_r = up + (size_t)row * K;
+    const device T* xn_r = xn + (size_t)row * K;
+    for (int h = int(t); h < H; h += 256) {
+        float acc = 0.0f;
+        for (int s = 0; s < HC; ++s) {
+            const int n = s * H + h;
+            const T g = T(1.0f / (1.0f + metal::exp(-float(up_r[n]))));
+            const T p = T(float(g) * float(xn_r[n]));
+            acc = s == 0 ? float(p) : float(T(acc + float(p)));
+        }
+        mixed[(size_t)row * H + h] = T(acc * (1.0f / float(HC)));
+    }
+    constexpr int PF = hc_pack_factor<BITS_I>();
+    constexpr int BP = hc_bytes_per_pack<BITS_I>();
+    constexpr int ROW_BYTES = K * BP / PF;
+    constexpr int GROUPS = K / 64;
+    constexpr int PER = K / 256;
+    float res[HC] = {0.0f};
+    float xv[PF];
+    const int e0 = int(t) * PER;
+    for (int e = e0; e < e0 + PER; e += PF) {
+        const float sum = hc_load_vector<T, PF, BITS_I>(xn_r + e, xv);
+        const int g = e / 64;
+        for (int r = 0; r < HC; ++r) {
+            res[r] += hc_qdot<PF, BITS_I>(
+                (const device uint8_t*)inject_w + r * ROW_BYTES + e * BP / PF,
+                xv, float(inject_s[r * GROUPS + g]), float(inject_b[r * GROUPS + g]),
+                sum);
+        }
+    }
+    threadgroup float part[HC][8];
+    for (int r = 0; r < HC; ++r) {
+        const float v = simd_sum(res[r]);
+        if (lane == 0) part[r][sg] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t < HC) {
+        float v = 0.0f;
+        for (int i = 0; i < 8; ++i) v += part[t][i];
+        const float q = float(T(float(T(v)) / float(HC)));
+        const float gate = float(T(1.0f / (1.0f + metal::exp(-q))));
+        inj[(size_t)row * HC + t] = T(2.0f * gate);
+    }
+"""
+
+
 def _kernel(
     name: str,
     input_names: list[str],
@@ -358,10 +415,54 @@ def _eps_array(module) -> mx.array:
     return eps
 
 
-def _kernel_norm(module, flat, rows, hc, hidden, dtype):
+# Prefill keeps Qwen4ExpRMSNorm's precise rsqrt; only the f32 sum order differs.
+_NP_SOURCE = _N_SOURCE.replace("metal::rsqrt", "metal::precise::rsqrt")
+
+# The previous block's residual write fused into the prefill stream norm:
+# - y = T(x + T(branch * gate[s])) rounds like the eager multiply and add.
+# - y is stored as the new residual stream and normalized as in _NP_SOURCE.
+_WN_SOURCE = r"""
+    const uint row = threadgroup_position_in_grid.z;
+    const uint s = threadgroup_position_in_grid.y;
+    const uint t = thread_index_in_threadgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    threadgroup float part[8];
+    constexpr int PER = (H + 255) / 256;
+    const size_t base = (size_t)row * K + (size_t)s * H;
+    const device T* bp = branch + (size_t)row * H;
+    const float g = float(gate[(size_t)row * HC + s]);
+    const device T* wp = w + (size_t)s * H;
+    float v[PER];
+    float ss = 0.0f;
+    for (int i = 0; i < PER; ++i) {
+        const int k = t + i * 256;
+        v[i] = 0.0f;
+        if (k < H) {
+            const T y = T(float(x[base + k]) + float(T(float(bp[k]) * g)));
+            y_out[base + k] = y;
+            v[i] = float(y);
+        }
+        ss += v[i] * v[i];
+    }
+    ss = simd_sum(ss);
+    if (lane == 0) part[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (int i = 0; i < 8; ++i) tot += part[i];
+    const float inv = metal::precise::rsqrt(tot / float(H) + eps[0]);
+    for (int i = 0; i < PER; ++i) {
+        const int k = t + i * 256;
+        if (k < H) xn[base + k] = T(v[i] * inv * (1.0f + float(wp[k])));
+    }
+"""
+
+
+def _kernel_norm(module, flat, rows, hc, hidden, dtype, precise=False):
     width = hc * hidden
+    name = "omlx_qwen4_hc_prefill_norm" if precise else "omlx_qwen4_hc_fused_norm"
     return _kernel(
-        "omlx_qwen4_hc_fused_norm", ["x", "w", "eps"], ["xn"], _N_SOURCE
+        name, ["x", "w", "eps"], ["xn"], _NP_SOURCE if precise else _N_SOURCE
     )(
         inputs=[flat, module.hc_norm.weight, _eps_array(module)],
         template=[("T", dtype), ("K", width), ("H", hidden)],
@@ -370,6 +471,27 @@ def _kernel_norm(module, flat, rows, hc, hidden, dtype):
         output_shapes=[(rows, width)],
         output_dtypes=[dtype],
     )[0]
+
+
+def _kernel_write_norm(module, flat, branch, gate, rows, hc, hidden, dtype):
+    width = hc * hidden
+    return _kernel(
+        "omlx_qwen4_hc_prefill_write_norm",
+        ["x", "branch", "gate", "w", "eps"],
+        ["y_out", "xn"],
+        _WN_SOURCE,
+    )(
+        inputs=[flat, branch, gate, module.hc_norm.weight, _eps_array(module)],
+        template=[("T", dtype), ("K", width), ("H", hidden), ("HC", hc)],
+        grid=(256, hc, rows),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, width), (rows, width)],
+        output_dtypes=[dtype, dtype],
+    )
+
+
+def _pack_factor(bits: int) -> int:
+    return 8 if bits == 5 else (4 if bits == 6 else 32 // bits)
 
 
 _TAILS: dict[tuple[int, int], object] = {}
@@ -393,18 +515,89 @@ def _tail(hc: int, hidden: int):
     return fn
 
 
-def prefill_forward(module, hyper_input):
-    """Prefill with canonical normalization and a compiled mean; None on failure."""
+def prefill_forward(module, hyper_input, write=None):
+    """Prefill with the fused stream norm and tail/inject epilogue; None on failure.
+
+    ``write`` is a pending ``(branch, gate)`` residual write onto ``hyper_input``.
+    The norm kernel applies it and returns the written stream as the passthrough.
+    """
     global _FAILURE_LOGGED
     try:
         hc, hidden = module.hc_count, module.hidden_size
+        width = hc * hidden
         dtype = hyper_input.dtype
-        normed = module.hc_norm(hyper_input)
+        rows = _rows_of(hyper_input)
+        flat = hyper_input.reshape(rows, width)
+        if write is None:
+            normed = _kernel_norm(module, flat, rows, hc, hidden, dtype, precise=True)
+        else:
+            branch, gate = write
+            lead = hyper_input.shape[:-1]
+            if not (
+                branch.shape == (*lead, hidden)
+                and gate.shape == (*lead, hc)
+                and branch.dtype == dtype
+                and gate.dtype == dtype
+            ):
+                return None
+            written, normed = _kernel_write_norm(
+                module,
+                flat,
+                branch.reshape(rows, hidden),
+                gate.reshape(rows, hc),
+                rows,
+                hc,
+                hidden,
+                dtype,
+            )
+            hyper_input = written.reshape(hyper_input.shape)
+        normed = normed.reshape(hyper_input.shape)
         mix = nn.silu(module.input_mix_weight_down(normed) / hc)
-        mixed = _tail(hc, hidden)(module.input_mix_weight_up(mix), normed)
+        up = module.input_mix_weight_up(mix)
         inject = module.block_inject_weight if "block_inject_weight" in module else None
-        injection = None if inject is None else 2 * mx.sigmoid(inject(normed) / hc)
-        signature = ("prefill", dtype, hc, hidden, module.hc_lowrank, module.input_mix_weight_down.bits)
+        if inject is None or width % (256 * _pack_factor(inject.bits)):
+            # Each of the 256 threads dots whole packs of the inject row.
+            mixed = _tail(hc, hidden)(up, normed)
+            injection = None if inject is None else 2 * mx.sigmoid(inject(normed) / hc)
+        else:
+            mixed, injection = _kernel(
+                "omlx_qwen4_hc_prefill_tail_inject",
+                ["up", "xn", "inject_w", "inject_s", "inject_b"],
+                ["mixed", "inj"],
+                _TI_SOURCE,
+                header=_HEADER,
+            )(
+                inputs=[
+                    up.reshape(rows, width),
+                    normed.reshape(rows, width),
+                    inject.weight,
+                    inject.scales,
+                    inject.biases,
+                ],
+                template=[
+                    ("T", dtype),
+                    ("BITS_I", inject.bits),
+                    ("K", width),
+                    ("H", hidden),
+                    ("HC", hc),
+                ],
+                grid=(256, 1, rows),
+                threadgroup=(256, 1, 1),
+                output_shapes=[(rows, hidden), (rows, hc)],
+                output_dtypes=[dtype, dtype],
+            )
+            mixed = mixed.reshape(*hyper_input.shape[:-1], hidden)
+            injection = injection.reshape(*hyper_input.shape[:-1], hc)
+        signature = (
+            "prefill",
+            dtype,
+            hc,
+            hidden,
+            module.hc_lowrank,
+            module.input_mix_weight_down.bits,
+            inject.bits if inject is not None else None,
+            write is not None,
+        )
         if signature not in _VALIDATED:
             mx.eval(mixed) if injection is None else mx.eval(mixed, injection)
             _VALIDATED.add(signature)

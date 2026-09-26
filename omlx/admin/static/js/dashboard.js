@@ -71,6 +71,8 @@
         'dflash_block_size',
         'dflash_verify_mode',
         'mtp_enabled',
+        'mtp_adaptive_max_depth',
+        'mtp_fixed_depth',
         'qwen35_ane_prefill_shared_fraction',
         'vlm_mtp_enabled',
         'vlm_mtp_draft_model',
@@ -133,7 +135,7 @@
             // Global settings
             globalSettings: {
                 base_path: '',
-                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
+                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, qwen4_gdn_decode_wide_proj: false, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
@@ -1161,6 +1163,7 @@
                             sse_keepalive_mode: this.globalSettings.server.sse_keepalive_mode,
                             burst_decode_mode: this.globalSettings.server.burst_decode_mode,
                             preserve_mid_system_cache: this.globalSettings.server.preserve_mid_system_cache,
+                            qwen4_gdn_decode_wide_proj: this.globalSettings.server.qwen4_gdn_decode_wide_proj,
                             distributed_inference_enabled: this.globalSettings.server.distributed_inference_enabled,
                             max_audio_upload_size: this.globalSettings.server.max_audio_upload_size,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
@@ -1946,6 +1949,8 @@
                     dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
                     dflash_ssd_cache_available: !!model?.dflash_ssd_cache_available,
                     mtp_enabled: s.mtp_enabled || false,
+                    mtp_adaptive_max_depth: [3, 4, 5, 6].includes(s.mtp_adaptive_max_depth)
+                        ? String(s.mtp_adaptive_max_depth) : '3',
                     mtp_compatible: model?.mtp_compatible === true,
                     mtp_compatibility_reason: model?.mtp_compatibility_reason || '',
                     is_paroquant: model?.is_paroquant === true,
@@ -3004,6 +3009,10 @@
                                     ? (this.modelSettings.dflash_verify_mode || 'adaptive')
                                     : null,
                                 mtp_enabled: !!this.modelSettings.mtp_enabled,
+                                mtp_adaptive_max_depth: this.modelSettings.mtp_enabled
+                                    ? parseInt(this.modelSettings.mtp_adaptive_max_depth || '3')
+                                    : null,
+                                mtp_fixed_depth: null,
                                 qwen35_ane_prefill_shared_fraction: Number(this.modelSettings.qwen35_ane_prefill_shared_fraction),
                                 vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
                                 vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
@@ -3069,6 +3078,8 @@
                                     dflash_block_size: null,
                                     dflash_verify_mode: null,
                                     mtp_enabled: false,
+                                    mtp_adaptive_max_depth: null,
+                                    mtp_fixed_depth: null,
                                     vlm_mtp_enabled: false,
                                     vlm_mtp_draft_model: null,
                                     vlm_mtp_draft_block_size: null,
@@ -3329,6 +3340,7 @@
                         this.modelSettings.dflash_block_size = null;
                         this.modelSettings.dflash_verify_mode = 'adaptive';
                         this.modelSettings.mtp_enabled = false;
+                        this.modelSettings.mtp_adaptive_max_depth = '3';
                         this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {
                         alert(window.t('js.error.no_config_defaults'));
@@ -6601,6 +6613,19 @@
             oqSelectedModelType() {
                 const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                 return model?.model_type || '';
+            },
+
+            oqAvailableLevels() {
+                return this.oqSelectedModelType() === 'deepseek_v41'
+                    ? [3, 4] : [2, 2.5, 2.7, 3, 3.5, 4, 5, 6, 8];
+            },
+
+            oqApplyModelPolicy() {
+                if (this.oqSelectedModelType() !== 'deepseek_v41') return;
+                if (!this.oqAvailableLevels().includes(this.oqLevel)) this.oqLevel = 4;
+                this.oqDtype = 'bfloat16';
+                this.oqTextOnly = false;
+                if (this.oqLevel === 4) this.oqSensitivityModelPath = '';
             },
 
             oqLevelLabel(level) {

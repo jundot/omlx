@@ -81,6 +81,8 @@ ALLOWED_ENDPOINTS = {
     "/admin/api/cluster/join-keys",
     "/admin/api/cluster/join-status",
     "/admin/api/cluster/cuda-fabric/verify",
+    "/admin/api/cluster/rdma-links",
+    "/admin/api/cluster/rdma-links/verify",
 }
 
 
