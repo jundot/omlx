@@ -1031,7 +1031,72 @@ def dynamic_roll(x, shifts, axis):
     return rolled
 
 
+def _roll_logical_prefix(x, shifts, length: int, axis: int):
+    """``dynamic_roll`` of ``x[:length]`` along ``axis``; the tail is kept.
+
+    For every position below ``length`` the gather index is exactly the one
+    ``dynamic_roll`` computes on the exact-width prefix, so the logical
+    window is bit-identical; positions at or past ``length`` map to
+    themselves and the output keeps ``x``'s full (capacity) width.
+    """
+    n = x.shape[axis]
+    if n == length:
+        return dynamic_roll(x, shifts, axis=axis)
+    if length <= 0:
+        return x
+    expand_shifts = (...,) + (None,) * (x.ndim - axis)
+    expand_indices = expand_shifts[:-1]
+    positions = mx.arange(n)[expand_indices]
+    rolled = (positions - shifts[expand_shifts]) % length
+    idx = mx.where(positions < length, rolled, positions)
+    return mx.take_along_axis(x, idx, axis=axis)
+
+
+def _ladder_capacity(needed: int, step: int) -> int:
+    """Capacity for ``needed`` columns with bounded-ratio headroom.
+
+    The grain ``g`` is 1/16 of the largest power of two <= ``needed`` (at
+    least one ``step``); the capacity is ``needed + g`` rounded up to a
+    multiple of ``g``. Spare capacity is therefore in ``[g, 2g)``: at least
+    ~1/32 of the length (so a bank decodes that far before regrowing) and at
+    most ``max(2 * step, needed / 8)``. The result is piecewise constant in
+    ``needed``: rebuilding a batch a few hundred tokens longer lands on the
+    same size, so MLX's pool can hand back the exact-size buffer the previous
+    batch released instead of stranding it.
+    """
+    needed = max(int(needed), 1)
+    grain = max(step, 1 << max(0, needed.bit_length() - 5))
+    grain = ((grain + step - 1) // step) * step
+    return ((needed + 2 * grain - 1) // grain) * grain
+
+
+def _logical_kv(cache):
+    """``(keys, values)`` cut to the width the concatenate layout would have."""
+    keys, values = cache.keys, cache.values
+    width = getattr(cache, "_width", None)
+    if keys is None or width is None or width == keys.shape[2]:
+        return keys, values
+    return keys[..., :width, :], values[..., :width, :]
+
+
 class BatchKVCache(_BaseCache):
+    """Left-padded batch KV cache backed by a capacity buffer.
+
+    The historical implementation concatenated one ``step`` onto the whole
+    bank every time the write position crossed the physical width, so every
+    256 decode tokens copied every row and stranded the previous exact-width
+    bank in MLX's pool. The bank now lives in a buffer whose capacity grows
+    on a bounded-ratio ladder (``_ladder_capacity``) and appends write in
+    place.
+
+    ``_width`` tracks the width the concatenate layout would have had (its
+    growth rule is replayed exactly), and columns ``[0, _width)`` hold exactly
+    the bytes that layout held -- including stale draft columns past ``_idx``
+    and the pad columns a ragged ``finalize`` rotates in. Columns at or past
+    ``_width`` are always zero. ``_width is None`` means the buffer was
+    assigned from outside and its full width is the logical width.
+    """
+
     step = 256
 
     def __init__(self, left_padding: List[int]):
@@ -1061,30 +1126,92 @@ class BatchKVCache(_BaseCache):
 
         self._right_padding = None
 
+    # Plain assignment (state restore, deserializers, tests) adopts the array
+    # as an exact-width bank, exactly like the former plain attributes.
+    @property
+    def keys(self):
+        return self._keys
+
+    @keys.setter
+    def keys(self, value):
+        self._keys = value
+        self._width = None
+
+    @property
+    def values(self):
+        return self._values
+
+    @values.setter
+    def values(self, value):
+        self._values = value
+        self._width = None
+
+    def _logical_width(self) -> int:
+        if self._width is not None:
+            return self._width
+        return 0 if self._keys is None else int(self._keys.shape[2])
+
+    def _grow(self, keys, values, base: int, width: int) -> None:
+        """Replay the concatenate growth: keep ``[0, base)``, zeros to ``width``."""
+        old_k, old_v = self._keys, self._values
+        B, n_kv_heads, _, k_head_dim = keys.shape
+        v_head_dim = values.shape[3]
+        if old_k is not None and (
+            old_k.dtype != keys.dtype
+            or old_v.dtype != values.dtype
+            or old_k.shape[:2] != keys.shape[:2]
+            or old_k.shape[3] != k_head_dim
+            or old_v.shape[:2] != values.shape[:2]
+            or old_v.shape[3] != v_head_dim
+        ):
+            # concatenate would promote or raise; keep its exact semantics.
+            fresh = width - base
+            self.keys = mx.concatenate(
+                [
+                    old_k[..., :base, :],
+                    mx.zeros((B, n_kv_heads, fresh, k_head_dim), keys.dtype),
+                ],
+                axis=2,
+            )
+            self.values = mx.concatenate(
+                [
+                    old_v[..., :base, :],
+                    mx.zeros((B, n_kv_heads, fresh, v_head_dim), values.dtype),
+                ],
+                axis=2,
+            )
+            return
+        capacity = 0 if old_k is None else int(old_k.shape[2])
+        if width > capacity:
+            capacity = _ladder_capacity(width, self.step)
+            new_k = mx.zeros((B, n_kv_heads, capacity, k_head_dim), keys.dtype)
+            new_v = mx.zeros((B, n_kv_heads, capacity, v_head_dim), values.dtype)
+            if base:
+                new_k[..., :base, :] = old_k[..., :base, :]
+                new_v[..., :base, :] = old_v[..., :base, :]
+            self._keys, self._values = new_k, new_v
+        # Otherwise columns [old width, width) are already zero, and growth
+        # only happens when the append covers [base, old width) anyway.
+        self._width = width
+
     def update_and_fetch(self, keys, values):
         prev = self._idx
-        if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
-            B, n_kv_heads, _, k_head_dim = keys.shape
-            v_head_dim = values.shape[3]
+        width = self._logical_width()
+        if self._keys is None or (prev + keys.shape[2]) > width:
             n_steps = (self.step + keys.shape[2] - 1) // self.step
-            k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
-            v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
-            new_k = mx.zeros(k_shape, keys.dtype)
-            new_v = mx.zeros(v_shape, values.dtype)
-            if self.keys is not None:
-                if prev % self.step != 0:
-                    self.keys = self.keys[..., :prev, :]
-                    self.values = self.values[..., :prev, :]
-                self.keys = mx.concatenate([self.keys, new_k], axis=2)
-                self.values = mx.concatenate([self.values, new_v], axis=2)
+            if self._keys is None:
+                base = 0
+            elif prev % self.step != 0:
+                base = prev
             else:
-                self.keys, self.values = new_k, new_v
+                base = width
+            self._grow(keys, values, base, base + n_steps * self.step)
 
         self.offset += keys.shape[2]
         self._idx += keys.shape[2]
-        self.keys[..., prev : self._idx, :] = keys
-        self.values[..., prev : self._idx, :] = values
-        return self.keys[..., : self._idx, :], self.values[..., : self._idx, :]
+        self._keys[..., prev : self._idx, :] = keys
+        self._values[..., prev : self._idx, :] = values
+        return self._keys[..., : self._idx, :], self._values[..., : self._idx, :]
 
     def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
         if left_padding is not None:
@@ -1102,8 +1229,15 @@ class BatchKVCache(_BaseCache):
     def finalize(self):
         if self._right_padding is not None:
             padding = self._right_padding
-            self.keys = dynamic_roll(self.keys, padding[:, None], axis=2)
-            self.values = dynamic_roll(self.values, padding[:, None], axis=2)
+            # Roll only the concatenate-layout width: identical gather indices
+            # there, and the zero tail past it stays put.
+            width = self._logical_width()
+            self._keys = _roll_logical_prefix(
+                self._keys, padding[:, None], width, axis=2
+            )
+            self._values = _roll_logical_prefix(
+                self._values, padding[:, None], width, axis=2
+            )
             self.offset -= padding
             self.left_padding += padding
             self._right_padding = None
@@ -1139,9 +1273,10 @@ class BatchKVCache(_BaseCache):
         """
         In-place filter to keep just the given indices in the cache.
         """
-        if self.keys is not None:
-            self.keys = self.keys[batch_indices]
-            self.values = self.values[batch_indices]
+        width = self._width
+        if self._keys is not None:
+            self._keys = self._keys[batch_indices]
+            self._values = self._values[batch_indices]
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
         if self._right_padding is not None:
@@ -1150,11 +1285,14 @@ class BatchKVCache(_BaseCache):
         # Shift left to reduce padding
         min_left_pad = self.left_padding.min().item()
         if min_left_pad > 0:
-            if self.keys is not None:
-                self.keys = self.keys[..., min_left_pad:, :]
-                self.values = self.values[..., min_left_pad:, :]
+            if self._keys is not None:
+                self._keys = self._keys[..., min_left_pad:, :]
+                self._values = self._values[..., min_left_pad:, :]
+                if width is not None:
+                    width -= min_left_pad
             self._idx -= min_left_pad
             self.left_padding -= min_left_pad
+        self._width = width
 
     def extend(self, other):
         """
@@ -1165,20 +1303,23 @@ class BatchKVCache(_BaseCache):
             self.offset = mx.concatenate([self.offset, other.offset])
             return
 
+        # The join is rare, so it runs the concatenate algorithm verbatim on
+        # both sides' concatenate-layout widths and adopts an exact result.
+        logical = {id(c): _logical_kv(c) for c in (self, other)}
         max_idx = max(self._idx, other._idx)
         L1 = L2 = 0
         if self.keys is not None:
-            B, H, L1, D = self.keys.shape
+            B, H, L1, D = logical[id(self)][0].shape
             M = self.values.shape[3]
         if other.keys is not None:
-            B, H, L2, D = other.keys.shape
+            B, H, L2, D = logical[id(other)][0].shape
             M = other.values.shape[3]
         max_size = max(L1, L2)
 
         # Pad the keys and values so they are right-justified
         # with the index and the same size
         def pad(c):
-            k, v = c.keys, c.values
+            k, v = logical[id(c)]
             if k is None:
                 Bc = c.offset.shape[0]
                 k = mx.array([]).reshape(Bc, H, 0, D)
@@ -1225,12 +1366,12 @@ class BatchKVCache(_BaseCache):
         Dv = max(c.values.shape[3] for c in caches if c.values is not None)
         dt = next(iter(c.keys.dtype for c in caches if c.keys is not None))
 
-        # Reserve the first append's step now. An exact-width merge made the
-        # next update_and_fetch concatenate a second full copy of every row and
-        # strand the exact buffer in MLX's pool (it can never satisfy a larger
-        # request). max_length + step is exactly the capacity that first
-        # append would have produced, and the reserved tail is zeros either way.
-        capacity = max_length + cls.step
+        # The concatenate layout of an exact merge plus its first append is
+        # max_length + step columns (the reserved tail is zeros either way).
+        # Allocate that width on the capacity ladder so the batch decodes in
+        # place for up to ~1/8 of its length before it has to grow.
+        width = max_length + cls.step
+        capacity = _ladder_capacity(width, cls.step)
         keys = mx.zeros((B, H, capacity, Dk), dtype=dt)
         values = mx.zeros((B, H, capacity, Dv), dtype=dt)
         for i, (p, c) in enumerate(zip(padding, caches)):
@@ -1242,6 +1383,7 @@ class BatchKVCache(_BaseCache):
         cache = cls(padding)
         cache.keys = keys
         cache.values = values
+        cache._width = width
         cache.offset += max_length
         cache._idx = max_length
 

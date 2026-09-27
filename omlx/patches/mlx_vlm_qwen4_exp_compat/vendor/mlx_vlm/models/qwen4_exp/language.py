@@ -21,7 +21,14 @@ import numpy as np
 
 from omlx.patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import register_ple_resource
 
-from .cache import BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
+from .cache import (
+    BatchKVCache,
+    KVCache,
+    QuantizedKVCache,
+    _ladder_capacity,
+    _roll_logical_prefix,
+    dynamic_roll,
+)
 from mlx_vlm.models.cache import ArraysCache
 from mlx_vlm.speculative.cache_state import start_speculative_cache
 from mlx_vlm.speculative.ops.linear import _target_verify_linear, _target_verify_linears
@@ -231,27 +238,6 @@ def _append_indexer_positions(
             f"got cached={cached.shape} and current={position_ids.shape}."
         )
     return mx.concatenate([cached, position_ids], axis=-1)
-
-
-def _roll_logical_prefix(x, shifts, length: int, axis: int):
-    """``dynamic_roll`` of ``x[:length]`` along ``axis``; the tail is kept.
-
-    For every position below ``length`` the gather index is exactly the one
-    ``dynamic_roll`` computes on the exact-width prefix, so the logical
-    window is bit-identical; positions at or past ``length`` map to
-    themselves and the output keeps ``x``'s full (stepped) width.
-    """
-    n = x.shape[axis]
-    if n == length:
-        return dynamic_roll(x, shifts, axis=axis)
-    if length <= 0:
-        return x
-    expand_shifts = (...,) + (None,) * (x.ndim - axis)
-    expand_indices = expand_shifts[:-1]
-    positions = mx.arange(n)[expand_indices]
-    rolled = (positions - shifts[expand_shifts]) % length
-    idx = mx.where(positions < length, rolled, positions)
-    return mx.take_along_axis(x, idx, axis=axis)
 
 
 class _QSAIndexerCache:
@@ -658,10 +644,11 @@ class BatchQSAKVCache:
     _omlx_mtp_batch_rollback_cache = True
     _omlx_mtp_verify_attention_cache = True
 
-    # Decode appends write into a stepped backing buffer instead of
+    # Decode appends write into a capacity-backed buffer instead of
     # concatenating the whole raw-key bank every step. Each concatenate left
     # the previous exact-width bank in MLX's pool, where it can never satisfy
     # a (larger) later request, so the pool grew with every page crossed.
+    # Capacity grows on the _ladder_capacity ladder with this minimum grain.
     index_step = 1024
 
     def __init__(self, left_padding):
@@ -787,8 +774,10 @@ class BatchQSAKVCache:
             or cached_positions.shape[:-1] != self._index_position_ids.shape[:-1]
             or end > int(self._index_keys.shape[1])
         ):
-            step = self.index_step
-            capacity = ((end + step - 1) // step) * step
+            # Same bounded-ratio ladder as the batch KV bank (spare capacity
+            # at most max(2 * index_step, end / 8)): a 130K bank regrows
+            # every 8K-16K tokens instead of every 1024.
+            capacity = _ladder_capacity(end, self.index_step)
             new_keys = mx.zeros(
                 (cached_keys.shape[0], capacity, cached_keys.shape[-1]),
                 dtype=cached_keys.dtype,

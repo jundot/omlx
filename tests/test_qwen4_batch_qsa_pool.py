@@ -6,7 +6,7 @@ Covers the MLX-pool fixes for 2+ row (Lightning MTP) batches:
 * ``BatchQSAKVCache.extract`` rows round their first append to one step
   instead of geometrically doubling the whole row.
 * ``BatchKVCache.merge`` reserves the first append step, producing exactly
-  the physical layout the old exact merge + first append produced.
+  the concatenate layout the old exact merge + first append produced.
 * ``BatchQSAKVCache`` indexer appends write into a stepped buffer; every
   update/trim/ragged-finalize sequence matches the old concatenate path
   bit-for-bit, and the backing width only changes on step crossings.
@@ -105,7 +105,10 @@ def test_merge_reserves_first_step_with_the_old_first_append_layout():
     rows = [_row(300, 1), _row(250, 11)]
     merged = BatchKVCache.merge(rows)
     assert merged.size() == 300
-    assert merged.keys.shape[2] == 300 + BatchKVCache.step
+    # Concatenate-layout width of an exact merge + first append; the backing
+    # capacity may be larger (see test_qwen4_batch_kv_capacity.py).
+    assert merged._width == 300 + BatchKVCache.step
+    assert merged.keys.shape[2] >= merged._width
 
     # Old behaviour: exact-width merge, then the first append concatenates.
     old = BatchKVCache([0, 50])
@@ -118,9 +121,11 @@ def test_merge_reserves_first_step_with_the_old_first_append_layout():
     k, v = _rnd((2, H, 4, D), 31), _rnd((2, H, 4, D), 32)
     merged.update_and_fetch(k, v)
     old.update_and_fetch(k, v)
-    assert merged.keys.shape == old.keys.shape
-    _assert_same(merged.keys, old.keys)
-    _assert_same(merged.values, old.values)
+    assert merged._width == old._width
+    _assert_same(merged.keys[..., : merged._width, :], old.keys[..., : old._width, :])
+    _assert_same(
+        merged.values[..., : merged._width, :], old.values[..., : old._width, :]
+    )
     assert merged._idx == old._idx
     np.testing.assert_array_equal(np.array(merged.offset), np.array(old.offset))
 
