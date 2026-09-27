@@ -42,14 +42,13 @@ and no significant new swap. Other inference processes were unloaded first.
 - Short text decode before matrix-prefill addition: 18.7–20.9 tokens/sec.
 - Cooperative real-expert projection: 0.493 ms; CPU oracle cosine approximately
   1.0, maximum absolute difference 3.05e-5 on the bounded fixture.
-- Actual oMLX API: 736-token request 3.89 seconds cold / 0.60 seconds warm,
+- Actual oMLX API: 736-token request 3.40 seconds cold / 0.60 seconds warm,
   729 cached tokens; both answered correctly.
 - Two reference images: identified red then blue correctly.
 - Tool use: returned structured get_weather(city=London), not source text.
-- Admin dashboard rendered; native unload request accepted. Tiny native reader
+- Admin dashboard rendered; queued native unload completed after activity drained. Tiny native reader
   tests separately confirm exact rows across shard boundaries and idempotent
-  resource cleanup. Completion of the queued API unload is a separate lifecycle
-  gate, not implied by request acceptance.
+  resource cleanup.
 
 Do not extrapolate small-prompt throughput or peak memory to a 128K prompt.
 Context admission and memory guards must stay enabled; long-context and
