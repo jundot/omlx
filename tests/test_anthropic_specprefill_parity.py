@@ -1,16 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """`/v1/messages` accepts the same SpecPrefill overrides as `/v1/chat/completions`.
 
-The two endpoints previously disagreed: a client could tune SpecPrefill per
-request on the OpenAI endpoint but not on the Anthropic one, where the field
-was silently dropped because `MessagesRequest` neither declared it nor allowed
-extras. These tests pin the parity and the shared semantics — omitted leaves
-the model/server setting in charge, true forces on, false forces off.
-
-The forwarding itself (chat_kwargs reaching the engine, including the
-model-settings fallback) is covered by the endpoint tests in
-tests/integration/test_server_endpoints.py::TestAnthropicMessagesEndpoint,
-not here.
+Forwarding to the engine is tested in
+tests/integration/test_server_endpoints.py::TestAnthropicMessagesEndpoint.
 """
 
 import pytest

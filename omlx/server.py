@@ -6614,9 +6614,8 @@ async def create_anthropic_message(
         if request.stop_sequences:
             chat_kwargs["stop"] = request.stop_sequences
 
-        # SpecPrefill: same per-request overrides the OpenAI endpoint accepts,
-        # with the same meaning — omitted leaves the model/server setting in
-        # charge, true forces it on, false forces it off.
+        # Same SpecPrefill overrides and model-settings fallback as the
+        # OpenAI endpoint.
         if request.specprefill is not None:
             chat_kwargs["specprefill"] = request.specprefill
         if request.specprefill_keep_pct is not None:
