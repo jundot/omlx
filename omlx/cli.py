@@ -553,7 +553,7 @@ def launch_command(args, extra_args: list[str] | None = None):
     # Determine model. Explicit CLI tier flags bypass the picker; otherwise always
     # prompt interactively so the user's selection is honoured.
     model = args.model
-    if not model and not getattr(integration, "requires_model_selection", True):
+    if not model and not integration.requires_model_selection:
         # The integration registers the server's whole model catalog, so
         # there is nothing to pick here; the optional per-tool default (or
         # --model) only seeds the tool's own default model.
@@ -563,7 +563,7 @@ def launch_command(args, extra_args: list[str] | None = None):
         )
     if not model and (cli_opus_model or cli_sonnet_model or cli_haiku_model):
         model = cli_sonnet_model or cli_opus_model or cli_haiku_model or ""
-    elif not model and getattr(integration, "requires_model_selection", True):
+    elif not model and integration.requires_model_selection:
         # Fetch available models from server
         try:
             resp = requests.get(f"{base_url}/v1/models", headers=headers, timeout=5)
@@ -662,6 +662,7 @@ def launch_command(args, extra_args: list[str] | None = None):
         max_tokens=model_info.get("max_tokens"),
         model_type=model_info.get("model_type"),
         reasoning=model_info.get("enable_thinking"),
+        models_status_map=models_status_map,
         tools_profile=getattr(args, "tools_profile", "coding"),
         extra_args=tuple(extra_args or ()),
         cross_session=getattr(args, "cross_session", False),

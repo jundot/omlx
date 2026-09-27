@@ -7,7 +7,7 @@ import os
 import shutil
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -29,6 +29,11 @@ class IntegrationContext:
     tools_profile: str = "coding"
     extra_args: tuple[str, ...] = ()
     cross_session: bool = False
+    # Per-model status/capacity map the launcher pre-fetched from
+    # GET /v1/models/status (keys: model id and model_alias). Integrations
+    # read it instead of fetching the status again themselves; empty for
+    # direct constructions.
+    models_status_map: dict[str, dict] = field(default_factory=dict)
 
     @property
     def base_url(self) -> str:

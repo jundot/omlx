@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import json
 import os
-import plistlib
 import re
 import shutil
 import subprocess
@@ -34,6 +33,7 @@ from pathlib import Path
 import yaml
 
 from omlx.integrations.base import Integration, IntegrationContext
+from omlx.integrations.macapp import find_mac_app
 from omlx.utils.install import get_cli_command_prefix
 
 DSH_APP_BUNDLE_ID = "com.deepseek.dsh"
@@ -125,19 +125,7 @@ def api_protocol() -> str:
 
 def find_dsh_app_bundle() -> Path | None:
     """App bundle path, or None. Matches on CFBundleIdentifier, not folder name."""
-    for root in _APP_BUNDLE_ROOTS:
-        bundle = root / DSH_APP_BUNDLE_NAME
-        plist_path = bundle / "Contents" / "Info.plist"
-        if not plist_path.is_file():
-            continue
-        try:
-            with plist_path.open("rb") as f:
-                info = plistlib.load(f)
-        except (OSError, plistlib.InvalidFileException):
-            continue
-        if info.get("CFBundleIdentifier") == DSH_APP_BUNDLE_ID:
-            return bundle
-    return None
+    return find_mac_app(_APP_BUNDLE_ROOTS, (DSH_APP_BUNDLE_NAME,), DSH_APP_BUNDLE_ID)
 
 
 def _app_is_running() -> bool:
@@ -346,31 +334,6 @@ def _provider_route_lines(
     return out
 
 
-def _llm_pi_ai_entry_lines(
-    base_url: str, models: list[dict], protocol: str
-) -> list[str]:
-    """Render a complete ``llm-pi-ai`` patch entry carrying the route."""
-    return [
-        _LLM_PI_AI_ENTRY_COMMENT,
-        f"- id: {_LLM_PI_AI_ENTRY_ID}",
-        f'  name: "{_LLM_PI_AI_ENTRY_NAME}"',
-        "  config:",
-        "    providers:",
-    ] + _provider_route_lines(base_url, models, protocol, indent=6)
-
-
-def _agent_default_entry_lines(model: str) -> list[str]:
-    """Render a complete ``agent-default-model`` patch entry."""
-    return [
-        _AGENT_DEFAULT_ENTRY_COMMENT,
-        f"- id: {_AGENT_DEFAULT_ENTRY_ID}",
-        f'  name: "{_AGENT_DEFAULT_ENTRY_NAME}"',
-        "  config:",
-        f"    provider: {PROVIDER_ROUTE}",
-        f"    model: {_yaml_quote(model)}",
-    ]
-
-
 def _append_entry(lines: list[str], entry: list[str]) -> list[str]:
     if lines and lines[-1].strip():
         lines = lines + [""]
@@ -405,22 +368,39 @@ def _parse_yaml(text: str, what: str):
         raise DshConfigShapeError(f"{what} is not valid YAML: {e}") from e
 
 
+def _upsert_entry(
+    lines: list[str], entry: tuple[str, str, str], render_body
+) -> tuple[list[str], int, int, int]:
+    """Append the entry when missing; ensure and locate its config block.
+
+    ``entry`` is ``(id, name, comment)``; ``render_body(indent)`` renders the
+    config content — and, after the id/name header, a missing entry. Returns
+    ``(lines, config_idx, config_indent, config_end)``.
+    """
+    entry_id, entry_name, comment = entry
+    bounds = _find_entry_bounds(lines, entry_id, entry_name)
+    if bounds is None:
+        header = [comment, f"- id: {entry_id}", f'  name: "{entry_name}"', "  config:"]
+        lines = _append_entry(lines, header + render_body(2))
+        return lines, len(lines) - len(header) + 3, 2, len(lines)
+    start, end = bounds
+    lines, cfg_idx, cfg_indent, cfg_end = _ensure_block(
+        lines, start, _entry_content_end(lines, start, end), "config", 2, render_body
+    )
+    return lines, cfg_idx, cfg_indent, cfg_end
+
+
 def _upsert_llm_pi_ai(
     lines: list[str], base_url: str, models: list[dict], protocol: str
 ) -> list[str]:
-    bounds = _find_entry_bounds(lines, _LLM_PI_AI_ENTRY_ID, _LLM_PI_AI_ENTRY_NAME)
-    if bounds is None:
-        return _append_entry(lines, _llm_pi_ai_entry_lines(base_url, models, protocol))
-    start, end = bounds
-
-    def config_body(indent: int) -> list[str]:
+    def render_body(indent: int) -> list[str]:
         return [" " * (indent + 2) + "providers:"] + _provider_route_lines(
             base_url, models, protocol, indent + 4
         )
 
-    lines, cfg_idx, cfg_indent, cfg_end = _ensure_block(
-        lines, start, _entry_content_end(lines, start, end), "config", 2, config_body
-    )
+    entry = _LLM_PI_AI_ENTRY_ID, _LLM_PI_AI_ENTRY_NAME, _LLM_PI_AI_ENTRY_COMMENT
+    lines, cfg_idx, cfg_indent, cfg_end = _upsert_entry(lines, entry, render_body)
+
     lines, prov_idx, prov_indent, prov_end = _ensure_block(
         lines,
         cfg_idx + 1,
@@ -441,45 +421,34 @@ def _upsert_llm_pi_ai(
 
 
 def _upsert_agent_default(lines: list[str], model: str) -> list[str]:
-    bounds = _find_entry_bounds(
-        lines, _AGENT_DEFAULT_ENTRY_ID, _AGENT_DEFAULT_ENTRY_NAME
-    )
-    if bounds is None:
-        return _append_entry(lines, _agent_default_entry_lines(model))
-    start, end = bounds
-
-    def config_body(indent: int) -> list[str]:
+    def render_body(indent: int) -> list[str]:
         pad = " " * (indent + 2)
         return [f"{pad}provider: {PROVIDER_ROUTE}", f"{pad}model: {_yaml_quote(model)}"]
 
-    lines, cfg_idx, cfg_indent, cfg_end = _ensure_block(
-        lines, start, _entry_content_end(lines, start, end), "config", 2, config_body
+    entry = (
+        _AGENT_DEFAULT_ENTRY_ID,
+        _AGENT_DEFAULT_ENTRY_NAME,
+        _AGENT_DEFAULT_ENTRY_COMMENT,
     )
+    lines, cfg_idx, cfg_indent, cfg_end = _upsert_entry(lines, entry, render_body)
+
+    # One pass rewrites both managed scalar keys: nothing before the config
+    # block moves, so the bounds returned above still hold (no re-locate).
     pad = " " * (cfg_indent + 2)
-    lines = _upsert_block(
-        lines,
-        cfg_idx + 1,
-        cfg_end,
-        "provider",
-        [f"{pad}provider: {PROVIDER_ROUTE}"],
-        allow_inline=True,
-    )
-    # The edit may have shifted lines; re-locate our config block (the
-    # shallowest one after `start` is ours).
-    found = _find_key_line(lines, "config", start, len(lines))
-    if found is None:  # pragma: no cover - the block was there one line ago
-        raise DshConfigShapeError("agent-default-model config block vanished")
-    cfg_idx, cfg_indent = found
-    cfg_end = _block_content_end(lines, cfg_idx, cfg_indent)
-    pad = " " * (cfg_indent + 2)
-    return _upsert_block(
-        lines,
-        cfg_idx + 1,
-        cfg_end,
-        "model",
-        [f"{pad}model: {_yaml_quote(model)}"],
-        allow_inline=True,
-    )
+    replacements = {
+        "provider": f"{pad}provider: {PROVIDER_ROUTE}",
+        "model": f"{pad}model: {_yaml_quote(model)}",
+    }
+    body: list[str] = []
+    for line in lines[cfg_idx + 1 : cfg_end]:
+        for key in list(replacements):
+            if line.startswith(f"{pad}{key}:"):
+                body.append(replacements.pop(key))
+                break
+        else:
+            body.append(line)
+    body += replacements.values()
+    return lines[: cfg_idx + 1] + body + lines[cfg_end:]
 
 
 def _validate_patch(
@@ -685,38 +654,18 @@ class DshIntegration(Integration):
         )
 
     def _fetch_models(self, ctx: IntegrationContext) -> list[dict]:
-        """List the server's models with capacity metadata for the route."""
-        import requests
+        """Build the route's model list from the launcher's pre-fetched status.
 
-        headers = {"Authorization": f"Bearer {ctx.auth_token}"} if ctx.api_key else {}
-
-        status_map: dict[str, dict] = {}
-        try:
-            resp = requests.get(
-                f"{ctx.base_url}/v1/models/status", headers=headers, timeout=5
+        The launcher already fetched ``/v1/models/status`` and passes its map
+        on the context, so a launch never fetches the model status twice.
+        """
+        status_map = ctx.models_status_map
+        # Display ids in server order: an aliased model sits under both keys.
+        ids = list(
+            dict.fromkeys(
+                info.get("model_alias") or m_id for m_id, info in status_map.items()
             )
-            if resp.ok:
-                for m in resp.json().get("models", []):
-                    if m_id := m.get("id"):
-                        status_map[m_id] = m
-                    if alias := m.get("model_alias"):
-                        status_map[alias] = m
-        except Exception:
-            pass
-
-        ids: list[str] = []
-        try:
-            resp = requests.get(f"{ctx.base_url}/v1/models", headers=headers, timeout=5)
-            resp.raise_for_status()
-            ids = [
-                m["id"]
-                for m in resp.json().get("data", [])
-                # Guard for servers that type the list; the status-driven
-                # check below does the real filtering when this is unset.
-                if m.get("id") and m.get("model_type") in ("llm", "vlm", None)
-            ]
-        except Exception:
-            pass
+        )
         if not ids and ctx.model:
             ids = [ctx.model]
 
@@ -724,8 +673,11 @@ class DshIntegration(Integration):
         for m_id in ids:
             info = status_map.get(m_id, {})
             # Chat models only (matches the launcher's picker): embedding /
-            # audio models on the server stay out of the route. Unknown types
-            # — status fetch failed — stay in.
+            # audio models on the server stay out of the route, hidden models
+            # stay out as they do from /v1/models, and records without a type
+            # — status metadata missing — stay in.
+            if info.get("is_hidden"):
+                continue
             model_type = info.get("model_type") or None
             if model_type and model_type not in ("llm", "vlm"):
                 continue

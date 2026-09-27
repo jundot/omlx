@@ -108,9 +108,7 @@ class TestCodexIntegration:
         )
 
         assert 'model_provider="omlx"' in args
-        assert (
-            'model_providers.omlx.base_url="http://192.168.1.100:9000/v1"' in args
-        )
+        assert 'model_providers.omlx.base_url="http://192.168.1.100:9000/v1"' in args
         assert 'model_providers.omlx.env_key="OMLX_API_KEY"' in args
         assert "model_context_window=240000" in args
         assert not any("model_auto_compact_token_limit" in arg for arg in args)
@@ -2145,6 +2143,20 @@ def _route(patch_path: Path, protocol: str = "openai-responses") -> tuple[dict, 
     return route, data
 
 
+@pytest.fixture
+def dsh_env(tmp_path, monkeypatch):
+    """Write the harness home into tmp_path and stub the model list.
+
+    Pointing OMLX_DSH_HOME at the scratch dir routes every harness file
+    there — and exercises the override itself.
+    """
+    monkeypatch.setenv("OMLX_DSH_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        DshIntegration, "_fetch_models", lambda self, c: [dict(m) for m in DSH_MODELS]
+    )
+    return tmp_path
+
+
 class TestDshIntegration:
     def test_get_command(self):
         dsh = DshIntegration()
@@ -2184,22 +2196,9 @@ class TestDshIntegration:
         with pytest.raises(SystemExit):
             DshIntegration().launch(ctx())
 
-    def test_configure_writes_route_and_credential(self, tmp_path, monkeypatch):
-        patch_path = tmp_path / "profiles" / "desktop" / "cordis.patch.yml"
-        creds_path = tmp_path / ".credentials.yaml"
-        monkeypatch.setattr("omlx.integrations.dsh.patch_file_path", lambda: patch_path)
-        monkeypatch.setattr(
-            "omlx.integrations.dsh.credentials_file_path", lambda: creds_path
-        )
-        monkeypatch.setattr(
-            "omlx.integrations.dsh.web_patch_file_path",
-            lambda: tmp_path / "profiles" / "web" / "cordis.patch.yml",
-        )
-        monkeypatch.setattr(
-            DshIntegration,
-            "_fetch_models",
-            lambda self, c: [dict(m) for m in DSH_MODELS],
-        )
+    def test_configure_writes_route_and_credential(self, dsh_env):
+        patch_path = dsh_env / "profiles" / "desktop" / "cordis.patch.yml"
+        creds_path = dsh_env / ".credentials.yaml"
 
         DshIntegration().configure(ctx(api_key="sk-test"))
 
@@ -2215,22 +2214,8 @@ class TestDshIntegration:
         creds = yaml.safe_load(creds_path.read_text())
         assert creds["refs"]["OMLX_API_KEY"] == "sk-test"
 
-    def test_configure_sets_default_model(self, tmp_path, monkeypatch):
-        patch_path = tmp_path / "cordis.patch.yml"
-        creds_path = tmp_path / ".credentials.yaml"
-        monkeypatch.setattr("omlx.integrations.dsh.patch_file_path", lambda: patch_path)
-        monkeypatch.setattr(
-            "omlx.integrations.dsh.credentials_file_path", lambda: creds_path
-        )
-        monkeypatch.setattr(
-            "omlx.integrations.dsh.web_patch_file_path",
-            lambda: tmp_path / "profiles" / "web" / "cordis.patch.yml",
-        )
-        monkeypatch.setattr(
-            DshIntegration,
-            "_fetch_models",
-            lambda self, c: [dict(m) for m in DSH_MODELS],
-        )
+    def test_configure_sets_default_model(self, dsh_env):
+        patch_path = dsh_env / "profiles" / "desktop" / "cordis.patch.yml"
 
         DshIntegration().configure(ctx(model="Qwen3.8-27B-oQ5e-mtp", api_key=""))
 
@@ -2242,40 +2227,22 @@ class TestDshIntegration:
         }
         # No API key configured: the ref still resolves (the dummy token the
         # base context supplies) so the route never fails MISSING_CREDENTIAL.
-        creds = yaml.safe_load(creds_path.read_text())
+        creds = yaml.safe_load((dsh_env / ".credentials.yaml").read_text())
         assert creds["refs"]["OMLX_API_KEY"] == "omlx"
 
-    def test_configure_updates_web_profile_too(self, tmp_path, monkeypatch):
+    def test_configure_updates_web_profile_too(self, dsh_env):
         # `dsh web` boots profiles/web — a separate profile from desktop's.
         # The same provider route must land in both patch layers.
-        monkeypatch.setattr(
-            "omlx.integrations.dsh.patch_file_path",
-            lambda: tmp_path / "profiles" / "desktop" / "cordis.patch.yml",
-        )
-        monkeypatch.setattr(
-            "omlx.integrations.dsh.web_patch_file_path",
-            lambda: tmp_path / "profiles" / "web" / "cordis.patch.yml",
-        )
-        monkeypatch.setattr(
-            "omlx.integrations.dsh.credentials_file_path",
-            lambda: tmp_path / ".credentials.yaml",
-        )
-        monkeypatch.setattr(
-            DshIntegration,
-            "_fetch_models",
-            lambda self, c: [dict(m) for m in DSH_MODELS],
-        )
-
         DshIntegration().configure(ctx())
 
         for target in (
-            tmp_path / "profiles" / "desktop" / "cordis.patch.yml",
-            tmp_path / "profiles" / "web" / "cordis.patch.yml",
+            dsh_env / "profiles" / "desktop" / "cordis.patch.yml",
+            dsh_env / "profiles" / "web" / "cordis.patch.yml",
         ):
             route, _ = _route(target)
             assert route["baseURL"] == "http://127.0.0.1:8000/v1"
             assert [m["id"] for m in route["models"]] == [m["id"] for m in DSH_MODELS]
-        creds = yaml.safe_load((tmp_path / ".credentials.yaml").read_text())
+        creds = yaml.safe_load((dsh_env / ".credentials.yaml").read_text())
         assert "OMLX_API_KEY" in creds["refs"]
 
     def test_configure_exits_when_server_has_no_models(self, monkeypatch):
@@ -2284,26 +2251,17 @@ class TestDshIntegration:
             DshIntegration().configure(ctx())
 
     def test_fetch_models_reads_capacity_and_modalities(self):
-        status_response = MagicMock()
-        status_response.ok = True
-        status_response.json.return_value = {
-            "models": [
-                {
-                    "id": "qwen-llm",
-                    "max_context_window": 65536,
-                    "max_tokens": 4096,
-                    "model_type": "llm",
-                },
-                {"id": "qwen-vl", "model_type": "vlm"},
-            ]
-        }
-        models_response = MagicMock()
-        models_response.json.return_value = {
-            "data": [{"id": "qwen-llm"}, {"id": "qwen-vl"}]
+        status_map = {
+            "qwen-llm": {
+                "id": "qwen-llm",
+                "max_context_window": 65536,
+                "max_tokens": 4096,
+                "model_type": "llm",
+            },
+            "qwen-vl": {"id": "qwen-vl", "model_type": "vlm"},
         }
 
-        with patch("requests.get", side_effect=[status_response, models_response]):
-            models = DshIntegration()._fetch_models(ctx(api_key="k"))
+        models = DshIntegration()._fetch_models(ctx(models_status_map=status_map))
 
         assert [m["id"] for m in models] == ["qwen-llm", "qwen-vl"]
         assert models[0]["contextWindow"] == 65536
@@ -2311,38 +2269,34 @@ class TestDshIntegration:
         assert models[0]["input"] == ["text"]
         assert models[1]["input"] == ["text", "image"]
 
-    def test_fetch_models_skips_non_chat_model_types(self):
-        status_response = MagicMock()
-        status_response.ok = True
-        status_response.json.return_value = {
-            "models": [
-                {"id": "chat-llm", "model_type": "llm"},
-                {"id": "embed-bert", "model_type": "embedding"},
-                {"id": "asr", "model_type": "audio_sts"},
-            ]
-        }
-        models_response = MagicMock()
-        models_response.json.return_value = {
-            # The list endpoint leaves model_type unset; filtering happens
-            # against the status map. Unknown types stay in.
-            "data": [
-                {"id": "chat-llm"},
-                {"id": "embed-bert"},
-                {"id": "asr"},
-                {"id": "untyped"},
-            ]
+    def test_fetch_models_uses_display_id_and_lists_it_once(self):
+        # The status map holds an aliased model under its id and its alias;
+        # the route must list the display id exactly once.
+        record = {"id": "phys-id", "model_alias": "chat-id", "model_type": "llm"}
+
+        models = DshIntegration()._fetch_models(
+            ctx(models_status_map={"phys-id": record, "chat-id": record})
+        )
+
+        assert [m["id"] for m in models] == ["chat-id"]
+
+    def test_fetch_models_skips_non_chat_and_hidden_models(self):
+        status_map = {
+            "chat-llm": {"id": "chat-llm", "model_type": "llm"},
+            "embed-bert": {"id": "embed-bert", "model_type": "embedding"},
+            "asr": {"id": "asr", "model_type": "audio_sts"},
+            # No type in the record: unknown types stay in.
+            "untyped": {"id": "untyped"},
+            # Hidden from /v1/models, so it stays out of the route.
+            "hidden": {"id": "hidden", "model_type": "llm", "is_hidden": True},
         }
 
-        with patch("requests.get", side_effect=[status_response, models_response]):
-            models = DshIntegration()._fetch_models(ctx())
+        models = DshIntegration()._fetch_models(ctx(models_status_map=status_map))
 
         assert [m["id"] for m in models] == ["chat-llm", "untyped"]
 
     def test_fetch_models_falls_back_to_selected_model(self):
-        status_response = MagicMock()
-        status_response.ok = False
-        with patch("requests.get", side_effect=[status_response, Exception("down")]):
-            models = DshIntegration()._fetch_models(ctx(model="only-model"))
+        models = DshIntegration()._fetch_models(ctx(model="only-model"))
 
         assert models == [{"id": "only-model", "name": "only-model", "input": ["text"]}]
 
@@ -2549,7 +2503,7 @@ class TestDshPatchWriter:
             "- id: llm-pi-ai\n"
             '  name: "@deepseek-ai/dsh-llm-pi-ai"\n'
             "  config:\n"
-            '    retryPolicy: !!js/object "{ mode: \'normal\' }"\n'
+            "    retryPolicy: !!js/object \"{ mode: 'normal' }\"\n"
             "    providers:\n"
             "      omlx:\n"
             "        api: openai-completions\n"
@@ -2566,7 +2520,7 @@ class TestDshPatchWriter:
         out = path.read_text()
 
         # The tagged values are still there, tag and payload included.
-        assert 'retryPolicy: !!js/object "{ mode: \'normal\' }"' in out
+        assert "retryPolicy: !!js/object \"{ mode: 'normal' }\"" in out
         assert 'transcriptView: !!js/string "standard"' in out
 
         # And the result still loads: the route moved, the tags did not.
@@ -2628,6 +2582,14 @@ class TestDshCredentialsRef:
         data = yaml.safe_load(path.read_text())
         assert data["refs"]["OMLX_API_KEY"] == "sk-new"
         assert data["records"] == {}
+
+    def test_rewrites_inline_empty_refs_as_block(self, tmp_path):
+        path = tmp_path / ".credentials.yaml"
+        path.write_text("version: 1\nrecords: {}\nrefs: {}\n")
+
+        write_credentials_ref(path, "OMLX_API_KEY", "sk-new")
+
+        assert yaml.safe_load(path.read_text())["refs"] == {"OMLX_API_KEY": "sk-new"}
 
     def test_creates_missing_file(self, tmp_path):
         path = tmp_path / ".credentials.yaml"
