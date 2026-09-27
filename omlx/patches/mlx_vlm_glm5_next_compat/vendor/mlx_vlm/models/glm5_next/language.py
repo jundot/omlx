@@ -31,6 +31,14 @@ from .linear import fused_quantized_matmul, linear_forward
 logger = logging.getLogger(__name__)
 _NATIVE_INDEXER_WARNED = False
 
+# Prefill allocator-pool limit (issue #3998): flush the pool only once it has
+# grown past this many bytes instead of after every layer. Per-layer flushes
+# force every layer to re-acquire its buffers, costing 20-35 % prefill on
+# hosts with memory headroom; the threshold still bounds the size-class churn
+# #3807 was fixing. Per-layer eval stays unconditional. The MTP runtime loop
+# (mlx_vlm_mtp/glm5_next_vlm_runtime.py) duplicates this policy deliberately.
+_PREFILL_POOL_LIMIT_BYTES = 4 << 30
+
 
 def _cache_parts(cache):
     """(kv, pool) halves of a sparse-layer cache; either half may be missing."""
@@ -1017,7 +1025,8 @@ class Glm5NextModel(nn.Module):
             h = layer(h, mask=mask, cache=c)
             if prefill:
                 mx.eval(h)
-                mx.clear_cache()
+                if mx.get_cache_memory() > _PREFILL_POOL_LIMIT_BYTES:
+                    mx.clear_cache()
 
         h = h.mean(axis=2)
         return self.norm(h)

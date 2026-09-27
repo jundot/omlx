@@ -1029,8 +1029,8 @@ def test_sparse_attention_completes_at_32k_with_fp32_scale_projection(monkeypatc
     )
 
 
-def test_prefill_evals_stream_per_layer_to_bound_transient(monkeypatch):
-    """Prefill releases layer intermediates and cached buffers; decode stays lazy."""
+def test_prefill_evals_per_layer_and_flushes_pool_on_threshold(monkeypatch):
+    """Prefill evals the stream per layer; pool flush is threshold-gated; decode stays lazy."""
     import mlx_vlm.models.glm5_next.language as lang
 
     text = _tiny_config().text_config
@@ -1053,16 +1053,35 @@ def test_prefill_evals_stream_per_layer_to_bound_transient(monkeypatch):
     monkeypatch.setattr(lang.mx, "clear_cache", clear_spy)
 
     ids = mx.zeros((1, 256), dtype=mx.int32)
+
+    # Below the pool limit the allocator pool must stay intact (#3998):
+    # per-layer flushes force every layer to re-acquire its buffers, which
+    # costs 20-35 % prefill on hosts with memory headroom.
+    monkeypatch.setattr(
+        lang.mx, "get_cache_memory", lambda: lang._PREFILL_POOL_LIMIT_BYTES - 1
+    )
     out = model(ids)
     real_eval(out)
     assert len(calls) >= text.num_hidden_layers, (
         f"prefill width must eval the stream per layer, got {len(calls)} eval calls"
         f" for {text.num_hidden_layers} layers"
     )
-    # Layer-specific buffer sizes can accumulate in the allocator pool.
+    assert not clears, (
+        "pool below the limit must not be cleared, got"
+        f" {len(clears)} clears for {text.num_hidden_layers} layers"
+    )
+
+    # Past the limit, layer boundaries flush the pool to bound the
+    # size-class churn #3807 was fixing.
+    calls.clear()
+    monkeypatch.setattr(
+        lang.mx, "get_cache_memory", lambda: lang._PREFILL_POOL_LIMIT_BYTES + 1
+    )
+    out = model(ids)
+    real_eval(out)
     assert len(clears) >= text.num_hidden_layers, (
-        f"prefill must clear the allocator pool per layer, got {len(clears)}"
-        f" clears for {text.num_hidden_layers} layers"
+        "prefill must clear the allocator pool once past the limit, got"
+        f" {len(clears)} clears for {text.num_hidden_layers} layers"
     )
 
     calls.clear()
@@ -1073,7 +1092,7 @@ def test_prefill_evals_stream_per_layer_to_bound_transient(monkeypatch):
     assert len(calls) < text.num_hidden_layers, (
         "decode width must stay lazy (no per-layer eval)"
     )
-    assert not clears, "decode width must not clear the pool per layer"
+    assert not clears, "decode width must not clear the pool even past the limit"
 
 
 def test_patch_overrides_site_packages_glm5_next_copy():

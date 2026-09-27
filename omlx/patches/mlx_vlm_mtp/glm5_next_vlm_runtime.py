@@ -45,6 +45,11 @@ logger = logging.getLogger(__name__)
 
 _APPLIED = False
 
+# Mirrors _PREFILL_POOL_LIMIT_BYTES in the vendor glm5_next/language.py:
+# this loop replaces Glm5NextModel.__call__, so the threshold-flush policy
+# (issue #3998) is deliberately duplicated here.
+_PREFILL_POOL_LIMIT_BYTES = 4 << 30
+
 # A depth-k chain verifies k+1 rows and PoolingCache only stashes an undo
 # log for updates of 8 rows or fewer.
 _MAX_CHAIN_DEPTH = 7
@@ -425,7 +430,8 @@ def _patch_model_call(g5_lang: Any) -> None:
                 h = layer(h, mask=mask, cache=c)
             if prefill:
                 mx.eval(h)
-                mx.clear_cache()
+                if mx.get_cache_memory() > _PREFILL_POOL_LIMIT_BYTES:
+                    mx.clear_cache()
 
         # Collapse the mHC streams first: everything downstream (the final
         # norm, the lm_head, and the nextn head) consumes the ordinary
