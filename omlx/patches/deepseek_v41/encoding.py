@@ -40,6 +40,10 @@ ASSISTANT_SP_TOKEN = "<｜Assistant｜>"
 LATEST_REMINDER_SP_TOKEN = "<｜latest_reminder｜>"
 
 IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
+# Literal stand-in substituted for the placeholder when it appears as plain text
+# (pasted logs, transcripts, quotes). Real images always arrive as image content
+# blocks, which this never touches.
+IMAGE_SANITIZE_REPLACEMENT = "[image]"
 IMAGE_TAG_PATTERN = re.compile(r"<image>(.*?)</image>", re.DOTALL)
 
 # Task special tokens for internal classification tasks
@@ -341,10 +345,10 @@ def _process_image_blocks(
         elif block.get("type") == "text":
             text = block.get("text") or ""
             if IMAGE_PLACEHOLDER in text:
-                raise ValueError(
-                    "Text block contains the DeepSeek image placeholder token in "
-                    "its text; images should be separate content blocks."
-                )
+                # See comment in _validate_no_image_sp_tokens: tool results with
+                # list content hit this path.
+                block = copy.copy(block)
+                block["text"] = text.replace(IMAGE_PLACEHOLDER, IMAGE_SANITIZE_REPLACEMENT)
             new_blocks.append(block)
         else:
             new_blocks.append(block)
@@ -352,18 +356,17 @@ def _process_image_blocks(
 
 
 def _validate_no_image_sp_tokens(msg: Dict[str, Any]) -> None:
-    """Reject user-supplied image placeholder tokens in textual fields."""
+    """Sanitize user-supplied image placeholder tokens in textual fields."""
     content = msg.get("content")
     if isinstance(content, str) and IMAGE_PLACEHOLDER in content:
-        raise ValueError(
-            "Message content contains the DeepSeek image placeholder token. "
-            "Images should be provided as image content blocks."
-        )
+        # Placeholder as plain text (pasted logs/transcripts) is data, not an
+        # image reference: replace it instead of rejecting the whole request.
+        msg["content"] = content.replace(IMAGE_PLACEHOLDER, IMAGE_SANITIZE_REPLACEMENT)
     reasoning_content = msg.get("reasoning_content")
     if isinstance(reasoning_content, str) and IMAGE_PLACEHOLDER in reasoning_content:
-        raise ValueError(
-            "reasoning_content contains the DeepSeek image placeholder token"
-        )
+        # See comment above.
+        msg["reasoning_content"] = reasoning_content.replace(
+            IMAGE_PLACEHOLDER, IMAGE_SANITIZE_REPLACEMENT)
 
 
 def process_image_messages(
