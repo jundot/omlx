@@ -203,3 +203,44 @@ def test_filter_after_managed_appends_keeps_keys_and_positions_aligned():
     assert batch.index_offset == batch.kv_cache.size()
     _assert_same(batch.index_keys, ref.index_keys[1:2, 4:])
     _assert_same(batch.index_position_ids, ref.index_position_ids[1:2, 4:])
+
+
+def test_join_lands_indexer_on_capacity_bit_for_bit():
+    batch = BatchQSAKVCache.merge([_row(700, 1), _row(650, 11)])
+    donor = _row(1500, 21).to_batch([0])
+    pads = [1500 - batch.index_offset, 0]
+    ref_keys = mx.concatenate(
+        [
+            mx.pad(batch.index_keys, [(0, 0), (pads[0], 0), (0, 0)]),
+            donor.index_keys,
+        ]
+    )
+    ref_positions = mx.concatenate(
+        [
+            mx.pad(batch.index_position_ids, [(0, 0), (pads[0], 0)]),
+            donor.index_position_ids,
+        ]
+    )
+    batch.extend(donor)
+    mx.eval(batch._index_keys, batch._index_position_ids)
+    _assert_same(batch.index_keys, ref_keys)
+    _assert_same(batch.index_position_ids, ref_positions)
+    assert batch.index_offset == batch.kv_cache.size() == 1500
+    # Past the joined width the capacity buffer is zero, and the first
+    # appends write in place instead of regrowing an exact-width bank.
+    assert not np.any(_bits(batch._index_keys[:, 1500:]))
+    width = int(batch._index_keys.shape[1])
+    ref = _ExactIndexer(ref_keys, ref_positions)
+    for step in range(8):
+        keys = _rnd((3, 4, DI), 300 + step)
+        positions = mx.broadcast_to(
+            mx.arange(1500 + 4 * step, 1504 + 4 * step, dtype=mx.int32)[None], (3, 4)
+        )
+        batch.kv_cache.update_and_fetch(
+            _rnd((3, H, 4, D), 500 + step), _rnd((3, H, 4, D), 700 + step)
+        )
+        got_k, got_p = batch.update_indexer(keys, positions)
+        ref.update(keys, positions)
+        _assert_same(got_k, ref.index_keys)
+        _assert_same(got_p, ref.index_position_ids)
+        assert int(batch._index_keys.shape[1]) == width

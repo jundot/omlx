@@ -1625,6 +1625,27 @@ def test_qwen4_cache_extension_keeps_existing_batch_in_place():
     assert [left.extract(i).offset for i in range(2)] == [3, 2]
 
 
+def test_qwen4_cache_join_releases_each_donor_layer():
+    """The join materializes layer by layer and drops each copied donor layer,
+    so old banks, donor rows and joined banks are never all alive at once."""
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache
+
+    import omlx.scheduler  # noqa: F401  (installs BatchGenerator cache patches)
+
+    left = [BatchQSAKVCache.merge([_warm_qsa_row(3, 10 * i)]) for i in range(1, 3)]
+    donor = [_warm_qsa_row(5, 100 * i) for i in range(1, 3)]
+    generate = importlib.import_module("mlx_lm.generate")
+
+    caches = generate._extend_cache(left, donor)
+
+    assert donor == [None, None]
+    assert caches == left
+    for cache in caches:
+        assert cache.offset.tolist() == [3, 5]
+        assert [cache.extract(i).offset for i in range(2)] == [3, 5]
+
+
 def test_qwen4_qsa_indexer_handles_ragged_batch_offsets():
     """``from_projected`` on a batched cache whose ``offset`` is a per-row
     array must keep the mask math on aligned-column scalars — previously the

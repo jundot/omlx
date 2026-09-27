@@ -1031,7 +1031,26 @@ def _patched_extend_cache(cache_a, cache_b):
         return cache_b
     if not cache_b:
         return cache_a
-    return [_extend_cache_layer(ca, cb) for ca, cb in zip(cache_a, cache_b)]
+    # Materialize the join one layer at a time and drop each donor layer once
+    # it is copied. Evaluated lazily as a whole, every layer's old bank,
+    # donor row and joined bank are alive together: at three ~200K-token
+    # rows that transient is about as large as the joined banks themselves.
+    # The donor batch is discarded after extend, so releasing its list
+    # entries is safe.
+    release = isinstance(cache_b, list)
+    extended = []
+    for i in range(min(len(cache_a), len(cache_b))):
+        layer = _extend_cache_layer(cache_a[i], cache_b[i])
+        if release:
+            cache_b[i] = None
+        try:
+            state = layer.state
+        except (AttributeError, NotImplementedError):
+            state = None  # Caches without a state keep the lazy join.
+        if state is not None:
+            mx.eval(state)
+        extended.append(layer)
+    return extended
 
 
 def _patched_ppb_split(self, indices):

@@ -1316,6 +1316,9 @@ class BatchKVCache(_BaseCache):
             M = other.values.shape[3]
         max_size = max(L1, L2)
 
+        if self._extend_into_capacity(other, logical, max_idx, max_size):
+            return
+
         # Pad the keys and values so they are right-justified
         # with the index and the same size
         def pad(c):
@@ -1341,6 +1344,53 @@ class BatchKVCache(_BaseCache):
             mx.concatenate, zip(*(pad(self), pad(other)))
         )
         self._idx = max_idx
+
+    def _extend_into_capacity(self, other, logical, max_idx: int, max_size: int):
+        """Write the concatenate layout of a join straight into a ladder bank.
+
+        The concatenate join materializes both padded sides and their exact
+        result, then the first append regrows that exact bank onto the
+        ladder: at three ~200K-token rows that is a transient of ~2x the
+        joined bank per layer, stranded in MLX's pool. Columns
+        ``[0, max_size)`` here hold exactly the concatenate result and the
+        tail is zero, so the bank decodes in place like a ``merge`` result.
+        Returns False (caller concatenates) when dtypes or head shapes
+        differ, since concatenate would promote or raise, or a side is empty.
+        """
+        sides = (self, other)
+        banks = [logical[id(c)] for c in sides]
+        if any(k is None for k, _ in banks):
+            return False
+        (k0, v0), (k1, v1) = banks
+        if (
+            k0.dtype != k1.dtype
+            or v0.dtype != v1.dtype
+            or k0.shape[1] != k1.shape[1]
+            or k0.shape[3] != k1.shape[3]
+            or v0.shape[1] != v1.shape[1]
+            or v0.shape[3] != v1.shape[3]
+        ):
+            return False
+        rows = [int(k.shape[0]) for k, _ in banks]
+        width = max_size + self.step
+        capacity = _ladder_capacity(width, self.step)
+        keys = mx.zeros((sum(rows), k0.shape[1], capacity, k0.shape[3]), k0.dtype)
+        values = mx.zeros((sum(rows), v0.shape[1], capacity, v0.shape[3]), v0.dtype)
+        start = 0
+        left_padding = []
+        for c, (k, v), n in zip(sides, banks, rows):
+            left = max_idx - c._idx
+            length = min(int(k.shape[2]), max_size - left)
+            keys[start : start + n, :, left : left + length] = k[..., :length, :]
+            values[start : start + n, :, left : left + length] = v[..., :length, :]
+            left_padding.append(c.left_padding + left)
+            start += n
+        self.offset = mx.concatenate([self.offset, other.offset])
+        self.left_padding = mx.concatenate(left_padding)
+        self._keys, self._values = keys, values
+        self._width = max_size
+        self._idx = max_idx
+        return True
 
     def extract(self, idx):
         cache = KVCache()

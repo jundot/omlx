@@ -950,15 +950,42 @@ class BatchQSAKVCache:
         target = max(self.index_offset, other.index_offset)
         left = self._pad_index(self, target, sample_keys, sample_positions)
         right = self._pad_index(other, target, sample_keys, sample_positions)
-        index_keys = mx.concatenate([left[0], right[0]], axis=0)
+        self.kv_cache.extend(other.kv_cache)
         position_axis = 1 if sample_positions.ndim == 3 else 0
-        index_position_ids = mx.concatenate(
+        if (
+            left[0].dtype == right[0].dtype
+            and left[1].dtype == right[1].dtype
+            and left[1].ndim == right[1].ndim
+        ):
+            # Join straight onto the capacity ladder the next append would
+            # regrow to, instead of an exact-width bank it copies again.
+            rows = int(left[0].shape[0])
+            capacity = _ladder_capacity(target + 1, self.index_step)
+            keys = mx.zeros(
+                (rows + int(right[0].shape[0]), capacity, left[0].shape[-1]),
+                dtype=left[0].dtype,
+            )
+            shape = list(left[1].shape)
+            shape[position_axis] += int(right[1].shape[position_axis])
+            shape[-1] = capacity
+            positions = mx.zeros(shape, dtype=left[1].dtype)
+            keys[:rows, :target] = left[0]
+            keys[rows:, :target] = right[0]
+            if position_axis:
+                positions[:, :rows, :target] = left[1]
+                positions[:, rows:, :target] = right[1]
+            else:
+                positions[:rows, :target] = left[1]
+                positions[rows:, :target] = right[1]
+            self._index_keys = keys
+            self._index_position_ids = positions
+            self._index_capacity_managed = True
+            self.index_offset = target
+            return
+        self.index_keys = mx.concatenate([left[0], right[0]], axis=0)
+        self.index_position_ids = mx.concatenate(
             [left[1], right[1]], axis=position_axis
         )
-
-        self.kv_cache.extend(other.kv_cache)
-        self.index_keys = index_keys
-        self.index_position_ids = index_position_ids
         self.index_offset = target
 
     def extract(self, idx):

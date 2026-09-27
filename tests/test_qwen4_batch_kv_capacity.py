@@ -388,6 +388,35 @@ def test_decode_after_merge_writes_in_place():
     _assert_equivalent(batch, ref)
 
 
+def test_decode_after_extend_writes_in_place():
+    length = 16384
+    batch = BatchKVCache.merge([_row(length - 900, 1), _row(length - 2000, 11)])
+    ref = _ConcatBatchKV.merge([_row(length - 900, 1), _row(length - 2000, 11)])
+    for step in range(3):
+        k, v = _rnd((2, H, 4, D), 300 + step), _rnd((2, H, 4, D), 400 + step)
+        batch.update_and_fetch(k, v)
+        ref.update_and_fetch(k, v)
+    # A prefilled singleton joins as an exact-width bank (``to_batch``).
+    row = _row(length, 21)
+    state = (*row.state, mx.array([length]), mx.array([0]))
+    donor, ref_donor = BatchKVCache([0]), _ConcatBatchKV([0])
+    donor.state = ref_donor.state = state
+    batch.extend(donor)
+    ref.extend(ref_donor)
+    _assert_equivalent(batch, ref)
+    # The join lands on the ladder directly, like a merge of the same rows.
+    capacity = batch.keys.shape[2]
+    width = length + BatchKVCache.step
+    assert width <= capacity <= width + width // 8
+    shapes = set()
+    for step in range(64):
+        k, v = _rnd((3, H, 4, D), 500 + step), _rnd((3, H, 4, D), 600 + step)
+        _same(batch.update_and_fetch(k, v)[0], ref.update_and_fetch(k, v)[0])
+        shapes.add(batch.keys.shape[2])
+    assert shapes == {capacity}
+    _assert_equivalent(batch, ref)
+
+
 def test_capacity_growth_is_bounded_ratio():
     batch = BatchKVCache([0, 0])
     capacities = []
