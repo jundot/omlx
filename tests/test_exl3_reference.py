@@ -77,6 +77,7 @@ def oracle(x, packed, suh, svh, ids, window):
 
 
 class Exl3Tests(unittest.TestCase):
+    @unittest.skipUnless(mx.metal.is_available(), "requires Metal")
     def test_rates_windows_and_broadcast(self):
         rng = np.random.default_rng(42)
         for hw, win in [(32, 16), (42, 15), (48, 12), (64, 16)]:
@@ -97,6 +98,7 @@ class Exl3Tests(unittest.TestCase):
                 atol=0.015,
             )
 
+    @unittest.skipUnless(mx.metal.is_available(), "requires Metal")
     def test_routed_broadcast_and_invalid_ids(self):
         rng = np.random.default_rng(89)
         q = rng.integers(0, 65536, (2, 8, 8, 42), dtype=np.uint16)
@@ -116,6 +118,7 @@ class Exl3Tests(unittest.TestCase):
         mx.eval(bad)
         self.assertTrue(np.isnan(np.asarray(bad)).all())
 
+    @unittest.skipUnless(mx.metal.is_available(), "requires Metal")
     def test_prefill_sorted_and_unsorted(self):
         rng = np.random.default_rng(101)
         for hw, win in [(32, 16), (42, 15), (48, 12), (64, 16)]:
