@@ -30,11 +30,8 @@ PATCH_MEMBER = re.compile(r"^\s+var ([A-Za-z][A-Za-z0-9]*): .* = nil$", re.M)
 # Removed by #2400: auto-compact now follows the model's real context window,
 # so neither the toggle nor its target has a server field any more.
 REMOVED_CLAUDE_CODE_KEYS = (
-    "claude_code_context_scaling_enabled",
-    "claude_code_target_context_size",
     "claudeCodeContextScalingEnabled",
     "claudeCodeTargetContextSize",
-    "contextScalingEnabled",
     "targetContextSize",
     # The row binding and the xcstrings keys the two rows used. A patch field
     # coming back under a fresh name is caught above, but a dead row with no
@@ -54,17 +51,14 @@ def _patch_members() -> set[str]:
     return set(PATCH_MEMBER.findall(body))
 
 
-def test_patch_declaration_is_discovered():
-    """Guards the parser itself: a renamed struct must not silently yield nothing."""
+def test_every_patch_field_is_accepted_by_the_server():
+    # Guards the parser itself: a renamed struct must not silently yield nothing.
     members = _patch_members()
     assert len(members) > 30
     assert "maxAudioUploadSize" in members
-
-
-def test_every_patch_field_is_accepted_by_the_server():
     accepted = set(GlobalSettingsRequest.model_fields)
     unknown = sorted(
-        member for member in _patch_members() if _snake_case(member) not in accepted
+        member for member in members if _snake_case(member) not in accepted
     )
     assert not unknown, (
         "GlobalSettingsPatch sends fields the server does not accept: "
