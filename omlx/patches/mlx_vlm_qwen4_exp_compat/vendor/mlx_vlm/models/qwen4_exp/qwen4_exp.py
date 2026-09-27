@@ -165,7 +165,15 @@ class Model(Qwen3_5Model):
                 source_scale_key not in weights
                 and runtime_scale_key not in weights
             ):
-                weights[source_scale_key] = mx.ones((1,), dtype=mx.bfloat16)
+                configured_dtype = str(
+                    getattr(self.config.text_config, "dtype", "bfloat16")
+                ).lower()
+                scale_dtype = (
+                    mx.float16
+                    if configured_dtype in {"float16", "fp16", "f16"}
+                    else mx.bfloat16
+                )
+                weights[source_scale_key] = mx.ones((1,), dtype=scale_dtype)
         mtp_enabled = get_mtp_runtime().enabled
 
         normalized = {}

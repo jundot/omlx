@@ -129,7 +129,6 @@ def test_qwen4_exact_hybrid_fallbacks_never_enter_native(monkeypatch):
     cases = [
         (mx.random.normal((2, 1, 10240)).astype(mx.bfloat16), False),
         (mx.random.normal((1, 2, 10240)).astype(mx.bfloat16), False),
-        (mx.random.normal((1, 1, 10240)).astype(mx.float16), False),
         (mx.random.normal((1, 1, 10240)).astype(mx.bfloat16), True),
     ]
     for stream, target_verify in cases:
@@ -144,6 +143,25 @@ def test_qwen4_exact_hybrid_fallbacks_never_enter_native(monkeypatch):
     mtp_output = module(mx.zeros((1, 1, 10240), dtype=mx.bfloat16))
     mx.eval(*mtp_output)
     bomb.assert_not_called()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_qwen4_fp16_exact_hybrid_integration_enters_native(monkeypatch):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp import hc_fused, hc_projection, language
+
+    monkeypatch.setattr(hc_fused, "_DISABLED", True)
+    module = _production_module(5, dtype=mx.float16)
+    assert language.fuse_hyper_connection_projections(module) == 1
+    assert language.compile_hyper_connections(module) == 1
+    native = MagicMock(wraps=hc_projection.hybrid_projection)
+    monkeypatch.setattr(hc_projection, "hybrid_projection", native)
+
+    stream = mx.random.normal((1, 1, 10240)).astype(mx.float16)
+    output = module(stream)
+    mx.eval(*output)
+
+    native.assert_called_once()
 
 
 def test_qwen4_exact_hybrid_preparation_fails_closed_for_other_geometry():

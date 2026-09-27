@@ -1810,7 +1810,7 @@ class Qwen4ExpGatedResidual(nn.Module):
             and not target_verify
             and hyper_input.ndim == 3
             and hyper_input.shape[:2] == (1, 1)
-            and hyper_input.dtype == mx.bfloat16
+            and hyper_input.dtype in (mx.float16, mx.bfloat16)
             and not get_mtp_runtime().enabled
         ):
             return compiled_forward(hyper_input)
@@ -1823,7 +1823,7 @@ class Qwen4ExpGatedResidual(nn.Module):
             getattr(self, "_omlx_exact_hybrid_projection", False)
             and not target_verify
             and hyper_input.shape == (1, 1, 10240)
-            and hyper_input.dtype == mx.bfloat16
+            and hyper_input.dtype in (mx.float16, mx.bfloat16)
             and not get_mtp_runtime().enabled
         ):
             from .hc_projection import hybrid_projection
