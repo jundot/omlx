@@ -2193,16 +2193,18 @@ class _SafeTensorMMap:
         return copied, dtype
 
     @staticmethod
-    def to_mx(copied: np.ndarray, dtype: str) -> mx.array:
+    def to_mx(copied: np.ndarray, dtype: str, *, fp8_dtype=None) -> mx.array:
         if dtype == "BF16":
             values = (copied.astype(np.uint32) << np.uint32(16)).view(np.float32)
             return mx.array(values).astype(mx.bfloat16)
         if dtype == "F8_E4M3":
-            return mx.from_fp8(mx.array(copied), dtype=mx.bfloat16)
+            if fp8_dtype is None:
+                fp8_dtype = mx.bfloat16
+            return mx.from_fp8(mx.array(copied), dtype=fp8_dtype)
         return mx.array(copied)
 
-    def rows(self, key: str, rows: list[int]) -> mx.array:
-        return self.to_mx(*self.rows_np(key, rows))
+    def rows(self, key: str, rows: list[int], *, fp8_dtype=None) -> mx.array:
+        return self.to_mx(*self.rows_np(key, rows), fp8_dtype=fp8_dtype)
 
     def _prefetch_missing_pages(self, row_indices, base_offset, row_bytes) -> bool:
         """Prefetch unmarked pages; return whether all were already marked."""
@@ -2534,7 +2536,7 @@ class DiskBackedShardedEmbedding(nn.Module):
         shape = indices.shape
         host = self._host_indices(indices)
         if host.size == 0:
-            return mx.zeros((*shape, self.dims), dtype=mx.bfloat16)
+            return mx.zeros((*shape, self.dims), dtype=self.weight_scale.dtype)
         pending = self._pending.pop(host.tobytes(), None)
         if pending is not None:
             plan, buffers = pending[0], pending[1].result()
@@ -2548,7 +2550,14 @@ class DiskBackedShardedEmbedding(nn.Module):
         _, _, touched, _, families, dtypes, bits, group_size = plan
         self.last_touched_shards = tuple(touched)
         self.rows_read = int(host.size)
-        arrays = [_SafeTensorMMap.to_mx(buffers[family], dtypes[family]) for family in families]
+        # Decode FP8 at the shared scale's compute dtype so multiplication
+        # does not introduce a mixed FP16/BF16 operation.
+        arrays = [
+            _SafeTensorMMap.to_mx(
+                buffers[family], dtypes[family], fp8_dtype=self.weight_scale.dtype
+            )
+            for family in families
+        ]
         self.last_uploads = len(arrays)
         values = arrays[0]
         if bits is not None:
@@ -2560,7 +2569,7 @@ class DiskBackedShardedEmbedding(nn.Module):
                 bits=bits,
                 mode="affine",
             )
-        values = values.astype(mx.bfloat16) * self.weight_scale
+        values = values.astype(self.weight_scale.dtype) * self.weight_scale
         return values.reshape(*shape, self.dims)
 
     def _gather_per_shard(self, host_indices: list[int], shape) -> mx.array:
@@ -2572,7 +2581,7 @@ class DiskBackedShardedEmbedding(nn.Module):
         touched = tuple(sorted(set(shard_indices)))
         self.last_touched_shards = touched
         self.rows_read = 0
-        result = mx.zeros((len(host_indices), self.dims), dtype=mx.bfloat16)
+        result = mx.zeros((len(host_indices), self.dims), dtype=self.weight_scale.dtype)
         for shard_index in touched:
             positions = [
                 i
@@ -2585,7 +2594,9 @@ class DiskBackedShardedEmbedding(nn.Module):
             weight_key, scales_key, biases_key, bits, group_size = self._shard_specs[
                 shard_index
             ]
-            values = self._tensor_readers[weight_key].rows(weight_key, local)
+            values = self._tensor_readers[weight_key].rows(
+                weight_key, local, fp8_dtype=self.weight_scale.dtype
+            )
             if bits is not None:
                 assert scales_key is not None
                 assert biases_key is not None
@@ -2600,7 +2611,7 @@ class DiskBackedShardedEmbedding(nn.Module):
                     bits=bits,
                     mode="affine",
                 )
-            values = values.astype(mx.bfloat16) * self.weight_scale
+            values = values.astype(self.weight_scale.dtype) * self.weight_scale
             self.rows_read += len(local)
             result = result.at[mx.array(positions, dtype=mx.int32)].add(values)
         return result.reshape(*shape, self.dims)
@@ -2688,7 +2699,7 @@ class ShardedEmbedding(nn.Module):
             local = host[order[start:end]] - offsets[shard_index]
             values = self.shards[int(shard_index)](mx.array(local.astype(np.int32)))
             if values.dtype == mx.uint8:
-                values = mx.from_fp8(values, dtype=mx.bfloat16)
+                values = mx.from_fp8(values, dtype=self.weight_scale.dtype)
             parts.append(values)
         values = parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=0)
         inverse = np.empty_like(order)
