@@ -91,6 +91,7 @@ NATIVE_SYMBOLS = (
     "qwen35_q6_affine_qmm_t",
     "qwen35_q8_affine_qmm_t",
     "qwen35_moe_weighted_sum",
+    "qwen35_gather_qmm_rhs_t",
     "qwen35_ane_q4_affine_qmm_t",
     "qwen35_ane_affine_qmm_t",
     "qwen35_ane_q4_swiglu_t",
@@ -1206,6 +1207,47 @@ def qwen35_moe_weighted_sum(
             stream=stream or mx.gpu,
         )
     raise RuntimeError("qwen35_moe_weighted_sum native kernel is unavailable")
+
+
+def gather_qmm_rhs_available() -> bool:
+    """True when the NAX sorted-expert gather kernel loaded on this machine."""
+    ready = getattr(_ext, "qwen35_gather_qmm_rhs_nax_ready", None)
+    if ready is None:
+        return False
+    try:
+        return bool(ready())
+    except Exception:
+        return False
+
+
+def qwen35_gather_qmm_rhs_t(
+    x: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    indices: mx.array,
+    bits: int,
+    group_size: int,
+    *,
+    stream=None,
+) -> mx.array:
+    """Sorted-expert ``gather_qmm(x, w, rhs_indices=indices, transpose=True)``.
+
+    One dispatch for any row count; raises ValueError for layouts the kernel
+    does not cover (the caller keeps its own fallback).
+    """
+    if _ext is None or not hasattr(_ext, "qwen35_gather_qmm_rhs_t"):
+        raise RuntimeError("qwen35_gather_qmm_rhs_t native kernel is unavailable")
+    return _ext.qwen35_gather_qmm_rhs_t(
+        x,
+        weight,
+        scales,
+        biases,
+        indices,
+        bits,
+        group_size,
+        **_native_stream_kwargs(stream),
+    )
 
 
 # --- oQ mixed-bit QxA8 (Q4/Q5, GS64, affine) on the M5 tensor units ---------

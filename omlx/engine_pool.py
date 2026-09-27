@@ -52,13 +52,19 @@ from .exceptions import (
     ModelUnavailableError,
     describe_ceiling_binding,
 )
-from .model_discovery import discover_models, format_size, is_realtime_stt_model
+from .model_discovery import (
+    VLM_NATIVE_TEXT_MODEL_TYPES,
+    discover_models,
+    format_size,
+    is_realtime_stt_model,
+)
 from .model_settings import (
     ane_prefill_backend,
     ane_prefill_fraction,
     validate_ane_prefill,
 )
 from .scheduler import SchedulerConfig
+from .utils.metal_sync import unreleased_graphics_bytes
 from .utils.model_loading import dflash_batched_requested, dflash_batched_supported
 from .utils.proc_memory import get_phys_footprint
 
@@ -184,6 +190,29 @@ def _qwen35_cpu_share_estimated_bytes(
         extra += gdn_layers * gdn_rows * hidden * _FP16_BYTES
 
     return int(extra * _CPU_SHARE_MATERIALIZATION_HEADROOM)
+
+
+# Re-reads of a dynamic-bound ceiling before a load is refused (1s in total).
+_ADMISSION_CEILING_RECHECKS = 4
+_ADMISSION_CEILING_RECHECK_S = 0.25
+
+
+def _settled_phys_footprint() -> int:
+    """phys_footprint minus freed Metal buffers the kernel still charges."""
+    mlx_bytes = int(mx.get_active_memory()) + int(mx.get_cache_memory())
+    return max(0, get_phys_footprint() - unreleased_graphics_bytes(mlx_bytes))
+
+
+def _is_metal_out_of_memory(exc: BaseException | None) -> bool:
+    while exc is not None:
+        text = str(exc)
+        if (
+            "kIOGPUCommandBufferCallbackErrorOutOfMemory" in text
+            or "Insufficient Memory" in text
+        ):
+            return True
+        exc = exc.__cause__
+    return False
 
 
 @dataclass
@@ -476,6 +505,25 @@ class EnginePool:
         rows = int(getattr(self._scheduler_config, "max_num_seqs", 8) or 8)
         return weights + rows * 48 * 1024 * 1024
 
+    def _resident_leaves_no_prompt_room(self, estimate: object, ceiling: int) -> bool:
+        """Whether a resident load would sit above the prompt admission line.
+
+        The scheduler admits prompts against ceiling x tier headroom, so a
+        resident load between that line and the ceiling cannot serve a
+        prompt. The checkpoint (the resident estimate without its 5% margin)
+        stands in for the footprint, so a load that can still serve stays
+        resident.
+        """
+        enforcer = getattr(self, "_process_memory_enforcer", None)
+        headroom = getattr(enforcer, "_prefill_headroom_safety", None)
+        if not isinstance(headroom, (int, float)) or not 0 < headroom < 1:
+            return False
+        if ceiling <= 0 or not getattr(estimate, "supported", False):
+            return False
+        line = int(ceiling * headroom)
+        footprint = int(estimate.resident_bytes / 1.05)
+        return footprint > line >= estimate.mmap_bytes
+
     def _qwen4_ple_offload_status(
         self,
         entry: EngineEntry,
@@ -501,7 +549,11 @@ class EnginePool:
                 # Price expert residency before deciding whether PLE must use SSD.
                 # The entry projection consumes these adjusted estimates once.
                 saved = estimate.checkpoint_bytes - estimate_offload_admission_bytes(
-                    entry.model_path, estimate.checkpoint_bytes, fraction
+                    entry.model_path,
+                    estimate.checkpoint_bytes,
+                    fraction,
+                    # A resident native MTP head is not discounted as offloaded.
+                    mtp_resident=bool(getattr(settings, "mtp_enabled", False)),
                 )
                 # PLE estimates include a 5% allowance on checkpoint bytes;
                 # offloaded expert bytes must release the same allowance.
@@ -527,12 +579,15 @@ class EnginePool:
                 ceiling = self._fallback_admission_ceiling()
             if ceiling <= 0:
                 ceiling = self._current_ceiling()
-        forced = estimate.force_ssd_offload(ceiling)
+        forced = estimate.force_ssd_offload(
+            ceiling
+        ) or self._resident_leaves_no_prompt_room(estimate, ceiling)
         if forced:
             logger.warning(
-                "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB exceeds the "
-                "%.1fGB memory ceiling (mmap needs %.1fGB). Decode will be "
-                "roughly 2.5x slower than a resident load.",
+                "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB leaves no "
+                "room to serve prompts under the %.1fGB memory ceiling (mmap "
+                "needs %.1fGB). Decode will be roughly 2.5x slower than a "
+                "resident load.",
                 entry.model_id,
                 estimate.resident_bytes / 1e9,
                 ceiling / 1e9,
@@ -615,11 +670,14 @@ class EnginePool:
                 ceiling = self._fallback_admission_ceiling()
             if ceiling <= 0:
                 ceiling = self._current_ceiling()
-        forced = estimate.force_ssd_offload(ceiling)
+        forced = estimate.force_ssd_offload(
+            ceiling
+        ) or self._resident_leaves_no_prompt_room(estimate, ceiling)
         if forced:
             logger.warning(
-                "DeepSeek V4.1 Engram forced to SSD for %s: resident %.1fGB exceeds the "
-                "%.1fGB memory ceiling (mmap needs %.1fGB).",
+                "DeepSeek V4.1 Engram forced to SSD for %s: resident %.1fGB leaves "
+                "no room to serve prompts under the %.1fGB memory ceiling (mmap "
+                "needs %.1fGB).",
                 entry.model_id,
                 estimate.resident_bytes / 1e9,
                 ceiling / 1e9,
@@ -780,6 +838,24 @@ class EnginePool:
         except Exception:  # noqa: BLE001
             return 0
 
+    def _dynamic_ceiling_binds(self) -> bool:
+        """Whether the free-memory-derived ceiling is the binding component."""
+        enforcer = getattr(self, "_process_memory_enforcer", None)
+        getter = getattr(enforcer, "get_ceiling_breakdown", None)
+        if not callable(getter):
+            return False
+        if getattr(enforcer, "memory_guard_tier", "") == "custom":
+            return False
+        try:
+            breakdown = getter()
+            dynamic = int(breakdown["dynamic"])
+            others = [
+                int(breakdown[k]) for k in ("static", "metal_cap") if breakdown[k] > 0
+            ]
+        except Exception:  # noqa: BLE001
+            return False
+        return 0 < dynamic < min(others, default=dynamic + 1)
+
     def _ceiling_binding_and_advice(
         self, *, ceiling: int, current: int, tail: str
     ) -> tuple[str | None, str | None]:
@@ -809,6 +885,8 @@ class EnginePool:
             static = int(breakdown["static"])
             dynamic = int(breakdown["dynamic"])
             metal_cap = int(breakdown["metal_cap"])
+            raw_getter = getattr(enforcer, "_get_effective_metal_cap_bytes", None)
+            metal_cap_raw = int(raw_getter()) if callable(raw_getter) else 0
         except Exception:  # noqa: BLE001
             return None, None
         if max(static, dynamic, metal_cap) <= 0:
@@ -821,6 +899,7 @@ class EnginePool:
             current=current,
             fmt=format_size,
             tail=tail,
+            metal_cap_raw=metal_cap_raw,
         )
 
     def _wake_process_memory_enforcer(self, *, active: bool = False) -> None:
@@ -1555,6 +1634,21 @@ class EnginePool:
     def _entry_is_busy(self, entry: EngineEntry) -> bool:
         return entry.in_use > 0 or self._entry_has_active_requests(entry)
 
+    @staticmethod
+    def _has_mlx_lm_path(entry: EngineEntry) -> bool:
+        """False for text families that only mlx-vlm implements."""
+        model_type = (entry.config_model_type or "").replace("-", "_").lower()
+        return model_type not in VLM_NATIVE_TEXT_MODEL_TYPES
+
+    def _force_lm_replaces_engine(self, model_id: str) -> bool:
+        """True when ``get_engine(force_lm=True)`` would reload a resident VLM."""
+        entry = self._entries.get(model_id)
+        return (
+            entry is not None
+            and isinstance(entry.engine, VLMBatchedEngine)
+            and self._has_mlx_lm_path(entry)
+        )
+
     def _entry_has_scheduler_work(self, entry: EngineEntry) -> bool:
         """Return True until deferred aborts have actually left the scheduler."""
         scheduler = self._resolve_scheduler_from_engine(entry.engine)
@@ -1676,6 +1770,7 @@ class EnginePool:
             or entry.engine is None
             or not entry.pending_unload_reason
             or entry.is_loading
+            or model_id in self._unloading_models
             or (entry.is_pinned and not entry.pending_unload_allow_pinned)
             or not self._entry_is_quiescent(entry)
         ):
@@ -1742,12 +1837,14 @@ class EnginePool:
         model_id: str,
         *,
         reason: str = "manual unload",
+        abort_active: bool = True,
     ) -> bool:
         """Unload now when idle, otherwise abort and unload after quiescence.
 
         Returns True when the engine was unloaded before this call returned and
         False when teardown was queued. New acquisitions are rejected while the
         pending marker is installed, so the engine can drain deterministically.
+        With ``abort_active=False`` in-flight work and leases finish first.
         """
         async with self._lock:
             entry = self._entries.get(model_id)
@@ -1765,11 +1862,11 @@ class EnginePool:
             self._mark_pending_unload_locked(
                 model_id,
                 reason,
-                abort_requested=True,
+                abort_requested=abort_active,
                 allow_pinned=True,
             )
             abort_all = getattr(entry.engine, "abort_all_requests", None)
-            if callable(abort_all):
+            if abort_active and callable(abort_all):
                 try:
                     await abort_all(
                         reason=(
@@ -1885,6 +1982,10 @@ class EnginePool:
             InsufficientMemoryError: If can't free enough memory (all pinned)
             ModelLoadingError: If model is already being loaded
         """
+        entry = self._entries.get(model_id)
+        if force_lm and entry is not None and not self._has_mlx_lm_path(entry):
+            # The VLM engine is the only text engine for these families.
+            force_lm = False
         ready = self._acquire_loaded_engine(
             model_id, force_lm, _lease, runtime_settings
         )
@@ -2025,6 +2126,7 @@ class EnginePool:
                 soft_target = self._admission_soft_target()
                 evict_target = min(soft_target, ceiling) if soft_target > 0 else ceiling
                 evicted_any = unloaded_for_admission
+                ceiling_rechecks = 0
                 while True:
                     # Consult the tracked accumulator alongside live memory:
                     # after a model settles or idles, mx.get_active_memory() and
@@ -2035,7 +2137,7 @@ class EnginePool:
                     # committing past the ceiling (#1623).
                     current = max(
                         mx.get_active_memory(),
-                        get_phys_footprint(),
+                        _settled_phys_footprint(),
                         self._current_model_memory,
                     )
                     projected = current + admission_size
@@ -2115,6 +2217,23 @@ class EnginePool:
                             f"evict; the system may swap heavily."
                         )
                         break
+
+                    if (
+                        ceiling_rechecks < _ADMISSION_CEILING_RECHECKS
+                        and self._dynamic_ceiling_binds()
+                    ):
+                        # Pages of a model unloaded just before this load
+                        # reach the free list up to ~0.2s after the process
+                        # footprint drops, so the dynamic ceiling can read
+                        # low for that long. Re-read it before refusing.
+                        ceiling_rechecks += 1
+                        await asyncio.sleep(_ADMISSION_CEILING_RECHECK_S)
+                        ceiling = max(ceiling, self._current_ceiling())
+                        soft_target = max(soft_target, self._admission_soft_target())
+                        evict_target = (
+                            min(soft_target, ceiling) if soft_target > 0 else ceiling
+                        )
+                        continue
 
                     # Still over budget under the applicable baseline. Use
                     # ModelTooLargeError when the model alone exceeds the
@@ -2408,7 +2527,7 @@ class EnginePool:
 
             while True:
                 active = mx.get_active_memory()
-                footprint = get_phys_footprint()
+                footprint = _settled_phys_footprint()
                 current = max(active, footprint, self._current_model_memory)
                 if current + predicted <= target:
                     # Use the same sample for admission and its decision log.
@@ -2441,7 +2560,7 @@ class EnginePool:
                             exclude_model_id, request_id
                         )
                         # Re-measure regardless of the reported delta: the
-                        # helper measures a process-wide footprint, so
+                        # helper reads the process-wide MLX pool, so
                         # concurrent allocation on another engine can mask a
                         # real reclaim as 0 bytes freed. The loop re-checks
                         # the target with a fresh reading; reclaim_attempted
@@ -2527,7 +2646,7 @@ class EnginePool:
         enforcer).
 
         Returns:
-            Bytes handed back to the OS (``get_phys_footprint`` delta, >= 0).
+            Pool bytes MLX handed back to the OS (>= 0).
         """
         entry = self._entries.get(model_id)
         engine = entry.engine if entry is not None else None
@@ -2544,14 +2663,17 @@ class EnginePool:
             # shape without the scheduler helper: skip -- reject as before.
             return 0
 
-        def _reclaim_on_engine_thread() -> None:
+        def _reclaim_on_engine_thread() -> int:
             gc.collect()
+            pooled = int(mx.get_cache_memory())
             reclaim()
+            return max(0, pooled - int(mx.get_cache_memory()))
 
-        before = get_phys_footprint()
         loop = asyncio.get_running_loop()
         try:
-            await loop.run_in_executor(executor, _reclaim_on_engine_thread)
+            # The footprint keeps charging the released pool for a while, so
+            # report the pool bytes MLX actually returned.
+            freed = await loop.run_in_executor(executor, _reclaim_on_engine_thread)
         except Exception as e:
             logger.warning(
                 "Pooled-buffer reclaim failed for prefill request %s: %s",
@@ -2559,7 +2681,6 @@ class EnginePool:
                 e,
             )
             return 0
-        freed = max(0, before - get_phys_footprint())
         if freed > 0:
             logger.info(
                 "Reclaimed %s of pooled Metal buffers for prefill request %s "
@@ -3334,7 +3455,7 @@ class EnginePool:
                         f"Successfully loaded {model_id} as VLM "
                         f"(fallback from force_lm)"
                     )
-                elif entry.engine_type == "vlm":
+                elif entry.engine_type == "vlm" and self._has_mlx_lm_path(entry):
                     # VLM loading failed -- fall back to LLM (BatchedEngine)
                     logger.warning(
                         f"VLM loading failed for {model_id}, "
@@ -3582,6 +3703,25 @@ class EnginePool:
             # inflated and the memory-ceiling admission check rejects all
             # subsequent loads until a server restart.
             self._schedule_failed_load_reclaim(model_id, pre_load_memory)
+            if (
+                not entry.abort_loading
+                and not entry_detached
+                and _is_metal_out_of_memory(exc)
+            ):
+                # Depends on what else is resident, so do not cache it: a retry
+                # after memory is freed can succeed with the same files.
+                logger.exception(
+                    "Model load for '%s' ran out of Metal memory", model_id
+                )
+                raise InsufficientMemoryError(
+                    required=resident_size,
+                    current=pre_load_memory,
+                    message=(
+                        f"Model '{model_id}' ran out of GPU memory while "
+                        f"loading: {exc}. Free memory (for example, unload "
+                        "another model) and retry."
+                    ),
+                ) from exc
             if not entry.abort_loading and not entry_detached:
                 self._mark_load_failure(entry, exc)
                 logger.exception(

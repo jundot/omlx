@@ -37,6 +37,7 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from .. import glm53_kda_prework
 from ..mlx_lm_mtp import prompt_priming
 from .glm5_next_batch_rollback import rollback_rows
 
@@ -239,6 +240,12 @@ def _patch_linear_attention(g5_lang: Any) -> None:
 
     def __call__(self, inputs, mask=None, cache=None, gdn_sink=None):
         B, S, _ = inputs.shape
+        # Same fused KDA prefill route as the vendor body's gate. The verify
+        # capture path needs the stock locals, so it never takes the shortcut.
+        if gdn_sink is None and glm53_kda_prework.glm53_kda_prefill_eligible(
+            self, inputs, mask, cache
+        ):
+            return glm53_kda_prework.glm53_kda_prefill(self, inputs, cache)
         has_right_padding = cache is not None and cache.lengths is not None
         if has_right_padding:
             mask = mx.arange(S)[None] < cache.lengths[:, None]

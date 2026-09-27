@@ -13,6 +13,7 @@ import pytest
 from omlx.engine_pool import (
     EngineEntry,
     EnginePool,
+    VLMBatchedEngine,
     _qwen35_cpu_share_estimated_bytes,
 )
 from omlx.exceptions import (
@@ -1096,6 +1097,63 @@ class TestVLMFallback:
             await pool._load_engine("model-a", force_lm=True)
 
     @pytest.mark.asyncio
+    async def test_force_lm_keeps_vlm_engine_for_vlm_native_text_model(
+        self, small_mock_model_dir
+    ):
+        """glm5_next has no mlx-lm class: force_lm loads the VLM engine directly
+        and never unloads a resident VLM engine to retry the LM load (#3959)."""
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        entry.model_type = "vlm"
+        entry.engine_type = "vlm"
+        entry.config_model_type = "glm5_next"
+
+        mock_vlm_engine = MagicMock()
+        mock_vlm_engine.start = AsyncMock()
+        with (
+            patch("omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine),
+            patch("omlx.engine_pool.BatchedEngine") as batched_cls,
+        ):
+            assert await pool.get_engine("model-a", force_lm=True) is mock_vlm_engine
+        batched_cls.assert_not_called()
+
+        resident = MagicMock(spec=VLMBatchedEngine)
+        resident.tokenizer = MagicMock()
+        entry.engine = resident
+        pool._unload_engine = AsyncMock()
+        assert pool._force_lm_replaces_engine("model-a") is False
+        assert await pool.get_engine("model-a", force_lm=True) is resident
+        pool._unload_engine.assert_not_awaited()
+
+        entry.config_model_type = "qwen3_vl"
+        assert pool._force_lm_replaces_engine("model-a") is True
+
+    @pytest.mark.asyncio
+    async def test_vlm_native_text_model_skips_llm_fallback(self, small_mock_model_dir):
+        """A glm5_next VLM start failure surfaces as-is instead of an LLM
+        fallback error that can never succeed (#3956)."""
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        entry.model_type = "vlm"
+        entry.engine_type = "vlm"
+        entry.config_model_type = "glm5_next"
+
+        mock_vlm_engine = MagicMock()
+        mock_vlm_engine.start = AsyncMock(side_effect=RuntimeError("bad expert table"))
+        with (
+            patch("omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine),
+            patch("omlx.engine_pool.BatchedEngine") as batched_cls,
+            pytest.raises(ModelUnavailableError) as excinfo,
+        ):
+            await pool._load_engine("model-a")
+
+        batched_cls.assert_not_called()
+        assert "bad expert table" in str(excinfo.value)
+        assert "LLM fallback" not in str(excinfo.value)
+
+    @pytest.mark.asyncio
     async def test_vlm_fallback_to_llm_both_fail_surfaces_both_errors(
         self, small_mock_model_dir
     ):
@@ -1401,6 +1459,31 @@ class TestEnginePoolAsync:
         refreshed = pool.get_entry("model-a")
         assert refreshed is not None
         assert refreshed.load_failed is False
+
+    @pytest.mark.asyncio
+    async def test_metal_oom_load_failure_is_not_cached(self, pool_with_mock_engines):
+        """Metal OOM depends on what else is resident, so the next request
+        retries the load instead of hitting a cached 409 (#3956)."""
+        pool = pool_with_mock_engines
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock(
+            side_effect=RuntimeError(
+                "[METAL] Command buffer execution failed: Insufficient Memory "
+                "(00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"
+            )
+        )
+        mock_engine.stop = AsyncMock()
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            for _ in range(2):
+                with pytest.raises(
+                    InsufficientMemoryError, match="ran out of GPU memory"
+                ):
+                    await pool.get_engine("model-a")
+
+        assert mock_engine.start.await_count == 2
+        assert pool.get_entry("model-a").load_failed is False
 
     @pytest.mark.asyncio
     async def test_runtime_settings_signature_reload(self, pool_with_mock_engines):
@@ -4057,6 +4140,48 @@ class TestEnginePoolInUseLease:
         assert entry.engine.abort_all_requests.await_count == 0
 
     @pytest.mark.asyncio
+    async def test_unload_without_abort_waits_for_lease_release(self):
+        """Settings reloads let leased work finish before teardown (#3961)."""
+        pool = _make_pool(ceiling=0)
+        entry = self._loaded_entry("leased")
+        entry.in_use = 1
+        entry.engine.abort_all_requests = AsyncMock(return_value=0)
+        pool._entries = {"leased": entry}
+        pool._unload_engine = AsyncMock()
+
+        unloaded = await pool.request_unload(
+            "leased", reason="settings changed", abort_active=False
+        )
+
+        assert unloaded is False
+        assert entry.pending_unload_reason == "settings changed"
+        assert entry.abort_requested is False
+        assert entry.engine.abort_all_requests.await_count == 0
+        pool._unload_engine.assert_not_awaited()
+
+        pending = pool._pending_unload_tasks["leased"]
+        await pool.release_engine("leased")
+
+        pool._unload_engine.assert_awaited_once_with("leased")
+        await asyncio.wait_for(pending, timeout=1)
+
+    @pytest.mark.asyncio
+    async def test_pending_unload_skips_teardown_already_in_progress(self):
+        """A direct unload that already started satisfies the pending marker."""
+        pool = _make_pool(ceiling=0)
+        entry = self._loaded_entry("model-a")
+        entry.pending_unload_reason = "settings changed"
+        pool._entries = {"model-a": entry}
+        pool._unloading_models.add("model-a")
+        pool._unload_engine = AsyncMock()
+
+        async with pool._lock:
+            assert await pool._unload_pending_if_idle_locked("model-a") is False
+
+        pool._unload_engine.assert_not_awaited()
+        assert entry.pending_unload_reason == "settings changed"
+
+    @pytest.mark.asyncio
     async def test_acquire_leases_then_releases_on_success(self):
         """acquire() leases on enter and releases in finally on normal exit."""
         pool = _make_pool(ceiling=0)
@@ -4436,6 +4561,34 @@ class TestLoadRefusalNamesBindingCeiling:
         assert "close other apps" in message.lower()
         assert "lower memory_guard_tier" not in message
 
+    @pytest.mark.asyncio
+    async def test_dynamic_ceiling_is_reread_before_refusing(
+        self, small_mock_model_dir
+    ):
+        """Right after an unload the freed pages are not yet on the free
+        list, so the first dynamic read is low; the load must not fail."""
+        pool = self._pool_with_enforcer(
+            small_mock_model_dir,
+            static=12_000,
+            dynamic=700,
+            metal_cap=12_000,
+            tier="aggressive",
+        )
+        reads = iter([700, 700])
+        pool._get_final_ceiling = lambda: next(reads, 12_000)
+
+        class _Admitted(Exception):
+            pass
+
+        with (
+            patch("omlx.engine_pool._ADMISSION_CEILING_RECHECK_S", 0),
+            patch("omlx.engine_pool.get_phys_footprint", return_value=0),
+            patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+            patch.object(pool, "_load_engine", AsyncMock(side_effect=_Admitted)),
+            pytest.raises(_Admitted),
+        ):
+            await pool.get_engine("model-a")
+
 
 @pytest.mark.parametrize(
     "ple_enabled,ceiling,expected,forced",
@@ -4482,12 +4635,109 @@ def test_qwen4_moe_savings_precede_ple_force_decision(
         ),
         patch(
             "omlx.patches.moe_expert_offload.estimate_offload_admission_bytes",
-            side_effect=lambda path, size, fraction: size - 400,
+            side_effect=lambda path, size, fraction, **kw: size - 400,
         ),
     ):
         _, is_forced, _ = pool._qwen4_ple_offload_status(entry, settings)
         assert is_forced is forced
         assert pool._entry_runtime_resident_size(entry, settings) == expected
+
+
+@pytest.mark.parametrize(
+    ("headroom", "forced"), [(0.9, True), (0.95, False), (None, False)]
+)
+def test_qwen4_ple_resident_load_must_leave_room_to_serve(tmp_path, headroom, forced):
+    """A resident load above ceiling * tier headroom admits no prompt, so
+    mmap wins when it fits that line; the checkpoint is the footprint."""
+    from types import SimpleNamespace
+
+    from omlx.model_settings import ModelSettings
+    from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
+        Qwen4ExpResidencyEstimate,
+    )
+
+    entry = EngineEntry(
+        model_id="qwen4",
+        model_path=str(tmp_path),
+        model_type="vlm",
+        engine_type="vlm",
+        config_model_type="qwen4_exp",
+        estimated_size=1050,
+    )
+    # Checkpoint 1000 fits the 1060 ceiling (resident estimate 1050).
+    estimate = Qwen4ExpResidencyEstimate(
+        supported=True,
+        checkpoint_bytes=1000,
+        ple_bytes=400,
+        resident_bytes=1050,
+        mmap_bytes=630,
+    )
+    pool = _make_pool(ceiling=1060)
+    if headroom is not None:
+        pool._process_memory_enforcer = SimpleNamespace(
+            _prefill_headroom_safety=headroom
+        )
+    with patch(
+        "omlx.patches.mlx_vlm_qwen4_exp_compat.residency."
+        "qwen4_exp_residency_estimate",
+        return_value=estimate,
+    ):
+        _, is_forced, _ = pool._qwen4_ple_offload_status(
+            entry, ModelSettings(), ceiling=1060
+        )
+    # 0.9 -> line 954 < 1000; 0.95 -> line 1007 >= 1000.
+    assert is_forced is forced
+
+
+@pytest.mark.parametrize("mtp_enabled", [False, True])
+def test_qwen4_ple_admission_keeps_native_mtp_head_resident(tmp_path, mtp_enabled):
+    """Lightning MTP + expert offload: the head is priced as resident."""
+    from omlx.model_settings import ModelSettings
+    from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
+        Qwen4ExpResidencyEstimate,
+    )
+
+    settings = ModelSettings(
+        moe_expert_offload_enabled=True,
+        moe_expert_offload_resident_fraction=0.5,
+        qwen4_ple_ssd_offload=True,
+        mtp_enabled=mtp_enabled,
+    )
+    entry = EngineEntry(
+        model_id="qwen4",
+        model_path=str(tmp_path),
+        model_type="vlm",
+        engine_type="vlm",
+        config_model_type="qwen4_exp",
+        estimated_size=1000,
+    )
+    estimate = Qwen4ExpResidencyEstimate(
+        supported=True,
+        checkpoint_bytes=950,
+        ple_bytes=400,
+        resident_bytes=1000,
+        mmap_bytes=600,
+    )
+    seen = []
+
+    def fake_estimate(path, size, fraction, mtp_resident=False):
+        seen.append(mtp_resident)
+        return size - (100 if mtp_resident else 400)
+
+    pool = _make_pool(ceiling=10_000)
+    with (
+        patch(
+            "omlx.patches.mlx_vlm_qwen4_exp_compat.residency."
+            "qwen4_exp_residency_estimate",
+            return_value=estimate,
+        ),
+        patch(
+            "omlx.patches.moe_expert_offload.estimate_offload_admission_bytes",
+            side_effect=fake_estimate,
+        ),
+    ):
+        pool._qwen4_ple_offload_status(entry, settings)
+    assert seen and all(flag is mtp_enabled for flag in seen)
 
 
 @pytest.mark.asyncio

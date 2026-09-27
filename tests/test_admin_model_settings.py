@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for load-failure invalidation in admin model settings."""
 
+import asyncio
 import copy
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -159,11 +160,19 @@ async def test_qwen_ane_prefill_settings_are_persisted():
     assert result["requires_reload"] is False
 
 
+def _idle_engine() -> MagicMock:
+    engine = MagicMock()
+    engine.has_active_requests.return_value = False
+    engine.scheduler = None
+    engine._engine = None
+    return engine
+
+
 @pytest.mark.asyncio
 async def test_qwen_ane_prefill_change_unloads_a_loaded_engine():
     pool, entry = _failed_pool()
     entry.config_model_type = "qwen3_5"
-    entry.engine = MagicMock()
+    entry.engine = _idle_engine()
     entry.load_failed = False
     pool._unload_engine = AsyncMock()
 
@@ -175,7 +184,39 @@ async def test_qwen_ane_prefill_change_unloads_a_loaded_engine():
 
     assert result["requires_reload"] is True
     assert result["auto_unloaded"] is True
+    assert result["reload_deferred"] is False
     pool._unload_engine.assert_awaited_once_with("ling")
+
+
+@pytest.mark.asyncio
+async def test_reload_setting_on_busy_engine_defers_unload():
+    """A save during a benchmark run must not abort it (#3961)."""
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5"
+    entry.engine = _idle_engine()
+    entry.engine.abort_all_requests = AsyncMock()
+    entry.load_failed = False
+    entry.in_use = 1
+    pool._unload_engine = AsyncMock()
+
+    result = await _update_settings(
+        pool,
+        ModelSettings(),
+        admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
+    )
+
+    assert result["requires_reload"] is True
+    assert result["auto_unloaded"] is False
+    assert result["reload_deferred"] is True
+    assert entry.pending_unload_reason == "settings changed"
+    assert entry.abort_requested is False
+    entry.engine.abort_all_requests.assert_not_awaited()
+    pool._unload_engine.assert_not_awaited()
+
+    pending = pool._pending_unload_tasks["ling"]
+    await pool.release_engine("ling")
+    pool._unload_engine.assert_awaited_once_with("ling")
+    await asyncio.wait_for(pending, timeout=1)
 
 
 @pytest.mark.asyncio
