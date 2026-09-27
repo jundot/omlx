@@ -8,6 +8,7 @@ import pytest
 
 from omlx.engine.batched import BatchedEngine
 from omlx.engine.vlm import VLMBatchedEngine
+from omlx.specprefill.boundary import resolve_static_prefix_end
 
 _TOKEN_RE = re.compile(r"\s+|\w+|[^\s\w]")
 
@@ -141,3 +142,25 @@ def test_mid_conversation_system_message_does_not_over_protect():
     content_start = prompt_ids.index(tok.encode(USER["content"])[0])
     assert batched <= content_start
     assert vlm <= content_start
+
+
+def test_probes_only_use_the_leading_system_messages():
+    messages = [
+        {"role": "system", "content": "A"},
+        {"role": "user", "content": "B"},
+        {"role": "assistant", "content": "C"},
+        {"role": "system", "content": "D"},
+        {"role": "user", "content": "E"},
+    ]
+    rendered = []
+
+    def render_tokens(probe_messages):
+        rendered.append(probe_messages)
+        return [1, 2, 3, len(rendered)]
+
+    resolve_static_prefix_end(messages, [1, 2, 3, 9], render_tokens)
+
+    assert len(rendered) == 2
+    for probe in rendered:
+        assert probe[:-1] == [messages[0]]
+        assert probe[-1]["role"] == "user"
