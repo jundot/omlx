@@ -334,13 +334,8 @@ class SchedulerSettings:
     # any engine decodes, and each chunk accrues a decode time debt repaid
     # before the next chunk runs. Off restores the pre-fairness behavior.
     decode_fairness: bool = True
-    # Ceiling on the share of process wall time background canonical-state
-    # recovery may receive, **aggregated across every engine** sharing the
-    # accelerator. Server-level rather than per-model on purpose: the engine
-    # pool rewrites the per-model recovery knobs on its shared scheduler
-    # config before every load, so a cap read from one of them would be
-    # whichever model happened to load last. Models keep their own
-    # enable/disable; they do not keep their own ceiling.
+    # Share of wall time background recovery may use, summed over all engines.
+    # Server-level because the pool rewrites per-model knobs before every load.
     canonical_state_recovery_global_budget_pct: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:

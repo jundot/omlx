@@ -85,19 +85,8 @@ class PrefillProgressTracker:
     ) -> bool:
         """True while any request other than the exclusions is in prefill.
 
-        The tracker is process-global and keyed by request id, so this is the
-        prefill half of the question ``DecodeActivityRegistry.others_decoding``
-        answers for decode: is another engine in this process using the GPU
-        right now. Entries are removed when a prefill completes, so a live
-        entry means live work.
-
-        ``exclude_prefix`` exists because background recovery writes its own
-        entries here under a synthetic id. Counting those as foreground has
-        two costs: a recovery job on one engine reads as busy to every other
-        engine for its whole life, including the minutes it spends waiting for
-        an allowance, and the engine that stood down never becomes runnable
-        and never gives up either. Mutual exclusion between recovery jobs is a
-        claim on the shared budget, not a side effect of this tracker.
+        ``exclude_prefix`` lets recovery skip its own entries. Recovery jobs are kept
+        apart by the budget claim, not by this tracker.
         """
         with self._lock:
             return any(

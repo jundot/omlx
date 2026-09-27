@@ -937,25 +937,12 @@ class _OffsetAdjustedRoPE:
         return getattr(object.__getattribute__(self, "_original"), name)
 
 
-# Every RoPE wrapper this module installs on a model. One tuple, read by both
-# `_unwrap_rope` and `is_specprefill_rope`, because the two questions must not
-# be able to disagree: a wrapper that unwinds but is not recognised would let a
-# dense forward run under a sparse prefill's positions, and a wrapper that is
-# recognised but does not unwind would nest on the next request. Registering a
-# new wrapper here is the single step that answers both.
+# Read by both _unwrap_rope and is_specprefill_rope so the two cannot disagree.
 _ROPE_WRAPPERS: tuple[type, ...] = (_OffsetAdjustedRoPE, _PositionMappedRoPE)
 
 
 def is_specprefill_rope(rope) -> bool:
-    """Whether this object is a sparse-prefill RoPE wrapper installed here.
-
-    The scheduler asks this before it may run a dense forward on the shared
-    model, so the answer has to survive ordinary refactoring of this module.
-    An identity test against the registered types does; comparing
-    ``type(rope).__name__`` against a literal did not, and failed *open* —
-    renaming a wrapper would have reported "no wrapper installed" and allowed
-    exactly the forward the check exists to prevent.
-    """
+    """Whether *rope* is a sparse-prefill RoPE wrapper from this module."""
     return isinstance(rope, _ROPE_WRAPPERS)
 
 

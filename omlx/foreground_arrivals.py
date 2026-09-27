@@ -1,37 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Process-global registry of foreground requests that have arrived.
 
-``EnginePool`` runs several engines in one process against one accelerator, so
-"is this engine idle" and "is this process idle" are different questions.
-``DecodeActivityRegistry`` answers the first for decode and
-``PrefillProgressTracker`` for prefill, but both are progress signals: they
-exist only once work is already running. Between the transport accepting a
-request and that request's first forward there is a span in which every
-progress signal in the process reads idle.
+The decode registry and prefill tracker only see work once it is running.
+Recovery starts work it cannot interrupt, so it also needs to know about a
+request between the transport accepting it and its first forward.
 
-Background canonical-state recovery cares about exactly that span, because it
-starts work it cannot interrupt. So this registry records the *arrival*
-directly rather than inferring it afterwards:
-
-* ``note_arrival`` runs on the asyncio event loop, before the request is handed
-  to the engine's executor;
-* ``note_admission`` re-stamps it once the engine owns it, which restarts the
-  expiry clock against the request's real lifetime rather than against its
-  queue wait;
-* ``note_departure`` drops it when the request finishes, aborts or fails to be
-  admitted at all.
-
-The entry deliberately outlives admission. On the admitting engine that is
-redundant — its own ``waiting``/``running`` lists already say so — but on every
-*other* engine in the pool it is the only thing that does, from admission until
-that engine's first prefill chunk reaches the progress tracker.
-
-Entries carry a monotonic timestamp and expire, so a request that arrives and
-then vanishes — cancelled in flight, rejected before ``add_request``, lost to an
-exception — cannot hold recovery off for the life of the process.
-
-Mirrors the shape of ``decode_activity.DecodeActivityRegistry``: one lock, CPU
-counters only, never held across a model call.
+The entry is kept past admission because other engines in the pool cannot see
+this engine's queues. Entries expire so a request that vanishes without a
+departure cannot hold recovery off forever.
 """
 
 from __future__ import annotations

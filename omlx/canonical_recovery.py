@@ -1,29 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Canonical state recovery: bookkeeping for a scheduler-owned dense re-prefill.
 
-A sparse (SpecPrefill) prefill serves its request and leaves nothing the prefix
-cache will accept: ``_cleanup_finished`` refuses to extract a cache whose
-``specprefill_indices`` is set, and the non-sliceable layers of a hybrid model
-only carry real state at a captured block boundary. The reusable dense prefix
-therefore stops advancing, and every later turn in the session pays to
-recompute the suffix the sparse turn did not canonicalize.
+A SpecPrefill turn stores no reusable prefix (_cleanup_finished skips requests
+with specprefill_indices set), so later turns keep paying for the suffix it did
+not store. Recovery re-reads that range densely while the engine is idle and
+publishes ordinary cache blocks.
 
-This module holds the *decision* half of a canonical state recovery: a dense re-read of a
-token range the session has already been served, run as scheduler-owned work,
-which publishes ordinary canonical cache state. It deliberately contains no MLX
-and touches no cache, so the policy can be tested without a model. The
-execution half lives in ``Scheduler``.
-
-Two things it exists to get right:
-
-**Publication happens at every safe boundary.** Canonical state for a
-non-sliceable layer exists only at a cache block boundary, and a partial block
-is not a smaller win but a corrupt one. Publishing at each boundary as it is
-reached is what makes an interrupted job worth the prefix it got to.
-
-**Growth is append-only and single-flight.** A session that adds a turn extends
-the live job's target rather than starting a second one, because two jobs on
-one session would recompute the same prefix twice and race to publish it.
+This module is the policy side only, with no MLX, so it can be tested without a
+model. Execution lives in Scheduler. Publishing happens only at block
+boundaries, and a growing session extends its one live job.
 """
 
 from __future__ import annotations
@@ -35,39 +20,23 @@ from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
-# How many consecutive yields a job may take before it is given up on. A yield
-# means the chunk did not run — the memory throttle wanted headroom, or the
-# chunk was aborted — and nothing the recovery job itself does will change
-# that, so retrying forever only keeps an idle engine awake.
+# A yield is a chunk the throttle or an abort refused. Retrying forever would
+# keep an idle engine awake.
 MAX_CONSECUTIVE_YIELDS = 8
 
-# How many consecutive idle steps a job may be *allowed* to run and still not
-# run before it is given up on. This is a different condition from a yield: a
-# yield is raised from inside a chunk, and the case this bounds never reaches
-# one. The engine is idle, the window grants service, and the runnable
-# predicate still says no — which on this runtime means a SpecPrefill RoPE
-# wrapper is installed with no request behind it, a state `_unwrap_rope`
-# documents as expected. Nothing the recovery job does takes it off, so
-# without a deadline the job never runs, never finishes and never gives up,
-# on a loop that keeps stepping for it. At the 50 ms step interval this is
-# about ten seconds.
+# Idle steps a job may be allowed to run and still not run (a leftover SpecPrefill RoPE
+# wrapper blocks it and the job cannot remove it). About ten seconds at 50 ms steps.
 MAX_BLOCKED_IDLE_STEPS = 200
 
-# The scheduling window a recovery allowance is granted in. The budget has to
-# replenish: measured over a job's whole life instead, one chunk that overran
-# the allowance early put the share above the cap for as long as the
-# denominator took to grow back, which at 5% on an 80K session was the rest of
-# the run. A job that overshoots once must be late, not finished.
+# The allowance refills per window, so one early overrun delays the job instead
+# of ending it.
 DEFAULT_BUDGET_WINDOW_S = 30.0
 
 
 def safe_publish_boundary(*, tokens_committed: int, block_size: int) -> int:
-    """The largest boundary at or below *tokens_committed* that may be published.
+    """Largest block boundary at or below *tokens_committed*.
 
-    Non-sliceable layers carry real state only at a block boundary; anything
-    between two boundaries restores as a placeholder and is rejected or walked
-    back. Publishing a partial block is therefore not a smaller win, it is a
-    corrupt one, so the floor is the block below.
+    Non-sliceable layers only have real state at a block boundary.
     """
     if block_size <= 0 or tokens_committed <= 0:
         return 0
@@ -76,34 +45,14 @@ def safe_publish_boundary(*, tokens_committed: int, block_size: int) -> int:
 
 @dataclass
 class CanonicalRecoveryBudget:
-    """A replenishing bounded share of wall time, aggregated over the process.
+    """A replenishing share of wall time, shared by every engine in the process.
 
-    There is one of these per process, created by ``EnginePool`` and adopted by
-    every scheduler. It rations one accelerator, and a process holds several
-    engines that share it, so a budget per engine would grant M loaded models M
-    times the configured ceiling with nothing adding them up.
-
-    Service is granted per tumbling window of ``window_s``:
-
-    - each window opens with an allowance of ``pct/100 * window_s`` seconds;
-    - unused allowance is discarded at the roll, so the job cannot bank credit
-      and spend it as one long slice in front of the foreground;
-    - a chunk that overruns the allowance is charged to the next window, which
-      is what makes the cap hold across windows rather than only inside one;
-    - that carried overshoot is capped at a single allowance, so one overrun
-      can cost at most one window of service and never a permanent lockout.
-
-    The chunk grain is the reason the last two rules are not symmetric. A
-    chunk cannot be interrupted once it is handed to the model, so when the
-    allowance is smaller than one chunk every chunk overshoots by
-    construction. The cap then bounds the lockout rather than the share.
+    Each window of ``window_s`` grants ``pct/100 * window_s`` seconds. Unused
+    allowance is dropped at the roll. An overrun is charged to the next window,
+    capped at one allowance, since a chunk cannot be interrupted.
     """
 
     pct: float = 0.0
-    # A non-positive window is a misconfiguration and is corrected in
-    # __post_init__ rather than interpreted. Left alone it made the allowance
-    # zero beside a non-zero measured share, which is state that contradicts
-    # itself.
     window_s: float = DEFAULT_BUDGET_WINDOW_S
     service_s: float = 0.0
     wall_start_s: float = field(default_factory=time.perf_counter)
@@ -111,22 +60,13 @@ class CanonicalRecoveryBudget:
     window_service_s: float = 0.0
     windows: int = 1
     overshoot_s: float = 0.0
-    # True when this object is the process-global budget the engine pool
-    # created and every scheduler adopted. A shared budget must never be
-    # reset by one of its owners: see `reset`.
+    # The pool's process-wide budget. Its owners must never reset it; see `reset`.
     shared: bool = False
-    # Owner keys currently registered. Registration grants nothing — it
-    # exists so a departing engine can deregister, and so a reader can say
-    # how many engines a share is being divided between.
     owners: set[str] = field(default_factory=set)
-    # The single execution claim. A recovery slice is uninterruptible and
-    # invisible from outside while it runs, so "is anyone recovering right
-    # now" cannot be answered by watching side effects; it is answered here,
-    # before the work starts.
+    # A slice cannot be interrupted, so it takes this claim before it starts.
     claim_key: str | None = None
     claim_at_s: float = 0.0
-    # A holder that dies mid-slice would otherwise hold the claim forever.
-    # Generous, because a legitimate slice is seconds.
+    # Frees the claim if its holder dies mid-slice. A real slice takes seconds.
     claim_ttl_s: float = 120.0
     _lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False, compare=False
@@ -143,11 +83,7 @@ class CanonicalRecoveryBudget:
             return 0.0
         return (self.pct / 100.0) * self.window_s
 
-    # -- ownership ------------------------------------------------------
-    # Registration is deliberately inert. An engine that loads, unloads and
-    # loads again must not find a fresh window waiting for it, or unloading
-    # becomes a way to discharge a debt — and under memory pressure the pool
-    # unloads and reloads on every eviction cycle.
+    # Registration grants nothing, so unloading and reloading cannot buy a fresh window.
 
     def register(self, owner: str) -> None:
         with self._lock:
@@ -158,8 +94,6 @@ class CanonicalRecoveryBudget:
             self.owners.discard(owner)
             if self.claim_key == owner:
                 self.claim_key = None
-
-    # -- the execution claim --------------------------------------------
 
     def try_claim(self, owner: str, now: float | None = None) -> bool:
         """Take the process-wide right to execute a recovery slice.
@@ -194,8 +128,6 @@ class CanonicalRecoveryBudget:
                 return False
             return (now - self.claim_at_s) < self.claim_ttl_s
 
-    # -- accounting -----------------------------------------------------
-
     def elapsed_s(self, now: float | None = None) -> float:
         now = now if now is not None else time.perf_counter()
         return max(0.0, now - self.wall_start_s)
@@ -216,13 +148,8 @@ class CanonicalRecoveryBudget:
             return
         skipped = int(elapsed // self.window_s)
         allowance = self.allowance_s
-        # Carry the overrun, capped at one allowance. It is not discharged by
-        # windows the job did not run in: the gap between two `allows` calls
-        # cannot tell "the job had nothing to do" from "the foreground was
-        # busy for a minute", and the second is the case the budget exists
-        # for. Discharging on the gap meant any busy period longer than two
-        # windows wiped the debt, so the cap stopped holding on exactly the
-        # sessions it was written for.
+        # Carry the overrun, capped at one allowance. Idle windows do not pay it
+        # off: a gap cannot tell "nothing to do" from "foreground was busy".
         self.window_service_s = min(
             max(0.0, self.window_service_s - allowance), allowance
         )
@@ -232,10 +159,8 @@ class CanonicalRecoveryBudget:
     def allows(self, now: float | None = None) -> bool:
         """Whether the current window still has allowance left.
 
-        The roll and the comparison are one critical section. Split, two
-        engines can both clear the test on allowance only one of them has —
-        and the charge for a slice necessarily lands after the grant, so
-        nothing downstream would catch it.
+        Roll and check under one lock so two engines cannot both spend the same
+        allowance.
         """
         if self.pct <= 0:
             return False
@@ -244,13 +169,7 @@ class CanonicalRecoveryBudget:
             return self.window_service_s < self.allowance_s
 
     def note_service(self, seconds: float) -> None:
-        """Charge service, globally.
-
-        The overshoot this accrues belongs to the budget rather than to the
-        owner that caused it. Per-owner debt would let the aggregate overrun
-        scale with the number of engines, which is the property this object
-        exists to remove.
-        """
+        """Charge service to the shared budget, not to the owner."""
         seconds = max(0.0, seconds)
         with self._lock:
             self.service_s += seconds
@@ -261,13 +180,7 @@ class CanonicalRecoveryBudget:
                 self.overshoot_s += self.window_service_s - max(before, allowance)
 
     def reset(self, now: float | None = None) -> None:
-        """Start the accounting over. Never valid on a shared budget.
-
-        One engine resetting a budget its peers are charging against would
-        forgive their spent allowance mid-window, erase the carried overshoot
-        and splice their accounting onto a new clock. `Scheduler.reset` checks
-        `shared` before calling this; the guard here is the backstop.
-        """
+        """Start the accounting over. Refuses on a shared budget."""
         if self.shared:
             raise RuntimeError(
                 "refusing to reset a shared recovery budget: one owner cannot "
@@ -291,10 +204,7 @@ class CanonicalRecoveryCounters:
     chunks: int = 0
     yielded_steps: int = 0
     service_s: float = 0.0
-    # Times a live dense state was given back while its job stayed alive.
-    # Separate from `yielded_steps`, which counts slices not taken: a job can
-    # yield many times holding the same state, and the memory question is
-    # about the state, not about the slices.
+    # States given back while the job stayed alive, as opposed to slices skipped.
     states_retired: int = 0
 
 
@@ -310,30 +220,16 @@ class CanonicalRecoveryJob:
     processed_tokens: int = 0       # dense tokens consumed this job, published or not
     published_boundaries: list[int] = field(default_factory=list)
     cancelled: bool = False
-    # Consecutive chunks that yielded without doing work. Bounded, because a
-    # yield that nothing ever satisfies is not a pause: the job stays live, the
-    # engine loop keeps stepping to serve it, and an idle server spins forever
-    # holding the job's whole prefill state resident.
     consecutive_yields: int = 0
-    # Set when the dense pass has consumed the whole target. Tracked explicitly
-    # rather than compared against target_tokens: the prefill path holds back
-    # the final token for the generation kickoff, so processed_tokens legitimately
-    # tops out one short and a `>=` comparison never fires.
+    # Set explicitly: a `>=` on target_tokens misses when the last token is held back.
     reached_target: bool = False
-    # Set by the scheduler; the opaque _PrefillState driving the dense chunks.
     prefill_state: object | None = None
 
     def note_reached_target(self) -> None:
         self.reached_target = True
 
     def extend(self, tokens: list[int]) -> bool:
-        """Grow the target append-only. Returns False if *tokens* is not a growth.
-
-        A turn that rewrites history rather than appending to it invalidates
-        everything already computed, so it is refused here and the caller
-        starts a new job instead of silently publishing state for a prefix the
-        session no longer has.
-        """
+        """Grow the target append-only. Returns False if *tokens* is not an append."""
         if len(tokens) <= self.target_tokens:
             return False
         if tokens[: self.target_tokens] != self.tokens[: self.target_tokens]:
@@ -358,20 +254,11 @@ class CanonicalRecoveryJob:
             self.published_boundaries.append(boundary)
 
     def note_ground_lost(self, restorable: int) -> None:
-        """Lower the watermark to what the serving cache can still produce.
+        """Lower the watermark to what the serving cache can still restore.
 
-        ``committed_tokens`` otherwise only rises, and it is a claim about the
-        cache rather than a record of this job's own work: blocks backing an
-        already-published prefix can be evicted, and under `hot_cache_only` an
-        evicted block is dropped rather than demoted, so the ground a boundary
-        was verified against can disappear afterwards.
-
-        A claim the cache can no longer honour is worse than no claim.
-        ``publishable_boundary`` refuses anything at or below the watermark, so
-        a stale-high one makes the job decline to republish exactly the range
-        that went missing. Walking it back lets the job re-read and republish
-        that range instead. The serving cache stays authoritative; this is the
-        job accepting its answer.
+        Published blocks can be evicted (under hot_cache_only they are dropped), and
+        since publishable_boundary refuses anything at or below the watermark, a stale
+        watermark would stop the job republishing the lost range.
         """
         restorable = max(0, restorable)
         if restorable >= self.committed_tokens:
@@ -388,46 +275,11 @@ class CanonicalRecoveryJob:
 
 
 def canonical_recovery_slice_cap(slice_tokens: int, request: object, n: int) -> int:
-    """Cap a recovery slice, which is not the same thing as its block.
+    """Cap a recovery slice, separately from the publication block.
 
-    Recovery publishes at a cache block boundary because that is the only
-    place canonical state exists for a non-sliceable layer. It does not have
-    to *compute* a whole block at a time, and the two were the same number
-    only because nothing had separated them.
-
-    The one a foreground request waits for is this one. A slice cannot be
-    interrupted once it is handed to the model, so a whole-block recovery unit
-    can delay an arriving request for the duration of that unit. Smaller
-    execution slices bound that blocking interval, independently of the
-    canonical publication grain.
-
-    Three controls, three different jobs:
-
-    - the recovery budget governs how *often* recovery collides with a
-      foreground request;
-    - the execution slice narrows how *long* that request is blocked when it
-      does — narrows, not determines: a slice is timed and charged as a whole
-      in ``_canonical_recovery_step``, and the state build that restores the
-      published prefix and the publish that extracts, stores and reads back
-      the new boundary are inside that whole and do not shrink with the cap.
-      The measured blocking bound is the whole unit, not the forward alone;
-    - the publication grain governs *when* reusable canonical state may be
-      committed, and is fixed by the cache layout rather than chosen.
-
-    Shrinking the slice changes nothing about publication.
-    ``clamp_prefill_chunk_to_boundary`` already stops a slice overshooting a
-    boundary, ``should_emit_prefill_boundary`` fires only on exact block
-    multiples, and ``safe_publish_boundary`` floors publication to them. More
-    slices reach the same boundaries; they simply leave a gap in between for a
-    request to arrive in.
-
-    Takes the cap rather than the config on purpose. The slice size is a
-    per-model setting and ``SchedulerConfig`` is one object shared by every
-    engine in the pool, so reading it here would have let a second model's load
-    rewrite the slice size of a scheduler already running — lengthening another
-    model's worst-case foreground blocking without that model's settings having
-    changed. The caller passes the value its own engine was loaded with, which
-    is how the enabled flag is already handled.
+    A slice cannot be interrupted, so its size bounds how long an arriving request
+    waits. Publishing still only happens at block boundaries. Takes the cap rather
+    than the config because the config is shared across engines in the pool.
     """
     if not getattr(request, "is_canonical_recovery", False):
         return n
@@ -452,27 +304,13 @@ def canonical_recovery_is_runnable(
 ) -> bool:
     """Whether a recovery chunk may start on this step.
 
-    Every clause is a defect from the earlier prototype's safety review, or a
-    constraint read out of the runtime, written down as a condition rather than
-    as a comment:
-
-    - ``specprefill_active`` — SpecPrefill installs ``_OffsetAdjustedRoPE`` on
-      the *shared* model and keeps it installed until generation ends. A dense
-      forward taken while it is installed reads that request's position offset,
-      so the recovery job must not run in that window at all.
-    - ``inbound_requests`` — a request is invisible to the scheduler until its
-      admission runs on the single-worker executor. Idleness judged from the
-      admitted lists alone starts a slice in front of a request that has
-      already arrived.
-    - ``consecutive_idle_steps`` — a slice holds the interpreter lock for its
-      whole duration, so back-to-back slices leave no window in which a request
-      can announce itself. Requiring two idle steps buys that window back at a
-      cost of one step interval per slice.
-    - ``foreign_engine_busy`` — every other clause here reads one scheduler's
-      own lists, and a process can hold several engines sharing one GPU. An
-      engine whose own lists are empty is idle; the *machine* it is about to
-      take a slice on may not be. Recovery is the lowest-priority work in the
-      process, so it stands down for foreground work anywhere in it.
+    - ``specprefill_active``: a SpecPrefill RoPE wrapper on the shared model
+      would give a dense forward the wrong positions.
+    - ``inbound_requests``: a request is invisible to the scheduler until its
+      admission runs on the executor.
+    - ``consecutive_idle_steps``: two idle steps leave a gap for an arriving
+      request to announce itself.
+    - ``foreign_engine_busy``: another engine in the process has foreground work.
     """
     if not enabled or not has_job:
         return False
@@ -490,16 +328,9 @@ def canonical_recovery_is_runnable(
 def apply_canonical_recovery_settings(
     scheduler_config: object, model_settings: object
 ) -> None:
-    """Carry a model's canonical-recovery knobs onto a shared ``SchedulerConfig``.
+    """Copy a model's recovery settings onto the shared SchedulerConfig at load.
 
-    Two of them, and neither is a ceiling: a model chooses whether to recover
-    and how large a slice it does it in. How much of the accelerator recovery
-    may have is one server-level number, because every engine in the pool
-    shares one accelerator and this config object is rewritten per load.
-
-    Mirrors how ``model_name``/``model_path`` are wired per model at engine
-    load: canonical state recovery is scheduler-owned, not per-request, so its settings
-    live on the config object rather than flowing through per-call kwargs.
+    Only the enable flag and slice size are per model. The budget is server-level.
     """
     scheduler_config.canonical_state_recovery_enabled = bool(
         getattr(model_settings, "canonical_state_recovery_enabled", False)
@@ -507,18 +338,7 @@ def apply_canonical_recovery_settings(
     scheduler_config.canonical_state_recovery_slice_tokens = int(
         getattr(model_settings, "canonical_state_recovery_slice_tokens", 0) or 0
     )
-    # Recovery takes two independent grants and neither implies the other: a
-    # model opts in here, and the server separately grants a process-wide
-    # share of the accelerator. That separation is deliberate — sparse
-    # execution does not imply that the debt it leaves is worth repaying, and
-    # one model must not be able to spend the machine every other model shares.
-    #
-    # It does leave one state that says nothing about itself: opted in, with
-    # the share still at its default of zero. `CanonicalRecoveryBudget.allows` is then
-    # False in every window and every candidate is declined before it runs,
-    # and nothing downstream reports it. Say so once per load, where the two
-    # grants are first seen together, so the operator learns it from the log
-    # rather than from an absence of counters.
+    # Enabled with a zero server budget never runs, and nothing else logs it.
     if scheduler_config.canonical_state_recovery_enabled and float(
         getattr(scheduler_config, "canonical_state_recovery_global_budget_pct", 0.0) or 0.0
     ) <= 0.0:

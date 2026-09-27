@@ -261,19 +261,12 @@ class ModelSettings:
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
         specprefill_threshold: Min tokens to trigger SpecPrefill.
-        canonical_state_recovery_enabled: Enable canonical state recovery, a scheduler-owned
-            dense re-read of a range a sparse prefill already served, run
-            only while the scheduler is idle. Off by default, and this
-            switch alone does not make recovery run: the server must also
-            grant a non-zero `scheduler.canonical_state_recovery_global_budget_pct`,
-            which is 0 by default. The two grants are deliberately
-            independent — a model opts into recovery, and the server rations
-            the accelerator every model shares — because sparse execution does
-            not imply that the debt it leaves is worth repaying.
-        canonical_state_recovery_slice_tokens: Tokens per recovery execution slice; 0
-            leaves it at the ordinary prefill step size. Not the publication
-            grain — recovery publishes only at cache block boundaries either
-            way. This is the slice a foreground request can arrive behind.
+        canonical_state_recovery_enabled: Re-read ranges a sparse prefill served,
+            densely, while the scheduler is idle. Off by default. Also needs a
+            non-zero `scheduler.canonical_state_recovery_global_budget_pct`
+            (0 by default).
+        canonical_state_recovery_slice_tokens: Tokens per recovery slice; 0 means
+            the ordinary prefill step size. Publishing is still per cache block.
         dflash_enabled: Enable DFlash speculative decoding. Qwen3.5-family VLM
             targets draft inside the batched engine (Lightning MTP verify path
             with greedy or sampled acceptance, continuous batching); other
@@ -427,12 +420,8 @@ class ModelSettings:
     specprefill_keep_pct: Optional[float] = None  # Keep rate (0.1-0.5, default 0.2)
     specprefill_threshold: Optional[int] = None  # Min tokens to trigger (default 8192)
 
-    # Canonical state recovery: a scheduler-owned dense re-prefill of ranges a sparse
-    # SpecPrefill turn left uncanonicalized. Off by default.
     canonical_state_recovery_enabled: bool = False
-    # Tokens per recovery execution slice; 0 = the ordinary prefill step size.
-    # Not the publication grain: recovery still publishes only at cache block
-    # boundaries. This is the slice a foreground request can arrive behind.
+    # 0 = the ordinary prefill step size. Publishing is still per cache block.
     canonical_state_recovery_slice_tokens: int = 0
 
     # DFlash (block diffusion speculative decoding)

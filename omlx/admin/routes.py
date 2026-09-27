@@ -355,7 +355,6 @@ class ModelSettingsRequest(BaseModel):
     specprefill_draft_model: str | None = None
     specprefill_keep_pct: float | None = None
     specprefill_threshold: int | None = None
-    # Progressive canonical state recovery (dense re-read of a sparsely-served range)
     canonical_state_recovery_enabled: bool | None = None
     canonical_state_recovery_slice_tokens: int | None = None
     # DFlash (block diffusion speculative decoding)
@@ -627,7 +626,6 @@ class GlobalSettingsRequest(BaseModel):
     chunked_prefill: bool | None = None
     prefill_priority: str | None = None  # "context" | "speed"
     decode_fairness: bool | None = None
-    # Aggregate ceiling on background recovery across every engine, percent.
     canonical_state_recovery_global_budget_pct: float | None = None
 
     # Cache settings
@@ -3073,9 +3071,6 @@ async def update_model_settings(
         current_settings.specprefill_keep_pct = request.specprefill_keep_pct or None
     if "specprefill_threshold" in sent:
         current_settings.specprefill_threshold = request.specprefill_threshold or None
-    # Canonical state recovery settings. Budget and mode are carried even when the value
-    # is falsy: 0.0 is a meaningful budget (the recovery job is admitted but never
-    # served), not an absent one.
     if "canonical_state_recovery_enabled" in sent:
         current_settings.canonical_state_recovery_enabled = bool(
             request.canonical_state_recovery_enabled
@@ -5167,10 +5162,7 @@ async def update_global_settings(
             f"Decode fairness {'enabled' if enabled else 'disabled'}"
         )
 
-    # Aggregate recovery ceiling (Live). One object serves every engine, so
-    # unlike the per-scheduler settings above this reaches them all by being
-    # updated in place — and updating rather than replacing is what stops a
-    # settings change handing every engine a fresh window and a clean debt.
+    # Update the shared budget in place so a settings change does not reset its window.
     if request.canonical_state_recovery_global_budget_pct is not None:
         pct = max(0.0, min(100.0, float(request.canonical_state_recovery_global_budget_pct)))
         global_settings.scheduler.canonical_state_recovery_global_budget_pct = pct
