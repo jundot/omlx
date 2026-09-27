@@ -274,9 +274,15 @@ class _QSAIndexerCache:
         self._invalidate_pooled_indexer()
 
     def reserve_index_capacity(self, tokens: int) -> None:
-        """Reserve a stepped prefill horizon; later growth uses plain steps."""
+        """Reserve a stepped prefill horizon; later growth uses plain steps.
+
+        The horizon also sizes a fixed-step KV buffer (``_reserved_tokens``).
+        """
 
         self._index_reserved_tokens = max(0, int(tokens))
+
+    def _reserved_tokens(self) -> int:
+        return getattr(self, "_index_reserved_tokens", 0)
 
     @property
     def index_keys(self):

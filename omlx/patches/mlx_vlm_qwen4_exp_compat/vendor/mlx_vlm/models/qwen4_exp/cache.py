@@ -357,6 +357,10 @@ class KVCache(_BaseCache):
         self.values = None
         self.offset = 0
 
+    def _reserved_tokens(self) -> int:
+        """Token horizon to allocate up front under ``geometric_growth``."""
+        return 0
+
     def update_and_fetch(self, keys, values):
         prev = self.offset
         if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
@@ -369,6 +373,12 @@ class KVCache(_BaseCache):
                 # doubled buffers (3L) coexisted during the copy. The logical
                 # prefix keys[..., :offset] is copied unchanged either way.
                 needed = prev + keys.shape[2]
+                # A known prefill horizon (QSA: the scheduler's prompt-length
+                # reservation) is allocated at once while the buffer is still
+                # below it, so a cold prefill never copies its growing prefix.
+                reserved = self._reserved_tokens()
+                if self.keys is None or self.keys.shape[2] < reserved:
+                    needed = max(needed, reserved)
                 capacity = ((needed + self.step - 1) // self.step) * self.step
             else:
                 n_steps = (self.step + keys.shape[2] - 1) // self.step
