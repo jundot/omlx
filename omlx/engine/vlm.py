@@ -4084,21 +4084,13 @@ class VLMBatchedEngine(BaseEngine):
     ) -> None:
         """Compute the static-prefix token boundary and add it to ``kwargs``.
 
-        SpecPrefill protects the prompt's static prefix — the system/developer
-        material and any tool-instruction scaffolding the template emits ahead
-        of the first conversation turn — from token dropping. The boundary is
-        measured against the rendered prompt by
-        ``specprefill.boundary.resolve_static_prefix_end``; see that module for
-        why it is not a subtraction of two renders. Shared by ``chat`` and
-        ``stream_chat`` so the non-streaming path protects the same region.
-        No-op unless the model has SpecPrefill enabled and the request has a
-        system or developer message.
+        SpecPrefill never drops tokens from the system/developer and tool
+        block ahead of the first turn. Shared by ``chat`` and ``stream_chat``.
+        No-op unless SpecPrefill is enabled and the request has a system or
+        developer message.
 
-        ``prompt`` is normally the already-tokenized VLM prompt (a list of
-        token IDs, per ``_process_chat_messages``); a string prompt is encoded.
-        For image-bearing turns the real prompt comes from the vision path
-        rather than this text template, so the probes stop matching early and
-        the boundary shrinks — under-protecting, never over-protecting.
+        ``prompt`` is usually token IDs from ``_process_chat_messages``. Image
+        turns render differently, so the boundary can only come out shorter.
         """
         specprefill_model_enabled = (
             getattr(self._model_settings, "specprefill_enabled", False)

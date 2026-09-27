@@ -966,15 +966,10 @@ class BatchedEngine(BaseEngine):
     ) -> None:
         """Compute the static-prefix token boundary and add it to ``kwargs``.
 
-        SpecPrefill protects the prompt's static prefix — the system/developer
-        material and any tool-instruction scaffolding the template emits ahead
-        of the first conversation turn — from token dropping. The boundary is
-        measured against the rendered prompt by
-        ``specprefill.boundary.resolve_static_prefix_end``; see that module for
-        why it is not a subtraction of two renders. Shared by ``chat`` and
-        ``stream_chat`` so the non-streaming path protects the same region.
-        No-op unless the model has SpecPrefill enabled and the request has a
-        system or developer message.
+        SpecPrefill never drops tokens from the system/developer and tool
+        block ahead of the first turn. Shared by ``chat`` and ``stream_chat``.
+        No-op unless SpecPrefill is enabled and the request has a system or
+        developer message.
         """
         specprefill_model_enabled = (
             getattr(self._model_settings, "specprefill_enabled", False)
