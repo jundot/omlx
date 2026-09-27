@@ -140,8 +140,7 @@ class TestAnotherEnginesPrefillWithdrawsTheChunk:
         Waiting behind a peer is the same kind of wait as a spent window and
         gets the same treatment: the loop parks rather than stepping twenty
         times a second for a job that cannot run, and the job survives so the
-        chunk can run once the peer is done. The stall deadline must not count
-        it either — there is a reason, and the reason ends.
+        chunk can run once the peer is done.
         """
         scheduler = _make_scheduler()
         scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
@@ -159,7 +158,6 @@ class TestAnotherEnginesPrefillWithdrawsTheChunk:
                 steps += 1
         assert steps == 0
         assert scheduler._canonical_recovery_job is not None
-        assert scheduler._canonical_recovery_blocked_idle_steps == 0
 
         get_prefill_tracker().remove("other-request")
         assert scheduler.has_requests()

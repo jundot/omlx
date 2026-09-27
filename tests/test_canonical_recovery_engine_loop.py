@@ -10,14 +10,12 @@ and the periodic *process-global* ``mx.clear_cache()``. That pool is shared
 with every other model the process serves, so a background job on one session
 is in a position to disturb foreground work it has nothing to do with.
 
-These tests pin the three things that keep that bounded:
+These tests pin the two things that keep that bounded:
 
 - the engine loop re-reads ``has_requests()`` once per ``step_interval``
   whether or not it stepped, so a job that is out of allowance can be parked
   and picked back up without anything having to wake it;
-- a job out of allowance is parked rather than polled;
-- a job that is allowed to run and cannot is given up on, because the runtime
-  can leave a condition installed that nothing the job does will ever clear.
+- a job out of allowance is parked rather than polled.
 """
 
 import asyncio
@@ -26,7 +24,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from omlx.canonical_recovery import MAX_BLOCKED_IDLE_STEPS
 from omlx.engine_core import EngineConfig, EngineCore
 from omlx.scheduler import Scheduler, SchedulerConfig, SchedulerOutput
 
@@ -190,71 +187,6 @@ class TestASpentWindowCostsNoSteps:
         scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         assert scheduler._canonical_recovery_job is None
         assert not scheduler.has_requests()
-
-
-class TestAStalledJobIsGivenUpOn:
-    """A job that may run and cannot must not pin the loop forever.
-
-    `_specprefill_rope_installed` refuses a dense forward while a SpecPrefill
-    RoPE wrapper is on the shared model, and nothing the recovery job does
-    takes it off. Without a deadline the job is live forever:
-    the loop keeps stepping for it, and the engine never becomes quiescent, so
-    the model can never be unloaded.
-
-    The yield limit does not cover this. `consecutive_yields` is raised from
-    inside a chunk and no chunk is ever reached here.
-    """
-
-    def _run_idle_steps(self, scheduler: Scheduler, steps: int) -> None:
-        for _ in range(steps):
-            scheduler.step()
-
-    def test_a_job_blocked_by_a_leftover_rope_wrapper_is_dropped(self):
-        scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
-        with patch.object(scheduler, "_specprefill_rope_installed", return_value=True):
-            self._run_idle_steps(scheduler, MAX_BLOCKED_IDLE_STEPS - 1)
-            assert scheduler._canonical_recovery_job is not None
-            assert scheduler._canonical_recovery_blocked_idle_steps == MAX_BLOCKED_IDLE_STEPS - 1
-            self._run_idle_steps(scheduler, 1)
-        assert scheduler._canonical_recovery_job is None
-        assert not scheduler.has_requests()
-
-    def test_a_busy_engine_is_not_a_stall(self):
-        """A job waiting behind foreground work has a reason, and it will end.
-
-        Dropping it here would punish exactly the sessions the feature is for,
-        and it buys nothing: the loop is stepping for the foreground anyway.
-        """
-        scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
-        # A request that has arrived and not yet been admitted: foreground
-        # pressure the scheduler's own lists cannot see, and the hardest case
-        # for the deadline to get right.
-        scheduler.note_inbound_request("inbound-1")
-        self._run_idle_steps(scheduler, MAX_BLOCKED_IDLE_STEPS * 2)
-        assert scheduler._canonical_recovery_job is not None
-        assert scheduler._canonical_recovery_blocked_idle_steps == 0
-
-    def test_a_spent_budget_is_not_a_stall(self):
-        """Waiting for an allowance is the ordinary case, and parking covers it."""
-        scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
-        _spend_the_window(scheduler)
-        with patch.object(scheduler, "_specprefill_rope_installed", return_value=True):
-            self._run_idle_steps(scheduler, MAX_BLOCKED_IDLE_STEPS * 2)
-        assert scheduler._canonical_recovery_job is not None
-        assert scheduler._canonical_recovery_blocked_idle_steps == 0
-
-    def test_a_chunk_that_runs_clears_the_deadline(self):
-        scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
-        with patch.object(scheduler, "_specprefill_rope_installed", return_value=True):
-            self._run_idle_steps(scheduler, 10)
-        assert scheduler._canonical_recovery_blocked_idle_steps == 10
-        with patch.object(scheduler, "_canonical_recovery_step", return_value=True):
-            self._run_idle_steps(scheduler, 2)
-        assert scheduler._canonical_recovery_blocked_idle_steps == 0
 
 
 class TestForegroundPriorityIsEngineGlobal:

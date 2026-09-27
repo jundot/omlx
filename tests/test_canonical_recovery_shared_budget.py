@@ -316,17 +316,6 @@ class TestAnExhaustedBudgetParksEveryEngine:
         budget.window_start_s -= WINDOW_S
         assert a.has_requests() and b.has_requests()
 
-    def test_waiting_on_a_peer_is_not_a_stall(self, two_engines):
-        """The deadline that drops a job which may run and cannot must not
-        fire on a job that is waiting for a reason that ends."""
-        a, b = two_engines
-        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1"))
-        get_prefill_tracker().update("b-foreground", 100, 8000, "model-b")
-        for _ in range(200):
-            a._canonical_recovery_after_step(MagicMock(has_work=False))
-        assert a._canonical_recovery_job is not None
-        assert a._canonical_recovery_blocked_idle_steps == 0
-
 
 class TestOneOwnersResetSparesTheRest:
     """5 — resetting B does not alter A's or the global spent allowance."""

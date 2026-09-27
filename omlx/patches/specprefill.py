@@ -937,15 +937,6 @@ class _OffsetAdjustedRoPE:
         return getattr(object.__getattribute__(self, "_original"), name)
 
 
-# Read by both _unwrap_rope and is_specprefill_rope so the two cannot disagree.
-_ROPE_WRAPPERS: tuple[type, ...] = (_OffsetAdjustedRoPE, _PositionMappedRoPE)
-
-
-def is_specprefill_rope(rope) -> bool:
-    """Whether *rope* is a sparse-prefill RoPE wrapper from this module."""
-    return isinstance(rope, _ROPE_WRAPPERS)
-
-
 def _unwrap_rope(rope):
     """Peel any sparse-prefill RoPE wrappers down to the genuine module.
 
@@ -954,7 +945,7 @@ def _unwrap_rope(rope):
     and, before this fix, crash in _PositionMappedRoPE. Always start from the
     genuine rope. See #766.
     """
-    while isinstance(rope, _ROPE_WRAPPERS):
+    while isinstance(rope, (_OffsetAdjustedRoPE, _PositionMappedRoPE)):
         rope = rope._original
     return rope
 

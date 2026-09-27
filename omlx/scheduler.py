@@ -58,7 +58,6 @@ from .cache.pooling_delta import compact_pooling_cache_snapshot
 from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
 from .canonical_recovery import (
     DEFAULT_BUDGET_WINDOW_S,
-    MAX_BLOCKED_IDLE_STEPS,
     MAX_CONSECUTIVE_YIELDS,
     CanonicalRecoveryBudget,
     CanonicalRecoveryCounters,
@@ -2194,8 +2193,6 @@ class Scheduler:
         self._canonical_recovery_counters = CanonicalRecoveryCounters()
         # Wait two idle steps so an arriving request has a step to announce itself.
         self._consecutive_idle_steps = 0
-        # See _canonical_recovery_note_blocked_step.
-        self._canonical_recovery_blocked_idle_steps = 0
         # Arrivals are process-global so a request on any engine holds off recovery on
         # all of them. Entries expire so an unadmitted request cannot block forever.
         self._canonical_recovery_inbound_ttl_s = FOREGROUND_ARRIVAL_TTL_S
@@ -13518,32 +13515,6 @@ class Scheduler:
     def _canonical_recovery_request_id(job: CanonicalRecoveryJob) -> str:
         return f"canonical-recovery:{job.session_key}"
 
-    def _specprefill_rope_installed(self) -> bool:
-        """Whether a SpecPrefill RoPE wrapper is installed on the shared model.
-
-        Checks the layers as well as the id, because `_requeue_or_fail_prefill`
-        clears the id without removing the wrapper.
-        """
-        if self._specprefill_active_request_id is not None:
-            return True
-        try:
-            from .patches.specprefill import (
-                _find_attention_layers,
-                _get_attn_module,
-                is_specprefill_rope,
-            )
-
-            layers = _find_attention_layers(self.model) or ()
-        except Exception:  # noqa: BLE001
-            # If the model cannot be inspected, treat the wrapper as installed.
-            return True
-        for _idx, layer in layers:
-            attn = _get_attn_module(layer)
-            rope = getattr(attn, "rope", None) if attn is not None else None
-            if rope is not None and is_specprefill_rope(rope):
-                return True
-        return False
-
     def _canonical_recovery_foreign_engine_busy(self) -> bool:
         """Foreground work on another engine in this process.
 
@@ -13577,7 +13548,7 @@ class Scheduler:
             waiting_requests=len(self.waiting),
             running_requests=len(self.running),
             prefilling_requests=len(self.prefilling),
-            specprefill_active=self._specprefill_rope_installed(),
+            specprefill_active=self._specprefill_active_request_id is not None,
             inbound_requests=self._canonical_recovery_inbound_count(),
             consecutive_idle_steps=self._consecutive_idle_steps,
             foreign_engine_busy=(
@@ -13832,30 +13803,6 @@ class Scheduler:
         else:
             logger.info("CanonicalRecovery: yielding a chunk to %s", reason)
 
-    def _canonical_recovery_note_blocked_step(self) -> None:
-        """Give up on a job that is allowed to run but keeps not running.
-
-        The usual cause is a SpecPrefill RoPE wrapper left on the model, which
-        `_specprefill_rope_installed` refuses to run under and the job cannot remove.
-        The yield limit does not cover it because no chunk ever starts.
-        """
-        if not self._canonical_recovery_budget.allows():
-            # Waiting on the budget is not a stall.
-            self._canonical_recovery_blocked_idle_steps = 0
-            return
-        self._canonical_recovery_blocked_idle_steps += 1
-        if self._canonical_recovery_blocked_idle_steps < MAX_BLOCKED_IDLE_STEPS:
-            return
-        job = self._canonical_recovery_job
-        logger.warning(
-            "CanonicalRecovery: dropping job after %d idle steps it was allowed to run "
-            "and could not (%d tokens committed)",
-            self._canonical_recovery_blocked_idle_steps,
-            job.committed_tokens if job is not None else 0,
-        )
-        self._canonical_recovery_blocked_idle_steps = 0
-        self._canonical_recovery_drop_job("blocked")
-
     def _canonical_recovery_publish(self, job: CanonicalRecoveryJob, boundary: int, state: Any) -> None:
         """Publish a boundary-aligned prefix through the ordinary store path.
 
@@ -14076,23 +14023,10 @@ class Scheduler:
     def _canonical_recovery_foreground_busy(self) -> bool:
         """Whether a dense forward would be unsafe or unwelcome right now.
 
-        Adds the RoPE wrapper, because a dense forward taken while SpecPrefill
-        has one installed reads another request's position offset.
+        Adds a live SpecPrefill request, whose RoPE wrapper would give a dense
+        forward its position offset.
         """
-        return self._canonical_recovery_local_requests() or self._specprefill_rope_installed()
-
-    def _canonical_recovery_engine_has_foreground(self) -> bool:
-        """Whether a wait that will end is why recovery did not run.
-
-        Leaves out the RoPE wrapper, which may never be removed, so the stall
-        deadline still applies to it.
-        """
-        return bool(
-            self._canonical_recovery_local_requests()
-            or self._canonical_recovery_inbound_count()
-            or self._canonical_recovery_foreign_engine_busy()
-            or self._canonical_recovery_claim_blocked()
-        )
+        return self._canonical_recovery_local_requests() or self._specprefill_active_request_id is not None
 
     def _canonical_recovery_note_step(self, did_foreground_work: bool) -> None:
         """Count idle steps, and stand the recovery job down when work appears."""
@@ -14419,7 +14353,6 @@ class Scheduler:
         """Run one recovery chunk if the engine has been idle for two steps."""
         self._canonical_recovery_note_step(bool(output.has_work))
         if self._canonical_recovery_runnable():
-            self._canonical_recovery_blocked_idle_steps = 0
             ran = self._canonical_recovery_step()
             # Reset on a yield too, so an arrival still gets its idle step.
             self._consecutive_idle_steps = 0
@@ -14433,12 +14366,6 @@ class Scheduler:
             # The slice will not run, so free its state now, on the executor thread.
             with suppress(Exception):
                 self._canonical_recovery_stand_down()
-            if self._canonical_recovery_engine_has_foreground():
-                self._canonical_recovery_blocked_idle_steps = 0
-            else:
-                self._canonical_recovery_note_blocked_step()
-        else:
-            self._canonical_recovery_blocked_idle_steps = 0
 
     def _publish_admin_snapshot(self) -> None:
         """Atomically publish a fresh admin-visible snapshot.
@@ -14500,7 +14427,6 @@ class Scheduler:
             self._canonical_recovery_budget.reset()
         self._canonical_recovery_counters = CanonicalRecoveryCounters()
         self._consecutive_idle_steps = 0
-        self._canonical_recovery_blocked_idle_steps = 0
         _mtp_priming.clear_owned(getattr(self, "model", None))
         with suppress(Exception):
             get_decode_activity().remove(self._decode_activity_key)

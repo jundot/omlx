@@ -11,13 +11,6 @@ than being rediscovered by a later review.
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from omlx.patches.specprefill import (
-    _ROPE_WRAPPERS,
-    _OffsetAdjustedRoPE,
-    _PositionMappedRoPE,
-    _unwrap_rope,
-    is_specprefill_rope,
-)
 from omlx.scheduler import Scheduler, SchedulerConfig
 
 
@@ -739,101 +732,6 @@ class TestStoreWorkerLifecycle:
         ) as worker:
             scheduler._canonical_recovery_publish(job, 256, state)
         assert worker.call_args.kwargs["retain_request_entry"] is True
-
-
-class TestRopeGuard:
-    """The guard has to read the model, not the bookkeeping variable.
-
-    `_handle_prefill_oom` clears `_specprefill_active_request_id` without
-    calling `cleanup_rope`, and the patch module documents the leftover wrapper
-    as an expected state. A dense forward taken while it is installed reads
-    another request's position offset, and the recovery job would publish
-    positionally wrong KV as ordinary canonical state.
-    """
-
-    def _layer_with_rope(self, rope):
-        attn = SimpleNamespace(rope=rope)
-        return SimpleNamespace(self_attn=attn)
-
-    def test_a_leftover_wrapper_blocks_the_canonical_recovery_with_the_id_already_clear(self):
-        scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
-        scheduler._consecutive_idle_steps = 5
-        assert scheduler._specprefill_active_request_id is None
-
-        wrapper = _OffsetAdjustedRoPE(SimpleNamespace(), adjustment=8)
-        scheduler.model.layers = [self._layer_with_rope(wrapper)]
-        assert scheduler._specprefill_rope_installed()
-        assert not scheduler._canonical_recovery_runnable()
-
-    def test_the_guard_does_not_depend_on_the_wrapper_class_name(self):
-        """A rename must not turn the guard off.
-
-        The guard used to compare ``type(rope).__name__`` against two literals,
-        so renaming a wrapper in the patch module would have reported that no
-        wrapper was installed and allowed the dense forward the guard exists to
-        prevent — a failure that is silent and open, and that no test with a
-        correctly named stub could have caught.
-        """
-        scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
-        scheduler._consecutive_idle_steps = 5
-
-        wrapper = _PositionMappedRoPE(SimpleNamespace(dims=64, base=10000.0, scale=1.0), [0, 1, 2])
-        renamed = type("SomethingElseEntirely", (type(wrapper),), {})
-        wrapper.__class__ = renamed
-        assert type(wrapper).__name__ not in (
-            "_OffsetAdjustedRoPE",
-            "_PositionMappedRoPE",
-        )
-
-        scheduler.model.layers = [self._layer_with_rope(wrapper)]
-        assert scheduler._specprefill_rope_installed()
-        assert not scheduler._canonical_recovery_runnable()
-
-    def test_every_registered_wrapper_both_unwinds_and_is_recognised(self):
-        """The two questions read one registry and cannot disagree.
-
-        A wrapper that unwinds but is not recognised lets a dense forward run
-        under a sparse prefill's positions; one that is recognised but does not
-        unwind nests on the next request. Both follow from a wrapper being
-        added to the module and left out of ``_ROPE_WRAPPERS``.
-        """
-        original = SimpleNamespace(dims=64, base=10000.0, scale=1.0)
-        built = {
-            _OffsetAdjustedRoPE: _OffsetAdjustedRoPE(original, adjustment=8),
-            _PositionMappedRoPE: _PositionMappedRoPE(original, [0, 1, 2]),
-        }
-        assert set(built) == set(_ROPE_WRAPPERS)
-        for wrapper in built.values():
-            assert is_specprefill_rope(wrapper)
-            assert _unwrap_rope(wrapper) is original
-
-    def test_an_ordinary_rope_does_not_block_recovery(self):
-        scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
-        scheduler._consecutive_idle_steps = 5
-
-        class RoPE:
-            pass
-
-        scheduler.model.layers = [self._layer_with_rope(RoPE())]
-        assert not is_specprefill_rope(scheduler.model.layers[0].self_attn.rope)
-        assert not scheduler._specprefill_rope_installed()
-        assert scheduler._canonical_recovery_runnable()
-
-    def test_a_model_that_cannot_be_inspected_is_treated_as_patched(self):
-        scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
-        scheduler._consecutive_idle_steps = 5
-        type(scheduler.model).layers = property(
-            lambda self: (_ for _ in ()).throw(RuntimeError("no layers"))
-        )
-        try:
-            assert scheduler._specprefill_rope_installed()
-            assert not scheduler._canonical_recovery_runnable()
-        finally:
-            del type(scheduler.model).layers
 
 
 class TestYieldBudget:

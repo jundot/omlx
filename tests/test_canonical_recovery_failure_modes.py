@@ -931,9 +931,7 @@ class TestACanonicalRecoveryFailureCannotFailTheBatch:
     answers an escaped exception by calling `fail_all_requests()` — every live
     request in the batch errored, by background work whose worst permitted
     outcome is losing its own progress. Several calls in that window are
-    unguarded; `_specprefill_rope_installed` is the clearest, because its
-    `try` covers the import and `_find_attention_layers` but not the loop that
-    reads each layer's `.rope`.
+    unguarded, such as the arrival registry's `expire` in the idle count.
     """
 
     def test_a_raising_idle_judgement_does_not_escape_the_step(self):
@@ -948,11 +946,10 @@ class TestACanonicalRecoveryFailureCannotFailTheBatch:
         assert not scheduler.has_requests()
 
     def test_a_raising_runnable_predicate_does_not_escape_the_step(self):
-        """The RoPE inspection lives behind this one."""
         scheduler = _make_scheduler()
         _queued(scheduler)
         with patch.object(
-            scheduler, "_canonical_recovery_runnable", side_effect=RuntimeError("no rope")
+            scheduler, "_canonical_recovery_runnable", side_effect=RuntimeError("boom")
         ):
             output = scheduler.step()
         assert output is not None

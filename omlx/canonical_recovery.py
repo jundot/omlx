@@ -24,10 +24,6 @@ logger = logging.getLogger(__name__)
 # keep an idle engine awake.
 MAX_CONSECUTIVE_YIELDS = 8
 
-# Idle steps a job may be allowed to run and still not run (a leftover SpecPrefill RoPE
-# wrapper blocks it and the job cannot remove it). About ten seconds at 50 ms steps.
-MAX_BLOCKED_IDLE_STEPS = 200
-
 # The allowance refills per window, so one early overrun delays the job instead
 # of ending it.
 DEFAULT_BUDGET_WINDOW_S = 30.0
