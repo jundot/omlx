@@ -58,8 +58,10 @@ def test_socket_side_channel_orders_ranks_and_reuses_connections(monkeypatch):
     }
 
 
-def test_sidecar_orders_ranks_without_using_parent_network(monkeypatch):
+def test_sidecar_orders_ranks_without_using_parent_network(monkeypatch, tmp_path):
     port = _free_loopback_port()
+    # oMLX.app exports PYTHONHOME for its bundled interpreter.
+    monkeypatch.setenv("PYTHONHOME", str(tmp_path))
     monkeypatch.setenv("MLX_JACCL_COORDINATOR", f"127.0.0.1:{port}")
     monkeypatch.setenv("OMLX_JACCL_SIDE_CHANNEL_TIMEOUT_SECONDS", "3")
     monkeypatch.setenv("OMLX_JACCL_SIDE_CHANNEL_TRANSPORT", "sidecar")

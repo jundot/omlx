@@ -56,18 +56,19 @@ def _composed(qkv, conv_state, conv1d):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("seq", [2, 3, 4, 5, 7, 9])
 @pytest.mark.parametrize("batch", [1, 2, 4])
-def test_fused_prework_bit_exact(seq, batch):
+def test_fused_prework_bit_exact(seq, batch, dtype):
     mx.random.seed(11)
-    conv_w = (mx.random.normal((C, 4, 1)) * 0.2).astype(mx.bfloat16)
+    conv_w = (mx.random.normal((C, 4, 1)) * 0.2).astype(dtype)
     conv1d = nn.Conv1d(C, C, kernel_size=4, groups=C, bias=False)
     conv1d.weight = conv_w
-    qkv = (mx.random.normal((batch, seq, C)) * 0.5).astype(mx.bfloat16)
-    state = (mx.random.normal((batch, 3, C)) * 0.5).astype(mx.bfloat16)
+    qkv = (mx.random.normal((batch, seq, C)) * 0.5).astype(dtype)
+    state = (mx.random.normal((batch, 3, C)) * 0.5).astype(dtype)
     inv = DK**-0.5
-    q_scale = mx.array(inv * inv, dtype=mx.bfloat16)
-    k_scale = mx.array(inv, dtype=mx.bfloat16)
+    q_scale = mx.array(inv * inv, dtype=dtype)
+    k_scale = mx.array(inv, dtype=dtype)
 
     ref = _composed(qkv, state, conv1d)
     got = gdn_prework_fused(qkv, state, conv_w, q_scale, k_scale, HK, HV, DK, DV)
@@ -888,6 +889,81 @@ def test_batched_verify_preserves_output_and_all_rollback_states(
     assert all(
         mx.array_equal(a, b).item() for a, b in zip(cache.state, reference_cache.state)
     )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("batch,retained", [(1, [3]), (1, [8]), (3, [1, 8, 5])])
+def test_fused_verify_replays_committed_rows_in_the_next_block(
+    monkeypatch, batch, retained, dtype
+):
+    """The fused verify stores no per-row states: a commit leaves a lazy replay
+    that the next block applies in its own launch. Outputs and committed states
+    stay bit-exact to the stock recording path across two blocks. fp16 allows
+    one ulp: on M1/M2 MLX's softplus rounds tiny values differently."""
+    import copy
+
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.qwen3_5 import language as q35
+
+    from omlx.patches import qwen35_gdn_verify_fused as fused_mod
+
+    args = SimpleNamespace(
+        hidden_size=64,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        rms_norm_eps=1e-6,
+    )
+    seq = 8
+    mx.random.seed(71)
+    module = q35.Qwen3_5GatedDeltaNet(args)
+    module.set_dtype(dtype)
+    module.eval()
+    blocks = [mx.random.normal((batch, seq, 64)).astype(dtype) for _ in range(2)]
+    cache = ArraysCache(size=2)
+    cache[0] = mx.random.normal((batch, 3, module.conv_dim)).astype(dtype)
+    cache[1] = mx.random.normal((batch, 4, 128, 128)) * 0.01
+    reference_cache = copy.deepcopy(cache)
+    verifier = Qwen3_5BatchInvariantForward()
+
+    def run(target, inputs):
+        transaction = start_speculative_cache([target], seq)
+        out = verifier._gated_delta(module, inputs, None, target)
+        mx.eval(out)
+        return out, transaction
+
+    expected = []
+    for inputs in blocks:
+        out, transaction = run(reference_cache, inputs)
+        transaction.commit(retained)
+        expected.append(out)
+
+    monkeypatch.setattr(prework_mod, "_PATCHED", False)
+    assert prework_mod.apply_qwen35_gdn_prework_patch()
+    replays = []
+    kernel = fused_mod._kernel
+
+    def record(main, replay):
+        replays.append((main, replay))
+        return kernel(main, replay)
+
+    monkeypatch.setattr(fused_mod, "_kernel", record)
+    def same(actual, reference):
+        if dtype == mx.bfloat16:
+            return mx.array_equal(actual, reference).item()
+        return mx.allclose(actual, reference, rtol=2e-3, atol=1e-6).item()
+
+    for index, inputs in enumerate(blocks):
+        out, transaction = run(cache, inputs)
+        assert same(out, expected[index])
+        transaction.commit(retained)
+    # The second block folded the first block's commit into its own launch.
+    assert (True, True) in replays
+    for actual, reference in zip(cache.state, reference_cache.state):
+        assert same(actual, reference)
 
 
 def test_qwen4_decode_setting_is_captured_per_model(monkeypatch):

@@ -1765,7 +1765,9 @@ def install_unequal_pipeline_plan(
 
     original = PipelineMixin.pipeline
 
-    def planned_pipeline(pipeline_model: Any, group: Any) -> None:
+    # Model overrides forward MLX-LM's ``split``. The plan replaces that
+    # split, so it is accepted and ignored.
+    def planned_pipeline(pipeline_model: Any, group: Any, split: Any = None) -> None:
         apply_pipeline_assignment(pipeline_model, group, assignments)
 
     # The worker's pre-load memory guard looks for this exact contract. A
