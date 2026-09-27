@@ -1004,11 +1004,7 @@ class TestBatchedEngineSpecPrefillForwarding:
             generate=AsyncMock(return_value=self._fake_output())
         )
 
-        # The boundary is measured against the rendered prompt, so the fake
-        # template has to render like a real one: a static leading block, then
-        # the conversation. See tests/test_specprefill_boundary.py for the
-        # full matrix; here we only check the engine wires it up and that the
-        # protected prefix actually covers the system text.
+        # A fake template with a static leading block, then the conversation.
         static_block = "<sys> you are helpful </sys>"
 
         def fake_template(msgs, *args, **kwargs):
