@@ -848,6 +848,161 @@ class TestParallelFetch:
         assert live["peak"] <= 4 * 9  # batch x tensors per expert
         assert live["now"] == 0  # nothing left holding bytes
 
+    def test_overlap_dispatches_gather_before_the_first_write(
+        self, tmp_path, monkeypatch
+    ):
+        """Fetch/compute overlap: the resident routes' gather is dispatched
+        before any miss is read, evaluated before the first slot write, the
+        layer's output is dispatched last, and the output is bit-identical to
+        the resident model either way. Keepalive pulses may interleave while
+        reads are pending; they do not change the order of the three."""
+        import omlx.patches.moe_expert_offload as meo
+
+        glu = _make_glu(seed=12)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        x = mx.random.normal((1, 1, D))
+        warm = mx.array([[[0, 1]]], dtype=mx.int32)  # experts 0, 1 resident
+        idx = mx.array([[[0, 9]]], dtype=mx.int32)  # 0 hits, 9 misses
+        ref = glu(x, idx)
+        mx.eval(ref)
+
+        def run(overlap):
+            model, cache = self._wrap(tmp_path, glu, "4", monkeypatch)
+            w = model.layers[0].experts.switch_glu
+            w._overlap = overlap
+            w(x, warm)
+            order = []
+            async_eval, sync_eval, install = mx.async_eval, mx.eval, cache._install
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    meo.mx,
+                    "async_eval",
+                    lambda *a: (order.append("gather"), async_eval(*a))[1],
+                )
+                patch.setattr(
+                    meo.mx,
+                    "eval",
+                    lambda *a: (order.append("barrier"), sync_eval(*a))[1],
+                )
+                patch.setattr(
+                    cache,
+                    "_install",
+                    lambda e, payload=None: (
+                        order.append("write"),
+                        install(e, payload),
+                    )[1],
+                )
+                out = w(x, idx)
+            mx.eval(out)
+            return out, order, (cache.hits, cache.misses)
+
+        on, on_order, on_counts = run(True)
+        off, off_order, off_counts = run(False)
+        assert bool(mx.array_equal(ref, on)) and bool(mx.array_equal(ref, off))
+        assert on_order[:2] == ["gather", "barrier"]  # dispatched, then evaluated
+        assert on_order.index("write") > 1  # ... both before the first slot write
+        assert on_order[-1] == "gather"  # the output, dispatched early
+        assert off_order == ["write"]
+        assert on_counts == off_counts == (1, 3)
+
+    def test_overlap_keeps_gpu_busy_while_reads_are_pending(
+        self, tmp_path, monkeypatch
+    ):
+        """While the overlap path waits on slow reads it keeps submitting GPU
+        work (the keepalive); the output stays bit-identical to the resident
+        model, and with the overlap off nothing is submitted."""
+        import time
+
+        import omlx.patches.moe_expert_offload as meo
+
+        glu = _make_glu(seed=14)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        x = mx.random.normal((1, 1, D))
+        warm = mx.array([[[0, 1]]], dtype=mx.int32)
+        idx = mx.array([[[0, 9]]], dtype=mx.int32)  # 0 hits, 9 misses
+        ref = glu(x, idx)
+        mx.eval(ref)
+        read = meo.CheckpointExpertStore.read
+
+        def slow_read(plan):
+            time.sleep(0.02)
+            return read(plan)
+
+        def run(overlap):
+            model, _ = self._wrap(tmp_path, glu, "4", monkeypatch)
+            w = model.layers[0].experts.switch_glu
+            w._overlap = overlap
+            w(x, warm)
+            submitted = []
+            async_eval = mx.async_eval
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    meo.CheckpointExpertStore, "read", staticmethod(slow_read)
+                )
+                patch.setattr(
+                    meo.mx,
+                    "async_eval",
+                    lambda *a: (submitted.append(1), async_eval(*a))[1],
+                )
+                out = w(x, idx)
+                mx.eval(out)
+            return out, len(submitted)
+
+        on, n_on = run(True)
+        off, n_off = run(False)
+        assert bool(mx.array_equal(ref, on)) and bool(mx.array_equal(ref, off))
+        assert n_on > 2 + 5  # the gather and the output, plus pulses during the reads
+        assert n_off == 0
+
+    def test_overlap_matches_serial_cache_state(self, tmp_path, monkeypatch):
+        """Overlap on and off are indistinguishable in everything but timing:
+        outputs, slot contents, LRU order and counters, over decode steps that
+        hit, miss and evict. With the serial reader the overlap stays off."""
+        import omlx.patches.moe_expert_offload as meo
+
+        glu = _make_glu(seed=13)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        mx.random.seed(17)
+        steps = [(mx.random.normal((2, 1, D)), _ri(2, 1, K)) for _ in range(16)]
+        refs = [glu(x, i) for x, i in steps]
+        mx.eval(*refs)
+
+        def run(overlap, workers):
+            model, cache = self._wrap(tmp_path, glu, workers, monkeypatch)
+            w = model.layers[0].experts.switch_glu
+            w._overlap = overlap
+            dispatched = []
+            async_eval = mx.async_eval
+            outs = []
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    meo.mx,
+                    "async_eval",
+                    lambda *a: (dispatched.append(1), async_eval(*a))[1],
+                )
+                for x, i in steps:  # one step evaluated before the next
+                    out = w(x, i)
+                    mx.eval(out)
+                    outs.append(out)
+            return cache, outs, len(dispatched)
+
+        serial, out_serial, n_serial = run(False, "8")
+        overlap, out_overlap, n_overlap = run(True, "8")
+        _, out_one, n_one = run(True, "1")
+        assert n_serial == 0 and n_one == 0 and n_overlap > 0
+        assert overlap.misses > overlap.capacity  # evictions happened
+        for ref, a, b, d in zip(refs, out_serial, out_overlap, out_one):
+            for got in (a, b, d):
+                assert bool(mx.array_equal(ref, got))
+        assert list(serial.slot_of.items()) == list(overlap.slot_of.items())
+        assert serial.free == overlap.free
+        assert (serial.hits, serial.misses) == (overlap.hits, overlap.misses)
+        assert bool(mx.array_equal(serial.map, overlap.map))
+        for proj in serial.projs:
+            for a, b in zip(serial.resident[proj], overlap.resident[proj]):
+                if a is not None:
+                    assert bool(mx.array_equal(a, b))
+
 
 @pytest.mark.slow
 class TestRealGeometry:
