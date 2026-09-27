@@ -440,6 +440,28 @@ class DownloadStatus(str, enum.Enum):
     CANCELLED = "cancelled"
 
 
+def _read_float(value, default: float = 0.0) -> float:
+    """A number this build cannot read reads as its default, never a raise.
+
+    Persisted rows outlive the code that wrote them: an ISO timestamp where a
+    float belongs, a counter stored as text, a JSON null. Every reader of the
+    queue file funnels through here (and :func:`_read_int`) so one such field
+    costs only that field, not the row.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _read_int(value, default: int = 0) -> int:
+    """Integer twin of :func:`_read_float`; see why there."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass
 class DownloadTask:
     """Represents a single model download task."""
@@ -488,7 +510,11 @@ class DownloadTask:
 
         Used to restore rows after a restart. An unknown status value (a row
         written by a newer build) folds into FAILED so the entry still
-        displays and stays retryable instead of crashing the queue load.
+        displays and stays retryable instead of crashing the queue load, and
+        every numeric field is read through _read_float/_read_int for the same
+        reason: a timestamp or counter this build cannot parse must not cost
+        the whole row — only a missing task_id/repo_id (the row's identity)
+        makes it unpersistable.
         """
         task = cls(
             task_id=str(data["task_id"]),
@@ -501,19 +527,19 @@ class DownloadTask:
             task.status = DownloadStatus(data.get("status") or "")
         except ValueError:
             task.status = DownloadStatus.FAILED
-        task.progress = float(data.get("progress", 0.0))
-        task.total_size = int(data.get("total_size", 0))
-        task.downloaded_size = int(data.get("downloaded_size", 0))
+        task.progress = _read_float(data.get("progress"))
+        task.total_size = _read_int(data.get("total_size"))
+        task.downloaded_size = _read_int(data.get("downloaded_size"))
         # Nothing transfers at boot: a restored row always reads 0 B/s.
         task.speed_bps = 0.0
         task.error = str(data.get("error", ""))
         # Credential for a later retry/resume; rows written before the
         # token field existed simply fall back to hub's env/login lookup.
         task.token = str(data.get("token") or "")
-        task.created_at = float(data.get("created_at") or 0.0) or task.created_at
-        task.started_at = float(data.get("started_at") or 0.0)
-        task.completed_at = float(data.get("completed_at") or 0.0)
-        task.retry_count = int(data.get("retry_count") or 0)
+        task.created_at = _read_float(data.get("created_at")) or task.created_at
+        task.started_at = _read_float(data.get("started_at"))
+        task.completed_at = _read_float(data.get("completed_at"))
+        task.retry_count = _read_int(data.get("retry_count"))
         return task
 
 
@@ -838,18 +864,12 @@ def _restore_created_at(entry: dict) -> float:
     whole restore, and outside it the assignment would drop every row behind
     it as well as the healing rewrite that follows.
     """
-    try:
-        return float(entry.get("created_at") or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
+    return _read_float(entry.get("created_at"))
 
 
 def _restore_retry_count(entry: dict) -> int:
     """A retry count this build cannot read reads as none rather than raising."""
-    try:
-        return int(entry.get("retry_count") or 0)
-    except (TypeError, ValueError):
-        return 0
+    return _read_int(entry.get("retry_count"))
 
 # Every xet download group still in flight. snapshot_download shards files
 # across hf_thread_map workers, so one snapshot runs many xet_get() calls
@@ -1670,12 +1690,17 @@ class HFDownloader:
         token, which falls back to HF_TOKEN/the login cache, and a resume
         that still fails on auth lands in FAILED where the user can
         re-enter a credential and retry. Never raises: a corrupt queue file
-        only loses the queue.
+        only loses the queue, and a row the environment refuses (e.g. a hub
+        that is not importable) stays on disk for a boot that can start it.
         """
         entries = _read_tasks_file(self._tasks_file)
         if not entries:
             return
         self._restoring = True
+        # Set when a row could not start for a reason that is not the row's
+        # own (the environment refused it). Those rows must stay on disk for
+        # the next boot, so the healing rewrite below is skipped entirely.
+        deferred = False
         try:
             for entry in sorted(
                 (e for e in entries if isinstance(e, dict)),
@@ -1694,9 +1719,26 @@ class HFDownloader:
                             repo_id, str(entry.get("token") or "")
                         )
                     except ValueError as exc:
+                        # The row itself is bad (invalid repo id, already
+                        # queued): it can never start, so let the rewrite
+                        # below forget it.
                         logger.warning(
                             "Could not resume download %s: %s", repo_id, exc
                         )
+                        continue
+                    except Exception as exc:  # noqa: BLE001 — restore never raises
+                        # Not the row's fault: start_download refused the
+                        # environment (an SDK that went away between boots, an
+                        # unexpected failure upstream). Keep restoring the rows
+                        # behind it and leave the on-disk queue untouched, so
+                        # the next boot retries this one instead of the healing
+                        # rewrite dropping it.
+                        logger.warning(
+                            "Deferring resume of %s to the next boot: %s",
+                            repo_id,
+                            exc,
+                        )
+                        deferred = True
                         continue
                     # Keep the pre-restart queue position and retry history.
                     # A row this build cannot read keeps the fresh task's own
@@ -1717,7 +1759,8 @@ class HFDownloader:
                 self._tasks.setdefault(task.task_id, task)
         finally:
             self._restoring = False
-        self._persist()
+        if not deferred:
+            self._persist()
 
     async def shutdown(self) -> None:
         """Cancel all active downloads and clean up."""

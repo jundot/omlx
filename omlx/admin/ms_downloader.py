@@ -903,12 +903,19 @@ class MSDownloader:
         when a row carries none, an empty token leaves the ModelScope SDK to
         its normal env/anonymous fallback, and a resume that still fails on
         auth lands in FAILED where the user can re-enter a credential and
-        retry. Never raises: a corrupt queue file only loses the queue.
+        retry. Never raises: a corrupt queue file only loses the queue, and a
+        row the environment refuses (start_download raising anything but
+        ValueError — the ModelScope SDK disappearing between boots is the
+        real case) stays on disk for a boot that can start it.
         """
         entries = _read_tasks_file(self._tasks_file)
         if not entries:
             return
         self._restoring = True
+        # Set when a row could not start for a reason that is not the row's
+        # own (the environment refused it). Those rows must stay on disk for
+        # the next boot, so the healing rewrite below is skipped entirely.
+        deferred = False
         try:
             for entry in sorted(
                 (e for e in entries if isinstance(e, dict)),
@@ -927,9 +934,25 @@ class MSDownloader:
                             repo_id, str(entry.get("token") or "")
                         )
                     except ValueError as exc:
+                        # The row itself is bad (invalid model id, already
+                        # queued): it can never start, so let the rewrite
+                        # below forget it.
                         logger.warning(
                             "Could not resume download %s: %s", repo_id, exc
                         )
+                        continue
+                    except Exception as exc:  # noqa: BLE001 — restore never raises
+                        # Not the row's fault: the SDK gate in start_download
+                        # raises RuntimeError when modelscope is not installed.
+                        # Keep restoring the rows behind it and leave the
+                        # on-disk queue untouched, so the next boot retries
+                        # this one instead of the healing rewrite dropping it.
+                        logger.warning(
+                            "Deferring resume of %s to the next boot: %s",
+                            repo_id,
+                            exc,
+                        )
+                        deferred = True
                         continue
                     # Keep the pre-restart queue position and retry history.
                     # A row this build cannot read keeps the fresh task's own
@@ -950,7 +973,8 @@ class MSDownloader:
                 self._tasks.setdefault(task.task_id, task)
         finally:
             self._restoring = False
-        self._persist()
+        if not deferred:
+            self._persist()
 
     async def shutdown(self) -> None:
         """Cancel all active downloads and clean up."""

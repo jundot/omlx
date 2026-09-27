@@ -4636,6 +4636,111 @@ class TestQueuePersistence:
         assert written["owner/unknown"]["status"] == DownloadStatus.FAILED.value
 
     @pytest.mark.asyncio
+    async def test_a_terminal_row_with_unreadable_numbers_still_restores(
+        self, downloader, tasks_file
+    ):
+        """A finished row gets the same tolerance the queued branch has.
+
+        The case above feeds an ISO timestamp and a text retry count to a
+        *queued* row (the _restore_* readers handle those). The same fields on
+        a *finished* row go through from_dict, which parsed every number
+        eagerly: one unparseable value raised, restore skipped the row, and
+        its display, error text and retry entry were lost — exactly what the
+        resumable branch is built to avoid.
+        """
+        tasks_file.parent.mkdir(parents=True, exist_ok=True)
+        tasks_file.write_text(
+            json.dumps(
+                [
+                    {
+                        "task_id": "junk",
+                        "repo_id": "owner/junk",
+                        "status": DownloadStatus.FAILED.value,
+                        "error": "boom",
+                        "progress": "n/a",
+                        "total_size": "big",
+                        "downloaded_size": None,
+                        "created_at": "2026-09-25T00:00:00",
+                        "started_at": [],
+                        "completed_at": {},
+                        "retry_count": "many",
+                    },
+                    {
+                        "task_id": "good",
+                        "repo_id": "owner/good",
+                        "status": DownloadStatus.COMPLETED.value,
+                        "created_at": 5.0,
+                        "retry_count": 1,
+                    },
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        await downloader.restore_tasks()
+
+        junk = downloader._tasks["junk"]
+        assert junk.status == DownloadStatus.FAILED
+        assert junk.error == "boom"
+        assert junk.progress == 0.0
+        assert junk.total_size == 0
+        assert junk.downloaded_size == 0
+        assert junk.retry_count == 0
+        assert junk.created_at  # the restore time, not 0.0
+        # ...and the healthy row behind it still restores.
+        assert downloader._tasks["good"].status == DownloadStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_a_row_start_download_refuses_stays_queued_on_disk(
+        self, downloader, tasks_file, caplog
+    ):
+        """`restore_tasks` promises never to raise — and a refusal that is not
+        the row's own must not cost the row either: the restore keeps going,
+        the healing rewrite is skipped, and the queue file stays byte-for-byte
+        so the next boot retries the interrupted row.
+        """
+        tasks_file.parent.mkdir(parents=True, exist_ok=True)
+        tasks_file.write_text(
+            json.dumps(
+                [
+                    {
+                        "task_id": "live",
+                        "repo_id": "owner/live",
+                        "status": DownloadStatus.DOWNLOADING.value,
+                        "created_at": 10.0,
+                    },
+                    {
+                        "task_id": "done",
+                        "repo_id": "owner/done",
+                        "status": DownloadStatus.COMPLETED.value,
+                        "created_at": 20.0,
+                    },
+                ]
+            ),
+            encoding="utf-8",
+        )
+        before = tasks_file.read_text(encoding="utf-8")
+
+        async def _refused(self, repo_id, hf_token):
+            raise RuntimeError("hub is not importable right now")
+
+        with (
+            patch.object(HFDownloader, "start_download", new=_refused),
+            caplog.at_level(logging.WARNING),
+        ):
+            await downloader.restore_tasks()
+
+        # The restore kept its promise and carried on: the terminal row came back.
+        assert downloader._tasks["done"].status == DownloadStatus.COMPLETED
+        # The row that could not start is not in memory...
+        assert "owner/live" not in {
+            t.repo_id for t in downloader._tasks.values()
+        }
+        # ...and is still queued on disk, byte for byte.
+        assert tasks_file.read_text(encoding="utf-8") == before
+        assert "Deferring resume of owner/live" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_restore_resumes_duplicate_interrupted_repo_once(
         self, downloader, tasks_file
     ):

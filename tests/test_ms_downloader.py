@@ -1293,6 +1293,55 @@ class TestMSQueuePersistence:
         assert "ms_SUPERSECRET" not in caplog.text
 
     @pytest.mark.asyncio
+    async def test_restore_defers_rows_the_sdk_cannot_start(
+        self, downloader, tasks_file, caplog
+    ):
+        """Without the ModelScope SDK, `start_download` raises RuntimeError —
+        a refusal that is not the row's own. `restore_tasks` promises never to
+        raise, so it must carry on (terminal rows still come back) and leave
+        the queue file untouched: the healing rewrite would otherwise drop the
+        interrupted row, and the next boot — with the SDK installed — would
+        find an empty queue.
+        """
+        tasks_file.parent.mkdir(parents=True, exist_ok=True)
+        tasks_file.write_text(
+            json.dumps(
+                [
+                    {
+                        "task_id": "live",
+                        "repo_id": "owner/live",
+                        "status": DownloadStatus.DOWNLOADING.value,
+                        "created_at": 10.0,
+                    },
+                    {
+                        "task_id": "done",
+                        "repo_id": "owner/done",
+                        "status": DownloadStatus.COMPLETED.value,
+                        "created_at": 20.0,
+                    },
+                ]
+            ),
+            encoding="utf-8",
+        )
+        before = tasks_file.read_text(encoding="utf-8")
+
+        with (
+            patch("omlx.admin.ms_downloader.MS_SDK_AVAILABLE", False),
+            caplog.at_level(logging.WARNING),
+        ):
+            await downloader.restore_tasks()
+
+        # The restore kept going: the terminal row came back for display.
+        assert downloader._tasks["done"].status == DownloadStatus.COMPLETED
+        # The row that could not start is not in memory...
+        assert "owner/live" not in {
+            t.repo_id for t in downloader._tasks.values()
+        }
+        # ...and is still queued on disk, byte for byte.
+        assert tasks_file.read_text(encoding="utf-8") == before
+        assert "Deferring resume of owner/live" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_credential_persists_and_restores_without_reaching_api(
         self, downloader, tasks_file
     ):
