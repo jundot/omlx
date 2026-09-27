@@ -10727,6 +10727,7 @@ class Scheduler:
         # failed_ids excludes _inflight_store_futures ids, so snapshots the
         # async store worker still reads are left intact.
         for rid in failed_ids:
+            self._cleanup_specprefill(rid)
             self._drop_boundary_snapshots_for_request(rid)
             self._release_paged_cache_for_request(rid)
         # Reset batch generator only (cache is not corrupted). Every row dies
@@ -12870,6 +12871,10 @@ class Scheduler:
             self._boundary_snapshot_store.cleanup_all()
         self._boundary_snapshot_required = None
 
+        active_specprefill = self._specprefill_active_request_id
+        if active_specprefill is not None:
+            self._cleanup_specprefill(active_specprefill)
+
         # Clear stale VLM position state to prevent re-corruption on retry
         if hasattr(self.model, "clear_vlm_position_state"):
             self.model.clear_vlm_position_state()
@@ -12948,6 +12953,8 @@ class Scheduler:
         request._extracted_cache = None
         request._model_cache_config = None
         request.think_prefix_sent = False
+        # Indices were scored against the pre-reset cached_tokens.
+        request.specprefill_indices = None
 
     def _collect_corruption_retry_requests(self) -> list[Request]:
         """Every live request that must be re-prefilled after a cache reset.
