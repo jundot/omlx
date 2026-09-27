@@ -1594,6 +1594,78 @@ class TestAnthropicMessagesEndpoint:
         ct_kwargs = recorded_chat_kwargs[0].get("chat_template_kwargs") or {}
         assert ct_kwargs.get("enable_thinking") is True
 
+    def test_anthropic_messages_forwards_request_specprefill_overrides(
+        self, client, mock_llm_engine
+    ):
+        """A client can tune SpecPrefill per request, same as /v1/chat/completions."""
+        recorded_chat_kwargs = []
+
+        async def chat(messages, **kwargs):
+            recorded_chat_kwargs.append(kwargs)
+            return MockGenerationOutput(text="Chat response.")
+
+        mock_llm_engine.chat = chat
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "test-model",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "specprefill": True,
+                "specprefill_keep_pct": 0.3,
+                "specprefill_threshold": 4096,
+            },
+        )
+
+        assert response.status_code == 200
+        assert recorded_chat_kwargs
+        assert recorded_chat_kwargs[0]["specprefill"] is True
+        assert recorded_chat_kwargs[0]["specprefill_keep_pct"] == 0.3
+        assert recorded_chat_kwargs[0]["specprefill_threshold"] == 4096
+
+    def test_anthropic_messages_specprefill_falls_back_to_model_settings(
+        self, client, mock_llm_engine
+    ):
+        """Omitting SpecPrefill fields on /v1/messages must not lose the
+        admin's per-model keep_pct/threshold, matching /v1/chat/completions."""
+        from omlx.model_settings import ModelSettings
+        from omlx.server import _server_state
+
+        class StubSettingsManager:
+            def get_settings(self, model_id):
+                return ModelSettings(
+                    specprefill_keep_pct=0.15,
+                    specprefill_threshold=2048,
+                )
+
+        recorded_chat_kwargs = []
+
+        async def chat(messages, **kwargs):
+            recorded_chat_kwargs.append(kwargs)
+            return MockGenerationOutput(text="Chat response.")
+
+        mock_llm_engine.chat = chat
+
+        original_settings_manager = _server_state.settings_manager
+        _server_state.settings_manager = StubSettingsManager()
+        try:
+            response = client.post(
+                "/v1/messages",
+                json={
+                    "model": "test-model",
+                    "max_tokens": 1024,
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+            )
+        finally:
+            _server_state.settings_manager = original_settings_manager
+
+        assert response.status_code == 200
+        assert recorded_chat_kwargs
+        assert recorded_chat_kwargs[0]["specprefill_keep_pct"] == 0.15
+        assert recorded_chat_kwargs[0]["specprefill_threshold"] == 2048
+        assert "specprefill" not in recorded_chat_kwargs[0]
+
 
 class TestEmbeddingsEndpoint:
     """Tests for the /v1/embeddings endpoint."""

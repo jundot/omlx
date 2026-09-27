@@ -6,10 +6,12 @@ request on the OpenAI endpoint but not on the Anthropic one, where the field
 was silently dropped because `MessagesRequest` neither declared it nor allowed
 extras. These tests pin the parity and the shared semantics — omitted leaves
 the model/server setting in charge, true forces on, false forces off.
-"""
 
-import ast
-import inspect
+The forwarding itself (chat_kwargs reaching the engine, including the
+model-settings fallback) is covered by the endpoint tests in
+tests/integration/test_server_endpoints.py::TestAnthropicMessagesEndpoint,
+not here.
+"""
 
 import pytest
 from pydantic import ValidationError
@@ -66,61 +68,3 @@ def test_rejects_wrong_types():
         _messages(specprefill="maybe")
     with pytest.raises(ValidationError):
         _messages(specprefill_threshold="lots")
-
-
-def _forwarding_sources(func, tree=None):
-    """Statements in `func` that assign chat_kwargs["specprefill*"].
-
-    Accepts a pre-parsed tree so a caller that also needs parent links can work
-    against the same node objects; parsing twice yields two disjoint trees.
-    """
-    if tree is None:
-        tree = ast.parse(inspect.getsource(func))
-    out = {}
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
-            continue
-        for target in node.targets:
-            if (isinstance(target, ast.Subscript)
-                    and getattr(target.value, "id", None) == "chat_kwargs"
-                    and isinstance(getattr(target, "slice", None), ast.Constant)
-                    and str(target.slice.value).startswith("specprefill")):
-                out.setdefault(target.slice.value, []).append(node)
-    return out
-
-
-def test_anthropic_handler_forwards_every_field():
-    import omlx.server as srv
-
-    forwarded = _forwarding_sources(srv.create_anthropic_message)
-    for field in SPECPREFILL_FIELDS:
-        assert field in forwarded, f"{field} is not forwarded by /v1/messages"
-
-
-def test_anthropic_forwarding_matches_the_openai_endpoint():
-    """Parity, not a second policy: neither endpoint may set a transport default.
-
-    Every assignment must be reached only when the client supplied something,
-    or via the model-settings fallback — never unconditionally.
-    """
-    import omlx.server as srv
-
-    for func in (srv.create_anthropic_message, srv.create_chat_completion):
-        tree = ast.parse(inspect.getsource(func))
-        parents = {}
-        for node in ast.walk(tree):
-            for child in ast.iter_child_nodes(node):
-                parents[child] = node
-        for field, assigns in _forwarding_sources(func, tree).items():
-            for assign in assigns:
-                guarded = False
-                cur = parents.get(assign)
-                while cur is not None:
-                    if isinstance(cur, ast.If):
-                        guarded = True
-                        break
-                    cur = parents.get(cur)
-                assert guarded, (
-                    f"{func.__name__} sets chat_kwargs[{field!r}] unconditionally; "
-                    "that would be a transport default, not parity"
-                )
