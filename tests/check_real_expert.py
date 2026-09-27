@@ -1,11 +1,13 @@
 """Local opt-in real checkpoint test: copies one expert, never a full bank."""
-import json,struct,time
+import json,struct,time,sys
 from pathlib import Path
 import numpy as np
 import mlx.core as mx
 from omlx.quantization.exl3 import Exl3Spec,Exl3SwitchLinear
 from tests.test_exl3_reference import oracle
-p=Path.home()/'.sushi/models/Qwen3.8-Flash-Next-Sushi-2.6bpw'
+if len(sys.argv) != 2:
+ raise SystemExit('Usage: python -m tests.check_real_expert MODEL_PATH')
+p=Path(sys.argv[1]).expanduser()
 spec=Exl3Spec.from_config(json.load(open(p/'config.json')))
 fpath=p/'model-exl3-L00-down.safetensors'
 with fpath.open('rb') as f:size=struct.unpack('<Q',f.read(8))[0];h=json.loads(f.read(size))
