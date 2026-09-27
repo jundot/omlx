@@ -2541,22 +2541,46 @@ class TestDshPatchWriter:
 
     def test_js_tags_do_not_break_parsing(self, tmp_path):
         # The patch layer allows `!!js` expressions; a route update must not
-        # choke on them or drop them.
+        # choke on them or drop them. Both shapes matter: a tag the reader
+        # cannot construct aborts the write, and a tag inside the entry being
+        # rewritten (or in a sibling entry) must survive it.
         path = tmp_path / "cordis.patch.yml"
         path.write_text(
             "- id: llm-pi-ai\n"
             '  name: "@deepseek-ai/dsh-llm-pi-ai"\n'
             "  config:\n"
+            '    retryPolicy: !!js/object "{ mode: \'normal\' }"\n'
             "    providers:\n"
             "      omlx:\n"
             "        api: openai-completions\n"
             '        baseURL: "http://127.0.0.1:8000/v1"\n'
             "        models:\n"
             "          - id: x\n"
+            "- id: ui-chat\n"
+            '  name: "@deepseek-ai/dsh-client-ui-chat"\n'
+            "  config:\n"
+            '    transcriptView: !!js/string "standard"\n'
         )
 
-        write_dsh_patch(path, "http://127.0.0.1:8000/v1", DSH_MODELS)
-        assert "omlx" in path.read_text()
+        write_dsh_patch(path, "http://127.0.0.1:9000/v1", DSH_MODELS)
+        out = path.read_text()
+
+        # The tagged values are still there, tag and payload included.
+        assert 'retryPolicy: !!js/object "{ mode: \'normal\' }"' in out
+        assert 'transcriptView: !!js/string "standard"' in out
+
+        # And the result still loads: the route moved, the tags did not.
+        from omlx.integrations.dsh import _parse_yaml
+
+        data = _parse_yaml(out, "the written patch")
+        entry = next(e for e in data if e.get("id") == "llm-pi-ai")
+        assert entry["config"]["retryPolicy"] == "{ mode: 'normal' }"
+        assert entry["config"]["providers"]["omlx"]["baseURL"] == (
+            "http://127.0.0.1:9000/v1"
+        )
+        assert [m["id"] for m in entry["config"]["providers"]["omlx"]["models"]] == [
+            m["id"] for m in DSH_MODELS
+        ]
 
 
 class TestDshCredentialsRef:
