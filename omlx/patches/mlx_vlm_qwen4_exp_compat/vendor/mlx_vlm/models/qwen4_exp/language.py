@@ -543,7 +543,6 @@ class QSAKVCache(_QSAIndexerCache, KVCache):
     def state(self, value):
         self.keys, self.values, index_keys, index_position_ids = value
         self.offset = 0 if self.keys is None else self.keys.shape[2]
-        self._geometric_capacity_managed = False
         self._restore_indexer_state(index_keys, index_position_ids)
 
     def trim(self, n):
@@ -562,7 +561,6 @@ class QSAKVCache(_QSAIndexerCache, KVCache):
                 self.values[idx : idx + 1, :, : self.offset, :]
             )
             cache.offset = self.offset
-            cache._geometric_capacity_managed = False
         if self.index_keys is not None:
             index_keys = mx.contiguous(self.index_keys[idx : idx + 1])
             if self.index_position_ids.ndim == 3:
@@ -972,11 +970,6 @@ class BatchQSAKVCache:
         cache = QSAKVCache()
         base = self.kv_cache.extract(idx)
         cache.keys, cache.values, cache.offset = base.keys, base.values, base.offset
-        if cache.keys is not None:
-            # Same contract as QSAKVCache.extract: the exact-width copy is
-            # caller-sized, so the next append rounds to one step instead of
-            # doubling the whole row (2x prompt KV per extracted row).
-            cache._geometric_capacity_managed = False
         if self.index_keys is not None:
             padding = int(self.left_padding[idx].item())
             cache.index_keys = mx.contiguous(
@@ -1156,7 +1149,6 @@ class QSAQuantizedKVCache(_QSAIndexerCache, QuantizedKVCache):
     def state(self, value):
         self.keys, self.values, index_keys, index_position_ids = value
         self.offset = 0 if self.keys is None else self.keys[0].shape[2]
-        self._geometric_capacity_managed = False
         self._restore_indexer_state(index_keys, index_position_ids)
 
     def trim(self, n):
@@ -1177,7 +1169,6 @@ class QSAQuantizedKVCache(_QSAIndexerCache, QuantizedKVCache):
                 for x in self.values
             )
             cache.offset = self.offset
-            cache._geometric_capacity_managed = False
         if self.index_keys is not None:
             index_keys = mx.contiguous(self.index_keys[idx : idx + 1])
             if self.index_position_ids.ndim == 3:

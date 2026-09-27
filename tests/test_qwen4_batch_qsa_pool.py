@@ -97,7 +97,6 @@ def test_batch_extract_rounds_first_append_to_one_step():
     length = 5000  # 2*L > one 8192 step, so doubling would show
     batch = BatchQSAKVCache.merge([_row(length, 1), _row(length - 3, 11)])
     row = batch.extract(0)
-    assert row._geometric_capacity_managed is False
     row.update_and_fetch(_rnd((1, H, 1, D), 21), _rnd((1, H, 1, D), 22))
     assert row.keys.shape[2] == 8192  # was max(8192, 2 * 5000) = 16384
 

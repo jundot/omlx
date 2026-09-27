@@ -240,7 +240,6 @@ class QuantizedKVCache(_BaseCache):
         self.offset = 0
         self.group_size = group_size
         self.bits = bits
-        self._geometric_capacity_managed = True
 
     def update_and_fetch(self, keys, values):
         B, n_kv_heads, num_steps, k_head_dim = keys.shape
@@ -250,11 +249,9 @@ class QuantizedKVCache(_BaseCache):
         if self.keys is None or (prev + num_steps) > self.keys[0].shape[-2]:
             el_per_int = 8 * mx.uint32.size // self.bits
             if self.geometric_growth:
-                old_capacity = 0 if self.keys is None else self.keys[0].shape[-2]
+                # Round up to one step; never double (see KVCache).
                 needed = prev + num_steps
                 capacity = ((needed + self.step - 1) // self.step) * self.step
-                if old_capacity and self._geometric_capacity_managed:
-                    capacity = max(capacity, 2 * old_capacity)
                 shape = (B, n_kv_heads, capacity)
             else:
                 new_steps = (self.step + num_steps - 1) // self.step * self.step
@@ -286,8 +283,6 @@ class QuantizedKVCache(_BaseCache):
                 )
             else:
                 self.keys, self.values = init_quant(k_head_dim), init_quant(v_head_dim)
-            if self.geometric_growth:
-                self._geometric_capacity_managed = True
 
         self.offset += num_steps
 
@@ -311,7 +306,6 @@ class QuantizedKVCache(_BaseCache):
     @state.setter
     def state(self, v):
         self.keys, self.values = v
-        self._geometric_capacity_managed = False
 
     @property
     def meta_state(self):
@@ -353,13 +347,15 @@ class QuantizedKVCache(_BaseCache):
 
 class KVCache(_BaseCache):
     step = 256
+    # When set, growth copies the logical prefix into a fresh zeroed buffer
+    # rounded up to one ``step`` instead of concatenating a step onto the old
+    # buffer. The historical name is kept; capacity no longer doubles.
     geometric_growth = False
 
     def __init__(self):
         self.keys = None
         self.values = None
         self.offset = 0
-        self._geometric_capacity_managed = True
 
     def update_and_fetch(self, keys, values):
         prev = self.offset
@@ -367,11 +363,13 @@ class KVCache(_BaseCache):
             B, n_kv_heads, _, k_head_dim = keys.shape
             v_head_dim = values.shape[3]
             if self.geometric_growth:
-                old_capacity = 0 if self.keys is None else self.keys.shape[2]
+                # Fixed-step growth. Doubling made capacity
+                # max(ceil_step(L + 1), 2L): a row just past a power of two
+                # (e.g. a 135K prompt) reserved ~2x its KV, and the old and
+                # doubled buffers (3L) coexisted during the copy. The logical
+                # prefix keys[..., :offset] is copied unchanged either way.
                 needed = prev + keys.shape[2]
                 capacity = ((needed + self.step - 1) // self.step) * self.step
-                if old_capacity and self._geometric_capacity_managed:
-                    capacity = max(capacity, 2 * old_capacity)
             else:
                 n_steps = (self.step + keys.shape[2] - 1) // self.step
                 capacity = n_steps * self.step
@@ -392,8 +390,6 @@ class KVCache(_BaseCache):
                     self.values = mx.concatenate([self.values, new_v], axis=2)
             else:
                 self.keys, self.values = new_k, new_v
-            if self.geometric_growth:
-                self._geometric_capacity_managed = True
 
         self.offset += keys.shape[2]
         self.keys[..., prev : self.offset, :] = keys
@@ -417,7 +413,6 @@ class KVCache(_BaseCache):
     def state(self, v):
         self.keys, self.values = v
         self.offset = self.keys.shape[2]
-        self._geometric_capacity_managed = False
 
     def is_trimmable(self):
         return True
