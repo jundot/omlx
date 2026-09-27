@@ -2296,9 +2296,35 @@ class TestDshIntegration:
         assert [m["id"] for m in models] == ["chat-llm", "untyped"]
 
     def test_fetch_models_falls_back_to_selected_model(self):
-        models = DshIntegration()._fetch_models(ctx(model="only-model"))
+        with patch("requests.get", side_effect=Exception("server down")):
+            models = DshIntegration()._fetch_models(ctx(model="only-model"))
 
         assert models == [{"id": "only-model", "name": "only-model", "input": ["text"]}]
+
+    def test_fetch_models_lists_from_endpoint_only_when_status_map_is_empty(self):
+        # Degraded launch: the launcher's status fetch failed (401 under
+        # allow_unauthenticated_inference), so its map is empty and the
+        # inventory comes from GET /v1/models — capacity keys stay absent.
+        list_response = MagicMock()
+        list_response.json.return_value = {
+            "data": [
+                {"id": "chat-llm", "model_type": "llm"},
+                {"id": "embed-bert", "model_type": "embedding"},
+            ]
+        }
+        with patch("requests.get", return_value=list_response) as get:
+            models = DshIntegration()._fetch_models(ctx())
+        assert [m["id"] for m in models] == ["chat-llm"]
+        assert models[0] == {"id": "chat-llm", "name": "chat-llm", "input": ["text"]}
+        assert get.call_count == 1
+
+        # A populated map means the launcher already did the work: the
+        # fallback must not fire a second inventory request.
+        with patch("requests.get", side_effect=AssertionError("fallback fired")):
+            models = DshIntegration()._fetch_models(
+                ctx(models_status_map={"q": {"id": "q", "model_type": "llm"}})
+            )
+        assert [m["id"] for m in models] == ["q"]
 
     def test_launch_opens_app_and_scrubs_session_env(self, monkeypatch):
         calls = {}

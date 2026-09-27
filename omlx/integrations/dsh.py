@@ -657,7 +657,8 @@ class DshIntegration(Integration):
         """Build the route's model list from the launcher's pre-fetched status.
 
         The launcher already fetched ``/v1/models/status`` and passes its map
-        on the context, so a launch never fetches the model status twice.
+        on the context, so a launch never fetches the model status twice; the
+        inventory is only requested when that map came back empty.
         """
         status_map = ctx.models_status_map
         # Display ids in server order: an aliased model sits under both keys.
@@ -666,6 +667,27 @@ class DshIntegration(Integration):
                 info.get("model_alias") or m_id for m_id, info in status_map.items()
             )
         )
+        if not ids:
+            # The launcher's status fetch failed (e.g. a 401 under
+            # allow_unauthenticated_inference, where /v1/models/status needs
+            # a key but /v1/models does not): ask for the inventory once.
+            import requests
+
+            headers = (
+                {"Authorization": f"Bearer {ctx.auth_token}"} if ctx.api_key else {}
+            )
+            try:
+                resp = requests.get(
+                    f"{ctx.base_url}/v1/models", headers=headers, timeout=5
+                )
+                resp.raise_for_status()
+                ids = [
+                    m["id"]
+                    for m in resp.json().get("data", [])
+                    if m.get("id") and m.get("model_type") in ("llm", "vlm", None)
+                ]
+            except Exception:
+                ids = []
         if not ids and ctx.model:
             ids = [ctx.model]
 
