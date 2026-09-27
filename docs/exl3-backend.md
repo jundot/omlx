@@ -26,6 +26,45 @@ Invalid expert ids are clamped before accessing scale/weight banks and produce
 NaN outputs. Floating-point summation differs from a serial reference, so
 numerical tests use explicit FP16-stage tolerances rather than bitwise claims.
 
+## Sushi 1.0.5 reader port
+
+The default EXL3 reader uses the v1.0.5 compile-time funnel extraction for
+all supported even halfword rates, including the 42-halfword 2.625bpw pack.
+Decode processes two output tiles per threadgroup and fetches both k-tiles
+before unpacking. Prefill uses compile-time fragment splits and two funnel
+reads. The previous accumulator and reduction ordering is retained. Set
+`OMLX_EXL3_FAST_READERS=0` before server startup to use the legacy readers;
+this flag is independent of MTP and never changes its acceptance policy.
+The 64-halfword decode path retains the legacy specialization.
+
+M1 Max, MLX 0.32.2, bounded synthetic 16-expert banks, Qwen projection
+geometry, ten ABBA pairs with ten evaluations per sample:
+
+| Projection | Routed rows | Legacy | New | Ratio |
+| --- | ---: | ---: | ---: | ---: |
+| 2560 → 640 | 10 | 0.435 ms | 0.419 ms | 1.04x |
+| 640 → 2560 | 10 | 0.455 ms | 0.383 ms | 1.19x |
+| 2560 → 640 | 128 | 1.416 ms | 1.327 ms | 1.07x |
+| 640 → 2560 | 128 | 1.381 ms | 1.214 ms | 1.14x |
+| 2560 → 640 | 512 | 1.415 ms | 1.201 ms | 1.18x |
+| 640 → 2560 | 512 | 1.389 ms | 1.171 ms | 1.19x |
+
+These are projection-only timings, not guaranteed whole-model gains. All
+fixtures were bit-identical. The 51 reader regressions cover every supported
+rate, wrap boundaries, and old/new decode and matrix-prefill equality; the
+five existing independent CPU projection tests also pass. Reproduce with
+`python -m benchmarks.exl3_readers` and
+`python -m pytest tests/test_exl3_fast_readers.py tests/test_exl3_reference.py`.
+A separate full-model MTP-off comparison used temperature zero, a 2048-token
+context cap and a 64-token output cap, after one load warmup. All four response
+contents matched byte for byte. Wall times (legacy → new) were coding
+4.18 → 3.92 s, chat 3.05 → 2.92 s, reasoning 4.27 → 4.25 s, and a 993-token
+prompt 4.96 → 4.43 s. Loaded allocation was 43.49 → 43.51 GiB; both runs
+kept over 8.9 GiB headroom and passed the post-load paging guard. These are
+single-pair small-context checks, not sustained decode or 128K measurements.
+
+This port does not include upstream GDN/HC changes or approximate typical MTP.
+
 ## Disk-backed n-gram table
 
 Flat `ngram_table.bin` files stamped `mlx-serve-ngram` expose virtual shards to
@@ -118,7 +157,8 @@ both comparisons to finish. Keep normal server memory guards enabled.
 ## Provenance and licences
 
 Format decoding, cooperative projection and matrix-prefill arithmetic adapted
-from Sushi commit 27ca1c8684c01d1970bf576d8cef80ebea617928,
+from Sushi commit 27ca1c8684c01d1970bf576d8cef80ebea617928 and v1.0.5
+commit 162c044702d7ed3095fb85868e6cce005c93ab34,
 `src/expert_exl3.zig` / `src/expert_exl3_kernels.zig`.
 Copyright (c) 2026 Theinruj Toranavikrai and David Dalcu.
 The [full MIT notice](licenses/sushi-MIT.txt) is retained. Sushi identifies these

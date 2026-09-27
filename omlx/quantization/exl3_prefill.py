@@ -5,7 +5,7 @@ See docs/licenses/sushi-MIT.txt and docs/exl3-backend.md.
 
 import mlx.core as mx
 
-FRAGMENTS = r"""
+LEGACY_FRAGMENTS = r"""
 #define SMAT_UNROLL _Pragma("clang loop unroll(full)")
 static inline uint smat_funnel(const device uint *words, uint end, uint nwords) {
   const uint last = (end - 1u) >> 5u;
@@ -48,6 +48,35 @@ static inline void smat_group(const device uint *words, uint g, thread half2 *p)
   }
 }
 """
+FRAGMENTS = r"""
+#define SMAT_UNROLL _Pragma("clang loop unroll(full)")
+static inline half2 smat_pair(uint f, uint s0, uint s1) {
+  return exl3_pairh(uint2((f >> s0) & 0xffffu, (f >> s1) & 0xffffu));
+}
+// The group's weights 0..L come from one 32-bit funnel ending at weight L, the rest from
+// one ending at weight 7: L is the widest split whose first codeword still fits.
+static inline constexpr uint smat_split(uint N) {
+  return exl3_end(N, 7u) - exl3_end(N, 0u) <= 16u ? 7u : exl3_end(N, 5u) - exl3_end(N, 0u) <= 16u ? 5u : 3u;
+}
+template<uint N>
+static inline void smat_group(const device uint *words, uint g, thread half2 *p) {
+  if (N == 64u) {
+    const ulong m = ((ulong)words[(g + 31u) & 31u] << 32u) | (ulong)words[g];
+    SMAT_UNROLL for (uint j = 0u; j < 4u; j++) p[j] = smat_pair(uint(m >> (24u - 8u * j)), 4u, 0u);
+  } else {
+    constexpr uint W = N / 2u;
+    constexpr uint L = smat_split(N);
+    const uint lo = uint(exl3_window(words, W * g + exl3_end(N, L), W, false));
+    const uint hi = uint(exl3_window(words, W * g + W, W, false));
+    constexpr uint E = exl3_end(N, L);
+    p[0] = smat_pair(lo, E - exl3_end(N, 0u), E - exl3_end(N, 1u));
+    p[1] = smat_pair(lo, E - exl3_end(N, 2u), E - exl3_end(N, 3u));
+    p[2] = L >= 5u ? smat_pair(lo, E - exl3_end(N, 4u), E - exl3_end(N, 5u)) : smat_pair(hi, W - exl3_end(N, 4u), W - exl3_end(N, 5u));
+    p[3] = L == 7u ? smat_pair(lo, E - exl3_end(N, 6u), 0u) : smat_pair(hi, W - exl3_end(N, 6u), 0u);
+  }
+}
+"""
+
 SOURCE = r"""
 uint win = uint(threadgroup_position_in_grid.y);
 uint sg = uint(simdgroup_index_in_threadgroup);
@@ -124,13 +153,14 @@ row = run_end;
 _KERNELS = {}
 
 
-def prefill_inner(x, ids, trellis, spec, n, header, sorted_indices):
+def prefill_inner(x, ids, trellis, spec, n, header, sorted_indices, *, fast_readers=True):
     rows, k = x.shape
     order = None
     if not sorted_indices:
         order = mx.argsort(ids)
         ids, x = ids[order], x[order]
-    kernel = _KERNELS.get(spec.window)
+    key = (spec.window, fast_readers)
+    kernel = _KERNELS.get(key)
     if kernel is None:
         hdr = "#include <metal_simdgroup_matrix>\n#define EXL3_FUNNEL48 0\n" + header
         hdr += f"\nstatic inline half2 exl3_pairh(uint2 cw) {{ return half2(exl3_decode2(cw,{(1 << spec.window) - 1}u)); }}\n"
@@ -139,9 +169,9 @@ def prefill_inner(x, ids, trellis, spec, n, header, sorted_indices):
             input_names=["x", "trellis", "eids", "wstarts", "wnlive"],
             output_names=["y"],
             source=SOURCE,
-            header=hdr + FRAGMENTS,
+            header=hdr + (FRAGMENTS if fast_readers else LEGACY_FRAGMENTS),
         )
-        _KERNELS[spec.window] = kernel
+        _KERNELS[key] = kernel
     starts = mx.arange(0, rows, 32, dtype=mx.uint32)
     lives = mx.minimum(mx.array(rows, dtype=mx.uint32) - starts, 32)
     y = kernel(

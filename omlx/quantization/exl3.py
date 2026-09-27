@@ -1,12 +1,14 @@
 """Experimental packed EXL3 routed projection; no cache or attention changes.
 
 Format/math adapted from beamivalice/sushi commit
-27ca1c8684c01d1970bf576d8cef80ebea617928 (MIT), expert_exl3.zig.
+27ca1c8684c01d1970bf576d8cef80ebea617928 and Sushi v1.0.5
+162c044702d7ed3095fb85868e6cce005c93ab34 (MIT), expert_exl3_kernels.zig.
 Copyright (c) 2026 Theinruj Toranavikrai and David Dalcu.
 See docs/exl3-backend.md for provenance and prototype limitations.
 """
 
 import math
+import os
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -89,7 +91,7 @@ if(!SCALE_FIRST) a*=float(scales[si]);
 y[row*DIM+col]=half(a);
 """
 
-_COOP_SOURCE = r"""
+_LEGACY_COOP_SOURCE = r"""
 threadgroup float partial[4 * 256];
 uint ot = uint(threadgroup_position_in_grid.x);
 uint slot = uint(threadgroup_position_in_grid.y);
@@ -191,11 +193,136 @@ if (lid < 16u) {
 threadgroup_barrier(mem_flags::mem_threadgroup);
 """
 
+_COOP_SOURCE = r"""
+threadgroup float partial[uint(OTPT) * 4 * 256];
+uint ot = uint(threadgroup_position_in_grid.x) * uint(OTPT);
+uint slot = uint(threadgroup_position_in_grid.y);
+uint split = uint(threadgroup_position_in_grid.z);
+uint sg = uint(simdgroup_index_in_threadgroup);
+uint lane = uint(thread_index_in_simdgroup);
+uint lid = uint(thread_index_in_threadgroup);
+constexpr uint TILE = 16u;
+constexpr uint N = uint(NHW);
+constexpr uint PACKED_HW = N;
+constexpr uint PACKED_W = N / 2u;
+constexpr uint IT = uint(IDIM) / TILE;
+constexpr uint OT = uint(ODIM) / TILE;
+constexpr uint SGS = 4u;
+constexpr uint SPLITS = 1u;
+const uint eid = uint(slots[slot]);
+const uint tiles_per_split = (IT + SPLITS - 1u) / SPLITS;
+const uint tk0 = split * tiles_per_split;
+const uint tk1 = min(tk0 + tiles_per_split, IT);
+const uint prow = (lane & 3u) * 2u;
+const uint pcol = lane >> 2u;
+uint pos[8];
+pos[0] = prow * 16u + pcol;
+pos[1] = (prow + 1u) * 16u + pcol;
+pos[2] = (prow + 8u) * 16u + pcol;
+pos[3] = (prow + 9u) * 16u + pcol;
+pos[4] = prow * 16u + pcol + 8u;
+pos[5] = (prow + 1u) * 16u + pcol + 8u;
+pos[6] = (prow + 8u) * 16u + pcol + 8u;
+pos[7] = (prow + 9u) * 16u + pcol + 8u;
+const uint row0 = pos[0] >> 4u;
+const uint row1 = pos[1] >> 4u;
+const uint row2 = pos[2] >> 4u;
+const uint row3 = pos[3] >> 4u;
+float acc[OTPT][8] = {};
+const size_t xb = (size_t)slot * (size_t)(IDIM);
+const size_t expert_stride = (size_t)IT * (size_t)OT * (size_t)PACKED_HW;
+const device uint* trellis_e = (const device uint*)(trellis + (size_t)eid * expert_stride);
+if (N == 64u) {
+for (uint tk = tk0 + sg; tk < tk1; tk += SGS) {
+  const device uint* words = trellis_e + ((size_t)tk * (size_t)OT + ot) * 32u;
+  const ulong merged = ((ulong)words[(lane + 31u) & 31u] << 32) | (ulong)words[lane];
+  const float in0 = float(x[xb + tk * TILE + row0]);
+  const float in1 = float(x[xb + tk * TILE + row1]);
+  const float in2 = float(x[xb + tk * TILE + row2]);
+  const float in3 = float(x[xb + tk * TILE + row3]);
+  const uint sh[8] = {28u, 24u, 20u, 16u, 12u, 8u, 4u, 0u};
+  const float ins[8] = {in0, in1, in2, in3, in0, in1, in2, in3};
+  for (uint p = 0u; p < 4u; p++) {
+    const uint2 cw = uint2(uint(merged >> sh[p * 2u]), uint(merged >> sh[p * 2u + 1u])) & uint2(0xffffu);
+    const float2 w = exl3_decode2(cw,(1u << WINDOW)-1u);
+    acc[0][p * 2u] = fma(ins[p * 2u], w.x, acc[0][p * 2u]);
+    acc[0][p * 2u + 1u] = fma(ins[p * 2u + 1u], w.y, acc[0][p * 2u + 1u]);
+  }
+}
+} else {
+  const device uint *wp = trellis_e + ((size_t)(tk0 + sg) * OT + ot) * PACKED_W;
+  const device half *pp = x + xb + (tk0 + sg) * TILE;
+  const uint sh[8] = {exl3_lane_sh(N, 0u), exl3_lane_sh(N, 1u), exl3_lane_sh(N, 2u), exl3_lane_sh(N, 3u), exl3_lane_sh(N, 4u), exl3_lane_sh(N, 5u), exl3_lane_sh(N, 6u), exl3_lane_sh(N, 7u)};
+  // IT is a whole H128 block, hence the second k-tile is always in range.
+  // Preserve the legacy per-accumulator k order and final reduction order.
+  for (uint tk = tk0 + sg; tk < tk1; tk += 2u * SGS) {
+    ulong merged[2][OTPT];
+    for (uint u = 0u; u < 2u; u++) {
+      for (uint o = 0u; o < uint(OTPT); o++) {
+        merged[u][o] = exl3_lane<N>(wp + u * SGS * OT * PACKED_W + o * PACKED_W, lane);
+      }
+    }
+    for (uint u = 0u; u < 2u; u++) {
+      const float in0 = float(pp[u * SGS * TILE + row0]);
+      const float in1 = float(pp[u * SGS * TILE + row1]);
+      const float in2 = float(pp[u * SGS * TILE + row2]);
+      const float in3 = float(pp[u * SGS * TILE + row3]);
+      const float ins[8] = {in0, in1, in2, in3, in0, in1, in2, in3};
+      for (uint o = 0u; o < uint(OTPT); o++) {
+        for (uint p = 0u; p < 4u; p++) {
+          const uint2 cw = uint2(uint(merged[u][o] >> sh[p * 2u]), uint(merged[u][o] >> sh[p * 2u + 1u])) & uint2(0xffffu);
+          const float2 w = exl3_decode2(cw, (1u << WINDOW)-1u);
+          acc[o][p * 2u] = fma(ins[p * 2u], w.x, acc[o][p * 2u]);
+          acc[o][p * 2u + 1u] = fma(ins[p * 2u + 1u], w.y, acc[o][p * 2u + 1u]);
+        }
+      }
+    }
+    wp += 2u * SGS * OT * PACKED_W;
+    pp += 2u * SGS * TILE;
+  }
+}
+for (uint o = 0u; o < uint(OTPT); o++) {
+  for (uint si = 0u; si < 8u; si++) {
+    partial[o * SGS * 256u + sg * 256u + pos[si]] = acc[o][si];
+  }
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+if (lid < 16u * uint(OTPT)) {
+  const uint o = lid >> 4u;
+  float sum = 0.0f;
+  for (uint r = 0u; r < 16u; r++) {
+    const uint p = r * 16u + (lid & 15u);
+    for (uint g = 0u; g < SGS; g++) {
+      sum += partial[o * SGS * 256u + g * 256u + p];
+    }
+  }
+  y[(size_t)slot * ODIM + (ot + o) * TILE + (lid & 15u)] = half(sum);
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+"""
+
 _COOP_HEADER = r"""
 static inline float2 exl3_decode2(uint2 cw, uint mask) {
  cw &= uint2(mask);
  uint2 r = ((cw * uint2(0xCBAC1FEDu)) & uint2(0x8FFF8FFFu)) ^ uint2(0x3B603B60u);
  half4 h=as_type<half4>(r); return float2(half2(h.x+h.y,h.z+h.w));
+}
+
+static inline constexpr uint exl3_end(uint N, uint j) { return ((j + 1u) * N) >> 4u; }
+static inline ulong exl3_window(const device uint *words, uint end, uint nwords, bool full) {
+  const uint last = (end - 1u) >> 5u;
+  const uint prev = last == 0u ? nwords - 1u : last - 1u;
+  const uint shift = (0u - end) & 31u;
+  ulong bits = (((ulong)words[prev] << 32u) | (ulong)words[last]) >> shift;
+  if (full) bits |= ((ulong)words[prev == 0u ? nwords - 1u : prev - 1u] << 32u) << (32u - shift);
+  return bits;
+}
+static inline constexpr uint exl3_lane_sh(uint N, uint j) { return N / 2u - exl3_end(N, j); }
+template<uint N>
+static inline ulong exl3_lane(const device uint *words, uint lane) {
+  constexpr uint W = N / 2u;
+  constexpr uint low = W & (0u - W);
+  return exl3_window(words, W * lane + W, W, exl3_lane_sh(N, 0u) + 16u > 32u + (low < 32u ? low : 32u));
 }
 struct exl3_win { uint i0; uint i1; uint sh; uint fresh; };
 static inline exl3_win exl3_pair_window(uint t0,uint n) {
@@ -207,7 +334,8 @@ static inline exl3_win exl3_pair_window(uint t0,uint n) {
 """
 
 _HAD_KERNEL = None
-_KERNEL = None
+_KERNELS = {}
+_FAST_READERS = os.environ.get("OMLX_EXL3_FAST_READERS", "1") != "0"
 
 
 def _scaled_hadamard(x, scales, ids, first):
@@ -231,29 +359,36 @@ def _scaled_hadamard(x, scales, ids, first):
 
 
 def _inner(x, ids, trellis, spec, n, sorted_indices=False):
-    global _KERNEL
     if x.shape[0] >= 32:
         from .exl3_prefill import prefill_inner
 
-        return prefill_inner(x, ids, trellis, spec, n, _COOP_HEADER, sorted_indices)
-    if _KERNEL is None:
-        _KERNEL = mx.fast.metal_kernel(
-            name="omlx_exl3_coop_gather",
+        return prefill_inner(
+            x, ids, trellis, spec, n, _COOP_HEADER, sorted_indices,
+            fast_readers=_FAST_READERS,
+        )
+    fast = _FAST_READERS and spec.halfwords < 64
+    kernel = _KERNELS.get(fast)
+    if kernel is None:
+        kernel = mx.fast.metal_kernel(
+            name="omlx_exl3_funnel_gather" if fast else "omlx_exl3_coop_gather",
             input_names=["x", "trellis", "slots"],
             output_names=["y"],
-            source=_COOP_SOURCE,
+            source=_COOP_SOURCE if fast else _LEGACY_COOP_SOURCE,
             header=_COOP_HEADER,
         )
+        _KERNELS[fast] = kernel
     rows, k = x.shape
-    return _KERNEL(
+    tiles = 2 if fast else 1
+    return kernel(
         inputs=[x, trellis, ids],
         template=[
             ("IDIM", k),
             ("ODIM", n),
             ("NHW", spec.halfwords),
             ("WINDOW", spec.window),
+            ("OTPT", tiles),
         ],
-        grid=(n // 16 * 128, rows, 1),
+        grid=(n // 16 // tiles * 128, rows, 1),
         threadgroup=(128, 1, 1),
         output_shapes=[(rows, n)],
         output_dtypes=[mx.float16],
