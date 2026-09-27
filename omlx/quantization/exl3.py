@@ -5,30 +5,59 @@ Format/math adapted from beamivalice/sushi commit
 Copyright (c) 2026 Theinruj Toranavikrai and David Dalcu.
 See docs/exl3-backend.md for provenance and prototype limitations.
 """
-from dataclasses import dataclass
+
 import math
+from dataclasses import dataclass
+
 import mlx.core as mx
 import mlx.nn as nn
+
 
 @dataclass(frozen=True)
 class Exl3Spec:
     halfwords: int
     window: int
+
     def __post_init__(self):
-        if (type(self.halfwords) is not int or not 32 <= self.halfwords <= 64
-                or self.halfwords % 2 or type(self.window) is not int
-                or not 8 <= self.window <= 16):
-            raise ValueError('Unsupported EXL3 trellis rate/window')
+        if (
+            type(self.halfwords) is not int
+            or not 32 <= self.halfwords <= 64
+            or self.halfwords % 2
+            or type(self.window) is not int
+            or not 8 <= self.window <= 16
+        ):
+            raise ValueError("Unsupported EXL3 trellis rate/window")
+
     @classmethod
     def from_config(cls, config):
-        q = config.get('expert_quant', {})
-        if q.get('format') != 'exl3' or q.get('codebook') != 'mcg' or q.get('out_scales') != 'svh':
-            raise ValueError('EXL3 prototype requires mcg codebook and svh output scales')
-        k = q.get('k'); n = float(k) * 16 if isinstance(k, (float, int)) and not isinstance(k, bool) else 0.0
-        w = q.get('window', 16)
-        if not math.isfinite(n) or not n.is_integer() or not 32 <= n <= 64 or int(n) % 2 or not isinstance(w, int) or isinstance(w, bool) or not 8 <= w <= 16:
-            raise ValueError('Unsupported EXL3 trellis rate/window')
+        q = config.get("expert_quant", {})
+        if (
+            q.get("format") != "exl3"
+            or q.get("codebook") != "mcg"
+            or q.get("out_scales") != "svh"
+        ):
+            raise ValueError(
+                "EXL3 prototype requires mcg codebook and svh output scales"
+            )
+        k = q.get("k")
+        n = (
+            float(k) * 16
+            if isinstance(k, (float, int)) and not isinstance(k, bool)
+            else 0.0
+        )
+        w = q.get("window", 16)
+        if (
+            not math.isfinite(n)
+            or not n.is_integer()
+            or not 32 <= n <= 64
+            or int(n) % 2
+            or not isinstance(w, int)
+            or isinstance(w, bool)
+            or not 8 <= w <= 16
+        ):
+            raise ValueError("Unsupported EXL3 trellis rate/window")
         return cls(int(n), w)
+
 
 def hadamard128(x):
     shape = x.shape
@@ -39,7 +68,8 @@ def hadamard128(x):
         a, b = z[:, :, 0, :], z[:, :, 1, :]
         y = mx.stack([a + b, a - b], axis=2).reshape(-1, 128)
         stride *= 2
-    return (y * (128 ** -0.5)).reshape(shape)
+    return (y * (128**-0.5)).reshape(shape)
+
 
 _HAD_SOURCE = r"""
 uint col=thread_position_in_grid.x,row=thread_position_in_grid.y;
@@ -179,75 +209,203 @@ static inline exl3_win exl3_pair_window(uint t0,uint n) {
 _HAD_KERNEL = None
 _KERNEL = None
 
+
 def _scaled_hadamard(x, scales, ids, first):
     global _HAD_KERNEL
     if _HAD_KERNEL is None:
-        _HAD_KERNEL = mx.fast.metal_kernel(name='omlx_exl3_scaled_hadamard',
-            input_names=['x','scales','ids'],output_names=['y'],source=_HAD_SOURCE)
-    rows,dim=x.shape
-    return _HAD_KERNEL(inputs=[x,scales,ids],template=[('DIM',dim),('SCALE_FIRST',first)],
-        grid=(dim,rows,1),threadgroup=(128,1,1),output_shapes=[x.shape],output_dtypes=[mx.float16])[0]
+        _HAD_KERNEL = mx.fast.metal_kernel(
+            name="omlx_exl3_scaled_hadamard",
+            input_names=["x", "scales", "ids"],
+            output_names=["y"],
+            source=_HAD_SOURCE,
+        )
+    rows, dim = x.shape
+    return _HAD_KERNEL(
+        inputs=[x, scales, ids],
+        template=[("DIM", dim), ("SCALE_FIRST", first)],
+        grid=(dim, rows, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[x.shape],
+        output_dtypes=[mx.float16],
+    )[0]
 
-def _inner(x, ids, trellis, spec, n):
+
+def _inner(x, ids, trellis, spec, n, sorted_indices=False):
     global _KERNEL
+    if x.shape[0] >= 32:
+        from .exl3_prefill import prefill_inner
+
+        return prefill_inner(x, ids, trellis, spec, n, _COOP_HEADER, sorted_indices)
     if _KERNEL is None:
-        _KERNEL = mx.fast.metal_kernel(name='omlx_exl3_coop_gather',
-            input_names=['x','trellis','slots'],output_names=['y'],source=_COOP_SOURCE,header=_COOP_HEADER)
-    rows,k=x.shape
-    return _KERNEL(inputs=[x,trellis,ids],template=[('IDIM',k),('ODIM',n),('NHW',spec.halfwords),('WINDOW',spec.window)],
-        grid=(n//16*128,rows,1),threadgroup=(128,1,1),output_shapes=[(rows,n)],output_dtypes=[mx.float16])[0]
+        _KERNEL = mx.fast.metal_kernel(
+            name="omlx_exl3_coop_gather",
+            input_names=["x", "trellis", "slots"],
+            output_names=["y"],
+            source=_COOP_SOURCE,
+            header=_COOP_HEADER,
+        )
+    rows, k = x.shape
+    return _KERNEL(
+        inputs=[x, trellis, ids],
+        template=[
+            ("IDIM", k),
+            ("ODIM", n),
+            ("NHW", spec.halfwords),
+            ("WINDOW", spec.window),
+        ],
+        grid=(n // 16 * 128, rows, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(rows, n)],
+        output_dtypes=[mx.float16],
+    )[0]
+
 
 class Exl3SwitchLinear(nn.Module):
     """Drop-in gathered linear projection; all state is ordinary MLX arrays."""
+
     def __init__(self, trellis, suh, svh, spec):
         super().__init__()
-        if trellis.ndim != 4 or trellis.dtype != mx.uint16 or trellis.shape[-1] != spec.halfwords:
-            raise ValueError('Invalid packed trellis shape/dtype')
+        if (
+            trellis.ndim != 4
+            or trellis.dtype != mx.uint16
+            or trellis.shape[-1] != spec.halfwords
+        ):
+            raise ValueError("Invalid packed trellis shape/dtype")
         e, kt, nt, _ = trellis.shape
         if min(e, kt, nt) <= 0:
-            raise ValueError('Empty EXL3 bank or dimensions')
-        if suh.shape != (e, kt * 16) or svh.shape != (e, nt * 16) or suh.dtype != mx.float16 or svh.dtype != mx.float16 or kt % 8 or nt % 8:
-            raise ValueError('Invalid EXL3 scales or Hadamard dimensions')
+            raise ValueError("Empty EXL3 bank or dimensions")
+        if (
+            suh.shape != (e, kt * 16)
+            or svh.shape != (e, nt * 16)
+            or suh.dtype != mx.float16
+            or svh.dtype != mx.float16
+            or kt % 8
+            or nt % 8
+        ):
+            raise ValueError("Invalid EXL3 scales or Hadamard dimensions")
         self.trellis, self.suh, self.svh = trellis, suh, svh
         self._spec = spec
         self.freeze()
+
     @property
-    def input_dims(self): return self.suh.shape[-1]
+    def input_dims(self):
+        return self.suh.shape[-1]
+
     @property
-    def output_dims(self): return self.svh.shape[-1]
+    def output_dims(self):
+        return self.svh.shape[-1]
+
     @property
-    def num_experts(self): return self.trellis.shape[0]
+    def num_experts(self):
+        return self.trellis.shape[0]
+
     def __call__(self, x, indices, sorted_indices=False):
-        if x.shape[-1] != self.input_dims or not mx.issubdtype(indices.dtype, mx.integer):
-            raise ValueError('Invalid EXL3 input width/expert indices')
+        if x.shape[-1] != self.input_dims or not mx.issubdtype(
+            indices.dtype, mx.integer
+        ):
+            raise ValueError("Invalid EXL3 input width/expert indices")
         # Mirror gather_mm broadcasting of [batch..., M, K] against rhs ids.
         batch = mx.broadcast_shapes(x.shape[:-2], indices.shape)
         z = mx.broadcast_to(x, (*batch, x.shape[-2], self.input_dims))
-        ids = mx.broadcast_to(indices[...,None], (*batch,x.shape[-2])).reshape(-1).astype(mx.uint32)
+        ids = (
+            mx.broadcast_to(indices[..., None], (*batch, x.shape[-2]))
+            .reshape(-1)
+            .astype(mx.uint32)
+        )
         valid = ids < self.num_experts
         safe_ids = mx.minimum(ids, self.num_experts - 1)
-        z = z.reshape(-1,self.input_dims).astype(mx.float16)
+        z = z.reshape(-1, self.input_dims).astype(mx.float16)
         prepared = _scaled_hadamard(z, self.suh, safe_ids, True)
-        inner = _inner(prepared, safe_ids, self.trellis, self._spec, self.output_dims)
+        inner = _inner(
+            prepared,
+            safe_ids,
+            self.trellis,
+            self._spec,
+            self.output_dims,
+            sorted_indices,
+        )
         y = _scaled_hadamard(inner, self.svh, safe_ids, False)
         y = mx.where(valid[:, None], y, mx.array(float("nan"), dtype=y.dtype))
-        return y.reshape(*batch,x.shape[-2],self.output_dims).astype(x.dtype)
+        return y.reshape(*batch, x.shape[-2], self.output_dims).astype(x.dtype)
 
 
 def install_packed_experts(model, config):
     """Replace only routed SwitchGLU projections before strict native loading."""
     import os
-    if os.environ.get('OMLX_EXL3_ENABLED', '0') != '1':
-        raise ValueError('EXL3 support is opt-in: set OMLX_EXL3_ENABLED=1')
-    spec = Exl3Spec.from_config({'expert_quant': config.expert_quant})
+
+    if os.environ.get("OMLX_EXL3_ENABLED", "0") != "1":
+        raise ValueError("EXL3 support is opt-in: set OMLX_EXL3_ENABLED=1")
+    spec = Exl3Spec.from_config({"expert_quant": config.expert_quant})
     for layer in model.language_model.model.layers:
-        mlp = getattr(getattr(layer, 'mlp', None), 'switch_mlp', None)
+        mlp = getattr(getattr(layer, "mlp", None), "switch_mlp", None)
         if mlp is None:
-            raise ValueError('EXL3 checkpoint requires routed experts in every layer')
-        for name in ('gate_proj', 'up_proj', 'down_proj'):
+            raise ValueError("EXL3 checkpoint requires routed experts in every layer")
+        for name in ("gate_proj", "up_proj", "down_proj"):
             old = getattr(mlp, name)
             e, n, k = old.weight.shape
-            setattr(mlp, name, Exl3SwitchLinear(
-                mx.zeros((e,k//16,n//16,spec.halfwords),dtype=mx.uint16),
-                mx.zeros((e,k),dtype=mx.float16),
-                mx.zeros((e,n),dtype=mx.float16),spec))
+            setattr(
+                mlp,
+                name,
+                Exl3SwitchLinear(
+                    mx.zeros((e, k // 16, n // 16, spec.halfwords), dtype=mx.uint16),
+                    mx.zeros((e, k), dtype=mx.float16),
+                    mx.zeros((e, n), dtype=mx.float16),
+                    spec,
+                ),
+            )
+
+
+def validate_checkpoint_headers(model_path, config):
+    """Reject mismatched packed banks before allocating any checkpoint arrays."""
+    import json
+    import struct
+    from pathlib import Path
+
+    spec = Exl3Spec.from_config(config)
+    text = config["text_config"]
+    hidden = text["hidden_size"]
+    intermediate = text["moe_intermediate_size"]
+    experts = text["num_experts"]
+    expected = {}
+    for layer in range(text["num_hidden_layers"]):
+        for proj, k, n in [
+            ("gate_proj", hidden, intermediate),
+            ("up_proj", hidden, intermediate),
+            ("down_proj", intermediate, hidden),
+        ]:
+            base = f"language_model.model.layers.{layer}.mlp.switch_mlp.{proj}"
+            expected[base + ".trellis"] = (
+                "U16",
+                [experts, k // 16, n // 16, spec.halfwords],
+            )
+            expected[base + ".suh"] = ("F16", [experts, k])
+            expected[base + ".svh"] = ("F16", [experts, n])
+    seen = set()
+    for path in Path(model_path).glob("*.safetensors"):
+        with path.open("rb") as f:
+            raw = f.read(8)
+            if len(raw) != 8:
+                raise ValueError("Truncated safetensors header")
+            size = struct.unpack("<Q", raw)[0]
+            if size > min(16 * 1024**2, path.stat().st_size - 8):
+                raise ValueError("Invalid safetensors header size")
+            header = json.loads(f.read(size))
+        for key, entry in header.items():
+            if key not in expected:
+                continue
+            if key in seen:
+                raise ValueError("Duplicate packed tensor: " + key)
+            dtype, shape = expected[key]
+            start, end = entry.get("data_offsets", [-1, -1])
+            if (
+                entry.get("dtype") != dtype
+                or entry.get("shape") != shape
+                or start < 0
+                or end - start != math.prod(shape) * 2
+                or size + 8 + end > path.stat().st_size
+            ):
+                raise ValueError("Invalid EXL3 checkpoint tensor: " + key)
+            seen.add(key)
+    missing = set(expected) - seen
+    if missing:
+        raise ValueError("Missing EXL3 tensors: " + ", ".join(sorted(missing)[:3]))

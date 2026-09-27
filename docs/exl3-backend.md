@@ -1,76 +1,75 @@
-# Experimental packed EXL3 projection
+# Native Qwen4-Exp packed EXL3 experts
 
-Base oMLX: f0d8428acd3220c364177d1ea9593e4e15f94107.
+Opt in with `OMLX_EXL3_ENABLED=1`. Supported checkpoints declare
+`expert_quant` with format `exl3`, codebook `mcg`, output scales `svh`,
+window 8–16 and an even halfword tile rate from 32 to 64. Initial validation
+covers the published Qwen3.8-Flash-Next-Sushi-2.6bpw pack (k=2.625/window=15).
+Other architectures/codebooks and packed MTP are explicitly unsupported.
 
-The tile permutation, tail-biting pair funnel, MCG codebook and normalized
-Hadamard stages follow Sushi commit 27ca1c8684c01d1970bf576d8cef80ebea617928,
-`src/expert_exl3.zig` and `src/expert_exl3_kernels.zig`. Sushi describes these
-as its own implementation of the ExLlamaV3 format. Adaptations here implement
-MLX module integration and gathered SIMD projection. Retained Sushi notices:
-[MIT licence](licenses/sushi-MIT.txt). No checkpoint Python is executed.
+The custom loader validates packed tensor headers before allocating weights,
+uses the vendored native Qwen4-Exp model, and replaces only its routed
+SwitchGLU projections. Packed U16 trellises remain compressed in memory.
+Native attention, vision, tool parsing, scheduler, KV cache, prefix cache and
+model unload continue through oMLX. Checkpoint Python is never imported.
+Embedded MTP is disabled for this loader; this contribution makes no claim
+about speculative decoding speed or parity.
 
-## Licence scope
+## Kernels
 
-Sushi's own EXL3 implementation is MIT. This permits modification and distribution
-with its copyright and permission notices retained. We are not incorporating the
-other Apache/BSD components enumerated in Sushi's NOTICE. If additional code is
-ported, audit its individual provenance and preserve the applicable notices.
+A scaled normalized Hadamard kernel brackets each packed projection. Decode
+uses a cooperative four-simdgroup tile kernel. Prefill uses sorted row windows
+and simdgroup matrix multiplication, sharing unpacked tiles across matching
+expert rows. Unsorted rows are sorted and inverse-permuted on the GPU.
+Invalid expert ids are clamped before accessing scale/weight banks and produce
+NaN outputs. Floating-point summation differs from a serial reference, so
+numerical tests use explicit FP16-stage tolerances rather than bitwise claims.
 
-The inspected local Qwen3.8 Flash-Next pack carries Qwen Community License 1.0.
-It explicitly permits use, modification, deployment and derivative works, with
-notice retention and additional commercial MaaS/AI-work-assistant conditions.
-Sam's noncommercial friends bot does not appear to trigger those commercial
-conditions. Model weights are not included in this source contribution.
-This is a licence-scope review of the supplied files, not a blanket certification
-of any future use or third-party hosting service.
+## Disk-backed n-gram table
 
-## Status and gates
+Flat `ngram_table.bin` files stamped `mlx-serve-ngram` expose virtual shards to
+the existing DiskBackedShardedEmbedding reader. No 32 GB table copy or full GPU
+upload is needed. The adapter validates metadata, quantization agreement,
+geometry, dtypes, tensor bounds/overlap and model-directory containment.
+Existing mmap, prefetch, row dequantization and close behavior are retained.
 
-This is NOT a production loader. MCG/svh packs, 128-wide Hadamard blocks,
-and integer halfword rates from 32 through 64 are the supported prototype scope.
-Native attention and cache types are unchanged. No full expert bank is expanded.
-Invalid expert ids produce NaN without out-of-bounds scale access.
+## Validation
 
-The independent CPU oracle passes synthetic rate/window fixtures and one real
-640-to-2560 expert. The original serial kernel measured 5.312 ms/projection;
-this is too slow for deployment. The SIMD prototype measured 3.584 ms/projection with real-expert cosine approximately 1.0 and maximum absolute difference 3.05e-5. It changes FP32 summation order. These are tiny projection microbenchmarks, not full-model performance.
+Local hardware: M1 Max, 64 GiB. MLX 0.32.2. Load and API checks ran under a
+separate process watchdog: >=49 GiB available before load, >=4.5 GiB headroom,
+and no significant new swap. Other inference processes were unloaded first.
 
-Remaining gates: efficient many-token prefill, exact mixed trunk loading,
-full-model PLE configuration and lifecycle,
-vision and tool regression tests, memory admission and cache restoration.
-Do not claim Sushi-pack support or open a support PR before these pass.
+- Full native load: 10.86 seconds, 43.09 GiB active MLX memory.
+- Short text decode before matrix-prefill addition: 18.7–20.9 tokens/sec.
+- Cooperative real-expert projection: 0.493 ms; CPU oracle cosine approximately
+  1.0, maximum absolute difference 3.05e-5 on the bounded fixture.
+- Actual oMLX API: 736-token request 3.89 seconds cold / 0.60 seconds warm,
+  729 cached tokens; both answered correctly.
+- Two reference images: identified red then blue correctly.
+- Tool use: returned structured get_weather(city=London), not source text.
+- Admin dashboard rendered; native unload request accepted. Tiny native reader
+  tests separately confirm exact rows across shard boundaries and idempotent
+  resource cleanup. Completion of the queued API unload is a separate lifecycle
+  gate, not implied by request acceptance.
 
-No live Herman service or model settings were changed by this prototype.
+Do not extrapolate small-prompt throughput or peak memory to a 128K prompt.
+Context admission and memory guards must stay enabled; long-context and
+multi-request behavior need additional measurement on each target machine.
 
-## Flat n-gram adapter results
+Run the numerical/storage tests with `python -m pytest tests/test_exl3_reference.py
+ tests/test_flat_ngram_views.py`. `benchmarks/exl3_native_smoke.py MODEL_PATH`
+is an explicit opt-in full-model smoke test; ensure adequate headroom first.
 
-A metadata adapter exposes the flat weight/scales/biases file as virtual row
-shards to the existing DiskBackedShardedEmbedding implementation. It reuses
-the native mmap/prefetch/affine row gather and close path. No table copy or
-resident dequantization is performed. Format, geometry, dtype, bounds,
-overlap, configuration agreement and directory containment are checked.
+## Provenance and licences
 
-Eight unit tests pass (packed projections and flat-table validation). An
-opt-in tiny native reader check confirms exact selected-row parity across
-shards with repeated ids, and idempotent resource cleanup. The real table's
-384 virtual descriptors validate from its header; tensor contents were not
-read during this check. These results do not establish full-model correctness.
+Format decoding, cooperative projection and matrix-prefill arithmetic adapted
+from Sushi commit 27ca1c8684c01d1970bf576d8cef80ebea617928,
+`src/expert_exl3.zig` / `src/expert_exl3_kernels.zig`.
+Copyright (c) 2026 Theinruj Toranavikrai and David Dalcu.
+The [full MIT notice](licenses/sushi-MIT.txt) is retained. Sushi identifies these
+as its own implementation of the ExLlamaV3 format. Other components from its
+NOTICE are not incorporated by this change.
 
-Reproduce with an Apple Silicon MLX Python environment:
-
-```sh
-python -m unittest -v tests.test_flat_ngram_views tests.test_exl3_reference
-python -m tests.check_flat_ngram_native
-python -m tests.check_real_expert
-```
-
-The last command requires Sam's local checkpoint path and copies just one
-expert. Do not include its hardcoded local model choice in an upstream suite.
-
-## Timebox conclusion
-
-Licence review and arithmetic/storage feasibility succeeded. Complete oMLX
-Sushi-pack support did not. EXL3 projection optimization, full strict mixed
-loader integration, prefill benchmarking and native cache/vision/tool checks
-are substantial remaining work. No load dispatch is installed, no full model
-was loaded, and no support PR was opened. Do not turn this prototype on live.
+Downloaded model weights retain their own publisher licences and are not
+redistributed here. The inspected pack is under Qwen Community License 1.0;
+its additional commercial MaaS/work-assistant conditions are distinct from
+Sushi's MIT source licence.
