@@ -1435,6 +1435,16 @@ def maybe_load_custom_quantization(
         )
         return None
 
+    if (config.get("expert_quant") or {}).get("format") == "exl3":
+        if config.get("model_type") != "qwen4_exp" or not is_vlm:
+            raise ValueError("EXL3 packed experts currently require native Qwen4-Exp VLM loading")
+        from ..quantization.exl3 import Exl3Spec
+        Exl3Spec.from_config(config)
+        from ..patches.mlx_vlm_qwen4_exp_compat import configure_qwen4_exp_runtime
+        configure_qwen4_exp_runtime(model_name, mode="mmap", mtp_enabled=False)
+        import mlx_vlm.utils as vlm_utils
+        return vlm_utils.load(model_name, trust_remote_code=False, strict=True)
+
     quant_config = config.get("quantization_config")
     quant_method = quant_config.get("quant_method") if quant_config else None
 

@@ -178,6 +178,7 @@ class ModelConfig(BaseModelConfig):
     eos_token_id: Optional[Union[int, List[int]]] = None
     quantization: Optional[Dict] = None
     quantization_config: Optional[Dict] = None
+    expert_quant: Optional[Dict] = None
 
     def __post_init__(self):
         if self.image_token_index is None:

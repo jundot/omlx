@@ -2330,7 +2330,25 @@ class DiskBackedShardedEmbedding(nn.Module):
         register_ple_resource(self, priority=1)
         model_path = Path(model_path)
         index_path = model_path / "model.safetensors.index.json"
-        weight_map = json.loads(index_path.read_text()).get("weight_map", {})
+        config_path = model_path / "config.json"
+        model_config = json.loads(config_path.read_text()) if config_path.exists() else {}
+        flat_table = model_config.get("ngram_table")
+        if flat_table is not None:
+            from omlx.quantization.ngram import flat_ngram_views
+
+            filename = flat_table["file"]
+            table_path = (model_path / filename).resolve()
+            if not table_path.is_relative_to(model_path.resolve()):
+                raise ValueError("Flat n-gram table must be inside the model directory")
+            views = flat_ngram_views(
+                table_path, prefix, self.shard_sizes, dims, flat_table
+            )
+            reader = _SafeTensorMMap(table_path)
+            reader._header.update(views)
+            self._readers[filename] = reader
+            weight_map = {key: filename for key in views}
+        else:
+            weight_map = json.loads(index_path.read_text()).get("weight_map", {})
 
         def register_reader(key: str) -> _SafeTensorMMap:
             filename = weight_map[key]
