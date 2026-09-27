@@ -26,9 +26,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from omlx.canonical_recovery import MAX_BLOCKED_IDLE_STEPS
 from omlx.engine_core import EngineConfig, EngineCore
 from omlx.scheduler import Scheduler, SchedulerConfig, SchedulerOutput
-from omlx.canonical_recovery import MAX_BLOCKED_IDLE_STEPS
 
 
 def _make_scheduler(**config_over) -> Scheduler:

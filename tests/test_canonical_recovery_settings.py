@@ -10,10 +10,10 @@ every load — a ceiling read off it would be whichever model loaded last.
 
 import pytest
 
+from omlx.canonical_recovery import apply_canonical_recovery_settings
 from omlx.model_settings import ModelSettings
 from omlx.scheduler import SchedulerConfig
 from omlx.settings import SchedulerSettings
-from omlx.canonical_recovery import apply_canonical_recovery_settings
 
 
 class TestModelSettingsRoundTrip:

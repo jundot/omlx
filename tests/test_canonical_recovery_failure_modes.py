@@ -33,6 +33,7 @@ from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from omlx.canonical_recovery import MAX_CONSECUTIVE_YIELDS
 from omlx.request import Request, SamplingParams
 from omlx.scheduler import (
     PrefillEvictionRequest,
@@ -41,7 +42,6 @@ from omlx.scheduler import (
     _PrefillAbortedError,
     _PrefillEvictionNeeded,
 )
-from omlx.canonical_recovery import MAX_CONSECUTIVE_YIELDS
 
 
 def _make_scheduler(**config_over) -> Scheduler:

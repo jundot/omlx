@@ -26,8 +26,8 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from omlx.scheduler import Scheduler, SchedulerConfig
 from omlx.canonical_recovery import CanonicalRecoveryJob
+from omlx.scheduler import Scheduler, SchedulerConfig
 
 BLOCK = 4096
 

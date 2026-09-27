@@ -8,14 +8,13 @@ background-densification prototype, so a regression there fails loudly rather
 than being rediscovered by a later review.
 """
 
-import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from omlx.patches.specprefill import (
+    _ROPE_WRAPPERS,
     _OffsetAdjustedRoPE,
     _PositionMappedRoPE,
-    _ROPE_WRAPPERS,
     _unwrap_rope,
     is_specprefill_rope,
 )
@@ -603,7 +602,7 @@ class TestTelemetrySurvivesNothing:
         assert scheduler._canonical_recovery_budget.service_s == 12.0
 
 
-class TestIdleAccounting:
+class TestTheJobDoesNotBlockItself:
     """The recovery job must not count itself as the work that blocks it."""
 
     def test_a_live_job_alone_does_not_reset_the_idle_run(self):

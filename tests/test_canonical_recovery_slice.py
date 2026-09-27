@@ -26,15 +26,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from omlx.model_settings import ModelSettings
-from omlx.prefill_boundaries import clamp_prefill_chunk_to_boundary
-from omlx.scheduler import Scheduler, SchedulerConfig
 from omlx.canonical_recovery import (
     CanonicalRecoveryJob,
     apply_canonical_recovery_settings,
-    safe_publish_boundary,
     canonical_recovery_slice_cap,
+    safe_publish_boundary,
 )
+from omlx.model_settings import ModelSettings
+from omlx.prefill_boundaries import clamp_prefill_chunk_to_boundary
+from omlx.scheduler import Scheduler, SchedulerConfig
 
 BLOCK = 4096
 

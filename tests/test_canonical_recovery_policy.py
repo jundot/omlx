@@ -13,8 +13,8 @@ from omlx.canonical_recovery import (
     DEFAULT_BUDGET_WINDOW_S,
     CanonicalRecoveryBudget,
     CanonicalRecoveryJob,
-    safe_publish_boundary,
     canonical_recovery_is_runnable,
+    safe_publish_boundary,
 )
 
 

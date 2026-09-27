@@ -33,7 +33,6 @@ from omlx.decode_activity import get_decode_activity
 from omlx.engine_pool import EnginePool
 from omlx.prefill_progress import get_prefill_tracker
 from omlx.scheduler import Scheduler, SchedulerConfig
-from omlx.canonical_recovery import CanonicalRecoveryBudget
 
 WINDOW_S = 30.0
 PCT = 10.0
@@ -157,7 +156,7 @@ class TestOneBudgetForTheProcess:
         budget = a._canonical_recovery_budget
         slice_s = 0.4
         granted = 0.0
-        for window in range(4):
+        for _ in range(4):
             budget.window_start_s -= WINDOW_S      # roll one window forward
             for engine in (a, b):
                 while engine._canonical_recovery_budget.allows():
