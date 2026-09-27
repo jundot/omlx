@@ -336,7 +336,11 @@ def install_packed_experts(model, config):
     if os.environ.get("OMLX_EXL3_ENABLED", "0") != "1":
         raise ValueError("EXL3 support is opt-in: set OMLX_EXL3_ENABLED=1")
     spec = Exl3Spec.from_config({"expert_quant": config.expert_quant})
-    for layer in model.language_model.model.layers:
+    layers = list(model.language_model.model.layers)
+    mtp = getattr(model, "mtp", None)
+    if mtp is not None:
+        layers.extend(mtp.layers)
+    for layer in layers:
         mlp = getattr(getattr(layer, "mlp", None), "switch_mlp", None)
         if mlp is None:
             raise ValueError("EXL3 checkpoint requires routed experts in every layer")
@@ -355,7 +359,7 @@ def install_packed_experts(model, config):
             )
 
 
-def validate_checkpoint_headers(model_path, config):
+def validate_checkpoint_headers(model_path, config, *, include_mtp=False):
     """Reject mismatched packed banks before allocating any checkpoint arrays."""
     import json
     import struct
@@ -367,19 +371,29 @@ def validate_checkpoint_headers(model_path, config):
     intermediate = text["moe_intermediate_size"]
     experts = text["num_experts"]
     expected = {}
-    for layer in range(text["num_hidden_layers"]):
+    banks = [
+        (f"language_model.model.layers.{layer}.mlp.switch_mlp", experts)
+        for layer in range(text["num_hidden_layers"])
+    ]
+    if include_mtp:
+        if text.get("mtp_num_hidden_layers", 1) != 1:
+            raise ValueError("EXL3 MTP supports the native one-layer draft head")
+        banks.append(
+            ("mtp.layers.0.mlp.switch_mlp", text.get("mtp_num_experts") or experts)
+        )
+    for prefix, bank_experts in banks:
         for proj, k, n in [
             ("gate_proj", hidden, intermediate),
             ("up_proj", hidden, intermediate),
             ("down_proj", intermediate, hidden),
         ]:
-            base = f"language_model.model.layers.{layer}.mlp.switch_mlp.{proj}"
+            base = f"{prefix}.{proj}"
             expected[base + ".trellis"] = (
                 "U16",
-                [experts, k // 16, n // 16, spec.halfwords],
+                [bank_experts, k // 16, n // 16, spec.halfwords],
             )
-            expected[base + ".suh"] = ("F16", [experts, k])
-            expected[base + ".svh"] = ("F16", [experts, n])
+            expected[base + ".suh"] = ("F16", [bank_experts, k])
+            expected[base + ".svh"] = ("F16", [bank_experts, n])
     seen = set()
     for path in Path(model_path).glob("*.safetensors"):
         with path.open("rb") as f:
@@ -391,6 +405,15 @@ def validate_checkpoint_headers(model_path, config):
                 raise ValueError("Invalid safetensors header size")
             header = json.loads(f.read(size))
         for key, entry in header.items():
+            if include_mtp:
+                for prefix in (
+                    "model.language_model.mtp.",
+                    "language_model.mtp.",
+                    "model.mtp.",
+                ):
+                    if key.startswith(prefix):
+                        key = "mtp." + key[len(prefix) :]
+                        break
             if key not in expected:
                 continue
             if key in seen:
