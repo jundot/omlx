@@ -44,7 +44,11 @@ def resolve_static_prefix_end(
     the real prompt. The result can include the first turn's header tokens.
     Returns 0 when there is nothing to protect.
     """
-    static_messages = [m for m in messages if m.get("role") in STATIC_PREFIX_ROLES]
+    static_messages = []
+    for message in messages:
+        if message.get("role") not in STATIC_PREFIX_ROLES:
+            break
+        static_messages.append(message)
     if not static_messages or len(static_messages) == len(messages):
         return 0
 
