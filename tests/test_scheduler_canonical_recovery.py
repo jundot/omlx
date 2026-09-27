@@ -51,21 +51,12 @@ def _make_scheduler(**config_over) -> Scheduler:
     return scheduler
 
 
-def _sparse_request(prompt_tokens: int, rid: str = "r1", scheduler=None):
-    """A finished sparse request, stamped with the cache that served it.
-
-    The stamp is part of the contract now: a recovery job is only queued by the
-    scheduler whose prefix-cache instance actually served the request, because
-    one served model can present more than one instance and state published
-    into the wrong one is valid, durable and unreachable.
-    """
+def _sparse_request(prompt_tokens: int, rid: str = "r1"):
+    """A finished request that took the sparse route."""
     request = MagicMock()
     request.request_id = rid
     request.prompt_token_ids = list(range(prompt_tokens))
     request.specprefill_indices = [1, 2, 3]
-    request._serving_prefix_cache_id = (
-        id(scheduler.block_aware_cache) if scheduler is not None else None
-    )
     return request
 
 
@@ -76,7 +67,7 @@ def _raise_on_call(*_args, **_kwargs):
 class TestCandidateAdmission:
     def test_a_sparse_request_queues_a_canonical_recovery_job(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         assert scheduler._canonical_recovery_job is not None
         # 1000 tokens, 256-token blocks: only whole blocks are publishable, so
         # the target is the last whole block and the 232-token remainder is
@@ -86,43 +77,43 @@ class TestCandidateAdmission:
     def test_a_dense_request_queues_nothing(self):
         """A dense request already stored its own checkpoint. There is no debt."""
         scheduler = _make_scheduler()
-        request = _sparse_request(1000, scheduler=scheduler)
+        request = _sparse_request(1000)
         request.specprefill_indices = None
         scheduler.note_canonical_recovery_candidate(request)
         assert scheduler._canonical_recovery_job is None
 
     def test_a_prompt_shorter_than_one_block_queues_nothing(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(100, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(100))
         assert scheduler._canonical_recovery_job is None
 
     def test_an_unreconstructible_model_queues_nothing(self):
         scheduler = _make_scheduler()
         scheduler._unreconstructible_cache_model = True
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         assert scheduler._canonical_recovery_job is None
 
     def test_disabled_queues_nothing(self):
         scheduler = _make_scheduler(canonical_state_recovery_enabled=False)
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         assert scheduler._canonical_recovery_job is None
 
     def test_an_append_extends_rather_than_replacing(self):
         """Single-flight: two jobs on one session recompute the same prefix."""
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         first = scheduler._canonical_recovery_job
         first.committed_tokens = 512
-        scheduler.note_canonical_recovery_candidate(_sparse_request(2000, rid="r2", scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(2000, rid="r2"))
         assert scheduler._canonical_recovery_job is first
         assert scheduler._canonical_recovery_job.target_tokens == 1792
         assert scheduler._canonical_recovery_job.committed_tokens == 512
 
     def test_a_rewritten_prefix_replaces_the_job(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         first = scheduler._canonical_recovery_job
-        rewritten = _sparse_request(2000, rid="r2", scheduler=scheduler)
+        rewritten = _sparse_request(2000, rid="r2")
         rewritten.prompt_token_ids[10] = -1
         scheduler.note_canonical_recovery_candidate(rewritten)
         assert scheduler._canonical_recovery_job is not first
@@ -134,7 +125,7 @@ class TestSafetyReviewConditions:
 
     def test_an_active_specprefill_makes_the_canonical_recovery_unrunnable(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         scheduler._consecutive_idle_steps = 5
         assert scheduler._canonical_recovery_runnable()
         scheduler._specprefill_active_request_id = "r1"
@@ -148,7 +139,7 @@ class TestSafetyReviewConditions:
         forward it is the only signal a *peer* engine has.
         """
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         scheduler._consecutive_idle_steps = 5
         assert scheduler._canonical_recovery_runnable()
         scheduler.note_inbound_request("incoming")
@@ -162,7 +153,7 @@ class TestSafetyReviewConditions:
         """Liveness: an arrival that never departs must not block the recovery
         job for the life of the process."""
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         scheduler._consecutive_idle_steps = 5
         scheduler.note_inbound_request("lost")
         assert not scheduler._canonical_recovery_runnable()
@@ -172,7 +163,7 @@ class TestSafetyReviewConditions:
 
     def test_one_idle_step_is_not_enough_to_start_a_chunk(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         scheduler._consecutive_idle_steps = 1
         assert not scheduler._canonical_recovery_runnable()
         scheduler._consecutive_idle_steps = 2
@@ -185,7 +176,7 @@ class TestSafetyReviewConditions:
         publish if that answer has changed.
         """
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         job = scheduler._canonical_recovery_job
         state = MagicMock(base_size=0, tokens_processed=256)
         scheduler._unreconstructible_cache_model = True
@@ -202,7 +193,7 @@ class TestSafetyReviewConditions:
         anything about what the worker does.
         """
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         job = scheduler._canonical_recovery_job
         state = MagicMock(base_size=0, tokens_processed=256, cache=[MagicMock()])
         with patch.object(
@@ -235,7 +226,7 @@ class TestSafetyReviewConditions:
         job recorded the commit, and the next turn restored nothing.
         """
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         job = scheduler._canonical_recovery_job
         state = MagicMock(base_size=0, tokens_processed=256, cache=[MagicMock()])
         with patch.object(
@@ -259,7 +250,7 @@ class TestSafetyReviewConditions:
         """Publishing the live cache would write placeholders for every block
         but the last, which a later restore rejects."""
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         job = scheduler._canonical_recovery_job
         state = MagicMock(base_size=0, tokens_processed=256, cache=[MagicMock()])
         with patch.object(
@@ -300,7 +291,7 @@ class TestSafetyReviewConditions:
         """
         scheduler = _make_scheduler()
         scheduler.note_canonical_recovery_candidate(
-            _sparse_request(1000, scheduler=scheduler)
+            _sparse_request(1000)
         )
         job = scheduler._canonical_recovery_job
         state = MagicMock(base_size=0, tokens_processed=8192, cache=[MagicMock()])
@@ -332,7 +323,7 @@ class TestSafetyReviewConditions:
         """
         scheduler = _make_scheduler()
         scheduler.note_canonical_recovery_candidate(
-            _sparse_request(1000, scheduler=scheduler)
+            _sparse_request(1000)
         )
         job = scheduler._canonical_recovery_job
         job.note_published(8192)
@@ -358,7 +349,7 @@ class TestSafetyReviewConditions:
 
     def test_a_dropped_job_releases_its_cache_footprint(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         with patch.object(
             scheduler, "_release_paged_cache_for_request"
         ) as release, patch.object(
@@ -373,7 +364,7 @@ class TestSafetyReviewConditions:
 class TestPublication:
     def test_a_new_boundary_publishes_mid_target(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         job = scheduler._canonical_recovery_job
         job.processed_tokens = 512
         assert job.publishable_boundary() == 512
@@ -382,7 +373,7 @@ class TestPublication:
         """Storing a state that has ingested tokens past a block as that
         block's state double-ingests them on restore."""
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         job = scheduler._canonical_recovery_job
         state = MagicMock(base_size=0, tokens_processed=300)
         with patch.object(scheduler, "_async_store_cache_worker") as worker:
@@ -394,7 +385,7 @@ class TestPublication:
 class TestIdleAccounting:
     def test_a_step_with_foreground_work_resets_the_idle_run(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         scheduler._consecutive_idle_steps = 4
         scheduler._canonical_recovery_note_step(did_foreground_work=True)
         assert scheduler._consecutive_idle_steps == 0
@@ -412,19 +403,19 @@ class TestLoopLiveness:
     def test_a_live_job_keeps_the_loop_stepping(self):
         scheduler = _make_scheduler()
         assert not scheduler.has_requests()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         assert scheduler.has_requests()
 
     def test_a_finished_job_does_not_hold_the_loop_awake(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         job = scheduler._canonical_recovery_job
         job.processed_tokens = job.target_tokens
         assert not scheduler.has_requests()
 
     def test_a_cancelled_job_does_not_hold_the_loop_awake(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         scheduler._canonical_recovery_job.cancelled = True
         assert not scheduler.has_requests()
 
@@ -436,7 +427,7 @@ class TestLoopLiveness:
         keep stepping for it.
         """
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         scheduler._canonical_recovery_budget.pct = 0.0
         assert not scheduler.has_requests()
 
@@ -451,7 +442,7 @@ class TestLoopLiveness:
         clear.
         """
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         budget = scheduler._canonical_recovery_budget
         budget.note_service(budget.window_s)       # far past this window's allowance
         assert not budget.allows()
@@ -484,7 +475,7 @@ class TestFinishedJobStopsRunning:
 
     def test_a_job_that_reached_its_target_is_not_runnable(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         scheduler._canonical_recovery_note_step(did_foreground_work=False)
         scheduler._canonical_recovery_note_step(did_foreground_work=False)
         assert scheduler._canonical_recovery_runnable()
@@ -496,12 +487,12 @@ class TestFinishedJobStopsRunning:
         """Finishing retires the work, it does not retire the job: the next
         turn extends the same job rather than starting over from nothing."""
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         scheduler._canonical_recovery_job.note_reached_target()
         scheduler._canonical_recovery_note_step(did_foreground_work=False)
         scheduler._canonical_recovery_note_step(did_foreground_work=False)
         assert not scheduler._canonical_recovery_runnable()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(2000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(2000))
         assert scheduler._canonical_recovery_runnable()
 
 
@@ -516,27 +507,27 @@ class TestJobSurvivesATurnWithNothingNew:
 
     def test_a_turn_below_the_next_boundary_keeps_the_job(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         job = scheduler._canonical_recovery_job
         job.note_published(768)
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1010, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1010))
         assert scheduler._canonical_recovery_job is job
         assert scheduler._canonical_recovery_job.committed_tokens == 768
 
     def test_a_turn_past_the_next_boundary_still_extends(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         job = scheduler._canonical_recovery_job
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1400, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1400))
         assert scheduler._canonical_recovery_job is job
         assert scheduler._canonical_recovery_job.target_tokens == 1280
 
     def test_a_rewritten_history_still_replaces_the_job(self):
         """The no-op path must not swallow a prompt that is not an append."""
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         job = scheduler._canonical_recovery_job
-        rewritten = _sparse_request(1000, scheduler=scheduler)
+        rewritten = _sparse_request(1000)
         rewritten.prompt_token_ids = [9] + list(range(1, 1000))
         scheduler.note_canonical_recovery_candidate(rewritten)
         assert scheduler._canonical_recovery_job is not job
@@ -547,7 +538,7 @@ class TestParking:
 
     def test_a_parked_job_is_not_runnable_and_keeps_its_prefix(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         job = scheduler._canonical_recovery_job
         job.note_published(768)
         scheduler._canonical_recovery_park_job(job, "nothing_to_do")
@@ -559,10 +550,10 @@ class TestParking:
 
     def test_an_append_wakes_a_parked_job(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         job = scheduler._canonical_recovery_job
         scheduler._canonical_recovery_park_job(job, "nothing_to_do")
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1400, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1400))
         scheduler._canonical_recovery_note_step(did_foreground_work=False)
         scheduler._canonical_recovery_note_step(did_foreground_work=False)
         assert scheduler._canonical_recovery_job is job
@@ -576,7 +567,7 @@ class TestTheWholeStepIsCharged:
 
     def test_a_step_that_never_reaches_the_model_still_costs_budget(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         scheduler._canonical_recovery_begin_state = _raise_on_call
         assert not scheduler._canonical_recovery_step()
         assert scheduler._canonical_recovery_counters.service_s > 0
@@ -593,7 +584,7 @@ class TestTelemetrySurvivesNothing:
 
     def test_reset_clears_the_recovery_telemetry(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         scheduler._canonical_recovery_counters.service_s = 12.0
         scheduler._canonical_recovery_budget.note_service(12.0)
         scheduler._canonical_recovery_note_step(did_foreground_work=False)
@@ -617,7 +608,7 @@ class TestIdleAccounting:
 
     def test_a_live_job_alone_does_not_reset_the_idle_run(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         assert scheduler.has_requests()          # keeps the loop stepping
         assert not scheduler._canonical_recovery_foreground_busy()
         scheduler._canonical_recovery_note_step(did_foreground_work=False)
@@ -627,7 +618,7 @@ class TestIdleAccounting:
 
     def test_an_active_specprefill_counts_as_foreground_busy(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         scheduler._specprefill_active_request_id = "r1"
         assert scheduler._canonical_recovery_foreground_busy()
         scheduler._canonical_recovery_note_step(did_foreground_work=False)
@@ -646,7 +637,7 @@ class TestCancellation:
 
     def test_cancel_canonical_recovery_work_makes_the_scheduler_quiescent(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         assert scheduler.has_requests()
         assert scheduler.cancel_canonical_recovery_work("unload") is True
         assert not scheduler.has_requests()
@@ -666,7 +657,7 @@ class TestCancellation:
         on the job object that recorded it.
         """
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         job = scheduler._canonical_recovery_job
         job.note_published(512)
         with patch.object(
@@ -729,7 +720,7 @@ class TestStoreWorkerLifecycle:
 
     def test_a_live_job_publishes_with_the_entry_retained(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(2000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(2000))
         job = scheduler._canonical_recovery_job
         state = MagicMock(base_size=0, tokens_processed=256, cache=[MagicMock()])
         with patch.object(
@@ -767,7 +758,7 @@ class TestRopeGuard:
 
     def test_a_leftover_wrapper_blocks_the_canonical_recovery_with_the_id_already_clear(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         scheduler._consecutive_idle_steps = 5
         assert scheduler._specprefill_active_request_id is None
 
@@ -786,7 +777,7 @@ class TestRopeGuard:
         correctly named stub could have caught.
         """
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         scheduler._consecutive_idle_steps = 5
 
         wrapper = _PositionMappedRoPE(SimpleNamespace(dims=64, base=10000.0, scale=1.0), [0, 1, 2])
@@ -821,7 +812,7 @@ class TestRopeGuard:
 
     def test_an_ordinary_rope_does_not_block_recovery(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         scheduler._consecutive_idle_steps = 5
 
         class RoPE:
@@ -834,7 +825,7 @@ class TestRopeGuard:
 
     def test_a_model_that_cannot_be_inspected_is_treated_as_patched(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         scheduler._consecutive_idle_steps = 5
         type(scheduler.model).layers = property(
             lambda self: (_ for _ in ()).throw(RuntimeError("no layers"))
@@ -859,7 +850,7 @@ class TestYieldBudget:
         from omlx.canonical_recovery import MAX_CONSECUTIVE_YIELDS
 
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         job = scheduler._canonical_recovery_job
         for _ in range(MAX_CONSECUTIVE_YIELDS - 1):
             scheduler._canonical_recovery_note_yield(job, "the throttle")
@@ -869,7 +860,7 @@ class TestYieldBudget:
 
     def test_a_chunk_that_ran_clears_the_yield_run(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         job = scheduler._canonical_recovery_job
         scheduler._canonical_recovery_note_yield(job, "the throttle")
         scheduler._canonical_recovery_note_yield(job, "the throttle")
@@ -909,48 +900,6 @@ class TestDisabledIsInert:
         note.assert_not_called()
 
 
-class TestServingCacheBinding:
-    """A recovery job belongs to the prefix-cache instance that served its request.
-
-    One served model can present more than one `BlockAwarePrefixCache`. State
-    published into the instance that did not serve the request is valid,
-    durable and unreachable — a restore on the serving path never looks there.
-    A traced run showed exactly that: the publication succeeded, the sidecar
-    committed, a restore against the publishing cache recovered the boundary in
-    full, and the foreground cache saw nothing.
-    """
-
-    def test_a_request_this_cache_did_not_serve_is_declined(self):
-        scheduler = _make_scheduler()
-        request = _sparse_request(1000)          # no serving stamp at all
-        scheduler.note_canonical_recovery_candidate(request)
-        assert scheduler._canonical_recovery_job is None
-
-    def test_a_request_served_by_another_instance_is_declined(self):
-        scheduler = _make_scheduler()
-        request = _sparse_request(1000, scheduler=scheduler)
-        request._serving_prefix_cache_id = id(scheduler.block_aware_cache) + 1
-        scheduler.note_canonical_recovery_candidate(request)
-        assert scheduler._canonical_recovery_job is None
-
-    def test_a_queued_job_records_the_instance_it_is_bound_to(self):
-        scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
-        assert scheduler._canonical_recovery_job.serving_cache_id == id(scheduler.block_aware_cache)
-
-    def test_publication_fails_closed_when_the_instance_changes(self):
-        scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
-        job = scheduler._canonical_recovery_job
-        state = MagicMock(base_size=0, tokens_processed=256, cache=[MagicMock()])
-        scheduler.block_aware_cache = MagicMock()      # a different instance
-        with patch.object(scheduler, "_async_store_cache_worker") as worker:
-            scheduler._canonical_recovery_publish(job, 256, state)
-        worker.assert_not_called()
-        assert job.committed_tokens == 0
-        assert scheduler._canonical_recovery_job is None           # dropped, not retried
-
-
 class TestRestorableInvariant:
     """canonical_committed_tokens <= independently_restorable_tokens.
 
@@ -980,7 +929,7 @@ class TestRestorableInvariant:
 
     def test_an_unrestorable_publication_does_not_advance_the_counter(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         job = scheduler._canonical_recovery_job
         self._publish(scheduler, job, readback=0)
         assert job.committed_tokens == 0
@@ -988,7 +937,7 @@ class TestRestorableInvariant:
 
     def test_a_restorable_publication_advances_it(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         job = scheduler._canonical_recovery_job
         self._publish(scheduler, job, readback=256)
         assert job.committed_tokens == 256
@@ -997,7 +946,7 @@ class TestRestorableInvariant:
     def test_a_partial_readback_does_not_advance_it(self):
         """The invariant is <=, so a boundary only partly visible is not one."""
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         job = scheduler._canonical_recovery_job
         self._publish(scheduler, job, readback=128)
         assert job.committed_tokens == 0
@@ -1005,7 +954,7 @@ class TestRestorableInvariant:
     def test_the_readback_probe_releases_its_own_entry(self):
         """It runs the real lookup, so it must not leave a block table behind."""
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         job = scheduler._canonical_recovery_job
         scheduler.block_aware_cache.fetch_cache.return_value = (
             SimpleNamespace(num_tokens=256),

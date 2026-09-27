@@ -54,14 +54,11 @@ def _make_scheduler(**config_over) -> Scheduler:
     return scheduler
 
 
-def _sparse_request(prompt_tokens: int, rid: str = "r1", scheduler=None):
+def _sparse_request(prompt_tokens: int, rid: str = "r1"):
     request = MagicMock()
     request.request_id = rid
     request.prompt_token_ids = list(range(prompt_tokens))
     request.specprefill_indices = [1, 2, 3]
-    request._serving_prefix_cache_id = (
-        id(scheduler.block_aware_cache) if scheduler is not None else None
-    )
     return request
 
 
@@ -86,7 +83,7 @@ def _idle(scheduler: Scheduler) -> None:
 class TestAnotherEnginesDecodeWithdrawsTheChunk:
     def test_a_foreign_decode_makes_the_job_not_runnable(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         _idle(scheduler)
         assert scheduler._canonical_recovery_runnable()
 
@@ -100,7 +97,7 @@ class TestAnotherEnginesDecodeWithdrawsTheChunk:
         """Its own decode is already covered by `running`, and counting it
         here would mean a scheduler stood down for itself."""
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         _idle(scheduler)
         get_decode_activity().publish(scheduler._decode_activity_key, 1)
         assert scheduler._canonical_recovery_runnable()
@@ -117,7 +114,7 @@ class TestAnotherEnginesPrefillWithdrawsTheChunk:
 
     def test_a_foreign_prefill_makes_the_job_not_runnable(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         _idle(scheduler)
         assert scheduler._canonical_recovery_runnable()
 
@@ -131,7 +128,7 @@ class TestAnotherEnginesPrefillWithdrawsTheChunk:
         """A job between chunks still holds its entry, so counting it would
         stop the job it belongs to from ever taking a second chunk."""
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         _idle(scheduler)
         rid = scheduler._canonical_recovery_request_id(scheduler._canonical_recovery_job)
         get_prefill_tracker().update(rid, 256, 768, "this-model")
@@ -147,7 +144,7 @@ class TestAnotherEnginesPrefillWithdrawsTheChunk:
         it either — there is a reason, and the reason ends.
         """
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         assert scheduler.has_requests()
 
         get_prefill_tracker().update("other-request", 100, 8000, "another-model")
@@ -189,7 +186,7 @@ class TestAnotherEnginesArrivalWithdrawsTheChunk:
         engine_a = _make_scheduler()
         engine_b = _make_scheduler()
         engine_a.note_canonical_recovery_candidate(
-            _sparse_request(1000, scheduler=engine_a)
+            _sparse_request(1000)
         )
         _idle(engine_a)
         assert engine_a._canonical_recovery_runnable()
@@ -210,7 +207,7 @@ class TestAnotherEnginesArrivalWithdrawsTheChunk:
         engine_a = _make_scheduler()
         engine_b = _make_scheduler()
         engine_a.note_canonical_recovery_candidate(
-            _sparse_request(1000, scheduler=engine_a)
+            _sparse_request(1000)
         )
         _idle(engine_a)
 
@@ -223,7 +220,7 @@ class TestAnotherEnginesArrivalWithdrawsTheChunk:
         engine_a = _make_scheduler()
         engine_b = _make_scheduler()
         engine_a.note_canonical_recovery_candidate(
-            _sparse_request(1000, scheduler=engine_a)
+            _sparse_request(1000)
         )
         _idle(engine_a)
 
@@ -245,7 +242,7 @@ class TestAnotherEnginesArrivalWithdrawsTheChunk:
         engine_b = _make_scheduler()
         for engine in (engine_a, engine_b):
             engine.note_canonical_recovery_candidate(
-                _sparse_request(1000, scheduler=engine)
+                _sparse_request(1000)
             )
             _idle(engine)
 
@@ -262,7 +259,7 @@ class TestAnotherEnginesArrivalWithdrawsTheChunk:
         engine_b._canonical_recovery_budget = engine_a._canonical_recovery_budget
         for engine in (engine_a, engine_b):
             engine.note_canonical_recovery_candidate(
-                _sparse_request(1000, scheduler=engine)
+                _sparse_request(1000)
             )
             _idle(engine)
         assert engine_a._canonical_recovery_runnable()

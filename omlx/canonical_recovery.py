@@ -309,17 +309,6 @@ class CanonicalRecoveryJob:
     committed_tokens: int = 0       # longest published canonical prefix
     processed_tokens: int = 0       # dense tokens consumed this job, published or not
     published_boundaries: list[int] = field(default_factory=list)
-    # Identity of the BlockAwarePrefixCache that served the originating
-    # request. A job is bound to it for its whole life: one served model can
-    # present more than one prefix-cache instance, and state published into the
-    # instance that did not serve the request is valid, durable and invisible.
-    serving_cache_id: int | None = None
-    # A weak reference to that same instance. The id alone answers "is this
-    # still the cache that served me", which is all the publish decision
-    # needs. Releasing the job's blocks needs the object: on the one path
-    # where the instance has changed, the current one is by construction not
-    # the one holding them.
-    serving_cache_ref: object | None = None
     cancelled: bool = False
     # Consecutive chunks that yielded without doing work. Bounded, because a
     # yield that nothing ever satisfies is not a pause: the job stays live, the

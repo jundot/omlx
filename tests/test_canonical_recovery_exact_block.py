@@ -60,14 +60,11 @@ def _make_scheduler(**config_over) -> Scheduler:
     return scheduler
 
 
-def _sparse_request(prompt_tokens: int, rid: str = "r1", scheduler=None):
+def _sparse_request(prompt_tokens: int, rid: str = "r1"):
     request = MagicMock()
     request.request_id = rid
     request.prompt_token_ids = list(range(prompt_tokens))
     request.specprefill_indices = [1, 2, 3]
-    request._serving_prefix_cache_id = (
-        id(scheduler.block_aware_cache) if scheduler is not None else None
-    )
     return request
 
 
@@ -95,7 +92,7 @@ class TestTheTargetIsTheBoundaryItself:
     def test_the_target_is_the_last_whole_block(self, prompt_tokens, expected_target):
         scheduler = _make_scheduler()
         scheduler.note_canonical_recovery_candidate(
-            _sparse_request(prompt_tokens, scheduler=scheduler)
+            _sparse_request(prompt_tokens)
         )
         job = scheduler._canonical_recovery_job
         assert job is not None
@@ -104,7 +101,7 @@ class TestTheTargetIsTheBoundaryItself:
     def test_a_prompt_shorter_than_one_block_still_queues_nothing(self):
         scheduler = _make_scheduler()
         scheduler.note_canonical_recovery_candidate(
-            _sparse_request(BLOCK - 1, scheduler=scheduler)
+            _sparse_request(BLOCK - 1)
         )
         assert scheduler._canonical_recovery_job is None
 

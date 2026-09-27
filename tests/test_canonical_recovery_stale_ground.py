@@ -177,7 +177,6 @@ class TestTheScenarioEndToEnd:
         request.request_id = "s"
         request.prompt_token_ids = list(range(8 * BLOCK + 10))
         request.specprefill_indices = [1, 2, 3]
-        request._serving_prefix_cache_id = id(scheduler.block_aware_cache)
         scheduler.note_canonical_recovery_candidate(request)
 
         assert scheduler._canonical_recovery_job is job

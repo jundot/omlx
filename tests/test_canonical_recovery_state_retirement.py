@@ -78,14 +78,11 @@ def _make_scheduler(**config_over) -> Scheduler:
     return scheduler
 
 
-def _sparse_request(prompt_tokens: int, rid: str = "r1", scheduler=None):
+def _sparse_request(prompt_tokens: int, rid: str = "r1"):
     request = MagicMock()
     request.request_id = rid
     request.prompt_token_ids = list(range(prompt_tokens))
     request.specprefill_indices = [1, 2, 3]
-    request._serving_prefix_cache_id = (
-        id(scheduler.block_aware_cache) if scheduler is not None else None
-    )
     return request
 
 
@@ -114,7 +111,7 @@ def _idle(scheduler: Scheduler) -> None:
 def _live_job(scheduler: Scheduler, *, committed: int = 2 * BLOCK, processed: int = 0):
     """A job mid-slice: state built, a boundary already published."""
     scheduler.note_canonical_recovery_candidate(
-        _sparse_request(8 * BLOCK, scheduler=scheduler)
+        _sparse_request(8 * BLOCK)
     )
     job = scheduler._canonical_recovery_job
     assert job is not None

@@ -87,20 +87,17 @@ def _clean_priming_slot():
     prompt_priming._SUPPRESS.value = False
 
 
-def _sparse_request(prompt_tokens: int, rid: str = "r1", scheduler=None):
+def _sparse_request(prompt_tokens: int, rid: str = "r1"):
     request = MagicMock()
     request.request_id = rid
     request.prompt_token_ids = list(range(prompt_tokens))
     request.specprefill_indices = [1, 2, 3]
-    request._serving_prefix_cache_id = (
-        id(scheduler.block_aware_cache) if scheduler is not None else None
-    )
     return request
 
 
 def _queued(scheduler, prompt_tokens: int = 1000):
     scheduler.note_canonical_recovery_candidate(
-        _sparse_request(prompt_tokens, scheduler=scheduler)
+        _sparse_request(prompt_tokens)
     )
     job = scheduler._canonical_recovery_job
     assert job is not None

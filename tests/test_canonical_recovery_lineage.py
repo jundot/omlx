@@ -61,25 +61,16 @@ def _make_scheduler(**config_over) -> Scheduler:
     return scheduler
 
 
-def _sparse_request(prompt_tokens: int, rid: str = "r1", scheduler=None):
-    """A finished sparse request, stamped with the cache that served it.
-
-    The stamp is part of the contract now: a recovery job is only queued by the
-    scheduler whose prefix-cache instance actually served the request, because
-    one served model can present more than one instance and state published
-    into the wrong one is valid, durable and unreachable.
-    """
+def _sparse_request(prompt_tokens: int, rid: str = "r1"):
+    """A finished request that took the sparse route."""
     request = MagicMock()
     request.request_id = rid
     request.prompt_token_ids = list(range(prompt_tokens))
     request.specprefill_indices = [1, 2, 3]
-    request._serving_prefix_cache_id = (
-        id(scheduler.block_aware_cache) if scheduler is not None else None
-    )
     return request
 
 
-def _sparse_request_on(tokens: list[int], rid: str, scheduler):
+def _sparse_request_on(tokens: list[int], rid: str):
     """The same request, over a token list the test wrote out itself.
 
     Every lineage question here is a question about token lists, so these are
@@ -87,7 +78,7 @@ def _sparse_request_on(tokens: list[int], rid: str, scheduler):
     tokens" would be asserting against whatever `_sparse_request` happened to
     generate, not against a prefix-extension it can point at.
     """
-    request = _sparse_request(0, rid=rid, scheduler=scheduler)
+    request = _sparse_request(0, rid=rid)
     request.prompt_token_ids = list(tokens)
     return request
 
@@ -197,9 +188,7 @@ class TestB2RapidTurnsCoalesce:
         with _lineage_spies(scheduler) as counts:
             for turn, prompt_len in enumerate(self.PROMPTS):
                 scheduler.note_canonical_recovery_candidate(
-                    _sparse_request_on(
-                        list(range(prompt_len)), rid=f"r{turn}", scheduler=scheduler
-                    )
+                    _sparse_request_on(list(range(prompt_len)), rid=f"r{turn}")
                 )
                 assert scheduler._canonical_recovery_job is not None
                 identities.append(id(scheduler._canonical_recovery_job))
@@ -219,9 +208,7 @@ class TestB2RapidTurnsCoalesce:
         first = None
         for turn, prompt_len in enumerate(self.PROMPTS):
             scheduler.note_canonical_recovery_candidate(
-                _sparse_request_on(
-                    list(range(prompt_len)), rid=f"r{turn}", scheduler=scheduler
-                )
+                _sparse_request_on(list(range(prompt_len)), rid=f"r{turn}")
             )
             job = scheduler._canonical_recovery_job
             if first is None:
@@ -237,15 +224,13 @@ class TestB2RapidTurnsCoalesce:
     def test_the_committed_prefix_survives_every_extension(self):
         scheduler = _make_scheduler()
         scheduler.note_canonical_recovery_candidate(
-            _sparse_request_on(list(range(20000)), rid="r0", scheduler=scheduler)
+            _sparse_request_on(list(range(20000)), rid="r0")
         )
         job = scheduler._canonical_recovery_job
         job.note_published(4 * BLOCK)
         for turn, prompt_len in enumerate(self.PROMPTS[1:], start=1):
             scheduler.note_canonical_recovery_candidate(
-                _sparse_request_on(
-                    list(range(prompt_len)), rid=f"r{turn}", scheduler=scheduler
-                )
+                _sparse_request_on(list(range(prompt_len)), rid=f"r{turn}")
             )
             assert scheduler._canonical_recovery_job is job
             assert job.committed_tokens == 4 * BLOCK
@@ -262,16 +247,14 @@ class TestB2RapidTurnsCoalesce:
         scheduler = _make_scheduler()
         for turn, prompt_len in enumerate(self.PROMPTS):
             scheduler.note_canonical_recovery_candidate(
-                _sparse_request_on(
-                    list(range(prompt_len)), rid=f"r{turn}", scheduler=scheduler
-                )
+                _sparse_request_on(list(range(prompt_len)), rid=f"r{turn}")
             )
         job = scheduler._canonical_recovery_job
         job.note_published(9 * BLOCK)
 
         with _lineage_spies(scheduler) as counts:
             scheduler.note_canonical_recovery_candidate(
-                _sparse_request_on(list(range(38100)), rid="r4", scheduler=scheduler)
+                _sparse_request_on(list(range(38100)), rid="r4")
             )
 
         assert scheduler._canonical_recovery_job is job
@@ -287,15 +270,15 @@ class TestB2RapidTurnsCoalesce:
         """The no-op must leave the append path usable, not just the object."""
         scheduler = _make_scheduler()
         scheduler.note_canonical_recovery_candidate(
-            _sparse_request_on(list(range(38000)), rid="r0", scheduler=scheduler)
+            _sparse_request_on(list(range(38000)), rid="r0")
         )
         job = scheduler._canonical_recovery_job
         scheduler.note_canonical_recovery_candidate(
-            _sparse_request_on(list(range(38100)), rid="r1", scheduler=scheduler)
+            _sparse_request_on(list(range(38100)), rid="r1")
         )
         with _lineage_spies(scheduler) as counts:
             scheduler.note_canonical_recovery_candidate(
-                _sparse_request_on(list(range(43000)), rid="r2", scheduler=scheduler)
+                _sparse_request_on(list(range(43000)), rid="r2")
             )
         assert scheduler._canonical_recovery_job is job
         assert counts.target_extensions == 1
@@ -341,15 +324,15 @@ class TestB3SharedPrefixFork:
         scheduler = _make_scheduler()
         with _lineage_spies(scheduler) as counts:
             scheduler.note_canonical_recovery_candidate(
-                _sparse_request_on(branch_a, rid="a1", scheduler=scheduler)
+                _sparse_request_on(branch_a, rid="a1")
             )
             job_a = scheduler._canonical_recovery_job
             scheduler.note_canonical_recovery_candidate(
-                _sparse_request_on(branch_b, rid="b1", scheduler=scheduler)
+                _sparse_request_on(branch_b, rid="b1")
             )
             job_b = scheduler._canonical_recovery_job
             scheduler.note_canonical_recovery_candidate(
-                _sparse_request_on(branch_a, rid="a2", scheduler=scheduler)
+                _sparse_request_on(branch_a, rid="a2")
             )
             job_a2 = scheduler._canonical_recovery_job
 
@@ -371,13 +354,13 @@ class TestB3SharedPrefixFork:
         _common, branch_a, branch_b = self._branches()
         scheduler = _make_scheduler()
         scheduler.note_canonical_recovery_candidate(
-            _sparse_request_on(branch_a, rid="a1", scheduler=scheduler)
+            _sparse_request_on(branch_a, rid="a1")
         )
         with patch.object(
             scheduler, "_canonical_recovery_drop_job", wraps=scheduler._canonical_recovery_drop_job
         ) as drop:
             scheduler.note_canonical_recovery_candidate(
-                _sparse_request_on(branch_b, rid="b1", scheduler=scheduler)
+                _sparse_request_on(branch_b, rid="b1")
             )
         drop.assert_called_once_with("replaced")
 
@@ -397,11 +380,11 @@ class TestB3SharedPrefixFork:
         scheduler = _make_scheduler()
         with _lineage_spies(scheduler) as counts:
             scheduler.note_canonical_recovery_candidate(
-                _sparse_request_on(branch_a, rid="a1", scheduler=scheduler)
+                _sparse_request_on(branch_a, rid="a1")
             )
             job_a = scheduler._canonical_recovery_job
             scheduler.note_canonical_recovery_candidate(
-                _sparse_request_on(longer_fork, rid="b1", scheduler=scheduler)
+                _sparse_request_on(longer_fork, rid="b1")
             )
 
         assert counts.extend_refusals == 1          # `extend` was reached
@@ -417,13 +400,13 @@ class TestB3SharedPrefixFork:
         scheduler = _make_scheduler()
 
         scheduler.note_canonical_recovery_candidate(
-            _sparse_request_on(branch_a, rid="a1", scheduler=scheduler)
+            _sparse_request_on(branch_a, rid="a1")
         )
         job_a = scheduler._canonical_recovery_job
         assert job_a.tokens == branch_a[: _target_for(len(branch_a))]
 
         scheduler.note_canonical_recovery_candidate(
-            _sparse_request_on(branch_b, rid="b1", scheduler=scheduler)
+            _sparse_request_on(branch_b, rid="b1")
         )
         job_b = scheduler._canonical_recovery_job
         assert job_b.tokens == branch_b[: _target_for(len(branch_b))]
@@ -446,7 +429,7 @@ class TestB3SharedPrefixFork:
         _common, branch_a, branch_b = self._branches()
         scheduler = _make_scheduler()
         scheduler.note_canonical_recovery_candidate(
-            _sparse_request_on(branch_a, rid="a1", scheduler=scheduler)
+            _sparse_request_on(branch_a, rid="a1")
         )
         job_a = scheduler._canonical_recovery_job
         job_a.note_published(8 * BLOCK)
@@ -458,7 +441,7 @@ class TestB3SharedPrefixFork:
             scheduler, "_drop_boundary_snapshots_for_request"
         ) as drop_snapshots:
             scheduler.note_canonical_recovery_candidate(
-                _sparse_request_on(branch_b, rid="b1", scheduler=scheduler)
+                _sparse_request_on(branch_b, rid="b1")
             )
         after = list(scheduler.block_aware_cache.mock_calls)
 
@@ -485,7 +468,7 @@ class TestB3SharedPrefixFork:
 
         scheduler = _make_scheduler()
         scheduler.note_canonical_recovery_candidate(
-            _sparse_request_on(branch_a, rid="a1", scheduler=scheduler)
+            _sparse_request_on(branch_a, rid="a1")
         )
         job_a = scheduler._canonical_recovery_job
         worker_a = _publish(
@@ -493,7 +476,7 @@ class TestB3SharedPrefixFork:
         )
 
         scheduler.note_canonical_recovery_candidate(
-            _sparse_request_on(branch_b, rid="b1", scheduler=scheduler)
+            _sparse_request_on(branch_b, rid="b1")
         )
         job_b = scheduler._canonical_recovery_job
         assert job_b is not job_a
@@ -531,7 +514,7 @@ class TestB4CompactionDivergence:
 
     def _started_job(self, scheduler, processed=2 * BLOCK, published=2 * BLOCK):
         scheduler.note_canonical_recovery_candidate(
-            _sparse_request_on(self._lineage_a(), rid="r1", scheduler=scheduler)
+            _sparse_request_on(self._lineage_a(), rid="r1")
         )
         job = scheduler._canonical_recovery_job
         job.processed_tokens = processed
@@ -555,7 +538,7 @@ class TestB4CompactionDivergence:
             scheduler, "_drop_boundary_snapshots_for_request"
         ) as drop_snapshots, _lineage_spies(scheduler) as counts:
             scheduler.note_canonical_recovery_candidate(
-                _sparse_request_on(self._compacted(), rid="r2", scheduler=scheduler)
+                _sparse_request_on(self._compacted(), rid="r2")
             )
 
         new = scheduler._canonical_recovery_job
@@ -585,7 +568,7 @@ class TestB4CompactionDivergence:
         assert old.committed_tokens == 2 * BLOCK
 
         scheduler.note_canonical_recovery_candidate(
-            _sparse_request_on(self._compacted(), rid="r2", scheduler=scheduler)
+            _sparse_request_on(self._compacted(), rid="r2")
         )
         new = scheduler._canonical_recovery_job
         assert new.committed_tokens == 0
@@ -598,7 +581,7 @@ class TestB4CompactionDivergence:
         old = self._started_job(scheduler)
         with patch.object(scheduler, "_canonical_recovery_publish") as publish:
             scheduler.note_canonical_recovery_candidate(
-                _sparse_request_on(self._compacted(), rid="r2", scheduler=scheduler)
+                _sparse_request_on(self._compacted(), rid="r2")
             )
             # Whatever the old job had reached, the drop offers none of it.
             assert old.publishable_boundary() == 0
@@ -615,7 +598,7 @@ class TestB4CompactionDivergence:
         """
         scheduler = _make_scheduler()
         scheduler.note_canonical_recovery_candidate(
-            _sparse_request_on(list(range(20000)), rid="r1", scheduler=scheduler)
+            _sparse_request_on(list(range(20000)), rid="r1")
         )
         job = scheduler._canonical_recovery_job
         old_target = job.target_tokens
@@ -628,7 +611,7 @@ class TestB4CompactionDivergence:
         job.prefill_state = state
 
         scheduler.note_canonical_recovery_candidate(
-            _sparse_request_on(list(range(24600)), rid="r2", scheduler=scheduler)
+            _sparse_request_on(list(range(24600)), rid="r2")
         )
         assert scheduler._canonical_recovery_job is job
         assert job.target_tokens > old_target
@@ -674,7 +657,7 @@ class TestB4CompactionDivergence:
 
         def swap_then_return(_state):
             scheduler.note_canonical_recovery_candidate(
-                _sparse_request_on(self._compacted(), rid="r2", scheduler=scheduler)
+                _sparse_request_on(self._compacted(), rid="r2")
             )
             return False
 
@@ -712,7 +695,7 @@ class TestB4CompactionDivergence:
         old.prefill_state = old_state
 
         scheduler.note_canonical_recovery_candidate(
-            _sparse_request_on(self._compacted(), rid="r2", scheduler=scheduler)
+            _sparse_request_on(self._compacted(), rid="r2")
         )
         new = scheduler._canonical_recovery_job
         assert new is not old
@@ -781,7 +764,7 @@ class TestB7FanOutIsBoundedByHavingOneSlot:
             for _round in range(3):
                 for index, tokens in enumerate(branches):
                     scheduler.note_canonical_recovery_candidate(
-                        _sparse_request_on(tokens, rid=f"b{index}", scheduler=scheduler)
+                        _sparse_request_on(tokens, rid=f"b{index}")
                     )
                     # One slot, always: there is nowhere for a second job to go.
                     assert scheduler._canonical_recovery_job is not None
@@ -802,7 +785,7 @@ class TestB7FanOutIsBoundedByHavingOneSlot:
         for _round in range(3):
             for index, tokens in enumerate(branches):
                 scheduler.note_canonical_recovery_candidate(
-                    _sparse_request_on(tokens, rid=f"b{index}", scheduler=scheduler)
+                    _sparse_request_on(tokens, rid=f"b{index}")
                 )
                 job = scheduler._canonical_recovery_job
                 # Each job gets as far as one block of dense work before the
@@ -826,7 +809,7 @@ class TestB7FanOutIsBoundedByHavingOneSlot:
         scheduler = _make_scheduler()
         ephemeral = self._branch(9)
         scheduler.note_canonical_recovery_candidate(
-            _sparse_request_on(ephemeral, rid="gone", scheduler=scheduler)
+            _sparse_request_on(ephemeral, rid="gone")
         )
         job = scheduler._canonical_recovery_job
         assert job is not None

@@ -20,7 +20,6 @@ import logging
 import os
 import threading
 import time
-import weakref
 from array import array
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable
@@ -9378,12 +9377,6 @@ class Scheduler:
         if request.request_id in self._prefix_cache_prepared:
             return
 
-        # Record which prefix-cache instance is serving this request. One
-        # served model can present more than one, and recovery has to know
-        # which one a restore would actually consult: state published into
-        # the other is valid, durable and unreachable.
-        if self.block_aware_cache is not None:
-            request._serving_prefix_cache_id = id(self.block_aware_cache)
         prefix_hook = getattr(self.model, "minimum_prefill_prefix", None)
         minimum_prefix = (
             prefix_hook(request.prompt_token_ids) if callable(prefix_hook) else 0
@@ -13599,21 +13592,6 @@ class Scheduler:
         if self._model_has_unreconstructible_cache():
             return
 
-        # Bind to the instance that served this request, and refuse the job
-        # outright when this scheduler is not that one. Publishing into a
-        # prefix cache the request never touched produces canonical state that
-        # is valid, durable and unreachable.
-        serving_cache_id = getattr(request, "_serving_prefix_cache_id", None)
-        if serving_cache_id is None or serving_cache_id != id(self.block_aware_cache):
-            logger.debug(
-                "CanonicalRecovery: declining %s, this scheduler's prefix cache did not "
-                "serve it (served=%s, here=%s)",
-                getattr(request, "request_id", "?"),
-                serving_cache_id,
-                id(self.block_aware_cache),
-            )
-            return
-
         tokens = list(getattr(request, "prompt_token_ids", None) or [])
         block = self.config.paged_cache_block_size
         # Only whole blocks are publishable, so the job targets the last whole
@@ -13665,8 +13643,6 @@ class Scheduler:
             tokens=tokens,
             target_tokens=boundary,
             block_size=block,
-            serving_cache_id=serving_cache_id,
-            serving_cache_ref=weakref.ref(self.block_aware_cache),
         )
         logger.info(
             "CanonicalRecovery: queued dense re-read of %d tokens (budget %.1f%%)",
@@ -13708,18 +13684,6 @@ class Scheduler:
             job.prefill_state = None
         self._drop_boundary_snapshots_for_request(rid)
         self._release_paged_cache_for_request(rid)
-        # That released against the *current* prefix cache. On the one drop
-        # path where the instance changed under the job — which is the path
-        # that exists because it can — the current one never issued this
-        # request id and the bound one still holds its block references. Ask
-        # the bound one too, while it is alive; a weak reference, because a
-        # replaced cache is usually being torn down and recovery must not be
-        # the reason it stays.
-        bound_ref = getattr(job, "serving_cache_ref", None)
-        bound = bound_ref() if callable(bound_ref) else None
-        if bound is not None and bound is not self.block_aware_cache:
-            with suppress(Exception):
-                bound.release_cache(rid)
         self.requests.pop(rid, None)
         self._prefix_cache_prepared.discard(rid)
         get_prefill_tracker().remove(rid)
@@ -14268,22 +14232,6 @@ class Scheduler:
         is why nothing below trusts the call and everything checks the result.
         """
         if self.block_aware_cache is None:
-            return
-        if (
-            job.serving_cache_id is not None
-            and job.serving_cache_id != id(self.block_aware_cache)
-        ):
-            # The prefix-cache instance changed under the job. Anything
-            # published now would land somewhere the serving restore path does
-            # not look, so fail closed rather than write unreachable state and
-            # count it.
-            logger.warning(
-                "CanonicalRecovery: refusing to publish, serving prefix cache changed "
-                "(bound=%s, now=%s)",
-                job.serving_cache_id,
-                id(self.block_aware_cache),
-            )
-            self._canonical_recovery_drop_job("serving_cache_changed")
             return
         if self._model_has_unreconstructible_cache():
             logger.info("CanonicalRecovery: refusing to publish, cache is unreconstructible")

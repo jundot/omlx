@@ -89,12 +89,11 @@ def _engine(config: SchedulerConfig | None = None, label: str = "m") -> Schedule
     return scheduler
 
 
-def _sparse_request(prompt_tokens: int, rid: str, scheduler: Scheduler):
+def _sparse_request(prompt_tokens: int, rid: str):
     request = MagicMock()
     request.request_id = rid
     request.prompt_token_ids = list(range(prompt_tokens))
     request.specprefill_indices = [1, 2, 3]
-    request._serving_prefix_cache_id = id(scheduler.block_aware_cache)
     return request
 
 
@@ -176,7 +175,7 @@ class TestForegroundOnOneEngineBlocksRecoveryOnTheOther:
 
     def test_a_foreign_decode_withdraws_the_chunk(self, two_engines):
         a, b = two_engines
-        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1", a))
+        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1"))
         _idle(a)
         assert a._canonical_recovery_runnable()
 
@@ -192,7 +191,7 @@ class TestForegroundOnOneEngineBlocksRecoveryOnTheOther:
         prefilling publishes a decode count of zero, which *removes* its
         registry entry."""
         a, _b = two_engines
-        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1", a))
+        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1"))
         _idle(a)
         assert a._canonical_recovery_runnable()
 
@@ -212,8 +211,8 @@ class TestForegroundOnOneEngineBlocksRecoveryOnTheOther:
         indefinitely. Mutual exclusion between recovery jobs is the claim.
         """
         a, b = two_engines
-        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1", a))
-        b.note_canonical_recovery_candidate(_sparse_request(1000, "r2", b))
+        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1"))
+        b.note_canonical_recovery_candidate(_sparse_request(1000, "r2"))
         _idle(a)
         get_prefill_tracker().update(
             b._canonical_recovery_request_id(b._canonical_recovery_job), 256, 8000, "model-b"
@@ -226,8 +225,8 @@ class TestTheFirstSliceIsNotInvisible:
 
     def test_the_claim_is_held_before_the_state_build(self, two_engines):
         a, b = two_engines
-        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1", a))
-        b.note_canonical_recovery_candidate(_sparse_request(1000, "r2", b))
+        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1"))
+        b.note_canonical_recovery_candidate(_sparse_request(1000, "r2"))
         _idle(a)
         _idle(b)
         assert a._canonical_recovery_runnable() and b._canonical_recovery_runnable()
@@ -252,8 +251,8 @@ class TestTheFirstSliceIsNotInvisible:
 
     def test_the_claim_is_released_when_the_slice_ends(self, two_engines):
         a, b = two_engines
-        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1", a))
-        b.note_canonical_recovery_candidate(_sparse_request(1000, "r2", b))
+        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1"))
+        b.note_canonical_recovery_candidate(_sparse_request(1000, "r2"))
         _idle(b)
         with patch.object(a, "_canonical_recovery_step_inner", return_value=False):
             a._canonical_recovery_step()
@@ -263,8 +262,8 @@ class TestTheFirstSliceIsNotInvisible:
     def test_a_slice_that_raises_still_releases_the_claim(self, two_engines):
         """Otherwise one failure stops recovery for the whole process."""
         a, b = two_engines
-        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1", a))
-        b.note_canonical_recovery_candidate(_sparse_request(1000, "r2", b))
+        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1"))
+        b.note_canonical_recovery_candidate(_sparse_request(1000, "r2"))
         _idle(b)
         with patch.object(
             a, "_canonical_recovery_step_inner", side_effect=RuntimeError("boom")
@@ -288,8 +287,8 @@ class TestAnExhaustedBudgetParksEveryEngine:
 
     def test_neither_engine_steps_while_the_window_is_spent(self, two_engines):
         a, b = two_engines
-        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1", a))
-        b.note_canonical_recovery_candidate(_sparse_request(1000, "r2", b))
+        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1"))
+        b.note_canonical_recovery_candidate(_sparse_request(1000, "r2"))
         assert a.has_requests() and b.has_requests()
 
         a._canonical_recovery_budget.note_service(WINDOW_S)     # far past one allowance
@@ -307,8 +306,8 @@ class TestAnExhaustedBudgetParksEveryEngine:
 
     def test_both_wake_when_the_window_replenishes(self, two_engines):
         a, b = two_engines
-        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1", a))
-        b.note_canonical_recovery_candidate(_sparse_request(1000, "r2", b))
+        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1"))
+        b.note_canonical_recovery_candidate(_sparse_request(1000, "r2"))
         budget = a._canonical_recovery_budget
         budget.note_service(WINDOW_S)
         assert not a.has_requests()
@@ -322,7 +321,7 @@ class TestAnExhaustedBudgetParksEveryEngine:
         """The deadline that drops a job which may run and cannot must not
         fire on a job that is waiting for a reason that ends."""
         a, b = two_engines
-        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1", a))
+        a.note_canonical_recovery_candidate(_sparse_request(1000, "r1"))
         get_prefill_tracker().update("b-foreground", 100, 8000, "model-b")
         for _ in range(200):
             a._canonical_recovery_after_step(MagicMock(has_work=False))
@@ -434,7 +433,7 @@ class TestABareSchedulerStillRecovers:
 
     def test_recovery_still_runs_on_a_bare_scheduler(self):
         solo = _engine()
-        solo.note_canonical_recovery_candidate(_sparse_request(1000, "r1", solo))
+        solo.note_canonical_recovery_candidate(_sparse_request(1000, "r1"))
         _idle(solo)
         assert solo._canonical_recovery_runnable()
         assert solo.has_requests()

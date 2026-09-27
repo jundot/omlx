@@ -58,14 +58,11 @@ def _make_scheduler(**config_over) -> Scheduler:
     return scheduler
 
 
-def _sparse_request(prompt_tokens: int, rid: str = "r1", scheduler=None):
+def _sparse_request(prompt_tokens: int, rid: str = "r1"):
     request = MagicMock()
     request.request_id = rid
     request.prompt_token_ids = list(range(prompt_tokens))
     request.specprefill_indices = [1, 2, 3]
-    request._serving_prefix_cache_id = (
-        id(scheduler.block_aware_cache) if scheduler is not None else None
-    )
     return request
 
 
@@ -160,7 +157,7 @@ class TestASpentWindowCostsNoSteps:
 
     def test_a_spent_window_takes_no_scheduler_steps(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         _spend_the_window(scheduler)
         counter_before = scheduler._step_counter
         assert self._drive(scheduler, 50) == 0
@@ -169,7 +166,7 @@ class TestASpentWindowCostsNoSteps:
     def test_an_allowed_window_does_step(self):
         """The contrast, so the test above is not passing for the wrong reason."""
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         counter_before = scheduler._step_counter
         with patch.object(scheduler, "_canonical_recovery_step", return_value=False):
             assert self._drive(scheduler, 5) == 5
@@ -178,7 +175,7 @@ class TestASpentWindowCostsNoSteps:
     def test_the_job_survives_being_parked(self):
         """Parking is not cancelling: the job and its committed prefix stay."""
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         job = scheduler._canonical_recovery_job
         job.note_published(512)
         _spend_the_window(scheduler)
@@ -190,7 +187,7 @@ class TestASpentWindowCostsNoSteps:
     def test_a_zero_budget_is_still_a_different_case(self):
         """Zero percent never replenishes, so its job is not waiting at all."""
         scheduler = _make_scheduler(canonical_state_recovery_global_budget_pct=0.0)
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         assert scheduler._canonical_recovery_job is None
         assert not scheduler.has_requests()
 
@@ -215,7 +212,7 @@ class TestAStalledJobIsGivenUpOn:
 
     def test_a_job_blocked_by_a_leftover_rope_wrapper_is_dropped(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         with patch.object(scheduler, "_specprefill_rope_installed", return_value=True):
             self._run_idle_steps(scheduler, MAX_BLOCKED_IDLE_STEPS - 1)
             assert scheduler._canonical_recovery_job is not None
@@ -231,7 +228,7 @@ class TestAStalledJobIsGivenUpOn:
         and it buys nothing: the loop is stepping for the foreground anyway.
         """
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         # A request that has arrived and not yet been admitted: foreground
         # pressure the scheduler's own lists cannot see, and the hardest case
         # for the deadline to get right.
@@ -243,7 +240,7 @@ class TestAStalledJobIsGivenUpOn:
     def test_a_spent_budget_is_not_a_stall(self):
         """Waiting for an allowance is the ordinary case, and parking covers it."""
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         _spend_the_window(scheduler)
         with patch.object(scheduler, "_specprefill_rope_installed", return_value=True):
             self._run_idle_steps(scheduler, MAX_BLOCKED_IDLE_STEPS * 2)
@@ -252,7 +249,7 @@ class TestAStalledJobIsGivenUpOn:
 
     def test_a_chunk_that_runs_clears_the_deadline(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         with patch.object(scheduler, "_specprefill_rope_installed", return_value=True):
             self._run_idle_steps(scheduler, 10)
         assert scheduler._canonical_recovery_blocked_idle_steps == 10
@@ -276,14 +273,14 @@ class TestForegroundPriorityIsEngineGlobal:
 
     def test_an_idle_engine_admits_a_chunk(self):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         self._idle(scheduler)
         assert scheduler._canonical_recovery_runnable()
 
     @pytest.mark.parametrize("queue", ["waiting", "running", "prefilling"])
     def test_any_foreground_queue_withdraws_the_chunk(self, queue):
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         self._idle(scheduler)
         assert scheduler._canonical_recovery_runnable()
         held = getattr(scheduler, queue)
@@ -301,7 +298,7 @@ class TestForegroundPriorityIsEngineGlobal:
         list says idle while a request is already waiting.
         """
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         self._idle(scheduler)
         assert scheduler._canonical_recovery_runnable()
         scheduler.note_inbound_request("inbound-1")
@@ -318,7 +315,7 @@ class TestForegroundPriorityIsEngineGlobal:
         is two idle steps, not one: the second is the window an arriving
         request has to announce itself in."""
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(1000, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(1000))
         self._idle(scheduler)
         assert scheduler._canonical_recovery_runnable()
         scheduler._canonical_recovery_note_step(did_foreground_work=True)
@@ -336,11 +333,11 @@ class TestForegroundPriorityIsEngineGlobal:
         """
         scheduler = _make_scheduler()
         scheduler.note_canonical_recovery_candidate(
-            _sparse_request(1000, rid="a", scheduler=scheduler)
+            _sparse_request(1000, rid="a")
         )
         first = scheduler._canonical_recovery_job
         budget = scheduler._canonical_recovery_budget
-        other = _sparse_request(1000, rid="b", scheduler=scheduler)
+        other = _sparse_request(1000, rid="b")
         other.prompt_token_ids = list(range(5000, 6000))
         scheduler.note_canonical_recovery_candidate(other)
         assert scheduler._canonical_recovery_job is not first

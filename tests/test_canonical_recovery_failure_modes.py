@@ -73,21 +73,12 @@ def _make_scheduler(**config_over) -> Scheduler:
     return scheduler
 
 
-def _sparse_request(prompt_tokens: int, rid: str = "r1", scheduler=None):
-    """A finished sparse request, stamped with the cache that served it.
-
-    The stamp is part of the contract now: a recovery job is only queued by the
-    scheduler whose prefix-cache instance actually served the request, because
-    one served model can present more than one instance and state published
-    into the wrong one is valid, durable and unreachable.
-    """
+def _sparse_request(prompt_tokens: int, rid: str = "r1"):
+    """A finished request that took the sparse route."""
     request = MagicMock()
     request.request_id = rid
     request.prompt_token_ids = list(range(prompt_tokens))
     request.specprefill_indices = [1, 2, 3]
-    request._serving_prefix_cache_id = (
-        id(scheduler.block_aware_cache) if scheduler is not None else None
-    )
     return request
 
 
@@ -173,7 +164,7 @@ def _assert_cleanup_not_fired(spy):
 
 def _queued(scheduler, prompt_tokens: int = 1000):
     scheduler.note_canonical_recovery_candidate(
-        _sparse_request(prompt_tokens, scheduler=scheduler)
+        _sparse_request(prompt_tokens)
     )
     job = scheduler._canonical_recovery_job
     assert job is not None
@@ -367,7 +358,7 @@ class TestNothingToReRead:
             scheduler._canonical_recovery_step()
         assert scheduler._canonical_recovery_job is job
         scheduler.note_canonical_recovery_candidate(
-            _sparse_request(1400, scheduler=scheduler)
+            _sparse_request(1400)
         )
         scheduler._canonical_recovery_note_step(did_foreground_work=False)
         scheduler._canonical_recovery_note_step(did_foreground_work=False)
@@ -772,65 +763,6 @@ class TestRestorableInvariantUnderFault:
 # --------------------------------------------------------------------------
 
 
-class TestServingCacheChangesUnderTheJob:
-    """State published into an instance that did not serve the request is
-    valid, durable and unreachable, so the publish fails closed."""
-
-    def test_a_changed_serving_cache_refuses_and_drops(self):
-        """Fault 11. Dropped. The job is bound to one prefix-cache instance.
-
-        A restore on the serving path never looks in another instance, so
-        publishing here would write state that is correct, counted and
-        invisible — which is worse than not publishing, because the counter
-        would then report canonical coverage that no request can reach.
-        """
-        scheduler = _make_scheduler()
-        job = _queued(scheduler)
-        state = _live_state(job, processed=BLOCK)
-        scheduler.block_aware_cache = MagicMock()      # a different instance
-
-        with _cleanup_spy(scheduler) as spy, _publish_path(scheduler) as path:
-            # (a)
-            assert scheduler._canonical_recovery_publish(job, BLOCK, state) is None
-            path.worker.assert_not_called()
-            # (d)
-            _assert_cleanup_fired(spy)
-
-        # (b) dropped, not retried: the binding cannot come back.
-        assert scheduler._canonical_recovery_job is None
-        assert job.cancelled is True
-        # (c)
-        assert job.committed_tokens == 0
-        assert scheduler._canonical_recovery_counters.publishes == 0
-        # (e)
-        assert scheduler.has_requests() is False
-
-    def test_the_drop_releases_against_the_bound_cache_as_well(self):
-        """The blocks live in the instance that served the job, not the new one.
-
-        `_release_paged_cache_for_request` releases against
-        `self.block_aware_cache`, the instance that is current now — which on
-        this path is by construction not the one holding this job's block
-        references. Without the second release the drop left them pinned in a
-        cache nothing would ever ask again. The job keeps a weak reference so
-        that a replaced cache which is genuinely being torn down is not kept
-        alive by the recovery job holding it.
-        """
-        scheduler = _make_scheduler()
-        bound_cache = scheduler.block_aware_cache
-        job = _queued(scheduler)
-        assert job.serving_cache_id == id(bound_cache)
-        state = _live_state(job, processed=BLOCK)
-
-        new_cache = MagicMock()
-        scheduler.block_aware_cache = new_cache
-        with _publish_path(scheduler):
-            scheduler._canonical_recovery_publish(job, BLOCK, state)
-
-        bound_cache.release_cache.assert_any_call(RID)
-        assert scheduler._canonical_recovery_job is None
-
-
 class TestModelBecomesUnreconstructible:
     def test_an_unreconstructible_model_refuses_and_drops(self):
         """Fault 12. Dropped. The gate is re-read at publish time.
@@ -1156,7 +1088,7 @@ class TestTheRecoveryRequestIsInvisibleToTheRequestSweeps:
         drains on that predicate. A job that survives the failure that killed
         every request keeps the engine awake and unloadable forever."""
         scheduler = _make_scheduler()
-        scheduler.note_canonical_recovery_candidate(_sparse_request(4 * BLOCK, scheduler=scheduler))
+        scheduler.note_canonical_recovery_candidate(_sparse_request(4 * BLOCK))
         assert scheduler._canonical_recovery_job is not None
         assert scheduler.has_requests()
         scheduler.fail_all_requests()
