@@ -1,6 +1,7 @@
 import json
 import struct
 from pathlib import Path
+
 from omlx.model_discovery import estimate_model_size
 
 
