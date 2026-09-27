@@ -4211,6 +4211,91 @@ def test_qwen_late_join_preserves_cache_without_history_replay(family, monkeypat
         gen.close()
 
 
+def _join_as_batch_row_finishes(model, prompts, joined_prompt, max_tokens=40):
+    """Finish row 0 of an active shared-MTP batch in the late join's ``next()``.
+
+    The finishing row filters the batch to a singleton MTP state inside
+    ``GenerationBatch.next``; the same ``BatchGenerator._next`` then extends
+    that singleton with the pending prompt. A one-token prompt splits into
+    generation at once, like the scheduler's externally prefilled inserts.
+    """
+    gen = BatchGenerator(
+        model,
+        sampler=lambda lp: mx.argmax(lp, -1),
+        prefill_batch_size=2,
+        max_tokens=max_tokens,
+    )
+    output = {}
+    try:
+        first = gen.insert(prompts)
+        for uid in first:
+            output[uid] = []
+
+        def step():
+            for response in gen.next()[1]:
+                output[response.uid].append(response.token)
+
+        for _ in range(12):
+            step()
+            active = gen._generation_batch
+            if getattr(active, "_omlx_mtp_batch_state", None):
+                break
+        assert getattr(active, "_omlx_mtp_batch_state", None)
+        # One more emitted token ends row 0 inside the next verify cycle.
+        active.max_tokens[0] = active._num_tokens[0] + 1
+        new_uid = gen.insert([joined_prompt])[0]
+        output[new_uid] = []
+        step()
+        assert first[0] not in gen._generation_batch.uids
+        assert set(gen._generation_batch.uids) == {first[1], new_uid}
+        for _ in range(64):
+            if not len(gen._generation_batch):
+                break
+            step()
+        return first, new_uid, output
+    finally:
+        gen.close()
+
+
+def test_late_join_as_batch_row_finishes_hands_off_without_replay(monkeypatch):
+    monkeypatch.setattr(
+        bg,
+        "_reconcile_mtp_to_standard",
+        lambda *args: pytest.fail("Late join replayed the surviving row's history"),
+    )
+    bg.apply()
+    cache_rollback.apply()
+    first, new_uid, output = _join_as_batch_row_finishes(
+        CountingModel(), [[1, 2], [10, 11]], [30], max_tokens=24
+    )
+    assert output[first[1]] == list(range(12, 12 + 24))
+    assert output[new_uid] == list(range(31, 31 + 24))
+
+
+@pytest.mark.parametrize("family", ["qwen", "qwen_vlm", "qwen4"])
+def test_qwen_late_join_as_batch_row_finishes_skips_history_replay(
+    family, monkeypatch
+):
+    monkeypatch.setattr(mlx_lm_mtp, "_MTP_ACTIVE", True)
+    mx.random.seed(3702)
+    model = _model(family)
+    mx.eval(model.parameters())
+    bg.apply()
+    prompts, joined = [[3, 4, 5], [7, 8, 9, 10, 11]], [12]
+    # Reference: the committed-history replay the handoff replaces.
+    with monkeypatch.context() as m:
+        m.setattr(bg, "_handoff_mtp_for_late_join", lambda *args: False)
+        _, _, replayed = _join_as_batch_row_finishes(model, prompts, joined)
+    monkeypatch.setattr(
+        bg,
+        "_reconcile_mtp_to_standard",
+        lambda *args: pytest.fail("Late join replayed the surviving row's history"),
+    )
+    first, new_uid, output = _join_as_batch_row_finishes(model, prompts, joined)
+    assert output == replayed
+    assert len(output[first[1]]) == 40 and len(output[new_uid]) == 40
+
+
 @pytest.mark.parametrize(
     "family,unequal_depths",
     [

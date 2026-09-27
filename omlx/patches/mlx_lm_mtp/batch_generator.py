@@ -201,15 +201,19 @@ def apply() -> bool:
 
             host_state = getattr(self, "_omlx_mtp_state", None)
             if host_state is not None and _mtp_state_valid_for_batch(self, host_state):
-                if host_state.reentry_probe:
-                    park_state = _mtp_park_state_for_batch(self)
-                    if park_state is not None:
-                        park_state.defer_probe()
-                if not _reconcile_mtp_to_standard(self, host_state):
-                    raise RuntimeError(
-                        "Lightning MTP could not restore the committed cache"
-                    )
-                _drop_mtp_state(self, "extend-reconciled")
+                # A shared batch that a finishing row just filtered to this
+                # singleton sits at a drained frontier: hand it off with at
+                # most a one-token forward instead of replaying its history.
+                if not _handoff_mtp_for_late_join(self, host_state):
+                    if host_state.reentry_probe:
+                        park_state = _mtp_park_state_for_batch(self)
+                        if park_state is not None:
+                            park_state.defer_probe()
+                    if not _reconcile_mtp_to_standard(self, host_state):
+                        raise RuntimeError(
+                            "Lightning MTP could not restore the committed cache"
+                        )
+                    _drop_mtp_state(self, "extend-reconciled")
             result = original_extend(self, batch, *args, **kwargs)
             _drop_mtp_state(batch, "donor-extended")
             _drop_invalid_mtp_state(self, "extend")
