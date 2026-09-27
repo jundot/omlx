@@ -1272,27 +1272,55 @@ class BatchKVCache(_BaseCache):
     def filter(self, batch_indices):
         """
         In-place filter to keep just the given indices in the cache.
+
+        Survivors are copied once, straight into a ladder bank. Gathering the
+        rows and then slicing off the shared left padding left a strided
+        view that the next append copied again, at an exact width that
+        changes every finish, so each finish allocated two banks and
+        stranded the second in MLX's pool.
         """
-        width = self._width
-        if self._keys is not None:
-            self._keys = self._keys[batch_indices]
-            self._values = self._values[batch_indices]
+        kept = (
+            batch_indices.tolist()
+            if isinstance(batch_indices, mx.array)
+            else list(batch_indices)
+        )
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
         if self._right_padding is not None:
             self._right_padding = self._right_padding[batch_indices]
 
         # Shift left to reduce padding
-        min_left_pad = self.left_padding.min().item()
+        min_left_pad = self.left_padding.min().item() if kept else 0
+        if self._keys is not None:
+            if kept:
+                self._compact_rows(kept, min_left_pad)
+            else:
+                self._keys = self._keys[batch_indices]
+                self._values = self._values[batch_indices]
         if min_left_pad > 0:
-            if self._keys is not None:
-                self._keys = self._keys[..., min_left_pad:, :]
-                self._values = self._values[..., min_left_pad:, :]
-                if width is not None:
-                    width -= min_left_pad
             self._idx -= min_left_pad
             self.left_padding -= min_left_pad
-        self._width = width
+
+    def _compact_rows(self, kept, start: int) -> None:
+        """Keep rows ``kept`` and drop the first ``start`` columns.
+
+        Columns ``[start, width)`` land at ``[0, width - start)``, exactly
+        the gather-then-slice layout; the tail past it stays zero.
+        """
+        old_k, old_v = self._keys, self._values
+        if not start and kept == list(range(int(old_k.shape[0]))):
+            return
+        width = self._logical_width()
+        length = width - start
+        capacity = _ladder_capacity(length, self.step)
+        _, H, _, Dk = old_k.shape
+        keys = mx.zeros((len(kept), H, capacity, Dk), old_k.dtype)
+        values = mx.zeros((len(kept), H, capacity, old_v.shape[3]), old_v.dtype)
+        for row, old in enumerate(kept):
+            keys[row : row + 1, :, :length] = old_k[old : old + 1, :, start:width]
+            values[row : row + 1, :, :length] = old_v[old : old + 1, :, start:width]
+        self._keys, self._values = keys, values
+        self._width = length
 
     def extend(self, other):
         """

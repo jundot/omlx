@@ -898,6 +898,32 @@ class BatchQSAKVCache:
         self.kv_cache.filter(batch_indices)
         if self.index_keys is None:
             return
+        kept = (
+            batch_indices.tolist()
+            if isinstance(batch_indices, mx.array)
+            else list(batch_indices)
+        )
+        keys, positions = self.index_keys, self.index_position_ids
+        length = int(keys.shape[1]) - min_left
+        if kept and length == self.index_offset - min_left:
+            # One copy straight onto the ladder the next append would regrow
+            # to, like ``extend``; gather-then-slice left a strided view that
+            # the first append copied again.
+            capacity = _ladder_capacity(length + 1, self.index_step)
+            new_keys = mx.zeros((len(kept), capacity, keys.shape[-1]), keys.dtype)
+            shape = list(positions.shape)
+            shape[-2], shape[-1] = len(kept), capacity
+            new_positions = mx.zeros(shape, dtype=positions.dtype)
+            for row, old in enumerate(kept):
+                new_keys[row : row + 1, :length] = keys[old : old + 1, min_left:]
+                new_positions[..., row : row + 1, :length] = positions[
+                    ..., old : old + 1, min_left:
+                ]
+            self._index_keys = new_keys
+            self._index_position_ids = new_positions
+            self._index_capacity_managed = True
+            self.index_offset = length
+            return
         self.index_keys = self.index_keys[batch_indices]
         if self.index_position_ids.ndim == 3:
             self.index_position_ids = self.index_position_ids[:, batch_indices]
