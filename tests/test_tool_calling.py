@@ -38,6 +38,7 @@ from omlx.api.tool_calling import (
     _strip_marker_spans,
     build_json_system_prompt,
     convert_tools_for_template,
+    repair_parameter_open_tags,
     enrich_tool_params_for_gemma4,
     extract_json_from_text,
     extract_tool_calls_with_thinking,
@@ -2009,6 +2010,86 @@ class TestParseToolCallsSyntaxError:
         # but the outer code must still complete gracefully.
         _, tool_calls = parse_tool_calls(text, tok)
         assert tool_calls is None or len(tool_calls) == 0
+
+
+class TestParameterOpenTagMissingGt:
+    """Regression: `<parameter=name=` with no `>` must not cost the tool argument.
+
+    The Qwen templates delimit a parameter as `<parameter=name>value</parameter>`.
+    Models occasionally emit a parameter with an empty value as
+
+        <parameter=proxy=
+        </parameter>
+
+    (no ``>``).  mlx-lm's qwen3_coder parser runs ``match_text.index(">")`` on
+    that payload and raises ``ValueError: substring not found``; the XML
+    fallback then recovers the call while silently dropping the parameter, so
+    the client gets a tool call whose arguments are missing a value it never
+    sees.
+    """
+
+    BASH_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "proxy": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": [],
+            },
+        },
+    }
+
+    MISSING_GT = (
+        "<tool_call>\n<function=bash>\n<parameter=proxy=\n</parameter>\n"
+        "<parameter=description>\nlist files\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+
+    def test_repair_leaves_valid_tags_untouched(self):
+        for good in (
+            "<parameter=proxy>\n</parameter>",
+            "<parameter=proxy>http://host:port</parameter>",
+            "<function=bash>\n<parameter=command>ls -la</parameter>",
+        ):
+            assert repair_parameter_open_tags(good) == good
+            assert repair_parameter_open_tags(repair_parameter_open_tags(good)) == good
+
+    def test_repair_rewrites_missing_gt_payload(self):
+        fixed = repair_parameter_open_tags(self.MISSING_GT)
+        assert "<parameter=proxy>" in fixed
+        assert "<parameter=proxy=" not in fixed
+        assert "<parameter=description>" in fixed
+
+    def test_xml_fallback_keeps_the_empty_argument(self):
+        _, tool_calls = _parse_xml_tool_calls(self.MISSING_GT, [self.BASH_TOOL])
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args == {"proxy": "", "description": "list files"}
+
+    def test_native_parser_gets_a_repaired_payload(self):
+        """The native qwen3_coder path must never see the unterminated tag."""
+        seen = {}
+
+        def strict_parser(payload, tools):
+            seen["payload"] = payload
+            body = re.search(r"<parameter=(.*?)</parameter>", payload, re.DOTALL)
+            name, _ = body.group(1).split(">", 1)  # ValueError before the fix
+            return {"name": "bash", "arguments": {name: ""}}
+
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = strict_parser
+
+        _, tool_calls = parse_tool_calls(self.MISSING_GT, tok, [self.BASH_TOOL])
+        assert tool_calls is not None and len(tool_calls) == 1
+        assert "<parameter=proxy=" not in seen["payload"]
 
 
 class TestParseNakedQwenFunctionCalls:
