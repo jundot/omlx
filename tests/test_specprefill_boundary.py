@@ -118,6 +118,17 @@ def test_render_error_leaves_no_boundary():
         assert "specprefill_system_end" not in kwargs
 
 
+def test_assistant_prefill_first_turn_does_not_over_protect():
+    # The probes use a user turn, so they stop matching at this header.
+    tok = FakeTokenizer()
+    draft = {"role": "assistant", "content": "partial draft answer"}
+    batched, vlm, prompt_ids = _boundaries(tok, [SYS, draft], _tools(2))
+    static_len = len(tok.encode(tok.static_prefix([SYS, draft], _tools(2))))
+    content_start = prompt_ids.index(tok.encode(draft["content"])[0])
+    for end in (batched, vlm):
+        assert static_len <= end <= content_start
+
+
 def test_mid_conversation_system_message_does_not_over_protect():
     tok = FakeTokenizer()
     messages = [
