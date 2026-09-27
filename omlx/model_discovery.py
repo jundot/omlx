@@ -988,7 +988,7 @@ def detect_preserve_thinking(model_path: Path) -> bool | None:
     return True
 
 
-def estimate_model_size(model_path: Path) -> int:
+def estimate_model_size(model_path: Path, *, include_mtp: bool = True) -> int:
     """
     Estimate model memory usage from safetensors/bin file sizes.
 
@@ -1007,14 +1007,17 @@ def estimate_model_size(model_path: Path) -> int:
     for f in safetensors_files:
         total_size += f.stat().st_size
 
-    # The native EXL3 backend deliberately drops MTP weights. Account for
-    # that before admission/unload estimates, without mapping weight data.
+    # Use bounded metadata for packed EXL3 admission estimates. Include the
+    # optional draft head conservatively at discovery. Runtime admission can
+    # exclude it when the native loader is configured to drop the head.
     import struct
 
     try:
         config = json.loads((model_path / "config.json").read_text())
-        if (config.get("model_type") == "qwen4_exp"
-                and config.get("expert_quant", {}).get("format") == "exl3"):
+        if (
+            config.get("model_type") == "qwen4_exp"
+            and config.get("expert_quant", {}).get("format") == "exl3"
+        ):
             resident = 0
             for shard in safetensors_files:
                 with shard.open("rb") as stream:
@@ -1023,7 +1026,9 @@ def estimate_model_size(model_path: Path) -> int:
                         raise ValueError("Invalid safetensors header")
                     header = json.loads(stream.read(header_len))
                 for name, record in header.items():
-                    if name == "__metadata__" or name.startswith((
+                    if name == "__metadata__":
+                        continue
+                    if not include_mtp and name.startswith((
                         "mtp.", "model.mtp.", "language_model.mtp.",
                         "model.language_model.mtp.",
                     )):
