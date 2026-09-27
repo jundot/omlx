@@ -73,6 +73,32 @@ async def _wait_for_downloads(downloader):
     )
 
 
+async def _noop(self, task_id, token):
+    """A stand-in _run_download: it takes the row and does nothing."""
+    return None
+
+
+def _write_rows(path, rows) -> None:
+    """Write a persisted queue file the way a previous boot left it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(rows), encoding="utf-8")
+
+
+def start_poll(
+    monkeypatch, downloader, task, model_dir, *, wire=None, interval=0.01
+):
+    """Run a poll loop for a test: fast ticks, generous stall deadlines.
+
+    Returns the task; it starts running at the caller's next await.
+    """
+    monkeypatch.setattr(hf_downloader_mod, "_PROGRESS_POLL_INTERVAL", interval)
+    monkeypatch.setattr(hf_downloader_mod, "_STARTUP_STALL_TIMEOUT", 5)
+    monkeypatch.setattr(hf_downloader_mod, "_STALL_TIMEOUT", 5)
+    return asyncio.create_task(
+        downloader._poll_progress(task.task_id, model_dir, wire)
+    )
+
+
 # =============================================================================
 # DownloadTask Tests
 # =============================================================================
@@ -3165,7 +3191,6 @@ class TestStallDetection:
         )
         downloader._tasks[task.task_id] = task
         counter = _WireCounter()
-        downloader._wire_counters[task.task_id] = counter
         frozen = _DownloadActivity()  # fetch phase: nothing lands on disk
 
         with patch.object(
@@ -3174,7 +3199,7 @@ class TestStallDetection:
             return_value=frozen,
         ), patch("omlx.admin.hf_downloader.abort_xet_session") as mock_abort:
             poll = asyncio.create_task(
-                downloader._poll_progress(task.task_id, model_dir)
+                downloader._poll_progress(task.task_id, model_dir, counter)
             )
             # Well past both 0.03s deadlines, wire bytes keep flowing.
             for _ in range(8):
@@ -3207,7 +3232,6 @@ class TestStallDetection:
         )
         downloader._tasks[task.task_id] = task
         counter = _WireCounter()
-        downloader._wire_counters[task.task_id] = counter
         frozen = _DownloadActivity()
 
         with patch.object(
@@ -3216,7 +3240,7 @@ class TestStallDetection:
             return_value=frozen,
         ), patch("omlx.admin.hf_downloader.abort_xet_session") as mock_abort:
             poll = asyncio.create_task(
-                downloader._poll_progress(task.task_id, model_dir)
+                downloader._poll_progress(task.task_id, model_dir, counter)
             )
             for _ in range(4):  # payload past the startup window, then stops
                 counter.add(1_000_000)
@@ -3424,20 +3448,27 @@ class TestXetHTTPFallback:
         task = DownloadTask(task_id="t1", repo_id="owner/model")
         downloader._tasks[task.task_id] = task
         seen: dict[str, object] = {}
+        counters: list = []
+        real_counter = hf_downloader_mod._WireCounter
+
+        def tracked_counter():
+            counter = real_counter()
+            counters.append(counter)
+            return counter
 
         def fail_xet(**kwargs):
             if kwargs.get("dry_run"):
                 return []
             # Bytes that arrived on the wire before the transport died.
-            downloader._wire_counters["t1"].add(7_000_000)
+            counters[0].add(7_000_000)
             raise RuntimeError(
                 "CAS service error: ReqwestMiddleware request failed "
                 "for /xet-read-token"
             )
 
         async def note_fallback(*_args, **_kwargs):
-            counter = downloader._wire_counters.get("t1")
-            seen["value"] = counter.value if counter is not None else None
+            # The replacement poll's own counter, not the dead xet call's.
+            seen["value"] = counters[-1].value if counters else None
 
         with patch(
             "omlx.admin.hf_downloader._get_hf_api",
@@ -3445,6 +3476,10 @@ class TestXetHTTPFallback:
         ), patch(
             "omlx.admin.hf_downloader.snapshot_download",
             side_effect=fail_xet,
+        ), patch.object(
+            hf_downloader_mod,
+            "_WireCounter",
+            new=tracked_counter,
         ), patch.object(
             downloader,
             "_run_http_fallback",
@@ -3617,6 +3652,7 @@ class TestDownloadSpeed:
                 files={"payload": state["allocated"]},
             )
 
+        scan.state = state  # the running total, for assertions
         return scan
 
     def test_defaults_read_as_a_per_second_rate(self):
@@ -3632,11 +3668,6 @@ class TestDownloadSpeed:
     @pytest.mark.asyncio
     async def test_poll_reports_speed_then_zeroes_it(self, model_dir, monkeypatch):
         """A live transfer publishes bytes/s; a terminal task publishes 0."""
-        import omlx.admin.hf_downloader as dl_module
-
-        monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", 0.01)
-        monkeypatch.setattr(dl_module, "_STARTUP_STALL_TIMEOUT", 5)
-        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 5)
         downloader = HFDownloader(model_dir=str(model_dir))
         task = DownloadTask(
             task_id="t-speed",
@@ -3651,9 +3682,7 @@ class TestDownloadSpeed:
             "_get_download_activity",
             side_effect=self._growing_activity(),
         ):
-            poll = asyncio.create_task(
-                downloader._poll_progress(task.task_id, model_dir)
-            )
+            poll = start_poll(monkeypatch, downloader, task, model_dir)
             await asyncio.sleep(0.05)
             observed_speed = task.speed_bps
             task.status = DownloadStatus.COMPLETED
@@ -3666,13 +3695,8 @@ class TestDownloadSpeed:
     @pytest.mark.asyncio
     async def test_speed_smooths_steady_rate(self, model_dir, monkeypatch):
         """A constant per-interval rate must be reported near its true value."""
-        import omlx.admin.hf_downloader as dl_module
-
         interval = 0.02
         step = 200_000
-        monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", interval)
-        monkeypatch.setattr(dl_module, "_STARTUP_STALL_TIMEOUT", 5)
-        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 5)
         downloader = HFDownloader(model_dir=str(model_dir))
         task = DownloadTask(
             task_id="t-smooth",
@@ -3686,8 +3710,8 @@ class TestDownloadSpeed:
             "_get_download_activity",
             side_effect=self._growing_activity(step),
         ):
-            poll = asyncio.create_task(
-                downloader._poll_progress(task.task_id, model_dir)
+            poll = start_poll(
+                monkeypatch, downloader, task, model_dir, interval=interval
             )
             # Let several samples accumulate so the EMA settles.
             await asyncio.sleep(0.12)
@@ -3904,12 +3928,8 @@ class TestDownloadSpeed:
         """xet's fetch phase pulls from the network before any disk write
         (reconstruction blocks are >= 256MB): the readout must show the wire
         rate while filesystem activity stays frozen, then clear to 0."""
-        import omlx.admin.hf_downloader as dl_module
         from omlx.admin.hf_downloader import _WireCounter
 
-        monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", 0.01)
-        monkeypatch.setattr(dl_module, "_STARTUP_STALL_TIMEOUT", 5)
-        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 5)
         downloader = HFDownloader(model_dir=str(model_dir))
         task = DownloadTask(
             task_id="t-wire",
@@ -3919,15 +3939,12 @@ class TestDownloadSpeed:
         )
         downloader._tasks[task.task_id] = task
         counter = _WireCounter()
-        downloader._wire_counters[task.task_id] = counter
 
         frozen = _DownloadActivity()  # no byte lands on disk during fetch
         with patch.object(
             downloader, "_get_download_activity", return_value=frozen
         ):
-            poll = asyncio.create_task(
-                downloader._poll_progress(task.task_id, model_dir)
-            )
+            poll = start_poll(monkeypatch, downloader, task, model_dir, wire=counter)
             observed = 0.0
             for _ in range(5):
                 counter.add(1_000_000)
@@ -3947,12 +3964,8 @@ class TestDownloadSpeed:
         """Fetch (wire) and reconstruction (disk) are two views of one
         payload: the published rate is the larger of the two, never their
         sum, which would count the same bytes twice."""
-        import omlx.admin.hf_downloader as dl_module
         from omlx.admin.hf_downloader import _WireCounter
 
-        monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", 0.02)
-        monkeypatch.setattr(dl_module, "_STARTUP_STALL_TIMEOUT", 5)
-        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 5)
         downloader = HFDownloader(model_dir=str(model_dir))
         task = DownloadTask(
             task_id="t-stage",
@@ -3962,26 +3975,19 @@ class TestDownloadSpeed:
         )
         downloader._tasks[task.task_id] = task
         counter = _WireCounter()
-        downloader._wire_counters[task.task_id] = counter
 
-        disk = {"bytes": 0}
-
-        def growing_activity(_path):
-            disk["bytes"] += 2_000_000
-            return _DownloadActivity(
-                file_count=1,
-                logical_size=disk["bytes"],
-                allocated_size=disk["bytes"],
-                latest_mtime_ns=1,
-                files={"payload": disk["bytes"]},
-            )
-
+        activity = self._growing_activity(step=2_000_000)
         observed = 0.0
         with patch.object(
-            downloader, "_get_download_activity", side_effect=growing_activity
+            downloader, "_get_download_activity", side_effect=activity
         ):
-            poll = asyncio.create_task(
-                downloader._poll_progress(task.task_id, model_dir)
+            poll = start_poll(
+                monkeypatch,
+                downloader,
+                task,
+                model_dir,
+                wire=counter,
+                interval=0.02,
             )
             start = time.monotonic()
             for _ in range(5):
@@ -3992,12 +3998,13 @@ class TestDownloadSpeed:
             task.status = DownloadStatus.COMPLETED
             await poll
 
+        grown = activity.state["allocated"]
         stage_rate = (
-            max(disk["bytes"], 10_000_000) / elapsed
+            max(grown, 10_000_000) / elapsed
         )  # the two stages carry comparable byte counts
         assert observed > 0
         assert observed <= stage_rate * 1.5, "must not exceed the larger stage"
-        assert observed < (disk["bytes"] + 10_000_000) / elapsed * 0.8, (
+        assert observed < (grown + 10_000_000) / elapsed * 0.8, (
             "the two stages must not be summed"
         )
 
@@ -4021,12 +4028,8 @@ class TestProgressFromWire:
     async def test_fetch_phase_progress_follows_the_wire(
         self, model_dir, monkeypatch
     ):
-        import omlx.admin.hf_downloader as dl_module
         from omlx.admin.hf_downloader import _WireCounter
 
-        monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", 0.01)
-        monkeypatch.setattr(dl_module, "_STARTUP_STALL_TIMEOUT", 5)
-        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 5)
         downloader = HFDownloader(model_dir=str(model_dir))
         task = DownloadTask(
             task_id="t-wire",
@@ -4036,16 +4039,12 @@ class TestProgressFromWire:
         )
         downloader._tasks[task.task_id] = task
         counter = _WireCounter()
-        downloader._wire_counters[task.task_id] = counter
-
         with patch.object(
             downloader,
             "_get_download_activity",
             return_value=_DownloadActivity(),  # fetch: the disk stays silent
         ):
-            poll = asyncio.create_task(
-                downloader._poll_progress(task.task_id, model_dir)
-            )
+            poll = start_poll(monkeypatch, downloader, task, model_dir, wire=counter)
             counter.add(2_500_000)
             await asyncio.sleep(0.05)  # several poll iterations
 
@@ -4073,12 +4072,8 @@ class TestProgressFromWire:
         The report must add that delta on top of the on-disk baseline:
         max(disk, wire) alone parks on the disk figure for the whole fetch
         phase — the freeze this class exists to prevent."""
-        import omlx.admin.hf_downloader as dl_module
         from omlx.admin.hf_downloader import _WireCounter
 
-        monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", 0.01)
-        monkeypatch.setattr(dl_module, "_STARTUP_STALL_TIMEOUT", 5)
-        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 5)
         downloader = HFDownloader(model_dir=str(model_dir))
         task = DownloadTask(
             task_id="t-resume",
@@ -4088,7 +4083,6 @@ class TestProgressFromWire:
         )
         downloader._tasks[task.task_id] = task
         counter = _WireCounter()
-        downloader._wire_counters[task.task_id] = counter
         resumed = _DownloadActivity(
             file_count=1,
             logical_size=6_000_000,
@@ -4100,9 +4094,7 @@ class TestProgressFromWire:
         with patch.object(
             downloader, "_get_download_activity", return_value=resumed
         ):
-            poll = asyncio.create_task(
-                downloader._poll_progress(task.task_id, model_dir)
-            )
+            poll = start_poll(monkeypatch, downloader, task, model_dir, wire=counter)
             counter.add(1_000_000)
             await asyncio.sleep(0.05)
             assert task.downloaded_size == 7_000_000
@@ -4125,12 +4117,8 @@ class TestProgressFromWire:
     ):
         """Once the transfer bar stops (fetch done) the disk leads: wire
         bytes never push the report below the on-disk size."""
-        import omlx.admin.hf_downloader as dl_module
         from omlx.admin.hf_downloader import _WireCounter
 
-        monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", 0.01)
-        monkeypatch.setattr(dl_module, "_STARTUP_STALL_TIMEOUT", 5)
-        monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 5)
         downloader = HFDownloader(model_dir=str(model_dir))
         task = DownloadTask(
             task_id="t-disk",
@@ -4141,7 +4129,6 @@ class TestProgressFromWire:
         downloader._tasks[task.task_id] = task
         counter = _WireCounter()
         counter.add(2_000_000)  # fetch delivered only part over the wire
-        downloader._wire_counters[task.task_id] = counter
         on_disk = _DownloadActivity(
             file_count=1,
             logical_size=8_000_000,
@@ -4152,9 +4139,7 @@ class TestProgressFromWire:
         with patch.object(
             downloader, "_get_download_activity", return_value=on_disk
         ):
-            poll = asyncio.create_task(
-                downloader._poll_progress(task.task_id, model_dir)
-            )
+            poll = start_poll(monkeypatch, downloader, task, model_dir, wire=counter)
             await asyncio.sleep(0.05)
 
             # The wire adds the bytes the disk has not caught up with; the
@@ -4407,9 +4392,6 @@ class TestQueuePersistence:
     async def test_start_download_persists_pending_row(
         self, downloader, tasks_file
     ):
-        async def _noop(self, task_id, hf_token):
-            return None
-
         with patch.object(HFDownloader, "_run_download", new=_noop):
             task = await downloader.start_download("owner/model")
 
@@ -4472,9 +4454,6 @@ class TestQueuePersistence:
     async def test_shutdown_leaves_row_resumable_on_disk(
         self, downloader, tasks_file
     ):
-        async def _noop(self, task_id, hf_token):
-            return None
-
         with patch.object(HFDownloader, "_run_download", new=_noop):
             task = await downloader.start_download("owner/model")
 
@@ -4491,190 +4470,43 @@ class TestQueuePersistence:
         )
 
     @pytest.mark.asyncio
-    async def test_restore_resumes_interrupted_and_keeps_terminal(
-        self, downloader, tasks_file
-    ):
-        tasks_file.parent.mkdir(parents=True, exist_ok=True)
-        tasks_file.write_text(
-            json.dumps(
-                [
-                    {
-                        "task_id": "done",
-                        "repo_id": "owner/done",
-                        "status": "completed",
-                        "progress": 100.0,
-                        "created_at": 100.0,
-                    },
-                    {
-                        "task_id": "fail",
-                        "repo_id": "owner/fail",
-                        "status": "failed",
-                        "error": "boom",
-                        "created_at": 200.0,
-                    },
-                    {
-                        "task_id": "live",
-                        "repo_id": "owner/live",
-                        "status": "downloading",
-                        "created_at": 300.0,
-                        "retry_count": 2,
-                    },
-                ]
-            ),
-            encoding="utf-8",
-        )
-
-        async def _noop(self, task_id, hf_token):
-            return None
-
-        with patch.object(HFDownloader, "_run_download", new=_noop):
-            await downloader.restore_tasks()
-
-        resumed = [
-            t for t in downloader._tasks.values()
-            if t.status == DownloadStatus.PENDING
-        ]
-        assert [t.repo_id for t in resumed] == ["owner/live"]
-        assert resumed[0].created_at == 300.0
-        assert resumed[0].retry_count == 2
-        # Terminal rows come back as display-only entries, error text intact.
-        assert downloader._tasks["done"].status == DownloadStatus.COMPLETED
-        assert downloader._tasks["done"].speed_bps == 0.0
-        assert downloader._tasks["fail"].error == "boom"
-        # The rewritten queue records the resumed row as pending under its
-        # new task id (task ids are restart-scoped; rows are matched by repo).
-        live_rows = [
-            r for r in self._rows(tasks_file)
-            if r["repo_id"] == "owner/live"
-        ]
-        assert live_rows
-        assert live_rows[0]["status"] == DownloadStatus.PENDING.value
-
-    @pytest.mark.asyncio
-    async def test_restore_tolerates_missing_and_corrupt_files(
-        self, downloader, tasks_file
-    ):
-        await downloader.restore_tasks()  # missing file: no-op
-
-        tasks_file.parent.mkdir(parents=True, exist_ok=True)
-        tasks_file.write_text("{not json", encoding="utf-8")
-        await downloader.restore_tasks()  # corrupt file: no-op, no raise
-        assert downloader._tasks == {}
-
-        tasks_file.write_text('{"not": "a list"}', encoding="utf-8")
-        await downloader.restore_tasks()
-        assert downloader._tasks == {}
-
-    @pytest.mark.asyncio
-    async def test_restore_warns_about_a_bad_row_without_its_token(
-        self, downloader, tasks_file, caplog
-    ):
-        """A row the loader cannot read is skipped, not fatal — and the row may
-        still carry the credential, so the warning leaves it out."""
-        tasks_file.parent.mkdir(parents=True, exist_ok=True)
-        tasks_file.write_text(
-            json.dumps([{
-                "task_id": "t1",
-                "status": "completed",
-                "token": "hf_SUPERSECRET",
-                # repo_id is what from_dict reads first; its absence is the
-                # KeyError this path already tolerates.
-            }]),
-            encoding="utf-8",
-        )
-
-        with caplog.at_level(logging.WARNING):
-            await downloader.restore_tasks()
-
-        assert "Skipping unpersistable download row" in caplog.text
-        assert "hf_SUPERSECRET" not in caplog.text
-
-    @pytest.mark.asyncio
-    async def test_one_row_this_build_cannot_read_does_not_lose_the_queue(
-        self, downloader, tasks_file
-    ):
-        """`restore_tasks` promises never to raise, so one field a build that
-        stored it differently left behind skips that row's bookkeeping alone:
-        the rows behind it come back and the healing rewrite runs."""
-        rows = [
-            # A queue row interrupted mid-download, carrying the two fields a
-            # newer build could have changed the type of.
-            {"task_id": "live", "repo_id": "owner/live",
-             "status": DownloadStatus.DOWNLOADING.value,
-             "created_at": "2026-09-25T00:00:00", "retry_count": "x"},
-            {"task_id": "done", "repo_id": "owner/done",
-             "status": DownloadStatus.COMPLETED.value,
-             "created_at": 5.0, "retry_count": 1},
-            # A status this build does not know is failed and display-only,
-            # not a queued row this boot never starts.
-            {"task_id": "no-status", "repo_id": "owner/unknown",
-             "created_at": 7.0},
-        ]
-        tasks_file.parent.mkdir(parents=True, exist_ok=True)
-        tasks_file.write_text(json.dumps(rows), encoding="utf-8")
-
-        async def _noop(self, task_id, hf_token):
-            return None
-
-        with patch.object(HFDownloader, "_run_download", new=_noop):
-            await downloader.restore_tasks()
-
-        by_repo = {task.repo_id: task for task in downloader._tasks.values()}
-        assert set(by_repo) == {"owner/live", "owner/done", "owner/unknown"}
-        assert by_repo["owner/live"].status in (
-            DownloadStatus.PENDING,
-            DownloadStatus.DOWNLOADING,
-        )
-        assert by_repo["owner/live"].retry_count == 0
-        assert by_repo["owner/done"].status == DownloadStatus.COMPLETED
-        assert by_repo["owner/unknown"].status == DownloadStatus.FAILED
-
-        # The rewrite at the end of the restore ran, so the next boot reads a
-        # queue this one already healed rather than failing the same way.
-        written = {row["repo_id"]: row for row in self._rows(tasks_file)}
-        assert set(written) == set(by_repo)
-        assert written["owner/unknown"]["status"] == DownloadStatus.FAILED.value
-
-    @pytest.mark.asyncio
     async def test_a_terminal_row_with_unreadable_numbers_still_restores(
         self, downloader, tasks_file
     ):
         """A finished row gets the same tolerance the queued branch has.
 
-        The case above feeds an ISO timestamp and a text retry count to a
-        *queued* row (the _restore_* readers handle those). The same fields on
-        a *finished* row go through from_dict, which parsed every number
-        eagerly: one unparseable value raised, restore skipped the row, and
-        its display, error text and retry entry were lost — exactly what the
-        resumable branch is built to avoid.
+        A *queued* row carrying an ISO timestamp and a text retry count
+        restores regardless (its two fields go through _read_float and
+        _read_int). The same fields on a *finished* row go through
+        from_dict, which parsed every number eagerly: one unparseable value
+        raised, restore skipped the row, and its display, error text and
+        retry entry were lost — exactly what the resumable branch is built
+        to avoid.
         """
-        tasks_file.parent.mkdir(parents=True, exist_ok=True)
-        tasks_file.write_text(
-            json.dumps(
-                [
-                    {
-                        "task_id": "junk",
-                        "repo_id": "owner/junk",
-                        "status": DownloadStatus.FAILED.value,
-                        "error": "boom",
-                        "progress": "n/a",
-                        "total_size": "big",
-                        "downloaded_size": None,
-                        "created_at": "2026-09-25T00:00:00",
-                        "started_at": [],
-                        "completed_at": {},
-                        "retry_count": "many",
-                    },
-                    {
-                        "task_id": "good",
-                        "repo_id": "owner/good",
-                        "status": DownloadStatus.COMPLETED.value,
-                        "created_at": 5.0,
-                        "retry_count": 1,
-                    },
-                ]
-            ),
-            encoding="utf-8",
+        _write_rows(
+            tasks_file,
+            [
+                {
+                    "task_id": "junk",
+                    "repo_id": "owner/junk",
+                    "status": DownloadStatus.FAILED.value,
+                    "error": "boom",
+                    "progress": "n/a",
+                    "total_size": "big",
+                    "downloaded_size": None,
+                    "created_at": "2026-09-25T00:00:00",
+                    "started_at": [],
+                    "completed_at": {},
+                    "retry_count": "many",
+                },
+                {
+                    "task_id": "good",
+                    "repo_id": "owner/good",
+                    "status": DownloadStatus.COMPLETED.value,
+                    "created_at": 5.0,
+                    "retry_count": 1,
+                },
+            ],
         )
 
         await downloader.restore_tasks()
@@ -4699,25 +4531,22 @@ class TestQueuePersistence:
         the healing rewrite is skipped, and the queue file stays byte-for-byte
         so the next boot retries the interrupted row.
         """
-        tasks_file.parent.mkdir(parents=True, exist_ok=True)
-        tasks_file.write_text(
-            json.dumps(
-                [
-                    {
-                        "task_id": "live",
-                        "repo_id": "owner/live",
-                        "status": DownloadStatus.DOWNLOADING.value,
-                        "created_at": 10.0,
-                    },
-                    {
-                        "task_id": "done",
-                        "repo_id": "owner/done",
-                        "status": DownloadStatus.COMPLETED.value,
-                        "created_at": 20.0,
-                    },
-                ]
-            ),
-            encoding="utf-8",
+        _write_rows(
+            tasks_file,
+            [
+                {
+                    "task_id": "live",
+                    "repo_id": "owner/live",
+                    "status": DownloadStatus.DOWNLOADING.value,
+                    "created_at": 10.0,
+                },
+                {
+                    "task_id": "done",
+                    "repo_id": "owner/done",
+                    "status": DownloadStatus.COMPLETED.value,
+                    "created_at": 20.0,
+                },
+            ],
         )
         before = tasks_file.read_text(encoding="utf-8")
 
@@ -4750,14 +4579,9 @@ class TestQueuePersistence:
             "status": "downloading",
             "created_at": 100.0,
         }
-        tasks_file.parent.mkdir(parents=True, exist_ok=True)
-        tasks_file.write_text(
-            json.dumps([dict(row, task_id="a"), dict(row, task_id="b")]),
-            encoding="utf-8",
+        _write_rows(
+            tasks_file, [dict(row, task_id="a"), dict(row, task_id="b")]
         )
-
-        async def _noop(self, task_id, hf_token):
-            return None
 
         with patch.object(HFDownloader, "_run_download", new=_noop):
             await downloader.restore_tasks()  # duplicate must not raise
@@ -4773,9 +4597,6 @@ class TestQueuePersistence:
     async def test_row_persists_credential_but_api_never_exposes_it(
         self, downloader, tasks_file
     ):
-        async def _noop(self, task_id, hf_token):
-            return None
-
         with patch.object(HFDownloader, "_run_download", new=_noop):
             task = await downloader.start_download("owner/model", "hf_secret")
 
@@ -4794,20 +4615,17 @@ class TestQueuePersistence:
         self, downloader, tasks_file
     ):
         """A gated download restarts with the token its request supplied."""
-        tasks_file.parent.mkdir(parents=True, exist_ok=True)
-        tasks_file.write_text(
-            json.dumps(
-                [
-                    {
-                        "task_id": "live",
-                        "repo_id": "owner/gated",
-                        "status": "downloading",
-                        "created_at": 100.0,
-                        "token": "hf_secret",
-                    }
-                ]
-            ),
-            encoding="utf-8",
+        _write_rows(
+            tasks_file,
+            [
+                {
+                    "task_id": "live",
+                    "repo_id": "owner/gated",
+                    "status": "downloading",
+                    "created_at": 100.0,
+                    "token": "hf_secret",
+                }
+            ],
         )
 
         seen: dict = {}
@@ -4840,19 +4658,16 @@ class TestQueuePersistence:
         self, downloader, tasks_file
     ):
         """Rows written before the token field keep hub's env/login lookup."""
-        tasks_file.parent.mkdir(parents=True, exist_ok=True)
-        tasks_file.write_text(
-            json.dumps(
-                [
-                    {
-                        "task_id": "live",
-                        "repo_id": "owner/model",
-                        "status": "pending",
-                        "created_at": 100.0,
-                    }
-                ]
-            ),
-            encoding="utf-8",
+        _write_rows(
+            tasks_file,
+            [
+                {
+                    "task_id": "live",
+                    "repo_id": "owner/model",
+                    "status": "pending",
+                    "created_at": 100.0,
+                }
+            ],
         )
 
         seen = "unset"
@@ -5029,23 +4844,6 @@ class TestXetGroupCancellation:
             assert await downloader.cancel_download(task.task_id) is True
 
         group.abort.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_shutdown_aborts_registered_group(self, downloader):
-        """shutdown() must stop the Rust transfer, not just flip the sigint.
-
-        The sigint flag alone can leave a reconstruction running, and the
-        interpreter would then wait for that non-daemon writer thread on
-        exit — a graceful restart mid-download has to unwind promptly.
-        """
-        group = MagicMock()
-        hf_downloader_mod._register_xet_group(group)
-
-        with patch("omlx.admin.hf_downloader.abort_xet_session"):
-            await downloader.shutdown()
-
-        group.abort.assert_called_once()
-        assert hf_downloader_mod._xet_groups == []
 
     @pytest.mark.asyncio
     async def test_cancel_aborts_every_concurrently_active_group(

@@ -6,11 +6,12 @@ import json
 import logging
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from omlx.admin.hf_downloader import DownloadStatus, DownloadTask
+from omlx.admin.hf_downloader import DownloadStatus, DownloadTask, HFDownloader
 from omlx.admin.ms_downloader import (
     MSDownloader,
     _ENRICH_CACHE,
@@ -33,6 +34,38 @@ async def _wait_for(predicate, timeout: float = 5.0) -> None:
         if asyncio.get_running_loop().time() >= deadline:
             raise AssertionError("Timed out waiting for download state")
         await asyncio.sleep(0.01)
+
+
+def _write_rows(path, rows) -> None:
+    """Write a persisted queue file the way a previous boot left it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(rows), encoding="utf-8")
+
+
+@pytest.fixture(params=[HFDownloader, MSDownloader], ids=["hf", "ms"])
+def queue(request, tmp_path):
+    """One downloader of either kind with its run body neutralised.
+
+    Restore only schedules each resumed row's run coroutine, so the tests
+    here replace it wholesale — and open the ModelScope SDK gate, the
+    check that HF's start_download simply does not have.
+    """
+    cls = request.param
+    model_dir = tmp_path / "models"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    tasks_file = tmp_path / "state" / f"{cls.__name__}_queue.json"
+
+    async def _noop(self, task_id, token):
+        return None
+
+    with patch.object(cls, "_run_download", new=_noop), patch(
+        "omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True
+    ):
+        yield SimpleNamespace(
+            cls=cls,
+            downloader=cls(model_dir=str(model_dir), tasks_file=tasks_file),
+            tasks_file=tasks_file,
+        )
 
 
 # =============================================================================
@@ -1173,92 +1206,102 @@ class TestMSQueuePersistence:
         )
 
     @pytest.mark.asyncio
-    async def test_restore_resumes_interrupted_rows(
-        self, tmp_path, downloader, tasks_file
-    ):
-        tasks_file.parent.mkdir(parents=True, exist_ok=True)
-        tasks_file.write_text(
-            json.dumps(
-                [
-                    {
-                        "task_id": "done",
-                        "repo_id": "owner/done",
-                        "status": "completed",
-                        "created_at": 100.0,
-                    },
-                    {
-                        "task_id": "live",
-                        "repo_id": "owner/live",
-                        "status": "downloading",
-                        "created_at": 200.0,
-                        "retry_count": 3,
-                    },
-                ]
-            ),
-            encoding="utf-8",
+    async def test_restore_resumes_interrupted_rows(self, queue):
+        downloader, tasks_file = queue.downloader, queue.tasks_file
+        _write_rows(
+            tasks_file,
+            [
+                {
+                    "task_id": "done",
+                    "repo_id": "owner/done",
+                    "status": "completed",
+                    "progress": 100.0,
+                    "created_at": 100.0,
+                },
+                {
+                    "task_id": "fail",
+                    "repo_id": "owner/fail",
+                    "status": "failed",
+                    "error": "boom",
+                    "created_at": 200.0,
+                },
+                {
+                    "task_id": "live",
+                    "repo_id": "owner/live",
+                    "status": "downloading",
+                    "created_at": 300.0,
+                    "retry_count": 2,
+                },
+            ],
         )
 
-        async def _noop(self, task_id, ms_token):
-            return None
-
-        with patch(
-            "omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True
-        ), patch.object(MSDownloader, "_run_download", new=_noop):
-            await downloader.restore_tasks()
+        await downloader.restore_tasks()
 
         resumed = [
             t for t in downloader._tasks.values()
             if t.status == DownloadStatus.PENDING
         ]
         assert [t.repo_id for t in resumed] == ["owner/live"]
-        assert resumed[0].created_at == 200.0
-        assert resumed[0].retry_count == 3
-        # Terminal rows come back as display-only entries.
+        assert resumed[0].created_at == 300.0
+        assert resumed[0].retry_count == 2
+        # Terminal rows come back as display-only entries, error text intact.
         assert downloader._tasks["done"].status == DownloadStatus.COMPLETED
+        assert downloader._tasks["done"].speed_bps == 0.0
+        assert downloader._tasks["fail"].error == "boom"
+        # The rewritten queue records the resumed row as pending under its
+        # new task id (task ids are restart-scoped; rows are matched by repo).
+        live_rows = [
+            r for r in self._rows(tasks_file)
+            if r["repo_id"] == "owner/live"
+        ]
+        assert live_rows
+        assert live_rows[0]["status"] == DownloadStatus.PENDING.value
 
     @pytest.mark.asyncio
     async def test_one_row_this_build_cannot_read_does_not_lose_the_queue(
-        self, downloader, tasks_file
+        self, queue
     ):
         """`restore_tasks` promises never to raise, so one field a build that
         stored it differently left behind skips that row's bookkeeping alone:
         the rows behind it come back and the healing rewrite runs."""
+        downloader, tasks_file = queue.downloader, queue.tasks_file
         rows = [
+            # A queue row interrupted mid-download, carrying the two fields a
+            # newer build could have changed the type of.
             {"task_id": "live", "repo_id": "owner/live",
              "status": DownloadStatus.DOWNLOADING.value,
              "created_at": "2026-09-25T00:00:00", "retry_count": "x"},
             {"task_id": "done", "repo_id": "owner/done",
              "status": DownloadStatus.COMPLETED.value,
              "created_at": 5.0, "retry_count": 1},
-            # A status this build does not know is failed and display-only.
+            # A status this build does not know is failed and display-only,
+            # not a queued row this boot never starts.
             {"task_id": "no-status", "repo_id": "owner/unknown",
              "created_at": 7.0},
         ]
-        tasks_file.parent.mkdir(parents=True, exist_ok=True)
-        tasks_file.write_text(json.dumps(rows), encoding="utf-8")
+        _write_rows(tasks_file, rows)
 
-        async def _noop(self, task_id, ms_token):
-            return None
-
-        with patch(
-            "omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True
-        ), patch.object(MSDownloader, "_run_download", new=_noop):
-            await downloader.restore_tasks()
+        await downloader.restore_tasks()
 
         by_repo = {task.repo_id: task for task in downloader._tasks.values()}
         assert set(by_repo) == {"owner/live", "owner/done", "owner/unknown"}
+        assert by_repo["owner/live"].status in (
+            DownloadStatus.PENDING,
+            DownloadStatus.DOWNLOADING,
+        )
         assert by_repo["owner/live"].retry_count == 0
         assert by_repo["owner/done"].status == DownloadStatus.COMPLETED
         assert by_repo["owner/unknown"].status == DownloadStatus.FAILED
 
+        # The rewrite at the end of the restore ran, so the next boot reads a
+        # queue this one already healed rather than failing the same way.
         written = {row["repo_id"]: row for row in self._rows(tasks_file)}
         assert set(written) == set(by_repo)
         assert written["owner/unknown"]["status"] == DownloadStatus.FAILED.value
 
     @pytest.mark.asyncio
-    async def test_restore_tolerates_missing_and_corrupt_files(
-        self, downloader, tasks_file
-    ):
+    async def test_restore_tolerates_missing_and_corrupt_files(self, queue):
+        downloader, tasks_file = queue.downloader, queue.tasks_file
         await downloader.restore_tasks()  # missing file: no-op
 
         tasks_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1272,25 +1315,24 @@ class TestMSQueuePersistence:
 
     @pytest.mark.asyncio
     async def test_restore_warns_about_a_bad_row_without_its_token(
-        self, downloader, tasks_file, caplog
+        self, queue, caplog
     ):
         """A row the loader cannot read is skipped, not fatal — and the row may
         still carry the credential, so the warning leaves it out."""
-        tasks_file.parent.mkdir(parents=True, exist_ok=True)
-        tasks_file.write_text(
-            json.dumps([{
-                "task_id": "t1",
-                "status": "completed",
-                "token": "ms_SUPERSECRET",
-            }]),
-            encoding="utf-8",
-        )
+        downloader, tasks_file = queue.downloader, queue.tasks_file
+        _write_rows(tasks_file, [{
+            "task_id": "t1",
+            "status": "completed",
+            "token": "SUPERSECRET",
+            # repo_id is what from_dict reads first; its absence is the
+            # KeyError this path already tolerates.
+        }])
 
         with caplog.at_level(logging.WARNING):
             await downloader.restore_tasks()
 
         assert "Skipping unpersistable download row" in caplog.text
-        assert "ms_SUPERSECRET" not in caplog.text
+        assert "SUPERSECRET" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_restore_defers_rows_the_sdk_cannot_start(
@@ -1303,25 +1345,22 @@ class TestMSQueuePersistence:
         interrupted row, and the next boot — with the SDK installed — would
         find an empty queue.
         """
-        tasks_file.parent.mkdir(parents=True, exist_ok=True)
-        tasks_file.write_text(
-            json.dumps(
-                [
-                    {
-                        "task_id": "live",
-                        "repo_id": "owner/live",
-                        "status": DownloadStatus.DOWNLOADING.value,
-                        "created_at": 10.0,
-                    },
-                    {
-                        "task_id": "done",
-                        "repo_id": "owner/done",
-                        "status": DownloadStatus.COMPLETED.value,
-                        "created_at": 20.0,
-                    },
-                ]
-            ),
-            encoding="utf-8",
+        _write_rows(
+            tasks_file,
+            [
+                {
+                    "task_id": "live",
+                    "repo_id": "owner/live",
+                    "status": DownloadStatus.DOWNLOADING.value,
+                    "created_at": 10.0,
+                },
+                {
+                    "task_id": "done",
+                    "repo_id": "owner/done",
+                    "status": DownloadStatus.COMPLETED.value,
+                    "created_at": 20.0,
+                },
+            ],
         )
         before = tasks_file.read_text(encoding="utf-8")
 

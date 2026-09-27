@@ -530,8 +530,6 @@ class DownloadTask:
         task.progress = _read_float(data.get("progress"))
         task.total_size = _read_int(data.get("total_size"))
         task.downloaded_size = _read_int(data.get("downloaded_size"))
-        # Nothing transfers at boot: a restored row always reads 0 B/s.
-        task.speed_bps = 0.0
         task.error = str(data.get("error", ""))
         # Credential for a later retry/resume; rows written before the
         # token field existed simply fall back to hub's env/login lookup.
@@ -856,20 +854,118 @@ def _read_tasks_file(path: Path | None) -> list[dict]:
     return data if isinstance(data, list) else []
 
 
-def _restore_created_at(entry: dict) -> float:
-    """Order persisted rows oldest first, and carry their queue position over.
+def _persist_queue(downloader) -> None:
+    """Write the queue to disk — no-op outside normal operation.
 
-    A row a build that stored the field differently left behind reads as 0.0
-    instead of raising: inside ``sorted`` a single bad value would abort the
-    whole restore, and outside it the assignment would drop every row behind
-    it as well as the healing rewrite that follows.
+    Skipped while restoring (the on-disk queue must stay intact until
+    every interrupted row has been re-queued) and during shutdown
+    (interrupted rows must keep saying "downloading" so the next boot
+    resumes them instead of seeing this process's dying cancelled state).
     """
-    return _read_float(entry.get("created_at"))
+    if (
+        downloader._tasks_file is None
+        or downloader._restoring
+        or downloader._shutting_down
+    ):
+        return
+    _write_tasks_file(downloader._tasks_file, downloader._tasks.values())
 
 
-def _restore_retry_count(entry: dict) -> int:
-    """A retry count this build cannot read reads as none rather than raising."""
-    return _read_int(entry.get("retry_count"))
+async def _restore_queue(downloader, logger) -> None:
+    """Restore the persisted queue after a restart.
+
+    Rows interrupted mid-download (pending/downloading) re-enter through
+    the downloader's own start_download, which resumes from files already
+    on disk and re-serializes behind the download semaphore; terminal rows
+    come back as display-only entries so a failed or cancelled download
+    stays retryable. The row's persisted request-supplied token rides
+    along with the resumed download (credential recovery for private and
+    gated repos); when a row carries none, start_download hands an empty
+    token — hub then falls back to HF_TOKEN/the login cache, ModelScope to
+    its env/anonymous fallback — and a resume that still fails on auth
+    lands in FAILED where the user can re-enter a credential and retry.
+    Never raises: a corrupt queue file only loses the queue, and a row the
+    environment refuses (an SDK that went away between boots — anything
+    start_download raises beyond ValueError) stays on disk for a boot that
+    can start it, because the healing rewrite below skips that row.
+    """
+    entries = _read_tasks_file(downloader._tasks_file)
+    if not entries:
+        return
+    downloader._restoring = True
+    # Set when a row could not start for a reason that is not the row's
+    # own (the environment refused it). Those rows must stay on disk for
+    # the next boot, so the healing rewrite below is skipped entirely.
+    deferred = False
+    try:
+        for entry in sorted(
+            (e for e in entries if isinstance(e, dict)),
+            # Order persisted rows oldest first, and carry their queue
+            # position over. A row a build that stored the field
+            # differently left behind reads as 0.0 instead of raising:
+            # inside ``sorted`` a single bad value would abort the whole
+            # restore, and outside it the assignment below would drop
+            # every row behind it as well as the healing rewrite.
+            key=lambda e: _read_float(e.get("created_at")),
+        ):
+            status = entry.get("status")
+            if status in (
+                DownloadStatus.PENDING.value,
+                DownloadStatus.DOWNLOADING.value,
+            ):
+                repo_id = entry.get("repo_id")
+                if not isinstance(repo_id, str):
+                    continue
+                try:
+                    task = await downloader.start_download(
+                        repo_id, str(entry.get("token") or "")
+                    )
+                except ValueError as exc:
+                    # The row itself is bad (invalid repo/model id, or
+                    # already queued): it can never start, so let the
+                    # rewrite below forget it.
+                    logger.warning(
+                        "Could not resume download %s: %s", repo_id, exc
+                    )
+                    continue
+                except Exception as exc:  # noqa: BLE001 — restore never raises
+                    # Not the row's fault: start_download refused the
+                    # environment (an SDK that went away between boots, an
+                    # unexpected failure upstream). Keep restoring the rows
+                    # behind it and leave the on-disk queue untouched, so
+                    # the next boot retries this one instead of the healing
+                    # rewrite dropping it.
+                    logger.warning(
+                        "Deferring resume of %s to the next boot: %s",
+                        repo_id,
+                        exc,
+                    )
+                    deferred = True
+                    continue
+                # Keep the pre-restart queue position and retry history.
+                # A row this build cannot read keeps the fresh task's own
+                # values instead of aborting the restore for the rows
+                # behind it — the same tolerance from_dict gets (a retry
+                # count this build cannot read reads as none, not raises).
+                task.created_at = (
+                    _read_float(entry.get("created_at")) or task.created_at
+                )
+                task.retry_count = _read_int(entry.get("retry_count"))
+                logger.info("Resumed interrupted download: %s", repo_id)
+                continue
+            try:
+                task = DownloadTask.from_dict(entry)
+            except (KeyError, TypeError, ValueError):
+                logger.warning(
+                    "Skipping unpersistable download row: %s",
+                    {k: v for k, v in entry.items() if k != "token"},
+                )
+                continue
+            downloader._tasks.setdefault(task.task_id, task)
+    finally:
+        downloader._restoring = False
+    if not deferred:
+        downloader._persist()
 
 # Every xet download group still in flight. snapshot_download shards files
 # across hf_thread_map workers, so one snapshot runs many xet_get() calls
@@ -1473,10 +1569,6 @@ class HFDownloader:
         self._restoring = False
         self._stalled: dict[str, _DownloadStalledError] = {}
         self._fallback_processes: dict[str, asyncio.subprocess.Process] = {}
-        # Network-byte counters fed by the transfer bar's progress callbacks;
-        # a second speed source alongside the filesystem meter so xet's
-        # fetch-but-don't-write phases don't read as 0 B/s.
-        self._wire_counters: dict[str, _WireCounter] = {}
         self._download_sem = asyncio.Semaphore(1)
 
     @property
@@ -1666,101 +1758,12 @@ class HFDownloader:
         ]
 
     def _persist(self) -> None:
-        """Write the queue to disk — no-op outside normal operation.
-
-        Skipped while restoring (the on-disk queue must stay intact until
-        every interrupted row has been re-queued) and during shutdown
-        (interrupted rows must keep saying "downloading" so the next boot
-        resumes them instead of seeing this process's dying cancelled state).
-        """
-        if self._tasks_file is None or self._restoring or self._shutting_down:
-            return
-        _write_tasks_file(self._tasks_file, self._tasks.values())
+        """Persist the queue; the lifecycle gates live in _persist_queue."""
+        _persist_queue(self)
 
     async def restore_tasks(self) -> None:
-        """Restore the persisted queue after a restart.
-
-        Rows interrupted mid-download (pending/downloading) re-enter through
-        start_download, which resumes from files already on disk and
-        re-serializes behind the download semaphore; terminal rows come back
-        as display-only entries so a failed or cancelled download stays
-        retryable. The row's persisted request-supplied token rides along
-        with the resumed download (credential recovery for private/gated
-        repos); when a row carries none, start_download hands hub an empty
-        token, which falls back to HF_TOKEN/the login cache, and a resume
-        that still fails on auth lands in FAILED where the user can
-        re-enter a credential and retry. Never raises: a corrupt queue file
-        only loses the queue, and a row the environment refuses (e.g. a hub
-        that is not importable) stays on disk for a boot that can start it.
-        """
-        entries = _read_tasks_file(self._tasks_file)
-        if not entries:
-            return
-        self._restoring = True
-        # Set when a row could not start for a reason that is not the row's
-        # own (the environment refused it). Those rows must stay on disk for
-        # the next boot, so the healing rewrite below is skipped entirely.
-        deferred = False
-        try:
-            for entry in sorted(
-                (e for e in entries if isinstance(e, dict)),
-                key=_restore_created_at,
-            ):
-                status = entry.get("status")
-                if status in (
-                    DownloadStatus.PENDING.value,
-                    DownloadStatus.DOWNLOADING.value,
-                ):
-                    repo_id = entry.get("repo_id")
-                    if not isinstance(repo_id, str):
-                        continue
-                    try:
-                        task = await self.start_download(
-                            repo_id, str(entry.get("token") or "")
-                        )
-                    except ValueError as exc:
-                        # The row itself is bad (invalid repo id, already
-                        # queued): it can never start, so let the rewrite
-                        # below forget it.
-                        logger.warning(
-                            "Could not resume download %s: %s", repo_id, exc
-                        )
-                        continue
-                    except Exception as exc:  # noqa: BLE001 — restore never raises
-                        # Not the row's fault: start_download refused the
-                        # environment (an SDK that went away between boots, an
-                        # unexpected failure upstream). Keep restoring the rows
-                        # behind it and leave the on-disk queue untouched, so
-                        # the next boot retries this one instead of the healing
-                        # rewrite dropping it.
-                        logger.warning(
-                            "Deferring resume of %s to the next boot: %s",
-                            repo_id,
-                            exc,
-                        )
-                        deferred = True
-                        continue
-                    # Keep the pre-restart queue position and retry history.
-                    # A row this build cannot read keeps the fresh task's own
-                    # values instead of aborting the restore for the rows
-                    # behind it — the same tolerance from_dict gets.
-                    task.created_at = _restore_created_at(entry) or task.created_at
-                    task.retry_count = _restore_retry_count(entry)
-                    logger.info("Resumed interrupted download: %s", repo_id)
-                    continue
-                try:
-                    task = DownloadTask.from_dict(entry)
-                except (KeyError, TypeError, ValueError):
-                    logger.warning(
-                        "Skipping unpersistable download row: %s",
-                        {k: v for k, v in entry.items() if k != "token"},
-                    )
-                    continue
-                self._tasks.setdefault(task.task_id, task)
-        finally:
-            self._restoring = False
-        if not deferred:
-            self._persist()
+        """Restore the persisted queue after a restart; see _restore_queue."""
+        await _restore_queue(self, logger)
 
     async def shutdown(self) -> None:
         """Cancel all active downloads and clean up."""
@@ -1785,7 +1788,6 @@ class HFDownloader:
                 if task and task.status == DownloadStatus.DOWNLOADING:
                     task.status = DownloadStatus.CANCELLED
         self._active_tasks.clear()
-        self._wire_counters.clear()
 
         # Reap any in-flight xet transfer threads: group abort stops every
         # shard's Rust transfer where it stands (sigint alone can leave a
@@ -1905,9 +1907,8 @@ class HFDownloader:
                     )
 
                 wire_counter = _WireCounter()
-                self._wire_counters[task_id] = wire_counter
                 self._progress_tasks[task_id] = asyncio.create_task(
-                    self._poll_progress(task_id, target_dir)
+                    self._poll_progress(task_id, target_dir, wire_counter)
                 )
 
                 xet_error: Exception | None = None
@@ -1955,9 +1956,8 @@ class HFDownloader:
                     # fetch-phase wire bytes no longer describe bytes any
                     # file of this task owns. Start the replacement poll
                     # from zero.
-                    self._wire_counters[task_id] = _WireCounter()
                     self._progress_tasks[task_id] = asyncio.create_task(
-                        self._poll_progress(task_id, target_dir)
+                        self._poll_progress(task_id, target_dir, _WireCounter())
                     )
                     try:
                         await self._run_http_fallback(task_id, dl_kwargs)
@@ -2042,7 +2042,6 @@ class HFDownloader:
             if progress_task and not progress_task.done():
                 progress_task.cancel()
             self._stalled.pop(task_id, None)
-            self._wire_counters.pop(task_id, None)
 
             # Remove from active tasks
             self._active_tasks.pop(task_id, None)
@@ -2120,7 +2119,9 @@ class HFDownloader:
                 return
             await process.wait()
 
-    async def _poll_progress(self, task_id: str, target_dir: Path) -> None:
+    async def _poll_progress(
+        self, task_id: str, target_dir: Path, wire: _WireCounter | None = None
+    ) -> None:
         """Poll the target directory to estimate download progress.
 
         Uses both directory size and file modification times to detect
@@ -2134,6 +2135,7 @@ class HFDownloader:
         not yet reconstructed on disk, and wire movement keeps the stall
         deadline fresh while the filesystem stays silent.
         """
+        wire = wire or _WireCounter()
         task = self._tasks.get(task_id)
         if task is None:
             return
@@ -2150,12 +2152,9 @@ class HFDownloader:
         # time rather than startup delay.
         speed_meter = _SpeedMeter()
         speed_meter.add(last_activity.files, now=last_activity_at)
-        wire_counter = self._wire_counters.get(task_id)
         wire_meter = _WireSpeedMeter()
-        wire_meter.add(
-            wire_counter.value if wire_counter else 0, now=last_activity_at
-        )
-        last_wire = wire_counter.value if wire_counter else 0
+        wire_meter.add(wire.value, now=last_activity_at)
+        last_wire = wire.value
         # Bytes already on disk when this attempt started. A resumed
         # download re-fetches only what is missing, so the wire counter
         # measures the remainder while the disk already holds the files
@@ -2171,7 +2170,7 @@ class HFDownloader:
                     break
 
                 activity = self._get_download_activity(target_dir)
-                wire_now = wire_counter.value if wire_counter else 0
+                wire_now = wire.value
 
                 # Progress follows whichever pipeline stage is further along:
                 # fetch-phase bytes exist only on the wire (reconstruction
@@ -2197,11 +2196,7 @@ class HFDownloader:
                 task.downloaded_size = reported
 
                 disk_bps = speed_meter.add(activity.files)
-                wire_bps = (
-                    wire_meter.add(wire_counter.value)
-                    if wire_counter
-                    else 0.0
-                )
+                wire_bps = wire_meter.add(wire_now)
                 # Report the larger of the two stages, never their sum: the
                 # fetch phase advances only the wire counter, the
                 # reconstruction flush advances only the disk meter, and a
