@@ -11396,6 +11396,8 @@ class Scheduler:
                 request.cached_tokens = 0
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
+                # Indices were scored against the rejected cache's cached_tokens.
+                request.specprefill_indices = None
 
             # SpecPrefill requests must be alone in the batch (RoPE patching
             # affects the entire model). Also block scheduling if another
