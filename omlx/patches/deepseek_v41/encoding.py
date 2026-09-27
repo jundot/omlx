@@ -342,8 +342,8 @@ def _process_image_blocks(
             text = block.get("text") or ""
             if IMAGE_PLACEHOLDER in text:
                 raise ValueError(
-                    f"Text block contains image placeholder '{IMAGE_PLACEHOLDER}': "
-                    f"'{text[:100]}'. Images should be separate content blocks."
+                    "Text block contains the DeepSeek image placeholder token in "
+                    "its text; images should be separate content blocks."
                 )
             new_blocks.append(block)
         else:
@@ -356,13 +356,13 @@ def _validate_no_image_sp_tokens(msg: Dict[str, Any]) -> None:
     content = msg.get("content")
     if isinstance(content, str) and IMAGE_PLACEHOLDER in content:
         raise ValueError(
-            f"Message content contains image special token '{IMAGE_PLACEHOLDER}'. "
+            "Message content contains the DeepSeek image placeholder token. "
             "Images should be provided as image content blocks."
         )
     reasoning_content = msg.get("reasoning_content")
     if isinstance(reasoning_content, str) and IMAGE_PLACEHOLDER in reasoning_content:
         raise ValueError(
-            f"reasoning_content contains image special token '{IMAGE_PLACEHOLDER}'"
+            "reasoning_content contains the DeepSeek image placeholder token"
         )
 
 
