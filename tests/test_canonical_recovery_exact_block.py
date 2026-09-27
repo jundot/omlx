@@ -17,9 +17,8 @@ publication floors to a block boundary:
     8,191, publish 4,096.
 
 Half a two-block session, lost to an off-by-one in a token that request never
-uses. The earlier workaround asked for one token *past* the boundary, which
-works whenever the prompt is longer than the boundary and cannot work when the
-prompt ends on it — there is no such token.
+uses. Asking for one token *past* the boundary cannot work when the prompt
+ends on it, because there is no such token.
 
 So the recovery state is built without the hold-back rather than compensated
 for afterwards, and the target is the boundary itself. Nothing artificial is
@@ -78,7 +77,7 @@ def _plain_request(n: int) -> Request:
 
 
 class TestTheTargetIsTheBoundaryItself:
-    """``note_canonical_recovery_candidate`` no longer asks for a spare token."""
+    """``note_canonical_recovery_candidate`` does not ask for a spare token."""
 
     @pytest.mark.parametrize(
         "prompt_tokens,expected_target",
@@ -135,10 +134,8 @@ class TestTheRecoveryStateKeepsEveryToken:
         assert state.last_token == [2 * BLOCK - 1]
 
     def test_the_progress_denominator_matches_what_will_be_prefilled(self):
-        """The progress sites spelled this ``total_length - 1``, which assumed
-        a hold-back that no longer always happens. ``total_length`` minus the
-        held-back token count is the same number for a foreground state and
-        the right one for a recovery state."""
+        """``total_length`` minus the held-back token count, which is right for
+        both a foreground state and a recovery state."""
         scheduler = _make_scheduler()
         recovery = self._state_for(scheduler, 2 * BLOCK)
         foreground = scheduler._begin_prefill(
@@ -171,7 +168,7 @@ class TestTheWholeBlockBecomesPublishable:
         assert job.done
 
     def test_a_prompt_longer_than_the_boundary_is_unchanged(self):
-        """The control: the case the old compensation already handled."""
+        """The control: a prompt that runs past the boundary."""
         job = self._job(8192)
         job.processed_tokens = 8192
         assert job.publishable_boundary() == 8192

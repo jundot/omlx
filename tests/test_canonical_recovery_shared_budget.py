@@ -2,12 +2,10 @@
 """One recovery budget for every engine sharing the accelerator.
 
 A recovery budget rations an accelerator, and an engine pool has exactly one
-between all of its engines. Built per scheduler — which is what a float on a
-shallow-copied config gives you — M loaded models granted M times the
-configured share, each measuring its own against its own wall clock, and
-nothing anywhere added them up.
+between all of its engines. A budget built per scheduler would grant M loaded
+models M times the configured share.
 
-The fix follows the shape the runtime already uses for its one other
+The budget follows the shape the runtime already uses for its one other
 cross-engine ceiling: the pool creates an *object* before any engine loads and
 hangs it on the shared scheduler config, where the same two shallow copies that
 snapshot every scalar pass the reference through untouched.
@@ -17,7 +15,7 @@ Two separate things live on that object and they are not substitutes:
 - the **budget** bounds the aggregate *share* of wall time;
 - the **claim** bounds concurrent *execution*, and closes the window between
   a job clearing its tracker entry to rebuild state and writing a new one at
-  the end of its first chunk — an interval in which a peer sees a process with
+  the end of its first chunk, an interval in which a peer sees a process with
   no recovery running and starts a slice of its own.
 
 These are the six scenarios the design review named, plus the two the ownership
@@ -122,7 +120,7 @@ def two_engines():
 
 
 class TestOneBudgetForTheProcess:
-    """1 — two engines cannot receive twice the cap."""
+    """1. Two engines cannot receive twice the cap."""
 
     def test_the_two_schedulers_hold_the_same_budget_object(self, two_engines):
         a, b = two_engines
@@ -162,15 +160,15 @@ class TestOneBudgetForTheProcess:
                 while engine._canonical_recovery_budget.allows():
                     engine._canonical_recovery_budget.note_service(slice_s)
                     granted += slice_s
-        # The bound comes out tight — exactly one allowance per window plus
-        # the single slice that overran the last of them — so it is compared
+        # The bound comes out tight (exactly one allowance per window plus
+        # the single slice that overran the last of them), so it is compared
         # with a tolerance rather than exactly, against float accumulation
         # over twelve additions.
         assert granted <= 4 * ALLOWANCE_S + slice_s + 1e-9
 
 
 class TestForegroundOnOneEngineBlocksRecoveryOnTheOther:
-    """2 — foreground on B blocks new recovery admission on A."""
+    """2. Foreground on B blocks new recovery admission on A."""
 
     def test_a_foreign_decode_withdraws_the_chunk(self, two_engines):
         a, b = two_engines
@@ -205,8 +203,8 @@ class TestForegroundOnOneEngineBlocksRecoveryOnTheOther:
         """And the reason it must not be.
 
         A recovery job holds its tracker entry from its first chunk until it
-        parks, finishes or is dropped — across every wait in between. Read as
-        foreground, one engine stood down for another engine's *waiting*,
+        parks, finishes or is dropped, across every wait in between. Read as
+        foreground, one engine would stand down for another engine's *waiting*,
         indefinitely. Mutual exclusion between recovery jobs is the claim.
         """
         a, b = two_engines
@@ -220,7 +218,7 @@ class TestForegroundOnOneEngineBlocksRecoveryOnTheOther:
 
 
 class TestTheFirstSliceIsNotInvisible:
-    """3 — no first-slice visibility hole."""
+    """3. No first-slice visibility hole."""
 
     def test_the_claim_is_held_before_the_state_build(self, two_engines):
         a, b = two_engines
@@ -234,8 +232,7 @@ class TestTheFirstSliceIsNotInvisible:
 
         def _inner():
             # The instant the state build could begin, the peer must already
-            # see a process with recovery running. Before the claim this was
-            # the whole duration of the first slice.
+            # see a process with recovery running.
             seen["b_blocked"] = b._canonical_recovery_claim_blocked()
             seen["b_runnable"] = b._canonical_recovery_runnable()
             seen["b_has_work"] = b.has_requests()
@@ -282,7 +279,7 @@ class TestTheFirstSliceIsNotInvisible:
 
 
 class TestAnExhaustedBudgetParksEveryEngine:
-    """4 — no starvation or spin while the shared window is spent."""
+    """4. No starvation or spin while the shared window is spent."""
 
     def test_neither_engine_steps_while_the_window_is_spent(self, two_engines):
         a, b = two_engines
@@ -318,7 +315,7 @@ class TestAnExhaustedBudgetParksEveryEngine:
 
 
 class TestOneOwnersResetSparesTheRest:
-    """5 — resetting B does not alter A's or the global spent allowance."""
+    """5. Resetting B does not alter A's or the global spent allowance."""
 
     def test_resetting_one_scheduler_leaves_the_shared_accounting_alone(
         self, two_engines
@@ -355,7 +352,7 @@ class TestOneOwnersResetSparesTheRest:
 
 
 class TestReloadBuysNothing:
-    """6 — unload and reload get no fresh allowance and no forgiven debt."""
+    """6. Unload and reload get no fresh allowance and no forgiven debt."""
 
     def test_a_returning_owner_finds_the_window_where_it_left_it(self, two_engines):
         a, b = two_engines

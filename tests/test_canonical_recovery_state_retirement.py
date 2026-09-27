@@ -348,7 +348,7 @@ class TestWhatSurvivesRetirement:
 
     def test_nothing_still_refers_to_the_retired_state(self):
         """The point is the arrays going away, so reachability is what is
-        asserted rather than the attribute that used to name them. A state
+        asserted rather than the attribute. A state
         the scheduler still holds somewhere else would satisfy
         ``prefill_state is None`` and free nothing."""
         scheduler = _make_scheduler()

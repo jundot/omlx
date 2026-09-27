@@ -5,7 +5,7 @@ A model chooses two things: whether to recover, and how large an execution
 slice it does it in. It does not choose a ceiling. The share of the machine
 recovery may have is one server-level number, because every engine in the pool
 shares one accelerator and the pool rewrites this same config object before
-every load — a ceiling read off it would be whichever model loaded last.
+every load, so a ceiling read off it would be whichever model loaded last.
 """
 
 import pytest
@@ -41,12 +41,7 @@ class TestModelSettingsRoundTrip:
 
 
 class TestThereIsNoPerModelCeiling:
-    """The knob that used to be here granted nothing and said otherwise.
-
-    It was read only when a Scheduler built its own budget, which under a pool
-    never happens — the pool always supplies one. An operator who set it got no
-    ceiling and no error, so it is gone rather than documented.
-    """
+    """The recovery ceiling is server-level only, with no per-model knob."""
 
     def test_model_settings_has_no_budget_percentage(self):
         assert not hasattr(ModelSettings(), "canonical_state_recovery_budget_pct")
@@ -88,8 +83,7 @@ class TestReachesSchedulerConfig:
         assert config.canonical_state_recovery_slice_tokens == 0
 
     def test_a_bare_scheduler_reads_the_same_server_level_ceiling(self):
-        """No pool, so the Scheduler builds its own budget — from the one
-        ceiling there is, not from a second per-model knob."""
+        """With no pool the Scheduler builds its own budget from the same ceiling."""
         from unittest.mock import MagicMock
 
         from omlx.scheduler import Scheduler
@@ -111,14 +105,12 @@ class TestReachesSchedulerConfig:
 
 
 class TestEnabledAndUnschedulableIsDiagnosable:
-    """Enabled with a zero ceiling is reachable, and used to be silent.
+    """Enabled with a zero ceiling is reachable and must say so.
 
     The per-model switch is the documented one, the ceiling is server-level and
     defaults to zero, and at zero `CanonicalRecoveryBudget.allows` is False in every
-    window, so every candidate is declined before it runs. Nothing downstream
-    reported it: the counters live on the usage object of requests the job
-    never touched, and the decline itself is not logged. An operator who set
-    the switch saw a feature that was on and did nothing.
+    window, so every candidate is declined before it runs. Nothing else would
+    report it, so the combination is logged at load.
     """
 
     def test_a_zero_server_ceiling_with_the_switch_on_is_logged(self, caplog):

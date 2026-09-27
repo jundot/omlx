@@ -2,10 +2,7 @@
 """Scheduler-level tests for progressive canonical state recovery.
 
 The model is mocked; what is under test is when the scheduler decides a
-recovery chunk may run, what it publishes, and what it releases. Each test in
-``TestSafetyReviewConditions`` corresponds to a defect found in an earlier
-background-densification prototype, so a regression there fails loudly rather
-than being rediscovered by a later review.
+recovery chunk may run, what it publishes, and what it releases.
 """
 
 from types import SimpleNamespace
@@ -113,7 +110,7 @@ class TestCandidateAdmission:
 
 
 class TestSafetyReviewConditions:
-    """One test per defect the earlier prototype's review found."""
+    """Conditions that must keep a recovery chunk from running or publishing."""
 
     def test_an_active_specprefill_makes_the_canonical_recovery_unrunnable(self):
         scheduler = _make_scheduler()
@@ -181,7 +178,7 @@ class TestSafetyReviewConditions:
 
         This asserts the route and its arguments only. What the route is worth
         is asserted separately, against the worker itself, in
-        TestStoreWorkerLifecycle — a test that mocks the worker cannot say
+        TestStoreWorkerLifecycle; a test that mocks the worker cannot say
         anything about what the worker does.
         """
         scheduler = _make_scheduler()
@@ -262,7 +259,7 @@ class TestSafetyReviewConditions:
         A publish only runs on the chunk that landed exactly on the boundary,
         and that chunk emits a boundary snapshot at the same token count before
         it returns, so the override should always end on the boundary. Every
-        way the capture can be skipped fails closed instead — no snapshots at
+        way the capture can be skipped fails closed instead: no snapshots at
         all leaves `_detect_boundary_snapshot_need` to refuse, and a failed SSD
         load returns no override rather than a short one.
 
@@ -274,7 +271,7 @@ class TestSafetyReviewConditions:
         snapshot out of the provider it returns. The block the range now ends
         on therefore has no snapshot of its own, so `store_cache` falls to
         `live_state_at_true_end` and stores the live recurrent state as that
-        block's — but the live state is at the boundary, not at the end of the
+        block's, but the live state is at the boundary, not at the end of the
         truncated range. A later restore would get a block whose state has
         already ingested tokens past its own end.
 
@@ -460,9 +457,7 @@ class TestFinishedJobStopsRunning:
     The prefill state is retired on completion, so a finished job that still
     counts as runnable rebuilds it on the next idle step, re-reads its whole
     target from the last committed boundary, publishes nothing new and
-    finishes again — every idle window, charged to the budget. This was
-    observed: one 8K session spent its entire run re-reading the same 4,096
-    tokens.
+    finishes again, every idle window, charged to the budget.
     """
 
     def test_a_job_that_reached_its_target_is_not_runnable(self):
@@ -569,9 +564,8 @@ class TestTheWholeStepIsCharged:
 class TestTelemetrySurvivesNothing:
     """An engine switch must not splice two runs into one share.
 
-    `reset()` cancels the recovery job, and the counters and the budget's own
-    wall clock used to survive it. The two service shares then covered two
-    runs with nothing on the wire saying so.
+    `reset()` cancels the recovery job, and must also clear the counters and
+    the budget's wall clock, or two runs share one service figure.
     """
 
     def test_reset_clears_the_recovery_telemetry(self):

@@ -4,16 +4,16 @@
 These tests do not say what the recovery job ought to do. They say what it
 does, for the three timelines a real session actually produces:
 
-**B2 — rapid turns.** Four turns arrive before any chunk runs. What the code
+**B2, rapid turns.** Four turns arrive before any chunk runs. What the code
 does with them is the difference between one job that re-reads the newest
 prompt and four jobs that each re-read the same prefix.
 
-**B3 — a shared-prefix fork.** Two branches off one common prefix. A token
+**B3, a shared-prefix fork.** Two branches off one common prefix. A token
 list is the cache key, so the question is not whether a branch is allowed to
 reuse the other's blocks but whether either job can ever hold a token list
 that is a mixture of the two.
 
-**B4 — compaction.** A turn whose prompt shares only its opening with the
+**B4, compaction.** A turn whose prompt shares only its opening with the
 previous one. The old lineage is gone and its in-flight work is worthless; the
 committed count that described it must not be carried onto its replacement.
 
@@ -239,10 +239,10 @@ class TestB2RapidTurnsCoalesce:
     def test_an_append_inside_the_same_block_neither_replaces_nor_extends(self):
         """38,000 -> 38,100 adds no whole block: jobs_created=0, extensions=0.
 
-        `extend` is never even reached — the equal-target guard in
-        `note_canonical_recovery_candidate` returns first — so `extend_refusals` stays 0
-        too. That guard is the whole point: reading `extend`'s refusal as "not
-        an append" is what used to destroy the job on a short turn.
+        `extend` is never reached, because the equal-target guard in
+        `note_canonical_recovery_candidate` returns first, so `extend_refusals` stays 0
+        too. Reading `extend`'s refusal as "not an append" would destroy the job
+        on a short turn.
         """
         scheduler = _make_scheduler()
         for turn, prompt_len in enumerate(self.PROMPTS):
@@ -315,7 +315,7 @@ class TestB3SharedPrefixFork:
         """jobs_created=3, target_extensions=0, superseded_jobs=2, cancelled_jobs=2.
 
         `extend` requires a strict prefix-extension and B is the same length as
-        A, so it is refused twice over — on length and on content — and the
+        A, so it is refused twice over, on length and on content, and the
         caller replaces. The shared 32,768 tokens buy the second branch
         nothing at the job level; whatever they buy it is bought later, in the
         prefix cache, by the token list being the key.
@@ -369,7 +369,7 @@ class TestB3SharedPrefixFork:
 
         Equal-length branches are refused on `len(tokens) <= target_tokens`
         alone and never reach the prefix comparison. A branch that is also
-        longer does reach it, and is refused there — which is the check that
+        longer does reach it, and is refused there, which is the check that
         keeps a job from adopting a token list whose middle it never computed.
         """
         common = _common_prefix(8)
@@ -525,7 +525,7 @@ class TestB4CompactionDivergence:
         """superseded_jobs=1, cancelled_jobs=1, jobs_created=1.
 
         The release is keyed by the *old* job's request id, which is the
-        session key of the turn that created it — so the new turn carrying a
+        session key of the turn that created it, so the new turn carrying a
         different request id is what makes this assertion mean anything.
         """
         scheduler = _make_scheduler()
@@ -592,8 +592,8 @@ class TestB4CompactionDivergence:
         """The branch `_canonical_recovery_step_inner` takes when the target moved under it.
 
         The state was built for the old target and would report `done` at it,
-        so it is retired. The boundary the chunk landed on is still valid —
-        `extend` verified the append, so those tokens are unchanged — and it
+        so it is retired. The boundary the chunk landed on is still valid
+        (`extend` verified the append, so those tokens are unchanged), and it
         is published before the state goes.
         """
         scheduler = _make_scheduler()
@@ -739,7 +739,7 @@ class TestB7FanOutIsBoundedByHavingOneSlot:
 
     An agent session fans out: a parent, four subagents, and short-lived
     lineages that end after a turn or two. The safety question is whether
-    recovery can multiply — N lineages buying N budgets, or a queue that grows
+    recovery can multiply: N lineages buying N budgets, or a queue that grows
     with the fan-out. The answer is structural rather than policy: there is one
     job slot and one budget object on the scheduler, and no queue at all.
 
@@ -802,8 +802,8 @@ class TestB7FanOutIsBoundedByHavingOneSlot:
         """Nothing tells recovery that a session is over.
 
         A short-lived lineage's job stays live until some other candidate
-        replaces it or it finishes its target. It is bounded — one job, one
-        token list, one set of blocks — and it is held on a prompt nobody will
+        replaces it or it finishes its target. It is bounded (one job, one
+        token list, one set of blocks), and it is held on a prompt nobody will
         ever send again, which is the other half of why fan-out yield is low.
         """
         scheduler = _make_scheduler()

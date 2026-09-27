@@ -6,7 +6,7 @@ loop, and they share one GPU. Every other clause in the runnable predicate
 reads one scheduler's own lists, which answer "am I idle" rather than "is the
 machine idle". A recovery chunk admitted on the strength of the first answer
 lands on a GPU another engine is using, and a chunk cannot be interrupted once
-it starts — so the foreground request it collides with is one this scheduler
+it starts, so the foreground request it collides with is one this scheduler
 never saw and cannot yield to.
 
 The foreground prefill path already treats this as a process-wide question and
@@ -14,7 +14,7 @@ already has the registry for it. These tests pin recovery asking the same
 question: the decode half through `others_decoding`, and the prefill half
 through the process-global prefill tracker, which is what a *foreign prefill*
 shows up in. A recovery chunk is itself a prefill, so its own entry is
-excluded — a job that stood down for itself would never run.
+excluded, or a job that stood down for itself would never run.
 """
 
 from unittest.mock import MagicMock
@@ -168,7 +168,7 @@ class TestAnotherEnginesArrivalWithdrawsTheChunk:
 
     Both of the registries above are progress signals: an entry exists once
     work is running. Between the transport accepting a request and that
-    request's first forward, every progress signal in the process reads idle —
+    request's first forward, every progress signal in the process reads idle,
     and that is precisely the window in which recovery decides to start
     something it cannot interrupt.
 
@@ -190,7 +190,7 @@ class TestAnotherEnginesArrivalWithdrawsTheChunk:
         assert engine_a._canonical_recovery_runnable()
 
         # The request reaches engine B. B has not admitted it, so B's own
-        # lists are empty too — nothing in this process is running yet.
+        # lists are empty too: nothing in this process is running yet.
         engine_b.note_inbound_request("fg-on-b")
         assert not engine_b._canonical_recovery_local_requests()
         assert not engine_a._canonical_recovery_runnable()
@@ -233,8 +233,7 @@ class TestAnotherEnginesArrivalWithdrawsTheChunk:
         """Recovery must not stand down for recovery through this signal.
 
         The synthetic request is built inside the scheduler and never passes
-        through the transport, so it never reaches the registry at all —
-        by construction rather than by an exclusion rule that could drift.
+        through the transport, so it never reaches the registry at all.
         """
         engine_a = _make_scheduler()
         engine_b = _make_scheduler()

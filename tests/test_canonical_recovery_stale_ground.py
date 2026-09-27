@@ -19,9 +19,9 @@ independently afterwards:
 along and drops the job if the old ground has gone. The gap is a session that
 never reaches a higher boundary: publish 12,288, lose blocks, then take turns
 that stay inside the same block. The job sits parked with a claim the cache
-cannot honour, and — because ``publishable_boundary`` refuses anything at or
-below the watermark — if it ever resumes it declines to republish exactly the
-range that went missing.
+cannot honour, and since ``publishable_boundary`` refuses anything at or below
+the watermark, if it ever resumes it declines to republish exactly the range
+that went missing.
 
 So the claim is re-checked where the answer is already in hand. A job resuming
 has just asked the serving cache what it can restore for this prompt; that

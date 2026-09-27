@@ -18,7 +18,7 @@ boundary, so publication is fixed at the block. Execution is not:
 ``_step_prefill_chunk`` advances one slice of a *persistent* prefill state,
 ``clamp_prefill_chunk_to_boundary`` already refuses to overshoot a boundary,
 and ``safe_publish_boundary`` floors publication to block multiples. These
-tests pin that separation — that a smaller slice reaches the same boundaries,
+tests pin that separation: a smaller slice reaches the same boundaries,
 publishes the same prefixes in the same order, and recomputes nothing.
 """
 

@@ -6,9 +6,8 @@ announces the arrival *before* handing the request to the executor, because the
 executor is the same single worker that runs ``step()`` and the request is
 invisible to the scheduler until that hand-off completes.
 
-``_canonical_recovery_inbound_count`` runs on that executor, and it does not
-just read — it expires stale entries, so it iterates the mapping and then
-deletes from it.
+``_canonical_recovery_inbound_count`` runs on that executor, and it also expires
+stale entries, so it iterates the mapping and then deletes from it.
 
 That is not the ``_pending_abort_ids`` idiom. A ``set.add`` / ``set.pop`` pair
 is a single bytecode each and the GIL makes it atomic; iterating a dict is not,
@@ -20,8 +19,8 @@ These tests drive both sides at once, with the window deliberately widened:
 the interpreter's thread-switch interval is dropped to a microsecond and the
 mapping is pre-loaded to a size no real arrival rate would reach. At realistic
 sizes the comprehension finishes well inside one switch interval, so the race
-is rare rather than absent — the amplification is what makes it a test instead
-of a coin flip. Without it these same tests pass against the unlocked dict.
+is rare rather than absent; the amplification makes it a test instead of a coin
+flip. Without it these same tests pass against the unlocked dict.
 
 The assertion is that no exception escaped, which cannot produce a false
 failure.
@@ -101,7 +100,7 @@ class TestInboundBookkeepingIsThreadSafe:
     def test_arrival_during_expiry_does_not_raise(self, fine_grained_switching):
         """The reader iterates while the writer inserts.
 
-        Every entry is already stale — the TTL is zero — so the reader takes
+        Every entry is already stale (the TTL is zero), so the reader takes
         the expiry branch on every call, which is the branch that iterates.
         """
         scheduler = _make_scheduler()

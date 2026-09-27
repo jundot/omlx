@@ -4,8 +4,8 @@
 ``test_scheduler_canonical_recovery.py`` asks what the recovery job does when its
 collaborators behave. This file asks what it does when they do not.
 
-The invariant is **fail closed**. A recovery failure may cost reuse — that is
-the whole of what it is allowed to cost. It must never cause a foreground
+The invariant is **fail closed**. A recovery failure may cost reuse, and
+that is the whole of what it is allowed to cost. It must never cause a foreground
 request to fail, invalid canonical state to become visible, a false committed
 token count, a leaked cache or block reference, an unbounded queue, or an
 engine that cannot be unloaded (a live job holds the engine loop awake, and the
@@ -13,11 +13,11 @@ unload path drains on the same predicate).
 
 Every test asserts five things about one injected fault:
 
-a. no exception escapes into the caller — the scheduler step path returns;
+a. no exception escapes into the caller: the scheduler step path returns;
 b. ``_canonical_recovery_job`` is left somewhere defensible, and the test says which of
    dropped / parked / intact it observed;
 c. ``job.committed_tokens`` advanced only behind a real publish *and* read-back;
-d. the cleanup calls fired for ``canonical-recovery:{session_key}`` — the paged-cache
+d. the cleanup calls fired for ``canonical-recovery:{session_key}``: the paged-cache
    release, the boundary-snapshot drop, the prefill tracker's ``remove`` and
    the ``requests`` pop;
 e. ``has_requests()`` afterwards reflects reality, because a dropped job that
@@ -25,8 +25,7 @@ e. ``has_requests()`` afterwards reflects reality, because a dropped job that
 
 These tests document what the code does, not what it should do. Where a fault
 leaves state that this file judges wrong, the docstring says so under "Gap" and
-the assertion still pins the behaviour that is actually there, so a fix changes
-a test rather than being discovered by a later review.
+the assertion still pins the behaviour that is actually there.
 """
 
 from contextlib import ExitStack, contextmanager
@@ -120,7 +119,7 @@ def _cleanup_spy(scheduler, rid: str = RID):
     tracker = MagicMock()
     # The spy exists to watch `remove`. Left as a bare MagicMock its
     # `any_active` returns a truthy Mock, which the scheduler reads as "some
-    # other engine is prefilling" — so every predicate that consults the
+    # other engine is prefilling", so every predicate that consults the
     # process-global tracker silently answers the opposite of what the test
     # set up.
     tracker.any_active.return_value = False
@@ -381,7 +380,7 @@ class TestChunkYields:
     the job stays live, `has_requests()` stays true, and an idle engine spins.
 
     What a pause keeps is the job: its committed prefix, its published blocks
-    and its lineage. What it no longer keeps is the live prefill state. That
+    and its lineage. It does not keep the live prefill state. That
     state is a materialised KV cache, and both of these pauses are pauses of
     unknown length -- the throttle one especially, since it is raised because
     the runtime is short of the very memory the state is holding. So the state
@@ -490,7 +489,7 @@ class TestChunkFails:
         """Fault 5. Dropped. A chunk that raised anything else is not a pause.
 
         The state it was running on is not trustworthy after an arbitrary
-        exception — the cache may be half-ingested — so nothing is published
+        exception (the cache may be half-ingested), so nothing is published
         from it and the job goes.
         """
         scheduler = _make_scheduler()
@@ -530,7 +529,7 @@ class TestPublishFailsWithoutCommitting:
 
     Every test here asserts the same shape: the publish returns, the counter
     does not move, the boundary list stays empty, and the job is left intact
-    and runnable rather than dropped — because the next boundary may well
+    and runnable rather than dropped, because the next boundary may well
     publish, and the fault is in one attempt rather than in the job.
     """
 
@@ -543,7 +542,7 @@ class TestPublishFailsWithoutCommitting:
         """Fault 6. Intact. `_extract_cache_states` raised inside the publish.
 
         The extraction is where the live cache becomes a storable payload, so
-        a failure here means there is nothing to store — and the job must not
+        a failure here means there is nothing to store, and the job must not
         record a commit for a boundary that never left the live cache.
         """
         scheduler = _make_scheduler()
@@ -572,7 +571,7 @@ class TestPublishFailsWithoutCommitting:
         """Fault 7. Intact. The store worker raised.
 
         Gap: the worker may have taken block references before raising, and
-        the publish path releases nothing on this branch — it returns. The
+        the publish path releases nothing on this branch; it returns. The
         references are given back only when the job is later dropped, parked
         or finished, each of which calls `_release_paged_cache_for_request`
         for the same request id. This test asserts that deferral rather than
@@ -629,7 +628,7 @@ class TestPublishFailsWithoutCommitting:
             assert scheduler._canonical_recovery_publish(job, 768, state) is None
             path.worker.assert_called_once()
             # The short store is caught before the read-back, so the probe is
-            # never even run — the claim is checked against the store's own
+            # never even run: the claim is checked against the store's own
             # result first.
             path.readback.assert_not_called()
             _assert_cleanup_not_fired(spy)
@@ -654,7 +653,7 @@ class TestRestorableInvariantUnderFault:
     can actually see the boundary.
 
     The failure this guards is silent. A false commit does not raise, does not
-    log an error and does not lose a request — it reports a canonical prefix
+    log an error and does not lose a request; it reports a canonical prefix
     that is not there, which is the one failure mode a measurement column must
     not have.
     """
@@ -928,8 +927,8 @@ class TestACanonicalRecoveryFailureCannotFailTheBatch:
     """The canonical state recovery block runs after `step()`'s own try/except.
 
     Anything escaping it leaves `step()` altogether, and the engine loop
-    answers an escaped exception by calling `fail_all_requests()` — every live
-    request in the batch errored, by background work whose worst permitted
+    answers an escaped exception by calling `fail_all_requests()`, which errors
+    every live request in the batch, by background work whose worst permitted
     outcome is losing its own progress. Several calls in that window are
     unguarded, such as the arrival registry's `expire` in the idle count.
     """
@@ -983,7 +982,7 @@ class TestRetiringStateMidChunkGivesTheFootprintBack:
     """An extension that lands during a chunk retires the state, and the state
     is holding a request entry and its paged blocks.
 
-    The publish immediately above kept them on purpose —
+    The publish immediately above kept them on purpose with
     `retain_request_entry=not job.done`, and a job about to be rebuilt is not
     done. The next window rebuilds under the same request id, which overwrites
     the block table and orphans the previous references: never decremented,
@@ -1040,8 +1039,8 @@ class TestTheRecoveryRequestIsInvisibleToTheRequestSweeps:
     That is precisely the shape two of them exist to find: a request popped
     off ``waiting`` and being prefilled right now is reachable through no
     queue either, and missing it hung clients (#2372). The recovery request
-    has the same shape and none of the meaning — no collector, no client, no
-    output — so failing it names an id nobody sent, and re-prefilling it
+    has the same shape and none of the meaning (no collector, no client, no
+    output), so failing it names an id nobody sent, and re-prefilling it
     schedules background work as foreground with nothing to emit to.
 
     Recovery is allowed to lose its work. It is not allowed to become a

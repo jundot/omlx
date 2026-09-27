@@ -69,14 +69,7 @@ def _spend_the_window(scheduler: Scheduler) -> None:
 
 
 class TestTheLoopRepollsWithoutAWake:
-    """The premise the parking decision rests on, measured rather than assumed.
-
-    An earlier version of ``_has_canonical_recovery_work`` held the predicate true through
-    a spent window on the belief that reporting no work would park the loop
-    until an unrelated request woke it — "which on an idle server is never".
-    The loop does not behave that way, and these two tests are why the belief
-    could be dropped rather than worked around.
-    """
+    """Reporting no work does not park the loop until a request wakes it."""
 
     @pytest.mark.asyncio
     async def test_an_idle_loop_re_reads_has_requests_every_interval(
@@ -194,8 +187,8 @@ class TestForegroundPriorityIsEngineGlobal:
 
     Every clause below is a *global* scheduler list. A session waiting on a
     tool is not slack while another request is being served, and the predicate
-    has no way to express "this session is idle" even if it wanted to — which
-    is the property that keeps recovery out of agent-identity semantics.
+    has no way to express "this session is idle", which keeps recovery out of
+    agent-identity semantics.
     """
 
     def _idle(self, scheduler: Scheduler) -> None:

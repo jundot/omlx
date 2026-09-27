@@ -4,9 +4,9 @@
 Canonical recovery only counts a boundary as published after asking the
 serving cache, through the same ``fetch_cache`` a real request takes, whether
 the boundary is actually reachable. That question acquires a reference on
-every block it matches. The probe stores nothing, so the ordinary release path
-— which frees through the request table only ``store_cache`` writes — has
-nothing to free, and the references stay held.
+every block it matches. The probe stores nothing, and the ordinary release path
+frees through the request table that only ``store_cache`` writes, so it has
+nothing to free and the references stay held.
 
 The cost is not a slow leak. Every boundary the recovery publishes pins a
 longer chain than the one before it, and pinned blocks are not evictable, so

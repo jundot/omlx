@@ -277,8 +277,8 @@ def _reset_prefill_tracker():
     Unlike the two registries above it has no TTL: an entry lives until the
     prefill completes or is aborted. A test that drives a single chunk never
     reaches either, and its entry then reads as foreign foreground prefill to
-    every later recovery predicate in the same process — which one test that
-    is depends on how xdist distributes the files.
+    every later recovery predicate in the same process, and which test that
+    hits depends on how xdist distributes the files.
     """
     from omlx.prefill_progress import get_prefill_tracker
 

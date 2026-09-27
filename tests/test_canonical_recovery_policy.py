@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the canonical-recovery decision layer.
 
-These are the conditions an earlier background-densification prototype got
-wrong, written as assertions rather than as review notes. Nothing here loads a
-model: the point of keeping the policy free of MLX is that it can be tested at
+Nothing here loads a model: the policy is free of MLX so it can be tested at
 this speed.
 """
 
@@ -65,12 +63,8 @@ class TestBudget:
 class TestReplenishingBudget:
     """The windowed budget: an allowance that comes back, and a debt that clears.
 
-    The lifetime cumulative-share budget this replaced had one failure mode.
-    One chunk that overran the allowance early held the measured share above
-    the cap until the denominator grew back, and on a long session that is the
-    rest of the run: the job overshot once and was finished rather than late.
-    Each test here pins a property that failure violated, and each one drives
-    the clock with an explicit ``now`` so nothing reads ``perf_counter``.
+    One early overrun must delay the job, not end it. Each test drives the
+    clock with an explicit ``now`` so nothing reads ``perf_counter``.
     """
 
     def _budget(self, pct=10.0, window_s=10.0):
@@ -345,8 +339,8 @@ class TestPublicationFloorsToABlock:
     every idle window, committed the same 4,096 of 8,192 each time, and
     re-read the same tokens for the rest of the session.
 
-    ``tests/test_canonical_recovery_exact_block.py`` pins the fix at the seam
-    where the state is built. These two pin the arithmetic it turns on.
+    ``tests/test_canonical_recovery_exact_block.py`` covers the seam where the
+    state is built. These two pin the arithmetic it turns on.
     """
 
     def _job(self, target, block=4096):
@@ -397,7 +391,7 @@ class TestTargetCompletion:
     """``reached_target`` is set by the chunk loop, not inferred from a count.
 
     A recovery state now consumes every token it is given, so
-    ``processed_tokens >= target_tokens`` does fire — but a job that stops
+    ``processed_tokens >= target_tokens`` does fire, but a job that stops
     short for any other reason (a yield, a throttle, a chunk that failed)
     must not be reported live forever, because a live job keeps the engine
     loop awake on an idle server. The explicit flag is what covers that.

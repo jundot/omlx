@@ -21,8 +21,8 @@ The contract these tests pin:
 Three separate mechanisms have to hold, because each covers a hole the others
 do not: the sidecar is never *prepared* for a recovery request, capture is
 *suppressed* for the duration of a recovery slice, and every exit path
-*releases* the synthetic id anyway — defence in depth for a model that acquired
-ownership by some route this file did not think of.
+*releases* the synthetic id anyway, in case a model acquired ownership by some
+other route.
 """
 
 from contextlib import ExitStack, contextmanager
@@ -121,8 +121,8 @@ def _own(scheduler, request_id: str) -> dict:
 def _bare_prefix_path(scheduler):
     """Reach the MTP block in ``_prepare_prefix_cache_for_request``.
 
-    With no paged cache the method takes its shortest route — every token is
-    uncached — which is the route that still ends at the priming hook.
+    With no paged cache every token is uncached, and that shortest route still
+    ends at the priming hook.
     """
     scheduler.block_aware_cache = None
     scheduler.paged_cache_manager = None
@@ -153,7 +153,7 @@ class TestTheSidecarIsNeverPreparedForRecovery:
         prepare.assert_not_called()
 
     def test_a_foreground_request_still_prepares_mtp_prefix_context(self):
-        """The control. Without it the fix above could be a global disable."""
+        """The control, so the test above cannot pass by disabling MTP globally."""
         scheduler = _make_scheduler()
         with _bare_prefix_path(scheduler) as prepare:
             scheduler._prepare_prefix_cache_for_request(
