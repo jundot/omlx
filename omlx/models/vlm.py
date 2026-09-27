@@ -527,18 +527,9 @@ class VLMModelAdapter(nn.Module):
         return mx.broadcast_to(seq_positions[None, :, :], (3, batch_size, seq_len))
 
     def position_ids_for_absolute(self, positions: mx.array) -> "mx.array | None":
-        """Lay out one caller-computed absolute position row for this model.
+        """Lay out absolute positions computed by the caller (sparse prefill).
 
-        Every other position path here derives positions from a cache offset,
-        which assumes the forward covers a contiguous run of the timeline.
-        Sparse prefill does not: it writes a selected subset of the prompt and
-        each token keeps its *original* position. Those positions cannot be
-        recovered from the cache offset, so the caller passes them in and this
-        applies the same per-model layout rules the derived paths use.
-
-        Returns ``None`` for a language model this adapter never hands
-        ``position_ids`` to itself; passing the argument there would be a
-        guess about an interface nothing here has established.
+        Returns None when the language model is not mRoPE.
         """
         if not self._uses_mrope:
             return None
@@ -647,10 +638,8 @@ class VLMModelAdapter(nn.Module):
         elif self._pending_embeds is not None:
             result = self._forward_with_embeddings(input_ids, cache, **kwargs)
         elif kwargs.get("position_ids") is not None:
-            # An explicit position_ids is an absolute timeline the caller
-            # computed itself and the branches below cannot reconstruct
-            # (sparse prefill keeps each selected token's original position).
-            # Honour it rather than overwriting it from the cache offset.
+            # Sparse prefill passes the original positions; don't rebuild
+            # them from the cache offset.
             result = self._language_model(input_ids, cache=cache, **kwargs)
         else:
             if self._uses_mrope and self._batch_rope_deltas is not None and cache is not None:

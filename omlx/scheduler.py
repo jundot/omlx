@@ -11086,9 +11086,6 @@ class Scheduler:
 
                     cleanup_rope(self.model)
                     request.specprefill_indices = None
-                    # The sparse decode delta goes with the sparse prefill it
-                    # described; an ordinary prefill must not inherit it.
-                    request.rope_deltas = 0.0
                     tracker.remove(request.request_id)
                     Scheduler._clear_cache(self)
                     self._cleanup_prefill_abort_request(request)
@@ -11099,6 +11096,7 @@ class Scheduler:
                     logger.error(f"SpecPrefill sparse prefill failed: {e}")
                     cleanup_rope(self.model)
                     request.specprefill_indices = None
+                    # The dense fallback must not decode with the sparse delta.
                     request.rope_deltas = 0.0
                     tracker.remove(request.request_id)
                     if cache_to_use is not None:
@@ -12623,11 +12621,6 @@ class Scheduler:
             if lm is not None and hasattr(lm, "_rope_deltas"):
                 lm._rope_deltas = saved
             request._prefill_saved_rope_deltas = None
-
-        # Same reason, for the delta a sparse prefill writes on the request
-        # when the model has no rope wrapper to carry it: the retry re-prefills
-        # densely and must not decode through the sparse offset.
-        request.rope_deltas = 0.0
 
         # Reset scheduling + cache + output state to a clean pre-prefill state
         # (mirrors _reschedule_running_requests). We deliberately drop
