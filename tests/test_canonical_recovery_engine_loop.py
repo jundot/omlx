@@ -196,9 +196,8 @@ class TestAStalledJobIsGivenUpOn:
     """A job that may run and cannot must not pin the loop forever.
 
     `_specprefill_rope_installed` refuses a dense forward while a SpecPrefill
-    RoPE wrapper is on the shared model, and `_unwrap_rope` documents a wrapper
-    left installed between requests as an expected state (#766). Nothing the
-    recovery job does takes it off. Without a deadline the job is live forever:
+    RoPE wrapper is on the shared model, and nothing the recovery job does
+    takes it off. Without a deadline the job is live forever:
     the loop keeps stepping for it, and the engine never becomes quiescent, so
     the model can never be unloaded.
 

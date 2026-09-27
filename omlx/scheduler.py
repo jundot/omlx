@@ -13707,19 +13707,8 @@ class Scheduler:
     def _specprefill_rope_installed(self) -> bool:
         """Whether a SpecPrefill RoPE wrapper is installed on the shared model.
 
-        `_specprefill_active_request_id` is bookkeeping and is not a reliable
-        answer to this question: `sparse_prefill` installs the wrapper in a
-        `finally` that runs before the id is ever set, and `_unwrap_rope`
-        documents a wrapper surviving between requests as an expected state
-        (#766). A dense forward taken while the wrapper is installed
-        reads another request's position offset, and the recovery job would
-        then publish positionally wrong KV as ordinary canonical state — the one
-        failure this design exists to make impossible. So ask the model.
-
-        The patch module answers, through ``is_specprefill_rope``. This used to
-        compare ``type(rope).__name__`` against two literals here, which fails
-        open on a rename: the wrapper would still be installed and this would
-        report that it was not.
+        Checks the layers as well as the id, because `_requeue_or_fail_prefill`
+        clears the id without removing the wrapper.
         """
         if self._specprefill_active_request_id is not None:
             return True
@@ -13732,9 +13721,7 @@ class Scheduler:
 
             layers = _find_attention_layers(self.model) or ()
         except Exception:  # noqa: BLE001
-            # If the model cannot be inspected, the safe answer is "installed".
-            # The import is inside the guard for the same reason: a predicate
-            # this module cannot reach is not a licence to run a dense forward.
+            # If the model cannot be inspected, treat the wrapper as installed.
             return True
         for _idx, layer in layers:
             attn = _get_attn_module(layer)
@@ -14177,12 +14164,9 @@ class Scheduler:
         """Bound how long a live job may hold the loop without being served.
 
         The engine is idle, the window grants service, and the job still did
-        not run. Something outside the budget refused it, and the one such
-        condition this runtime can leave latent is a SpecPrefill RoPE wrapper
-        that was never cleaned up: ``_unwrap_rope`` documents the leftover
-        wrapper as an expected state (#766), ``_specprefill_rope_installed``
-        is right to refuse a dense forward under it, and nothing the recovery
-        job does will ever take it off.
+        not run. The usual cause is a SpecPrefill RoPE wrapper left on the
+        model, which `_specprefill_rope_installed` refuses to run under and
+        which the recovery job cannot remove.
 
         The yield limit does not cover this. ``consecutive_yields`` is only
         raised from inside a chunk and no chunk is ever reached here, so
