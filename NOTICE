@@ -1,0 +1,12 @@
+This project includes code adapted from Sushi (https://github.com/beamivalice/sushi),
+commit 27ca1c8684c01d1970bf576d8cef80ebea617928:
+
+omlx/quantization/exl3.py
+omlx/quantization/exl3_prefill.py
+
+Copyright (c) 2026 Theinruj Toranavikrai
+Copyright (c) 2026 David Dalcu
+
+These portions are used under the MIT License. The full copyright and permission
+notice is retained in docs/licenses/sushi-MIT.txt. See docs/exl3-backend.md for the
+adaptation scope and numerical validation.
