@@ -36,6 +36,12 @@ REMOVED_CLAUDE_CODE_KEYS = (
     "claudeCodeTargetContextSize",
     "contextScalingEnabled",
     "targetContextSize",
+    # The row binding and the xcstrings keys the two rows used. A patch field
+    # coming back under a fresh name is caught above, but a dead row with no
+    # patch field at all re-introduces only these tokens.
+    "contextScaling",
+    "context_scaling",
+    "target_context",
 )
 
 
