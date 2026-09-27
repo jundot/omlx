@@ -2948,7 +2948,7 @@ class Scheduler:
         packed attention/indexer kernels stream arbitrary chunk widths and the
         per-layer eval backpressure already bounds chunk residency. Measured
         on a non-NAX M3 Ultra Studio: pp4096 +13.5%, pp8192 +9.3% at 8192
-        (docs/experimental/dsv41_flash_speedup.md), so the gate is native
+        (jundot/omlx#3949, same-build A/B), so the gate is native
         kernel + >=64GB without the NAX requirement. Narrow hosts keep the
         existing floor/default geometry.
         ``OMLX_DSV41_WIDE_STEP_FORCE`` overrides: >0 forces that width
