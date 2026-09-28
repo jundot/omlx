@@ -35,6 +35,7 @@ import sys
 import mlx.core as mx
 import mlx.nn as nn
 
+from . import qwen4_gdn_fused_decode as fused_gdn
 from . import qwen35_gdn_verify_fused
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ _QWEN4_DECODE_KERNEL = None
 _QWEN4_NORM_GATE_KERNEL = None
 _QWEN4_DECODE_ENGAGED_LOGGED = False
 _QWEN35_DECODE_ENGAGED_LOGGED = False
+_QWEN4_MULTI_ROW_ENGAGED_LOGGED = False
 _QWEN4_PREFILL_KERNELS = None
 _QWEN4_PREFILL_ENGAGED_LOGGED = False
 _QWEN4_PREFILL_ENABLED = os.environ.get("OMLX_QWEN4_GDN_PREFILL_FUSED", "1") != "0"
@@ -846,6 +848,34 @@ def _qwen4_l2_norm_sites():
     )
 
 
+def _qwen4_multi_row_decode_eligible(module, inputs, mask, cache) -> bool:
+    return (
+        fused_gdn.enabled()
+        and mask is None
+        and fused_gdn.eligible(inputs, cache)
+        and _qwen4_gdn_geometry_ok(module)
+    )
+
+
+def _qwen4_multi_row_decode(module, inputs, cache):
+    """Stock B2/B3 one-token decode with the post-projection chain in one launch."""
+    from mlx_vlm.models.qwen3_5 import language as q35
+
+    mixed_qkv = module.in_proj_qkv(inputs)
+    z = module.in_proj_z(inputs)
+    b, a = module._project_gates(inputs)
+    out = fused_gdn.run(module, cache, mixed_qkv, z, b, a)
+    if hasattr(cache, "advance"):
+        cache.advance(1)
+        q35._qwen3_5_advance_left_padding_info(cache, 1)
+        q35._qwen3_5_advance_lengths_info(cache, 1)
+    global _QWEN4_MULTI_ROW_ENGAGED_LOGGED
+    if not _QWEN4_MULTI_ROW_ENGAGED_LOGGED:
+        _QWEN4_MULTI_ROW_ENGAGED_LOGGED = True
+        logger.info("Qwen4 multi-row single-launch GDN decode engaged")
+    return module.out_proj(out)
+
+
 def apply_qwen35_gdn_prework_patch() -> bool:
     """Install fused prework at ordinary decode and speculative entry points."""
     global _PATCHED
@@ -871,6 +901,8 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         # must keep their original implementation and cache semantics.
         if kwargs:
             return original(self, inputs, mask=mask, cache=cache, **kwargs)
+        if _qwen4_multi_row_decode_eligible(self, inputs, mask, cache):
+            return _qwen4_multi_row_decode(self, inputs, cache)
         if _qwen4_prefill_eligible(self, inputs, mask, cache):
             return _qwen4_prefill(self, inputs, cache)
         if _qwen35_decode_eligible(self, inputs, mask, cache):
