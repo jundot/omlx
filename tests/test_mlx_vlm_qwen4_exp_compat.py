@@ -550,7 +550,18 @@ def test_qwen4_exp_sanitize_keeps_converted_ple_shared_scale():
     assert mx.array_equal(result[key], scale).item()
 
 
-def test_qwen4_exp_sanitize_adds_unit_ple_scale_for_bf16_checkpoint():
+@pytest.mark.parametrize(
+    ("configured_dtype", "expected_dtype"),
+    [
+        (None, mx.bfloat16),
+        ("bfloat16", mx.bfloat16),
+        ("float16", mx.float16),
+    ],
+)
+def test_qwen4_exp_sanitize_adds_unit_ple_scale_for_checkpoint_dtype(
+    configured_dtype,
+    expected_dtype,
+):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
 
@@ -565,6 +576,7 @@ def test_qwen4_exp_sanitize_adds_unit_ple_scale_for_bf16_checkpoint():
                 num_hidden_layers=0,
                 num_experts=0,
                 ple_layer_ids=[2],
+                dtype=configured_dtype,
             )
         )
     )
@@ -572,9 +584,7 @@ def test_qwen4_exp_sanitize_adds_unit_ple_scale_for_bf16_checkpoint():
     result = Model.sanitize(model, {})
 
     assert list(name for name in result if name.endswith("weight_scale")) == [key]
-    assert mx.array_equal(
-        result[key], mx.ones((1,), dtype=mx.bfloat16)
-    ).item()
+    assert mx.array_equal(result[key], mx.ones((1,), dtype=expected_dtype)).item()
 
 
 def test_qwen4_quantization_sanitize_keeps_mmap_ple_shards(tmp_path):

@@ -14,8 +14,8 @@ remaining verify-cycle cost after the attention split.
 One Metal launch replaces the whole chain. Numerics notes carried from the
 donor kernel: the in-kernel sigmoid uses MLX's own unary formula
 (exp-of-abs), which the challenge swept bit-exact over all finite bf16
-inputs; the RMS applies the ones-weight rounding then the separate scalar
-multiply's rounding — the composed chain's two casts.
+inputs; the normalization kernels preserve the loaded 16-bit compute dtype
+at the same rounding sites as the composed chain.
 
 For S=2, the next conv state retains one row from the old conv state.
 Longer verify windows fill the entire next state from the new qkv rows.
@@ -23,7 +23,7 @@ This kernel also runs automatically for compatible FP16/BF16 B1/T1 decode
 through Qwen3_5GatedDeltaNet on Metal. Gates,
 recurrence, final norm and projections remain unchanged. Other Qwen3.5
 decode shapes and prefill keep the stock path. Qwen4 has its separate
-BF16 decode prework and norm-gate kernels below.
+FP16/BF16 prefill, decode, and L2-verify kernels below.
 """
 
 from __future__ import annotations
@@ -51,6 +51,7 @@ _QWEN4_PREFILL_ENGAGED_LOGGED = False
 _QWEN4_PREFILL_ENABLED = os.environ.get("OMLX_QWEN4_GDN_PREFILL_FUSED", "1") != "0"
 _QWEN4_PREFILL_MIN_ROWS = 64
 _VERIFY_REJECT_DIAG = 0
+_SUPPORTED_FLOAT_DTYPES = (mx.float16, mx.bfloat16)
 
 _SOURCE = """
     uint lane = thread_position_in_threadgroup.x;
@@ -98,8 +99,8 @@ _SOURCE = """
             // Stock Qwen4 L2 chain: x * rsqrt(sum(square(x), -1) + 1e-6),
             // with dk^-0.5 applied to q only.  mx.square rounds per
             // element; mx.sum accumulates each lane's four contiguous
-            // bf16 values sequentially, reduces with an fp32 xor tree and
-            // rounds once.  Mirror every rounding site exactly.
+            // 16-bit values sequentially, reduces with an fp32 xor tree and
+            // rounds once.  Mirror every rounding site at the loaded dtype.
             float tv = float(l2acc);
             tv += simd_shuffle_xor(tv, short(16));
             tv += simd_shuffle_xor(tv, short(8));
@@ -268,7 +269,7 @@ _QWEN4_DECODE_SOURCE = """
             beta_out[head] = (bv < T(0)) ? by : T(1) - by;
 
             // compute_g casts A_log to FP32 but keeps softplus(a+dt_bias)
-            // in BF16 before the FP32 multiply and outer exp.
+            // in the loaded 16-bit dtype before the FP32 multiply and outer exp.
             const T apd = T(float(a_in[head]) + float(dt_bias[head]));
             const T neg_abs = -metal::abs(apd);
             const T exp_term = T(metal::precise::exp(float(neg_abs)));
@@ -295,8 +296,8 @@ _QWEN4_NORM_GATE_SOURCE = """
     sumsq = simd_sum(sumsq);
     float inv = metal::precise::rsqrt(sumsq / float(DV) + float(eps));
     for (uint i = 0; i < 4; ++i) {
-        // mx.fast.rms_norm materializes BF16 before Qwen4 casts it back to
-        // FP32 for the sigmoid product.
+        // mx.fast.rms_norm materializes the loaded 16-bit dtype before Qwen4
+        // casts it back to FP32 for the sigmoid product.
         const T normed = norm_w[lane * 4 + i] * T(xs[i] * inv);
         float zv = float(z[base + i]);
         float sy = 1.0f / (1.0f + metal::precise::exp(metal::abs(zv)));
@@ -497,30 +498,38 @@ def _qwen4_prefill_kernels():
     return _QWEN4_PREFILL_KERNELS
 
 
+def _qwen4_prefill_candidate(module, inputs, mask, cache) -> bool:
+    """Whether this call is in the fused Qwen4 prefill operation's domain."""
+
+    return bool(
+        _QWEN4_PREFILL_ENABLED
+        and type(module).__name__ == "Qwen4ExpGatedDeltaNet"
+        and type(module).__module__ == "mlx_vlm.models.qwen4_exp.language"
+        and mask is None
+        and cache is not None
+        and isinstance(inputs, mx.array)
+        and inputs.ndim == 3
+        and inputs.shape[0] == 1
+        and inputs.shape[1] >= _QWEN4_PREFILL_MIN_ROWS
+        and inputs.shape[2] == _QWEN4_HIDDEN_SIZE
+        and inputs.dtype in _SUPPORTED_FLOAT_DTYPES
+        and mx.default_device() == mx.gpu
+        and len(getattr(cache, "cache", ())) == 2
+        and not getattr(cache, "is_speculating", True)
+        and not getattr(cache, "history_capacity", 0)
+        and getattr(cache, "lengths", None) is None
+        and getattr(cache, "left_padding", None) is None
+    )
+
+
 def _qwen4_prefill_eligible(module, inputs, mask, cache) -> bool:
-    if (
-        not _QWEN4_PREFILL_ENABLED
-        or mask is not None
-        or cache is None
-        or not isinstance(inputs, mx.array)
-        or inputs.ndim != 3
-        or inputs.shape[0] != 1
-        or inputs.shape[1] < _QWEN4_PREFILL_MIN_ROWS
-        or inputs.shape[2] != _QWEN4_HIDDEN_SIZE
-        or inputs.dtype != mx.bfloat16
-        or mx.default_device() != mx.gpu
-        or len(getattr(cache, "cache", ())) != 2
-        or getattr(cache, "is_speculating", True)
-        or getattr(cache, "history_capacity", 0)
-        or getattr(cache, "lengths", None) is not None
-        or getattr(cache, "left_padding", None) is not None
-    ):
+    if not _qwen4_prefill_candidate(module, inputs, mask, cache):
         return False
     conv_state, recurrent_state = cache[0], cache[1]
     if conv_state is not None and not (
         isinstance(conv_state, mx.array)
         and conv_state.shape == (1, 3, 10240)
-        and conv_state.dtype == mx.bfloat16
+        and conv_state.dtype == inputs.dtype
     ):
         return False
     if recurrent_state is not None and not (
@@ -529,7 +538,7 @@ def _qwen4_prefill_eligible(module, inputs, mask, cache) -> bool:
         and recurrent_state.dtype == mx.float32
     ):
         return False
-    return _qwen4_gdn_geometry_ok(module)
+    return _qwen4_gdn_compute_dtype(module) == inputs.dtype
 
 
 def _qwen4_prefill(module, inputs, cache):
@@ -540,6 +549,8 @@ def _qwen4_prefill(module, inputs, cache):
     mixed_qkv = module.in_proj_qkv(inputs)
     z = module.in_proj_z(inputs)
     b, a = module._project_gates(inputs)
+    if any(value.dtype != inputs.dtype for value in (mixed_qkv, z, b, a)):
+        raise RuntimeError("Qwen4 fused GDN prefill projections changed compute dtype")
     conv_state = cache[0]
     if conv_state is None:
         conv_state = mx.zeros((1, 3, module.conv_dim), dtype=inputs.dtype)
@@ -551,8 +562,8 @@ def _qwen4_prefill(module, inputs, cache):
             mixed_qkv,
             conv_state,
             module.conv1d.weight,
-            mx.array(dk**-0.5, dtype=mx.bfloat16),
-            mx.array(1.0, dtype=mx.bfloat16),
+            mx.array(dk**-0.5, dtype=inputs.dtype),
+            mx.array(1.0, dtype=inputs.dtype),
             mx.array(length, dtype=mx.int32),
         ],
         template=[
@@ -599,7 +610,10 @@ def _qwen4_prefill(module, inputs, cache):
     global _QWEN4_PREFILL_ENGAGED_LOGGED
     if not _QWEN4_PREFILL_ENGAGED_LOGGED:
         _QWEN4_PREFILL_ENGAGED_LOGGED = True
-        logger.info("Qwen4 fused GDN prefill prework and norm-gate engaged")
+        logger.info(
+            "Qwen4 fused GDN prefill prework and norm-gate engaged (dtype=%s)",
+            inputs.dtype,
+        )
     return module.out_proj(flat)
 
 
@@ -616,7 +630,7 @@ def _qwen4_norm_gate_kernel():
 
 
 def qwen4_decode_norm_gate_fused(y, z, norm_w, *, hv, dv, eps):
-    """Fuse Qwen4's BF16 RMSNorm + FP32 sigmoid-gate at B1/T1."""
+    """Fuse Qwen4's 16-bit RMSNorm + FP32 sigmoid-gate at B1/T1."""
 
     return _qwen4_norm_gate_kernel()(
         inputs=[y, z, norm_w, mx.array(eps, dtype=mx.float32)],
@@ -653,8 +667,8 @@ _ALLOWED_GROUPS = frozenset({32, 64, 128})
 _QWEN4_HIDDEN_SIZE = 2560
 
 
-def _qwen4_gdn_geometry_ok(module) -> bool:
-    """Require the supported Qwen4 GDN geometry, convolution and gate weights."""
+def _qwen4_gdn_compute_dtype(module):
+    """Return the uniform 16-bit dtype for a supported Qwen4 GDN module."""
 
     conv_dim = 2 * 16 * 128 + 48 * 128
     if (
@@ -667,31 +681,40 @@ def _qwen4_gdn_geometry_ok(module) -> bool:
         or module.head_v_dim != 128
         or module.conv_kernel_size != 4
     ):
-        return False
+        return None
 
     conv = getattr(module, "conv1d", None)
     norm = getattr(module, "norm", None)
-    return not (
+    if (
         conv is None
         or getattr(conv, "bias", None) is not None
         or conv.weight.shape != (conv_dim, 4, 1)
-        or conv.weight.dtype != mx.bfloat16
+        or conv.weight.dtype not in _SUPPORTED_FLOAT_DTYPES
         or norm is None
         or getattr(norm, "activation", None) != "sigmoid"
         or norm.weight.shape != (128,)
-        or norm.weight.dtype != mx.bfloat16
+        or norm.weight.dtype != conv.weight.dtype
         or module.A_log.shape != (48,)
-        or module.A_log.dtype != mx.bfloat16
+        or module.A_log.dtype != conv.weight.dtype
         or module.dt_bias.shape != (48,)
-        or module.dt_bias.dtype != mx.bfloat16
-    )
+        or module.dt_bias.dtype != conv.weight.dtype
+    ):
+        return None
+    return conv.weight.dtype
 
 
-def _qwen4_decode_static_eligible(module) -> bool:
-    """Require the supported Qwen4 geometry and canonical affine storage."""
+def _qwen4_gdn_geometry_ok(module) -> bool:
+    """Whether the module has a supported uniform Qwen4 GDN compute layout."""
 
-    if not _qwen4_gdn_geometry_ok(module):
-        return False
+    return _qwen4_gdn_compute_dtype(module) is not None
+
+
+def _qwen4_decode_static_dtype(module):
+    """Return the compute dtype for supported Qwen4 affine decode storage."""
+
+    dtype = _qwen4_gdn_compute_dtype(module)
+    if dtype is None:
+        return None
     conv_dim = 2 * 16 * 128 + 48 * 128
 
     # The q4 prefill routing reclasses these projections to a QuantizedLinear
@@ -713,10 +736,10 @@ def _qwen4_decode_static_eligible(module) -> bool:
             linear.weight.shape == (rows, packed_cols)
             and linear.weight.dtype == mx.uint32
             and linear.scales.shape == (rows, scale_cols)
-            and linear.scales.dtype == mx.bfloat16
+            and linear.scales.dtype == dtype
             and linear.biases is not None
             and linear.biases.shape == (rows, scale_cols)
-            and linear.biases.dtype == mx.bfloat16
+            and linear.biases.dtype == dtype
             and "bias" not in linear
         )
 
@@ -733,14 +756,14 @@ def _qwen4_decode_static_eligible(module) -> bool:
         conv_dim,
         qkv_signatures,
     ):
-        return False
+        return None
     for linear, rows in (
         (module.in_proj_z, 48 * 128),
         (module.in_proj_b, 48),
         (module.in_proj_a, 48),
     ):
         if not canonical_projection(linear, rows, aux_signatures):
-            return False
+            return None
 
     out = module.out_proj
     # out_proj sits after the fused norm/gate, so its allocation cannot reach
@@ -748,11 +771,35 @@ def _qwen4_decode_static_eligible(module) -> bool:
     # checks remain. Its input is the concatenated value stream, not the
     # residual stream.
     out_signatures = None if wide else {(5, 128)}
-    return canonical_projection(
+    if not canonical_projection(
         out,
         _QWEN4_HIDDEN_SIZE,
         out_signatures,
         in_dim=module.num_v_heads * module.head_v_dim,
+    ):
+        return None
+    return dtype
+
+
+def _qwen4_decode_static_eligible(module) -> bool:
+    """Require the supported Qwen4 geometry and canonical affine storage."""
+
+    return _qwen4_decode_static_dtype(module) is not None
+
+
+def _qwen4_decode_candidate(module, inputs, mask, cache) -> bool:
+    """Whether this call is in the fused Qwen4 B1/T1 operation's domain."""
+
+    return bool(
+        type(module).__name__ == "Qwen4ExpGatedDeltaNet"
+        and type(module).__module__ == "mlx_vlm.models.qwen4_exp.language"
+        and mask is None
+        and cache is not None
+        and isinstance(inputs, mx.array)
+        and inputs.shape == (1, 1, _QWEN4_HIDDEN_SIZE)
+        and inputs.dtype in _SUPPORTED_FLOAT_DTYPES
+        and getattr(cache, "lengths", None) is None
+        and getattr(cache, "left_padding", None) is None
     )
 
 
@@ -767,13 +814,7 @@ def _qwen4_decode_dynamic_eligible(
     if (
         target_verify
         or gdn_sink is not None
-        or mask is not None
-        or cache is None
-        or not isinstance(inputs, mx.array)
-        or inputs.shape != (1, 1, 2560)
-        or inputs.dtype != mx.bfloat16
-        or getattr(cache, "lengths", None) is not None
-        or getattr(cache, "left_padding", None) is not None
+        or not _qwen4_decode_candidate(module, inputs, mask, cache)
     ):
         return False
     conv_state = cache[0]
@@ -781,11 +822,11 @@ def _qwen4_decode_dynamic_eligible(
     return (
         isinstance(conv_state, mx.array)
         and conv_state.shape == (1, 3, 10240)
-        and conv_state.dtype == mx.bfloat16
+        and conv_state.dtype == inputs.dtype
         and isinstance(recurrent_state, mx.array)
         and recurrent_state.shape == (1, 48, 128, 128)
         and recurrent_state.dtype == mx.float32
-        and _qwen4_decode_static_eligible(module)
+        and _qwen4_decode_static_dtype(module) == inputs.dtype
     )
 
 
@@ -871,8 +912,13 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         # must keep their original implementation and cache semantics.
         if kwargs:
             return original(self, inputs, mask=mask, cache=cache, **kwargs)
-        if _qwen4_prefill_eligible(self, inputs, mask, cache):
-            return _qwen4_prefill(self, inputs, cache)
+        if _qwen4_prefill_candidate(self, inputs, mask, cache):
+            if _qwen4_prefill_eligible(self, inputs, mask, cache):
+                return _qwen4_prefill(self, inputs, cache)
+            if inputs.dtype == mx.float16:
+                raise RuntimeError(
+                    "Qwen4 FP16 fused GDN prefill contract is unavailable"
+                )
         if _qwen35_decode_eligible(self, inputs, mask, cache):
             mixed_qkv = self.in_proj_qkv(inputs)
             # The kernel reads projections, convolution weights and state as one dtype.
@@ -922,18 +968,27 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                 logger.info("Qwen B1/T1 fused GDN prework engaged")
             return result
 
+        qwen4_candidate = _qwen4_decode_candidate(self, inputs, mask, cache)
         if not _qwen4_decode_dynamic_eligible(self, inputs, mask, cache, None, False):
+            if qwen4_candidate and inputs.dtype == mx.float16:
+                raise RuntimeError(
+                    "Qwen4 FP16 fused GDN decode contract is unavailable"
+                )
             return original(self, inputs, mask=mask, cache=cache)
         mixed_qkv, z, b, a = _target_verify_linears(
             (self.in_proj_qkv, self.in_proj_z, self.in_proj_b, self.in_proj_a), inputs
         )
+        if inputs.dtype == mx.float16 and any(
+            value.dtype != inputs.dtype for value in (mixed_qkv, z, b, a)
+        ):
+            raise RuntimeError("Qwen4 FP16 GDN projections changed compute dtype")
         inv = self.head_k_dim**-0.5
         q, k, v, conv_state, g, beta = qwen4_decode_prework_fused(
             mixed_qkv,
             cache[0],
             self.conv1d.weight,
-            mx.array(inv * inv, dtype=mx.bfloat16),
-            mx.array(inv, dtype=mx.bfloat16),
+            mx.array(inv * inv, dtype=inputs.dtype),
+            mx.array(inv, dtype=inputs.dtype),
             b,
             a,
             self.A_log,
@@ -961,7 +1016,11 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         global _QWEN4_DECODE_ENGAGED_LOGGED
         if not _QWEN4_DECODE_ENGAGED_LOGGED:
             _QWEN4_DECODE_ENGAGED_LOGGED = True
-            logger.info("Qwen4 fused B1/T1 GDN decode prework and norm-gate engaged")
+            logger.info(
+                "Qwen4 fused B1/T1 GDN decode prework and norm-gate engaged "
+                "(dtype=%s)",
+                inputs.dtype,
+            )
         return result
 
     def verify(verifier, layer, inputs, mask, cache):
@@ -982,65 +1041,79 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                 and sites[1] is not None
                 and getattr(type(layer), "_normalize_qk", None) is sites[1]
             )
-        if not (
-            (compatible_norm or l2_norm)
-            and cache is not None
-            and cache.is_speculating
-            and 2 <= length <= 9
-            and mask is None
-            and inputs.dtype in (mx.bfloat16, mx.float16)
-            and layer.conv_kernel_size == 4
-            and layer.head_k_dim == 128
-            and layer.head_v_dim == 128
-            and cache.lengths is None
+        real_qwen4 = (
+            type(layer).__name__ == "Qwen4ExpGatedDeltaNet"
+            and type(layer).__module__ == "mlx_vlm.models.qwen4_exp.language"
+        )
+        dtype_ok = inputs.dtype in _SUPPORTED_FLOAT_DTYPES
+        module_dtype_ok = (
+            not real_qwen4 or _qwen4_gdn_compute_dtype(layer) == inputs.dtype
+        )
+        cache_dtype_ok = bool(
+            cache is not None
             and cache[0] is not None
             and cache[0].shape[0] == inputs.shape[0]
             and cache[0].dtype == inputs.dtype
-            and layer.conv1d.weight.dtype == inputs.dtype
-            and getattr(layer.conv1d, "bias", None) is None
-        ):
+        )
+        checks = (
+            ("norm", compatible_norm or l2_norm),
+            ("speculating", cache is not None and cache.is_speculating),
+            ("length", 2 <= length <= 9),
+            ("mask", mask is None),
+            ("compute_dtype", dtype_ok),
+            ("module_dtype", module_dtype_ok),
+            ("conv_kernel", layer.conv_kernel_size == 4),
+            ("dk128", layer.head_k_dim == 128),
+            ("dv128", layer.head_v_dim == 128),
+            ("lengths", cache is not None and cache.lengths is None),
+            ("c0", cache_dtype_ok),
+            (
+                "conv_w",
+                layer.conv1d.weight.dtype == inputs.dtype
+                and getattr(layer.conv1d, "bias", None) is None,
+            ),
+        )
+        if not all(ok for _, ok in checks):
             global _VERIFY_REJECT_DIAG
             # Only T>=2 verify calls can engage; skip S=1 decode probes.
             if cache is not None and length >= 2 and _VERIFY_REJECT_DIAG < 3:
                 _VERIFY_REJECT_DIAG += 1
-                failed = [
-                    name
-                    for name, ok in (
-                        ("norm", compatible_norm or l2_norm),
-                        ("speculating", cache.is_speculating),
-                        ("length", 2 <= length <= 9),
-                        ("mask", mask is None),
-                        ("inputs_dtype", inputs.dtype in (mx.bfloat16, mx.float16)),
-                        ("conv_kernel", layer.conv_kernel_size == 4),
-                        ("dk128", layer.head_k_dim == 128),
-                        ("dv128", layer.head_v_dim == 128),
-                        ("lengths", cache.lengths is None),
-                        (
-                            "c0",
-                            cache[0] is not None
-                            and cache[0].shape[0] == inputs.shape[0]
-                            and cache[0].dtype == inputs.dtype,
-                        ),
-                        (
-                            "conv_w",
-                            layer.conv1d.weight.dtype == inputs.dtype
-                            and getattr(layer.conv1d, "bias", None) is None,
-                        ),
-                    )
-                    if not ok
-                ]
+                failed = [name for name, ok in checks if not ok]
                 logger.info(
-                    "[gdn-prework] verify gate reject: %s (verifier=%s S=%d l2=%s)",
+                    "[gdn-prework] verify gate reject: %s "
+                    "(verifier=%s S=%d l2=%s dtype=%s)",
                     failed,
                     type(verifier).__name__,
                     length,
                     l2_norm,
+                    inputs.dtype,
+                )
+            fp16_candidate = bool(
+                real_qwen4
+                and l2_norm
+                and inputs.dtype == mx.float16
+                and cache is not None
+                and cache.is_speculating
+                and 2 <= length <= 9
+                and mask is None
+            )
+            if fp16_candidate:
+                failed = [name for name, ok in checks if not ok]
+                raise RuntimeError(
+                    "Qwen4 FP16 fused GDN verify contract is unavailable: "
+                    + ", ".join(failed)
                 )
             return original_verify(verifier, layer, inputs, mask, cache)
         mixed_qkv, z, b, a = verifier._linears(
             (layer.in_proj_qkv, layer.in_proj_z, layer.in_proj_b, layer.in_proj_a),
             inputs,
         )
+        if (
+            l2_norm
+            and inputs.dtype == mx.float16
+            and any(value.dtype != inputs.dtype for value in (mixed_qkv, z, b, a))
+        ):
+            raise RuntimeError("Qwen4 FP16 verify projections changed compute dtype")
         inv = layer.head_k_dim**-0.5
         if l2_norm:
             q_scale = mx.array(inv, dtype=inputs.dtype)
@@ -1098,9 +1171,10 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         if not _ENGAGED_LOGGED:
             _ENGAGED_LOGGED = True
             logger.info(
-                "[gdn-prework] fused verify prework engaged (S=%d, l2=%s)",
+                "[gdn-prework] fused verify prework engaged " "(S=%d, l2=%s, dtype=%s)",
                 length,
                 l2_norm,
+                inputs.dtype,
             )
         return result
 

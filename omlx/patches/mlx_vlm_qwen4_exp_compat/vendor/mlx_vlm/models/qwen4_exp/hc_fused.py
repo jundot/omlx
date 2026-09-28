@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Metal kernels for Qwen4 hyper-connection inputs.
 
-Decode (at most 16 BF16 rows) fuses per-stream RMS norm, down/inject
+Decode (at most 16 FP16 or BF16 rows) fuses per-stream RMS norm, down/inject
 projections with activation, and the up projection with stream mixing.
 Prefill keeps the down/up projections on the MLX matmul path and fuses only
 the stream norm and the mixing/inject epilogue. Both need four streams and
 affine group-size-64 projections with 4/5/6/8-bit weights. FP32 epilogues
-can round differently from the canonical BF16 operations.
+can round differently from the canonical 16-bit operations.
 
 Each kernel specialization is evaluated once to catch lazy compilation errors.
-Failures only fall back for the current call; later evaluation errors propagate.
+BF16 failures fall back for the current call; FP16 and later evaluation errors
+propagate.
 Disable with OMLX_QWEN4_HC_FUSED=0.
 """
 
@@ -303,9 +304,9 @@ def enabled() -> bool:
     return not _DISABLED
 
 
-def _quantized_ok(projection) -> bool:
+def _quantized_ok(projection, dtype) -> bool:
     return (
-        type(projection) is nn.QuantizedLinear
+        isinstance(projection, nn.QuantizedLinear)
         and getattr(projection, "group_size", None) == _GROUP_SIZE
         and getattr(projection, "bits", None) in _SUPPORTED_BITS
         and getattr(projection, "mode", "affine") == "affine"
@@ -314,8 +315,8 @@ def _quantized_ok(projection) -> bool:
         and projection.weight.dtype == mx.uint32
         and isinstance(getattr(projection, "scales", None), mx.array)
         and isinstance(getattr(projection, "biases", None), mx.array)
-        and projection.scales.dtype == mx.bfloat16
-        and projection.biases.dtype == mx.bfloat16
+        and projection.scales.dtype == dtype
+        and projection.biases.dtype == dtype
     )
 
 
@@ -336,7 +337,7 @@ def _rows_of(hyper_input) -> int | None:
     if not (
         isinstance(hyper_input, mx.array)
         and hyper_input.ndim == 3
-        and hyper_input.dtype == mx.bfloat16
+        and hyper_input.dtype in (mx.float16, mx.bfloat16)
     ):
         return None
     return hyper_input.shape[0] * hyper_input.shape[1]
@@ -388,19 +389,19 @@ def _layout_compatible(module, hyper_input) -> bool:
         norm is not None
         and getattr(norm, "group_size", None) == hidden
         and isinstance(getattr(norm, "weight", None), mx.array)
-        and norm.weight.dtype == mx.bfloat16
+        and norm.weight.dtype == hyper_input.dtype
         and norm.weight.shape == (hc_count * hidden,)
     ):
         return _ineligible("hc_norm layout")
     if not (
-        _quantized_ok(getattr(module, "input_mix_weight_down", None))
-        and _quantized_ok(getattr(module, "input_mix_weight_up", None))
+        _quantized_ok(getattr(module, "input_mix_weight_down", None), hyper_input.dtype)
+        and _quantized_ok(getattr(module, "input_mix_weight_up", None), hyper_input.dtype)
     ):
         return _ineligible(
-            "projection quantisation (need affine group-size-64 4/5/6/8-bit with bf16 scales)"
+            "projection quantisation (need affine group-size-64 4/5/6/8-bit with scales matching the activation dtype)"
         )
     if "block_inject_weight" in module and not _quantized_ok(
-        module.block_inject_weight
+        module.block_inject_weight, hyper_input.dtype
     ):
         return _ineligible("block_inject_weight quantisation")
     return mx.default_device() == mx.gpu and mx.metal.is_available()
@@ -516,10 +517,11 @@ def _tail(hc: int, hidden: int):
 
 
 def prefill_forward(module, hyper_input, write=None):
-    """Prefill with the fused stream norm and tail/inject epilogue; None on failure.
+    """Prefill with the fused stream norm and tail/inject epilogue.
 
     ``write`` is a pending ``(branch, gate)`` residual write onto ``hyper_input``.
     The norm kernel applies it and returns the written stream as the passthrough.
+    BF16 failures return ``None``; FP16 failures propagate.
     """
     global _FAILURE_LOGGED
     try:
@@ -605,6 +607,8 @@ def prefill_forward(module, hyper_input, write=None):
             return mixed
         return mixed, hyper_input, injection
     except Exception as exc:  # noqa: BLE001 - optional native path
+        if hyper_input.dtype == mx.float16:
+            raise
         if not _FAILURE_LOGGED:
             _FAILURE_LOGGED = True
             logger.warning(
@@ -616,7 +620,7 @@ def prefill_forward(module, hyper_input, write=None):
 
 
 def fused_forward(module, hyper_input):
-    """Return fused outputs, or None on construction or first-evaluation failure."""
+    """Return fused outputs; BF16 failures return None, FP16 failures propagate."""
     global _FAILURE_LOGGED
     try:
         hc, hidden, lowrank = module.hc_count, module.hidden_size, module.hc_lowrank
@@ -700,6 +704,8 @@ def fused_forward(module, hyper_input):
             return mixed
         return mixed, hyper_input, injection.reshape(batch, seq, hc)
     except Exception as exc:  # noqa: BLE001 - optional native path
+        if hyper_input.dtype == mx.float16:
+            raise
         if not _FAILURE_LOGGED:
             _FAILURE_LOGGED = True
             logger.warning(

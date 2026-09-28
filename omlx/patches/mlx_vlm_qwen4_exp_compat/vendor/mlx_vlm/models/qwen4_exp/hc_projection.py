@@ -330,8 +330,8 @@ def compatible_projections(down, injection) -> bool:
     if _DISABLED:
         return False
     if not (
-        type(down) is nn.QuantizedLinear
-        and type(injection) is nn.QuantizedLinear
+        isinstance(down, nn.QuantizedLinear)
+        and isinstance(injection, nn.QuantizedLinear)
         and getattr(down, "group_size", None)
         == getattr(injection, "group_size", None)
         == _GROUP_SIZE
@@ -361,8 +361,9 @@ def compatible_projections(down, injection) -> bool:
         == (_HC_COUNT, _STREAM_WIDTH // _GROUP_SIZE)
         and down.biases.shape == down.scales.shape
         and injection.biases.shape == injection.scales.shape
-        and down.scales.dtype == down.biases.dtype == mx.bfloat16
-        and injection.scales.dtype == injection.biases.dtype == mx.bfloat16
+        and down.scales.dtype == down.biases.dtype
+        and down.scales.dtype in (mx.float16, mx.bfloat16)
+        and injection.scales.dtype == injection.biases.dtype == down.scales.dtype
     )
 
 
@@ -371,15 +372,16 @@ def hybrid_projection(
     down,
     injection,
 ) -> mx.array | None:
-    """Return exact concatenated ``down, inject`` output or fail closed."""
+    """Return concatenated projections; ineligible layouts return None, FP16 errors raise."""
     global _RUNTIME_FAILED, _FAILURE_LOGGED
 
     if not (
-        not _RUNTIME_FAILED
-        and isinstance(x, mx.array)
+        isinstance(x, mx.array)
+        and (x.dtype == mx.float16 or not _RUNTIME_FAILED)
         and x.shape == (1, 1, _STREAM_WIDTH)
-        and x.dtype == mx.bfloat16
+        and x.dtype in (mx.float16, mx.bfloat16)
         and compatible_projections(down, injection)
+        and x.dtype == down.scales.dtype
         and mx.default_device() == mx.gpu
         and mx.metal.is_available()
     ):
@@ -406,6 +408,8 @@ def hybrid_projection(
             output_dtypes=[x.dtype],
         )[0]
     except Exception as exc:  # noqa: BLE001 - optional native path
+        if x.dtype == mx.float16:
+            raise
         _RUNTIME_FAILED = True
         if not _FAILURE_LOGGED:
             _FAILURE_LOGGED = True
