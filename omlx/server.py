@@ -1986,6 +1986,38 @@ def _resolve_metric_durations(
     return prefill_duration, generation_duration
 
 
+def _usage_timing_fields(
+    prompt_tokens: int,
+    completion_tokens: int,
+    *,
+    ttft: float | None,
+    prefill_duration: float,
+    generation_duration: float,
+    cached_tokens: int = 0,
+) -> dict:
+    """Timing fields for a non-streaming Usage, computed like the final streaming chunk.
+
+    The prompt rate counts only the tokens prefilled in this request: cached
+    prefix tokens were restored, not computed, during prefill_duration.
+    """
+    computed = max(prompt_tokens - (cached_tokens or 0), 0)
+    return {
+        "time_to_first_token": round(ttft, 2) if ttft is not None else None,
+        "prompt_eval_duration": (
+            round(prefill_duration, 2) if prefill_duration > 0 else None
+        ),
+        "generation_duration": round(generation_duration, 2),
+        "prompt_tokens_per_second": (
+            round(computed / prefill_duration, 2) if prefill_duration > 0 else None
+        ),
+        "generation_tokens_per_second": (
+            round(completion_tokens / generation_duration, 2)
+            if generation_duration > 0
+            else None
+        ),
+    }
+
+
 def _get_ocr_defaults(model_id: str | None) -> dict | None:
     """Get OCR generation defaults for a model, or None if not an OCR model."""
     if model_id is None:
@@ -3885,11 +3917,12 @@ async def create_completion(
                 f"({tokens_per_sec:.1f} tok/s), prompt: {total_prompt_tokens}"
             )
 
-            prefill_duration = (
+            ttft = (
                 (first_token_at - start_time)
                 if first_token_at is not None
-                else 0.0
+                else None
             )
+            prefill_duration = ttft if ttft is not None else 0.0
             gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
             get_server_metrics().record_request_complete(
                 prompt_tokens=total_prompt_tokens,
@@ -3917,6 +3950,18 @@ async def create_completion(
                         else None
                     ),
                     total_time=round(elapsed, 2),
+                    **(
+                        _usage_timing_fields(
+                            total_prompt_tokens,
+                            total_completion_tokens,
+                            ttft=ttft,
+                            prefill_duration=prefill_duration,
+                            generation_duration=gen_duration,
+                            cached_tokens=total_cached_tokens,
+                        )
+                        if len(prompts) == 1
+                        else {}
+                    ),
                 ),
             ).model_dump_json(exclude_none=True)
 
@@ -4378,13 +4423,16 @@ async def create_chat_completion(
             ttft = (
                 (first_token_at - start_time)
                 if first_token_at is not None
-                else 0.0
+                else None
             )
-            gen_duration = elapsed - ttft if ttft > 0 else elapsed
+            metric_prefill = ttft if ttft is not None else 0.0
+            gen_duration = (
+                elapsed - metric_prefill if metric_prefill > 0 else elapsed
+            )
             metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
                 output,
                 is_diffusion=is_diffusion,
-                prefill_duration=ttft,
+                prefill_duration=metric_prefill,
                 generation_duration=gen_duration,
             )
 
@@ -4475,6 +4523,14 @@ async def create_chat_completion(
                         else None
                     ),
                     total_time=round(elapsed, 2),
+                    **_usage_timing_fields(
+                        output.prompt_tokens,
+                        output.completion_tokens,
+                        ttft=ttft,
+                        prefill_duration=metric_prefill_duration,
+                        generation_duration=metric_gen_duration,
+                        cached_tokens=output.cached_tokens,
+                    ),
                 ),
             ).model_dump_json(exclude_none=True)
 
@@ -5071,19 +5127,14 @@ async def stream_completion(
                         if model_load_duration > 1.0
                         else None
                     ),
-                    time_to_first_token=round(ttft, 2),
                     total_time=round(total_time, 2),
-                    prompt_eval_duration=round(metric_prefill_duration, 2),
-                    generation_duration=round(metric_gen_duration, 2),
-                    prompt_tokens_per_second=(
-                        round(pt / metric_prefill_duration, 2)
-                        if metric_prefill_duration > 0
-                        else None
-                    ),
-                    generation_tokens_per_second=(
-                        round(ct / metric_gen_duration, 2)
-                        if metric_gen_duration > 0
-                        else None
+                    **_usage_timing_fields(
+                        pt,
+                        ct,
+                        ttft=ttft,
+                        prefill_duration=metric_prefill_duration,
+                        generation_duration=metric_gen_duration,
+                        cached_tokens=last_output.cached_tokens,
                     ),
                 ).model_dump(exclude_none=True),
             }
@@ -5904,26 +5955,19 @@ async def stream_chat_completion(
                         if model_load_duration > 1.0
                         else None
                     ),
-                    time_to_first_token=(
-                        round(model_ttft, 2) if model_ttft is not None else None
-                    ),
                     time_to_first_visible_token=(
                         round(visible_ttft, 2)
                         if visible_ttft is not None
                         else None
                     ),
                     total_time=round(total_time, 2),
-                    prompt_eval_duration=round(metric_prefill_duration, 2),
-                    generation_duration=round(metric_gen_duration, 2),
-                    prompt_tokens_per_second=(
-                        round(pt / metric_prefill_duration, 2)
-                        if metric_prefill_duration > 0
-                        else None
-                    ),
-                    generation_tokens_per_second=(
-                        round(ct / metric_gen_duration, 2)
-                        if metric_gen_duration > 0
-                        else None
+                    **_usage_timing_fields(
+                        pt,
+                        ct,
+                        ttft=model_ttft,
+                        prefill_duration=metric_prefill_duration,
+                        generation_duration=metric_gen_duration,
+                        cached_tokens=last_output.cached_tokens,
                     ),
                 ),
             )
