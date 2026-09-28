@@ -203,6 +203,11 @@ from .exceptions import (
 )
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
 from .server_metrics import get_server_metrics, reset_server_metrics
+from .utils.request_id import (
+    REQUEST_ID_STATE_KEY,
+    new_request_id,
+    resolve_request_id,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -1299,10 +1304,72 @@ class ClientDisconnectTrackingMiddleware:
         await self.app(scope, tracked_receive, send)
 
 
+class RequestIdMiddleware:
+    """Name every request, and tell the client what that name is.
+
+    The id published here is the one oMLX logs and ``/admin/api/stats`` keys a
+    request by (``prefilling[].request_id`` / ``waiting[].request_id``), so a
+    client that reads the response header can follow its own request through
+    the server instead of inferring it from timings. An inbound
+    ``x-request-id`` is honoured when well-formed, so a caller that already has
+    a tracing id keeps it; anything else is replaced by a minted one.
+
+    Pure ASGI rather than ``BaseHTTPMiddleware``: the latter wraps
+    ``StreamingResponse`` in an intermediate pipe layer, which corrupts
+    keep-alive connections (see ``DebugRequestLoggingMiddleware``).
+
+    Ids are held for the lifetime of the response so two in-flight requests
+    never share one: a client that reuses a value (a constant, or a retry of an
+    id still running) gets a minted replacement instead of a second request
+    that could be confused with the first by targeted abort.
+    """
+
+    def __init__(self, app):
+        self.app = app
+        self._in_flight: set[str] = set()
+
+    def _claim(self, request_id: str) -> str:
+        """Reserve ``request_id`` for this request, minting if already taken."""
+        while request_id in self._in_flight:
+            request_id = new_request_id()
+        self._in_flight.add(request_id)
+        return request_id
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        inbound_headers = {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in scope.get("headers", [])
+        }
+        request_id = self._claim(resolve_request_id(inbound_headers.get("x-request-id")))
+        scope.setdefault("state", {})[REQUEST_ID_STATE_KEY] = request_id
+        encoded_id = request_id.encode("ascii")
+
+        async def send_with_request_id(message):
+            if message["type"] == "http.response.start":
+                headers = [
+                    (key, value)
+                    for key, value in message.get("headers", [])
+                    if key.lower() != b"x-request-id"
+                ]
+                headers.append((b"x-request-id", encoded_id))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_with_request_id)
+        finally:
+            self._in_flight.discard(request_id)
+
+
 # Keep this outside response middleware so every consumer of ASGI ``receive``
 # passes through the same one-shot disconnect fan-out.
 app.add_middleware(ClientDisconnectTrackingMiddleware)
 app.add_middleware(DebugRequestLoggingMiddleware)
+app.add_middleware(RequestIdMiddleware)
 
 
 # =============================================================================
@@ -2510,15 +2577,32 @@ async def _aclose_async_iterator(iterator: object) -> None:
         await close()
 
 
-def _request_abort_id(engine: BaseEngine) -> str | None:
-    """Mint an opaque id only for engines with targeted abort semantics."""
+def _request_correlation_id(http_request: FastAPIRequest) -> str:
+    """The id this request is known by, as published by RequestIdMiddleware.
+
+    Falls back to a freshly minted id when the middleware did not run (direct
+    handler calls in tests), so callers always get something usable.
+    """
+
+    state = http_request.scope.get("state") or {}
+    return resolve_request_id(state.get(REQUEST_ID_STATE_KEY))
+
+
+def _request_abort_id(engine: BaseEngine, preferred: str | None = None) -> str | None:
+    """The id used for targeted abort, or None without those semantics.
+
+    ``preferred`` is the request's correlation id: reusing it keeps the abort
+    handle and the engine's own request id the same value, so an aborted
+    request is still identifiable in logs and admin stats. A fresh opaque id
+    is only minted when the caller has none.
+    """
 
     if not getattr(engine, "supports_request_scoped_abort", False):
         return None
     abort = getattr(engine, "abort_request", None)
     if not callable(abort):
         return None
-    return f"transport-{uuid.uuid4().hex}"
+    return preferred or f"transport-{uuid.uuid4().hex}"
 
 
 async def _with_request_disconnect_abort(
@@ -3752,15 +3836,17 @@ async def create_completion(
 
         # Pre-flight prefill memory guard — see create_chat_completion for
         # the reason this must precede any StreamingResponse return.
-        # Thread the client-provided X-Request-ID when present so the 400
-        # log line and the FastAPI handler trace correlate with whatever
-        # the client is using on its side.
-        upstream_request_id = http_request.headers.get("x-request-id")
+        # The id this request is logged and reported under: the client's
+        # x-request-id when it sent a usable one, otherwise a minted id.
+        # Threading it into preflight keeps the 400 log line and the FastAPI
+        # handler trace on the same value the client sees in its response
+        # header.
+        request_id = _request_correlation_id(http_request)
         await _raise_if_llm_lease_abort_requested(lease)
         for prompt in prompts:
-            await engine.preflight_completion(prompt, request_id=upstream_request_id)
+            await engine.preflight_completion(prompt, request_id=request_id)
         await _raise_if_llm_lease_abort_requested(lease)
-        inference_request_id = _request_abort_id(engine)
+        inference_request_id = _request_abort_id(engine, request_id)
 
         if request.stream:
             response_id = f"cmpl-{uuid.uuid4().hex[:8]}"
@@ -3779,7 +3865,7 @@ async def create_completion(
                                 prompt_token_ids=prompt_token_ids_by_prompt[0],
                                 resolved_model=resolved_model,
                                 response_id=response_id,
-                                inference_request_id=inference_request_id,
+                                inference_request_id=request_id,
                             ),
                             http_request=http_request,
                             keepalive_chunk=keepalive,
@@ -3832,8 +3918,9 @@ async def create_completion(
             thinking_budget = _resolve_thinking_budget(request, request.model)
             if thinking_budget is not None:
                 gen_kwargs["thinking_budget"] = thinking_budget
-            if inference_request_id is not None:
-                gen_kwargs["_request_id"] = inference_request_id
+            # Name the request even when the engine has no targeted abort:
+            # this is what makes it findable in server.log and admin stats.
+            gen_kwargs["_request_id"] = request_id
             # Widen the repetition-penalty look-back window when the client
             # asks for it (mlx-lm default window is 20 tokens).
             repetition_context_size = getattr(
@@ -4304,17 +4391,17 @@ async def create_chat_completion(
         # handled exception, but response already started" and the client sees
         # an incomplete chunked read. Running the check here lets
         # prefill_memory_exceeded_handler return a clean HTTP 400.
+        request_id = _request_correlation_id(http_request)
         await _raise_if_llm_lease_abort_requested(lease)
         await engine.preflight_chat(
             messages,
-            request_id=http_request.headers.get("x-request-id"),
+            request_id=request_id,
             **chat_kwargs,
         )
 
         await _raise_if_llm_lease_abort_requested(lease)
-        inference_request_id = _request_abort_id(engine)
-        if inference_request_id is not None:
-            chat_kwargs["_request_id"] = inference_request_id
+        inference_request_id = _request_abort_id(engine, request_id)
+        chat_kwargs["_request_id"] = request_id
 
         if request.stream:
             # Pre-mint the completion id so the keepalive frame (emitted before the
@@ -6662,16 +6749,16 @@ async def create_anthropic_message(
 
         # Pre-flight prefill memory guard — must precede any StreamingResponse
         # return so PrefillMemoryExceededError can be mapped to HTTP 400.
+        request_id = _request_correlation_id(http_request)
         await _raise_if_llm_lease_abort_requested(lease)
         await engine.preflight_chat(
             messages,
-            request_id=http_request.headers.get("x-request-id"),
+            request_id=request_id,
             **chat_kwargs,
         )
         await _raise_if_llm_lease_abort_requested(lease)
-        inference_request_id = _request_abort_id(engine)
-        if inference_request_id is not None:
-            chat_kwargs["_request_id"] = inference_request_id
+        inference_request_id = _request_abort_id(engine, request_id)
+        chat_kwargs["_request_id"] = request_id
 
         if request.stream:
             return StreamingResponse(
@@ -7209,16 +7296,16 @@ async def create_response(
 
         # Pre-flight prefill memory guard — must precede any StreamingResponse
         # return so PrefillMemoryExceededError can be mapped to HTTP 400.
+        request_id = _request_correlation_id(http_request)
         await _raise_if_llm_lease_abort_requested(lease)
         await engine.preflight_chat(
             messages,
-            request_id=http_request.headers.get("x-request-id"),
+            request_id=request_id,
             **chat_kwargs,
         )
         await _raise_if_llm_lease_abort_requested(lease)
-        inference_request_id = _request_abort_id(engine)
-        if inference_request_id is not None:
-            chat_kwargs["_request_id"] = inference_request_id
+        inference_request_id = _request_abort_id(engine, request_id)
+        chat_kwargs["_request_id"] = request_id
 
         if request.stream:
             sse_headers = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}

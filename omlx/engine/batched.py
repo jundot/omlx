@@ -21,6 +21,7 @@ from ..model_settings import (
     validate_ane_prefill,
 )
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
+from ..utils.request_id import valid_request_id
 from ..utils.tokenizer import get_tokenizer_config
 from .base import (
     BaseEngine,
@@ -1155,6 +1156,10 @@ class BatchedEngine(BaseEngine):
         request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            # The server's correlation id when it supplied one, so this
+            # request is identifiable in logs and admin stats. An unusable
+            # value falls back to the engine's own minted id.
+            request_id=valid_request_id(kwargs.pop("_request_id", None)),
             tools=tools,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
             preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),

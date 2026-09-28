@@ -270,6 +270,8 @@ Native Swift / SwiftUI menubar app (not Electron). Start, stop, and monitor the 
 
 Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stats (`stream_options.include_usage`), Anthropic adaptive thinking, and vision inputs (base64, URL).
 
+Every response carries an `X-Request-ID` header. Send your own `x-request-id` (ASCII, up to 128 bytes of `A-Za-z0-9._:-`) and it is used as-is; otherwise one is minted. That id is the request's identity inside the server, so it is what appears in `server.log` and in `/admin/api/stats` (`prefilling[].request_id`, `waiting[].request_id`) — enough to follow one request's cache hit and prefill progress instead of inferring it from timings.
+
 | Endpoint | Description |
 |----------|-------------|
 | `POST /v1/chat/completions` | Chat completions (streaming) |
