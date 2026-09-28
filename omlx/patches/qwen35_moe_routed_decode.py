@@ -60,6 +60,14 @@ armed and the block folds its shared expert; one-row windows run the
 one-token launches. If the first window launch fails, the verifier keeps
 its composed MoE. ``OMLX_QWEN35_MOE_VERIFY_WINDOW=0`` keeps it too.
 
+Batched calls of 2..8 rows in total (B >= 2 decode, and B >= 2 verify
+windows, which row-exact verify does not arm) run the same four launches,
+so every row equals the one-token decode of that row and batched decode is
+batch-invariant for the MoE block. The composed multi-row block they
+replace sums its combine in another order: about one row in six differs
+from that row's one-token decode by one or two bf16 ulps.
+``OMLX_QWEN35_MOE_BATCHED_WINDOW=0`` keeps the composed block for them.
+
 MLX commits a command buffer once the inputs bound to it exceed its size cap
 (50 MB by default), counting each input array whole. The stacked expert
 weights are hundreds of MB, so every launch that binds them ends a command
@@ -107,6 +115,11 @@ _DISABLED = False
 _PROVEN = False
 _VERIFY_WINDOW = os.environ.get("OMLX_QWEN35_MOE_VERIFY_WINDOW", "1") != "0"
 WINDOW_MAX_ROWS = 8
+# Batched rows (B >= 2 decode, and B >= 2 verify windows, which are not
+# row-exact armed) also run the window launches when they total at most
+# WINDOW_MAX_ROWS, so each row is the fused one-token call on that row, as
+# for B1. One-row calls keep their paths.
+_BATCHED_WINDOW = os.environ.get("OMLX_QWEN35_MOE_BATCHED_WINDOW", "1") != "0"
 _WINDOW_DISABLED = False
 _WINDOW_PROVEN = False
 
@@ -794,7 +807,9 @@ def _ensure_verify_window_patch(cls) -> None:
 
     @wraps(original)
     def verify_window(self, feed_forward, x):
-        if is_row_exact_armed() and isinstance(feed_forward, cls):
+        if (
+            is_row_exact_armed() or (_BATCHED_WINDOW and x.ndim == 3 and x.shape[0] >= 2)
+        ) and isinstance(feed_forward, cls):
             y = routed_verify_window(feed_forward, x)
             if y is not None:
                 return y.reshape(x.shape)
@@ -827,6 +842,10 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
         global _DISABLED, _PROVEN
         plan = routed_decode_plan(self, x)
         if plan is None or not router_eligible(x, self.num_experts):
+            if _BATCHED_WINDOW and x.ndim == 3 and x.shape[0] >= 2:
+                y = routed_verify_window(self, x)
+                if y is not None:
+                    return y.reshape(x.shape)
             return orig_call(self, x)
         shared = shared_gate = None
         if not plan.fold:
