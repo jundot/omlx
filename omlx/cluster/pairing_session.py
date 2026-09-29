@@ -7,7 +7,7 @@ import hashlib
 import secrets
 import threading
 from typing import TYPE_CHECKING, Any
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 
 from .pairing import (
@@ -191,6 +191,18 @@ class PairingSession:
                     )
                 self._save()
                 message = attempt["error"]
+            # Log only structured exception metadata. Raw exception strings
+            # may include addresses, request payloads or cancellation secrets.
+            reason = exc.reason if isinstance(exc, URLError) else None
+            self.manager._record_audit(
+                "join_request_failed",
+                node_id=self.manager.node_id,
+                detail={
+                    "error_type": type(exc).__name__,
+                    "reason_type": type(reason).__name__ if reason is not None else None,
+                    "http_status": exc.code if isinstance(exc, HTTPError) else None,
+                },
+            )
             raise PairingRequestError(message) from exc
         with self.lock:
             if self.attempt is attempt:
