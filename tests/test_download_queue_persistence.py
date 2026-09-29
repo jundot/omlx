@@ -190,31 +190,16 @@ class TestQueuePersistence:
         to avoid.
         """
         downloader, tasks_file = queue.downloader, queue.tasks_file
-        _write_rows(
-            tasks_file,
-            [
-                {
-                    "task_id": "junk",
-                    "repo_id": "owner/junk",
-                    "status": DownloadStatus.FAILED.value,
-                    "error": "boom",
-                    "progress": "n/a",
-                    "total_size": "big",
-                    "downloaded_size": None,
-                    "created_at": "2026-09-25T00:00:00",
-                    "started_at": [],
-                    "completed_at": {},
-                    "retry_count": "many",
-                },
-                {
-                    "task_id": "good",
-                    "repo_id": "owner/good",
-                    "status": DownloadStatus.COMPLETED.value,
-                    "created_at": 5.0,
-                    "retry_count": 1,
-                },
-            ],
-        )
+        _write_rows(tasks_file, [
+            {"task_id": "junk", "repo_id": "owner/junk",
+             "status": DownloadStatus.FAILED.value, "error": "boom",
+             "progress": "n/a", "total_size": "big", "downloaded_size": None,
+             "created_at": "2026-09-25T00:00:00", "started_at": [],
+             "completed_at": {}, "retry_count": "many"},
+            {"task_id": "good", "repo_id": "owner/good",
+             "status": DownloadStatus.COMPLETED.value, "created_at": 5.0,
+             "retry_count": 1},
+        ])
 
         await downloader.restore_tasks()
 
@@ -239,23 +224,12 @@ class TestQueuePersistence:
         so the next boot retries the interrupted row.
         """
         downloader, tasks_file = queue.downloader, queue.tasks_file
-        _write_rows(
-            tasks_file,
-            [
-                {
-                    "task_id": "live",
-                    "repo_id": "owner/live",
-                    "status": DownloadStatus.DOWNLOADING.value,
-                    "created_at": 10.0,
-                },
-                {
-                    "task_id": "done",
-                    "repo_id": "owner/done",
-                    "status": DownloadStatus.COMPLETED.value,
-                    "created_at": 20.0,
-                },
-            ],
-        )
+        _write_rows(tasks_file, [
+            {"task_id": "live", "repo_id": "owner/live",
+             "status": DownloadStatus.DOWNLOADING.value, "created_at": 10.0},
+            {"task_id": "done", "repo_id": "owner/done",
+             "status": DownloadStatus.COMPLETED.value, "created_at": 20.0},
+        ])
         before = tasks_file.read_text(encoding="utf-8")
 
         with refuse_resume, caplog.at_level(logging.WARNING):
@@ -274,32 +248,14 @@ class TestQueuePersistence:
     @pytest.mark.asyncio
     async def test_restore_resumes_interrupted_rows(self, queue):
         downloader, tasks_file = queue.downloader, queue.tasks_file
-        _write_rows(
-            tasks_file,
-            [
-                {
-                    "task_id": "done",
-                    "repo_id": "owner/done",
-                    "status": "completed",
-                    "progress": 100.0,
-                    "created_at": 100.0,
-                },
-                {
-                    "task_id": "fail",
-                    "repo_id": "owner/fail",
-                    "status": "failed",
-                    "error": "boom",
-                    "created_at": 200.0,
-                },
-                {
-                    "task_id": "live",
-                    "repo_id": "owner/live",
-                    "status": "downloading",
-                    "created_at": 300.0,
-                    "retry_count": 2,
-                },
-            ],
-        )
+        _write_rows(tasks_file, [
+            {"task_id": "done", "repo_id": "owner/done", "status": "completed",
+             "progress": 100.0, "created_at": 100.0},
+            {"task_id": "fail", "repo_id": "owner/fail", "status": "failed",
+             "error": "boom", "created_at": 200.0},
+            {"task_id": "live", "repo_id": "owner/live",
+             "status": "downloading", "created_at": 300.0, "retry_count": 2},
+        ])
 
         await downloader.restore_tasks()
 

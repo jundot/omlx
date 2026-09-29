@@ -73,6 +73,19 @@ async def _wait_for_downloads(downloader):
     )
 
 
+def _downloading_task(model_dir, *, task_id="t1", total_size=0):
+    """One running task on its own downloader, with no poll started yet."""
+    downloader = HFDownloader(model_dir=str(model_dir))
+    task = DownloadTask(
+        task_id=task_id,
+        repo_id="owner/model",
+        status=DownloadStatus.DOWNLOADING,
+        total_size=total_size,
+    )
+    downloader._tasks[task.task_id] = task
+    return downloader, task
+
+
 def start_poll(
     monkeypatch, downloader, task, model_dir, *, wire=None, interval=0.01
 ):
@@ -3096,13 +3109,7 @@ class TestStallDetection:
         monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", 0.01)
         target = model_dir / "owner" / "model"
         target.mkdir(parents=True)
-        downloader = HFDownloader(model_dir=str(model_dir))
-        task = DownloadTask(
-            task_id="t1",
-            repo_id="owner/model",
-            status=DownloadStatus.DOWNLOADING,
-        )
-        downloader._tasks[task.task_id] = task
+        downloader, task = _downloading_task(model_dir, task_id="t1")
         calls = 0
 
         def zero_byte_temp(_path):
@@ -3132,13 +3139,7 @@ class TestStallDetection:
         monkeypatch.setattr(dl_module, "_STARTUP_STALL_TIMEOUT", 1)
         monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 0.03)
         monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", 0.01)
-        downloader = HFDownloader(model_dir=str(model_dir))
-        task = DownloadTask(
-            task_id="t1",
-            repo_id="owner/model",
-            status=DownloadStatus.DOWNLOADING,
-        )
-        downloader._tasks[task.task_id] = task
+        downloader, task = _downloading_task(model_dir, task_id="t1")
         empty = _DownloadActivity()
         writing = _DownloadActivity(
             file_count=1,
@@ -3172,13 +3173,7 @@ class TestStallDetection:
         monkeypatch.setattr(dl_module, "_STARTUP_STALL_TIMEOUT", 0.03)
         monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 0.03)
         monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", 0.01)
-        downloader = HFDownloader(model_dir=str(model_dir))
-        task = DownloadTask(
-            task_id="t1",
-            repo_id="owner/model",
-            status=DownloadStatus.DOWNLOADING,
-        )
-        downloader._tasks[task.task_id] = task
+        downloader, task = _downloading_task(model_dir, task_id="t1")
         counter = _WireCounter()
         frozen = _DownloadActivity()  # fetch phase: nothing lands on disk
 
@@ -3213,13 +3208,7 @@ class TestStallDetection:
         monkeypatch.setattr(dl_module, "_STARTUP_STALL_TIMEOUT", 0.03)
         monkeypatch.setattr(dl_module, "_STALL_TIMEOUT", 0.3)
         monkeypatch.setattr(dl_module, "_PROGRESS_POLL_INTERVAL", 0.01)
-        downloader = HFDownloader(model_dir=str(model_dir))
-        task = DownloadTask(
-            task_id="t1",
-            repo_id="owner/model",
-            status=DownloadStatus.DOWNLOADING,
-        )
-        downloader._tasks[task.task_id] = task
+        downloader, task = _downloading_task(model_dir, task_id="t1")
         counter = _WireCounter()
         frozen = _DownloadActivity()
 
@@ -3670,14 +3659,7 @@ class TestDownloadSpeed:
     @pytest.mark.asyncio
     async def test_poll_reports_speed_then_zeroes_it(self, model_dir, monkeypatch):
         """A live transfer publishes bytes/s; a terminal task publishes 0."""
-        downloader = HFDownloader(model_dir=str(model_dir))
-        task = DownloadTask(
-            task_id="t-speed",
-            repo_id="owner/model",
-            status=DownloadStatus.DOWNLOADING,
-            total_size=10_000_000,
-        )
-        downloader._tasks[task.task_id] = task
+        downloader, task = _downloading_task(model_dir, task_id="t-speed", total_size=10_000_000)
 
         with patch.object(
             downloader,
@@ -3699,13 +3681,7 @@ class TestDownloadSpeed:
         """A constant per-interval rate must be reported near its true value."""
         interval = 0.02
         step = 200_000
-        downloader = HFDownloader(model_dir=str(model_dir))
-        task = DownloadTask(
-            task_id="t-smooth",
-            repo_id="owner/model",
-            status=DownloadStatus.DOWNLOADING,
-        )
-        downloader._tasks[task.task_id] = task
+        downloader, task = _downloading_task(model_dir, task_id="t-smooth")
 
         with patch.object(
             downloader,
@@ -3887,14 +3863,7 @@ class TestDownloadSpeed:
         rate while filesystem activity stays frozen, then clear to 0."""
         from omlx.admin.hf_downloader import _WireCounter
 
-        downloader = HFDownloader(model_dir=str(model_dir))
-        task = DownloadTask(
-            task_id="t-wire",
-            repo_id="owner/model",
-            status=DownloadStatus.DOWNLOADING,
-            total_size=10_000_000_000,
-        )
-        downloader._tasks[task.task_id] = task
+        downloader, task = _downloading_task(model_dir, task_id="t-wire", total_size=10_000_000_000)
         counter = _WireCounter()
 
         frozen = _DownloadActivity()  # no byte lands on disk during fetch
@@ -3923,14 +3892,7 @@ class TestDownloadSpeed:
         sum, which would count the same bytes twice."""
         from omlx.admin.hf_downloader import _WireCounter
 
-        downloader = HFDownloader(model_dir=str(model_dir))
-        task = DownloadTask(
-            task_id="t-stage",
-            repo_id="owner/model",
-            status=DownloadStatus.DOWNLOADING,
-            total_size=10_000_000_000,
-        )
-        downloader._tasks[task.task_id] = task
+        downloader, task = _downloading_task(model_dir, task_id="t-stage", total_size=10_000_000_000)
         counter = _WireCounter()
 
         activity = self._growing_activity(step=2_000_000)
@@ -4030,14 +3992,7 @@ class TestProgressFromWire:
     ):
         from omlx.admin.hf_downloader import _WireCounter
 
-        downloader = HFDownloader(model_dir=str(model_dir))
-        task = DownloadTask(
-            task_id="t-wire",
-            repo_id="owner/model",
-            status=DownloadStatus.DOWNLOADING,
-            total_size=10_000_000,
-        )
-        downloader._tasks[task.task_id] = task
+        downloader, task = _downloading_task(model_dir, task_id="t-wire", total_size=10_000_000)
         counter = _WireCounter()
         counter.add(preload)
 
@@ -4244,11 +4199,6 @@ class TestResolveEndpoint:
         assert r1 == r2 == "https://huggingface.co"
         # Second call was a cache hit — head() count unchanged from first probe.
         assert mock_client.head.call_count == 2
-
-
-# =============================================================================
-# Queue Persistence and Restart Resume
-# =============================================================================
 
 
 # =============================================================================
