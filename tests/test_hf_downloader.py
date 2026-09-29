@@ -27,6 +27,7 @@ from omlx.admin.hf_downloader import (
     _calc_safetensors_disk_size,
     _histogram_has_packed_u32,
     _is_xet_transport_error,
+    _SpeedMeter,
     _make_cancellable_tqdm,
     _sum_safetensors_blob_bytes,
 )
@@ -3612,6 +3613,19 @@ class TestMtimeActivityDetection:
 # =============================================================================
 
 
+class _PositiveRate:
+    """A table cell for a rate that must be greater than zero."""
+
+    def __eq__(self, other):
+        return other > 0
+
+    def __repr__(self):
+        return "> 0"
+
+
+_POSITIVE = _PositiveRate()
+
+
 class TestDownloadSpeed:
     """The poll loop must publish a live rate and clear it at terminal states."""
 
@@ -3712,112 +3726,67 @@ class TestDownloadSpeed:
         # Order of magnitude of the true rate: smoothing must not lose it.
         assert 0.25 * expected <= steady_speed <= 4 * expected
 
-    def test_speed_meter_forgets_stale_history_within_the_window(self):
-        """A stopped transfer must read 0 quickly, not decay forever.
-
-        This is the lag complaint: an exponential average keeps a fraction
-        of the old rate alive indefinitely, so the number trails reality.
-        The fixed window must bottom out once every sample in it is flat
-        (one poll interval after the window has passed the last byte).
-        """
-        from omlx.admin.hf_downloader import _SpeedMeter
-
-        window = 2.0
-        interval = 1.0
+    @staticmethod
+    def _meter_rates(window, samples):
+        """Feed (timestamp, per-file allocated map) samples to a meter."""
         meter = _SpeedMeter(window=window)
-        t = 100.0
-        last_byte_at = t + 4 * interval  # 50 MB/s for 4 intervals, then stops
+        return [meter.add(files, now=now) for now, files in samples]
 
-        # The poll loop samples every interval whether or not bytes moved.
-        rates = []
-        for i in range(8):
-            now = t + i * interval
-            bytes_written = min(i * 50_000_000, 4 * 50_000_000)
-            rates.append(meter.add({"payload": bytes_written}, now=now))
-
-        # The last byte lands on the tick `last_byte_at` names: the meter is
-        # still reporting traffic there, and only bottoms out afterwards.
-        assert last_byte_at == t + 4 * interval
-        assert rates[4] > 0.0, "the rate must not reach 0 before the transfer stops"
-        assert rates[-1] == 0.0, "speed must reach 0 within ~window of the last byte"
-
-    def test_speed_meter_reports_true_mean_over_the_window(self):
-        """The reported rate is bytes/second over the window, not a blend."""
-        from omlx.admin.hf_downloader import _SpeedMeter
-
-        meter = _SpeedMeter(window=3.0)
-        t = 50.0
-        # Steady 10 MB/s sampled every second.
-        for i in range(6):
-            rate = meter.add({"payload": i * 10_000_000}, now=t + i * 1.0)
-        # Window spans 3s of history -> exactly the true rate.
-        assert abs(rate - 10_000_000) < 1_000_000
-
-    def test_speed_meter_survives_a_truncated_file(self):
-        """A truncated file must not poison the window with a negative
-        delta (which would freeze the display), and its refill must count
-        as real growth from the new, smaller baseline."""
-        from omlx.admin.hf_downloader import _SpeedMeter
-
-        meter = _SpeedMeter(window=2.0)
-        t = 10.0
-        meter.add({"f": 100_000_000}, now=t)  # baseline: everything is new
-        meter.add({"f": 100_000_000}, now=t + 1)  # idle at full size
-        after_shrink = meter.add({"f": 50_000_000}, now=t + 2)
-        assert after_shrink == 0.0, "a truncation is not transfer"
-        # Refill to 150M from the 50M baseline: 100M of genuine growth
-        # must surface, not be suppressed by the stale 100M size.
-        recovered = meter.add({"f": 150_000_000}, now=t + 3)
-        assert recovered > 0
-
-    def test_speed_meter_ignores_bytes_that_reappear_wholesale(self):
-        """Resume must not read the previously downloaded bytes as fresh
-        transfer. Cleanup racing the retry can make one walk come back
-        empty (temp wiped, rglob aborted); the next complete walk then
-        sees the whole tree again. The old aggregate window re-anchored on
-        the empty sample and reported the reappearance as the entire prior
-        download arriving within one window — a multi-GB/s spike for a
-        second. File-level continuity: forgotten paths start at zero."""
-        from omlx.admin.hf_downloader import _SpeedMeter
-
-        meter = _SpeedMeter(window=1.0)
-        t = 100.0
-        full = {"a": 27_000_000_000, "b": 1_000_000_000}
-        meter.add(full, now=t)  # prime: everything is new -> no growth
-        assert meter.add(dict(full), now=t + 0.5) == 0.0  # idle at full size
-        assert meter.add({}, now=t + 1.0) == 0.0  # wiped / aborted walk
-        reappeared = meter.add(dict(full), now=t + 1.5)  # tree back in full
-        assert reappeared == 0.0, "reappearing bytes are not new transfer"
-
-    def test_speed_meter_ignores_a_file_first_seen_at_full_size(self):
-        """A file moved/copied into the tree wholesale is not transfer,
-        but once it is under watch its real growth still counts."""
-        from omlx.admin.hf_downloader import _SpeedMeter
-
-        meter = _SpeedMeter(window=1.0)
-        t = 0.0
-        base = {"x": 1_000_000}
-        meter.add(dict(base), now=t)
-        assert meter.add(dict(base), now=t + 0.5) == 0.0
-        moved_in = {"x": 1_000_000, "y": 5_000_000_000}
-        assert meter.add(moved_in, now=t + 1.0) == 0.0, (
-            "first sight at full size must not count"
-        )
-        grown = {"x": 1_000_000, "y": 5_000_100_000}
-        assert meter.add(grown, now=t + 1.5) > 0, (
-            "growth of a tracked file still counts"
-        )
-
-    def test_speed_meter_prime_after_a_partial_walk_does_not_spike(self):
-        """The retry's baseline scan can abort mid-way (cleanup race).
-        A prime of nothing followed by a complete walk must read 0, not
-        the whole model's bytes divided by one poll interval."""
-        from omlx.admin.hf_downloader import _SpeedMeter
-
-        meter = _SpeedMeter(window=1.0)
-        meter.add({}, now=0.0)  # walk aborted at prime time
-        rate = meter.add({"model": 20_000_000_000}, now=0.5)
-        assert rate == 0.0
+    @pytest.mark.parametrize(
+        "window, samples, expected",
+        [
+            pytest.param(
+                2.0,
+                [(i * 1.0, {"payload": min(i * 50_000_000, 4 * 50_000_000)})
+                 for i in range(8)],
+                {4: _POSITIVE, 7: 0.0},
+                id="a-stopped-transfer-settles-to-zero-within-the-window",
+            ),
+            pytest.param(
+                3.0,
+                [(i * 1.0, {"payload": i * 10_000_000}) for i in range(6)],
+                {5: pytest.approx(10_000_000, abs=1_000_000)},
+                id="the-window-reports-the-true-mean",
+            ),
+            pytest.param(
+                2.0,
+                [(0, {"f": 100_000_000}), (1, {"f": 100_000_000}),
+                 (2, {"f": 50_000_000}), (3, {"f": 150_000_000})],
+                {2: 0.0, 3: _POSITIVE},
+                id="a-truncation-is-not-transfer",
+            ),
+            pytest.param(
+                1.0,
+                [(0, {"a": 27_000_000_000, "b": 1_000_000_000}),
+                 (0.5, {"a": 27_000_000_000, "b": 1_000_000_000}),
+                 (1.0, {}),  # wiped / aborted walk
+                 (1.5, {"a": 27_000_000_000, "b": 1_000_000_000})],
+                {1: 0.0, 2: 0.0, 3: 0.0},
+                id="bytes-that-reappear-wholesale-are-not-transfer",
+            ),
+            pytest.param(
+                1.0,
+                [(0, {"x": 1_000_000}), (0.5, {"x": 1_000_000}),
+                 (1.0, {"x": 1_000_000, "y": 5_000_000_000}),
+                 (1.5, {"x": 1_000_000, "y": 5_000_100_000})],
+                {2: 0.0, 3: _POSITIVE},
+                id="a-file-first-seen-at-full-size-is-not-transfer",
+            ),
+            pytest.param(
+                1.0,
+                [(0.0, {}), (0.5, {"model": 20_000_000_000})],
+                {1: 0.0},
+                id="a-partial-prime-walk-does-not-spike",
+            ),
+        ],
+    )
+    def test_speed_meter(self, window, samples, expected):
+        """The fixed window bottoms out at 0, reports the true mean, and
+        never counts bytes it has not watched grow (first sight, truncation,
+        a tree that reappeared after an aborted walk)."""
+        rates = self._meter_rates(window, samples)
+        for tick, want in expected.items():
+            assert rates[tick] == want, f"tick {tick}"
 
     def test_only_the_transfer_bar_feeds_the_wire_counter(self):
         """Wire bytes come from xet's network-transfer bar alone.
@@ -4004,7 +3973,13 @@ class TestDownloadSpeed:
 
 class TestProgressFromWire:
     """Reported bytes must not freeze at the small files while xet's fetch
-    phase moves the payload over the network before any disk write."""
+    phase moves the payload over the network before any disk write.
+
+    One row per contract: the wire leads a fresh transfer, a resume adds the
+    wire delta on top of the on-disk baseline, and the reconstruction phase
+    never reports below the disk. A step's (download, progress) pair is exact
+    unless the contract is a floor (`>=`).
+    """
 
     @pytest.fixture
     def model_dir(self, tmp_path):
@@ -4012,9 +3987,46 @@ class TestProgressFromWire:
         d.mkdir()
         return d
 
+    @pytest.mark.parametrize(
+        "disk, preload, steps",
+        [
+            pytest.param(
+                _DownloadActivity(),  # fetch: the disk stays silent
+                0,
+                [(2_500_000, 2_500_000, 25.0, True),
+                 (9_500_000, 10_000_000, 99.0, True)],
+                id="the-wire-leads-a-fresh-transfer",
+            ),
+            pytest.param(
+                # A resumed download: earlier files are already on disk.
+                _DownloadActivity(
+                    file_count=1,
+                    logical_size=6_000_000,
+                    allocated_size=6_000_000,
+                    latest_mtime_ns=1,
+                    files={"big.safetensors": 6_000_000},
+                ),
+                0,
+                [(1_000_000, 7_000_000, 70.0, True),
+                 (2_000_000, 8_000_000, 80.0, False)],
+                id="a-resume-adds-the-wire-delta-to-the-disk-baseline",
+            ),
+            pytest.param(
+                _DownloadActivity(
+                    file_count=1,
+                    logical_size=8_000_000,
+                    allocated_size=8_000_000,
+                    latest_mtime_ns=1,
+                ),
+                2_000_000,  # fetch delivered only part over the wire
+                [(0, 8_000_000, 80.0, False)],
+                id="reconstruction-keeps-the-disk-reading",
+            ),
+        ],
+    )
     @pytest.mark.asyncio
-    async def test_fetch_phase_progress_follows_the_wire(
-        self, model_dir, monkeypatch
+    async def test_reported_bytes_follow_the_leading_stage(
+        self, model_dir, monkeypatch, disk, preload, steps
     ):
         from omlx.admin.hf_downloader import _WireCounter
 
@@ -4027,115 +4039,27 @@ class TestProgressFromWire:
         )
         downloader._tasks[task.task_id] = task
         counter = _WireCounter()
-        with patch.object(
-            downloader,
-            "_get_download_activity",
-            return_value=_DownloadActivity(),  # fetch: the disk stays silent
-        ):
-            poll = start_poll(monkeypatch, downloader, task, model_dir, wire=counter)
-            counter.add(2_500_000)
-            await asyncio.sleep(0.05)  # several poll iterations
-
-            # The wire stage leads: 25% instead of a frozen 0%.
-            assert task.downloaded_size == 2_500_000
-            assert task.progress == 25.0
-
-            # The wire may pass the size estimate (retries, protocol
-            # overhead): the report caps at the estimate, and 100% stays
-            # reserved for snapshot_download's completion write.
-            counter.add(9_500_000)
-            await asyncio.sleep(0.05)
-            assert task.downloaded_size == 10_000_000
-            assert task.progress == 99.0
-
-            task.status = DownloadStatus.COMPLETED
-            await poll
-
-    @pytest.mark.asyncio
-    async def test_resume_adds_the_wire_delta_to_the_on_disk_baseline(
-        self, model_dir, monkeypatch
-    ):
-        """A resumed download re-fetches only the missing bytes, so its wire
-        counter starts at zero while the disk already holds earlier files.
-        The report must add that delta on top of the on-disk baseline:
-        max(disk, wire) alone parks on the disk figure for the whole fetch
-        phase — the freeze this class exists to prevent."""
-        from omlx.admin.hf_downloader import _WireCounter
-
-        downloader = HFDownloader(model_dir=str(model_dir))
-        task = DownloadTask(
-            task_id="t-resume",
-            repo_id="owner/model",
-            status=DownloadStatus.DOWNLOADING,
-            total_size=10_000_000,
-        )
-        downloader._tasks[task.task_id] = task
-        counter = _WireCounter()
-        resumed = _DownloadActivity(
-            file_count=1,
-            logical_size=6_000_000,
-            allocated_size=6_000_000,
-            latest_mtime_ns=1,
-            files={"big.safetensors": 6_000_000},
-        )
+        counter.add(preload)
 
         with patch.object(
-            downloader, "_get_download_activity", return_value=resumed
+            downloader, "_get_download_activity", return_value=disk
         ):
-            poll = start_poll(monkeypatch, downloader, task, model_dir, wire=counter)
-            counter.add(1_000_000)
-            await asyncio.sleep(0.05)
-            assert task.downloaded_size == 7_000_000
-            assert task.progress == 70.0
-
-            counter.add(2_000_000)
-            await asyncio.sleep(0.05)
-            # The wire adds the bytes the disk has not caught up with; the
-            # on-disk reading is the floor, never regressed by stale wire
-            # bytes, and the total caps the report.
-            assert task.downloaded_size >= 8_000_000
-            assert task.progress >= 80.0
-
-            task.status = DownloadStatus.COMPLETED
-            await poll
-
-    @pytest.mark.asyncio
-    async def test_reconstruction_phase_keeps_the_disk_reading(
-        self, model_dir, monkeypatch
-    ):
-        """Once the transfer bar stops (fetch done) the disk leads: wire
-        bytes never push the report below the on-disk size."""
-        from omlx.admin.hf_downloader import _WireCounter
-
-        downloader = HFDownloader(model_dir=str(model_dir))
-        task = DownloadTask(
-            task_id="t-disk",
-            repo_id="owner/model",
-            status=DownloadStatus.DOWNLOADING,
-            total_size=10_000_000,
-        )
-        downloader._tasks[task.task_id] = task
-        counter = _WireCounter()
-        counter.add(2_000_000)  # fetch delivered only part over the wire
-        on_disk = _DownloadActivity(
-            file_count=1,
-            logical_size=8_000_000,
-            allocated_size=8_000_000,
-            latest_mtime_ns=1,
-        )
-
-        with patch.object(
-            downloader, "_get_download_activity", return_value=on_disk
-        ):
-            poll = start_poll(monkeypatch, downloader, task, model_dir, wire=counter)
-            await asyncio.sleep(0.05)
-
-            # The wire adds the bytes the disk has not caught up with; the
-            # on-disk reading is the floor, never regressed by stale wire
-            # bytes, and the total caps the report.
-            assert task.downloaded_size >= 8_000_000
-            assert task.progress >= 80.0
-
+            poll = start_poll(
+                monkeypatch, downloader, task, model_dir, wire=counter
+            )
+            for added, size, progress, exact in steps:
+                counter.add(added)
+                await asyncio.sleep(0.05)  # several poll iterations
+                # The wire may pass the size estimate (retries, protocol
+                # overhead) and stale wire bytes must never pull the report
+                # below the disk: the total caps it and 100% stays reserved
+                # for snapshot_download's completion write.
+                if exact:
+                    assert task.downloaded_size == size
+                    assert task.progress == progress
+                else:
+                    assert task.downloaded_size >= size
+                    assert task.progress >= progress
             task.status = DownloadStatus.COMPLETED
             await poll
 
