@@ -53,11 +53,17 @@ API_PROTOCOLS = ("openai-responses", "openai-completions", "anthropic-messages")
 # `open` forwards the environment to the app, and the app resolves its profile
 # from these — a shell started *inside* a harness session exports them, which
 # would bring the app up on the wrong home than the one just configured.
+# `DSH_PROFILE` and `DSH_PROFILE_DIR` are the profile pair 0.2 exports in every
+# shell call (the profile's name and its directory): a shell started from
+# `dsh web` carries `web`, and the app would come up on that profile rather
+# than the `desktop` one the route was just written into.
 _DSH_LAUNCH_ENV_SCRUB = (
     "DSH_HOME",
     "DSH_SESSION_ID",
     "DSH_SESSION_JSONL",
     "DSH_SHELL",
+    "DSH_PROFILE",
+    "DSH_PROFILE_DIR",
 )
 
 _PATCH_ENTRY_HEADER = (

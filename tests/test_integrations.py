@@ -2349,7 +2349,14 @@ class TestDshIntegration:
             "open",
             "/Applications/DeepSeek Harness.app",
         ]
-        for key in ("DSH_HOME", "DSH_SESSION_ID", "DSH_SESSION_JSONL", "DSH_SHELL"):
+        for key in (
+            "DSH_HOME",
+            "DSH_SESSION_ID",
+            "DSH_SESSION_JSONL",
+            "DSH_SHELL",
+            "DSH_PROFILE",
+            "DSH_PROFILE_DIR",
+        ):
             assert key not in calls["env"]
 
 
