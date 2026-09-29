@@ -140,9 +140,18 @@ def test_supports_gating():
     assert not nax.supports(x.astype(mx.float32), w4, s64, s64, idx, 64, 4, "affine")
     assert not nax.supports(x, w4, s64.astype(mx.float16), s64, idx, 64, 4, "affine")
     assert not nax.supports(x, w4, s64, None, idx, 64, 4, "affine")
-    # Unsupported bit widths / modes / group sizes.
+    # 3-bit affine: 8 values per 3 bytes, straddling the loader's words.
     w3 = mx.zeros((E, N, K * 3 // 32), dtype=mx.uint32)
-    assert not nax.supports(x, w3, s64, s64, idx, 64, 3, "affine")
+    s32 = mx.zeros((E, N, K // 32), dtype=mx.bfloat16)
+    s128 = mx.zeros((E, N, K // 128), dtype=mx.bfloat16)
+    assert nax.supports(x, w3, s64, s64, idx, 64, 3, "affine")
+    assert nax.supports(x, w3, s32, s32, idx, 32, 3, "affine")
+    assert nax.supports(x, w3, s128, s128, idx, 128, 3, "affine")
+    # Unsupported bit widths / modes / group sizes.
+    w5 = mx.zeros((E, N, K * 5 // 32), dtype=mx.uint32)
+    assert not nax.supports(x, w5, s64, s64, idx, 64, 5, "affine")
+    assert not nax.supports(x, w3, s64, None, idx, 64, 3, "affine")
+    assert not nax.supports(x, w3, s64.astype(mx.float32), s64, idx, 64, 3, "affine")
     assert not nax.supports(x, w4, s32u8, None, idx, 32, 4, "nvfp4")
     s16 = mx.zeros((E, N, K // 16), dtype=mx.uint8)
     assert not nax.supports(x, w4, s16, None, idx, 16, 4, "mxfp4")
@@ -243,6 +252,81 @@ def test_bit_identical_to_stock_sorted_kernel(mode, bits, gs, dtype, plan, K):
     ref = _stock_sorted(x, wq, scales, biases, idx, mode, bits, gs)
     assert out.shape == ref.shape and out.dtype == ref.dtype
     assert mx.array_equal(out, ref).item()
+
+
+# Plans 3-bit can run: bm 128 with a 64-deep K step splits the loader's
+# chunks into 16 values (48 bits, not whole uint32 words).
+_B3_PLANS = [p for p in _PLANS if not (p.bm == 128 and p.bk == 64)]
+
+
+@needs_nax
+@pytest.mark.parametrize("gs", [32, 64, 128])
+@pytest.mark.parametrize("plan", _B3_PLANS, ids=_plan_id)
+def test_bit_identical_affine_3bit(gs, plan):
+    """3-bit across every plan it accepts, both K-tail depths.
+
+    The straddling 24-bit packs are the only difference from 4/8-bit: the
+    dequantized values and tensor-op order must match mlx's b_3 kernel
+    bit-for-bit.
+    """
+    E, N = len(_COUNTS), 128
+    for K in (256, 384):
+        wq, scales, biases, _ = _quantized(E, N, K, "affine", 3, gs, mx.bfloat16)
+        x, idx = _rows(_COUNTS, K, mx.bfloat16)
+        out = _nax(x, wq, scales, biases, idx, "affine", 3, gs, plan)
+        ref = _stock_sorted(x, wq, scales, biases, idx, "affine", 3, gs)
+        assert mx.array_equal(out, ref).item(), f"gs={gs} K={K} {plan}"
+
+
+@needs_nax
+def test_affine_3bit_rejects_unaligned_loader_chunks():
+    """bm 128 x bk 64 gives 16-value (48-bit) chunks: declined, no
+    compile attempt, the caller keeps the stock path."""
+    E, N, K = 4, 128, 256
+    wq, scales, biases, _ = _quantized(E, N, K, "affine", 3, 64, mx.bfloat16)
+    x, idx = _rows(_COUNTS[:E], K, mx.bfloat16)
+    for plan in [p for p in _PLANS if p.bm == 128 and p.bk == 64]:
+        assert (
+            nax.sorted_gather_qmm(
+                x, wq, scales, biases, idx, group_size=64, bits=3, plan=plan
+            )
+            is None
+        )
+        assert (
+            nax.sorted_gather_qmm_swiglu(
+                x, wq, scales, biases, idx, group_size=64, bits=3, plan=plan
+            )
+            is None
+        )
+
+
+@needs_nax
+@pytest.mark.parametrize("K", [96, 544])
+def test_affine_3bit_ragged_k_matches_fp32_reference(K):
+    """K % 64 == 32: the tail packs read exactly to the row's last byte."""
+    E, N = len(_COUNTS), 128
+    wq, scales, biases, wd = _quantized(E, N, K, "affine", 3, 32, mx.bfloat16)
+    x, idx = _rows(_COUNTS, K, mx.bfloat16)
+    out = _nax(x, wq, scales, biases, idx, "affine", 3, 32)
+    ref = _fp32_ref(x, wd, idx)
+    err = mx.abs(out.astype(mx.float32) - ref)
+    tol = mx.abs(ref) * 2.0**-7 + 1e-3
+    assert mx.all(err <= tol).item(), f"max err {err.max().item()}"
+
+
+@needs_nax
+def test_affine_3bit_tail_never_reads_past_the_row():
+    """NaN past the last expert's last byte must not reach the output."""
+    E, N, K = 4, 64, 96
+    wq, scales, biases, wd = _quantized(E, N, K, "affine", 3, 32, mx.bfloat16)
+    nan = mx.full((64,), float("nan"), dtype=mx.bfloat16)
+    s_view = mx.concatenate([scales.reshape(-1), nan])[: scales.size].reshape(scales.shape)
+    b_view = mx.concatenate([biases.reshape(-1), nan])[: biases.size].reshape(biases.shape)
+    x, idx = _rows((0, 0, 0, 40), K, mx.bfloat16)
+    out = _nax(x, wq, s_view, b_view, idx, "affine", 3, 32)
+    assert not mx.any(mx.isnan(out)).item()
+    ref = _fp32_ref(x, wd, idx)
+    assert mx.abs(out.astype(mx.float32) - ref).max().item() < 0.05
 
 
 @needs_nax
@@ -540,6 +624,21 @@ def test_self_test_passes_for_supported_instantiations(plan):
         assert nax._self_test(full) is True, full
 
 
+@needs_nax
+@pytest.mark.parametrize("plan", _B3_PLANS, ids=_plan_id)
+def test_self_test_passes_affine_3bit(plan):
+    """Every accepted 3-bit instantiation passes its own canary: aligned K
+    against mlx's b_3 sorted kernel, ragged K against fp32."""
+    for align_n, align_k in [(True, True), (False, True), (True, False)]:
+        if plan.sched == DB and not (align_n and align_k):
+            continue
+        for gs in (32, 64, 128):
+            if nax._canary_k(plan, align_k) % gs:
+                continue  # canary K not divisible by the group size
+            key = (mx.bfloat16, "affine", 3, gs, plan, align_n, align_k)
+            assert nax._self_test(key) is True, key
+
+
 # ---------------------------------------------------------------------------
 # Gate/up SwiGLU epilogue (sorted_gather_qmm_swiglu)
 # ---------------------------------------------------------------------------
@@ -549,6 +648,7 @@ _EPI_FORMATS = [
     ("mxfp4", 4, 32, mx.bfloat16),  # MiMo-V2.6
     ("affine", 4, 32, mx.bfloat16),
     ("affine", 8, 64, mx.float16),
+    ("affine", 3, 64, mx.bfloat16),
 ]
 # Every pinned plan on the main format, the other formats on the automatic
 # plan. Each runtime instantiation also runs its own canary.
