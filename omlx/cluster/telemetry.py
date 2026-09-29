@@ -1479,18 +1479,20 @@ def install_server_telemetry(
             # its writes; it runs later on this same generation thread.
             snapshot_ctx.model = model
             snapshot_ctx.prompt = list(tokens)
-            if ssd_store is not None:
-                # The collective is taken on every request, hit or miss, so all
-                # ranks reach it the same number of times regardless of their
-                # in-memory state; the agreed boundary is only used when the
-                # in-memory tier missed. This is what lets SSD serve the batched
-                # path, whose byte-based eviction can diverge across ranks.
+            cache, rest = agree_prompt_cache_plan(cache, tokens, rest)
+            if ssd_store is not None and len(rest) == len(tokens):
+                # Memory agreement makes this branch uniform across ranks,
+                # including when only one rank had a hit or an invalid offset.
+                # A rejected memory hit must not suppress a usable SSD prefix.
+                cache = None
                 boundary = agree_ssd_boundary(model, tokens)
-                if cache is None and boundary > 0:
+                if boundary > 0:
                     loaded = ssd_store.load(model, tokens, boundary)
                     if loaded is not None:
                         cache, rest = loaded, list(tokens[boundary:])
-            cache, rest = agree_prompt_cache_plan(cache, tokens, rest)
+                    # A file may disappear or fail to restore after the vote.
+                    # No rank may proceed until restored offsets agree too.
+                    cache, rest = agree_prompt_cache_plan(cache, tokens, rest)
             entries, nbytes = self._omlx_cache_inventory()
             telemetry.observe_cache_lookup(
                 prompt_tokens=len(tokens),
