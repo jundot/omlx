@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Join recovery across process restarts and unreachable coordinators."""
 
+import errno
 import json
+import socket
 import stat
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -228,3 +230,38 @@ def test_superseded_proof_cannot_remove_new_peer_request(tmp_path):
     assert joiner.ui_session.cancel()["state"] == "idle"
     assert not joiner.ui_session.withdrawals
     assert coordinator._pending[joiner.node_id] is new_request
+
+
+@pytest.mark.parametrize("reason", [
+    ConnectionRefusedError(errno.ECONNREFUSED, "refused"),
+    socket.gaierror(socket.EAI_NONAME, "unknown host"),
+])
+def test_failed_initial_connection_does_not_require_remote_cleanup(tmp_path, reason):
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+    original = joiner._http_post
+    def fail(*args):
+        raise URLError(reason)
+    joiner._http_post = fail
+    with pytest.raises(PairingRequestError):
+        joiner.ui_session.begin("coordinator:8000")
+    assert not coordinator.pending_requests()
+    assert "cancel_token" not in joiner.ui_session.attempt
+    restored = _restart(tmp_path, joiner)
+    calls = []
+    def retry(url, payload, timeout):
+        calls.append(url)
+        return original(url, payload, timeout)
+    restored._http_post = retry
+    assert restored.ui_session.begin("coordinator:8000")["state"] == "awaiting_approval"
+    assert calls == ["http://coordinator:8000/api/cluster/pair/request"]
+
+
+@pytest.mark.parametrize("reason", [TimeoutError("timeout"), ConnectionResetError("reset")])
+def test_ambiguous_transport_failures_keep_cancellation_proof(tmp_path, reason):
+    _, joiner, *_ = _loopback_pair(tmp_path)
+    def fail(*args):
+        raise URLError(reason)
+    joiner._http_post = fail
+    with pytest.raises(PairingRequestError):
+        joiner.ui_session.begin("coordinator:8000")
+    assert joiner.ui_session.attempt.get("cancel_token")
