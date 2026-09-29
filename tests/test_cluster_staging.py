@@ -802,5 +802,3 @@ def test_remote_default_uses_published_worker_shim(monkeypatch):
         == {}
     )
     assert commands[0][-1].startswith(CLUSTER_PYTHON_SHIM + " -c ")
-
-
