@@ -18,9 +18,7 @@ def repair_tool_parser(tokenizer: Any) -> str | None:
     """
     from mlx_lm import tokenizer_utils
 
-    TokenizerWrapper = tokenizer_utils.TokenizerWrapper
-
-    if not isinstance(tokenizer, TokenizerWrapper):
+    if not isinstance(tokenizer, tokenizer_utils.TokenizerWrapper):
         return None
     parser = tokenizer.tool_parser
     if getattr(parser, "__module__", None) != "mlx_lm.tool_parsers.json_tools":
