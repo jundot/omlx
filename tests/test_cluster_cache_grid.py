@@ -97,3 +97,43 @@ def test_queued_unaligned_prefix_does_not_shrink_active_prefill(monkeypatch, tmp
         assert responses[0].progress[0] == 8
         assert batch.prefill_step_size == 4
         batch.close()
+
+
+@pytest.mark.parametrize(
+    "case", ["completion_capacity", "terminal_token", "freed_capacity"]
+)
+def test_only_admitted_nonterminal_prompts_limit_step(monkeypatch, tmp_path, case):
+    monkeypatch.setattr(
+        mx.distributed, "init", lambda: SimpleNamespace(size=lambda: 1, rank=lambda: 0)
+    )
+    marker = SimpleNamespace(update=lambda *a, **k: None)
+    model = Model()
+    with install_server_telemetry(
+        marker,
+        heartbeat_interval=0,
+        prefill_step_size=4,
+        ssd_cache_dir=str(tmp_path),
+        ssd_cache_persistent=True,
+    ):
+        batch = server.BatchGenerator(
+            model,
+            max_tokens=1 if case == "freed_capacity" else 10,
+            prefill_step_size=4,
+            completion_batch_size=2,
+            prefill_batch_size=2,
+        )
+        if case in ("completion_capacity", "freed_capacity"):
+            batch.insert_segments(segments=[[[0]]], all_tokens=[[]])
+            batch.next()
+        else:
+            batch.insert_segments(segments=[[[3]]], all_tokens=[[0, 1, 2]])
+        uid = batch.insert_segments(segments=[[list(range(13))]], all_tokens=[[]])[0]
+        if case in ("completion_capacity", "freed_capacity"):
+            batch.insert_segments(
+                segments=[[list(range(3, 13))]], all_tokens=[[0, 1, 2]]
+            )
+        responses, _ = batch.next()
+        response = next(response for response in responses if response.uid == uid)
+        assert response.progress[0] == (1 if case == "freed_capacity" else 4)
+        assert batch.prefill_step_size == 4
+        batch.close()

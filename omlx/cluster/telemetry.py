@@ -1412,29 +1412,36 @@ def install_server_telemetry(
             if getattr(response, "end_of_prompt", False):
                 self._omlx_tokens.pop(uid, None)
 
+        def _omlx_align_prefill_step(self, sequences) -> None:
+            if ssd_store is None:
+                return
+            step = min(self.prefill_step_size, snapshot_step)
+            for uid, segments in sequences:
+                # MLX-LM moves these directly to generation before prefill.
+                if len(segments) == 1 and len(segments[0]) == 1:
+                    continue
+                full = self._omlx_tokens.get(uid)
+                if full is not None:
+                    position = len(full) - sum(map(len, segments))
+                    step = min(step, snapshot_step - position % snapshot_step)
+            self.prefill_step_size = step
+
+        def _make_batch(self, n):
+            # Use the actual admission count, after generation frees capacity.
+            self._omlx_align_prefill_step(
+                (state[0], state[1]) for state in islice(self._unprocessed_sequences, n)
+            )
+            return super()._make_batch(n)
+
         def next(self) -> Any:
             started = time.perf_counter()
             original_step = getattr(self, "prefill_step_size", None)
             if ssd_store is not None and original_step is not None:
-                # Message segments can end between SSD boundaries. Shorten the
-                # next chunk to reach the global grid, preserving each segment.
-                step = min(original_step, snapshot_step)
                 active = zip(
                     getattr(getattr(self, "_prompt_batch", None), "uids", ()),
                     getattr(self, "_currently_processing", ()),
                 )
-                sequences = [(uid, state[0]) for uid, state in active]
-                # Only newly admitted prompts can affect this step. A queued
-                # request with an unaligned prefix must not shrink every chunk.
-                slots = max(0, self.prefill_batch_size - len(sequences))
-                pending = islice(self._unprocessed_sequences, slots)
-                sequences.extend((state[0], state[1]) for state in pending)
-                for uid, segments in sequences:
-                    full = self._omlx_tokens.get(uid)
-                    if full is not None:
-                        position = len(full) - sum(map(len, segments))
-                        step = min(step, snapshot_step - position % snapshot_step)
-                self.prefill_step_size = step
+                self._omlx_align_prefill_step((uid, state[0]) for uid, state in active)
             try:
                 prompt_responses, generation_responses = super().next()
             finally:
