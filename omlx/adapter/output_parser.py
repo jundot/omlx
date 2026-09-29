@@ -1312,6 +1312,9 @@ def detect_output_parser(
     filesystem path is available so parser sessions can locate
     tokenizer.json for their streaming detokenizers.
     """
+    from ..utils.tool_parser import repair_tool_parser
+
+    repair_tool_parser(tokenizer)
     session_model_path = model_path or model_name
 
     model_type = model_config.get("model_type") if model_config else None
