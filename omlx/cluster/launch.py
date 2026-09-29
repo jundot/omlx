@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 _EVENT_PREFIX = "OMLX_CLUSTER_EVENT:"
 _LOG_LINE_LIMIT = 8192
 _LOG_HISTORY = 200
+_FAILURE_OUTPUT_GRACE_SECONDS = 2.0
 _REMOTE_OUTPUT_LIMIT = 64 * 1024
 _FABRIC_INTERFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 _DEFAULT_CONNECTX_MIN_BYTES_PER_SECOND = 2 * 1024**3
@@ -2882,12 +2883,15 @@ class DistributedJobSupervisor:
                 or len(self.rank_ready_events) < self.deployment.world_size
             ):
                 if self.failure_event is not None:
+                    if self.failure_event.get("type") == "rank_exit":
+                        self._wait_for_launcher_output()
                     raise DistributedLaunchError(self._failure_detail())
                 process = self.process
                 if process is None:
                     raise DistributedLaunchError("launcher disappeared")
                 returncode = process.poll()
                 if returncode is not None:
+                    self._wait_for_launcher_output()
                     raise DistributedLaunchError(self._exit_detail(returncode))
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -3335,12 +3339,32 @@ class DistributedJobSupervisor:
         value = event.get("reason") or event.get("error")
         return str(value)[:_LOG_LINE_LIMIT] if value else None
 
+    def _wait_for_launcher_output(self) -> None:
+        """Let a failing launcher flush rank output. Caller holds ``_condition``.
+
+        mlx.launch prints a rank exit from that rank's thread but forwards the
+        rank's own stderr through a queue, so the exit line can arrive first.
+        """
+
+        deadline = time.monotonic() + _FAILURE_OUTPUT_GRACE_SECONDS
+        while any(reader.is_alive() for reader in self._readers):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            self._condition.wait(timeout=min(remaining, 0.1))
+
     def _failure_detail(self) -> str:
         reason = self._failure_reason()
         event_type = str((self.failure_event or {}).get("type") or "worker failure")
-        return (
+        detail = (
             f"distributed worker reported {event_type}: {reason or 'unknown failure'}"
         )
+        if event_type == "rank_exit":
+            # A rank that fails before its marker exists leaves only stderr.
+            lines = tuple(self._stderr)[-20:]
+            if lines:
+                detail += "\n" + "\n".join(lines)
+        return detail
 
     def status(self) -> DistributedJobStatus:
         process = self.process

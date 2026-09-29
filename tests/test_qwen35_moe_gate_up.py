@@ -369,3 +369,57 @@ def test_expert_ordered_verify_gather_matches_gather_qmm(bits):
             ).reshape(rows * top_k, n)
             got = moe_verify_gather.gather_qmv(linear, x, indices.reshape(-1), top_k)
             assert mx.array_equal(got, expected).item()
+
+
+def _vlm_decode_switch(bits, seed):
+    from mlx_vlm.models.switch_layers import SwitchGLU as VLMSwitchGLU
+
+    mx.random.seed(seed)
+    glu = VLMSwitchGLU(2560, 640, 16)
+    glu.set_dtype(mx.bfloat16)
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        setattr(glu, name, getattr(glu, name).to_quantized(64, bits))
+    glu.eval()
+    model = _FakeQwen4Model()
+    model.named_modules = lambda: [("experts", glu)]
+    assert apply_qwen35_moe_gate_up_fusion(model) == 1
+    return glu
+
+
+def _assert_decode_plan_matches_per_call(monkeypatch, glu, seed):
+    mx.random.seed(seed)
+    for batch in (1, 3):
+        x = (mx.random.normal((batch, 1, 2560)) * 0.5).astype(mx.bfloat16)
+        idx = mx.random.randint(0, 16, shape=(batch, 1, 10)).astype(mx.uint32)
+        monkeypatch.setattr(patch_mod, "_DECODE_PLAN_ENABLED", False)
+        ref = glu(x, idx)
+        mx.eval(ref)
+        monkeypatch.setattr(patch_mod, "_DECODE_PLAN_ENABLED", True)
+        out = glu(x, idx)
+        mx.eval(out)
+        assert out.shape == ref.shape and out.dtype == ref.dtype == mx.bfloat16
+        assert mx.array_equal(out.view(mx.uint16), ref.view(mx.uint16)).item()
+
+
+@pytest.mark.parametrize("bits", [4, 5])
+@pytest.mark.parametrize("seed", [1, 2])
+def test_vlm_decode_plan_is_bit_identical_to_per_call_path(monkeypatch, bits, seed):
+    glu = _vlm_decode_switch(bits, seed)
+    _assert_decode_plan_matches_per_call(monkeypatch, glu, seed)
+
+
+def test_vlm_decode_plan_follows_replaced_experts(monkeypatch):
+    from mlx_vlm.models.switch_layers import SwitchLinear as VLMSwitchLinear
+
+    glu = _vlm_decode_switch(5, 3)
+    _assert_decode_plan_matches_per_call(monkeypatch, glu, 3)
+    down = VLMSwitchLinear(640, 2560, 16, bias=False)
+    down.set_dtype(mx.bfloat16)
+    glu.down_proj = down.to_quantized(64, 4)
+    _assert_decode_plan_matches_per_call(monkeypatch, glu, 4)
+    gate_up = glu.gate_up_proj
+    gate_up.weight = mx.random.randint(
+        0, 2**32 - 1, gate_up.weight.shape, dtype=mx.uint32
+    )
+    gate_up.scales = (gate_up.scales * 0.5).astype(gate_up.scales.dtype)
+    _assert_decode_plan_matches_per_call(monkeypatch, glu, 5)

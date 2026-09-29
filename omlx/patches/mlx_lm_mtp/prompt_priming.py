@@ -898,6 +898,28 @@ def retain_batch_head_history(batch, owner):
         registry.uids[uid] = (ctx, None)
 
 
+def retain_parked_head_history(model, uid, mtp_cache, folded, pending_hidden, cache):
+    """Keep a parked singleton's committed head history for its re-entry probe.
+
+    ``pending_hidden`` is the head input of the token the park handoff just
+    fed, so the next ordinary decode token continues the same timeline.
+    """
+    if not priming_enabled():
+        return
+    host, registry = _owned(model, create=True)
+    anchor = _anchor(cache)
+    if registry is None or anchor is None or uid in registry.uids:
+        return
+    ctx = _PrimeCtx(
+        mtp_cache=mtp_cache,
+        pending_hidden=pending_hidden,
+        folded=folded,
+        expected_offset=anchor.offset,
+        deferred_pairs=[],
+    )
+    registry.uids[uid] = (ctx, None)
+
+
 def _capture_deferred_history(host, inputs, hidden, cache):
     import mlx.core as mx
 

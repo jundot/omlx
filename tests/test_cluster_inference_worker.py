@@ -2,8 +2,10 @@
 """Fail-closed validation of the model stage loaded by a cluster rank."""
 
 import contextlib
+import inspect
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -13,13 +15,16 @@ import time
 from types import SimpleNamespace
 from typing import Any
 
+import mlx_lm.server as mlx_server
 import pytest
+from mlx_lm.generate import DEFAULT_QUANTIZED_KV_START
 
 import omlx.cluster.inference_worker as inference_worker
 from omlx.cluster.inference_worker import (
     _bind_generation_thread_stream,
     _cross_thread_generation_stream,
     _execution_settings,
+    _exit_on_generation_failure,
     _install_distributed_model_protocol,
     _server_arguments,
     _validate_loaded_stage,
@@ -318,6 +323,31 @@ def test_launcher_watchdog_records_reason_and_exits_reparented_rank():
     assert exit_codes == [1]
 
 
+def test_dead_generation_thread_records_reason_and_exits_rank():
+    updates: list[tuple[str, dict]] = []
+    events: list[dict] = []
+    calls: list[str] = []
+    marker = SimpleNamespace(
+        update=lambda phase, **extra: updates.append((phase, extra))
+    )
+    error = "AttributeError: 'SimpleNamespace' object has no attribute 'kv_bits'"
+
+    _exit_on_generation_failure(
+        marker,
+        0,
+        error,
+        emit_event=events.append,
+        release_memory=lambda _reason: calls.append("release"),
+        exit_process=lambda code: calls.append(f"exit {code}"),
+    )
+
+    reason = f"rank 0 generation thread died: {error}"
+    assert updates == [("failed", {"error": reason})]
+    # The supervisor turns any event with a reason into the job failure.
+    assert events == [{"type": "generation_failed", "reason": reason}]
+    assert calls == ["release", "exit 1"]
+
+
 def test_worker_execution_contract_reaches_mlx_lm_and_runtime_optimizations():
     args = build_parser().parse_args(
         [
@@ -373,6 +403,33 @@ def test_worker_execution_contract_reaches_mlx_lm_and_runtime_optimizations():
     assert server.pipeline is True
 
     assert _server_arguments(args, tensor_parallel_size=2).pipeline is False
+
+
+def test_server_arguments_cover_every_cli_arg_mlx_lm_server_reads():
+    # A missing attribute kills the rank's generation thread on its first
+    # request, long after the model loaded.
+    args = build_parser().parse_args(
+        [
+            "--model",
+            "org/model",
+            "--backend",
+            "ring",
+            "--port",
+            "32000",
+            "--deployment-id",
+            "dep",
+            "--plan-hash",
+            "a" * 64,
+            "--plan",
+            "{}",
+        ]
+    )
+    server = _server_arguments(args)
+    read = set(re.findall(r"cli_args\.(\w+)", inspect.getsource(mlx_server)))
+
+    assert read - set(vars(server)) == set()
+    assert server.kv_bits is None
+    assert server.quantized_kv_start == DEFAULT_QUANTIZED_KV_START
 
 
 # ---------------------------------------------------------------------------

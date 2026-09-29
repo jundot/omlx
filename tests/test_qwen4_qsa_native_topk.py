@@ -35,7 +35,10 @@ def test_qwen4_qsa_topk_symbol_is_part_of_the_extension_abi():
 )
 @pytest.mark.parametrize("blocks", [12_500, 25_000])
 def test_qwen4_qsa_topk_matches_argpartition_at_50k_100k_equivalent(blocks):
-    """50K/100K tokens at Qwen4's four-token compression ratio."""
+    """50K/100K tokens at Qwen4's four-token compression ratio.
+
+    The prefill caller skips its sort, so rows must come back ascending.
+    """
     rng = np.random.default_rng(41 + blocks)
     scores = rng.standard_normal((1, 4, blocks), dtype=np.float32)
     actual = fast.qwen4_qsa_topk_indices(mx.array(scores))
@@ -44,7 +47,7 @@ def test_qwen4_qsa_topk_matches_argpartition_at_50k_100k_equivalent(blocks):
 
     assert actual.shape == (1, 4, TOPK)
     assert actual.dtype == mx.uint32
-    assert mx.array_equal(_sorted_sets(actual), _sorted_sets(expected)).item()
+    assert mx.array_equal(actual.astype(mx.int32), _sorted_sets(expected)).item()
 
 
 @pytest.mark.skipif(

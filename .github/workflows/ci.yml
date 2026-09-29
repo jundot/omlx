@@ -15,11 +15,15 @@ permissions:
 
 jobs:
   test:
-    runs-on: macos-14
+    runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        # PRs run only the app bundle runtime; main pushes cover every supported version.
+        python-version: >-
+          ${{ github.event_name == 'pull_request'
+          && fromJSON('["3.11"]')
+          || fromJSON('["3.11", "3.12", "3.13"]') }}
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0

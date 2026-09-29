@@ -856,6 +856,13 @@ def maybe_apply_pre_load_patches(
             fixed = getattr(model_settings, "mtp_fixed_depth", None)
             if fixed:
                 set_mtp_depth(int(fixed), fixed=True)
+            elif (
+                model_type == "qwen3_5"
+                and (text_config or config).get("hidden_size") == 5120
+                and (text_config or config).get("num_hidden_layers") == 64
+            ):
+                # Qwen 27B keeps an adaptive ceiling of at least four tokens.
+                set_mtp_depth(max(4, int(depth or 4)))
             elif depth:
                 set_mtp_depth(int(depth))
             elif model_type.startswith("nemotron_h"):
