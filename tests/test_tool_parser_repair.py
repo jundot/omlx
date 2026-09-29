@@ -78,11 +78,11 @@ def test_non_mlx_wrappers_unchanged():
     assert repair_tool_parser(SimpleNamespace()) is None
 
 
-def test_marker_failure_does_not_partially_change_parser():
+def test_marker_failure_does_not_partially_change_parser(caplog):
     tokenizer = wrapper("<arg_key>")
     tokenizer._tokenizer.encode = lambda *a, **kw: []
-    with pytest.raises(ValueError, match="nonempty"):
-        repair_tool_parser(tokenizer)
+    assert repair_tool_parser(tokenizer) is None
+    assert "keeping the existing parser" in caplog.text
     assert tokenizer.tool_parser is json_tools.parse_tool_call
     assert tokenizer.tool_call_start_tokens == (1,)
 
@@ -111,3 +111,29 @@ def test_custom_template_function_is_not_overridden():
     tokenizer._chat_template = lambda *args: "custom"
     assert repair_tool_parser(tokenizer) is None
     assert tokenizer.tool_parser is json_tools.parse_tool_call
+
+
+@pytest.mark.parametrize(
+    "error", [ValueError("bad marker"), RuntimeError("encoder failed")]
+)
+def test_marker_encoding_exception_preserves_parser(error, caplog):
+    tokenizer = wrapper("<arg_key>")
+
+    def fail(*args, **kwargs):
+        raise error
+
+    tokenizer._tokenizer.encode = fail
+    assert repair_tool_parser(tokenizer) is None
+    assert tokenizer.tool_parser is json_tools.parse_tool_call
+    assert tokenizer.tool_call_start_tokens == (1,)
+    assert "keeping the existing parser" in caplog.text
+
+
+def test_missing_private_inference_api_keeps_parser(monkeypatch, caplog):
+    from mlx_lm import tokenizer_utils
+
+    monkeypatch.delattr(tokenizer_utils, "_infer_tool_parser")
+    tokenizer = wrapper("<arg_key>")
+    assert repair_tool_parser(tokenizer) is None
+    assert tokenizer.tool_parser is json_tools.parse_tool_call
+    assert "unsupported MLX-LM" in caplog.text
