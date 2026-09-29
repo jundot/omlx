@@ -710,6 +710,12 @@ def default_revocation_driver(revocation: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+class _NoPairingRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # A redirected connection failure cannot prove the POST was undelivered.
+        return None
+
+
 def _default_http_post(url: str, payload: dict[str, Any], timeout: float) -> Any:
     request = urllib.request.Request(
         url,
@@ -717,7 +723,8 @@ def _default_http_post(url: str, payload: dict[str, Any], timeout: float) -> Any
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    opener = urllib.request.build_opener(_NoPairingRedirects())
+    with opener.open(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
