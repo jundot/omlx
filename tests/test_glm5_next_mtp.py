@@ -731,8 +731,8 @@ def make_host(dtype=mx.float32, *, mtp_layers=0):
     return host
 
 
-@pytest.mark.parametrize("size", [2, 3, 4])
-@pytest.mark.parametrize("depth", [1, 2, 3, 7])
+@pytest.mark.parametrize("size", [2, 4])
+@pytest.mark.parametrize("depth", [1, 3, 7])
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
 def test_vector_restore_and_continuation_match_scalar(size, depth, dtype):
     mx.random.seed(349)

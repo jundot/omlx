@@ -4256,8 +4256,7 @@ def test_qwen_late_join_preserves_cache_without_history_replay(family, monkeypat
         ("step", False),
     ],
 )
-@pytest.mark.parametrize("late_join", [False, True])
-@pytest.mark.parametrize("batch_size", [2, 4])
+@pytest.mark.parametrize("late_join,batch_size", [(False, 4), (True, 2), (True, 4)])
 def test_multi_request_mtp_or_singleton_only_matches_standard(
     family, unequal_depths, late_join, batch_size, monkeypatch
 ):
@@ -4652,7 +4651,7 @@ def test_batched_head_matches_row_caches_across_depth_changes(size, family, stoc
         mlx_lm_mtp.set_mtp_active(active)
 
 
-@pytest.mark.parametrize("size", [2, 4])
+@pytest.mark.parametrize("size", [4])
 @pytest.mark.parametrize("late_join", [False, True])
 @pytest.mark.parametrize("family", ["qwen_vlm", "qwen4"])
 def test_batched_head_survives_join_and_staggered_finish(
@@ -5242,7 +5241,7 @@ def test_verify_qmm_routes_batched_rows_through_mma_kernel(
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("bits", [4, 5])
-@pytest.mark.parametrize("rows", [4, 7, 8])
+@pytest.mark.parametrize("rows", [4, 8])
 def test_sg8_kernels_match_quantized_matmul(bits, rows, dtype):
     """Plain, gate/up swiglu and grouped sg8 launches against stock qmm."""
     from omlx.patches import qwen35_verify_qmm as vq

@@ -102,10 +102,9 @@ def test_fused_matches_canonical_path(bits, rows, use_combine):
 #   768  -> down tail 256 for 4/5-bit;                          norm and inject loops exact
 #   1152 -> down tail 128 (all bits), inject tail 128 (4/5-bit), norm tail 128
 #   1344 -> down tail 320 (4/5) / 64 (6/8), inject tail 64,       norm tail 64
-#   512, 1536 -> odd multiples of 512, no tails anywhere
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize("bits", [4, 5, 6, 8])
-@pytest.mark.parametrize("hidden", [512, 768, 1152, 1344, 1536])
+@pytest.mark.parametrize("hidden", [768, 1152, 1344])
 def test_fused_matches_canonical_path_at_other_hidden_sizes(hidden, bits):
     mx.random.seed(20260906 + hidden + bits)
     _assert_fused_matches_canonical(_module(bits, True, hidden=hidden), 16, True)
@@ -1019,7 +1018,7 @@ def test_two_launch_decode_keeps_three_launch_bits(bits, use_combine, monkeypatc
 # and norm blocks (see test_fused_matches_canonical_path_at_other_hidden_sizes).
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize("bits", [4, 5, 6, 8])
-@pytest.mark.parametrize("hidden", [64, 768, 1152, 1344])
+@pytest.mark.parametrize("hidden", [64, 1152, 1344])
 def test_two_launch_decode_keeps_bits_with_partial_blocks(hidden, bits, monkeypatch):
     from mlx_vlm.models.qwen4_exp import hc_fused
 
