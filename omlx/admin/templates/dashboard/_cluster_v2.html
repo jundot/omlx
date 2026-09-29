@@ -375,13 +375,13 @@
                                 <label class="block text-xs font-medium text-neutral-700">
                                     <span x-text="window.t('cluster.v2.ssh_accounts.local').replace('{name}', deviceName(selfDevice()))"></span>
                                     <input type="text" x-model="sshSetup.localUser" required autocomplete="username"
-                                           autocapitalize="none" spellcheck="false" maxlength="64" pattern="[A-Za-z_][A-Za-z0-9_\-]{0,63}"
+                                           autocapitalize="none" spellcheck="false" maxlength="64" pattern="[A-Za-z_][A-Za-z0-9_.\-]{0,63}"
                                            :disabled="join.busy" class="mt-1.5 w-full rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2 text-sm focus:border-neutral-500 focus:ring-1 focus:ring-neutral-500">
                                 </label>
                                 <label class="block text-xs font-medium text-neutral-700">
                                     <span x-text="window.t('cluster.v2.ssh_accounts.remote').replace('{name}', sshSetup.target ? deviceName(sshSetup.target) : sshSetup.targetName)"></span>
                                     <input type="text" x-model="sshSetup.remoteUser" required autocomplete="off"
-                                           autocapitalize="none" spellcheck="false" maxlength="64" pattern="[A-Za-z_][A-Za-z0-9_\-]{0,63}"
+                                           autocapitalize="none" spellcheck="false" maxlength="64" pattern="[A-Za-z_][A-Za-z0-9_.\-]{0,63}"
                                            :disabled="join.busy" class="mt-1.5 w-full rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2 text-sm focus:border-neutral-500 focus:ring-1 focus:ring-neutral-500">
                                 </label>
                             </div>
@@ -391,6 +391,10 @@
                                 <button type="button" @click="sshSetup = null" :disabled="join.busy" class="rounded-lg border border-neutral-200 px-3 py-2 text-xs font-medium text-neutral-600 hover:bg-neutral-50 disabled:opacity-50">{{ t('cluster.v2.ssh_accounts.cancel') }}</button>
                             </div>
                         </form>
+                        <p class="mt-4 text-xs text-neutral-500">{{ t('cluster.v2.ssh_accounts.legacy_help') }}</p>
+                        <button type="button" @click="useLegacyPairing()" :disabled="join.busy"
+                                class="mt-2 text-xs font-medium text-neutral-600 underline disabled:opacity-50"
+                                data-cluster-v2-legacy-pairing>{{ t('cluster.v2.ssh_accounts.legacy') }}</button>
                     </section>
                 </template>
 
@@ -478,22 +482,11 @@
                                 <p class="text-xs text-neutral-600 mt-3">
                                     {{ t('cluster.v2.pairing.approval_blurb') }}
                                 </p>
-                                <div class="flex items-center gap-2 mt-2">
-                                    <input type="text" inputmode="numeric" maxlength="6"
-                                           x-model="pairing.code"
-                                           @keydown.enter="submitPairApproval(device)"
-                                           placeholder="{{ t('cluster.v2.pairing.code_placeholder') }}"
-                                           class="w-36 px-3 py-2 text-center text-lg font-mono tracking-[0.3em] border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent"
-                                           data-cluster-v2-pair-code>
-                                    <button type="button" @click="submitPairApproval(device)"
-                                            :disabled="pairing.busy"
-                                            class="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-50"
-                                            data-cluster-v2-approve>
-                                        <i data-lucide="check" class="w-3.5 h-3.5"></i>
-                                        {{ t('cluster.v2.pairing.approve') }}
-                                    </button>
-                                </div>
-                                <div class="text-xs text-red-600 mt-2" x-show="pairing.error" x-text="pairing.error"></div>
+                                <button type="button" @click="beginPairing(device)"
+                                        class="mt-2 inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800"
+                                        data-cluster-v2-approve>
+                                    {{ t('cluster.v2.ssh_accounts.continue') }}
+                                </button>
                             </div>
                         </template>
                     </div>

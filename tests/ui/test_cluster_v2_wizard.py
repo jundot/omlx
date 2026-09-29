@@ -2716,8 +2716,8 @@ component.apiFetch = async (url, options) => {calls.push(JSON.parse(options.body
 (async () => {
     component.beginPairing({node_id: 'peer', friendly_name: 'Peer'});
     const before = {calls: calls.length, target: component.pairing.target};
-    component.sshSetup.localUser = 'local_user';
-    component.sshSetup.remoteUser = 'remote_user';
+    component.sshSetup.localUser = 'local.user';
+    component.sshSetup.remoteUser = 'remote.user';
     await component.submitSSHSetup();
     component.pairing.code = '123456';
     await component.submitPairApproval(component.pairing.target);
@@ -2729,8 +2729,8 @@ component.apiFetch = async (url, options) => {calls.push(JSON.parse(options.body
         {
             "node_id": "peer",
             "code": "123456",
-            "local_ssh_user": "local_user",
-            "remote_ssh_user": "remote_user",
+            "local_ssh_user": "local.user",
+            "remote_ssh_user": "remote.user",
         }
     ]
     assert result["setup"] is None
@@ -2789,3 +2789,46 @@ console.log(JSON.stringify({state: component.wizardState(), local: component.dev
         "sshSetup.target ? deviceName(sshSetup.target) : sshSetup.targetName"
         in template
     )
+
+
+@pytest.mark.parametrize("approve", [False, True])
+def test_explicit_legacy_pairing_omits_account_fields(approve):
+    result = _run_wizard("""
+const calls = [];
+component.notify = () => {};
+component.startChecks = () => {};
+component.apiFetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    if ('local_ssh_user' in body || 'remote_ssh_user' in body) throw new Error('422');
+    calls.push(body);
+    return {state: 'awaiting_approval', code: '123456'};
+};
+(async () => {
+    const approve = APPROVE;
+    if (approve) component.beginPairing({node_id: 'peer', state: 'awaiting_approval'});
+    else await component.beginJoinAddr('peer:8000', 'Peer');
+    component.sshSetup.localUser = 'ignored.user';
+    component.sshSetup.remoteUser = 'ignored.peer';
+    await component.useLegacyPairing();
+    if (approve) {
+        component.pairing.code = '123456';
+        await component.submitPairApproval(component.pairing.target);
+    }
+    console.log(JSON.stringify({calls, setup: component.sshSetup}));
+})();
+""".replace("APPROVE", "true" if approve else "false"))
+    assert result["calls"] == (
+        [{"node_id": "peer", "code": "123456"}]
+        if approve
+        else [{"coordinator_addr": "peer:8000"}]
+    )
+    assert result["setup"] is None
+
+
+def test_incoming_request_opens_account_step_before_code_entry():
+    template = _read(TEMPLATE)
+    pending = template.split('<template x-if="pendingApprovals().length', 1)[1]
+    pending = pending.split('<template x-if="pairing.target', 1)[0]
+    assert '@click="beginPairing(device)"' in pending
+    assert "submitPairApproval(device)" not in pending
+    assert 'x-model="pairing.code"' not in pending

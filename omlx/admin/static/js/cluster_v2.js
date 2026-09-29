@@ -1357,7 +1357,7 @@ function clusterV2Wizard() {
             const localUser = setup.localUser.trim();
             const remoteUser = setup.remoteUser.trim();
             if (![localUser, remoteUser].every(
-                (user) => /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(user),
+                (user) => /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(user),
             )) {
                 setup.error = window.t('cluster.v2.ssh_accounts.invalid');
                 return;
@@ -1371,6 +1371,17 @@ function clusterV2Wizard() {
                     localUser,
                     remoteUser,
                 });
+            }
+        },
+
+        async useLegacyPairing() {
+            const setup = this.sshSetup;
+            if (!setup || this.join.busy) return;
+            if (setup.mode === 'approve') {
+                this.openPairApproval(setup.target);
+                this.sshSetup = null;
+            } else {
+                await this.beginJoinAddr(setup.address, setup.targetName, {});
             }
         },
 

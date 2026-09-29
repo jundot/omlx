@@ -2023,5 +2023,7 @@
   "cluster.v2.ssh_accounts.remote": "Username on {name}",
   "cluster.v2.ssh_accounts.invalid": "Enter both account short names, without spaces.",
   "cluster.v2.ssh_accounts.continue": "Continue to pairing",
-  "cluster.v2.ssh_accounts.cancel": "Cancel"
+  "cluster.v2.ssh_accounts.cancel": "Cancel",
+  "cluster.v2.ssh_accounts.legacy": "Use default SSH accounts (older oMLX)",
+  "cluster.v2.ssh_accounts.legacy_help": "Pairing with an older oMLX version? Use the default SSH accounts instead. The names entered above will not be sent. Custom accounts require both Macs to be updated."
 }
