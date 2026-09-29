@@ -2586,14 +2586,17 @@ process.stdout.write(JSON.stringify({state: component.wizardState(), active: com
     assert 'x-show="join.cleanup_pending"' in template
 
 
-@pytest.mark.parametrize("deployment,expected", [
-    ({}, True),
-    ({"execution": {}}, True),
-    ({"execution": {"prompt_cache_ssd": False}}, False),
-    ({"prompt_cache_ssd": False}, False),
-    ({"execution": {"prompt_cache_ssd": False}, "prompt_cache_ssd": True}, False),
-    ({"execution": {"prompt_cache_ssd": True}, "prompt_cache_ssd": False}, True),
-])
+@pytest.mark.parametrize(
+    "deployment,expected",
+    [
+        ({}, True),
+        ({"execution": {}}, True),
+        ({"execution": {"prompt_cache_ssd": False}}, False),
+        ({"prompt_cache_ssd": False}, False),
+        ({"execution": {"prompt_cache_ssd": False}, "prompt_cache_ssd": True}, False),
+        ({"execution": {"prompt_cache_ssd": True}, "prompt_cache_ssd": False}, True),
+    ],
+)
 def test_ssd_hydration_defaults_on_but_preserves_explicit_choice(deployment, expected):
     result = _run_wizard(
         "component.hydratePlannerFromDeployment(" + json.dumps(deployment) + ");"
