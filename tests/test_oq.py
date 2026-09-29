@@ -539,6 +539,9 @@ class TestHelpers:
     def test_is_moe_router_router(self):
         assert _is_moe_router("model.layers.0.block_sparse_moe.router") is True
 
+    def test_is_moe_router_gemma4_router_proj(self):
+        assert _is_moe_router("language_model.model.layers.0.router.proj") is True
+
     def test_is_moe_router_gate_proj_not_router(self):
         assert _is_moe_router("model.layers.0.mlp.gate_proj") is False
 
@@ -1173,6 +1176,13 @@ class TestStreamingHelpers:
         config = {"num_hidden_layers": 32, "num_local_experts": 8}
         bits, gs, mode = _get_predicate_bits("model.layers.0.mlp.gate", config, 4, 64)
         assert bits is None  # Router → fp16 (not quantized)
+
+    def test_get_predicate_bits_gemma4_router_fp16(self):
+        config = {"num_hidden_layers": 30, "text_config": {"num_experts": 128}}
+        bits, gs, mode = _get_predicate_bits(
+            "language_model.model.layers.0.router.proj.weight", config, 4, 64
+        )
+        assert bits is None
 
     def test_get_predicate_bits_default_affine4(self):
         config = {"num_hidden_layers": 32}
