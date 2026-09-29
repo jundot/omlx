@@ -133,6 +133,9 @@ def _service(
         tailscale_status=tailscale_status,
         zeroconf_module=zeroconf_module,
     )
+    if zeroconf_module is not None:
+        # Resolving the host name can block for ~35 s on CI runners.
+        service._local_addresses = lambda: []
     return service, clock
 
 

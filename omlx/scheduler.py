@@ -568,7 +568,6 @@ class _RegisteredRow(NamedTuple):
 
 _UID_ROW_REGISTRY_MAX = 4096
 _QWEN4_WIDE_PREFILL_STEP = 8192
-_QWEN4_WIDE_PREFILL_MIN_TOKENS = 2048 + _QWEN4_WIDE_PREFILL_STEP
 # Keyed by (id(model), uid): mlx-lm's BatchGenerator numbers uids per
 # instance starting at 0, so two engines serving concurrently (or an engine
 # reload) produce colliding uid sequences. The model object is the one
@@ -1654,6 +1653,48 @@ def _expected_chunk_len(step_size: int, remaining: int, kv_total: int, boundary_
             next_n = min(next_n, delta)
     return max(1, next_n)
 
+
+def _mimo_fused_full_attention() -> bool:
+    """True when MiMo's 192/128 full-attention layers run a fused kernel.
+
+    Stock mlx has no fused SDPA for these head dims; the fused route comes
+    from ``omlx.utils.fast_attention`` (native kernel when the installed mlx
+    supports the dims, else the tensor-unit kernel with padded heads).
+    """
+    try:
+        from .utils import fast_attention
+    except ImportError:
+        return False
+    try:
+        if fast_attention._native_mixed_dims_supported(192, 128):
+            return True
+        return bool(fast_attention._nax_available())
+    except Exception:
+        return False
+
+
+def _oversized_sorted_gather_ok() -> bool:
+    """True when a sorted gather_qmm above 32768 rows runs as one dispatch.
+
+    Stock mlx 0.32.2's sorted NAX kernel overflows past 32768 rows, so the
+    m5_gather_qmm reroute splits such calls into slices plus a copy unless
+    oMLX's JIT gather (m5_gather_qmm_nax) or the native NAX gather is there.
+    """
+    try:
+        from .patches import m5_gather_qmm_nax
+
+        if m5_gather_qmm_nax.enabled():
+            return True
+    except ImportError:
+        pass
+    try:
+        from .patches.m5_gather_qmm import _resolve_native_gather
+
+        return _resolve_native_gather() is not None
+    except Exception:
+        return False
+
+
 @dataclass
 class SchedulerConfig:
     """Configuration for the scheduler."""
@@ -1924,6 +1965,9 @@ class Scheduler:
         # prefill step changes cache-ON from one forward into multiple forwards.
         self._qwen35_prefill_floor = self._detect_qwen35_prefill_floor()
         self._qwen4_wide_prefill_step = self._detect_qwen4_wide_prefill_step()
+        self._qwen4_wide_first_chunk = bool(
+            self._qwen4_wide_prefill_step
+        ) and not self._qwen4_ple_gathers_ahead()
 
         # For strict RotatingKVCache reuse, align paged cache block size to
         # the model's rotating window size when paged cache is enabled.
@@ -2810,6 +2854,10 @@ class Scheduler:
     # cached prefixes floor to 2048-token multiples instead of 512.
     _POOLING_ROTATING_BLOCK_SIZE = 2048
 
+    # MiMo prefill chunk (and, with the prefix cache on, paged-cache block) on
+    # NAX hosts with at least 128 GB; other large hosts keep 4096.
+    _MIMO_NAX_PREFILL_FLOOR = 8192
+
     def _is_mimo_hybrid(self) -> bool:
         """MiMo hybrid MoE (standard softmax attn + rotating KV).
 
@@ -2870,6 +2918,12 @@ class Scheduler:
             # them for a measured ~+34% MoE prefill throughput on
             # M3 Ultra. 2048 is a multiple of the 128 window.
             lo = hi = self._POOLING_ROTATING_BLOCK_SIZE
+            # With the cache on every chunk is clamped to the next block
+            # boundary, so a wider prefill floor (MiMo on 128 GB+ hosts)
+            # only takes effect if the block grows with it.
+            floor = int(getattr(self, "_qwen35_prefill_floor", 0) or 0)
+            if floor > hi and floor % window_size == 0:
+                lo = hi = floor
 
         if window_size >= hi or window_size >= lo:
             target_block_size = window_size
@@ -2926,17 +2980,47 @@ class Scheduler:
                     return 0
             if is_qwen35 or is_qwen4 or is_glm5_next:
                 from .custom_kernels.nax import is_nax_available
+                from .patches.glm_moe_dsa.sparse_mla_nax import (
+                    nax_sparse_mla_available,
+                )
                 from .settings import get_system_memory
 
-                if get_system_memory() >= 64 * 1024**3 and not is_nax_available():
-                    # Keep the default chunk size on NAX hosts.
+                if get_system_memory() < 64 * 1024**3:
+                    return 0
+                if not is_nax_available():
+                    return 4096
+                # NAX hosts keep the default chunk, except GLM-5.3 with the
+                # tensor-unit sparse MLA: its attention cost per query does not
+                # depend on the chunk, so a wider chunk feeds the MoE more rows.
+                if is_glm5_next and nax_sparse_mla_available():
+                    return 4096
+            if self._is_mimo_hybrid():
+                from .custom_kernels.nax import is_nax_available
+                from .settings import get_system_memory
+
+                # MiMo's top-8-of-256 routing leaves ~64 rows per expert at a
+                # 2048-token chunk; 4096 fills the gather_qmm tiles better and
+                # the doubled activation footprint is small next to the model
+                # on hosts with this much memory. Only with fused full
+                # attention: otherwise its 9 full-attention layers (192/128
+                # head dims) materialise [heads, chunk, context] scores and
+                # the wider chunk is slower. On NAX GPUs 8192 (~256 rows per
+                # expert) lifts the expert GEMMs further when the >32768-row
+                # sorted gather runs as one dispatch (the fused attention's
+                # causal work is the same in any chunking).
+                if (
+                    get_system_memory() >= 128 * 1024**3
+                    and _mimo_fused_full_attention()
+                ):
+                    if is_nax_available() and _oversized_sorted_gather_ok():
+                        return self._MIMO_NAX_PREFILL_FLOOR
                     return 4096
         except Exception:
             logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)
         return 0
 
     def _detect_qwen4_wide_prefill_step(self) -> int:
-        """Return the step used after the first chunk of long Qwen4-Exp prompts."""
+        """Return the wide Qwen4-Exp prefill step (0 when the host cannot use it)."""
         try:
             model_type = str(getattr(self.model, "model_type", "") or "")
             if not model_type:
@@ -2959,6 +3043,24 @@ class Scheduler:
         except Exception:
             logger.debug("qwen4 wide prefill probe failed", exc_info=True)
         return 0
+
+    def _qwen4_ple_gathers_ahead(self) -> bool:
+        """True when SSD-backed PLE rows are gathered one prefill chunk ahead.
+
+        Only then does a narrow first chunk buy anything: it lets the gather
+        of the next chunk overlap GPU work. Models without a probe count as
+        gathering ahead.
+        """
+        if getattr(self.model, "prefetch_ple", None) is None:
+            return False
+        probe = getattr(self.model, "ple_gathers_ahead", None)
+        if probe is None:
+            return True
+        try:
+            return bool(probe())
+        except Exception:
+            logger.debug("qwen4 PLE gather-ahead probe failed", exc_info=True)
+            return True
 
     # Default block size for ArraysCache-only hybrid models. Raise the effective
     # target to the configured/model-specific prefill step so cache ON/OFF use
@@ -5778,15 +5880,13 @@ class Scheduler:
             if floor and size < floor:
                 size = floor
             wide = getattr(self, "_qwen4_wide_prefill_step", 0)
-            if (
-                wide
-                and processed_tokens > 0
-                and processed_tokens + remaining_tokens
-                >= _QWEN4_WIDE_PREFILL_MIN_TOKENS
+            if wide and (
+                processed_tokens > 0 or getattr(self, "_qwen4_wide_first_chunk", False)
             ):
-                # Wide steps feed the expert GEMMs more rows per expert. The
-                # first chunk stays narrow so the SSD n-gram gather for the
-                # next chunk overlaps GPU work.
+                # Wide steps feed the expert GEMMs more rows per expert. With
+                # SSD-backed PLE the first chunk stays narrow so the n-gram
+                # gather for the next chunk overlaps GPU work; resident PLE has
+                # nothing to overlap, so the first chunk is wide too.
                 size = max(size, wide)
                 if getattr(self, "block_aware_cache", None) is None:
                     # No block clamp runs; end on the grid that cache-ON uses.

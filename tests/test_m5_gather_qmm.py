@@ -22,6 +22,7 @@ def _fresh_state(monkeypatch):
     """
     monkeypatch.delenv("OMLX_M5_GATHER_QMM_FIX", raising=False)
     monkeypatch.delenv("OMLX_M5_GATHER_QMM_NATIVE", raising=False)
+    monkeypatch.delenv("OMLX_M5_GATHER_QMM_NAX", raising=False)
     monkeypatch.setattr(patch_mod, "_native_gather", None)
     was_installed = getattr(mx.gather_qmm, "_omlx_m5_reroute", False)
     raw = patch_mod._original_gather_qmm if was_installed else mx.gather_qmm
@@ -229,8 +230,14 @@ def _kernel_defective_here() -> bool:
     not _kernel_defective_here(),
     reason="sorted gather_qmm NAX kernel is healthy on this machine",
 )
-def test_reroute_restores_correct_output_on_defective_hardware():
-    """On affected hardware the patched call matches the fp32 reference."""
+@pytest.mark.parametrize("nax_route", ["1", "0"])
+def test_reroute_restores_correct_output_on_defective_hardware(monkeypatch, nax_route):
+    """On affected hardware the patched call matches the fp32 reference.
+
+    Covered with the NAX route (m5_gather_qmm_nax) and with only the stock
+    reroute (flag dropped for K % 64 != 0).
+    """
+    monkeypatch.setenv("OMLX_M5_GATHER_QMM_NAX", nax_route)
     assert apply_m5_gather_qmm_workaround()
 
     n, e, out_dim, k = 80, 8, 64, 96
@@ -261,8 +268,13 @@ def test_reroute_restores_correct_output_on_defective_hardware():
     not _kernel_defective_here(),
     reason="sorted gather_qmm NAX kernel is healthy on this machine",
 )
-def test_segmented_sorted_call_matches_reference_past_row_cap():
-    """>32768 sorted rows stay on the NAX rhs kernel and still match fp32."""
+@pytest.mark.parametrize("nax_route", ["1", "0"])
+def test_segmented_sorted_call_matches_reference_past_row_cap(monkeypatch, nax_route):
+    """>32768 sorted rows stay on the tensor units and still match fp32.
+
+    One NAX-route dispatch, or (route off) the native kernel / slices.
+    """
+    monkeypatch.setenv("OMLX_M5_GATHER_QMM_NAX", nax_route)
     assert apply_m5_gather_qmm_workaround()
 
     n, e, out_dim, k = patch_mod._MAX_SORTED_ROWS + 4096, 8, 64, 64
@@ -312,9 +324,11 @@ def _native_gather_here() -> bool:
     ],
 )
 def test_native_oversized_call_is_bit_identical_to_slices(
-    bits, group_size, dtype, out_dim, k
+    monkeypatch, bits, group_size, dtype, out_dim, k
 ):
     """Past the row cap the native dispatch equals the sliced mlx result."""
+    # The NAX route would take the supported layouts first.
+    monkeypatch.setenv("OMLX_M5_GATHER_QMM_NAX", "0")
     assert apply_m5_gather_qmm_workaround()
 
     n, e = patch_mod._MAX_SORTED_ROWS + 7001, 96

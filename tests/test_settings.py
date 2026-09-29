@@ -93,6 +93,7 @@ class TestServerSettings:
             "max_audio_upload_size": "100MB",
             "max_image_upload_size": "50MB",
             "max_image_side_length": 2048,
+            "gpu_keep_warm_interval": 0.5,
         }
 
     def test_qwen4_decode_setting_round_trip(self):

@@ -207,6 +207,12 @@ class ServerSettings:
     max_image_upload_size: str = "50MB"
     # Maximum side length in pixels for VLM input images (0 to disable downscaling).
     max_image_side_length: int = 2048
+    # Seconds between trivial GPU kernels submitted while a model is loaded
+    # but idle, so the GPU stays out of its idle power state (the first
+    # command buffer after ~1s+ of GPU idle stalls for up to seconds on
+    # large resident models). Ticks stop after 5 minutes without requests.
+    # 0 disables.
+    gpu_keep_warm_interval: float = 0.5
 
     def max_audio_upload_bytes(self) -> int:
         """Configured audio upload limit in bytes. Non-positive sizes raise ValueError."""
@@ -248,6 +254,7 @@ class ServerSettings:
             max_audio_upload_size=data.get("max_audio_upload_size", "100MB"),
             max_image_upload_size=data.get("max_image_upload_size", "50MB"),
             max_image_side_length=data.get("max_image_side_length", 2048),
+            gpu_keep_warm_interval=float(data.get("gpu_keep_warm_interval", 0.5)),
         )
 
 
@@ -1172,6 +1179,13 @@ class GlobalSettings:
             self.server.preserve_mid_system_cache = (
                 preserve_mid_system_cache.strip().lower() in {"1", "true", "yes", "on"}
             )
+        if gpu_keep_warm := os.getenv("OMLX_GPU_KEEP_WARM_INTERVAL"):
+            try:
+                self.server.gpu_keep_warm_interval = float(gpu_keep_warm)
+            except ValueError:
+                logger.warning(
+                    f"Invalid OMLX_GPU_KEEP_WARM_INTERVAL value: {gpu_keep_warm}"
+                )
         if max_audio_upload_size := os.getenv("OMLX_MAX_AUDIO_UPLOAD_SIZE"):
             self.server.max_audio_upload_size = max_audio_upload_size
         if max_image_upload_size := (

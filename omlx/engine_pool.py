@@ -69,6 +69,25 @@ from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
 
+
+def _touch_gpu() -> None:
+    """Run one trivial kernel so the GPU stays out of its idle power state.
+
+    Apple silicon parks the GPU after roughly a second without work, and the
+    first command buffer afterwards stalls for a time that grows with the
+    idle gap and the resident footprint (156 GB model on an M5 Ultra: +1.0 s
+    after 2 s idle, +1.7 s after 6 s — measured on both prefill and decode,
+    the kernels themselves run at full speed once it resumes). A request
+    arriving after a pause pays that on top of its TTFT. One tiny kernel
+    per keep-warm period is enough to prevent it; CPU activity alone is not.
+    """
+    mx.eval(mx.zeros((1,), dtype=mx.float32) + 1)
+
+
+# Stop keep-warm ticks after this long without requests, so an idle laptop
+# with a resident model still lets the GPU reach its idle power state.
+_GPU_KEEP_WARM_IDLE_WINDOW_S = 300.0
+
 _FP16_BYTES = 2
 _MAX_AFFINE_BYTES_PER_WEIGHT = 1.0625  # q8 plus fp16 scale/bias per group
 _CPU_SHARE_MATERIALIZATION_HEADROOM = 1.5
@@ -342,7 +361,74 @@ class EnginePool:
         self._failed_load_reclaim_tasks: set[asyncio.Task[None]] = set()
         self._failed_load_reclaim_task: asyncio.Task[None] | None = None
         self._shutting_down = False
+        # Idle GPU keep-warm ticker (see _touch_gpu). Configured by the server
+        # from ServerSettings.gpu_keep_warm_interval; started on first load.
+        self._gpu_keep_warm_interval: float = 0.0
+        self._gpu_keep_warm_task: asyncio.Task[None] | None = None
+        self._gpu_keep_warm_last_active = 0.0
         self.configure_hot_cache_budget()
+
+    def configure_gpu_keep_warm(self, interval_seconds: float) -> None:
+        """Set the idle keep-warm period in seconds (0 or less disables it)."""
+        try:
+            interval = float(interval_seconds or 0.0)
+        except (TypeError, ValueError):
+            interval = 0.0
+        self._gpu_keep_warm_interval = max(0.0, interval)
+        if self._gpu_keep_warm_interval <= 0 and self._gpu_keep_warm_task is not None:
+            self._gpu_keep_warm_task.cancel()
+            self._gpu_keep_warm_task = None
+
+    def _ensure_gpu_keep_warm_task(self) -> None:
+        if self._gpu_keep_warm_interval <= 0 or self._shutting_down:
+            return
+        task = self._gpu_keep_warm_task
+        if task is not None and not task.done():
+            return
+        self._gpu_keep_warm_task = asyncio.get_running_loop().create_task(
+            self._gpu_keep_warm_loop(), name="gpu-keep-warm"
+        )
+
+    def _gpu_keep_warm_needed(self) -> bool:
+        """True when a model is resident, idle, and used within the idle window."""
+        now = time.time()
+        last_request = self._gpu_keep_warm_last_active
+        loaded = False
+        for entry in self._entries.values():
+            if entry.engine is None:
+                continue
+            loaded = True
+            if self._entry_has_active_requests(entry):
+                # Generation steps already keep the GPU busy.
+                self._gpu_keep_warm_last_active = now
+                return False
+            # last_access marks request start; long requests are caught above.
+            last_request = max(last_request, entry.last_access)
+        return loaded and now - last_request < _GPU_KEEP_WARM_IDLE_WINDOW_S
+
+    async def _gpu_keep_warm_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        while not self._shutting_down:
+            interval = self._gpu_keep_warm_interval
+            if interval <= 0:
+                return
+            await asyncio.sleep(interval)
+            if not self._gpu_keep_warm_needed():
+                continue
+            try:
+                await loop.run_in_executor(get_mlx_executor(), _touch_gpu)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("GPU keep-warm tick failed: %s", exc)
+
+    async def _stop_gpu_keep_warm(self) -> None:
+        task = self._gpu_keep_warm_task
+        self._gpu_keep_warm_task = None
+        if task is None:
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     def _distributed_deployment_for_entry(
         self, entry: EngineEntry
@@ -3454,6 +3540,7 @@ class EnginePool:
             self._current_model_memory += resident_size
             load_completed = True
             self._clear_load_failure(entry)
+            self._ensure_gpu_keep_warm_task()
 
             # Batched DFlash: load the block drafter and attach it to the
             # Lightning MTP verify path. Fail-soft like the VLM MTP drafter.
@@ -3716,6 +3803,7 @@ class EnginePool:
     async def shutdown(self) -> None:
         """Shutdown all engines gracefully."""
         self._shutting_down = True
+        await self._stop_gpu_keep_warm()
         reclaim_tasks = tuple(self._failed_load_reclaim_tasks)
         for task in reclaim_tasks:
             task.cancel()

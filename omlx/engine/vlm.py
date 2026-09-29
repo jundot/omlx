@@ -2170,13 +2170,11 @@ class VLMBatchedEngine(BaseEngine):
             is not False
         ):
             try:
-                from ..patches.qwen35_moe_gate_up import (
-                    apply_qwen35_moe_gate_up_fusion,
-                )
+                from ..patches.moe_gate_up_fusion import apply_moe_gate_up_fusion
 
                 await loop.run_in_executor(
                     get_mlx_executor(),
-                    apply_qwen35_moe_gate_up_fusion,
+                    apply_moe_gate_up_fusion,
                     self._vlm_model,
                 )
             except Exception:

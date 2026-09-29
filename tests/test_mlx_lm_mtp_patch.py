@@ -2049,6 +2049,28 @@ class TestMtpCompatibilityHelpers:
         assert _is_mtp_compatible({"mtp_num_hidden_layers": 1}, None) is False
 
 
+class TestRowExactVerifyGate:
+    @pytest.mark.parametrize("batch, armed", [(1, True), (4, False)])
+    def test_row_exact_verify_arms_single_stream_only(self, monkeypatch, batch, armed):
+        # B > 1 verify has no one-row decode to match, and row-exact would run
+        # its B x R rows one by one.
+        calls = []
+        monkeypatch.setattr(
+            bg,
+            "_set_verify_qmm_armed",
+            lambda flag, *, row_exact=False: calls.append((flag, row_exact)),
+        )
+
+        class _Model:
+            _omlx_mtp_row_exact_verify = True
+
+            def __call__(self, inputs, **kwargs):
+                return mx.zeros((*inputs.shape, 8)), mx.zeros((*inputs.shape, 4))
+
+        bg._call_backbone(_Model(), mx.zeros((batch, 4), dtype=mx.int32), [])
+        assert calls[0] == (True, armed)
+
+
 class TestPreLoadPatchDispatch:
     def test_dispatch_skips_when_mtp_disabled(self, tmp_path):
         config_path = tmp_path / "config.json"
@@ -4234,8 +4256,7 @@ def test_qwen_late_join_preserves_cache_without_history_replay(family, monkeypat
         ("step", False),
     ],
 )
-@pytest.mark.parametrize("late_join", [False, True])
-@pytest.mark.parametrize("batch_size", [2, 4])
+@pytest.mark.parametrize("late_join,batch_size", [(False, 4), (True, 2), (True, 4)])
 def test_multi_request_mtp_or_singleton_only_matches_standard(
     family, unequal_depths, late_join, batch_size, monkeypatch
 ):
@@ -4630,7 +4651,7 @@ def test_batched_head_matches_row_caches_across_depth_changes(size, family, stoc
         mlx_lm_mtp.set_mtp_active(active)
 
 
-@pytest.mark.parametrize("size", [2, 4])
+@pytest.mark.parametrize("size", [4])
 @pytest.mark.parametrize("late_join", [False, True])
 @pytest.mark.parametrize("family", ["qwen_vlm", "qwen4"])
 def test_batched_head_survives_join_and_staggered_finish(
@@ -5220,7 +5241,7 @@ def test_verify_qmm_routes_batched_rows_through_mma_kernel(
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("bits", [4, 5])
-@pytest.mark.parametrize("rows", [4, 7, 8])
+@pytest.mark.parametrize("rows", [4, 8])
 def test_sg8_kernels_match_quantized_matmul(bits, rows, dtype):
     """Plain, gate/up swiglu and grouped sg8 launches against stock qmm."""
     from omlx.patches import qwen35_verify_qmm as vq

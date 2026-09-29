@@ -17,6 +17,7 @@ import functools
 import inspect
 import logging
 import math
+import os
 import time
 import weakref
 from collections import deque
@@ -33,18 +34,43 @@ from . import prompt_priming as _prompt_priming
 logger = logging.getLogger(__name__)
 
 
-def _set_verify_qmm_armed(flag: bool) -> None:
+def _set_verify_qmm_armed(flag: bool, *, row_exact: bool = False) -> None:
     """Arm the verify-shape qmm routing for the duration of an MTP forward.
 
-    Import is deferred and failure-tolerant: the kernel module is optional
-    and its absence must not affect the MTP path.
+    ``row_exact`` arms the row-exact mode instead (see
+    ``_row_exact_verify``). Import is deferred and failure-tolerant: the
+    kernel module is optional and its absence must not affect the MTP path.
     """
     try:
         from ..qwen35_verify_qmm import set_verify_qmm_armed
 
-        set_verify_qmm_armed(flag)
+        set_verify_qmm_armed(flag, row_exact=row_exact)
     except Exception:
         pass
+
+
+_ROW_EXACT_DISABLED = os.environ.get("OMLX_MTP_ROW_EXACT_VERIFY", "1").strip() == "0"
+
+
+def _row_exact_verify(model: Any) -> bool:
+    """Whether the target's verify rows must reproduce its one-row decode.
+
+    Models opt in with ``_omlx_mtp_row_exact_verify`` (Qwen4-Exp). Their
+    armed verify forwards then run every multi-row quantized projection,
+    DeltaNet prework and attention row with the arithmetic of a serial
+    decode step, so greedy MTP output equals MTP-off output byte for byte.
+    ``OMLX_MTP_ROW_EXACT_VERIFY=0`` restores the faster verify kernels.
+    """
+    if _ROW_EXACT_DISABLED:
+        return False
+    for candidate in (
+        model,
+        getattr(model, "_language_model", None),
+        getattr(model, "language_model", None),
+    ):
+        if getattr(candidate, "_omlx_mtp_row_exact_verify", False):
+            return True
+    return False
 
 
 def _set_dspark_target_verify(model: Any, flag: bool) -> None:
@@ -2071,7 +2097,12 @@ def _call_backbone_impl(
     _rollback_mod.set_undo_armed(True)
     # The affine verify qmm kernel is a Qwen-specific optimization. Keep the
     # DeepSeek target on its architecture-native quantized linear path.
-    _set_verify_qmm_armed(not dspark_verify)
+    # Row-exact runs each row as a one-row matvec. Batched decode has no
+    # one-row baseline, so B > 1 verify keeps the multi-row kernels.
+    _set_verify_qmm_armed(
+        not dspark_verify,
+        row_exact=inputs.shape[0] == 1 and _row_exact_verify(model),
+    )
     _set_dspark_target_verify(model, dspark_verify)
     try:
         result = model(inputs, **kwargs)

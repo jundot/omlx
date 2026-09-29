@@ -10,6 +10,7 @@ import time
 import weakref
 from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Lock, RLock
@@ -20,6 +21,7 @@ import mlx.nn as nn
 import numpy as np
 
 from omlx.patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import register_ple_resource
+from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
 
 from .cache import BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
 from mlx_vlm.models.cache import ArraysCache
@@ -33,14 +35,18 @@ from ..qwen3_5.language import (
     _create_qwen3_5_attention_mask,
     _create_qwen3_5_ssm_mask,
 )
+from ..qwen3_5 import language as q35_language
 from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from .config import ModelConfig, TextConfig
 from .qsa_fast import (
     contiguous_causal_gathered_qsa,
     contiguous_causal_gathered_qsa_decode,
+    decode_block_selection_mask,
+    masked_decode_sdpa,
     pool_completed_index_keys,
 )
 from . import hc_fused
+from .hc_projection import env_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +111,11 @@ def _gathered_min_query_tokens() -> int:
         except ValueError:
             pass
     return 16
+
+
+def _row_exact_verify_armed() -> bool:
+    """Inside an armed MTP verify whose rows must equal serial decode steps."""
+    return is_row_exact_armed()
 
 
 def _split_text_mrope_positions(
@@ -1055,36 +1066,87 @@ class QSAQuantizedKVCache(_QSAIndexerCache, QuantizedKVCache):
         return size + self.indexer_nbytes
 
 
-# Dispatch each decoder layer's graph to the GPU as soon as it is built (decode and
-# verify rows only) so the GPU executes layer i while the host builds layer i+1.
-# Scheduling only: outputs are bit-identical. Disable with OMLX_QWEN4_EAGER_DISPATCH=0.
-_EAGER_DISPATCH = os.environ.get("OMLX_QWEN4_EAGER_DISPATCH", "1").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
+# Dispatch decoder layers' graphs to the GPU as they are built (decode and verify
+# rows only) so the GPU executes earlier layers while the host builds later ones.
+# The first _EAGER_DISPATCH_WARMUP layers commit one by one (the GPU starts as
+# early as before and its queue fills), then every _EAGER_DISPATCH_EVERY-th
+# layer: each commit costs ~20 us of host CPU, and the queued GPU work covers
+# the host's build of the next group.
+# Scheduling only: outputs are bit-identical. Disable with OMLX_QWEN4_EAGER_DISPATCH=0;
+# OMLX_QWEN4_EAGER_DISPATCH_EVERY=1 commits every layer.
+_EAGER_DISPATCH = env_enabled("OMLX_QWEN4_EAGER_DISPATCH")
 _EAGER_DISPATCH_MAX_ROWS = 64
+_EAGER_DISPATCH_EVERY_DEFAULT = 3
+
+
+def _eager_dispatch_every() -> int:
+    raw = os.environ.get("OMLX_QWEN4_EAGER_DISPATCH_EVERY", "").strip()
+    try:
+        return max(1, int(raw)) if raw else _EAGER_DISPATCH_EVERY_DEFAULT
+    except ValueError:
+        return _EAGER_DISPATCH_EVERY_DEFAULT
+
+
+_EAGER_DISPATCH_EVERY = _eager_dispatch_every()
+_EAGER_DISPATCH_WARMUP = 6
 # Lightning MTP verify rows through the gathered QSA arm (OMLX_QWEN4_QSA_GATHERED_VERIFY=0 disables).
-_GATHERED_VERIFY_DISABLED = os.environ.get(
-    "OMLX_QWEN4_QSA_GATHERED_VERIFY", "1"
-).strip().lower() in {"0", "false", "no", "off"}
+_GATHERED_VERIFY_DISABLED = not env_enabled("OMLX_QWEN4_QSA_GATHERED_VERIFY")
+# Row-exact Lightning MTP verify rows on the masked QSA arm score and select
+# blocks and run SDPA per row with the serial decode kernels
+# (OMLX_QWEN4_QSA_MASKED_VERIFY=0 keeps the multi-row mask and MLX SDPA).
+_MASKED_VERIFY_DISABLED = not env_enabled("OMLX_QWEN4_QSA_MASKED_VERIFY")
+# Lightning MTP one-row windows (the activation step, depth-0 cycles) have no
+# draft to reject, so they run the serial decode step itself rather than a
+# verify forward (OMLX_QWEN4_MTP_ONE_ROW_DECODE=0 keeps the verify forward).
+_ONE_ROW_MTP_DECODE_DISABLED = not env_enabled("OMLX_QWEN4_MTP_ONE_ROW_DECODE")
+# Set while such a step runs: a verify forward never feeds prompt priming.
+_MTP_ONE_ROW_STEP: ContextVar[bool] = ContextVar(
+    "omlx_qwen4_mtp_one_row_step", default=False
+)
+# Attention/indexer norms keep their FP32 1 + weight scale between calls
+# (OMLX_QWEN4_NORM_SCALE_CACHE=0 rebuilds it every call; same values).
+_NORM_SCALE_CACHE_DISABLED = not env_enabled("OMLX_QWEN4_NORM_SCALE_CACHE")
 
 
 class Qwen4ExpRMSNorm(nn.Module):
-    """Qwen4 RMSNorm, whose checkpoint weights are centered at zero."""
+    """Qwen4 RMSNorm, whose checkpoint weights are centered at zero.
 
-    def __init__(self, dim: int, group_size: int | None = None, eps: float = 1e-6):
+    ``cache_scale`` keeps the FP32 ``1 + weight`` built from the current weight
+    array instead of two launches per call. Only for norms that ``mx.compile``
+    never traces: a scale cached inside a trace would outlive it.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        group_size: int | None = None,
+        eps: float = 1e-6,
+        cache_scale: bool = False,
+    ):
         super().__init__()
         self.eps = eps
         self.group_size = group_size
         if group_size is not None and dim % group_size:
             raise ValueError(f"{dim=} must be divisible by {group_size=}")
         self.weight = mx.zeros(dim)
+        # Plain attributes, not parameters: (weight the scale was built from, scale).
+        self._cache_scale = cache_scale and not _NORM_SCALE_CACHE_DISABLED
+        self._cached_scale = None
+
+    def _scale(self) -> mx.array:
+        weight = self.weight
+        if not self._cache_scale:
+            return 1.0 + weight.astype(mx.float32)
+        cached = self._cached_scale
+        if cached is None or cached[0] is not weight:
+            # A reloaded weight is a new array; the old scale is dropped.
+            cached = (weight, 1.0 + weight.astype(mx.float32))
+            object.__setattr__(self, "_cached_scale", cached)
+        return cached[1]
 
     def __call__(self, x: mx.array) -> mx.array:
         dtype = x.dtype
-        scale = 1.0 + self.weight.astype(mx.float32)
+        scale = self._scale()
         if self.group_size is None:
             return mx.fast.rms_norm(x, scale, self.eps).astype(dtype)
         # rms_norm takes a 1-D weight, so a grouped norm cannot hand it the
@@ -1157,8 +1219,12 @@ class Qwen4ExpQSAIndexer(nn.Module):
             (self.n_heads + self.kv_heads) * self.head_dim,
             bias=False,
         )
-        self.q_layernorm = Qwen4ExpRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_layernorm = Qwen4ExpRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_layernorm = Qwen4ExpRMSNorm(
+            self.head_dim, eps=config.rms_norm_eps, cache_scale=True
+        )
+        self.k_layernorm = Qwen4ExpRMSNorm(
+            self.head_dim, eps=config.rms_norm_eps, cache_scale=True
+        )
 
     @staticmethod
     def _default_position_ids(batch: int, start: int, length: int):
@@ -1276,7 +1342,6 @@ class Qwen4ExpQSAIndexer(nn.Module):
             return None
 
         query = self._apply_rope(query, position_ids)
-        complete_key_len = max_complete_blocks * self.compress_ratio
         if cache is not None and hasattr(cache, "pooled_indexer_keys"):
             pooled_keys = cache.pooled_indexer_keys(
                 self.compress_ratio,
@@ -1299,6 +1364,38 @@ class Qwen4ExpQSAIndexer(nn.Module):
         scores = query.astype(mx.float32) @ pooled_keys.astype(mx.float32).transpose(
             0, 1, 3, 2
         )
+        if batch == 1 and seq_len == 1 and past_len == key_len - 1:
+            return self.aligned_row_mask(scores, key_len)
+        return self._selection_mask(scores, past_len, key_len, max_complete_blocks)
+
+    def aligned_row_mask(self, scores: mx.array, key_len: int) -> mx.array:
+        """Token mask of one batch-one row whose query is the last of its
+        ``key_len`` keys, from its FP32 head scores ``[1, heads, 1, blocks]``."""
+        # Every complete block is causal and the sparse arm is active, so the
+        # mask is the winning blocks plus the incomplete tail -- one launch
+        # for the ops of _selection_mask.
+        decode_mask = decode_block_selection_mask(
+            scores,
+            head_dim=self.head_dim,
+            key_tokens=key_len,
+            compress_ratio=self.compress_ratio,
+            block_topk=self.block_topk,
+        )
+        if decode_mask is not None:
+            return decode_mask
+        return self._selection_mask(
+            scores, key_len - 1, key_len, key_len // self.compress_ratio
+        )
+
+    def _selection_mask(
+        self,
+        scores: mx.array,
+        past_len: int,
+        key_len: int,
+        max_complete_blocks: int,
+    ) -> mx.array:
+        batch, _, seq_len, _ = scores.shape
+        complete_key_len = max_complete_blocks * self.compress_ratio
         scores = mx.sum(mx.maximum(scores, 0), axis=1)
         scores = scores / math.sqrt(self.head_dim)
 
@@ -1351,8 +1448,12 @@ class Qwen4ExpQSAIndexer(nn.Module):
 class Qwen4ExpAttention(Qwen3_5Attention):
     def __init__(self, config: TextConfig):
         super().__init__(config)
-        self.q_norm = Qwen4ExpRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Qwen4ExpRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = Qwen4ExpRMSNorm(
+            self.head_dim, eps=config.rms_norm_eps, cache_scale=True
+        )
+        self.k_norm = Qwen4ExpRMSNorm(
+            self.head_dim, eps=config.rms_norm_eps, cache_scale=True
+        )
         self.indexer = Qwen4ExpQSAIndexer(config, self.rotary_emb)
 
     @staticmethod
@@ -1687,6 +1788,266 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         output = output.reshape(batch, length, -1)
         return self.o_proj(output * mx.sigmoid(gate))
 
+    def _row_exact_gathered_verify_eligible(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[Any],
+        position_ids: Optional[mx.array],
+        position_embeddings: Optional[tuple[mx.array, mx.array]],
+        target_verify: bool,
+    ) -> bool:
+        """Row-exact Lightning MTP verify windows reaching past the QSA budget
+        with text positions: the arms whose rows a serial decode step would
+        attend through gathered QSA, or densely just below the crossover."""
+
+        if not (target_verify and _row_exact_verify_armed()):
+            return False
+        causal_mask = mask is None or (isinstance(mask, str) and mask == "causal")
+        if not (
+            x.ndim == 3
+            and x.shape[0] == 1
+            and causal_mask
+            and type(cache) is QSAKVCache
+            and isinstance(cache.offset, int)
+            and position_embeddings is None
+            and _rank_two_text_position_ids(position_ids, x.shape[1])
+        ):
+            return False
+        if cache.offset:
+            if cache.index_keys is None or cache.index_position_ids is None:
+                return False
+            if (
+                cache.index_keys.shape[1] != cache.offset
+                or cache.index_position_ids.shape[-1] != cache.offset
+            ):
+                return False
+        return cache.offset + x.shape[1] > self.indexer.token_budget
+
+    def _row_exact_gathered_verify(
+        self,
+        x: mx.array,
+        cache: QSAKVCache,
+        position_ids: Optional[mx.array] = None,
+    ) -> mx.array:
+        """Attend every verify row exactly as its serial decode step would.
+
+        Projections, norms and RoPE are per-row arithmetic already. Each row
+        then appends its own indexer key, pools blocks on the serial schedule
+        and runs the serial arm for its prefix: gathered QSA decode past the
+        block budget, otherwise plain one-row SDPA over the whole prefix
+        (what the official path computes when the indexer selects every block).
+        """
+
+        batch, length, _ = x.shape
+        q_proj_output, new_keys, new_values = _target_verify_linears(
+            (self.q_proj, self.k_proj, self.v_proj), x
+        )
+        queries, gate = mx.split(
+            q_proj_output.reshape(batch, length, self.num_attention_heads, -1),
+            2,
+            axis=-1,
+        )
+        gate = gate.reshape(batch, length, -1)
+        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
+        new_keys = self.k_norm(
+            new_keys.reshape(batch, length, self.num_key_value_heads, self.head_dim)
+        ).transpose(0, 2, 1, 3)
+        new_values = new_values.reshape(
+            batch, length, self.num_key_value_heads, self.head_dim
+        ).transpose(0, 2, 1, 3)
+
+        past_len = cache.offset
+        text_position_ids, rotary_position_ids = _split_text_mrope_positions(
+            position_ids, batch, length, past_len
+        )
+        queries, new_keys = self.rotary_emb.apply_rotary(
+            queries,
+            new_keys,
+            rotary_position_ids,
+            unsqueeze_dim=1,
+        )
+        keys, values = cache.update_and_fetch(new_keys, new_values)
+
+        projected = _target_verify_linear(self.indexer.index_qk_proj, x).reshape(
+            batch,
+            length,
+            self.indexer.n_heads + self.indexer.kv_heads,
+            self.indexer.head_dim,
+        )
+        index_queries = self.indexer.q_layernorm(
+            projected[:, :, : self.indexer.n_heads]
+        ).transpose(0, 2, 1, 3)
+        raw_index_keys = projected[:, :, self.indexer.n_heads :].squeeze(2)
+        index_queries = self.indexer._apply_rope(
+            index_queries,
+            text_position_ids,
+        ).transpose(0, 2, 1, 3)
+
+        outputs = []
+        for row in range(length):
+            key_tokens = past_len + row + 1
+            # A decode step's query is a contiguous [1, H, 1, D] array; the
+            # native decode SDPA accepts only that layout.
+            row_queries = mx.contiguous(queries[:, :, row : row + 1])
+            cache.update_indexer(
+                raw_index_keys[:, row : row + 1],
+                text_position_ids[..., row : row + 1],
+            )
+            row_keys = keys[..., :key_tokens, :]
+            row_values = values[..., :key_tokens, :]
+            if key_tokens // self.indexer.compress_ratio > self.indexer.block_topk:
+                pooled_index_keys = cache.pooled_indexer_keys(
+                    self.indexer.compress_ratio,
+                    self.indexer.k_layernorm,
+                    self.indexer._apply_rope,
+                    cache_tag=self.indexer,
+                )
+                output = contiguous_causal_gathered_qsa_decode(
+                    row_queries,
+                    row_keys,
+                    row_values,
+                    index_queries[:, row : row + 1],
+                    pooled_index_keys,
+                    num_query_heads=self.num_attention_heads,
+                    num_key_value_heads=self.num_key_value_heads,
+                    head_dim=self.head_dim,
+                    indexer_head_dim=self.indexer.head_dim,
+                    compress_ratio=self.indexer.compress_ratio,
+                    token_budget=self.indexer.token_budget,
+                )
+            else:
+                output = q35_language.scaled_dot_product_attention(
+                    row_queries,
+                    row_keys,
+                    row_values,
+                    cache=cache,
+                    scale=self.scale,
+                    mask=None,
+                ).transpose(0, 2, 1, 3)
+            outputs.append(output)
+        output = outputs[0] if length == 1 else mx.concatenate(outputs, axis=1)
+        output = output.reshape(batch, length, -1)
+        return _target_verify_linear(self.o_proj, output * mx.sigmoid(gate))
+
+    def _row_exact_masked_verify_eligible(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[Any],
+        position_embeddings: Optional[tuple[mx.array, mx.array]],
+        target_verify: bool,
+    ) -> bool:
+        """Multi-row row-exact verify windows whose serial decode steps all take
+        the masked QSA arm (``_masked_decode``): past the block budget from the
+        first row on, positions the gathered arms above do not take. One-row
+        windows keep the path below, which already selects with the decode
+        kernel and runs MLX's SDPA (same bits, faster below ~16K keys)."""
+
+        if _MASKED_VERIFY_DISABLED or not (target_verify and _row_exact_verify_armed()):
+            return False
+        causal_mask = mask is None or (isinstance(mask, str) and mask == "causal")
+        if not (
+            x.ndim == 3
+            and x.shape[0] == 1
+            and x.shape[1] > 1
+            and causal_mask
+            and type(cache) is QSAKVCache
+            and isinstance(cache.offset, int)
+            and position_embeddings is None
+        ):
+            return False
+        index_keys = cache.index_keys
+        index_positions = cache.index_position_ids
+        if (
+            index_keys is None
+            or index_positions is None
+            or index_keys.shape[1] != cache.offset
+            or index_positions.shape[-1] != cache.offset
+        ):
+            return False
+        indexer = self.indexer
+        return (cache.offset + 1) // indexer.compress_ratio > indexer.block_topk
+
+    def _row_exact_masked_verify(
+        self,
+        x: mx.array,
+        cache: QSAKVCache,
+        position_ids: Optional[mx.array],
+    ) -> mx.array:
+        """Attend every verify row exactly as its serial ``_masked_decode`` step.
+
+        Projections, norms, RoPE and the cache appends cover all rows at once
+        (per-row arithmetic already). Each row then scores its own completed
+        blocks as a one-row product -- the multi-row product is a GEMM whose
+        FP32 sums round differently -- selects them with the decode kernel and
+        runs the selected-keys decode SDPA over its causal prefix.
+        """
+
+        batch, length, _ = x.shape
+        indexer = self.indexer
+        past_len = cache.offset
+        # The indexer half of ``indexer.from_projected`` for all rows.
+        projected = _target_verify_linear(indexer.index_qk_proj, x).reshape(
+            batch, length, indexer.n_heads + indexer.kv_heads, indexer.head_dim
+        )
+        index_queries = indexer.q_layernorm(projected[:, :, : indexer.n_heads]).transpose(
+            0, 2, 1, 3
+        )
+        index_positions = (
+            position_ids
+            if position_ids is not None
+            else indexer._default_position_ids(batch, past_len, length)
+        )
+        cache.update_indexer(projected[:, :, indexer.n_heads :].squeeze(2), index_positions)
+        index_queries = indexer._apply_rope(index_queries, index_positions)
+        pooled_keys = mx.expand_dims(
+            cache.pooled_indexer_keys(
+                indexer.compress_ratio,
+                indexer.k_layernorm,
+                indexer._apply_rope,
+                cache_tag=indexer,
+            ),
+            axis=1,
+        ).astype(mx.float32)
+
+        q_proj_output, keys, values = _VERIFIER._linears(
+            (self.q_proj, self.k_proj, self.v_proj), x
+        )
+        queries, keys, values, gate, _ = self._prepare_projected_qkv(
+            q_proj_output, keys, values, cache, position_ids, None, None
+        )
+
+        outputs = []
+        for row in range(length):
+            key_tokens = past_len + row + 1
+            blocks = key_tokens // indexer.compress_ratio
+            # A contiguous one-row FP32 query, as the serial step builds it: a
+            # strided row view takes another matmul kernel (other FP32 sums).
+            scores = index_queries[:, :, row : row + 1].astype(mx.float32) @ pooled_keys[
+                :, :, :blocks
+            ].transpose(0, 1, 3, 2)
+            row_mask = indexer.aligned_row_mask(scores, key_tokens)
+            row_queries = queries[:, :, row : row + 1]
+            row_keys = keys[..., :key_tokens, :]
+            row_values = values[..., :key_tokens, :]
+            output = masked_decode_sdpa(
+                row_queries, row_keys, row_values, row_mask, self.scale
+            )
+            if output is None:
+                output = q35_language.scaled_dot_product_attention(
+                    row_queries,
+                    row_keys,
+                    row_values,
+                    cache=cache,
+                    scale=self.scale,
+                    mask=row_mask,
+                )
+            outputs.append(output)
+        output = mx.concatenate(outputs, axis=2).transpose(0, 2, 1, 3)
+        output = output.reshape(batch, length, -1)
+        return _VERIFIER._linear(self.o_proj, output * mx.sigmoid(gate))
+
     def __call__(
         self,
         x: mx.array,
@@ -1717,6 +2078,18 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             cache._omlx_last_prefill_gathered = True
             return self._gathered_text_prefill(x, cache, position_ids)
 
+        if self._row_exact_gathered_verify_eligible(
+            x,
+            mask,
+            cache,
+            position_ids,
+            position_embeddings,
+            target_verify,
+        ):
+            if x.shape[1] > 1:
+                cache._omlx_last_prefill_gathered = True
+            return self._row_exact_gathered_verify(x, cache, position_ids)
+
         if self._gathered_text_verify_eligible(
             x,
             mask,
@@ -1729,6 +2102,12 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             return self._gathered_text_prefill(
                 x, cache, position_ids, target_verify=True
             )
+
+        if self._row_exact_masked_verify_eligible(
+            x, mask, cache, position_embeddings, target_verify
+        ):
+            cache._omlx_last_prefill_gathered = False
+            return self._row_exact_masked_verify(x, cache, position_ids)
 
         if cache is not None and x.ndim == 3 and x.shape[1] > 1:
             cache._omlx_last_prefill_gathered = False
@@ -1754,6 +2133,14 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             return _VERIFIER._attention(
                 self, x, mask, cache, position_ids, position_embeddings
             )
+        if (
+            qsa_mask is not None
+            and mask is qsa_mask
+            and x.shape[:2] == (1, 1)
+            and type(cache) is QSAKVCache
+            and position_embeddings is None
+        ):
+            return self._masked_decode(x, mask, cache, position_ids)
         return super().__call__(
             x,
             mask=mask,
@@ -1761,6 +2148,34 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             position_ids=position_ids,
             position_embeddings=position_embeddings,
         )
+
+    def _masked_decode(
+        self,
+        x: mx.array,
+        mask: mx.array,
+        cache: QSAKVCache,
+        position_ids: Optional[mx.array],
+    ) -> mx.array:
+        """``Qwen3_5Attention.__call__`` for one QSA-masked decode row, with an
+        SDPA that visits only the selected keys (same bits as MLX's)."""
+
+        batch, length, _ = x.shape
+        queries, keys, values, gate, mask = self._prepare_projected_qkv(
+            self.q_proj(x),
+            self.k_proj(x),
+            self.v_proj(x),
+            cache,
+            position_ids,
+            None,
+            mask,
+        )
+        output = masked_decode_sdpa(queries, keys, values, mask, self.scale)
+        if output is None:
+            output = q35_language.scaled_dot_product_attention(
+                queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            )
+        output = output.transpose(0, 2, 1, 3).reshape(batch, length, -1)
+        return self.o_proj(output * mx.sigmoid(gate))
 
 
 class Qwen4ExpGatedResidual(nn.Module):
@@ -1790,12 +2205,19 @@ class Qwen4ExpGatedResidual(nn.Module):
         self, hyper_input: mx.array, target_verify: bool = False, write=None
     ):
         # ``write`` is a pending (branch, gate) residual write onto hyper_input.
+        # The written residual comes back as the passthrough; the mixer (no
+        # block_inject_weight) then returns (mixed, written).
         if write is not None:
-            if not target_verify and hc_fused.prefill_compatible(self, hyper_input):
+            fused = None
+            if hc_fused.write_enabled() and hc_fused.compatible(self, hyper_input):
+                fused = hc_fused.fused_forward(self, hyper_input, write)
+            elif not target_verify and hc_fused.prefill_compatible(self, hyper_input):
                 fused = hc_fused.prefill_forward(self, hyper_input, write)
-                if fused is not None:
-                    return fused
+            if fused is not None:
+                return fused
             hyper_input = _hc_write(hyper_input, *write)
+            out = self(hyper_input, target_verify=target_verify)
+            return out if "block_inject_weight" in self else (out, hyper_input)
         if hc_fused.compatible(self, hyper_input):
             fused = hc_fused.fused_forward(self, hyper_input)
             if fused is not None:
@@ -2921,6 +3343,95 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         return embeddings.reshape(*embeddings.shape[:-2], -1)
 
 
+# MLX sends dilated depthwise convolutions through its grouped implicit GEMM
+# (one GEMM group per channel: ~8.7 ms for the 6k-row, 10240-channel PLE short
+# conv). This kernel is MLX's own depthwise_conv_1d arithmetic (sequential fp32
+# sum of bf16 products, one rounding) with a dilation; it is checked bit-equal
+# against mx.conv1d on first use. OMLX_QWEN4_PLE_CONV_KERNEL=0 disables it.
+_DEPTHWISE_CONV_SOURCE = r"""
+    const uint c = thread_position_in_grid.x;
+    const uint t = thread_position_in_grid.y;
+    const uint b = thread_position_in_grid.z;
+    if (c >= C) return;
+    // Row counts come from the grid so one pipeline serves every length.
+    const size_t t_out = threads_per_grid.y;
+    const size_t t_in = t_out + (K - 1) * DIL;
+    const device T* src = x + ((size_t)b * t_in + t) * C + c;
+    float acc = 0.0f;
+    for (int i = 0; i < K; ++i) {
+        acc += static_cast<float>(src[(size_t)i * DIL * C]) *
+            static_cast<float>(w[c * K + i]);
+    }
+    y[((size_t)b * t_out + t) * C + c] = static_cast<T>(acc);
+"""
+_DEPTHWISE_CONV_STATE = {
+    "enabled": env_enabled("OMLX_QWEN4_PLE_CONV_KERNEL"),
+    "kernel": None,
+    "validated": False,
+}
+
+
+def _depthwise_conv1d(conv: nn.Conv1d, x: mx.array) -> mx.array:
+    """``conv(x)`` for a bias-free depthwise (groups == channels) Conv1d."""
+
+    weight = getattr(conv, "weight", None)
+    state = _DEPTHWISE_CONV_STATE
+    if not (
+        state["enabled"]
+        and isinstance(weight, mx.array)
+        and x.ndim == 3
+        and weight.ndim == 3
+        and weight.shape[-1] == 1
+        and weight.shape[0] == x.shape[-1] == getattr(conv, "groups", None)
+        and getattr(conv, "stride", None) == 1
+        and getattr(conv, "padding", None) == 0
+        and isinstance(getattr(conv, "dilation", None), int)
+        and "bias" not in conv
+        and x.dtype == weight.dtype
+        and x.dtype in (mx.bfloat16, mx.float16, mx.float32)
+        and mx.default_device() == mx.gpu
+    ):
+        return conv(x)
+    batch, rows, channels = x.shape
+    taps = weight.shape[1]
+    out_rows = rows - (taps - 1) * conv.dilation
+    if out_rows <= 0:
+        return conv(x)
+    try:
+        if state["kernel"] is None:
+            state["kernel"] = mx.fast.metal_kernel(
+                name="omlx_qwen4_depthwise_conv1d",
+                input_names=["x", "w"],
+                output_names=["y"],
+                source=_DEPTHWISE_CONV_SOURCE,
+            )
+        output = state["kernel"](
+            inputs=[x, weight],
+            template=[
+                ("T", x.dtype),
+                ("C", channels),
+                ("K", taps),
+                ("DIL", conv.dilation),
+            ],
+            grid=(channels, out_rows, batch),
+            threadgroup=(min(256, channels), 1, 1),
+            output_shapes=[(batch, out_rows, channels)],
+            output_dtypes=[x.dtype],
+        )[0]
+        if not state["validated"]:
+            reference = conv(x)
+            mx.eval(output, reference)
+            if not mx.array_equal(output, reference).item():
+                raise RuntimeError("depthwise conv kernel differs from mx.conv1d")
+            state["validated"] = True
+            return reference
+        return output
+    except Exception as exc:  # noqa: BLE001 - optional fast path
+        state["enabled"] = False
+        logger.warning("Qwen4 PLE depthwise conv kernel disabled: %s", exc)
+        return conv(x)
+
+
 class Qwen4ExpPLELayer(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int, ple_layer_index: int):
         super().__init__()
@@ -2971,7 +3482,7 @@ class Qwen4ExpPLELayer(nn.Module):
         conv_input = mx.concatenate([state, x], axis=1)
         if cache is not None:
             cache.update_window(2, conv_input, self.short_conv_state_len)
-        return nn.silu(self.conv1d(conv_input)), state
+        return nn.silu(_depthwise_conv1d(self.conv1d, conv_input)), state
 
     def __call__(
         self,
@@ -3059,9 +3570,20 @@ class Qwen4ExpDecoderLayer(nn.Module):
         position_ids: Optional[mx.array],
         gdn_sink=None,
         target_verify: bool = False,
+        write=None,
+        defer_write: bool = False,
     ):
+        """``write`` is the previous layer's pending (branch, gate) residual
+        write onto ``hidden_states``. ``defer_write`` returns this layer's own
+        pending write as ``(residual, branch, gate)`` instead of applying it."""
+        # Children by item (one dict lookup, not nn.Module.__getattr__):
+        # this runs for every layer of every decode step.
         if "ple" in self:
-            hidden_states = hidden_states + self.ple(
+            if write is not None:
+                # The PLE block reads the full residual.
+                hidden_states = _hc_write(hidden_states, *write)
+                write = None
+            hidden_states = hidden_states + self["ple"](
                 hidden_states,
                 input_ids,
                 cache,
@@ -3069,34 +3591,35 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 target_verify=target_verify,
             )
 
-        mixed, hyper_input, injection_weights = self.attn_hyper_connection(
+        mixed, hyper_input, injection_weights = self["attn_hyper_connection"](
             hidden_states,
             target_verify=target_verify,
+            write=write,
         )
         if self.is_linear:
+            linear_attn = self["linear_attn"]
             branch = (
-                _VERIFIER._gated_delta(self.linear_attn, mixed, mask, cache)
+                _VERIFIER._gated_delta(linear_attn, mixed, mask, cache)
                 if target_verify
-                else self.linear_attn(mixed, mask=mask, cache=cache)
+                else linear_attn(mixed, mask=mask, cache=cache)
             )
         else:
-            branch = self.self_attn(
+            branch = self["self_attn"](
                 mixed,
                 mask=mask,
                 cache=cache,
                 position_ids=position_ids,
                 target_verify=target_verify,
             )
-        mixed, hyper_input, injection_weights = self.mlp_hyper_connection(
+        mixed, hyper_input, injection_weights = self["mlp_hyper_connection"](
             hyper_input,
             target_verify=target_verify,
             write=(branch, injection_weights),
         )
-        branch = (
-            _VERIFIER._feed_forward(self.mlp, mixed)
-            if target_verify
-            else self.mlp(mixed)
-        )
+        mlp = self["mlp"]
+        branch = _VERIFIER._feed_forward(mlp, mixed) if target_verify else mlp(mixed)
+        if defer_write:
+            return hyper_input, branch, injection_weights
         return _hc_write(hyper_input, branch, injection_weights)
 
 
@@ -3147,6 +3670,18 @@ class Qwen4ExpModel(nn.Module):
             ssm_mask = mask
 
         capture = set(capture_layer_ids or [])
+        target_verify = gdn_sink is not None
+        # Each layer's tail residual write stays pending and is applied inside
+        # the next hyper-connection norm; ``hidden_states`` is the residual
+        # before it (OMLX_QWEN4_HC_FUSED_WRITE=0 applies it eagerly).
+        defer_write = hc_fused.write_enabled()
+        # Every layer keeps the residual's leading (batch, rows) dims.
+        eager = (
+            _EAGER_DISPATCH
+            and hidden_states.shape[0] * hidden_states.shape[1]
+            <= _EAGER_DISPATCH_MAX_ROWS
+        )
+        write = None
         for index, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
             layer_mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(
@@ -3156,23 +3691,36 @@ class Qwen4ExpModel(nn.Module):
                 cache=layer_cache,
                 position_ids=position_ids,
                 gdn_sink=gdn_sink,
-                target_verify=gdn_sink is not None,
+                target_verify=target_verify,
+                write=write,
+                defer_write=defer_write,
             )
-            if (
-                _EAGER_DISPATCH
-                and hidden_states.shape[0] * hidden_states.shape[1]
-                <= _EAGER_DISPATCH_MAX_ROWS
+            if defer_write:
+                hidden_states, write = hidden_states[0], hidden_states[1:]
+            if eager and (
+                index < _EAGER_DISPATCH_WARMUP or index % _EAGER_DISPATCH_EVERY == 0
             ):
-                mx.async_eval(hidden_states)
+                mx.async_eval(hidden_states, *(write or ()))
             if hidden_sink is not None and index in capture:
-                hidden_sink.append(
-                    self.hyper_connection_mixer(
-                        hidden_states,
-                        target_verify=gdn_sink is not None,
+                if write is None:
+                    mixed = self.hyper_connection_mixer(
+                        hidden_states, target_verify=target_verify
                     )
-                )
+                else:
+                    mixed, hidden_states = self.hyper_connection_mixer(
+                        hidden_states, target_verify=target_verify, write=write
+                    )
+                    write = None
+                hidden_sink.append(mixed)
 
-        if inputs_embeds is None and gdn_sink is None:
+        mixed = None
+        if write is not None:
+            # The final mixer applies the last write and returns the residual.
+            mixed, hidden_states = self.hyper_connection_mixer(
+                hidden_states, target_verify=target_verify, write=write
+            )
+
+        if inputs_embeds is None and gdn_sink is None and not _MTP_ONE_ROW_STEP.get():
             host_ref = getattr(self, "_omlx_mtp_prime_host", None)
             host = host_ref() if host_ref is not None else None
             if host is not None:
@@ -3191,10 +3739,11 @@ class Qwen4ExpModel(nn.Module):
             # mixer. Ordinary layer captures retain their mixed representation.
             hidden_sink.append(hidden_states)
 
-        return self.hyper_connection_mixer(
-            hidden_states,
-            target_verify=gdn_sink is not None,
-        )
+        if mixed is None:
+            mixed = self.hyper_connection_mixer(
+                hidden_states, target_verify=target_verify
+            )
+        return mixed
 
 
 class Qwen4ExpMTPModule(nn.Module):
@@ -3304,6 +3853,8 @@ class Qwen4ExpMTPModule(nn.Module):
         positions = mx.maximum(mx.array(offset), 0).reshape(-1, 1)
         positions = positions + mx.arange(hidden_states.shape[1])[None]
         position_ids = mx.broadcast_to(positions, hidden_states.shape[:2])
+        defer_write = hc_fused.write_enabled()
+        write = None
         for layer, layer_cache in zip(self.layers, cache):
             hidden_states = layer(
                 hidden_states,
@@ -3311,13 +3862,23 @@ class Qwen4ExpMTPModule(nn.Module):
                 mask=mask,
                 cache=layer_cache,
                 position_ids=position_ids,
+                write=write,
+                defer_write=defer_write,
             )
+            if defer_write:
+                hidden_states, write = hidden_states[0], hidden_states[1:]
+        if write is not None:
+            # The mixer applies the last write and returns (mixed, residual).
+            return self.hyper_connection_mixer(hidden_states, write=write)
         return self.hyper_connection_mixer(hidden_states), hidden_states
 
 
 class LanguageModel(Qwen3_5LanguageModel):
     _omlx_mtp_multi_request = True
     _omlx_mtp_batch_rollback = True
+    # Lightning MTP verify rows reproduce one-row decode arithmetic, so
+    # greedy MTP output equals MTP-off output (batch_generator._row_exact_verify).
+    _omlx_mtp_row_exact_verify = True
 
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         nn.Module.__init__(self)
@@ -3358,11 +3919,20 @@ class LanguageModel(Qwen3_5LanguageModel):
         mtp_capture = return_hidden and kwargs.get("capture_layer_ids") is None
         if mtp_capture:
             kwargs["capture_layer_ids"] = []
+        one_row_step = (
+            mtp_capture
+            and not _ONE_ROW_MTP_DECODE_DISABLED
+            and inputs_embeds is None
+            and tuple(inputs.shape) == (1, 1)
+            and cache is not None
+            and not any(getattr(c, "_speculation", None) is not None for c in cache)
+        )
         transaction = (
             start_speculative_cache(cache or [], inputs.shape[1])
-            if mtp_capture
+            if mtp_capture and not one_row_step
             else None
         )
+        step = _MTP_ONE_ROW_STEP.set(True) if one_row_step else None
         try:
             output = super().__call__(inputs, inputs_embeds, mask, cache, **kwargs)
             if mtp_capture and output.hidden_states:
@@ -3373,6 +3943,17 @@ class LanguageModel(Qwen3_5LanguageModel):
             if transaction is not None:
                 transaction.abort()
             raise
+        finally:
+            if step is not None:
+                _MTP_ONE_ROW_STEP.reset(step)
+
+    def ple_gathers_ahead(self) -> bool:
+        """True when an SSD-backed PLE table gathers rows one prefill chunk ahead."""
+        for layer in self.model.layers:
+            ple = getattr(layer, "ple", None)
+            if ple is not None and getattr(ple.ple_embedding.ngram_embedding, "prefetch", None) is not None:
+                return True
+        return False
 
     def prefetch_ple(self, next_ids: mx.array, current_ids: mx.array) -> None:
         """Start gathering the next prefill chunk's PLE rows while ``current_ids`` runs."""
