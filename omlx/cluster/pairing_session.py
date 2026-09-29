@@ -102,7 +102,11 @@ class PairingSession:
             return result
 
     def begin(
-        self, address: str, *, local_ssh_user=None, remote_ssh_user=None
+        self,
+        address: str,
+        *,
+        local_ssh_user: str | None = None,
+        remote_ssh_user: str | None = None,
     ) -> dict[str, Any]:
         with self.mutation_lock:
             with self.lock:
@@ -116,7 +120,11 @@ class PairingSession:
             )
 
     def _begin(
-        self, address: str, *, local_ssh_user=None, remote_ssh_user=None
+        self,
+        address: str,
+        *,
+        local_ssh_user: str | None = None,
+        remote_ssh_user: str | None = None,
     ) -> dict[str, Any]:
         raw = address.strip()
         try:

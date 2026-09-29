@@ -125,7 +125,9 @@ def validate_pairing_code(code: str) -> str:
     return code
 
 
-def validate_ssh_accounts(local_ssh_user=None, remote_ssh_user=None):
+def validate_ssh_accounts(
+    local_ssh_user: str | None = None, remote_ssh_user: str | None = None
+) -> None:
     """Bind enrollment to the account that actually owns the local SSH keys."""
     if local_ssh_user is None and remote_ssh_user is None:
         return
@@ -982,7 +984,7 @@ class PairingManager:
     # -- joiner side ----------------------------------------------------------
 
     def start_join(
-        self, *, local_ssh_user=None, remote_ssh_user=None
+        self, *, local_ssh_user: str | None = None, remote_ssh_user: str | None = None
     ) -> dict[str, Any]:
         """Generate the 6-digit code the joiner displays; valid 10 minutes."""
 
@@ -1370,7 +1372,12 @@ class PairingManager:
             return [self._pending[key].to_dict(now) for key in sorted(self._pending)]
 
     def approve(
-        self, node_id: str, code: str, *, local_ssh_user=None, remote_ssh_user=None
+        self,
+        node_id: str,
+        code: str,
+        *,
+        local_ssh_user: str | None = None,
+        remote_ssh_user: str | None = None,
     ) -> dict[str, Any]:
         """Verify the displayed code, issue the cluster key, enroll the peer.
 
