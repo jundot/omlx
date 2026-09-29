@@ -361,6 +361,11 @@ class EnginePool:
         self._failed_load_reclaim_tasks: set[asyncio.Task[None]] = set()
         self._failed_load_reclaim_task: asyncio.Task[None] | None = None
         self._shutting_down = False
+        # Forced-offload decisions are recomputed by every status and projection
+        # call, including the read-only model list the desktop app polls. Keep
+        # the last emitted state per (model, decision) so a stable decision logs
+        # once instead of once per poll (upstream issue #4099).
+        self._offload_warn_state: dict[tuple[str, str], bool] = {}
         # Idle GPU keep-warm ticker (see _touch_gpu). Configured by the server
         # from ServerSettings.gpu_keep_warm_interval; started on first load.
         self._gpu_keep_warm_interval: float = 0.0
@@ -608,6 +613,39 @@ class EnginePool:
         footprint = int(estimate.resident_bytes / 1.05)
         return footprint > line >= estimate.mmap_bytes
 
+    def _log_offload_decision_once(
+        self,
+        model_id: str,
+        kind: str,
+        forced: bool,
+        message: str,
+        *args: object,
+    ) -> None:
+        """Log a forced-offload decision only when it changes for this model.
+
+        The Qwen4 PLE and DeepSeek V4.1 Engram resolvers below are also reached
+        from read-only paths: the admin model list, the per-model detail
+        endpoint and the engine runtime signature. A polled model list calls
+        them once per UI refresh, so warning on every call turns one stable
+        decision into thousands of identical log lines (measured: ~1.7k/h while
+        a desktop app polled the list every ~2s). The decision itself is
+        unaffected — only the emission is deduplicated, and a transition still
+        reports.
+        """
+
+        state = getattr(self, "_offload_warn_state", None)
+        if state is None:
+            # Pools built via __new__ (tests, single-purpose embedders) never
+            # ran __init__; keep dedup working without requiring it.
+            state = {}
+            self._offload_warn_state = state
+        key = (model_id, kind)
+        if state.get(key) == forced:
+            return
+        state[key] = forced
+        if forced:
+            logger.warning(message, *args)
+
     def _qwen4_ple_offload_status(
         self,
         entry: EngineEntry,
@@ -666,17 +704,19 @@ class EnginePool:
         forced = estimate.force_ssd_offload(
             ceiling
         ) or self._resident_leaves_no_prompt_room(estimate, ceiling)
-        if forced:
-            logger.warning(
-                "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB leaves no "
-                "room to serve prompts under the %.1fGB memory ceiling (mmap "
-                "needs %.1fGB). Decode will be roughly 2.5x slower than a "
-                "resident load.",
-                entry.model_id,
-                estimate.resident_bytes / 1e9,
-                ceiling / 1e9,
-                estimate.mmap_bytes / 1e9,
-            )
+        self._log_offload_decision_once(
+            entry.model_id,
+            "qwen4_ple_ssd_offload",
+            forced,
+            "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB leaves no "
+            "room to serve prompts under the %.1fGB memory ceiling (mmap "
+            "needs %.1fGB). Decode will be roughly 2.5x slower than a "
+            "resident load.",
+            entry.model_id,
+            estimate.resident_bytes / 1e9,
+            ceiling / 1e9,
+            estimate.mmap_bytes / 1e9,
+        )
         requested = bool(
             settings is not None and getattr(settings, "qwen4_ple_ssd_offload", False)
         )
@@ -757,16 +797,18 @@ class EnginePool:
         forced = estimate.force_ssd_offload(
             ceiling
         ) or self._resident_leaves_no_prompt_room(estimate, ceiling)
-        if forced:
-            logger.warning(
-                "DeepSeek V4.1 Engram forced to SSD for %s: resident %.1fGB leaves "
-                "no room to serve prompts under the %.1fGB memory ceiling (mmap "
-                "needs %.1fGB).",
-                entry.model_id,
-                estimate.resident_bytes / 1e9,
-                ceiling / 1e9,
-                estimate.mmap_bytes / 1e9,
-            )
+        self._log_offload_decision_once(
+            entry.model_id,
+            "deepseek_v41_engram_ssd_offload",
+            forced,
+            "DeepSeek V4.1 Engram forced to SSD for %s: resident %.1fGB leaves "
+            "no room to serve prompts under the %.1fGB memory ceiling (mmap "
+            "needs %.1fGB).",
+            entry.model_id,
+            estimate.resident_bytes / 1e9,
+            ceiling / 1e9,
+            estimate.mmap_bytes / 1e9,
+        )
         requested = bool(
             settings is not None
             and getattr(settings, "deepseek_v41_engram_ssd_offload", False)
