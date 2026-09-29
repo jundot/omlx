@@ -752,12 +752,13 @@ def scp_push(
         result = subprocess.run(
             [
                 "scp",
+                "-s",
                 "-q",
                 *cluster_ssh_options(connect_timeout=10),
                 "-c",
                 cipher,
                 str(source),
-                f"{destination_host}:{shlex.quote(temporary_path)}",
+                f"{destination_host}:{temporary_path}",
             ],
             capture_output=True,
             text=True,
@@ -823,7 +824,9 @@ def scp_copy(
         )
         return
 
-    remote_source = shlex.quote(f"{source_dir.rstrip('/')}/{filename}")
+    # SFTP receives paths as arguments, not shell commands. Shell quotes here
+    # become literal filename characters, breaking directories with spaces.
+    remote_source = f"{source_dir.rstrip('/')}/{filename}"
     if destination_local:
         destination = Path(destination_dir).expanduser()
         destination.mkdir(parents=True, exist_ok=True)
@@ -832,6 +835,7 @@ def scp_copy(
             result = subprocess.run(
                 [
                     "scp",
+                    "-s",
                     "-q",
                     *cluster_ssh_options(connect_timeout=10),
                     "-c",
@@ -877,13 +881,14 @@ def scp_copy(
             result = subprocess.run(
                 [
                     "scp",
+                    "-s",
                     "-3",
                     "-q",
                     *cluster_ssh_options(connect_timeout=10),
                     "-c",
                     cipher,
                     f"{source_host}:{remote_source}",
-                    f"{destination_host}:{shlex.quote(temporary_path)}",
+                    f"{destination_host}:{temporary_path}",
                 ],
                 capture_output=True,
                 text=True,

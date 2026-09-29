@@ -782,3 +782,40 @@ def test_free_space_is_readable_for_a_path_that_does_not_exist_yet(tmp_path):
     from omlx.cluster.staging import free_disk_bytes
 
     assert free_disk_bytes(tmp_path / "not" / "created" / "yet") > 0
+
+
+@pytest.mark.parametrize(
+    "source_local,destination_local", [(True, False), (False, True), (False, False)]
+)
+def test_copy_paths_with_spaces_use_sftp_without_shell_quotes(
+    tmp_path, monkeypatch, source_local, destination_local
+):
+    source = tmp_path / "source with spaces"
+    source.mkdir()
+    (source / "config.json").write_bytes(b"{}")
+    destination = tmp_path / "destination with spaces"
+    commands = []
+
+    def run(command, **kwargs):
+        commands.append(command)
+        if command[0] == "scp" and destination_local:
+            Path(command[-1]).write_bytes(b"{}")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    scp_copy(
+        source_host="127.0.0.1" if source_local else "source.example",
+        destination_host="127.0.0.1" if destination_local else "destination.example",
+        source_dir=str(source),
+        destination_dir=str(destination),
+        filename="config.json",
+    )
+    copy = next(c for c in commands if c[0] == "scp")
+    assert "-s" in copy
+    if not source_local:
+        assert f"source.example:{source}/config.json" in copy
+    if not destination_local:
+        assert copy[-1].startswith(f"destination.example:{destination}/")
+    assert (
+        "-3" in copy if not source_local and not destination_local else "-3" not in copy
+    )
