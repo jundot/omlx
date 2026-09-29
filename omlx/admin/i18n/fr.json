@@ -2024,6 +2024,6 @@
   "cluster.v2.ssh_accounts.invalid": "Saisissez les deux noms courts, sans espaces.",
   "cluster.v2.ssh_accounts.continue": "Continuer l’appairage",
   "cluster.v2.ssh_accounts.cancel": "Annuler",
-  "cluster.v2.ssh_accounts.legacy": "Use default SSH accounts (older oMLX)",
-  "cluster.v2.ssh_accounts.legacy_help": "Pairing with an older oMLX version? Use the default SSH accounts instead. The names entered above will not be sent. Custom accounts require both Macs to be updated."
+  "cluster.v2.ssh_accounts.legacy": "Utiliser les comptes SSH par défaut (ancien oMLX)",
+  "cluster.v2.ssh_accounts.legacy_help": "L’autre Mac utilise une ancienne version d’oMLX ? Utilisez les comptes SSH par défaut. Les noms saisis ci-dessus ne seront pas envoyés. Les comptes personnalisés nécessitent une version à jour sur les deux Mac."
 }
