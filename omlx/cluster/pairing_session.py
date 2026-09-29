@@ -47,6 +47,11 @@ class PairingSession:
                     "created_at": self.attempt["expires_at"] - CODE_TTL_SECONDS,
                     "expires_at": self.attempt["expires_at"],
                     "completing": False,
+                    **{
+                        key: self.attempt[key]
+                        for key in ("local_ssh_user", "remote_ssh_user")
+                        if key in self.attempt
+                    },
                 }
 
     def _save(self) -> None:
@@ -96,7 +101,9 @@ class PairingSession:
                     return self.snapshot()
             return result
 
-    def begin(self, address: str) -> dict[str, Any]:
+    def begin(
+        self, address: str, *, local_ssh_user=None, remote_ssh_user=None
+    ) -> dict[str, Any]:
         with self.mutation_lock:
             with self.lock:
                 cleanup = (
@@ -104,9 +111,13 @@ class PairingSession:
                 )
             if cleanup:
                 self.cancel()
-            return self._begin(address)
+            return self._begin(
+                address, local_ssh_user=local_ssh_user, remote_ssh_user=remote_ssh_user
+            )
 
-    def _begin(self, address: str) -> dict[str, Any]:
+    def _begin(
+        self, address: str, *, local_ssh_user=None, remote_ssh_user=None
+    ) -> dict[str, Any]:
         raw = address.strip()
         try:
             parsed = urlsplit(raw if "://" in raw else "http://" + raw)
@@ -141,7 +152,9 @@ class PairingSession:
                 raise PairingStateError(
                     "Cancel the existing join before starting another."
                 )
-            shown = self.manager.start_join()
+            shown = self.manager.start_join(
+                local_ssh_user=local_ssh_user, remote_ssh_user=remote_ssh_user
+            )
             try:
                 payload = self.manager.build_join_request()
             except Exception:

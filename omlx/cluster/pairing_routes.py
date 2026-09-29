@@ -73,9 +73,22 @@ class PairRequestBody(BaseModel):
     addrs: list[str] = Field(default_factory=list, max_length=8)
     ssh_public_key: str = Field(min_length=32, max_length=8192)
     ssh_host_public_key: str = Field(min_length=32, max_length=8192)
+    ssh_user: str | None = Field(
+        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$"
+    )
+    expected_ssh_user: str | None = Field(
+        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$"
+    )
 
 
 class PairApproveBody(BaseModel):
+    local_ssh_user: str | None = Field(
+        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$"
+    )
+    remote_ssh_user: str | None = Field(
+        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$"
+    )
+
     model_config = ConfigDict(extra="forbid")
 
     node_id: str = Field(min_length=1, max_length=255)
@@ -89,6 +102,13 @@ class PairDenyBody(BaseModel):
 
 
 class PairJoinBody(BaseModel):
+    local_ssh_user: str | None = Field(
+        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$"
+    )
+    remote_ssh_user: str | None = Field(
+        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$"
+    )
+
     model_config = ConfigDict(extra="forbid")
     coordinator_addr: str = Field(min_length=1, max_length=255)
 
@@ -98,7 +118,10 @@ async def cluster_pair_join(body: PairJoinBody, response: Response):
     response.headers["Cache-Control"] = "no-store"
     try:
         return await asyncio.to_thread(
-            _manager().ui_session.begin, body.coordinator_addr
+            _manager().ui_session.begin,
+            body.coordinator_addr,
+            local_ssh_user=body.local_ssh_user,
+            remote_ssh_user=body.remote_ssh_user,
         )
     except PairingStateError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -193,7 +216,13 @@ async def cluster_pair_approve(body: PairApproveBody):
 
     manager = _manager()
     try:
-        result = await asyncio.to_thread(manager.approve, body.node_id, body.code)
+        result = await asyncio.to_thread(
+            manager.approve,
+            body.node_id,
+            body.code,
+            local_ssh_user=body.local_ssh_user,
+            remote_ssh_user=body.remote_ssh_user,
+        )
     except PairingError as exc:
         raise _pairing_http_error(exc) from exc
     try:

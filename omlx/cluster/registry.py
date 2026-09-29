@@ -487,8 +487,15 @@ class DeviceRegistry:
         addrs: list[str] | None = None,
         http_port: int | None = None,
         paired_at: float | None = None,
+        ssh_user: str | None = None,
     ) -> dict[str, Any]:
         """Promote a device to trusted/paired and persist it."""
+
+        if ssh_user is not None and (
+            not isinstance(ssh_user, str)
+            or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,63}", ssh_user)
+        ):
+            raise ValueError("cluster device SSH user is invalid")
 
         with self._lock:
             existing = self._paired.get(node_id) or self._discovered.get(node_id, {})
@@ -511,8 +518,10 @@ class DeviceRegistry:
                 if addrs is not None
                 else list(existing.get("last_addrs") or []),
             }
-            if existing.get("ssh_user"):
-                device["ssh_user"] = existing["ssh_user"]
+            if ssh_user is not None or existing.get("ssh_user"):
+                device["ssh_user"] = (
+                    ssh_user if ssh_user is not None else existing["ssh_user"]
+                )
             effective_port = http_port or existing.get("http_port")
             if effective_port:
                 device["http_port"] = int(effective_port)

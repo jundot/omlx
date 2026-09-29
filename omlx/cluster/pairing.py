@@ -43,6 +43,8 @@ import json
 import logging
 import os
 import platform
+import pwd
+import re
 import secrets
 import socket
 import subprocess
@@ -123,21 +125,42 @@ def validate_pairing_code(code: str) -> str:
     return code
 
 
+def validate_ssh_accounts(local_ssh_user=None, remote_ssh_user=None):
+    """Bind enrollment to the account that actually owns the local SSH keys."""
+    if local_ssh_user is None and remote_ssh_user is None:
+        return
+    for user in (local_ssh_user, remote_ssh_user):
+        if not isinstance(user, str) or not re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_-]{0,63}", user
+        ):
+            raise PairingRequestError("Enter both SSH account short names.")
+    if local_ssh_user != pwd.getpwuid(os.geteuid()).pw_name:
+        raise PairingRequestError(
+            "The local SSH account must be the account running oMLX."
+        )
+
+
 def pairing_code_hash(
     code: str,
     node_id: str,
     ssh_public_key: str = "",
     ssh_host_public_key: str = "",
     salt: bytes = b"",
+    *,
+    ssh_user: str | None = None,
+    expected_ssh_user: str | None = None,
 ) -> str:
     """Slowly derive a verifier bound to the node and both SSH identities."""
 
+    identity = {
+        "node_id": node_id,
+        "ssh_public_key": ssh_public_key,
+        "ssh_host_public_key": ssh_host_public_key,
+    }
+    if ssh_user is not None or expected_ssh_user is not None:
+        identity.update(ssh_user=ssh_user, expected_ssh_user=expected_ssh_user)
     payload = json.dumps(
-        {
-            "node_id": node_id,
-            "ssh_public_key": ssh_public_key,
-            "ssh_host_public_key": ssh_host_public_key,
-        },
+        identity,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -486,6 +509,7 @@ class DeviceRegistryBridge:
                 addrs=record.get("last_addrs") or None,
                 paired_at=record.get("paired_at"),
                 http_port=record.get("http_port"),
+                **({"ssh_user": record["ssh_user"]} if record.get("ssh_user") else {}),
             )
             return
         self._call(self._PUT, record)
@@ -607,6 +631,8 @@ class _PendingRequest:
     locked_until: float | None = None
     approving: bool = False
     cancel_token_hash: str | None = None
+    ssh_user: str | None = None
+    expected_ssh_user: str | None = None
 
     def to_dict(self, now: float) -> dict[str, Any]:
         locked = self.locked_until is not None and self.locked_until > now
@@ -955,9 +981,12 @@ class PairingManager:
 
     # -- joiner side ----------------------------------------------------------
 
-    def start_join(self) -> dict[str, Any]:
+    def start_join(
+        self, *, local_ssh_user=None, remote_ssh_user=None
+    ) -> dict[str, Any]:
         """Generate the 6-digit code the joiner displays; valid 10 minutes."""
 
+        validate_ssh_accounts(local_ssh_user, remote_ssh_user)
         code = generate_pairing_code()
         now = self._clock()
         self._local_code = {
@@ -966,7 +995,14 @@ class PairingManager:
             "expires_at": now + CODE_TTL_SECONDS,
             "completing": False,
         }
-        return {"code": code, "expires_at": self._local_code["expires_at"]}
+        accounts = {}
+        if local_ssh_user is not None:
+            accounts = {
+                "local_ssh_user": local_ssh_user,
+                "remote_ssh_user": remote_ssh_user,
+            }
+            self._local_code.update(accounts)
+        return {"code": code, "expires_at": self._local_code["expires_at"], **accounts}
 
     def build_join_request(self, code: str | None = None) -> dict[str, Any]:
         """Assemble the pair/request payload — identity + code hash, no code."""
@@ -978,6 +1014,13 @@ class PairingManager:
                 raise PairingExpiredError("the displayed pairing code has expired")
             code = self._local_code["code"]
         validate_pairing_code(code)
+        local = self._local_code or {}
+        accounts = {}
+        if local.get("local_ssh_user"):
+            accounts = {
+                "ssh_user": local["local_ssh_user"],
+                "expected_ssh_user": local["remote_ssh_user"],
+            }
         caps = self._caps_provider() if self._caps_provider else {}
         ssh_public_key = normalize_ssh_public_key(self._ssh_key_provider() or "")
         ssh_host_public_key = normalize_ssh_public_key(
@@ -994,7 +1037,9 @@ class PairingManager:
                 ssh_public_key,
                 ssh_host_public_key,
                 code_salt,
+                **accounts,
             ),
+            **accounts,
             "code_salt": base64.b64encode(code_salt).decode("ascii"),
             "http_port": self.http_port,
             "addrs": self.local_addrs(),
@@ -1080,8 +1125,20 @@ class PairingManager:
             "ssh_public_key": coordinator.get("ssh_public_key"),
             "ssh_host_public_key": coordinator.get("ssh_host_public_key"),
         }
+        if local_code.get("remote_ssh_user"):
+            coordinator_peer["ssh_user"] = coordinator.get("ssh_user")
         observed_tag = str(status.get("coordinator_identity_tag") or "")
         try:
+            validate_ssh_accounts(
+                local_code.get("local_ssh_user"), local_code.get("remote_ssh_user")
+            )
+            if (
+                local_code.get("remote_ssh_user")
+                and coordinator_peer.get("ssh_user") != local_code["remote_ssh_user"]
+            ):
+                raise PairingCodeError(
+                    "The remote SSH account does not match this pairing request."
+                )
             expected_tag = coordinator_identity_tag(cluster_key, coordinator_peer)
         except Exception:
             with self._lock:
@@ -1120,6 +1177,8 @@ class PairingManager:
             "state": "paired",
             "role": "coordinator",
         }
+        if local_code.get("remote_ssh_user"):
+            record["ssh_user"] = local_code["remote_ssh_user"]
         key_record = {
             "cluster_key": cluster_key.hex(),
             "peer_public_key": coordinator.get("ssh_public_key"),
@@ -1206,6 +1265,16 @@ class PairingManager:
         http_port = payload.get("http_port")
         ssh_public_key = payload.get("ssh_public_key")
         ssh_host_public_key = payload.get("ssh_host_public_key")
+        ssh_user = payload.get("ssh_user")
+        expected_ssh_user = payload.get("expected_ssh_user")
+        if ssh_user is not None or expected_ssh_user is not None:
+            for user in (ssh_user, expected_ssh_user):
+                if not isinstance(user, str) or not re.fullmatch(
+                    r"[A-Za-z_][A-Za-z0-9_-]{0,63}", user
+                ):
+                    raise PairingRequestError(
+                        "Invalid SSH account names in pairing request."
+                    )
         if not node_id or len(node_id) > 255:
             raise PairingRequestError("join request is missing a node_id")
         if node_id == self.node_id:
@@ -1254,6 +1323,8 @@ class PairingManager:
                     and existing.ssh_host_public_key == ssh_host_public_key
                     and existing.addrs == normalized_addrs[:8]
                     and existing.cancel_token_hash == cancel_token_hash
+                    and existing.ssh_user == ssh_user
+                    and existing.expected_ssh_user == expected_ssh_user
                 )
                 if same_request:
                     return existing.to_dict(now)
@@ -1272,6 +1343,8 @@ class PairingManager:
                 code_hash=code_hash,
                 code_salt=code_salt,
                 cancel_token_hash=cancel_token_hash,
+                ssh_user=ssh_user,
+                expected_ssh_user=expected_ssh_user,
                 addrs=normalized_addrs[:8],
                 http_port=int(http_port) if http_port is not None else None,
                 ssh_public_key=ssh_public_key,
@@ -1296,7 +1369,9 @@ class PairingManager:
             self._prune_pending(now)
             return [self._pending[key].to_dict(now) for key in sorted(self._pending)]
 
-    def approve(self, node_id: str, code: str) -> dict[str, Any]:
+    def approve(
+        self, node_id: str, code: str, *, local_ssh_user=None, remote_ssh_user=None
+    ) -> dict[str, Any]:
         """Verify the displayed code, issue the cluster key, enroll the peer.
 
         Order is fail-closed: code verify → key wrap → SSH TOFU enrollment →
@@ -1334,12 +1409,24 @@ class PairingManager:
                 # Lockout served: fresh set of attempts, code still valid by TTL.
                 pending.locked_until = None
                 pending.attempts = 0
+            validate_ssh_accounts(local_ssh_user, remote_ssh_user)
+            if local_ssh_user is not None and (
+                pending.expected_ssh_user != local_ssh_user
+                or pending.ssh_user != remote_ssh_user
+            ):
+                raise PairingRequestError(
+                    "Both Macs must confirm matching SSH accounts. Restart pairing on an updated oMLX version."
+                )
+            if pending.ssh_user is not None:
+                validate_ssh_accounts(pending.expected_ssh_user, pending.ssh_user)
             expected = pairing_code_hash(
                 code,
                 node_id,
                 pending.ssh_public_key or "",
                 pending.ssh_host_public_key,
                 pending.code_salt,
+                ssh_user=pending.ssh_user,
+                expected_ssh_user=pending.expected_ssh_user,
             )
             if not hmac.compare_digest(expected, pending.code_hash):
                 pending.attempts += 1
@@ -1365,6 +1452,8 @@ class PairingManager:
 
         try:
             coordinator_material = self.local_ssh_material()
+            if pending.ssh_user is not None:
+                coordinator_material["ssh_user"] = pending.expected_ssh_user
         except Exception as exc:
             self._record_audit(
                 "approve_enrollment_failed",
@@ -1418,6 +1507,8 @@ class PairingManager:
             "state": "paired",
             "role": "peer",
         }
+        if pending.ssh_user is not None:
+            record["ssh_user"] = pending.ssh_user
         key_record = {
             "cluster_key": cluster_key.hex(),
             # The joiner retrieves this package via pair/status and unwraps it
