@@ -1733,6 +1733,9 @@ class VLMBatchedEngine(BaseEngine):
         # Holds the loaded gemma4_assistant drafter when vlm_mtp_enabled.
         # Phase 2A: attached but not yet wired into the decode path.
         self._vlm_mtp_drafter: Any | None = None
+        # Holds the DFlash block drafter attached to Lightning MTP when
+        # dflash_enabled routes here instead of DFlashEngine.
+        self._dflash_drafter: Any | None = None
         self._diffusion_family: str | None = None
         self._diffusion_lock = asyncio.Lock()
         self._diffusion_active_requests = 0
@@ -2167,17 +2170,160 @@ class VLMBatchedEngine(BaseEngine):
             is not False
         ):
             try:
-                from ..patches.qwen35_moe_gate_up import (
-                    apply_qwen35_moe_gate_up_fusion,
-                )
+                from ..patches.moe_gate_up_fusion import apply_moe_gate_up_fusion
 
                 await loop.run_in_executor(
                     get_mlx_executor(),
-                    apply_qwen35_moe_gate_up_fusion,
+                    apply_moe_gate_up_fusion,
                     self._vlm_model,
                 )
             except Exception:
                 logger.debug("MoE gate+up fusion not applied", exc_info=True)
+
+        # Qwen ANE prefill compiles its slices from the stock QuantizedLinear
+        # layout, so build them before the packed projections replace it. The
+        # class hooks are installed later, outside the other Qwen class patches.
+        ane_count = 0
+        requested_ane_sequence_length = 2048
+        if (
+            getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)
+            and ane_prefill_backend(self.model_type) == "qwen"
+        ):
+            ane_fraction = ane_prefill_fraction(
+                self._model_settings.qwen35_ane_prefill_fraction, self.model_type
+            )
+            try:
+                from ..patches.qwen35_ane_prefill import enable_qwen35_ane_prefill
+
+                requested_ane_sequence_length = int(
+                    getattr(
+                        self._model_settings,
+                        "qwen35_ane_prefill_sequence_length",
+                        2048,
+                    )
+                )
+
+                def _enable_ane_prefill():
+                    return enable_qwen35_ane_prefill(
+                        self._vlm_model,
+                        sequence_length=requested_ane_sequence_length,
+                        tail_padding_min_tokens=int(
+                            getattr(
+                                self._model_settings,
+                                "qwen35_ane_prefill_tail_padding_min_tokens",
+                                0,
+                            )
+                            or 0
+                        ),
+                        fraction=ane_fraction,
+                        max_layers=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_max_layers",
+                            64,
+                        ),
+                        gdn=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn",
+                            True,
+                        ),
+                        gdn_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn_fraction",
+                            0.50,
+                        ),
+                        gdn_max_layers=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn_max_layers",
+                            48,
+                        ),
+                        dual_ane=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_dual_ane",
+                            True,
+                        ),
+                        ane_down_fraction=(
+                            ane_fraction
+                            if getattr(
+                                self._model_settings,
+                                "qwen35_ane_prefill_fused_down",
+                                False,
+                            )
+                            else 0.0
+                        ),
+                        fused_down=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_fused_down",
+                            False,
+                        ),
+                        cpu_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_fraction",
+                            0.135,
+                        )
+                        if getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_enabled",
+                            False,
+                        )
+                        else 0.0,
+                        cpu_down_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_down_fraction",
+                            0.0,
+                        )
+                        if getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_enabled",
+                            False,
+                        )
+                        else 0.0,
+                        cpu_gdn_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_gdn_fraction",
+                            0.0,
+                        )
+                        if getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_enabled",
+                            False,
+                        )
+                        else 0.0,
+                        cpu_threads=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_threads",
+                            8,
+                        ),
+                        cpu_shared_resource=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_shared_resource",
+                            True,
+                        ),
+                        install_dispatch=False,
+                    )
+
+                ane_count = await loop.run_in_executor(
+                    get_mlx_executor(),
+                    _enable_ane_prefill,
+                )
+            except Exception:
+                logger.warning("Qwen ANE prefill not enabled", exc_info=True)
+
+        # Dense Qwen3.5-family 4-bit projections -> tile-repacked layout for
+        # the M5 tensor units. Replaces the layers in place, so resident
+        # memory does not grow; runs on the MLX executor before any forward.
+        try:
+            from ..patches import qwen35_packed_linear
+
+            if qwen35_packed_linear.enabled(self._vlm_model):
+                packed = await loop.run_in_executor(
+                    get_mlx_executor(),
+                    qwen35_packed_linear.pack_model,
+                    self._vlm_model,
+                )
+                if packed:
+                    logger.info("Qwen packed 4-bit projections: %d layers", packed)
+        except Exception:
+            logger.warning("Qwen packed 4-bit projections not applied", exc_info=True)
 
         _fix_processor_none_pixels(self._processor)
         self._diffusion_family = self._detect_diffusion_family()
@@ -2402,6 +2548,17 @@ class VLMBatchedEngine(BaseEngine):
         except Exception:
             logger.debug("Qwen MoE router patch not applied", exc_info=True)
 
+        # One-token routed experts: gate+up/SwiGLU and down/weighted-sum in
+        # two launches instead of five (bit-identical; needs the router patch).
+        try:
+            from ..patches.qwen35_moe_routed_decode import (
+                apply_qwen35_moe_routed_decode_patch,
+            )
+
+            apply_qwen35_moe_routed_decode_patch()
+        except Exception:
+            logger.debug("Qwen MoE routed decode patch not applied", exc_info=True)
+
         # oQ mixed-bit QxA8 prefill kernels. Gated on the per-model setting
         # because it quantizes activations to INT8, which changes numerics;
         # the patch itself falls through for anything it cannot route.
@@ -2421,142 +2578,21 @@ class VLMBatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("oQ A8 prefill patch not applied", exc_info=True)
 
-        if (
-            getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)
-            and ane_prefill_backend(self.model_type) == "qwen"
-        ):
-            ane_fraction = ane_prefill_fraction(
-                self._model_settings.qwen35_ane_prefill_fraction, self.model_type
-            )
+        if ane_count or getattr(self._vlm_model, "_omlx_ane_gdn_prefill_count", 0):
             try:
                 from ..patches.qwen35_ane_prefill import (
+                    ane_prefill_transient_bytes,
                     configure_qwen35_ane_prefill_scheduler,
-                    enable_qwen35_ane_prefill,
+                    install_qwen35_ane_prefill_dispatch,
                 )
 
-                requested_ane_sequence_length = int(
-                    getattr(
-                        self._model_settings,
-                        "qwen35_ane_prefill_sequence_length",
-                        2048,
-                    )
-                )
-
-                def _enable_ane_prefill():
-                    return enable_qwen35_ane_prefill(
-                        self._vlm_model,
-                        sequence_length=requested_ane_sequence_length,
-                        tail_padding_min_tokens=int(
-                            getattr(
-                                self._model_settings,
-                                "qwen35_ane_prefill_tail_padding_min_tokens",
-                                0,
-                            )
-                            or 0
-                        ),
-                        fraction=ane_fraction,
-                        max_layers=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_max_layers",
-                            64,
-                        ),
-                        gdn=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_gdn",
-                            True,
-                        ),
-                        gdn_fraction=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_gdn_fraction",
-                            0.50,
-                        ),
-                        gdn_max_layers=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_gdn_max_layers",
-                            48,
-                        ),
-                        dual_ane=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_dual_ane",
-                            True,
-                        ),
-                        ane_down_fraction=(
-                            ane_fraction
-                            if getattr(
-                                self._model_settings,
-                                "qwen35_ane_prefill_fused_down",
-                                False,
-                            )
-                            else 0.0
-                        ),
-                        fused_down=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_fused_down",
-                            False,
-                        ),
-                        cpu_fraction=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_fraction",
-                            0.135,
-                        )
-                        if getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_enabled",
-                            False,
-                        )
-                        else 0.0,
-                        cpu_down_fraction=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_down_fraction",
-                            0.0,
-                        )
-                        if getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_enabled",
-                            False,
-                        )
-                        else 0.0,
-                        cpu_gdn_fraction=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_gdn_fraction",
-                            0.0,
-                        )
-                        if getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_enabled",
-                            False,
-                        )
-                        else 0.0,
-                        cpu_threads=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_threads",
-                            8,
-                        ),
-                        cpu_shared_resource=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_shared_resource",
-                            True,
-                        ),
-                    )
-
-                ane_count = await loop.run_in_executor(
-                    get_mlx_executor(),
-                    _enable_ane_prefill,
-                )
-                if ane_count or getattr(
-                    self._vlm_model, "_omlx_ane_gdn_prefill_count", 0
-                ):
+                if install_qwen35_ane_prefill_dispatch():
                     configure_qwen35_ane_prefill_scheduler(
                         scheduler,
                         requested_ane_sequence_length,
                     )
-                    # The scheduler snapshotted model info before these
-                    # banks existed; price the compiled I/O surfaces now so
+                    # Price the compiled I/O surfaces off the full model so
                     # admission charges them while the banks are resident.
-                    from ..patches.qwen35_ane_prefill import (
-                        ane_prefill_transient_bytes,
-                    )
-
                     monitor = getattr(scheduler, "memory_monitor", None)
                     if monitor is not None:
                         monitor.set_ane_prefill_transient_bytes(
@@ -2702,6 +2738,32 @@ class VLMBatchedEngine(BaseEngine):
     def vlm_mtp_drafter(self) -> Any | None:
         return self._vlm_mtp_drafter
 
+    @property
+    def vlm_model(self) -> Any | None:
+        """The loaded mlx-vlm model (target for external drafters)."""
+        return self._vlm_model
+
+    def set_dflash_drafter(self, drafter: Any) -> None:
+        """Attach a DFlash block drafter to the Lightning MTP decode path."""
+        from ..speculative.dflash_drafter import attach_drafter
+
+        language_model = getattr(self._adapter, "_language_model", None)
+        if language_model is None:
+            raise RuntimeError("VLM engine has no language model for the drafter")
+        attach_drafter(language_model, drafter)
+        self._dflash_drafter = drafter
+        logger.info(
+            "DFlash drafter attached to engine: %s (kind=%s, block=%d, layers=%s)",
+            self._model_name,
+            drafter.kind,
+            drafter.block_size,
+            drafter.target_layer_ids,
+        )
+
+    @property
+    def dflash_drafter(self) -> Any | None:
+        return self._dflash_drafter
+
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
         cancelled = False
@@ -2723,7 +2785,9 @@ class VLMBatchedEngine(BaseEngine):
         # Drop wrapper-side references before EngineCore.close() performs its
         # final worker-thread MLX reclaim. Otherwise the VLM wrapper can keep
         # model weights or cached feature arrays alive until after the reclaim
-        # pass has already run.
+        # pass has already run. Mark unloaded first: the scheduler is no longer
+        # reachable once _engine is cleared.
+        self._loaded = False
         _clear_teardown_references(
             self,
             none_attrs=(
@@ -2734,6 +2798,7 @@ class VLMBatchedEngine(BaseEngine):
                 "_tokenizer",
                 "_grammar_compiler",
                 "_vlm_mtp_drafter",
+                "_dflash_drafter",
                 "_diffusion_family",
             ),
             false_attrs=("_grammar_compiler_init_attempted",),
@@ -2747,7 +2812,6 @@ class VLMBatchedEngine(BaseEngine):
                     logger.warning(f"Error closing engine: {e}")
         self._diffusion_cancel_events = set()
         self._diffusion_active_requests = 0
-        self._loaded = False
         logger.info("VLMBatchedEngine stopped")
         if cancelled:
             raise asyncio.CancelledError

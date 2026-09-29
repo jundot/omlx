@@ -245,7 +245,7 @@ def _calibration_model_settings(
 
     return SimpleNamespace(
         mtp_enabled=mtp_enabled,
-        mtp_num_draft_tokens=1,
+        mtp_adaptive_max_depth=1,
         # Calibration executes Qwen4 PLE, but only as sparse row gathers.
         # Force the existing SSD mmap path even when a compact proxy falls
         # below serving's automatic offload threshold.

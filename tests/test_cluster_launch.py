@@ -7,8 +7,11 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -319,6 +322,31 @@ def test_supervisor_preserves_structured_peer_loss_reason():
     assert supervisor.status().failure_reason == reason
     assert reason in supervisor._exit_detail(1)
     assert "generic launcher noise" not in supervisor._exit_detail(1)
+
+
+def test_rank_exit_detail_waits_for_rank_stderr_forwarded_after_the_exit_line():
+    supervisor = launch.DistributedJobSupervisor(_deployment(), preflight=False)
+    supervisor.process = SimpleNamespace(poll=lambda: None)
+
+    # mlx.launch prints the exit line before it forwards the rank's own stderr.
+    def launcher_stderr():
+        yield "[WARN] Node with rank 0 exited with code 1\n"
+        time.sleep(0.2)
+        yield "RuntimeError: JACCL side-channel helper stopped (status=1)\n"
+
+    reader = threading.Thread(
+        target=supervisor._drain,
+        args=(launcher_stderr(), supervisor._stderr, False),
+        daemon=True,
+    )
+    supervisor._readers.append(reader)
+    reader.start()
+
+    with pytest.raises(
+        launch.DistributedLaunchError,
+        match=r"(?s)rank 0 exited with code 1.*side-channel helper stopped",
+    ):
+        supervisor._wait_for_ready()
 
 
 def test_supervisor_prefers_rank_marker_over_mlx_cleanup_traceback(monkeypatch):

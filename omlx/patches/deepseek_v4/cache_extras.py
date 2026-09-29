@@ -93,7 +93,7 @@ class PoolingCache(_BaseCache):
     def offset(self):
         return self._pool_len
 
-    def _grow_pool(self, needed: int) -> None:
+    def _grow_pool(self, needed: int, *, exact: bool = False) -> None:
         """Ensure backing capacity for ``needed`` rows (geometric growth).
 
         Copies only the logical region; rows outside it were never visible
@@ -101,10 +101,37 @@ class PoolingCache(_BaseCache):
         buffer, whose committed bytes stay valid.
         """
         old = self._pool_buf
-        capacity = max(needed, 2 * old.shape[1])
+        capacity = needed if exact else max(needed, 2 * old.shape[1])
         new = mx.zeros((old.shape[0], capacity, old.shape[2]), dtype=old.dtype)
         new[:, : self._pool_len] = old[:, : self._pool_len]
         self._pool_buf = new
+
+    def prefill_capacity_bytes(self, tokens: int) -> int:
+        """Bytes ``reserve_prefill_capacity(tokens)`` would add."""
+        if self._pool_buf is None:
+            return 0
+        rows = int(tokens) // self.ratio - self._pool_buf.shape[1]
+        if rows <= 0:
+            return 0
+        return rows * (self._pool_buf.nbytes // max(1, self._pool_buf.shape[1]))
+
+    def prefill_spare_bytes(self) -> int:
+        """Bytes of pool capacity beyond the rows written so far."""
+        if self._pool_buf is None:
+            return 0
+        rows = self._pool_buf.shape[1] - self._pool_len
+        return rows * (self._pool_buf.nbytes // max(1, self._pool_buf.shape[1]))
+
+    def reserve_prefill_capacity(self, tokens: int) -> list:
+        """Size the pool for a known prompt length in one allocation.
+
+        Each geometric regrowth leaves the old buffer in the MLX pool at a
+        size no later request matches. Returns the arrays to evaluate.
+        """
+        if not self.prefill_capacity_bytes(tokens):
+            return []
+        self._grow_pool(int(tokens) // self.ratio, exact=True)
+        return [self._pool_buf]
 
     def accumulate_windows(self, kv: mx.array, gate: mx.array, offset):
         B, L, D1 = kv.shape

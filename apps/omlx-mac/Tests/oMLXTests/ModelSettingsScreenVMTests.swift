@@ -72,6 +72,23 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(settings["turboquant_kv_enabled"]?.value as? Bool, true)
     }
 
+    func testLightningMtpAdaptiveMaxDepthInWorkingProfile() {
+        let vm = ModelSettingsScreenVM()
+        vm.mtpEnabled = true
+        XCTAssertEqual(vm.currentSettingsDict()[ProfileSettingsKey.mtpAdaptiveMaxDepth]?.value as? Int, 3)
+        XCTAssertEqual(ModelSettingsScreenVM.mtpDepthOptions.map(\.0), ["3", "4", "5", "6"])
+
+        for depth in 3...6 {
+            vm.mtpAdaptiveMaxDepth = String(depth)
+            let settings = vm.currentSettingsDict()
+            XCTAssertEqual(settings[ProfileSettingsKey.mtpAdaptiveMaxDepth]?.value as? Int, depth)
+            XCTAssertNil(settings["mtp_fixed_depth"])
+        }
+
+        vm.mtpEnabled = false
+        XCTAssertNil(vm.currentSettingsDict()[ProfileSettingsKey.mtpAdaptiveMaxDepth])
+    }
+
     func testVlmMtpDraftModelOptionsIncludeQwenMtpConfigType() {
         let vm = ModelSettingsScreenVM()
         vm.modelID = "Qwopus3.6-35B-A3B-v1-4bit-MLXVLM-Target"

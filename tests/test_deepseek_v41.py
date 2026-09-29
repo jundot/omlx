@@ -18,6 +18,7 @@ from omlx.api.utils import extract_text_content, uses_native_reasoning_content
 from omlx.cache.deepseek_v41_delta import compact_state
 from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
 from omlx.patches.deepseek_v41.config import ModelConfig
+from omlx.patches.deepseek_v41.encoding import IMAGE_PLACEHOLDER, encode_messages
 from omlx.patches.deepseek_v41.language import LanguageModel
 from omlx.patches.deepseek_v41.processing import Processor
 
@@ -233,6 +234,28 @@ def test_echoed_reasoning_renders_one_think_block():
     turn = prompt[prompt.index("<｜Assistant｜>") : prompt.index("<｜User｜>Continue.")]
     assert turn.startswith("<｜Assistant｜><think>Let me write.</think>")
     assert turn.count("<think>") == 1
+
+
+def test_literal_image_placeholder_in_text_is_replaced():
+    literal = f"log {IMAGE_PLACEHOLDER}"
+    messages = [
+        {"role": "user", "content": literal},
+        {"role": "assistant", "content": "ok", "reasoning_content": literal},
+        {"role": "tool", "content": [{"type": "text", "text": literal}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": literal},
+                {"type": "image_url", "image_url": {"url": "data:x"}},
+            ],
+        },
+    ]
+    prompt, media = encode_messages(
+        messages, thinking_mode="chat", return_multi_modal_data=True
+    )
+    # Only the real image block may render the placeholder token.
+    assert prompt.count(IMAGE_PLACEHOLDER) == len(media["images"]) == 1
+    assert prompt.count("log [image]") == 3
 
 
 def test_left_padding():

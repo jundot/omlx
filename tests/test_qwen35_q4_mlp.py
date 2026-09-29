@@ -449,6 +449,38 @@ def test_qwen35_q4_prefill_linear_patch_routes_supported_only(monkeypatch):
     assert calls["count"] == 0
 
 
+def test_qwen35_q4_prefill_linear_patch_offers_packed_projections(monkeypatch):
+    """Packed projections give the prefill backend first refusal, as stock ones do."""
+    _require_q4_kernel()
+    import mlx_vlm.models.qwen3_5.language as qwen35_lang
+
+    import omlx.patches.qwen35_q4_mlp as q4patch
+    from omlx.patches.qwen35_packed_linear import PackedLinear, _pack
+
+    monkeypatch.setenv("OMLX_QWEN35_Q4_LINEAR", "1")
+    monkeypatch.setenv("OMLX_QWEN35_Q4_LINEAR_MIN_TOKENS", "16")
+    source = nn.QuantizedLinear(256, 128, bias=False, group_size=64, bits=4)
+    source.set_dtype(mx.bfloat16)
+    routed = mx.ones((1, 32, 128), dtype=mx.bfloat16)
+    seen = []
+
+    def backend(linear, x):
+        seen.append(x.shape[-2])
+        return routed if x.shape[-2] < 64 else None
+
+    monkeypatch.setattr(q4patch, "_PREFILL_LINEAR_BACKEND", backend)
+    monkeypatch.setattr(PackedLinear, "__call__", lambda self, x: "packed")
+    module = qwen35_lang.Qwen3_5Attention.__new__(qwen35_lang.Qwen3_5Attention)
+    nn.Module.__init__(module)
+    module.q_proj = _pack([source])[0]
+    assert q4patch.apply_qwen35_q4_prefill_linear_patch(module) is True
+
+    assert module.q_proj(mx.zeros((1, 32, 256), mx.bfloat16)) is routed
+    assert module.q_proj(mx.zeros((1, 64, 256), mx.bfloat16)) == "packed"
+    assert module.q_proj(mx.zeros((1, 1, 256), mx.bfloat16)) == "packed"
+    assert seen == [32, 64]
+
+
 def test_qwen35_q4_lm_attention_uses_sdpa_installed_after_the_patch(monkeypatch):
     """The patch must not freeze the SDPA it saw at install time (issue #2372).
 

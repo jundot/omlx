@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for omlx.utils.model_loading.maybe_load_custom_quantization."""
 
+import json
 import sys
 import types
 from unittest.mock import MagicMock
@@ -562,12 +563,80 @@ class TestVlmMtpPreLoadDispatch:
             '"text_config": {"mtp_num_hidden_layers": 4}}',
         )
         _write_mtp_index(tmp_path, has_mtp=True)
-        settings = types.SimpleNamespace(mtp_enabled=True, mtp_num_draft_tokens=2)
+        settings = types.SimpleNamespace(mtp_enabled=True, mtp_adaptive_max_depth=2)
 
         maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
 
         stub = sys.modules["omlx.patches.mlx_lm_mtp"]
         stub.set_mtp_depth.assert_called_once_with(2)
+
+    def test_fixed_depth_takes_precedence_over_adaptive_max(
+        self, tmp_path, monkeypatch
+    ):
+        self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "gemma4", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 4}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(
+            mtp_enabled=True, mtp_adaptive_max_depth=6, mtp_fixed_depth=2
+        )
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        stub = sys.modules["omlx.patches.mlx_lm_mtp"]
+        stub.set_mtp_depth.assert_called_once_with(2, fixed=True)
+
+    @pytest.mark.parametrize(
+        ("nax", "depth", "expected"),
+        [(True, None, 4), (False, None, 3), (True, 3, 3), (True, 5, 5), (True, 6, 6)],
+    )
+    def test_dense_qwen_default_depth_follows_nax(
+        self, tmp_path, monkeypatch, nax, depth, expected
+    ):
+        self._stub_patches(monkeypatch)
+        monkeypatch.setattr(model_loading, "_nax_available", lambda: nax)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "qwen3_5", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 1}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(mtp_enabled=True, mtp_adaptive_max_depth=depth)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        stub = sys.modules["omlx.patches.mlx_lm_mtp"]
+        stub.set_mtp_depth.assert_called_once_with(expected)
+
+    @pytest.mark.parametrize("nax", [True, False])
+    @pytest.mark.parametrize("for_vlm", [True, False])
+    @pytest.mark.parametrize("depth", [None, 3, 4, 5, 6])
+    def test_qwen_27b_adaptive_ceiling_has_floor_four(
+        self, tmp_path, monkeypatch, nax, for_vlm, depth
+    ):
+        self._stub_patches(monkeypatch)
+        monkeypatch.setattr(model_loading, "_nax_available", lambda: nax)
+        text = {
+            "mtp_num_hidden_layers": 1,
+            "hidden_size": 5120,
+            "num_hidden_layers": 64,
+        }
+        config = {"model_type": "qwen3_5"}
+        if for_vlm:
+            config.update(vision_config={}, text_config=text)
+        else:
+            config.update(text)
+        path = _write_config(tmp_path, json.dumps(config))
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(mtp_enabled=True, mtp_adaptive_max_depth=depth)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=for_vlm)
+
+        stub = sys.modules["omlx.patches.mlx_lm_mtp"]
+        stub.set_mtp_depth.assert_called_once_with(max(4, depth or 4))
 
     def test_gemma4_without_mtp_heads_skips_mtp_patches(self, tmp_path, monkeypatch):
         # Plain gemma4 VLMs (no merged assistant) must stay untouched by

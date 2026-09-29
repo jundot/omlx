@@ -8,6 +8,7 @@ for better throughput when serving multiple concurrent requests.
 
 import asyncio
 import copy
+import functools
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
@@ -353,9 +354,17 @@ class BatchedEngine(BaseEngine):
                     0.25,
                 )
             )
+            # Lightning MTP: the draft head's experts stay resident while the
+            # backbone streams, matching the VLM engine and what admission
+            # prices (run_in_executor takes no kwargs, so bind with partial).
             moe_offload_wrapped = await loop.run_in_executor(
                 get_mlx_executor(),
-                apply_moe_expert_offload,
+                functools.partial(
+                    apply_moe_expert_offload,
+                    mtp_resident=bool(
+                        getattr(self._model_settings, "mtp_enabled", False)
+                    ),
+                ),
                 self._model,
                 self._model_name,
                 fraction,
@@ -394,13 +403,11 @@ class BatchedEngine(BaseEngine):
             is not False
         ):
             try:
-                from ..patches.qwen35_moe_gate_up import (
-                    apply_qwen35_moe_gate_up_fusion,
-                )
+                from ..patches.moe_gate_up_fusion import apply_moe_gate_up_fusion
 
                 await loop.run_in_executor(
                     get_mlx_executor(),
-                    apply_qwen35_moe_gate_up_fusion,
+                    apply_moe_gate_up_fusion,
                     self._model,
                 )
             except Exception:

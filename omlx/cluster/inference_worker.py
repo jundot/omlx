@@ -16,7 +16,7 @@ import time
 from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext, suppress
 from datetime import UTC, datetime
-from functools import wraps
+from functools import partial, wraps
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -469,6 +469,11 @@ def _server_arguments(
         prompt_cache_size=args.prompt_cache_size,
         prompt_cache_bytes=args.prompt_cache_bytes,
         max_kv_size=args.max_kv_size,
+        # MLX-LM CLI defaults. kv_bits=None keeps KV quantization off and
+        # the generator batchable.
+        kv_bits=None,
+        kv_group_size=64,
+        quantized_kv_start=5000,
     )
 
 
@@ -723,6 +728,32 @@ def _watch_launcher_parent(
             logger.warning("Launcher watchdog Metal release failed", exc_info=True)
         exit_process(1)
         return
+
+
+def _exit_on_generation_failure(
+    marker: RuntimeMarker,
+    rank: int,
+    error: str,
+    *,
+    emit_event: Any = _emit_event,
+    release_memory: Any = _release_metal_memory,
+    exit_process: Any = os._exit,
+) -> None:
+    """End a rank whose MLX-LM generation thread died.
+
+    The rank cannot generate again. Exiting through the same path as the
+    watchdogs lets the launcher report the failure and lets unload proceed,
+    instead of leaving a rank that still counts the dead request as active.
+    """
+
+    reason = f"rank {rank} generation thread died: {error}"[:1000]
+    with suppress(Exception):
+        marker.update("failed", error=reason)
+    with suppress(Exception):
+        emit_event({"type": "generation_failed", "reason": reason})
+    with suppress(Exception):
+        release_memory(f"generation failure exit: {reason}")
+    exit_process(1)
 
 
 def _peer_hosts_by_rank(
@@ -1517,6 +1548,9 @@ def run_worker(args: argparse.Namespace) -> int:
                             prefill_step_size=args.prefill_step_size,
                         ),
                         control_plane=control_plane,
+                        on_generation_failed=partial(
+                            _exit_on_generation_failure, marker, rank
+                        ),
                     ),
                     _bind_generation_thread_stream(
                         ResponseGenerator,

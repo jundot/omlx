@@ -2467,13 +2467,13 @@ def test_switch_sorting_preserves_other_formats(
     hidden = (mx.random.normal((1, tokens, 128)) * 0.1).astype(mx.float16)
     indices = mx.random.randint(0, 8, (1, tokens, 8)).astype(mx.uint32)
     calls = []
-    original_sort = sl._gather_sort
+    original_sort = sl.sort_routes
 
     def tracked_sort(x, indices):
         calls.append(indices.size)
         return original_sort(x, indices)
 
-    monkeypatch.setattr(sl, "_gather_sort", tracked_sort)
+    monkeypatch.setattr(sl, "sort_routes", tracked_sort)
     actual = model(hidden, indices)
     mx.eval(actual)
     should_sort = tokens == 8 or sort_at_32

@@ -1216,7 +1216,7 @@ Example directory structure:
         type=str,
         choices=["off", "safe", "balanced", "aggressive"],
         default=None,
-        help="Memory guard tier, or 'off' to disable the guard. safe reserves more system memory; aggressive allows more oMLX memory use. Passing a tier also turns the guard on. (default: balanced)",
+        help="Memory guard tier, or 'off' to disable the guard. The tier sets how much memory stays free for other apps: safe keeps about 20%% of RAM (6-16 GB), balanced about 8%% (3-8 GB), aggressive 2%% (1.5-4 GB) and may compress other apps' memory. Passing a tier also turns the guard on. (default: balanced)",
     )
     serve_parser.add_argument(
         "--memory-guard-gb",

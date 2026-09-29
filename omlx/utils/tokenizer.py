@@ -6,14 +6,44 @@ This module provides shared tokenizer configuration and fixes that are used
 across multiple modules in the codebase.
 """
 
+import copy
 import json
 import logging
+import weakref
 from collections.abc import Callable
 from functools import lru_cache, partial
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Prototype streaming detokenizers per tokenizer object, keyed by how they
+# were built. mlx-lm's SPM/BPE detokenizers convert the entire vocabulary in
+# __init__ (~90 ms for a 250k-token vocab), which is a per-request cost when
+# the tokenizer has no reusable detokenizer of its own (mlx-vlm and raw HF
+# tokenizers). Requests copy the prototype instead, the way mlx-lm's
+# TokenizerWrapper.detokenizer does: the copy shares only the vocabulary
+# tables, which are never mutated, and reset() gives it fresh streaming state.
+_DETOKENIZER_PROTOTYPES: "weakref.WeakKeyDictionary[Any, dict[str, Any]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _fresh_detokenizer(tokenizer: Any, key: str, build: Callable[[], Any]) -> Any:
+    """Return a fresh streaming detokenizer, building its prototype once."""
+    try:
+        prototypes = _DETOKENIZER_PROTOTYPES.setdefault(tokenizer, {})
+    except TypeError:
+        # Not weak-referenceable or not hashable: build per request as before.
+        prototypes = None
+    prototype = prototypes.get(key) if prototypes is not None else None
+    if prototype is None:
+        prototype = build()
+        if prototypes is not None:
+            prototypes[key] = prototype
+    detokenizer = copy.copy(prototype)
+    detokenizer.reset()
+    return detokenizer
 
 
 def unwrap_tokenizer(tokenizer):
@@ -379,7 +409,9 @@ def _create_decoder_aware_detokenizer(
         return None
 
     try:
-        return factory(tokenizer)
+        return _fresh_detokenizer(
+            tokenizer, f"decoder:{tokenizer_file}", lambda: factory(tokenizer)
+        )
     except Exception as exc:
         logger.debug(
             "Failed to create decoder-aware detokenizer from %s: %s",
@@ -457,7 +489,9 @@ def create_streaming_detokenizer(
         try:
             from mlx_lm.tokenizer_utils import BPEStreamingDetokenizer
 
-            return BPEStreamingDetokenizer(tokenizer)
+            return _fresh_detokenizer(
+                tokenizer, "ocr-bpe", lambda: BPEStreamingDetokenizer(tokenizer)
+            )
         except Exception as exc:
             raise RuntimeError(
                 "Failed to create a byte-level Unlimited-OCR detokenizer."
