@@ -268,8 +268,8 @@ def test_qwen4_resident_ple_fuses_packed_shards_exactly():
     expected = embedding(indices)
     mx.eval(expected)
 
-    assert embedding.fuse_quantized_shards() is True
-    assert embedding.fuse_quantized_shards() is False
+    assert embedding.fuse_quantized_shards(None) is True
+    assert embedding.fuse_quantized_shards(None) is False
     assert embedding.shards == []
     # The fused arm performs one device gather and no longer consults the host
     # shard boundaries after load.
