@@ -364,6 +364,8 @@ shown beside a failed SSH check; successfully connected devices have no form.
 A manual override invalidates earlier probes and plans. Clear the override to
 restore the enrolled target or OpenSSH configuration.
 
-Both Macs need the account-aware pairing version for the new wizard flow.
-Older API clients that omit account selection retain the original protocol;
-there is no silent downgrade when account names have been explicitly selected.
+Custom account selection requires the account-aware pairing version on both
+Macs. For an older peer, choose **Use default SSH accounts (older oMLX)** in
+the account step. This explicitly omits the entered names and uses the original
+protocol, just like older API clients. There is no automatic downgrade after
+a failed request. Dotted account short names such as `first.last` are accepted.
