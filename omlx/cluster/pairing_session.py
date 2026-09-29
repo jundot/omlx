@@ -199,7 +199,9 @@ class PairingSession:
                 node_id=self.manager.node_id,
                 detail={
                     "error_type": type(exc).__name__,
-                    "reason_type": type(reason).__name__ if reason is not None else None,
+                    "reason_type": (
+                        type(reason).__name__ if reason is not None else None
+                    ),
                     "http_status": exc.code if isinstance(exc, HTTPError) else None,
                 },
             )
