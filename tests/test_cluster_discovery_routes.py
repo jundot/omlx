@@ -629,15 +629,20 @@ def test_manual_paired_endpoint_persists_and_rehydrates_on_reboot(
     service.stop()
 
 
-@pytest.mark.parametrize("old_state,new_state,old_key,new_key,expected", [
-    ("stale", "verified", "keyA", "keyA", "remote_user@192.0.2.2"),
-    ("verified", "verified", "keyA", "keyA", None),
-    ("stale", "unknown", "keyA", "keyA", None),
-    ("stale", "verified", "keyA", "keyB", None),
-    ("stale", "verified", "", "keyA", None),
-    ("stale", "verified", "keyA", "", None),
-])
-def test_address_failover_requires_fresh_same_key_peer(old_state, new_state, old_key, new_key, expected):
+@pytest.mark.parametrize(
+    "old_state,new_state,old_key,new_key,expected",
+    [
+        ("stale", "verified", "keyA", "keyA", "remote_user@192.0.2.2"),
+        ("verified", "verified", "keyA", "keyA", None),
+        ("stale", "unknown", "keyA", "keyA", None),
+        ("stale", "verified", "keyA", "keyB", None),
+        ("stale", "verified", "", "keyA", None),
+        ("stale", "verified", "keyA", "", None),
+    ],
+)
+def test_address_failover_requires_fresh_same_key_peer(
+    old_state, new_state, old_key, new_key, expected
+):
     row = {"ssh_target": "remote_user@192.0.2.1", "addrs": [{"ip": "192.0.2.2"}]}
     health = {"192.0.2.1": {"state": old_state}, "192.0.2.2": {"state": new_state}}
     lines = []
@@ -650,9 +655,13 @@ def test_address_failover_requires_fresh_same_key_peer(old_state, new_state, old
 
 
 def test_address_failover_refuses_unrecognized_or_revoked_key_records():
-    assert discovery_routes._known_address_keys("192.0.2.1", [
-        "@revoked 192.0.2.1 ssh-ed25519 keyA", "|1|hash|value ssh-ed25519 keyA"
-    ]) == set()
+    assert (
+        discovery_routes._known_address_keys(
+            "192.0.2.1",
+            ["@revoked 192.0.2.1 ssh-ed25519 keyA", "|1|hash|value ssh-ed25519 keyA"],
+        )
+        == set()
+    )
 
 
 def test_address_failover_preserves_explicit_user_and_never_guesses_ssh_config():
@@ -661,10 +670,15 @@ def test_address_failover_preserves_explicit_user_and_never_guesses_ssh_config()
     lines = ["192.0.2.1 ssh-ed25519 keyA", "192.0.2.2 ssh-ed25519 keyA"]
     assert discovery_routes._preferred_ssh_target(row, health, lines) is None
     row["ssh_user"] = "chosen_user"
-    assert discovery_routes._preferred_ssh_target(row, health, lines) == "chosen_user@192.0.2.2"
+    assert (
+        discovery_routes._preferred_ssh_target(row, health, lines)
+        == "chosen_user@192.0.2.2"
+    )
 
 
-def test_devices_offer_fresh_same_key_address_after_repeated_failure(_configured_stores, monkeypatch, tmp_path):
+def test_devices_offer_fresh_same_key_address_after_repeated_failure(
+    _configured_stores, monkeypatch, tmp_path
+):
     from types import SimpleNamespace
 
     from omlx.cluster import enrollment, ssh_keys
@@ -672,12 +686,23 @@ def test_devices_offer_fresh_same_key_address_after_repeated_failure(_configured
     identity, registry, client = _configured_stores
     registry.mark_paired("peer", friendly_name="Worker", addrs=["192.0.2.1"])
     online = {"192.0.2.1"}
-    service = DiscoveryService(identity, registry, DiscoveryConfig(),
+    service = DiscoveryService(
+        identity,
+        registry,
+        DiscoveryConfig(),
         prober=lambda ip, *_: {"node_id": "peer"} if ip in online else None,
-        zeroconf_module=None)
+        zeroconf_module=None,
+    )
     configure_discovery_service(service)
-    monkeypatch.setattr(enrollment, "get_cluster_enrollment", lambda: SimpleNamespace(
-        list_nodes=lambda: [SimpleNamespace(node_id="peer", ssh="remote_user@192.0.2.1")]))
+    monkeypatch.setattr(
+        enrollment,
+        "get_cluster_enrollment",
+        lambda: SimpleNamespace(
+            list_nodes=lambda: [
+                SimpleNamespace(node_id="peer", ssh="remote_user@192.0.2.1")
+            ]
+        ),
+    )
     known = tmp_path / "known_hosts"
     known.write_text("192.0.2.1 ssh-ed25519 keyA\n192.0.2.2 ssh-ed25519 keyA\n")
     monkeypatch.setattr(ssh_keys, "get_known_hosts_path", lambda: known)

@@ -1223,8 +1223,15 @@ class DiscoveryService:
                 failures = candidate.get("consecutive_failures", 0)
                 fresh = success is not None and now - success < self.config.dead_after
                 result[ip] = {
-                    "state": "verified" if candidate.get("verified") and fresh else
-                             "stale" if failures >= 3 or success is not None else "unknown",
+                    "state": (
+                        "verified"
+                        if candidate.get("verified") and fresh
+                        else (
+                            "stale"
+                            if failures >= 3 or success is not None
+                            else "unknown"
+                        )
+                    ),
                     "consecutive_failures": failures,
                 }
             return result
@@ -1763,7 +1770,9 @@ class DiscoveryService:
                 if candidate is not None:
                     candidate["last_transport"] = diagnostic.get("transport")
                     candidate["last_error"] = diagnostic.get("error")
-                    candidate["consecutive_failures"] = candidate.get("consecutive_failures", 0) + 1
+                    candidate["consecutive_failures"] = (
+                        candidate.get("consecutive_failures", 0) + 1
+                    )
                     if candidate["consecutive_failures"] >= 3:
                         candidate["verified"] = False
             return

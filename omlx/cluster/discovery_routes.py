@@ -44,7 +44,9 @@ def _known_address_keys(host: str, lines: list[str]) -> set[str]:
     return keys
 
 
-def _preferred_ssh_target(row: dict[str, Any], health: dict, lines: list[str]) -> str | None:
+def _preferred_ssh_target(
+    row: dict[str, Any], health: dict, lines: list[str]
+) -> str | None:
     """Offer a known same-key alternate only after the previous address is stale."""
     original = row.get("ssh_target") or next(iter(row.get("last_addrs") or []), "")
     if not original:
@@ -398,7 +400,9 @@ async def cluster_devices(is_admin: bool = Depends(require_admin)):
         from .ssh_keys import get_known_hosts_path
 
         with suppress(OSError):
-            known_hosts_lines = get_known_hosts_path().read_text(encoding="utf-8").splitlines()
+            known_hosts_lines = (
+                get_known_hosts_path().read_text(encoding="utf-8").splitlines()
+            )
     for row in paired:
         _enrich_paired_row(row, observed_records.get(row.get("node_id")))
         if service is not None:

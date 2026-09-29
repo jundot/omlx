@@ -2596,4 +2596,8 @@ component.planProposal = old;
 console.log(JSON.stringify({target: component.sshTargetFor(peer),
     host: component.deploymentHosts()[0].ssh, original: old.activation.hosts[0].ssh}));
 """)
-    assert result == {"target": "remote_user@192.0.2.2", "host": "remote_user@192.0.2.2", "original": "remote_user@192.0.2.1"}
+    assert result == {
+        "target": "remote_user@192.0.2.2",
+        "host": "remote_user@192.0.2.2",
+        "original": "remote_user@192.0.2.1",
+    }

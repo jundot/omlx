@@ -1280,7 +1280,9 @@ def test_rdma_fabric_caps_stays_false_when_disabled_or_no_devices():
 
 def test_address_health_requires_repeated_failures_and_recovers():
     alive = [True]
-    service, clock = _service(prober=lambda *_: {"node_id": "peer"} if alive[0] else None)
+    service, clock = _service(
+        prober=lambda *_: {"node_id": "peer"} if alive[0] else None
+    )
     service._add_candidate("192.0.2.1", 8000, node_id="peer", if_type="manual")
     service._probe_candidate("192.0.2.1", 8000)
     alive[0] = False
@@ -1292,7 +1294,10 @@ def test_address_health_requires_repeated_failures_and_recovers():
     assert service._candidates[("192.0.2.1", 8000)]["verified"] is False
     alive[0] = True
     service._probe_candidate("192.0.2.1", 8000)
-    assert service.address_health("peer")["192.0.2.1"] == {"state": "verified", "consecutive_failures": 0}
+    assert service.address_health("peer")["192.0.2.1"] == {
+        "state": "verified",
+        "consecutive_failures": 0,
+    }
     clock.advance(service.config.dead_after)
     assert service.address_health("peer")["192.0.2.1"]["state"] == "stale"
 
