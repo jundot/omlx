@@ -168,8 +168,10 @@ def test_dotted_accounts_pair_and_persist(tmp_path, monkeypatch):
     coordinator.handle_join_request(joiner.build_join_request())
     _accounts(monkeypatch, "coordinator.user")
     coordinator.approve(
-        joiner.node_id, shown["code"],
-        local_ssh_user="coordinator.user", remote_ssh_user="joiner.user",
+        joiner.node_id,
+        shown["code"],
+        local_ssh_user="coordinator.user",
+        remote_ssh_user="joiner.user",
     )
     _accounts(monkeypatch, "joiner.user")
     joiner.complete_join(coordinator.join_status(joiner.node_id))
