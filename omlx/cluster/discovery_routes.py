@@ -279,7 +279,9 @@ def _enrich_paired_row(row: dict[str, Any], record: dict[str, Any] | None) -> No
 
 class DeviceSSHUserRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    ssh_user: str | None = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$")
+    ssh_user: str | None = Field(
+        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$"
+    )
 
 
 @discovery_router.put("/devices/{node_id}/ssh-user")
