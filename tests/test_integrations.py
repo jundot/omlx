@@ -2196,54 +2196,51 @@ class TestDshIntegration:
         with pytest.raises(SystemExit):
             DshIntegration().launch(ctx())
 
-    def test_configure_writes_route_and_credential(self, dsh_env):
-        patch_path = dsh_env / "profiles" / "desktop" / "cordis.patch.yml"
-        creds_path = dsh_env / ".credentials.yaml"
+    def test_configure_writes_route_and_credential(self, dsh_env, monkeypatch):
+        """One launch's configuration, for the shapes ``ctx`` can take.
 
-        DshIntegration().configure(ctx(api_key="sk-test"))
+        Every case writes a whole harness home of its own: the route lands in
+        both patch layers (`dsh web` boots ``profiles/web``), the credential
+        store gets the key's token, and the session default follows ``--model``.
+        """
+        # (name, ctx overrides, expected agent config, expected credential)
+        cases = [
+            ("no default model keeps the session default untouched",
+             {"api_key": "sk-test"}, None, "sk-test"),
+            # No API key configured: the ref still resolves (the dummy token the
+            # base context supplies) so the route never fails MISSING_CREDENTIAL.
+            ("a named model becomes the session default",
+             {"model": "Qwen3.8-27B-oQ5e-mtp", "api_key": ""},
+             {"provider": "omlx", "model": "Qwen3.8-27B-oQ5e-mtp"}, "omlx"),
+        ]
+        for index, (name, overrides, agent, token) in enumerate(cases):
+            home = dsh_env / f"case-{index}"
+            home.mkdir()
+            monkeypatch.setenv("OMLX_DSH_HOME", str(home))
 
-        route, data = _route(patch_path)
-        assert route["baseURL"] == "http://127.0.0.1:8000/v1"
-        assert route["apiKeyEnv"] == "OMLX_API_KEY"
-        assert [m["id"] for m in route["models"]] == [m["id"] for m in DSH_MODELS]
-        assert route["models"][0]["contextWindow"] == 131072
-        assert route["models"][1]["input"] == ["text", "image"]
-        # No default model was named: the session default stays untouched.
-        assert not any(e.get("id") == "agent-default-model" for e in data)
+            DshIntegration().configure(ctx(**overrides))
 
-        creds = yaml.safe_load(creds_path.read_text())
-        assert creds["refs"]["OMLX_API_KEY"] == "sk-test"
+            for profile in ("desktop", "web"):
+                route, _ = _route(home / "profiles" / profile / "cordis.patch.yml")
+                assert route["baseURL"] == "http://127.0.0.1:8000/v1", name
+                assert route["apiKeyEnv"] == "OMLX_API_KEY", name
+                assert [m["id"] for m in route["models"]] == [
+                    m["id"] for m in DSH_MODELS
+                ], name
+                assert route["models"][0]["contextWindow"] == 131072, name
+                assert route["models"][1]["input"] == ["text", "image"], name
 
-    def test_configure_sets_default_model(self, dsh_env):
-        patch_path = dsh_env / "profiles" / "desktop" / "cordis.patch.yml"
+            _, data = _route(home / "profiles" / "desktop" / "cordis.patch.yml")
+            if agent is None:
+                assert not any(
+                    e.get("id") == "agent-default-model" for e in data
+                ), name
+            else:
+                entry = next(e for e in data if e.get("id") == "agent-default-model")
+                assert entry["config"] == agent, name
 
-        DshIntegration().configure(ctx(model="Qwen3.8-27B-oQ5e-mtp", api_key=""))
-
-        _, data = _route(patch_path)
-        agent = next(e for e in data if e.get("id") == "agent-default-model")
-        assert agent["config"] == {
-            "provider": "omlx",
-            "model": "Qwen3.8-27B-oQ5e-mtp",
-        }
-        # No API key configured: the ref still resolves (the dummy token the
-        # base context supplies) so the route never fails MISSING_CREDENTIAL.
-        creds = yaml.safe_load((dsh_env / ".credentials.yaml").read_text())
-        assert creds["refs"]["OMLX_API_KEY"] == "omlx"
-
-    def test_configure_updates_web_profile_too(self, dsh_env):
-        # `dsh web` boots profiles/web — a separate profile from desktop's.
-        # The same provider route must land in both patch layers.
-        DshIntegration().configure(ctx())
-
-        for target in (
-            dsh_env / "profiles" / "desktop" / "cordis.patch.yml",
-            dsh_env / "profiles" / "web" / "cordis.patch.yml",
-        ):
-            route, _ = _route(target)
-            assert route["baseURL"] == "http://127.0.0.1:8000/v1"
-            assert [m["id"] for m in route["models"]] == [m["id"] for m in DSH_MODELS]
-        creds = yaml.safe_load((dsh_env / ".credentials.yaml").read_text())
-        assert "OMLX_API_KEY" in creds["refs"]
+            creds = yaml.safe_load((home / ".credentials.yaml").read_text())
+            assert creds["refs"]["OMLX_API_KEY"] == token, name
 
     def test_configure_exits_when_server_has_no_models(self, monkeypatch):
         monkeypatch.setattr(DshIntegration, "_fetch_models", lambda self, c: [])
@@ -2419,82 +2416,73 @@ class TestDshPatchWriter:
         # A timestamped backup of the previous file exists.
         assert any(tmp_path.glob("cordis.patch.*.bak"))
 
-    def test_no_default_model_leaves_agent_entry_untouched(self, tmp_path):
-        path = tmp_path / "cordis.patch.yml"
-        path.write_text(
-            "- id: agent-default-model\n"
-            '  name: "@deepseek-ai/dsh-agent-default-model"\n'
-            "  config:\n"
-            "    provider: opencode-go1\n"
-            '    model: "mimo-v2.6-flash"\n'
-        )
+    # Seeds for `test_existing_files_are_patched_in_place`: patch layers that
+    # already carry something the write has to keep or replace.
+    _AGENT_ENTRY = (
+        "- id: agent-default-model\n"
+        '  name: "@deepseek-ai/dsh-agent-default-model"\n'
+        "  config:\n"
+        "    provider: opencode-go1\n"
+        '    model: "mimo-v2.6-flash"\n'
+    )
+    _PI_AI_ENTRY = (
+        "- id: llm-pi-ai\n"
+        '  name: "@deepseek-ai/dsh-llm-pi-ai"\n'
+        "  config:\n"
+        "    providers:\n"
+        "      omlx:\n"
+        "        api: openai-completions\n"
+        '        baseURL: "http://127.0.0.1:8000/v1"\n'
+        "        models:\n"
+        "          - id: x\n"
+    )
 
-        write_dsh_patch(path, "http://127.0.0.1:8000/v1", DSH_MODELS)
+    def test_existing_files_are_patched_in_place(self, tmp_path):
+        """Write a seeded patch layer, re-read it, and check what landed.
 
-        data = yaml.safe_load(path.read_text())
-        agent = next(e for e in data if e.get("id") == "agent-default-model")
-        assert agent["config"]["provider"] == "opencode-go1"
-        assert agent["config"]["model"] == "mimo-v2.6-flash"
+        Covers the shapes a patch layer can be in — a plain entry, an entry
+        whose nested value is an empty flow container — and the two default
+        model cases, with and without a `--model`.
+        """
+        # (name, seed, default_model, expected agent config or None)
+        cases = [
+            ("no default model leaves the agent entry untouched",
+             self._AGENT_ENTRY, None,
+             {"provider": "opencode-go1", "model": "mimo-v2.6-flash"}),
+            ("a default model rewrites the existing agent entry",
+             self._AGENT_ENTRY + self._PI_AI_ENTRY, "Qwen3.8-27B-oQ5e-mtp",
+             {"provider": "omlx", "model": "Qwen3.8-27B-oQ5e-mtp"}),
+            ("an empty flow config is rewritten",
+             "- id: llm-pi-ai\n"
+             '  name: "@deepseek-ai/dsh-llm-pi-ai"\n'
+             "  config: {}\n",
+             None, None),
+            ("an empty flow providers is rewritten",
+             "- id: llm-pi-ai\n"
+             '  name: "@deepseek-ai/dsh-llm-pi-ai"\n'
+             "  config:\n"
+             "    providers: {}\n",
+             None, None),
+        ]
+        for index, (name, seed, default_model, agent) in enumerate(cases):
+            path = tmp_path / f"patch-{index}.yml"
+            path.write_text(seed)
 
-    def test_default_model_rewrites_existing_entry(self, tmp_path):
-        path = tmp_path / "cordis.patch.yml"
-        path.write_text(
-            "- id: agent-default-model\n"
-            '  name: "@deepseek-ai/dsh-agent-default-model"\n'
-            "  config:\n"
-            "    provider: opencode-go1\n"
-            '    model: "mimo-v2.6-flash"\n'
-            "- id: llm-pi-ai\n"
-            '  name: "@deepseek-ai/dsh-llm-pi-ai"\n'
-            "  config:\n"
-            "    providers:\n"
-            "      omlx:\n"
-            "        api: openai-completions\n"
-            '        baseURL: "http://127.0.0.1:8000/v1"\n'
-            "        models:\n"
-            "          - id: x\n"
-        )
+            write_dsh_patch(
+                path, "http://127.0.0.1:8000/v1", DSH_MODELS,
+                default_model=default_model,
+            )
 
-        write_dsh_patch(
-            path,
-            "http://127.0.0.1:8000/v1",
-            DSH_MODELS,
-            default_model="Qwen3.8-27B-oQ5e-mtp",
-        )
-
-        data = yaml.safe_load(path.read_text())
-        agent = next(e for e in data if e.get("id") == "agent-default-model")
-        assert agent["config"] == {
-            "provider": "omlx",
-            "model": "Qwen3.8-27B-oQ5e-mtp",
-        }
-
-    def test_empty_flow_config_is_rewritten(self, tmp_path):
-        path = tmp_path / "cordis.patch.yml"
-        path.write_text(
-            "- id: llm-pi-ai\n"
-            '  name: "@deepseek-ai/dsh-llm-pi-ai"\n'
-            "  config: {}\n"
-        )
-
-        write_dsh_patch(path, "http://127.0.0.1:8000/v1", DSH_MODELS)
-
-        route, _ = _route(path)
-        assert [m["id"] for m in route["models"]] == [m["id"] for m in DSH_MODELS]
-
-    def test_empty_flow_providers_is_rewritten(self, tmp_path):
-        path = tmp_path / "cordis.patch.yml"
-        path.write_text(
-            "- id: llm-pi-ai\n"
-            '  name: "@deepseek-ai/dsh-llm-pi-ai"\n'
-            "  config:\n"
-            "    providers: {}\n"
-        )
-
-        write_dsh_patch(path, "http://127.0.0.1:8000/v1", DSH_MODELS)
-
-        route, _ = _route(path)
-        assert route["baseURL"] == "http://127.0.0.1:8000/v1"
+            route, data = _route(path)
+            assert route["baseURL"] == "http://127.0.0.1:8000/v1", name
+            assert [m["id"] for m in route["models"]] == [
+                m["id"] for m in DSH_MODELS
+            ], name
+            entries = {e.get("id"): e for e in data if isinstance(e, dict)}
+            if agent is None:
+                assert "agent-default-model" not in entries, name
+            else:
+                assert entries["agent-default-model"]["config"] == agent, name
 
     def test_populated_inline_config_is_refused(self, tmp_path):
         path = tmp_path / "cordis.patch.yml"
@@ -2571,66 +2559,55 @@ class TestDshPatchWriter:
 
 
 class TestDshCredentialsRef:
-    def test_updates_existing_ref_and_keeps_others(self, tmp_path):
-        path = tmp_path / ".credentials.yaml"
-        path.write_text(
-            "version: 1\n"
-            "records:\n"
-            "  deepseek-account-platform/default:\n"
-            "    kind: token\n"
-            "    payload:\n"
-            '      token: "secret"\n'
-            "refs:\n"
-            '  DEEPSEEK_API_KEY: "dk"\n'
-            '  OMLX_API_KEY: "stale"\n'
-        )
+    def test_each_store_shape_gains_the_ref(self, tmp_path):
+        """Write a seeded credential store, re-read it, and check the ref.
 
-        write_credentials_ref(path, "OMLX_API_KEY", "sk-fresh")
+        The store is hand-edited, so every shape it can be in gets a case: an
+        existing block-style section (with records beside it), a section
+        missing the ref, no section at all, an empty flow container, and no
+        file yet.
+        """
+        # (name, seed or None, value, expected refs, expected records)
+        cases = [
+            ("updates an existing ref and keeps the others",
+             "version: 1\n"
+             "records:\n"
+             "  deepseek-account-platform/default:\n"
+             "    kind: token\n"
+             "    payload:\n"
+             '      token: "secret"\n'
+             "refs:\n"
+             '  DEEPSEEK_API_KEY: "dk"\n'
+             '  OMLX_API_KEY: "stale"\n',
+             "sk-fresh",
+             {"DEEPSEEK_API_KEY": "dk", "OMLX_API_KEY": "sk-fresh"},
+             {"deepseek-account-platform/default": {
+                 "kind": "token", "payload": {"token": "secret"}}}),
+            ("appends a missing ref to an existing section",
+             'version: 1\nrecords: {}\nrefs:\n  DEEPSEEK_API_KEY: "dk"\n',
+             "sk-new",
+             {"DEEPSEEK_API_KEY": "dk", "OMLX_API_KEY": "sk-new"}, {}),
+            ("appends a refs section when missing",
+             "version: 1\nrecords: {}\n",
+             "sk-new", {"OMLX_API_KEY": "sk-new"}, {}),
+            ("rewrites an inline empty refs as a block",
+             "version: 1\nrecords: {}\nrefs: {}\n",
+             "sk-new", {"OMLX_API_KEY": "sk-new"}, {}),
+            ("creates a missing file",
+             None, "sk-new", {"OMLX_API_KEY": "sk-new"}, {}),
+        ]
+        for index, (name, seed, value, refs, records) in enumerate(cases):
+            path = tmp_path / f"credentials-{index}.yaml"
+            if seed is not None:
+                path.write_text(seed)
 
-        data = yaml.safe_load(path.read_text())
-        assert data["version"] == 1
-        assert data["refs"]["OMLX_API_KEY"] == "sk-fresh"
-        assert data["refs"]["DEEPSEEK_API_KEY"] == "dk"
-        assert (
-            data["records"]["deepseek-account-platform/default"]["payload"]["token"]
-            == "secret"
-        )
-        assert any(tmp_path.glob(".credentials.*.bak"))
+            write_credentials_ref(path, "OMLX_API_KEY", value)
 
-    def test_appends_missing_ref_to_existing_section(self, tmp_path):
-        path = tmp_path / ".credentials.yaml"
-        path.write_text('version: 1\nrecords: {}\nrefs:\n  DEEPSEEK_API_KEY: "dk"\n')
-
-        write_credentials_ref(path, "OMLX_API_KEY", "sk-new")
-
-        data = yaml.safe_load(path.read_text())
-        assert data["refs"] == {"DEEPSEEK_API_KEY": "dk", "OMLX_API_KEY": "sk-new"}
-
-    def test_appends_refs_section_when_missing(self, tmp_path):
-        path = tmp_path / ".credentials.yaml"
-        path.write_text("version: 1\nrecords: {}\n")
-
-        write_credentials_ref(path, "OMLX_API_KEY", "sk-new")
-
-        data = yaml.safe_load(path.read_text())
-        assert data["refs"]["OMLX_API_KEY"] == "sk-new"
-        assert data["records"] == {}
-
-    def test_rewrites_inline_empty_refs_as_block(self, tmp_path):
-        path = tmp_path / ".credentials.yaml"
-        path.write_text("version: 1\nrecords: {}\nrefs: {}\n")
-
-        write_credentials_ref(path, "OMLX_API_KEY", "sk-new")
-
-        assert yaml.safe_load(path.read_text())["refs"] == {"OMLX_API_KEY": "sk-new"}
-
-    def test_creates_missing_file(self, tmp_path):
-        path = tmp_path / ".credentials.yaml"
-        write_credentials_ref(path, "OMLX_API_KEY", "sk-new")
-
-        data = yaml.safe_load(path.read_text())
-        assert data == {
-            "version": 1,
-            "records": {},
-            "refs": {"OMLX_API_KEY": "sk-new"},
-        }
+            data = yaml.safe_load(path.read_text())
+            assert data["version"] == 1, name
+            assert data["records"] == records, name
+            assert data["refs"] == refs, name
+            # A store that existed is backed up first; a new one has nothing to
+            # back up.
+            backups = list(tmp_path.glob(f"credentials-{index}.*.bak"))
+            assert bool(backups) == (seed is not None), name

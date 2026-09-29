@@ -24,15 +24,13 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import yaml
 
-from omlx.integrations.base import Integration, IntegrationContext
+from omlx.integrations.base import Integration, IntegrationContext, backup_then_write
 from omlx.integrations.macapp import find_mac_app
 from omlx.utils.install import get_cli_command_prefix
 
@@ -195,33 +193,34 @@ def _inline_value(line: str) -> str:
     return rest.split(" #", 1)[0].strip()
 
 
-def _block_content_end(lines: list[str], key_idx: int, key_indent: int) -> int:
-    """Index just past a key's last content line.
+def _last_content_line(lines: list[str], start: int, end: int) -> int:
+    """Index just past the last content line in ``lines[start:end]``.
 
-    Trailing blanks/comments are excluded so they survive a replacement;
-    comments before later content belong to the block and go with it.
+    Blanks and comments are not content, so trailing ones are left to survive a
+    replacement; comments before later content go with the block.
     """
-    j = key_idx + 1
-    content_end = j
-    while j < len(lines):
-        line = lines[j]
+    last = start
+    for i in range(start, min(end, len(lines))):
+        line = lines[i]
+        if line.strip() and not line.lstrip().startswith("#"):
+            last = i + 1
+    return last
+
+
+def _block_content_end(lines: list[str], key_idx: int, key_indent: int) -> int:
+    """Index just past a key's last content line, up to the next shallower line."""
+    end = key_idx + 1
+    while end < len(lines):
+        line = lines[end]
         if line.strip() and (len(line) - len(line.lstrip())) <= key_indent:
             break
-        j += 1
-        if line.strip() and not line.lstrip().startswith("#"):
-            content_end = j
-    return content_end
+        end += 1
+    return _last_content_line(lines, key_idx + 1, end)
 
 
 def _entry_content_end(lines: list[str], start: int, end: int) -> int:
     """Index just past an entry's last content line (trailing comments kept)."""
-    j = end
-    while j > start + 1:
-        line = lines[j - 1]
-        if line.strip() and not line.lstrip().startswith("#"):
-            break
-        j -= 1
-    return j
+    return _last_content_line(lines, start + 1, end)
 
 
 def _find_entry_bounds(
@@ -246,6 +245,24 @@ def _find_entry_bounds(
     return None
 
 
+def _refuse_inline_value(
+    lines: list[str], key_idx: int, key: str, allow_inline: bool = False
+) -> bool:
+    """Check a located key line, refusing a value a rewrite would silently drop.
+
+    Returns whether the line holds an inline flow value: a populated one
+    (``config: {...}``) raises unless ``allow_inline`` names it the managed
+    target; an empty flow container has nothing to drop.
+    """
+    inline = _inline_value(lines[key_idx])
+    if inline and inline not in ("{}", "[]") and not allow_inline:
+        raise DshConfigShapeError(
+            f"`{key}` uses inline flow style ({lines[key_idx].strip()}); "
+            "convert it to block style first"
+        )
+    return bool(inline)
+
+
 def _upsert_block(
     lines: list[str],
     start: int,
@@ -265,12 +282,7 @@ def _upsert_block(
     if found is None:
         return lines[:end] + block + lines[end:]
     key_idx, key_indent = found
-    inline = _inline_value(lines[key_idx])
-    if inline and inline not in ("{}", "[]") and not allow_inline:
-        raise DshConfigShapeError(
-            f"`{key}` uses inline flow style ({lines[key_idx].strip()}); "
-            "convert it to block style first"
-        )
+    _refuse_inline_value(lines, key_idx, key, allow_inline)
     content_end = _block_content_end(lines, key_idx, key_indent)
     return lines[:key_idx] + block + lines[content_end:]
 
@@ -286,8 +298,8 @@ def _ensure_block(
     """Ensure ``key`` exists as a block; returns ``(lines, idx, indent, end)``.
 
     ``render_body(indent)`` renders the nested content below the key line.
-    Creates the key at ``end``, rewrites an empty flow value in place, and
-    refuses a populated inline value (via ``_upsert_block``).
+    Creates the key at ``end`` and rewrites an empty flow value in place; a
+    populated inline value is refused (see ``_refuse_inline_value``).
     """
     found = _find_key_line(lines, key, start, end)
     if found is None:
@@ -295,13 +307,8 @@ def _ensure_block(
         lines = lines[:end] + block + lines[end:]
         return lines, end, indent, end + len(block)
     key_idx, key_indent = found
-    inline = _inline_value(lines[key_idx])
-    if inline and inline not in ("{}", "[]"):
-        raise DshConfigShapeError(
-            f"`{key}` uses inline flow style ({lines[key_idx].strip()}); "
-            "convert it to block style first"
-        )
-    if inline:  # empty flow container: rewrite in place
+    if _refuse_inline_value(lines, key_idx, key):
+        # Empty flow container: rewrite in place.
         block = [f"{' ' * key_indent}{key}:"] + render_body(key_indent)
         lines = lines[:key_idx] + block + lines[key_idx + 1 :]
         return lines, key_idx, key_indent, key_idx + len(block)
@@ -500,18 +507,10 @@ def _validate_patch(
             raise ValueError("agent-default-model was not rewritten")
 
 
-def _backup_then_write(path: Path, text: str) -> None:
-    if path.exists():
-        timestamp = int(time.time())
-        backup = path.with_suffix(f".{timestamp}.bak")
-        try:
-            shutil.copy2(path, backup)
-            print(f"Backup: {backup}")
-        except OSError as e:
-            print(f"Warning: could not create backup for {path}: {e}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
-    print(f"Config updated: {path}")
+def _write_config(path: Path, text: str) -> None:
+    """Back up, then write — dsh's own messages, naming the file in the warning."""
+    backup_then_write(path, text, failure=f"could not create backup for {path}",
+                      note="Config updated")
 
 
 def write_dsh_patch(
@@ -549,7 +548,26 @@ def write_dsh_patch(
             f"generated config for {config_path} failed validation: {e}"
         ) from e
 
-    _backup_then_write(config_path, text)
+    _write_config(config_path, text)
+
+
+def _upsert_ref(lines: list[str], ref_name: str, value: str) -> list[str]:
+    """Upsert one key in the credential store's top-level ``refs:`` mapping."""
+    entry = f"{ref_name}: {_yaml_quote(value)}"
+    block = ["refs:", f"  {entry}"]
+    refs = _find_key_line(lines, "refs", 0, len(lines))
+    if refs is None or refs[1] != 0:
+        # No top-level section (or only a nested `refs:` key): create one.
+        return _upsert_block(lines, len(lines), len(lines), "refs", block)
+    r_idx, r_indent = refs
+    if _inline_value(lines[r_idx]):
+        # `refs: {}` rewritten as a block; a populated inline value raises
+        # instead of dropping its entries.
+        return _upsert_block(lines, r_idx, r_idx + 1, "refs", block)
+    # Block-style section: upsert just our key inside it.
+    return _upsert_block(lines, r_idx + 1, _block_content_end(lines, r_idx, r_indent),
+                         ref_name, [f"{' ' * (r_indent + 2)}{entry}"],
+                         allow_inline=True)
 
 
 def write_credentials_ref(credentials_path: Path, ref_name: str, value: str) -> None:
@@ -559,31 +577,7 @@ def write_credentials_ref(credentials_path: Path, ref_name: str, value: str) -> 
             lines = credentials_path.read_text(encoding="utf-8").splitlines()
         except OSError as e:
             raise DshConfigShapeError(f"cannot read {credentials_path}: {e}") from e
-        refs = _find_key_line(lines, "refs", 0, len(lines))
-        if refs is not None and refs[1] == 0 and not _inline_value(lines[refs[0]]):
-            # Block-style section: upsert just our key inside it.
-            r_idx, r_indent = refs
-            lines = _upsert_block(
-                lines,
-                r_idx + 1,
-                _block_content_end(lines, r_idx, r_indent),
-                ref_name,
-                [f"{' ' * (r_indent + 2)}{ref_name}: {_yaml_quote(value)}"],
-                allow_inline=True,
-            )
-        elif refs is not None and refs[1] == 0:
-            # `refs: {}` rewritten as a block; a populated inline value
-            # raises instead of dropping its entries.
-            lines = _upsert_block(
-                lines,
-                refs[0],
-                refs[0] + 1,
-                "refs",
-                ["refs:", f"  {ref_name}: {_yaml_quote(value)}"],
-            )
-        else:
-            # No top-level section (or only a nested `refs:` key): create one.
-            lines = lines + ["refs:", f"  {ref_name}: {_yaml_quote(value)}"]
+        lines = _upsert_ref(lines, ref_name, value)
     else:
         lines = [
             "version: 1",
@@ -599,7 +593,7 @@ def write_credentials_ref(credentials_path: Path, ref_name: str, value: str) -> 
             f"generated credential store failed validation for {ref_name!r}"
         )
 
-    _backup_then_write(credentials_path, text)
+    _write_config(credentials_path, text)
 
 
 # ---------------------------------------------------------------------------

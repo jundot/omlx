@@ -185,23 +185,32 @@ class Integration:
                 print("Creating new config file.")
                 existing = {}
 
-            # Create timestamped backup
-            timestamp = int(time.time())
-            backup = config_path.with_suffix(f".{timestamp}.bak")
-            try:
-                shutil.copy2(config_path, backup)
-                print(f"Backup: {backup}")
-            except OSError as e:
-                print(f"Warning: could not create backup: {e}")
-
         updater(existing)
 
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(
-            json.dumps(existing, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        print(f"Config written: {config_path}")
+        payload = json.dumps(existing, indent=2, ensure_ascii=False) + "\n"
+        backup_then_write(config_path, payload)
+
+
+def backup_then_write(
+    path: Path, text: str, *, failure: str = "could not create backup",
+    note: str = "Config written",
+) -> None:
+    """Back up an existing config, then write ``text`` over it.
+
+    Best effort: a config that cannot be backed up is still written, and a
+    failed copy only earns a warning.
+    """
+    if path.exists():
+        backup = path.with_suffix(f".{int(time.time())}.bak")
+        try:
+            shutil.copy2(path, backup)
+            print(f"Backup: {backup}")
+        except OSError as e:
+            print(f"Warning: {failure}: {e}")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    print(f"{note}: {path}")
 
 
 def _select_model_curses(models_info: list[dict], tool_name: str) -> str:
