@@ -635,10 +635,7 @@ def test_ssh_user_is_persisted_and_can_be_cleared(_configured_stores, user):
     registry.mark_paired("peer-1", friendly_name="worker")
     url = "/api/cluster/devices/peer-1/ssh-user"
     assert client.put(url, json={"ssh_user": user}).status_code == 200
-    assert (
-        client.get("/api/cluster/devices").json()["paired"][0]["ssh_user"]
-        == user
-    )
+    assert client.get("/api/cluster/devices").json()["paired"][0]["ssh_user"] == user
     assert DeviceRegistry(registry.path).paired()[0]["ssh_user"] == user
     registry.mark_paired("peer-1", friendly_name="renamed")
     assert registry.paired()[0]["ssh_user"] == user
