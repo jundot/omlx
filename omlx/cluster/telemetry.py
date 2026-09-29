@@ -14,6 +14,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -1413,7 +1414,32 @@ def install_server_telemetry(
 
         def next(self) -> Any:
             started = time.perf_counter()
-            prompt_responses, generation_responses = super().next()
+            original_step = getattr(self, "prefill_step_size", None)
+            if ssd_store is not None and original_step is not None:
+                # Message segments can end between SSD boundaries. Shorten the
+                # next chunk to reach the global grid, preserving each segment.
+                step = min(original_step, snapshot_step)
+                active = zip(
+                    getattr(getattr(self, "_prompt_batch", None), "uids", ()),
+                    getattr(self, "_currently_processing", ()),
+                )
+                sequences = [(uid, state[0]) for uid, state in active]
+                # Only newly admitted prompts can affect this step. A queued
+                # request with an unaligned prefix must not shrink every chunk.
+                slots = max(0, self.prefill_batch_size - len(sequences))
+                pending = islice(self._unprocessed_sequences, slots)
+                sequences.extend((state[0], state[1]) for state in pending)
+                for uid, segments in sequences:
+                    full = self._omlx_tokens.get(uid)
+                    if full is not None:
+                        position = len(full) - sum(map(len, segments))
+                        step = min(step, snapshot_step - position % snapshot_step)
+                self.prefill_step_size = step
+            try:
+                prompt_responses, generation_responses = super().next()
+            finally:
+                if original_step is not None:
+                    self.prefill_step_size = original_step
             elapsed = time.perf_counter() - started
             for response in generation_responses:
                 response.token = _python_token_id(response.token)
