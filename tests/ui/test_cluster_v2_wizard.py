@@ -2673,3 +2673,13 @@ def test_ssh_user_change_discards_old_checks_without_blocking_new_checks():
         "ssh": "new@192.0.2.1",
         "targets": ["old@192.0.2.1", "new@192.0.2.1"],
     }
+
+
+def test_ssh_repair_form_only_belongs_to_failed_check():
+    template = _read(TEMPLATE)
+    form = template.index("data-cluster-v2-ssh-user")
+    checks = template.index("data-cluster-v2-checks")
+    assert form > checks
+    assert "row.key === 'ssh' && row.status === 'fail'" in template[checks:form]
+    assert "checks.probes[peer.node_id]?.ok === false" in template[checks:form]
+
