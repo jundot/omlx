@@ -200,6 +200,7 @@ function clusterV2Wizard() {
         // ---- wizard cursor ---------------------------------------------------
         // Null = derive from the snapshot. Explicit values: 'checks', 'plan'.
         stage: null,
+        sshSetup: null,
         pairing: { target: null, code: '', busy: false, error: '' },
 
         // ---- joiner side (this Mac shows the code, the other Mac approves) ---
@@ -1053,6 +1054,7 @@ function clusterV2Wizard() {
         // plan / active / error
         // =====================================================================
         wizardState() {
+            if (this.sshSetup) return 'pairing';
             if (this.devicesUnreachable) return 'error';
             // A durable deployment keeps its management panel mounted, but its
             // badge is driven by deploymentRuntimeState(), not by persistence.
@@ -1340,8 +1342,43 @@ function clusterV2Wizard() {
         // Pairing (Module B)
         // =====================================================================
         beginPairing(device) {
+            this.sshSetup = {
+                mode: 'approve',
+                target: device,
+                localUser: '',
+                remoteUser: '',
+                error: '',
+            };
+        },
+
+        async submitSSHSetup() {
+            const setup = this.sshSetup;
+            if (!setup || this.join.busy) return;
+            const localUser = setup.localUser.trim();
+            const remoteUser = setup.remoteUser.trim();
+            if (![localUser, remoteUser].every(
+                (user) => /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(user),
+            )) {
+                setup.error = window.t('cluster.v2.ssh_accounts.invalid');
+                return;
+            }
+            setup.error = '';
+            if (setup.mode === 'approve') {
+                this.openPairApproval(setup.target, localUser, remoteUser);
+                this.sshSetup = null;
+            } else {
+                await this.beginJoinAddr(setup.address, setup.targetName, {
+                    localUser,
+                    remoteUser,
+                });
+            }
+        },
+
+        openPairApproval(device, localUser, remoteUser) {
             this.pairing = {
                 target: device,
+                localUser,
+                remoteUser,
                 code: '',
                 busy: false,
                 error: '',
@@ -1364,7 +1401,11 @@ function clusterV2Wizard() {
             try {
                 await this.apiFetch(CLUSTER_V2_API.pairApprove, {
                     method: 'POST',
-                    body: JSON.stringify({ node_id: device.node_id, code }),
+                    body: JSON.stringify({
+                        node_id: device.node_id, code,
+                        local_ssh_user: this.pairing.localUser,
+                        remote_ssh_user: this.pairing.remoteUser,
+                    }),
                 });
                 this.notify(
                     'success',
@@ -1521,14 +1562,29 @@ function clusterV2Wizard() {
             await this.beginJoinAddr(target, this.deviceName(device));
         },
 
-        async beginJoinAddr(coordinatorAddr, targetName) {
+        async beginJoinAddr(coordinatorAddr, targetName, accounts = null) {
             if (this.join.busy) return;
+            if (!accounts) {
+                this.sshSetup = {
+                    mode: 'join',
+                    address: coordinatorAddr,
+                    targetName,
+                    localUser: '',
+                    remoteUser: '',
+                    error: '',
+                };
+                return;
+            }
             const revision = ++this.joinRevision;
             this.join.busy = true;
             try {
                 const snapshot = await this.apiFetch(CLUSTER_V2_API.pairJoin, {
                     method: 'POST',
-                    body: JSON.stringify({ coordinator_addr: coordinatorAddr }),
+                    body: JSON.stringify({
+                        coordinator_addr: coordinatorAddr,
+                        local_ssh_user: accounts.localUser,
+                        remote_ssh_user: accounts.remoteUser,
+                    }),
                 });
                 if (revision !== this.joinRevision) return;
                 this.join = {
@@ -1539,14 +1595,14 @@ function clusterV2Wizard() {
                 };
                 this.joinApprovedNotified = false;
                 this.joinDeniedNotified = false;
+                this.sshSetup = null;
                 this.cancelPairing();
             } catch (error) {
                 if (revision !== this.joinRevision) return;
                 this.join.busy = false;
-                this.notify(
-                    'error',
-                    error?.message || window.t('cluster.v2.err.reach_mac'),
-                );
+                const message = error?.message || window.t('cluster.v2.err.reach_mac');
+                if (this.sshSetup) this.sshSetup.error = message;
+                else this.notify('error', message);
             }
         },
 

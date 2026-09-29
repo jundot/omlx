@@ -1299,10 +1299,10 @@ def test_show_code_instead_posts_the_best_reachable_address():
     assert "'manual', 'tb', 'thunderbolt', 'ethernet', 'tailscale'" in javascript
     assert "fe80:" in javascript
     assert "device.http_port || 8000" in javascript
-    # The join POST carries exactly the coordinator address.
-    assert re.search(
-        r"JSON\.stringify\(\{ coordinator_addr: coordinatorAddr \}\)", javascript
-    )
+    # Account selection is sent with the chosen endpoint.
+    assert "coordinator_addr: coordinatorAddr" in javascript
+    assert "local_ssh_user: accounts.localUser" in javascript
+    assert "remote_ssh_user: accounts.remoteUser" in javascript
 
 
 def test_expired_join_offers_start_again_not_a_dead_end():
@@ -2557,7 +2557,7 @@ component.apiFetch = (url) => url.endsWith('/cancel')
 (async () => {
   const pending = DELAYED_ACTION === 'poll'
     ? component.refreshJoinState()
-    : component.beginJoinAddr('peer:8000', 'Peer');
+    : component.beginJoinAddr('peer:8000', 'Peer', {localUser: 'local_user', remoteUser: 'peer_user'});
   await component.cancelJoin();
   resolveOld({state: 'awaiting_approval', code: '123456'});
   await pending;
@@ -2675,6 +2675,86 @@ def test_ssh_user_change_discards_old_checks_without_blocking_new_checks():
     }
 
 
+def test_join_waits_for_both_account_inputs_before_contacting_peer():
+    result = _run_wizard("""
+const calls = [];
+component.apiFetch = async (url, options) => {
+    calls.push(JSON.parse(options.body));
+    return {state: 'awaiting_approval', code: '123456'};
+};
+(async () => {
+    await component.beginJoinAddr('peer:8000', 'Peer');
+    const before = {calls: calls.length, local: component.sshSetup.localUser, remote: component.sshSetup.remoteUser};
+    component.sshSetup.localUser = 'local_user';
+    await component.submitSSHSetup();
+    const incomplete = {calls: calls.length, error: component.sshSetup.error};
+    component.sshSetup.remoteUser = 'remote_user';
+    await component.submitSSHSetup();
+    console.log(JSON.stringify({before, incomplete, calls, setup: component.sshSetup, code: component.join.code}));
+})();
+""")
+    assert result["before"] == {"calls": 0, "local": "", "remote": ""}
+    assert result["incomplete"]["calls"] == 0
+    assert result["incomplete"]["error"]
+    assert result["calls"] == [
+        {
+            "coordinator_addr": "peer:8000",
+            "local_ssh_user": "local_user",
+            "remote_ssh_user": "remote_user",
+        }
+    ]
+    assert result["setup"] is None
+    assert result["code"] == "123456"
+
+
+def test_approval_sends_both_selected_accounts_with_code():
+    result = _run_wizard("""
+const calls = [];
+component.notify = () => {};
+component.startChecks = () => {};
+component.apiFetch = async (url, options) => {calls.push(JSON.parse(options.body)); return {};};
+(async () => {
+    component.beginPairing({node_id: 'peer', friendly_name: 'Peer'});
+    const before = {calls: calls.length, target: component.pairing.target};
+    component.sshSetup.localUser = 'local_user';
+    component.sshSetup.remoteUser = 'remote_user';
+    await component.submitSSHSetup();
+    component.pairing.code = '123456';
+    await component.submitPairApproval(component.pairing.target);
+    console.log(JSON.stringify({before, calls, setup: component.sshSetup, target: component.pairing.target}));
+})();
+""")
+    assert result["before"] == {"calls": 0, "target": None}
+    assert result["calls"] == [
+        {
+            "node_id": "peer",
+            "code": "123456",
+            "local_ssh_user": "local_user",
+            "remote_ssh_user": "remote_user",
+        }
+    ]
+    assert result["setup"] is None
+    assert result["target"] is None
+
+
+def test_account_validation_error_preserves_inputs_for_retry():
+    result = _run_wizard("""
+component.apiFetch = async () => {throw new Error('The local SSH account must be the account running oMLX.');};
+(async () => {
+    await component.beginJoinAddr('peer:8000', 'Peer');
+    component.sshSetup.localUser = 'wrong_user';
+    component.sshSetup.remoteUser = 'peer_user';
+    await component.submitSSHSetup();
+    console.log(JSON.stringify({setup: component.sshSetup, busy: component.join.busy, code: component.join.code}));
+})();
+""")
+    assert result["setup"]["localUser"] == "wrong_user"
+    assert result["setup"]["remoteUser"] == "peer_user"
+    assert "account running oMLX" in result["setup"]["error"]
+    assert result["busy"] is False
+    assert result["code"] is None
+
+
 def test_ssh_repair_form_only_belongs_to_failed_check():
     template = _read(TEMPLATE)
     form = template.index("data-cluster-v2-ssh-user")
@@ -2687,3 +2767,25 @@ def test_ssh_repair_form_only_belongs_to_failed_check():
 def test_ssh_repair_input_allows_dotted_accounts():
     template = _read(TEMPLATE)
     assert 'pattern="[A-Za-z_][A-Za-z0-9_.\\-]{0,63}"' in template
+
+
+def test_account_step_uses_device_names_and_pairing_stage():
+    result = _run_wizard("""
+component.devicesPayload = {self: {node_id: 'self', friendly_name: 'Studio-Test'}, paired: [], discovered: []};
+component.beginPairing({node_id: 'peer', friendly_name: 'Portable-Test'});
+console.log(JSON.stringify({state: component.wizardState(), local: component.deviceName(component.selfDevice()), remote: component.deviceName(component.sshSetup.target)}));
+""")
+    assert result == {
+        "state": "pairing",
+        "local": "Studio-Test",
+        "remote": "Portable-Test",
+    }
+    template = _read(TEMPLATE)
+    assert (
+        "window.t('cluster.v2.ssh_accounts.local').replace('{name}', deviceName(selfDevice()))"
+        in template
+    )
+    assert (
+        "sshSetup.target ? deviceName(sshSetup.target) : sshSetup.targetName"
+        in template
+    )

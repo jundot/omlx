@@ -345,17 +345,25 @@ the two target Macs:
    single-stream decode, concurrent aggregate decode, cache hit rate, pipeline
    utilization, and long-context KV growth.
 
-### Different SSH usernames in the Cluster v2 wizard
+### SSH accounts during Cluster v2 pairing
 
-On each paired remote device card, enter the remote account's short login name
-in **SSH username** and select **Save SSH username**. Re-run the checks, then
-create a new plan. For example, a coordinator logged in as `coordinator_user`
-can connect to a worker as `worker_user` without editing `~/.ssh/config`.
+Before showing or approving a pairing code, the wizard asks for the account
+short name on each Mac. Each input is labeled with that Mac's device name.
+Use the account running oMLX on that Mac; enrollment installs keys for that
+account and does not write into another user's home directory.
 
-The override is stored by node ID on the coordinator and survives refreshes and
-restarts. It applies to peer checks, model discovery and newly planned launches,
-even when the peer address changes. Clear the field and save to restore the
-enrolled login or normal OpenSSH configuration. Only an administrator can change
-it, and only for an already paired device. Pairing keys remain unchanged.
-Existing signed deployments retain their original SSH targets; recreate their
-plan to use a changed username.
+Both updated peers confirm the account names. The join request binds the names
+to its code verifier, and the approval authenticates the coordinator's account
+with its existing identity tag. After code approval, the existing enrollment
+flow automatically installs public keys and pins host keys in both directions.
+The selected remote account is saved per device and reused for subsequent SSH
+checks, model discovery, and deployment plans. No private key is transmitted.
+
+The account step closes when pairing continues. A username repair form is only
+shown beside a failed SSH check; successfully connected devices have no form.
+A manual override invalidates earlier probes and plans. Clear the override to
+restore the enrolled target or OpenSSH configuration.
+
+Both Macs need the account-aware pairing version for the new wizard flow.
+Older API clients that omit account selection retain the original protocol;
+there is no silent downgrade when account names have been explicitly selected.

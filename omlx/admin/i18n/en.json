@@ -2016,5 +2016,12 @@
   "settings.global.reset_ok": "OK",
   "settings.global.reset_cancel": "Cancel",
   "settings.advanced.qwen4_gdn_decode_wide_proj": "Qwen4 Extended Fused Decode",
-  "settings.advanced.qwen4_gdn_decode_wide_proj_hint": "Speeds up single-request generation on supported affine-quantized Qwen4-family models with a hidden size of 2560. Contributor benchmarks on 8-bit Qwen3.8-Flash-Next reported 3-6% faster generation with 1.5 GiB of extra memory; results vary. Does not affect prefill or batched generation. Off by default. Reload the model to apply changes."
+  "settings.advanced.qwen4_gdn_decode_wide_proj_hint": "Speeds up single-request generation on supported affine-quantized Qwen4-family models with a hidden size of 2560. Contributor benchmarks on 8-bit Qwen3.8-Flash-Next reported 3-6% faster generation with 1.5 GiB of extra memory; results vary. Does not affect prefill or batched generation. Off by default. Reload the model to apply changes.",
+  "cluster.v2.ssh_accounts.title": "SSH accounts",
+  "cluster.v2.ssh_accounts.help": "Enter the account short name running oMLX on each Mac. Public keys are exchanged automatically after you confirm the pairing code.",
+  "cluster.v2.ssh_accounts.local": "Username on {name} (this Mac)",
+  "cluster.v2.ssh_accounts.remote": "Username on {name}",
+  "cluster.v2.ssh_accounts.invalid": "Enter both account short names, without spaces.",
+  "cluster.v2.ssh_accounts.continue": "Continue to pairing",
+  "cluster.v2.ssh_accounts.cancel": "Cancel"
 }

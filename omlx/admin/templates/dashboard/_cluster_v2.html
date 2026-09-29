@@ -364,8 +364,38 @@
                  class="bg-white border border-neutral-200 rounded-2xl overflow-hidden mb-6"
                  data-cluster-v2-state="pairing" data-cluster-v2-pairing>
             <div class="p-5 sm:p-6 max-w-xl">
+                <template x-if="sshSetup">
+                    <section class="mb-5"
+                             data-cluster-v2-ssh-accounts aria-labelledby="cluster-ssh-accounts-title"
+                             x-init="$nextTick(() => $el.scrollIntoView({ block: 'nearest', behavior: 'smooth' }))">
+                        <h3 id="cluster-ssh-accounts-title" class="text-base font-semibold text-neutral-900">{{ t('cluster.v2.ssh_accounts.title') }}</h3>
+                        <p class="mt-1 text-xs text-neutral-500">{{ t('cluster.v2.ssh_accounts.help') }}</p>
+                        <form @submit.prevent="submitSSHSetup()" class="mt-4 max-w-xl">
+                            <div class="grid grid-cols-1 sm:grid-cols-2 items-end gap-4">
+                                <label class="block text-xs font-medium text-neutral-700">
+                                    <span x-text="window.t('cluster.v2.ssh_accounts.local').replace('{name}', deviceName(selfDevice()))"></span>
+                                    <input type="text" x-model="sshSetup.localUser" required autocomplete="username"
+                                           autocapitalize="none" spellcheck="false" maxlength="64" pattern="[A-Za-z_][A-Za-z0-9_\-]{0,63}"
+                                           :disabled="join.busy" class="mt-1.5 w-full rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2 text-sm focus:border-neutral-500 focus:ring-1 focus:ring-neutral-500">
+                                </label>
+                                <label class="block text-xs font-medium text-neutral-700">
+                                    <span x-text="window.t('cluster.v2.ssh_accounts.remote').replace('{name}', sshSetup.target ? deviceName(sshSetup.target) : sshSetup.targetName)"></span>
+                                    <input type="text" x-model="sshSetup.remoteUser" required autocomplete="off"
+                                           autocapitalize="none" spellcheck="false" maxlength="64" pattern="[A-Za-z_][A-Za-z0-9_\-]{0,63}"
+                                           :disabled="join.busy" class="mt-1.5 w-full rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2 text-sm focus:border-neutral-500 focus:ring-1 focus:ring-neutral-500">
+                                </label>
+                            </div>
+                            <p x-show="sshSetup.error" x-text="sshSetup.error" role="alert" class="mt-3 text-xs text-red-700"></p>
+                            <div class="mt-4 flex items-center gap-2">
+                                <button type="submit" :disabled="join.busy" class="inline-flex items-center gap-1.5 rounded-lg bg-neutral-900 px-3 py-2 text-xs font-semibold text-white hover:bg-neutral-800 disabled:opacity-50">{{ t('cluster.v2.ssh_accounts.continue') }}</button>
+                                <button type="button" @click="sshSetup = null" :disabled="join.busy" class="rounded-lg border border-neutral-200 px-3 py-2 text-xs font-medium text-neutral-600 hover:bg-neutral-50 disabled:opacity-50">{{ t('cluster.v2.ssh_accounts.cancel') }}</button>
+                            </div>
+                        </form>
+                    </section>
+                </template>
+
                 <!-- This Mac is the joiner: it shows the code, the other Mac approves. -->
-                <template x-if="joinActive()">
+                <template x-if="joinActive() && !sshSetup">
                     <div class="mb-5 rounded-xl border border-neutral-900 ring-1 ring-neutral-900 p-4"
                          data-cluster-v2-joining>
                         <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.v2.pairing.joining') }}</div>
@@ -426,7 +456,7 @@
                 </template>
 
                 <!-- Pending approval arriving from another Mac. -->
-                <template x-if="pendingApprovals().length && !pairing.target">
+                <template x-if="pendingApprovals().length && !pairing.target && !sshSetup">
                     <div>
                         <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.v2.pairing.wants_join') }}</div>
                         <template x-for="device in pendingApprovals()" :key="device.node_id">
@@ -470,7 +500,7 @@
                 </template>
 
                 <!-- User pressed Pair on a discovered card. -->
-                <template x-if="pairing.target">
+                <template x-if="pairing.target && !sshSetup">
                     <div>
                         <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('cluster.v2.pairing.new_mac') }}</div>
                         <h4 class="text-base font-semibold text-neutral-900 mt-2"
