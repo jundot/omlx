@@ -19,11 +19,10 @@ import requests
 from .hf_downloader import (
     DownloadStatus,
     DownloadTask,
+    _QueuePersistenceMixin,
     _SpeedMeter,
     _format_model_size,
     _format_param_count,
-    _persist_queue,
-    _restore_queue,
 )
 
 logger = logging.getLogger(__name__)
@@ -383,7 +382,7 @@ async def _fetch_ms_models_rest(
     return []
 
 
-class MSDownloader:
+class MSDownloader(_QueuePersistenceMixin):
     """Manages ModelScope model downloads with progress tracking.
 
     Uses modelscope.snapshot_download() for actual downloads and polls
@@ -689,15 +688,7 @@ class MSDownloader:
         self._progress_tasks: dict[str, asyncio.Task] = {}
         self._on_complete = on_complete
         self._cancelled: set[str] = set()
-        # Where the queue persists for restart recovery; None disables
-        # persistence (tests and embedders manage their own lifecycle).
-        self._tasks_file = Path(tasks_file) if tasks_file else None
-        # _persist() stays silent while either flag is set: shutdown must
-        # leave on-disk rows reading "pending/downloading" so the next boot
-        # resumes them, and restore must not rewrite the queue until every
-        # interrupted row has been re-queued.
-        self._shutting_down = False
-        self._restoring = False
+        self._init_queue(tasks_file)
         self._download_sem = asyncio.Semaphore(1)
 
     @property
@@ -876,14 +867,6 @@ class MSDownloader:
             task.to_dict()
             for task in sorted(self._tasks.values(), key=lambda t: t.created_at)
         ]
-
-    def _persist(self) -> None:
-        """Persist the queue; the lifecycle gates live in _persist_queue."""
-        _persist_queue(self)
-
-    async def restore_tasks(self) -> None:
-        """Restore the persisted queue after a restart; see _restore_queue."""
-        await _restore_queue(self, logger)
 
     async def shutdown(self) -> None:
         """Cancel all active downloads and clean up."""
@@ -1077,8 +1060,8 @@ class MSDownloader:
         # window before the first sleep so the first reading covers transfer
         # time rather than startup.
         speed_meter = _SpeedMeter()
-        _logical, _mtime, files = self._scan_dir(target_dir)
-        speed_meter.add(files)
+        activity = self._get_download_activity(target_dir)
+        speed_meter.add(activity.files)
 
         try:
             while task.status == DownloadStatus.DOWNLOADING:
@@ -1087,9 +1070,11 @@ class MSDownloader:
                 if task.status != DownloadStatus.DOWNLOADING:
                     break
 
-                current_size, latest_mtime, files = self._scan_dir(target_dir)
+                activity = self._get_download_activity(target_dir)
+                current_size = activity.logical_size
+                latest_mtime = activity.latest_mtime_ns / 1e9
                 task.downloaded_size = current_size
-                task.speed_bps = speed_meter.add(files)
+                task.speed_bps = speed_meter.add(activity.files)
 
                 if task.total_size > 0:
                     # Cap at 99% until snapshot_download confirms completion
@@ -1129,41 +1114,6 @@ class MSDownloader:
             # Terminal states (done, failed, cancelled, stalled) report no
             # rate — only a live transfer has a speed.
             task.speed_bps = 0.0
-
-    @staticmethod
-    def _scan_dir(path: Path) -> tuple[int, float, dict[str, int]]:
-        """Walk a directory once for (logical size, latest mtime, per-file
-        allocated blocks).
-
-        Progress, liveness and the speed meter read different signals, so
-        one walk serves all three instead of re-walking the tree per signal.
-        The per-file map feeds the meter's file-level continuity: bytes that
-        appear wholesale between two walks (files replayed after a resume, a
-        tree that vanished and came back) are not transfer.
-        """
-        if not path.exists():
-            return 0, 0.0, {}
-        logical = 0
-        latest_mtime = 0.0
-        files: dict[str, int] = {}
-        try:
-            for f in path.rglob("*"):
-                if f.is_file():
-                    try:
-                        st = f.stat()
-                    except OSError:
-                        continue
-                    logical += st.st_size
-                    files[str(f)] = getattr(st, "st_blocks", 0) * 512
-                    if st.st_mtime > latest_mtime:
-                        latest_mtime = st.st_mtime
-        except OSError:
-            # Partial walk (concurrent cleanup): hand over what we saw.
-            # Paths dropped here are forgotten by the meter, so a complete
-            # walk next tick reads as first-sight (0 growth) instead of
-            # replaying the whole tree as one giant delta.
-            pass
-        return logical, latest_mtime, files
 
     @staticmethod
     def _get_dir_size(path: Path) -> int:

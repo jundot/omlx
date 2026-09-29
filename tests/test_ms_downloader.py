@@ -11,7 +11,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from omlx.admin.hf_downloader import DownloadStatus, DownloadTask, HFDownloader
+from omlx.admin.hf_downloader import (
+    DownloadStatus,
+    DownloadTask,
+    HFDownloader,
+    _DownloadActivity,
+)
 from omlx.admin.ms_downloader import (
     MSDownloader,
     _ENRICH_CACHE,
@@ -467,16 +472,23 @@ class TestMSDownloader:
     def test_get_dir_size_nonexistent(self, tmp_path):
         assert MSDownloader._get_dir_size(tmp_path / "nonexistent") == 0
 
-    def test_scan_dir_reports_all_signals_in_one_walk(self, tmp_path):
+    def test_get_download_activity_reports_all_signals_in_one_walk(
+        self, tmp_path
+    ):
         (tmp_path / "a.bin").write_bytes(b"x" * 300)
-        logical, mtime, files = MSDownloader._scan_dir(tmp_path)
-        assert logical == 300
-        assert mtime > 0
+        activity = MSDownloader._get_download_activity(tmp_path)
+        assert activity.logical_size == 300
+        assert activity.latest_mtime_ns > 0
         # The per-file map feeds the speed meter's continuity tracking.
-        assert files[str(tmp_path / "a.bin")] >= 300
+        assert activity.files[str(tmp_path / "a.bin")] >= 300
 
-    def test_scan_dir_nonexistent(self, tmp_path):
-        assert MSDownloader._scan_dir(tmp_path / "nope") == (0, 0.0, {})
+    def test_get_download_activity_nonexistent(self, tmp_path):
+        empty = MSDownloader._get_download_activity(tmp_path / "nope")
+        assert (empty.logical_size, empty.latest_mtime_ns, empty.files) == (
+            0,
+            0,
+            {},
+        )
 
     @pytest.mark.asyncio
     async def test_poll_reports_speed_then_zeroes_it(self, downloader, monkeypatch):
@@ -497,16 +509,17 @@ class TestMSDownloader:
 
         def growing_scan(_path):
             state["allocated"] += 150_000
-            # (logical size, latest mtime, per-file allocated map)
-            return (
-                state["allocated"],
-                time.time(),
-                {"payload": state["allocated"]},
+            return _DownloadActivity(
+                file_count=1,
+                logical_size=state["allocated"],
+                allocated_size=state["allocated"],
+                latest_mtime_ns=int(time.time() * 1e9),
+                files={"payload": state["allocated"]},
             )
 
         with patch.object(
             downloader,
-            "_scan_dir",
+            "_get_download_activity",
             side_effect=growing_scan,
         ):
             poll = asyncio.create_task(

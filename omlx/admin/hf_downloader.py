@@ -967,6 +967,73 @@ async def _restore_queue(downloader, logger) -> None:
     if not deferred:
         downloader._persist()
 
+
+class _QueuePersistenceMixin:
+    """The restart-surviving queue shared by both downloader backends.
+
+    HuggingFace and ModelScope differ only in how a download runs; the queue
+    file, its lifecycle gates, the restore walk and the one directory walk
+    that feeds progress, liveness and the speed meter are the same.
+    """
+
+    @staticmethod
+    def _get_download_activity(path: Path) -> _DownloadActivity:
+        """Return size, allocation, and mtime signals including Hub temp files."""
+        if not path.exists():
+            return _DownloadActivity()
+        file_count = 0
+        logical_size = 0
+        allocated_size = 0
+        latest_mtime_ns = 0
+        files: dict[str, int] = {}
+        try:
+            for file_path in path.rglob("*"):
+                if not file_path.is_file():
+                    continue
+                try:
+                    stat = file_path.stat()
+                except OSError:
+                    continue
+                file_count += 1
+                logical_size += stat.st_size
+                blocks = getattr(stat, "st_blocks", 0) * 512
+                allocated_size += blocks
+                files[str(file_path)] = blocks
+                latest_mtime_ns = max(latest_mtime_ns, stat.st_mtime_ns)
+        except OSError:
+            # A walk aborted mid-way (concurrent cleanup) under-counts.
+            # Hand the partial `files` map to the meter anyway: paths that
+            # drop out are forgotten, so when they show up again they read
+            # as first-sight (0) instead of replaying as a giant delta.
+            pass
+        return _DownloadActivity(
+            file_count=file_count,
+            logical_size=logical_size,
+            allocated_size=allocated_size,
+            latest_mtime_ns=latest_mtime_ns,
+            files=files,
+        )
+
+    def _init_queue(self, tasks_file: str | Path | None) -> None:
+        # Where the queue persists for restart recovery; None disables
+        # persistence (tests and embedders manage their own lifecycle).
+        self._tasks_file = Path(tasks_file) if tasks_file else None
+        # _persist() stays silent while either flag is set: shutdown must
+        # leave on-disk rows reading "pending/downloading" so the next boot
+        # resumes them, and restore must not rewrite the queue until every
+        # interrupted row has been re-queued.
+        self._shutting_down = False
+        self._restoring = False
+
+    def _persist(self) -> None:
+        """Persist the queue; the lifecycle gates live in _persist_queue."""
+        _persist_queue(self)
+
+    async def restore_tasks(self) -> None:
+        """Restore the persisted queue after a restart; see _restore_queue."""
+        await _restore_queue(self, logger)
+
+
 # Every xet download group still in flight. snapshot_download shards files
 # across hf_thread_map workers, so one snapshot runs many xet_get() calls
 # concurrently — one XetFileDownloadGroup per file — and cancel/shutdown must
@@ -1221,7 +1288,7 @@ def _install_xet_group_capture() -> None:
         logger.debug("xet group capture not installed", exc_info=True)
 
 
-class HFDownloader:
+class HFDownloader(_QueuePersistenceMixin):
     """Manages HuggingFace model downloads with progress tracking.
 
     Uses huggingface_hub.snapshot_download() for actual downloads and polls
@@ -1558,15 +1625,7 @@ class HFDownloader:
         self._progress_tasks: dict[str, asyncio.Task] = {}
         self._on_complete = on_complete
         self._cancelled: set[str] = set()
-        # Where the queue persists for restart recovery; None disables
-        # persistence (tests and embedders manage their own lifecycle).
-        self._tasks_file = Path(tasks_file) if tasks_file else None
-        # _persist() stays silent while either flag is set: shutdown must
-        # leave on-disk rows reading "pending/downloading" so the next boot
-        # resumes them, and restore must not rewrite the queue until every
-        # interrupted row has been re-queued.
-        self._shutting_down = False
-        self._restoring = False
+        self._init_queue(tasks_file)
         self._stalled: dict[str, _DownloadStalledError] = {}
         self._fallback_processes: dict[str, asyncio.subprocess.Process] = {}
         self._download_sem = asyncio.Semaphore(1)
@@ -1756,14 +1815,6 @@ class HFDownloader:
             task.to_dict()
             for task in sorted(self._tasks.values(), key=lambda t: t.created_at)
         ]
-
-    def _persist(self) -> None:
-        """Persist the queue; the lifecycle gates live in _persist_queue."""
-        _persist_queue(self)
-
-    async def restore_tasks(self) -> None:
-        """Restore the persisted queue after a restart; see _restore_queue."""
-        await _restore_queue(self, logger)
 
     async def shutdown(self) -> None:
         """Cancel all active downloads and clean up."""
@@ -2258,44 +2309,6 @@ class HFDownloader:
             # Terminal states (done, failed, cancelled, stalled) report no
             # rate — only a live transfer has a speed.
             task.speed_bps = 0.0
-
-    @staticmethod
-    def _get_download_activity(path: Path) -> _DownloadActivity:
-        """Return size, allocation, and mtime signals including Hub temp files."""
-        if not path.exists():
-            return _DownloadActivity()
-        file_count = 0
-        logical_size = 0
-        allocated_size = 0
-        latest_mtime_ns = 0
-        files: dict[str, int] = {}
-        try:
-            for file_path in path.rglob("*"):
-                if not file_path.is_file():
-                    continue
-                try:
-                    stat = file_path.stat()
-                except OSError:
-                    continue
-                file_count += 1
-                logical_size += stat.st_size
-                blocks = getattr(stat, "st_blocks", 0) * 512
-                allocated_size += blocks
-                files[str(file_path)] = blocks
-                latest_mtime_ns = max(latest_mtime_ns, stat.st_mtime_ns)
-        except OSError:
-            # A walk aborted mid-way (concurrent cleanup) under-counts.
-            # Hand the partial `files` map to the meter anyway: paths that
-            # drop out are forgotten, so when they show up again they read
-            # as first-sight (0) instead of replaying as a giant delta.
-            pass
-        return _DownloadActivity(
-            file_count=file_count,
-            logical_size=logical_size,
-            allocated_size=allocated_size,
-            latest_mtime_ns=latest_mtime_ns,
-            files=files,
-        )
 
     @staticmethod
     def _get_dir_size(path: Path) -> int:
