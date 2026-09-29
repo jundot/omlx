@@ -289,7 +289,7 @@ class DeviceRegistry:
         ssh_user = item.get("ssh_user")
         if ssh_user is not None:
             if not isinstance(ssh_user, str) or not re.fullmatch(
-                r"[A-Za-z_][A-Za-z0-9_-]{0,63}", ssh_user
+                r"[A-Za-z_][A-Za-z0-9_.-]{0,63}", ssh_user
             ):
                 raise ValueError("cluster device SSH user is invalid")
             device["ssh_user"] = ssh_user
@@ -531,7 +531,7 @@ class DeviceRegistry:
         """Persist an administrator's SSH login override for an already paired node."""
         if ssh_user is not None and (
             not isinstance(ssh_user, str)
-            or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,63}", ssh_user)
+            or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,63}", ssh_user)
         ):
             raise ValueError("cluster device SSH user is invalid")
         with self._lock:

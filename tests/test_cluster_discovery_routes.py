@@ -629,18 +629,19 @@ def test_manual_paired_endpoint_persists_and_rehydrates_on_reboot(
     service.stop()
 
 
-def test_ssh_user_is_persisted_and_can_be_cleared(_configured_stores):
+@pytest.mark.parametrize("user", ["remote_user", "prenom.nom"])
+def test_ssh_user_is_persisted_and_can_be_cleared(_configured_stores, user):
     _, registry, client = _configured_stores
     registry.mark_paired("peer-1", friendly_name="worker")
     url = "/api/cluster/devices/peer-1/ssh-user"
-    assert client.put(url, json={"ssh_user": "remote_user"}).status_code == 200
+    assert client.put(url, json={"ssh_user": user}).status_code == 200
     assert (
         client.get("/api/cluster/devices").json()["paired"][0]["ssh_user"]
-        == "remote_user"
+        == user
     )
-    assert DeviceRegistry(registry.path).paired()[0]["ssh_user"] == "remote_user"
+    assert DeviceRegistry(registry.path).paired()[0]["ssh_user"] == user
     registry.mark_paired("peer-1", friendly_name="renamed")
-    assert registry.paired()[0]["ssh_user"] == "remote_user"
+    assert registry.paired()[0]["ssh_user"] == user
     assert client.put(url, json={"ssh_user": None}).status_code == 200
     assert "ssh_user" not in DeviceRegistry(registry.path).paired()[0]
 
