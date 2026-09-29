@@ -8,8 +8,10 @@ which failure the SDK reports), and each such seam is selected by a fixture.
 """
 
 import asyncio
+import json
 import logging
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -17,7 +19,17 @@ import pytest
 
 from omlx.admin.hf_downloader import DownloadStatus, DownloadTask, HFDownloader
 from omlx.admin.ms_downloader import MSDownloader
-from tests._download_helpers import _read_rows, _write_rows
+
+
+def _write_rows(path: Path, rows) -> None:
+    """Write a persisted queue file the way a previous boot left it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(rows), encoding="utf-8")
+
+
+def _read_rows(path: Path) -> list:
+    """Read back the persisted queue rows."""
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 @pytest.fixture(params=[HFDownloader, MSDownloader], ids=["hf", "ms"])
