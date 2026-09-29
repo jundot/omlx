@@ -2584,3 +2584,16 @@ process.stdout.write(JSON.stringify({state: component.wizardState(), active: com
     template = _read(TEMPLATE)
     assert "data-cluster-v2-join-cleanup" in template
     assert 'x-show="join.cleanup_pending"' in template
+
+
+def test_wizard_uses_server_verified_ssh_alternative_for_new_connections():
+    result = _run_wizard("""
+const peer = {node_id: 'peer', paired: true, ssh_target: 'remote_user@192.0.2.1',
+    preferred_ssh_target: 'remote_user@192.0.2.2', addrs: [{ip: '192.0.2.1'}, {ip: '192.0.2.2'}]};
+component.devicesPayload = {self: null, paired: [peer], discovered: []};
+const old = {activation: {hosts: [{ssh: 'remote_user@192.0.2.1'}]}};
+component.planProposal = old;
+console.log(JSON.stringify({target: component.sshTargetFor(peer),
+    host: component.deploymentHosts()[0].ssh, original: old.activation.hosts[0].ssh}));
+""")
+    assert result == {"target": "remote_user@192.0.2.2", "host": "remote_user@192.0.2.2", "original": "remote_user@192.0.2.1"}

@@ -16,6 +16,7 @@ import asyncio
 import ipaddress
 import threading
 import time
+from contextlib import suppress
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -27,6 +28,54 @@ from .identity import get_node_identity
 from .registry import get_device_registry
 
 discovery_router = APIRouter(prefix="/api/cluster", tags=["cluster-discovery"])
+
+
+def _known_address_keys(host: str, lines: list[str]) -> set[str]:
+    """Read exact pinned aliases only; ambiguous/hashed/config aliases fail closed."""
+    keys = set()
+    for line in lines:
+        parts = line.split()
+        if (
+            len(parts) >= 3
+            and not parts[0].startswith(("#", "@", "|"))
+            and host in parts[0].split(",")
+        ):
+            keys.add(" ".join(parts[1:3]))
+    return keys
+
+
+def _preferred_ssh_target(row: dict[str, Any], health: dict, lines: list[str]) -> str | None:
+    """Offer a known same-key alternate only after the previous address is stale."""
+    original = row.get("ssh_target") or next(iter(row.get("last_addrs") or []), "")
+    if not original:
+        return None
+    user, separator, host = str(original).rpartition("@")
+    if not separator:
+        host = str(original)
+    # Moving a bare ssh_config alias can silently select a different User.
+    # Require an explicit enrolled/admin login before automatic address changes.
+    login = row.get("ssh_user") or (user if separator else None)
+    if not login:
+        return None
+    if health.get(host, {}).get("state") != "stale":
+        return None
+    trusted = _known_address_keys(host, lines)
+    if not trusted:
+        return None
+    for addr in row.get("addrs") or []:
+        ip = addr.get("ip")
+        if not ip or health.get(ip, {}).get("state") != "verified":
+            continue
+        # The shared SSH policy currently forces AddressFamily=inet.
+        try:
+            if ipaddress.ip_address(ip).version != 4:
+                continue
+        except ValueError:
+            continue
+        keys = _known_address_keys(ip, lines)
+        if keys and keys <= trusted:
+            return f"{login}@{ip}"
+    return None
 
 
 class ProbeRateLimiter:
@@ -344,8 +393,20 @@ async def cluster_devices(is_admin: bool = Depends(require_admin)):
     # Devices paired before caps were exchanged carry empty caps on disk;
     # enrich them from what discovery has actually seen before suppressing
     # their node_ids from the discovered list below.
+    known_hosts_lines = []
+    if service is not None:
+        from .ssh_keys import get_known_hosts_path
+
+        with suppress(OSError):
+            known_hosts_lines = get_known_hosts_path().read_text(encoding="utf-8").splitlines()
     for row in paired:
         _enrich_paired_row(row, observed_records.get(row.get("node_id")))
+        if service is not None:
+            health = service.address_health(row["node_id"])
+            row["address_health"] = health
+            preferred = _preferred_ssh_target(row, health, known_hosts_lines)
+            if preferred:
+                row["preferred_ssh_target"] = preferred
 
     # Nothing flips the discovery service's in-memory ``PeerRecord.paired``
     # the moment pairing completes, so a stale (possibly dead) record for a

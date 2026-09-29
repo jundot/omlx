@@ -1664,6 +1664,8 @@ function clusterV2Wizard() {
         },
 
         sshTargetFor(device) {
+            // The server only offers fresh alternatives with an already pinned matching key.
+            if (device?.preferred_ssh_target) return String(device.preferred_ssh_target);
             // Pairing enrollment records the SSH target; the devices payload
             // surfaces it as ssh_target on paired rows. Fall back to the
             // first verified probe address when no enrollment exists yet.
