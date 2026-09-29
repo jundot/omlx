@@ -579,7 +579,7 @@
                                                         <input type="text" autocomplete="off" autocapitalize="none" spellcheck="false"
                                                                :value="sshUserDrafts[device.node_id] ?? device.ssh_user ?? ''"
                                                                @input="sshUserDrafts[device.node_id] = $event.target.value"
-                                                               pattern="[A-Za-z_][A-Za-z0-9_\-]{0,63}" maxlength="64"
+                                                               pattern="[A-Za-z_][A-Za-z0-9_.\-]{0,63}" maxlength="64"
                                                                :disabled="sshUserSaving[device.node_id] || checks.running || planLoading"
                                                                class="mt-1 w-full rounded-lg border border-neutral-300 px-2 py-1.5 text-xs">
                                                     </label>

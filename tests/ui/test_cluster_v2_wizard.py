@@ -2683,3 +2683,8 @@ def test_ssh_repair_form_only_belongs_to_failed_check():
     assert "row.key === 'ssh' && row.status === 'fail'" in template[checks:form]
     assert "checks.probes[peer.node_id]?.ok === false" in template[checks:form]
 
+
+
+def test_ssh_repair_input_allows_dotted_accounts():
+    template = _read(TEMPLATE)
+    assert 'pattern="[A-Za-z_][A-Za-z0-9_.\\-]{0,63}"' in template
