@@ -36,6 +36,7 @@ import os
 import re
 import struct
 import threading
+import time
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
@@ -301,6 +302,11 @@ def _shutdown_io_pool() -> None:
 # Poll interval while the overlap path waits on reads (see _GpuKeepalive).
 _KEEPALIVE_PERIOD_S = 50e-6
 _KEEPALIVE_LOCAL = threading.local()
+# A decode step overlaps only when its first missing expert is still being read
+# this long after the reads were issued. Faster reads (page cache, fast internal
+# storage) keep the serial order: an idle gap this short barely lowers the GPU
+# clock, and splitting the gather in two would cost more than it hides.
+_OVERLAP_GRACE_S = 0.5e-3
 
 
 class _GpuKeepalive:
@@ -455,22 +461,25 @@ class ExpertCache:
             return
         self._ensure_ids(set(int(e) for e in idx.reshape(-1).tolist()))
 
-    def _ensure_ids(
-        self, needed: set, before_writes=None, keep_gpu_busy: bool = False
-    ) -> None:
+    def _ensure_ids(self, needed: set, on_slow_read=None) -> bool:
         """:meth:`ensure` for a route set already read back from the device.
 
-        ``before_writes``, when given, runs once, right before this call's
-        first slot write: the overlap path evaluates its in-flight gather
-        there. ``keep_gpu_busy`` keeps the GPU clocked while reads are
-        waited on (see :meth:`OffloadSwitchGLU._forward_overlap`).
+        With ``on_slow_read`` (the decode overlap path), the call checks once,
+        at its first miss and before any slot write, whether that expert's
+        reads finish within ``_OVERLAP_GRACE_S`` of being issued. If they do
+        not, ``on_slow_read()`` runs and may dispatch GPU work; what it returns
+        is evaluated right before the first slot write, and the rest of the
+        call's reads are waited on with the GPU kept busy (see
+        :meth:`OffloadSwitchGLU._forward_overlap`). Returns whether that
+        happened.
         """
         pool = _io_pool()
-        keepalive = _gpu_keepalive() if keep_gpu_busy and pool is not None else None
         queue = [e for e in needed if e not in self.slot_of] if pool is not None else []
         window = _io_batch()
         pending: dict[int, list] = {}
         sent = 0
+        keepalive = barrier = None
+        slow = False
 
         def prefetch(upto: int) -> None:
             nonlocal sent
@@ -490,6 +499,7 @@ class ExpertCache:
 
         try:
             prefetch(window)
+            deadline = time.perf_counter() + _OVERLAP_GRACE_S
             done = 0
             for e in needed:
                 if e in self.slot_of:
@@ -502,9 +512,14 @@ class ExpertCache:
                 if sent < len(queue) and queue[sent] == e:
                     prefetch(done + window)
                 group = pending.get(e)
-                if before_writes is not None:
-                    before_writes()
-                    before_writes = None
+                if on_slow_read is not None:  # the first miss: nothing written yet
+                    futures = [f for _, _, _, f in group or ()]
+                    timeout = max(0.0, deadline - time.perf_counter())
+                    if futures and wait(futures, timeout=timeout).not_done:
+                        slow = True
+                        barrier = on_slow_read()
+                        keepalive = _gpu_keepalive()
+                    on_slow_read = None
                 if group is None:
                     self._install(e)
                     continue
@@ -512,6 +527,9 @@ class ExpertCache:
                 prefetch(done + window)
                 if keepalive is not None:
                     keepalive.wait([f for _, _, _, f in group])
+                if barrier is not None:
+                    mx.eval(barrier)  # right before the first slot write
+                    barrier = None
                 self._install(
                     e,
                     [(name, field, plan, f.result()) for name, field, plan, f in group],
@@ -529,6 +547,7 @@ class ExpertCache:
         # evaluating every resident tensor on every miss measured 22% slower
         # at identical peak memory. Prefill's transient is bounded by the
         # per-chunk eval in __call__, which is a different mechanism.
+        return slow
 
     def qmm(
         self, name: str, x: mx.array, slots: mx.array, sorted_indices: bool = False
@@ -563,9 +582,9 @@ class OffloadSwitchGLU(nn.Module):
         super().__init__()
         self.cache = ExpertCache(glu, capacity, disk)
         self.activation = glu.activation
-        # Fetch/compute overlap in decode: the GPU stays busy while the
-        # missing experts are read. OMLX_MOE_OFFLOAD_OVERLAP=0 keeps the
-        # serial order (read, then compute).
+        # Fetch/compute overlap in decode: the GPU stays busy while slow
+        # reads of missing experts are pending. OMLX_MOE_OFFLOAD_OVERLAP=0
+        # keeps the serial order (read, then compute) for every step.
         self._overlap = os.environ.get("OMLX_MOE_OFFLOAD_OVERLAP", "1") != "0"
 
     def _glu(self, x: mx.array, slots: mx.array) -> mx.array:
@@ -574,46 +593,67 @@ class OffloadSwitchGLU(nn.Module):
         gate = c.qmm("gate_proj", x, slots)
         return c.qmm("down_proj", self.activation(up, gate), slots)
 
+    def _glu_routes(self, flat_x: mx.array, flat: list, pos: list, k: int) -> mx.array:
+        """The experts' output for the flat route positions ``pos`` only.
+
+        Each route gets its token's row and its expert's slot, the layout of
+        the expert-major prefill chunks: the same unsorted kernel as the full
+        decode gather, so every row is bit-identical to it.
+        """
+        rows = mx.take(flat_x, mx.array([p // k for p in pos], dtype=mx.int32), axis=0)
+        slots = mx.array([self.cache.slot_of[flat[p]] for p in pos], dtype=mx.int32)
+        return self._glu(mx.expand_dims(rows, (-2, -3)), slots.reshape(-1, 1))
+
     def _forward_overlap(self, x: mx.array, indices: mx.array) -> mx.array:
-        """Decode step that keeps the GPU busy while missing experts are read.
+        """Decode step that keeps the GPU busy while slow reads are pending.
 
         The serial step reads the route set back, reads the misses, then
-        computes, and the GPU idles through the read. Apple GPUs lower their
-        clock after a couple of milliseconds idle, so the next layer's work
-        runs slower too. Here, after the same readback, the resident routes'
-        ``gather_qmm`` is dispatched with ``async_eval`` before the reads are
-        waited on, a trivial kernel keeps the GPU clocked for the rest of the
-        wait (:class:`_GpuKeepalive`), the miss routes are gathered once they
-        are installed, and the two results are selected per route.
-        ``gather_qmm`` is per-row, so this is bit-identical to one gather over
-        the filled cache (a masked route reads slot 0 and is discarded). The
-        in-flight gather is evaluated right before the first slot write:
-        while it still references the resident arrays a write cannot happen
-        in place and copies the whole array (2.5 ms instead of 0.5 ms per
-        expert at 2.8 MB experts). A step that is all hits or all misses
-        takes one gather. The layer's output is dispatched as soon as it is
-        built, so the GPU starts on it while the next layer's graph is built.
+        computes, and the GPU idles through the read. When the first missing
+        expert arrives within ``_OVERLAP_GRACE_S`` of its reads being issued
+        (page cache, fast storage) that is the right order, and this step
+        takes it unchanged. When it does not, the GPU would idle for
+        milliseconds, and Apple GPUs lower their clock after a couple of
+        milliseconds idle, so the next layer's work runs slower too. Then the
+        resident routes' ``gather_qmm`` is dispatched while the reads
+        continue, a trivial kernel keeps the GPU clocked for the rest of the
+        wait (:class:`_GpuKeepalive`), the missing routes are gathered once
+        they are installed, and the layer's output is dispatched as soon as
+        it is built. Every route is computed once, by the same kernel as the
+        serial gather (``gather_qmm`` is per-row), so the output is
+        bit-identical. The resident gather is evaluated right before the
+        first slot write: while it still references the resident arrays a
+        write cannot happen in place and copies the whole array (2.5 ms
+        instead of 0.5 ms per expert at 2.8 MB experts).
         """
         c = self.cache
-        needed = set(int(e) for e in indices.reshape(-1).tolist())  # the sync
-        n_miss = sum(1 for e in needed if e not in c.slot_of)
-        xe = mx.expand_dims(x, (-2, -3))
-        if 0 < n_miss < len(needed):
-            slots = mx.take(c.map, indices)  # this step's residency, before installs
-            resident = slots >= 0
-            y_hit = self._glu(xe, mx.where(resident, slots, 0))
-            mx.async_eval(y_hit)
-            c._ensure_ids(
-                needed, before_writes=lambda: mx.eval(y_hit), keep_gpu_busy=True
-            )
-            y_miss = self._glu(xe, mx.where(resident, 0, mx.take(c.map, indices)))
-            # gather_qmm output is indices.shape + (1, out_dim): select per route.
-            out = mx.where(resident[..., None, None], y_hit, y_miss)
-        else:  # all hits (nothing to read) or all misses (nothing to overlap)
-            c._ensure_ids(needed, keep_gpu_busy=True)
-            out = self._glu(xe, mx.take(c.map, indices))
-        out = out.squeeze(-2)
-        mx.async_eval(out)
+        flat = indices.reshape(-1).tolist()  # the sync
+        hit = [e in c.slot_of for e in flat]  # residency before any install
+        hit_pos = [p for p, h in enumerate(hit) if h]
+        flat_x = x.reshape(-1, x.shape[-1])
+        k = indices.shape[-1]
+        y_hit = None
+
+        def on_slow_read():
+            nonlocal y_hit
+            if hit_pos:
+                y_hit = self._glu_routes(flat_x, flat, hit_pos, k)
+                mx.async_eval(y_hit)
+            return y_hit
+
+        slow = c._ensure_ids(set(flat), on_slow_read)
+        if y_hit is None:  # fast reads, or no resident route: one gather
+            out = self._glu(mx.expand_dims(x, (-2, -3)), mx.take(c.map, indices))
+            out = out.squeeze(-2)
+        else:
+            miss_pos = [p for p, h in enumerate(hit) if not h]
+            y = mx.concatenate([y_hit, self._glu_routes(flat_x, flat, miss_pos, k)])
+            back = [0] * len(flat)  # route p's row in y
+            for row, p in enumerate(hit_pos + miss_pos):
+                back[p] = row
+            out = mx.take(y, mx.array(back, dtype=mx.int32), axis=0)
+            out = out.reshape(indices.shape + (y.shape[-1],))
+        if slow:
+            mx.async_eval(out)
         return out
 
     def _forward(self, x: mx.array, indices: mx.array) -> mx.array:
