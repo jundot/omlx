@@ -344,3 +344,18 @@ the two target Macs:
 7. the target large model's per-rank resident memory, TTFT, prefill throughput,
    single-stream decode, concurrent aggregate decode, cache hit rate, pipeline
    utilization, and long-context KV growth.
+
+### Different SSH usernames in the Cluster v2 wizard
+
+On each paired remote device card, enter the remote account's short login name
+in **SSH username** and select **Save SSH username**. Re-run the checks, then
+create a new plan. For example, a coordinator logged in as `coordinator_user`
+can connect to a worker as `worker_user` without editing `~/.ssh/config`.
+
+The override is stored by node ID on the coordinator and survives refreshes and
+restarts. It applies to peer checks, model discovery and newly planned launches,
+even when the peer address changes. Clear the field and save to restore the
+enrolled login or normal OpenSSH configuration. Only an administrator can change
+it, and only for an already paired device. Pairing keys remain unchanged.
+Existing signed deployments retain their original SSH targets; recreate their
+plan to use a changed username.

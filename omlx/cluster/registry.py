@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import threading
 from contextlib import suppress
@@ -285,6 +286,13 @@ class DeviceRegistry:
             if isinstance(last_addrs, list)
             else [],
         }
+        ssh_user = item.get("ssh_user")
+        if ssh_user is not None:
+            if not isinstance(ssh_user, str) or not re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_-]{0,63}", ssh_user
+            ):
+                raise ValueError("cluster device SSH user is invalid")
+            device["ssh_user"] = ssh_user
         http_port = item.get("http_port")
         if http_port is not None:
             if (
@@ -503,6 +511,8 @@ class DeviceRegistry:
                 if addrs is not None
                 else list(existing.get("last_addrs") or []),
             }
+            if existing.get("ssh_user"):
+                device["ssh_user"] = existing["ssh_user"]
             effective_port = http_port or existing.get("http_port")
             if effective_port:
                 device["http_port"] = int(effective_port)
@@ -515,6 +525,30 @@ class DeviceRegistry:
                 self._paired = previous
                 raise
             self.load_error = None
+            return dict(device)
+
+    def set_ssh_user(self, node_id: str, ssh_user: str | None) -> dict[str, Any]:
+        """Persist an administrator's SSH login override for an already paired node."""
+        if ssh_user is not None and (
+            not isinstance(ssh_user, str)
+            or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,63}", ssh_user)
+        ):
+            raise ValueError("cluster device SSH user is invalid")
+        with self._lock:
+            if node_id not in self._paired:
+                raise KeyError(node_id)
+            previous = self._paired[node_id]
+            device = dict(previous)
+            if ssh_user is None:
+                device.pop("ssh_user", None)
+            else:
+                device["ssh_user"] = ssh_user
+            self._paired[node_id] = device
+            try:
+                self._save()
+            except Exception:
+                self._paired[node_id] = previous
+                raise
             return dict(device)
 
     def unpair(self, node_id: str) -> bool:

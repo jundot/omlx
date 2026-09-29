@@ -57,6 +57,7 @@ function clusterV2Wizard() {
         manualDevice: '/api/cluster/devices/manual',
         unpair: (nodeId) =>
             `/api/cluster/devices/${encodeURIComponent(nodeId)}`,
+        sshUser: (nodeId) => `/api/cluster/devices/${encodeURIComponent(nodeId)}/ssh-user`,
         models: '/admin/api/cluster/models',
         catalogue: '/admin/api/cluster/catalogue',
         peerProbe: '/admin/api/cluster/peer-probe',
@@ -178,6 +179,8 @@ function clusterV2Wizard() {
     return {
         // ---- snapshot state -------------------------------------------------
         devicesPayload: null,
+        sshUserDrafts: {},
+        sshUserSaving: {},
         devicesLoaded: false,
         devicesError: '',
         devicesFailureCount: 0,
@@ -1663,11 +1666,43 @@ function clusterV2Wizard() {
             this.checks.ranAt = Date.now();
         },
 
+        async saveSSHUser(device) {
+            const nodeId = device.node_id;
+            if (this.sshUserSaving[nodeId]) return;
+            const value = String(this.sshUserDrafts[nodeId] ?? device.ssh_user ?? '').trim();
+            this.sshUserSaving = {...this.sshUserSaving, [nodeId]: true};
+            try {
+                const saved = await this.apiFetch(CLUSTER_V2_API.sshUser(nodeId), {
+                    method: 'PUT',
+                    body: JSON.stringify({ssh_user: value || null}),
+                });
+                device.ssh_user = saved.ssh_user;
+                this.sshUserDrafts = {...this.sshUserDrafts, [nodeId]: value};
+                // A plan and its probes are tied to the previous SSH identity.
+                ++this.planRequestRevision;
+                this.plan = null;
+                this.planProposal = null;
+                this.checks.probes = {};
+                this.checks.benchmark = null;
+                this.checks.started = false;
+                await this.refreshDevices();
+                this.notify('success', window.t('cluster.v2.device.ssh_user_saved'));
+            } catch (error) {
+                this.notify('error', error?.message || window.t('cluster.v2.device.ssh_user_error'));
+            } finally {
+                this.sshUserSaving = {...this.sshUserSaving, [nodeId]: false};
+            }
+        },
+
         sshTargetFor(device) {
             // Pairing enrollment records the SSH target; the devices payload
             // surfaces it as ssh_target on paired rows. Fall back to the
             // first verified probe address when no enrollment exists yet.
-            if (device?.ssh_target) return String(device.ssh_target);
+            const user = device?.ssh_user;
+            const withUser = (target) => user
+                ? `${user}@${String(target).replace(/^[^@]+@/, '')}`
+                : String(target);
+            if (device?.ssh_target) return withUser(device.ssh_target);
             const addrs = Array.isArray(device?.addrs) ? device.addrs : [];
             // A bare fe80:: link-local address has no scope id here, so SSH
             // to it has no route — prefer any routable address first.
@@ -1675,7 +1710,7 @@ function clusterV2Wizard() {
                 (addr) => addr && addr.ip && !String(addr.ip).startsWith('fe80::'),
             );
             const first = usable[0] || addrs.find((addr) => addr && addr.ip);
-            return first ? String(first.ip) : this.deviceName(device);
+            return withUser(first ? first.ip : this.deviceName(device));
         },
 
         async probePeer(peer) {
