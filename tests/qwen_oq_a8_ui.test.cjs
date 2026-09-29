@@ -10,7 +10,7 @@ const context = {
     localStorage: {getItem: () => null},
     THEME_STORAGE_KEY: 'theme',
     ENHANCED_READABILITY_KEY: 'readability',
-    window: {},
+    window: {t: key => key},
     navigator: {language: 'en'},
     document: {},
 };
@@ -31,7 +31,30 @@ assert.equal(state.isQwenOqA8Model(null), false);
 
 state.modelSettings.qwen35_oq_a8_enabled = true;
 state.modelSettings.qwen35_ane_prefill_enabled = true;
-assert.match(state.validateQwenOqA8Settings(), /cannot both/);
+assert.equal(state.validateQwenOqA8Settings(), 'js.error.ane_oq_a8_conflict');
 state.modelSettings.qwen35_ane_prefill_enabled = false;
 assert.equal(state.validateQwenOqA8Settings(), null);
 console.log('Architecture-only visibility and ANE conflict checks passed');
+
+(async () => {
+    const app = create();
+    app.loadModels = async () => {};
+    app.selectedModel = {id: 'qwen', config_model_type: 'qwen3_5'};
+    let payload;
+    context.fetch = async (_url, init) => {
+        payload = JSON.parse(init.body);
+        return {ok: true, json: async () => ({})};
+    };
+    context.alert = message => { throw Error(message); };
+    app.modelSettings = app.buildModelSettingsState(app.selectedModel, {mtp_enabled: true, mtp_fixed_depth: 2});
+    assert.equal(app.modelSettings.mtp_adaptive_max_depth, '3');
+    for (const depth of [3, 4, 5, 6]) {
+        app.modelSettings.mtp_adaptive_max_depth = String(depth);
+        await app.saveModelSettings();
+        assert.equal(payload.mtp_adaptive_max_depth, depth);
+        assert.equal(payload.mtp_fixed_depth, null);
+        const restored = app.buildModelSettingsState(app.selectedModel, payload);
+        assert.equal(restored.mtp_adaptive_max_depth, String(depth));
+    }
+    console.log('Lightning MTP adaptive maximum round-trip and fixed-depth reset passed');
+})().catch(error => {console.error(error); process.exitCode = 1});

@@ -137,6 +137,21 @@ class VLMModelAdapter(nn.Module):
 
     def release_resources(self) -> None:
         """Drop references to VLM-owned MLX arrays before engine teardown reclaim."""
+        if self._vlm_model is not None:
+            try:
+                from ..patches.qwen35_ane_prefill import release_qwen35_ane_prefill
+
+                # EngineCore calls this hook after draining its worker.
+                released, programs = release_qwen35_ane_prefill(self._vlm_model)
+                if released:
+                    logger.info(
+                        "Released %d ANE prefill module state(s) (%d program(s)) "
+                        "on VLM engine close",
+                        released,
+                        programs,
+                    )
+            except Exception:
+                logger.warning("ANE prefill state release failed", exc_info=True)
         close = getattr(self._vlm_model, "close", None)
         if callable(close):
             close()
@@ -553,6 +568,11 @@ class VLMModelAdapter(nn.Module):
         if hook is not None:
             hook(next_ids, current_ids)
 
+    def ple_gathers_ahead(self) -> bool:
+        """Whether the language model gathers PLE rows one prefill chunk ahead."""
+        probe = getattr(self._language_model, "ple_gathers_ahead", None)
+        return bool(probe()) if probe is not None else False
+
     def _omlx_prefill(self, input_ids, cache=None, **kwargs):
         """Forward the scheduler's cache-only contract to DeepSeek V4.1."""
         if self.model_type == "deepseek_v41":
@@ -591,7 +611,11 @@ class VLMModelAdapter(nn.Module):
         prefill_text_positions = self._qwen4_text_prefill_positions
         step_text_positions = self._qwen4_step_text_positions
         self._qwen4_text_prefill_positions = False
-        return_hidden = bool(kwargs.get("return_hidden", False))
+        # Layer captures (block drafter prefill seeds) also need the full
+        # output object rather than bare logits.
+        return_hidden = bool(kwargs.get("return_hidden", False)) or bool(
+            kwargs.get("capture_layer_ids")
+        )
         if skip_lm_head:
             # Scheduler prefill chunks discard their logits. Translate the
             # shared cache-only contract into the official Qwen model hook so

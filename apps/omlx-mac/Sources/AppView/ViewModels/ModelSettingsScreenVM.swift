@@ -55,7 +55,7 @@ final class ModelSettingsScreenVM {
         case dflashVerifyMode, dflashDraftWindowSize, dflashDraftSinkSize, dflashBlockSize
         case dflashInMemoryCache, dflashInMemoryCacheGib, dflashInMemoryCacheMaxEntries
         case dflashSsdCache, dflashSsdCacheGib
-        case mtpEnabled
+        case mtpEnabled, mtpAdaptiveMaxDepth
         case vlmMtpEnabled, vlmMtpDraftModel, vlmMtpDraftBlockSize
     }
 
@@ -176,6 +176,17 @@ final class ModelSettingsScreenVM {
             ("64", "64"),
             ("128", "128"),
         ]
+    }
+
+    static var mtpDepthOptions: [(String, String)] {
+        let adaptive = String(localized: "settings.acceleration.mtp.depth.adaptive",
+                              defaultValue: "3 tokens (Default)",
+                              comment: "Default Lightning MTP adaptive maximum draft depth")
+        return [("3", adaptive)] + (4...6).map { depth in
+            ("\(depth)", String(localized: "settings.acceleration.mtp.depth.option",
+                                defaultValue: "\(depth) tokens",
+                                comment: "Lightning MTP depth option; placeholder is the maximum draft token count"))
+        }
     }
 
     static var dflashVerifyModeOptions: [(String, String)] {
@@ -343,6 +354,8 @@ final class ModelSettingsScreenVM {
 
     // Experimental: native MTP
     var mtpEnabled: Bool = false
+    /// Empty = adaptive depth.
+    var mtpAdaptiveMaxDepth: String = "3"
 
     // Experimental: VLM MTP (assistant-drafter speculative decoding for VLMs).
     // Block size is held as a string for the editor; empty = mlx-vlm default.
@@ -477,7 +490,7 @@ final class ModelSettingsScreenVM {
             return true
         case .dflashSsdCache, .dflashSsdCacheGib:
             return true
-        case .mtpEnabled, .vlmMtpEnabled, .vlmMtpDraftModel:
+        case .mtpEnabled, .mtpAdaptiveMaxDepth, .vlmMtpEnabled, .vlmMtpDraftModel:
             return true
         case .vlmMtpDraftBlockSize:
             return true
@@ -643,6 +656,7 @@ final class ModelSettingsScreenVM {
                 self.dflashSsdCacheGib = DflashByteSize.bytesToGib(s?.dflashSsdCacheMaxBytes)
                     .map(String.init) ?? "20"
                 self.mtpEnabled = s?.mtpEnabled ?? false
+                self.mtpAdaptiveMaxDepth = s?.mtpAdaptiveMaxDepth.flatMap { (3...6).contains($0) ? String($0) : nil } ?? "3"
                 self.vlmMtpEnabled = s?.vlmMtpEnabled ?? false
                 self.vlmMtpDraftModel = s?.vlmMtpDraftModel ?? ""
                 self.vlmMtpDraftBlockSize = s?.vlmMtpDraftBlockSize.map(String.init) ?? ""
@@ -874,7 +888,10 @@ final class ModelSettingsScreenVM {
         case .dflashSsdCache:          patch.dflashSsdCache = dflashSsdCache
         case .dflashSsdCacheGib:
             patch.dflashSsdCacheMaxBytes = DflashByteSize.gibToBytes(Int(dflashSsdCacheGib))
-        case .mtpEnabled:              patch.mtpEnabled = mtpEnabled
+        case .mtpEnabled, .mtpAdaptiveMaxDepth:
+            patch.mtpEnabled = mtpEnabled
+            patch.mtpAdaptiveMaxDepth = Int(mtpAdaptiveMaxDepth) ?? 3
+            patch.mtpFixedDepth = .some(nil)
         case .vlmMtpEnabled:           patch.vlmMtpEnabled = vlmMtpEnabled
         case .vlmMtpDraftModel:        patch.vlmMtpDraftModel = vlmMtpDraftModel.isEmpty ? nil : vlmMtpDraftModel
         case .vlmMtpDraftBlockSize:    patch.vlmMtpDraftBlockSize = Int(vlmMtpDraftBlockSize)
@@ -1326,6 +1343,9 @@ final class ModelSettingsScreenVM {
                 }
             }
             putBool(ProfileSettingsKey.mtpEnabled, mtpEnabled)
+            if mtpEnabled {
+                putInt(ProfileSettingsKey.mtpAdaptiveMaxDepth, mtpAdaptiveMaxDepth)
+            }
             putBool(ProfileSettingsKey.vlmMtpEnabled, vlmMtpEnabled)
             if vlmMtpEnabled {
                 putString(ProfileSettingsKey.vlmMtpDraftModel, vlmMtpDraftModel)

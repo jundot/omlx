@@ -10,6 +10,7 @@ import pytest
 
 import omlx.patches.qwen35_ane_prefill as ane_patch
 from omlx.custom_kernels.qwen35_prefill import fast
+from omlx.patches import qwen35_packed_linear
 
 
 def test_ane_compile_bindings_release_the_python_gil():
@@ -186,6 +187,39 @@ class _Q6GDN(nn.Module):
 def test_q6_mlp_and_gdn_are_eligible_for_ane_hybrid_prefill():
     assert ane_patch._eligible_pair(_Q6MLP())
     assert ane_patch._eligible_gdn(_Q6GDN())
+
+
+def _q4_bf16(input_dims, output_dims):
+    linear = nn.QuantizedLinear(
+        input_dims, output_dims, bias=False, group_size=64, bits=4
+    )
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+    return linear
+
+
+def test_packed_projections_are_ineligible_instead_of_raising():
+    # Packing leaves GDN b/a (narrower than a tile) stock beside packed qkv/z.
+    gdn = SimpleNamespace(
+        in_proj_qkv=_q4_bf16(256, 256),
+        in_proj_z=_q4_bf16(256, 128),
+        in_proj_b=_q4_bf16(256, 48),
+        in_proj_a=_q4_bf16(256, 48),
+    )
+    mlp = SimpleNamespace(
+        gate_proj=_q4_bf16(256, 256),
+        up_proj=_q4_bf16(256, 256),
+        down_proj=_q4_bf16(256, 256),
+    )
+    assert ane_patch._eligible_gdn(gdn)
+    assert ane_patch._eligible_pair(mlp)
+
+    qwen35_packed_linear._pack_layer(SimpleNamespace(linear_attn=gdn, mlp=mlp))
+
+    assert isinstance(gdn.in_proj_qkv, qwen35_packed_linear.PackedLinear)
+    assert type(gdn.in_proj_b) is nn.QuantizedLinear
+    assert not ane_patch._eligible_gdn(gdn)
+    assert not ane_patch._eligible_pair(mlp)
 
 
 @pytest.mark.parametrize(
@@ -2556,6 +2590,35 @@ def test_prefill_status_flags_attempted_but_empty():
     status = ane_patch.qwen35_ane_prefill_status(model)
     assert status["attempted"] is True
     assert status["configured"] is False
+
+
+def test_release_qwen35_ane_prefill_drops_all_native_state_and_is_idempotent():
+    """Unload releases ordinary, fused, and GDN ANE state exactly once."""
+    ordinary = SimpleNamespace(_omlx_ane_prefill_state=object())
+    fused = SimpleNamespace(_omlx_ane_fused_down_state=object())
+    gdn = SimpleNamespace(_omlx_ane_gdn_state=object())
+    model = SimpleNamespace(
+        modules=lambda: (ordinary, fused, gdn),
+        _omlx_ane_mlp_prefill_count=2,
+        _omlx_ane_gdn_prefill_count=1,
+        _omlx_ane_dual_prefill_count=3,
+        _omlx_ane_resident_program_count=7,
+    )
+
+    assert ane_patch.release_qwen35_ane_prefill(model) == (3, 7)
+    assert ordinary._omlx_ane_prefill_state is None
+    assert ordinary._omlx_ane_prefill_failed is True
+    assert fused._omlx_ane_fused_down_state is None
+    assert fused._omlx_ane_prefill_failed is True
+    assert gdn._omlx_ane_gdn_state is None
+    assert gdn._omlx_ane_gdn_failed is True
+    assert model._omlx_ane_prefill_shed is True
+    assert model._omlx_ane_mlp_prefill_count == 0
+    assert model._omlx_ane_gdn_prefill_count == 0
+    assert model._omlx_ane_dual_prefill_count == 0
+    assert model._omlx_ane_resident_program_count == 0
+
+    assert ane_patch.release_qwen35_ane_prefill(model) == (0, 0)
 
 
 def test_prefill_status_safe_on_untouched_model():

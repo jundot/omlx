@@ -48,6 +48,7 @@ from ..moe_expert_offload import (
     _GLUStoreView,
     _io_batch,
     _io_pool,
+    _is_mtp_path,
     _minimum_experts,
     _resolve_model_dir,
 )
@@ -311,15 +312,6 @@ def _iter_deepseek_v4_switch_glus(model):
                 yield from walk(obj, i, v, f"{path}.{i}")
 
     yield from walk(None, None, model, "")
-
-
-def _is_mtp_path(path: str) -> bool:
-    """Tree path of a module inside the embedded MTP draft head.
-
-    Matches the VLM-nested ``language_model.mtp.<i>.*`` and the text-root
-    ``mtp.<i>.*`` layouts, mirroring ``glm5_next_vlm_runtime._is_mtp_named``.
-    """
-    return path == "mtp" or path.startswith("mtp.") or ".mtp." in path
 
 
 def apply_deepseek_v4_moe_expert_offload(

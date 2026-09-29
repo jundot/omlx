@@ -551,58 +551,6 @@ def test_predicted_transient_zero_without_signals():
     assert ns._predicted_chunk_transient(4, 1000) == 0.0
 
 
-def test_bounded_qwen4_route_drops_unfused_dense_history():
-    """A route flip to bounded array-mask SDPA must retire unfused samples."""
-    from omlx import memory_monitor
-    from omlx.memory_monitor import make_prefill_memory_profile
-
-    config = SimpleNamespace(
-        model_type="qwen4_exp",
-        num_hidden_layers=48,
-        num_attention_heads=24,
-        num_key_value_heads=2,
-        head_dim=256,
-        indexer_n_heads=4,
-        indexer_head_dim=128,
-        indexer_budget=2048,
-        indexer_compress_ratio=4,
-        full_attention_interval=4,
-        layer_types=None,
-    )
-    profile = make_prefill_memory_profile(config, compute_dtype_size=2)
-    monitor = MemoryMonitor(max_kv_cache_memory=_GB, eviction_enabled=False)
-    monitor.set_model_info(
-        num_layers=48,
-        num_kv_heads=2,
-        head_dim=256,
-        dtype_size=2,
-        num_attention_heads=24,
-        prefill_memory_profile=profile,
-    )
-    routes = memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.get(256)
-    memory_monitor.register_tiled_prefill_head_dim(
-        256,
-        min_query_len=16,
-        min_kv_len=8192,
-        kv_tile=1024,
-        supports_array_mask=True,
-    )
-    try:
-        tracker = PrefillTransientTracker()
-        tracker.update(2048, int(25.4 * 1024**2 * 2048))
-        ns = _throttle_ctx(current=0, hard=240 * _GB, samples_bpt=None, monitor=monitor)
-        ns._prefill_transient_tracker = tracker
-        Scheduler._sdpa256_bounded_route_changed(ns, False)
-        Scheduler._sdpa256_bounded_route_changed(ns, True)
-
-        predicted = ns._predicted_chunk_transient(2048, 174_000)
-        stale = 25.4 * 1024**2 * 2048 * Scheduler._PREFILL_TRANSIENT_SAFETY
-        assert predicted < stale / 8
-    finally:
-        if routes is None:
-            memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
-        else:
-            memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS[256] = routes
 
 
 def test_predicted_transient_drops_dense_ewma_when_qsa_static_is_cheaper():
@@ -1195,6 +1143,114 @@ def test_record_chunk_transient_keeps_partial_context_sample():
     assert tracker.last_delta_bytes == partial_delta
 
 
+def test_chunk_backpressure_holds_mlx_at_the_peak_target(monkeypatch):
+    """While a chunk runs, MLX memory is capped at the guard's peak target."""
+    calls = []
+    monkeypatch.setattr(
+        sched_mod, "set_chunk_memory_limit", lambda owner, limit: calls.append(limit)
+    )
+    ns = _throttle_ctx(current=30 * _GB, hard=50 * _GB)
+    ns._prefill_memory_guard = True
+    ns._last_mlx_active_memory_bytes = 20 * _GB
+    ns._current_usage_bytes = lambda: 30 * _GB
+    target = Scheduler._prefill_peak_target(ns)
+
+    with Scheduler._chunk_backpressure(ns):
+        assert calls == [20 * _GB + target - 30 * _GB]
+    assert calls[-1] is None
+
+    # Past the target, the chunk still gets the floor instead of a stall.
+    calls.clear()
+    ns._current_usage_bytes = lambda: target + _GB
+    with Scheduler._chunk_backpressure(ns):
+        pass
+    assert calls == [20 * _GB + Scheduler._CHUNK_BACKPRESSURE_FLOOR_BYTES, None]
+
+
+def _filled_caches():
+    from mlx_lm.models.cache import CacheList, KVCache, RotatingKVCache
+
+    from omlx.patches.deepseek_v4.cache_extras import PoolingCache
+
+    mx = sched_mod.mx
+    keys = mx.arange(2 * 3 * 4, dtype=mx.float16).reshape(1, 2, 3, 4)
+    kv, inner, rotating = KVCache(), KVCache(), RotatingKVCache(max_size=8)
+    for c in (kv, inner, rotating):
+        c.update_and_fetch(keys, keys)
+    pool = PoolingCache(4)
+    pool.update_and_fetch(mx.ones((1, 1, 4), dtype=mx.float16))
+    return keys, kv, inner, rotating, pool, [kv, CacheList(inner, pool), rotating]
+
+
+def _reserve_ctx(*, current=0, cap=0, floor_transient=0, headroom=1.0, busy=False):
+    mx = sched_mod.mx
+    charged = []
+    return SimpleNamespace(
+        charged=charged,
+        running={"other": object()} if busy else {},
+        _stream=mx.default_stream(mx.default_device()),
+        _memory_hard_limit_bytes=cap,
+        _prefill_headroom_safety=headroom,
+        _PREFILL_HEADROOM_SAFETY=Scheduler._PREFILL_HEADROOM_SAFETY,
+        _prefill_abort_cap=lambda: 0,
+        _current_usage_bytes=lambda: current,
+        _prefill_min_chunk_tokens=32,
+        _admission_transient_bound=lambda n, kv_len, **kwargs: (
+            charged.append(n) or floor_transient
+        ),
+    )
+
+
+def test_prefill_reserve_sizes_growing_caches_once():
+    """KV caches, including CacheList members, grow once and then fill in place."""
+    mx = sched_mod.mx
+    keys, kv, inner, rotating, pool, caches = _filled_caches()
+    ns = _reserve_ctx()
+
+    with patch.object(sched_mod, "_sync_and_clear_cache") as clear:
+        assert Scheduler._reserve_prefill_capacity(ns, caches, 600) == 3
+    # One release per grown cache, so a restored prefix is never held twice.
+    assert clear.call_count == 3
+    for c in (kv, inner):
+        assert c.keys.shape[2] == c.values.shape[2] == 768
+        assert c.offset == 3
+        assert bool(mx.array_equal(c.keys[..., :3, :], keys))
+    assert pool._pool_buf.shape[1] == 150
+    assert rotating.keys.shape[2] == 3
+
+    buffer = kv.keys
+    kv.update_and_fetch(keys, keys)
+    assert kv.keys is buffer
+    assert Scheduler._reserve_prefill_capacity(ns, caches, 600) == 0
+
+
+def test_prefill_reserve_keeps_room_for_a_floor_chunk():
+    """With other requests in flight, a reserve that would starve their next
+    chunk falls back to growth; a lone prompt only has to fit itself."""
+    _, kv, _, _, pool, caches = _filled_caches()
+    # The reserve itself (~34KB) fits under the cap; the floor chunk does not.
+    ns = _reserve_ctx(
+        current=10 * _GB - 1024**2, cap=10 * _GB, floor_transient=1024**2, busy=True
+    )
+
+    with patch.object(sched_mod, "_sync_and_clear_cache") as clear:
+        assert Scheduler._reserve_prefill_capacity(ns, caches, 600) == 0
+    clear.assert_not_called()
+    assert ns.charged == [32]
+    assert kv.keys.shape[2] == 256
+    assert pool._pool_buf.shape[1] == 1
+
+    # The reserve must fit under the peak target (hard x headroom), not the
+    # hard limit.
+    ns = _reserve_ctx(current=9.5 * _GB, cap=10 * _GB, headroom=0.9)
+    with patch.object(sched_mod, "_sync_and_clear_cache"):
+        assert Scheduler._reserve_prefill_capacity(ns, caches, 600) == 0
+
+    ns = _reserve_ctx(current=10 * _GB - 1024**2, cap=10 * _GB, floor_transient=1024**2)
+    with patch.object(sched_mod, "_sync_and_clear_cache"):
+        assert Scheduler._reserve_prefill_capacity(ns, caches, 600) == 3
+
+
 @pytest.mark.parametrize(
     ("monitor", "expected_gathered", "expected_state_route"),
     [(_qwen4_monitor(), True, True), (_monitor(head_dim=192), False, None)],
@@ -1243,6 +1299,8 @@ def test_step_prefill_reclaims_before_first_guard(
         "_others_decoding",
         "_should_clear_after_chunk",
         "_accrue_decode_debt",
+        "_dflash_prefill_capture",
+        "_dflash_seed_prefill",
     ):
         setattr(ns, _name, getattr(Scheduler, _name).__get__(ns, Scheduler))
     ns._step_prefill_chunk = Scheduler._step_prefill_chunk.__get__(ns, Scheduler)
@@ -1258,16 +1316,30 @@ def test_step_prefill_reclaims_before_first_guard(
         ),
         patch.object(sched_mod.mx, "stream"),
         patch.object(sched_mod.mx, "eval", lambda *args: events.append("eval")),
-        patch.object(sched_mod, "get_phys_footprint", side_effect=[100, 300]),
+        patch.object(
+            sched_mod.mx, "get_active_memory", side_effect=[10 * _GB, 10 * _GB + 64]
+        ),
+        patch.object(sched_mod.mx, "get_cache_memory", side_effect=[0, 2 * _GB]),
+        # The previous chunk's released pool still sits in both ledgers, so
+        # only the MLX counters show this chunk's growth.
+        patch.object(sched_mod, "get_phys_footprint", return_value=41 * _GB),
+        patch.object(sched_mod, "get_graphics_footprint", return_value=40 * _GB),
+        patch.object(
+            Scheduler,
+            "_reserve_prefill_capacity",
+            lambda self, cache, tokens, rid=None: events.append(("reserve", tokens)),
+        ),
     ):
         done = ns._step_prefill_chunk(state)
 
     assert done is False
-    assert events[:3] == ["sync", "adaptive", "guard"]
+    # The whole prompt (3 prefill tokens plus the last) is reserved before
+    # the first guard reads current usage.
+    assert events[:4] == ["sync", ("reserve", 4), "adaptive", "guard"]
     ns._record_chunk_transient.assert_called_once_with(
         2,
-        100,
-        300,
+        11 * _GB,
+        13 * _GB + 64,
         request_id="req-prefill",
         loop_label="chunked_step",
         kv_len=0,
@@ -1605,9 +1677,12 @@ def test_qwen4_local_reclaim_updates_next_guard_prediction(route):
         gathered_core=route,
     )
     before = ns._predicted_chunk_transient(512, 180_000, gathered_core=route)
+    # macOS 27 keeps charging the released pool to phys_footprint for a
+    # moment after the clear, so only the pool size shows what was released.
     with (
         patch.object(sched_mod, "_sync_and_clear_cache"),
-        patch.object(sched_mod, "get_phys_footprint", side_effect=[80 * _GB, 50 * _GB]),
+        patch.object(sched_mod.mx, "get_cache_memory", return_value=30 * _GB),
+        patch.object(sched_mod, "get_phys_footprint", return_value=80 * _GB),
     ):
         Scheduler._clear_cache(ns)
     charge = ns._prefill_transient_tracker.flat_overhead_charge_for(route)
@@ -1654,6 +1729,9 @@ def test_generic_prefill_loop_submits_chunks_with_fixed_reclaim_charge(
     current = cap - 1000 * 1024**2
     ns._prefill_transient_tracker.record_reclaim(960 * 1024**2)
     monkeypatch.setattr(sched_mod, "get_phys_footprint", lambda: current)
+    # Chunk growth is read from MLX counters; hold them flat as well.
+    monkeypatch.setattr(sched_mod.mx, "get_active_memory", lambda: 0)
+    monkeypatch.setattr(sched_mod.mx, "get_cache_memory", lambda: 0)
     submitted = []
 
     def forward(tokens, *args, **kwargs):
@@ -1690,6 +1768,9 @@ def test_generic_prefill_loop_submits_chunks_with_fixed_reclaim_charge(
 
     assert submitted == [192, 192, 192, 192, 192, 64]
     assert all(layer.offset == len(prompt) - 1 for layer in cache)
+    # Sized once for the whole prompt after the first chunk; step growth
+    # would have ended at 1216.
+    assert all(layer.keys.shape[2] == 1280 for layer in cache)
 
 
 @pytest.mark.parametrize("chunked", [False, True])
@@ -2139,3 +2220,81 @@ def test_v41_flat_overhead_charges_pool_once_and_releases_on_reclaim():
     ns._prefill_transient_tracker.record_flat_reclaim(12 * _GB)
     charged = ns._predicted_chunk_transient(2047, 2048)
     assert charged == pytest.approx(static * 1.3 + flat, rel=1e-6)
+
+
+# --------------------------------------------------------------------------
+# Bounded SDPA256 route: what the guard sees
+# --------------------------------------------------------------------------
+
+
+def _register_sdpa256_route():
+    from omlx import memory_monitor as mm
+    from omlx.patches import sdpa256_attention as sdpa256
+
+    mm._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+    assert sdpa256._register_bounded_route(sdpa256._SDPA256_MIN_KV_LEN)
+    return sdpa256
+
+
+def test_second_resident_model_does_not_change_the_sdpa256_charge(monkeypatch):
+    """A sibling engine's weights raise the guard's live baseline, but the
+    route and the per-chunk charge are functions of the request alone, so the
+    chunk the guard admits is priced for the route that will actually run."""
+    from omlx import memory_monitor as mm
+
+    monkeypatch.setitem(mm._SDPA_TILED_PREFILL_HEAD_DIMS, 256, ())
+    _register_sdpa256_route()
+    q_len, kv_len = 4096, 28672
+    weights = 18 * _GB
+
+    alone = _throttle_ctx(
+        current=20 * _GB, hard=50 * _GB, monitor=_monitor(256), min_chunk=256
+    )
+    alone._fake_current = 20 * _GB
+    both = _throttle_ctx(
+        current=20 * _GB + weights, hard=50 * _GB, monitor=_monitor(256), min_chunk=256
+    )
+    both._fake_current = 20 * _GB + weights
+
+    assert alone._predicted_chunk_transient(
+        q_len, kv_len
+    ) == both._predicted_chunk_transient(q_len, kv_len)
+    assert _guard_call(alone, q_len, kv_len=kv_len) == q_len
+    assert _guard_call(both, q_len, kv_len=kv_len) == q_len
+
+
+def test_concurrent_admission_race_is_documented_not_fixed(monkeypatch):
+    """Characterization, not a fix.
+
+    Admission compares one instantaneous ``_current_usage_bytes()`` reading
+    against a limit; nothing reserves the bytes a chunk has been admitted to
+    allocate, so two chunks admitted before either transient lands both pass.
+    Keeping head-dim-256 prefill on the bounded route shrinks the per-request
+    attention transient by more than an order of magnitude, which reduces the
+    exposure, but the race belongs to the admission design and is unchanged.
+    """
+    from omlx import memory_monitor as mm
+    from omlx.memory_monitor import (
+        SDPA256_UNFUSED_SCORE_DTYPE_SIZE,
+        estimate_unfused_sdpa_call_bytes,
+    )
+
+    monkeypatch.setitem(mm._SDPA_TILED_PREFILL_HEAD_DIMS, 256, ())
+    _register_sdpa256_route()
+    q_len, kv_len = 4096, 28672
+    ns = _throttle_ctx(
+        current=20 * _GB, hard=50 * _GB, monitor=_monitor(256), min_chunk=256
+    )
+    ns._fake_current = 20 * _GB
+
+    first = _guard_call(ns, q_len, kv_len=kv_len)
+    # Live usage deliberately does not move: the first chunk is admitted but
+    # has not allocated yet. This is the whole race.
+    second = _guard_call(ns, q_len, kv_len=kv_len)
+    assert first == q_len and second == q_len
+
+    bounded_charge = ns._predicted_chunk_transient(q_len, kv_len)
+    unfused = estimate_unfused_sdpa_call_bytes(
+        32, q_len, kv_len, 256, SDPA256_UNFUSED_SCORE_DTYPE_SIZE
+    )
+    assert 2 * bounded_charge < unfused

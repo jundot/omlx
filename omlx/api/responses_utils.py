@@ -192,7 +192,8 @@ def convert_responses_input_to_messages(
             known.
         preserve_images: If True, images in function_call_output lists are
             preserved as a user message following the tool run so VLM engines
-            can extract them. If False, they become a text placeholder.
+            can extract them. If False, they become a text placeholder, and
+            message image parts are dropped so the content stays a string.
 
     Returns:
         List of message dicts compatible with chat template.
@@ -293,7 +294,7 @@ def convert_responses_input_to_messages(
                     elif isinstance(part, str):
                         text_parts.append(part)
                         converted_parts.append({"type": "text", "text": part})
-                if has_image:
+                if has_image and preserve_images:
                     # Keep as content list so VLM can extract images
                     content = converted_parts
                 else:

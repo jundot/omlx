@@ -71,6 +71,8 @@
         'dflash_block_size',
         'dflash_verify_mode',
         'mtp_enabled',
+        'mtp_adaptive_max_depth',
+        'mtp_fixed_depth',
         'qwen35_ane_prefill_shared_fraction',
         'vlm_mtp_enabled',
         'vlm_mtp_draft_model',
@@ -133,7 +135,7 @@
             // Global settings
             globalSettings: {
                 base_path: '',
-                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
+                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, qwen4_gdn_decode_wide_proj: false, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
@@ -1161,6 +1163,7 @@
                             sse_keepalive_mode: this.globalSettings.server.sse_keepalive_mode,
                             burst_decode_mode: this.globalSettings.server.burst_decode_mode,
                             preserve_mid_system_cache: this.globalSettings.server.preserve_mid_system_cache,
+                            qwen4_gdn_decode_wide_proj: this.globalSettings.server.qwen4_gdn_decode_wide_proj,
                             distributed_inference_enabled: this.globalSettings.server.distributed_inference_enabled,
                             max_audio_upload_size: this.globalSettings.server.max_audio_upload_size,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
@@ -1946,6 +1949,8 @@
                     dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
                     dflash_ssd_cache_available: !!model?.dflash_ssd_cache_available,
                     mtp_enabled: s.mtp_enabled || false,
+                    mtp_adaptive_max_depth: [3, 4, 5, 6].includes(s.mtp_adaptive_max_depth)
+                        ? String(s.mtp_adaptive_max_depth) : '3',
                     mtp_compatible: model?.mtp_compatible === true,
                     mtp_compatibility_reason: model?.mtp_compatibility_reason || '',
                     is_paroquant: model?.is_paroquant === true,
@@ -3004,6 +3009,10 @@
                                     ? (this.modelSettings.dflash_verify_mode || 'adaptive')
                                     : null,
                                 mtp_enabled: !!this.modelSettings.mtp_enabled,
+                                mtp_adaptive_max_depth: this.modelSettings.mtp_enabled
+                                    ? parseInt(this.modelSettings.mtp_adaptive_max_depth || '3')
+                                    : null,
+                                mtp_fixed_depth: null,
                                 qwen35_ane_prefill_shared_fraction: Number(this.modelSettings.qwen35_ane_prefill_shared_fraction),
                                 vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
                                 vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
@@ -3069,6 +3078,8 @@
                                     dflash_block_size: null,
                                     dflash_verify_mode: null,
                                     mtp_enabled: false,
+                                    mtp_adaptive_max_depth: null,
+                                    mtp_fixed_depth: null,
                                     vlm_mtp_enabled: false,
                                     vlm_mtp_draft_model: null,
                                     vlm_mtp_draft_block_size: null,
@@ -3088,6 +3099,8 @@
                                 alert(window.t('js.info.model_settings_auto_reloaded'));
                             } else if (data.auto_unloaded) {
                                 alert(window.t('js.info.model_settings_auto_unloaded'));
+                            } else if (data.reload_deferred) {
+                                alert(window.t('js.info.model_settings_reload_deferred'));
                             } else {
                                 alert(window.t('js.info.model_type_reload_required'));
                             }
@@ -3256,6 +3269,8 @@
                         alert(window.t('js.info.model_settings_auto_reloaded'));
                     } else if (data.auto_unloaded) {
                         alert(window.t('js.info.model_settings_auto_unloaded'));
+                    } else if (data.reload_deferred) {
+                        alert(window.t('js.info.model_settings_reload_deferred'));
                     } else {
                         alert(window.t('js.info.model_type_reload_required'));
                     }
@@ -3329,6 +3344,7 @@
                         this.modelSettings.dflash_block_size = null;
                         this.modelSettings.dflash_verify_mode = 'adaptive';
                         this.modelSettings.mtp_enabled = false;
+                        this.modelSettings.mtp_adaptive_max_depth = '3';
                         this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {
                         alert(window.t('js.error.no_config_defaults'));
@@ -5320,6 +5336,16 @@
                 }
             },
 
+            accLocalTruncationLine(r) {
+                return window.t('acc_bench.results.text_export.local_truncation_line')
+                    .replace('{truncated}', r.truncated_count)
+                    .replace('{total}', r.total)
+                    .replace('{truncated_correct}', r.truncated_correct_count)
+                    .replace('{accuracy}', r.finished_accuracy == null
+                        ? '—' : (r.finished_accuracy * 100).toFixed(1) + '%')
+                    .replace('{finished}', r.finished_count);
+            },
+
             accBuildText() {
                 if (this.accAllResults.length === 0) return '';
                 const pad = (s, w) => s.toString().padStart(w);
@@ -5415,6 +5441,8 @@
                                     .replace('{invalid}', r.invalid_response_count)
                                     .replace('{parse}', r.parse_error_count)
                             );
+                        } else if (r.truncated_count > 0) {
+                            lines.push('  ' + this.accLocalTruncationLine(r));
                         }
                     }
                 }
@@ -5471,6 +5499,13 @@
                             valid_answer_accuracy: r.valid_answer_accuracy,
                             reliability_warning: r.reliability_warning,
                         });
+                    } else if (r.truncated_count !== undefined) {
+                        Object.assign(exportData, {
+                            truncated_count: r.truncated_count,
+                            truncated_correct_count: r.truncated_correct_count,
+                            finished_count: r.finished_count,
+                            finished_accuracy: r.finished_accuracy,
+                        });
                     }
                     content = JSON.stringify(exportData, null, 2);
                     mime = 'application/json';
@@ -5478,7 +5513,7 @@
                     const esc = s => '"' + (s || '').replace(/"/g, '""') + '"';
                     const lines = [r.external
                         ? 'id,category,status,correct,expected,predicted,finish_reason,reasoning_fields,prompt_tokens,completion_tokens,error_message,question,raw_response,time_s'
-                        : 'id,category,correct,expected,predicted,question,raw_response,time_s'];
+                        : 'id,category,correct,expected,predicted,question,raw_response,time_s,finish_reason,completion_tokens'];
                     for (const q of qr) {
                         if (r.external) {
                             lines.push([
@@ -5490,7 +5525,7 @@
                                 esc(q.raw_response), q.time_s,
                             ].join(','));
                         } else {
-                            lines.push([q.id, esc(q.category || ''), q.correct, esc(q.expected), esc(q.predicted), esc(q.question), esc(q.raw_response), q.time_s].join(','));
+                            lines.push([q.id, esc(q.category || ''), q.correct, esc(q.expected), esc(q.predicted), esc(q.question), esc(q.raw_response), q.time_s, esc(q.finish_reason || ''), q.completion_tokens ?? ''].join(','));
                         }
                     }
                     content = lines.join('\n');
@@ -5526,6 +5561,8 @@
                                 .replace('{invalid}', r.invalid_response_count)
                                 .replace('{parse}', r.parse_error_count)
                         );
+                    } else if (r.truncated_count > 0) {
+                        lines.splice(4, 0, this.accLocalTruncationLine(r));
                     }
                     for (const q of qr) {
                         const label = r.external ? (q.status || 'invalid_response').toUpperCase() : (q.correct ? 'CORRECT' : 'WRONG');
@@ -5540,7 +5577,7 @@
                                     .replace('{category}', () => q.category)
                             );
                         }
-                        if (r.external && q.finish_reason) {
+                        if (q.finish_reason && (r.external || q.finish_reason !== 'stop')) {
                             lines.push(
                                 window.t('acc_bench.results.text_export.finish_reason_line')
                                     .replace('{reason}', () => q.finish_reason)
@@ -5793,12 +5830,10 @@
             },
 
             // Description text shown next to the Memory guard tier dropdown.
-            // safe / balanced / aggressive get a "free + inactive + N% of
-            // active (via macOS reclaim_method)" sentence. custom shows the
-            // user-supplied ceiling.
+            // Each tier says how much memory it leaves for other apps; the
+            // server computes it (ProcessMemoryEnforcer) for this Mac.
             get memoryGuardTierDescription() {
                 const tier = this.globalSettings.memory?.memory_guard_tier || 'balanced';
-                const tierLabel = window.t('settings.resource.guard_tier.' + tier);
                 if (tier === 'custom') {
                     const gb = Number(
                         this.globalSettings.memory?.memory_guard_custom_ceiling_gb || 0
@@ -5807,90 +5842,54 @@
                         .t('settings.resource.guard_tier.description_custom')
                         .replace('{custom_gb}', gb);
                 }
-                const pct = { safe: 20, balanced: 50, aggressive: 80 }[tier] ?? 50;
-                const method = window.t(
-                    'settings.resource.guard_tier.reclaim_method.' + tier
-                );
+                const preview = this.globalSettings.system?.memory_guard_preview?.[tier];
+                const reserveGB = Number((preview?.reserve_bytes || 0) / 1024 ** 3).toFixed(1);
                 return window
-                    .t('settings.resource.guard_tier.description_template')
-                    .replace('{tier}', tierLabel)
-                    .replace('{active_pct}', pct)
-                    .replace('{reclaim_method}', method);
+                    .t('settings.resource.guard_tier.description.' + tier)
+                    .replace('{reserve}', `${reserveGB} GB`);
             },
 
-            // Breakdown line. For ratio tiers: `Free X, inactive Y, active Z
-            // × N% = R → ceiling C`. For custom: `Custom ceiling X GB →
-            // effective ceiling C` (after clamp by static / metal cap).
+            // Breakdown line from the server preview. For reserve tiers:
+            // `Free X + inactive Y (+ Z of other apps' memory) - reserve R ->
+            // ceiling C`. For custom: `Custom ceiling X GB -> effective
+            // ceiling C` after the server's static / Metal clamp.
             get memoryGuardBreakdownHTML() {
                 const sys = this.globalSettings.system || {};
                 const GB = 1024 ** 3;
                 const tier = this.globalSettings.memory?.memory_guard_tier || 'balanced';
-                const fmt = (gb) => Number(gb).toFixed(1);
-                const bold = (gb) => `<strong>${fmt(gb)} GB</strong>`;
-
-                // Static / metal cap for the final clamp shown to the user.
-                // The small-system threshold must track
-                // ProcessMemoryEnforcer._SMALL_SYSTEM_THRESHOLD (24 GB): under
-                // it the server reserves a flat 4 GB regardless of tier. This
-                // read 16 and so understated the static ceiling by up to 4 GB
-                // on every 16-23 GB Mac.
-                const totalGB = (sys.total_memory_bytes || 0) / GB;
-                const staticReserveGB =
-                    tier === 'custom'
-                        ? 2
-                        : totalGB < 24
-                            ? 4
-                            : { safe: 8, balanced: 6, aggressive: 4 }[tier] ?? 6;
-                const staticCeiling = Math.max(0, totalGB - staticReserveGB);
-                const metalCapGB = (sys.iogpu_wired_limit_bytes || 0) / GB;
-
-                // Helper: is the kernel iogpu.wired_limit_mb the smallest
-                // of the three candidates? When yes we swap "→ ceiling" for
-                // "/ effective ceiling X (kernel limit)" so the user knows
-                // why the value isn't what their tier math suggested.
-                const kernelBinds = (candidates, finalCeiling) =>
-                    metalCapGB > 0 &&
-                    Math.abs(metalCapGB - finalCeiling) < 1e-6 &&
-                    candidates.every((c) => c >= metalCapGB - 1e-6);
+                const preview = sys.memory_guard_preview?.[tier];
+                if (!preview) return '';
+                const bold = (bytes) => `<strong>${Number(bytes / GB).toFixed(1)} GB</strong>`;
 
                 if (tier === 'custom') {
-                    const custom = Number(
-                        this.globalSettings.memory?.memory_guard_custom_ceiling_gb || 0
-                    );
-                    const candidates = [custom, staticCeiling];
-                    if (metalCapGB > 0) candidates.push(metalCapGB);
-                    const ceiling = Math.max(0, Math.min(...candidates));
-                    const tmpl = kernelBinds([custom, staticCeiling], ceiling)
-                        ? 'settings.resource.guard_tier.breakdown_custom_kernel_limit'
-                        : 'settings.resource.guard_tier.breakdown_custom';
+                    const custom =
+                        Number(this.globalSettings.memory?.memory_guard_custom_ceiling_gb || 0) * GB;
+                    const limits = [preview.static_bytes, preview.metal_cap_bytes].filter((v) => v > 0);
+                    const ceiling = Math.max(0, Math.min(custom, ...limits));
+                    const kernelBinds =
+                        preview.metal_cap_bytes > 0 &&
+                        ceiling === preview.metal_cap_bytes &&
+                        ceiling < custom;
                     return window
-                        .t(tmpl)
+                        .t(
+                            kernelBinds
+                                ? 'settings.resource.guard_tier.breakdown_custom_kernel_limit'
+                                : 'settings.resource.guard_tier.breakdown_custom'
+                        )
                         .replace('{custom_gb}', bold(custom))
                         .replace('{ceiling}', bold(ceiling));
                 }
 
-                const freeGB = (sys.free_memory_bytes || 0) / GB;
-                const inactiveGB = (sys.inactive_memory_bytes || 0) / GB;
-                const activeGB = (sys.active_memory_bytes || 0) / GB;
-                const ratio = { safe: 0.2, balanced: 0.5, aggressive: 0.8 }[tier] ?? 0.5;
-                const pct = Math.round(ratio * 100);
-                const reclaim = activeGB * ratio;
-                const omlxGB = (sys.omlx_phys_footprint_bytes || 0) / GB;
-                const dynamicCeiling = omlxGB + freeGB + inactiveGB + reclaim;
-                const candidates = [dynamicCeiling, staticCeiling];
-                if (metalCapGB > 0) candidates.push(metalCapGB);
-                const ceiling = Math.max(0, Math.min(...candidates));
-                const tmpl = kernelBinds([dynamicCeiling, staticCeiling], ceiling)
+                const key = preview.binding === 'metal_cap'
                     ? 'settings.resource.guard_tier.breakdown_kernel_limit'
                     : 'settings.resource.guard_tier.breakdown';
                 return window
-                    .t(tmpl)
-                    .replace('{free}', bold(freeGB))
-                    .replace('{inactive}', bold(inactiveGB))
-                    .replace('{active}', bold(activeGB))
-                    .replace(/{active_pct}/g, pct)
-                    .replace('{reclaim}', bold(reclaim))
-                    .replace('{ceiling}', bold(ceiling));
+                    .t(key)
+                    .replace('{free}', bold(preview.free_bytes))
+                    .replace('{inactive}', bold(preview.inactive_bytes))
+                    .replace('{other}', bold(preview.other_apps_bytes))
+                    .replace('{reserve}', bold(preview.reserve_bytes))
+                    .replace('{ceiling}', bold(preview.ceiling_bytes));
             },
 
             // Computed hot cache size in GB (for manual input)
@@ -6601,6 +6600,19 @@
             oqSelectedModelType() {
                 const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                 return model?.model_type || '';
+            },
+
+            oqAvailableLevels() {
+                return this.oqSelectedModelType() === 'deepseek_v41'
+                    ? [3, 4] : [2, 2.5, 2.7, 3, 3.5, 4, 5, 6, 8];
+            },
+
+            oqApplyModelPolicy() {
+                if (this.oqSelectedModelType() !== 'deepseek_v41') return;
+                if (!this.oqAvailableLevels().includes(this.oqLevel)) this.oqLevel = 4;
+                this.oqDtype = 'bfloat16';
+                this.oqTextOnly = false;
+                if (this.oqLevel === 4) this.oqSensitivityModelPath = '';
             },
 
             oqLevelLabel(level) {

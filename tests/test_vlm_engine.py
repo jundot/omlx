@@ -2782,8 +2782,11 @@ class TestStopSafety:
 
         mock_inner_engine = MagicMock()
 
+        loaded_at_close = []
+
         def close_side_effect():
             events.append("inner_close")
+            loaded_at_close.append(engine._loaded)
             assert engine._engine is None
             assert engine._vlm_model is None
             assert engine._processor is None
@@ -2799,6 +2802,48 @@ class TestStopSafety:
         await engine.stop()
 
         assert events == ["stop", "vision_cache", "inner_close"]
+        # The memory enforcer reads a loaded engine with no scheduler as a
+        # wrapper break, so the flag must drop together with _engine.
+        assert loaded_at_close == [False]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("release_fails", [False, True])
+    async def test_stop_releases_ane_through_adapter_close(self, release_fails):
+        from omlx.models.vlm import VLMModelAdapter
+
+        engine = _make_loaded_engine()
+        model = engine._vlm_model
+        adapter = VLMModelAdapter(model)
+        engine._adapter = adapter
+        events = []
+        engine._engine.stop = AsyncMock(side_effect=lambda: events.append("stop"))
+        inner = MagicMock()
+        engine._engine.engine = inner
+
+        def close():
+            events.append("close")
+            assert engine._vlm_model is None
+            adapter.release_resources()
+
+        inner.close.side_effect = close
+
+        def release(value):
+            events.append("release")
+            assert value is model
+            assert adapter._vlm_model is model
+            if release_fails:
+                raise RuntimeError("native release unavailable")
+            return 3, 6
+
+        with patch(
+            "omlx.patches.qwen35_ane_prefill.release_qwen35_ane_prefill",
+            side_effect=release,
+        ):
+            await engine.stop()
+
+        assert events == ["stop", "close", "release"]
+        assert adapter._vlm_model is None
+        assert engine._engine is None
 
     @pytest.mark.asyncio
     async def test_stop_sets_diffusion_cancel_before_dropping_model_refs(self):
@@ -3149,6 +3194,34 @@ class TestCaptureVLMPositionState:
         vlm_module._capture_vlm_position_state(None, extra)
 
         assert extra == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import VLMBatchedEngine")
+@pytest.mark.parametrize("model_type", ["gemma4", "gemma4_unified"])
+@pytest.mark.parametrize(
+    "vision_config, with_image", [(None, True), (None, False), ({}, True)]
+)
+async def test_preflight_gemma4_image_support(model_type, vision_config, with_image):
+    from omlx.exceptions import InvalidRequestError
+
+    engine = _make_loaded_engine(model_type=model_type)
+    engine._vlm_model.config.vision_config = vision_config
+    engine._apply_chat_template = MagicMock(return_value="test")
+    engine._tokenizer = SimpleNamespace(encode=lambda text: [1])
+    engine._preflight_or_raise_with_eviction = AsyncMock()
+    content = [_image_part(16, 16)] if with_image else "Hello"
+    messages = [{"role": "user", "content": content}]
+
+    if vision_config is None and with_image:
+        with pytest.raises(InvalidRequestError, match="does not support image") as exc:
+            await engine.preflight_chat(messages)
+        assert exc.value.field == "messages"
+        engine._apply_chat_template.assert_not_called()
+        engine._preflight_or_raise_with_eviction.assert_not_called()
+    else:
+        await engine.preflight_chat(messages)
+        engine._preflight_or_raise_with_eviction.assert_awaited_once()
 
 
 @pytest.mark.asyncio

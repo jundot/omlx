@@ -54,16 +54,8 @@ _SDPA_VECTOR_SUPPORTED_HEAD_DIMS = frozenset({64, 96, 128, 256})
 # dim-less path and matches the fp16/bf16 majority of MLX inference models.
 _SDPA_FALLBACK_SCORE_DTYPE_SIZE = 2
 
-# Bytes/elem the unfused head-dim-256 fallback actually materializes on
-# Metal: MLX keeps the attention score matrix in fp32 even for bf16/fp16
-# models (measured ~33GiB IOAccelerator spike on a 160k-token VLM prefill at
-# head_dim=256). Shared by the sdpa256 route gate
-# (patches/sdpa256_attention._tiled_route_required) and the Qwen4 prefill
-# profile so the router and the guard price the real fallback identically.
-# Kept separate from _SDPA_FALLBACK_SCORE_DTYPE_SIZE: that default covers
-# the dim-less generic path where the compute dtype is unknown and the
-# fp16/bf16 majority is the better prior; widening it globally would
-# re-price unrelated models without evidence.
+# Conservative score width for head-dim-256 unfused memory estimates.
+# Keep the generic fallback width unchanged for other model profiles.
 SDPA256_UNFUSED_SCORE_DTYPE_SIZE = 4
 
 # Head dims whose multi-token prefill is routed to an O(L) tiled/online-softmax
@@ -137,12 +129,7 @@ def estimate_unfused_sdpa_call_bytes(
     head_dim: int,
     score_dtype_size: float = _SDPA_FALLBACK_SCORE_DTYPE_SIZE,
 ) -> int:
-    """Transient bytes for ONE SDPA call taking the unfused fallback: the
-    materialized ``[n_q, query_tokens, kv_len]`` score matrix plus the fp32
-    output. Shared by the per-request prefill-peak estimate
-    (``MemoryMonitor._estimate_sdpa_activation_bytes``) and the sdpa256 route
-    gate (``patches/sdpa256_attention._tiled_route_required``) so the guard
-    and the router price the unfused path with the same math (issue #2204)."""
+    """Estimate one unfused call's score matrix and FP32 output allocation."""
     scores = n_q_heads * query_tokens * kv_len * score_dtype_size
     output = n_q_heads * query_tokens * head_dim * 4
     return int(scores + output)
@@ -245,6 +232,7 @@ class MemoryMonitor:
         self._head_dim: Optional[int] = None
         # KV storage width; may be fractional with TurboQuant.
         self._dtype_size: float = 2
+        self._prefill_dtype_size: float = 2
         self._kv_bytes_per_token_override: float | None = None
         # SDPA score-matrix width = model compute/activation dtype, distinct from
         # _dtype_size (which the scheduler may override to a fractional TurboQuant
@@ -458,6 +446,7 @@ class MemoryMonitor:
         rotating_layer_specs: Sequence[tuple[int, int]] | None = None,
         prefill_memory_profile: PrefillMemoryProfile | None = None,
         ane_prefill_transient_bytes: int = 0,
+        prefill_dtype_size: Optional[float] = None,
     ) -> None:
         """
         Set model information for memory estimation.
@@ -489,11 +478,20 @@ class MemoryMonitor:
             prefill_memory_profile: Optional model-specific strategy for cache
                 and prefill transient shapes that the uniform estimator cannot
                 represent.
+            prefill_dtype_size: Bytes per KV element while a prompt prefills.
+                Defaults to ``dtype_size``. A cache that is quantized after
+                prefill holds the full-width KV, and briefly both copies,
+                before it shrinks to ``dtype_size``.
         """
         self._num_layers = num_layers
         self._num_kv_heads = num_kv_heads
         self._head_dim = head_dim
         self._dtype_size = dtype_size
+        self._prefill_dtype_size = (
+            prefill_dtype_size
+            if prefill_dtype_size is not None and prefill_dtype_size > 0
+            else dtype_size
+        )
         self._score_dtype_size = (
             compute_dtype_size
             if compute_dtype_size and compute_dtype_size > 0
@@ -669,7 +667,7 @@ class MemoryMonitor:
             layers = self._num_layers or 0
         kv_heads = self._num_kv_heads or 0
         dim = self._head_dim or 0
-        dtype = self._dtype_size
+        dtype = self._prefill_dtype_size
 
         if not (layers and kv_heads and dim):
             return 0
@@ -1965,10 +1963,16 @@ def estimate_qwen4_exp_kv_bytes_per_token(
     return float(qsa_layers * per_layer)
 
 
+# Per-layer caches that hold recurrent state instead of attention KV.
+_STATE_ONLY_CACHE_TYPES = frozenset({"ArraysCache", "MambaCache", "SizedArraysCache"})
+
+
 def estimate_mla_kv_bytes_per_token(
     config: Any,
     cache_list: Any,
     dtype_size: float,
+    *,
+    latent_kv_cache: bool = False,
 ) -> float | None:
     """Estimate exact resident KV bytes/token for MLA-style caches.
 
@@ -1979,6 +1983,10 @@ def estimate_mla_kv_bytes_per_token(
     ``index_head_dim`` key per token, while GLM-5.3 pools those keys by the
     cache's compression ratio. Falling back to the standard uniform KV formula
     over-counts these models by more than an order of magnitude.
+
+    ``latent_kv_cache`` marks absorbed MLA (DeepSeek-V3, Kimi, GLM-4.7-Flash,
+    ...), which stores the latent and RoPE key in a plain KVCache per layer.
+    Expanded MLA (DeepSeek-V2, MiniCPM3) stores full K/V there instead.
     """
     kv_lora_rank = _cfg_get(config, "kv_lora_rank")
     rope_dim = _cfg_get(config, "qk_rope_head_dim")
@@ -1994,6 +2002,11 @@ def estimate_mla_kv_bytes_per_token(
         for layer_cache in cache_list:
             caches = getattr(layer_cache, "caches", None)
             if caches is None:
+                if (
+                    latent_kv_cache
+                    and type(layer_cache).__name__ not in _STATE_ONLY_CACHE_TYPES
+                ):
+                    main_cache_layers += 1
                 continue
             n_caches = len(caches)
             if n_caches >= 1:

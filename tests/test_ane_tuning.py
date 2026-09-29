@@ -983,3 +983,97 @@ def test_bank_compiler_available_matches_serving_probe(monkeypatch):
     assert fast.qwen35_ane_bank_compiler_available() is False
     with pytest.raises(RuntimeError, match="procedure-bank compiler"):
         fast.qwen35_ane_compile_linear_bank([], 2048, 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("worker_fails", [False, True])
+async def test_calibration_cancellation_drains_worker(monkeypatch, worker_fails):
+    import asyncio
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    entered = asyncio.Event()
+    finish = threading.Event()
+    drained = threading.Event()
+    loop = asyncio.get_running_loop()
+    run = ane_tuning.create_run(ane_tuning.ANETuningRequest(model_id="qwen"))
+
+    def calibrate(run, engine, settings):
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            assert finish.wait(5)
+            if worker_fails:
+                raise RuntimeError("native dispatch failed")
+            ane_tuning._set_phase_running(run, 1, "Next candidate")
+        finally:
+            drained.set()
+
+    monkeypatch.setattr(ane_tuning, "_calibrate_components_sync", calibrate)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr("omlx.engine_core.get_mlx_executor", lambda: executor)
+        task = asyncio.create_task(
+            ane_tuning._calibrate_components(run, object(), ModelSettings())
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert run.phase == "cleaning_up"
+            assert not task.done()
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            finish.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 5)
+            assert drained.is_set()
+            assert run.results[1]["state"] == "pending"
+        finally:
+            finish.set()
+            if not task.done():
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+
+@pytest.mark.asyncio
+async def test_cancelled_tuning_stays_active_until_unload_finishes(monkeypatch):
+    import asyncio
+
+    unloading = asyncio.Event()
+    finish = asyncio.Event()
+    loaded = False
+
+    async def get_engine(*args, **kwargs):
+        nonlocal loaded
+        loaded = True
+        return object()
+
+    async def calibrate(*args):
+        raise asyncio.CancelledError
+
+    async def measure(run, pool, settings, candidate):
+        return {**ane_tuning._empty_result(candidate), "processing_tps": 100.0}
+
+    async def unload(model_id):
+        unloading.set()
+        await finish.wait()
+
+    monkeypatch.setattr(ane_tuning, "_calibrate_components", calibrate)
+    monkeypatch.setattr(ane_tuning, "_measure_candidate", measure)
+    pool = SimpleNamespace(
+        _settings_manager=SimpleNamespace(get_settings=lambda _: ModelSettings()),
+        get_engine=get_engine,
+        get_loaded_model_ids=lambda: ["qwen"] if loaded else [],
+        _unload_engine=unload,
+    )
+    run = ane_tuning.create_run(ane_tuning.ANETuningRequest(model_id="qwen"))
+    run.task = asyncio.create_task(ane_tuning.run_tuning(run, pool))
+    try:
+        await asyncio.wait_for(unloading.wait(), 5)
+        assert ane_tuning.get_active_run() is run
+        assert run.phase == "cleaning_up"
+    finally:
+        finish.set()
+        await asyncio.wait_for(run.task, 5)
+    assert run.status == "cancelled"
+    assert ane_tuning.get_active_run() is None

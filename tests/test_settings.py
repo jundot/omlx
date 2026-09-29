@@ -6,7 +6,7 @@ import os
 import tempfile
 from argparse import Namespace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -53,6 +53,7 @@ class TestServerSettings:
         assert settings.auto_start_on_launch is True
         assert settings.burst_decode_mode == "balanced"
         assert settings.preserve_mid_system_cache is True
+        assert settings.qwen4_gdn_decode_wide_proj is False
         assert settings.distributed_inference_enabled is False
         assert settings.max_audio_upload_size == "100MB"
         assert settings.max_audio_upload_bytes() == 100 * 1024 * 1024
@@ -87,11 +88,20 @@ class TestServerSettings:
             "auto_start_on_launch": True,
             "burst_decode_mode": "balanced",
             "preserve_mid_system_cache": True,
+            "qwen4_gdn_decode_wide_proj": False,
             "distributed_inference_enabled": False,
             "max_audio_upload_size": "100MB",
             "max_image_upload_size": "50MB",
             "max_image_side_length": 2048,
+            "gpu_keep_warm_interval": 0.5,
         }
+
+    def test_qwen4_decode_setting_round_trip(self):
+        settings = GlobalSettings()
+        assert ServerSettings.from_dict({}).qwen4_gdn_decode_wide_proj is False
+        settings.server = ServerSettings.from_dict({"qwen4_gdn_decode_wide_proj": True})
+        assert settings.server.to_dict()["qwen4_gdn_decode_wide_proj"] is True
+        assert settings.to_scheduler_config().qwen4_gdn_decode_wide_proj is True
 
     def test_from_dict_distributed_inference_is_opt_in(self):
         assert ServerSettings.from_dict({}).distributed_inference_enabled is False
@@ -1102,6 +1112,35 @@ class TestMemorySettings:
         """Test deserialization with prefill guard disabled."""
         settings = MemorySettings.from_dict({"prefill_memory_guard": False})
         assert settings.prefill_memory_guard is False
+
+    def test_admin_rejects_custom_tier_without_ceiling_before_applying(
+        self, tmp_path, monkeypatch
+    ):
+        """A zero custom ceiling must never reach the live enforcer."""
+        import asyncio
+
+        from fastapi import HTTPException
+
+        from omlx.admin import routes as admin_routes
+        from omlx.server import _server_state
+
+        gs = GlobalSettings(base_path=tmp_path)
+        enforcer = MagicMock()
+        enforcer.memory_guard_tier = "balanced"
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+        monkeypatch.setattr(_server_state, "process_memory_enforcer", enforcer)
+
+        request = admin_routes.GlobalSettingsRequest.model_validate(
+            {"memory_guard_tier": "custom", "memory_guard_custom_ceiling_gb": 0}
+        )
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert exc.value.status_code == 400
+        assert gs.memory.memory_guard_tier == "balanced"
+        assert enforcer.memory_guard_tier == "balanced"
 
 
 class TestGlobalSettings:
