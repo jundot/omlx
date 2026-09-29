@@ -15,7 +15,6 @@ import numpy as np
 from omlx.custom_kernels.glm_moe_dsa import fast
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 
-
 compat.apply_mlx_vlm_qwen4_exp_compat_patch()
 from mlx_vlm.models.qwen4_exp import qsa_fast  # noqa: E402
 
@@ -34,12 +33,8 @@ def _time(call, repetitions: int):
 
 def _portable(queries, keys, values, selected, selected_valid):
     query_tokens = queries.shape[2]
-    selected_keys = qsa_fast._batch_gather_tokens(
-        keys.transpose(0, 2, 1, 3), selected
-    ).transpose(0, 1, 3, 2, 4)
-    selected_values = qsa_fast._batch_gather_tokens(
-        values.transpose(0, 2, 1, 3), selected
-    ).transpose(0, 1, 3, 2, 4)
+    selected_keys = qsa_fast._gather_kv_rows(keys, selected)
+    selected_values = qsa_fast._gather_kv_rows(values, selected)
     grouped_queries = queries.transpose(0, 2, 1, 3).reshape(
         1, query_tokens, 2, 12, 256
     )
@@ -78,6 +73,10 @@ def main():
     queries = mx.random.normal((1, 24, args.query_tokens, 256)).astype(mx.bfloat16)
     keys = mx.random.normal((1, 2, args.key_tokens, 256)).astype(mx.bfloat16)
     values = mx.random.normal((1, 2, args.key_tokens, 256)).astype(mx.bfloat16)
+    index_queries = mx.random.normal((1, 4, args.query_tokens, 128)).astype(mx.bfloat16)
+    pooled_keys = mx.random.normal((1, 1, args.key_tokens // 4, 128)).astype(
+        mx.bfloat16
+    )
     blocks = []
     expanded = []
     expanded_valid = []
@@ -107,7 +106,56 @@ def main():
 
     reference = _portable(queries, keys, values, selected_tokens, valid)
     mx.eval(reference)
-    for key_tile, dimension_tile in ((128, 32), (64, 64)):
+
+    def score_call():
+        return fast.qwen4_qsa_indexer_scores(
+            index_queries,
+            pooled_keys,
+            mask_ratio=4,
+            mask_q_offset=q_offset,
+        )
+
+    mx.eval(score_call())
+    score_samples, scores = _time(score_call, args.repetitions)
+    print(
+        f"native index scores: median={statistics.median(score_samples):.3f} ms "
+        f"min={min(score_samples):.3f} max={max(score_samples):.3f}"
+    )
+
+    def topk_call():
+        return fast.qwen4_qsa_topk_indices(scores)
+
+    mx.eval(topk_call())
+    topk_samples, _ = _time(topk_call, args.repetitions)
+    print(
+        f"native top-k: median={statistics.median(topk_samples):.3f} ms "
+        f"min={min(topk_samples):.3f} max={max(topk_samples):.3f}"
+    )
+
+    def pipeline_call():
+        pipeline_scores = score_call()
+        pipeline_blocks = fast.qwen4_qsa_topk_indices(pipeline_scores)
+        return fast.qwen4_qsa_sparse_gqa_attention(
+            queries,
+            keys,
+            values,
+            pipeline_blocks[:, None],
+            256**-0.5,
+            q_offset,
+            key_tile=64,
+            dimension_tile=64,
+        )
+
+    mx.eval(pipeline_call())
+    pipeline_samples, _ = _time(pipeline_call, args.repetitions)
+    print(
+        f"native score+top-k+attention: "
+        f"median={statistics.median(pipeline_samples):.3f} ms "
+        f"min={min(pipeline_samples):.3f} max={max(pipeline_samples):.3f}"
+    )
+
+    for key_tile, dimension_tile in ((128, 32), (256, 32), (64, 64), (128, 64)):
+
         def call(key_tile=key_tile, dimension_tile=dimension_tile):
             return fast.qwen4_qsa_sparse_gqa_attention(
                 queries,

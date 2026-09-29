@@ -33,6 +33,7 @@ if HAS_MLX:
         _io_pool,
         _shutdown_io_pool,
         apply_moe_expert_offload,
+        estimate_offload_admission_bytes,
         moe_offload_stats,
     )
 
@@ -967,3 +968,30 @@ def test_qwen38_flash_next_routing_and_eviction(tmp_path, length, batch):
         assert len(cache.slot_of) <= 64
     if length > 1:
         assert cache.misses > cache.capacity
+
+
+@pytest.mark.parametrize("mtp_resident", [False, True])
+def test_mtp_resident_keeps_native_head_unwrapped(tmp_path, mtp_resident):
+    """Qwen4-Exp Lightning MTP: the ``mtp.*`` head stays resident and priced."""
+    backbone, head = _make_glu(0), _make_glu(1)
+    model = _MiniMoE([backbone])
+    model.mtp = _MiniMoE([head])
+    _save_checkpoint(
+        tmp_path,
+        {
+            **_glu_tensors(backbone, "layers.0.experts.switch_glu"),
+            **_glu_tensors(head, "mtp.layers.0.experts.switch_glu"),
+        },
+    )
+    full = (tmp_path / "model.safetensors").stat().st_size
+    streamed = estimate_offload_admission_bytes(tmp_path, full, 0.25)
+    priced = estimate_offload_admission_bytes(
+        tmp_path, full, 0.25, mtp_resident=mtp_resident
+    )
+
+    wrapped = apply_moe_expert_offload(model, tmp_path, 0.25, mtp_resident=mtp_resident)
+
+    assert wrapped == (1 if mtp_resident else 2)
+    assert isinstance(model.layers[0].experts.switch_glu, OffloadSwitchGLU)
+    assert (model.mtp.layers[0].experts.switch_glu is head) is mtp_resident
+    assert (priced > streamed) is mtp_resident

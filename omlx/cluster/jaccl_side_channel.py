@@ -371,9 +371,12 @@ class _SidecarAllGather:
         executable = _sidecar_python()
         if executable is None:  # defensive: transport selection already checks
             raise RuntimeError("JACCL side-channel helper Python is unavailable")
+        # -I: the bundled app exports PYTHONHOME for its own interpreter, and
+        # system Python cannot start under that home.
         self._process = subprocess.Popen(
             [
                 executable,
+                "-I",
                 "-u",
                 "-c",
                 _SIDECAR_PROGRAM,

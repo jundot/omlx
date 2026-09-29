@@ -714,7 +714,8 @@ class DeepseekV32MoE(nn.Module):
             scores=scores if use_weighted_sum else None,
             weighted_sum=use_weighted_sum,
         )
-        if not use_weighted_sum:
+        # Unsummed routes: no weighted sum asked for, or the kernel declined.
+        if y.ndim == x.ndim + 1:
             y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
         if self.config.n_shared_experts is not None:
             y = y + self.shared_experts(x)

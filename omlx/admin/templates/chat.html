@@ -4426,12 +4426,6 @@
             alert(window.t('chat.error.invalid_audio_type'));
             return;
         }
-        // Mirrors MAX_AUDIO_UPLOAD_BYTES on the server
-        const maxMb = 100;
-        if (file.size > maxMb * 1024 * 1024) {
-            alert(window.t('chat.error.audio_too_large').replace('{max}', maxMb));
-            return;
-        }
         const id = `aud_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
         this.uploadAudio = { id, file, filename: file.name, size: file.size };
     },
@@ -5651,7 +5645,10 @@
                 }
                 const errorText = await response.text();
                 let detail = null;
-                try { detail = JSON.parse(errorText)?.detail; } catch (e) { }
+                try {
+                    const payload = JSON.parse(errorText);
+                    detail = payload?.error?.message || payload?.detail;
+                } catch (e) { }
                 throw new Error(
                     (typeof detail === 'string' && detail) || errorText || `Error: ${response.status}`
                 );

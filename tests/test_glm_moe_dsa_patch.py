@@ -651,6 +651,13 @@ def test_deepseek_affine_block_moe_kernels_match_gather_qmm():
     if not fast.has_symbol("deepseek_affine_gather_qmm_blocks"):
         pytest.skip("DeepSeek affine block-list kernels are unavailable")
 
+    from omlx.custom_kernels.nax import is_nax_available
+
+    if is_nax_available():
+        # Stock gather_qmm runs the NAX kernels here, whose accumulation
+        # order differs from the simdgroup block kernels.
+        pytest.skip("reference gather_qmm is not bit-comparable on NAX GPUs")
+
     from omlx.patches.deepseek_v4.switch_layers import (
         _block_config,
         _build_mxfp4_blocks,
@@ -787,7 +794,11 @@ def test_deepseek_switchglu_uses_affine_block_kernels(monkeypatch):
     if not fast.has_symbol("deepseek_affine_gather_qmm_pair_concat_blocks"):
         pytest.skip("DeepSeek affine block-list kernels are unavailable")
 
+    from omlx.patches.deepseek_v4 import switch_layers
     from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
+
+    # NAX GPUs send prefill-sized calls to stock gather_qmm instead.
+    monkeypatch.setattr(switch_layers, "_nax_prefers_stock", lambda num_routes: False)
 
     mx.random.seed(13)
 
@@ -847,7 +858,11 @@ def test_deepseek_switchglu_uses_fp16_affine_blocks_for_bf16_inputs(monkeypatch)
     if not fast.has_symbol("deepseek_affine_gather_qmm_pair_concat_blocks"):
         pytest.skip("DeepSeek affine block-list kernels are unavailable")
 
+    from omlx.patches.deepseek_v4 import switch_layers
     from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
+
+    # NAX GPUs send prefill-sized calls to stock gather_qmm instead.
+    monkeypatch.setattr(switch_layers, "_nax_prefers_stock", lambda num_routes: False)
 
     mx.random.seed(19)
 
@@ -940,6 +955,40 @@ def test_deepseek_switchglu_does_not_use_native_weighted_sum(monkeypatch):
 
     assert y.shape == (1, 11, 6, 16)
     assert calls["weighted_sum"] == 0
+
+
+def test_glm_moe_sums_routes_when_weighted_sum_declines(monkeypatch):
+    """The SwitchGLU returns unsummed routes when the kernel rejects a shape."""
+    mx = pytest.importorskip("mlx.core")
+
+    from omlx.patches.glm_moe_dsa import deepseek_v32
+
+    B, L, K, D = 1, 64, 8, 16
+    x = mx.random.normal((B, L, D), dtype=mx.bfloat16)
+    inds = mx.zeros((B, L, K), dtype=mx.uint32)
+    scores = mx.softmax(mx.random.normal((B, L, K), dtype=mx.float32), axis=-1)
+    routes = mx.random.normal((B, L, K, D), dtype=mx.bfloat16)
+
+    def declined_switch(x, inds, scores=None, weighted_sum=False):
+        assert weighted_sum
+        return routes
+
+    monkeypatch.setattr(deepseek_v32, "_use_glm_moe_weighted_sum", lambda c: True)
+    monkeypatch.setattr(
+        deepseek_v32, "glm_fast", SimpleNamespace(glm_moe_weighted_sum=None)
+    )
+    moe = SimpleNamespace(
+        sharding_group=None,
+        config=SimpleNamespace(n_shared_experts=None),
+        gate=lambda x: (inds, scores),
+        switch_mlp=declined_switch,
+    )
+    y = deepseek_v32.DeepseekV32MoE.__call__(moe, x)
+    expected = (routes * scores[..., None]).sum(axis=-2).astype(routes.dtype)
+    mx.eval(y, expected)
+
+    assert y.shape == (B, L, D)
+    assert mx.array_equal(y, expected).item()
 
 
 def test_glm_direct_sparse_mla_threshold_requires_native(monkeypatch):

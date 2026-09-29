@@ -34,6 +34,7 @@ _SOURCE = r"""
     threadgroup U sum_exp_scores[BN];
 
     int K_SIZE = int(k_size[0]);
+    int KV_STRIDE = int(kv_stride[0]);
     int query_token = int(q_batch_head_idx) % QUERY_T;
     int batch_idx = int(q_batch_head_idx) / (NUM_Q_HEADS * QUERY_T);
     int q_head_idx = (int(q_batch_head_idx) / QUERY_T) % NUM_Q_HEADS;
@@ -44,10 +45,10 @@ _SOURCE = r"""
     const device T* qptr =
         queries + int(q_batch_head_idx) * D_SIZE + int(simd_lid) * qk_per_thread;
     const device T* kptr =
-        keys + (batch_idx * NUM_KV_HEADS + kv_head_idx) * K_SIZE * D_SIZE +
+        keys + (batch_idx * NUM_KV_HEADS + kv_head_idx) * KV_STRIDE * D_SIZE +
         (pad + int(simd_gid)) * D_SIZE + int(simd_lid) * qk_per_thread;
     const device T* vptr =
-        values + (batch_idx * NUM_KV_HEADS + kv_head_idx) * K_SIZE * V_SIZE +
+        values + (batch_idx * NUM_KV_HEADS + kv_head_idx) * KV_STRIDE * V_SIZE +
         (pad + int(simd_gid)) * V_SIZE + int(simd_lid) * v_per_thread;
     device T* optr =
         out + int(q_batch_head_idx) * V_SIZE + int(simd_gid) * v_per_thread;
@@ -130,11 +131,48 @@ _SOURCE = r"""
 def _kernel():
     return mx.fast.metal_kernel(
         name="omlx_qwen_verify_ragged_sdpa",
-        input_names=["queries", "keys", "values", "pads", "scale", "k_size", "mask"],
+        input_names=[
+            "queries",
+            "keys",
+            "values",
+            "pads",
+            "scale",
+            "k_size",
+            "kv_stride",
+            "mask",
+        ],
         output_names=["out"],
         header="#include <metal_simdgroup>\nusing namespace metal;\n",
         source=_SOURCE,
     )
+
+
+def _cache_buffers(cache, keys, values):
+    """Return the cache's backing K/V buffers when ``keys``/``values`` are their prefix.
+
+    The fetched K/V are views of the step-grown cache buffers. Copying them to
+    make them contiguous allocates the current context length every verify
+    cycle, and the MLX buffer pool cannot reuse those growing sizes.
+    """
+    if type(cache) not in (BatchKVCache, KVCache, LMBatchKVCache, LMKVCache):
+        return None
+    key_buffer = getattr(cache, "keys", None)
+    value_buffer = getattr(cache, "values", None)
+    position = getattr(cache, "_idx", getattr(cache, "offset", None))
+    if (
+        not isinstance(key_buffer, mx.array)
+        or not isinstance(value_buffer, mx.array)
+        or not isinstance(position, int)
+        or position != keys.shape[2]
+        or key_buffer.shape[:2] != keys.shape[:2]
+        or key_buffer.shape[2] < position
+        or key_buffer.shape[3] != keys.shape[3]
+        or value_buffer.shape != key_buffer.shape
+        or key_buffer.dtype != keys.dtype
+        or value_buffer.dtype != values.dtype
+    ):
+        return None
+    return key_buffer, value_buffer
 
 
 def verify_attention(queries, keys, values, *, cache, scale, mask):
@@ -190,14 +228,20 @@ def verify_attention(queries, keys, values, *, cache, scale, mask):
         mask_dims = (1, 1, 1)
         mask = mx.array([True])
 
+    buffers = _cache_buffers(cache, keys, values)
+    if buffers is None:
+        keys, values = mx.contiguous(keys), mx.contiguous(values)
+    else:
+        keys, values = buffers
     return _kernel()(
         inputs=[
             mx.contiguous(queries),
-            mx.contiguous(keys),
-            mx.contiguous(values),
+            keys,
+            values,
             pads.astype(mx.int32),
             mx.array([scale]),
             mx.array([size], dtype=mx.int32),
+            mx.array([keys.shape[2]], dtype=mx.int32),
             mx.contiguous(mask),
         ],
         template=[

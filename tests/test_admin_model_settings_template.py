@@ -42,7 +42,7 @@ def test_lightning_mtp_and_turboquant_are_not_ui_mutexed():
     lightning_mtp = _section(
         html,
         "<!-- Lightning MTP (built-in MTP head speculative decoding) -->",
-        "<!-- Experimental Features -->",
+        "<!-- DFlash -->",
     )
 
     assert "modelSettings.mtp_enabled" not in turboquant
@@ -54,7 +54,7 @@ def test_vlm_mtp_still_conflicts_with_turboquant():
     vlm_mtp = _section(
         html,
         "<!-- VLM MTP",
-        "<!-- Performance",
+        "<!-- Experimental Features -->",
     )
 
     assert "modelSettings.turboquant_kv_enabled" in vlm_mtp

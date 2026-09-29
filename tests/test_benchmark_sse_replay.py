@@ -21,6 +21,7 @@ from typing import Optional
 
 import pytest
 
+from omlx.admin import accuracy_benchmark
 from omlx.admin.benchmark import (
     BenchmarkRequest,
     BenchmarkRun,
@@ -55,8 +56,9 @@ async def _drain(
         async with run.cond:
             while seen >= len(run.events) and not run.terminal:
                 try:
-                    await asyncio.wait_for(run.cond.wait(), timeout=timeout)
-                except asyncio.TimeoutError:
+                    async with asyncio.timeout(timeout):
+                        await run.cond.wait()
+                except TimeoutError:
                     break
             new = list(run.events[seen:])
             seen = len(run.events)
@@ -275,6 +277,40 @@ class TestAccuracyBenchmarkSSEReplay:
 
         r1, r2, _ = await asyncio.gather(reader(), reader(), producer())
         assert r1 == r2
+
+    @pytest.mark.asyncio
+    async def test_stream_disconnect_leaves_condition_released(self):
+        """A disconnect must not leave run.cond held by a finished task (#3960).
+
+        Starlette cancels a disconnected stream more than once. Here a producer
+        holds the lock across the first cancel and releases it before the
+        stream resumes from the second one.
+        """
+        from omlx.admin import routes as admin_routes
+
+        run = _acc_run()
+        accuracy_benchmark._accuracy_runs[run.bench_id] = run
+        try:
+            response = await admin_routes.stream_accuracy_benchmark(
+                run.bench_id, is_admin=True
+            )
+            reader = asyncio.create_task(response.body_iterator.__anext__())
+            for _ in range(3):
+                await asyncio.sleep(0)
+
+            await run.cond.acquire()
+            reader.cancel()
+            for _ in range(3):
+                await asyncio.sleep(0)
+            reader.cancel()
+            run.cond.release()
+            with pytest.raises(StopAsyncIteration):
+                await reader
+
+            await asyncio.wait_for(acc_send_event(run, {"type": "done"}), 1.0)
+            assert not run.cond.locked()
+        finally:
+            accuracy_benchmark._accuracy_runs.pop(run.bench_id, None)
 
     @pytest.mark.asyncio
     async def test_last_progress_still_tracked(self):
