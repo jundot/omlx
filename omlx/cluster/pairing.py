@@ -133,7 +133,7 @@ def validate_ssh_accounts(
         return
     for user in (local_ssh_user, remote_ssh_user):
         if not isinstance(user, str) or not re.fullmatch(
-            r"[A-Za-z_][A-Za-z0-9_-]{0,63}", user
+            r"[A-Za-z_][A-Za-z0-9_.-]{0,63}", user
         ):
             raise PairingRequestError("Enter both SSH account short names.")
     if local_ssh_user != pwd.getpwuid(os.geteuid()).pw_name:
@@ -1272,7 +1272,7 @@ class PairingManager:
         if ssh_user is not None or expected_ssh_user is not None:
             for user in (ssh_user, expected_ssh_user):
                 if not isinstance(user, str) or not re.fullmatch(
-                    r"[A-Za-z_][A-Za-z0-9_-]{0,63}", user
+                    r"[A-Za-z_][A-Za-z0-9_.-]{0,63}", user
                 ):
                     raise PairingRequestError(
                         "Invalid SSH account names in pairing request."

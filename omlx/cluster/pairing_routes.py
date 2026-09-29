@@ -74,19 +74,19 @@ class PairRequestBody(BaseModel):
     ssh_public_key: str = Field(min_length=32, max_length=8192)
     ssh_host_public_key: str = Field(min_length=32, max_length=8192)
     ssh_user: str | None = Field(
-        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$"
+        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$"
     )
     expected_ssh_user: str | None = Field(
-        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$"
+        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$"
     )
 
 
 class PairApproveBody(BaseModel):
     local_ssh_user: str | None = Field(
-        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$"
+        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$"
     )
     remote_ssh_user: str | None = Field(
-        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$"
+        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$"
     )
 
     model_config = ConfigDict(extra="forbid")
@@ -103,10 +103,10 @@ class PairDenyBody(BaseModel):
 
 class PairJoinBody(BaseModel):
     local_ssh_user: str | None = Field(
-        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$"
+        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$"
     )
     remote_ssh_user: str | None = Field(
-        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$"
+        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$"
     )
 
     model_config = ConfigDict(extra="forbid")

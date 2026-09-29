@@ -157,3 +157,21 @@ def test_selected_account_is_persisted_by_real_registry(tmp_path):
     )
     restored = DeviceRegistry(tmp_path / "devices.json")
     assert restored.get("peer")["ssh_user"] == "peer_user"
+
+
+def test_dotted_accounts_pair_and_persist(tmp_path, monkeypatch):
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+    _accounts(monkeypatch, "joiner.user")
+    shown = joiner.start_join(
+        local_ssh_user="joiner.user", remote_ssh_user="coordinator.user"
+    )
+    coordinator.handle_join_request(joiner.build_join_request())
+    _accounts(monkeypatch, "coordinator.user")
+    coordinator.approve(
+        joiner.node_id, shown["code"],
+        local_ssh_user="coordinator.user", remote_ssh_user="joiner.user",
+    )
+    _accounts(monkeypatch, "joiner.user")
+    joiner.complete_join(coordinator.join_status(joiner.node_id))
+    assert coordinator.paired_devices()[0]["ssh_user"] == "joiner.user"
+    assert joiner.paired_devices()[0]["ssh_user"] == "coordinator.user"

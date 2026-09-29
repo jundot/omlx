@@ -493,7 +493,7 @@ class DeviceRegistry:
 
         if ssh_user is not None and (
             not isinstance(ssh_user, str)
-            or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,63}", ssh_user)
+            or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,63}", ssh_user)
         ):
             raise ValueError("cluster device SSH user is invalid")
 
