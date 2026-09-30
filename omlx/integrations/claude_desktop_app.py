@@ -16,13 +16,13 @@ a reminder to restart it.
 
 from __future__ import annotations
 
-import plistlib
 import subprocess
 import sys
 from pathlib import Path
 
 from omlx.integrations.base import Integration, IntegrationContext
 from omlx.integrations.claude_desktop import configure_omlx_gateway
+from omlx.integrations.macapp import find_mac_app
 from omlx.utils.install import get_cli_command_prefix
 
 CLAUDE_DESKTOP_BUNDLE_ID = "com.anthropic.claudefordesktop"
@@ -36,20 +36,7 @@ def find_claude_desktop_bundle() -> Path | None:
 
     Matches on CFBundleIdentifier rather than the folder name.
     """
-    for root in _APP_BUNDLE_ROOTS:
-        for name in _APP_BUNDLE_NAMES:
-            bundle = root / name
-            plist_path = bundle / "Contents" / "Info.plist"
-            if not plist_path.is_file():
-                continue
-            try:
-                with plist_path.open("rb") as f:
-                    info = plistlib.load(f)
-            except (OSError, plistlib.InvalidFileException):
-                continue
-            if info.get("CFBundleIdentifier") == CLAUDE_DESKTOP_BUNDLE_ID:
-                return bundle
-    return None
+    return find_mac_app(_APP_BUNDLE_ROOTS, _APP_BUNDLE_NAMES, CLAUDE_DESKTOP_BUNDLE_ID)
 
 
 def is_claude_desktop_running() -> bool:
@@ -80,7 +67,7 @@ class ClaudeDesktopAppIntegration(Integration):
             ),
             # The app resolves tier aliases server-side at request time,
             # so there is no single launch-time model to pick.
-            requires_model=False,
+            requires_model_selection=False,
         )
 
     def is_installed(self) -> bool:

@@ -680,7 +680,8 @@ def launch_command(args, extra_args: list[str] | None = None):
 
     # Determine model. Explicit CLI tier flags bypass the picker; otherwise always
     # prompt interactively so the user's selection is honoured. Integrations
-    # that resolve models server-side (requires_model=False) skip this block.
+    # that resolve models server-side (requires_model_selection=False) skip
+    # this block.
     model = args.model
     if not model and not integration.requires_model_selection:
         # The integration registers the server's whole model catalog, so

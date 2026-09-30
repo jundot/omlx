@@ -24,6 +24,7 @@ def _make_settings(desktop_enabled=True, api_key="test-key"):
     settings = SimpleNamespace(
         server=SimpleNamespace(host="127.0.0.1", port=8000),
         auth=SimpleNamespace(api_key=api_key),
+        integrations=SimpleNamespace(claude_desktop_model=None),
         claude_code=SimpleNamespace(
             desktop_enabled=desktop_enabled,
             opus_model=None,
@@ -118,18 +119,18 @@ def _mock_integration(display_name):
 
 class TestRequiresModelFlag:
     def test_claude_desktop_skips_model(self):
-        assert ClaudeDesktopAppIntegration().requires_model is False
+        assert ClaudeDesktopAppIntegration().requires_model_selection is False
 
     def test_other_integrations_require_model(self):
-        assert ClaudeCodeIntegration().requires_model is True
-        assert OpenCodeIntegration().requires_model is True
+        assert ClaudeCodeIntegration().requires_model_selection is True
+        assert OpenCodeIntegration().requires_model_selection is True
 
 
 class TestClaudeDesktopLaunch:
     def test_no_picker_with_multiple_models(self, capsys):
         """Multiple models available: select_model must not be called."""
         integration = _mock_integration("Claude Desktop")
-        integration.requires_model = False
+        integration.requires_model_selection = False
         settings, _ = _make_settings(desktop_enabled=True)
 
         _run_launch(
@@ -148,7 +149,7 @@ class TestClaudeDesktopLaunch:
         ctx = integration.launch.call_args.args[0]
         assert ctx.model == ""
         out = capsys.readouterr().out
-        assert "via oMLX gateway" in out
+        assert "Launching Claude Desktop..." in out
         assert "with model" not in out
 
     def test_disabled_flag_yes_enables_via_admin_api(self, capsys):
@@ -194,7 +195,7 @@ class TestClaudeDesktopLaunch:
     def test_disabled_flag_yes_never_saves_file(self, capsys):
         """GlobalSettings.save must not be called on the Y path."""
         integration = _mock_integration("Claude Desktop")
-        integration.requires_model = False
+        integration.requires_model_selection = False
         settings, save = _make_settings(desktop_enabled=False)
         calls: list = []
 
@@ -224,7 +225,7 @@ class TestClaudeDesktopLaunch:
     def test_disabled_flag_no_exits_cleanly_without_launch(self, capsys):
         """Answering N exits 0 without configuring or launching anything."""
         integration = _mock_integration("Claude Desktop")
-        integration.requires_model = False
+        integration.requires_model_selection = False
         settings, save = _make_settings(desktop_enabled=False)
         requests_mock = MagicMock()
         session_factory = MagicMock()
@@ -318,7 +319,7 @@ class TestClaudeDesktopLaunch:
     def test_server_unreachable_exits_1_without_save(self, capsys):
         """A network error aborts without a silent file fallback."""
         integration = _mock_integration("Claude Desktop")
-        integration.requires_model = False
+        integration.requires_model_selection = False
         settings, save = _make_settings(desktop_enabled=False)
 
         session = MagicMock()
@@ -342,7 +343,7 @@ class TestClaudeDesktopLaunch:
     def test_enabled_flag_never_prompts(self):
         """With the switch on, input must not be consulted."""
         integration = _mock_integration("Claude Desktop")
-        integration.requires_model = False
+        integration.requires_model_selection = False
         settings, save = _make_settings(desktop_enabled=True)
 
         def _fail_prompt(_prompt=""):
@@ -365,7 +366,7 @@ class TestClaudeDesktopLaunch:
     def test_non_interactive_exits_1_with_instructions(self, capsys):
         """Without a TTY there is no prompt: exit 1 and explain how to enable."""
         integration = _mock_integration("Claude Desktop")
-        integration.requires_model = False
+        integration.requires_model_selection = False
         settings, save = _make_settings(desktop_enabled=False)
 
         with (
@@ -387,7 +388,7 @@ class TestOtherIntegrationsKeepPicker:
     def test_picker_still_shown(self, capsys):
         """Regression guard: model-based integrations still use select_model."""
         integration = _mock_integration("OpenCode")
-        integration.requires_model = True
+        integration.requires_model_selection = True
         integration.select_model.return_value = "picked-model"
         settings = SimpleNamespace(
             server=SimpleNamespace(host="127.0.0.1", port=8000),
