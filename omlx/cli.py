@@ -470,6 +470,8 @@ def launch_command(args, extra_args: list[str] | None = None):
     extra_args are unknown CLI tokens forwarded to the underlying tool binary
     (e.g. ``-r`` / ``--resume <id>`` for Claude Code).
     """
+    from urllib.parse import quote
+
     import requests
 
     from .integrations import IntegrationContext, get_integration, list_integrations
@@ -528,6 +530,7 @@ def launch_command(args, extra_args: list[str] | None = None):
         print(f"oMLX server is not running at {base_url}")
         print("Start the server first: omlx start")
         sys.exit(1)
+    default_model = _optional_str(resp.json().get("default_model"))
 
     # Get API key: CLI args > settings.json > empty
     api_key = getattr(args, "api_key", None) or settings.auth.api_key or ""
@@ -604,10 +607,16 @@ def launch_command(args, extra_args: list[str] | None = None):
         if not model and models_info_list:
             saved_model = _optional_str(settings.integrations.codex_model)
             available_ids = {info["id"] for info in models_info_list}
-            model = (
-                saved_model
-                if saved_model in available_ids
-                else models_info_list[0]["id"]
+            default_alias = _optional_str(
+                models_status_map.get(default_model or "", {}).get("model_alias")
+            )
+            model = next(
+                (
+                    candidate
+                    for candidate in (saved_model, default_alias, default_model)
+                    if candidate is not None and candidate in available_ids
+                ),
+                models_info_list[0]["id"],
             )
             print(f"Using model: {model} (switch models inside Codex)")
     elif not model and (cli_opus_model or cli_sonnet_model or cli_haiku_model):
@@ -720,6 +729,23 @@ def launch_command(args, extra_args: list[str] | None = None):
             else ()
         ),
     )
+
+    if native_model_picker and not (
+        model_info.get("loaded") or model_info.get("is_loading")
+    ):
+        load_model_id = model_info.get("source_model_id") or model_info.get("id") or model
+        try:
+            resp = requests.post(
+                f"{base_url}/v1/models/{quote(load_model_id, safe='')}/load",
+                headers=headers,
+                params={"wait": "false"},
+                timeout=3,
+            )
+            resp.raise_for_status()
+            print(f"Warming up model: {model} (loading in background)")
+        except requests.RequestException as exc:
+            print(f"Warning: could not warm up model '{model}': {exc}")
+            print("Launching anyway; oMLX will load the model on demand.")
 
     # Launch
     if model:

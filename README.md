@@ -262,8 +262,12 @@ omlx launch codex --model your-model-id
 Both integrations refresh a Codex model catalog from oMLX's available chat models,
 so you can switch models with the CLI's `/model` selector or the desktop app's
 model picker instead of selecting just one model before launch. Without `--model`,
-oMLX uses the saved Codex integration model when available, otherwise the first
-model returned by the server (favorites first).
+oMLX uses the saved Codex integration model when available, otherwise the
+oMLX default model (including its served alias). If neither is available,
+it falls back to the first chat model returned by the server (favorites first).
+The selected model starts loading in the background before Codex opens; launch
+does not wait for loading to finish. Warm-up request failures produce a warning
+without preventing launch, and normal inference can still load the model on demand.
 
 The catalog preserves served aliases and exposed profiles, includes unloaded
 models that oMLX can load on demand, and records each model's context window and

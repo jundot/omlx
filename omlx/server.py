@@ -280,6 +280,7 @@ class ServerState:
     # /health returns 503 with status "loading" until it flips to True so
     # port watchdogs see liveness instead of a closed port (#2184).
     pinned_preload_complete: bool = True
+    model_load_tasks: dict[str, asyncio.Task[None]] = field(default_factory=dict)
     # Snapshot at init_server(). Settings may be edited while this process is
     # running, but routes, navigation, and Bonjour switch together on restart.
     distributed_inference_enabled: bool = False
@@ -700,6 +701,12 @@ async def lifespan(app: FastAPI):
         preload_task.cancel()
         with suppress(asyncio.CancelledError):
             await preload_task
+    model_load_tasks = list(_server_state.model_load_tasks.values())
+    for task in model_load_tasks:
+        task.cancel()
+    if model_load_tasks:
+        await asyncio.gather(*model_load_tasks, return_exceptions=True)
+    _server_state.model_load_tasks.clear()
     get_server_metrics().close()
     if ttl_task is not None:
         ttl_task.cancel()
@@ -3527,9 +3534,20 @@ async def unload_model(model_id: str, _: bool = Depends(verify_api_key)):
     return {"status": "ok", "model_id": model_id}
 
 
+async def _load_model_in_background(pool: EnginePool, model_id: str) -> None:
+    try:
+        await pool.get_engine(model_id)
+    except Exception:
+        logger.exception("Background model load failed for %s", model_id)
+    else:
+        logger.info("Background model load completed for %s", model_id)
+
+
 @app.post("/v1/models/{model_id}/load")
-async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
-    """Load a discovered model into memory. Blocks until loading completes."""
+async def load_model_public(
+    model_id: str, _: bool = Depends(verify_api_key), wait: bool = True
+):
+    """Load a discovered model; wait=false acknowledges a background load."""
     if _server_state.engine_pool is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
@@ -3542,6 +3560,23 @@ async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
             "model_id": model_id,
             "message": f"Already loaded: {model_id}",
         }
+
+    if not wait:
+        tasks = _server_state.model_load_tasks
+        if model_id not in tasks and not entry.is_loading:
+            task = asyncio.create_task(
+                _load_model_in_background(_server_state.engine_pool, model_id)
+            )
+            tasks[model_id] = task
+            task.add_done_callback(lambda _: tasks.pop(model_id, None))
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "loading",
+                "model_id": model_id,
+                "message": f"Loading {model_id}",
+            },
+        )
 
     try:
         await _server_state.engine_pool.get_engine(model_id)

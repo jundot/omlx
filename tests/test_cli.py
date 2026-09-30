@@ -396,20 +396,37 @@ class TestLaunchCommandOptions:
 class TestLaunchCommandFunction:
     """Tests for launch command runtime behavior."""
 
+    @pytest.fixture(autouse=True)
+    def mock_model_load(self):
+        with patch("requests.post") as post:
+            yield post
+
     @pytest.mark.parametrize("tool", ["codex", "codex_app"])
     @pytest.mark.parametrize(
-        ("requested_model", "saved_model", "expected_model"),
+        ("requested_model", "saved_model", "default_model", "expected_model"),
         [
-            (None, None, "vision-alias"),
-            (None, "text-model", "text-model"),
-            (None, "removed-model", "vision-alias"),
-            ("text-model", "vision-alias", "text-model"),
-            ("embedding-model", None, None),
-            ("image-model", None, None),
+            (None, None, None, "vision-alias"),
+            (None, None, "text-model", "text-model"),
+            (None, None, "raw-vision-id", "vision-alias"),
+            (None, None, "vision-alias", "vision-alias"),
+            (None, "vision-alias", "text-model", "vision-alias"),
+            (None, "removed-model", "text-model", "text-model"),
+            (None, None, "removed-model", "vision-alias"),
+            (None, None, "hidden-model", "vision-alias"),
+            (None, None, "embedding-model", "vision-alias"),
+            ("text-model", "vision-alias", "vision-alias", "text-model"),
+            ("embedding-model", None, "text-model", None),
+            ("image-model", None, "text-model", None),
         ],
     )
     def test_codex_uses_native_picker_with_all_chat_models(
-        self, tool, requested_model, saved_model, expected_model
+        self,
+        tool,
+        requested_model,
+        saved_model,
+        default_model,
+        expected_model,
+        mock_model_load,
     ):
         from omlx.cli import launch_command
 
@@ -417,6 +434,7 @@ class TestLaunchCommandFunction:
         integration.display_name = "Codex"
         integration.is_installed.return_value = True
         health_response = MagicMock()
+        health_response.json.return_value = {"default_model": default_model}
         status_response = MagicMock()
         status_response.ok = True
         status_response.json.return_value = {
@@ -454,6 +472,11 @@ class TestLaunchCommandFunction:
                 {"id": "image-model"},
             ]
         }
+        if default_model in ("raw-vision-id", "vision-alias"):
+            models_response.json.return_value["data"][:2] = [
+                {"id": "text-model"},
+                {"id": "vision-alias"},
+            ]
         settings = SimpleNamespace(
             server=SimpleNamespace(host="127.0.0.1", port=8000),
             auth=SimpleNamespace(api_key="saved-key"),
@@ -485,22 +508,102 @@ class TestLaunchCommandFunction:
         integration.select_model.assert_not_called()
         if expected_model is None:
             integration.launch.assert_not_called()
+            mock_model_load.assert_not_called()
             return
         context = integration.launch.call_args.args[0]
         assert context.model == expected_model
         assert context.extra_args == ("--example-flag",)
-        assert [model.id for model in context.models] == ["vision-alias", "text-model"]
-        assert context.models[0].model_type == "vlm"
-        assert context.models[0].context_window == 131072
-        assert context.models[0].reasoning is True
-        assert context.models[0].reasoning_effort_options == ("xhigh", "medium", "low")
-        assert context.models[0].reasoning_effort_default == "xhigh"
+        catalog = {model.id: model for model in context.models}
+        assert set(catalog) == {"vision-alias", "text-model"}
+        assert catalog["vision-alias"].model_type == "vlm"
+        assert catalog["vision-alias"].context_window == 131072
+        assert catalog["vision-alias"].reasoning is True
+        assert catalog["vision-alias"].reasoning_effort_options == (
+            "xhigh",
+            "medium",
+            "low",
+        )
+        assert catalog["vision-alias"].reasoning_effort_default == "xhigh"
         if expected_model == "vision-alias":
             assert context.reasoning_effort_options == ("xhigh", "medium", "low")
             assert context.reasoning_effort_default == "xhigh"
-        assert context.models[1].context_window == 8192
-        assert context.models[1].reasoning is False
+        assert catalog["text-model"].context_window == 8192
+        assert catalog["text-model"].reasoning is False
         assert get.call_args.kwargs["headers"] == {"Authorization": "Bearer saved-key"}
+        if expected_model == "vision-alias":
+            mock_model_load.assert_called_once_with(
+                "http://127.0.0.1:8000/v1/models/raw-vision-id/load",
+                headers={"Authorization": "Bearer saved-key"},
+                params={"wait": "false"},
+                timeout=3,
+            )
+        else:
+            mock_model_load.assert_not_called()
+
+    @pytest.mark.parametrize("tool", ["codex", "codex_app"])
+    @pytest.mark.parametrize("load_failure", [None, "http", "timeout"])
+    def test_codex_warms_selected_profile_before_launch(
+        self, tool, load_failure, mock_model_load, capsys
+    ):
+        import requests
+
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.display_name = "Codex"
+        integration.is_installed.return_value = True
+        health_response = MagicMock()
+        health_response.json.return_value = {"default_model": "first"}
+        status_response = MagicMock()
+        status_response.json.return_value = {
+            "models": [
+                {
+                    "id": "coding-profile",
+                    "source_model_id": "raw-model",
+                    "model_type": "llm",
+                    "loaded": False,
+                }
+            ]
+        }
+        models_response = MagicMock()
+        models_response.json.return_value = {"data": [{"id": "coding-profile"}]}
+        settings = SimpleNamespace(
+            server=SimpleNamespace(host="127.0.0.1", port=8000),
+            auth=SimpleNamespace(api_key="key"),
+            claude_code=None,
+        )
+        if load_failure == "http":
+            mock_model_load.return_value.raise_for_status.side_effect = (
+                requests.HTTPError("warm-up rejected")
+            )
+        elif load_failure == "timeout":
+            mock_model_load.side_effect = requests.Timeout("warm-up timed out")
+        integration.launch.side_effect = (
+            lambda context: mock_model_load.assert_called_once()
+        )
+        args = argparse.Namespace(
+            tool=tool, host=None, port=None, api_key=None, model="coding-profile"
+        )
+        with (
+            patch(
+                "requests.get",
+                side_effect=[health_response, status_response, models_response],
+            ),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+        ):
+            launch_command(args)
+
+        mock_model_load.assert_called_once_with(
+            "http://127.0.0.1:8000/v1/models/raw-model/load",
+            headers={"Authorization": "Bearer key"},
+            params={"wait": "false"},
+            timeout=3,
+        )
+        assert integration.launch.call_args.args[0].model == "coding-profile"
+        assert ("Warning: could not warm up" in capsys.readouterr().out) == (
+            load_failure is not None
+        )
 
     @pytest.mark.parametrize("tool", ["codex", "codex_app"])
     def test_codex_model_listing_failure_keeps_explicit_model(self, tool, capsys):
