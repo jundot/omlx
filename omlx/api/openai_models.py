@@ -607,7 +607,7 @@ class ModelInfo(BaseModel):
     # to /v1/models/status (see #1308).
     max_model_len: int | None = None
     # Claude Desktop (Anthropic gateway mode) extensions. Only serialized on
-    # annotated Claude tier-model entries (see ClaudeTierModelInfo below);
+    # derived Claude tier alias entries (see ClaudeTierModelInfo below);
     # excluded by default so the standard OpenAI listing is byte-identical
     # to previous releases.
     display_name: str | None = Field(default=None, exclude=True)
@@ -618,10 +618,10 @@ class ModelInfo(BaseModel):
 
 
 class ClaudeTierModelInfo(ModelInfo):
-    """ModelInfo for annotated Claude Desktop tier models.
+    """ModelInfo for derived Claude Desktop tier aliases.
 
     Re-includes the Anthropic gateway metadata fields that the base class
-    excludes, so only native tier-model entries carry ``display_name`` /
+    excludes, so only tier-alias entries carry ``display_name`` /
     ``created_at`` / ``anthropic_family_tier`` / ``is_family_default`` /
     ``max_tokens`` in /v1/models.
     """

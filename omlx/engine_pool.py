@@ -90,47 +90,43 @@ def _touch_gpu() -> None:
 # with a resident model still lets the GPU reach its idle power state.
 _GPU_KEEP_WARM_IDLE_WINDOW_S = 300.0
 
-# Claude Desktop tier configuration. When ``ClaudeCodeSettings.desktop_enabled``
-# is set, oMLX annotates the native tier models in /v1/models with Anthropic
-# family metadata. These are NOT exposed IDs: the tier models are served under
-# their own native IDs and the client matches on the metadata
-# Configurable Claude Desktop tiers, in priority order opus, sonnet, haiku
-# (duplicate-model resolution: the first tier wins). Each entry is the tier
-# attribute name on the Claude Code settings object (``<tier>_model``). The
-# public model ID is the configured native ``<tier>_model`` value itself;
-# Claude Desktop matches tiers from the ``anthropic_family_tier`` metadata
-# exposed in /v1/models, never from the ID.
-CLAUDE_DESKTOP_TIERS: tuple[str, ...] = ("opus", "sonnet", "haiku")
+# Claude Desktop tier alias slots. When ``ClaudeCodeSettings.desktop_enabled``
+# is set, oMLX exposes these slot IDs as derived (non-persisted) model IDs
+# that resolve at runtime to the models configured in the Claude Code tiers.
+# Each entry maps the public slot ID to the tier attribute name on the
+# Claude Code settings object (``opus_model`` / ``sonnet_model`` /
+# ``haiku_model``).
+CLAUDE_DESKTOP_TIER_SLOTS: tuple[tuple[str, str], ...] = (
+    ("claude-opus-5", "opus"),
+    ("claude-sonnet-5", "sonnet"),
+    ("claude-haiku-4-5-20251001", "haiku"),
+)
+
+# Anthropic family tier label exposed per slot in /v1/models metadata.
+CLAUDE_DESKTOP_TIER_FAMILY: dict[str, str] = {
+    "claude-opus-5": "opus",
+    "claude-sonnet-5": "sonnet",
+    "claude-haiku-4-5-20251001": "haiku",
+}
 
 
 def build_claude_tier_aliases(claude_code_settings) -> dict[str, str]:
-    """Build native-model -> family map from Claude Code settings.
+    """Build slot-ID -> tier-model map from Claude Code settings.
 
-    Returns an empty dict when ``desktop_enabled`` is falsy or no tier has a
-    configured model. Keys are the native model IDs assigned to tiers, values
-    are the family labels (``"opus"`` / ``"sonnet"`` / ``"haiku"``). When the
-    same model is assigned to two tiers, the first in opus, sonnet, haiku
-    order wins and a warning is logged. Duck-typed on purpose: anything
-    exposing ``desktop_enabled`` / ``<tier>_model`` attributes works.
+    Returns an empty dict when ``desktop_enabled`` is falsy. Tiers with no
+    configured model (None/empty) are omitted, so their slot is neither
+    exposed nor resolved. Duck-typed on purpose: anything exposing
+    ``desktop_enabled`` / ``<tier>_model`` attributes works.
     """
     if claude_code_settings is None or not getattr(
         claude_code_settings, "desktop_enabled", False
     ):
         return {}
     aliases: dict[str, str] = {}
-    for tier in CLAUDE_DESKTOP_TIERS:
+    for slot_id, tier in CLAUDE_DESKTOP_TIER_SLOTS:
         target = getattr(claude_code_settings, f"{tier}_model", None)
-        if not target:
-            continue
-        if target in aliases:
-            logger.warning(
-                "Claude Desktop tier model %r assigned to multiple tiers; "
-                "keeping %r-tier priority",
-                target,
-                aliases[target],
-            )
-            continue
-        aliases[target] = tier
+        if target:
+            aliases[slot_id] = target
     return aliases
 
 
@@ -1732,16 +1728,19 @@ class EnginePool:
         self,
         model_id_or_alias: str,
         settings_manager,
+        claude_tier_aliases: dict[str, str] | None = None,
     ) -> str:
         """Resolve a model alias to its actual model_id (directory name).
 
         Tries exact match in _entries first, then case-insensitive match,
         then active cluster deployment IDs, exposed profile model IDs, and
-        model settings aliases. Claude Desktop tier models use their native
-        IDs and resolve naturally here; no slot-ID resolution is needed. If
-        those fail and input contains a provider prefix
-        (e.g. "omlx/my-model"), strips the prefix and retries. Returns the
-        original string if no match is found.
+        model settings aliases. Claude Desktop tier aliases (derived at
+        runtime from the Claude Code tier models, passed via
+        ``claude_tier_aliases``) resolve AFTER exact directory matches and
+        custom ``model_alias`` entries, so a real model or user alias with
+        the same name always wins. If those fail and input contains a
+        provider prefix (e.g. "omlx/my-model"), strips the prefix and
+        retries. Returns the original string if no match is found.
         """
         if model_id_or_alias in self._entries:
             return model_id_or_alias
@@ -1782,6 +1781,13 @@ class EnginePool:
                 if ms.model_alias and ms.model_alias == model_id_or_alias:
                     return mid
 
+        # Claude Desktop tier aliases are derived at runtime and resolve only
+        # after exact directory matches and custom aliases.
+        if claude_tier_aliases:
+            tier_target = claude_tier_aliases.get(model_id_or_alias)
+            if tier_target is not None:
+                return tier_target
+
         # Strip provider prefix (e.g. "omlx/qwen3.5-35b" -> "qwen3.5-35b")
         if "/" in model_id_or_alias:
             stripped = model_id_or_alias.split("/", 1)[1]
@@ -1794,6 +1800,10 @@ class EnginePool:
                 for mid, ms in all_settings.items():
                     if ms.model_alias and ms.model_alias == stripped:
                         return mid
+            if claude_tier_aliases:
+                tier_target = claude_tier_aliases.get(stripped)
+                if tier_target is not None:
+                    return tier_target
 
         return model_id_or_alias
 

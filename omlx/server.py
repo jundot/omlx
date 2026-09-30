@@ -203,6 +203,7 @@ from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine.decision import DecisionEngine
 from .engine_pool import (
+    CLAUDE_DESKTOP_TIER_FAMILY,
     EnginePool,
     build_claude_tier_aliases,
 )
@@ -1455,9 +1456,11 @@ async def get_engine(
         if runtime is not None:
             model_id, runtime_settings = runtime
         else:
-            model_id = pool.resolve_model_id(model_id, sm)
+            model_id = _pool_resolve_model_id(
+                pool, model_id, sm, get_claude_tier_aliases()
+            )
     else:
-        model_id = pool.resolve_model_id(model_id, sm)
+        model_id = _pool_resolve_model_id(pool, model_id, sm, get_claude_tier_aliases())
     _wake_process_memory_enforcer(active=True)
 
     # Only thread optional kwargs through when they are needed, so the common
@@ -2022,17 +2025,29 @@ def get_model_settings_for_request(model_id: str | None):
 
 
 def get_claude_tier_aliases() -> dict[str, str]:
-    """Return Claude Desktop tier metadata from global settings.
+    """Return derived Claude Desktop tier aliases from global settings.
 
-    Each entry maps a native model ID assigned to a Claude Code tier to its
-    family label (``"opus"`` / ``"sonnet"`` / ``"haiku"``). Returns an empty
-    dict when Claude Desktop exposure is disabled (the default) or no tier
-    is configured.
+    Each entry maps a public slot ID (``claude-opus-5`` /
+    ``claude-sonnet-5`` / ``claude-haiku-4-5-20251001``) to the model
+    configured in the matching Claude Code tier. Returns an empty dict
+    when Claude Desktop exposure is disabled (the default) or no tier is
+    configured.
     """
     gs = _server_state.global_settings
     if gs is None:
         return {}
     return build_claude_tier_aliases(getattr(gs, "claude_code", None))
+
+
+def _pool_resolve_model_id(
+    pool, model_id: str, settings_manager, tier_aliases=None
+) -> str:
+    """Resolve via the pool, threading Claude tier aliases when present."""
+    if not tier_aliases:
+        return pool.resolve_model_id(model_id, settings_manager)
+    return pool.resolve_model_id(
+        model_id, settings_manager, claude_tier_aliases=tier_aliases
+    )
 
 
 def resolve_model_id(model_id: str | None) -> str | None:
@@ -2045,7 +2060,9 @@ def resolve_model_id(model_id: str | None) -> str | None:
     pool = _server_state.engine_pool
     if pool is None:
         return model_id
-    return pool.resolve_model_id(model_id, _server_state.settings_manager)
+    return _pool_resolve_model_id(
+        pool, model_id, _server_state.settings_manager, get_claude_tier_aliases()
+    )
 
 
 async def _ensure_tokenizer_for_system_probe(
@@ -3635,10 +3652,9 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
                     max_model_len=get_max_context_window(model_id),
                 )
             )
-        # Both sets are needed by the exposed-profile block below; the
-        # Claude tier-annotation block only needs the listing itself, and it
-        # runs with or without a settings manager, so they are built here
-        # rather than inside the settings guard.
+        # Both sets are needed by the exposed-profile and Claude tier-alias
+        # blocks below, and the latter runs with or without a settings manager,
+        # so they are built here rather than inside the settings guard.
         physical_ids = {m["id"] for m in status["models"]}
         existing_ids = {m.id for m in models}
         if settings_manager:
@@ -3660,43 +3676,58 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
                 )
                 existing_ids.add(profile_model_id)
 
-        # Claude Desktop tiers: the tier models are exposed under their own
-        # native IDs with Anthropic family metadata attached. No synthetic
-        # IDs are added: the client matches tiers on the metadata
-        # (``anthropicFamilyTier``), not on the model ID. Entries whose ID
-        # is a tier native model are annotated in place; tier keys with no
-        # matching entry (hidden model, undiscovered, or filtered exposed
-        # alias) are skipped with a warning, never a crash.
-        tier_map = get_claude_tier_aliases()
-        if tier_map:
+        # Claude Desktop tier aliases: derived, non-persisted slot IDs
+        # that resolve at runtime to the configured Claude Code tier models.
+        # Skipped (with a warning, never a crash) when the slot collides with
+        # an existing model ID or an exposed custom alias, and when the tier
+        # names a model that is not discovered: resolution hands the raw tier
+        # value to pool.get_engine, which only accepts physical model IDs, so
+        # a stale or aliased tier would list a slot no request can serve.
+        tier_aliases = get_claude_tier_aliases()
+        if tier_aliases:
+            custom_aliases = set()
+            if settings_manager:
+                for _ms in settings_manager.get_all_settings().values():
+                    if _ms.model_alias:
+                        custom_aliases.add(_ms.model_alias)
             created_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-            matched_ids: set[str] = set()
-            for idx, entry in enumerate(models):
-                family = tier_map.get(entry.id)
-                if family is None:
+            for slot_id, tier_model in tier_aliases.items():
+                if (
+                    slot_id in existing_ids
+                    or slot_id in physical_ids
+                    or slot_id in custom_aliases
+                ):
+                    logger.warning(
+                        "Skipping Claude Desktop tier alias %r: collides with "
+                        "an existing model ID or custom alias",
+                        slot_id,
+                    )
+                    continue
+                if tier_model not in physical_ids:
+                    logger.warning(
+                        "Skipping Claude Desktop tier alias %r: tier model %r "
+                        "is not an available model",
+                        slot_id,
+                        tier_model,
+                    )
                     continue
                 max_tokens = _server_state.sampling.max_tokens
-                tier_ms = get_model_settings_for_request(entry.id)
+                tier_ms = get_model_settings_for_request(tier_model)
                 if tier_ms is not None and tier_ms.max_tokens is not None:
                     max_tokens = tier_ms.max_tokens
-                models[idx] = ClaudeTierModelInfo(
-                    id=entry.id,
-                    owned_by=entry.owned_by,
-                    max_model_len=entry.max_model_len,
-                    display_name=getattr(entry, "display_name", None) or entry.id,
-                    created_at=created_at,
-                    anthropic_family_tier=family,
-                    is_family_default=True,
-                    max_tokens=max_tokens,
-                )
-                matched_ids.add(entry.id)
-            for native_id in tier_map:
-                if native_id not in matched_ids:
-                    logger.warning(
-                        "Skipping Claude Desktop tier model %r: "
-                        "not an available model in the listing",
-                        native_id,
+                models.append(
+                    ClaudeTierModelInfo(
+                        id=slot_id,
+                        owned_by="omlx",
+                        max_model_len=get_max_context_window(tier_model),
+                        display_name=tier_model,
+                        created_at=created_at,
+                        anthropic_family_tier=CLAUDE_DESKTOP_TIER_FAMILY.get(slot_id),
+                        is_family_default=True,
+                        max_tokens=max_tokens,
                     )
+                )
+                existing_ids.add(slot_id)
 
     if _markitdown_is_visible() and not any(
         m.id == MARKITDOWN_MODEL_ID for m in models
@@ -3712,7 +3743,7 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
     # ``ModelInfo`` (dropping the tier metadata), while a route-level
     # exclude would drop upstream fields like ``max_model_len: null``.
     # Per-item ``model_dump()`` honors each instance's own field config:
-    # standard entries stay byte-identical, tier models carry metadata.
+    # standard entries stay byte-identical, tier aliases carry metadata.
     return JSONResponse(
         content={
             "object": "list",

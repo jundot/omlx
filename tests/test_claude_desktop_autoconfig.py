@@ -306,7 +306,7 @@ class TestGatewayModelFormat:
         from omlx.api.openai_models import ClaudeTierModelInfo
 
         entry = ClaudeTierModelInfo(
-            id="sonnet-phys",
+            id="claude-sonnet-5",
             owned_by="omlx",
             max_model_len=8192,
             display_name="sonnet-phys",
