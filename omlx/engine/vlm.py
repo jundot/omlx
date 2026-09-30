@@ -1754,11 +1754,10 @@ def _audio_feature_cache_key_ranges(
         return np.asarray(value)
 
     features = _to_np(input_features)
-    mask = (
-        None
-        if input_features_mask is None
-        else _to_np(input_features_mask).astype(np.bool_)
-    )
+    mask = None if input_features_mask is None else _to_np(input_features_mask)
+    binary_mask = mask is not None and np.all((mask == 0) | (mask == 1))
+    if binary_mask:
+        mask = mask.astype(np.bool_)
 
     runs = []
     position = 0
@@ -1775,6 +1774,7 @@ def _audio_feature_cache_key_ranges(
     def _hash_mask(value):
         audio_hash.update(b"mask:")
         audio_hash.update(str(value.shape).encode())
+        audio_hash.update(str(value.dtype).encode())
         audio_hash.update(np.ascontiguousarray(value).tobytes())
 
     aligned_mask = mask is not None and mask.shape == features.shape[:2]
@@ -1789,10 +1789,10 @@ def _audio_feature_cache_key_ranges(
             clip = features[i]
             if aligned_mask:
                 clip_mask = mask[i]
-                valid = int(clip_mask.sum())
+                valid = int(clip_mask.sum()) if binary_mask else 0
                 # Canonical right padding is represented by the trimmed shape.
                 # Other layouts affect embeddings and must be keyed explicitly.
-                if clip_mask[:valid].all():
+                if binary_mask and clip_mask[:valid].all():
                     clip = clip[:valid]
                 else:
                     _hash_mask(clip_mask)
@@ -4397,10 +4397,14 @@ class VLMBatchedEngine(BaseEngine):
                 audio_token_id = getattr(config, "audio_token_id", None)
                 if audio_token_id is None:
                     audio_token_id = getattr(config, "audio_token_index", None)
+                audio_mask = extra_model_inputs.get("input_features_mask")
+                if audio_mask is None:
+                    # Qwen Omni exposes the same mask under this alias.
+                    audio_mask = extra_model_inputs.get("feature_attention_mask")
                 image_cache_key_ranges = _audio_feature_cache_key_ranges(
                     token_ids,
                     extra_model_inputs["input_features"],
-                    extra_model_inputs.get("input_features_mask"),
+                    audio_mask,
                     audio_token_id,
                     image_ranges,
                 )

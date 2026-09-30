@@ -176,12 +176,20 @@ def test_invalid_grid_never_exposes_unkeyed_image_blocks(grid, tokens):
 AUDIO = 98
 
 
-def prepare_audio_case(ids, features, mask):
+def prepare_audio_case(
+    ids,
+    features,
+    mask,
+    *,
+    mask_name="input_features_mask",
+    model_type="gemma4",
+    extra_inputs=None,
+):
     engine = VLMBatchedEngine(model_name="audio-boundary-test")
     engine._processor = MagicMock()
     engine._processor.apply_chat_template.return_value = "prompt"
     engine._vlm_model = MagicMock()
-    engine._vlm_model.config.model_type = "gemma4"
+    engine._vlm_model.config.model_type = model_type
     engine._vlm_model.config.audio_token_id = AUDIO
     engine._vlm_model.get_input_embeddings.return_value = SimpleNamespace(
         inputs_embeds=mx.zeros((1, len(ids), 1))
@@ -194,7 +202,8 @@ def prepare_audio_case(ids, features, mask):
         return {
             "input_ids": mx.array([ids]),
             "input_features": features,
-            "input_features_mask": mask,
+            mask_name: mask,
+            **(extra_inputs or {}),
         }
 
     clips = [(mx.zeros((16000,)), 16000)] * features.shape[0]
@@ -322,11 +331,64 @@ def test_later_audio_mask_changes_preserve_earlier_clip_key():
     assert a[1] != b[1]
 
 
-def test_audio_mask_hash_uses_boolean_semantics():
+def test_audio_nonbinary_mask_is_not_collapsed_to_boolean():
     ids = [AUDIO]
     features = mx.ones((1, 3, 2))
     a = _audio_feature_cache_key_ranges(ids, features, mx.array([[0, 2, 3]]), AUDIO, [])
     b = _audio_feature_cache_key_ranges(
         ids, features, mx.array([[False, True, True]]), AUDIO, []
     )
+    assert a != b
+
+
+@pytest.mark.parametrize("mask_name", ["input_features_mask", "feature_attention_mask"])
+def test_qwen_omni_audio_mask_changes_cache_identity(mask_name):
+    ids = [1] * 4 + [AUDIO] * 4 + [2] * 4
+    features = mx.ones((1, 2, 6))
+    a = prepare_audio_case(
+        ids,
+        features,
+        mx.array([[True] * 6]),
+        mask_name=mask_name,
+        model_type="qwen3_omni_moe",
+    )
+    b = prepare_audio_case(
+        ids,
+        features,
+        mx.array([[True] * 4 + [False] * 2]),
+        mask_name=mask_name,
+        model_type="qwen3_omni_moe",
+    )
+    assert reused_tokens(ids, a[5], b[5], a[3], b[3]) == 4
+
+
+def test_binary_audio_masks_share_boolean_semantics():
+    ids = [AUDIO]
+    features = mx.ones((1, 3, 2))
+    a = _audio_feature_cache_key_ranges(ids, features, mx.array([[0, 1, 1]]), AUDIO, [])
+    b = _audio_feature_cache_key_ranges(
+        ids, features, mx.array([[False, True, True]]), AUDIO, []
+    )
     assert a == b
+
+
+@pytest.mark.parametrize("primary_present", [False, True])
+def test_audio_mask_alias_respects_primary_mask_precedence(primary_present):
+    ids = [1] * 4 + [AUDIO] * 4 + [2] * 4
+    features = mx.ones((1, 2, 6))
+    primary = mx.ones((1, 6), dtype=mx.bool_) if primary_present else None
+    a = prepare_audio_case(
+        ids,
+        features,
+        primary,
+        model_type="qwen3_omni_moe",
+        extra_inputs={"feature_attention_mask": mx.array([[True] * 6])},
+    )
+    b = prepare_audio_case(
+        ids,
+        features,
+        primary,
+        model_type="qwen3_omni_moe",
+        extra_inputs={"feature_attention_mask": mx.array([[True] * 4 + [False] * 2])},
+    )
+    assert reused_tokens(ids, a[5], b[5], a[3], b[3]) == (12 if primary_present else 4)
