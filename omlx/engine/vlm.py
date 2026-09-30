@@ -594,6 +594,20 @@ def _resolve_optiq_vision_sidecar(model_dir: Path) -> Path | None:
     return sidecar
 
 
+_AUDIO_WEIGHT_PREFIXES = ("audio_tower.", "embed_audio.", "audio_encoder.")
+
+
+def _is_audio_weight_key(key: str) -> bool:
+    """True for audio encoder weights under MLX or HF naming.
+
+    HF-named checkpoints keep a leading `model.` (`model.audio_tower.*`) that
+    mlx-vlm's sanitize strips only at load time.
+    """
+    if key.startswith("model."):
+        key = key[len("model.") :]
+    return key.startswith(_AUDIO_WEIGHT_PREFIXES)
+
+
 def _has_audio_weights(model_dir: Path) -> bool:
     """Return True iff checkpoint shards or MiMo's sidecar contain audio weights."""
     import safetensors
@@ -610,9 +624,8 @@ def _has_audio_weights(model_dir: Path) -> bool:
         try:
             with safetensors.safe_open(str(sf), framework="np") as f:
                 # safetensors.safe_open exposes keys() but is not a Mapping.
-                for k in f.keys():  # noqa: SIM118
-                    if k.startswith(("audio_tower.", "embed_audio.", "audio_encoder.")):
-                        return True
+                if any(_is_audio_weight_key(k) for k in f.keys()):  # noqa: SIM118
+                    return True
         except Exception:
             # Corrupt or unreadable shard — treat as no audio info, let
             # downstream loader produce its own error.
