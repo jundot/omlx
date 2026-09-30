@@ -226,6 +226,45 @@ class TestUtilsPatch:
         assert model.args.use_native_ratio128_attention is expected_enabled
         assert loaded_config["use_native_ratio128_attention"] is expected_enabled
 
+    @pytest.mark.parametrize(
+        ("model_type", "delegated"),
+        (("llama", True), ("deepseek_v4", False)),
+    )
+    def test_only_deepseek_v4_uses_replacement_body(
+        self, tmp_path, monkeypatch, model_type, delegated
+    ):
+        import mlx.nn as nn
+        import mlx_lm.utils as utils_mod
+
+        from omlx.patches.deepseek_v4 import utils_patch
+
+        calls = []
+
+        def original(model_path, **kwargs):
+            calls.append(model_path)
+            return "original", {}
+
+        monkeypatch.setattr(utils_mod, "load_model", original)
+        patched = utils_patch._build_patched_load_model()
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+
+        class CapturingModel(nn.Module):
+            def __init__(self, args):
+                super().__init__()
+
+        result = patched(
+            tmp_path,
+            strict=False,
+            lazy=True,
+            get_model_classes=lambda config: (
+                CapturingModel,
+                SimpleNamespace(from_dict=lambda c: None),
+            ),
+        )
+
+        assert (calls == [tmp_path]) is delegated
+        assert (result[0] == "original") is delegated
+
 
 class TestBatchCacheConversion:
     """Model-owned caches retain batch conversion with upstream cache creation."""

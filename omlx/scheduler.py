@@ -375,7 +375,10 @@ class _StoreCacheGate:
 # Import tiered cache components
 try:
     from .cache.boundary_snapshot_store import BoundarySnapshotSSDStore
-    from .cache.paged_ssd_cache import PagedSSDCacheManager
+    from .cache.paged_ssd_cache import (
+        PagedSSDCacheManager,
+        numerics_revision_for_model,
+    )
     from .memory_monitor import (
         MemoryMonitor,
         collect_kv_layer_specs,
@@ -387,6 +390,7 @@ try:
     HAS_TIERED_CACHE = True
 except ImportError:
     PagedSSDCacheManager = None
+    numerics_revision_for_model = None
     BoundarySnapshotSSDStore = None
     MemoryMonitor = None
     collect_kv_layer_specs = None
@@ -625,11 +629,12 @@ def _row_drifted(current_lps, expected_lps) -> bool:
     Two distinct empty lists are equivalent — the #1799 normalisation mints
     fresh ``[]`` objects every step — so only differing content counts. The
     caller's identity check is the steady-state fast path; this only runs
-    past it.
+    past it. mlx-lm stores each row as a tuple while the registry keeps a
+    list, so compare contents rather than container types.
     """
     if not current_lps and not expected_lps:
         return False
-    return current_lps != expected_lps
+    return tuple(current_lps) != tuple(expected_lps)
 
 
 def _log_drift_correction(uids, slot_count) -> None:
@@ -14352,6 +14357,7 @@ class Scheduler:
                     layer_cache_types,
                     turboquant_kv_bits=turboquant_kv_bits,
                     cachelist_subtypes=cachelist_subtypes,
+                    numerics=numerics_revision_for_model(self.model),
                 )
             else:
                 manager.adopt_layer_signature_if_unset(layer_cache_types)

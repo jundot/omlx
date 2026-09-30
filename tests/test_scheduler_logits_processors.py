@@ -1034,6 +1034,47 @@ class TestRowRealignment:
         ]
         assert realign_levels == [logging.WARNING, logging.DEBUG]
 
+    def test_tuple_row_matching_registry_list_is_not_drift(self, monkeypatch, caplog):
+        """mlx-lm stores each row as a tuple; the registry keeps a list."""
+        import logging
+        from collections import OrderedDict
+
+        import omlx.scheduler as scheduler
+
+        monkeypatch.setattr(scheduler, "_uid_row_registry", OrderedDict())
+        monkeypatch.setattr(scheduler, "_uid_row_drift_last_warning", float("-inf"))
+        monkeypatch.setattr(
+            scheduler, "_original_generation_batch_step", lambda self: "stepped"
+        )
+
+        def penalty_processor(token_context, logits):
+            return logits
+
+        class FakeModel:
+            pass
+
+        class FakeBatch:
+            pass
+
+        sampler = object()
+        batch = FakeBatch()
+        batch.model = FakeModel()
+        batch.uids = [1]
+        batch.logits_processors = [(penalty_processor,)]
+        batch.samplers = [sampler]
+        batch._next_tokens = None
+        scheduler._register_uid_rows(batch.model, [1], [sampler], [[penalty_processor]])
+
+        with caplog.at_level(logging.DEBUG, logger=scheduler.logger.name):
+            scheduler._patched_generation_batch_step(batch)
+
+        assert not [
+            record
+            for record in caplog.records
+            if "Realigned generation-batch row state" in record.getMessage()
+        ]
+
+
 
 class TestRegistryCleanupPaths:
     """Every path that retires a uid — or the whole generator — must release

@@ -6,7 +6,9 @@ from __future__ import annotations
 import contextlib
 import copy
 import gc
+import importlib.util
 import json
+import sys
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -2404,6 +2406,53 @@ class TestMTPPatchSelfHealing:
             "__call__ should carry the MTP marker after re-apply, "
             f"got {current_call!r}"
         )
+
+
+def _fresh_qwen35_module(monkeypatch, name):
+    """Execute a private copy of mlx-lm's qwen3_5 so class patches stay local."""
+    import mlx_lm.models.qwen3_5 as qwen35
+
+    qualname = f"mlx_lm.models.{name}"
+    spec = importlib.util.spec_from_file_location(qualname, qwen35.__file__)
+    module = importlib.util.module_from_spec(spec)
+    module.__package__ = "mlx_lm.models"
+    monkeypatch.setitem(sys.modules, qualname, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_gated_delta_net_body_matches_stock_qk_norm(monkeypatch):
+    """The MTP body must normalize q/k like the stock body it replaces."""
+    from omlx.patches.mlx_lm_mtp import qwen35_model
+
+    stock = _fresh_qwen35_module(monkeypatch, "_omlx_test_qwen35_stock")
+    patched = _fresh_qwen35_module(monkeypatch, "_omlx_test_qwen35_mtp")
+    qwen35_model._patch_gated_delta_net(patched)
+
+    args = stock.TextModelArgs(
+        model_type="qwen3_5",
+        hidden_size=128,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=64,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=512,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=64,
+        linear_value_head_dim=64,
+        linear_conv_kernel_dim=4,
+    )
+    ref = stock.GatedDeltaNet(args)
+    # Tiny k rows make the l2norm eps visible in the output.
+    rows = mx.arange(ref.in_proj_qkv.weight.shape[0])
+    k_scale = mx.where((rows >= ref.key_dim) & (rows < 2 * ref.key_dim), 1e-3, 1.0)
+    ref.in_proj_qkv.weight = ref.in_proj_qkv.weight * k_scale[:, None]
+    gdn = patched.GatedDeltaNet(args)
+    gdn.update(ref.parameters())
+
+    x = mx.random.normal((1, 8, 128), key=mx.random.key(0))
+    assert mx.allclose(gdn(x), ref(x), atol=1e-5).item()
 
 
 # ---------------------------------------------------------------------------
