@@ -157,7 +157,7 @@
   "status.claude_code.command": "Команда",
   "status.claude_code.copy_command_tooltip": "Копировать команду",
   "status.claude_code.desktop": "Claude Desktop",
-  "status.claude_code.desktop_hint": "Предоставляет claude-opus-5 / claude-sonnet-5 / claude-haiku-4-5-20251001 как псевдонимы моделей уровней выше",
+  "status.claude_code.desktop_hint": "Предоставляет claude-opus / claude-sonnet / claude-haiku как псевдонимы моделей уровней выше",
   "status.claude_code.desktop_configured": "Настроено",
   "status.claude_code.desktop_not_configured": "Не настроено",
   "status.claude_code.desktop_side_effect": "Включение записывает конфигурацию Claude Desktop (только macOS)",

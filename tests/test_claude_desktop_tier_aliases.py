@@ -5,9 +5,9 @@ When ``ClaudeCodeSettings.desktop_enabled`` is set, oMLX exposes three
 derived (non-persisted) slot IDs that resolve at runtime to the models
 configured in the Claude Code tiers:
 
-- ``claude-opus-5`` -> ``claude_code.opus_model`` (family ``opus``)
-- ``claude-sonnet-5`` -> ``claude_code.sonnet_model`` (family ``sonnet``)
-- ``claude-haiku-4-5-20251001`` -> ``claude_code.haiku_model`` (family ``haiku``)
+- ``claude-opus`` -> ``claude_code.opus_model`` (family ``opus``)
+- ``claude-sonnet`` -> ``claude_code.sonnet_model`` (family ``sonnet``)
+- ``claude-haiku`` -> ``claude_code.haiku_model`` (family ``haiku``)
 """
 
 from __future__ import annotations
@@ -21,9 +21,9 @@ from omlx.engine_pool import build_claude_tier_aliases
 from omlx.model_settings import ModelSettings, ModelSettingsManager
 from omlx.settings import ClaudeCodeSettings, GlobalSettings
 
-OPUS_SLOT = "claude-opus-5"
-SONNET_SLOT = "claude-sonnet-5"
-HAIKU_SLOT = "claude-haiku-4-5-20251001"
+OPUS_SLOT = "claude-opus"
+SONNET_SLOT = "claude-sonnet"
+HAIKU_SLOT = "claude-haiku"
 
 
 def _claude_settings(**kwargs) -> ClaudeCodeSettings:
@@ -247,7 +247,7 @@ class TestListModelsTierAliases:
         # The physical model keeps its ID; no tier entry shadows it.
         assert by_id[SONNET_SLOT].get("display_name") != "sonnet-phys"
         assert OPUS_SLOT in by_id
-        assert any("claude-sonnet-5" in r.message for r in caplog.records)
+        assert any("claude-sonnet" in r.message for r in caplog.records)
 
     def test_collision_with_custom_alias_skipped(self, tmp_path, caplog):
         models = [_model("opus-phys"), _model("sonnet-phys"), _model("other")]

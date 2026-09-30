@@ -157,7 +157,7 @@
   "status.claude_code.command": "Commande",
   "status.claude_code.copy_command_tooltip": "Copier la commande",
   "status.claude_code.desktop": "Claude Desktop",
-  "status.claude_code.desktop_hint": "Expose claude-opus-5 / claude-sonnet-5 / claude-haiku-4-5-20251001 comme alias des modèles de niveau ci-dessus",
+  "status.claude_code.desktop_hint": "Expose claude-opus / claude-sonnet / claude-haiku comme alias des modèles de niveau ci-dessus",
   "status.claude_code.desktop_configured": "Configuré",
   "status.claude_code.desktop_not_configured": "Non configuré",
   "status.claude_code.desktop_side_effect": "L'activation écrit la configuration de Claude Desktop (macOS uniquement)",

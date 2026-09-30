@@ -97,16 +97,16 @@ _GPU_KEEP_WARM_IDLE_WINDOW_S = 300.0
 # Claude Code settings object (``opus_model`` / ``sonnet_model`` /
 # ``haiku_model``).
 CLAUDE_DESKTOP_TIER_SLOTS: tuple[tuple[str, str], ...] = (
-    ("claude-opus-5", "opus"),
-    ("claude-sonnet-5", "sonnet"),
-    ("claude-haiku-4-5-20251001", "haiku"),
+    ("claude-opus", "opus"),
+    ("claude-sonnet", "sonnet"),
+    ("claude-haiku", "haiku"),
 )
 
 # Anthropic family tier label exposed per slot in /v1/models metadata.
 CLAUDE_DESKTOP_TIER_FAMILY: dict[str, str] = {
-    "claude-opus-5": "opus",
-    "claude-sonnet-5": "sonnet",
-    "claude-haiku-4-5-20251001": "haiku",
+    "claude-opus": "opus",
+    "claude-sonnet": "sonnet",
+    "claude-haiku": "haiku",
 }
 
 

@@ -157,7 +157,7 @@
   "status.claude_code.command": "コマンド",
   "status.claude_code.copy_command_tooltip": "コマンドをコピー",
   "status.claude_code.desktop": "Claude Desktop",
-  "status.claude_code.desktop_hint": "claude-opus-5 / claude-sonnet-5 / claude-haiku-4-5-20251001 を上記ティアモデルのエイリアスとして公開する",
+  "status.claude_code.desktop_hint": "claude-opus / claude-sonnet / claude-haiku を上記ティアモデルのエイリアスとして公開する",
   "status.claude_code.desktop_configured": "設定済み",
   "status.claude_code.desktop_not_configured": "未設定",
   "status.claude_code.desktop_side_effect": "有効化すると Claude Desktop の設定が書き込まれます（macOS のみ）",

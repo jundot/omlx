@@ -2027,8 +2027,8 @@ def get_model_settings_for_request(model_id: str | None):
 def get_claude_tier_aliases() -> dict[str, str]:
     """Return derived Claude Desktop tier aliases from global settings.
 
-    Each entry maps a public slot ID (``claude-opus-5`` /
-    ``claude-sonnet-5`` / ``claude-haiku-4-5-20251001``) to the model
+    Each entry maps a public slot ID (``claude-opus`` /
+    ``claude-sonnet`` / ``claude-haiku``) to the model
     configured in the matching Claude Code tier. Returns an empty dict
     when Claude Desktop exposure is disabled (the default) or no tier is
     configured.

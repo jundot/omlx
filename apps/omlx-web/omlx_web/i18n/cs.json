@@ -157,7 +157,7 @@
   "status.claude_code.command": "Příkaz",
   "status.claude_code.copy_command_tooltip": "Kopírovat příkaz",
   "status.claude_code.desktop": "Claude Desktop",
-  "status.claude_code.desktop_hint": "Zobrazit claude-opus-5 / claude-sonnet-5 / claude-haiku-4-5-20251001 jako aliasy výše uvedených modelů úrovní",
+  "status.claude_code.desktop_hint": "Zobrazit claude-opus / claude-sonnet / claude-haiku jako aliasy výše uvedených modelů úrovní",
   "status.claude_code.desktop_configured": "Nastaveno",
   "status.claude_code.desktop_not_configured": "Nenastaveno",
   "status.claude_code.desktop_side_effect": "Zapnutím se zapíše konfigurace Claude Desktop (pouze macOS)",

@@ -913,7 +913,7 @@ class ClaudeCodeSettings:
     sonnet_model: str | None = None
     haiku_model: str | None = None
     # When True, oMLX exposes derived Claude Desktop tier aliases
-    # (claude-opus-5 / claude-sonnet-5 / claude-haiku-4-5-20251001)
+    # (claude-opus / claude-sonnet / claude-haiku)
     # that resolve at runtime to the configured tier models.
     desktop_enabled: bool = False
 
