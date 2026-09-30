@@ -6891,9 +6891,7 @@ class Scheduler:
         # thinking close into them can leave every logit masked to -inf. Only
         # grammars compiled with a separate reasoning phase can use a budget.
         grammar_allows_thinking = sampling_params.compiled_grammar is None or (
-            getattr(
-                sampling_params.compiled_grammar, "_omlx_has_thinking_phase", False
-            )
+            getattr(sampling_params.compiled_grammar, "_omlx_has_thinking_phase", False)
             is True
         )
         if (
