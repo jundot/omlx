@@ -289,3 +289,68 @@ def test_top_k_indices_matches_full_sort(vocab, top_k):
     expected = mx.sort(mx.argsort(-values, axis=-1)[:, :top_k], axis=-1)
     actual = mx.sort(top_k_indices(values, top_k), axis=-1)
     assert mx.array_equal(expected, actual).item()
+
+
+def _flat_logprobs(vocab: int, dtype) -> mx.array:
+    """A near-uniform row with one clear winner: every logprob is about -log(V)."""
+    mx.random.seed(0)
+    logits = mx.random.normal((1, vocab)) * 0.05
+    logits[0, 7] += 1.5
+    lp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    return lp.astype(dtype)
+
+
+@pytest.mark.parametrize("temp", [1e-4, 2e-5])
+def test_float16_small_temperature_samples_the_top_token(temp):
+    """float16 logprobs / temp overflows to -inf across the whole row here."""
+    from omlx.patches.mlx_lm_mtp.batch_generator import _accept_lp_for
+
+    lp = _flat_logprobs(50000, mx.float16)
+    sampler = make_sampler(temp=temp)
+    tokens = [sampler(lp).item() for _ in range(8)]
+    assert tokens == [7] * 8
+    token, density = sampler.sample_with_logprobs(lp)
+    assert token.item() == 7
+    assert mx.isfinite(density[0, 7]).item()
+    assert mx.isfinite(_accept_lp_for(sampler, lp)[0, 7]).item()
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_temperature_scaling_keeps_non_float16_dtype(dtype):
+    lp = _flat_logprobs(1000, dtype)
+    assert make_sampler(temp=0.7)._mtp_sampling_logits(lp).dtype == dtype
+
+
+@pytest.mark.parametrize("temp", [1e-39, 1e-7])
+def test_near_zero_temperature_is_greedy(temp):
+    """1 / 1e-39 overflows float32; below 1e-5 sampling is argmax anyway."""
+    lp = _flat_logprobs(50000, mx.float32)
+    sampler = make_sampler(temp=temp, top_p=0.9)
+    assert sampler.temp == 0.0
+    assert not hasattr(sampler, "sample_with_logprobs")
+    assert [sampler(lp).item() for _ in range(4)] == [7] * 4
+
+
+def test_top_p_mass_is_accumulated_in_float32():
+    """A bfloat16 running sum stops growing long before it reaches the nucleus."""
+    mx.random.seed(0)
+    logits = mx.random.normal((1, 151936)) * 2.0
+    lp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    kept_f32 = (apply_top_p(lp, 0.9) > -float("inf")).sum().item()
+    out = apply_top_p(lp.astype(mx.bfloat16), 0.9)
+    kept_bf16 = (out > -float("inf")).sum().item()
+    assert out.dtype == mx.bfloat16
+    assert abs(kept_bf16 - kept_f32) <= 0.01 * kept_f32
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("top_p", [1e-8, 1e-6])
+def test_tiny_top_p_keeps_the_most_likely_token(dtype, top_p):
+    """1 - top_p is at or above the float32 total here, so nothing passed."""
+    lp = _flat_logprobs(50000, dtype)
+    out = apply_top_p(lp, top_p)
+    assert out[0, 7].item() == lp[0, 7].item()
+    if dtype == mx.float32:
+        assert (out > -float("inf")).sum().item() == 1
+        sampler = make_sampler(temp=1.0, top_p=top_p)
+        assert [sampler(lp).item() for _ in range(4)] == [7] * 4

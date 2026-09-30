@@ -24,8 +24,11 @@ import mlx.core as mx
 
 def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
     """Top-p (nucleus) filtering — keep the smallest set of tokens whose
-    cumulative probability mass is at least ``top_p``."""
-    probs = mx.exp(logprobs)
+    cumulative probability mass is at least ``top_p``. The most likely token
+    is always kept."""
+    # Sum in float32: a bfloat16 running sum over a large vocabulary stops
+    # growing once each new term is below its rounding step.
+    probs = mx.exp(logprobs.astype(mx.float32))
     sorted_indices = mx.argsort(logprobs, axis=-1)
     sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
 
@@ -39,11 +42,11 @@ def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
     )
     cumulative_probs = mx.take_along_axis(cumulative_probs, inverse_indices, axis=-1)
 
-    return mx.where(
-        cumulative_probs > 1 - top_p,
-        logprobs,
-        -float("inf"),
-    )
+    # With a tiny top_p, 1 - top_p rounds to (or above) the float32 total, so
+    # no token passes the threshold. Keep the most likely one regardless.
+    keep = cumulative_probs > 1 - top_p
+    keep = keep | (logprobs == mx.max(logprobs, axis=-1, keepdims=True))
+    return mx.where(keep, logprobs, -float("inf"))
 
 
 def apply_min_p(
@@ -168,10 +171,28 @@ def apply_xtc(
     )
 
 
+# Below this temperature, sampling is argmax in practice: a 1e-3 logprob gap
+# already becomes a factor of e^100. make_sampler treats these as greedy, which
+# also keeps 1 / temp finite.
+_MIN_SAMPLING_TEMP = 1e-5
+
+
+def scale_by_temperature(logits: mx.array, temp: float) -> mx.array:
+    """Return ``logits / temp``, scaling float16 input in float32.
+
+    float16 tops out at 65504, so a small temperature turns every entry of a
+    flat row into -inf and the draw is no longer from the requested
+    distribution. Other dtypes are kept so seeded draws do not move.
+    """
+    if logits.dtype == mx.float16:
+        logits = logits.astype(mx.float32)
+    return logits * (1 / temp)
+
+
 def categorical_sampling(logits: mx.array, temp: float) -> mx.array:
     """Sample a token id from the categorical distribution defined by
     ``logits / temp``. RNG state is advanced through ``mx.random.categorical``."""
-    return mx.random.categorical(logits * (1 / temp))
+    return mx.random.categorical(scale_by_temperature(logits, temp))
 
 
 def make_sampler(
@@ -186,9 +207,12 @@ def make_sampler(
 ) -> Callable[[mx.array], mx.array]:
     """Build a sampler callable matching ``mlx_lm.sample_utils.make_sampler``.
 
-    Returns ``argmax`` when ``temp == 0``; otherwise composes optional
-    top-p / min-p / xtc / top-k filters and finishes with categorical sampling.
+    Returns ``argmax`` when ``temp == 0`` (or below ``_MIN_SAMPLING_TEMP``);
+    otherwise composes optional top-p / min-p / xtc / top-k filters and
+    finishes with categorical sampling.
     """
+    if 0 < temp < _MIN_SAMPLING_TEMP:
+        temp = 0.0
     if temp == 0:
         sampler = lambda x: mx.argmax(x, axis=-1)
     else:
@@ -221,7 +245,7 @@ def make_sampler(
         def sampling_logits(logprobs: mx.array):
             for method in sampling_methods:
                 logprobs = method(logprobs)
-            return logprobs * (1 / temp)
+            return scale_by_temperature(logprobs, temp)
 
         def sample_with_logprobs(logprobs: mx.array, *, rowwise: bool = False):
             # Draft sampling and its acceptance density share the same filters.

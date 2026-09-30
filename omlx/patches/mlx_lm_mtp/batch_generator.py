@@ -1631,6 +1631,7 @@ def _accept_lp_for(sampler, lp):
         apply_top_k,
         apply_top_p,
         apply_top_p_top_k,
+        scale_by_temperature,
     )
 
     temp = float(getattr(sampler, "temp", 0.0) or 0.0)
@@ -1655,7 +1656,7 @@ def _accept_lp_for(sampler, lp):
 
     # Temperature scale + renormalize so the output is a proper logprob
     # distribution that can be indexed by token id for the acceptance check.
-    scaled = (out * (1.0 / temp)).astype(mx.float32)
+    scaled = scale_by_temperature(out, temp).astype(mx.float32)
     return scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
 
 
