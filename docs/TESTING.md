@@ -76,6 +76,8 @@ Run `python -m pytest -q tests/test_qwen4_verify_attention_rows.py` to check tha
 
 # Prefill memory accounting tests
 
+`python -m pytest -q tests/test_preflight_post_eviction.py tests/test_engine_preflight.py` checks route admission after eviction or reclaim. Both batched wrappers must refresh their cached MLX sample on the owning executor, including when the pool reports that no action was necessary. Controlled memory readings cover newly available headroom, insufficient headroom, and requests that already fit without executor work.
+
 Run `python -m pytest -q tests/test_prefill_transient_tracker.py tests/test_prefill_oom_graceful.py` to check retained versus reclaimed overhead, configured chunk sizes, and abort-cap enforcement. The loop tests run a small initialized MLX model with controlled footprint readings through external and chunked prefill; they do not load a checkpoint.
 
 # Prefix cache completion tests
