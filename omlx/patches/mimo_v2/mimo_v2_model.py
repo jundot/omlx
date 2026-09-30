@@ -2,6 +2,7 @@
 # ruff: noqa
 # Copyright © 2026 Apple Inc.
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -30,6 +31,8 @@ from omlx.patches.mimo_v2.fused_qkv_layout import (
     layer_head_geometry,
     split_fused_qkv,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -613,6 +616,23 @@ class Model(nn.Module):
             return None if tensor is None else tensor.shape
 
         TP = detect_fused_qkv_tp(self.args, shape_of)
+        n_mtp = int(self.args.num_nextn_predict_layers or 0)
+        mtp_tp = TP
+        main_fused = any(
+            fused_qkv_keys(i)[1] in weights for i in range(self.args.num_hidden_layers)
+        )
+        sidecar_fused = any(
+            f"model.mtp.layers.{i}.self_attn.qkv_proj.weight_scale_inv" in weights
+            for i in range(n_mtp)
+        )
+        if sidecar_fused and not main_fused:
+            # Sliding-window qkv shapes fit every TP degree, so the split main
+            # layers leave nothing to detect; Xiaomi's releases use TP=4.
+            mtp_tp = 4
+            logger.info(
+                "MiMo MTP sidecar: the main layers are already split; assuming "
+                "the official TP=4 fused qkv layout"
+            )
 
         def dequant_block(weight, scale_inv):
             weight = mx.from_fp8(weight, dtype=bf16)
@@ -646,7 +666,7 @@ class Model(nn.Module):
             weights[f"{prefix}.k_proj.weight"] = k
             weights[f"{prefix}.v_proj.weight"] = v
 
-        for layer_idx in range(int(self.args.num_nextn_predict_layers or 0)):
+        for layer_idx in range(n_mtp):
             prefix = f"model.mtp.layers.{layer_idx}.self_attn"
             qkv_prefix = f"{prefix}.qkv_proj"
             qkv_key = f"{qkv_prefix}.weight"
@@ -655,7 +675,7 @@ class Model(nn.Module):
                 q, k, v = split_fused_qkv(
                     weights.pop(qkv_key),
                     weights.pop(scale_key),
-                    tp=TP,
+                    tp=mtp_tp,
                     n_h=self.args.swa_num_attention_heads,
                     n_kv=self.args.swa_num_key_value_heads,
                     hd=self.args.swa_head_dim,

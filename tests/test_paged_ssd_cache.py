@@ -32,6 +32,7 @@ from omlx.cache.paged_ssd_cache import (
     _restore_tensor_from_bytes,
     _signature_turboquant_bits,
     _write_safetensors_no_mx,
+    numerics_revision_for_model,
     parse_size,
 )
 
@@ -4331,6 +4332,91 @@ class TestLayerSignatureSweep:
         # Same call signature — already set, returns False, flag stays.
         assert mgr.adopt_layer_signature_if_unset(["ArraysCache", "KVCache"]) is False
         assert mgr._signature_sweep_completed is True
+
+
+class TestNumericsSignature:
+    """Blocks computed before a model's numerics changed must not be reused.
+
+    mlx-lm's Qwen3.5 GDN q/k norm eps changed with the 94cdcae pin, so KV and
+    GDN state saved earlier by the mlx-lm path diverge from a fresh prefill.
+    """
+
+    HYBRID = ["ArraysCache", "KVCache", "ArraysCache", "KVCache"]
+    REVISION = "gdn-qk-norm-2"
+
+    def _make_meta(self, *, block_hash: bytes, numerics: str | None):
+        now = time.time()
+        return PagedSSDBlockMetadata(
+            block_hash=block_hash,
+            file_path=Path("/tmp/never-touched.safetensors"),
+            file_size=1024,
+            token_count=2048,
+            created_at=now,
+            last_access=now,
+            num_layers=4,
+            model_name="test-model",
+            block_size=2048,
+            layer_cache_types=self.HYBRID,
+            cache_signature=_cache_compat_signature(
+                model_name="test-model",
+                num_layers=4,
+                block_size=2048,
+                layer_cache_types=self.HYBRID,
+                numerics=numerics,
+            ),
+        )
+
+    def _make_manager(self, tmp_path: Path, numerics: str | None):
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1 << 30,
+            expected_model_name="test-model",
+            expected_num_layers=4,
+            expected_block_size=2048,
+        )
+        manager.set_expected_layer_signature(self.HYBRID, numerics=numerics)
+        return manager
+
+    def test_revision_follows_the_live_model_modules(self):
+        nn = pytest.importorskip("mlx.nn")
+        qwen35 = pytest.importorskip("mlx_lm.models.qwen3_5")
+        args = qwen35.TextModelArgs(
+            model_type="qwen3_5",
+            hidden_size=64,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=32,
+            rms_norm_eps=1e-6,
+            max_position_embeddings=128,
+            linear_num_value_heads=2,
+            linear_num_key_heads=1,
+            linear_key_head_dim=32,
+            linear_value_head_dim=32,
+            linear_conv_kernel_dim=4,
+        )
+
+        assert numerics_revision_for_model(qwen35.GatedDeltaNet(args)) == (
+            self.REVISION
+        )
+        assert numerics_revision_for_model(nn.Linear(4, 4)) is None
+
+    def test_sweep_drops_blocks_from_other_numerics(self, tmp_path: Path):
+        mgr = self._make_manager(tmp_path, self.REVISION)
+        mgr._index.add(self._make_meta(block_hash=b"21" * 10, numerics=None))
+        mgr._index.add(self._make_meta(block_hash=b"22" * 10, numerics=self.REVISION))
+
+        assert mgr.invalidate_stale_layer_signature() == 1
+        assert mgr._index.get(b"21" * 10) is None
+        assert mgr._index.get(b"22" * 10) is not None
+        assert mgr.signature_mismatch_reason("") is not None
+
+    def test_unaffected_models_keep_every_block(self, tmp_path: Path):
+        mgr = self._make_manager(tmp_path, None)
+        mgr._index.add(self._make_meta(block_hash=b"23" * 10, numerics=None))
+
+        assert mgr.invalidate_stale_layer_signature() == 0
+        assert mgr._index.get(b"23" * 10) is not None
+        assert "numerics" not in json.loads(mgr._expected_cache_signature())
 
 
 class TestTurboquantBitsSignature:

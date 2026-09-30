@@ -1,4 +1,9 @@
 {
+  "cluster.v2.device.ssh_user": "SSH username",
+  "cluster.v2.device.ssh_user_help": "Enter the remote computer’s account short name. Leave blank to use the enrolled login or SSH configuration.",
+  "cluster.v2.device.ssh_user_save": "Save SSH username",
+  "cluster.v2.device.ssh_user_saved": "SSH username saved. Run the checks again.",
+  "cluster.v2.device.ssh_user_error": "Could not save SSH username.",
   "app.title": "oMLX Admin",
   "app.tagline": "LLM inference, optimized for your Mac",
   "login.title_login": "Login - oMLX Admin",
@@ -157,6 +162,7 @@
   "status.active_models.last_token_ago": "last token {age} ago",
   "status.integrations.claude_code": "Claude Code",
   "status.integrations.copilot_cli": "Copilot CLI",
+  "status.integrations.dsh": "DeepSeek Harness",
   "status.integrations.hermes_agent": "Hermes Agent",
   "status.active_models.idle": "idle",
   "status.active_models.pressure_label": "{current} / {soft} soft / {hard} hard",

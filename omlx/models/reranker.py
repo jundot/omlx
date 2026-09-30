@@ -30,6 +30,7 @@ from ..patches.modernbert_attention import patch_modernbert_attention
 from ..patches.qwen3_sliding_window import apply_qwen3_sliding_window_patch
 from ..utils.image import load_image
 from .mlx_embeddings_compat import (
+    patch_qwen3_vl_position_ids_recompute,
     patch_qwen3_vl_processor_for_torch_free_image_loading,
 )
 
@@ -240,6 +241,7 @@ class MLXRerankerModel:
         embedder is decided by the input dict shape at inference time.
         """
         patch_qwen3_vl_processor_for_torch_free_image_loading()
+        patch_qwen3_vl_position_ids_recompute()
         from mlx_embeddings import load as mlx_emb_load
 
         return mlx_emb_load(
@@ -826,6 +828,7 @@ class MLXRerankerModel:
             else:
                 # Use mlx-embeddings for other architectures (ModernBert, etc.)
                 patch_qwen3_vl_processor_for_torch_free_image_loading()
+                patch_qwen3_vl_position_ids_recompute()
                 from mlx_embeddings import load
 
                 self.model, self.processor = load(

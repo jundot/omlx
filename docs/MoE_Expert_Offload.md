@@ -35,12 +35,13 @@ with a resident-fraction field accepting 5% to 95%, including fractional percent
 Toggling triggers an engine reload (it is a load-time transform). The env
 kill switch `OMLX_MOE_EXPERT_OFFLOAD=0` disables it regardless of settings.
 
-Two env vars tune the reader, and neither changes what is computed:
+Three env vars tune the read path, and none changes what is computed:
 
 | variable | default | effect |
 |---|---|---|
 | `OMLX_MOE_OFFLOAD_IO_WORKERS` | 12 | threads reading missing experts. `1` or less (or an unparseable value) keeps the serial path and starts no threads |
 | `OMLX_MOE_OFFLOAD_IO_BATCH` | `4 x workers` | experts whose reads may be in flight at once — the bound on the host memory the pipeline holds ahead of the slot writes |
+| `OMLX_MOE_OFFLOAD_OVERLAP` | 1 | in decode, when a step's reads are slow, keep the GPU busy while they finish: compute the resident routes, keep the GPU clocked for the rest of the read, and dispatch each layer's output as soon as it is built (needs the parallel reader). Steps whose reads arrive within 0.5 ms keep the serial order. `0` keeps the serial order for every step: read, then compute |
 
 ## Performance
 
@@ -81,6 +82,8 @@ L's compute), which has measured LRU→optimal headroom of +17pp hit rate at
 low residency.
 
 A call's misses are read in parallel with `os.pread` on a shared thread pool. `ensure()` schedules missing experts before the serial install loop. Slot writes, LRU updates, and hit/miss counters stay on the calling thread.
+
+In decode, a slow read no longer leaves the GPU idle. The routing readback classifies the step's routes and the missing experts' reads are issued as before. If the first of them has not arrived 0.5 ms later, the step overlaps: the resident routes' `gather_qmm` is dispatched while the reads continue, a trivial kernel keeps the GPU busy until they finish, the missing routes are gathered once they are installed, and the layer's output is dispatched as soon as it is built. Each route is computed once, by the same kernel as the serial gather (`gather_qmm` is per-row), so the output is bit-identical. The resident gather is evaluated before the first slot write, because a write into an array a pending gather still references copies the whole array. The resident gather is only a fraction of a millisecond of GPU time, while a slow step waits a few milliseconds on its reads, and Apple GPUs lower their clock after a couple of milliseconds idle, which slows the next layer's work as well; keeping the GPU busy through the wait is what pays. Reads that arrive within 0.5 ms (page cache, fast internal storage) keep the serial order: an idle gap that short barely lowers the clock, and splitting the gather would cost more than it hides. Measured on `Qwen3.8-Flash-Next-oQ4e` (`qwen4_exp`, 48 layers wrapped), experts on a USB4 SSD, M4 Air 32 GB, greedy, output byte-identical with and without the overlap: 480 tokens after a 480-token warm-up at 18.8% residency, 3.56 tok/s serial and 5.03 with the overlap (two runs each, the drive's throttle stalls excluded); replaying two coding-agent sessions request by request (1.6k to 6k-token prompts with tool calls), 2.94 to 3.70 tok/s at 18.8% residency and 2.64 to 2.61 at 12.5%, where each decode step waits on about three misses and the reads set the pace. Time to first token is unchanged: prefill does not take this path.
 
 ## Supported models
 

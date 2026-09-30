@@ -1076,6 +1076,61 @@ class TestUpdateGlobalSettingsEmbeddingBatchSize:
         assert gs.scheduler.embedding_batch_size == 32
 
 
+class TestUpdateGlobalSettingsMaxConcurrentRequests:
+    """update_global_settings: saving and hot-applying max concurrent requests."""
+
+    def _setup(self, validate_errors=()):
+        gs = MagicMock()
+        gs.scheduler = SimpleNamespace(
+            max_concurrent_requests=1,
+            embedding_batch_size=32,
+            chunked_prefill=False,
+        )
+        gs.validate.return_value = list(validate_errors)
+        gs.save.return_value = None
+        return gs, SimpleNamespace(apply_max_concurrent_requests=AsyncMock())
+
+    def _save(self, gs, pool, value):
+        request = GlobalSettingsRequest(max_concurrent_requests=value)
+        with (
+            _patched_global_settings(gs),
+            patch.object(
+                omlx.server, "_server_state", SimpleNamespace(engine_pool=pool)
+            ),
+        ):
+            return asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+    def test_saves_and_hot_applies_max_concurrent_requests(self):
+        gs, pool = self._setup()
+
+        result = self._save(gs, pool, 4)
+
+        assert "max_concurrent_requests" in result["runtime_applied"]
+        assert gs.scheduler.max_concurrent_requests == 4
+        pool.apply_max_concurrent_requests.assert_awaited_once_with(4)
+
+    def test_unchanged_value_is_not_hot_applied(self):
+        gs, pool = self._setup()
+
+        result = self._save(gs, pool, 1)
+
+        assert "max_concurrent_requests" not in result["runtime_applied"]
+        pool.apply_max_concurrent_requests.assert_not_awaited()
+
+    def test_does_not_hot_apply_when_validation_fails(self):
+        gs, pool = self._setup(validate_errors=["invalid max_concurrent_requests"])
+
+        with pytest.raises(HTTPException) as exc_info:
+            self._save(gs, pool, 0)
+
+        assert exc_info.value.status_code == 400
+        assert gs.scheduler.max_concurrent_requests == 1
+        pool.apply_max_concurrent_requests.assert_not_awaited()
+        gs.save.assert_not_called()
+
+
 class TestUpdateGlobalSettingsGdnSidecarStateDtype:
     """update_global_settings: GDN sidecar precision invariants.
 

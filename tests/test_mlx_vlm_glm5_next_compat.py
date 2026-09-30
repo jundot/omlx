@@ -3627,11 +3627,22 @@ def test_dsa_topk_rows_matches_native_topk(pool):
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
-def test_indexer_fast_selection_matches_general_path(monkeypatch):
+@pytest.mark.parametrize("native_topk", [True, False])
+def test_indexer_fast_selection_matches_general_path(monkeypatch, native_topk):
     """Where the general path scores decode rows with the NAX indexer, the
     fast selection takes the same scores."""
-    if not _native_indexer_available():
+    if native_topk and not _native_indexer_available():
         pytest.skip("GLM DSA native indexer extension is not built")
+    if not native_topk:
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        has_symbol = fast.has_symbol
+        monkeypatch.setattr(
+            fast,
+            "has_symbol",
+            lambda name: name != "dsa_topk_indices" and has_symbol(name),
+        )
+
     language = _language()
     nax_calls = []
     real_nax = language.indexer_scores_nax

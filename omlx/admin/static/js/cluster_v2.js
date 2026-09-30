@@ -57,6 +57,7 @@ function clusterV2Wizard() {
         manualDevice: '/api/cluster/devices/manual',
         unpair: (nodeId) =>
             `/api/cluster/devices/${encodeURIComponent(nodeId)}`,
+        sshUser: (nodeId) => `/api/cluster/devices/${encodeURIComponent(nodeId)}/ssh-user`,
         models: '/admin/api/cluster/models',
         catalogue: '/admin/api/cluster/catalogue',
         peerProbe: '/admin/api/cluster/peer-probe',
@@ -178,6 +179,8 @@ function clusterV2Wizard() {
     return {
         // ---- snapshot state -------------------------------------------------
         devicesPayload: null,
+        sshUserDrafts: {},
+        sshUserSaving: {},
         devicesLoaded: false,
         devicesError: '',
         devicesFailureCount: 0,
@@ -1663,27 +1666,58 @@ function clusterV2Wizard() {
             this.checks.ranAt = Date.now();
         },
 
+        async saveSSHUser(device) {
+            const nodeId = device.node_id;
+            if (this.sshUserSaving[nodeId]) return;
+            const value = String(this.sshUserDrafts[nodeId] ?? device.ssh_user ?? '').trim();
+            this.sshUserSaving = {...this.sshUserSaving, [nodeId]: true};
+            try {
+                const saved = await this.apiFetch(CLUSTER_V2_API.sshUser(nodeId), {
+                    method: 'PUT',
+                    body: JSON.stringify({ssh_user: value || null}),
+                });
+                device.ssh_user = saved.ssh_user;
+                this.sshUserDrafts = {...this.sshUserDrafts, [nodeId]: value};
+                // A plan and its probes are tied to the previous SSH identity.
+                ++this.planRequestRevision;
+                this.plan = null;
+                this.planProposal = null;
+                this.checks.probes = {};
+                this.checks.benchmark = null;
+                this.checks.started = false;
+                await this.refreshDevices();
+                this.notify('success', window.t('cluster.v2.device.ssh_user_saved'));
+            } catch (error) {
+                this.notify('error', error?.message || window.t('cluster.v2.device.ssh_user_error'));
+            } finally {
+                this.sshUserSaving = {...this.sshUserSaving, [nodeId]: false};
+            }
+        },
+
         sshTargetFor(device) {
+            const enrolled = String(device?.ssh_target || '');
+            const separator = enrolled.lastIndexOf('@');
+            const user = device?.ssh_user || (separator > 0 ? enrolled.slice(0, separator) : '');
+            const withUser = (target) => user
+                ? `${user}@${String(target).replace(/^[^@]+@/, '')}`
+                : String(target);
             const addrs = Array.isArray(device?.addrs) ? device.addrs : [];
             // A bare fe80:: link-local address has no scope id here, so SSH
             // to it has no route — prefer any routable address first.
             const usable = addrs.filter(
                 (addr) => addr && addr.ip && !String(addr.ip).startsWith('fe80::'),
             );
-            // Pairing pins every address. Prefer the first verified address,
-            // retaining an explicit login from enrollment when one exists.
+            // Pairing pins every address. Select a verified address before
+            // falling back to the enrolled target, keeping the same login.
             const verified = usable.find(
-                (addr) => device?.address_health?.[addr.ip]?.state === 'verified',
+                // The shared SSH policy forces AddressFamily=inet.
+                (addr) => !String(addr.ip).includes(':')
+                    && device?.address_health?.[addr.ip]?.state === 'verified',
             );
-            if (verified) {
-                const target = String(device?.ssh_target || '');
-                const login = target.slice(0, target.lastIndexOf('@') + 1);
-                return `${login}${verified.ip}`;
-            }
-            if (device?.preferred_ssh_target) return String(device.preferred_ssh_target);
-            if (device?.ssh_target) return String(device.ssh_target);
+            if (verified) return withUser(verified.ip);
+            if (device?.ssh_target) return withUser(device.ssh_target);
             const first = usable[0] || addrs.find((addr) => addr && addr.ip);
-            return first ? String(first.ip) : this.deviceName(device);
+            return withUser(first ? first.ip : this.deviceName(device));
         },
 
         async probePeer(peer) {

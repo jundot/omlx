@@ -19,7 +19,6 @@ import mlx.core as mx
 import numpy as np
 
 from ..engine_core import get_mlx_executor
-from ..patches.mlx_audio_sampling import ensure_uncompiled_tts_samplers
 from .audio_utils import DEFAULT_SAMPLE_RATE as _DEFAULT_SAMPLE_RATE
 from .audio_utils import audio_to_wav_bytes as _audio_to_wav_bytes
 from .base import BaseNonStreamingEngine
@@ -107,10 +106,6 @@ class TTSEngine(BaseNonStreamingEngine):
             return
 
         logger.info(f"Starting TTS engine: {self._model_name}")
-
-        # Must run before mlx-audio imports so backend modules bind the
-        # compile-free samplers instead of mlx-lm's compiled ones (#2312).
-        ensure_uncompiled_tts_samplers()
 
         try:
             from mlx_audio.tts.utils import load_model as _load_model

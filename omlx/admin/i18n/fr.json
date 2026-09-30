@@ -1,4 +1,9 @@
 {
+  "cluster.v2.device.ssh_user": "Utilisateur SSH",
+  "cluster.v2.device.ssh_user_help": "Saisissez le nom court du compte de la machine distante. Laissez vide pour utiliser le compte appairé ou la configuration SSH.",
+  "cluster.v2.device.ssh_user_save": "Enregistrer l’utilisateur SSH",
+  "cluster.v2.device.ssh_user_saved": "Utilisateur SSH enregistré. Relancez les vérifications.",
+  "cluster.v2.device.ssh_user_error": "Impossible d’enregistrer l’utilisateur SSH.",
   "app.title": "oMLX Admin",
   "app.tagline": "Inférence LLM, optimisée pour votre Mac",
   "login.title_login": "Connexion - oMLX Admin",
@@ -157,6 +162,7 @@
   "status.active_models.last_token_ago": "last token {age} ago",
   "status.integrations.claude_code": "Claude Code",
   "status.integrations.copilot_cli": "Copilot CLI",
+  "status.integrations.dsh": "DeepSeek Harness",
   "status.integrations.hermes_agent": "Hermes Agent",
   "status.active_models.idle": "idle",
   "status.active_models.pressure_label": "{current} / {soft} soft / {hard} hard",

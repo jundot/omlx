@@ -34,12 +34,10 @@ def _write_mtp_index(tmp_path, has_mtp: bool) -> None:
 
 
 class TestRemoteCodePreflight:
-    @pytest.mark.parametrize("supported", [False, True])
     @pytest.mark.parametrize("trusted", [False, True])
     def test_final_tokenizer_load_uses_the_configured_trust_setting(
-        self, monkeypatch, supported, trusted
+        self, monkeypatch, trusted
     ):
-        monkeypatch.setattr(model_loading, "_LM_LOAD_ACCEPTS_TRC", supported)
         monkeypatch.setattr(model_loading, "preflight_text_remote_code", MagicMock())
         loader = MagicMock(return_value=("MODEL", "TOKENIZER"))
         monkeypatch.setitem(sys.modules, "mlx_lm", types.SimpleNamespace(load=loader))
@@ -51,7 +49,7 @@ class TestRemoteCodePreflight:
         assert actual["tokenizer_config"] == {
             "trust_remote_code": trusted, "tool_parser_type": "k2_horizon"
         }
-        assert ("trust_remote_code" in actual) is supported
+        assert actual["trust_remote_code"] is trusted
         assert options["trust_remote_code"] is not trusted
 
     def test_custom_model_file_is_rejected_before_weight_loading(self, tmp_path):
@@ -273,15 +271,10 @@ class TestLlama4PreLoadDispatch:
 
 
 class TestLoadTextModel:
-    def test_forwards_trust_remote_code_when_mlx_lm_supports_it(
-        self, tmp_path, monkeypatch
-    ):
+    def test_forwards_trust_remote_code(self, tmp_path, monkeypatch):
         path = _write_config(tmp_path, '{"model_type": "llama"}')
         maybe_apply = MagicMock()
         monkeypatch.setattr(model_loading, "maybe_apply_pre_load_patches", maybe_apply)
-        # Pin the capability flag so the test is deterministic regardless of the
-        # installed mlx-lm version (lm_load_compat reads this global at call time).
-        monkeypatch.setattr(model_loading, "_LM_LOAD_ACCEPTS_TRC", True)
 
         load_mock = MagicMock(return_value=("MODEL", "TOKENIZER"))
         monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(load=load_mock))
@@ -299,31 +292,6 @@ class TestLoadTextModel:
             path,
             tokenizer_config={"trust_remote_code": True},
             trust_remote_code=True,
-        )
-
-    def test_omits_trust_remote_code_when_mlx_lm_lacks_it(self, tmp_path, monkeypatch):
-        # Some mlx-lm releases dropped ``trust_remote_code`` from ``load``.
-        # lm_load_compat must omit the kwarg there rather than raise TypeError.
-        path = _write_config(tmp_path, '{"model_type": "llama"}')
-        monkeypatch.setattr(
-            model_loading, "maybe_apply_pre_load_patches", MagicMock()
-        )
-        monkeypatch.setattr(model_loading, "_LM_LOAD_ACCEPTS_TRC", False)
-
-        load_mock = MagicMock(return_value=("MODEL", "TOKENIZER"))
-        monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(load=load_mock))
-
-        settings = types.SimpleNamespace(trust_remote_code=True)
-        result = model_loading.load_text_model(
-            path,
-            tokenizer_config={"trust_remote_code": True},
-            model_settings=settings,
-        )
-
-        assert result == ("MODEL", "TOKENIZER")
-        load_mock.assert_called_once_with(
-            path,
-            tokenizer_config={"trust_remote_code": True},
         )
 
 

@@ -267,9 +267,25 @@ def test_qwen4_resident_ple_fuses_packed_shards_exactly():
     indices = mx.array([[0, 9, 17, 31, 9]], dtype=mx.int32)
     expected = embedding(indices)
     mx.eval(expected)
+    scales_dtype = embedding.shards[0].scales.dtype
+    loads = []
 
-    assert embedding.fuse_quantized_shards() is True
-    assert embedding.fuse_quantized_shards() is False
+    def load_sources():
+        loads.append(1)
+        # Reloaded copies with another scales dtype must not replace the shards.
+        return [
+            SimpleNamespace(
+                weight=shard.weight,
+                scales=shard.scales.astype(mx.float16),
+                biases=shard.biases,
+            )
+            for shard in embedding.shards
+        ]
+
+    assert embedding.fuse_quantized_shards(load_sources) is True
+    assert embedding.fused.scales.dtype == scales_dtype
+    assert embedding.fuse_quantized_shards(load_sources) is False
+    assert len(loads) == 1
     assert embedding.shards == []
     # The fused arm performs one device gather and no longer consults the host
     # shard boundaries after load.

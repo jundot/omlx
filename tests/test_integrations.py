@@ -3,7 +3,7 @@
 import json
 import plistlib
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
@@ -18,6 +18,13 @@ from omlx.integrations.codex import (
 )
 from omlx.integrations.codex_app import CodexAppIntegration, find_codex_app_bundle
 from omlx.integrations.copilot import CopilotIntegration
+from omlx.integrations.dsh import (
+    DshConfigShapeError,
+    DshIntegration,
+    find_dsh_app_bundle,
+    write_credentials_ref,
+    write_dsh_patch,
+)
 from omlx.integrations.hermes import HermesIntegration
 from omlx.integrations.openclaw import OpenClawIntegration
 from omlx.integrations.opencode import OpenCodeIntegration
@@ -38,7 +45,7 @@ def ctx(**overrides) -> IntegrationContext:
 class TestIntegrationRegistry:
     def test_list_integrations(self):
         integrations = list_integrations()
-        assert len(integrations) == 8
+        assert len(integrations) == 9
         names = {i.name for i in integrations}
         assert names == {
             "claude",
@@ -49,6 +56,7 @@ class TestIntegrationRegistry:
             "openclaw",
             "hermes",
             "pi",
+            "dsh",
         }
 
     def test_get_integration(self):
@@ -60,6 +68,7 @@ class TestIntegrationRegistry:
         assert get_integration("openclaw") is not None
         assert get_integration("hermes") is not None
         assert get_integration("pi") is not None
+        assert get_integration("dsh") is not None
         assert get_integration("nonexistent") is None
 
 
@@ -99,9 +108,7 @@ class TestCodexIntegration:
         )
 
         assert 'model_provider="omlx"' in args
-        assert (
-            'model_providers.omlx.base_url="http://192.168.1.100:9000/v1"' in args
-        )
+        assert 'model_providers.omlx.base_url="http://192.168.1.100:9000/v1"' in args
         assert 'model_providers.omlx.env_key="OMLX_API_KEY"' in args
         assert "model_context_window=240000" in args
         assert not any("model_auto_compact_token_limit" in arg for arg in args)
@@ -2055,18 +2062,20 @@ class TestIntegrationSettings:
         assert settings.openclaw_model is None
         assert settings.hermes_model is None
         assert settings.pi_model is None
+        assert settings.dsh_model is None
         assert settings.openclaw_tools_profile == "coding"
 
     def test_to_dict(self):
         from omlx.settings import IntegrationSettings
 
-        settings = IntegrationSettings(codex_model="qwen3.5")
+        settings = IntegrationSettings(codex_model="qwen3.5", dsh_model="Qwen3.8")
         d = settings.to_dict()
         assert d["copilot_model"] is None
         assert d["codex_model"] == "qwen3.5"
         assert d["opencode_model"] is None
         assert d["hermes_model"] is None
         assert d["pi_model"] is None
+        assert d["dsh_model"] == "Qwen3.8"
         assert d["openclaw_tools_profile"] == "coding"
 
     def test_from_dict(self):
@@ -2078,6 +2087,7 @@ class TestIntegrationSettings:
                 "codex_model": "llama",
                 "opencode_model": "qwen",
                 "hermes_model": "hermes-qwen",
+                "dsh_model": "Qwen3.8",
             }
         )
         assert settings.copilot_model == "gpt-oss"
@@ -2086,9 +2096,520 @@ class TestIntegrationSettings:
         assert settings.openclaw_model is None
         assert settings.hermes_model == "hermes-qwen"
         assert settings.pi_model is None
+        assert settings.dsh_model == "Qwen3.8"
 
     def test_from_dict_empty(self):
         from omlx.settings import IntegrationSettings
 
         settings = IntegrationSettings.from_dict({})
         assert settings.codex_model is None
+        assert settings.dsh_model is None
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek Harness (dsh)
+# ---------------------------------------------------------------------------
+
+DSH_MODELS = [
+    {
+        "id": "Qwen3.8-27B-oQ5e-mtp",
+        "name": "Qwen3.8-27B-oQ5e-mtp",
+        "contextWindow": 131072,
+        "maxTokens": 32768,
+        "input": ["text"],
+    },
+    {
+        "id": "qwen-vl",
+        "name": "qwen-vl",
+        "contextWindow": 32768,
+        "maxTokens": 8192,
+        "input": ["text", "image"],
+    },
+]
+
+
+def make_dsh_bundle(root: Path, with_cli: bool = False) -> Path:
+    """Create a fake DeepSeek Harness app bundle in ``root``."""
+    return make_app_bundle(
+        root, "DeepSeek Harness.app", bundle_id="com.deepseek.dsh", with_cli=with_cli
+    )
+
+
+def _route(patch_path: Path, protocol: str = "openai-responses") -> tuple[dict, dict]:
+    data = yaml.safe_load(patch_path.read_text())
+    pi_ai = next(e for e in data if e.get("id") == "llm-pi-ai")
+    route = pi_ai["config"]["providers"]["omlx"]
+    assert route["api"] == protocol
+    return route, data
+
+
+@pytest.fixture
+def dsh_env(tmp_path, monkeypatch):
+    """Write the harness home into tmp_path and stub the model list.
+
+    Pointing OMLX_DSH_HOME at the scratch dir routes every harness file
+    there — and exercises the override itself.
+    """
+    monkeypatch.setenv("OMLX_DSH_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        DshIntegration, "_fetch_models", lambda self, c: [dict(m) for m in DSH_MODELS]
+    )
+    return tmp_path
+
+
+class TestDshIntegration:
+    def test_get_command(self):
+        dsh = DshIntegration()
+        cmd = dsh.get_command(ctx(model="Qwen3.8-27B-oQ5e-mtp"))
+        assert "omlx launch dsh" in cmd
+        assert "--model Qwen3.8-27B-oQ5e-mtp" in cmd
+
+    def test_get_command_no_model(self):
+        dsh = DshIntegration()
+        assert dsh.get_command(ctx(model="")) == "omlx launch dsh"
+
+    def test_type(self):
+        assert DshIntegration().type == "config_file"
+
+    def test_requires_no_interactive_model_selection(self):
+        # dsh registers the whole model catalog; the model flag only seeds
+        # the harness session default, so launch must not force a picker.
+        assert DshIntegration().requires_model_selection is False
+        # Every other integration keeps the picker semantics.
+        assert OpenCodeIntegration().requires_model_selection is True
+        assert PiIntegration().requires_model_selection is True
+
+    def test_is_installed_with_app_bundle(self, tmp_path, monkeypatch):
+        make_dsh_bundle(tmp_path)
+        monkeypatch.setattr("omlx.integrations.dsh._APP_BUNDLE_ROOTS", (tmp_path,))
+        assert DshIntegration().is_installed() is True
+        assert find_dsh_app_bundle() == tmp_path / "DeepSeek Harness.app"
+
+    def test_not_installed(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("omlx.integrations.dsh._APP_BUNDLE_ROOTS", (tmp_path,))
+        assert DshIntegration().is_installed() is False
+        assert find_dsh_app_bundle() is None
+
+    def test_launch_without_bundle_exits(self, monkeypatch):
+        monkeypatch.setattr("omlx.integrations.dsh.find_dsh_app_bundle", lambda: None)
+        monkeypatch.setattr(DshIntegration, "configure", lambda self, c: None)
+        with pytest.raises(SystemExit):
+            DshIntegration().launch(ctx())
+
+    def test_configure_writes_route_and_credential(self, dsh_env, monkeypatch):
+        """One launch's configuration, for the shapes ``ctx`` can take.
+
+        Every case writes a whole harness home of its own: the route lands in
+        both patch layers (`dsh web` boots ``profiles/web``), the credential
+        store gets the key's token, and the session default follows ``--model``.
+        """
+        # (name, ctx overrides, expected agent config, expected credential)
+        cases = [
+            ("no default model keeps the session default untouched",
+             {"api_key": "sk-test"}, None, "sk-test"),
+            # No API key configured: the ref still resolves (the dummy token the
+            # base context supplies) so the route never fails MISSING_CREDENTIAL.
+            ("a named model becomes the session default",
+             {"model": "Qwen3.8-27B-oQ5e-mtp", "api_key": ""},
+             {"provider": "omlx", "model": "Qwen3.8-27B-oQ5e-mtp"}, "omlx"),
+        ]
+        for index, (name, overrides, agent, token) in enumerate(cases):
+            home = dsh_env / f"case-{index}"
+            home.mkdir()
+            monkeypatch.setenv("OMLX_DSH_HOME", str(home))
+
+            DshIntegration().configure(ctx(**overrides))
+
+            for profile in ("desktop", "web"):
+                route, _ = _route(home / "profiles" / profile / "cordis.patch.yml")
+                assert route["baseURL"] == "http://127.0.0.1:8000/v1", name
+                assert route["apiKeyEnv"] == "OMLX_API_KEY", name
+                assert [m["id"] for m in route["models"]] == [
+                    m["id"] for m in DSH_MODELS
+                ], name
+                assert route["models"][0]["contextWindow"] == 131072, name
+                assert route["models"][1]["input"] == ["text", "image"], name
+
+            _, data = _route(home / "profiles" / "desktop" / "cordis.patch.yml")
+            if agent is None:
+                assert not any(
+                    e.get("id") == "agent-default-model" for e in data
+                ), name
+            else:
+                entry = next(e for e in data if e.get("id") == "agent-default-model")
+                assert entry["config"] == agent, name
+
+            creds = yaml.safe_load((home / ".credentials.yaml").read_text())
+            assert creds["refs"]["OMLX_API_KEY"] == token, name
+
+    def test_configure_exits_when_server_has_no_models(self, monkeypatch):
+        monkeypatch.setattr(DshIntegration, "_fetch_models", lambda self, c: [])
+        with pytest.raises(SystemExit):
+            DshIntegration().configure(ctx())
+
+    def test_fetch_models_reads_capacity_and_modalities(self):
+        status_map = {
+            "qwen-llm": {
+                "id": "qwen-llm",
+                "max_context_window": 65536,
+                "max_tokens": 4096,
+                "model_type": "llm",
+            },
+            "qwen-vl": {"id": "qwen-vl", "model_type": "vlm"},
+        }
+
+        models = DshIntegration()._fetch_models(ctx(models_status_map=status_map))
+
+        assert [m["id"] for m in models] == ["qwen-llm", "qwen-vl"]
+        assert models[0]["contextWindow"] == 65536
+        assert models[0]["maxTokens"] == 4096
+        assert models[0]["input"] == ["text"]
+        assert models[1]["input"] == ["text", "image"]
+
+    def test_fetch_models_uses_display_id_and_lists_it_once(self):
+        # The status map holds an aliased model under its id and its alias;
+        # the route must list the display id exactly once.
+        record = {"id": "phys-id", "model_alias": "chat-id", "model_type": "llm"}
+
+        models = DshIntegration()._fetch_models(
+            ctx(models_status_map={"phys-id": record, "chat-id": record})
+        )
+
+        assert [m["id"] for m in models] == ["chat-id"]
+
+    def test_fetch_models_skips_non_chat_and_hidden_models(self):
+        status_map = {
+            "chat-llm": {"id": "chat-llm", "model_type": "llm"},
+            "embed-bert": {"id": "embed-bert", "model_type": "embedding"},
+            "asr": {"id": "asr", "model_type": "audio_sts"},
+            # No type in the record: unknown types stay in.
+            "untyped": {"id": "untyped"},
+            # Hidden from /v1/models, so it stays out of the route.
+            "hidden": {"id": "hidden", "model_type": "llm", "is_hidden": True},
+        }
+
+        models = DshIntegration()._fetch_models(ctx(models_status_map=status_map))
+
+        assert [m["id"] for m in models] == ["chat-llm", "untyped"]
+
+    def test_fetch_models_falls_back_to_selected_model(self):
+        with patch("requests.get", side_effect=Exception("server down")):
+            models = DshIntegration()._fetch_models(ctx(model="only-model"))
+
+        assert models == [{"id": "only-model", "name": "only-model", "input": ["text"]}]
+
+    def test_fetch_models_lists_from_endpoint_only_when_status_map_is_empty(self):
+        # Degraded launch: the launcher's status fetch failed (401 under
+        # allow_unauthenticated_inference), so its map is empty and the
+        # inventory comes from GET /v1/models — capacity keys stay absent.
+        list_response = MagicMock()
+        list_response.json.return_value = {
+            "data": [
+                {"id": "chat-llm", "model_type": "llm"},
+                {"id": "embed-bert", "model_type": "embedding"},
+            ]
+        }
+        with patch("requests.get", return_value=list_response) as get:
+            models = DshIntegration()._fetch_models(ctx())
+        assert [m["id"] for m in models] == ["chat-llm"]
+        assert models[0] == {"id": "chat-llm", "name": "chat-llm", "input": ["text"]}
+        assert get.call_count == 1
+
+        # A populated map means the launcher already did the work: the
+        # fallback must not fire a second inventory request.
+        with patch("requests.get", side_effect=AssertionError("fallback fired")):
+            models = DshIntegration()._fetch_models(
+                ctx(models_status_map={"q": {"id": "q", "model_type": "llm"}})
+            )
+        assert [m["id"] for m in models] == ["q"]
+
+    def test_launch_opens_app_and_scrubs_session_env(self, monkeypatch):
+        calls = {}
+
+        def fake_run(cmd, env=None, **kwargs):
+            calls["cmd"] = cmd
+            calls["env"] = env
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr(
+            "omlx.integrations.dsh.find_dsh_app_bundle",
+            lambda: Path("/Applications/DeepSeek Harness.app"),
+        )
+        monkeypatch.setattr("omlx.integrations.dsh._app_is_running", lambda: False)
+        monkeypatch.setattr("omlx.integrations.dsh.subprocess.run", fake_run)
+        monkeypatch.setattr(DshIntegration, "configure", lambda self, c: None)
+
+        integration = DshIntegration()
+        integration.launch(ctx())
+
+        assert calls["cmd"] == [
+            "open",
+            "/Applications/DeepSeek Harness.app",
+        ]
+        for key in (
+            "DSH_HOME",
+            "DSH_SESSION_ID",
+            "DSH_SESSION_JSONL",
+            "DSH_SHELL",
+            "DSH_PROFILE",
+            "DSH_PROFILE_DIR",
+        ):
+            assert key not in calls["env"]
+
+
+class TestDshPatchWriter:
+    def test_creates_new_file(self, tmp_path):
+        path = tmp_path / "cordis.patch.yml"
+        write_dsh_patch(path, "http://127.0.0.1:8000/v1", DSH_MODELS)
+
+        route, data = _route(path)
+        assert route["baseURL"] == "http://127.0.0.1:8000/v1"
+        assert [m["id"] for m in route["models"]] == [m["id"] for m in DSH_MODELS]
+        assert isinstance(data, list) and data[0]["id"] == "llm-pi-ai"
+
+    def test_replaces_route_and_preserves_everything_else(self, tmp_path):
+        path = tmp_path / "cordis.patch.yml"
+        path.write_text(
+            "# header comment kept\n"
+            "- id: llm-pi-ai\n"
+            '  name: "@deepseek-ai/dsh-llm-pi-ai"\n'
+            "  config:\n"
+            "    providers:\n"
+            "      # 用户的旧注释\n"
+            "      omlx:\n"
+            "        displayName: omlx\n"
+            "        api: openai-completions\n"
+            '        baseURL: "http://127.0.0.1:8000/v1"\n'
+            "        models:\n"
+            "          - id: Stale-Model\n"
+            "            name: Stale-Model\n"
+            "      opencode-go1:\n"
+            "        displayName: OpenCode-Go\n"
+            "        # 分组＝协议\n"
+            "        api: openai-completions\n"
+            '        baseURL: "https://opencode.ai/zen/go/v1"\n'
+            "        models:\n"
+            "          - id: mimo-v2.6-flash\n"
+            "            name: mimo-v2.6-flash\n"
+            "- id: ui-chat\n"
+            '  name: "@deepseek-ai/dsh-client-ui-chat"\n'
+            "  config:\n"
+            "    transcriptView: standard\n"
+        )
+
+        write_dsh_patch(path, "http://127.0.0.1:9000/v1", DSH_MODELS)
+        out = path.read_text()
+
+        # The managed route was replaced with the full catalog.
+        route, data = _route(path)
+        assert route["baseURL"] == "http://127.0.0.1:9000/v1"
+        assert [m["id"] for m in route["models"]] == [m["id"] for m in DSH_MODELS]
+        assert "Stale-Model" not in out
+
+        # Everything the user did not ask us to manage survives.
+        assert "# header comment kept" in out
+        assert "# 分组＝协议" in out
+        assert "opencode-go1" in yaml.safe_load(out)[0]["config"]["providers"]
+        assert data[-1]["id"] == "ui-chat"
+        assert data[-1]["config"] == {"transcriptView": "standard"}
+
+        # A timestamped backup of the previous file exists.
+        assert any(tmp_path.glob("cordis.patch.*.bak"))
+
+    # Seeds for `test_existing_files_are_patched_in_place`: patch layers that
+    # already carry something the write has to keep or replace.
+    _AGENT_ENTRY = (
+        "- id: agent-default-model\n"
+        '  name: "@deepseek-ai/dsh-agent-default-model"\n'
+        "  config:\n"
+        "    provider: opencode-go1\n"
+        '    model: "mimo-v2.6-flash"\n'
+    )
+    _PI_AI_ENTRY = (
+        "- id: llm-pi-ai\n"
+        '  name: "@deepseek-ai/dsh-llm-pi-ai"\n'
+        "  config:\n"
+        "    providers:\n"
+        "      omlx:\n"
+        "        api: openai-completions\n"
+        '        baseURL: "http://127.0.0.1:8000/v1"\n'
+        "        models:\n"
+        "          - id: x\n"
+    )
+
+    def test_existing_files_are_patched_in_place(self, tmp_path):
+        """Write a seeded patch layer, re-read it, and check what landed.
+
+        Covers the shapes a patch layer can be in — a plain entry, an entry
+        whose nested value is an empty flow container — and the two default
+        model cases, with and without a `--model`.
+        """
+        # (name, seed, default_model, expected agent config or None)
+        cases = [
+            ("no default model leaves the agent entry untouched",
+             self._AGENT_ENTRY, None,
+             {"provider": "opencode-go1", "model": "mimo-v2.6-flash"}),
+            ("a default model rewrites the existing agent entry",
+             self._AGENT_ENTRY + self._PI_AI_ENTRY, "Qwen3.8-27B-oQ5e-mtp",
+             {"provider": "omlx", "model": "Qwen3.8-27B-oQ5e-mtp"}),
+            ("an empty flow config is rewritten",
+             "- id: llm-pi-ai\n"
+             '  name: "@deepseek-ai/dsh-llm-pi-ai"\n'
+             "  config: {}\n",
+             None, None),
+            ("an empty flow providers is rewritten",
+             "- id: llm-pi-ai\n"
+             '  name: "@deepseek-ai/dsh-llm-pi-ai"\n'
+             "  config:\n"
+             "    providers: {}\n",
+             None, None),
+        ]
+        for index, (name, seed, default_model, agent) in enumerate(cases):
+            path = tmp_path / f"patch-{index}.yml"
+            path.write_text(seed)
+
+            write_dsh_patch(
+                path, "http://127.0.0.1:8000/v1", DSH_MODELS,
+                default_model=default_model,
+            )
+
+            route, data = _route(path)
+            assert route["baseURL"] == "http://127.0.0.1:8000/v1", name
+            assert [m["id"] for m in route["models"]] == [
+                m["id"] for m in DSH_MODELS
+            ], name
+            entries = {e.get("id"): e for e in data if isinstance(e, dict)}
+            if agent is None:
+                assert "agent-default-model" not in entries, name
+            else:
+                assert entries["agent-default-model"]["config"] == agent, name
+
+    def test_populated_inline_config_is_refused(self, tmp_path):
+        path = tmp_path / "cordis.patch.yml"
+        path.write_text(
+            "- id: llm-pi-ai\n"
+            '  name: "@deepseek-ai/dsh-llm-pi-ai"\n'
+            "  config: {retryPolicy: {mode: normal}}\n"
+        )
+
+        with pytest.raises(DshConfigShapeError):
+            write_dsh_patch(path, "http://127.0.0.1:8000/v1", DSH_MODELS)
+
+        # The refusal never overwrote the user's file.
+        assert "retryPolicy" in path.read_text()
+
+    def test_refuses_empty_model_list(self, tmp_path):
+        path = tmp_path / "cordis.patch.yml"
+        with pytest.raises(DshConfigShapeError):
+            write_dsh_patch(path, "http://127.0.0.1:8000/v1", [])
+        assert not path.exists()
+
+    def test_protocol_env_override(self, tmp_path, monkeypatch):
+        path = tmp_path / "cordis.patch.yml"
+        monkeypatch.setenv("OMLX_DSH_API", "openai-completions")
+        write_dsh_patch(path, "http://127.0.0.1:8000/v1", DSH_MODELS)
+        _route(path, protocol="openai-completions")
+
+        monkeypatch.setenv("OMLX_DSH_API", "bogus")
+        with pytest.raises(DshConfigShapeError):
+            write_dsh_patch(path, "http://127.0.0.1:8000/v1", DSH_MODELS)
+
+    def test_js_tags_do_not_break_parsing(self, tmp_path):
+        # The patch layer allows `!!js` expressions; a route update must not
+        # choke on them or drop them. Both shapes matter: a tag the reader
+        # cannot construct aborts the write, and a tag inside the entry being
+        # rewritten (or in a sibling entry) must survive it.
+        path = tmp_path / "cordis.patch.yml"
+        path.write_text(
+            "- id: llm-pi-ai\n"
+            '  name: "@deepseek-ai/dsh-llm-pi-ai"\n'
+            "  config:\n"
+            "    retryPolicy: !!js/object \"{ mode: 'normal' }\"\n"
+            "    providers:\n"
+            "      omlx:\n"
+            "        api: openai-completions\n"
+            '        baseURL: "http://127.0.0.1:8000/v1"\n'
+            "        models:\n"
+            "          - id: x\n"
+            "- id: ui-chat\n"
+            '  name: "@deepseek-ai/dsh-client-ui-chat"\n'
+            "  config:\n"
+            '    transcriptView: !!js/string "standard"\n'
+        )
+
+        write_dsh_patch(path, "http://127.0.0.1:9000/v1", DSH_MODELS)
+        out = path.read_text()
+
+        # The tagged values are still there, tag and payload included.
+        assert "retryPolicy: !!js/object \"{ mode: 'normal' }\"" in out
+        assert 'transcriptView: !!js/string "standard"' in out
+
+        # And the result still loads: the route moved, the tags did not.
+        from omlx.integrations.dsh import _parse_yaml
+
+        data = _parse_yaml(out, "the written patch")
+        entry = next(e for e in data if e.get("id") == "llm-pi-ai")
+        assert entry["config"]["retryPolicy"] == "{ mode: 'normal' }"
+        assert entry["config"]["providers"]["omlx"]["baseURL"] == (
+            "http://127.0.0.1:9000/v1"
+        )
+        assert [m["id"] for m in entry["config"]["providers"]["omlx"]["models"]] == [
+            m["id"] for m in DSH_MODELS
+        ]
+
+
+class TestDshCredentialsRef:
+    def test_each_store_shape_gains_the_ref(self, tmp_path):
+        """Write a seeded credential store, re-read it, and check the ref.
+
+        The store is hand-edited, so every shape it can be in gets a case: an
+        existing block-style section (with records beside it), a section
+        missing the ref, no section at all, an empty flow container, and no
+        file yet.
+        """
+        # (name, seed or None, value, expected refs, expected records)
+        cases = [
+            ("updates an existing ref and keeps the others",
+             "version: 1\n"
+             "records:\n"
+             "  deepseek-account-platform/default:\n"
+             "    kind: token\n"
+             "    payload:\n"
+             '      token: "secret"\n'
+             "refs:\n"
+             '  DEEPSEEK_API_KEY: "dk"\n'
+             '  OMLX_API_KEY: "stale"\n',
+             "sk-fresh",
+             {"DEEPSEEK_API_KEY": "dk", "OMLX_API_KEY": "sk-fresh"},
+             {"deepseek-account-platform/default": {
+                 "kind": "token", "payload": {"token": "secret"}}}),
+            ("appends a missing ref to an existing section",
+             'version: 1\nrecords: {}\nrefs:\n  DEEPSEEK_API_KEY: "dk"\n',
+             "sk-new",
+             {"DEEPSEEK_API_KEY": "dk", "OMLX_API_KEY": "sk-new"}, {}),
+            ("appends a refs section when missing",
+             "version: 1\nrecords: {}\n",
+             "sk-new", {"OMLX_API_KEY": "sk-new"}, {}),
+            ("rewrites an inline empty refs as a block",
+             "version: 1\nrecords: {}\nrefs: {}\n",
+             "sk-new", {"OMLX_API_KEY": "sk-new"}, {}),
+            ("creates a missing file",
+             None, "sk-new", {"OMLX_API_KEY": "sk-new"}, {}),
+        ]
+        for index, (name, seed, value, refs, records) in enumerate(cases):
+            path = tmp_path / f"credentials-{index}.yaml"
+            if seed is not None:
+                path.write_text(seed)
+
+            write_credentials_ref(path, "OMLX_API_KEY", value)
+
+            data = yaml.safe_load(path.read_text())
+            assert data["version"] == 1, name
+            assert data["records"] == records, name
+            assert data["refs"] == refs, name
+            # A store that existed is backed up first; a new one has nothing to
+            # back up.
+            backups = list(tmp_path.glob(f"credentials-{index}.*.bak"))
+            assert bool(backups) == (seed is not None), name
+            if seed is None:
+                assert path.stat().st_mode & 0o777 == 0o600, name

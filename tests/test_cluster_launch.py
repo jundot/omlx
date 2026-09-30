@@ -2422,3 +2422,17 @@ def test_reap_orphaned_launches_leaves_an_active_job_alone(tmp_path, monkeypatch
     assert report["reaped"] == []
     assert kills == []
     assert launch._launch_manifest_path(tmp_path, "cluster-test").exists()
+
+
+def test_peer_probe_stops_immediately_on_ssh_auth_failure():
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv, 255, stdout="", stderr="Permission denied (publickey)."
+        )
+
+    with pytest.raises(DistributedLaunchError, match="Permission denied"):
+        probe_remote_host("worker@example.invalid", runner=runner)
+    assert len(calls) == 1

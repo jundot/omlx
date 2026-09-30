@@ -166,3 +166,33 @@ test('Cancel restores unsaved edits, controls, and the previous pending state', 
     }
     assert.equal(requests.length, 0);
 });
+
+test('the download queue formats bytes per second across units', () => {
+    const {state} = fixture();
+    // A stopped transfer reads an explicit 0 B/s (hiding the readout made an
+    // interrupted row look like a UI bug); a live one scales.
+    assert.equal(state.formatSpeed({speed_bps: 0}), '0 B/s');
+    assert.equal(state.formatSpeed({speed_bps: 512}), '512 B/s');
+    assert.equal(state.formatSpeed({speed_bps: 1024}), '1.0 KB/s');
+    assert.equal(state.formatSpeed({speed_bps: 45298483.2}), '43.2 MB/s');
+    assert.equal(state.formatSpeed({speed_bps: 3.5 * 1024 ** 3}), '3.5 GB/s');
+});
+
+test('the rate reaches the progress line and both queue templates', () => {
+    const {state} = fixture();
+    const line = String(state.formatProgress({
+        progress: 45.5,
+        downloaded_size: 536870912,
+        total_size: 1073741824,
+        speed_bps: 45298483.2,
+    }));
+    assert.ok(line.includes('43.2 MB/s'), line);
+    // Each queue (HuggingFace and ModelScope) hands the task to the shared
+    // formatters: one progress line and one queued-row rate per queue.
+    const template = fs.readFileSync(
+        path.join(__dirname, '../omlx/admin/templates/dashboard/_models.html'),
+        'utf8'
+    );
+    assert.ok(template.split('x-text="formatProgress(task)"').length - 1 >= 2);
+    assert.ok(template.split('formatSpeed(task)').length - 1 >= 2);
+});

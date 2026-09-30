@@ -16,6 +16,11 @@ import mlx.core as mx
 
 from mlx_lm.models.cache import _BaseCache
 
+# Widest single update whose pooling remainder can still be rolled back
+# through the undo log. Depth-k MTP chains verify at most 8 tokens; the
+# GLM-5.3 DFlash lane verifies up to a 16-token draft block per cycle.
+POOLING_UNDO_MAX_TOKENS = 16
+
 
 class PoolingCache(_BaseCache):
     """Cache for pooled (compressed) KV tokens with a remainder buffer.
@@ -143,12 +148,13 @@ class PoolingCache(_BaseCache):
 
         # One-update undo log for MTP draft rejection: trim() needs the
         # pre-update state plus this update's raw inputs to undo the last
-        # token when it completed a pool window. Only decode / MTP-verify
-        # sized updates (L <= 8 covers depth-k chain verify windows) are
-        # ever trimmed; skipping the stash for prompt chunks avoids pinning
-        # large prefill projections. Buffer slices are taken before any
-        # mutation, so they reference the pre-update array node.
-        if L <= 8:
+        # token when it completed a pool window. Only decode / MTP-verify /
+        # DFlash-verify sized updates (POOLING_UNDO_MAX_TOKENS covers depth-k
+        # chain verify windows and a 16-token DFlash block) are ever trimmed;
+        # skipping the stash for prompt chunks avoids pinning large prefill
+        # projections. Buffer slices are taken before any mutation, so they
+        # reference the pre-update array node.
+        if L <= POOLING_UNDO_MAX_TOKENS:
             try:
                 from omlx.patches.mlx_lm_mtp import cache_rollback
 

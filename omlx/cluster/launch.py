@@ -2174,6 +2174,7 @@ def probe_remote_host(
         timeout=timeout,
         runner=runner,
     )
+    _raise_for_ssh_transport_failure(ssh_target, completed)
     if completed.returncode != 0:
         try:
             discovered = discover_remote_python_executable(

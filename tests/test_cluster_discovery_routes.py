@@ -629,59 +629,12 @@ def test_manual_paired_endpoint_persists_and_rehydrates_on_reboot(
     service.stop()
 
 
-@pytest.mark.parametrize(
-    "old_state,new_state,old_key,new_key,expected",
-    [
-        ("stale", "verified", "keyA", "keyA", "remote_user@192.0.2.2"),
-        ("verified", "verified", "keyA", "keyA", None),
-        ("stale", "unknown", "keyA", "keyA", None),
-        ("stale", "verified", "keyA", "keyB", None),
-        ("stale", "verified", "", "keyA", None),
-        ("stale", "verified", "keyA", "", None),
-    ],
-)
-def test_address_failover_requires_fresh_same_key_peer(
-    old_state, new_state, old_key, new_key, expected
-):
-    row = {"ssh_target": "remote_user@192.0.2.1", "addrs": [{"ip": "192.0.2.2"}]}
-    health = {"192.0.2.1": {"state": old_state}, "192.0.2.2": {"state": new_state}}
-    lines = []
-    if old_key:
-        lines.append(f"192.0.2.1 ssh-ed25519 {old_key}")
-    if new_key:
-        lines.append(f"192.0.2.2 ssh-ed25519 {new_key}")
-    assert discovery_routes._preferred_ssh_target(row, health, lines) == expected
-    assert row["ssh_target"] == "remote_user@192.0.2.1"
-
-
-def test_address_failover_refuses_unrecognized_or_revoked_key_records():
-    assert (
-        discovery_routes._known_address_keys(
-            "192.0.2.1",
-            ["@revoked 192.0.2.1 ssh-ed25519 keyA", "|1|hash|value ssh-ed25519 keyA"],
-        )
-        == set()
-    )
-
-
-def test_address_failover_preserves_explicit_user_and_never_guesses_ssh_config():
-    row = {"last_addrs": ["192.0.2.1"], "addrs": [{"ip": "192.0.2.2"}]}
-    health = {"192.0.2.1": {"state": "stale"}, "192.0.2.2": {"state": "verified"}}
-    lines = ["192.0.2.1 ssh-ed25519 keyA", "192.0.2.2 ssh-ed25519 keyA"]
-    assert discovery_routes._preferred_ssh_target(row, health, lines) is None
-    row["ssh_user"] = "chosen_user"
-    assert (
-        discovery_routes._preferred_ssh_target(row, health, lines)
-        == "chosen_user@192.0.2.2"
-    )
-
-
-def test_devices_offer_fresh_same_key_address_after_repeated_failure(
-    _configured_stores, monkeypatch, tmp_path
+def test_devices_expose_address_health_for_ordinary_paired_peer(
+    _configured_stores, monkeypatch
 ):
     from types import SimpleNamespace
 
-    from omlx.cluster import enrollment, ssh_keys
+    from omlx.cluster import enrollment
 
     identity, registry, client = _configured_stores
     registry.mark_paired("peer", friendly_name="Worker", addrs=["192.0.2.1"])
@@ -698,14 +651,9 @@ def test_devices_offer_fresh_same_key_address_after_repeated_failure(
         enrollment,
         "get_cluster_enrollment",
         lambda: SimpleNamespace(
-            list_nodes=lambda: [
-                SimpleNamespace(node_id="peer", ssh="remote_user@192.0.2.1")
-            ]
+            list_nodes=lambda: [SimpleNamespace(node_id="peer", ssh="192.0.2.1")]
         ),
     )
-    known = tmp_path / "known_hosts"
-    known.write_text("192.0.2.1 ssh-ed25519 keyA\n192.0.2.2 ssh-ed25519 keyA\n")
-    monkeypatch.setattr(ssh_keys, "get_known_hosts_path", lambda: known)
     for ip in ("192.0.2.1", "192.0.2.2"):
         service._add_candidate(ip, 8000, node_id="peer", if_type="manual")
     service._probe_candidate("192.0.2.1", 8000)
@@ -718,13 +666,65 @@ def test_devices_offer_fresh_same_key_address_after_repeated_failure(
     assert "preferred_ssh_target" not in row
     service._probe_candidate("192.0.2.1", 8000)
     row = client.get("/api/cluster/devices").json()["paired"][0]
-    assert row["preferred_ssh_target"] == "remote_user@192.0.2.2"
-    assert row["ssh_target"] == "remote_user@192.0.2.1"
+    assert row["address_health"]["192.0.2.1"]["state"] == "stale"
+    assert row["address_health"]["192.0.2.2"]["state"] == "verified"
+    assert not row.get("ssh_user")
+    assert row["ssh_target"] == "192.0.2.1"
     assert "preferred_ssh_target" not in registry.paired()[0]
 
 
-def test_address_failover_respects_ssh_ipv4_policy():
-    row = {"ssh_target": "user@192.0.2.1", "addrs": [{"ip": "2001:db8::2"}]}
-    health = {"192.0.2.1": {"state": "stale"}, "2001:db8::2": {"state": "verified"}}
-    lines = ["192.0.2.1 ssh-ed25519 keyA", "2001:db8::2 ssh-ed25519 keyA"]
-    assert discovery_routes._preferred_ssh_target(row, health, lines) is None
+@pytest.mark.parametrize("user", ["remote_user", "prenom.nom"])
+def test_ssh_user_is_persisted_and_can_be_cleared(_configured_stores, user):
+    _, registry, client = _configured_stores
+    registry.mark_paired("peer-1", friendly_name="worker")
+    url = "/api/cluster/devices/peer-1/ssh-user"
+    assert client.put(url, json={"ssh_user": user}).status_code == 200
+    assert client.get("/api/cluster/devices").json()["paired"][0]["ssh_user"] == user
+    assert DeviceRegistry(registry.path).paired()[0]["ssh_user"] == user
+    registry.mark_paired("peer-1", friendly_name="renamed")
+    assert registry.paired()[0]["ssh_user"] == user
+    assert client.put(url, json={"ssh_user": None}).status_code == 200
+    assert "ssh_user" not in DeviceRegistry(registry.path).paired()[0]
+
+
+@pytest.mark.parametrize(
+    "user", ["-oProxyCommand=x", "user@host", "a b", "x\n", "a" * 65]
+)
+def test_ssh_user_rejects_unsafe_values(_configured_stores, user):
+    _, registry, client = _configured_stores
+    registry.mark_paired("peer-1", friendly_name="worker")
+    response = client.put(
+        "/api/cluster/devices/peer-1/ssh-user", json={"ssh_user": user}
+    )
+    assert response.status_code == 422
+    assert "ssh_user" not in registry.paired()[0]
+
+
+def test_ssh_user_requires_existing_pair_and_admin(_configured_stores):
+    _, _, client = _configured_stores
+    assert (
+        client.put(
+            "/api/cluster/devices/unknown/ssh-user", json={"ssh_user": "worker"}
+        ).status_code
+        == 404
+    )
+    client.app.dependency_overrides.clear()
+    assert client.put(
+        "/api/cluster/devices/unknown/ssh-user", json={"ssh_user": "worker"}
+    ).status_code in (401, 403)
+
+
+def test_ssh_user_write_failure_preserves_previous_value(
+    _configured_stores, monkeypatch
+):
+    _, registry, _ = _configured_stores
+    registry.mark_paired("peer-1", friendly_name="worker")
+    registry.set_ssh_user("peer-1", "original")
+
+    def fail():
+        raise OSError("disk full")
+
+    monkeypatch.setattr(registry, "_save", fail)
+    with pytest.raises(OSError):
+        registry.set_ssh_user("peer-1", "replacement")
+    assert registry.paired()[0]["ssh_user"] == "original"

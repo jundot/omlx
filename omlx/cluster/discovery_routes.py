@@ -16,10 +16,10 @@ import asyncio
 import ipaddress
 import threading
 import time
-from contextlib import suppress
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, ConfigDict, Field
 
 from .._version import __version__
 from ..admin.auth import require_admin
@@ -28,56 +28,6 @@ from .identity import get_node_identity
 from .registry import get_device_registry
 
 discovery_router = APIRouter(prefix="/api/cluster", tags=["cluster-discovery"])
-
-
-def _known_address_keys(host: str, lines: list[str]) -> set[str]:
-    """Read exact pinned aliases only; ambiguous/hashed/config aliases fail closed."""
-    keys = set()
-    for line in lines:
-        parts = line.split()
-        if (
-            len(parts) >= 3
-            and not parts[0].startswith(("#", "@", "|"))
-            and host in parts[0].split(",")
-        ):
-            keys.add(" ".join(parts[1:3]))
-    return keys
-
-
-def _preferred_ssh_target(
-    row: dict[str, Any], health: dict, lines: list[str]
-) -> str | None:
-    """Offer a known same-key alternate only after the previous address is stale."""
-    original = row.get("ssh_target") or next(iter(row.get("last_addrs") or []), "")
-    if not original:
-        return None
-    user, separator, host = str(original).rpartition("@")
-    if not separator:
-        host = str(original)
-    # Moving a bare ssh_config alias can silently select a different User.
-    # Require an explicit enrolled/admin login before automatic address changes.
-    login = row.get("ssh_user") or (user if separator else None)
-    if not login:
-        return None
-    if health.get(host, {}).get("state") != "stale":
-        return None
-    trusted = _known_address_keys(host, lines)
-    if not trusted:
-        return None
-    for addr in row.get("addrs") or []:
-        ip = addr.get("ip")
-        if not ip or health.get(ip, {}).get("state") != "verified":
-            continue
-        # The shared SSH policy currently forces AddressFamily=inet.
-        try:
-            if ipaddress.ip_address(ip).version != 4:
-                continue
-        except ValueError:
-            continue
-        keys = _known_address_keys(ip, lines)
-        if keys and keys <= trusted:
-            return f"{login}@{ip}"
-    return None
 
 
 class ProbeRateLimiter:
@@ -327,6 +277,30 @@ def _enrich_paired_row(row: dict[str, Any], record: dict[str, Any] | None) -> No
         row["http_port"] = http_port
 
 
+class DeviceSSHUserRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ssh_user: str | None = Field(
+        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$"
+    )
+
+
+@discovery_router.put("/devices/{node_id}/ssh-user")
+async def set_device_ssh_user(
+    node_id: str, body: DeviceSSHUserRequest, is_admin: bool = Depends(require_admin)
+):
+    """Set or clear a login override without changing SSH keys or pairing trust."""
+    try:
+        registry = get_device_registry()
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=503, detail="cluster registry is not configured"
+        ) from exc
+    try:
+        return registry.set_ssh_user(node_id, body.ssh_user)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="paired device not found") from exc
+
+
 @discovery_router.get("/devices")
 async def cluster_devices(is_admin: bool = Depends(require_admin)):
     """Cluster device inventory for the wizard UI.
@@ -395,22 +369,11 @@ async def cluster_devices(is_admin: bool = Depends(require_admin)):
     # Devices paired before caps were exchanged carry empty caps on disk;
     # enrich them from what discovery has actually seen before suppressing
     # their node_ids from the discovered list below.
-    known_hosts_lines = []
-    if service is not None:
-        from .ssh_keys import get_known_hosts_path
-
-        with suppress(OSError):
-            known_hosts_lines = (
-                get_known_hosts_path().read_text(encoding="utf-8").splitlines()
-            )
     for row in paired:
         _enrich_paired_row(row, observed_records.get(row.get("node_id")))
         if service is not None:
             health = service.address_health(row["node_id"])
             row["address_health"] = health
-            preferred = _preferred_ssh_target(row, health, known_hosts_lines)
-            if preferred:
-                row["preferred_ssh_target"] = preferred
 
     # Nothing flips the discovery service's in-memory ``PeerRecord.paired``
     # the moment pairing completes, so a stale (possibly dead) record for a

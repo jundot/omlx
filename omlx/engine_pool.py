@@ -21,7 +21,7 @@ import logging
 import os
 import time
 from collections import OrderedDict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -233,6 +233,27 @@ def _is_metal_out_of_memory(exc: BaseException | None) -> bool:
     return False
 
 
+def _set_concurrency_limits(config: object, value: int) -> None:
+    config.max_num_seqs = value
+    config.completion_batch_size = value
+
+
+def _set_decode_cap(scheduler: object, value: int) -> None:
+    """Set the live decode cap. Must run on the engine's MLX executor.
+
+    The MTP wrapper saves and restores this cap around a generation step, so a
+    write from another thread can be lost.
+    """
+    generator = getattr(scheduler, "batch_generator", None)
+    if generator is None:
+        return
+    try:
+        # Same floor as BatchGenerator.__init__.
+        generator.completion_batch_size = max(value, generator.prefill_batch_size)
+    except Exception:
+        logger.warning("Live decode cap update failed", exc_info=True)
+
+
 @dataclass
 class EngineEntry:
     """Per-model state in the engine pool."""
@@ -361,6 +382,8 @@ class EnginePool:
         self._failed_load_reclaim_tasks: set[asyncio.Task[None]] = set()
         self._failed_load_reclaim_task: asyncio.Task[None] | None = None
         self._shutting_down = False
+        # Last logged forced-offload state per (model_id, kind).
+        self._offload_warn_state: dict[tuple[str, str], bool] = {}
         # Idle GPU keep-warm ticker (see _touch_gpu). Configured by the server
         # from ServerSettings.gpu_keep_warm_interval; started on first load.
         self._gpu_keep_warm_interval: float = 0.0
@@ -608,6 +631,33 @@ class EnginePool:
         footprint = int(estimate.resident_bytes / 1.05)
         return footprint > line >= estimate.mmap_bytes
 
+    def _log_offload_decision_once(
+        self,
+        model_id: str,
+        kind: str,
+        forced: bool,
+        message: str,
+        *args: object,
+    ) -> None:
+        """Log a forced offload only when its state changes for this model.
+
+        The admin model list and the runtime signature resolve it on every poll
+        and request.
+        """
+
+        state = getattr(self, "_offload_warn_state", None)
+        if state is None:
+            # Pools built via __new__ (tests, single-purpose embedders) never
+            # ran __init__; keep dedup working without requiring it.
+            state = {}
+            self._offload_warn_state = state
+        key = (model_id, kind)
+        if state.get(key) == forced:
+            return
+        state[key] = forced
+        if forced:
+            logger.warning(message, *args)
+
     def _qwen4_ple_offload_status(
         self,
         entry: EngineEntry,
@@ -666,17 +716,19 @@ class EnginePool:
         forced = estimate.force_ssd_offload(
             ceiling
         ) or self._resident_leaves_no_prompt_room(estimate, ceiling)
-        if forced:
-            logger.warning(
-                "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB leaves no "
-                "room to serve prompts under the %.1fGB memory ceiling (mmap "
-                "needs %.1fGB). Decode will be roughly 2.5x slower than a "
-                "resident load.",
-                entry.model_id,
-                estimate.resident_bytes / 1e9,
-                ceiling / 1e9,
-                estimate.mmap_bytes / 1e9,
-            )
+        self._log_offload_decision_once(
+            entry.model_id,
+            "qwen4_ple_ssd_offload",
+            forced,
+            "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB leaves no "
+            "room to serve prompts under the %.1fGB memory ceiling (mmap "
+            "needs %.1fGB). Decode will be roughly 2.5x slower than a "
+            "resident load.",
+            entry.model_id,
+            estimate.resident_bytes / 1e9,
+            ceiling / 1e9,
+            estimate.mmap_bytes / 1e9,
+        )
         requested = bool(
             settings is not None and getattr(settings, "qwen4_ple_ssd_offload", False)
         )
@@ -757,16 +809,18 @@ class EnginePool:
         forced = estimate.force_ssd_offload(
             ceiling
         ) or self._resident_leaves_no_prompt_room(estimate, ceiling)
-        if forced:
-            logger.warning(
-                "DeepSeek V4.1 Engram forced to SSD for %s: resident %.1fGB leaves "
-                "no room to serve prompts under the %.1fGB memory ceiling (mmap "
-                "needs %.1fGB).",
-                entry.model_id,
-                estimate.resident_bytes / 1e9,
-                ceiling / 1e9,
-                estimate.mmap_bytes / 1e9,
-            )
+        self._log_offload_decision_once(
+            entry.model_id,
+            "deepseek_v41_engram_ssd_offload",
+            forced,
+            "DeepSeek V4.1 Engram forced to SSD for %s: resident %.1fGB leaves "
+            "no room to serve prompts under the %.1fGB memory ceiling (mmap "
+            "needs %.1fGB).",
+            entry.model_id,
+            estimate.resident_bytes / 1e9,
+            ceiling / 1e9,
+            estimate.mmap_bytes / 1e9,
+        )
         requested = bool(
             settings is not None
             and getattr(settings, "deepseek_v41_engram_ssd_offload", False)
@@ -1197,6 +1251,44 @@ class EnginePool:
                 engine = entry.engine if entry is not None else None
                 if isinstance(engine, EmbeddingEngine):
                     engine._batch_size = batch_size
+
+    async def apply_max_concurrent_requests(self, value: int) -> None:
+        """Apply max concurrent requests to future and currently loaded engines.
+
+        Sets both the admission cap and the decode batch cap. Lowering the value
+        stops new rows only; rows that are decoding finish normally.
+        """
+        value = int(value)
+        if value <= 0:
+            raise ValueError("max concurrent requests must be > 0")
+
+        async with self._lock:
+            _set_concurrency_limits(self._scheduler_config, value)
+            for entry in list(self._entries.values()):
+                engine = entry.engine if entry is not None else None
+                # Cluster ranks build their schedulers from the deployment.
+                if engine is None or getattr(
+                    engine, "_prefill_memory_guard_managed_externally", False
+                ):
+                    continue
+                # DFlash keeps its own config copy for the lazy fallback engine.
+                for host in (engine, getattr(engine, "_fallback_engine", None)):
+                    if host is None:
+                        continue
+                    config = getattr(host, "_scheduler_config", None)
+                    if config is not None:
+                        _set_concurrency_limits(config, value)
+                    core = getattr(getattr(host, "_engine", None), "engine", None)
+                    scheduler = getattr(core, "scheduler", None)
+                    if scheduler is None:
+                        continue
+                    _set_concurrency_limits(scheduler.config, value)
+                    executor = getattr(core, "_mlx_executor", None)
+                    if executor is None:
+                        continue
+                    # A shut-down executor means the engine is stopping.
+                    with suppress(RuntimeError):
+                        executor.submit(_set_decode_cap, scheduler, value)
 
     def discover_models(
         self, model_dirs: str | list[str], pinned_models: list[str] | None = None
@@ -3177,6 +3269,10 @@ class EnginePool:
             model_settings = runtime_settings
             if model_settings is None and self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
+            # A status read may have logged a forced offload long before this
+            # load. Log it again next to the load.
+            for kind in ("qwen4_ple_ssd_offload", "deepseek_v41_engram_ssd_offload"):
+                self._offload_warn_state.pop((model_id, kind), None)
             model_settings = self._effective_qwen4_model_settings(entry, model_settings)
             model_settings = self._effective_deepseek_v41_model_settings(
                 entry, model_settings
