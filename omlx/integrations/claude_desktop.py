@@ -7,8 +7,8 @@ is enabled, oMLX writes the Claude Desktop JSON configs so the app talks
 (ollama-switcher) needed. When disabled, the previous configuration is
 restored.
 
-File logic mirrors ``docs/task/references/ClaudeConfig.swift`` (validated
-in the field), adapted to point at oMLX itself:
+File logic mirrors the Claude Desktop gateway configuration format used by
+ollama-switcher (validated in the field), adapted to point at oMLX itself:
 
 1. ``~/Library/Application Support/Claude/claude_desktop_config.json``
    → ``deploymentMode: "3p"``
@@ -80,7 +80,8 @@ _GATEWAY_KEYS = (
 # was active in ``_meta.json`` before :func:`configure_omlx_gateway` took
 # over, so :func:`restore` can hand the selection back to a third-party
 # gateway profile (e.g. ollama-switcher) instead of dropping it.
-_PREVIOUS_APPLIED_ID_KEY = "_omlxPreviousAppliedId"
+_PREVIOUS_APPLIED_ID_KEY = "_omlxP...Id"
+_PREVIOUS_DEPLOYMENT_MODE_KEY = "_omlxP...ode"
 
 
 def _is_macos() -> bool:
@@ -180,6 +181,17 @@ def configure_omlx_gateway(
     paths = _paths(resolved)
     key = (api_key or "").strip() or "omlx"
 
+    # Remember the user's deployment mode before we flip it to "3p", so
+    # restore() can put back a pre-existing third-party setup instead of
+    # forcing first-party mode. The marker is written on the first apply
+    # even when there was no prior mode (null), so re-applies stay
+    # idempotent and never capture our own "3p" as the user's default.
+    profile = _read_json(paths["profile"])
+    if _PREVIOUS_DEPLOYMENT_MODE_KEY not in profile:
+        profile[_PREVIOUS_DEPLOYMENT_MODE_KEY] = _read_json(
+            paths["claude_config"]
+        ).get("deploymentMode")
+
     _set_deployment_mode(paths["claude_config"], "3p")
     _set_deployment_mode(paths["claude3p_config"], "3p")
 
@@ -191,7 +203,6 @@ def configure_omlx_gateway(
     meta["appliedId"] = PROFILE_ID
     _write_json(paths["meta"], meta)
 
-    profile = _read_json(paths["profile"])
     # Remember who was applied before us (unless we were already applied, in
     # which case the previously stored marker stays valid).
     if previous_applied_id and previous_applied_id != PROFILE_ID:
@@ -217,9 +228,11 @@ def restore(home: Path | None = None) -> bool:
 
     Removes the gateway keys from the oMLX profile, drops the ``_meta.json``
     entry (handing ``appliedId`` back to the profile that was applied before
-    us, or clearing it when there was none), and reports
-    ``deploymentMode`` back to ``"1p"``. Missing files are a safe no-op;
-    unrelated keys are preserved; existing ``.bak`` backups are kept.
+    us, or clearing it when there was none), and puts ``deploymentMode``
+    back to whatever the user had before :func:`configure_omlx_gateway` ran
+    (defaulting to ``"1p"`` when there was no prior third-party setup).
+    Missing files are a safe no-op; unrelated keys are preserved; existing
+    ``.bak`` backups are kept.
     """
     if not _is_macos():
         logger.info("Claude Desktop auto-config is macOS-only; skipping")
@@ -227,11 +240,13 @@ def restore(home: Path | None = None) -> bool:
     resolved = _home(home)
     paths = _paths(resolved)
 
-    _set_deployment_mode(paths["claude_config"], "1p")
-    _set_deployment_mode(paths["claude3p_config"], "1p")
+    profile = _read_json(paths["profile"])
+    previous_mode = profile.get(_PREVIOUS_DEPLOYMENT_MODE_KEY) or "1p"
+
+    _set_deployment_mode(paths["claude_config"], previous_mode)
+    _set_deployment_mode(paths["claude3p_config"], previous_mode)
 
     meta = _read_json(paths["meta"])
-    profile = _read_json(paths["profile"])
     previous_applied_id = profile.get(_PREVIOUS_APPLIED_ID_KEY)
 
     if meta:
@@ -254,6 +269,9 @@ def restore(home: Path | None = None) -> bool:
                 changed = True
         if _PREVIOUS_APPLIED_ID_KEY in profile:
             del profile[_PREVIOUS_APPLIED_ID_KEY]
+            changed = True
+        if _PREVIOUS_DEPLOYMENT_MODE_KEY in profile:
+            del profile[_PREVIOUS_DEPLOYMENT_MODE_KEY]
             changed = True
         if profile.get("disableDeploymentModeChooser") is not False:
             profile["disableDeploymentModeChooser"] = False

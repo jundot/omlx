@@ -529,111 +529,17 @@ def launch_command(args, extra_args: list[str] | None = None):
     base_url = f"http://{connect_host}:{port}"
 
     # Claude Desktop resolves tier aliases server-side, so it needs no
-    # launch-time model — but it does need the desktop switch. Gate early so
-    # a declined prompt exits without touching the server or any config file.
+    # launch-time model — but it does need the desktop switch. The toggle
+    # lives in the dashboard; the CLI only points the user there.
     if tool_name == "claude_desktop" and not bool(
         getattr(getattr(settings, "claude_code", None), "desktop_enabled", False)
     ):
-        if not sys.stdin.isatty():
-            print("Claude Desktop mode is not enabled in oMLX settings.")
-            print(
-                "Enable it in the oMLX dashboard (Integrations → Claude Desktop)"
-                " or re-run this command in a terminal to enable it on demand."
-            )
-            sys.exit(1)
-        answer = input("Enable Claude Desktop mode in oMLX settings? [Y/n]: ")
-        if answer.strip().lower() in ("", "y", "yes"):
-            # Enable through the same admin endpoint the dashboard uses so
-            # the running server applies it in memory (and persists it)
-            # instead of a local file save the live process cannot see.
-            # The desktop restart stays with the launcher below, so no
-            # restart_desktop flag is sent here.
-            login_key = getattr(args, "api_key", None) or getattr(
-                settings.auth, "api_key", ""
-            ) or ""
-            session = requests.Session()
-            if login_key:
-                try:
-                    login_resp = session.post(
-                        f"{base_url}/admin/api/login",
-                        json={"api_key": login_key},
-                        timeout=5,
-                    )
-                except Exception:
-                    print(
-                        f"Could not reach oMLX server at {base_url} "
-                        "to enable Claude Desktop mode."
-                    )
-                    print("Start the server first: omlx start")
-                    sys.exit(1)
-                if login_resp.status_code == 401:
-                    print(
-                        "Could not enable Claude Desktop mode: "
-                        "the API key was rejected (401)."
-                    )
-                    print(
-                        "Check the master API key (auth.api_key in settings.json "
-                        "or --api-key) or enable it in the oMLX dashboard "
-                        "(Integrations → Claude Desktop)."
-                    )
-                    sys.exit(1)
-                # Any other non-OK login (e.g. 400 when the server has no API
-                # key configured) falls through to an unauthenticated attempt
-                # below, which servers with skip_api_key_verification allow.
-            # No local API key: the login endpoint rejects empty keys (400),
-            # so skip it and try the settings endpoint without a cookie.
-            try:
-                settings_resp = session.post(
-                    f"{base_url}/admin/api/global-settings",
-                    json={"claude_code_desktop_enabled": True},
-                    timeout=5,
-                )
-            except Exception:
-                print(
-                    f"Could not reach oMLX server at {base_url} "
-                    "to enable Claude Desktop mode."
-                )
-                print("Start the server first: omlx start")
-                sys.exit(1)
-            if settings_resp.ok:
-                # Keep this process's copy in sync without touching
-                # settings.json; the server already persisted the change.
-                claude_settings = getattr(settings, "claude_code", None)
-                if claude_settings is not None:
-                    claude_settings.desktop_enabled = True
-                print("Claude Desktop mode enabled.")
-                print(
-                    "Tier alias models are now available via /v1/models "
-                    "(claude-opus, claude-sonnet, claude-haiku)."
-                )
-            elif settings_resp.status_code == 401:
-                print(
-                    "Could not enable Claude Desktop mode: not authorized (401)."
-                )
-                print(
-                    "Set the master API key (auth.api_key in settings.json "
-                    "or --api-key) or enable it in the oMLX dashboard "
-                    "(Integrations → Claude Desktop) with an admin session."
-                )
-                sys.exit(1)
-            else:
-                detail = ""
-                try:
-                    detail = f" {settings_resp.json().get('detail', '')}".rstrip()
-                except Exception:
-                    detail = ""
-                print(
-                    "Could not enable Claude Desktop mode:"
-                    f" server returned {settings_resp.status_code}.{detail}"
-                )
-                sys.exit(1)
-        else:
-            print(
-                "Claude Desktop mode not enabled — nothing to launch. Enable "
-                "it in the oMLX dashboard (Integrations → Claude Desktop) "
-                "or re-run and choose Y."
-            )
-            return
+        print("Claude Desktop mode is not enabled in oMLX settings.")
+        print(
+            "Enable it in the oMLX dashboard (Integrations → Claude Desktop) "
+            "and re-run this command."
+        )
+        sys.exit(1)
 
     # Check if oMLX server is running
     try:

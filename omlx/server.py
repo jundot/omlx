@@ -2042,20 +2042,12 @@ def get_claude_tier_aliases() -> dict[str, str]:
 def _pool_resolve_model_id(
     pool, model_id: str, settings_manager, tier_aliases=None
 ) -> str:
-    """Resolve via the pool, threading Claude tier aliases when present.
-
-    The ``claude_tier_aliases`` kwarg is only passed when non-empty so pool
-    stubs used in older tests (which don't accept it) keep working; a
-    TypeError fallback covers pools that don't support it at all.
-    """
+    """Resolve via the pool, threading Claude tier aliases when present."""
     if not tier_aliases:
         return pool.resolve_model_id(model_id, settings_manager)
-    try:
-        return pool.resolve_model_id(
-            model_id, settings_manager, claude_tier_aliases=tier_aliases
-        )
-    except TypeError:
-        return pool.resolve_model_id(model_id, settings_manager)
+    return pool.resolve_model_id(
+        model_id, settings_manager, claude_tier_aliases=tier_aliases
+    )
 
 
 def resolve_model_id(model_id: str | None) -> str | None:
