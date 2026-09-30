@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Base class for external tool integrations."""
 
 from __future__ import annotations
@@ -9,6 +10,16 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+@dataclass(frozen=True)
+class IntegrationModel:
+    """A discoverable chat model and its per-model capabilities."""
+
+    id: str
+    context_window: int | None = None
+    model_type: str | None = None
+    reasoning: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -34,6 +45,7 @@ class IntegrationContext:
     # read it instead of fetching the status again themselves; empty for
     # direct constructions.
     models_status_map: dict[str, dict] = field(default_factory=dict)
+    models: tuple[IntegrationModel, ...] = ()
 
     @property
     def base_url(self) -> str:

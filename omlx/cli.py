@@ -473,10 +473,23 @@ def launch_command(args, extra_args: list[str] | None = None):
     import requests
 
     from .integrations import IntegrationContext, get_integration, list_integrations
+    from .integrations.base import IntegrationModel
     from .settings import GlobalSettings
 
     def _optional_str(value) -> str | None:
         return value if isinstance(value, str) and value else None
+
+    def _is_chat_model(info: dict) -> bool:
+        return info.get("model_type") in (None, "llm", "vlm") and info.get(
+            "engine_type"
+        ) not in (
+            "image",
+            "embedding",
+            "reranker",
+            "audio_stt",
+            "audio_tts",
+            "audio_sts",
+        )
 
     tool_name = args.tool
 
@@ -550,8 +563,9 @@ def launch_command(args, extra_args: list[str] | None = None):
     except Exception:
         pass
 
-    # Determine model. Explicit CLI tier flags bypass the picker; otherwise always
-    # prompt interactively so the user's selection is honoured.
+    # Codex uses its native model selector, backed by a launch-time catalog.
+    # Other integrations retain the interactive oMLX picker.
+    native_model_picker = tool_name in ("codex", "codex_app")
     model = args.model
     if not model and not integration.requires_model_selection:
         # The integration registers the server's whole model catalog, so
@@ -561,34 +575,53 @@ def launch_command(args, extra_args: list[str] | None = None):
             _optional_str(getattr(settings.integrations, f"{tool_name}_model", None))
             or ""
         )
-    if not model and (cli_opus_model or cli_sonnet_model or cli_haiku_model):
-        model = cli_sonnet_model or cli_opus_model or cli_haiku_model or ""
-    elif not model and integration.requires_model_selection:
-        # Fetch available models from server
+    models_info_list = []
+    if native_model_picker or (
+        integration.requires_model_selection
+        and not model
+        and not (cli_opus_model or cli_sonnet_model or cli_haiku_model)
+    ):
         try:
             resp = requests.get(f"{base_url}/v1/models", headers=headers, timeout=5)
             resp.raise_for_status()
-            data = resp.json()
-            models = [
-                m["id"]
-                for m in data.get("data", [])
-                if m.get("model_type") in ("llm", "vlm", None)
-            ]
-        except Exception:
-            models = []
+            for entry in resp.json().get("data", []):
+                model_id = entry["id"]
+                info = {**entry, **models_status_map.get(model_id, {}), "id": model_id}
+                if _is_chat_model(info):
+                    models_info_list.append(info)
+        except (requests.RequestException, ValueError, KeyError) as exc:
+            if native_model_picker and model:
+                print(f"Warning: could not list oMLX models: {exc}")
+                print("Only the requested model will be available in Codex.")
+            models_info_list = []
 
-        if not models:
-            print("No models available. Load a model first.")
+    if native_model_picker:
+        if not _is_chat_model(models_status_map.get(model, {})):
+            print(
+                f"Cannot launch {integration.display_name} with non-chat model '{model}'."
+            )
             sys.exit(1)
-
-        if len(models) == 1:
-            model = models[0]
+        if not model and models_info_list:
+            saved_model = _optional_str(settings.integrations.codex_model)
+            available_ids = {info["id"] for info in models_info_list}
+            model = (
+                saved_model
+                if saved_model in available_ids
+                else models_info_list[0]["id"]
+            )
+            print(f"Using model: {model} (switch models inside Codex)")
+    elif not model and (cli_opus_model or cli_sonnet_model or cli_haiku_model):
+        model = cli_sonnet_model or cli_opus_model or cli_haiku_model or ""
+    elif not model and models_info_list:
+        if len(models_info_list) == 1:
+            model = models_info_list[0]["id"]
             print(f"Using model: {model}")
         else:
-            models_info_list = [
-                {"id": m_id, **models_status_map.get(m_id, {})} for m_id in models
-            ]
             model = integration.select_model(models_info_list, integration.display_name)
+
+    if not model and integration.requires_model_selection:
+        print("No models available. Load a model first.")
+        sys.exit(1)
 
     # Check if tool is installed
     if not integration.is_installed():
@@ -666,6 +699,20 @@ def launch_command(args, extra_args: list[str] | None = None):
         tools_profile=getattr(args, "tools_profile", "coding"),
         extra_args=tuple(extra_args or ()),
         cross_session=getattr(args, "cross_session", False),
+        models=(
+            tuple(
+                IntegrationModel(
+                    id=info["id"],
+                    context_window=info.get("max_context_window")
+                    or info.get("max_model_len"),
+                    model_type=info.get("model_type"),
+                    reasoning=info.get("enable_thinking"),
+                )
+                for info in models_info_list
+            )
+            if native_model_picker
+            else ()
+        ),
     )
 
     # Launch

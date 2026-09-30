@@ -1,7 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
 """Tests for the integrations module."""
 
 import json
 import plistlib
+import tomllib
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -9,12 +11,14 @@ import pytest
 import yaml
 
 from omlx.integrations import get_integration, list_integrations
-from omlx.integrations.base import IntegrationContext
+from omlx.integrations.base import IntegrationContext, IntegrationModel
 from omlx.integrations.claude import ClaudeCodeIntegration
 from omlx.integrations.codex import (
     CodexIntegration,
     codex_config_args,
+    codex_model_catalog,
     write_codex_config,
+    write_codex_model_catalog,
 )
 from omlx.integrations.codex_app import CodexAppIntegration, find_codex_app_bundle
 from omlx.integrations.copilot import CopilotIntegration
@@ -95,7 +99,7 @@ class TestCodexIntegration:
     def test_get_command_no_model(self):
         codex = CodexIntegration()
         cmd = codex.get_command(ctx(port=8000, api_key="", model=""))
-        assert "select-a-model" in cmd
+        assert cmd.endswith("launch codex")
 
     def test_config_args_use_process_scoped_provider(self):
         args = codex_config_args(
@@ -135,7 +139,7 @@ class TestCodexIntegration:
         assert codex.type == "env_var"
         assert codex.display_name == "Codex"
 
-    def test_launch_forwards_extra_args(self):
+    def test_launch_forwards_extra_args(self, tmp_path):
         codex = CodexIntegration()
         captured = {}
 
@@ -151,6 +155,9 @@ class TestCodexIntegration:
         }
         with (
             patch("omlx.integrations.codex.write_codex_config") as writer,
+            patch(
+                "omlx.integrations.codex.CODEX_CONFIG_PATH", tmp_path / "config.toml"
+            ),
             patch("omlx.integrations.codex.os.environ", base_env),
             patch("omlx.integrations.codex.os.execvpe", side_effect=fake_execvpe),
         ):
@@ -171,6 +178,95 @@ class TestCodexIntegration:
         assert "PYTHONPATH" not in captured["env"]
         assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
         writer.assert_not_called()
+        assert not (tmp_path / "config.toml").exists()
+        catalog_arg = next(
+            arg for arg in captured["argv"] if arg.startswith("model_catalog_json=")
+        )
+        catalog = json.loads(Path(json.loads(catalog_arg.split("=", 1)[1])).read_text())
+        assert catalog["models"][0]["slug"] == "qwen3.5"
+
+
+class TestCodexModelCatalog:
+    def test_preserves_ids_and_per_model_capabilities(self):
+        catalog = codex_model_catalog(
+            ctx(
+                model="vision-alias",
+                context_window=999999,
+                reasoning=True,
+                models=(
+                    IntegrationModel("small-text", 8192, "llm", False),
+                    IntegrationModel("vision-alias", 131072, "vlm", True),
+                    IntegrationModel("embedding", 1024, "embedding"),
+                    IntegrationModel("audio", 1024, "stt"),
+                ),
+            )
+        )
+        models = catalog["models"]
+        assert [model["slug"] for model in models] == ["vision-alias", "small-text"]
+        assert [model["priority"] for model in models] == [0, 1]
+        assert models[0]["context_window"] == 131072
+        assert models[0]["input_modalities"] == ["text", "image"]
+        assert models[0]["default_reasoning_level"] == "high"
+        assert models[0]["supported_reasoning_levels"] == [
+            {"effort": "high", "description": "Use model thinking"}
+        ]
+        assert models[1]["context_window"] == 8192
+        assert models[1]["input_modalities"] == ["text"]
+        assert models[1]["supported_reasoning_levels"] == []
+        assert models[1]["default_reasoning_level"] is None
+        assert models[1]["truncation_policy"]["limit"] == 2048
+        assert all(model["base_instructions"] for model in models)
+        assert all(not model["prefer_websockets"] for model in models)
+
+    def test_explicit_non_chat_model_is_not_added(self):
+        assert codex_model_catalog(ctx(model="embedding", model_type="embedding")) == {
+            "models": []
+        }
+
+    @pytest.mark.parametrize("context_window", [None, 0, -1])
+    def test_unknown_or_invalid_context_uses_fallback(self, context_window):
+        catalog = codex_model_catalog(ctx(model="model", context_window=context_window))
+        assert catalog["models"][0]["context_window"] == 32768
+
+    def test_explicit_model_is_included_when_listing_is_unavailable(self):
+        catalog = codex_model_catalog(ctx(model="deepseek-r1", context_window=65536))
+        assert len(catalog["models"]) == 1
+        model = catalog["models"][0]
+        assert model["slug"] == "deepseek-r1"
+        assert model["context_window"] == 65536
+        assert model["default_reasoning_level"] == "high"
+
+    def test_metadata_overrides_reasoning_name_heuristic(self):
+        catalog = codex_model_catalog(ctx(model="deepseek-r1", reasoning=False))
+        assert catalog["models"][0]["supported_reasoning_levels"] == []
+        assert catalog["models"][0]["context_window"] == 32768
+        assert catalog["models"][0]["input_modalities"] == ["text"]
+
+    def test_catalog_overrides_do_not_freeze_model_settings(self, tmp_path):
+        path = tmp_path / "catalog.json"
+        args = codex_config_args(
+            ctx(model="thinking", reasoning=True, context_window=4096), path
+        )
+        assert f"model_catalog_json={json.dumps(str(path))}" in args
+        assert not any(arg.startswith("model_context_window=") for arg in args)
+        assert not any(arg.startswith("model_reasoning_effort=") for arg in args)
+        assert 'model_providers.omlx.wire_api="responses"' in args
+        assert "model_providers.omlx.supports_websockets=false" in args
+
+    def test_catalog_refreshes_without_replacing_other_catalogs(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        other_catalog = tmp_path / "my-models.json"
+        other_catalog.write_text("user-owned")
+        path = write_codex_model_catalog(config_path, ctx(model="old"))
+        new_path = write_codex_model_catalog(config_path, ctx(model="new"))
+        assert path == new_path
+        assert json.loads(path.read_text())["models"][0]["slug"] == "new"
+        assert other_catalog.read_text() == "user-owned"
+        assert not config_path.exists()
+        assert (
+            write_codex_model_catalog(config_path, ctx(port=9000, model="other"))
+            != path
+        )
 
 
 class TestCodexConfigWriter:
@@ -194,6 +290,75 @@ class TestCodexConfigWriter:
         assert 'model_provider = "omlx"' in content
         assert 'base_url = "http://192.168.1.100:9000/v1"' in content
         assert 'env_key = "OMLX_API_KEY"' in content
+
+    def test_writes_catalog_and_clears_global_model_overrides(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            "model_context_window = 999999\n"
+            "model_auto_compact_token_limit = 900000\n"
+            'model_reasoning_effort = "high"\n'
+            'model_reasoning_summary = "auto"\n'
+            "model_supports_reasoning_summaries = true\n"
+            'approval_policy = "on-request"\n'
+            "[model_providers.other]\n"
+            'name = "Other"\n'
+        )
+        write_codex_config(
+            config_path,
+            ctx(
+                model='model "with quotes"',
+                models=(IntegrationModel('model "with quotes"', 8192, "llm", False),),
+            ),
+        )
+        config = tomllib.loads(config_path.read_text())
+        assert config["model"] == 'model "with quotes"'
+        assert config["approval_policy"] == "on-request"
+        assert config["model_providers"]["other"]["name"] == "Other"
+        assert "model_context_window" not in config
+        assert "model_auto_compact_token_limit" not in config
+        assert "model_reasoning_effort" not in config
+        assert "model_reasoning_summary" not in config
+        assert "model_supports_reasoning_summaries" not in config
+        models = json.loads(Path(config["model_catalog_json"]).read_text())["models"]
+        assert models[0]["context_window"] == 8192
+        assert config["model_providers"]["omlx"]["wire_api"] == "responses"
+        assert config["model_providers"]["omlx"]["supports_websockets"] is False
+
+    def test_backup_failure_does_not_overwrite_config(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        config_path.write_text('model = "old"\n')
+        with (
+            patch(
+                "omlx.integrations.codex.shutil.copy2", side_effect=OSError("read-only")
+            ),
+            pytest.raises(OSError, match="read-only"),
+        ):
+            write_codex_config(config_path, ctx(model="new"))
+        assert config_path.read_text() == 'model = "old"\n'
+
+    def test_replaces_provider_subtables_and_commented_header(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            "[model_providers.omlx] # old provider\n"
+            'name = "Old"\n'
+            "[model_providers.omlx.http_headers]\n"
+            'old_header = "old"\n'
+            "[model_providers.other] # keep\n"
+            'name = "Other"\n'
+        )
+        write_codex_config(config_path, ctx(model="new"))
+        providers = tomllib.loads(config_path.read_text())["model_providers"]
+        assert providers["omlx"]["name"] == "oMLX"
+        assert "http_headers" not in providers["omlx"]
+        assert providers["other"]["name"] == "Other"
+
+    def test_invalid_config_is_not_overwritten(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        config_path.write_text('model = "unterminated\n')
+        with pytest.raises(tomllib.TOMLDecodeError):
+            write_codex_config(config_path, ctx(model="new"))
+        assert config_path.read_text() == 'model = "unterminated\n'
+        assert not list(tmp_path.glob("omlx-models-*.json"))
 
     def test_creates_backup(self, tmp_path):
         config_path = tmp_path / "config.toml"
@@ -269,6 +434,9 @@ class TestCodexAppIntegration:
         cmd = codex_app.get_command(ctx(port=8000, api_key="key", model="qwen3.5"))
         assert "omlx launch codex_app" in cmd
         assert "--model qwen3.5" in cmd
+
+    def test_get_command_no_model(self):
+        assert CodexAppIntegration().get_command(ctx()).endswith("launch codex_app")
 
     def test_configure(self, tmp_path):
         codex_app = CodexAppIntegration()

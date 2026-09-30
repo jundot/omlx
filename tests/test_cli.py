@@ -396,6 +396,209 @@ class TestLaunchCommandOptions:
 class TestLaunchCommandFunction:
     """Tests for launch command runtime behavior."""
 
+    @pytest.mark.parametrize("tool", ["codex", "codex_app"])
+    @pytest.mark.parametrize(
+        ("requested_model", "saved_model", "expected_model"),
+        [
+            (None, None, "vision-alias"),
+            (None, "text-model", "text-model"),
+            (None, "removed-model", "vision-alias"),
+            ("text-model", "vision-alias", "text-model"),
+            ("embedding-model", None, None),
+            ("image-model", None, None),
+        ],
+    )
+    def test_codex_uses_native_picker_with_all_chat_models(
+        self, tool, requested_model, saved_model, expected_model
+    ):
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.display_name = "Codex"
+        integration.is_installed.return_value = True
+        health_response = MagicMock()
+        status_response = MagicMock()
+        status_response.ok = True
+        status_response.json.return_value = {
+            "models": [
+                {
+                    "id": "raw-vision-id",
+                    "model_alias": "vision-alias",
+                    "model_type": "vlm",
+                    "max_context_window": 131072,
+                    "enable_thinking": True,
+                    "loaded": False,
+                },
+                {
+                    "id": "text-model",
+                    "model_type": "llm",
+                    "max_context_window": 8192,
+                    "enable_thinking": False,
+                    "loaded": True,
+                },
+                {"id": "embedding-model", "model_type": "embedding"},
+                {"id": "hidden-model", "model_type": "llm", "is_hidden": True},
+                {"id": "audio-model", "model_type": "stt"},
+                {"id": "image-model", "model_type": "llm", "engine_type": "image"},
+            ]
+        }
+        models_response = MagicMock()
+        models_response.json.return_value = {
+            "data": [
+                {"id": "vision-alias"},
+                {"id": "text-model"},
+                {"id": "embedding-model"},
+                {"id": "audio-model"},
+                {"id": "image-model"},
+            ]
+        }
+        settings = SimpleNamespace(
+            server=SimpleNamespace(host="127.0.0.1", port=8000),
+            auth=SimpleNamespace(api_key="saved-key"),
+            integrations=SimpleNamespace(codex_model=saved_model),
+            claude_code=None,
+        )
+        args = argparse.Namespace(
+            tool=tool,
+            host=None,
+            port=None,
+            api_key=None,
+            model=requested_model,
+        )
+        with (
+            patch(
+                "requests.get",
+                side_effect=[health_response, status_response, models_response],
+            ) as get,
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+        ):
+            if expected_model is None:
+                with pytest.raises(SystemExit) as exc:
+                    launch_command(args)
+                assert exc.value.code == 1
+            else:
+                launch_command(args, extra_args=["--example-flag"])
+
+        integration.select_model.assert_not_called()
+        if expected_model is None:
+            integration.launch.assert_not_called()
+            return
+        context = integration.launch.call_args.args[0]
+        assert context.model == expected_model
+        assert context.extra_args == ("--example-flag",)
+        assert [model.id for model in context.models] == ["vision-alias", "text-model"]
+        assert context.models[0].model_type == "vlm"
+        assert context.models[0].context_window == 131072
+        assert context.models[0].reasoning is True
+        assert context.models[1].context_window == 8192
+        assert context.models[1].reasoning is False
+        assert get.call_args.kwargs["headers"] == {"Authorization": "Bearer saved-key"}
+
+    @pytest.mark.parametrize("tool", ["codex", "codex_app"])
+    def test_codex_model_listing_failure_keeps_explicit_model(self, tool, capsys):
+        import requests
+
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.display_name = "Codex"
+        integration.is_installed.return_value = True
+        health_response = MagicMock()
+        status_response = MagicMock()
+        status_response.ok = False
+        settings = SimpleNamespace(
+            server=SimpleNamespace(host="127.0.0.1", port=8000),
+            auth=SimpleNamespace(api_key=""),
+            claude_code=None,
+        )
+        args = argparse.Namespace(
+            tool=tool, host=None, port=None, api_key=None, model="explicit"
+        )
+        with (
+            patch(
+                "requests.get",
+                side_effect=[
+                    health_response,
+                    status_response,
+                    requests.ConnectionError("offline"),
+                ],
+            ),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+        ):
+            launch_command(args)
+        context = integration.launch.call_args.args[0]
+        assert context.model == "explicit"
+        assert context.models == ()
+        integration.select_model.assert_not_called()
+        assert "Only the requested model" in capsys.readouterr().out
+
+    def test_codex_uses_public_context_limit_when_status_unavailable(self):
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.is_installed.return_value = True
+        health_response = MagicMock()
+        status_response = MagicMock()
+        status_response.ok = False
+        models_response = MagicMock()
+        models_response.json.return_value = {
+            "data": [{"id": "model", "max_model_len": 16384}]
+        }
+        settings = SimpleNamespace(
+            server=SimpleNamespace(host="127.0.0.1", port=8000),
+            auth=SimpleNamespace(api_key=""),
+            integrations=SimpleNamespace(codex_model=None),
+            claude_code=None,
+        )
+        args = argparse.Namespace(
+            tool="codex", host=None, port=None, api_key=None, model=None
+        )
+        with (
+            patch(
+                "requests.get",
+                side_effect=[health_response, status_response, models_response],
+            ),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+        ):
+            launch_command(args)
+        assert integration.launch.call_args.args[0].models[0].context_window == 16384
+        integration.select_model.assert_not_called()
+
+    @pytest.mark.parametrize("tool", ["codex", "codex_app"])
+    def test_codex_without_chat_models_exits(self, tool):
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        health_response = MagicMock()
+        status_response = MagicMock()
+        status_response.ok = False
+        models_response = MagicMock()
+        models_response.json.return_value = {"data": []}
+        settings = SimpleNamespace(
+            server=SimpleNamespace(host="127.0.0.1", port=8000),
+            auth=SimpleNamespace(api_key=""),
+            claude_code=None,
+        )
+        args = argparse.Namespace(
+            tool=tool, host=None, port=None, api_key=None, model=None
+        )
+        with (
+            patch(
+                "requests.get",
+                side_effect=[health_response, status_response, models_response],
+            ),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            pytest.raises(SystemExit) as exc,
+        ):
+            launch_command(args)
+        assert exc.value.code == 1
+        integration.launch.assert_not_called()
+        integration.select_model.assert_not_called()
+
     def test_launch_command_passes_model_type_to_integration(self):
         """VLM model metadata should be forwarded to integrations."""
         from omlx.cli import launch_command

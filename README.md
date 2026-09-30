@@ -250,6 +250,41 @@ Set up OpenClaw, OpenCode, Codex, Hermes Agent, Copilot, Pi, and DeepSeek Harnes
   <img src="docs/images/omlx_integrations.png" alt="oMLX Integrations" width="720">
 </p>
 
+#### Codex model switching
+
+```bash
+omlx launch codex
+omlx launch codex_app
+# Optionally select the initial model; other models remain available:
+omlx launch codex --model your-model-id
+```
+
+Both integrations refresh a Codex model catalog from oMLX's available chat models,
+so you can switch models with the CLI's `/model` selector or the desktop app's
+model picker instead of selecting just one model before launch. Without `--model`,
+oMLX uses the saved Codex integration model when available, otherwise the first
+model returned by the server (favorites first).
+
+The catalog preserves served aliases and exposed profiles, includes unloaded
+models that oMLX can load on demand, and records each model's context window and
+text/image input support. Embedding, reranking, audio, and image-generation models
+are excluded when their type is available from the model status endpoint. If
+status is unavailable, the public model listing supplies context limits and input
+support defaults to text-only. Thinking models retain the existing high-effort
+default; additional reasoning effort levels are not inferred.
+
+Requires a Codex version supporting
+[`model_catalog_json`](https://developers.openai.com/codex/config-reference/#model_catalog_json).
+The catalog is loaded at startup: relaunch through oMLX after adding or removing
+models, changing aliases, or updating model settings. Restart an already-running
+desktop app to apply the refreshed configuration. The CLI uses process-scoped
+provider/catalog overrides without changing your `config.toml`; the desktop
+integration backs up and updates that file as before. A custom `CODEX_HOME` is
+respected, and oMLX's generated catalogs do not overwrite other catalog files.
+User-specified global context/reasoning overrides in CLI configuration can still
+take precedence over catalog metadata; the desktop integration clears these
+overrides so limits follow the selected model.
+
 ### Performance Benchmark
 
 One-click benchmarking from the admin panel. Measures prefill (PP) and text generation (TG) tokens per second, with partial prefix cache hit testing for realistic performance numbers.
