@@ -47,7 +47,11 @@ class Omlx < Formula
     working_dir var
     log_path var/"log/omlx.log"
     error_log_path var/"log/omlx.log"
-    environment_variables PATH: std_service_path_env
+    # launchd KeepAlive respawns the process, so it is a supervisor in the
+    # sense /admin/api/server/restart expects: declare it so the dashboard
+    # restart button works under `brew services` instead of returning 503.
+    environment_variables PATH: std_service_path_env,
+                          OMLX_SUPERVISED: "launchd"
   end
 
   def install
