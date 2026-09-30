@@ -1711,6 +1711,85 @@ def _count_image_tokens_real(
     return total
 
 
+def _audio_feature_cache_key_ranges(
+    token_ids: list[int],
+    input_features: Any,
+    input_features_mask: Any,
+    audio_token_id: int | None,
+    image_ranges: list[tuple[int, str]],
+) -> list[tuple[int, str]]:
+    """Extend image cache boundaries with cumulative audio-clip identities.
+
+    Audio placeholder tokens only encode clip length, so without this two
+    different clips of equal length share prefix-cache blocks. Each clip is
+    hashed without its batch padding (clips are padded to the longest one in
+    the request), so a clip keeps its key when a later turn adds a longer one.
+    """
+    import hashlib
+
+    import numpy as np
+
+    def _to_np(value):
+        if isinstance(value, mx.array):
+            if value.dtype == mx.bfloat16:
+                value = value.astype(mx.float32)
+            return np.array(value)
+        return np.asarray(value)
+
+    features = _to_np(input_features)
+    mask = None if input_features_mask is None else _to_np(input_features_mask)
+
+    runs = []
+    position = 0
+    while audio_token_id is not None and position < len(token_ids):
+        if token_ids[position] != audio_token_id:
+            position += 1
+            continue
+        runs.append(position)
+        while position < len(token_ids) and token_ids[position] == audio_token_id:
+            position += 1
+
+    audio_hash = hashlib.sha256()
+    audio_events = []
+    if features.ndim >= 2 and len(runs) == features.shape[0]:
+        for i, start in enumerate(runs):
+            clip = features[i]
+            if mask is not None and mask.shape[:2] == features.shape[:2]:
+                valid = int(mask[i].sum())
+                # Trim only right padding; any other mask layout keeps the
+                # padded row, which can over-key but never collide.
+                if mask[i][:valid].all():
+                    clip = clip[:valid]
+            audio_hash.update(str(clip.shape).encode())
+            audio_hash.update(np.ascontiguousarray(clip).tobytes())
+            audio_events.append((start, audio_hash.hexdigest()))
+    else:
+        # Clips can't be matched to token runs: key everything from the
+        # first audio token on (or the whole request) on all audio input.
+        audio_hash.update(str(features.shape).encode())
+        audio_hash.update(np.ascontiguousarray(features).tobytes())
+        audio_events.append((runs[0] if runs else 0, audio_hash.hexdigest()))
+
+    events = [(start, key, None) for start, key in image_ranges]
+    events += [(start, None, key) for start, key in audio_events]
+    ranges = []
+    image_key = ""
+    audio_key = None
+    for start, image_update, audio_update in sorted(events, key=lambda e: e[0]):
+        if image_update is not None:
+            image_key = image_update
+        if audio_update is not None:
+            audio_key = audio_update
+        key = image_key
+        if audio_key is not None:
+            key = hashlib.sha256(f"audio:{image_key}:{audio_key}".encode()).hexdigest()
+        if ranges and ranges[-1][0] == start:
+            ranges[-1] = (start, key)
+        else:
+            ranges.append((start, key))
+    return ranges
+
+
 class VLMBatchedEngine(BaseEngine):
     """
     VLM engine with continuous batching, tiered KV cache, and boundary snapshots.
@@ -4262,6 +4341,23 @@ class VLMBatchedEngine(BaseEngine):
                     token_ids,
                     extra_model_inputs["audio_codes"],
                     self._vlm_model.config.audio_token_id,
+                    image_ranges,
+                )
+                image_cache_key_start = image_cache_key_ranges[0][0]
+                image_hash = image_cache_key_ranges[-1][1]
+            elif has_audio and "input_features" in extra_model_inputs:
+                image_ranges = image_cache_key_ranges
+                if image_hash is not None and not image_ranges:
+                    image_ranges = [(0, image_hash)]
+                config = self._vlm_model.config
+                audio_token_id = getattr(config, "audio_token_id", None)
+                if audio_token_id is None:
+                    audio_token_id = getattr(config, "audio_token_index", None)
+                image_cache_key_ranges = _audio_feature_cache_key_ranges(
+                    token_ids,
+                    extra_model_inputs["input_features"],
+                    extra_model_inputs.get("input_features_mask"),
+                    audio_token_id,
                     image_ranges,
                 )
                 image_cache_key_start = image_cache_key_ranges[0][0]
