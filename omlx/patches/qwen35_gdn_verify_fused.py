@@ -19,9 +19,8 @@ read. Any other reader of the slot evaluates the lazy replay normally.
 
 The arithmetic follows the stock chain: the per-row reduction order of
 ``gated_delta_update``, the bf16 or fp16 rounding points of ``compute_g`` and
-``sigmoid``, MLX ``rms_norm`` and ``_precise_swiglu``. Compiled MLX graphs use
-precise transcendentals while custom kernels default to fast math, so the
-helpers call ``metal::precise`` explicitly. The result is bit-exact on M3 and
+``sigmoid``, MLX ``rms_norm`` and ``_precise_swiglu``. The decay helpers use
+precise transcendentals, and the SiLU gate follows the installed MLX build. The result is bit-exact on M3 and
 later GPUs. On M1/M2 MLX's own softplus rounds very small values differently,
 so the decay of such rows can differ by one ulp.
 """
@@ -29,6 +28,7 @@ so the decay of such rows can differ by one ulp.
 from __future__ import annotations
 
 import logging
+from functools import cache
 
 import mlx.core as mx
 
@@ -219,7 +219,8 @@ _NORM_GATE = """
     for (int i = 0; i < 4; ++i) {
         InT normed = norm_w[lane * 4 + i] * static_cast<InT>(x[i] * inv);
         float g = static_cast<float>(zp[i]);
-        float sy = 1 / (1 + metal::precise::exp(metal::abs(g)));
+        // Match the installed MLX float32 sigmoid arithmetic.
+        float sy = 1 / (1 + SIGMOID_EXP(metal::abs(g)));
         float sig = (g < 0) ? sy : 1 - sy;
         InT o = static_cast<InT>((g * sig) * static_cast<float>(normed));
         op[i] = o;
@@ -261,6 +262,49 @@ def _kernel(main: bool, replay: bool):
     return kernel
 
 
+@cache
+def _sigmoid_exp():
+    """Match served SiLU across all gate encodings before fusing the norm.
+
+    Released and nightly MLX builds differ in their float32 exponential.
+    Probe both expressions once; decline fusion if neither is equivalent.
+    """
+    from mlx_vlm.models.qwen3_5.language import _precise_swiglu
+
+    encodings = mx.arange(65536, dtype=mx.uint32).astype(mx.uint16)
+    gates = mx.concatenate(
+        [
+            encodings.view(dtype).astype(mx.float32)
+            for dtype in (mx.float16, mx.bfloat16)
+        ]
+    )
+    expected = _precise_swiglu(gates, gates, mx.ones_like(gates))
+    for expression in ("metal::exp", "metal::precise::exp"):
+        kernel = mx.fast.metal_kernel(
+            name="omlx_gdn_sigmoid_probe",
+            input_names=["gates"],
+            output_names=["out"],
+            source="""
+                uint i = thread_position_in_grid.x;
+                float g = gates[i];
+                float sy = 1 / (1 + EXP(metal::abs(g)));
+                out[i] = g * (g < 0 ? sy : 1 - sy);
+            """.replace("EXP", expression),
+        )
+        (actual,) = kernel(
+            inputs=[gates],
+            grid=(gates.size, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[gates.shape],
+            output_dtypes=[mx.float32],
+        )
+        same = (actual == expected) | (mx.isnan(actual) & mx.isnan(expected))
+        if mx.all(same).item():
+            return expression
+    logger.warning("GDN fused norm disabled: unsupported MLX sigmoid arithmetic")
+    return None
+
+
 def _norm_gate_kernel(eps: float):
     key = ("norm_gate", float(eps))
     kernel = _KERNELS.get(key)
@@ -269,7 +313,9 @@ def _norm_gate_kernel(eps: float):
             name="omlx_gdn_norm_gate_eps" + f"{eps:.0e}".replace("-", "m"),
             input_names=["y", "z", "norm_w"],
             output_names=["out", "xs"],
-            source=_NORM_GATE.replace("EPS", f"{float(eps)!r}f"),
+            source=_NORM_GATE.replace("EPS", f"{float(eps)!r}f").replace(
+                "SIGMOID_EXP", _sigmoid_exp()
+            ),
         )
         _KERNELS[key] = kernel
     return kernel
@@ -304,6 +350,7 @@ def fused_eligible(layer, q, cache, length) -> bool:
         and layer.norm.weight.dtype == q.dtype
         and (state is None or state.dtype == mx.float32)
         and length <= 32
+        and _sigmoid_exp() is not None
     )
 
 

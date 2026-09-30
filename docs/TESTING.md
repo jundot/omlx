@@ -182,6 +182,15 @@ Run `python -m pytest tests/test_oq.py -k TestStreamedCalibration` for streamed 
 
 Run `python -m pytest -q tests/test_qwen35_moe_routed_decode.py tests/test_qwen35_moe_router.py tests/test_qwen35_moe_gate_up.py` to check the one-token routed-expert kernels. Real `Qwen3_5MoeSparseMoeBlock` instances laid out like Qwen3.8-Flash-Next oQ (quantized routed experts, 8-bit shared expert and shared-expert gate, bf16 router) must match the served body bit for bit, with the shared expert and its gate folded into the two launches: 5-bit (oQ5e) and 4-bit experts at the Flash-Next shape (hidden 2560, intermediate 640, top-k 10), and 5-bit gs32, 6-bit gs128 and 8-bit experts at smaller shapes. A bf16 shared expert stays composed and must match too. Both launches are also run in FP32 against MLX's FP32 mat-vecs (routed and shared gate+up after SwiGLU, the gate row, every routed and shared down row), because BF16 outputs hide one-ulp FP32 differences (a fast-math `exp` in the SwiGLU sigmoid passes most BF16 cases but fails these). The kernels bind a one-expert view of the stacked weights; routing to experts 500+ of 512 checks that the view still reads the stacked buffer, and replacing the expert or shared-expert arrays must rebuild the cached plan. The other cases check that shapes where MLX would pick a different mat-vec partition, 3-bit experts, top-k 8, prefill and verify rows, float16, blocks without the gate+up fusion and a kernel failure all keep the served body. The one-launch router softmax + top-k must return the indices and scores of the softmax and top-k launches for random logits and engineered near-ties (every logit repeated eight times, logits on adjacent bf16 values, two-valued rows), a block whose router rows repeat eight times must route like the served block, and the softmax runs in FP32 against MLX's FP32 softmax (a fast reciprocal or a precise `exp` still routes identically but fails there). The router gemv must return MLX's `x @ W.T` logits bit for bit at 512x2560, 256x2048 and 128x1024, and its FP32 row sums must equal MLX's FP32 gemv on the same values (a `simd_sum` in place of MLX's shuffle-down tree changes only a few BF16 logits but every FP32 sum); shapes where MLX reduces K differently (K >= 16 N, a guarded K tail) keep `nn.Linear`.
 
+# Qwen3.5 fused verifier norm
+
+Run `python -m pytest -q tests/test_qwen35_gdn_norm_gate.py` on a Metal-capable
+Mac to compare the fused gated RMS norm with the served SiLU graph. Tests cover
+FP16/BF16, varied RMS weights, three epsilon values, every gate encoding, and
+fallback when the installed MLX arithmetic is unsupported. The check supports
+both released and nightly MLX builds; it does not assume the exponential from
+the version number.
+
 # Engine idle timing tests
 
 `python -m pytest -q tests/test_engine_idle_completion.py tests/test_engine_pool.py tests/test_active_models_visibility.py` checks that lease completion refreshes the LRU/TTL timestamp and that busy models report zero idle time. The regression cases include a request longer than its TTL, overlapping requests, pending unload, cancelled release, and redundant releases.
