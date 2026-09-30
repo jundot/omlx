@@ -4320,19 +4320,22 @@ async def create_chat_completion(
         ):
             merged_ct_kwargs["preserve_thinking"] = True
 
-        # Add compiled grammar for logit-level structured output.
-        # When a reasoning_parser is configured, the structural tag includes
-        # a thinking phase — auto-set a thinking_budget so the model exits
-        # the reasoning phase and the grammar can activate.
+        # Add compiled grammar for logit-level structured output; the
+        # prompt-injection fallback needs the same reasoning-phase budget
+        # a reasoning_parser model needs before grammar can activate.
         if compiled_grammar is not None:
             chat_kwargs["compiled_grammar"] = compiled_grammar
-            if reasoning_parser and "thinking_budget" not in chat_kwargs:
-                default_budget = min(max_tokens // 2, 4096)
-                chat_kwargs["thinking_budget"] = default_budget
-                logger.debug(
-                    "Auto-set thinking_budget=%d for grammar-constrained request",
-                    default_budget,
-                )
+        if (
+            (compiled_grammar is not None or response_format_warning is not None)
+            and reasoning_parser
+            and "thinking_budget" not in chat_kwargs
+        ):
+            default_budget = min(max_tokens // 2, 4096)
+            chat_kwargs["thinking_budget"] = default_budget
+            logger.debug(
+                "Auto-set thinking_budget=%d for grammar-constrained request",
+                default_budget,
+            )
 
         # Add tools if provided (includes MCP tools)
         if tools_for_template:
@@ -7254,16 +7257,22 @@ async def create_response(
         ):
             merged_ct_kwargs["preserve_thinking"] = True
 
-        # Add compiled grammar for logit-level structured output.
+        # Add compiled grammar for logit-level structured output; the
+        # prompt-injection fallback needs the same reasoning-phase budget
+        # as the compiled path (see create_chat_completion).
         if compiled_grammar is not None:
             chat_kwargs["compiled_grammar"] = compiled_grammar
-            if reasoning_parser and "thinking_budget" not in chat_kwargs:
-                default_budget = min(max_tokens // 2, 4096)
-                chat_kwargs["thinking_budget"] = default_budget
-                logger.debug(
-                    "Auto-set thinking_budget=%d for grammar-constrained request",
-                    default_budget,
-                )
+        if (
+            (compiled_grammar is not None or response_format_warning is not None)
+            and reasoning_parser
+            and "thinking_budget" not in chat_kwargs
+        ):
+            default_budget = min(max_tokens // 2, 4096)
+            chat_kwargs["thinking_budget"] = default_budget
+            logger.debug(
+                "Auto-set thinking_budget=%d for grammar-constrained request",
+                default_budget,
+            )
 
         if tools_for_template:
             chat_kwargs["tools"] = tools_for_template
