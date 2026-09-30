@@ -839,6 +839,7 @@ def routed_verify_window(block, x):
     if (
         plan is None
         or plan.hidden != hidden
+        or plan.dtype != x.dtype
         or not plan.fold
         or plan.router_logits is None
     ):

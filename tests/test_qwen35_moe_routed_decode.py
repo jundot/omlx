@@ -417,10 +417,25 @@ def test_mismatched_projection_dtypes_keep_composed_path():
     assert routed.routed_decode_plan(block, mx.zeros((1, 1, 1024), mx.float16)) is None
 
 
-
 def test_mismatched_router_dtype_uses_stock_gate():
     block = _block(1024, 512, top_k=8, dtype=mx.float16)
     block.gate["weight"] = block.gate["weight"].astype(mx.bfloat16)
     plan = routed.routed_decode_plan(block, mx.zeros((1, 1, 1024), mx.float16))
     assert plan is not None
     assert plan.router_logits is None
+
+
+def test_verify_window_rejects_mismatched_activation_dtype(monkeypatch):
+    block = _block(1024, 512, top_k=10, dtype=mx.float16)
+    monkeypatch.setattr(routed, "_WINDOW_DISABLED", False)
+    monkeypatch.setattr(routed, "_VERIFY_WINDOW", True)
+    monkeypatch.setattr(
+        routed,
+        "router_gemv",
+        lambda weight: lambda x: pytest.fail(
+            "Mismatched verify activations must not reach a typed router kernel"
+        ),
+    )
+    assert (
+        routed.routed_verify_window(block, mx.zeros((1, 2, 1024), mx.bfloat16)) is None
+    )
