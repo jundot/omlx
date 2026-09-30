@@ -302,6 +302,8 @@ _NUMERICS_REVISIONS = {
     "mlx_lm.models.qwen3_5": "gdn-qk-norm-2",
     "mlx_lm.models.qwen3_next": "gdn-qk-norm-2",
     "mlx_lm.models.bailing_hybrid": "gdn-qk-norm-2",
+    # omlx.patches.qwen35_gdn_prework applies the same fix to mlx-vlm.
+    "mlx_vlm.models.qwen3_5.language": "gdn-qk-norm-2",
 }
 
 

@@ -1012,6 +1012,18 @@ def maybe_apply_pre_load_patches(
                     model_name,
                 )
 
+    # mlx-vlm Qwen3.5-family GDN layers normalize q/k like the mlx-lm path.
+    if for_vlm and (
+        str(model_type or "").startswith("qwen3_5")
+        or str(text_model_type or "").startswith("qwen3_5")
+    ):
+        try:
+            from ..patches.qwen35_gdn_prework import apply_qwen35_vlm_qk_norm_patch
+        except Exception as e:
+            logger.warning("Qwen3.5 VLM q/k norm patch import failed: %s", e)
+        else:
+            apply_qwen35_vlm_qk_norm_patch()
+
     # qwen3_5_moe covers Qwen3.6 too (HF config sets model_type=qwen3_5_moe).
     # The nested-visual sanitize wrap remaps language_model.model.visual.*
     # to vision_tower.* for Qwen3.6's nested ViT layout. Wraps whichever
