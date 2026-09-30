@@ -302,7 +302,7 @@ class EngineEntry:
         | TTSEngine
         | None
     ) = None  # Loaded engine instance
-    last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
+    last_access: float = 0.0  # Latest load/acquire/release for LRU and TTL
     is_loading: bool = False  # Prevent concurrent loads
     loading_started_at: float | None = None  # Timestamp when current load started
     is_pinned: bool = False  # Never evict if True
@@ -425,7 +425,7 @@ class EnginePool:
                 # Generation steps already keep the GPU busy.
                 self._gpu_keep_warm_last_active = now
                 return False
-            # last_access marks request start; long requests are caught above.
+            # Leases refresh last_access at both request start and completion.
             last_request = max(last_request, entry.last_access)
         return loaded and now - last_request < _GPU_KEEP_WARM_IDLE_WINDOW_S
 
@@ -2413,11 +2413,13 @@ class EnginePool:
         if entry is not None and not entry.pending_unload_reason:
             if entry.in_use > 0:
                 entry.in_use -= 1
+                entry.last_access = time.time()
             return
         async with self._lock:
             e = self._entries.get(model_id)
             if e is not None and e.in_use > 0:
                 e.in_use -= 1
+                e.last_access = time.time()
             await self._unload_pending_if_idle_locked(model_id)
 
     def _finish_lease_release_task(self, task: asyncio.Task[None]) -> None:
