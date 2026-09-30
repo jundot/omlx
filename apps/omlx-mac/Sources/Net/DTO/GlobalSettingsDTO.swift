@@ -171,10 +171,9 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let opusModel: String?
         let sonnetModel: String?
         let haikuModel: String?
-        /// exposes claude-opus-5 / claude-sonnet-5 /
-        /// claude-haiku-4-5-20251001 as tier-model aliases for Claude
-        /// Desktop. Optional so older servers that omit the key still
-        /// decode (nil = disabled).
+        /// Annotates the configured tier models with Anthropic family
+        /// metadata (anthropic_family_tier) for Claude Desktop. Optional so
+        /// older servers that omit the key still decode (nil = disabled).
         let desktopEnabled: Bool?
     }
 

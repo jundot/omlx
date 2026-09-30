@@ -110,7 +110,7 @@ private struct ClaudeCodeSection: View {
                                   defaultValue: "Claude Desktop",
                                   comment: "Row label for the Claude Desktop tier-alias toggle"),
                     sublabel: String(localized: "integrations.claude.desktop.sub",
-                                     defaultValue: "Expose claude-opus-5 / claude-sonnet-5 / claude-haiku-4-5-20251001 as aliases of the tier models",
+                                     defaultValue: "Expose claude-opus / claude-sonnet / claude-haiku as aliases of the tier models",
                                      comment: "Sublabel explaining the Claude Desktop tier-alias toggle")
                 ) {
                     Toggle("", isOn: vm.bind($vm.desktopEnabled, save: {
