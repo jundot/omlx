@@ -1664,18 +1664,24 @@ function clusterV2Wizard() {
         },
 
         sshTargetFor(device) {
-            // The server only offers fresh alternatives with an already pinned matching key.
-            if (device?.preferred_ssh_target) return String(device.preferred_ssh_target);
-            // Pairing enrollment records the SSH target; the devices payload
-            // surfaces it as ssh_target on paired rows. Fall back to the
-            // first verified probe address when no enrollment exists yet.
-            if (device?.ssh_target) return String(device.ssh_target);
             const addrs = Array.isArray(device?.addrs) ? device.addrs : [];
             // A bare fe80:: link-local address has no scope id here, so SSH
             // to it has no route — prefer any routable address first.
             const usable = addrs.filter(
                 (addr) => addr && addr.ip && !String(addr.ip).startsWith('fe80::'),
             );
+            // Pairing pins every address. Prefer the first verified address,
+            // retaining an explicit login from enrollment when one exists.
+            const verified = usable.find(
+                (addr) => device?.address_health?.[addr.ip]?.state === 'verified',
+            );
+            if (verified) {
+                const target = String(device?.ssh_target || '');
+                const login = target.slice(0, target.lastIndexOf('@') + 1);
+                return `${login}${verified.ip}`;
+            }
+            if (device?.preferred_ssh_target) return String(device.preferred_ssh_target);
+            if (device?.ssh_target) return String(device.ssh_target);
             const first = usable[0] || addrs.find((addr) => addr && addr.ip);
             return first ? String(first.ip) : this.deviceName(device);
         },

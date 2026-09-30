@@ -2601,3 +2601,44 @@ console.log(JSON.stringify({target: component.sshTargetFor(peer),
         "host": "remote_user@192.0.2.2",
         "original": "remote_user@192.0.2.1",
     }
+
+
+@pytest.mark.parametrize("login", ["", "remote_user@"])
+@pytest.mark.parametrize("verified", [True, False])
+def test_wizard_selects_verified_address_without_ssh_user(login, verified):
+    original = login + "192.0.2.1"
+    expected = login + ("192.0.2.2" if verified else "192.0.2.1")
+    result = _run_wizard(
+        """
+const peer = {
+    node_id: 'peer', paired: true, ssh_target: ORIGINAL,
+    addrs: [{ip: '192.0.2.1'}, {ip: '192.0.2.2'}, {ip: '192.0.2.3'}],
+    address_health: {
+        '192.0.2.1': {state: 'stale'},
+        '192.0.2.2': {state: STATE},
+        '192.0.2.3': {state: STATE},
+    },
+};
+component.devicesPayload = {self: null, paired: [peer], discovered: []};
+component.planProposal = {activation: {hosts: [{ssh: ORIGINAL}]}};
+let probed;
+component.apiFetch = async (url, options) => {
+    probed = JSON.parse(options.body).ssh;
+    return {};
+};
+(async () => {
+    await component.probePeer(peer);
+    console.log(JSON.stringify({target: component.sshTargetFor(peer),
+        host: component.deploymentHosts()[0].ssh, probed,
+        original: component.planProposal.activation.hosts[0].ssh}));
+})();
+""".replace("ORIGINAL", json.dumps(original)).replace(
+            "STATE", json.dumps("verified" if verified else "stale")
+        )
+    )
+    assert result == {
+        "target": expected,
+        "host": expected,
+        "probed": expected,
+        "original": original,
+    }
