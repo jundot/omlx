@@ -36,19 +36,6 @@ _REMOTE_CODE_METADATA_PATTERNS = [
     "*.jinja",
 ]
 
-# mlx_lm.load dropped trust_remote_code in some releases. Check once at
-# import time so call sites can pass it safely across versions.
-def _mlx_lm_load_accepts_trust_remote_code() -> bool:
-    try:
-        import inspect
-        from mlx_lm import load as _lm_load
-        return "trust_remote_code" in inspect.signature(_lm_load).parameters
-    except Exception:
-        return False
-
-_LM_LOAD_ACCEPTS_TRC = _mlx_lm_load_accepts_trust_remote_code()
-
-
 def ensure_model_code_trusted(
     config: dict[str, Any],
     *,
@@ -131,9 +118,7 @@ def lm_load_compat(path_or_repo: str, *, trust_remote_code: bool = False, **kwar
         trust_remote_code=trust_remote_code,
     )
     from mlx_lm import load
-    if _LM_LOAD_ACCEPTS_TRC:
-        kwargs["trust_remote_code"] = trust_remote_code
-    return load(path_or_repo, **kwargs)
+    return load(path_or_repo, trust_remote_code=trust_remote_code, **kwargs)
 
 
 def expand_per_layer_quant_keys(cfg: dict) -> dict:

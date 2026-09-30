@@ -22,7 +22,6 @@ try:
 except ImportError:
     HAS_MLX = False
 
-from ._rotating_subclass import PrefillReadyRotatingKVCache
 from .deepseek_v41_delta import DELTA_CLASS as V41_DELTA_CLASS
 from .deepseek_v41_delta import compact_state as compact_v41_state
 from .deepseek_v41_delta import restore_chain as restore_v41_chain
@@ -4688,99 +4687,6 @@ class BlockAwarePrefixCache(CacheManager):
         except Exception as e:
             logger.debug(f"Fallback reconstruction failed: {e}")
             return None
-
-    def _find_kv_shape_ref(
-        self,
-        all_block_data: list[list[tuple[Any, Any]]],
-        layer_cache_types: list[str] | None = None,
-    ) -> tuple[int, int] | None:
-        """Find (kv_heads, head_dim) from a KVCache layer's stored data.
-
-        Used to create zero-length RotatingKVCache tensors with the correct shape.
-
-        Args:
-            all_block_data: All loaded block data
-            layer_cache_types: Per-layer cache type names
-
-        Returns:
-            (kv_heads, head_dim) tuple, or None if not found
-        """
-        if not all_block_data:
-            return None
-
-        for layer_idx, layer_data in enumerate(all_block_data[0]):
-            # Skip non-KVCache layers
-            if layer_cache_types and layer_idx < len(layer_cache_types):
-                if layer_cache_types[layer_idx] != "KVCache":
-                    continue
-            # Guard against non-tuple formats (CacheList stores List[Tuple])
-            if not isinstance(layer_data, tuple) or len(layer_data) != 2:
-                continue
-            keys, _ = layer_data
-            if hasattr(keys, "shape") and len(keys.shape) == 4:
-                return (keys.shape[1], keys.shape[3])
-
-        return None
-
-    def _create_empty_rotating_cache(
-        self,
-        meta_state: tuple | None = None,
-        kvcache_offset: int = 0,
-        kv_shape_ref: tuple[int, int] | None = None,
-    ) -> Any | None:
-        """
-        Create an empty RotatingKVCache for partial prefix restore.
-
-        Creates a RotatingKVCache with zero-length keys/values (not None) and
-        offset matching the KVCache layers. This ensures:
-        1. mlx-lm's empty() returns False → Continuation mode (not Fresh Start)
-        2. Position IDs (RoPE) are correct for all layers
-        3. The merge creates a zero-length buffer (not zero-filled) so that
-           no phantom attention positions exist during window padding reprocessing
-
-        Uses PrefillReadyRotatingKVCache (clamped size() by buffer length)
-        so BatchRotatingKVCache.merge() never reads beyond the actual buffer
-        and never sees zero-padded positions as valid attention keys.
-
-        Args:
-            meta_state: RotatingKVCache meta_state tuple (keep, max_size, offset, _idx).
-            kvcache_offset: Offset to match KVCache layers (= restored token count).
-            kv_shape_ref: (kv_heads, head_dim) from a KVCache layer for tensor shape.
-
-        Returns:
-            RotatingKVCache with zero-length keys/values, or None on failure.
-        """
-        if meta_state and len(meta_state) >= 2:
-            keep = int(meta_state[0])
-            max_size = int(meta_state[1])
-        else:
-            logger.warning(
-                "Cannot create empty RotatingKVCache: meta_state missing or incomplete"
-            )
-            return None
-
-        cache = PrefillReadyRotatingKVCache(max_size=max_size, keep=keep)
-        cache.offset = kvcache_offset
-
-        # Set zero-length keys/values so empty() returns False.
-        # This prevents mlx-lm from entering Fresh Start mode which
-        # would discard all cached KVCache data.
-        if kv_shape_ref and HAS_MLX:
-            kv_heads, head_dim = kv_shape_ref
-            cache.keys = mx.zeros((1, kv_heads, 0, head_dim))
-            cache.values = mx.zeros((1, kv_heads, 0, head_dim))
-            cache._idx = 0
-            logger.debug(
-                f"Created empty RotatingKVCache: max_size={max_size}, keep={keep}, "
-                f"offset={kvcache_offset}, kv_heads={kv_heads}, head_dim={head_dim}"
-            )
-        else:
-            logger.debug(
-                f"Created empty RotatingKVCache: max_size={max_size}, keep={keep} "
-                f"(no shape ref, keys=None)"
-            )
-
-        return cache
 
     def _validate_block_cache_data(
         self,

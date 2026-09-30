@@ -3011,21 +3011,6 @@ class TestPrefixCacheCacheList:
         result = prefix_cache._validate_block_cache_data(cache_data, layer_cache_types)
         assert result is True
 
-    def test_find_kv_shape_ref_skips_cache_list(self, prefix_cache, mx):
-        """Test _find_kv_shape_ref skips CacheList layers."""
-        all_block_data = [
-            [
-                [
-                    (mx.zeros((1, 8, 32, 64)), mx.zeros((1, 8, 32, 64)))
-                ],  # CacheList: List[Tuple]
-                (mx.zeros((1, 4, 32, 128)), mx.zeros((1, 4, 32, 128))),  # KVCache
-            ]
-        ]
-        layer_cache_types = ["CacheList", "KVCache"]
-
-        result = prefix_cache._find_kv_shape_ref(all_block_data, layer_cache_types)
-        assert result == (4, 128)  # From KVCache layer, not CacheList
-
     def test_reconstruct_cache_list_partial_match_reject(self, mx):
         """Test reconstruct_cache rejects CacheList with placeholder (partial match)."""
         from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
