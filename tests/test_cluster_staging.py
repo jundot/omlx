@@ -819,3 +819,87 @@ def test_copy_paths_with_spaces_use_sftp_without_shell_quotes(
     assert (
         "-3" in copy if not source_local and not destination_local else "-3" not in copy
     )
+
+
+@pytest.mark.parametrize("missing", [False, True])
+@pytest.mark.parametrize("direction", ["push", "pull", "relay"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "with spaces",
+        "model[1]",
+        "model*",
+        "model?",
+        "back\\slash",
+        "single'quote",
+        'double"quote',
+    ],
+)
+def test_real_sftp_copies_literal_paths(
+    tmp_path, monkeypatch, direction, name, missing
+):
+    import shutil
+
+    from omlx.cluster import staging
+
+    scp = shutil.which("scp")
+    server = next(
+        (
+            str(p)
+            for p in (
+                Path("/usr/libexec/sftp-server"),
+                Path("/usr/lib/openssh/sftp-server"),
+            )
+            if p.is_file()
+        ),
+        None,
+    )
+    if not scp or not server:
+        pytest.skip("OpenSSH scp and local sftp-server are required")
+    source = tmp_path / ("source " + name)
+    destination = tmp_path / ("destination " + name)
+    source.mkdir()
+    filename = name + ".safetensors"
+    content = b"the exact requested file\x00\xff"
+    (source / filename).write_bytes(content)
+    # Neighbors must never substitute for a literal glob-bearing name.
+    (source / "model1.safetensors").write_bytes(b"wrong file")
+    (source / "modelOTHER.safetensors").write_bytes(b"wrong file")
+    decoy = tmp_path / "source model1"
+    decoy.mkdir()
+    (decoy / "model1.safetensors").write_bytes(b"wrong directory and file")
+    destination.mkdir()
+    (destination / filename).write_bytes(b"previous contents")
+    if missing:
+        (source / filename).unlink()
+    real_run = subprocess.run
+
+    def run(command, **kwargs):
+        if command[0] == "scp":
+            command = [scp, "-D", server, *command[1:]]
+        elif command[0] == "ssh":
+            command = ["/bin/sh", "-c", command[-1]]
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(staging, "is_local_host", lambda host: host == "local")
+    monkeypatch.setattr(staging, "cluster_ssh_options", lambda **kwargs: [])
+    monkeypatch.setattr(staging.subprocess, "run", run)
+
+    def copy():
+        scp_copy(
+            source_host="local" if direction == "push" else "source.invalid",
+            destination_host="local" if direction == "pull" else "destination.invalid",
+            source_dir=str(source),
+            destination_dir=str(destination),
+            filename=filename,
+        )
+
+    if missing:
+        with pytest.raises(RuntimeError):
+            copy()
+    else:
+        copy()
+    assert (destination / filename).read_bytes() == (
+        b"previous contents" if missing else content
+    )
+    assert sorted(p.name for p in destination.iterdir()) == [filename]

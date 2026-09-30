@@ -827,6 +827,10 @@ def scp_copy(
     # SFTP receives paths as arguments, not shell commands. Shell quotes here
     # become literal filename characters, breaking directories with spaces.
     remote_source = f"{source_dir.rstrip('/')}/{filename}"
+    # SFTP scp still expands remote source globs; quote their metacharacters.
+    remote_source = "".join(
+        "\\" + char if char in "\\*?[]" else char for char in remote_source
+    )
     if destination_local:
         destination = Path(destination_dir).expanduser()
         destination.mkdir(parents=True, exist_ok=True)
