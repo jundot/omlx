@@ -412,3 +412,101 @@ def test_qwen35_loader_paths_match_offload_admission(tmp_path, flat):
     assert moe_offload_compatibility(tmp_path)[0] is False
     full = checkpoint.stat().st_size
     assert estimate_offload_admission_bytes(tmp_path, full, 0.25) == full
+
+@pytest.mark.parametrize("ceiling", [500, 0])
+def test_admin_reports_offload_sizes_and_fit(tmp_path, ceiling):
+    """``/api/models`` carries the admission size per residency option and the
+    largest residency that fits the ceiling, from the engine pool's own
+    arithmetic; without a ceiling every option "fits" and there is no fit."""
+    import asyncio
+    from unittest.mock import MagicMock, patch
+
+    from omlx.admin import routes
+    from omlx.model_settings import ModelSettings
+
+    pool = MagicMock()
+    pool.get_status.return_value = {
+        "models": [
+            {"id": "model", "model_path": str(tmp_path), "config_model_type": "olmoe"}
+        ]
+    }
+    pool._fallback_admission_ceiling.return_value = ceiling
+    pool.get_entry.return_value = object()
+    pool.moe_offload_admission_bytes.side_effect = (
+        lambda entry, settings, fraction, ceiling=None: int(1000 * fraction)
+    )
+    pool.fit_moe_offload_fraction.return_value = 0.375
+    manager = MagicMock()
+    manager.get_all_settings.return_value = {"model": ModelSettings()}
+    with (
+        patch.object(routes, "_get_engine_pool", return_value=pool),
+        patch.object(routes, "_get_settings_manager", return_value=manager),
+        patch.object(
+            routes, "_get_server_state", return_value=MagicMock(default_model=None)
+        ),
+        patch.object(routes, "_get_global_settings", return_value=None),
+        patch.object(routes, "_dflash_compat_for_model", return_value=(False, "")),
+        patch.object(routes, "_mtp_compat_for_model", return_value=(False, "")),
+        patch.object(routes, "_paroquant_compat_for_model", return_value=(False, "")),
+        patch(
+            "omlx.patches.moe_offload_compat.moe_offload_compatibility",
+            return_value=(True, ""),
+        ),
+    ):
+        model = asyncio.run(routes.list_models(is_admin=True))["models"][0]
+    assert model["moe_expert_offload_supported"] is True
+    known = ceiling > 0
+    assert model["moe_expert_offload_presets"] == [
+        {"fraction": 0.125, "bytes": 125, "fits": True},
+        {"fraction": 0.25, "bytes": 250, "fits": True},
+        {"fraction": 0.5, "bytes": 500, "fits": True},
+        {"fraction": 0.75, "bytes": 750, "fits": not known},
+    ]
+    assert model["moe_expert_offload_fit_fraction"] == (0.375 if known else None)
+    assert model["moe_expert_offload_fit_bytes"] == (375 if known else 0)
+    expected_ceiling = ceiling if known else None
+    for call in pool.moe_offload_admission_bytes.call_args_list:
+        assert call.kwargs["ceiling"] == expected_ceiling
+    if known:
+        pool.fit_moe_offload_fraction.assert_called_once()
+        assert pool.fit_moe_offload_fraction.call_args.args[2] == ceiling
+    else:
+        pool.fit_moe_offload_fraction.assert_not_called()
+
+
+def test_admin_offload_sizing_failure_is_not_fatal(tmp_path):
+    """A sizing error leaves the model listed with empty sizing fields."""
+    import asyncio
+    from unittest.mock import MagicMock, patch
+
+    from omlx.admin import routes
+
+    pool = MagicMock()
+    pool.get_status.return_value = {
+        "models": [
+            {"id": "model", "model_path": str(tmp_path), "config_model_type": "olmoe"}
+        ]
+    }
+    pool._fallback_admission_ceiling.return_value = 500
+    pool.moe_offload_admission_bytes.side_effect = OSError("shard vanished")
+    manager = MagicMock()
+    manager.get_all_settings.return_value = {}
+    with (
+        patch.object(routes, "_get_engine_pool", return_value=pool),
+        patch.object(routes, "_get_settings_manager", return_value=manager),
+        patch.object(
+            routes, "_get_server_state", return_value=MagicMock(default_model=None)
+        ),
+        patch.object(routes, "_get_global_settings", return_value=None),
+        patch.object(routes, "_dflash_compat_for_model", return_value=(False, "")),
+        patch.object(routes, "_mtp_compat_for_model", return_value=(False, "")),
+        patch.object(routes, "_paroquant_compat_for_model", return_value=(False, "")),
+        patch(
+            "omlx.patches.moe_offload_compat.moe_offload_compatibility",
+            return_value=(True, ""),
+        ),
+    ):
+        model = asyncio.run(routes.list_models(is_admin=True))["models"][0]
+    assert model["moe_expert_offload_presets"] == []
+    assert model["moe_expert_offload_fit_fraction"] is None
+    assert model["moe_expert_offload_fit_bytes"] == 0

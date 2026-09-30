@@ -1432,6 +1432,8 @@
                                                 <span class="text-xs text-neutral-500">{{ t('modal.model_settings.moe_expert_offload_resident_range') }}</span>
                                             </div>
                                             <p x-show="moeExpertOffloadResidentInvalid() && modelSettings.moe_expert_offload_resident_touched" x-cloak class="mt-1.5 text-xs text-red-600">{{ t('modal.model_settings.moe_expert_offload_resident_range_error') }}</p>
+                                            <p class="text-xs text-neutral-500 mt-1" x-show="moeOffloadFitOption()" x-cloak><button type="button" class="underline hover:text-neutral-900" @click="applyMoeOffloadFit()" x-text="moeOffloadFitLabel()"></button></p>
+                                            <p class="text-xs text-neutral-500 mt-1" x-show="moeOffloadNoFit()" x-cloak>{{ t('modal.model_settings.moe_expert_offload_no_fit') }}</p>
                                         </div>
                                     </div>
                                 </template>
