@@ -3859,11 +3859,11 @@ class TestSchemaAwareFallbackCoercion:
         # An unbalanced quote is not a JSON literal; keep it raw.
         assert _coerce_param_value('"unterminated', "city", props, "t") == '"unterminated'
 
-    def test_union_type_list_keeps_legacy_behavior(self):
-        """A JSON Schema union type list falls back to best-effort parsing."""
+    def test_union_type_list_respects_declared_types(self):
+        """A nullable string must not be converted to an undeclared number."""
         props = {"v": {"type": ["string", "null"]}}
         assert _coerce_param_value("hello", "v", props, "t") == "hello"
-        assert _coerce_param_value("123", "v", props, "t") == 123
+        assert _coerce_param_value("123", "v", props, "t") == "123"
 
     def test_repair_json_value(self):
         assert _repair_json_value('[{"a": [1, 2}]}') == [{"a": [1, 2]}]
@@ -5495,3 +5495,163 @@ def test_qwen_untyped_parameter_is_not_decoded_twice(monkeypatch):
         tools,
     )
     assert json.loads(calls[0].function.arguments)["v"] == "123"
+
+
+@pytest.mark.parametrize(
+    "parser_module",
+    ["mlx_lm.tool_parsers.qwen3_coder", "mlx_vlm.tools.parsers.qwen3_coder", None],
+)
+@pytest.mark.parametrize(
+    "types, raw, expected",
+    [
+        (
+            ["object", "null"],
+            '{"enabled":true,"missing":null}',
+            {"enabled": True, "missing": None},
+        ),
+        (["array", "null"], "[true,null]", [True, None]),
+        (["boolean", "null"], "true", True),
+        (["string", "null"], "123", "123"),
+        (["string", "null"], "true", "true"),
+        (["string", "null"], '{"enabled":true}', '{"enabled":true}'),
+        (["string", "null"], '"123"', "123"),
+        (["string", "null"], "null", None),
+        (["number", "null"], "1.25", 1.25),
+        (["integer", "null"], "1.0", 1.0),
+        (["string", "integer"], "1.25", "1.25"),
+        (["null", "object"], '{"enabled":false}', {"enabled": False}),
+        (["null", "string"], "123", "123"),
+        (["string", "integer"], "false", "false"),
+        (["string"], "null", "null"),
+        (["string", "null"], '"null"', "null"),
+        (["number", "string"], "42", 42),
+        (["null"], "null", None),
+    ],
+)
+def test_xml_union_parameter_preserves_declared_value_type(
+    parser_module, types, raw, expected
+):
+    import importlib
+    from types import SimpleNamespace
+
+    schema = {"type": "object", "properties": {"v": {"type": types}}, "required": ["v"]}
+    tools = [{"function": {"name": "f", "parameters": schema}}]
+    if parser_module is None:
+        tokenizer = None
+    else:
+        parser = importlib.import_module(parser_module)
+        tokenizer = SimpleNamespace(
+            has_tool_calling=True,
+            tool_call_start=parser.tool_call_start,
+            tool_call_end=parser.tool_call_end,
+            tool_parser=parser.parse_tool_call,
+        )
+    _, calls = parse_tool_calls(
+        f"<tool_call><function=f><parameter=v>{raw}</parameter></function></tool_call>",
+        tokenizer,
+        tools,
+    )
+    assert calls and len(calls) == 1
+    arguments = json.loads(calls[0].function.arguments)
+    assert arguments["v"] == expected
+    assert type(arguments["v"]) is type(expected)
+    assert validate_json_schema(arguments, schema)[0]
+
+
+def test_qwen_union_parameter_is_not_decoded_twice(monkeypatch):
+    from mlx_lm.tool_parsers import qwen3_coder
+
+    monkeypatch.setattr(
+        qwen3_coder, "_convert_param_value", lambda value, *args: json.loads(value)
+    )
+    tools = [
+        {
+            "function": {
+                "name": "f",
+                "parameters": {"properties": {"v": {"type": ["string", "null"]}}},
+            }
+        }
+    ]
+    _, calls = parse_tool_calls(
+        '<tool_call><function=f><parameter=v>"123"</parameter></function></tool_call>',
+        TestNakedQwenFollowup.tokenizer(),
+        tools,
+    )
+    assert json.loads(calls[0].function.arguments)["v"] == "123"
+
+
+@pytest.mark.parametrize("types", [["unknown"], [None], []])
+def test_invalid_union_type_declarations_keep_best_effort_parsing(types):
+    assert _coerce_param_value("123", "v", {"v": {"type": types}}, "f") == 123
+
+
+@pytest.mark.parametrize(
+    "parser_module",
+    ["mlx_lm.tool_parsers.qwen3_coder", "mlx_vlm.tools.parsers.qwen3_coder"],
+)
+@pytest.mark.parametrize(
+    "types, raw, expected",
+    [
+        (["array", "null"], "(1, 2)", [1, 2]),
+        (["object", "null"], "{'enabled': True}", {"enabled": True}),
+    ],
+)
+def test_native_union_parameter_keeps_correct_python_literal_values(
+    parser_module, types, raw, expected
+):
+    import importlib
+    from types import SimpleNamespace
+
+    parser = importlib.import_module(parser_module)
+    tokenizer = SimpleNamespace(
+        has_tool_calling=True,
+        tool_call_start=parser.tool_call_start,
+        tool_call_end=parser.tool_call_end,
+        tool_parser=parser.parse_tool_call,
+    )
+    tools = [
+        {
+            "function": {
+                "name": "f",
+                "parameters": {"properties": {"v": {"type": types}}},
+            }
+        }
+    ]
+    _, calls = parse_tool_calls(
+        f"<tool_call><function=f><parameter=v>{raw}</parameter></function></tool_call>",
+        tokenizer,
+        tools,
+    )
+    assert json.loads(calls[0].function.arguments)["v"] == expected
+
+
+@pytest.mark.parametrize(
+    "parser_module",
+    ["mlx_lm.tool_parsers.qwen3_coder", "mlx_vlm.tools.parsers.qwen3_coder", None],
+)
+def test_xml_union_accepts_either_valid_interpretation(parser_module):
+    import importlib
+    from types import SimpleNamespace
+
+    schema = {"type": "object", "properties": {"v": {"type": ["string", "boolean"]}}}
+    tools = [{"function": {"name": "f", "parameters": schema}}]
+    parser = importlib.import_module(parser_module) if parser_module else None
+    tokenizer = (
+        SimpleNamespace(
+            has_tool_calling=True,
+            tool_call_start=parser.tool_call_start,
+            tool_call_end=parser.tool_call_end,
+            tool_parser=parser.parse_tool_call,
+        )
+        if parser
+        else None
+    )
+    _, calls = parse_tool_calls(
+        "<tool_call><function=f><parameter=v>true</parameter></function></tool_call>",
+        tokenizer,
+        tools,
+    )
+    arguments = json.loads(calls[0].function.arguments)
+    # Native parsing may already produce a permitted string or boolean.
+    assert arguments["v"] in ("true", True)
+    assert validate_json_schema(arguments, schema)[0]

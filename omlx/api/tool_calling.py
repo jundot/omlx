@@ -26,7 +26,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import regex
-from jsonschema import SchemaError, ValidationError, validate
+from jsonschema import Draft202012Validator, SchemaError, ValidationError, validate
+from jsonschema.exceptions import UndefinedTypeCheck
 
 from .openai_models import FunctionCall, ResponseFormat, ToolCall
 
@@ -296,6 +297,21 @@ def _repair_json_value(val: str) -> Optional[Any]:
         return None
 
 
+def _matches_union_type(value: Any, types: list) -> bool | None:
+    """Check declared alternatives, preserving malformed schemas' legacy behavior."""
+    if not types:
+        return None
+    # Native Qwen parsers can return tuples; tool-call serialization emits arrays.
+    if isinstance(value, tuple):
+        value = list(value)
+    try:
+        return any(
+            Draft202012Validator.TYPE_CHECKER.is_type(value, ptype) for ptype in types
+        )
+    except (UndefinedTypeCheck, TypeError):
+        return None
+
+
 def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
     """Convert an XML-extracted parameter value per its declared schema type.
 
@@ -307,11 +323,16 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
     spec = props.get(key)
     raw_type = spec.get("type") if isinstance(spec, dict) else None
     if not isinstance(raw_type, str):
-        # Undeclared param, union type list, or anyOf: legacy behavior.
         try:
-            return json.loads(val)
+            decoded = json.loads(val)
         except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
             return val
+        if isinstance(raw_type, list):
+            # Plain 123 remains a string for ["string", "null"].
+            matches = _matches_union_type(decoded, raw_type)
+            return val if matches is False else decoded
+        # Undeclared params and oneOf/anyOf retain best-effort JSON parsing.
+        return decoded
     if val.strip().lower() == "null":
         return None
     ptype = raw_type.strip().lower()
@@ -1999,10 +2020,18 @@ def _parse_tool_calls_impl(
                             # Use XML values to avoid decoding parsed strings twice.
                             for key, val in _iter_xml_parameters(match):
                                 spec = props.get(key)
-                                if (
-                                    isinstance(spec, dict)
-                                    and "type" not in spec
-                                    and isinstance(arguments.get(key), str)
+                                if isinstance(spec, dict) and (
+                                    (
+                                        isinstance(spec.get("type"), list)
+                                        and _matches_union_type(
+                                            arguments.get(key), spec["type"]
+                                        )
+                                        is False
+                                    )
+                                    or (
+                                        "type" not in spec
+                                        and isinstance(arguments.get(key), str)
+                                    )
                                 ):
                                     arguments[key] = _coerce_param_value(
                                         val, key, props, name

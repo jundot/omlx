@@ -297,6 +297,8 @@ Supports all function calling formats available in mlx-lm, JSON schema validatio
 
 Models not listed above may still work if their chat template accepts `tools` and their output uses a recognized `<tool_call>` XML format. For tool-enabled streaming, assistant text is emitted incrementally while known tool-call control markup is suppressed from visible content; structured tool calls are emitted after parsing the completed turn.
 
+XML tool arguments respect JSON Schema type lists such as `"type": ["string", "null"]`: numeric-looking string values remain strings, and nullable objects and arrays are decoded as containers. Already valid values from the native Qwen parsers are preserved.
+
 ## Models
 
 Point `--model-dir` at a directory containing MLX-format model subdirectories. Two-level organization folders (e.g., `mlx-community/model-name/`) are also supported.
