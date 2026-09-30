@@ -152,183 +152,60 @@ class TestClaudeDesktopLaunch:
         assert "Launching Claude Desktop..." in out
         assert "with model" not in out
 
-    def test_disabled_flag_yes_enables_via_admin_api(self, capsys):
-        """Answering Y enables the flag through the admin API, not a file save."""
-        integration = ClaudeDesktopAppIntegration()
-        settings, save = _make_settings(desktop_enabled=False)
-        calls: list = []
-        fake_session = _FakeAdminSession(calls)
+    @pytest.mark.parametrize("is_tty", [True, False])
+    def test_disabled_exits_with_dashboard_guidance(self, capsys, is_tty):
+        """Disabled switch exits 1 with dashboard guidance, zero admin HTTP.
 
-        with (
-            patch.object(integration, "is_installed", return_value=True),
-            patch(
-                "omlx.integrations.claude_desktop_app.configure_omlx_gateway",
-                return_value=True,
-            ) as gateway,
-            patch(
-                "omlx.integrations.claude_desktop_app.is_claude_desktop_running",
-                return_value=True,
-            ),
-            patch("sys.platform", "darwin"),
-            patch("sys.stdin.isatty", return_value=True),
-            patch("builtins.input", return_value="y"),
-            patch("requests.Session", return_value=fake_session),
-            patch("requests.get", side_effect=[_health_response(), _status_response()]),
-            patch("omlx.integrations.get_integration", return_value=integration),
-            patch("omlx.settings.GlobalSettings.load", return_value=settings),
-        ):
-            launch_command(_make_args())
-
-        assert settings.claude_code.desktop_enabled is True
-        save.assert_not_called()
-        assert calls[0][0].endswith("/admin/api/login")
-        assert calls[0][1] == {"api_key": "test-key"}
-        assert calls[1][0].endswith("/admin/api/global-settings")
-        assert calls[1][1] == {"claude_code_desktop_enabled": True}
-        assert "restart_desktop" not in calls[1][1]
-        gateway.assert_called_once()
-        out = capsys.readouterr().out
-        assert "Tier alias models are now available" in out
-        assert "Restart the oMLX server" not in out
-        assert "saved to settings.json" not in out
-
-    def test_disabled_flag_yes_never_saves_file(self, capsys):
-        """GlobalSettings.save must not be called on the Y path."""
+        Replaces the removed interactive login flow (Y/n prompt + /admin/api
+        login + /admin/api/global-settings): the gate now fires before the
+        health check, prints dashboard guidance, and attempts no HTTP.
+        """
         integration = _mock_integration("Claude Desktop")
         integration.requires_model_selection = False
         settings, save = _make_settings(desktop_enabled=False)
-        calls: list = []
-
-        with (
-            patch("sys.stdin.isatty", return_value=True),
-            patch("builtins.input", return_value="y"),
-            patch(
-                "requests.Session",
-                return_value=_FakeAdminSession(calls),
-            ),
-            patch(
-                "requests.get", side_effect=[_health_response(), _status_response()]
-            ),
-            patch("omlx.integrations.get_integration", return_value=integration),
-            patch("omlx.settings.GlobalSettings.load", return_value=settings),
-            patch(
-                "omlx.settings.GlobalSettings.save",
-                side_effect=AssertionError("must not save to file"),
-            ),
-        ):
-            launch_command(_make_args())
-
-        save.assert_not_called()
-        assert len(calls) == 2
-        capsys.readouterr()
-
-    def test_disabled_flag_no_exits_cleanly_without_launch(self, capsys):
-        """Answering N exits 0 without configuring or launching anything."""
-        integration = _mock_integration("Claude Desktop")
-        integration.requires_model_selection = False
-        settings, save = _make_settings(desktop_enabled=False)
-        requests_mock = MagicMock()
         session_factory = MagicMock()
+        requests_get = MagicMock()
+
+        def _fail_prompt(_prompt=""):
+            raise AssertionError("must not prompt: interactive flow removed")
 
         with (
-            patch("sys.stdin.isatty", return_value=True),
-            patch("builtins.input", return_value="n"),
-            patch("requests.get", requests_mock),
+            patch("sys.stdin.isatty", return_value=is_tty),
+            patch("builtins.input", side_effect=_fail_prompt),
+            patch("requests.get", requests_get),
             patch("requests.Session", session_factory),
             patch("omlx.integrations.get_integration", return_value=integration),
             patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            pytest.raises(SystemExit) as exc,
         ):
             launch_command(_make_args())
 
+        assert exc.value.code == 1
         save.assert_not_called()
         integration.launch.assert_not_called()
-        requests_mock.assert_not_called()
+        # No admin HTTP attempted: neither the old Session POSTs nor even
+        # the health-check GET (the gate fires first).
         session_factory.assert_not_called()
-        assert "nothing to launch" in capsys.readouterr().out
-
-    def test_login_401_exits_1_without_configure(self, capsys):
-        """A rejected API key aborts before configuring or launching."""
-        integration = ClaudeDesktopAppIntegration()
-        settings, save = _make_settings(desktop_enabled=False)
-        calls: list = []
-        fake_session = _FakeAdminSession(
-            calls,
-            login_resp=_FakeApiResponse(401, {"detail": "Invalid API key"}),
-        )
-
-        with (
-            patch.object(integration, "is_installed", return_value=True),
-            patch(
-                "omlx.integrations.claude_desktop_app.configure_omlx_gateway",
-                return_value=True,
-            ) as gateway,
-            patch("sys.platform", "darwin"),
-            patch("sys.stdin.isatty", return_value=True),
-            patch("builtins.input", return_value="y"),
-            patch("requests.Session", return_value=fake_session),
-            patch("omlx.integrations.get_integration", return_value=integration),
-            patch("omlx.settings.GlobalSettings.load", return_value=settings),
-            pytest.raises(SystemExit) as exc,
-        ):
-            launch_command(_make_args())
-
-        assert exc.value.code == 1
-        save.assert_not_called()
-        gateway.assert_not_called()
-        assert any(url.endswith("/admin/api/login") for url, _ in calls)
-        assert not any(
-            url.endswith("/admin/api/global-settings") for url, _ in calls
-        )
-        assert "rejected (401)" in capsys.readouterr().out
-
-    def test_empty_api_key_unauthenticated_401_exits_1(self, capsys):
-        """Without a local key the settings POST is tried cookieless; 401 aborts."""
-        integration = ClaudeDesktopAppIntegration()
-        settings, save = _make_settings(desktop_enabled=False, api_key="")
-        calls: list = []
-        fake_session = _FakeAdminSession(
-            calls,
-            settings_resp=_FakeApiResponse(401, {"detail": "Unauthorized"}),
-        )
-
-        with (
-            patch.object(integration, "is_installed", return_value=True),
-            patch(
-                "omlx.integrations.claude_desktop_app.configure_omlx_gateway",
-                return_value=True,
-            ) as gateway,
-            patch("sys.platform", "darwin"),
-            patch("sys.stdin.isatty", return_value=True),
-            patch("builtins.input", return_value="y"),
-            patch("requests.Session", return_value=fake_session),
-            patch("omlx.integrations.get_integration", return_value=integration),
-            patch("omlx.settings.GlobalSettings.load", return_value=settings),
-            pytest.raises(SystemExit) as exc,
-        ):
-            launch_command(_make_args())
-
-        assert exc.value.code == 1
-        save.assert_not_called()
-        gateway.assert_not_called()
-        assert not any(url.endswith("/admin/api/login") for url, _ in calls)
-        assert any(
-            url.endswith("/admin/api/global-settings") for url, _ in calls
-        )
-        assert "not authorized (401)" in capsys.readouterr().out
+        requests_get.assert_not_called()
+        out = capsys.readouterr().out
+        assert "not enabled" in out
+        assert "dashboard" in out
+        assert "Integrations → Claude Desktop" in out
 
     def test_server_unreachable_exits_1_without_save(self, capsys):
-        """A network error aborts without a silent file fallback."""
+        """With desktop enabled, an unreachable server aborts at health check."""
         integration = _mock_integration("Claude Desktop")
         integration.requires_model_selection = False
-        settings, save = _make_settings(desktop_enabled=False)
+        settings, save = _make_settings(desktop_enabled=True)
 
-        session = MagicMock()
-        session.post.side_effect = ConnectionError("refused")
+        session_factory = MagicMock()
 
         with (
-            patch("sys.stdin.isatty", return_value=True),
-            patch("builtins.input", return_value="y"),
-            patch("requests.Session", return_value=session),
+            patch(
+                "requests.get",
+                side_effect=ConnectionError("refused"),
+            ),
+            patch("requests.Session", session_factory),
             patch("omlx.integrations.get_integration", return_value=integration),
             patch("omlx.settings.GlobalSettings.load", return_value=settings),
             pytest.raises(SystemExit) as exc,
@@ -338,7 +215,10 @@ class TestClaudeDesktopLaunch:
         assert exc.value.code == 1
         save.assert_not_called()
         integration.launch.assert_not_called()
-        assert "Could not reach oMLX server" in capsys.readouterr().out
+        session_factory.assert_not_called()
+        out = capsys.readouterr().out
+        assert "oMLX server is not running" in out
+        assert "Start the server first" in out
 
     def test_enabled_flag_never_prompts(self):
         """With the switch on, input must not be consulted."""

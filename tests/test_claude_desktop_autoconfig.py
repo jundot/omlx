@@ -6,8 +6,8 @@ is enabled, oMLX writes the macOS Claude Desktop JSON configs so the app
 talks directly to the oMLX gateway (no external reverse proxy). Disabling
 restores the previous configuration.
 
-File logic mirrors ``docs/task/references/ClaudeConfig.swift``; the gateway
-``/v1/models`` format follows ``docs/task/references/ModelMap.swift``.
+File logic mirrors the Claude Desktop gateway configuration format; the
+gateway ``/v1/models`` format follows the ollama-switcher model map.
 """
 
 from __future__ import annotations
@@ -214,6 +214,72 @@ class TestRestore:
         restore(home=tmp_path)
         meta = _read(meta_path)
         assert meta["appliedId"] == "other-id"
+
+    def test_restore_keeps_foreign_3p_mode(self, tmp_path, monkeypatch):
+        """A pre-existing third-party 3p setup survives configure+restore."""
+        _force_macos(monkeypatch)
+        base = tmp_path / "Library" / "Application Support"
+        target = base / "Claude/claude_desktop_config.json"
+        target.parent.mkdir(parents=True)
+        target.write_text(json.dumps({"deploymentMode": "3p"}), encoding="utf-8")
+
+        configure_omlx_gateway(8000, "k", home=tmp_path)
+        assert _read(base / "Claude/claude_desktop_config.json")["deploymentMode"] == "3p"
+        assert restore(home=tmp_path) is True
+        assert _read(base / "Claude/claude_desktop_config.json")["deploymentMode"] == "3p"
+        assert (
+            _read(base / "Claude-3p/claude_desktop_config.json")["deploymentMode"]
+            == "3p"
+        )
+
+    def test_restore_defaults_to_1p_when_no_prior_mode(self, tmp_path, monkeypatch):
+        """No prior mode: configure -> restore falls back to first-party 1p."""
+        _force_macos(monkeypatch)
+        configure_omlx_gateway(8000, "k", home=tmp_path)
+        assert restore(home=tmp_path) is True
+
+        base = tmp_path / "Library" / "Application Support"
+        assert _read(base / "Claude/claude_desktop_config.json")["deploymentMode"] == "1p"
+        assert (
+            _read(base / "Claude-3p/claude_desktop_config.json")["deploymentMode"]
+            == "1p"
+        )
+
+    def test_reconfigure_keeps_original_mode(self, tmp_path, monkeypatch):
+        """A second apply must not overwrite the marker with our own 3p."""
+        _force_macos(monkeypatch)
+        base = tmp_path / "Library" / "Application Support"
+        target = base / "Claude/claude_desktop_config.json"
+        target.parent.mkdir(parents=True)
+        target.write_text(
+            json.dumps({"deploymentMode": "1p", "theme": "dark"}), encoding="utf-8"
+        )
+
+        configure_omlx_gateway(8000, "k", home=tmp_path)
+        profile_path = (
+            base / "Claude-3p/configLibrary" / f"{PROFILE_ID}.json"
+        )
+        assert _read(profile_path)[claude_desktop._PREVIOUS_DEPLOYMENT_MODE_KEY] == "1p"
+
+        configure_omlx_gateway(8001, "k2", home=tmp_path)  # re-apply
+        assert _read(profile_path)[claude_desktop._PREVIOUS_DEPLOYMENT_MODE_KEY] == "1p"
+
+        restore(home=tmp_path)
+        data = _read(target)
+        assert data == {"deploymentMode": "1p", "theme": "dark"}
+
+    def test_restore_removes_private_marker(self, tmp_path, monkeypatch):
+        """After restore the private previous-mode marker must be gone."""
+        _force_macos(monkeypatch)
+        configure_omlx_gateway(8000, "k", home=tmp_path)
+        base = tmp_path / "Library" / "Application Support"
+        profile_path = base / "Claude-3p/configLibrary" / f"{PROFILE_ID}.json"
+        assert claude_desktop._PREVIOUS_DEPLOYMENT_MODE_KEY in _read(profile_path)
+
+        assert restore(home=tmp_path) is True
+        profile = _read(profile_path)
+        assert claude_desktop._PREVIOUS_DEPLOYMENT_MODE_KEY not in profile
+        assert "_omlxPreviousDeploymentMode" not in profile
 
     def test_non_macos_noop(self, tmp_path, monkeypatch):
         _force_not_macos(monkeypatch)
