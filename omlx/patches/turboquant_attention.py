@@ -536,6 +536,10 @@ def apply_turboquant_attention_patch() -> bool:
             "TurboQuant VLM target-verify attention patch skipped", exc_info=True
         )
 
+    from .turboquant_quantize import apply_turboquant_quantize_patch
+
+    apply_turboquant_quantize_patch()
+
     original_sdpa = mlx_base.scaled_dot_product_attention
 
     def patched_sdpa(

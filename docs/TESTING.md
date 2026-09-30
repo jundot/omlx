@@ -181,3 +181,16 @@ Run `python -m pytest tests/test_oq.py -k TestStreamedCalibration` for streamed 
 # Fused routed-expert decode tests
 
 Run `python -m pytest -q tests/test_qwen35_moe_routed_decode.py tests/test_qwen35_moe_router.py tests/test_qwen35_moe_gate_up.py` to check the one-token routed-expert kernels. Real `Qwen3_5MoeSparseMoeBlock` instances laid out like Qwen3.8-Flash-Next oQ (quantized routed experts, 8-bit shared expert and shared-expert gate, bf16 router) must match the served body bit for bit, with the shared expert and its gate folded into the two launches: 5-bit (oQ5e) and 4-bit experts at the Flash-Next shape (hidden 2560, intermediate 640, top-k 10), and 5-bit gs32, 6-bit gs128 and 8-bit experts at smaller shapes. A bf16 shared expert stays composed and must match too. Both launches are also run in FP32 against MLX's FP32 mat-vecs (routed and shared gate+up after SwiGLU, the gate row, every routed and shared down row), because BF16 outputs hide one-ulp FP32 differences (a fast-math `exp` in the SwiGLU sigmoid passes most BF16 cases but fails these). The kernels bind a one-expert view of the stacked weights; routing to experts 500+ of 512 checks that the view still reads the stacked buffer, and replacing the expert or shared-expert arrays must rebuild the cached plan. The other cases check that shapes where MLX would pick a different mat-vec partition, 3-bit experts, top-k 8, prefill and verify rows, float16, blocks without the gate+up fusion and a kernel failure all keep the served body. The one-launch router softmax + top-k must return the indices and scores of the softmax and top-k launches for random logits and engineered near-ties (every logit repeated eight times, logits on adjacent bf16 values, two-valued rows), a block whose router rows repeat eight times must route like the served block, and the softmax runs in FP32 against MLX's FP32 softmax (a fast reciprocal or a precise `exp` still routes identically but fails there). The router gemv must return MLX's `x @ W.T` logits bit for bit at 512x2560, 256x2048 and 128x1024, and its FP32 row sums must equal MLX's FP32 gemv on the same values (a `simd_sum` in place of MLX's shuffle-down tree changes only a few BF16 logits but every FP32 sum); shapes where MLX reduces K differently (K >= 16 N, a guarded K tail) keep `nn.Linear`.
+
+# TurboQuant decode quantization
+
+Run `python -m pytest -q tests/test_turboquant_quantize.py tests/test_turboquant.py`
+on a Metal-capable Mac to compare the compiled one-token RHT MSE codec with
+its original implementation. Tests cover FP16/BF16/FP32 inputs, head dimensions
+64/128/256, 1–4-bit indices, live rotation signs and midpoints, strided inputs,
+unsupported layouts, and fallback. Stored norms and packed indices must match.
+Set `OMLX_TURBOQUANT_COMPILE_QUANTIZE=1` before starting oMLX to opt into
+compiled decode quantization; it is disabled by default. Compare against `0`
+on the same hardware and workload, including first-token latency. Warming
+improves decode on MLX 0.32.2, but short-prompt TTFT and nightly builds can
+regress. Prefill and other layouts retain the original codec.
