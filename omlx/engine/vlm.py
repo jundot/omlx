@@ -1754,7 +1754,11 @@ def _audio_feature_cache_key_ranges(
         return np.asarray(value)
 
     features = _to_np(input_features)
-    mask = None if input_features_mask is None else _to_np(input_features_mask)
+    mask = (
+        None
+        if input_features_mask is None
+        else _to_np(input_features_mask).astype(np.bool_)
+    )
 
     runs = []
     position = 0
@@ -1767,22 +1771,39 @@ def _audio_feature_cache_key_ranges(
             position += 1
 
     audio_hash = hashlib.sha256()
+
+    def _hash_mask(value):
+        audio_hash.update(b"mask:")
+        audio_hash.update(str(value.shape).encode())
+        audio_hash.update(np.ascontiguousarray(value).tobytes())
+
+    aligned_mask = mask is not None and mask.shape == features.shape[:2]
+    # Unknown layouts cannot safely be split into per-clip masks. Include the
+    # whole mask in every cumulative key instead of ignoring it.
+    if mask is not None and not aligned_mask:
+        _hash_mask(mask)
+
     audio_events = []
     if features.ndim >= 2 and len(runs) == features.shape[0]:
         for i, start in enumerate(runs):
             clip = features[i]
-            if mask is not None and mask.shape[:2] == features.shape[:2]:
-                valid = int(mask[i].sum())
-                # Trim only right padding; any other mask layout keeps the
-                # padded row, which can over-key but never collide.
-                if mask[i][:valid].all():
+            if aligned_mask:
+                clip_mask = mask[i]
+                valid = int(clip_mask.sum())
+                # Canonical right padding is represented by the trimmed shape.
+                # Other layouts affect embeddings and must be keyed explicitly.
+                if clip_mask[:valid].all():
                     clip = clip[:valid]
+                else:
+                    _hash_mask(clip_mask)
             audio_hash.update(str(clip.shape).encode())
             audio_hash.update(np.ascontiguousarray(clip).tobytes())
             audio_events.append((start, audio_hash.hexdigest()))
     else:
         # Clips can't be matched to token runs: key everything from the
         # first audio token on (or the whole request) on all audio input.
+        if aligned_mask:
+            _hash_mask(mask)
         audio_hash.update(str(features.shape).encode())
         audio_hash.update(np.ascontiguousarray(features).tobytes())
         audio_events.append((runs[0] if runs else 0, audio_hash.hexdigest()))

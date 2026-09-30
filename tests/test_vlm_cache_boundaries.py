@@ -272,3 +272,61 @@ def test_unmatched_audio_runs_key_from_first_audio_token_or_start(audio_token_id
     )
     assert [start for start, _ in ranges] == [1 if audio_token_id else 0]
     assert ranges[0][1] != other[0][1]
+
+
+@pytest.mark.parametrize("second_mask", [[True, False, True], [True, True, True]])
+def test_audio_mask_changes_do_not_reuse_audio_blocks(second_mask):
+    ids = [1] * 4 + [AUDIO] * 4 + [2] * 4
+    features = mx.ones((1, 3, 2))
+    a = prepare_audio_case(ids, features, mx.array([[False, True, True]]))
+    b = prepare_audio_case(ids, features, mx.array([second_mask]))
+    assert reused_tokens(ids, a[5], b[5], a[3], b[3]) == 4
+    assert reused_tokens(ids, a[5], a[5], a[3], a[3]) == 12
+
+
+@pytest.mark.parametrize("audio_token_id", [AUDIO, None])
+def test_unmatched_audio_runs_include_mask_in_cache_key(audio_token_id):
+    ids = [1, AUDIO, 2, AUDIO, 3]
+    features = mx.ones((1, 3, 2))
+    a = _audio_feature_cache_key_ranges(
+        ids, features, mx.array([[True, True, False]]), audio_token_id, []
+    )
+    b = _audio_feature_cache_key_ranges(
+        ids, features, mx.array([[True, False, False]]), audio_token_id, []
+    )
+    assert a != b
+
+
+def test_audio_mask_in_unrecognized_feature_layout_is_keyed():
+    # Some encoders use (batch, channels, time), rather than (batch, time, channels).
+    features = mx.ones((1, 2, 3))
+    a = _audio_feature_cache_key_ranges(
+        [AUDIO], features, mx.array([[True, True, False]]), AUDIO, []
+    )
+    b = _audio_feature_cache_key_ranges(
+        [AUDIO], features, mx.array([[True, False, False]]), AUDIO, []
+    )
+    assert a != b
+
+
+def test_later_audio_mask_changes_preserve_earlier_clip_key():
+    ids = [1, AUDIO, 2, AUDIO, 3]
+    features = mx.ones((2, 3, 2))
+    a = _audio_feature_cache_key_ranges(
+        ids, features, mx.array([[True] * 3, [False, True, True]]), AUDIO, []
+    )
+    b = _audio_feature_cache_key_ranges(
+        ids, features, mx.array([[True] * 3, [True, False, True]]), AUDIO, []
+    )
+    assert a[0] == b[0]
+    assert a[1] != b[1]
+
+
+def test_audio_mask_hash_uses_boolean_semantics():
+    ids = [AUDIO]
+    features = mx.ones((1, 3, 2))
+    a = _audio_feature_cache_key_ranges(ids, features, mx.array([[0, 2, 3]]), AUDIO, [])
+    b = _audio_feature_cache_key_ranges(
+        ids, features, mx.array([[False, True, True]]), AUDIO, []
+    )
+    assert a == b
