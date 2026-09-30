@@ -912,9 +912,9 @@ class ClaudeCodeSettings:
     opus_model: str | None = None
     sonnet_model: str | None = None
     haiku_model: str | None = None
-    # When True, oMLX exposes derived Claude Desktop tier aliases
-    # (claude-opus-5 / claude-sonnet-5 / claude-haiku-4-5-20251001)
-    # that resolve at runtime to the configured tier models.
+    # When True, oMLX annotates the configured tier models in /v1/models
+    # with Anthropic family metadata (anthropic_family_tier) so Claude
+    # Desktop can match them to its opus/sonnet/haiku tiers.
     desktop_enabled: bool = False
 
     def to_dict(self) -> dict[str, Any]:
