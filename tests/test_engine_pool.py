@@ -1630,6 +1630,37 @@ class TestEnginePoolAsync:
         engines[3].stop.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_dflash_enabled_without_resolvable_draft_warns_and_falls_back(
+        self, pool_with_mock_engines, caplog
+    ):
+        """dflash_enabled=True with no explicit dflash_draft_model and no
+        bundled-draft match (model-a is plain ``llama``, not mimo) used to
+        fall through to the default engine with zero log signal -- making a
+        stale/mistaken dflash_enabled=true indistinguishable from a healthy
+        load. It must now warn, and still load normally."""
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine),
+            caplog.at_level(logging.WARNING, logger="omlx.engine_pool"),
+        ):
+            engine = await pool.get_engine(
+                "model-a", runtime_settings=ModelSettings(dflash_enabled=True)
+            )
+
+        assert engine is mock_engine
+        mock_engine.start.assert_called_once()
+        assert any(
+            "no draft model could be resolved" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
     async def test_runtime_settings_reload_rejected_while_leased(
         self, pool_with_mock_engines
     ):
