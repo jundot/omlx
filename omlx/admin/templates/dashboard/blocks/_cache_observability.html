@@ -201,9 +201,15 @@
                         <tr>
                             <td class="px-3 py-2 font-medium">
                                 <span x-text="m.id"></span>
+                                <span x-show="m.cache_tier === 'splash'" x-cloak
+                                      class="ml-1.5 px-1.5 py-0.5 text-[10px] font-semibold rounded bg-neutral-100 text-neutral-600 border border-neutral-200"
+                                      x-text="window.t('status.runtime_cache.splash_badge')"></span>
                                 <span x-show="m.cache_tier === 'rank-prompt-snapshot'" x-cloak
                                       class="ml-1.5 px-1.5 py-0.5 text-[10px] font-semibold rounded bg-violet-50 text-violet-600 border border-violet-200"
                                       x-text="window.t('cluster.badge.label')"></span>
+                                <div x-show="m.cache_tier === 'splash' && m.splash_cache" x-cloak
+                                     class="text-[11px] font-normal text-neutral-400 mt-0.5"
+                                     x-text="window.t('status.runtime_cache.splash_reused') + ' ' + formatNumber(m.splash_cache?.reused_tokens || 0) + ' ' + window.t('status.runtime_cache.splash_tok') + ' · ' + window.t('status.runtime_cache.splash_state') + ' ' + formatNumber(m.splash_cache?.state_entries || 0) + ' · ' + formatSizeBytes(m.splash_cache?.state_bytes || 0)"></div>
                             </td>
                             <template x-if="m.cache_tier === 'rank-prompt-snapshot'">
                                 <td class="px-3 py-2 text-right text-neutral-500"

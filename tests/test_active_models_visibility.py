@@ -468,10 +468,10 @@ class FakeDFlashPool:
         }
 
 
-def _build_with_pool(pool):
+def _build_with_pool(pool, server_state=None):
     with (
         patch.object(admin_routes, "_get_engine_pool", return_value=pool),
-        patch("omlx.admin.routes._get_server_state", return_value=None),
+        patch("omlx.admin.routes._get_server_state", return_value=server_state),
         patch.object(admin_routes, "_get_settings_manager", return_value=None),
         patch.object(admin_routes, "_get_global_settings", return_value=None),
         patch(
@@ -509,6 +509,65 @@ def test_active_models_dflash_primary_counts_activity():
     assert data["total_active_requests"] == 1
     assert model["active_requests"] == 1
     assert model["activities"][0]["detail"] == "generating"
+
+
+class FakeLivePool:
+    """Fake EnginePool exposing a model whose engine has get_live_requests()."""
+
+    def __init__(self, engine):
+        self._entries = {"live-model": SimpleNamespace(engine=engine)}
+
+    def get_status(self):
+        return {
+            "current_model_memory": 1024,
+            "final_ceiling": 2048,
+            "models": [
+                {
+                    "id": "live-model",
+                    "loaded": True,
+                    "is_loading": False,
+                    "estimated_size": 1024,
+                    "pinned": False,
+                }
+            ],
+        }
+
+
+def test_active_models_includes_get_live_requests_rows():
+    """Engines exposing get_live_requests() populate prefilling and generating rows."""
+    fake_prefill_row = {
+        "request_id": "req-pp-1",
+        "processed": 50,
+        "total": 100,
+        "speed": 100.0,
+        "eta": 0.5,
+        "elapsed": 1.2,
+        "detail": None,
+    }
+    fake_generating_row = {
+        "request_id": "req-gen-1",
+        "elapsed_seconds": 2.5,
+        "generated_tokens": 30,
+        "tokens_per_second": 12.0,
+        "last_activity_age_seconds": 0.1,
+        "prompt_tokens": 100,
+        "max_tokens": 256,
+    }
+
+    class Engine:
+        def get_live_requests(self):
+            return {
+                "prefilling": [fake_prefill_row],
+                "generating": [fake_generating_row],
+            }
+
+    data = _build_with_pool(FakeLivePool(Engine()))
+
+    model = data["models"][0]
+    assert data["total_active_requests"] == 2
+    assert model["active_requests"] == 2
+    assert model["prefilling"] == [fake_prefill_row]
+    assert model["generating"] == [fake_generating_row]
 
 
 def test_active_models_resolves_scheduler_property_without_async_core():
@@ -616,3 +675,53 @@ def test_dflash_dashboard_localizes_metrics_and_shows_session_fallbacks():
     for locale_path in i18n_dir.glob("*.json"):
         locale = json.loads(locale_path.read_text(encoding="utf-8"))
         assert not keys - locale.keys(), f"{locale_path.name} is missing DFlash keys"
+
+
+def test_active_models_includes_external_process_memory():
+    from omlx.process_memory_enforcer import _format_gb
+
+    external_mem = 2 * 1024 * 1024 * 1024  # 2 GB
+    pool = SimpleNamespace(
+        _entries={},
+        get_status=lambda: {
+            "current_model_memory": 1024 * 1024 * 1024,
+            "final_ceiling": 8 * 1024 * 1024 * 1024,
+            "external_process_memory": external_mem,
+            "models": [],
+        },
+    )
+    enforcer_status = {
+        "enabled": True,
+        "current_bytes": 4 * 1024 * 1024 * 1024,
+        "soft_bytes": 10 * 1024 * 1024 * 1024,
+        "hard_bytes": 12 * 1024 * 1024 * 1024,
+        "ceiling_bytes": 14 * 1024 * 1024 * 1024,
+        "pressure_level": "ok",
+    }
+    server_state = SimpleNamespace(
+        process_memory_enforcer=SimpleNamespace(get_status=lambda: enforcer_status)
+    )
+    data = _build_with_pool(pool, server_state=server_state)
+
+    # When enforcer is enabled
+    assert data["model_memory_used"] == (4 + 2) * 1024 * 1024 * 1024
+    assert data["model_memory_max"] == (14 + 2) * 1024 * 1024 * 1024
+    mp = data["memory_pressure"]
+    assert mp["external_process_memory"] == external_mem
+    assert mp["current_bytes"] == (4 + 2) * 1024 * 1024 * 1024
+    assert mp["soft_bytes"] == (10 + 2) * 1024 * 1024 * 1024
+    assert mp["hard_bytes"] == (12 + 2) * 1024 * 1024 * 1024
+    assert mp["current_formatted"] == _format_gb((4 + 2) * 1024 * 1024 * 1024)
+    assert mp["pressure_level"] == "ok"
+
+    # When enforcer is disabled
+    disabled_state = SimpleNamespace(
+        process_memory_enforcer=SimpleNamespace(get_status=lambda: {"enabled": False})
+    )
+    data_disabled = _build_with_pool(pool, server_state=disabled_state)
+
+    assert data_disabled["model_memory_used"] == (1 + 2) * 1024 * 1024 * 1024
+    assert data_disabled["model_memory_max"] == (8 + 2) * 1024 * 1024 * 1024
+    mp_disabled = data_disabled["memory_pressure"]
+    assert mp_disabled["external_process_memory"] == external_mem
+    assert mp_disabled["current_bytes"] == external_mem
