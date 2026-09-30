@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """omlx sampling utilities — mx.compile-free re-implementation of mlx-lm samplers.
 
-mlx-lm 0.31.x decorates ``categorical_sampling`` and the apply_* helpers with
-``@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)``. In
-the omlx server environment the decorator stops advancing the RNG state after
-the first call: all subsequent samples reuse the same state, so identical
-prompts produce character-identical output even at temperature > 1. Direct
-calls to the underlying primitives advance the state correctly.
+mlx-lm decorates ``categorical_sampling`` and the apply_* helpers with
+``@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)``.
+Before mlx 0.32.1 (mlx#3828) that decorator froze the RNG state when called
+from a thread other than the one that imported mlx-lm, so identical prompts
+produced character-identical output even at temperature > 1.
 
-This module mirrors the mlx-lm implementation but drops the ``mx.compile``
-wrappers, keeping behavior identical otherwise. ``make_sampler`` matches
+This module mirrors the mlx-lm implementation without the ``mx.compile``
+wrappers and adds the fused top-p/top-k, chunked top-k and MTP acceptance
+helpers the server paths use. ``make_sampler`` matches
 ``mlx_lm.sample_utils.make_sampler`` so it can replace the import in scheduler
 without further changes.
 """
@@ -24,26 +24,18 @@ import mlx.core as mx
 
 def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
     """Top-p (nucleus) filtering — keep the smallest set of tokens whose
-    cumulative probability mass is at least ``top_p``."""
-    probs = mx.exp(logprobs)
-    sorted_indices = mx.argsort(logprobs, axis=-1)
-    sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
+    cumulative probability mass is at least ``top_p``.
 
-    cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
-
-    inverse_indices = mx.put_along_axis(
-        mx.zeros_like(sorted_indices),
-        sorted_indices,
-        mx.arange(sorted_indices.shape[-1], dtype=sorted_indices.dtype),
-        axis=-1,
-    )
-    cumulative_probs = mx.take_along_axis(cumulative_probs, inverse_indices, axis=-1)
-
-    return mx.where(
-        cumulative_probs > 1 - top_p,
-        logprobs,
-        -float("inf"),
-    )
+    Matches mlx-lm #1912: the mass is summed in float32 from the top, the most
+    likely token always survives, and tokens tied at the cutoff are kept.
+    """
+    sorted_logprobs = mx.sort(logprobs, axis=-1)
+    sorted_probs = mx.exp(sorted_logprobs.astype(mx.float32))
+    mass_above = mx.cumsum(sorted_probs, axis=-1, reverse=True, inclusive=False)
+    total_mass = mass_above[..., :1] + sorted_probs[..., :1]
+    num_dropped = (mass_above >= top_p * total_mass).sum(axis=-1, keepdims=True)
+    threshold = mx.take_along_axis(sorted_logprobs, num_dropped, axis=-1)
+    return mx.where(logprobs < threshold, -float("inf"), logprobs)
 
 
 def apply_min_p(
@@ -72,7 +64,7 @@ def apply_min_p(
         tokens_to_remove = mx.put_along_axis(
             tokens_to_remove,
             top_indices,
-            False,
+            mx.array(False),
             axis=-1,
         )
 
@@ -157,7 +149,9 @@ def apply_xtc(
         )
 
     probs = mx.softmax(logits, -1)
-    mask = probs > mx.where(probs > xtc_threshold, probs, mx.inf).min()
+    mask = probs > mx.where(probs > xtc_threshold, probs, mx.inf).min(
+        axis=-1, keepdims=True
+    )
     if xtc_special_tokens:
         mask[..., xtc_special_tokens] = False
 

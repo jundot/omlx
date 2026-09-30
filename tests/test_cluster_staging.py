@@ -784,6 +784,26 @@ def test_free_space_is_readable_for_a_path_that_does_not_exist_yet(tmp_path):
     assert free_disk_bytes(tmp_path / "not" / "created" / "yet") > 0
 
 
+def test_remote_default_uses_published_worker_shim(monkeypatch):
+    from omlx.cluster.staging import run_remote_python
+    from omlx.cluster.worker_shim import CLUSTER_PYTHON_SHIM
+
+    commands = []
+
+    def run(command, **kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert (
+        run_remote_python(
+            "worker@example.invalid", "print('{}')", "model", description="test"
+        )
+        == {}
+    )
+    assert commands[0][-1].startswith(CLUSTER_PYTHON_SHIM + " -c ")
+
+
 @pytest.mark.parametrize(
     "source_local,destination_local", [(True, False), (False, True), (False, False)]
 )

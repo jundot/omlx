@@ -6,6 +6,8 @@ import concurrent.futures
 import json
 import logging
 import shutil
+import threading
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -24,7 +26,7 @@ from omlx.exceptions import (
     ModelTooLargeError,
     ModelUnavailableError,
 )
-from omlx.scheduler import PrefillEvictionRequest
+from omlx.scheduler import PrefillEvictionRequest, SchedulerConfig
 
 
 def _make_pool(ceiling: int | None = None, **kwargs) -> EnginePool:
@@ -1775,6 +1777,24 @@ class TestEnginePoolAsync:
             "model-a", a
         ) == pool._engine_runtime_signature("model-a", b)
 
+    def test_runtime_signature_ignores_turboquant_bits_spelling(
+        self, pool_with_mock_engines
+    ):
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+
+        def signature(bits=None):
+            settings = ModelSettings(turboquant_kv_enabled=True)
+            if bits is not None:
+                settings.turboquant_kv_bits = bits
+            return pool._engine_runtime_signature("model-a", settings)
+
+        # Legacy profiles and the dataclass default store ints; the API stores floats.
+        assert signature() == signature(4.0)
+        assert signature(8) == signature(8.0)
+        assert signature(3) != signature(3.5)
+
     def test_runtime_signature_ignores_request_only_profile_fields(
         self, pool_with_mock_engines
     ):
@@ -1940,6 +1960,96 @@ class TestEnginePoolAsync:
 
         assert pool._scheduler_config.embedding_batch_size == 5
         assert engine.get_stats()["batch_size"] == 5
+
+    @staticmethod
+    def _engine_with_scheduler(executor, prefill_batch_size=1):
+        scheduler = SimpleNamespace(
+            config=SchedulerConfig(max_num_seqs=1, completion_batch_size=1),
+            batch_generator=SimpleNamespace(
+                completion_batch_size=1, prefill_batch_size=prefill_batch_size
+            ),
+        )
+        core = SimpleNamespace(scheduler=scheduler, _mlx_executor=executor)
+        return SimpleNamespace(_engine=SimpleNamespace(engine=core)), scheduler
+
+    @staticmethod
+    def _add_entry(pool, model_id, engine):
+        pool._entries[model_id] = EngineEntry(
+            model_id=model_id,
+            model_path=f"/tmp/{model_id}",
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=1024,
+            engine=engine,
+        )
+
+    @pytest.mark.asyncio
+    async def test_apply_max_concurrent_requests_updates_loaded_engines(self):
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        stopped = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        stopped.shutdown()
+        pool = _make_pool(
+            scheduler_config=SchedulerConfig(max_num_seqs=1, completion_batch_size=1)
+        )
+        batched, scheduler = self._engine_with_scheduler(executor, prefill_batch_size=6)
+        fallback, fallback_scheduler = self._engine_with_scheduler(executor)
+        dflash_config = SchedulerConfig(max_num_seqs=1, completion_batch_size=1)
+        dflash = SimpleNamespace(
+            _scheduler_config=dflash_config, _fallback_engine=fallback
+        )
+        stopping, stopping_scheduler = self._engine_with_scheduler(stopped)
+        cluster_config = SchedulerConfig(max_num_seqs=1, completion_batch_size=1)
+        cluster = SimpleNamespace(
+            _scheduler_config=cluster_config,
+            _prefill_memory_guard_managed_externally=True,
+        )
+        for model_id, engine in (
+            ("batched", batched),
+            ("dflash", dflash),
+            ("stopping", stopping),
+            ("cluster", cluster),
+        ):
+            self._add_entry(pool, model_id, engine)
+
+        await pool.apply_max_concurrent_requests(4)
+        executor.shutdown(wait=True)
+
+        for config in (
+            pool._scheduler_config,
+            scheduler.config,
+            dflash_config,
+            fallback_scheduler.config,
+            stopping_scheduler.config,
+        ):
+            assert (config.max_num_seqs, config.completion_batch_size) == (4, 4)
+        # The generator cap keeps the BatchGenerator floor of prefill rows.
+        assert scheduler.batch_generator.completion_batch_size == 6
+        assert fallback_scheduler.batch_generator.completion_batch_size == 4
+        assert (cluster_config.max_num_seqs, cluster_config.completion_batch_size) == (
+            1,
+            1,
+        )
+
+    @pytest.mark.asyncio
+    async def test_apply_max_concurrent_requests_writes_decode_cap_between_steps(
+        self,
+    ):
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        step_running = threading.Event()
+        finish_step = threading.Event()
+        executor.submit(lambda: (step_running.set(), finish_step.wait(5)))
+        assert step_running.wait(5)
+        pool = _make_pool(scheduler_config=SchedulerConfig())
+        engine, scheduler = self._engine_with_scheduler(executor)
+        self._add_entry(pool, "batched", engine)
+
+        await pool.apply_max_concurrent_requests(4)
+
+        assert scheduler.config.completion_batch_size == 4
+        assert scheduler.batch_generator.completion_batch_size == 1
+        finish_step.set()
+        executor.shutdown(wait=True)
+        assert scheduler.batch_generator.completion_batch_size == 4
 
     @pytest.mark.asyncio
     async def test_get_engine_returns_cached(self, pool_with_mock_engines):

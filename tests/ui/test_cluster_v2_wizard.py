@@ -2584,3 +2584,69 @@ process.stdout.write(JSON.stringify({state: component.wizardState(), active: com
     template = _read(TEMPLATE)
     assert "data-cluster-v2-join-cleanup" in template
     assert 'x-show="join.cleanup_pending"' in template
+
+
+def test_explicit_ssh_user_follows_peer_addresses_and_deployment_hosts():
+    result = _run_wizard("""
+const peer = {node_id: 'worker', paired: true, ssh_user: 'remote_user',
+              addrs: [{ip: '192.0.2.10'}]};
+component.devicesPayload = {paired: [peer], discovered: [], self: null};
+const initial = component.sshTargetFor(peer);
+peer.addrs = [{ip: '192.0.2.20'}];
+const moved = component.deploymentHosts()[0].ssh;
+peer.ssh_target = 'enrolled@worker.example';
+const override = component.sshTargetFor(peer);
+delete peer.ssh_user;
+const fallback = component.sshTargetFor(peer);
+console.log(JSON.stringify({initial, moved, override, fallback}));
+""")
+    assert result == {
+        "initial": "remote_user@192.0.2.10",
+        "moved": "remote_user@192.0.2.20",
+        "override": "remote_user@worker.example",
+        "fallback": "enrolled@worker.example",
+    }
+
+
+def test_save_ssh_user_invalidates_old_plan_and_probes():
+    result = _run_wizard("""
+(async () => {
+const peer = {node_id: 'worker', paired: true};
+component.sshUserDrafts.worker = ' remote_user ';
+component.plan = {old: true}; component.planProposal = {old: true};
+component.checks.probes = {worker: {ok: true}};
+component.checks.started = true;
+let sent;
+component.apiFetch = async (url, options) => {
+    sent = {url, body: JSON.parse(options.body)};
+    return {ssh_user: 'remote_user'};
+};
+component.refreshDevices = async () => {};
+component.notify = () => {};
+await component.saveSSHUser(peer);
+console.log(JSON.stringify({sent, user: peer.ssh_user, plan: component.plan,
+    proposal: component.planProposal, probes: component.checks.probes,
+    started: component.checks.started}));
+})().catch(error => {console.error(error); process.exit(1);});
+""")
+    assert result["sent"] == {
+        "url": "/api/cluster/devices/worker/ssh-user",
+        "body": {"ssh_user": "remote_user"},
+    }
+    assert result["user"] == "remote_user"
+    assert result["plan"] is None and result["proposal"] is None
+    assert result["probes"] == {} and result["started"] is False
+
+
+def test_ssh_repair_form_only_belongs_to_failed_check():
+    template = _read(TEMPLATE)
+    form = template.index("data-cluster-v2-ssh-user")
+    checks = template.index("data-cluster-v2-checks")
+    assert form > checks
+    assert "row.key === 'ssh' && row.status === 'fail'" in template[checks:form]
+    assert "checks.probes[peer.node_id]?.ok === false" in template[checks:form]
+
+
+def test_ssh_repair_input_allows_dotted_accounts():
+    template = _read(TEMPLATE)
+    assert 'pattern="[A-Za-z_][A-Za-z0-9_.\\-]{0,63}"' in template

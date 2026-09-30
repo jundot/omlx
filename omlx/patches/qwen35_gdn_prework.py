@@ -15,7 +15,8 @@ One Metal launch replaces the whole chain. Numerics notes carried from the
 donor kernel: the in-kernel sigmoid uses MLX's own unary formula
 (exp-of-abs), which the challenge swept bit-exact over all finite bf16
 inputs; the RMS applies the ones-weight rounding then the separate scalar
-multiply's rounding — the composed chain's two casts.
+multiply's rounding — the composed chain's two casts. The RMS eps follows
+mlx-lm ``normalize_qk`` (see ``apply_qwen35_vlm_qk_norm_patch``).
 
 For S=2, the next conv state retains one row from the old conv state.
 Longer verify windows fill the entire next state from the new qkv rows.
@@ -39,6 +40,7 @@ import sys
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.models.gated_delta import normalize_qk
 
 from . import qwen35_gdn_verify_fused
 from .module_cache import cached_per_module
@@ -142,7 +144,9 @@ _SOURCE = """
             }
         } else {
             sumsq = simd_sum(sumsq);
-            float inv = metal::precise::rsqrt(sumsq / float(DK) + 1e-6f);
+            // normalize_qk: the l2norm eps 1e-6 lands on sum(x^2), so the
+            // RMS form uses 1e-6 / DK.
+            float inv = metal::precise::rsqrt(sumsq / float(DK) + 1e-6f / float(DK));
             const T scale = is_q ? q_scale : k_scale;
             for (uint i = 0; i < 4; ++i) {
                 const T rms = T(1) * T(float(activated[i]) * inv);
@@ -1693,9 +1697,41 @@ def _qwen4_l2_norm_sites():
     )
 
 
+def _qwen35_normalize_qk(self, q, k):
+    return normalize_qk(q, k, inv_scale=k.shape[-1] ** -0.5, eps=1e-6)
+
+
+def _qwen35_verify_normalize_qk(layer, q, k):
+    del layer
+    return normalize_qk(q, k, inv_scale=k.shape[-1] ** -0.5, eps=1e-6)
+
+
+def apply_qwen35_vlm_qk_norm_patch() -> bool:
+    """Normalize mlx-vlm Qwen3.5 GDN q/k like mlx-lm ``normalize_qk``.
+
+    mlx-vlm adds the l2norm eps to mean(x^2) instead of sum(x^2), which
+    differs from the reference model and from the mlx-lm path. The fused
+    prework kernel above implements the patched form.
+    """
+    from mlx_vlm.models.qwen3_5 import language as q35
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+
+    gdn_cls = q35.Qwen3_5GatedDeltaNet
+    if gdn_cls.__dict__.get("_normalize_qk") is _qwen35_normalize_qk:
+        return False
+    gdn_cls._normalize_qk = _qwen35_normalize_qk
+    Qwen3_5BatchInvariantForward._normalize_gated_delta_qk = staticmethod(
+        _qwen35_verify_normalize_qk
+    )
+    logger.info("mlx-vlm Qwen3.5 GDN q/k normalization follows mlx-lm normalize_qk")
+    return True
+
+
 def apply_qwen35_gdn_prework_patch() -> bool:
     """Install fused prework at ordinary decode and speculative entry points."""
     global _PATCHED
+    # The fused kernel assumes the patched q/k normalization.
+    apply_qwen35_vlm_qk_norm_patch()
     if _PATCHED:
         return True
     if not mx.metal.is_available():

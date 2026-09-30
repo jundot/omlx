@@ -21,7 +21,7 @@ import logging
 import os
 import time
 from collections import OrderedDict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -231,6 +231,27 @@ def _is_metal_out_of_memory(exc: BaseException | None) -> bool:
             return True
         exc = exc.__cause__
     return False
+
+
+def _set_concurrency_limits(config: object, value: int) -> None:
+    config.max_num_seqs = value
+    config.completion_batch_size = value
+
+
+def _set_decode_cap(scheduler: object, value: int) -> None:
+    """Set the live decode cap. Must run on the engine's MLX executor.
+
+    The MTP wrapper saves and restores this cap around a generation step, so a
+    write from another thread can be lost.
+    """
+    generator = getattr(scheduler, "batch_generator", None)
+    if generator is None:
+        return
+    try:
+        # Same floor as BatchGenerator.__init__.
+        generator.completion_batch_size = max(value, generator.prefill_batch_size)
+    except Exception:
+        logger.warning("Live decode cap update failed", exc_info=True)
 
 
 @dataclass
@@ -1197,6 +1218,44 @@ class EnginePool:
                 engine = entry.engine if entry is not None else None
                 if isinstance(engine, EmbeddingEngine):
                     engine._batch_size = batch_size
+
+    async def apply_max_concurrent_requests(self, value: int) -> None:
+        """Apply max concurrent requests to future and currently loaded engines.
+
+        Sets both the admission cap and the decode batch cap. Lowering the value
+        stops new rows only; rows that are decoding finish normally.
+        """
+        value = int(value)
+        if value <= 0:
+            raise ValueError("max concurrent requests must be > 0")
+
+        async with self._lock:
+            _set_concurrency_limits(self._scheduler_config, value)
+            for entry in list(self._entries.values()):
+                engine = entry.engine if entry is not None else None
+                # Cluster ranks build their schedulers from the deployment.
+                if engine is None or getattr(
+                    engine, "_prefill_memory_guard_managed_externally", False
+                ):
+                    continue
+                # DFlash keeps its own config copy for the lazy fallback engine.
+                for host in (engine, getattr(engine, "_fallback_engine", None)):
+                    if host is None:
+                        continue
+                    config = getattr(host, "_scheduler_config", None)
+                    if config is not None:
+                        _set_concurrency_limits(config, value)
+                    core = getattr(getattr(host, "_engine", None), "engine", None)
+                    scheduler = getattr(core, "scheduler", None)
+                    if scheduler is None:
+                        continue
+                    _set_concurrency_limits(scheduler.config, value)
+                    executor = getattr(core, "_mlx_executor", None)
+                    if executor is None:
+                        continue
+                    # A shut-down executor means the engine is stopping.
+                    with suppress(RuntimeError):
+                        executor.submit(_set_decode_cap, scheduler, value)
 
     def discover_models(
         self, model_dirs: str | list[str], pinned_models: list[str] | None = None

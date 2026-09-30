@@ -27,14 +27,15 @@ from pathlib import Path
 from typing import Any
 
 from .ssh_policy import cluster_ssh_options
+from .worker_shim import CLUSTER_PYTHON_SHIM
 
 _LAYER = re.compile(r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)(?:\.|$)")
 _MAX_HEADER_BYTES = 64 * 1024 * 1024
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
-# Where a peer's oMLX checkout keeps its interpreter. Unquoted on the remote
-# command line so the peer's shell expands ``~`` to its own home.
-DEFAULT_REMOTE_PYTHON = "~/omlx-distributed/.venv/bin/python"
+# Every running oMLX installation publishes this interpreter shim. Keep the
+# peer-home form so the remote shell expands it for the authenticated user.
+DEFAULT_REMOTE_PYTHON = CLUSTER_PYTHON_SHIM
 
 
 def is_local_host(host: str) -> bool:

@@ -13,21 +13,31 @@ from types import ModuleType, SimpleNamespace
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
+from mlx_lm.models.gated_delta import normalize_qk
 from mlx_vlm.models.qwen3_5 import language
 from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
 from mlx_vlm.speculative.cache_state import start_speculative_cache
 from mlx_vlm.speculative.ops import linear as linear_ops
 
 
+from omlx.patches import qwen35_gdn_prework as prework_mod
+
+
 @pytest.fixture(autouse=True)
 def restore_hooks(monkeypatch):
     cls = language.Qwen3_5GatedDeltaNet
     monkeypatch.setattr(cls, "__call__", cls.__call__)
+    monkeypatch.setattr(cls, "_normalize_qk", cls._normalize_qk)
     verifier = Qwen3_5BatchInvariantForward
     monkeypatch.setattr(verifier, "_gated_delta", verifier._gated_delta)
+    monkeypatch.setattr(
+        verifier,
+        "_normalize_gated_delta_qk",
+        verifier.__dict__["_normalize_gated_delta_qk"],
+    )
+    prework_mod.apply_qwen35_vlm_qk_norm_patch()
 
 
-from omlx.patches import qwen35_gdn_prework as prework_mod
 from omlx.patches.qwen35_gdn_prework import (
     gdn_prework_fused,
     qwen4_decode_norm_gate_fused,
@@ -49,9 +59,7 @@ def _composed(qkv, conv_state, conv1d):
     q = q.reshape(B, S, HK, DK)
     k = k.reshape(B, S, HK, DK)
     v = v.reshape(B, S, HV, DV)
-    inv = DK**-0.5
-    q = (inv**2) * mx.fast.rms_norm(q, None, 1e-6)
-    k = inv * mx.fast.rms_norm(k, None, 1e-6)
+    q, k = normalize_qk(q, k, inv_scale=DK**-0.5, eps=1e-6)
     return q, k, v, new_state
 
 
@@ -75,6 +83,21 @@ def test_fused_prework_bit_exact(seq, batch, dtype):
     for name, r, g in zip(("q", "k", "v", "conv_state"), ref, got):
         assert r.shape == g.shape, name
         assert bool((r == g).all().item()), f"{name} not bit-exact at S={seq}"
+
+
+def test_vlm_qk_norm_patch_matches_mlx_lm_normalize_qk():
+    """mlx-vlm added the l2norm eps to mean(x^2); tiny k rows expose it."""
+    mx.random.seed(3)
+    q = mx.random.normal((1, 2, HK, DK)).astype(mx.bfloat16)
+    k = (mx.random.normal((1, 2, HK, DK)) * 1e-3).astype(mx.bfloat16)
+    expected = normalize_qk(q, k, inv_scale=DK**-0.5, eps=1e-6)
+
+    layer = language.Qwen3_5GatedDeltaNet.__new__(language.Qwen3_5GatedDeltaNet)
+    for actual in (
+        layer._normalize_qk(q, k),
+        Qwen3_5BatchInvariantForward._normalize_gated_delta_qk(layer, q, k),
+    ):
+        assert all(mx.array_equal(a, e).item() for a, e in zip(actual, expected))
 
 
 def _composed_l2(qkv, conv_state, conv1d):

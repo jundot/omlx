@@ -5,6 +5,7 @@ import logging
 import math
 import mmap
 import os
+import re
 import struct
 import time
 import weakref
@@ -12,9 +13,11 @@ from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 from threading import Lock, RLock
-from typing import Any, Optional
+from types import SimpleNamespace
+from typing import Any, Callable, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -3118,7 +3121,9 @@ class ShardedEmbedding(nn.Module):
         values = mx.take(values, mx.array(inverse.astype(np.int32)), axis=0)
         return (values * self.weight_scale).reshape(*indices.shape, self.dims)
 
-    def fuse_quantized_shards(self) -> bool:
+    def fuse_quantized_shards(
+        self, load_sources: Callable[[], list | None] | None = None
+    ) -> bool:
         """Join compatible packed shards without dequantizing the PLE table.
 
         Resident Qwen4 PLE otherwise synchronizes token IDs to the host before
@@ -3126,7 +3131,9 @@ class ShardedEmbedding(nn.Module):
         single packed embedding keeps exactly the same affine rows while making
         the lookup a normal device-side gather.  The caller owns the temporary
         peak-memory admission check required while old and joined buffers
-        coexist.
+        coexist.  ``load_sources`` runs only once the shards can be joined, and
+        its copies are used only when every packed array matches in shape and
+        dtype.
         """
 
         if getattr(self, "fused", None) is not None:
@@ -3154,6 +3161,11 @@ class ShardedEmbedding(nn.Module):
         if total_rows != self.shard_offsets[-1] or first.dims != self.dims:
             return False
 
+        sources = load_sources() if load_sources is not None else None
+        if not sources or [_packed_layout(s) for s in sources] != [
+            _packed_layout(s) for s in shards
+        ]:
+            sources = shards
         fused = nn.QuantizedEmbedding(
             1,
             self.dims,
@@ -3161,12 +3173,12 @@ class ShardedEmbedding(nn.Module):
             bits=first.bits,
             mode=first.mode,
         )
-        fused.weight = mx.concatenate([shard.weight for shard in shards], axis=0)
-        fused.scales = mx.concatenate([shard.scales for shard in shards], axis=0)
+        fused.weight = mx.concatenate([shard.weight for shard in sources], axis=0)
+        fused.scales = mx.concatenate([shard.scales for shard in sources], axis=0)
         if first.biases is None:
             fused.biases = None
         else:
-            fused.biases = mx.concatenate([shard.biases for shard in shards], axis=0)
+            fused.biases = mx.concatenate([shard.biases for shard in sources], axis=0)
         fused.num_embeddings = total_rows
         arrays = [fused.weight, fused.scales]
         if fused.biases is not None:
@@ -3175,6 +3187,42 @@ class ShardedEmbedding(nn.Module):
         self.fused = fused
         self.shards = []
         return True
+
+
+def _packed_layout(shard) -> tuple:
+    return tuple(
+        None if array is None else (array.shape, array.dtype)
+        for array in (
+            getattr(shard, name, None) for name in ("weight", "scales", "biases")
+        )
+    )
+
+
+def _droppable_ple_shards(layer_idx: int) -> list | None:
+    """Read PLE shards lazily from a single layer.
+
+    The loader continues to reference installed shards until loading completes.
+    Joining the shards keeps them all in memory in addition to the joined table,
+    doubling the table's memory consumption. Create a separate, uniquely droppable
+    reference for the join, so the memory can be immediately freed.
+    """
+    if _PLE_RUNTIME_MODEL_PATH is None:
+        return None
+    index = _PLE_RUNTIME_MODEL_PATH / "model.safetensors.index.json"
+    if not index.exists():
+        return None
+    key_re = re.compile(
+        rf"layers\.{layer_idx}\.ple\.ple_embedding\.ngram_embedding"
+        r"\.shards?[._](\d+)\.(weight|scales|biases)$"
+    )
+    files, shards = {}, {}
+    for key, filename in json.loads(index.read_text())["weight_map"].items():
+        if match := key_re.search(key):
+            if filename not in files:
+                files[filename] = mx.load(str(index.parent / filename))
+            shard = shards.setdefault(int(match[1]), {"biases": None})
+            shard[match[2]] = files[filename][key]
+    return [SimpleNamespace(**shards[i]) for i in sorted(shards)]
 
 
 def fuse_resident_ple_embeddings(
@@ -3200,8 +3248,15 @@ def fuse_resident_ple_embeddings(
             "ngram_embedding",
             None,
         )
-        if type(embedding) is ShardedEmbedding and embedding.fuse_quantized_shards():
+        if type(embedding) is ShardedEmbedding and embedding.fuse_quantized_shards(
+            partial(_droppable_ple_shards, ple.ple_embedding.layer_idx)
+        ):
             fused += 1
+    if fused:
+        # Drop any unused cache items, such as PLE shards, to prevent OOM. Make sure the
+        # GPU is not referencing them first
+        mx.synchronize()
+        mx.clear_cache()
     return fused
 
 

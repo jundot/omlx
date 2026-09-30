@@ -737,7 +737,9 @@ def _is_audio_tensor(name: str) -> bool:
 
 def _is_moe_router(path: str) -> bool:
     """Detect MoE router/gate layers (distinct from gate_proj)."""
-    if path.endswith(("mlp.gate", ".router", ".router.layer", ".v_router")):
+    if path.endswith(
+        ("mlp.gate", ".router", ".router.layer", ".v_router", ".router.proj")
+    ):
         return True
     if path.endswith(".gate") and "gate_proj" not in path:
         return True

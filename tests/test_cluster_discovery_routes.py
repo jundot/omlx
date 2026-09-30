@@ -627,3 +627,60 @@ def test_manual_paired_endpoint_persists_and_rehydrates_on_reboot(
     assert ("10.0.0.2", 9123) in rebooted._candidates
     assert rebooted._candidates[("10.0.0.2", 9123)]["node_id"] == "tb-peer"
     service.stop()
+
+
+@pytest.mark.parametrize("user", ["remote_user", "prenom.nom"])
+def test_ssh_user_is_persisted_and_can_be_cleared(_configured_stores, user):
+    _, registry, client = _configured_stores
+    registry.mark_paired("peer-1", friendly_name="worker")
+    url = "/api/cluster/devices/peer-1/ssh-user"
+    assert client.put(url, json={"ssh_user": user}).status_code == 200
+    assert client.get("/api/cluster/devices").json()["paired"][0]["ssh_user"] == user
+    assert DeviceRegistry(registry.path).paired()[0]["ssh_user"] == user
+    registry.mark_paired("peer-1", friendly_name="renamed")
+    assert registry.paired()[0]["ssh_user"] == user
+    assert client.put(url, json={"ssh_user": None}).status_code == 200
+    assert "ssh_user" not in DeviceRegistry(registry.path).paired()[0]
+
+
+@pytest.mark.parametrize(
+    "user", ["-oProxyCommand=x", "user@host", "a b", "x\n", "a" * 65]
+)
+def test_ssh_user_rejects_unsafe_values(_configured_stores, user):
+    _, registry, client = _configured_stores
+    registry.mark_paired("peer-1", friendly_name="worker")
+    response = client.put(
+        "/api/cluster/devices/peer-1/ssh-user", json={"ssh_user": user}
+    )
+    assert response.status_code == 422
+    assert "ssh_user" not in registry.paired()[0]
+
+
+def test_ssh_user_requires_existing_pair_and_admin(_configured_stores):
+    _, _, client = _configured_stores
+    assert (
+        client.put(
+            "/api/cluster/devices/unknown/ssh-user", json={"ssh_user": "worker"}
+        ).status_code
+        == 404
+    )
+    client.app.dependency_overrides.clear()
+    assert client.put(
+        "/api/cluster/devices/unknown/ssh-user", json={"ssh_user": "worker"}
+    ).status_code in (401, 403)
+
+
+def test_ssh_user_write_failure_preserves_previous_value(
+    _configured_stores, monkeypatch
+):
+    _, registry, _ = _configured_stores
+    registry.mark_paired("peer-1", friendly_name="worker")
+    registry.set_ssh_user("peer-1", "original")
+
+    def fail():
+        raise OSError("disk full")
+
+    monkeypatch.setattr(registry, "_save", fail)
+    with pytest.raises(OSError):
+        registry.set_ssh_user("peer-1", "replacement")
+    assert registry.paired()[0]["ssh_user"] == "original"

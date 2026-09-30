@@ -885,6 +885,11 @@ class Glm5NextIndexer(nn.Module):
         Same scores, top-k kernel and index expansion as the general path;
         see ``decode_kernels.dsa_decode_scores``.  Returns None to fall back.
         """
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        # The fused top-k follows native ordering, not the argpartition fallback.
+        if not fast.has_symbol("dsa_topk_indices"):
+            return None
         if isinstance(before, list):
             if len(before) != 1 or after[0] - before[0] != S:
                 return None

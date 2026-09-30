@@ -36,19 +36,6 @@ _REMOTE_CODE_METADATA_PATTERNS = [
     "*.jinja",
 ]
 
-# mlx_lm.load dropped trust_remote_code in some releases. Check once at
-# import time so call sites can pass it safely across versions.
-def _mlx_lm_load_accepts_trust_remote_code() -> bool:
-    try:
-        import inspect
-        from mlx_lm import load as _lm_load
-        return "trust_remote_code" in inspect.signature(_lm_load).parameters
-    except Exception:
-        return False
-
-_LM_LOAD_ACCEPTS_TRC = _mlx_lm_load_accepts_trust_remote_code()
-
-
 def ensure_model_code_trusted(
     config: dict[str, Any],
     *,
@@ -131,9 +118,7 @@ def lm_load_compat(path_or_repo: str, *, trust_remote_code: bool = False, **kwar
         trust_remote_code=trust_remote_code,
     )
     from mlx_lm import load
-    if _LM_LOAD_ACCEPTS_TRC:
-        kwargs["trust_remote_code"] = trust_remote_code
-    return load(path_or_repo, **kwargs)
+    return load(path_or_repo, trust_remote_code=trust_remote_code, **kwargs)
 
 
 def expand_per_layer_quant_keys(cfg: dict) -> dict:
@@ -1026,6 +1011,18 @@ def maybe_apply_pre_load_patches(
                     "(no MTP heads; switch_mlp load correctness)",
                     model_name,
                 )
+
+    # mlx-vlm Qwen3.5-family GDN layers normalize q/k like the mlx-lm path.
+    if for_vlm and (
+        str(model_type or "").startswith("qwen3_5")
+        or str(text_model_type or "").startswith("qwen3_5")
+    ):
+        try:
+            from ..patches.qwen35_gdn_prework import apply_qwen35_vlm_qk_norm_patch
+        except Exception as e:
+            logger.warning("Qwen3.5 VLM q/k norm patch import failed: %s", e)
+        else:
+            apply_qwen35_vlm_qk_norm_patch()
 
     # qwen3_5_moe covers Qwen3.6 too (HF config sets model_type=qwen3_5_moe).
     # The nested-visual sanitize wrap remaps language_model.model.visual.*

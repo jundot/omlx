@@ -344,3 +344,9 @@ the two target Macs:
 7. the target large model's per-rank resident memory, TTFT, prefill throughput,
    single-stream decode, concurrent aggregate decode, cache hit rate, pipeline
    utilization, and long-context KV growth.
+
+### Different SSH usernames in the Cluster v2 wizard
+
+Pairing installs each Mac's key in the account that runs oMLX, and each Mac sends that account name with its pairing request or approval. The other Mac stores it and uses it for peer checks, model discovery and new plans, so Macs with different usernames need no extra setup.
+
+A peer on an older oMLX version does not send its account name, and devices paired before this version have none stored. If the SSH check fails for such a device, enter the remote account's short login name in the **SSH username** field shown under the failed check and select **Save SSH username**, then re-run the checks. Clearing the field and saving removes the stored account, including one received during pairing, and falls back to your OpenSSH configuration. Existing signed deployments keep their original SSH targets; recreate their plan to use a changed username.

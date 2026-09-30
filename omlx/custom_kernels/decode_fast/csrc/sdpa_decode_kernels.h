@@ -38,8 +38,10 @@ inline void load_vec(thread T (&dst)[N], const device T* p) {
   }
 }
 
+// The host dispatches 32 SIMD groups. Declare that size so register allocation
+// does not lower the pipeline's maximum below the 1024-thread launch.
 template <typename T, int D, int V = D>
-[[kernel]] void omlx_sdpa_decode(
+[[kernel, max_total_threads_per_threadgroup(1024)]] void omlx_sdpa_decode(
     const device T* queries [[buffer(0)]],
     const device T* keys [[buffer(1)]],
     const device T* values [[buffer(2)]],
@@ -290,7 +292,7 @@ template <typename T, int D, int V = D>
 }
 
 template <typename T, int D, int V = D>
-[[kernel]] void omlx_sdpa_decode_2pass_1(
+[[kernel, max_total_threads_per_threadgroup(1024)]] void omlx_sdpa_decode_2pass_1(
     const device T* queries [[buffer(0)]],
     const device T* keys [[buffer(1)]],
     const device T* values [[buffer(2)]],
@@ -526,7 +528,7 @@ template <typename T, int D, int V = D>
 }
 
 template <typename T, int D>
-[[kernel]] void omlx_sdpa_decode_2pass_2(
+[[kernel, max_total_threads_per_threadgroup(1024)]] void omlx_sdpa_decode_2pass_2(
     const device float* partials [[buffer(0)]],
     const device float* sums [[buffer(1)]],
     const device float* maxs [[buffer(2)]],

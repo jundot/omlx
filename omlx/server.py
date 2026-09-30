@@ -665,6 +665,18 @@ async def lifespan(app: FastAPI):
     if mcp_config:
         await init_mcp(mcp_config)
 
+    # Resume persisted download queues after settings and model dirs are set.
+    if _server_state.hf_downloader is not None:
+        try:
+            await _server_state.hf_downloader.restore_tasks()
+        except Exception as exc:  # pragma: no cover - never block startup
+            logger.warning("HF download queue restore failed: %s", exc)
+    if _server_state.ms_downloader is not None:
+        try:
+            await _server_state.ms_downloader.restore_tasks()
+        except Exception as exc:  # pragma: no cover - never block startup
+            logger.warning("MS download queue restore failed: %s", exc)
+
     yield
 
     # Shutdown: Save all-time stats, stop TTL task, process memory enforcer, etc.
@@ -2347,6 +2359,13 @@ def init_server(
     # Initialize HuggingFace downloader
     from .admin.hf_downloader import HFDownloader
     from .admin.routes import set_hf_downloader
+    from .settings import resolve_default_base_path
+
+    tasks_base = (
+        Path(global_settings.base_path)
+        if global_settings is not None
+        else resolve_default_base_path()
+    )
 
     async def _refresh_models_after_download():
         """Re-discover models when a HuggingFace download completes."""
@@ -2361,6 +2380,7 @@ def init_server(
     _server_state.hf_downloader = HFDownloader(
         model_dir=dir_list[0],  # Downloads go to primary directory
         on_complete=_refresh_models_after_download,
+        tasks_file=tasks_base / "hf_download_tasks.json",
     )
     set_hf_downloader(_server_state.hf_downloader)
     logger.info("HF Downloader initialized")
@@ -2375,6 +2395,7 @@ def init_server(
             _server_state.ms_downloader = MSDownloader(
                 model_dir=dir_list[0],
                 on_complete=_refresh_models_after_download,
+                tasks_file=tasks_base / "ms_download_tasks.json",
             )
             set_ms_downloader(_server_state.ms_downloader)
             logger.info("ModelScope Downloader initialized")
@@ -4705,6 +4726,9 @@ def _compile_with_structural_tag(
     return compiler.compile_structural_tag(tag_dict)
 
 
+_JSON_SCHEMA_MAX_WHITESPACE_CNT = 32
+
+
 def _compile_bare_grammar(compiler, fmt: dict):
     """Compile a grammar without any structural tag wrapping."""
     if fmt["type"] == "json_schema":
@@ -4714,7 +4738,15 @@ def _compile_bare_grammar(compiler, fmt: dict):
         if not schema:
             return compiler.compile_builtin_json_grammar()
         schema_str = _json.dumps(schema) if isinstance(schema, dict) else schema
-        return compiler.compile_json_schema(schema_str)
+        # An unlimited whitespace run can trap a grammar-constrained decoder
+        # after an early string termination: whitespace remains valid while
+        # every useful token is masked.  Keep the bound local to the compiler
+        # call so ordinary JSON and user-supplied EBNF/regex grammars retain
+        # their existing behavior.
+        return compiler.compile_json_schema(
+            schema_str,
+            max_whitespace_cnt=_JSON_SCHEMA_MAX_WHITESPACE_CNT,
+        )
     elif fmt["type"] == "grammar":
         return compiler.compile_grammar(fmt["grammar"])
     elif fmt["type"] == "regex":
