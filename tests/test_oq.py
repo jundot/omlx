@@ -2207,6 +2207,38 @@ class TestLazyTensorIndex:
         del idx["layer.0.weight"]
         assert "layer.0.weight" not in idx
 
+    @pytest.fixture
+    def scalar_sf_file(self, tmp_path):
+        # Gemma 4 audio-tower clamp bounds are 0-dim BF16 (0x414D == 12.8125).
+        import struct
+
+        path = tmp_path / "scalars.safetensors"
+        tensors = {
+            "audio_tower.input_max": (struct.pack("<H", 0x414D), [], "BF16"),
+            "layer.0.weight": np.random.randn(4, 8).astype(np.float16),
+        }
+        _write_safetensors(str(path), tensors)
+        return str(path)
+
+    def test_scalar_items_getitem_and_pop(self, scalar_sf_file):
+        idx = _LazyTensorIndex([scalar_sf_file])
+        key = "audio_tower.input_max"
+        loaded = [dict(idx.items())[key], idx[key], idx.pop(key)]
+        for arr in loaded:
+            assert arr.shape == ()
+            assert arr.dtype == mx.bfloat16
+            assert arr.item() == 12.8125
+
+    def test_scalar_through_discovered_plan(self, scalar_sf_file):
+        idx = _LazyTensorIndex([scalar_sf_file])
+        plan = _discover_sanitize_plan(
+            lambda weights: {"m." + k: v for k, v in weights.items()}, idx
+        )
+        assert plan is not None
+        arr = _DiscoveredPlan(plan, idx).pop("m.audio_tower.input_max")
+        assert arr.shape == ()
+        assert arr.item() == 12.8125
+
 
 # =============================================================================
 # Test _quantize_chunked
