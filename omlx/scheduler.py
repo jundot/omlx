@@ -6933,9 +6933,8 @@ class Scheduler:
                 logits_processors.append(processor)
 
         # Add grammar constraint processor for structured output.
-        # Phase awareness (thinking vs output) is handled by the compiled
-        # grammar itself via xgrammar structural tags, so we don't need
-        # think_end_ids here.
+        # Reasoning-aware grammars handle thinking/output phases through
+        # structural tags; bare grammars constrain output immediately.
         if sampling_params.compiled_grammar is not None:
             try:
                 from .api.grammar import GrammarConstraintProcessor
