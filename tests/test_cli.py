@@ -427,6 +427,8 @@ class TestLaunchCommandFunction:
                     "model_type": "vlm",
                     "max_context_window": 131072,
                     "enable_thinking": True,
+                    "reasoning_effort_options": ["xhigh", "medium", "low"],
+                    "reasoning_effort_default": "xhigh",
                     "loaded": False,
                 },
                 {
@@ -491,6 +493,11 @@ class TestLaunchCommandFunction:
         assert context.models[0].model_type == "vlm"
         assert context.models[0].context_window == 131072
         assert context.models[0].reasoning is True
+        assert context.models[0].reasoning_effort_options == ("xhigh", "medium", "low")
+        assert context.models[0].reasoning_effort_default == "xhigh"
+        if expected_model == "vision-alias":
+            assert context.reasoning_effort_options == ("xhigh", "medium", "low")
+            assert context.reasoning_effort_default == "xhigh"
         assert context.models[1].context_window == 8192
         assert context.models[1].reasoning is False
         assert get.call_args.kwargs["headers"] == {"Authorization": "Bearer saved-key"}

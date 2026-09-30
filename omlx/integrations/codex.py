@@ -51,11 +51,50 @@ def codex_model_catalog(ctx: IntegrationContext) -> dict:
             context_window=ctx.context_window,
             model_type=ctx.model_type,
             reasoning=ctx.reasoning,
+            reasoning_effort_options=ctx.reasoning_effort_options,
+            reasoning_effort_default=ctx.reasoning_effort_default,
         )
     ordered = sorted(models.values(), key=lambda model: model.id != ctx.model)
     entries = []
     for priority, model in enumerate(ordered):
         reasoning = _is_reasoning_model(model.id, model.reasoning)
+        # Codex accepts a fixed effort enum. Do not invent levels from a
+        # thinking boolean, or advertise custom template values it cannot send.
+        efforts = (
+            [
+                effort
+                for effort in (
+                    "none",
+                    "minimal",
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra",
+                )
+                if effort in model.reasoning_effort_options
+            ]
+            if model.reasoning is not False
+            else []
+        )
+        default_effort = (
+            "medium" if "medium" in efforts else model.reasoning_effort_default
+        )
+        if efforts:
+            if default_effort not in efforts:
+                default_effort = efforts[0]
+            reasoning_levels = [
+                {"effort": effort, "description": f"Use {effort} reasoning effort"}
+                for effort in efforts
+            ]
+        else:
+            default_effort = "high" if reasoning else None
+            reasoning_levels = (
+                [{"effort": "high", "description": "Use model thinking"}]
+                if reasoning
+                else []
+            )
         # Status can be unavailable for inference-only API keys. Do not let
         # Codex's large GPT context default overstate an unknown local limit.
         context_window = (
@@ -77,14 +116,8 @@ def codex_model_catalog(ctx: IntegrationContext) -> dict:
                 "input_modalities": (
                     ["text", "image"] if model.model_type == "vlm" else ["text"]
                 ),
-                "default_reasoning_level": "high" if reasoning else None,
-                # Preserve the integration's existing high-effort thinking default;
-                # do not invent additional effort levels from a boolean flag.
-                "supported_reasoning_levels": (
-                    [{"effort": "high", "description": "Use model thinking"}]
-                    if reasoning
-                    else []
-                ),
+                "default_reasoning_level": default_effort,
+                "supported_reasoning_levels": reasoning_levels,
                 "supports_reasoning_summaries": False,
                 "supports_reasoning_summary_parameter": False,
                 "support_verbosity": False,

@@ -62,9 +62,10 @@ from omlx.model_settings import ModelSettings
 
 
 class TestReasoningEffortChatTemplateKwargs:
-    def test_adds_top_level_reasoning_effort(self):
-        assert merge_reasoning_effort_chat_template_kwargs(None, "xhigh") == {
-            "reasoning_effort": "xhigh"
+    @pytest.mark.parametrize("effort", ["low", "medium", "xhigh"])
+    def test_adds_top_level_reasoning_effort(self, effort):
+        assert merge_reasoning_effort_chat_template_kwargs(None, effort) == {
+            "reasoning_effort": effort
         }
 
     def test_explicit_template_kwarg_wins(self):

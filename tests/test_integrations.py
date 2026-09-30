@@ -218,6 +218,56 @@ class TestCodexModelCatalog:
         assert all(model["base_instructions"] for model in models)
         assert all(not model["prefer_websockets"] for model in models)
 
+    @pytest.mark.parametrize("listed", [True, False])
+    def test_qwen_native_efforts_default_to_medium(self, listed):
+        metadata = {
+            "reasoning": True,
+            "reasoning_effort_options": ("xhigh", "medium", "low"),
+            "reasoning_effort_default": "xhigh",
+        }
+        catalog = codex_model_catalog(
+            ctx(
+                model="custom-alias",
+                models=(IntegrationModel("custom-alias", **metadata),) if listed else (),
+                **metadata,
+            )
+        )
+        model = catalog["models"][0]
+        assert model["default_reasoning_level"] == "medium"
+        assert [level["effort"] for level in model["supported_reasoning_levels"]] == [
+            "low",
+            "medium",
+            "xhigh",
+        ]
+
+    @pytest.mark.parametrize("default,expected", [("low", "low"), ("bogus", "low")])
+    def test_native_default_without_medium_and_unknown_values(self, default, expected):
+        model = codex_model_catalog(
+            ctx(
+                model="alias",
+                reasoning=True,
+                reasoning_effort_options=("low", "ultra", "custom", "low"),
+                reasoning_effort_default=default,
+            )
+        )["models"][0]
+        assert model["default_reasoning_level"] == expected
+        assert [level["effort"] for level in model["supported_reasoning_levels"]] == [
+            "low",
+            "ultra",
+        ]
+
+    def test_disabled_thinking_does_not_advertise_effort(self):
+        model = codex_model_catalog(
+            ctx(
+                model="alias",
+                reasoning=False,
+                reasoning_effort_options=("low", "medium", "xhigh"),
+                reasoning_effort_default="xhigh",
+            )
+        )["models"][0]
+        assert model["supported_reasoning_levels"] == []
+        assert model["default_reasoning_level"] is None
+
     def test_explicit_non_chat_model_is_not_added(self):
         assert codex_model_catalog(ctx(model="embedding", model_type="embedding")) == {
             "models": []

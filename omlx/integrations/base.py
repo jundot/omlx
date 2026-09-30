@@ -20,6 +20,8 @@ class IntegrationModel:
     context_window: int | None = None
     model_type: str | None = None
     reasoning: bool | None = None
+    reasoning_effort_options: tuple[str, ...] = ()
+    reasoning_effort_default: str | None = None
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,8 @@ class IntegrationContext:
     # direct constructions.
     models_status_map: dict[str, dict] = field(default_factory=dict)
     models: tuple[IntegrationModel, ...] = ()
+    reasoning_effort_options: tuple[str, ...] = ()
+    reasoning_effort_default: str | None = None
 
     @property
     def base_url(self) -> str:

@@ -696,6 +696,8 @@ def launch_command(args, extra_args: list[str] | None = None):
         model_type=model_info.get("model_type"),
         reasoning=model_info.get("enable_thinking"),
         models_status_map=models_status_map,
+        reasoning_effort_options=tuple(model_info.get("reasoning_effort_options") or ()),
+        reasoning_effort_default=model_info.get("reasoning_effort_default"),
         tools_profile=getattr(args, "tools_profile", "coding"),
         extra_args=tuple(extra_args or ()),
         cross_session=getattr(args, "cross_session", False),
@@ -707,6 +709,10 @@ def launch_command(args, extra_args: list[str] | None = None):
                     or info.get("max_model_len"),
                     model_type=info.get("model_type"),
                     reasoning=info.get("enable_thinking"),
+                    reasoning_effort_options=tuple(
+                        info.get("reasoning_effort_options") or ()
+                    ),
+                    reasoning_effort_default=info.get("reasoning_effort_default"),
                 )
                 for info in models_info_list
             )
