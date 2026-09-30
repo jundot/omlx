@@ -4779,7 +4779,11 @@ def _compile_with_structural_tag(
             "compiling structural tag as-is",
             reasoning_parser,
         )
-    return compiler.compile_structural_tag(tag_dict)
+    from .api.grammar import mark_grammar_thinking_phase
+
+    return mark_grammar_thinking_phase(
+        compiler.compile_structural_tag(tag_dict), enabled=reasoning
+    )
 
 
 _JSON_SCHEMA_MAX_WHITESPACE_CNT = 32
