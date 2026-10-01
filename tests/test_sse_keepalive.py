@@ -382,7 +382,7 @@ class TestResolveKeepalive:
                 _resolve_keepalive("openai_completion") == _KEEPALIVE_COMPLETION_CHUNK
             )
             assert _resolve_keepalive("anthropic") == _KEEPALIVE_ANTHROPIC_PING
-            # Responses API has no official ping; chunk mode disables keepalive
+            # Responses keepalives require per-stream identity and ordering.
             assert _resolve_keepalive("openai_responses") is None
         finally:
             _server_state.global_settings.server.sse_keepalive_mode = original

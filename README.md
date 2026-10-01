@@ -203,6 +203,15 @@ Handles concurrent requests through mlx-lm's BatchGenerator. Max concurrent requ
 
 Runs smaller context models with Claude Code by reporting the model's real context window to auto-compact instead of scaling token counts, and SSE keep-alive prevents read timeouts during long prefill.
 
+### Responses API Streaming
+
+Streaming `/v1/responses` requests also emit `response.in_progress` keepalives
+while waiting for the first model output in the default `sse_keepalive_mode="chunk"`
+mode. These events preserve the response ID and event sequence so clients such
+as Codex can wait through long prefills. The `comment` and `off` modes remain
+available. Keepalives do not shorten prompt processing or cover model loading
+before the SSE response starts.
+
 ### Multi-Model Serving
 
 Load LLMs, VLMs, embedding models, and rerankers within the same server. Models are managed through a combination of automatic and manual controls:
