@@ -16,7 +16,7 @@ class Omlx < Formula
   depends_on "rust" => :build
   depends_on arch: :arm64
   depends_on macos: :sequoia
-  depends_on "python@3.11"
+  depends_on "python@3.12"
 
   # macOS 27 beta's `strip` corrupts dynamic offsets in Mach-O libraries
   # (llvm/llvm-project#203678). Skip Homebrew's post-install clean pass over
@@ -52,7 +52,7 @@ class Omlx < Formula
 
   def install
     # Create venv with pip so dependency resolution works properly
-    system "python3.11", "-m", "venv", libexec
+    system "python3.12", "-m", "venv", libexec
 
     # Build native extensions from source with headerpad so Homebrew can
     # rewrite Mach-O install names to absolute Cellar/opt paths. Rust/maturin
