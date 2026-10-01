@@ -1027,13 +1027,22 @@ def assess_link(
 # moment it is read off the host. Nothing below caches; that is the point.
 # ---------------------------------------------------------------------------
 
-# Two hosts can carry these at once without being able to reach each other:
-# loopback is per-host, and a 169.254 address means DHCP failed, so unrelated
-# Macs agree on the subnet and on nothing else.
-_UNROUTABLE_NETWORKS = (
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("169.254.0.0/16"),
-)
+# Loopback is per-host — two unrelated Macs both carrying a 127.0.0.1 proves
+# nothing about being able to reach each other. No verification could ever
+# make that meaningful, so it is excluded everywhere, unconditionally.
+_LOOPBACK_NETWORK = ipaddress.ip_network("127.0.0.0/8")
+
+# A 169.254 address alone is similarly meaningless for matching: unrelated
+# Macs on completely different cables can each self-assign one and land in
+# the same /16 by definition, not because they share a link. That is only a
+# reason to distrust a *bare subnet match* — it is not a reason to hide the
+# address from candidate discovery entirely, because a genuine point-to-point
+# Thunderbolt Bridge legitimately self-assigns one when there is no DHCP
+# relay across the cable (Apple's own recommended setup with no server on
+# the link), and verify_link_reachability's route+ping/TCP check already
+# proves or refutes reachability for every candidate before it is used. Used
+# only where that verification does not apply — see _interface_ip below.
+_UNROUTABLE_NETWORKS = (_LOOPBACK_NETWORK, ipaddress.ip_network("169.254.0.0/16"))
 
 # Which shared link to prefer when hosts have several. RDMA over Thunderbolt
 # beats plain Thunderbolt beats whatever else routes.
@@ -1133,7 +1142,11 @@ def _interface_address(interface: str, fields: list[str]) -> InterfaceAddress | 
         address = ipaddress.IPv4Address(fields[1])
     except ValueError:
         return None
-    if any(address in network for network in _UNROUTABLE_NETWORKS):
+    # Only loopback is excluded here, not the full _UNROUTABLE_NETWORKS — see
+    # its definition for why a 169.254 address is a legitimate candidate at
+    # this layer: shared_link_addresses' downstream verification is what
+    # proves or refutes it, not a blanket address-range guess.
+    if address in _LOOPBACK_NETWORK:
         return None
     prefix_length = 32
     if "netmask" in fields:
