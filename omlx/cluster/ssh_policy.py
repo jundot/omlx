@@ -18,15 +18,22 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
-_MANAGED_IDENTITY = "~/.ssh/omlx_cluster"
+from .ssh_identity import _MANAGED_IDENTITY
 
 
 def cluster_ssh_options(
     *,
     connect_timeout: float | None = None,
     keepalive: bool = False,
+    identity: str | None = None,
 ) -> list[str]:
-    """Return ``-o`` arguments that never read from an interactive terminal."""
+    """Return ``-o`` arguments that never read from an interactive terminal.
+
+    ``identity`` overrides the managed key for the one case that cannot use it:
+    key provisioning connects with an operator's existing admin key precisely
+    because the managed identity is not installed on that host yet. Everything
+    else leaves it unset and gets the managed identity.
+    """
 
     options = [
         "BatchMode=yes",
@@ -43,7 +50,7 @@ def cluster_ssh_options(
         # The pairing UI creates this dedicated identity. Naming it explicitly
         # makes the exchanged key usable without ssh-agent or ~/.ssh/config,
         # while OpenSSH can still fall back to an operator's existing keys.
-        f"IdentityFile={_MANAGED_IDENTITY}",
+        f"IdentityFile={identity or _MANAGED_IDENTITY}",
         # Suppress the benign "permanently added" / "known by other names"
         # chatter. Changed-key failures are errors and remain visible.
         "LogLevel=ERROR",
