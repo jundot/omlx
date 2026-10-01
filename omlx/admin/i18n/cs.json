@@ -2017,5 +2017,10 @@
   "settings.global.reset_ok": "OK",
   "settings.global.reset_cancel": "Zrušit",
   "settings.advanced.qwen4_gdn_decode_wide_proj": "Qwen4 Extended Fused Decode",
-  "settings.advanced.qwen4_gdn_decode_wide_proj_hint": "Speeds up single-request generation on supported affine-quantized Qwen4-family models with a hidden size of 2560. Contributor benchmarks on 8-bit Qwen3.8-Flash-Next reported 3-6% faster generation with 1.5 GiB of extra memory; results vary. Does not affect prefill or batched generation. Off by default. Reload the model to apply changes."
+  "settings.advanced.qwen4_gdn_decode_wide_proj_hint": "Speeds up single-request generation on supported affine-quantized Qwen4-family models with a hidden size of 2560. Contributor benchmarks on 8-bit Qwen3.8-Flash-Next reported 3-6% faster generation with 1.5 GiB of extra memory; results vary. Does not affect prefill or batched generation. Off by default. Reload the model to apply changes.",
+  "cluster.v2.join.forget_cleanup": "Forget this cleanup",
+  "cluster.v2.join.confirm_forget_cleanup": "Confirm forget",
+  "cluster.v2.join.forget_cleanup_warning": "Stop retrying this old cancellation and permanently clear this warning on this Mac. The other Mac may still retain the old request. Current pairing and cluster setup stay unchanged.",
+  "cluster.v2.join.cleanup_forgotten": "Old cleanup forgotten on this Mac. Remote cleanup was not confirmed.",
+  "cluster.v2.join.forget_cleanup_error": "Could not forget this cleanup."
 }

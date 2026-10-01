@@ -21,7 +21,17 @@
         <div x-show="join.cleanup_pending" x-cloak
              class="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800"
              role="status" data-cluster-v2-join-cleanup>
-            {{ t('cluster.v2.join.cleanup_pending') }}
+            <p>{{ t('cluster.v2.join.cleanup_pending') }}</p>
+            <div class="mt-2 flex flex-wrap items-center gap-2">
+                <button type="button" @click="forgetJoinCleanup()" :disabled="join.busy"
+                        class="px-3 py-1.5 text-xs font-semibold rounded-lg border border-amber-300 hover:bg-amber-100 disabled:opacity-40"
+                        data-cluster-v2-forget-cleanup>
+                    <span x-text="confirmForgetCleanup ? window.t('cluster.v2.join.confirm_forget_cleanup') : window.t('cluster.v2.join.forget_cleanup')"></span>
+                </button>
+                <button type="button" x-show="confirmForgetCleanup" @click="confirmForgetCleanup = false"
+                        :disabled="join.busy" class="px-2 py-1 text-xs">{{ t('cluster.v2.common.cancel') }}</button>
+            </div>
+            <p x-show="confirmForgetCleanup" class="mt-2">{{ t('cluster.v2.join.forget_cleanup_warning') }}</p>
         </div>
 
         <!-- Where you are. Five steps, derived from the live snapshot. -->

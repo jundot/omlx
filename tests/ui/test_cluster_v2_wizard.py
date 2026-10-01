@@ -59,6 +59,7 @@ PEER_RECORD_FIELDS = {
 # The complete network surface the wizard is allowed to use (spec Module C:
 # Module A/B endpoints + the pre-existing planner/activate API only).
 ALLOWED_ENDPOINTS = {
+    "/api/cluster/pair/join/cleanup",
     "/api/cluster/devices",
     "/api/cluster/node_id",
     "/api/cluster/discovery/health",  # Module C stub, pending Module A impl
@@ -2650,3 +2651,51 @@ def test_ssh_repair_form_only_belongs_to_failed_check():
 def test_ssh_repair_input_allows_dotted_accounts():
     template = _read(TEMPLATE)
     assert 'pattern="[A-Za-z_][A-Za-z0-9_.\\-]{0,63}"' in template
+
+
+def test_forget_cleanup_requires_confirmation_and_ignores_old_poll():
+    result = _run_wizard("""
+        (async () => {
+            const calls = [];
+            let resolvePoll;
+            component.join = {...component.join, state: 'approved', cleanup_pending: true};
+            component.joinApprovedNotified = true;
+            component.notify = () => {};
+            component.apiFetch = (url, options) => {
+                if (!options) return new Promise(resolve => { resolvePoll = resolve; });
+                calls.push({url, method: options.method});
+                return Promise.resolve({state: 'approved', cleanup_pending: false});
+            };
+            const poll = component.refreshJoinState();
+            await component.forgetJoinCleanup();
+            const before = calls.length;
+            await component.forgetJoinCleanup();
+            resolvePoll({state: 'approved', cleanup_pending: true});
+            await poll;
+            console.log(JSON.stringify({before, calls, pending: component.join.cleanup_pending, state: component.join.state, busy: component.join.busy}));
+        })();
+    """)
+    assert result["before"] == 0
+    assert result["calls"] == [
+        {"url": "/api/cluster/pair/join/cleanup", "method": "DELETE"}
+    ]
+    assert result["pending"] is False
+    assert result["state"] == "approved"
+    assert result["busy"] is False
+
+
+def test_forget_cleanup_failure_keeps_banner():
+    result = _run_wizard("""
+        (async () => {
+            const notices = [];
+            component.join.cleanup_pending = true;
+            component.notify = (kind, text) => notices.push({kind, text});
+            component.apiFetch = async () => { throw Error('Storage failed'); };
+            await component.forgetJoinCleanup();
+            await component.forgetJoinCleanup();
+            console.log(JSON.stringify({pending: component.join.cleanup_pending, busy: component.join.busy, notices}));
+        })();
+    """)
+    assert result["pending"] is True
+    assert result["busy"] is False
+    assert result["notices"] == [{"kind": "error", "text": "Storage failed"}]

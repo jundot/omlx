@@ -322,6 +322,25 @@ class PairingSession:
                 self.polling = False
         return self.snapshot()
 
+    def forget_cleanup(self) -> dict[str, Any]:
+        """Abandon saved withdrawals locally without changing the active join."""
+        # Match mutation/retry lock order and let an in-flight retry finish
+        # before removing the proof it holds. Never initiate network I/O here.
+        with self.mutation_lock, self.cleanup_lock, self.lock:
+            previous = self.withdrawals
+            if previous:
+                self.withdrawals = []
+                try:
+                    self._save()
+                except Exception:
+                    self.withdrawals = previous
+                    raise
+                self.retry_after.clear()
+                self.manager._record_audit(
+                    "join_cleanup_forgotten", node_id=self.manager.node_id
+                )
+            return self.snapshot()
+
     def cancel(self) -> dict[str, Any]:
         with self.mutation_lock:
             return self._cancel()

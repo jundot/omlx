@@ -54,6 +54,7 @@ function clusterV2Wizard() {
         pairDeny: '/api/cluster/pair/deny',
         pairJoin: '/api/cluster/pair/join',
         pairJoinCancel: '/api/cluster/pair/join/cancel',
+        pairJoinCleanup: '/api/cluster/pair/join/cleanup',
         manualDevice: '/api/cluster/devices/manual',
         unpair: (nodeId) =>
             `/api/cluster/devices/${encodeURIComponent(nodeId)}`,
@@ -220,6 +221,7 @@ function clusterV2Wizard() {
         joinApprovedNotified: false,
         joinDeniedNotified: false,
         joinRevision: 0,
+        confirmForgetCleanup: false,
 
         // ---- add by IP (when multicast discovery is unavailable) -------------
         manualAddr: '',
@@ -503,6 +505,7 @@ function clusterV2Wizard() {
                 if (!snapshot || revision !== this.joinRevision) return;
                 const previous = this.join.state;
                 this.join = { ...this.join, ...snapshot, busy: false };
+                if (!snapshot.cleanup_pending) this.confirmForgetCleanup = false;
                 if (
                     snapshot.state === 'approved' &&
                     !this.joinApprovedNotified
@@ -1588,6 +1591,29 @@ function clusterV2Wizard() {
                         error?.message || window.t('cluster.v2.err.cancel_join'),
                     );
                 }
+            }
+        },
+
+        async forgetJoinCleanup() {
+            if (this.join.busy || !this.join.cleanup_pending) return;
+            if (!this.confirmForgetCleanup) {
+                this.confirmForgetCleanup = true;
+                return;
+            }
+            this.confirmForgetCleanup = false;
+            const revision = ++this.joinRevision;
+            this.join.busy = true;
+            try {
+                const snapshot = await this.apiFetch(CLUSTER_V2_API.pairJoinCleanup, {
+                    method: 'DELETE',
+                });
+                if (revision !== this.joinRevision) return;
+                this.join = { ...this.join, ...snapshot, busy: false };
+                this.notify('info', window.t('cluster.v2.join.cleanup_forgotten'));
+            } catch (error) {
+                if (revision !== this.joinRevision) return;
+                this.join.busy = false;
+                this.notify('error', error?.message || window.t('cluster.v2.join.forget_cleanup_error'));
             }
         },
 
