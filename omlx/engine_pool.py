@@ -3068,6 +3068,8 @@ class EnginePool:
         min_expected_freed = max(0, settle_size - settle_tolerance)
         settled = False
         settle_indeterminate = False
+        settle_stalled = False
+        last_freed: int | None = None
         for _settle_round in range(10):
             active_now = mx.get_active_memory()
             actual_freed = pre_unload_active - active_now
@@ -3104,6 +3106,36 @@ class EnginePool:
                     f"settle wait"
                 )
                 break
+            if (
+                last_freed is not None
+                and actual_freed == last_freed
+                and actual_freed > 0
+                and not footprint_pending
+            ):
+                # This unload released memory, stopped short of the bar, and
+                # the gauge has not moved since. The remaining rounds only
+                # repeat gc/synchronize/clear_cache against a number that is
+                # not changing, so they cannot settle the barrier — burn them
+                # and the 3s emergency reclaim for nothing (#2757: ~10s
+                # shutdown hang on a model that plateaus just short).
+                #
+                # Scoped deliberately:
+                #  - actual_freed > 0 means memory *was* returned and merely
+                #    fell short. A constant 0 is a different situation, left
+                #    to run the full barrier and its emergency reclaim.
+                #  - not footprint_pending, because a flat MLX gauge with the
+                #    phys footprint ledger still lagging is exactly what the
+                #    barrier exists to wait out; bailing there is what causes
+                #    the 507 on an immediate settings reload.
+                settle_stalled = True
+                logger.info(
+                    f"Settle for '{model_id}' stalled at "
+                    f"{format_size(actual_freed)} across two rounds "
+                    f"(need>={format_size(min_expected_freed)}); "
+                    f"skipping further settle rounds"
+                )
+                break
+            last_freed = actual_freed
             logger.debug(
                 f"Settle round {_settle_round + 1} for '{model_id}': "
                 f"freed={format_size(actual_freed)} "
@@ -3135,6 +3167,15 @@ class EnginePool:
             # enforcer re-poll, and pre-load admission re-reads the live gauge
             # alongside the tracked accumulator (the #1623 max() in
             # get_engine), so any unreleased memory stays visible to both.
+            pass
+        elif settle_stalled:
+            # The barrier gave up early because the gauge stopped moving
+            # (logged above). Emergency reclaim is skipped for the same
+            # reason it is skipped above, and more directly here: it is three
+            # more gc + synchronize + clear_cache rounds, which is precisely
+            # the work that just proved it releases nothing. Recovery relies
+            # on the same two safety nets — the enforcer re-poll woken below
+            # and the live gauge re-read at pre-load admission.
             pass
         else:
             # Barrier timed out - try emergency reclaim
