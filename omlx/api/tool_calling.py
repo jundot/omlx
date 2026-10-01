@@ -43,16 +43,19 @@ def _template_safe_description(value: Any) -> str:
 
 
 def _copy_schema_with_template_defaults(value: Any, *, is_schema: bool) -> Any:
-    """Copy JSON Schema data while filling missing schema descriptions."""
+    """Copy JSON Schema with stable object order and template descriptions."""
     if isinstance(value, dict):
         copied = {}
-        for key, child in value.items():
+        # Equivalent client JSON key orders must render the same token prefix.
+        # Keep array order intact: only object member order is canonicalized.
+        for key in sorted(value):
+            child = value[key]
             if key == "properties" and isinstance(child, dict):
                 copied[key] = {
                     name: _copy_schema_with_template_defaults(
-                        prop_schema, is_schema=True
+                        child[name], is_schema=True
                     )
-                    for name, prop_schema in child.items()
+                    for name in sorted(child)
                 }
             elif key in {
                 "items",

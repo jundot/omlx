@@ -531,6 +531,78 @@ class TestBuildJsonSystemPrompt:
 class TestConvertToolsForTemplate:
     """Tests for convert_tools_for_template function."""
 
+    @pytest.mark.parametrize("render_properties", [False, True])
+    def test_schema_key_order_does_not_change_rendered_tools(self, render_properties):
+        """Equivalent JSON object orders must produce the same prompt prefix."""
+        from jinja2 import Environment, StrictUndefined
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search text"},
+                "filters": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "days": {"type": "integer", "minimum": 1},
+                        },
+                    },
+                },
+            },
+            "required": ["query", "filters"],
+            "anyOf": [{"type": "string"}, {"type": "number"}],
+        }
+
+        def reverse_object_keys(value):
+            """Simulate a client reserializing objects without changing arrays."""
+            if isinstance(value, dict):
+                return {
+                    key: reverse_object_keys(child)
+                    for key, child in reversed(list(value.items()))
+                }
+            if isinstance(value, list):
+                return [reverse_object_keys(child) for child in value]
+            return value
+
+        def make_tools(parameters):
+            """Wrap a schema in the OpenAI tool format used by the converter."""
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "search",
+                        "parameters": parameters,
+                    },
+                }
+            ]
+
+        tools = make_tools(schema)
+        reordered_tools = make_tools(reverse_object_keys(schema))
+        originals = [json.dumps(tools), json.dumps(reordered_tools)]
+        converted = convert_tools_for_template(tools)
+        reordered = convert_tools_for_template(reordered_tools)
+
+        # Qwen templates serialize objects or iterate properties directly.
+        env = Environment(undefined=StrictUndefined)
+        env.policies["json.dumps_kwargs"] = {"sort_keys": False}
+        template = env.from_string(
+            "{% for tool in tools %}"
+            + (
+                "{% for name, spec in tool.function.parameters.properties.items() %}"
+                "{{ name }}:{{ spec | tojson }}{% endfor %}"
+                if render_properties
+                else "{{ tool | tojson }}"
+            )
+            + "{% endfor %}"
+        )
+        assert template.render(tools=converted) == template.render(tools=reordered)
+        assert [json.dumps(tools), json.dumps(reordered_tools)] == originals
+        parameters = converted[0]["function"]["parameters"]
+        assert parameters["required"] == ["query", "filters"]
+        assert [item["type"] for item in parameters["anyOf"]] == ["string", "number"]
+
     def test_none_tools(self):
         """Test with None tools."""
         result = convert_tools_for_template(None)
