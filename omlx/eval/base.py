@@ -15,6 +15,24 @@ logger = logging.getLogger(__name__)
 THINKING_MIN_TOKENS = 8192
 THINKING_MAX_TOKENS = 32768
 
+# Lines that open a code region in an unfenced model answer.
+_CODE_REGION_STARTS = ("def ", "class ", "import ", "from ", "#", "@")
+
+
+def _looks_like_prose(line: str) -> bool:
+    """Return True when ``line`` is certainly not code.
+
+    Deliberately conservative and one-sided: a line is only called prose when
+    it opens with a capitalised word, which is how a model answer introduces a
+    new draft ("Here is the final version:", "I will use a helper") and how
+    almost no Python statement begins. Anything unrecognised counts as code, so
+    this can fail to split a region but can never discard one.
+    """
+    if not line.strip() or line[:1].isspace():
+        return False
+    first_word = line.split(maxsplit=1)[0]
+    return first_word[:1].isupper() and first_word[1:2].islower()
+
 
 @dataclass
 class QuestionResult:
@@ -167,23 +185,32 @@ class BaseBenchmark(ABC):
         if blocks:
             return blocks[-1].strip()
 
-        # Line-by-line fallback
+        # Line-by-line fallback. Take the LAST contiguous code region, not the
+        # first, so a draft or a reasoning leftover earlier in the answer does
+        # not win over the final version. Starting at the last `def` instead
+        # would be wrong: a normal solution is one region holding an import
+        # followed by several helpers, and truncating to the final `def` drops
+        # the import and the earlier helpers (#2661).
         lines = response.split("\n")
-        code_lines = []
-        in_code = False
+        regions: list[list[str]] = []
+        current: list[str] | None = None
         for line in lines:
-            if not in_code and (
-                line.startswith("def ")
-                or line.startswith("class ")
-                or line.startswith("import ")
-                or line.startswith("from ")
-                or line.startswith("#")
-            ):
-                in_code = True
-            if in_code:
-                code_lines.append(line)
+            if current is None:
+                if line.startswith(_CODE_REGION_STARTS):
+                    current = [line]
+                continue
+            if _looks_like_prose(line):
+                # Prose between two runs of code ends the current region.
+                regions.append(current)
+                current = None
+            else:
+                current.append(line)
+        if current is not None:
+            regions.append(current)
 
-        return "\n".join(code_lines) if code_lines else response
+        if regions:
+            return "\n".join(regions[-1]).strip()
+        return response
 
     @staticmethod
     def _strip_think_tags(text: str) -> str:

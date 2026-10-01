@@ -337,6 +337,72 @@ class TestStripThinkTags:
         assert BaseBenchmark._strip_think_tags("<think>still thinking") == "<think>still thinking"
 
 
+# --- Code Extraction Tests ---
+
+
+class TestExtractLastCodeBlock:
+    """The unfenced fallback must return the final code region, not the first.
+
+    Thinking-mode answers and models that revise themselves put a draft ahead
+    of the version they settle on. Taking the first ``def`` scored the draft
+    instead and collapsed HumanEval accuracy (#2661).
+    """
+
+    def test_draft_before_final_version(self):
+        response = "Draft:\ndef draft():\n    pass\n\nFinal:\ndef real():\n    return 42"
+        assert BaseBenchmark._extract_last_code_block(response) == (
+            "def real():\n    return 42"
+        )
+
+    def test_keeps_imports_and_helpers_of_one_region(self):
+        """A solution is one region; taking the last def alone would truncate it."""
+        response = (
+            "import os\n\n"
+            "def helper():\n    return os.getcwd()\n\n"
+            "def main():\n    return helper()"
+        )
+        code = BaseBenchmark._extract_last_code_block(response)
+        assert "import os" in code
+        assert "def helper()" in code
+        assert "def main()" in code
+
+    def test_keeps_module_level_statements(self):
+        response = "while not ready():\n    wait()\nprint(1)\n"
+        code = BaseBenchmark._extract_last_code_block(response)
+        assert "while not ready():" in code
+        assert "print(1)" in code
+
+    def test_nested_defs_stay_together(self):
+        response = "def outer():\n    def inner():\n        return 1\n    return inner()"
+        assert BaseBenchmark._extract_last_code_block(response) == response
+
+    def test_prose_before_single_region_is_dropped(self):
+        response = "Here is the implementation:\ndef real():\n    return 1"
+        assert BaseBenchmark._extract_last_code_block(response) == (
+            "def real():\n    return 1"
+        )
+
+    def test_leading_comment_kept_with_its_region(self):
+        code = BaseBenchmark._extract_last_code_block(
+            "# helper first\ndef real():\n    return 1"
+        )
+        assert code.startswith("# helper first")
+        assert "def real():" in code
+
+    def test_fenced_block_still_wins(self):
+        response = "<think>draft</think>\n```python\ndef real():\n    return 1\n```"
+        assert BaseBenchmark._extract_last_code_block(response) == (
+            "def real():\n    return 1"
+        )
+
+    def test_no_code_returns_response_unchanged(self):
+        response = "I am not sure how to solve this."
+        assert BaseBenchmark._extract_last_code_block(response) == response
+
+    def test_empty_response(self):
+        assert BaseBenchmark._extract_last_code_block("") == ""
+
+
 # --- Thinking Mode Tests ---
 
 
