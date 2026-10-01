@@ -610,6 +610,17 @@ def test_loopback_and_self_assigned_addresses_are_never_a_shared_subnet():
     assert not any(address.startswith("169.254.") for address in addresses)
 
 
+def test_thunderbolt_link_local_addresses_are_accepted_for_rdma_interfaces():
+    """macOS self-assigns 169.254.x.x on direct Thunderbolt point-to-point links."""
+
+    parsed = parse_interface_addresses(
+        _LAPTOP_IFCONFIG, allowed_link_local_interfaces={"en5"}
+    )
+    addresses = {a.address for a in parsed}
+
+    assert "169.254.138.14" in addresses
+
+
 def test_a_hex_flag_word_does_not_push_an_address_onto_the_interface_above_it():
     """ifconfig prints flags in hex: bridge100's 8a63 read as no header at all,
     and its address was attributed to the interface listed before it."""
