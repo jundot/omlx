@@ -1502,23 +1502,8 @@ def verify_link_reachability(
         route = run(local.host, ("/sbin/route", "-n", "get", remote.address))
         selected = _route_interface(route.stdout) if route.returncode == 0 else ""
         if selected != local.interface:
-            # Linux does not implement macOS's ``route -n get`` form. Binding
-            # a TCP connection to the candidate source address proves both the
-            # route and that the peer's SSH service answers on that exact path,
-            # without needing a platform-specific interface command.
-            script = (
-                "import socket,sys\n"
-                "s=socket.create_connection((sys.argv[2],22),timeout=3,"
-                "source_address=(sys.argv[1],0))\n"
-                "s.close()"
-            )
-            if route.returncode != 0:
-                bound = run(
-                    local.host,
-                    ("python3", "-c", script, local.address, remote.address),
-                )
-                if bound.returncode == 0:
-                    continue
+            if route.returncode != 0 and _tcp_probe_succeeds(run, local, remote):
+                continue
             detail = (
                 f"route uses {selected}"
                 if selected
@@ -1533,8 +1518,44 @@ def verify_link_reachability(
             ("/sbin/ping", "-n", "-c", "1", "-W", "1000", remote.address),
         )
         if ping.returncode != 0:
+            # A single dropped ICMP echo is not proof the path is dead: macOS's
+            # Firewall "stealth mode" silently drops it by default, and this is
+            # only one packet with a 1-second window. Fall back to the same
+            # real TCP connection the route-mismatch branch above already
+            # trusts — it proves both the route and that the peer's SSH
+            # service actually answers on this exact source/destination pair.
+            if _tcp_probe_succeeds(run, local, remote):
+                continue
             return False, (
                 f"{local.host} routes {remote.address} over {local.interface}, "
                 "but the peer did not answer on that address."
             )
     return True, link.reason
+
+
+_TCP_PROBE_SCRIPT = (
+    "import socket,sys\n"
+    "s=socket.create_connection((sys.argv[2],22),timeout=3,"
+    "source_address=(sys.argv[1],0))\n"
+    "s.close()"
+)
+
+
+def _tcp_probe_succeeds(
+    run: LinkCommandRunner,
+    local: LinkEndpoint,
+    remote: LinkEndpoint,
+) -> bool:
+    """Whether a real TCP connection to the peer's SSH port succeeds.
+
+    Binding the source address proves both the route and that the peer's SSH
+    service answers on this exact path — without needing a platform-specific
+    interface command (Linux has no ``route -n get``) or trusting ICMP, which
+    is routinely filtered without the path actually being unusable.
+    """
+
+    bound = run(
+        local.host,
+        ("python3", "-c", _TCP_PROBE_SCRIPT, local.address, remote.address),
+    )
+    return bound.returncode == 0
