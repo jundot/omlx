@@ -2031,7 +2031,34 @@ class EnginePool:
             return None
         return entry.pending_unload_reason or "request abort"
 
-    def _acquire_loaded_engine(self, model_id, force_lm, lease, runtime_settings):
+    @staticmethod
+    def _runtime_failed_engine(engine: object) -> bool:
+        """True for a distributed engine whose ranks died (it can never serve again)."""
+        reason = getattr(engine, "runtime_failed_reason", None)
+        return isinstance(reason, str) and bool(reason.strip())
+
+    async def _reloadable_failed_engine(self, model_id: str) -> bool:
+        """True when the resident engine is dead AND its deployment can be rebuilt.
+
+        Rebuilding means tearing the old ranks down, and that teardown is
+        verified on every Mac. When a peer is off or off the network (the usual
+        way a rank dies with ``peer_lost``) it cannot succeed, so the engine is
+        left in place and requests keep getting the fast 503 from its health
+        gate instead of each one running a doomed teardown. Called outside the
+        pool lock: the reachability probe is bounded but is network I/O.
+        """
+        entry = self._entries.get(model_id)
+        engine = entry.engine if entry is not None else None
+        if engine is None or not self._runtime_failed_engine(engine):
+            return False
+        reachable = getattr(engine, "peers_reachable", None)
+        if reachable is None:
+            return True
+        return bool(await reachable())
+
+    def _acquire_loaded_engine(
+        self, model_id, force_lm, lease, runtime_settings, reload_failed=False
+    ):
         """Lease a ready engine without waiting for another model's disk drain.
 
         This path has no await: the unload marker and lease update are atomic
@@ -2045,6 +2072,7 @@ class EnginePool:
             or entry.pending_unload_reason
             or model_id in self._unloading_models
             or (force_lm and isinstance(entry.engine, VLMBatchedEngine))
+            or (reload_failed and self._runtime_failed_engine(entry.engine))
         ):
             return None
         expected = self._engine_runtime_signature(model_id, runtime_settings)
@@ -2110,8 +2138,9 @@ class EnginePool:
         if force_lm and entry is not None and not self._has_mlx_lm_path(entry):
             # The VLM engine is the only text engine for these families.
             force_lm = False
+        reload_failed = await self._reloadable_failed_engine(model_id)
         ready = self._acquire_loaded_engine(
-            model_id, force_lm, _lease, runtime_settings
+            model_id, force_lm, _lease, runtime_settings, reload_failed
         )
         if ready is not None:
             return ready
@@ -2136,6 +2165,20 @@ class EnginePool:
                 if candidate > 0:
                     ngram_admission_ceiling = candidate
             unloaded_for_admission = False
+
+            if (
+                reload_failed
+                and entry.engine is not None
+                and self._runtime_failed_engine(entry.engine)
+            ):
+                logger.warning(
+                    "Distributed runtime for %s is no longer serviceable (%s); "
+                    "unloading it so this request reloads the deployment",
+                    model_id,
+                    getattr(entry.engine, "runtime_failed_reason", ""),
+                )
+                await self._unload_engine(model_id)
+                unloaded_for_admission = True
 
             # Already loaded - just update access time
             if entry.engine is not None:
