@@ -59,6 +59,7 @@ PEER_RECORD_FIELDS = {
 # The complete network surface the wizard is allowed to use (spec Module C:
 # Module A/B endpoints + the pre-existing planner/activate API only).
 ALLOWED_ENDPOINTS = {
+    "/admin/api/cluster/forget",
     "/api/cluster/devices",
     "/api/cluster/node_id",
     "/api/cluster/discovery/health",  # Module C stub, pending Module A impl
@@ -2650,3 +2651,60 @@ def test_ssh_repair_form_only_belongs_to_failed_check():
 def test_ssh_repair_input_allows_dotted_accounts():
     template = _read(TEMPLATE)
     assert 'pattern="[A-Za-z_][A-Za-z0-9_.\\-]{0,63}"' in template
+
+
+def test_forget_local_requires_its_own_confirmation_and_reports_remote_uncertainty():
+    result = _run_wizard("""
+(async () => {
+    const requests = [], notices = [];
+    component.apiFetch = async (url, options) => { requests.push({url, method: options.method}); return {}; };
+    component.notify = (level, text) => notices.push(text);
+    component.refreshDeployments = async () => {};
+    component.refreshRuntime = async () => {};
+    const deployment = {deployment_id: 'offline'};
+    await component.deactivateDeployment(deployment);
+    await component.deactivateDeployment(deployment, true);
+    const beforeConfirm = requests.length;
+    await component.deactivateDeployment(deployment, true);
+    console.log(JSON.stringify({beforeConfirm, requests, notices, busy: component.clusterLifecycleBusy}));
+})();
+""")
+    assert result["beforeConfirm"] == 0
+    assert result["requests"] == [
+        {
+            "url": "/admin/api/cluster/deployments/offline?local_only=true",
+            "method": "DELETE",
+        }
+    ]
+    assert "Remote shutdown was not verified" in result["notices"][0]
+    assert result["busy"] is False
+
+
+def test_forget_member_and_entire_cluster_have_separate_confirmations():
+    result = _run_wizard("""
+        (async () => {
+            const requests = [];
+            component.apiFetch = async (url) => { requests.push(url); return {}; };
+            component.notify = () => {};
+            component.refreshDevices = async () => {};
+            component.refreshDeployments = async () => {};
+            component.refreshRuntime = async () => {};
+            await component.forgetCluster({node_id: 'peer/a'});
+            await component.forgetCluster({node_id: 'peer/b'});
+            await component.forgetCluster();
+            const beforeConfirm = requests.length;
+            await component.forgetCluster();
+            await component.forgetCluster({node_id: 'peer/a'});
+            await component.forgetCluster({node_id: 'peer/a'});
+            console.log(JSON.stringify({beforeConfirm, requests, busy: component.clusterLifecycleBusy}));
+        })();
+    """)
+    assert result["beforeConfirm"] == 0
+    assert result["requests"] == [
+        "/admin/api/cluster/forget",
+        "/admin/api/cluster/forget?node_id=peer%2Fa",
+    ]
+    assert result["busy"] is False
+    template = _read(TEMPLATE)
+    assert 'data-cluster-v2-forget-device' in template
+    assert 'data-cluster-v2-forget-all' in template

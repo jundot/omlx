@@ -289,6 +289,7 @@ function clusterV2Wizard() {
         stagingTimer: null,
         confirmUnpairFor: '',
         confirmDeactivateFor: '',
+        confirmForgetFor: '',
         confirmUnloadFor: '',
         confirmChangeModelFor: '',
         clusterLifecycleBusy: false,
@@ -3504,11 +3505,36 @@ function clusterV2Wizard() {
             }
         },
 
-        async deactivateDeployment(deployment) {
+        async forgetCluster(device = null) {
+            if (this.clusterLifecycleBusy) return;
+            const nodeId = device?.node_id;
+            const confirmation = nodeId ? `node:${nodeId}` : 'all';
+            if (this.confirmForgetFor !== confirmation) {
+                this.confirmForgetFor = confirmation;
+                return;
+            }
+            this.confirmForgetFor = '';
+            this.clusterLifecycleBusy = true;
+            try {
+                await this.apiFetch('/admin/api/cluster/forget' +
+                    (nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : ''), {method: 'DELETE'});
+                this.notify('info', window.t('cluster.v2.toast.forgotten_local'));
+                await this.refreshDevices();
+                await this.refreshDeployments();
+                await this.refreshRuntime();
+            } catch (error) {
+                this.notify('error', error?.message || window.t('cluster.v2.err.unpair'));
+            } finally {
+                this.clusterLifecycleBusy = false;
+            }
+        },
+
+        async deactivateDeployment(deployment, localOnly = false) {
             const id = deployment?.deployment_id;
             if (!id || this.clusterLifecycleBusy) return;
-            if (this.confirmDeactivateFor !== id) {
-                this.confirmDeactivateFor = id;
+            const confirmation = localOnly ? `${id}:local` : id;
+            if (this.confirmDeactivateFor !== confirmation) {
+                this.confirmDeactivateFor = confirmation;
                 return;
             }
             this.confirmDeactivateFor = '';
@@ -3516,10 +3542,10 @@ function clusterV2Wizard() {
             this.confirmUnloadFor = '';
             this.clusterLifecycleBusy = true;
             try {
-                await this.apiFetch(CLUSTER_V2_API.deployment(id), {
+                await this.apiFetch(CLUSTER_V2_API.deployment(id) + (localOnly ? "?local_only=true" : ""), {
                     method: 'DELETE',
                 });
-                this.notify('info', window.t('cluster.v2.toast.deactivated'));
+                this.notify('info', window.t(localOnly ? 'cluster.v2.toast.forgotten_local' : 'cluster.v2.toast.deactivated'));
                 await this.refreshDeployments();
                 await this.refreshRuntime();
             } catch (error) {
