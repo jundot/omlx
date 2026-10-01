@@ -393,6 +393,7 @@ class CacheSettings:
     # True/False preserve the legacy explicit split/embedded choices.
     gdn_ssd_split_enabled: bool | None = None
     gdn_ssd_pending_max_size: str = "512MB"
+    gdn_ssd_max_size: str = "0"
     gdn_sidecar_state_dtype: str = "fp32"
 
     def get_gdn_snapshot_storage(self) -> str:
@@ -459,6 +460,13 @@ class CacheSettings:
             return get_auto_ssd_cache_size(cache_dir)
         return parse_size(self.ssd_cache_max_size)
 
+    def get_gdn_ssd_max_size_bytes(self) -> int | None:
+        """Return the separate GDN sidecar budget, or None for legacy shared-limit behavior."""
+        value = (self.gdn_ssd_max_size or "0").strip().lower()
+        if value in {"0", "auto", ""}:
+            return None
+        return parse_size(value)
+
     def get_hot_cache_max_size_bytes(self) -> int:
         """Get hot cache max size in bytes. 0 means disabled."""
         return parse_size(self.hot_cache_max_size)
@@ -524,6 +532,7 @@ class CacheSettings:
             gdn_ssd_pending_max_size=data.get(
                 "gdn_ssd_pending_max_size", "512MB"
             ),
+            gdn_ssd_max_size=data.get("gdn_ssd_max_size", "0"),
             gdn_sidecar_state_dtype=str(
                 data.get("gdn_sidecar_precision", "fp32")
             ).lower(),
@@ -1255,6 +1264,8 @@ class GlobalSettings:
             )
         if gdn_ssd_pending_max := os.getenv("OMLX_GDN_SSD_PENDING_MAX_SIZE"):
             self.cache.gdn_ssd_pending_max_size = gdn_ssd_pending_max
+        if gdn_ssd_max := os.getenv("OMLX_GDN_SSD_MAX_SIZE"):
+            self.cache.gdn_ssd_max_size = gdn_ssd_max
         if gdn_sidecar_dtype := os.getenv("OMLX_GDN_SIDECAR_STATE_DTYPE"):
             self.cache.gdn_sidecar_state_dtype = gdn_sidecar_dtype.lower()
         if initial_blocks := os.getenv("OMLX_INITIAL_CACHE_BLOCKS"):
@@ -1773,6 +1784,13 @@ class GlobalSettings:
                     errors.append("ssd_cache_max_size must be positive")
             except ValueError as e:
                 errors.append(f"Invalid ssd_cache_max_size: {e}")
+        if self.cache.gdn_ssd_max_size.lower() not in {"0", "auto", ""}:
+            try:
+                size = parse_size(self.cache.gdn_ssd_max_size)
+                if size <= 0:
+                    errors.append("gdn_ssd_max_size must be positive")
+            except ValueError as e:
+                errors.append(f"Invalid gdn_ssd_max_size: {e}")
 
         try:
             hot_cache_size = parse_size(self.cache.hot_cache_max_size)
@@ -1909,6 +1927,7 @@ class GlobalSettings:
             gdn_ssd_pending_max_bytes=parse_size(
                 self.cache.gdn_ssd_pending_max_size
             ),
+            gdn_ssd_max_size=self.cache.get_gdn_ssd_max_size_bytes(),
             gdn_sidecar_state_dtype=self.cache.gdn_sidecar_state_dtype,
         )
 
