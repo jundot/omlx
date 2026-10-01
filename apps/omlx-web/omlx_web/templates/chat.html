@@ -4972,17 +4972,15 @@
     },
 
     async downloadChats() {
-        const history = localStorage.getItem(CHAT_HISTORY_STORAGE_KEY);
-        if (!history) {
+        // Export the chats the page holds, not the localStorage copy: when a
+        // save exceeds the storage quota, localStorage keeps an older snapshot
+        // that can lack every message shown on screen.
+        const chats = this.chatHistory || [];
+        if (!chats.length) {
             alert(window.t('chat.no_chats_to_export'));
             return;
         }
         try {
-            const chats = JSON.parse(history);
-            if (!chats.length) {
-                alert(window.t('chat.no_chats_to_export'));
-                return;
-            }
             const json = JSON.stringify(chats, null, 2);
             const blob = new Blob([json], { type: 'application/json' });
             const url = URL.createObjectURL(blob);
