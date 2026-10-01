@@ -1360,6 +1360,12 @@ def run_worker(args: argparse.Namespace) -> int:
         # indexer weights) legitimately have such parameters.
         apply_mlx_lm_pipeline_index_patch()
 
+        # One prefill chunk is one GPU command buffer: bound it by the KV depth
+        # so a deep prompt cannot trip the Metal command-buffer watchdog.
+        from omlx.patches import prefill_depth_step
+
+        prefill_depth_step.install()
+
         # Pin this rank's stage so the loader honours the plan instead of an
         # even split. Must precede load: mlx-lm builds the model and calls
         # pipeline() inside load_default().
