@@ -126,7 +126,7 @@ enum ShellEnvWriter {
         let script = """
         #!/bin/sh
         BOOTSTRAP="$HOME/Library/Application Support/oMLX/base-path"
-        if [ -r "$BOOTSTRAP" ]; then
+        if [ -z "$\(variableName)" ] && [ -r "$BOOTSTRAP" ]; then
             IFS= read -r \(variableName) < "$BOOTSTRAP" || \(variableName)=""
             if [ -n "$\(variableName)" ]; then
                 export \(variableName)
