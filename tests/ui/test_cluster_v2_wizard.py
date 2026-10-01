@@ -2650,3 +2650,97 @@ def test_ssh_repair_form_only_belongs_to_failed_check():
 def test_ssh_repair_input_allows_dotted_accounts():
     template = _read(TEMPLATE)
     assert 'pattern="[A-Za-z_][A-Za-z0-9_.\\-]{0,63}"' in template
+
+
+def test_discovered_membership_card_offers_pairing_with_a_persistent_form():
+    template = _read(TEMPLATE)
+    start = template.index(":key=\"'membership-found-' + device.node_id\"")
+    end = template.index("</template>", start)
+    assert '@click="beginMembershipPairing(device)"' in template[start:end]
+    form = template.index("data-cluster-v2-membership-pairing-form")
+    assert form > end
+    assert 'x-show="pairing.target"' in template[end:form]
+    assert '@keydown.enter="submitPairApproval(pairing.target)"' in template[form:]
+
+
+def test_membership_pairing_waits_for_the_selected_macs_request():
+    result = _run_wizard("""
+        (async () => {
+            const calls = [];
+            component.apiFetch = async (url) => { calls.push(url); return {}; };
+            component.devicesPayload = {paired: [], discovered: [{node_id: 'new', state: 'discovered'}]};
+            component.beginMembershipPairing({node_id: 'new'});
+            component.pairing.code = '123456';
+            await component.submitPairApproval(component.pairing.target);
+            const missing = {calls: calls.length, error: component.pairing.error};
+            component.devicesPayload.discovered = [{node_id: 'other', state: 'awaiting_approval'}];
+            await component.submitPairApproval(component.pairing.target);
+            console.log(JSON.stringify({missing, calls, open: component.membershipPanelOpen, target: component.pairing.target.node_id}));
+        })();
+    """)
+    assert result["missing"]["calls"] == 0
+    assert result["missing"]["error"]
+    assert result["calls"] == []
+    assert result["open"] is True
+    assert result["target"] == "new"
+
+
+def test_membership_pairing_keeps_the_active_model_until_explicit_replan():
+    result = _run_wizard("""
+        (async () => {
+            const calls = [], probes = [];
+            const deployment = {deployment_id: 'existing', model: 'current-model', assignments: [{node_id: 'self'}, {node_id: 'old'}]};
+            component.configuredDeployment = () => deployment;
+            component.devicesPayload = {paired: [{node_id: 'old', paired: true}], discovered: [{node_id: 'new', state: 'discovered'}]};
+            component.executionProfile = 'custom';
+            component.selectedModelPath = 'current-model';
+            component.beginMembershipPairing({node_id: 'new'});
+            component.pairing.code = '123456';
+            component.devicesPayload.discovered = [{node_id: 'new', state: 'awaiting_approval'}];
+            component.apiFetch = async (url, options) => { calls.push({url, body: JSON.parse(options.body)}); return {}; };
+            component.notify = () => {};
+            component.refreshDevices = async () => { component.devicesPayload = {paired: [{node_id: 'old', paired: true}, {node_id: 'new', paired: true}], discovered: []}; };
+            component.probePeer = async (peer) => probes.push(peer.node_id);
+            component.startChecks = () => { throw Error('must not leave active cluster'); };
+            component.runPlan = async () => { throw Error('must not replan automatically'); };
+            await component.submitPairApproval(component.pairing.target);
+            console.log(JSON.stringify({calls, probes, candidates: component.membershipCandidates().map(x => x.node_id), target: component.pairing.target, profile: component.executionProfile, model: component.selectedModelPath, deployment}));
+        })();
+    """)
+    assert result["calls"] == [
+        {
+            "url": "/api/cluster/pair/approve",
+            "body": {"node_id": "new", "code": "123456"},
+        }
+    ]
+    assert result["probes"] == ["new"]
+    assert result["candidates"] == ["new"]
+    assert result["target"] is None
+    assert result["profile"] == "custom"
+    assert result["model"] == "current-model"
+    assert result["deployment"]["assignments"] == [
+        {"node_id": "self"},
+        {"node_id": "old"},
+    ]
+
+
+def test_membership_pairing_failure_can_be_retried_or_cancelled():
+    result = _run_wizard("""
+        (async () => {
+            component.devicesPayload = {paired: [], discovered: [{node_id: 'new', state: 'awaiting_approval'}]};
+            component.beginMembershipPairing({node_id: 'new'});
+            component.pairing.code = '123456';
+            component.apiFetch = async () => { throw Object.assign(Error('Incorrect code'), {status: 403}); };
+            await component.submitPairApproval(component.pairing.target);
+            const failed = {target: component.pairing.target.node_id, code: component.pairing.code, error: component.pairing.error, busy: component.pairing.busy};
+            component.cancelPairing();
+            console.log(JSON.stringify({failed, target: component.pairing.target}));
+        })();
+    """)
+    assert result["failed"] == {
+        "target": "new",
+        "code": "123456",
+        "error": "Incorrect code",
+        "busy": False,
+    }
+    assert result["target"] is None

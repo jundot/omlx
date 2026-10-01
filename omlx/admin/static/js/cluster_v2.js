@@ -1358,6 +1358,10 @@ function clusterV2Wizard() {
                 this.pairing.error = window.t('cluster.v2.pair.code_hint');
                 return;
             }
+            if (this.membershipPanelOpen && !this.membershipPairingReady()) {
+                this.pairing.error = window.t('cluster.v2.membership.waiting_request');
+                return;
+            }
             this.pairing.busy = true;
             this.pairing.error = '';
             try {
@@ -3136,6 +3140,18 @@ function clusterV2Wizard() {
         // =================================================================
         // Active membership — pair first, then sign one N-node re-plan.
         // =================================================================
+        beginMembershipPairing(device) {
+            if (!device?.node_id || this.pairing.busy) return;
+            this.membershipPanelOpen = true;
+            this.beginPairing(device);
+        },
+
+        membershipPairingReady() {
+            return this.pendingApprovals().some(
+                (device) => device.node_id === this.pairing.target?.node_id,
+            );
+        },
+
         deploymentMemberIds(deployment = this.configuredDeployment()) {
             return new Set(
                 (deployment?.assignments || [])
