@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import secrets
 import socket
 import threading
@@ -39,6 +40,23 @@ def _connection_failure_message(exc: Exception) -> str | None:
     if isinstance(reason, ConnectionRefusedError):
         return "The coordinator refused the connection. Check that oMLX is running and its port is correct, then retry."
     return None
+
+
+def _missing_join_request(exc: Exception) -> bool:
+    """Recognize a legacy cancellation response, not a missing HTTP endpoint."""
+    if not isinstance(exc, HTTPError) or exc.code != 404:
+        return False
+    try:
+        # Error pages may be arbitrarily large; only inspect a small JSON body.
+        body = exc.read(4097)
+        if len(body) > 4096:
+            return False
+        payload = json.loads(body)
+    except (OSError, ValueError):
+        return False
+    return (
+        isinstance(payload, dict) and payload.get("detail") == "no pending join request"
+    )
 
 
 class PairingSession:
@@ -374,10 +392,13 @@ class PairingSession:
                     2.0,
                 )
             except Exception as exc:
-                # A different attempt owns the peer's record now. This proof
-                # must never remove it, nor block local cancellation forever.
-                if not isinstance(exc, PairingCodeError) and not (
-                    isinstance(exc, HTTPError) and exc.code == 403
+                # A different attempt owns the record, or a legacy coordinator
+                # explicitly reports that it is absent. A generic 404 can mean
+                # the cancellation endpoint is missing; retain that proof.
+                if (
+                    not isinstance(exc, PairingCodeError)
+                    and not (isinstance(exc, HTTPError) and exc.code == 403)
+                    and not _missing_join_request(exc)
                 ):
                     return
                 self.manager._record_audit(
