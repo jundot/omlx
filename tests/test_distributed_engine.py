@@ -677,6 +677,38 @@ async def test_distributed_stream_waits_for_usage_before_final_output():
 
 
 @pytest.mark.asyncio
+async def test_distributed_stream_accepts_pretokenized_token_id_list():
+    event = {
+        "choices": [{"text": "A", "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": 3,
+            "completion_tokens": 1,
+            "total_tokens": 4,
+        },
+    }
+    content = f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n"
+    seen_requests = []
+
+    def handler(request):
+        seen_requests.append(json.loads(request.content.decode()))
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=content,
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        outputs = [output async for output in engine.stream_generate([101, 102, 103])]
+    finally:
+        await engine._client.aclose()
+
+    assert len(outputs) == 1
+    assert outputs[0].prompt_tokens == 3
+    assert seen_requests[0]["prompt"] == [101, 102, 103]
+
+
+@pytest.mark.asyncio
 async def test_stream_records_real_prefill_and_decode_for_automatic_choice(
     monkeypatch,
     tmp_path,
