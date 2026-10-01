@@ -82,13 +82,24 @@
                                 <div class="flex gap-1">
                                     <template x-for="lvl in ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']" :key="lvl">
                                         <button type="button"
-                                                @click="logMinLevel = lvl"
+                                                @click="selectLogLevel(lvl, $event)"
+                                                :title="window.t('logs.level_exact_hint')"
                                                 :class="[levelButtonClass(lvl), logMinLevel === lvl ? 'ring-2 ring-offset-1 ring-neutral-500' : '']"
                                                 class="px-2 py-1 text-xs font-mono font-semibold rounded transition-all"
                                                 x-text="lvl">
                                         </button>
                                     </template>
                                 </div>
+                                <!-- Exact-match indicator: the range styling is
+                                     suppressed in this mode, so say so plainly. -->
+                                <span x-show="logExactLevel"
+                                      class="flex items-center gap-1 text-xs font-medium text-emerald-700">
+                                    <span x-text="window.t('logs.level_exact_badge').replace('{level}', logExactLevel)"></span>
+                                    <button type="button"
+                                            @click="logExactLevel = null"
+                                            class="underline"
+                                            x-text="window.t('logs.level_exact_clear')"></button>
+                                </span>
                             </div>
                         </div>
                     </div>
