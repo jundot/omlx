@@ -23,6 +23,10 @@ speculative routes remain intact. See
 [GDN decode prework](experimental/qwen35_fp16_decode.md) for the hardware, geometry
 limits and real-model benchmark requirements.
 
+# M4 dense MLP prefill
+
+For the opt-in M4 Max dense MLP QMM route, run `python -m pytest -q tests/test_m4_dense_mlp_prefill.py tests/test_model_loading.py tests/test_qwen35_q4_mlp.py tests/test_vlm_engine.py tests/test_batched_engine.py`. See [M4 dense MLP prefill](experimental/m4_dense_mlp_prefill.md) for geometry, native-layout fallback tests and paired real-model benchmark commands.
+
 # First-token burst release
 
 Run `python -m pytest -q tests/test_engine_core.py tests/test_output_collector.py`

@@ -1405,6 +1405,10 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
     except Exception:
         logger.debug("t5 bias free skipped", exc_info=True)
 
+    from ..patches.m4_dense_mlp_prefill import apply_m4_dense_mlp_prefill
+
+    apply_m4_dense_mlp_prefill(model)
+
     if model_settings is None:
         return model
 
