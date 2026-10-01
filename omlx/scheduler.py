@@ -2725,10 +2725,9 @@ class Scheduler:
                     )
                 # Cleanup uid maps now that the slot is reclaimable.
                 _unregister_uid_row(self.model, uid)
-                if uid in self.uid_to_request_id:
-                    del self.uid_to_request_id[uid]
-                if request_id in self.request_id_to_uid:
-                    del self.request_id_to_uid[request_id]
+                self.uid_to_request_id.pop(uid, None)
+                if self.request_id_to_uid.get(request_id) == uid:
+                    self.request_id_to_uid.pop(request_id, None)
                 self._inflight_store_futures.pop(request_id, None)
                 self._inflight_store_info.pop(request_id, None)
                 self._clear_request_admission_bookkeeping(request_id)
@@ -10574,8 +10573,12 @@ class Scheduler:
                     if callable(close):
                         close()
             _unregister_uid_row(self.model, uid)
-            del self.uid_to_request_id[uid]
-            del self.request_id_to_uid[request.request_id]
+            # Idempotent, for the same reason as the temp-UID cleanup in
+            # _schedule_waiting: fail_all_requests() pops these maps from the
+            # MLX executor thread (#1031).
+            self.uid_to_request_id.pop(uid, None)
+            if self.request_id_to_uid.get(request.request_id) == uid:
+                self.request_id_to_uid.pop(request.request_id, None)
 
         if request_id in self.running:
             del self.running[request_id]
@@ -11954,9 +11957,16 @@ class Scheduler:
                     )
                     continue
 
-                # Clean up temp UID mapping
-                del self.uid_to_request_id[temp_uid]
-                del self.request_id_to_uid[request.request_id]
+                # Clean up temp UID mapping. This has to be idempotent:
+                # fail_all_requests() runs on the MLX executor thread (see
+                # engine_core's engine loop) and pops the same maps, so it can
+                # land here between our check and the delete. The reverse
+                # mapping only goes if it still points at OUR temp UID, so a
+                # request already re-registered with a real BatchGenerator UID
+                # survives (#1031).
+                self.uid_to_request_id.pop(temp_uid, None)
+                if self.request_id_to_uid.get(request.request_id) == temp_uid:
+                    self.request_id_to_uid.pop(request.request_id, None)
 
                 # Prefill complete: remove from progress tracker so dashboard
                 # shows "generating" instead of "PP" during decode.
@@ -12845,9 +12855,9 @@ class Scheduler:
                     if hasattr(self.model, "unregister_rope_delta"):
                         self.model.unregister_rope_delta(uid)
                     _unregister_uid_row(self.model, uid)
-                    if uid in self.uid_to_request_id:
-                        del self.uid_to_request_id[uid]
-                    del self.request_id_to_uid[request_id]
+                    self.uid_to_request_id.pop(uid, None)
+                    if self.request_id_to_uid.get(request_id) == uid:
+                        self.request_id_to_uid.pop(request_id, None)
 
             # Clean up streaming detokenizer
             self._cleanup_detokenizer(request_id)
