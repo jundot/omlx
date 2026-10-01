@@ -349,6 +349,12 @@ private struct StatTilesRow: View {
                               comment: "Stat tile label for cache efficiency percentage"),
                 value: stats.map { String(format: "%.1f%%", $0.cacheEfficiency) } ?? "—"
             )
+            StatTile(
+                label: String(localized: "status.tile.generated",
+                              defaultValue: "Generated Tokens",
+                              comment: "Stat tile label for generated (completion) tokens"),
+                value: stats.map { fmtNum($0.totalCompletionTokens) } ?? "—"
+            )
         }
         .padding(.horizontal, 14)
         .padding(.bottom, 4)
