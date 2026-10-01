@@ -209,6 +209,16 @@ class BaseBenchmark(ABC):
             regions.append(current)
 
         if regions:
+            # Prefer the last region that actually defines something. A
+            # trailing "Also:\nimport os" or a closing remark must not
+            # displace the solution that precedes it — taking a bare last
+            # region there would drop the function entirely and score an
+            # answer the previous behaviour kept.
+            for region in reversed(regions):
+                if any(
+                    line.startswith(("def ", "class ", "async def ")) for line in region
+                ):
+                    return "\n".join(region).strip()
             return "\n".join(regions[-1]).strip()
         return response
 

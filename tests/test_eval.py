@@ -354,6 +354,29 @@ class TestExtractLastCodeBlock:
             "def real():\n    return 42"
         )
 
+    def test_trailing_import_does_not_displace_the_solution(self):
+        """A closing remark plus an import must not replace the answer."""
+        response = "def real():\n    return 1\n\nNote that we also need:\nimport os"
+        assert BaseBenchmark._extract_last_code_block(response) == (
+            "def real():\n    return 1"
+        )
+
+    def test_trailing_comment_does_not_displace_the_solution(self):
+        response = "def real():\n    return 1\n\nNote:\n# uses math"
+        assert BaseBenchmark._extract_last_code_block(response) == (
+            "def real():\n    return 1"
+        )
+
+    def test_trailing_from_import_does_not_displace_the_solution(self):
+        response = "def real():\n    return 1\n\nAlso:\nfrom typing import List"
+        assert BaseBenchmark._extract_last_code_block(response) == (
+            "def real():\n    return 1"
+        )
+
+    def test_async_definition_is_still_preferred(self):
+        response = "try_it()\n\nAsync version:\nasync def go():\n    return 1"
+        assert "async def go():" in BaseBenchmark._extract_last_code_block(response)
+
     def test_keeps_imports_and_helpers_of_one_region(self):
         """A solution is one region; taking the last def alone would truncate it."""
         response = (
