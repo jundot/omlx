@@ -175,3 +175,70 @@ def test_prompt_batch_full_split_moves_cache_without_copy():
     assert moved.uids == [42]
     assert moved.prompt_cache[0] is arrays
     assert moved.prompt_cache[1] is kv
+
+
+def _mixed_layers(seed: int, length: int):
+    """One row of a hybrid model: linear, attention and nested layers."""
+    mx.random.seed(seed)
+    arrays = ArraysCache(1)
+    arrays[0] = mx.random.normal((1, 2, 3))
+    kv = KVCache()
+    kv.update_and_fetch(
+        mx.random.normal((1, 2, length, 4)), mx.random.normal((1, 2, length, 4))
+    )
+    nested_kv = KVCache()
+    nested_kv.update_and_fetch(
+        mx.random.normal((1, 1, length, 4)), mx.random.normal((1, 1, length, 4))
+    )
+    nested = CacheList(nested_kv, _arrays_cache(float(seed)))
+    layers = [arrays, BatchKVCache.merge([kv]), nested]
+    mx.eval([c.state for c in layers])
+    return layers
+
+
+def _flat_state(layers):
+    out = []
+    for layer in layers:
+        state = layer.state
+        stack = [state]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, (list, tuple)):
+                stack.extend(reversed(item))
+            elif isinstance(item, mx.array):
+                out.append(item)
+    return out
+
+
+def test_join_evaluates_each_layer_and_matches_the_lazy_join():
+    """The layer-by-layer join releases the donor and is bit-identical to
+    joining every layer lazily, for non-Qwen4 cache types too."""
+    gen = importlib.import_module("mlx_lm.generate")
+
+    expected = [
+        omlx.scheduler._extend_cache_layer(a, b)
+        for a, b in zip(_mixed_layers(1, 5), _mixed_layers(2, 3))
+    ]
+    donor = _mixed_layers(2, 3)
+    joined = gen._extend_cache(_mixed_layers(1, 5), donor)
+
+    assert donor == [None, None, None]
+    assert [type(c) for c in joined] == [type(c) for c in expected]
+    got, want = _flat_state(joined), _flat_state(expected)
+    assert len(got) == len(want)
+    for a, b in zip(got, want):
+        assert a.dtype == b.dtype and a.shape == b.shape
+        assert mx.array_equal(a, b).item()
+
+
+def test_join_of_fresh_prompt_batches_keeps_empty_layers():
+    """A prompt batch joins freshly made (empty) caches; state access on
+    them must not break the per-layer evaluation."""
+    gen = importlib.import_module("mlx_lm.generate")
+    left = [ArraysCache(1), BatchKVCache([0]), CacheList(KVCache(), ArraysCache(1))]
+    right = [ArraysCache(1), BatchKVCache([0]), CacheList(KVCache(), ArraysCache(1))]
+
+    joined = gen._extend_cache(left, right)
+
+    assert len(joined) == 3
+    assert joined[1].offset.tolist() == [0, 0]

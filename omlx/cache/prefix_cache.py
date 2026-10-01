@@ -3119,6 +3119,7 @@ class BlockAwarePrefixCache(CacheManager):
         self,
         block_table: BlockTable,
         promote_to_hot_cache: bool = True,
+        reserve_tokens: int = 0,
     ) -> list[Any] | None:
         """
         Reconstruct cache objects from paged SSD-stored block data.
@@ -3140,6 +3141,9 @@ class BlockAwarePrefixCache(CacheManager):
                 Will be modified in-place if partial reconstruction.
             promote_to_hot_cache: When False, SSD-loaded blocks are not retained
                 in hot cache after active KV reconstruction.
+            reserve_tokens: Prompt length the restored prefix will be extended
+                to. Caches whose handler supports ``reconstruct_reserved``
+                are assembled straight into buffers of that size.
 
         Returns:
             List of reconstructed cache objects (one per layer),
@@ -4398,8 +4402,18 @@ class BlockAwarePrefixCache(CacheManager):
                             state_dict[info.name] = elem
                         layer_states.append(state_dict)
 
-                    concat_state = marker_handler.concatenate_states(layer_states)
-                    cache = marker_handler.reconstruct_cache(concat_state, None)
+                    cache = None
+                    reconstruct_reserved = getattr(
+                        marker_handler, "reconstruct_reserved", None
+                    )
+                    if reserve_tokens and callable(reconstruct_reserved):
+                        # Blocks go straight into a buffer sized for the
+                        # prompt instead of a concatenated copy that the
+                        # first prefill chunk would copy again to grow.
+                        cache = reconstruct_reserved(layer_states, reserve_tokens)
+                    if cache is None:
+                        concat_state = marker_handler.concatenate_states(layer_states)
+                        cache = marker_handler.reconstruct_cache(concat_state, None)
                     if cache is None:
                         logger.error(
                             f"Layer {layer_idx}: failed to reconstruct {marker_class}"

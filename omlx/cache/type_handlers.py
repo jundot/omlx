@@ -1743,6 +1743,71 @@ class Qwen4QSAKVCacheHandler(CacheTypeHandler):
     def concatenate_states(self, states: list[dict[str, Any]]) -> dict[str, Any]:
         if not HAS_MLX or not states:
             return {}
+        grouped = self._group_block_elements(states)
+        concatenated = [
+            mx.concatenate(elements, axis=info.sequence_axis) if elements else None
+            for info, elements in zip(self.get_state_axis_info(), grouped)
+        ]
+        return {
+            **{
+                info.name: value
+                for info, value in zip(self.get_state_axis_info(), concatenated)
+            },
+            "states": tuple(concatenated),
+            "cache_type": self.cache_type.value,
+        }
+
+    def reconstruct_reserved(
+        self,
+        states: list[dict[str, Any]],
+        reserve_tokens: int,
+    ) -> Any:
+        """Restore block states straight into buffers sized for the prompt.
+
+        Produces the cache ``reconstruct_cache(concatenate_states(states))``
+        would, with ``reserve_index_capacity(reserve_tokens)`` applied, but
+        writes each block into its final buffer: no concatenated copy, and no
+        regrowth copy when prefill resumes within ``reserve_tokens``. Returns
+        None when that shortcut does not apply (the caller then concatenates).
+        """
+        if not HAS_MLX or not states or reserve_tokens <= 0:
+            return None
+        grouped = self._group_block_elements(states)
+        if not grouped[0] or any(len(parts) != len(grouped[0]) for parts in grouped):
+            return None
+        for info, parts in zip(self.get_state_axis_info(), grouped):
+            axis = info.sequence_axis
+            first = parts[0]
+            # Anything concatenate would promote or reject keeps that path.
+            if any(
+                part.dtype != first.dtype
+                or part.ndim != first.ndim
+                or part.shape[:axis] != first.shape[:axis]
+                or part.shape[axis + 1 :] != first.shape[axis + 1 :]
+                for part in parts
+            ):
+                return None
+        try:
+            from ..patches.mlx_vlm_qwen4_exp_compat import (
+                apply_mlx_vlm_qwen4_exp_compat_patch,
+            )
+
+            apply_mlx_vlm_qwen4_exp_compat_patch()
+            from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Qwen4 QSAKVCache unavailable: %s", exc)
+            return None
+        keys, values, index_keys, positions = grouped
+        return QSAKVCache.from_block_parts(
+            keys,
+            values,
+            index_keys,
+            [_deserialize_qsa_positions(part) for part in positions],
+            reserve_tokens,
+        )
+
+    def _group_block_elements(self, states: list[dict[str, Any]]) -> list[list[Any]]:
+        """Validate block states and group their elements for concatenation."""
         grouped: list[list[Any]] = [[] for _ in self.get_state_axis_info()]
         state_lengths = []
         for state in states:
@@ -1762,21 +1827,14 @@ class Qwen4QSAKVCacheHandler(CacheTypeHandler):
             raise ValueError(
                 "Non-empty QSA prefix chains cannot contain empty cache blocks"
             )
-        concatenated = []
-        for info, elements in zip(self.get_state_axis_info(), grouped):
-            if info.name == "index_position_ids":
-                elements = _normalize_qsa_position_states(elements)
-            concatenated.append(
-                mx.concatenate(elements, axis=info.sequence_axis) if elements else None
+        return [
+            (
+                _normalize_qsa_position_states(elements)
+                if info.name == "index_position_ids"
+                else elements
             )
-        return {
-            **{
-                info.name: value
-                for info, value in zip(self.get_state_axis_info(), concatenated)
-            },
-            "states": tuple(concatenated),
-            "cache_type": self.cache_type.value,
-        }
+            for info, elements in zip(self.get_state_axis_info(), grouped)
+        ]
 
     def deserialize_state(
         self,

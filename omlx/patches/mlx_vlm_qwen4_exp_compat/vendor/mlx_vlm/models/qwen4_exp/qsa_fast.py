@@ -1459,7 +1459,63 @@ def contiguous_causal_gathered_qsa(
     return mx.concatenate(outputs, axis=1)
 
 
+def batched_causal_block_selection(
+    index_queries: mx.array,
+    pooled_index_keys: mx.array,
+    visible: mx.array,
+    *,
+    compress_ratio: int,
+    block_topk: int,
+    indexer_head_dim: int,
+) -> tuple[mx.array, mx.array]:
+    """QSA key selection of every query of a batch of contiguous rows.
+
+    ``index_queries`` ``[B, heads, L, D]`` are normalized and rotated;
+    ``pooled_index_keys`` ``[B, blocks, D]`` holds each row's completed blocks
+    left-aligned from its first token (zero past the row's own count);
+    ``visible`` ``[B, L]`` is how many of its row's tokens each query sees.
+    Returns row-relative token indices ``[B, L, block_topk * ratio + ratio - 1]``
+    (int32, chronological) and their validity: the query's top ``block_topk``
+    causal blocks by the FP32 score the indexer uses -- every causal block
+    below the crossover -- then its incomplete tail. Invalid slots index 0.
+    ``blocks`` must exceed ``block_topk``.
+    """
+
+    ratio = compress_ratio
+    batch, _, length, _ = index_queries.shape
+    blocks = pooled_index_keys.shape[1]
+    complete = visible // ratio
+    scores = index_queries.astype(mx.float32) @ pooled_index_keys[:, None].astype(
+        mx.float32
+    ).swapaxes(-1, -2)
+    scores = mx.sum(mx.maximum(scores, 0), axis=1) / math.sqrt(indexer_head_dim)
+    scores = mx.where(
+        mx.arange(blocks)[None, None] < complete[..., None], scores, -mx.inf
+    )
+    # argpartition's top-k set is unordered; restore key order as the dense
+    # path's SDPA reads keys.
+    chosen = mx.sort(
+        mx.argpartition(scores, kth=-block_topk, axis=-1)[..., -block_topk:].astype(
+            mx.int32
+        ),
+        axis=-1,
+    )
+    tokens = (chosen[..., None] * ratio + mx.arange(ratio, dtype=mx.int32)).reshape(
+        batch, length, block_topk * ratio
+    )
+    tail = complete[..., None] * ratio + mx.arange(ratio - 1, dtype=mx.int32)
+    valid = mx.concatenate(
+        [
+            mx.repeat(chosen < complete[..., None], ratio, axis=-1),
+            tail < visible[..., None],
+        ],
+        axis=-1,
+    )
+    return mx.where(valid, mx.concatenate([tokens, tail], axis=-1), 0), valid
+
+
 __all__ = [
+    "batched_causal_block_selection",
     "contiguous_causal_gathered_qsa",
     "contiguous_causal_gathered_qsa_decode",
     "contiguous_causal_query_chunk",
