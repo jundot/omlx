@@ -442,3 +442,45 @@ def test_explicit_mask_is_preserved_when_verify_kernel_declines():
     )
     assert result is None
     original.assert_not_called()
+
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("width", range(2, 9))
+def test_target_verify_rows_match_one_row_decode(width):
+    """Width-stable verify scores every row exactly like a one-row decode.
+
+    The MTP depth controller changes the block width between cycles, so a
+    position is verified at different widths, or decoded alone, from one run
+    to the next. Rows that differ from the one-row result let greedy output
+    change between runs.
+    """
+    from mlx_vlm.models.qwen3_5 import language as q35_lang
+
+    from omlx.patches.qwen35_verify_qmm import set_verify_width_stable
+    from omlx.patches.qwen35_verify_sdpa_split import (
+        apply_qwen35_verify_sdpa_split_patch,
+    )
+
+    assert apply_qwen35_verify_sdpa_split_patch()
+    mx.random.seed(5)
+    prefix, scale = 500, HD**-0.5
+    k = (mx.random.normal((1, HKV, prefix + width, HD)) * 0.5).astype(mx.bfloat16)
+    v = (mx.random.normal((1, HKV, prefix + width, HD)) * 0.5).astype(mx.bfloat16)
+    q = (mx.random.normal((1, HQ, width, HD)) * 0.5).astype(mx.bfloat16)
+    set_verify_width_stable(True)
+    try:
+        out = q35_lang._qwen3_5_left_padded_attention(
+            q, k, v, cache=None, scale=scale, mask="causal"
+        )
+        mx.eval(out)
+    finally:
+        set_verify_width_stable(False)
+    for i in range(width):
+        one = mx.fast.scaled_dot_product_attention(
+            q[:, :, i : i + 1],
+            k[:, :, : prefix + i + 1],
+            v[:, :, : prefix + i + 1],
+            scale=scale,
+        )
+        assert mx.array_equal(out[:, :, i : i + 1], one).item(), i
