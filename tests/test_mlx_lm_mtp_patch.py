@@ -4150,12 +4150,14 @@ def _model(family):
 
         return nh.Model(nh.ModelArgs.from_dict(TINY_CONFIG))
     if family == "glm":
+        from test_glm_moe_dsa_patch import _glm_generate_patch_installed
         from test_glm_mtp_patch import TINY_CFG
 
         from omlx.patches.glm_moe_dsa import apply_glm_moe_dsa_patch
         from omlx.patches.mlx_lm_mtp import glm_moe_dsa_model
 
-        apply_glm_moe_dsa_patch()
+        with _glm_generate_patch_installed():
+            apply_glm_moe_dsa_patch()
         glm_moe_dsa_model.apply()
         from mlx_lm.models.glm_moe_dsa import Model, ModelArgs
 

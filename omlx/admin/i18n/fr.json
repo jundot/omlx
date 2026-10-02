@@ -2017,5 +2017,19 @@
   "settings.global.reset_ok": "OK",
   "settings.global.reset_cancel": "Annuler",
   "settings.advanced.qwen4_gdn_decode_wide_proj": "Qwen4 Extended Fused Decode",
-  "settings.advanced.qwen4_gdn_decode_wide_proj_hint": "Speeds up single-request generation on supported affine-quantized Qwen4-family models with a hidden size of 2560. Contributor benchmarks on 8-bit Qwen3.8-Flash-Next reported 3-6% faster generation with 1.5 GiB of extra memory; results vary. Does not affect prefill or batched generation. Off by default. Reload the model to apply changes."
+  "settings.advanced.qwen4_gdn_decode_wide_proj_hint": "Speeds up single-request generation on supported affine-quantized Qwen4-family models with a hidden size of 2560. Contributor benchmarks on 8-bit Qwen3.8-Flash-Next reported 3-6% faster generation with 1.5 GiB of extra memory; results vary. Does not affect prefill or batched generation. Off by default. Reload the model to apply changes.",
+  "cluster.v2.active.forget_local": "Oublier tout le cluster",
+  "cluster.v2.active.confirm_forget_local": "Confirmer l’oubli de tout le cluster",
+  "cluster.v2.active.forget_local_warning": "Pour un Mac distant : supprime uniquement son couplage local et les répartitions de modèles qui l’utilisent ; les autres Macs restent couplés. Quitter ce Mac ou oublier tout le cluster supprime toutes les répartitions et tous les couplages locaux. Les processus locaux doivent s’arrêter ; les Macs distants peuvent encore fonctionner.",
+  "cluster.v2.toast.forgotten_local": "Suppression locale terminée. L’arrêt distant n’a pas été vérifié.",
+  "cluster.v2.active.forget_mac": "Oublier ce Mac",
+  "cluster.v2.active.confirm_forget_mac": "Cliquer pour confirmer",
+  "cluster.v2.active.leave_cluster": "Quitter le cluster",
+  "cluster.v2.join.forget_cleanup": "Oublier ce nettoyage",
+  "cluster.v2.join.confirm_forget_cleanup": "Confirmer l’oubli",
+  "cluster.v2.join.forget_cleanup_warning": "Arrêter les tentatives de cette ancienne annulation et supprimer définitivement cet avertissement sur ce Mac. L’autre Mac peut conserver l’ancienne demande. Le couplage actuel et le cluster restent inchangés.",
+  "cluster.v2.join.cleanup_forgotten": "Ancien nettoyage oublié sur ce Mac. Le nettoyage distant n’a pas été confirmé.",
+  "cluster.v2.join.forget_cleanup_error": "Impossible d’oublier ce nettoyage.",
+  "cluster.v2.membership.waiting_request": "En attente du code et de la demande de couplage de ce Mac.",
+  "cluster.v2.membership.add_device": "Ajouter ce Mac"
 }

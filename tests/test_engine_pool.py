@@ -1630,6 +1630,33 @@ class TestEnginePoolAsync:
         engines[3].stop.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_dflash_enabled_without_resolvable_draft_warns_and_falls_back(
+        self, pool_with_mock_engines, caplog
+    ):
+        """dflash_enabled without a resolvable draft warns and loads normally."""
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine),
+            caplog.at_level(logging.WARNING, logger="omlx.engine_pool"),
+        ):
+            engine = await pool.get_engine(
+                "model-a", runtime_settings=ModelSettings(dflash_enabled=True)
+            )
+
+        assert engine is mock_engine
+        mock_engine.start.assert_called_once()
+        assert any(
+            "no draft model is set" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
     async def test_runtime_settings_reload_rejected_while_leased(
         self, pool_with_mock_engines
     ):
@@ -3646,6 +3673,66 @@ class TestMemorySettleBarrier:
         assert not any(call.args == (0.1,) for call in sleep.call_args_list)
 
     @pytest.mark.asyncio
+    async def test_settle_bails_when_freed_plateaus_short(
+        self, pool_with_loaded_model, caplog
+    ):
+        """A non-zero plateau short of the bar ends the barrier (#2757)."""
+        pool = pool_with_loaded_model
+        # Need >= 3GB freed; 0.6GB is freed and then stays flat.
+        freed_short = 10 * 1024**3 - int(0.6 * 1024**3)
+        sleep_calls = []
+
+        async def mock_sleep(duration):
+            sleep_calls.append(duration)
+
+        with (
+            caplog.at_level(logging.INFO),
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("asyncio.sleep", side_effect=mock_sleep),
+        ):
+            mock_mx.get_active_memory = MagicMock(
+                side_effect=[10 * 1024**3] + [freed_short] * 12
+            )
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._unload_engine("model-a")
+
+        assert "stalled at" in caplog.text
+        assert "Settle barrier timed out" not in caplog.text
+        # Pre-unload sample + 2 settle rounds, and no emergency reclaim.
+        assert mock_mx.get_active_memory.call_count == 3
+        assert 1.0 not in sleep_calls
+        assert pool._current_model_memory == 0
+        assert pool._entries["model-a"].engine is None
+
+    @pytest.mark.asyncio
+    async def test_settle_keeps_waiting_while_footprint_pending(
+        self, pool_with_loaded_model
+    ):
+        """A plateau does not end the barrier while the footprint lags."""
+        pool = pool_with_loaded_model
+        freed_short = 10 * 1024**3 - int(0.6 * 1024**3)
+
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_phys_footprint", return_value=50 * 1024**3),
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            mock_mx.get_active_memory = MagicMock(
+                side_effect=[10 * 1024**3] + [freed_short] * 12
+            )
+            mock_mx.synchronize = MagicMock()
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._unload_engine("model-a")
+
+        # Pre-unload + 10 settle rounds + the emergency reclaim's own check.
+        assert mock_mx.get_active_memory.call_count == 12
+
+    @pytest.mark.asyncio
     async def test_settle_takes_multiple_rounds(self, pool_with_loaded_model):
         """Test settle barrier succeeds after multiple rounds of GC."""
         pool = pool_with_loaded_model
@@ -5076,3 +5163,29 @@ async def test_cancelled_unload_retains_marker_until_stop_finishes():
     with pytest.raises(asyncio.CancelledError):
         await task
     assert not pool._unloading_models
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("busy", [False, True])
+async def test_local_cluster_removal_preserves_busy_guard_and_scope(busy):
+    pool = _make_pool()
+    engine = MagicMock()
+    engine.runtime_failed_reason = "peer lost"
+    engine.has_active_requests.return_value = busy
+    pool._entries["test-model"] = EngineEntry(
+        model_id="test-model",
+        model_path="/fake/path",
+        model_type="llm",
+        engine_type="distributed_batched",
+        estimated_size=1000,
+        engine=engine,
+        in_use=int(busy),
+    )
+    pool._unload_engine = AsyncMock()
+    if busy:
+        with pytest.raises(ModelBusyError):
+            await pool.prepare_cluster_reload("test-model", local_only=True)
+        pool._unload_engine.assert_not_awaited()
+    else:
+        await pool.prepare_cluster_reload("test-model", local_only=True)
+        pool._unload_engine.assert_awaited_once_with("test-model", local_only=True)

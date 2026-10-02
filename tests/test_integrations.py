@@ -2360,12 +2360,38 @@ class TestDshIntegration:
 class TestDshPatchWriter:
     def test_creates_new_file(self, tmp_path):
         path = tmp_path / "cordis.patch.yml"
-        write_dsh_patch(path, "http://127.0.0.1:8000/v1", DSH_MODELS)
+        write_dsh_patch(
+            path, "http://127.0.0.1:8000/v1", DSH_MODELS, default_model="qwen-vl"
+        )
 
         route, data = _route(path)
         assert route["baseURL"] == "http://127.0.0.1:8000/v1"
         assert [m["id"] for m in route["models"]] == [m["id"] for m in DSH_MODELS]
         assert isinstance(data, list) and data[0]["id"] == "llm-pi-ai"
+
+        # The harness refuses duplicate mapping keys, so each key lands once.
+        out = path.read_text()
+        assert out.count("providers:") == 1
+        assert out.count("provider: omlx") == 1
+
+    def test_duplicate_keys_are_refused(self, tmp_path):
+        path = tmp_path / "cordis.patch.yml"
+        seed = (
+            "- id: llm-pi-ai\n"
+            '  name: "@deepseek-ai/dsh-llm-pi-ai"\n'
+            "  config:\n"
+            "    providers:\n"
+            "      omlx:\n"
+            "        models:\n"
+            "          - id: x\n"
+            "    providers:\n"
+            "      other: {}\n"
+        )
+        path.write_text(seed)
+
+        with pytest.raises(DshConfigShapeError, match="duplicate key"):
+            write_dsh_patch(path, "http://127.0.0.1:8000/v1", DSH_MODELS)
+        assert path.read_text() == seed
 
     def test_replaces_route_and_preserves_everything_else(self, tmp_path):
         path = tmp_path / "cordis.patch.yml"

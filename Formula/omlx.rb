@@ -3,8 +3,8 @@ class Omlx < Formula
 
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jundot/omlx"
-  url "https://github.com/jundot/omlx/archive/refs/tags/v0.7.0rc1.tar.gz"
-  sha256 "202f0f2187fd530a11be59ed1c4942b8a38dc1eea9428308f8b20b0e3a803d56"
+  url "https://github.com/jundot/omlx/archive/refs/tags/v0.7.0.tar.gz"
+  sha256 "cd58f72b7390896d8484ae0056cb8f578e21b18b448a5199caa023118a215c83"
   license "Apache-2.0"
 
   head "https://github.com/jundot/omlx.git", branch: "main"
@@ -47,7 +47,11 @@ class Omlx < Formula
     working_dir var
     log_path var/"log/omlx.log"
     error_log_path var/"log/omlx.log"
-    environment_variables PATH: std_service_path_env
+    # launchd KeepAlive respawns the process, so it is a supervisor in the
+    # sense /admin/api/server/restart expects: declare it so the dashboard
+    # restart button works under `brew services` instead of returning 503.
+    environment_variables PATH: std_service_path_env,
+                          OMLX_SUPERVISED: "launchd"
   end
 
   def install

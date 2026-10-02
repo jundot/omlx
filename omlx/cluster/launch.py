@@ -330,6 +330,7 @@ def _set_serve_release(
     payload: dict[str, Any] | None,
     *,
     runner: SSHRunner = subprocess.run,
+    local_only: bool = False,
 ) -> None:
     """Atomically publish or clear the post-load serve gate on every rank."""
 
@@ -357,7 +358,7 @@ def _set_serve_release(
     remote_root = str(state_dir).rstrip("/") or "."
     remote_path = f"{remote_root}/{filename}"
     for host in deployment.hosts:
-        if host.ssh in _LOOPBACK_SSH_TARGETS:
+        if local_only or host.ssh in _LOOPBACK_SSH_TARGETS:
             continue
         script = (
             _REMOTE_CLEAR_SERVE_MARKER_SCRIPT
@@ -365,8 +366,12 @@ def _set_serve_release(
             else _REMOTE_SERVE_MARKER_SCRIPT
         )
         arguments = [remote_path] if encoded is None else [remote_path, encoded]
+        # Absolute interpreter like the staging transfers: a bare "python3"
+        # resolves through the remote login shell's PATH, where a modified
+        # environment can shadow it. The marker script is stdlib-only, so
+        # /usr/bin/python3 suffices.
         command = " ".join(
-            ["python3", "-c", shlex.quote(script)]
+            ["/usr/bin/python3", "-c", shlex.quote(script)]
             + [shlex.quote(item) for item in arguments]
         )
         completed = _run_cluster_ssh(
@@ -770,6 +775,7 @@ def stop_deployment_processes(
     state_dir: str | Path = "~/.omlx/cluster/runtime",
     kill_grace: float = 3.0,
     runner: SSHRunner = subprocess.run,
+    local_only: bool = False,
 ) -> dict[str, Any]:
     """Stop and prove exit of one deployment without trusting pool ownership.
 
@@ -845,6 +851,7 @@ def stop_deployment_processes(
     hosts = [
         {"rank": rank, "node_id": host.node_id, "ssh": host.ssh}
         for rank, host in enumerate(deployment.hosts)
+        if not local_only or host.ssh in _LOOPBACK_SSH_TARGETS
     ]
     failures.extend(
         _sweep_rank_processes(
@@ -2950,8 +2957,11 @@ class DistributedJobSupervisor:
                 time.sleep(0.05)
         raise TimeoutError("rank-zero inference endpoint did not start listening")
 
-    def stop(self) -> None:
-        self._terminate()
+    def stop(self, *, local_only: bool = False) -> None:
+        if local_only:
+            self._terminate(local_only=True)
+        else:
+            self._terminate()
 
     def _write_launch_manifest(self) -> None:
         process = self.process
@@ -2981,6 +2991,7 @@ class DistributedJobSupervisor:
         *,
         process_group: int | None = None,
         kill_grace: float = 3.0,
+        local_only: bool = False,
     ) -> list[str]:
         """Kill rank processes that outlived the launcher group.
 
@@ -2992,6 +3003,7 @@ class DistributedJobSupervisor:
             [
                 {"rank": rank, "node_id": host.node_id, "ssh": host.ssh}
                 for rank, host in enumerate(self.deployment.hosts)
+                if not local_only or host.ssh in _LOOPBACK_SSH_TARGETS
             ],
             state_dir=self.state_dir,
             plan_hash=self.deployment.plan_hash,
@@ -2999,7 +3011,7 @@ class DistributedJobSupervisor:
             kill_grace=kill_grace,
         )
 
-    def _terminate(self) -> None:
+    def _terminate(self, *, local_only: bool = False) -> None:
         """Tear the job down and *prove* the teardown worked.
 
         ``stop()`` used to report success after a best-effort SIGKILL: the
@@ -3083,7 +3095,8 @@ class DistributedJobSupervisor:
             # A rank that escaped the group (reparented before the kill)
             # survives a verified group exit; sweep it by its marker pid.
             leftovers = self._sweep_rank_leftovers(
-                process_group=None if group_signal_denied else process_group
+                process_group=None if group_signal_denied else process_group,
+                **({"local_only": True} if local_only else {}),
             )
             if (
                 not group_signal_denied
@@ -3111,7 +3124,8 @@ class DistributedJobSupervisor:
             if process.poll() is None:
                 with suppress(subprocess.TimeoutExpired):
                     process.wait(timeout=2.0)
-        self._reap_remote_ranks()
+        if not local_only:
+            self._reap_remote_ranks()
         for reader in self._readers:
             reader.join(timeout=0.5)
         self._readers.clear()
@@ -3132,7 +3146,9 @@ class DistributedJobSupervisor:
         # Every rank is proven gone, so its RDMA link may carry the next launch.
         _release_rdma_stage_links(self.deployment.deployment_id)
         with suppress(Exception):
-            _set_serve_release(self.deployment, self.state_dir, None)
+            _set_serve_release(
+                self.deployment, self.state_dir, None, local_only=local_only
+            )
         if self._temporary is not None:
             self._temporary.cleanup()
             self._temporary = None

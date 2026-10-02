@@ -131,7 +131,7 @@ dependencies = [
     # (PR 11), Muse Glimmer prefix snapshots (PR 5), and GDN verify q/k
     # normalization that follows mlx-lm normalize_qk.
     "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@71f7c2cae42a968ddc981972a8ad35368dc587a9",
-    "markitdown[pdf,docx,pptx]==0.1.7",
+    "markitdown[pdf,docx,pptx]==0.1.8",
 ]
 
 [project.optional-dependencies]
