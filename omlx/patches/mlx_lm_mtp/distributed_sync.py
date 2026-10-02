@@ -72,6 +72,45 @@ def install_batch_policy() -> bool:
     return True
 
 
+def sync_max_depth() -> tuple[int, bool]:
+    """Rank 0's max draft depth (and fixed flag) on every rank, before the model is built.
+
+    ``maybe_apply_pre_load_patches`` derives the depth ceiling on each rank from
+    its own model and chip (``qwen3_5``: 4 where the M5 packed verify kernels
+    exist, 3 elsewhere). The verify window length is what the pipeline's
+    all_gather shapes depend on, so a cluster mixing an M5 with an older Mac
+    disagreed on the very first verify. The patched ``TextModel.__init__`` copies
+    the global onto the instance when the model is built, so this has to run
+    after the patches and before the load; ``install`` does.
+    """
+
+    import mlx.core as mx
+
+    from . import get_mtp_depth, is_mtp_depth_fixed, set_mtp_depth
+
+    group = mx.distributed.init()
+    depth, fixed = int(get_mtp_depth()), bool(is_mtp_depth_fixed())
+    if group.size() <= 1:
+        return depth, fixed
+    local = mx.array([depth, int(fixed)], dtype=mx.int32)
+    if group.rank() != 0:
+        local = mx.zeros_like(local)
+    agreed = mx.distributed.all_sum(local, group=group)
+    mx.eval(agreed)
+    agreed_depth, agreed_fixed = int(agreed[0].item()), bool(agreed[1].item())
+    if (agreed_depth, agreed_fixed) != (depth, fixed):
+        logger.warning(
+            "MTP max depth differs across ranks (local %d fixed=%s, rank 0 %d "
+            "fixed=%s): adopting rank 0's",
+            depth,
+            fixed,
+            agreed_depth,
+            agreed_fixed,
+        )
+        set_mtp_depth(agreed_depth, fixed=agreed_fixed)
+    return agreed_depth, agreed_fixed
+
+
 def install() -> bool:
     """Wrap ``_DepthController.observe`` so all ranks adopt rank 0's decision."""
 
@@ -79,6 +118,7 @@ def install() -> bool:
 
     from . import batch_generator
 
+    sync_max_depth()
     install_batch_policy()
 
     controller = getattr(batch_generator, "_DepthController", None)
