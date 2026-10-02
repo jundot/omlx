@@ -1295,9 +1295,9 @@ def qwen4_verify(monkeypatch):
     launches = []
     step = prework_mod.qwen4_verify_step_fused
 
-    def counted(*args):
+    def counted(*args, **kwargs):
         launches.append(args[0].shape[1])
-        return step(*args)
+        return step(*args, **kwargs)
 
     monkeypatch.setattr(prework_mod, "qwen4_verify_step_fused", counted)
     yield launches
@@ -1353,10 +1353,11 @@ _PARAVIRTUAL_GPU = mx.metal.is_available() and not str(
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.skipif(_PARAVIRTUAL_GPU, reason="per-op reference is not row-exact here")
 @pytest.mark.parametrize("signatures", [((6, 64),) * 4, ((8, 64),) * 4])
-@pytest.mark.parametrize("rows", [1, 2, 3, 4, 9])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 6, 7, 8, 9])
 @pytest.mark.parametrize("seed", [3, 11])
+@pytest.mark.parametrize("deferred", [True, False])
 def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
-    monkeypatch, qwen4_verify, signatures, rows, seed
+    monkeypatch, qwen4_verify, signatures, rows, seed, deferred
 ):
     """Outputs, next states, rollback records and every accepted prefix."""
     import copy
@@ -1364,6 +1365,7 @@ def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
     from mlx.utils import tree_flatten
 
     module = _real_qwen4_decode_module(signatures, seed)
+    monkeypatch.setattr(prework_mod, "_QWEN4_VERIFY_DEFERRED_STATES", deferred)
     inputs, conv_state, recurrent_state = _verify_inputs(rows, seed + rows)
     monkeypatch.setattr(prework_mod, "_QWEN4_VERIFY_FUSED", False)
     want, want_cache, want_tx = _verify_block(module, inputs, conv_state, recurrent_state)
@@ -1381,10 +1383,17 @@ def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
     assert got_window[0] == kind == "window" and got_window[2] == width == 3
     assert _same(want_window, got_window[1])
     (kind, want_history, want_final), got_states = want_records[1], got_records[1]
-    assert got_states[0] == kind == "states"
+    assert kind == "states"
     if rows == 1:
+        assert got_states[0] == "states"
         assert want_history is None and got_states[1] is None
+    elif deferred:
+        # No per-step states are written; each is recomputed on demand.
+        assert got_states[0] == "deferred" and got_states[3] == rows
+        for kept in range(1, rows):
+            assert _same(want_history[:, kept - 1], got_states[4](kept)), kept
     else:
+        assert got_states[0] == "states"
         assert _same(want_history, got_states[1])
     assert _same(want_final, got_states[2])
     for keep in range(rows + 1):
@@ -1401,7 +1410,7 @@ def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("rows", [2, 3, 4])
+@pytest.mark.parametrize("rows", [2, 3, 4, 5, 6, 7, 8])
 @pytest.mark.parametrize("seed", [5, 23])
 def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
     monkeypatch, qwen4_verify, rows, seed
@@ -1437,11 +1446,12 @@ def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
     for t in range(rows):
         assert _same(outputs[t][:, 0], got[:, t]), t
     window = cache._speculation["records"][0][1]
-    _, history, final = cache._speculation["records"][1]
+    kind, _, final, _, state_after = cache._speculation["records"][1]
+    assert kind == "deferred"
     for t in range(rows + 1):
         assert _same(convs[t], window[:, t : t + 3]), t
     for t in range(rows - 1):
-        assert _same(states[t + 1], history[:, t]), t
+        assert _same(states[t + 1], state_after(t + 1)), t
     assert _same(states[rows], final)
     assert _same(convs[rows], cache[0]) and _same(states[rows], cache[1])
     for keep in range(rows + 1):
