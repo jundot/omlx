@@ -1203,6 +1203,8 @@ def _make_row_batch(
 
 
 def _merge_row_caches(row_caches: List[List[Any]]) -> List[Any]:
+    import mlx.core as mx
+
     if not row_caches:
         return []
     merged = []
@@ -1213,7 +1215,11 @@ def _merge_row_caches(row_caches: List[List[Any]]) -> List[Any]:
             raise _MtpStepFallback(
                 f"cache {type(per_row[0]).__name__} cannot merge row caches"
             )
-        merged.append(merge(per_row))
+        layer = merge(per_row)
+        # Do not retain the padding/copy graphs for every target or head layer.
+        if not layer.empty():
+            mx.eval(layer.state)
+        merged.append(layer)
     return merged
 
 
