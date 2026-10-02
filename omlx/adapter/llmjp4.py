@@ -25,10 +25,13 @@ first header has no ``<|start|>``. ``analysis`` bodies stream inside oMLX's
 ``<|call|>`` and ``<|return|>`` are EOS tokens in the model's
 generation_config, and the scheduler does not pass EOS tokens to parser
 sessions, so a call usually arrives without its terminator. A trailing
-``functions.*`` message whose body is a JSON object is therefore a call; one
-closed by ``<|end|>`` is not, matching Harmony call semantics. The final
-message ends the turn: the model sometimes closes its answer with ``<|end|>``
-and goes on to write an imagined next turn, which is not parsed.
+``functions.*`` message whose body is a JSON object is therefore a call.
+LLM-jp-4.1 chat templates render parallel calls as consecutive
+``functions.*`` messages, all but the last closed by ``<|end|>``, so every
+message in a run that ends in a call is a call. A run that ends in
+``<|end|>`` is not, matching Harmony call semantics. The final message ends
+the turn: the model sometimes closes its answer with ``<|end|>`` and goes on
+to write an imagined next turn, which is not parsed.
 """
 
 from __future__ import annotations
@@ -211,8 +214,10 @@ class _Llmjp4ChannelSplitter:
         self._header_opened = False  # the current header began with <|start|>
         self._tool_name: str | None = None
         self._tool_body = ""
-        # (name, body, end marker or None) for each functions.* message.
-        self.tool_messages: list[tuple[str, str, str | None]] = []
+        self._prev_kind: str | None = None  # kind of the last closed message
+        # Runs of consecutive functions.* messages, each message stored as
+        # (name, body, end marker or None).
+        self.tool_runs: list[list[tuple[str, str, str | None]]] = []
         self.stopped = False
 
     def _partial_suffix_len(self, text: str) -> int:
@@ -232,10 +237,15 @@ class _Llmjp4ChannelSplitter:
     def _end_message(self, end: str | None) -> str:
         """Close the current message; return any visible closing text."""
         if self._kind == "tool" and self._tool_name:
-            self.tool_messages.append((self._tool_name, self._tool_body, end))
+            message = (self._tool_name, self._tool_body, end)
+            if self._prev_kind == "tool" and self.tool_runs:
+                self.tool_runs[-1].append(message)
+            else:
+                self.tool_runs.append([message])
         if self._kind == "final":
             # The final answer is the last message of a turn.
             self.stopped = True
+        self._prev_kind = self._kind
         self._kind = None
         self._head = ""
         self._header_opened = False
@@ -342,32 +352,40 @@ class _Llmjp4ChannelSplitter:
         return out + self._close_think()
 
 
-def _tool_calls_from_messages(
-    messages: list[tuple[str, str, str | None]],
+def _json_object(body: str) -> dict | None:
+    try:
+        parsed = json.loads(body.strip() or "{}")
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _tool_calls_from_runs(
+    runs: list[list[tuple[str, str, str | None]]],
 ) -> list[dict[str, str]]:
     tool_calls: list[dict[str, str]] = []
-    for name, body, end in messages:
-        if end not in (_CALL, None):
+    for run in runs:
+        _, last_body, last_end = run[-1]
+        if last_end not in (_CALL, None):
             # Closed by <|end|> or <|return|>: not a Harmony call.
             continue
-        arguments = body.strip() or "{}"
-        try:
-            parsed = json.loads(arguments)
-        except (json.JSONDecodeError, ValueError):
-            parsed = None
-        if not isinstance(parsed, dict):
-            if end == _CALL:
+        if last_end is None and _json_object(last_body) is None:
+            # Without <|call|> this is usually a body cut off by max_tokens,
+            # so the calls before it are unfinished too.
+            continue
+        for name, body, _ in run:
+            arguments = _json_object(body)
+            if arguments is None:
                 logger.warning(
                     "Dropping LLM-jp-4 tool call %r: arguments are not a JSON "
                     "object: %r",
                     name,
-                    arguments[:120],
+                    body.strip()[:120],
                 )
-            # Without <|call|> this is usually a body cut off by max_tokens.
-            continue
-        tool_calls.append(
-            {"name": name, "arguments": json.dumps(parsed, ensure_ascii=False)}
-        )
+                continue
+            tool_calls.append(
+                {"name": name, "arguments": json.dumps(arguments, ensure_ascii=False)}
+            )
     return tool_calls
 
 
@@ -396,7 +414,7 @@ class Llmjp4OutputParserSession:
             text = self._splitter.feed(self._decoder.finalize())
         text += self._splitter.finish()
 
-        tool_calls = _tool_calls_from_messages(self._splitter.tool_messages)
+        tool_calls = _tool_calls_from_runs(self._splitter.tool_runs)
         return OutputParserFinalizeResult(
             stream_text=text,
             visible_text=text,

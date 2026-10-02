@@ -229,6 +229,56 @@ def test_tool_message_closed_by_end_is_not_a_call(generate):
     assert final.tool_calls == []
 
 
+_PARALLEL_CALLS = (
+    "<|channel|>analysis<|message|>Need both.<|end|>"
+    "<|start|>assistant to=functions.get_weather<|channel|>commentary "
+    '<|constrain|> json<|message|>{"city": "東京"}<|end|>'
+    "<|start|>assistant to=functions.get_time<|channel|>commentary "
+    '<|constrain|> json<|message|>{"tz": "Asia/Tokyo"}<|call|>'
+)
+
+
+@pytest.mark.parametrize("keep_eos", [False, True])
+def test_parallel_tool_calls(generate, keep_eos):
+    """LLM-jp-4.1 closes every parallel call but the last with <|end|>."""
+    stream, _, final = generate(_PARALLEL_CALLS, keep_eos=keep_eos)
+
+    assert stream == "<think>Need both.</think>"
+    assert final.tool_calls == [
+        {"name": "get_weather", "arguments": '{"city": "東京"}'},
+        {"name": "get_time", "arguments": '{"tz": "Asia/Tokyo"}'},
+    ]
+    assert final.finish_reason == "tool_calls"
+
+
+def test_parallel_messages_before_final_answer_are_not_calls(generate):
+    stream, _, final = generate(
+        _PARALLEL_CALLS.replace("<|call|>", "<|end|>")
+        + "<|start|>assistant<|channel|>final<|message|>Done."
+    )
+
+    assert stream == "<think>Need both.</think>Done."
+    assert final.tool_calls == []
+
+
+def test_parallel_calls_cut_off_by_max_tokens_are_not_calls(generate):
+    stream, _, final = generate(_PARALLEL_CALLS.split('"Asia')[0])
+
+    assert stream == "<think>Need both.</think>"
+    assert final.tool_calls == []
+    assert final.finish_reason is None
+
+
+def test_reasoning_between_tool_messages_splits_the_run(generate):
+    _, _, final = generate(
+        'to=functions.lookup<|channel|>commentary<|message|>{"q": 1}<|end|>'
+        "<|start|>assistant<|channel|>analysis<|message|>Retry.<|end|>"
+        '<|start|>assistant to=functions.lookup<|channel|>commentary<|message|>{"q": 2}'
+    )
+
+    assert final.tool_calls == [{"name": "lookup", "arguments": '{"q": 2}'}]
+
+
 def test_truncated_arguments_are_not_a_call(generate):
     stream, _, final = generate(
         'to=functions.lookup<|channel|>commentary<|message|>{"q": "par'
