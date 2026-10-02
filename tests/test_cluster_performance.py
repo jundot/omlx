@@ -129,14 +129,17 @@ def test_execution_tuner_reduces_concurrency_and_synchronizes_prompt_cache():
     assert tuned.prompt_concurrency == 1
     assert tuned.prefill_step_size == 512
     assert tuned.pipeline_microbatch_size == 1
-    assert tuned.prompt_cache_size == 1
+    # #3062: the count is tier-capped, no longer pinned to exactly one.
+    assert tuned.prompt_cache_size == 2
     assert tuned.prompt_cache_bytes is None
     assert tuned.ring_connections_per_ip == 1
     assert "critical headroom" in tuned.tuning_reason
-    assert "synchronized single-prefix cache" in tuned.tuning_reason
+    assert "count-based prompt cache" in tuned.tuning_reason
 
 
-def test_prompt_cache_is_synchronized_even_when_auto_tuning_is_disabled():
+def test_prompt_cache_count_is_honored_even_when_auto_tuning_is_disabled():
+    """#3062: the knob is no longer a no-op; only byte eviction stays off."""
+
     settings = replace(
         execution_profile("throughput", auto_tune=False),
         prompt_cache_size=16,
@@ -153,9 +156,9 @@ def test_prompt_cache_is_synchronized_even_when_auto_tuning_is_disabled():
     )
 
     assert tuned.decode_concurrency == settings.decode_concurrency
-    assert tuned.prompt_cache_size == 1
+    assert tuned.prompt_cache_size == 16
     assert tuned.prompt_cache_bytes is None
-    assert "synchronized single-prefix cache" in tuned.tuning_reason
+    assert "count-based prompt cache" in tuned.tuning_reason
 
 
 def test_performance_profiles_reject_nonfinite_measurements():
@@ -673,3 +676,23 @@ def test_non_batchable_model_never_reports_continuous_batching_active():
         assert batching["enabled"] is True
         assert batching["active"] is False
         assert "sequentially" in batching["reason"]
+
+
+def test_ample_headroom_passes_the_configured_cache_count_through():
+    """The tier passthrough was dead code behind the forced single slot."""
+
+    settings = replace(
+        execution_profile("balanced"),
+        prompt_cache_size=12,
+    )
+    tuned = tune_execution_settings(
+        settings,
+        [
+            SimpleNamespace(headroom_bytes=64 * 1024**3),
+            SimpleNamespace(headroom_bytes=64 * 1024**3),
+        ],
+        backend="jaccl",
+    )
+
+    assert tuned.prompt_cache_size == 12
+    assert tuned.prompt_cache_bytes is None
