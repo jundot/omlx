@@ -49,30 +49,6 @@ def _make_pool(ceiling: int | None = None, **kwargs) -> EnginePool:
 
 
 @pytest.fixture
-def mock_model_dir(tmp_path):
-    """Create a mock model directory with multiple models."""
-    # Create model-a (1GB)
-    model_a = tmp_path / "model-a"
-    model_a.mkdir()
-    (model_a / "config.json").write_text(json.dumps({"model_type": "llama"}))
-    (model_a / "model.safetensors").write_bytes(b"0" * (1024 * 1024 * 1024))  # 1GB
-
-    # Create model-b (2GB)
-    model_b = tmp_path / "model-b"
-    model_b.mkdir()
-    (model_b / "config.json").write_text(json.dumps({"model_type": "qwen"}))
-    (model_b / "model.safetensors").write_bytes(b"0" * (2 * 1024 * 1024 * 1024))  # 2GB
-
-    # Create model-c (500MB MLLM)
-    model_c = tmp_path / "model-c"
-    model_c.mkdir()
-    (model_c / "config.json").write_text(json.dumps({"vision_config": {}}))
-    (model_c / "model.safetensors").write_bytes(b"0" * (512 * 1024 * 1024))  # 500MB
-
-    return tmp_path
-
-
-@pytest.fixture
 def small_mock_model_dir(tmp_path):
     """Create a mock model directory with small models for fast tests."""
     # Create model-a (1KB)
