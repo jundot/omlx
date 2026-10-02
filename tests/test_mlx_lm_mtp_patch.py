@@ -5642,3 +5642,76 @@ def test_spec_command_buffers_restore_caps_after_the_step(monkeypatch, raised):
         raise RuntimeError("step failed")
     assert inside == (bg._SPEC_BUFFER_CAPS if raised else (50, 50))
     assert caps[-1] == (50, 50)
+
+
+def test_activation_replay_compares_logits_hidden_and_logical_cache(
+    tmp_path, monkeypatch
+):
+    """Exercise the same diagnostic used with the real quantized checkpoint."""
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "activation_audit",
+        Path(__file__).parents[1] / "scripts" / "compare_mtp_activation.py",
+    )
+    audit = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(audit)
+    previous = mlx_lm_mtp.is_mtp_active()
+    mlx_lm_mtp.set_mtp_active(True)
+    try:
+        mx.random.seed(173)
+        model = _model("qwen_vlm")
+        prompts = [[3, 4, 5 + i] + [6] * i for i in range(4)]
+        before, after = tmp_path / "before", tmp_path / "after"
+        with monkeypatch.context() as patch:
+            patch.setattr(bg, "_initial_batch_forward", lambda batch: None)
+            audit.replay(model, prompts, [7, 8, 9], before)
+        audit.replay(model, prompts, [7, 8, 9], after)
+        report = audit.compare(before, after)
+        assert report["before_shared"] == [False] * 3
+        assert report["after_shared"] == [True] * 3
+        assert report["finite"] and report["top1_equal"]
+        assert max(t["max_abs"] for t in report["tensors"]) < 1e-4
+        assert audit.compare(after, after)["exact"]
+        # Ensure a cache-only corruption fails even with identical output logits.
+        path = after / "step-2-row-3.safetensors"
+        arrays = mx.load(str(path))
+        name = next(k for k in arrays if k.startswith("layer."))
+        arrays[name] = arrays[name] + 1
+        mx.eval(arrays)
+        mx.save_safetensors(str(path), arrays)
+        changed = audit.compare(before, after)
+        assert not changed["exact"]
+        assert any(
+            t["tensor"] == name and t["max_abs"] > 0.9 for t in changed["tensors"]
+        )
+    finally:
+        mlx_lm_mtp.set_mtp_active(previous)
+
+
+def test_shared_activation_with_adaptive_policy_matches_greedy_target(monkeypatch):
+    previous = mlx_lm_mtp.is_mtp_active()
+    mlx_lm_mtp.set_mtp_active(True)
+    try:
+        mx.random.seed(173)
+        model = _model("qwen_vlm")
+        prompts = [[3, 4, 5 + i] + [6] * i for i in range(4)]
+        shared = []
+        initial = bg._initial_batch_forward
+
+        def record_shared(batch):
+            result = initial(batch)
+            if result is not None:
+                shared.append(tuple(batch.uids))
+            return result
+
+        monkeypatch.setattr(bg, "_initial_batch_forward", record_shared)
+        # Keep the real batch policy and depth controller, including late joins.
+        actual, _ = generate(model, prompts, [24] * 4, late_join=True)
+        assert shared, "Exercise shared activation rather than target-only fallback"
+        model._language_model._omlx_mtp_decode_enabled = False
+        expected, _ = generate(model, prompts, [24] * 4, late_join=True)
+        assert actual == expected
+    finally:
+        mlx_lm_mtp.set_mtp_active(previous)
