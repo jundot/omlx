@@ -1,11 +1,14 @@
 // In-place auto-updater.
 //
-// Flow: download .dmg → hdiutil attach → copy the inner oMLX.app next to
-// the running bundle as `.oMLX-update.app` → hdiutil detach → on
+// Flow: download .dmg → hdiutil attach (checksum-verified) → copy the inner
+// oMLX.app next to the running bundle as `.oMLX-update.app` → `codesign
+// --verify --deep --strict` the staged bundle → hdiutil detach → on
 // confirmation, register a one-shot launchd worker that waits for our PID
 // to exit, atomically swaps the staged bundle into place, strips the
-// quarantine xattr, and `open`s the new bundle. No EdDSA signature check —
-// Apple's notarization stapled to the DMG is the trust boundary.
+// quarantine xattr, and `open`s the new bundle. The codesign gate is the
+// tamper check for those bytes (the quarantine strip means Gatekeeper will
+// not re-assess on first launch); trust in *who signed* the update comes
+// from Apple's notarization on the official DMG.
 //
 // Cancellation: `cancel()` is best-effort; an in-flight download exits at
 // the next stream chunk. A staged copy that's already on disk gets
@@ -24,6 +27,7 @@ final class AppUpdater {
         case cleanupFailed(String)
         case appNotFoundInVolume
         case stageFailed(String)
+        case signatureInvalid(String)
         case cancelled
 
         var description: String {
@@ -36,6 +40,8 @@ final class AppUpdater {
             case .cleanupFailed(let m): return "Could not clean up update files: \(m)"
             case .appNotFoundInVolume: return "oMLX.app not found inside the downloaded DMG"
             case .stageFailed(let m): return "Could not stage the update: \(m)"
+            case .signatureInvalid(let m):
+                return "The downloaded update failed signature verification and was discarded: \(m)"
             case .cancelled: return "Update cancelled"
             }
         }
@@ -172,10 +178,17 @@ final class AppUpdater {
         let stagedApp = app.deletingLastPathComponent().appendingPathComponent(Self.stagedAppName)
         do {
             try stageApp(fromMount: mountPoint, to: stagedApp)
+            // Verify the staged bundle's code signature before it can ever
+            // be swapped into place and launched. The update flow strips
+            // com.apple.quarantine after the swap, so Gatekeeper's normal
+            // first-launch assessment never runs — this check is the one
+            // gate that catches a tampered, truncated, or re-signed
+            // payload.
+            try verifyAppSignature(at: stagedApp.path)
         } catch let err as UpdateError {
             onError(err); return
         } catch {
-            onError(.stageFailed(error.localizedDescription)); return
+            onError(.signatureInvalid(error.localizedDescription)); return
         }
 
         if cancelled { return }
@@ -337,9 +350,13 @@ final class AppUpdater {
     // MARK: - Mount / unmount
 
     private func mountDMG(at dmg: URL) throws -> URL {
+        // hdiutil verifies the image's embedded checksum by default; the
+        // old -noverify skipped that check, which combined with the
+        // post-copy quarantine strip left the download bytes unverified
+        // end to end.
         let result = try runProcess(
             "/usr/bin/hdiutil",
-            args: ["attach", "-nobrowse", "-noverify", "-noautoopen", "-mountrandom", "/tmp", dmg.path]
+            args: ["attach", "-nobrowse", "-noautoopen", "-mountrandom", "/tmp", dmg.path]
         )
         guard result.status == 0 else {
             throw UpdateError.mountFailed(result.stderr.isEmpty ? result.stdout : result.stderr)
@@ -398,6 +415,26 @@ final class AppUpdater {
             return mountPoint.appendingPathComponent(name)
         }
         throw UpdateError.appNotFoundInVolume
+    }
+
+    // MARK: - Signature verification
+
+    /// Validates the staged bundle's code signature (and, via `--deep`,
+    /// every nested helper/framework). `--strict` treats any revocation or
+    /// resource mismatch as fatal. This runs *before* the swap: after it,
+    /// the updater strips quarantine, so Gatekeeper would never re-check.
+    func verifyAppSignature(at appPath: String) throws {
+        let result = try runProcess(
+            "/usr/bin/codesign",
+            args: ["--verify", "--deep", "--strict", appPath]
+        )
+        guard result.status == 0 else {
+            let detail = result.stderr.isEmpty ? result.stdout : result.stderr
+            NSLog("oMLX updater: signature verification failed: %@", detail)
+            throw UpdateError.signatureInvalid(
+                detail.isEmpty ? "codesign exited \(result.status)" : detail
+            )
+        }
     }
 
     // MARK: - Swap + relaunch (called from outside, right before terminate)
