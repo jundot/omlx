@@ -136,13 +136,15 @@ def test_openai_models_hides_markitdown_when_not_exposed():
     assert MARKITDOWN_MODEL_ID not in ids
 
 
-def test_markitdown_chat_completion_converts_file(monkeypatch):
+@pytest.mark.parametrize("mime_type", ["application/pdf", "application/octet-stream"])
+def test_markitdown_chat_completion_converts_file(monkeypatch, mime_type):
     state = ServerState()
     state.engine_pool = _EmptyPool()
     state.global_settings = _settings_with_markitdown_model()
 
     def fake_convert(file: MarkItDownFile, **kwargs) -> str:
         assert file.filename == "sample.pdf"
+        assert file.mime_type == "application/pdf"
         return "# Converted"
 
     monkeypatch.setattr("omlx.api.markitdown.convert_file_to_markdown", fake_convert)
@@ -153,7 +155,9 @@ def test_markitdown_chat_completion_converts_file(monkeypatch):
             "/v1/chat/completions",
             json={
                 "model": MARKITDOWN_MODEL_ID,
-                "messages": [{"role": "user", "content": [_file_part()]}],
+                "messages": [
+                    {"role": "user", "content": [_file_part(mime_type=mime_type)]}
+                ],
             },
         )
 
@@ -674,6 +678,56 @@ def test_openai_file_data_without_filename_infers_from_data_uri():
     assert parsed.filename == "attachment.txt"
     assert parsed.mime_type == "text/plain"
     assert parsed.data == b"Plain notes"
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected_mime_type"),
+    [
+        ("notes.MD", "text/markdown"),
+        ("notes.txt", "text/plain"),
+        ("sample.pdf", "application/pdf"),
+        (
+            "sample.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+        (
+            "sample.pptx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ),
+    ],
+)
+@pytest.mark.parametrize("explicit_mime", [True, False])
+def test_generic_attachment_mime_uses_supported_filename(
+    filename, expected_mime_type, explicit_mime
+):
+    part = _file_part(
+        filename=filename,
+        data=_data_uri(b"document", mime_type="application/octet-stream"),
+        mime_type="application/octet-stream" if explicit_mime else "",
+    )
+
+    parsed = parse_file_part(part, max_file_size_mb=25)
+
+    assert parsed.mime_type == expected_mime_type
+    assert parsed.filename == filename
+    assert parsed.data == b"document"
+
+
+@pytest.mark.parametrize("filename", ["sheet.xlsx", "page.html", "sample"])
+def test_generic_attachment_mime_does_not_allow_unsupported_filename(filename):
+    with pytest.raises(MarkItDownRequestError, match="not supported|Unsupported"):
+        parse_file_part(
+            _file_part(filename=filename, mime_type="application/octet-stream"),
+            max_file_size_mb=25,
+        )
+
+
+def test_supported_filename_does_not_override_specific_unsupported_mime():
+    with pytest.raises(MarkItDownRequestError, match="Unsupported attachment MIME"):
+        parse_file_part(
+            _file_part(filename="notes.md", mime_type="image/png"),
+            max_file_size_mb=25,
+        )
 
 
 def test_file_id_is_rejected():
