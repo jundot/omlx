@@ -817,3 +817,60 @@ def test_the_detected_link_speed_is_carried_into_the_explanation():
     assert link.link_speed_gbps == 120
     assert "120 Gb/s" in link.reason
     assert link.to_dict()["source"]["address"] == "10.0.1.1"
+
+
+def test_a_failed_probe_is_unknown_not_a_fabricated_ethernet_link(monkeypatch):
+    """#3021/#3030: probe failure must not become a measured refusal of TP."""
+
+    class BoomConfig:
+        class Host:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        @staticmethod
+        def extract_connectivity(hosts, verbose=False):
+            raise OSError("ssh auth failed for the probe")
+
+    monkeypatch.setattr(
+        "omlx.cluster.transport._import_mlx_config",
+        lambda: BoomConfig,
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.transport._rdma_available",
+        lambda hosts, ssh_prefix="": False,
+    )
+
+    transports = detect_transports(["a.local", "b.local"])
+
+    assert transports == (), "unknown — not a fabricated Ethernet measurement"
+
+
+def test_a_successful_empty_probe_still_reports_measured_ethernet(monkeypatch):
+    """Probes that RAN and found no fast link: Ethernet is the true answer."""
+
+    class FakeConfig:
+        class Host:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        @staticmethod
+        def extract_connectivity(hosts, verbose=False):
+            return hosts, {}
+
+        @staticmethod
+        def make_connectivity_matrix(hosts, reverse):
+            return [[False, False], [False, False]]
+
+    monkeypatch.setattr(
+        "omlx.cluster.transport._import_mlx_config",
+        lambda: FakeConfig,
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.transport._rdma_available",
+        lambda hosts, ssh_prefix="": False,
+    )
+
+    transports = detect_transports(["a.local", "b.local"])
+
+    assert transports
+    assert all(item.kind == "ethernet" for item in transports)
