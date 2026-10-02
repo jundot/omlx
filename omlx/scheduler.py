@@ -11751,6 +11751,8 @@ class Scheduler:
                     logger.error(f"SpecPrefill sparse prefill failed: {e}")
                     cleanup_rope(self.model)
                     request.specprefill_indices = None
+                    # The dense fallback must not decode with the sparse delta.
+                    request.rope_deltas = 0.0
                     tracker.remove(request.request_id)
                     if cache_to_use is not None:
                         # run_specprefill_target_prefill bases its prefill on
