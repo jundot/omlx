@@ -85,6 +85,7 @@ def test_verifier_routes_short_moe_blocks_through_fused_router(
 
     from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
     from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
+
     from omlx.patches import qwen35_moe_router as router
 
     monkeypatch.setattr(
@@ -183,7 +184,7 @@ def test_fused_combine_declines_other_layouts(monkeypatch):
 
     assert router.fused_moe_combine(*operands(rows=2)) is None  # verify rows stay composed
     assert router.fused_moe_combine(*operands(top_k=7)) is None
-    assert router.fused_moe_combine(*operands(dtype=mx.float16)) is None
+    assert router.fused_moe_combine(*operands(dtype=mx.float32)) is None
     monkeypatch.setattr(router, "_COMBINE_DISABLED", True)
     assert router.fused_moe_combine(*operands()) is None
 
@@ -195,6 +196,7 @@ def test_one_row_moe_block_matches_composed_combine(monkeypatch, seed):
     from types import SimpleNamespace
 
     from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
+
     from omlx.patches import qwen35_moe_router as router
 
     assert router.apply_qwen35_moe_router_patch()
@@ -308,7 +310,7 @@ def test_softmax_topk_row_declines_layouts_it_does_not_reproduce():
     # MLX's softmax ends 320 experts in a partial simdgroup.
     assert softmax_topk_row(mx.zeros((1, 1, 320), mx.bfloat16), 10) is None
     assert softmax_topk_row(mx.zeros((1, 2, 512), mx.bfloat16), 10) is None
-    assert softmax_topk_row(mx.zeros((1, 1, 512), mx.float16), 10) is None
+    assert softmax_topk_row(mx.zeros((1, 1, 512), mx.float32), 10) is None
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -360,4 +362,7 @@ def test_router_gemv_declines_layouts_mlx_reduces_differently():
     assert router_logits_row(x, mx.zeros((128, 2048), mx.bfloat16)) is None
     # K % 128: MLX's guarded tail block.
     assert router_logits_row(x[..., :2000], mx.zeros((512, 2000), mx.bfloat16)) is None
-    assert router_logits_row(x.astype(mx.float16), mx.zeros((512, 2048), mx.float16)) is None
+    assert (
+        router_logits_row(x.astype(mx.float32), mx.zeros((512, 2048), mx.float32))
+        is None
+    )

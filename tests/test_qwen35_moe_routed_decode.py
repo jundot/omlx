@@ -49,7 +49,15 @@ def _patched_block(monkeypatch):
 
 
 def _block(
-    hidden, inter, top_k=10, bits=4, group_size=64, seed=0, experts=EXPERTS, quantized_shared=True
+    hidden,
+    inter,
+    top_k=10,
+    bits=4,
+    group_size=64,
+    seed=0,
+    experts=EXPERTS,
+    quantized_shared=True,
+    dtype=mx.bfloat16,
 ):
     """A block laid out like Qwen3.8-Flash-Next oQ: quantized routed experts,
     8-bit shared expert (gs128 where the shape allows), 8-bit gs64
@@ -68,7 +76,7 @@ def _block(
         num_experts_per_tok=top_k,
     )
     block = Qwen3_5MoeSparseMoeBlock(args)
-    block.set_dtype(mx.bfloat16)
+    block.set_dtype(dtype)
     sm = block.switch_mlp
     for name in ("gate_proj", "up_proj", "down_proj"):
         setattr(sm, name, getattr(sm, name).to_quantized(group_size, bits))
@@ -259,7 +267,6 @@ def test_tied_router_logits_route_like_the_served_block():
         assert _same_bits(ref, out)
 
 
-
 @pytest.mark.parametrize(
     "owner,names",
     [
@@ -283,9 +290,8 @@ def test_plan_follows_replaced_weights(owner, names):
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"hidden": 1024, "inter": 512},  # down would take qmv_fast
         {"hidden": 960, "inter": 320},  # gate+up would take qmv
-        {"hidden": 1024, "inter": 320, "top_k": 8},
+        {"hidden": 1024, "inter": 320, "top_k": 6},
         {"hidden": 1024, "inter": 320, "bits": 3},
     ],
 )
@@ -352,3 +358,84 @@ def test_apply_is_idempotent(_patched_block):
     call = cls.__call__
     assert routed.apply_qwen35_moe_routed_decode_patch()
     assert cls.__call__ is call
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("top_k", [8, 10])
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+def test_fast_down_and_top8_are_bit_identical(dtype, top_k, bits):
+    block = _block(1024, 512, bits=bits, top_k=top_k, dtype=dtype)
+    for step in range(8):
+        x = (mx.random.normal((1, 1, 1024)) * (0.5 + step)).astype(dtype)
+        plan = routed.routed_decode_plan(block, x)
+        assert plan is not None and plan.fold and plan.dtype == dtype
+        ref, out = _pair(block, x)
+        assert _same_bits(ref, out)
+    assert not routed._DISABLED
+
+
+def test_routing_plan_rebuilds_when_top_k_changes():
+    block = _block(1024, 512, top_k=8, dtype=mx.float16)
+    x = mx.zeros((1, 1, 1024), mx.float16)
+    plan = routed.routed_decode_plan(block, x)
+    block.top_k = 10
+    changed = routed.routed_decode_plan(block, x)
+    assert changed is not plan
+    assert changed.down_threadgroup[1] == 11
+
+
+@pytest.mark.parametrize(
+    "inter,group_size", [(320, 32), (512, 32), (384, 128), (512, 128)]
+)
+@pytest.mark.parametrize("quantized_shared", [False, True])
+def test_fp16_top8_folded_and_composed_shared_paths(
+    inter, group_size, quantized_shared
+):
+    block = _block(
+        1024,
+        inter,
+        top_k=8,
+        bits=4,
+        group_size=group_size,
+        quantized_shared=quantized_shared,
+        dtype=mx.float16,
+    )
+    for step in range(4):
+        x = (mx.random.normal((1, 1, 1024)) * (step + 0.5)).astype(mx.float16)
+        plan = routed.routed_decode_plan(block, x)
+        assert plan is not None and plan.fold == quantized_shared
+        ref, out = _pair(block, x)
+        assert _same_bits(ref, out)
+    assert not routed._DISABLED
+
+
+def test_mismatched_projection_dtypes_keep_composed_path():
+    block = _block(1024, 512, top_k=8, dtype=mx.float16)
+    down = block.switch_mlp.down_proj
+    down["scales"] = down["scales"].astype(mx.bfloat16)
+    down["biases"] = down["biases"].astype(mx.bfloat16)
+    assert routed.routed_decode_plan(block, mx.zeros((1, 1, 1024), mx.float16)) is None
+
+
+def test_mismatched_router_dtype_uses_stock_gate():
+    block = _block(1024, 512, top_k=8, dtype=mx.float16)
+    block.gate["weight"] = block.gate["weight"].astype(mx.bfloat16)
+    plan = routed.routed_decode_plan(block, mx.zeros((1, 1, 1024), mx.float16))
+    assert plan is not None
+    assert plan.router_logits is None
+
+
+def test_verify_window_rejects_mismatched_activation_dtype(monkeypatch):
+    block = _block(1024, 512, top_k=10, dtype=mx.float16)
+    monkeypatch.setattr(routed, "_WINDOW_DISABLED", False)
+    monkeypatch.setattr(routed, "_VERIFY_WINDOW", True)
+    monkeypatch.setattr(
+        routed,
+        "router_gemv",
+        lambda weight: lambda x: pytest.fail(
+            "Mismatched verify activations must not reach a typed router kernel"
+        ),
+    )
+    assert (
+        routed.routed_verify_window(block, mx.zeros((1, 2, 1024), mx.bfloat16)) is None
+    )
