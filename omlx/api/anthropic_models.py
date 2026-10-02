@@ -122,6 +122,26 @@ _KNOWN_CONTENT_BLOCK_TYPES: frozenset[str] = frozenset(
     }
 )
 
+# Sentinel tag for blocks that carry no usable ``type`` at all.
+_UNSET_TYPE_TAG = "untyped"
+
+# The pre-#3754 union, kept verbatim and still reachable. Every variant above
+# declares ``type: Literal[...] = "..."`` with a default, so this smart union
+# inferred the type from the remaining fields: a payload with no ``type`` key
+# still validated as whichever model its shape fit. Retiring that leniency is
+# not part of #3754, so ``_content_block_tag`` sends untyped blocks here instead
+# of rejecting them, reusing the original inference rather than reimplementing
+# it.
+_LegacyContentBlock = (
+    ContentBlockText
+    | ContentBlockImage
+    | ContentBlockToolUse
+    | ContentBlockToolResult
+    | ContentBlockThinking
+    | ContentBlockDocument
+    | ContentBlockInputAudio
+)
+
 
 def _content_block_tag(value: Any) -> str:
     """Callable discriminator: known ``type`` -> its strict model, else catch-all.
@@ -132,24 +152,25 @@ def _content_block_tag(value: Any) -> str:
     "")``, so the client gets a 200 with a silently degraded prompt instead of a
     422 naming the bad field. Routing on ``type`` first keeps that 422.
 
-    One deliberate tightening vs. the old plain union: a block with a missing,
-    null or non-string ``type`` is now rejected. Every variant declared
-    ``type: Literal[...] = "..."`` with a default, so the smart union used to
-    infer one from the remaining fields; ``type`` is required by the Anthropic
-    API, and nothing in oMLX sends it omitted.
+    Blocks with no usable ``type`` (missing, null, empty or non-string) take the
+    ``_UNSET_TYPE_TAG`` branch, which is the original union, so they keep
+    validating exactly as they did before this fix.
     """
     if isinstance(value, dict):
         block_type = value.get("type")
     else:
         block_type = getattr(value, "type", None)
-    if isinstance(block_type, str) and block_type in _KNOWN_CONTENT_BLOCK_TYPES:
+    if not isinstance(block_type, str) or not block_type:
+        return _UNSET_TYPE_TAG
+    if block_type in _KNOWN_CONTENT_BLOCK_TYPES:
         return block_type
     return "unknown"
 
 
 # Union type for all content blocks
 ContentBlock = Annotated[
-    Annotated[ContentBlockText, Tag("text")]
+    Annotated[_LegacyContentBlock, Tag(_UNSET_TYPE_TAG)]
+    | Annotated[ContentBlockText, Tag("text")]
     | Annotated[ContentBlockImage, Tag("image")]
     | Annotated[ContentBlockToolUse, Tag("tool_use")]
     | Annotated[ContentBlockToolResult, Tag("tool_result")]

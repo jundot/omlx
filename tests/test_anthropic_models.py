@@ -18,9 +18,11 @@ from omlx.api.anthropic_models import (
     AnthropicUsage,
     ContentBlockDeltaEvent,
     ContentBlockDocument,
+    ContentBlockImage,
     ContentBlockStartEvent,
     ContentBlockStopEvent,
     ContentBlockText,
+    ContentBlockThinking,
     ContentBlockToolResult,
     ContentBlockToolUse,
     ErrorEvent,
@@ -383,12 +385,12 @@ class TestContentBlockForwardCompat:
             # Wrong-typed required fields must still be rejected.
             {"type": "text", "text": 123},
             {"type": "tool_use", "id": 1, "name": "f", "input": {}},
-            # A missing/null/non-string `type` is invalid, not "unknown":
-            # `type` is required on every Anthropic content block.
-            {"text": "hi"},
+            # A null/non-string `type` names no block, and an empty type names
+            # none either -- origin/main rejected all of these.
             {},
             {"type": None},
             {"type": 123},
+            {"type": ""},
         ],
     )
     def test_malformed_known_blocks_still_rejected(self, block):
@@ -396,14 +398,40 @@ class TestContentBlockForwardCompat:
 
         With a naive ``union_mode="left_to_right"`` catch-all these all validate
         and the converter then emits an empty text part / a tool message with
-        ``tool_call_id: ""``. Measured against this fix's converter: a type-less
-        ``{"text": "hi"}`` becomes ``{"role": "user", "content": ""}`` and a
+        ``tool_call_id: ""``. Measured against this fix's converter: a
         ``tool_result`` without ``tool_use_id`` becomes
         ``{"role": "tool", "tool_call_id": "", ...}`` -- a 200 with a silently
         degraded prompt instead of a 422 that names the bad field.
         """
         with pytest.raises(ValidationError):
             AnthropicMessage(role="user", content=[block])
+
+    @pytest.mark.parametrize(
+        ("block", "expected_cls"),
+        [
+            ({"text": "hi"}, ContentBlockText),
+            ({"source": {"type": "base64", "data": "x"}}, ContentBlockImage),
+            (
+                {"thinking": "hmm", "signature": "sig"},
+                ContentBlockThinking,
+            ),
+        ],
+    )
+    def test_type_less_block_keeps_origin_main_leniency(self, block, expected_cls):
+        """A block with no ``type`` must behave exactly as it did on origin/main.
+
+        Every variant declares ``type: Literal[...] = "..."`` with a default, so
+        the old plain union inferred the type from the remaining fields. This
+        fix must not tighten that: #3754 only asks to accept unknown *types*,
+        and silently rejecting payloads that used to validate would be an
+        unrequested default-behavior change (CONTRIBUTING: discuss first).
+        The sentinel tag routes type-less blocks back through the original
+        7-way smart union, so the inference is reused rather than reimplemented.
+        """
+        msg = AnthropicMessage(role="user", content=[block])
+
+        assert type(msg.content[0]) is expected_cls
+        assert msg.content[0].model_dump() == expected_cls(**block).model_dump()
 
 
 class TestAnthropicTool:
