@@ -709,12 +709,20 @@ def test_automatic_never_falls_back_to_an_unsupported_pipeline():
         supports_pipeline=False,
     )
 
-    with pytest.raises(PlanningError, match="no tensor-parallel degree"):
+    with pytest.raises(PlanningError, match="link is not fast enough") as exc_info:
         choose_parallelism(
             unsupported,
             _nodes(2),
             transports=[_link("ethernet", speed=10, tb_version=None)],
         )
+    # The degree really does divide the architecture cleanly here (8 % 2 == 0)
+    # — the message must not claim otherwise. That was the actual bug: the
+    # generic "no tensor-parallel degree divides" fallback fired even though
+    # divisibility was never the problem, hiding the real cause (slow link,
+    # no pipeline fallback for this architecture).
+    assert "divides" in str(exc_info.value)
+    assert "cleanly" in str(exc_info.value)
+    assert "pipeline" in str(exc_info.value)
 
 
 def test_grouped_query_attention_bounds_the_split():
