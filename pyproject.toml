@@ -274,6 +274,11 @@ include = ["omlx*"]
 "omlx.custom_kernels.decode_fast" = ["*.metallib", "*.dylib", "*.so"]
 "omlx.custom_kernels.minimax_m3" = ["*.metallib", "*.dylib", "*.so"]
 "omlx.custom_kernels.qwen35_prefill" = ["*.metallib", "*.dylib", "*.so"]
+# bonsai builds omlx_bonsai_kernels.metallib like the rest (setup.py's
+# ext_modules includes omlx.custom_kernels.bonsai._ext); the metallib is
+# lazy-loaded on first dispatch, so a wheel missing it passes import/ABI
+# probes and only fails (or silently falls back) on first use.
+"omlx.custom_kernels.bonsai" = ["*.metallib", "*.dylib", "*.so"]
 
 [tool.uv]
 # mlx and mlx-lm are git-pinned; override transitive pins
