@@ -3089,13 +3089,18 @@ def generate(
         for uid in gen.insert(
             prompts[:initial],
             max_tokens=limits[:initial],
-            logits_processors=processors,
-            samplers=samplers,
+            logits_processors=processors[:initial] if processors else None,
+            samplers=samplers[:initial] if samplers else None,
         ):
             output[uid] = []
         for step in range(100):
             if late_join and step == 2:
-                for uid in gen.insert(prompts[1:], max_tokens=limits[1:]):
+                for uid in gen.insert(
+                    prompts[1:],
+                    max_tokens=limits[1:],
+                    logits_processors=processors[1:] if processors else None,
+                    samplers=samplers[1:] if samplers else None,
+                ):
                     output[uid] = []
             _, responses = gen.next()
             for response in responses:
@@ -4468,10 +4473,11 @@ def test_multi_request_mtp_or_singleton_only_matches_standard(
         mlx_lm_mtp.set_mtp_depth(depth)
 
 
-@pytest.mark.parametrize("size", [2, 4])
+@pytest.mark.parametrize("size", [2, 6])
 @pytest.mark.parametrize("late_join", [False, True])
+@pytest.mark.parametrize("stochastic", [False, True])
 def test_initialization_uses_one_forward_without_cache_extraction(
-    size, late_join, monkeypatch
+    size, late_join, stochastic, monkeypatch
 ):
     active = mlx_lm_mtp.is_mtp_active()
     mlx_lm_mtp.set_mtp_active(True)
@@ -4515,11 +4521,43 @@ def test_initialization_uses_one_forward_without_cache_extraction(
 
         monkeypatch.setattr(bg, "_call_backbone", backbone)
         monkeypatch.setattr(bg, "_prepare_mtp_batch_state_for_next", prepare)
-        prompts = [[3, 4, 5], [3, 6, 7, 8], [4, 5, 6], [7, 8, 9, 10]][:size]
-        actual, _ = generate(model, prompts, [20] * size, late_join=late_join)
+        prompts = [[3, 4, 5 + i] + [6] * i for i in range(size)]
+        from omlx.utils.sampling import make_sampler
+
+        samplers = (
+            [make_sampler(temp=1, top_k=20, top_p=0.95)] * size if stochastic else None
+        )
+        processors = (
+            [[lambda tokens, logits: logits + 0.1 * (mx.arange(256) == 7)]] * size
+            if stochastic
+            else None
+        )
+        mx.random.seed(819)
+        actual, _ = generate(
+            model,
+            prompts,
+            [20] * size,
+            late_join=late_join,
+            samplers=samplers,
+            processors=processors,
+        )
         assert shared
-        model._language_model._omlx_mtp_decode_enabled = False
-        expected, _ = generate(model, prompts, [20] * size, late_join=late_join)
+        if stochastic:
+            # Same sampling policy and RNG draws, using the old private-row
+            # activation as the reference (standard decode draws differently).
+            monkeypatch.setattr(bg, "_prepare_mtp_batch_state_for_next", original)
+            monkeypatch.setattr(bg, "_initial_batch_forward", lambda batch: None)
+        else:
+            model._language_model._omlx_mtp_decode_enabled = False
+        mx.random.seed(819)
+        expected, _ = generate(
+            model,
+            prompts,
+            [20] * size,
+            late_join=late_join,
+            samplers=samplers,
+            processors=processors,
+        )
         assert actual == expected
     finally:
         mlx_lm_mtp.set_mtp_active(active)

@@ -1270,15 +1270,10 @@ def _initial_batch_forward(gen_batch):
         and getattr(host, "_omlx_mtp_batch_rollback", False)
         and gen_batch._next_tokens is not None
         and all(type(c) in cache_types for c in gen_batch.prompt_cache)
-        and all(
-            _is_greedy(
-                _make_row_batch(gen_batch, i, prompt_cache=gen_batch.prompt_cache)
-            )
-            and not _row_value(gen_batch.logits_processors, i)
-            for i in range(len(gen_batch.uids))
-        )
     ):
         return None
+    # Only the deterministic backbone is batched here. _post_init_mtp still
+    # applies each row's processors and sampler, in the original row order.
     # Validate the offset layout before advancing the shared target cache.
     offsets = _prompt_priming._row_offsets(gen_batch.prompt_cache, len(gen_batch.uids))
     if offsets is None:
