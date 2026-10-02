@@ -3136,10 +3136,12 @@ class TestExtractMultimodalContent:
         assert parts[0]["input_audio"]["format"] == "wav"
 
     @pytest.mark.parametrize("part_type", ["video_url", "input_video"])
-    def test_video_input_is_preserved(self, part_type):
-        parts = _extract_multimodal_content_list(
-            [{"type": part_type, part_type: {"url": "data:video/mp4;base64,AA=="}}]
-        )
+    @pytest.mark.parametrize(
+        "value", [{"url": "data:video/mp4;base64,AA=="}, "data:video/mp4;base64,AA=="]
+    )
+    def test_video_input_is_preserved(self, part_type, value):
+        message = Message(role="user", content=[{"type": part_type, part_type: value}])
+        parts = _extract_multimodal_content_list(message.content)
 
         assert parts == [
             {

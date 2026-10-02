@@ -15,6 +15,8 @@ import mlx.nn as nn
 from mlx_lm.models.activations import swiglu
 from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 from omlx.custom_kernels.nax import is_nax_available
+from omlx.patches.m5_gather_qmm import fused_gate_up_activation
+from omlx.patches.moe_routes import sort_routes
 
 _DEEPSEEK_MXFP4_SMALL_BLOCK_BM = 16
 _DEEPSEEK_MXFP4_SMALL_BLOCK_VARIANT = 1
@@ -67,12 +69,24 @@ def _sort_threshold(*projections) -> int:
     return 64
 
 
+def has_native_block_kernels(projection) -> bool:
+    """Whether ``projection``'s format has native block/pair gather kernels.
+
+    MXFP4 (4-bit, group 32) and affine 2/3-bit group-64 experts can run gate
+    and up through the native pair kernels; every other format runs them as
+    stock ``gather_qmm`` calls.
+    """
+    if not isinstance(projection, QuantizedSwitchLinear):
+        return False
+    mode, bits, group_size = projection.mode, projection.bits, projection.group_size
+    return (mode == "mxfp4" and bits == 4 and group_size == 32) or (
+        mode == "affine" and bits in (2, 3) and group_size == 64
+    )
+
+
 def _gather_sort(x, indices):
-    *_, M = indices.shape
-    indices = indices.flatten()
-    order = mx.argsort(indices)
-    inv_order = mx.argsort(order)
-    return x.flatten(0, -3)[order // M], indices[order], inv_order
+    x, row_map, indices, inv_order = sort_routes(x, indices)
+    return x[row_map], indices, inv_order
 
 
 def _scatter_unsort(x, inv_order, shape=None):
@@ -432,23 +446,33 @@ class SwitchGLU(nn.Module):
         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
         self.activation = activation
 
+    def projections(self) -> tuple:
+        """Expert projections in call order: gate/up (or fused), then down."""
+        if "gate_up_proj" in self:
+            return (self.gate_up_proj, self.down_proj)
+        return (self.up_proj, self.gate_proj, self.down_proj)
+
     def __call__(self, x, indices, scores=None, weighted_sum=False) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
         original_dtype = x.dtype
+        projections = self.projections()
+        fused_gate_up = len(projections) == 2
 
-        do_sort = indices.size >= _sort_threshold(
-            self.gate_proj, self.up_proj, self.down_proj
-        )
+        do_sort = indices.size >= _sort_threshold(*projections)
         idx = indices
         inv_order = None
+        token_rows = None
         if do_sort:
-            x, idx, inv_order = _gather_sort(x, indices)
+            # The replicated rows x_tok[row_map] stay lazy: never computed
+            # when the fused gate/up kernel reads the token rows in place.
+            x_tok, row_map, idx, inv_order = sort_routes(x, indices)
+            x = x_tok[row_map]
+            token_rows = (x_tok, row_map)
         if self.training:
             idx = mx.stop_gradient(idx)
 
         block_plan = None
         native_kinds = None
-        projections = (self.up_proj, self.gate_proj, self.down_proj)
         use_f16_moe = original_dtype == mx.bfloat16 and all(
             isinstance(p, QuantizedSwitchLinear)
             and p._has_affine_metadata_dtype(mx.float16)
@@ -475,16 +499,19 @@ class SwitchGLU(nn.Module):
                 block_bm, block_variant = _block_config(idx.size, block_kind)
                 block_meta, block_count = _build_mxfp4_blocks(
                     idx,
-                    self.up_proj.num_experts,
+                    self.down_proj.num_experts,
                     block_bm,
                 )
                 block_plan = (block_meta, block_count, block_variant)
 
         if use_f16_moe:
             x = x.astype(mx.float16)
+            if token_rows is not None:
+                token_rows = (token_rows[0].astype(mx.float16), token_rows[1])
 
         use_pair_proj = (
-            block_plan is not None
+            not fused_gate_up
+            and block_plan is not None
             and native_kinds is not None
             and native_kinds[0] == "mxfp4"
             and native_kinds[1] == "mxfp4"
@@ -493,7 +520,8 @@ class SwitchGLU(nn.Module):
             and self.up_proj.num_experts == self.gate_proj.num_experts
         )
         use_affine_pair_proj = (
-            block_plan is not None
+            not fused_gate_up
+            and block_plan is not None
             and native_kinds is not None
             and native_kinds[0] == "affine"
             and native_kinds[1] == "affine"
@@ -503,7 +531,28 @@ class SwitchGLU(nn.Module):
             and self.up_proj.num_experts == self.gate_proj.num_experts
             and glm_fast.has_symbol("deepseek_affine_gather_qmm_pair_concat_blocks")
         )
-        if use_pair_proj:
+        x_act = None
+        if fused_gate_up:
+            if (
+                do_sort
+                and block_plan is None
+                and not self.training
+                and isinstance(self.gate_up_proj, QuantizedSwitchLinear)
+            ):
+                # Sorted prefill on M5 (stock gather_qmm route): the
+                # activation in the [gate; up] matmul's epilogue
+                # (bit-identical; None keeps the path below).
+                x_act = fused_gate_up_activation(
+                    self.gate_up_proj, x, idx, self.activation, token_rows=token_rows
+                )
+            if x_act is None:
+                # One gather_qmm over the [gate; up] expert rows; each output
+                # column is the same K-reduction as in the separate calls.
+                x_gate_up = self.gate_up_proj(
+                    x, idx, sorted_indices=do_sort, block_plan=block_plan
+                )
+                x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+        elif use_pair_proj:
             block_meta, block_count, block_variant = _unpack_mxfp4_block_plan(
                 block_plan
             )
@@ -560,11 +609,11 @@ class SwitchGLU(nn.Module):
             x_gate = self.gate_proj(
                 x, idx, sorted_indices=do_sort, block_plan=block_plan
             )
-        x = self.activation(x_up, x_gate)
+        x = self.activation(x_up, x_gate) if x_act is None else x_act
         if (
             block_plan is not None
             and native_kinds is not None
-            and native_kinds[2] == "affine"
+            and native_kinds[-1] == "affine"
             and isinstance(self.down_proj, QuantizedSwitchLinear)
             and x.dtype != self.down_proj["scales"].dtype
             and self.down_proj["scales"].dtype in (mx.float16, mx.bfloat16)

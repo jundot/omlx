@@ -18,6 +18,9 @@ from typing import Any
 
 import mlx.core as mx
 
+from .m5_gather_qmm import fused_gate_up_activation
+from .moe_routes import sort_routes
+
 logger = logging.getLogger(__name__)
 
 _PATCHED = False
@@ -76,21 +79,37 @@ def _native_switch_weighted_sum(
     scores: mx.array,
     weighted_sum: Callable[..., mx.array],
 ) -> mx.array:
-    from mlx_lm.models.switch_layers import _gather_sort
-
-    x_sorted, idx, inv_order = _gather_sort(mx.expand_dims(x, (-2, -3)), inds)
+    # mlx-lm's _gather_sort; the replicated rows stay lazy and are never
+    # computed when the gate/up kernel reads the token rows in place.
+    x_tok, row_map, idx, inv_order = sort_routes(mx.expand_dims(x, (-2, -3)), inds)
+    x_sorted = x_tok[row_map]
     if switch_mlp.training:
         idx = mx.stop_gradient(idx)
 
     gate_up = getattr(switch_mlp, "gate_up_proj", None)
+    x_act = None
     if gate_up is not None:
-        x_gate_up = gate_up(x_sorted, idx, sorted_indices=True)
-        x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+        if not switch_mlp.training:
+            # M5: the activation in the [gate; up] matmul's epilogue, rows
+            # read through the row map (bit-identical; None keeps the split
+            # + activation below).
+            x_act = fused_gate_up_activation(
+                gate_up,
+                x_sorted,
+                idx,
+                switch_mlp.activation,
+                token_rows=(x_tok, row_map),
+            )
+        if x_act is None:
+            x_gate_up = gate_up(x_sorted, idx, sorted_indices=True)
+            x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
     else:
         x_up = switch_mlp.up_proj(x_sorted, idx, sorted_indices=True)
         x_gate = switch_mlp.gate_proj(x_sorted, idx, sorted_indices=True)
+    if x_act is None:
+        x_act = switch_mlp.activation(x_up, x_gate)
     x_sorted = switch_mlp.down_proj(
-        switch_mlp.activation(x_up, x_gate),
+        x_act,
         idx,
         sorted_indices=True,
     )

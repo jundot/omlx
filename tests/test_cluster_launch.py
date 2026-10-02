@@ -2422,3 +2422,65 @@ def test_reap_orphaned_launches_leaves_an_active_job_alone(tmp_path, monkeypatch
     assert report["reaped"] == []
     assert kills == []
     assert launch._launch_manifest_path(tmp_path, "cluster-test").exists()
+
+
+def test_peer_probe_stops_immediately_on_ssh_auth_failure():
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv, 255, stdout="", stderr="Permission denied (publickey)."
+        )
+
+    with pytest.raises(DistributedLaunchError, match="Permission denied"):
+        probe_remote_host("worker@example.invalid", runner=runner)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("local_failure", [False, True])
+def test_local_only_teardown_never_contacts_remote_peer(
+    tmp_path, monkeypatch, local_failure
+):
+    calls = []
+
+    def sweep(deployment_id, hosts, **kwargs):
+        calls.append(hosts)
+        return ["local worker survived"] if local_failure else []
+
+    def no_ssh(*args, **kwargs):
+        pytest.fail("local-only removal must not contact a remote Mac")
+
+    monkeypatch.setattr(launch, "_sweep_rank_processes", sweep)
+    if local_failure:
+        with pytest.raises(
+            launch.DistributedTeardownError, match="local worker survived"
+        ):
+            launch.stop_deployment_processes(
+                _deployment(), state_dir=tmp_path, runner=no_ssh, local_only=True
+            )
+    else:
+        result = launch.stop_deployment_processes(
+            _deployment(), state_dir=tmp_path, runner=no_ssh, local_only=True
+        )
+        assert result["ranks_checked"] == 1
+    assert calls == [[{"rank": 0, "node_id": "local", "ssh": "127.0.0.1"}]]
+
+
+
+def test_supervisor_local_stop_skips_remote_reaping(tmp_path, monkeypatch):
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(), preflight=False, state_dir=str(tmp_path)
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_reap_remote_ranks",
+        lambda: pytest.fail("remote reaping attempted"),
+    )
+    monkeypatch.setattr(
+        launch,
+        "_run_cluster_ssh",
+        lambda *_a, **_k: pytest.fail("remote serve gate cleared over SSH"),
+    )
+    supervisor.stop(local_only=True)
+    assert supervisor.process is None

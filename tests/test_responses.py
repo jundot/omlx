@@ -371,7 +371,7 @@ class TestConvertResponsesInput:
                 ],
             ),
         ]
-        messages = convert_responses_input_to_messages(items)
+        messages = convert_responses_input_to_messages(items, preserve_images=True)
         content = messages[0]["content"]
         # Content should be a list (not flattened to string) when images present
         assert isinstance(content, list)
@@ -394,11 +394,26 @@ class TestConvertResponsesInput:
                 ],
             ),
         ]
-        messages = convert_responses_input_to_messages(items)
+        messages = convert_responses_input_to_messages(items, preserve_images=True)
         content = messages[0]["content"]
         assert isinstance(content, list)
         assert content[1]["image_url"] == "https://example.com/img.png"
         assert content[1]["detail"] == "auto"  # default
+
+    def test_input_image_dropped_without_preserve_images(self):
+        """Text engines get a string, as /v1/chat/completions does (#4069)."""
+        items = [
+            InputItem(
+                type="message",
+                role="user",
+                content=[
+                    {"type": "input_text", "text": "Reply OK."},
+                    {"type": "input_image", "image_url": "data:image/png;base64,abc"},
+                ],
+            ),
+        ]
+        messages = convert_responses_input_to_messages(items)
+        assert messages[0]["content"] == "Reply OK."
 
     def test_text_only_content_parts_flattened(self):
         """Content with only text parts should still be flattened to string."""

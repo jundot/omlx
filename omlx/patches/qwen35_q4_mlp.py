@@ -654,9 +654,11 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
         orig_gdn = gdn_cls.__call__
         try:
             gdn_module = importlib.import_module(gdn_cls.__module__)
-            gated_delta_update = gdn_module.gated_delta_update
         except Exception:
-            gated_delta_update = getattr(module, "gated_delta_update", None)
+            gdn_module = module
+        gated_delta_update = getattr(gdn_module, "gated_delta_update", None)
+        # Must match the stock body, which decode and short chunks still use.
+        normalize_qk = getattr(gdn_module, "normalize_qk", None)
 
         def patched_gdn(self, inputs, mask=None, cache=None, n_confirmed: int = 0):
             # n_confirmed is the Native-MTP draft/verify split (patches/mlx_lm_mtp).
@@ -665,6 +667,7 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
             # __call__ only when set, so stock GatedDeltaNet stays compatible.
             if (
                 gated_delta_update is None
+                or normalize_qk is None
                 or inputs.ndim != 3
                 or inputs.shape[-2] < min_tokens
                 or self.sharding_group is not None
@@ -738,9 +741,7 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
             ]
 
             state = cache[1] if cache else None
-            inv_scale = k.shape[-1] ** -0.5
-            q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-            k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+            q, k = normalize_qk(q, k, inv_scale=self.head_k_dim**-0.5, eps=1e-6)
 
             out, state = gated_delta_update(
                 q,

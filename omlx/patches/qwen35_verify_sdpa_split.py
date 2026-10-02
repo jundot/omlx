@@ -40,10 +40,13 @@ tail next to the head's cache, and ``prefix_tail_attention`` reads both.
 
 from __future__ import annotations
 
+import functools
 import logging
 import struct
 
 import mlx.core as mx
+
+from .qwen35_verify_qmm import is_row_exact_armed
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +76,89 @@ def _chunked_causal_sdpa(queries, keys, values, scale, limit: int):
     c0 = 0
     while c0 < q_len:
         c1 = min(c0 + limit, q_len)
+        kv_end = kv_len - (q_len - c1)
+        outs.append(
+            mx.fast.scaled_dot_product_attention(
+                queries[..., c0:c1, :],
+                keys[..., :kv_end, :],
+                values[..., :kv_end, :],
+                scale=scale,
+                mask="causal",
+            )
+        )
+        c0 = c1
+    if len(outs) == 1:
+        return outs[0]
+    return mx.concatenate(outs, axis=-2)
+
+
+@functools.lru_cache(maxsize=None)
+def _gpu_class() -> str:
+    try:
+        return str(mx.device_info().get("architecture", ""))[-1:]
+    except Exception:
+        return ""
+
+
+def _vector_plan(key_len: int, gqa_factor: int, rows: int) -> tuple:
+    """MLX 0.32.2's vector-SDPA kernel plan for ``rows`` query rows over
+    ``key_len`` keys (head dim 256): one pass, or two passes with this many
+    key partitions. A row's arithmetic depends on the plan, not on the rows
+    sharing the call."""
+    devc = _gpu_class()
+    if not ((devc in ("d", "s") and key_len >= 1024) or (gqa_factor > 1 and key_len >= 4096)):
+        return (1,)
+    n_simds = gqa_factor * rows
+    if devc == "s":
+        blocks = 64
+        if key_len > 1024 and n_simds > 4:
+            if key_len <= 8192:
+                blocks = 128
+            elif key_len <= 32768:
+                blocks = 256
+            elif key_len <= 65536:
+                blocks = 512
+            else:
+                blocks = 1024
+    elif devc == "d":
+        blocks = 128
+        if n_simds <= 2 and key_len > 8192:
+            blocks = 256
+        elif n_simds >= 6:
+            if 16384 <= key_len < 65536:
+                blocks = 512
+            elif key_len >= 65536:
+                blocks = 1024
+    else:
+        blocks = 64 if n_simds >= 4 else 32
+    return (2, blocks)
+
+
+def _row_exact_causal_sdpa(queries, keys, values, scale, limit: int):
+    """``_chunked_causal_sdpa`` whose chunks keep every row on the kernel plan
+    of its own one-row decode call.
+
+    A chunk runs MLX's plan for its last row's key count, while its earlier
+    rows decode serially over fewer keys; where that crosses a plan boundary
+    (one to two passes at 1024 keys, 128 to 512 partitions at 16384 on M5)
+    the chunk shrinks, down to the row alone.
+    """
+    q_len = queries.shape[-2]
+    kv_len = keys.shape[-2]
+    gqa_factor = queries.shape[-3] // keys.shape[-3]
+    outs = []
+    c0 = 0
+    while c0 < q_len:
+        c1 = min(c0 + limit, q_len)
+        while c1 - c0 > 1:
+            kv_end = kv_len - (q_len - c1)
+            plan = _vector_plan(kv_end, gqa_factor, c1 - c0)
+            if all(
+                _vector_plan(kv_end - offset, gqa_factor, 1) == plan
+                for offset in range(c1 - c0)
+            ):
+                break
+            c1 -= 1
         kv_end = kv_len - (q_len - c1)
         outs.append(
             mx.fast.scaled_dot_product_attention(
@@ -853,7 +939,13 @@ def apply_qwen35_verify_sdpa_split_patch() -> bool:
                 try:
                     q_len = queries.shape[-2]
                     wide_from = min(limit + 1, _WIDE_MIN_ROWS)
-                    if (
+                    if is_row_exact_armed():
+                        # MLX's vector kernel scores each query row exactly
+                        # like a one-row decode call on the same kernel plan;
+                        # the tile kernels below round probabilities
+                        # differently.
+                        out = _row_exact_causal_sdpa(queries, keys, values, scale, limit)
+                    elif (
                         q_len <= _WIDE_MAX_ROWS
                         and keys.shape[-2] >= _GQA_MIN_KEYS
                         and queries.shape[1] // keys.shape[1] <= _GQA_MAX_GROUP

@@ -4,9 +4,9 @@ import SwiftUI
 @Observable
 final class IntegrationsScreenVM {
     enum Field: Sendable {
-        case claudeMode, opusModel, sonnetModel, haikuModel, contextScaling, targetContextSize
+        case claudeMode, opusModel, sonnetModel, haikuModel
         case codexModel, opencodeModel, openclawModel, piModel, openclawToolsProfile
-        case hermesModel, copilotModel
+        case hermesModel, copilotModel, dshModel
         case mcpConfig
     }
 
@@ -15,17 +15,6 @@ final class IntegrationsScreenVM {
     var opusModel: String = ""
     var sonnetModel: String = ""
     var haikuModel: String = ""
-    var contextScaling: Bool = false
-    /// Free-text editor backing for `claude_code.target_context_size`. The
-    /// server stores an `int`; we keep the screen field as a string so the
-    /// user can type/clear without intermediate parse errors and we validate
-    /// on save.
-    var targetContextSizeText: String = "200000"
-    /// Last value persisted to the server. Drives the per-section Apply
-    /// button under Target Context Size — diverges from
-    /// `targetContextSizeText` whenever the user has unsaved edits,
-    /// converges on a successful save. Mirrors `mcpConfigLoaded` below.
-    private(set) var targetContextSizeLoaded: String = "200000"
 
     // Other integrations
     var codexModel: String = ""
@@ -35,6 +24,7 @@ final class IntegrationsScreenVM {
     var openclawToolsProfile: String = "coding"
     var hermesModel: String = ""
     var copilotModel: String = ""
+    var dshModel: String = ""
 
     // MCP
     var mcpConfigPath: String = ""
@@ -114,16 +104,10 @@ final class IntegrationsScreenVM {
     var hermesCommand: String   { "\(cliCommandPrefix) launch hermes" }
     var piCommand: String       { "\(cliCommandPrefix) launch pi" }
     var copilotCommand: String  { "\(cliCommandPrefix) launch copilot" }
+    var dshCommand: String      { "\(cliCommandPrefix) launch dsh" }
 
     var hasPendingMCPChanges: Bool {
         mcpConfigPath.trimmingCharacters(in: .whitespaces) != mcpConfigLoaded
-    }
-
-    /// True when the Target Context Size draft diverges from the saved
-    /// baseline. The per-section Apply button under that field uses this
-    /// to gate its `disabled` state.
-    var hasPendingContextSizeChange: Bool {
-        targetContextSizeText.trimmingCharacters(in: .whitespaces) != targetContextSizeLoaded
     }
 
     func bind<T: Equatable>(
@@ -149,12 +133,6 @@ final class IntegrationsScreenVM {
                 self.opusModel       = cc.opusModel ?? ""
                 self.sonnetModel     = cc.sonnetModel ?? ""
                 self.haikuModel      = cc.haikuModel ?? ""
-                self.contextScaling  = cc.contextScalingEnabled ?? false
-                if let target = cc.targetContextSize {
-                    let s = String(target)
-                    self.targetContextSizeText = s
-                    self.targetContextSizeLoaded = s
-                }
             }
             if let it = settings.integrations {
                 self.codexModel           = it.codexModel ?? ""
@@ -164,6 +142,7 @@ final class IntegrationsScreenVM {
                 self.openclawToolsProfile = it.openclawToolsProfile ?? "coding"
                 self.hermesModel          = it.hermesModel ?? ""
                 self.copilotModel         = it.copilotModel ?? ""
+                self.dshModel             = it.dshModel ?? ""
             }
             if let mcp = settings.mcp {
                 let path = mcp.configPath ?? ""
@@ -199,16 +178,6 @@ final class IntegrationsScreenVM {
         case .opusModel:            patch.claudeCodeOpusModel = opusModel
         case .sonnetModel:          patch.claudeCodeSonnetModel = sonnetModel
         case .haikuModel:           patch.claudeCodeHaikuModel = haikuModel
-        case .contextScaling:       patch.claudeCodeContextScalingEnabled = contextScaling
-        case .targetContextSize:
-            let trimmed = targetContextSizeText.trimmingCharacters(in: .whitespaces)
-            guard let n = Int(trimmed), n > 0 else {
-                self.lastError = String(localized: "integrations.error.target_context_invalid",
-                                        defaultValue: "Target context size must be a positive integer.",
-                                        comment: "Integrations screen error when the target context size input is invalid")
-                return
-            }
-            patch.claudeCodeTargetContextSize = n
         case .codexModel:           patch.integrationsCodexModel = codexModel
         case .opencodeModel:        patch.integrationsOpencodeModel = opencodeModel
         case .openclawModel:        patch.integrationsOpenclawModel = openclawModel
@@ -216,6 +185,7 @@ final class IntegrationsScreenVM {
         case .openclawToolsProfile: patch.integrationsOpenclawToolsProfile = openclawToolsProfile
         case .hermesModel:          patch.integrationsHermesModel = hermesModel
         case .copilotModel:         patch.integrationsCopilotModel = copilotModel
+        case .dshModel:             patch.integrationsDshModel = dshModel
         case .mcpConfig:
             patch.mcpConfig = mcpConfigPath.trimmingCharacters(in: .whitespaces)
         }
@@ -225,8 +195,6 @@ final class IntegrationsScreenVM {
             switch field {
             case .mcpConfig:
                 self.mcpConfigLoaded = mcpConfigPath.trimmingCharacters(in: .whitespaces)
-            case .targetContextSize:
-                self.targetContextSizeLoaded = targetContextSizeText.trimmingCharacters(in: .whitespaces)
             default:
                 break
             }

@@ -6,10 +6,12 @@ Tests JSON schema validation, JSON extraction, and tool conversion functions.
 """
 
 import ast
+import importlib
 import json
 import logging
 import re
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -43,8 +45,10 @@ from omlx.api.tool_calling import (
     extract_tool_calls_with_thinking,
     format_tool_call_for_message,
     parse_json_output,
+    parse_qwen_tool_calls,
     parse_tool_calls,
     parse_tool_calls_with_thinking_fallback,
+    repair_parameter_open_tags,
     restore_gemma4_param_names,
     sanitize_tool_call_markup,
     validate_json_schema,
@@ -530,6 +534,67 @@ class TestBuildJsonSystemPrompt:
 
 class TestConvertToolsForTemplate:
     """Tests for convert_tools_for_template function."""
+
+    @pytest.mark.parametrize("render_properties", [False, True])
+    def test_schema_key_order_does_not_change_rendered_tools(self, render_properties):
+        """Equivalent JSON object orders must produce the same prompt prefix."""
+        from jinja2 import Environment, StrictUndefined
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search text"},
+                "filters": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "days": {"type": "integer", "minimum": 1},
+                        },
+                    },
+                },
+            },
+            "required": ["query", "filters"],
+            "anyOf": [{"type": "string"}, {"type": "number"}],
+        }
+
+        def reverse_object_keys(value):
+            if isinstance(value, dict):
+                return {
+                    key: reverse_object_keys(child)
+                    for key, child in reversed(list(value.items()))
+                }
+            if isinstance(value, list):
+                return [reverse_object_keys(child) for child in value]
+            return value
+
+        tools, reordered_tools = (
+            [{"type": "function", "function": {"name": "search", "parameters": params}}]
+            for params in (schema, reverse_object_keys(schema))
+        )
+        originals = [json.dumps(tools), json.dumps(reordered_tools)]
+        converted = convert_tools_for_template(tools)
+        reordered = convert_tools_for_template(reordered_tools)
+
+        # Qwen templates serialize objects or iterate properties directly.
+        env = Environment(undefined=StrictUndefined)
+        env.policies["json.dumps_kwargs"] = {"sort_keys": False}
+        template = env.from_string(
+            "{% for tool in tools %}"
+            + (
+                "{% for name, spec in tool.function.parameters.properties.items() %}"
+                "{{ name }}:{{ spec | tojson }}{% endfor %}"
+                if render_properties
+                else "{{ tool | tojson }}"
+            )
+            + "{% endfor %}"
+        )
+        assert template.render(tools=converted) == template.render(tools=reordered)
+        assert [json.dumps(tools), json.dumps(reordered_tools)] == originals
+        parameters = converted[0]["function"]["parameters"]
+        assert parameters["required"] == ["query", "filters"]
+        assert [item["type"] for item in parameters["anyOf"]] == ["string", "number"]
 
     def test_none_tools(self):
         """Test with None tools."""
@@ -2009,6 +2074,85 @@ class TestParseToolCallsSyntaxError:
         # but the outer code must still complete gracefully.
         _, tool_calls = parse_tool_calls(text, tok)
         assert tool_calls is None or len(tool_calls) == 0
+
+
+_QWEN_PARSER_MODULES = [
+    "mlx_lm.tool_parsers.qwen3_coder",
+    "mlx_vlm.tools.parsers.qwen3_coder",
+    None,
+]
+
+
+def _qwen_parser_tokenizer(parser_module):
+    if parser_module is None:
+        return None
+    parser = importlib.import_module(parser_module)
+    return SimpleNamespace(
+        has_tool_calling=True,
+        tool_call_start=parser.tool_call_start,
+        tool_call_end=parser.tool_call_end,
+        tool_parser=parser.parse_tool_call,
+    )
+
+
+class TestParameterOpenTagMissingGt:
+    """Empty Qwen parameters whose open tag lost its ``>``."""
+
+    BASH_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "proxy": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": [],
+            },
+        },
+    }
+
+    def test_repair_leaves_valid_tags_untouched(self):
+        for good in (
+            "<parameter=proxy>\n</parameter>",
+            "<parameter=proxy>http://host:port</parameter>",
+            "<function=bash>\n<parameter=command>ls -la</parameter>",
+        ):
+            assert repair_parameter_open_tags(good) == good
+
+    @pytest.mark.parametrize("parser_module", _QWEN_PARSER_MODULES)
+    @pytest.mark.parametrize("open_tag", ["<parameter=proxy=", "<parameter=proxy"])
+    def test_empty_argument_is_kept(self, parser_module, open_tag):
+        text = (
+            f"<tool_call>\n<function=bash>\n{open_tag}\n</parameter>\n"
+            "<parameter=description>\nlist files\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        _, tool_calls = parse_tool_calls(
+            text, _qwen_parser_tokenizer(parser_module), [self.BASH_TOOL]
+        )
+        assert len(tool_calls) == 1
+        assert json.loads(tool_calls[0].function.arguments) == {
+            "proxy": "",
+            "description": "list files",
+        }
+
+    @pytest.mark.parametrize("parser_module", _QWEN_PARSER_MODULES)
+    @pytest.mark.parametrize("with_call", [False, True])
+    def test_prose_is_not_rewritten(self, parser_module, with_call):
+        call = (
+            "<tool_call>\n<function=bash>\n<parameter=description>\nls\n"
+            "</parameter>\n</function>\n</tool_call>\n"
+        )
+        text = (call if with_call else "") + "The open tag is <parameter=name"
+        tokenizer = _qwen_parser_tokenizer(parser_module)
+        content, _ = parse_tool_calls(text, tokenizer, [self.BASH_TOOL])
+        qwen_content, _, _ = parse_qwen_tool_calls(
+            text, tokenizer, [self.BASH_TOOL], "stop"
+        )
+        assert content.endswith("<parameter=name")
+        assert qwen_content.endswith("<parameter=name")
 
 
 class TestParseNakedQwenFunctionCalls:
@@ -3859,11 +4003,11 @@ class TestSchemaAwareFallbackCoercion:
         # An unbalanced quote is not a JSON literal; keep it raw.
         assert _coerce_param_value('"unterminated', "city", props, "t") == '"unterminated'
 
-    def test_union_type_list_keeps_legacy_behavior(self):
-        """A JSON Schema union type list falls back to best-effort parsing."""
+    def test_union_type_list_respects_declared_types(self):
+        """A nullable string must not be converted to an undeclared number."""
         props = {"v": {"type": ["string", "null"]}}
         assert _coerce_param_value("hello", "v", props, "t") == "hello"
-        assert _coerce_param_value("123", "v", props, "t") == 123
+        assert _coerce_param_value("123", "v", props, "t") == "123"
 
     def test_repair_json_value(self):
         assert _repair_json_value('[{"a": [1, 2}]}') == [{"a": [1, 2]}]
@@ -5482,16 +5626,93 @@ def test_qwen_untyped_parameter_conversion_boundaries(spec, raw, expected):
     assert json.loads(calls[0].function.arguments)["v"] == expected
 
 
-def test_qwen_untyped_parameter_is_not_decoded_twice(monkeypatch):
+@pytest.mark.parametrize("spec", [{}, {"type": ["string", "null"]}])
+def test_qwen_parameter_is_not_decoded_twice(monkeypatch, spec):
     from mlx_lm.tool_parsers import qwen3_coder
 
     monkeypatch.setattr(
         qwen3_coder, "_convert_param_value", lambda value, *args: json.loads(value)
     )
-    tools = [{"function": {"name": "f", "parameters": {"properties": {"v": {}}}}}]
+    tools = [{"function": {"name": "f", "parameters": {"properties": {"v": spec}}}}]
     _, calls = parse_tool_calls(
         '<tool_call><function=f><parameter=v>"123"</parameter></function></tool_call>',
         TestNakedQwenFollowup.tokenizer(),
         tools,
     )
     assert json.loads(calls[0].function.arguments)["v"] == "123"
+
+
+@pytest.mark.parametrize("parser_module", _QWEN_PARSER_MODULES)
+@pytest.mark.parametrize(
+    "types, raw, expected",
+    [
+        (
+            ["object", "null"],
+            '{"enabled":true,"missing":null}',
+            {"enabled": True, "missing": None},
+        ),
+        (["array", "null"], "[true,null]", [True, None]),
+        (["boolean", "null"], "true", True),
+        (["string", "null"], "123", "123"),
+        (["string", "null"], "true", "true"),
+        (["string", "null"], '{"enabled":true}', '{"enabled":true}'),
+        (["string", "null"], '"123"', "123"),
+        (["string", "null"], "null", None),
+        (["number", "null"], "1.25", 1.25),
+        (["integer", "null"], "1.0", 1.0),
+        (["string", "integer"], "1.25", "1.25"),
+        (["string"], "null", "null"),
+        (["string", "null"], '"null"', "null"),
+        (["number", "string"], "42", 42),
+    ],
+)
+def test_xml_union_parameter_preserves_declared_value_type(
+    parser_module, types, raw, expected
+):
+    schema = {"type": "object", "properties": {"v": {"type": types}}, "required": ["v"]}
+    tools = [{"function": {"name": "f", "parameters": schema}}]
+    _, calls = parse_tool_calls(
+        f"<tool_call><function=f><parameter=v>{raw}</parameter></function></tool_call>",
+        _qwen_parser_tokenizer(parser_module),
+        tools,
+    )
+    assert calls and len(calls) == 1
+    arguments = json.loads(calls[0].function.arguments)
+    assert arguments["v"] == expected
+    assert type(arguments["v"]) is type(expected)
+    assert validate_json_schema(arguments, schema)[0]
+
+
+@pytest.mark.parametrize("types", [["unknown"], [None], []])
+def test_invalid_union_type_declarations_keep_best_effort_parsing(types):
+    assert _coerce_param_value("123", "v", {"v": {"type": types}}, "f") == 123
+
+
+@pytest.mark.parametrize(
+    "parser_module",
+    ["mlx_lm.tool_parsers.qwen3_coder", "mlx_vlm.tools.parsers.qwen3_coder"],
+)
+@pytest.mark.parametrize(
+    "types, raw, expected",
+    [
+        (["array", "null"], "(1, 2)", [1, 2]),
+        (["object", "null"], "{'enabled': True}", {"enabled": True}),
+    ],
+)
+def test_native_union_parameter_keeps_correct_python_literal_values(
+    parser_module, types, raw, expected
+):
+    tools = [
+        {
+            "function": {
+                "name": "f",
+                "parameters": {"properties": {"v": {"type": types}}},
+            }
+        }
+    ]
+    _, calls = parse_tool_calls(
+        f"<tool_call><function=f><parameter=v>{raw}</parameter></function></tool_call>",
+        _qwen_parser_tokenizer(parser_module),
+        tools,
+    )
+    assert json.loads(calls[0].function.arguments)["v"] == expected

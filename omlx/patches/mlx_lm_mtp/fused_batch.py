@@ -166,7 +166,7 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
     ):
         # Resolve all acceptance counts and token IDs in one host transfer.
         # Stateful processors and stochastic samplers retain their row path.
-        targets = mx.argmax(logits, axis=-1).astype(mx.int32)
+        targets = bg._greedy_targets(bg._logprobs(logits))
         drafts = inputs[:, 1:].astype(mx.int32)
         matches = (targets[:, :-1] == drafts).astype(mx.int32)
         accepted = mx.cumprod(matches, axis=1).sum(axis=1, keepdims=True)

@@ -1368,3 +1368,16 @@ def test_stale_marker_reports_zero_rank_side_active_requests(tmp_path, monkeypat
     assert engine.rank_side_active_requests() == 0
 
 
+
+
+@pytest.mark.asyncio
+async def test_local_stop_passes_scope_to_supervisor(monkeypatch):
+    engine = _ready_engine(lambda request: httpx.Response(200, json={}))
+    calls = []
+    monkeypatch.setattr(
+        engine._supervisor, "stop", lambda **kwargs: calls.append(kwargs)
+    )
+    await engine.stop(local_only=True)
+    assert calls == [{"local_only": True}]
+    assert engine._client is None
+    assert not engine._loaded

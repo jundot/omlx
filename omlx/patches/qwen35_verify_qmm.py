@@ -94,14 +94,25 @@ _MIN_SG8_ROUTE_N = 1024
 _SG8_MIN_ROWS = 4
 
 
-def set_verify_qmm_armed(flag: bool) -> None:
-    """Arm/disarm verify-qmm routing (MTP verify forwards only)."""
-    _ROUTE_ARMED.value = bool(flag)
+def set_verify_qmm_armed(flag: bool, *, row_exact: bool = False) -> None:
+    """Arm/disarm verify-qmm routing (MTP verify forwards only).
+
+    ``row_exact`` arms the row-exact mode instead: every multi-row
+    ``nn.QuantizedLinear`` call runs ``row_exact_qmv`` (one-row decode
+    arithmetic per row) and the fast verify kernels below stay disarmed.
+    """
+    _ROUTE_ARMED.value = bool(flag) and not row_exact
+    _ROUTE_ARMED.row_exact = bool(flag) and bool(row_exact)
     _ROUTE_ARMED.layers = 0
 
 
 def _is_armed() -> bool:
     return getattr(_ROUTE_ARMED, "value", False)
+
+
+def is_row_exact_armed() -> bool:
+    """True inside a verify forward whose rows must equal serial decode rows."""
+    return getattr(_ROUTE_ARMED, "row_exact", False)
 
 
 # ---------------------------------------------------------------------------
@@ -1496,7 +1507,11 @@ def apply_verify_qmm_patch() -> bool:
 
     orig_call = cls.__call__
 
+    from .row_exact_qmv import quantized_linear as row_exact_linear
+
     def patched_call(self, x):
+        if is_row_exact_armed() and x.ndim >= 2 and x.size // x.shape[-1] > 1:
+            return row_exact_linear(self, x)
         if (
             not _is_armed()
             or x.ndim != 3

@@ -33,7 +33,25 @@ _install_torch_stub()
 from omlx.patches.m5_gather_qmm import apply_m5_gather_qmm_workaround
 apply_m5_gather_qmm_workaround()
 
+from omlx.custom_kernels.nax import is_nax_available
 from omlx.request import Request, SamplingParams
+
+
+@pytest.fixture
+def glm5_fused_decode():
+    """GLM-5.3's fused decode/verify kernels, which run (and replay the
+    reference bit for bit) only on NAX GPUs."""
+    if not is_nax_available():
+        pytest.skip("the fused GLM-5.3 decode kernels run on M5 (NAX) GPUs")
+    from omlx.patches.mlx_vlm_glm5_next_compat import (
+        apply_mlx_vlm_glm5_next_compat_patch,
+    )
+
+    apply_mlx_vlm_glm5_next_compat_patch()
+    from mlx_vlm.models.glm5_next import language
+
+    assert language._DECODE_FUSION
+    return language
 
 
 @pytest.fixture(autouse=True)

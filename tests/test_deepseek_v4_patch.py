@@ -226,6 +226,45 @@ class TestUtilsPatch:
         assert model.args.use_native_ratio128_attention is expected_enabled
         assert loaded_config["use_native_ratio128_attention"] is expected_enabled
 
+    @pytest.mark.parametrize(
+        ("model_type", "delegated"),
+        (("llama", True), ("deepseek_v4", False)),
+    )
+    def test_only_deepseek_v4_uses_replacement_body(
+        self, tmp_path, monkeypatch, model_type, delegated
+    ):
+        import mlx.nn as nn
+        import mlx_lm.utils as utils_mod
+
+        from omlx.patches.deepseek_v4 import utils_patch
+
+        calls = []
+
+        def original(model_path, **kwargs):
+            calls.append(model_path)
+            return "original", {}
+
+        monkeypatch.setattr(utils_mod, "load_model", original)
+        patched = utils_patch._build_patched_load_model()
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+
+        class CapturingModel(nn.Module):
+            def __init__(self, args):
+                super().__init__()
+
+        result = patched(
+            tmp_path,
+            strict=False,
+            lazy=True,
+            get_model_classes=lambda config: (
+                CapturingModel,
+                SimpleNamespace(from_dict=lambda c: None),
+            ),
+        )
+
+        assert (calls == [tmp_path]) is delegated
+        assert (result[0] == "original") is delegated
+
 
 class TestBatchCacheConversion:
     """Model-owned caches retain batch conversion with upstream cache creation."""
@@ -2053,16 +2092,19 @@ class TestPoolingCacheTrimRollback:
         )
 
     def test_untrimmable_when_no_undo_after_prompt(self, applied_patch):
-        """Prompt-sized updates (L > 8) don't stash an undo log; a trim at
-        a pool boundary right after one must report not-trimmable instead
-        of corrupting state. (Updates up to L == 8 keep an undo so depth-k
-        MTP verify windows can roll back.)"""
+        """Prompt-sized updates (L > POOLING_UNDO_MAX_TOKENS) don't stash an
+        undo log; a trim at a pool boundary right after one must report
+        not-trimmable instead of corrupting state. (Updates up to the bound
+        keep an undo so depth-k MTP / DFlash verify windows can roll back.)"""
         from mlx_lm.models.cache import PoolingCache
 
+        from omlx.patches.deepseek_v4.cache_extras import POOLING_UNDO_MAX_TOKENS
+
         cache = PoolingCache(4)
+        width = POOLING_UNDO_MAX_TOKENS + 4  # one window past the bound
         self._push(
             cache,
-            self._tok([float(v) for v in range(1, 13)]),  # L = 12 > 8
+            self._tok([float(v) for v in range(1, width + 1)]),
             0,
         )
         assert cache.remainder == 0
@@ -2467,13 +2509,13 @@ def test_switch_sorting_preserves_other_formats(
     hidden = (mx.random.normal((1, tokens, 128)) * 0.1).astype(mx.float16)
     indices = mx.random.randint(0, 8, (1, tokens, 8)).astype(mx.uint32)
     calls = []
-    original_sort = sl._gather_sort
+    original_sort = sl.sort_routes
 
     def tracked_sort(x, indices):
         calls.append(indices.size)
         return original_sort(x, indices)
 
-    monkeypatch.setattr(sl, "_gather_sort", tracked_sort)
+    monkeypatch.setattr(sl, "sort_routes", tracked_sort)
     actual = model(hidden, indices)
     mx.eval(actual)
     should_sort = tokens == 8 or sort_at_32

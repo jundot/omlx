@@ -17,6 +17,7 @@ import functools
 import inspect
 import logging
 import math
+import os
 import time
 import weakref
 from collections import deque
@@ -33,18 +34,43 @@ from . import prompt_priming as _prompt_priming
 logger = logging.getLogger(__name__)
 
 
-def _set_verify_qmm_armed(flag: bool) -> None:
+def _set_verify_qmm_armed(flag: bool, *, row_exact: bool = False) -> None:
     """Arm the verify-shape qmm routing for the duration of an MTP forward.
 
-    Import is deferred and failure-tolerant: the kernel module is optional
-    and its absence must not affect the MTP path.
+    ``row_exact`` arms the row-exact mode instead (see
+    ``_row_exact_verify``). Import is deferred and failure-tolerant: the
+    kernel module is optional and its absence must not affect the MTP path.
     """
     try:
         from ..qwen35_verify_qmm import set_verify_qmm_armed
 
-        set_verify_qmm_armed(flag)
+        set_verify_qmm_armed(flag, row_exact=row_exact)
     except Exception:
         pass
+
+
+_ROW_EXACT_DISABLED = os.environ.get("OMLX_MTP_ROW_EXACT_VERIFY", "1").strip() == "0"
+
+
+def _row_exact_verify(model: Any) -> bool:
+    """Whether the target's verify rows must reproduce its one-row decode.
+
+    Models opt in with ``_omlx_mtp_row_exact_verify`` (Qwen4-Exp). Their
+    armed verify forwards then run every multi-row quantized projection,
+    DeltaNet prework and attention row with the arithmetic of a serial
+    decode step, so greedy MTP output equals MTP-off output byte for byte.
+    ``OMLX_MTP_ROW_EXACT_VERIFY=0`` restores the faster verify kernels.
+    """
+    if _ROW_EXACT_DISABLED:
+        return False
+    for candidate in (
+        model,
+        getattr(model, "_language_model", None),
+        getattr(model, "language_model", None),
+    ):
+        if getattr(candidate, "_omlx_mtp_row_exact_verify", False):
+            return True
+    return False
 
 
 def _set_dspark_target_verify(model: Any, flag: bool) -> None:
@@ -201,15 +227,19 @@ def apply() -> bool:
 
             host_state = getattr(self, "_omlx_mtp_state", None)
             if host_state is not None and _mtp_state_valid_for_batch(self, host_state):
-                if host_state.reentry_probe:
-                    park_state = _mtp_park_state_for_batch(self)
-                    if park_state is not None:
-                        park_state.defer_probe()
-                if not _reconcile_mtp_to_standard(self, host_state):
-                    raise RuntimeError(
-                        "Lightning MTP could not restore the committed cache"
-                    )
-                _drop_mtp_state(self, "extend-reconciled")
+                # A shared batch that a finishing row just filtered to this
+                # singleton sits at a drained frontier: hand it off with at
+                # most a one-token forward instead of replaying its history.
+                if not _handoff_mtp_for_late_join(self, host_state):
+                    if host_state.reentry_probe:
+                        park_state = _mtp_park_state_for_batch(self)
+                        if park_state is not None:
+                            park_state.defer_probe()
+                    if not _reconcile_mtp_to_standard(self, host_state):
+                        raise RuntimeError(
+                            "Lightning MTP could not restore the committed cache"
+                        )
+                    _drop_mtp_state(self, "extend-reconciled")
             result = original_extend(self, batch, *args, **kwargs)
             _drop_mtp_state(batch, "donor-extended")
             _drop_invalid_mtp_state(self, "extend")
@@ -1571,6 +1601,19 @@ def _logprobs(logits_2d):
     return logits_2d - mx.logsumexp(logits_2d, axis=-1, keepdims=True)
 
 
+# Serial greedy decoding (mlx-lm ``GenerationBatch._step``) samples
+# ``logits - logsumexp(logits)`` in the logits dtype, so its argmax runs over
+# rounded log-probabilities: once a logit is below half the logsumexp the
+# bf16 subtraction is inexact, two adjacent logits can land on one
+# log-probability, and the tie goes to the lower token id. Verify rows take
+# the same argmax so greedy MTP output equals MTP-off output.
+def _greedy_targets(logprobs):
+    """Greedy tokens of verify rows, as the serial greedy sampler picks them."""
+    import mlx.core as mx
+
+    return mx.argmax(logprobs, axis=-1).astype(mx.int32)
+
+
 def _accept_lp_for(sampler, lp):
     """Reproduce the sampler's filter+temperature pipeline on `lp` so the
     acceptance ratio (and residual distribution) match the distribution the
@@ -2071,7 +2114,12 @@ def _call_backbone_impl(
     _rollback_mod.set_undo_armed(True)
     # The affine verify qmm kernel is a Qwen-specific optimization. Keep the
     # DeepSeek target on its architecture-native quantized linear path.
-    _set_verify_qmm_armed(not dspark_verify)
+    # Row-exact runs each row as a one-row matvec. Batched decode has no
+    # one-row baseline, so B > 1 verify keeps the multi-row kernels.
+    _set_verify_qmm_armed(
+        not dspark_verify,
+        row_exact=inputs.shape[0] == 1 and _row_exact_verify(model),
+    )
     _set_dspark_target_verify(model, dspark_verify)
     try:
         result = model(inputs, **kwargs)
@@ -3987,7 +4035,7 @@ def _run_verify_cycle_chain(
         state.stats.zero_cycles += 1
     elif is_greedy:
         if greedy_result is None:
-            targets = mx.argmax(rows, axis=-1).astype(mx.int32)  # (k+1,)
+            targets = _greedy_targets(combined_lp)  # (k+1,)
             matches = (targets[:k] == state.drafts.astype(mx.int32)).astype(mx.int32)
             m_arr = mx.cumprod(matches).sum().reshape(1)
             host_arr = mx.concatenate([m_arr, targets, state.drafts.astype(mx.int32)])

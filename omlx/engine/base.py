@@ -180,6 +180,14 @@ async def _run_scheduler_preflight_with_cleanup_retry(
                 eviction_request.request_id,
             )
             await eviction_callback(eviction_request)
+            # The pool re-measures after eviction/reclaim, but its reading
+            # does not update this scheduler's cached MLX sample. Refresh
+            # even when the callback reports no action: it may already see
+            # enough headroom while this scheduler still charges old bytes.
+            refresh_usage = getattr(scheduler, "refresh_route_preflight_usage", None)
+            if executor is not None and callable(refresh_usage):
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(executor, refresh_usage)
         scheduler.preflight_or_raise(
             num_prompt_tokens=num_prompt_tokens,
             request_id=request_id,

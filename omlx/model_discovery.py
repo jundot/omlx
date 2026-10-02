@@ -77,6 +77,8 @@ VLM_MODEL_TYPES = {
 # models and adapts their language model to oMLX's scheduler.
 VLM_NATIVE_TEXT_MODEL_TYPES = {
     "cohere2_moe",
+    # mlx-lm ships its own deepseek_v41 without the oMLX cache and kernels.
+    "deepseek_v41",
     "glm5_next",
     "minimax_m3",
 }

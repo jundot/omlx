@@ -387,7 +387,10 @@ class _StoreCacheGate:
 # Import tiered cache components
 try:
     from .cache.boundary_snapshot_store import BoundarySnapshotSSDStore
-    from .cache.paged_ssd_cache import PagedSSDCacheManager
+    from .cache.paged_ssd_cache import (
+        PagedSSDCacheManager,
+        numerics_revision_for_model,
+    )
     from .memory_monitor import (
         MemoryMonitor,
         collect_kv_layer_specs,
@@ -399,6 +402,7 @@ try:
     HAS_TIERED_CACHE = True
 except ImportError:
     PagedSSDCacheManager = None
+    numerics_revision_for_model = None
     BoundarySnapshotSSDStore = None
     MemoryMonitor = None
     collect_kv_layer_specs = None
@@ -583,7 +587,6 @@ class _RegisteredRow(NamedTuple):
 
 _UID_ROW_REGISTRY_MAX = 4096
 _QWEN4_WIDE_PREFILL_STEP = 8192
-_QWEN4_WIDE_PREFILL_MIN_TOKENS = 2048 + _QWEN4_WIDE_PREFILL_STEP
 # Keyed by (id(model), uid): mlx-lm's BatchGenerator numbers uids per
 # instance starting at 0, so two engines serving concurrently (or an engine
 # reload) produce colliding uid sequences. The model object is the one
@@ -641,11 +644,12 @@ def _row_drifted(current_lps, expected_lps) -> bool:
     Two distinct empty lists are equivalent — the #1799 normalisation mints
     fresh ``[]`` objects every step — so only differing content counts. The
     caller's identity check is the steady-state fast path; this only runs
-    past it.
+    past it. mlx-lm stores each row as a tuple while the registry keeps a
+    list, so compare contents rather than container types.
     """
     if not current_lps and not expected_lps:
         return False
-    return current_lps != expected_lps
+    return tuple(current_lps) != tuple(expected_lps)
 
 
 def _log_drift_correction(uids, slot_count) -> None:
@@ -701,13 +705,6 @@ def _realigned_rows(model, uids, cur_samplers, cur_lps):
 
 def _omlx_realign_generation_batch_rows(self) -> None:
     """Realign positional row state with ``uids`` before any decode path reads it."""
-    if self.logits_processors is None:
-        self.logits_processors = []
-    else:
-        self.logits_processors = [
-            procs if procs is not None else [] for procs in self.logits_processors
-        ]
-
     uids = getattr(self, "uids", None) or []
     if not uids:
         return
@@ -782,22 +779,8 @@ def _patched_generation_batch_step(self):
         deltas = [model._uid_rope_deltas.get(uid, 0.0) for uid in self.uids]
         _bind_step_rope_deltas(model, mx.array(deltas), self.uids)
 
-    # Defensive: mlx-lm's GenerationBatch._step does `any(self.logits_processors)`
-    # and `for p in self.logits_processors[e]`, both of which crash when a row
-    # slot is None.  Normalise the whole list AND every per-row slot to [] here,
-    # at the single consumption chokepoint, so the original step and the
-    # grammar-accept loop below are both safe regardless of slot origin.
-    #
-    # The insert call sites already wrap each request's processors as a list,
-    # but that is not enough: on a heterogeneous continuous-batch merge,
-    # mlx-lm's GenerationBatch.extend() re-introduces None slots via
-    # `if not any(self.logits_processors): self.logits_processors =
-    # [None] * len(self.uids)`.  `any([[], []])` is False, so empty-list slots
-    # collapse back to None whenever a batch with no *active* processor merges
-    # with a grammar-constrained one (e.g. a plain chat request joining a batch
-    # that is serving a structured json_schema request).  Per-row normalisation
-    # at this chokepoint is the only place that covers both insert and merge.
-    # See #934 / #1747.
+    # Realign sampler/processor rows with uids before the original step and
+    # the grammar-accept loop read them by position.
     _omlx_realign_generation_batch_rows(self)
 
     # Must run after the realignment: it reads self.logits_processors[e] as
@@ -810,43 +793,6 @@ def _patched_generation_batch_step(self):
 
 GenerationBatch._omlx_realign_rows = _omlx_realign_generation_batch_rows
 GenerationBatch._step = _patched_generation_batch_step
-
-
-# ---------------------------------------------------------------------------
-# Monkey-patch GenerationBatch.filter to keep logits_processors aligned with
-# uids.  mlx-lm's filter only reindexes the processor list when at least one
-# row has an active processor:
-#
-#     if any(self.logits_processors):
-#         self.logits_processors = [self.logits_processors[idx] for idx in keep]
-#
-# There is no else branch (unlike the prompt-batch class, which resets to
-# ``[[]] * len(keep)``), so when every slot is empty — the normal state after
-# serving requests without per-request processors — the stale list survives
-# while uids/tokens shrink.  A later extend() then appends the next request's
-# processors BEHIND its own row index: the row reads a leftover empty slot and
-# the real processor (thinking budget, grammar constraint) is silently never
-# applied.  Which requests are affected depends on insertion/removal order,
-# and alignment self-heals once the broken request finishes, so the symptom
-# is an intermittently ignored thinking_budget or grammar.  See #934/#1747
-# for the sibling None-slot collapse handled in _patched_generation_batch_step.
-_original_generation_batch_filter = GenerationBatch.filter
-
-
-def _patched_generation_batch_filter(self, keep):
-    lps = self.logits_processors
-    lps_inert = not lps or not any(lps)
-    if lps is None:
-        # ``any(None)`` inside the original filter raises TypeError.
-        self.logits_processors = []
-    _original_generation_batch_filter(self, keep)
-    if lps_inert:
-        # Original filter skipped the reindex; reset to one empty slot per
-        # surviving row so extend() appends at the correct indices.
-        self.logits_processors = [[] for _ in keep]
-
-
-GenerationBatch.filter = _patched_generation_batch_filter
 
 
 _TQ_SINGLETON_CACHE_TYPE: type[Any] | None = None
@@ -1062,9 +1008,7 @@ def _patched_ppb_split(self, indices):
         new_batch.prefill_step_size = self.prefill_step_size
         new_batch.samplers = self.samplers
         new_batch.fallback_sampler = self.fallback_sampler
-        # Defensive: normalise None → [] to avoid mlx-lm crash in _step
-        lps = self.logits_processors if self.logits_processors is not None else []
-        new_batch.logits_processors = lps
+        new_batch.logits_processors = self.logits_processors
         new_batch.stop_sequences = self.stop_sequences
         new_batch.max_tokens = self.max_tokens
         if hasattr(self, "_omlx_glm_dsa_adaptive_prefill"):
@@ -1669,6 +1613,74 @@ def _expected_chunk_len(step_size: int, remaining: int, kv_total: int, boundary_
             next_n = min(next_n, delta)
     return max(1, next_n)
 
+
+def _glm5_next_prefill_floor() -> int:
+    """Return the wide-prefill floor for GLM-5.3 (0 when the host cannot use it).
+
+    Wider chunks require the native sparse MLA path. NAX hosts also need the
+    tensor-unit sparse MLA: its attention cost per query does not depend on
+    the chunk, so a wider chunk feeds the MoE more rows.
+    """
+    try:
+        from .custom_kernels.glm_moe_dsa import fast
+        from .custom_kernels.nax import is_nax_available
+        from .patches.glm_moe_dsa.sparse_mla_nax import nax_sparse_mla_available
+        from .settings import get_system_memory
+
+        if not fast.is_native_available() or not fast.has_symbol(
+            "glm_dsa_sparse_mla_attention"
+        ):
+            return 0
+        if get_system_memory() < 64 * 1024**3:
+            return 0
+        if not is_nax_available() or nax_sparse_mla_available():
+            return 4096
+    except Exception:
+        logger.debug("glm5_next prefill floor probe failed", exc_info=True)
+    return 0
+
+
+def _mimo_fused_full_attention() -> bool:
+    """True when MiMo's 192/128 full-attention layers run a fused kernel.
+
+    Stock mlx has no fused SDPA for these head dims; the fused route comes
+    from ``omlx.utils.fast_attention`` (native kernel when the installed mlx
+    supports the dims, else the tensor-unit kernel with padded heads).
+    """
+    try:
+        from .utils import fast_attention
+    except ImportError:
+        return False
+    try:
+        if fast_attention._native_mixed_dims_supported(192, 128):
+            return True
+        return bool(fast_attention._nax_available())
+    except Exception:
+        return False
+
+
+def _oversized_sorted_gather_ok() -> bool:
+    """True when a sorted gather_qmm above 32768 rows runs as one dispatch.
+
+    Stock mlx 0.32.2's sorted NAX kernel overflows past 32768 rows, so the
+    m5_gather_qmm reroute splits such calls into slices plus a copy unless
+    oMLX's JIT gather (m5_gather_qmm_nax) or the native NAX gather is there.
+    """
+    try:
+        from .patches import m5_gather_qmm_nax
+
+        if m5_gather_qmm_nax.enabled():
+            return True
+    except ImportError:
+        pass
+    try:
+        from .patches.m5_gather_qmm import _resolve_native_gather
+
+        return _resolve_native_gather() is not None
+    except Exception:
+        return False
+
+
 @dataclass
 class SchedulerConfig:
     """Configuration for the scheduler."""
@@ -1873,6 +1885,48 @@ class _BoundarySnapshotProvider:
                 staged_path.unlink()
             return False
 
+    @classmethod
+    def stage_and_commit(
+        cls,
+        *,
+        store: Any,
+        paged_ssd_manager: Any,
+        request_id: str,
+        token_count: int,
+        snapshot: list[dict[str, Any]],
+        source_block_hash: bytes,
+        layer_cache_types: list[str] | tuple[str, ...] | None,
+        layer_meta_states: list[Any] | None,
+        model_name: str,
+        block_size: int,
+    ) -> bool:
+        """Stage one extracted recurrent snapshot and promote it to a sidecar."""
+        if store is None or paged_ssd_manager is None:
+            return False
+        if not store.save(
+            request_id,
+            token_count,
+            snapshot,
+            lambda extracted: (extracted, None),
+            block_size=block_size,
+        ):
+            return False
+        provider = cls(
+            store=store,
+            request_id=request_id,
+            valid_tcs=[token_count],
+            in_memory_snapshots={},
+            paged_ssd_manager=paged_ssd_manager,
+        )
+        return provider.commit_gdn_checkpoint(
+            token_count,
+            source_block_hash,
+            layer_cache_types=list(layer_cache_types or []),
+            layer_meta_states=layer_meta_states,
+            model_name=model_name,
+            block_size=block_size,
+        )
+
 
 class Scheduler:
     """
@@ -1953,6 +2007,9 @@ class Scheduler:
         # prefill step changes cache-ON from one forward into multiple forwards.
         self._qwen35_prefill_floor = self._detect_qwen35_prefill_floor()
         self._qwen4_wide_prefill_step = self._detect_qwen4_wide_prefill_step()
+        self._qwen4_wide_first_chunk = bool(
+            self._qwen4_wide_prefill_step
+        ) and not self._qwen4_ple_gathers_ahead()
 
         # For strict RotatingKVCache reuse, align paged cache block size to
         # the model's rotating window size when paged cache is enabled.
@@ -2727,23 +2784,25 @@ class Scheduler:
                             "Async store_cache for %s raised: %s", request_id, exc
                         )
             try:
-                # Run batch_generator.remove on the inference thread.
-                try:
-                    _safe_sync_stream(self._stream)
-                    self._remove_uid_from_active_batch(uid)
-                    if hasattr(self.model, "unregister_rope_delta"):
-                        self.model.unregister_rope_delta(uid)
-                except Exception as e:
-                    logger.warning(
-                        "Deferred batch_generator.remove(uid=%s) failed: %s",
-                        uid,
-                        e,
-                    )
-                # Cleanup uid maps now that the slot is reclaimable.
-                _unregister_uid_row(self.model, uid)
-                if uid in self.uid_to_request_id:
+                # A batch generator reset drops this row and the next generator
+                # reuses uids from 0. Touch the uid only while this request owns it.
+                if self.uid_to_request_id.get(uid) == request_id:
+                    # Run batch_generator.remove on the inference thread.
+                    try:
+                        _safe_sync_stream(self._stream)
+                        self._remove_uid_from_active_batch(uid)
+                        if hasattr(self.model, "unregister_rope_delta"):
+                            self.model.unregister_rope_delta(uid)
+                    except Exception as e:
+                        logger.warning(
+                            "Deferred batch_generator.remove(uid=%s) failed: %s",
+                            uid,
+                            e,
+                        )
+                    # Cleanup uid maps now that the slot is reclaimable.
+                    _unregister_uid_row(self.model, uid)
                     del self.uid_to_request_id[uid]
-                if request_id in self.request_id_to_uid:
+                if self.request_id_to_uid.get(request_id) == uid:
                     del self.request_id_to_uid[request_id]
                 self._inflight_store_futures.pop(request_id, None)
                 self._inflight_store_info.pop(request_id, None)
@@ -2883,6 +2942,10 @@ class Scheduler:
     # cached prefixes floor to 2048-token multiples instead of 512.
     _POOLING_ROTATING_BLOCK_SIZE = 2048
 
+    # MiMo prefill chunk (and, with the prefix cache on, paged-cache block) on
+    # NAX hosts with at least 128 GB; other large hosts keep 4096.
+    _MIMO_NAX_PREFILL_FLOOR = 8192
+
     def _is_mimo_hybrid(self) -> bool:
         """MiMo hybrid MoE (standard softmax attn + rotating KV).
 
@@ -2943,6 +3006,12 @@ class Scheduler:
             # them for a measured ~+34% MoE prefill throughput on
             # M3 Ultra. 2048 is a multiple of the 128 window.
             lo = hi = self._POOLING_ROTATING_BLOCK_SIZE
+            # With the cache on every chunk is clamped to the next block
+            # boundary, so a wider prefill floor (MiMo on 128 GB+ hosts)
+            # only takes effect if the block grows with it.
+            floor = int(getattr(self, "_qwen35_prefill_floor", 0) or 0)
+            if floor > hi and floor % window_size == 0:
+                lo = hi = floor
 
         if window_size >= hi or window_size >= lo:
             target_block_size = window_size
@@ -2988,28 +3057,44 @@ class Scheduler:
                     "qwen4_qsa_sparse_gqa_attention"
                 ):
                     return 0
-            # Wider GLM chunks require the native sparse MLA path.
-            is_glm5_next = model_type.startswith("glm5_next")
-            if is_glm5_next:
-                from .custom_kernels.glm_moe_dsa import fast
-
-                if not fast.is_native_available() or not fast.has_symbol(
-                    "glm_dsa_sparse_mla_attention"
-                ):
-                    return 0
-            if is_qwen35 or is_qwen4 or is_glm5_next:
+            if model_type.startswith("glm5_next"):
+                return _glm5_next_prefill_floor()
+            if is_qwen35 or is_qwen4:
                 from .custom_kernels.nax import is_nax_available
                 from .settings import get_system_memory
 
-                if get_system_memory() >= 64 * 1024**3 and not is_nax_available():
-                    # Keep the default chunk size on NAX hosts.
+                if get_system_memory() < 64 * 1024**3:
+                    return 0
+                # NAX hosts keep the default chunk.
+                if not is_nax_available():
+                    return 4096
+            if self._is_mimo_hybrid():
+                from .custom_kernels.nax import is_nax_available
+                from .settings import get_system_memory
+
+                # MiMo's top-8-of-256 routing leaves ~64 rows per expert at a
+                # 2048-token chunk; 4096 fills the gather_qmm tiles better and
+                # the doubled activation footprint is small next to the model
+                # on hosts with this much memory. Only with fused full
+                # attention: otherwise its 9 full-attention layers (192/128
+                # head dims) materialise [heads, chunk, context] scores and
+                # the wider chunk is slower. On NAX GPUs 8192 (~256 rows per
+                # expert) lifts the expert GEMMs further when the >32768-row
+                # sorted gather runs as one dispatch (the fused attention's
+                # causal work is the same in any chunking).
+                if (
+                    get_system_memory() >= 128 * 1024**3
+                    and _mimo_fused_full_attention()
+                ):
+                    if is_nax_available() and _oversized_sorted_gather_ok():
+                        return self._MIMO_NAX_PREFILL_FLOOR
                     return 4096
         except Exception:
             logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)
         return 0
 
     def _detect_qwen4_wide_prefill_step(self) -> int:
-        """Return the step used after the first chunk of long Qwen4-Exp prompts."""
+        """Return the wide Qwen4-Exp prefill step (0 when the host cannot use it)."""
         try:
             model_type = str(getattr(self.model, "model_type", "") or "")
             if not model_type:
@@ -3032,6 +3117,24 @@ class Scheduler:
         except Exception:
             logger.debug("qwen4 wide prefill probe failed", exc_info=True)
         return 0
+
+    def _qwen4_ple_gathers_ahead(self) -> bool:
+        """True when SSD-backed PLE rows are gathered one prefill chunk ahead.
+
+        Only then does a narrow first chunk buy anything: it lets the gather
+        of the next chunk overlap GPU work. Models without a probe count as
+        gathering ahead.
+        """
+        if getattr(self.model, "prefetch_ple", None) is None:
+            return False
+        probe = getattr(self.model, "ple_gathers_ahead", None)
+        if probe is None:
+            return True
+        try:
+            return bool(probe())
+        except Exception:
+            logger.debug("qwen4 PLE gather-ahead probe failed", exc_info=True)
+            return True
 
     # Default block size for ArraysCache-only hybrid models. Raise the effective
     # target to the configured/model-specific prefill step so cache ON/OFF use
@@ -5852,15 +5955,13 @@ class Scheduler:
             if floor and size < floor:
                 size = floor
             wide = getattr(self, "_qwen4_wide_prefill_step", 0)
-            if (
-                wide
-                and processed_tokens > 0
-                and processed_tokens + remaining_tokens
-                >= _QWEN4_WIDE_PREFILL_MIN_TOKENS
+            if wide and (
+                processed_tokens > 0 or getattr(self, "_qwen4_wide_first_chunk", False)
             ):
-                # Wide steps feed the expert GEMMs more rows per expert. The
-                # first chunk stays narrow so the SSD n-gram gather for the
-                # next chunk overlaps GPU work.
+                # Wide steps feed the expert GEMMs more rows per expert. With
+                # SSD-backed PLE the first chunk stays narrow so the n-gram
+                # gather for the next chunk overlaps GPU work; resident PLE has
+                # nothing to overlap, so the first chunk is wide too.
                 size = max(size, wide)
                 if getattr(self, "block_aware_cache", None) is None:
                     # No block clamp runs; end on the grid that cache-ON uses.
@@ -6835,12 +6936,8 @@ class Scheduler:
         self, sampling_params: SamplingParams, request: Any = None
     ) -> tuple[Callable[[mx.array], mx.array], list[Callable]]:
         """Build per-request sampler and logits processors."""
-        # Use omlx.utils.sampling.make_sampler instead of mlx_lm.sample_utils.
-        # The mlx-lm version decorates categorical_sampling and apply_* with
-        # @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state),
-        # which fails to advance the RNG state after the first call in this
-        # server environment. Identical prompts then produce identical output
-        # even at temperature > 1.
+        # omlx.utils.sampling.make_sampler carries the fused top-p/top-k and
+        # MTP acceptance metadata that mlx_lm.sample_utils does not.
         sampler = omlx_make_sampler(
             temp=sampling_params.temperature,
             top_p=sampling_params.top_p,
@@ -6879,9 +6976,16 @@ class Scheduler:
         if suppress_processor is not None:
             logits_processors.append(suppress_processor)
 
-        # Add thinking budget processor for reasoning models
+        # Bare grammars constrain the answer from its first token. Forcing a
+        # thinking close into them can leave every logit masked to -inf. Only
+        # grammars compiled with a separate reasoning phase can use a budget.
+        grammar_allows_thinking = sampling_params.compiled_grammar is None or (
+            getattr(sampling_params.compiled_grammar, "_omlx_has_thinking_phase", False)
+            is True
+        )
         if (
-            sampling_params.thinking_budget is not None
+            grammar_allows_thinking
+            and sampling_params.thinking_budget is not None
             and request is not None
             and (
                 getattr(request, "needs_think_prefix", False)
@@ -6916,9 +7020,8 @@ class Scheduler:
                 logits_processors.append(processor)
 
         # Add grammar constraint processor for structured output.
-        # Phase awareness (thinking vs output) is handled by the compiled
-        # grammar itself via xgrammar structural tags, so we don't need
-        # think_end_ids here.
+        # Reasoning-aware grammars handle thinking/output phases through
+        # structural tags; bare grammars constrain output immediately.
         if sampling_params.compiled_grammar is not None:
             try:
                 from .api.grammar import GrammarConstraintProcessor
@@ -10853,6 +10956,7 @@ class Scheduler:
         # failed_ids excludes _inflight_store_futures ids, so snapshots the
         # async store worker still reads are left intact.
         for rid in failed_ids:
+            self._cleanup_specprefill(rid)
             self._drop_boundary_snapshots_for_request(rid)
             self._release_paged_cache_for_request(rid)
         # Reset batch generator only (cache is not corrupted). Every row dies
@@ -11521,6 +11625,8 @@ class Scheduler:
                 request.cached_tokens = 0
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
+                # Indices were scored against the rejected cache's cached_tokens.
+                request.specprefill_indices = None
 
             # SpecPrefill requests must be alone in the batch (RoPE patching
             # affects the entire model). Also block scheduling if another
@@ -12062,16 +12168,6 @@ class Scheduler:
             # Insert into BatchGenerator with pre-filled cache + last token.
             # BatchGenerator only handles decode from here.
             #
-            # IMPORTANT: ``logits_processors`` MUST be passed as a per-row
-            # list (possibly empty), never None.  mlx-lm's
-            # GenerationBatch._step does ``for p in self.logits_processors[e]``
-            # in any branch where ``any(self.logits_processors)`` is True
-            # (e.g., heterogeneous merge with another row that has a
-            # processor).  A None slot crashes that loop with
-            # ``TypeError: 'NoneType' object is not iterable``, which then
-            # bubbles into the engine retry loop and presents as a hang.
-            # See vllm-mlx-patched commit 8d4052b for the same root cause
-            # in a sibling project, and #934 for the user-visible symptom.
             per_row_lps = list(logits_processors) if logits_processors else []
             # insert() merges the prompt cache into the batch KV caches with
             # lazy ops; keep them on the engine stream so the next decode
@@ -13002,6 +13098,10 @@ class Scheduler:
             self._boundary_snapshot_store.cleanup_all()
         self._boundary_snapshot_required = None
 
+        active_specprefill = self._specprefill_active_request_id
+        if active_specprefill is not None:
+            self._cleanup_specprefill(active_specprefill)
+
         # Clear stale VLM position state to prevent re-corruption on retry
         if hasattr(self.model, "clear_vlm_position_state"):
             self.model.clear_vlm_position_state()
@@ -13080,6 +13180,8 @@ class Scheduler:
         request._extracted_cache = None
         request._model_cache_config = None
         request.think_prefix_sent = False
+        # Indices were scored against the pre-reset cached_tokens.
+        request.specprefill_indices = None
 
     def _collect_corruption_retry_requests(self) -> list[Request]:
         """Every live request that must be re-prefilled after a cache reset.
@@ -15084,6 +15186,7 @@ class Scheduler:
                     layer_cache_types,
                     turboquant_kv_bits=turboquant_kv_bits,
                     cachelist_subtypes=cachelist_subtypes,
+                    numerics=numerics_revision_for_model(self.model),
                 )
             else:
                 manager.adopt_layer_signature_if_unset(layer_cache_types)
@@ -15230,6 +15333,15 @@ class Scheduler:
                             dequantization_counter=lambda: (
                                 self._boundary_snapshot_store.gdn_state_dequantizations
                             ),
+                        )
+                        boundary_store = self._boundary_snapshot_store
+                        paged_ssd_manager = self.paged_ssd_cache_manager
+                        self.block_aware_cache.set_exact_gdn_checkpoint_writer(
+                            lambda **kwargs: _BoundarySnapshotProvider.stage_and_commit(
+                                store=boundary_store,
+                                paged_ssd_manager=paged_ssd_manager,
+                                **kwargs,
+                            )
                         )
                 except Exception as e:
                     logger.debug(

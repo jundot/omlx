@@ -12,8 +12,6 @@
     "port": 8964,
     "api_key": "sk-omlx-EXAMPLE-KEY-REDACTED",
     "cli_prefix": "/Applications/oMLX.app/Contents/MacOS/omlx-cli",
-    "claude_code_context_scaling_enabled": false,
-    "claude_code_target_context_size": 200000,
     "engines": {
         "mlx-lm": {
             "name": "mlx-lm",
