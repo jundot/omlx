@@ -55,6 +55,7 @@
   "navbar.logout": "로그아웃",
   "navbar.update_available": "업데이트 가능: v{version}",
   "navbar.go_to_github": "GitHub으로 이동",
+  "navbar.copy_version": "버전 복사",
   "status.section_label": "대시보드",
   "status.heading": "서빙 통계",
   "status.layout.customize": "Customize dashboard",

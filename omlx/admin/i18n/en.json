@@ -55,6 +55,7 @@
   "navbar.logout": "Logout",
   "navbar.update_available": "Update available: v{version}",
   "navbar.go_to_github": "Go to GitHub",
+  "navbar.copy_version": "Copy version",
   "status.section_label": "Dashboard",
   "status.heading": "Serving Stats",
   "status.layout.customize": "Customize dashboard",

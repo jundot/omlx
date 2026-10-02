@@ -55,6 +55,7 @@
   "navbar.logout": "ログアウト",
   "navbar.update_available": "アップデートあり: v{version}",
   "navbar.go_to_github": "GitHubへ移動",
+  "navbar.copy_version": "バージョンをコピー",
   "status.section_label": "ダッシュボード",
   "status.heading": "配信統計",
   "status.layout.customize": "Customize dashboard",
