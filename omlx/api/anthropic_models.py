@@ -200,6 +200,12 @@ class MessagesRequest(BaseModel):
     thinking: ThinkingConfig | None = None
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: dict[str, Any] | None = None
+    # SpecPrefill: per-request enable/disable (None = use model setting)
+    specprefill: bool | None = None
+    # SpecPrefill: per-request keep percentage (0.1-0.5, None = use model setting)
+    specprefill_keep_pct: float | None = None
+    # SpecPrefill: per-request threshold override (min tokens to trigger, None = use model setting)
+    specprefill_threshold: int | None = None
 
 
 # =============================================================================
