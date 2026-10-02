@@ -27,7 +27,10 @@ OMLX_QWEN35_MOE_COMBINE_FUSED=0 keeps the composed ops.
 one launch for the fused routed decode: one simdgroup reproduces MLX's
 single-row block softmax (its per-simdgroup partial maxima and sums and
 their order) and then selects exactly as ``fused_router_topk`` does, so
-indices and scores are bit-identical to the two launches.
+indices and scores are bit-identical to the two launches. The bf16
+selection packs each probability with its expert index into one integer
+key and keeps each lane's three largest keys at hand, so a selection is one
+simd_max; ``TOPK_HEADER`` exports it for launches that fold the routing in.
 ``softmax_topk_rows`` runs that source verbatim for each row of a verify
 window in one launch. OMLX_QWEN35_MOE_ROUTER_SOFTMAX_FOLD=0 keeps the two
 launches.
@@ -36,9 +39,10 @@ launches.
 one-row gemv arithmetic (per-lane column order, shuffle-down tree) but one
 simdgroup per expert instead of MLX's four experts per simdgroup on 32
 threadgroups, so the logits are bit-identical and the 2.6 MB weight read
-spreads over the whole GPU. A verify window's rows share one launch, each
-simdgroup reading its weight row once for all of them, each row keeping the
-one-row arithmetic. OMLX_QWEN35_MOE_ROUTER_GEMV=0 keeps ``nn.Linear``.
+spreads over the whole GPU. A verify window's rows share one launch with
+one simdgroup per (expert, row), each row keeping the one-row arithmetic;
+the simdgroups of one expert are adjacent, so its weight row is fetched
+once. OMLX_QWEN35_MOE_ROUTER_GEMV=0 keeps ``nn.Linear``.
 """
 
 from __future__ import annotations
@@ -111,54 +115,191 @@ METAL_FUNC void omlx_router_softmax_row(
 }
 """
 
-# fused_router_topk's selection and renormalization over those values. A
+# fused_router_topk's selection and renormalization over those values, for
+# lane ``lane`` of one simdgroup. Selection j is the j-th largest
+# (probability, expert) pair: equal probabilities resolve to the highest
+# index, as in the per-row launch. ``nth(logits, lane, n)`` is the expert of
+# selection n alone (every lane returns it), ``write<K>`` stores the top K
+# and their renormalized scores.
+#
+# The generic scan (the FP32 test instantiations) is the per-row launch's: a
 # lane's values ascend in expert index, so ">=" keeps the highest index of
-# equal values in the lane and simd_max(index) the highest across lanes:
-# ties resolve to the highest index exactly as in the per-row launch.
-_SOFTMAX_TOPK_SOURCE = """
-    constexpr uint PER = uint(NE) / 32;
-    const uint lane = thread_position_in_threadgroup.x;
+# equal values in the lane and simd_max(index) the highest across lanes. For
+# bf16 the values are bf16 probabilities in [+0, 1] or NaN (never selected),
+# so each packs into a unique key ((bf16 bits + 1) << 16) | expert, 0 for
+# NaN, whose order is that selection order. Each lane keeps its three
+# largest remaining keys, so a selection is one simd_max over the lanes'
+# largest; the selected lane moves on and rescans its keys once its three
+# are used. Key 0 stands for the per-row launch's -inf / NE when nothing is
+# left.
+_TOPK_SELECT_HEADER = _SOFTMAX_ROW_HEADER + """
+template <typename T, int NE>
+struct omlx_router_topk {
+  enum : uint { PER = uint(NE) / 32 };
+
+  static METAL_FUNC void select(
+      thread const float* vals, thread bool* taken, uint lane, thread float& p, thread uint& i) {
+    float best = -INFINITY;
+    uint best_i = uint(NE);
+    uint best_k = 0;
+    for (uint k = 0; k < PER; ++k) {
+      if (!taken[k] && vals[k] >= best) {
+        best = vals[k];
+        best_i = ((k / 4) * 32 + lane) * 4 + (k % 4);
+        best_k = k;
+      }
+    }
+    float gbest = simd_max(best);
+    uint cand = (best == gbest) ? best_i : 0u;
+    uint gbest_i = simd_max(cand);
+    if (best == gbest && best_i == gbest_i) {
+      taken[best_k] = true;
+    }
+    p = gbest;
+    i = gbest_i;
+  }
+
+  static METAL_FUNC uint nth(const device T* logits, uint lane, int n) {
     float vals[PER];
     omlx_router_softmax_row<T, NE>(logits, lane, vals);
-
     bool taken[PER];
     for (uint k = 0; k < PER; ++k) {
-        taken[k] = false;
+      taken[k] = false;
+    }
+    float p;
+    uint i = uint(NE);
+    for (int j = 0; j <= n; ++j) {
+      select(vals, taken, lane, p, i);
+    }
+    return i;
+  }
+
+  template <int K>
+  static METAL_FUNC void write(
+      const device T* logits, uint lane, device uint32_t* indices, device T* scores) {
+    float vals[PER];
+    omlx_router_softmax_row<T, NE>(logits, lane, vals);
+    bool taken[PER];
+    for (uint k = 0; k < PER; ++k) {
+      taken[k] = false;
     }
     float sel_p[K];
     uint sel_i[K];
-    for (uint j = 0; j < K; ++j) {
-        float best = -INFINITY;
-        uint best_i = uint(NE);
-        uint best_k = 0;
-        for (uint k = 0; k < PER; ++k) {
-            if (!taken[k] && vals[k] >= best) {
-                best = vals[k];
-                best_i = ((k / 4) * 32 + lane) * 4 + (k % 4);
-                best_k = k;
-            }
-        }
-        float gbest = simd_max(best);
-        uint cand = (best == gbest) ? best_i : 0u;
-        uint gbest_i = simd_max(cand);
-        if (best == gbest && best_i == gbest_i) {
-            taken[best_k] = true;
-        }
-        sel_p[j] = gbest;
-        sel_i[j] = gbest_i;
+    for (int j = 0; j < K; ++j) {
+      select(vals, taken, lane, sel_p[j], sel_i[j]);
     }
+    omlx_router_topk_store<T, K>(sel_p, sel_i, lane, indices, scores);
+  }
+};
 
-    if (lane == 0) {
-        float total = 0.0f;
-        for (uint j = 0; j < K; ++j) {
-            total += sel_p[j];
-        }
-        float inv = 1.0f / total;
-        for (uint j = 0; j < K; ++j) {
-            indices[j] = sel_i[j];
-            scores[j] = T(sel_p[j] * inv);
-        }
+template <int NE>
+struct omlx_router_topk<bfloat16_t, NE> {
+  enum : uint { PER = uint(NE) / 32 };
+
+  static METAL_FUNC void keys(const device bfloat16_t* logits, uint lane, thread uint* key) {
+    float vals[PER];
+    omlx_router_softmax_row<bfloat16_t, NE>(logits, lane, vals);
+    for (uint k = 0; k < PER; ++k) {
+      const uint expert = ((k / 4) * 32 + lane) * 4 + (k % 4);
+      key[k] = metal::isnan(vals[k])
+          ? 0u
+          : ((((as_type<uint>(vals[k]) >> 16) + 1u) << 16) | expert);
     }
+  }
+
+  // The lane's three largest keys below ``below`` in descending order (0:
+  // none left).
+  static METAL_FUNC void top3(thread const uint* key, uint below, thread uint* head) {
+    uint a = 0u, b = 0u, c = 0u;
+    for (uint k = 0; k < PER; ++k) {
+      const uint v = key[k] < below ? key[k] : 0u;
+      const bool ga = v > a, gb = v > b, gc = v > c;
+      c = gb ? b : (gc ? v : c);
+      b = ga ? a : (gb ? v : b);
+      a = ga ? v : a;
+    }
+    head[0] = a;
+    head[1] = b;
+    head[2] = c;
+  }
+
+  // The next selection's key: the largest lane head. Its lane moves to its
+  // next key, refilling its heads below the selection once all three are
+  // taken.
+  static METAL_FUNC uint step(thread const uint* key, thread uint* head, thread int& left) {
+    const uint sel = simd_max(head[0]);
+    if (sel != 0u && head[0] == sel) {
+      head[0] = head[1];
+      head[1] = head[2];
+      head[2] = 0u;
+      if (--left == 0) {
+        top3(key, sel, head);
+        left = 3;
+      }
+    }
+    return sel;
+  }
+
+  static METAL_FUNC uint nth(const device bfloat16_t* logits, uint lane, int n) {
+    uint key[PER];
+    keys(logits, lane, key);
+    uint head[3];
+    top3(key, 0xffffffffu, head);
+    int left = 3;
+    uint sel = 0u;
+    for (int j = 0; j <= n; ++j) {
+      sel = step(key, head, left);
+    }
+    return sel == 0u ? uint(NE) : (sel & 0xffffu);
+  }
+
+  template <int K>
+  static METAL_FUNC void write(
+      const device bfloat16_t* logits, uint lane, device uint32_t* indices,
+      device bfloat16_t* scores) {
+    uint key[PER];
+    keys(logits, lane, key);
+    uint head[3];
+    top3(key, 0xffffffffu, head);
+    int left = 3;
+    float sel_p[K];
+    uint sel_i[K];
+    for (int j = 0; j < K; ++j) {
+      const uint sel = step(key, head, left);
+      sel_p[j] = sel == 0u ? -INFINITY : as_type<float>(((sel >> 16) - 1u) << 16);
+      sel_i[j] = sel == 0u ? uint(NE) : (sel & 0xffffu);
+    }
+    omlx_router_topk_store<bfloat16_t, K>(sel_p, sel_i, lane, indices, scores);
+  }
+};
+"""
+
+# Lane 0 renormalizes the selection over its own sum and stores it.
+_TOPK_STORE_HEADER = """
+template <typename T, int K>
+METAL_FUNC void omlx_router_topk_store(
+    thread const float* sel_p, thread const uint* sel_i, uint lane,
+    device uint32_t* indices, device T* scores) {
+  if (lane == 0) {
+    float total = 0.0f;
+    for (uint j = 0; j < K; ++j) {
+      total += sel_p[j];
+    }
+    float inv = 1.0f / total;
+    for (uint j = 0; j < K; ++j) {
+      indices[j] = sel_i[j];
+      scores[j] = T(sel_p[j] * inv);
+    }
+  }
+}
+"""
+
+# Headers for kernels selecting experts (qwen35_moe_routed_decode reuses it).
+TOPK_HEADER = _TOPK_STORE_HEADER + _TOPK_SELECT_HEADER
+
+_SOFTMAX_TOPK_SOURCE = """
+    const uint lane = thread_position_in_threadgroup.x;
+    omlx_router_topk<T, NE>::template write<K>(logits, lane, indices, scores);
 """
 
 _SOURCE = """
@@ -262,7 +403,6 @@ def fused_router_topk(probs, top_k: int):
 
 _GEMV_DISABLED = os.environ.get("OMLX_QWEN35_MOE_ROUTER_GEMV", "1") == "0"
 _GEMV_KERNEL = None
-_GEMV_ROWS = 1  # rows per simdgroup
 _GEMV_SIMDGROUPS = 4
 
 # MLX 0.32.2 gemv for ``x @ W.T`` with W [N, K] row-major (the kernel MLX
@@ -303,66 +443,23 @@ METAL_FUNC void omlx_router_gemv_rows(
 }
 """
 
+# One simdgroup per (expert, row): simdgroup s computes expert s / M of row
+# s % M with the one-row arithmetic, so an M-row window (a verify window)
+# has M times the simdgroups of one row and every row keeps its bits. The
+# M simdgroups of one expert are adjacent and share its weight row through
+# the cache.
 _GEMV_SOURCE = """
     const uint lane = thread_index_in_simdgroup;
-    const int row0 = (int(threadgroup_position_in_grid.y) * NSG +
-                      int(simdgroup_index_in_threadgroup)) * R;
-    float result[R];
-    omlx_router_gemv_rows<T, K, R>(w + size_t(row0) * K, x, lane, result);
+    const int s = int(threadgroup_position_in_grid.y) * NSG +
+                  int(simdgroup_index_in_threadgroup);
+    const int expert = s / M;
+    const int m = s % M;
+    float result[1];
+    omlx_router_gemv_rows<T, K, 1>(w + size_t(expert) * K, x + m * K, lane, result);
     if (lane == 0) {
-      for (int r = 0; r < R; r++) {
-        y[row0 + r] = static_cast<T>(result[r]);
-      }
+      y[m * N + expert] = static_cast<T>(result[0]);
     }
 """
-
-# The same per-row arithmetic for M rows (a verify window): each simdgroup
-# loads its weight row once per column block and accumulates every row's
-# products into that row's own sum in the order of omlx_router_gemv_rows.
-_GEMV_WINDOW_HEADER = """
-template <typename T, int K, int M>
-METAL_FUNC void omlx_router_gemv_window(
-    const device T* mat, const device T* x, uint lane, thread float* result) {
-  for (int m = 0; m < M; m++) {
-    result[m] = 0;
-  }
-  for (int i = 0; i < K / 128; i++) {
-    const int bn = int(lane) * 4 + i * 128;
-    T inter[4];
-    for (int tn = 0; tn < 4; tn++) {
-      inter[tn] = mat[bn + tn];
-    }
-    for (int m = 0; m < M; m++) {
-      float v_coeff[4];
-      for (int tn = 0; tn < 4; tn++) {
-        v_coeff[tn] = static_cast<float>(x[m * K + bn + tn]);
-      }
-      for (int tn = 0; tn < 4; tn++) {
-        result[m] += inter[tn] * v_coeff[tn];
-      }
-    }
-  }
-  for (int m = 0; m < M; m++) {
-    for (ushort sn = 16; sn >= 1; sn >>= 1) {
-      result[m] += simd_shuffle_down(result[m], sn);
-    }
-  }
-}
-"""
-
-_GEMV_WINDOW_SOURCE = """
-    const uint lane = thread_index_in_simdgroup;
-    const int row0 = int(threadgroup_position_in_grid.y) * NSG +
-                     int(simdgroup_index_in_threadgroup);
-    float result[M];
-    omlx_router_gemv_window<T, K, M>(w + size_t(row0) * K, x, lane, result);
-    if (lane == 0) {
-      for (int m = 0; m < M; m++) {
-        y[m * N + row0] = static_cast<T>(result[m]);
-      }
-    }
-"""
-_GEMV_WINDOW_KERNEL = None
 
 
 def router_gemv(weight):
@@ -380,45 +477,21 @@ def router_gemv(weight):
     if _GEMV_DISABLED or weight.ndim != 2 or weight.dtype != mx.bfloat16:
         return None
     n, k = weight.shape
-    if not 64 < k < 16 * n or k % 128 or n % (_GEMV_ROWS * _GEMV_SIMDGROUPS):
+    if not 64 < k < 16 * n or k % 128 or n % _GEMV_SIMDGROUPS:
         return None
     if _GEMV_KERNEL is None:
         _GEMV_KERNEL = mx.fast.metal_kernel(
-            name="omlx_qwen35_moe_router_gemv_row",
+            name="omlx_qwen35_moe_router_gemv",
             input_names=["x", "w"],
             output_names=["y"],
             header=_GEMV_ROWS_HEADER,
             source=_GEMV_SOURCE,
         )
     kernel = _GEMV_KERNEL
-    template = [("T", mx.bfloat16), ("K", k), ("R", _GEMV_ROWS), ("NSG", _GEMV_SIMDGROUPS)]
-    grid = (32, n // _GEMV_ROWS, 1)
-    threadgroup = (32, _GEMV_SIMDGROUPS, 1)
 
     def launch(x):
         rows = x.size // k
-        if rows > 1:
-            return launch_window(x, rows)
         return kernel(
-            inputs=[x, weight],
-            template=template,
-            grid=grid,
-            threadgroup=threadgroup,
-            output_shapes=[(*x.shape[:-1], n)],
-            output_dtypes=[mx.bfloat16],
-        )[0]
-
-    def launch_window(x, rows):
-        global _GEMV_WINDOW_KERNEL
-        if _GEMV_WINDOW_KERNEL is None:
-            _GEMV_WINDOW_KERNEL = mx.fast.metal_kernel(
-                name="omlx_qwen35_moe_router_gemv_window",
-                input_names=["x", "w"],
-                output_names=["y"],
-                header=_GEMV_WINDOW_HEADER,
-                source=_GEMV_WINDOW_SOURCE,
-            )
-        return _GEMV_WINDOW_KERNEL(
             inputs=[x, weight],
             template=[
                 ("T", mx.bfloat16),
@@ -427,7 +500,7 @@ def router_gemv(weight):
                 ("M", rows),
                 ("NSG", _GEMV_SIMDGROUPS),
             ],
-            grid=(32, n, 1),
+            grid=(32, n * rows, 1),
             threadgroup=(32, _GEMV_SIMDGROUPS, 1),
             output_shapes=[(*x.shape[:-1], n)],
             output_dtypes=[mx.bfloat16],
@@ -444,30 +517,38 @@ def router_logits_row(x, weight):
     return None if launch is None else launch(x)
 
 
+def softmax_topk_eligible(logits) -> bool:
+    """Whether ``softmax_topk_rows`` reproduces the routing of ``logits``
+    ([..., NE], 1..``_MAX_ROWS`` rows), so a launch may run its source:
+    bf16 rows of MLX's single-row block softmax with whole simdgroups (NE %
+    128 == 0, NE <= 4096), unless OMLX_QWEN35_MOE_ROUTER_SOFTMAX_FOLD=0."""
+    ne = logits.shape[-1]
+    return (
+        not _SOFTMAX_FOLD_DISABLED
+        and logits.size // ne <= _MAX_ROWS
+        and ne % 128 == 0
+        and ne <= 4096
+        and logits.dtype == mx.bfloat16
+    )
+
+
 def softmax_topk_row(logits, top_k: int):
     """``fused_router_topk(mx.softmax(logits, axis=-1, precise=True), top_k)``
     for one bf16 row of gate logits, in one launch.
 
-    Returns None outside the layout this reproduces (MLX's single-row block
-    softmax with whole simdgroups: NE % 128 == 0, NE <= 4096) or when
-    OMLX_QWEN35_MOE_ROUTER_SOFTMAX_FOLD=0.
+    Returns None outside the layout this reproduces
+    (``softmax_topk_eligible``) or for more than one row.
     """
     global _SOFTMAX_TOPK_KERNEL
     ne = logits.shape[-1]
-    if (
-        _SOFTMAX_FOLD_DISABLED
-        or logits.size != ne
-        or ne % 128
-        or ne > 4096
-        or logits.dtype != mx.bfloat16
-    ):
+    if logits.size != ne or not softmax_topk_eligible(logits):
         return None
     if _SOFTMAX_TOPK_KERNEL is None:
         _SOFTMAX_TOPK_KERNEL = mx.fast.metal_kernel(
             name="omlx_qwen35_moe_router_softmax_topk_row",
             input_names=["logits"],
             output_names=["indices", "scores"],
-            header=_SOFTMAX_ROW_HEADER,
+            header=TOPK_HEADER,
             source=_SOFTMAX_TOPK_SOURCE,
         )
     lead = logits.shape[:-1]
@@ -512,20 +593,14 @@ def softmax_topk_rows(logits, top_k: int):
     rows = logits.size // ne
     if rows == 1:
         return softmax_topk_row(logits, top_k)
-    if (
-        _SOFTMAX_FOLD_DISABLED
-        or rows > _MAX_ROWS
-        or ne % 128
-        or ne > 4096
-        or logits.dtype != mx.bfloat16
-    ):
+    if not softmax_topk_eligible(logits):
         return None
     if _SOFTMAX_TOPK_ROWS_KERNEL is None:
         _SOFTMAX_TOPK_ROWS_KERNEL = mx.fast.metal_kernel(
             name="omlx_qwen35_moe_router_softmax_topk_rows",
             input_names=["logits"],
             output_names=["indices", "scores"],
-            header=_SOFTMAX_ROW_HEADER,
+            header=TOPK_HEADER,
             source=_SOFTMAX_TOPK_ROWS_SOURCE,
         )
     lead = logits.shape[:-1]
