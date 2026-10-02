@@ -943,7 +943,7 @@ def _capture_deferred_history(host, inputs, hidden, cache):
         paired_tokens = inputs
     if paired_tokens.shape[1]:
         ctx.deferred_pairs.append((paired_hidden, paired_tokens))
-    ctx.pending_hidden = hidden[:, -1:]
+    ctx.pending_hidden = hidden[:, -1:] + 0
     ctx.expected_offset = after
     return True
 
@@ -1084,7 +1084,7 @@ def _capture_single(
         pairs_tokens = inputs
     else:
         if seq_len <= 1:
-            ctx.pending_hidden = normed[:, -1:]
+            ctx.pending_hidden = normed[:, -1:] + 0
             ctx.expected_offset = offset_after
             return
         pairs_hidden = normed[:, :-1]
@@ -1097,7 +1097,8 @@ def _capture_single(
     host.mtp_forward(pairs_hidden, pairs_tokens, ctx.mtp_cache, logits_keep=1)
     ctx.folded += int(pairs_tokens.shape[1])
     ctx.folded_this_request += int(pairs_tokens.shape[1])
-    ctx.pending_hidden = normed[:, -1:]
+    # An evaluated slice still owns the full chunk's backing allocation.
+    ctx.pending_hidden = normed[:, -1:] + 0
     ctx.expected_offset = offset_after
     _capture_boundary_candidate(
         ctx,
