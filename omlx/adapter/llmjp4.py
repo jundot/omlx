@@ -123,14 +123,37 @@ def _classify_header(header: str) -> tuple[str, str | None]:
     return "text", None
 
 
-def _looks_like_header(text: str) -> bool:
-    """Return True for a header cut off before ``<|message|>``."""
-    return (
-        _CHANNEL in text
-        or _CONSTRAIN in text
-        or _RECIPIENT_RE.search(text) is not None
-        or text.strip() in ("", "assistant")
-    )
+_HEADER_WORDS = ("assistant", "functions.", "to=", *_OTHER_ROLES, *_CHANNEL_NAMES)
+
+
+def _is_header_word(word: str, *, partial: bool = False) -> bool:
+    """A role, recipient, or channel word; with ``partial``, also a prefix."""
+    if word.startswith(("functions.", "to=")) or word in _HEADER_WORDS:
+        return True
+    return partial and any(known.startswith(word) for known in _HEADER_WORDS)
+
+
+def _looks_like_header(text: str, *, after_marker: bool, opened: bool) -> bool:
+    """Return True for a header cut off before ``<|message|>``.
+
+    Headers are ``ROLE [to=RECIPIENT] [CHANNEL]``. Fine-tunes sometimes
+    write the channel as a bare word, or omit ``<|start|>`` after an end
+    marker. EOS or ``max_tokens`` can end the output inside a header, even
+    mid-word (``assistant anal``). A partial word counts only after
+    ``<|start|>`` or a full header word, so a short answer such as ``a``
+    after ``<|end|>`` stays visible. Before any marker the remainder is the
+    whole output, so only an obvious header is held there.
+    """
+    if _CHANNEL in text or _CONSTRAIN in text or _RECIPIENT_RE.search(text):
+        return True
+    words = text.split()
+    if not words or words == ["assistant"]:
+        return True
+    if not after_marker or len(words) > 4:
+        return False
+    if not all(_is_header_word(word) for word in words[:-1]):
+        return False
+    return _is_header_word(words[-1], partial=opened or len(words) > 1)
 
 
 class _IncrementalDecoder:
@@ -184,6 +207,8 @@ class _Llmjp4ChannelSplitter:
         self._kind: str | None = None  # None = reading a header
         self._head = ""
         self._think_open = False
+        self._seen_marker = False
+        self._header_opened = False  # the current header began with <|start|>
         self._tool_name: str | None = None
         self._tool_body = ""
         # (name, body, end marker or None) for each functions.* message.
@@ -213,6 +238,7 @@ class _Llmjp4ChannelSplitter:
             self.stopped = True
         self._kind = None
         self._head = ""
+        self._header_opened = False
         self._tool_name = None
         self._tool_body = ""
         return self._close_think()
@@ -233,19 +259,24 @@ class _Llmjp4ChannelSplitter:
         return self._close_think() + head
 
     def _handle_marker(self, marker: str) -> str:
+        self._seen_marker = True
         if marker in (_CHANNEL, _CONSTRAIN):
             if self._kind is None:
                 self._head += marker
             return ""
         if marker == _START:
+            text = ""
             if self._kind is None:
                 self._head = ""
-                return ""
-            # A body without an end marker is off-protocol; close it anyway.
-            return self._end_message(None)
+            else:
+                # A body without an end marker is off-protocol; close it anyway.
+                text = self._end_message(None)
+            self._header_opened = True
+            return text
         if marker == _MESSAGE:
             if self._kind is not None:
                 return ""
+            self._header_opened = False
             head, self._head = self._head, ""
             kind, name = _classify_header(head)
             if kind == "other_role":
@@ -304,7 +335,9 @@ class _Llmjp4ChannelSplitter:
         # Flush an unclassified remainder unless it is a cut-off header, so
         # off-protocol text is never dropped.
         head, self._head = self._head, ""
-        if head and not _looks_like_header(head):
+        if head and not _looks_like_header(
+            head, after_marker=self._seen_marker, opened=self._header_opened
+        ):
             out += self._close_think() + head
         return out + self._close_think()
 

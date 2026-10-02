@@ -281,6 +281,45 @@ def test_other_role_header_stops_generation(generate):
     assert final.tool_calls == []
 
 
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "user",
+        "system ",
+        "us",
+        "functions.get_weather",
+        "functi",
+        "assistant analysis",
+        "assistant anal",
+        "assistant to",
+        "assistant to=functions.get_weather",
+        "assistant<|channel|>comm",
+    ],
+)
+def test_header_cut_off_by_eos_is_not_visible(generate, tail):
+    stream, _, final = generate(
+        f"<|channel|>analysis<|message|>hmm<|end|><|start|>{tail}<|return|>"
+    )
+
+    assert stream == "<think>hmm</think>"
+    assert final.tool_calls == []
+
+
+@pytest.mark.parametrize("tail", ["assistant anal", "analysis", "user"])
+def test_header_without_start_cut_off_by_eos_is_not_visible(generate, tail):
+    """The model sometimes omits <|start|> after an end marker."""
+    stream, _, _ = generate(f"<|channel|>analysis<|message|>hmm<|end|>{tail}")
+
+    assert stream == "<think>hmm</think>"
+
+
+@pytest.mark.parametrize("tail", ["a", "an", "as", "to", "us", "a user"])
+def test_short_text_after_end_is_visible(generate, tail):
+    stream, _, _ = generate(f"<|channel|>analysis<|message|>hmm<|end|>{tail}")
+
+    assert stream == f"<think>hmm</think>{tail}"
+
+
 def test_missing_channel_marker_uses_bare_channel_word(generate):
     stream, _, _ = generate(
         "analysis<|message|>think<|end|><|start|>assistant final<|message|>ok"
@@ -304,10 +343,11 @@ def test_angle_bracket_text_is_not_a_marker(generate):
     assert stream == "a <| b <tag>"
 
 
-def test_off_protocol_text_is_not_dropped(generate):
-    stream, _, final = generate("Plain answer.")
+@pytest.mark.parametrize("text", ["Plain answer.", "final", "user"])
+def test_off_protocol_text_is_not_dropped(generate, text):
+    stream, _, final = generate(text)
 
-    assert stream == "Plain answer."
+    assert stream == text
     assert final.tool_calls == []
 
 
