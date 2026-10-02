@@ -375,7 +375,10 @@ class _StoreCacheGate:
 # Import tiered cache components
 try:
     from .cache.boundary_snapshot_store import BoundarySnapshotSSDStore
-    from .cache.paged_ssd_cache import PagedSSDCacheManager
+    from .cache.paged_ssd_cache import (
+        PagedSSDCacheManager,
+        numerics_revision_for_model,
+    )
     from .memory_monitor import (
         MemoryMonitor,
         collect_kv_layer_specs,
@@ -387,6 +390,7 @@ try:
     HAS_TIERED_CACHE = True
 except ImportError:
     PagedSSDCacheManager = None
+    numerics_revision_for_model = None
     BoundarySnapshotSSDStore = None
     MemoryMonitor = None
     collect_kv_layer_specs = None
@@ -625,11 +629,12 @@ def _row_drifted(current_lps, expected_lps) -> bool:
     Two distinct empty lists are equivalent — the #1799 normalisation mints
     fresh ``[]`` objects every step — so only differing content counts. The
     caller's identity check is the steady-state fast path; this only runs
-    past it.
+    past it. mlx-lm stores each row as a tuple while the registry keeps a
+    list, so compare contents rather than container types.
     """
     if not current_lps and not expected_lps:
         return False
-    return current_lps != expected_lps
+    return tuple(current_lps) != tuple(expected_lps)
 
 
 def _log_drift_correction(uids, slot_count) -> None:
@@ -685,13 +690,6 @@ def _realigned_rows(model, uids, cur_samplers, cur_lps):
 
 def _omlx_realign_generation_batch_rows(self) -> None:
     """Realign positional row state with ``uids`` before any decode path reads it."""
-    if self.logits_processors is None:
-        self.logits_processors = []
-    else:
-        self.logits_processors = [
-            procs if procs is not None else [] for procs in self.logits_processors
-        ]
-
     uids = getattr(self, "uids", None) or []
     if not uids:
         return
@@ -766,22 +764,8 @@ def _patched_generation_batch_step(self):
         deltas = [model._uid_rope_deltas.get(uid, 0.0) for uid in self.uids]
         _bind_step_rope_deltas(model, mx.array(deltas), self.uids)
 
-    # Defensive: mlx-lm's GenerationBatch._step does `any(self.logits_processors)`
-    # and `for p in self.logits_processors[e]`, both of which crash when a row
-    # slot is None.  Normalise the whole list AND every per-row slot to [] here,
-    # at the single consumption chokepoint, so the original step and the
-    # grammar-accept loop below are both safe regardless of slot origin.
-    #
-    # The insert call sites already wrap each request's processors as a list,
-    # but that is not enough: on a heterogeneous continuous-batch merge,
-    # mlx-lm's GenerationBatch.extend() re-introduces None slots via
-    # `if not any(self.logits_processors): self.logits_processors =
-    # [None] * len(self.uids)`.  `any([[], []])` is False, so empty-list slots
-    # collapse back to None whenever a batch with no *active* processor merges
-    # with a grammar-constrained one (e.g. a plain chat request joining a batch
-    # that is serving a structured json_schema request).  Per-row normalisation
-    # at this chokepoint is the only place that covers both insert and merge.
-    # See #934 / #1747.
+    # Realign sampler/processor rows with uids before the original step and
+    # the grammar-accept loop read them by position.
     _omlx_realign_generation_batch_rows(self)
 
     # Must run after the realignment: it reads self.logits_processors[e] as
@@ -794,43 +778,6 @@ def _patched_generation_batch_step(self):
 
 GenerationBatch._omlx_realign_rows = _omlx_realign_generation_batch_rows
 GenerationBatch._step = _patched_generation_batch_step
-
-
-# ---------------------------------------------------------------------------
-# Monkey-patch GenerationBatch.filter to keep logits_processors aligned with
-# uids.  mlx-lm's filter only reindexes the processor list when at least one
-# row has an active processor:
-#
-#     if any(self.logits_processors):
-#         self.logits_processors = [self.logits_processors[idx] for idx in keep]
-#
-# There is no else branch (unlike the prompt-batch class, which resets to
-# ``[[]] * len(keep)``), so when every slot is empty — the normal state after
-# serving requests without per-request processors — the stale list survives
-# while uids/tokens shrink.  A later extend() then appends the next request's
-# processors BEHIND its own row index: the row reads a leftover empty slot and
-# the real processor (thinking budget, grammar constraint) is silently never
-# applied.  Which requests are affected depends on insertion/removal order,
-# and alignment self-heals once the broken request finishes, so the symptom
-# is an intermittently ignored thinking_budget or grammar.  See #934/#1747
-# for the sibling None-slot collapse handled in _patched_generation_batch_step.
-_original_generation_batch_filter = GenerationBatch.filter
-
-
-def _patched_generation_batch_filter(self, keep):
-    lps = self.logits_processors
-    lps_inert = not lps or not any(lps)
-    if lps is None:
-        # ``any(None)`` inside the original filter raises TypeError.
-        self.logits_processors = []
-    _original_generation_batch_filter(self, keep)
-    if lps_inert:
-        # Original filter skipped the reindex; reset to one empty slot per
-        # surviving row so extend() appends at the correct indices.
-        self.logits_processors = [[] for _ in keep]
-
-
-GenerationBatch.filter = _patched_generation_batch_filter
 
 
 _TQ_SINGLETON_CACHE_TYPE: type[Any] | None = None
@@ -1046,9 +993,7 @@ def _patched_ppb_split(self, indices):
         new_batch.prefill_step_size = self.prefill_step_size
         new_batch.samplers = self.samplers
         new_batch.fallback_sampler = self.fallback_sampler
-        # Defensive: normalise None → [] to avoid mlx-lm crash in _step
-        lps = self.logits_processors if self.logits_processors is not None else []
-        new_batch.logits_processors = lps
+        new_batch.logits_processors = self.logits_processors
         new_batch.stop_sequences = self.stop_sequences
         new_batch.max_tokens = self.max_tokens
         if hasattr(self, "_omlx_glm_dsa_adaptive_prefill"):
@@ -1654,6 +1599,32 @@ def _expected_chunk_len(step_size: int, remaining: int, kv_total: int, boundary_
     return max(1, next_n)
 
 
+def _glm5_next_prefill_floor() -> int:
+    """Return the wide-prefill floor for GLM-5.3 (0 when the host cannot use it).
+
+    Wider chunks require the native sparse MLA path. NAX hosts also need the
+    tensor-unit sparse MLA: its attention cost per query does not depend on
+    the chunk, so a wider chunk feeds the MoE more rows.
+    """
+    try:
+        from .custom_kernels.glm_moe_dsa import fast
+        from .custom_kernels.nax import is_nax_available
+        from .patches.glm_moe_dsa.sparse_mla_nax import nax_sparse_mla_available
+        from .settings import get_system_memory
+
+        if not fast.is_native_available() or not fast.has_symbol(
+            "glm_dsa_sparse_mla_attention"
+        ):
+            return 0
+        if get_system_memory() < 64 * 1024**3:
+            return 0
+        if not is_nax_available() or nax_sparse_mla_available():
+            return 4096
+    except Exception:
+        logger.debug("glm5_next prefill floor probe failed", exc_info=True)
+    return 0
+
+
 def _mimo_fused_full_attention() -> bool:
     """True when MiMo's 192/128 full-attention layers run a fused kernel.
 
@@ -1884,6 +1855,48 @@ class _BoundarySnapshotProvider:
             with suppress(OSError):
                 staged_path.unlink()
             return False
+
+    @classmethod
+    def stage_and_commit(
+        cls,
+        *,
+        store: Any,
+        paged_ssd_manager: Any,
+        request_id: str,
+        token_count: int,
+        snapshot: list[dict[str, Any]],
+        source_block_hash: bytes,
+        layer_cache_types: list[str] | tuple[str, ...] | None,
+        layer_meta_states: list[Any] | None,
+        model_name: str,
+        block_size: int,
+    ) -> bool:
+        """Stage one extracted recurrent snapshot and promote it to a sidecar."""
+        if store is None or paged_ssd_manager is None:
+            return False
+        if not store.save(
+            request_id,
+            token_count,
+            snapshot,
+            lambda extracted: (extracted, None),
+            block_size=block_size,
+        ):
+            return False
+        provider = cls(
+            store=store,
+            request_id=request_id,
+            valid_tcs=[token_count],
+            in_memory_snapshots={},
+            paged_ssd_manager=paged_ssd_manager,
+        )
+        return provider.commit_gdn_checkpoint(
+            token_count,
+            source_block_hash,
+            layer_cache_types=list(layer_cache_types or []),
+            layer_meta_states=layer_meta_states,
+            model_name=model_name,
+            block_size=block_size,
+        )
 
 
 class Scheduler:
@@ -2969,30 +2982,16 @@ class Scheduler:
                     "qwen4_qsa_sparse_gqa_attention"
                 ):
                     return 0
-            # Wider GLM chunks require the native sparse MLA path.
-            is_glm5_next = model_type.startswith("glm5_next")
-            if is_glm5_next:
-                from .custom_kernels.glm_moe_dsa import fast
-
-                if not fast.is_native_available() or not fast.has_symbol(
-                    "glm_dsa_sparse_mla_attention"
-                ):
-                    return 0
-            if is_qwen35 or is_qwen4 or is_glm5_next:
+            if model_type.startswith("glm5_next"):
+                return _glm5_next_prefill_floor()
+            if is_qwen35 or is_qwen4:
                 from .custom_kernels.nax import is_nax_available
-                from .patches.glm_moe_dsa.sparse_mla_nax import (
-                    nax_sparse_mla_available,
-                )
                 from .settings import get_system_memory
 
                 if get_system_memory() < 64 * 1024**3:
                     return 0
+                # NAX hosts keep the default chunk.
                 if not is_nax_available():
-                    return 4096
-                # NAX hosts keep the default chunk, except GLM-5.3 with the
-                # tensor-unit sparse MLA: its attention cost per query does not
-                # depend on the chunk, so a wider chunk feeds the MoE more rows.
-                if is_glm5_next and nax_sparse_mla_available():
                     return 4096
             if self._is_mimo_hybrid():
                 from .custom_kernels.nax import is_nax_available
@@ -6848,12 +6847,8 @@ class Scheduler:
         self, sampling_params: SamplingParams, request: Any = None
     ) -> tuple[Callable[[mx.array], mx.array], list[Callable]]:
         """Build per-request sampler and logits processors."""
-        # Use omlx.utils.sampling.make_sampler instead of mlx_lm.sample_utils.
-        # The mlx-lm version decorates categorical_sampling and apply_* with
-        # @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state),
-        # which fails to advance the RNG state after the first call in this
-        # server environment. Identical prompts then produce identical output
-        # even at temperature > 1.
+        # omlx.utils.sampling.make_sampler carries the fused top-p/top-k and
+        # MTP acceptance metadata that mlx_lm.sample_utils does not.
         sampler = omlx_make_sampler(
             temp=sampling_params.temperature,
             top_p=sampling_params.top_p,
@@ -12036,16 +12031,6 @@ class Scheduler:
             # Insert into BatchGenerator with pre-filled cache + last token.
             # BatchGenerator only handles decode from here.
             #
-            # IMPORTANT: ``logits_processors`` MUST be passed as a per-row
-            # list (possibly empty), never None.  mlx-lm's
-            # GenerationBatch._step does ``for p in self.logits_processors[e]``
-            # in any branch where ``any(self.logits_processors)`` is True
-            # (e.g., heterogeneous merge with another row that has a
-            # processor).  A None slot crashes that loop with
-            # ``TypeError: 'NoneType' object is not iterable``, which then
-            # bubbles into the engine retry loop and presents as a hang.
-            # See vllm-mlx-patched commit 8d4052b for the same root cause
-            # in a sibling project, and #934 for the user-visible symptom.
             per_row_lps = list(logits_processors) if logits_processors else []
             # insert() merges the prompt cache into the batch KV caches with
             # lazy ops; keep them on the engine stream so the next decode
@@ -14340,6 +14325,7 @@ class Scheduler:
                     layer_cache_types,
                     turboquant_kv_bits=turboquant_kv_bits,
                     cachelist_subtypes=cachelist_subtypes,
+                    numerics=numerics_revision_for_model(self.model),
                 )
             else:
                 manager.adopt_layer_signature_if_unset(layer_cache_types)
@@ -14486,6 +14472,15 @@ class Scheduler:
                             dequantization_counter=lambda: (
                                 self._boundary_snapshot_store.gdn_state_dequantizations
                             ),
+                        )
+                        boundary_store = self._boundary_snapshot_store
+                        paged_ssd_manager = self.paged_ssd_cache_manager
+                        self.block_aware_cache.set_exact_gdn_checkpoint_writer(
+                            lambda **kwargs: _BoundarySnapshotProvider.stage_and_commit(
+                                store=boundary_store,
+                                paged_ssd_manager=paged_ssd_manager,
+                                **kwargs,
+                            )
                         )
                 except Exception as e:
                     logger.debug(

@@ -14,6 +14,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -1411,9 +1412,41 @@ def install_server_telemetry(
             if getattr(response, "end_of_prompt", False):
                 self._omlx_tokens.pop(uid, None)
 
+        def _omlx_align_prefill_step(self, sequences) -> None:
+            if ssd_store is None:
+                return
+            step = min(self.prefill_step_size, snapshot_step)
+            for uid, segments in sequences:
+                # MLX-LM moves these directly to generation before prefill.
+                if len(segments) == 1 and len(segments[0]) == 1:
+                    continue
+                full = self._omlx_tokens.get(uid)
+                if full is not None:
+                    position = len(full) - sum(map(len, segments))
+                    step = min(step, snapshot_step - position % snapshot_step)
+            self.prefill_step_size = step
+
+        def _make_batch(self, n):
+            # Use the actual admission count, after generation frees capacity.
+            self._omlx_align_prefill_step(
+                (state[0], state[1]) for state in islice(self._unprocessed_sequences, n)
+            )
+            return super()._make_batch(n)
+
         def next(self) -> Any:
             started = time.perf_counter()
-            prompt_responses, generation_responses = super().next()
+            original_step = getattr(self, "prefill_step_size", None)
+            if ssd_store is not None and original_step is not None:
+                active = zip(
+                    getattr(getattr(self, "_prompt_batch", None), "uids", ()),
+                    getattr(self, "_currently_processing", ()),
+                )
+                self._omlx_align_prefill_step((uid, state[0]) for uid, state in active)
+            try:
+                prompt_responses, generation_responses = super().next()
+            finally:
+                if original_step is not None:
+                    self.prefill_step_size = original_step
             elapsed = time.perf_counter() - started
             for response in generation_responses:
                 response.token = _python_token_id(response.token)
@@ -1479,18 +1512,20 @@ def install_server_telemetry(
             # its writes; it runs later on this same generation thread.
             snapshot_ctx.model = model
             snapshot_ctx.prompt = list(tokens)
-            if ssd_store is not None:
-                # The collective is taken on every request, hit or miss, so all
-                # ranks reach it the same number of times regardless of their
-                # in-memory state; the agreed boundary is only used when the
-                # in-memory tier missed. This is what lets SSD serve the batched
-                # path, whose byte-based eviction can diverge across ranks.
+            cache, rest = agree_prompt_cache_plan(cache, tokens, rest)
+            if ssd_store is not None and len(rest) == len(tokens):
+                # Memory agreement makes this branch uniform across ranks,
+                # including when only one rank had a hit or an invalid offset.
+                # A rejected memory hit must not suppress a usable SSD prefix.
+                cache = None
                 boundary = agree_ssd_boundary(model, tokens)
-                if cache is None and boundary > 0:
+                if boundary > 0:
                     loaded = ssd_store.load(model, tokens, boundary)
                     if loaded is not None:
                         cache, rest = loaded, list(tokens[boundary:])
-            cache, rest = agree_prompt_cache_plan(cache, tokens, rest)
+                    # A file may disappear or fail to restore after the vote.
+                    # No rank may proceed until restored offsets agree too.
+                    cache, rest = agree_prompt_cache_plan(cache, tokens, rest)
             entries, nbytes = self._omlx_cache_inventory()
             telemetry.observe_cache_lookup(
                 prompt_tokens=len(tokens),

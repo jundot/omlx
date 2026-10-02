@@ -16,6 +16,7 @@ import json
 
 import mlx.core as mx
 import mlx.nn as nn
+import mlx_lm.utils as mlx_lm_utils
 import numpy as np
 import pytest
 from mlx.utils import tree_flatten
@@ -489,6 +490,39 @@ class TestPatchLifecycle:
             assert loaded.dtype == mx.uint8
         finally:
             remove_bonsai_t5_load_patch()
+
+    @pytest.mark.skipif(
+        not hasattr(mlx_lm_utils, "infer_quant_config"),
+        reason="mlx-lm pin predates infer_quant_config",
+    )
+    @pytest.mark.parametrize("group_size", [64, 128])
+    def test_installed_patch_reports_t5_layers_as_2bit(self, group_size):
+        """mlx-lm's width-based inference would read t5 rows as 6 bits."""
+        rng = np.random.default_rng(0)
+        q = rng.integers(0, 3, size=(4, 2 * group_size), dtype=np.uint8)
+        t5 = nn.QuantizedLinear(2 * group_size, 4, group_size=group_size, bits=2)
+        q4 = nn.QuantizedLinear(2 * group_size, 4, group_size=group_size, bits=4)
+        weights = {
+            "t5.weight": mx.array(pack_t5(q, group_size)),
+            "t5.scales": t5.scales,
+            "q4.weight": q4.weight,
+            "q4.scales": q4.scales,
+        }
+        linear = nn.Linear(2 * group_size, 4, bias=False)
+        try:
+            apply_bonsai_t5_load_patch()
+            infer = mlx_lm_utils.infer_quant_config
+            assert infer("t5", linear, weights) == {
+                "group_size": group_size,
+                "bits": 2,
+                "mode": "affine",
+            }
+            assert infer("q4", linear, weights)["bits"] == 4
+        finally:
+            remove_bonsai_t5_load_patch()
+        assert (
+            mlx_lm_utils.infer_quant_config is not bonsai_t5_load._t5_infer_quant_config
+        )
 
     def test_prefill_threshold_matches_bonsai_qmv(self):
         # The two module constants are documented as must-match.

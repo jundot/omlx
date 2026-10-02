@@ -96,6 +96,7 @@ class MockRerankerEngineImpl(RerankerEngine):
         # Don't call super().__init__ to avoid loading real model
         self._model_name = model_name
         self._model = None  # Set as None but present
+        self.calls: List[Dict[str, Any]] = []
 
     @property
     def model_name(self) -> str:
@@ -110,6 +111,7 @@ class MockRerankerEngineImpl(RerankerEngine):
     async def rerank(
         self, query: str, documents: List[str], top_n: Optional[int] = None, **kwargs
     ) -> MockRerankOutput:
+        self.calls.append({"documents": list(documents), "kwargs": dict(kwargs)})
         n_docs = len(documents)
         scores = [0.9 - i * 0.2 for i in range(n_docs)]
         indices = list(range(n_docs))
@@ -1811,6 +1813,22 @@ class TestRerankEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert len(data["results"]) == 2
+
+    def test_rerank_forwards_max_length(self, client, mock_engine_pool):
+        """Request max_length must reach the engine; omitted means model default."""
+        mock_engine_pool._models.append(
+            {"id": "test-rerank-model", "loaded": True, "pinned": False, "size": 500000}
+        )
+        body = {"model": "test-rerank-model", "query": "q", "documents": ["d"]}
+
+        statuses = [
+            client.post("/v1/rerank", json={**body, **extra}).status_code
+            for extra in ({}, {"max_length": 8192}, {"max_length": 0})
+        ]
+        assert statuses == [200, 200, 422]
+
+        calls = mock_engine_pool._reranker_engine.calls
+        assert [call["kwargs"]["max_length"] for call in calls] == [None, 8192]
 
     def test_rerank_response_format(self, client, mock_engine_pool):
         """Test rerank response format."""

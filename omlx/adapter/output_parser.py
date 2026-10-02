@@ -9,12 +9,16 @@ suppression) and exposes a uniform token-by-token interface.
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Protocol
+
+from mlx_lm import tokenizer_utils
 
 from ..utils.tokenizer import (
     create_streaming_detokenizer,
@@ -343,6 +347,46 @@ class BailingHybridOutputParserSession:
             tool_calls=tool_calls,
             finish_reason="tool_calls" if tool_calls else None,
         )
+
+
+def repair_tool_parser(tokenizer: Any) -> str | None:
+    """Replace a ``json_tools`` label that the chat template contradicts.
+
+    MLX-LM trusts ``tool_parser_type`` from tokenizer_config.json. Some
+    conversions store a stale ``json_tools`` label for XML grammars, so the
+    JSON parser drops every call. Only the in-memory wrapper is changed.
+    """
+    if not isinstance(tokenizer, tokenizer_utils.TokenizerWrapper):
+        return None
+    parser_module = getattr(tokenizer.tool_parser, "__module__", None)
+    if parser_module != "mlx_lm.tool_parsers.json_tools":
+        return None
+    template = tokenizer.chat_template
+    # A chat_template_type renderer does not use the Jinja template.
+    if tokenizer._chat_template is not None or not isinstance(template, str):
+        return None
+    # Resolve at call time because patches (hy_v3) rebind this function.
+    # An empty vocab keeps the choice based on the template only.
+    inferred = tokenizer_utils._infer_tool_parser(
+        SimpleNamespace(chat_template=template, get_vocab=dict)
+    )
+    if inferred in (None, "json_tools"):
+        return None
+    module = importlib.import_module(f"mlx_lm.tool_parsers.{inferred}")
+    tokenizer._tool_parser = module.parse_tool_call
+    tokenizer._tool_call_start = module.tool_call_start
+    tokenizer._tool_call_end = module.tool_call_end
+    tokenizer._tool_call_start_tokens = tuple(
+        tokenizer.encode(module.tool_call_start, add_special_tokens=False)
+    )
+    tokenizer._tool_call_end_tokens = tuple(
+        tokenizer.encode(module.tool_call_end, add_special_tokens=False)
+    )
+    logger.warning(
+        "Tool parser json_tools conflicts with the chat template; using %s",
+        inferred,
+    )
+    return inferred
 
 
 def install_minimax_m3_tokenizer_protocol(
@@ -1312,6 +1356,7 @@ def detect_output_parser(
     filesystem path is available so parser sessions can locate
     tokenizer.json for their streaming detokenizers.
     """
+    repair_tool_parser(tokenizer)
     session_model_path = model_path or model_name
 
     model_type = model_config.get("model_type") if model_config else None

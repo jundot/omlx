@@ -43,6 +43,10 @@ VALID_PROMPT_LENGTHS = [1024, 4096, 8192, 16384, 32768, 65536, 131072, 200000]
 # Valid batch sizes for continuous batching tests
 VALID_BATCH_SIZES = [2, 4, 8]
 
+# Below this, the decode span is mostly back-to-back emission bursts (e.g. the
+# first two queued MTP tokens), so tokens / span is not a decode rate.
+_MIN_TG_TOKENS = 16
+
 
 class BenchmarkContextProfile(StrEnum):
     """Stable identifiers for the bundled throughput-benchmark corpora."""
@@ -621,12 +625,12 @@ def _compute_single_metrics(
     e2e_duration = end_time - start_time
 
     ttft_ms: float | None = ttft_s * 1000
-    if generation_measured and completion_tokens > 1 and gen_duration > 0:
+    if generation_measured and completion_tokens >= _MIN_TG_TOKENS and gen_duration > 0:
         tpot_ms: float | None = (gen_duration / (completion_tokens - 1)) * 1000
         gen_tps: float | None = completion_tokens / gen_duration
     else:
         # Generation timing could not be measured (e.g. all content arrived
-        # in a single burst with no measurable inter-token span) — report
+        # in a single burst, or an early stop left too few tokens) - report
         # unmeasured rather than a misleading 0.0.
         tpot_ms = None
         gen_tps = None
@@ -840,6 +844,13 @@ async def _run_single_test(
 
     if generation_duration_s is None:
         generation_duration_s = producer_generation_duration_s
+
+    if metric_completion_tokens < min(max_tokens, _MIN_TG_TOKENS):
+        logger.warning(
+            f"Benchmark test pp{pp_len} stopped after "
+            f"{metric_completion_tokens}/{max_tokens} tokens; "
+            f"tg is not reported."
+        )
 
     generation_measured = generation_duration_s is not None
     trace_prefill_duration_s = prefill_duration_s

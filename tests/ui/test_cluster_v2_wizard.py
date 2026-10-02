@@ -59,6 +59,10 @@ PEER_RECORD_FIELDS = {
 # The complete network surface the wizard is allowed to use (spec Module C:
 # Module A/B endpoints + the pre-existing planner/activate API only).
 ALLOWED_ENDPOINTS = {
+    "/api/cluster/pair/join/cleanup",
+
+
+    "/admin/api/cluster/forget",
     "/api/cluster/devices",
     "/api/cluster/node_id",
     "/api/cluster/discovery/health",  # Module C stub, pending Module A impl
@@ -2603,3 +2607,438 @@ def test_ssd_hydration_defaults_on_but_preserves_explicit_choice(deployment, exp
         "console.log(JSON.stringify({enabled: component.promptCacheSsd}));"
     )
     assert result["enabled"] is expected
+
+
+@pytest.mark.parametrize("login", ["", "remote_user@"])
+@pytest.mark.parametrize("verified", [True, False])
+def test_wizard_selects_verified_address_without_ssh_user(login, verified):
+    original = login + "192.0.2.1"
+    expected = login + ("192.0.2.2" if verified else "192.0.2.1")
+    result = _run_wizard(
+        """
+const peer = {
+    node_id: 'peer', paired: true, ssh_target: ORIGINAL,
+    addrs: [{ip: '192.0.2.1'}, {ip: '192.0.2.2'}, {ip: '192.0.2.3'}],
+    address_health: {
+        '192.0.2.1': {state: 'stale'},
+        '192.0.2.2': {state: STATE},
+        '192.0.2.3': {state: STATE},
+    },
+};
+component.devicesPayload = {self: null, paired: [peer], discovered: []};
+component.planProposal = {activation: {hosts: [{ssh: ORIGINAL}]}};
+let probed;
+component.apiFetch = async (url, options) => {
+    probed = JSON.parse(options.body).ssh;
+    return {};
+};
+(async () => {
+    await component.probePeer(peer);
+    console.log(JSON.stringify({target: component.sshTargetFor(peer),
+        host: component.deploymentHosts()[0].ssh, probed,
+        original: component.planProposal.activation.hosts[0].ssh}));
+})();
+""".replace("ORIGINAL", json.dumps(original)).replace(
+            "STATE", json.dumps("verified" if verified else "stale")
+        )
+    )
+    assert result == {
+        "target": expected,
+        "host": expected,
+        "probed": expected,
+        "original": original,
+    }
+
+
+def test_explicit_ssh_user_follows_peer_addresses_and_deployment_hosts():
+    result = _run_wizard("""
+const peer = {node_id: 'worker', paired: true, ssh_user: 'remote_user',
+              addrs: [{ip: '192.0.2.10'}]};
+component.devicesPayload = {paired: [peer], discovered: [], self: null};
+const initial = component.sshTargetFor(peer);
+peer.addrs = [{ip: '192.0.2.20'}];
+const moved = component.deploymentHosts()[0].ssh;
+peer.ssh_target = 'enrolled@worker.example';
+const override = component.sshTargetFor(peer);
+delete peer.ssh_user;
+const fallback = component.sshTargetFor(peer);
+console.log(JSON.stringify({initial, moved, override, fallback}));
+""")
+    assert result == {
+        "initial": "remote_user@192.0.2.10",
+        "moved": "remote_user@192.0.2.20",
+        "override": "remote_user@worker.example",
+        "fallback": "enrolled@worker.example",
+    }
+
+
+def test_save_ssh_user_invalidates_old_plan_and_probes():
+    result = _run_wizard("""
+(async () => {
+const peer = {node_id: 'worker', paired: true};
+component.sshUserDrafts.worker = ' remote_user ';
+component.plan = {old: true}; component.planProposal = {old: true};
+component.checks.probes = {worker: {ok: true}};
+component.checks.started = true;
+let sent;
+component.apiFetch = async (url, options) => {
+    sent = {url, body: JSON.parse(options.body)};
+    return {ssh_user: 'remote_user'};
+};
+component.refreshDevices = async () => {};
+component.notify = () => {};
+await component.saveSSHUser(peer);
+console.log(JSON.stringify({sent, user: peer.ssh_user, plan: component.plan,
+    proposal: component.planProposal, probes: component.checks.probes,
+    started: component.checks.started}));
+})().catch(error => {console.error(error); process.exit(1);});
+""")
+    assert result["sent"] == {
+        "url": "/api/cluster/devices/worker/ssh-user",
+        "body": {"ssh_user": "remote_user"},
+    }
+    assert result["user"] == "remote_user"
+    assert result["plan"] is None and result["proposal"] is None
+    assert result["probes"] == {} and result["started"] is False
+
+
+def test_ssh_repair_form_only_belongs_to_failed_check():
+    template = _read(TEMPLATE)
+    form = template.index("data-cluster-v2-ssh-user")
+    checks = template.index("data-cluster-v2-checks")
+    assert form > checks
+    assert "row.key === 'ssh' && row.status === 'fail'" in template[checks:form]
+    assert "checks.probes[peer.node_id]?.ok === false" in template[checks:form]
+
+
+def test_ssh_repair_input_allows_dotted_accounts():
+    template = _read(TEMPLATE)
+    assert 'pattern="[A-Za-z_][A-Za-z0-9_.\\-]{0,63}"' in template
+
+
+def test_discovered_membership_card_offers_pairing_with_a_persistent_form():
+    template = _read(TEMPLATE)
+    start = template.index(":key=\"'membership-found-' + device.node_id\"")
+    end = template.index("</template>", start)
+    assert '@click="beginMembershipPairing(device)"' in template[start:end]
+    form = template.index("data-cluster-v2-membership-pairing-form")
+    assert form > end
+    assert 'x-show="pairing.target"' in template[end:form]
+    assert '@keydown.enter="submitPairApproval(pairing.target)"' in template[form:]
+
+
+def test_membership_pairing_waits_for_the_selected_macs_request():
+    result = _run_wizard("""
+        (async () => {
+            const calls = [];
+            component.apiFetch = async (url) => { calls.push(url); return {}; };
+            component.devicesPayload = {paired: [], discovered: [{node_id: 'new', state: 'discovered'}]};
+            component.beginMembershipPairing({node_id: 'new'});
+            component.pairing.code = '123456';
+            await component.submitPairApproval(component.pairing.target);
+            const missing = {calls: calls.length, error: component.pairing.error};
+            component.devicesPayload.discovered = [{node_id: 'other', state: 'awaiting_approval'}];
+            await component.submitPairApproval(component.pairing.target);
+            console.log(JSON.stringify({missing, calls, open: component.membershipPanelOpen, target: component.pairing.target.node_id}));
+        })();
+    """)
+    assert result["missing"]["calls"] == 0
+    assert result["missing"]["error"]
+    assert result["calls"] == []
+    assert result["open"] is True
+    assert result["target"] == "new"
+
+
+def test_membership_pairing_keeps_the_active_model_until_explicit_replan():
+    result = _run_wizard("""
+        (async () => {
+            const calls = [], probes = [];
+            const deployment = {deployment_id: 'existing', model: 'current-model', assignments: [{node_id: 'self'}, {node_id: 'old'}]};
+            component.configuredDeployment = () => deployment;
+            component.devicesPayload = {paired: [{node_id: 'old', paired: true}], discovered: [{node_id: 'new', state: 'discovered'}]};
+            component.executionProfile = 'custom';
+            component.selectedModelPath = 'current-model';
+            component.beginMembershipPairing({node_id: 'new'});
+            component.pairing.code = '123456';
+            component.devicesPayload.discovered = [{node_id: 'new', state: 'awaiting_approval'}];
+            component.apiFetch = async (url, options) => { calls.push({url, body: JSON.parse(options.body)}); return {}; };
+            component.notify = () => {};
+            component.refreshDevices = async () => { component.devicesPayload = {paired: [{node_id: 'old', paired: true}, {node_id: 'new', paired: true}], discovered: []}; };
+            component.probePeer = async (peer) => probes.push(peer.node_id);
+            component.startChecks = () => { throw Error('must not leave active cluster'); };
+            component.runPlan = async () => { throw Error('must not replan automatically'); };
+            await component.submitPairApproval(component.pairing.target);
+            console.log(JSON.stringify({calls, probes, candidates: component.membershipCandidates().map(x => x.node_id), target: component.pairing.target, profile: component.executionProfile, model: component.selectedModelPath, deployment}));
+        })();
+    """)
+    assert result["calls"] == [
+        {
+            "url": "/api/cluster/pair/approve",
+            "body": {"node_id": "new", "code": "123456"},
+        }
+    ]
+    assert result["probes"] == ["new"]
+    assert result["candidates"] == ["new"]
+    assert result["target"] is None
+    assert result["profile"] == "custom"
+    assert result["model"] == "current-model"
+    assert result["deployment"]["assignments"] == [
+        {"node_id": "self"},
+        {"node_id": "old"},
+    ]
+
+
+def test_membership_pairing_failure_can_be_retried_or_cancelled():
+    result = _run_wizard("""
+        (async () => {
+            component.devicesPayload = {paired: [], discovered: [{node_id: 'new', state: 'awaiting_approval'}]};
+            component.beginMembershipPairing({node_id: 'new'});
+            component.pairing.code = '123456';
+            component.apiFetch = async () => { throw Object.assign(Error('Incorrect code'), {status: 403}); };
+            await component.submitPairApproval(component.pairing.target);
+            const failed = {target: component.pairing.target.node_id, code: component.pairing.code, error: component.pairing.error, busy: component.pairing.busy};
+            component.cancelPairing();
+            console.log(JSON.stringify({failed, target: component.pairing.target}));
+        })();
+    """)
+    assert result["failed"] == {
+        "target": "new",
+        "code": "123456",
+        "error": "Incorrect code",
+        "busy": False,
+    }
+    assert result["target"] is None
+
+
+def test_forget_cleanup_requires_confirmation_and_ignores_old_poll():
+    result = _run_wizard("""
+        (async () => {
+            const calls = [];
+            let resolvePoll;
+            component.join = {...component.join, state: 'approved', cleanup_pending: true};
+            component.joinApprovedNotified = true;
+            component.notify = () => {};
+            component.apiFetch = (url, options) => {
+                if (!options) return new Promise(resolve => { resolvePoll = resolve; });
+                calls.push({url, method: options.method});
+                return Promise.resolve({state: 'approved', cleanup_pending: false});
+            };
+            const poll = component.refreshJoinState();
+            await component.forgetJoinCleanup();
+            const before = calls.length;
+            await component.forgetJoinCleanup();
+            resolvePoll({state: 'approved', cleanup_pending: true});
+            await poll;
+            console.log(JSON.stringify({before, calls, pending: component.join.cleanup_pending, state: component.join.state, busy: component.join.busy}));
+        })();
+    """)
+    assert result["before"] == 0
+    assert result["calls"] == [
+        {"url": "/api/cluster/pair/join/cleanup", "method": "DELETE"}
+    ]
+    assert result["pending"] is False
+    assert result["state"] == "approved"
+    assert result["busy"] is False
+
+
+def test_forget_cleanup_failure_keeps_banner():
+    result = _run_wizard("""
+        (async () => {
+            const notices = [];
+            component.join.cleanup_pending = true;
+            component.notify = (kind, text) => notices.push({kind, text});
+            component.apiFetch = async () => { throw Error('Storage failed'); };
+            await component.forgetJoinCleanup();
+            await component.forgetJoinCleanup();
+            console.log(JSON.stringify({pending: component.join.cleanup_pending, busy: component.join.busy, notices}));
+        })();
+    """)
+    assert result["pending"] is True
+    assert result["busy"] is False
+    assert result["notices"] == [{"kind": "error", "text": "Storage failed"}]
+
+
+def test_forget_local_requires_its_own_confirmation_and_reports_remote_uncertainty():
+    result = _run_wizard("""
+(async () => {
+    const requests = [], notices = [];
+    component.apiFetch = async (url, options) => { requests.push({url, method: options.method}); return {}; };
+    component.notify = (level, text) => notices.push(text);
+    component.refreshDeployments = async () => {};
+    component.refreshRuntime = async () => {};
+    const deployment = {deployment_id: 'offline'};
+    await component.deactivateDeployment(deployment);
+    await component.deactivateDeployment(deployment, true);
+    const beforeConfirm = requests.length;
+    await component.deactivateDeployment(deployment, true);
+    console.log(JSON.stringify({beforeConfirm, requests, notices, busy: component.clusterLifecycleBusy}));
+})();
+""")
+    assert result["beforeConfirm"] == 0
+    assert result["requests"] == [
+        {
+            "url": "/admin/api/cluster/deployments/offline?local_only=true",
+            "method": "DELETE",
+        }
+    ]
+    assert "Remote shutdown was not verified" in result["notices"][0]
+    assert result["busy"] is False
+
+
+def test_forget_member_and_entire_cluster_have_separate_confirmations():
+    result = _run_wizard("""
+        (async () => {
+            const requests = [];
+            component.apiFetch = async (url) => { requests.push(url); return {}; };
+            component.notify = () => {};
+            component.refreshDevices = async () => {};
+            component.refreshDeployments = async () => {};
+            component.refreshRuntime = async () => {};
+            await component.forgetCluster({node_id: 'peer/a'});
+            await component.forgetCluster({node_id: 'peer/b'});
+            await component.forgetCluster();
+            const beforeConfirm = requests.length;
+            await component.forgetCluster();
+            await component.forgetCluster({node_id: 'peer/a'});
+            await component.forgetCluster({node_id: 'peer/a'});
+            console.log(JSON.stringify({beforeConfirm, requests, busy: component.clusterLifecycleBusy}));
+        })();
+    """)
+    assert result["beforeConfirm"] == 0
+    assert result["requests"] == [
+        "/admin/api/cluster/forget",
+        "/admin/api/cluster/forget?node_id=peer%2Fa",
+    ]
+    assert result["busy"] is False
+    template = _read(TEMPLATE)
+    assert 'data-cluster-v2-forget-device' in template
+    assert 'data-cluster-v2-forget-all' in template
+
+
+@pytest.mark.parametrize(
+    "device, expected",
+    [
+        pytest.param(
+            {"ssh_target": "192.0.2.1", "ssh_user": "paired_user"},
+            "paired_user@192.0.2.2",
+            id="pairing-account",
+        ),
+        pytest.param(
+            {"ssh_target": "old_user@192.0.2.1", "ssh_user": "saved_user"},
+            "saved_user@192.0.2.2",
+            id="saved-account-overrides-enrollment",
+        ),
+        pytest.param(
+            {"ssh_target": "enrolled_user@192.0.2.1"},
+            "enrolled_user@192.0.2.2",
+            id="enrolled-account",
+        ),
+        pytest.param({}, "192.0.2.2", id="no-enrolled-target-or-account"),
+        pytest.param(
+            {"ssh_target": "192.0.2.1", "address_health": {}},
+            "192.0.2.1",
+            id="no-verified-address-keeps-enrollment",
+        ),
+        pytest.param(
+            {"ssh_target": "192.0.2.1", "address_health": None},
+            "192.0.2.1",
+            id="legacy-peer-without-health",
+        ),
+        pytest.param(
+            {
+                "ssh_target": "old_user@192.0.2.1",
+                "ssh_user": "saved_user",
+                "address_health": {},
+            },
+            "saved_user@192.0.2.1",
+            id="fallback-keeps-account-override",
+        ),
+        pytest.param(
+            {"address_health": {}},
+            "192.0.2.1",
+            id="legacy-address-fallback",
+        ),
+        pytest.param(
+            {"ssh_target": "192.0.2.1", "addrs": []},
+            "192.0.2.1",
+            id="health-address-must-be-advertised",
+        ),
+        pytest.param(
+            {"ssh_target": "192.0.2.1", "addrs": None},
+            "192.0.2.1",
+            id="missing-address-list",
+        ),
+        pytest.param(
+            {
+                "address_health": {
+                    "192.0.2.1": {"state": "verified"},
+                    "192.0.2.2": {"state": "verified"},
+                }
+            },
+            "192.0.2.1",
+            id="first-verified-address-is-stable",
+        ),
+        pytest.param(
+            {
+                "addrs": [None, {}, {"ip": "fe80::1"}, {"ip": "192.0.2.2"}],
+                "address_health": {
+                    "fe80::1": {"state": "verified"},
+                    "192.0.2.2": {"state": "verified"},
+                },
+            },
+            "192.0.2.2",
+            id="ignore-unscoped-link-local-and-malformed-entries",
+        ),
+        pytest.param(
+            {
+                "address_health": {
+                    "192.0.2.1": {"state": "unverified"},
+                    "192.0.2.2": {"state": "stale"},
+                    "192.0.2.3": {"state": "verified"},
+                }
+            },
+            "192.0.2.3",
+            id="skip-unverified-and-stale-addresses",
+        ),
+        pytest.param(
+            {
+                "addrs": [{"ip": "2001:db8::1"}, {"ip": "192.0.2.2"}],
+                "address_health": {
+                    "2001:db8::1": {"state": "verified"},
+                    "192.0.2.2": {"state": "verified"},
+                },
+            },
+            "192.0.2.2",
+            id="verified-ipv4-matches-ssh-policy",
+        ),
+        pytest.param(
+            {
+                "ssh_target": "192.0.2.1",
+                "addrs": [{"ip": "2001:db8::1"}],
+                "address_health": {"2001:db8::1": {"state": "verified"}},
+            },
+            "192.0.2.1",
+            id="ipv6-only-health-keeps-enrollment",
+        ),
+    ],
+)
+def test_wizard_verified_address_selection_preserves_login_and_fallback(
+    device, expected
+):
+    peer = {
+        "node_id": "peer",
+        "paired": True,
+        "addrs": [{"ip": "192.0.2.1"}, {"ip": "192.0.2.2"}, {"ip": "192.0.2.3"}],
+        "address_health": {
+            "192.0.2.1": {"state": "stale"},
+            "192.0.2.2": {"state": "verified"},
+            "192.0.2.3": {"state": "verified"},
+        },
+        **device,
+    }
+    result = _run_wizard(
+        "console.log(JSON.stringify(component.sshTargetFor(PEER)));".replace(
+            "PEER", json.dumps(peer)
+        )
+    )
+    assert result == expected

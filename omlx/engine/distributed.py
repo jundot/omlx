@@ -491,14 +491,17 @@ raise SystemExit(2)
                 + ", ".join(incompatible)
             )
 
-    async def stop(self) -> None:
+    async def stop(self, *, local_only: bool = False) -> None:
         client, self._client = self._client, None
         try:
             if client is not None:
                 await client.aclose()
         finally:
             try:
-                await asyncio.to_thread(self._supervisor.stop)
+                await asyncio.to_thread(
+                    self._supervisor.stop,
+                    **({"local_only": True} if local_only else {}),
+                )
             finally:
                 self._tokenizer = None
                 self._model_type = None

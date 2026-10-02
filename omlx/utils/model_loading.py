@@ -36,19 +36,6 @@ _REMOTE_CODE_METADATA_PATTERNS = [
     "*.jinja",
 ]
 
-# mlx_lm.load dropped trust_remote_code in some releases. Check once at
-# import time so call sites can pass it safely across versions.
-def _mlx_lm_load_accepts_trust_remote_code() -> bool:
-    try:
-        import inspect
-        from mlx_lm import load as _lm_load
-        return "trust_remote_code" in inspect.signature(_lm_load).parameters
-    except Exception:
-        return False
-
-_LM_LOAD_ACCEPTS_TRC = _mlx_lm_load_accepts_trust_remote_code()
-
-
 def ensure_model_code_trusted(
     config: dict[str, Any],
     *,
@@ -131,9 +118,7 @@ def lm_load_compat(path_or_repo: str, *, trust_remote_code: bool = False, **kwar
         trust_remote_code=trust_remote_code,
     )
     from mlx_lm import load
-    if _LM_LOAD_ACCEPTS_TRC:
-        kwargs["trust_remote_code"] = trust_remote_code
-    return load(path_or_repo, **kwargs)
+    return load(path_or_repo, trust_remote_code=trust_remote_code, **kwargs)
 
 
 def expand_per_layer_quant_keys(cfg: dict) -> dict:
@@ -1027,6 +1012,18 @@ def maybe_apply_pre_load_patches(
                     model_name,
                 )
 
+    # mlx-vlm Qwen3.5-family GDN layers normalize q/k like the mlx-lm path.
+    if for_vlm and (
+        str(model_type or "").startswith("qwen3_5")
+        or str(text_model_type or "").startswith("qwen3_5")
+    ):
+        try:
+            from ..patches.qwen35_gdn_prework import apply_qwen35_vlm_qk_norm_patch
+        except Exception as e:
+            logger.warning("Qwen3.5 VLM q/k norm patch import failed: %s", e)
+        else:
+            apply_qwen35_vlm_qk_norm_patch()
+
     # qwen3_5_moe covers Qwen3.6 too (HF config sets model_type=qwen3_5_moe).
     # The nested-visual sanitize wrap remaps language_model.model.visual.*
     # to vision_tower.* for Qwen3.6's nested ViT layout. Wraps whichever
@@ -1283,6 +1280,20 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
     )
 
 
+def mimo_mtp_sidecar_config(model_name: str | Path) -> dict[str, str] | None:
+    """Model-config override that loads ``<model>/mtp/model_mtp.safetensors``.
+
+    MiMo V2 MLX conversions usually drop the next-token-prediction layers;
+    the upstream ``model_mtp.safetensors`` placed under ``mtp/`` restores
+    Lightning MTP decoding (``mimo_v2`` sanitize splits and dequantizes it).
+    """
+    mtp_sidecar = Path(model_name).expanduser() / "mtp" / "model_mtp.safetensors"
+    if not mtp_sidecar.is_file():
+        return None
+    logger.info("Loading MiMo MTP sidecar from %s", mtp_sidecar)
+    return {"omlx_mtp_sidecar": str(mtp_sidecar)}
+
+
 def load_text_model(
     model_name: str,
     tokenizer_config: dict[str, Any] | None = None,
@@ -1296,10 +1307,9 @@ def load_text_model(
         else False
     )
     load_kwargs = {}
-    mtp_sidecar = Path(model_name).expanduser() / "mtp" / "model_mtp.safetensors"
-    if mtp_sidecar.is_file():
-        load_kwargs["model_config"] = {"omlx_mtp_sidecar": str(mtp_sidecar)}
-        logger.info("Loading MiMo MTP sidecar from %s", mtp_sidecar)
+    sidecar_config = mimo_mtp_sidecar_config(model_name)
+    if sidecar_config is not None:
+        load_kwargs["model_config"] = sidecar_config
     return lm_load_compat(
         model_name,
         tokenizer_config=tokenizer_config,

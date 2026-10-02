@@ -44,6 +44,19 @@ except ImportError:
     preprocess_harmony_messages = None  # type: ignore
 
 
+def _mtp_sidecar_load_kwargs(model_name: str) -> dict[str, Any]:
+    """Loader kwargs for a MiMo MTP sidecar next to the checkpoint.
+
+    MLX conversions of MiMo V2 drop the next-token-prediction layers; the
+    upstream ``model_mtp.safetensors`` under ``<model>/mtp/`` restores
+    Lightning MTP decoding (same rule as ``load_text_model``).
+    """
+    from ..utils.model_loading import mimo_mtp_sidecar_config
+
+    sidecar_config = mimo_mtp_sidecar_config(model_name)
+    return {"model_config": sidecar_config} if sidecar_config else {}
+
+
 class BatchedEngine(BaseEngine):
     """
     Batched engine for continuous batching.
@@ -311,6 +324,7 @@ class BatchedEngine(BaseEngine):
                 self._model_name,
                 tokenizer_config=tokenizer_config,
                 trust_remote_code=self._trust_remote_code,
+                **_mtp_sidecar_load_kwargs(self._model_name),
                 # With expert offload the load stays lazy so the wrap below
                 # can drop non-resident expert tensors BEFORE anything
                 # materializes them; materialize_lazy_state then evaluates

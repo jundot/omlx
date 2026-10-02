@@ -1211,6 +1211,31 @@ class DiscoveryService:
             "peers": len(self._peers),
         }
 
+    def address_health(self, node_id: str) -> dict[str, dict[str, Any]]:
+        """Return transient per-address health; persisted pairing is not liveness."""
+        with self._lock:
+            now = self._clock()
+            result = {}
+            for (ip, _port), candidate in self._candidates.items():
+                if candidate.get("node_id") != node_id:
+                    continue
+                success = candidate.get("last_success")
+                failures = candidate.get("consecutive_failures", 0)
+                fresh = success is not None and now - success < self.config.dead_after
+                result[ip] = {
+                    "state": (
+                        "verified"
+                        if candidate.get("verified") and fresh
+                        else (
+                            "stale"
+                            if failures >= 3 or success is not None
+                            else "unknown"
+                        )
+                    ),
+                    "consecutive_failures": failures,
+                }
+            return result
+
     def on_change(self, callback: Callable[[PeerRecord], None]) -> None:
         with self._lock:
             self._callbacks.append(callback)
@@ -1745,6 +1770,11 @@ class DiscoveryService:
                 if candidate is not None:
                     candidate["last_transport"] = diagnostic.get("transport")
                     candidate["last_error"] = diagnostic.get("error")
+                    candidate["consecutive_failures"] = (
+                        candidate.get("consecutive_failures", 0) + 1
+                    )
+                    if candidate["consecutive_failures"] >= 3:
+                        candidate["verified"] = False
             return
         node_id = result.get("node_id")
         if hint is not None and node_id != hint:
@@ -1761,6 +1791,8 @@ class DiscoveryService:
             candidate = self._candidates.get((ip, port))
             if candidate is not None:
                 candidate["verified"] = True
+                candidate["last_success"] = now
+                candidate["consecutive_failures"] = 0
                 candidate["rtt"] = rtt
                 candidate["node_id"] = node_id
                 candidate["last_transport"] = diagnostic.get("transport")

@@ -18,6 +18,8 @@ from typing import Any
 import mlx_lm.server as mlx_server
 import pytest
 from mlx_lm.generate import DEFAULT_QUANTIZED_KV_START
+from mlx_lm.tokenizer_utils import TokenizerWrapper
+from mlx_lm.tool_parsers import json_tools, qwen3_coder
 
 import omlx.cluster.inference_worker as inference_worker
 from omlx.cluster.inference_worker import (
@@ -176,6 +178,21 @@ def test_distributed_minimax_protocol_replaces_generic_tool_and_thinking_markers
         ],
     )
     assert parsed == {"name": "get_weather", "arguments": {"city": "Paris"}}
+
+
+def test_distributed_protocol_repairs_json_tools_label(tmp_path):
+    tokenizer = TokenizerWrapper.__new__(TokenizerWrapper)
+    tokenizer._tokenizer = SimpleNamespace(
+        chat_template="<tool_call>\n<function=",
+        encode=lambda text, **kwargs: list(text.encode()),
+    )
+    tokenizer._chat_template = None
+    tokenizer._tool_parser = json_tools.parse_tool_call
+    tokenizer._tool_call_start = "<tool_call>"
+    tokenizer._tool_call_end = "</tool_call>"
+
+    assert _install_distributed_model_protocol(tokenizer, tmp_path) == ""
+    assert tokenizer.tool_parser is qwen3_coder.parse_tool_call
 
 
 def test_distributed_protocol_leaves_other_model_families_untouched(tmp_path):

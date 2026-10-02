@@ -539,6 +539,9 @@ class TestHelpers:
     def test_is_moe_router_router(self):
         assert _is_moe_router("model.layers.0.block_sparse_moe.router") is True
 
+    def test_is_moe_router_gemma4_router_proj(self):
+        assert _is_moe_router("language_model.model.layers.0.router.proj") is True
+
     def test_is_moe_router_gate_proj_not_router(self):
         assert _is_moe_router("model.layers.0.mlp.gate_proj") is False
 
@@ -1173,6 +1176,13 @@ class TestStreamingHelpers:
         config = {"num_hidden_layers": 32, "num_local_experts": 8}
         bits, gs, mode = _get_predicate_bits("model.layers.0.mlp.gate", config, 4, 64)
         assert bits is None  # Router → fp16 (not quantized)
+
+    def test_get_predicate_bits_gemma4_router_fp16(self):
+        config = {"num_hidden_layers": 30, "text_config": {"num_experts": 128}}
+        bits, gs, mode = _get_predicate_bits(
+            "language_model.model.layers.0.router.proj.weight", config, 4, 64
+        )
+        assert bits is None
 
     def test_get_predicate_bits_default_affine4(self):
         config = {"num_hidden_layers": 32}
@@ -2196,6 +2206,38 @@ class TestLazyTensorIndex:
         idx = _LazyTensorIndex([path])
         del idx["layer.0.weight"]
         assert "layer.0.weight" not in idx
+
+    @pytest.fixture
+    def scalar_sf_file(self, tmp_path):
+        # Gemma 4 audio-tower clamp bounds are 0-dim BF16 (0x414D == 12.8125).
+        import struct
+
+        path = tmp_path / "scalars.safetensors"
+        tensors = {
+            "audio_tower.input_max": (struct.pack("<H", 0x414D), [], "BF16"),
+            "layer.0.weight": np.random.randn(4, 8).astype(np.float16),
+        }
+        _write_safetensors(str(path), tensors)
+        return str(path)
+
+    def test_scalar_items_getitem_and_pop(self, scalar_sf_file):
+        idx = _LazyTensorIndex([scalar_sf_file])
+        key = "audio_tower.input_max"
+        loaded = [dict(idx.items())[key], idx[key], idx.pop(key)]
+        for arr in loaded:
+            assert arr.shape == ()
+            assert arr.dtype == mx.bfloat16
+            assert arr.item() == 12.8125
+
+    def test_scalar_through_discovered_plan(self, scalar_sf_file):
+        idx = _LazyTensorIndex([scalar_sf_file])
+        plan = _discover_sanitize_plan(
+            lambda weights: {"m." + k: v for k, v in weights.items()}, idx
+        )
+        assert plan is not None
+        arr = _DiscoveredPlan(plan, idx).pop("m.audio_tower.input_max")
+        assert arr.shape == ()
+        assert arr.item() == 12.8125
 
 
 # =============================================================================
@@ -5579,17 +5621,14 @@ class TestMeasureSensitivityVlmMtp:
         mock_set_active.assert_not_called()
 
     def test_text_load_forwards_trust_remote_code(self, monkeypatch):
-        """Text sensitivity load forwards the mlx-lm custom-code opt-in when
-        the installed mlx-lm supports it."""
+        """Text sensitivity load forwards the mlx-lm custom-code opt-in."""
         import omlx.utils.model_loading as real_ml
 
         self._patch_common(monkeypatch, has_mtp=True)
         mock_load = MagicMock(return_value=(MagicMock(), MagicMock()))
         monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(load=mock_load))
         # _patch_common swapped model_loading for a MagicMock; oq imports
-        # lm_load_compat from it. Expose the real shim and pin the capability
-        # flag so forwarding is deterministic regardless of installed mlx-lm.
-        monkeypatch.setattr(real_ml, "_LM_LOAD_ACCEPTS_TRC", True)
+        # lm_load_compat from it, so expose the real shim.
         sys.modules["omlx.utils.model_loading"].lm_load_compat = real_ml.lm_load_compat
 
         _measure_sensitivity(
@@ -5603,14 +5642,13 @@ class TestMeasureSensitivityVlmMtp:
 
 
 class TestCollectImatrixTextLoad:
-    def test_uses_compat_loader_without_trust_remote_code(self, monkeypatch):
-        """oQe calibration works with current mlx-lm, which removed this kwarg."""
+    def test_uses_compat_loader_with_trust_remote_code(self, monkeypatch):
+        """oQe calibration forwards the custom-code opt-in to mlx-lm."""
         from omlx import oq as oq_mod
         import omlx.utils.model_loading as real_ml
 
         mock_load = MagicMock(return_value=(MagicMock(), MagicMock()))
         monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(load=mock_load))
-        monkeypatch.setattr(real_ml, "_LM_LOAD_ACCEPTS_TRC", False)
         monkeypatch.setattr(real_ml, "_has_mtp_heads", MagicMock(return_value=False))
         monkeypatch.setattr(
             real_ml, "_checkpoint_has_mtp_weights", MagicMock(return_value=False)
@@ -5622,7 +5660,7 @@ class TestCollectImatrixTextLoad:
 
         oq_mod._collect_imatrix("/fake/text", {}, trust_remote_code=True)
 
-        assert "trust_remote_code" not in mock_load.call_args.kwargs
+        assert mock_load.call_args.kwargs["trust_remote_code"] is True
 
     def test_vlm_proxy_passes_lenient_load_directly(self, monkeypatch):
         """SSD-mapped proxy tensors are not normal model parameters.

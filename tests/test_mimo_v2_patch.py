@@ -14,6 +14,7 @@ from mlx.utils import tree_flatten
 from mlx_lm.models.activations import swiglu
 from mlx_lm.models.base import create_causal_mask
 
+from omlx.engine import batched as batched_engine
 from omlx.patches.mimo_v2 import decode_fast as df
 from omlx.patches.mimo_v2 import moe_decode as md
 from omlx.patches.mimo_v2 import sdpa_flash as sf
@@ -446,6 +447,17 @@ def test_load_text_model_injects_mtp_sidecar(tmp_path, monkeypatch):
 
     assert captured["model_name"] == str(tmp_path)
     assert captured["model_config"] == {"omlx_mtp_sidecar": str(sidecar)}
+
+
+def test_batched_engine_load_kwargs_carry_mtp_sidecar(tmp_path):
+    assert batched_engine._mtp_sidecar_load_kwargs(str(tmp_path)) == {}
+    sidecar = tmp_path / "mtp" / "model_mtp.safetensors"
+    sidecar.parent.mkdir()
+    sidecar.touch()
+
+    assert batched_engine._mtp_sidecar_load_kwargs(str(tmp_path)) == {
+        "model_config": {"omlx_mtp_sidecar": str(sidecar)}
+    }
 
 
 def test_multimodal_mimo_is_explicitly_routed_to_text_engine(tmp_path, caplog):
@@ -1577,3 +1589,63 @@ def test_sdpa_flash_declines_unsupported_shapes():
         sf.sdpa_flash(q32, k.astype(mx.float32), v.astype(mx.float32), 1.0, None, None)
         is None
     )
+
+
+def _fp8_fused_qkv_sidecar(prefix, *, tp, n_h=4, n_kv=2, hd=32, vhd=24, cols=128):
+    """A pre-sharded FP8 fused qkv whose rows say which shard/part they are (values chosen to be exact in e4m3)."""
+    from omlx.patches.mimo_v2.fused_qkv_layout import (
+        FUSED_QKV_BLOCK_SIZE,
+        fused_qkv_part_rows,
+        fused_qkv_shard_rows,
+    )
+
+    q_pr, k_pr, v_pr = fused_qkv_part_rows(n_h, n_kv, hd, vhd, tp)
+    actual_pr, padded_pr = fused_qkv_shard_rows(n_h, n_kv, hd, vhd, tp)
+    # On disk the shards are stored back to back without padding; only the
+    # block scales are laid out on the per-shard padded grid.
+    rows = []
+    for shard in range(tp):
+        rows.extend(
+            [1.0 + shard] * q_pr + [10.0 + shard] * k_pr + [32.0 + 4 * shard] * v_pr
+        )
+    assert len(rows) == tp * actual_pr
+    weight = mx.to_fp8(mx.array(rows, dtype=mx.float32)[:, None] * mx.ones((1, cols)))
+    scale = mx.ones(
+        (tp * padded_pr // FUSED_QKV_BLOCK_SIZE, cols // FUSED_QKV_BLOCK_SIZE)
+    )
+    sidecar = {f"{prefix}.weight": weight, f"{prefix}.weight_scale_inv": scale}
+    return sidecar, (q_pr, k_pr, v_pr)
+
+
+def _sanitized_qkv_rows(sidecar, monkeypatch):
+    mimo_v2 = _load_patch_module()
+    from omlx.patches.mlx_lm_mtp import set_mtp_active
+
+    config = _minimal_config(
+        num_nextn_predict_layers=1,
+        omlx_mtp_sidecar="/models/mimo/mtp/model_mtp.safetensors",
+    )
+    set_mtp_active(True)
+    try:
+        model = mimo_v2.Model(mimo_v2.ModelArgs.from_dict(config))
+    finally:
+        set_mtp_active(False)
+    monkeypatch.setattr(mimo_v2.mx, "load", lambda path: sidecar)
+    out = model.sanitize({})
+    prefix = "model.mtp.layers.0.self_attn"
+    return {
+        name: out[f"{prefix}.{name}_proj.weight"][:, 0].astype(mx.float32).tolist()
+        for name in ("q", "k", "v")
+    }
+
+
+def test_fp8_sidecar_qkv_assumes_the_official_tp4_layout_when_main_is_split(
+    monkeypatch,
+):
+    prefix = "model.mtp.layers.0.self_attn.qkv_proj"
+    sidecar, (q_pr, k_pr, v_pr) = _fp8_fused_qkv_sidecar(prefix, tp=4)
+    rows = _sanitized_qkv_rows(sidecar, monkeypatch)
+    # Each projection is the concatenation of its per-shard parts, in order.
+    assert rows["q"] == [1.0 + s for s in range(4) for _ in range(q_pr)]
+    assert rows["k"] == [10.0 + s for s in range(4) for _ in range(k_pr)]
+    assert rows["v"] == [32.0 + 4 * s for s in range(4) for _ in range(v_pr)]

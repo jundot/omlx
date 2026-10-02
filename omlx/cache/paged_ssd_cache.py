@@ -260,6 +260,7 @@ def _cache_compat_signature(
     cachelist_subtypes: dict[str, list[str]] | None = None,
     payload_layout: str | None = None,
     gdn_sidecar_state_dtype: str | None = None,
+    numerics: str | None = None,
 ) -> str:
     """Return a stable compatibility signature for a persisted cache block."""
     payload = {
@@ -287,7 +288,49 @@ def _cache_compat_signature(
         payload["payload_layout"] = payload_layout
     if gdn_sidecar_state_dtype is not None:
         payload["gdn_sidecar_state_dtype"] = gdn_sidecar_state_dtype
+    # Only models whose forward numerics changed carry a revision, so other
+    # signatures stay byte-identical to the previous format.
+    if numerics is not None:
+        payload["numerics"] = numerics
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+# Model modules whose forward numerics changed under a dependency update.
+# Blocks written before the change are unsafe for these models only.
+_NUMERICS_REVISIONS = {
+    # mlx-lm a63e24c scales the GDN q/k l2norm eps by inv_scale**2.
+    "mlx_lm.models.qwen3_5": "gdn-qk-norm-2",
+    "mlx_lm.models.qwen3_next": "gdn-qk-norm-2",
+    "mlx_lm.models.bailing_hybrid": "gdn-qk-norm-2",
+    # omlx.patches.qwen35_gdn_prework applies the same fix to mlx-vlm.
+    "mlx_vlm.models.qwen3_5.language": "gdn-qk-norm-2",
+}
+
+
+def numerics_revision_for_model(model: Any) -> str | None:
+    """Return the numerics revision of a loaded model, or None."""
+    modules = getattr(model, "modules", None)
+    if not callable(modules):
+        return None
+    revisions = {
+        _NUMERICS_REVISIONS[name]
+        for module in modules()
+        if (name := type(module).__module__) in _NUMERICS_REVISIONS
+    }
+    return ",".join(sorted(revisions)) or None
+
+
+def _signature_numerics(cache_signature: str) -> str | None:
+    """Extract ``numerics`` from a stored signature, or None."""
+    if not cache_signature:
+        return None
+    try:
+        payload = json.loads(cache_signature)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload.get("numerics")
 
 
 def cache_signature_for(
@@ -1715,6 +1758,9 @@ class PagedSSDCacheManager(CacheManager):
         # the layer signature. None disables the check (legacy managers /
         # models without mixed CacheList layers).
         self._expected_cachelist_subtypes: dict[str, list[str]] | None = None
+        # Numerics revision of the live model (see ``_NUMERICS_REVISIONS``).
+        # None accepts every block, like the TurboQuant depth.
+        self._expected_numerics: str | None = None
         # Set once we have swept stale-signature blocks for the current
         # ``_expected_layer_cache_types`` / ``_expected_turboquant_kv_bits``.
         # Re-assigning the signature (e.g., via
@@ -2663,6 +2709,7 @@ class PagedSSDCacheManager(CacheManager):
             return (
                 self._payload_layout == "embedded"
                 and self._signature_bits_match("")
+                and self._signature_numerics_match("")
             )
 
         try:
@@ -2726,7 +2773,16 @@ class PagedSSDCacheManager(CacheManager):
         if not self._signature_bits_match(metadata.cache_signature):
             return False
 
+        if not self._signature_numerics_match(metadata.cache_signature):
+            return False
+
         return True
+
+    def _signature_numerics_match(self, cache_signature: str) -> bool:
+        """True when a block was computed with the live model's numerics."""
+        if self._expected_numerics is None:
+            return True
+        return _signature_numerics(cache_signature) == self._expected_numerics
 
     def _signature_bits_match(self, cache_signature: str) -> bool:
         """True when a block's recorded TurboQuant depth satisfies expectations.
@@ -2774,6 +2830,11 @@ class PagedSSDCacheManager(CacheManager):
             return (
                 "TurboQuant depth: expected "
                 f"{self._expected_turboquant_kv_bits}, got {actual}"
+            )
+        if not self._signature_numerics_match(cache_signature):
+            return (
+                f"numerics: expected {self._expected_numerics}, "
+                f"got {_signature_numerics(cache_signature)}"
             )
 
         expected_subtypes = self._expected_cachelist_subtypes
@@ -2841,6 +2902,7 @@ class PagedSSDCacheManager(CacheManager):
             turboquant_kv_bits=turboquant_kv_bits,
             cachelist_subtypes=cachelist_subtypes,
             payload_layout=self._payload_layout,
+            numerics=self._expected_numerics,
         )
 
     def gdn_cache_signature_for(
@@ -3448,6 +3510,7 @@ class PagedSSDCacheManager(CacheManager):
                     cache_data, layer_cache_types, layer_meta_states
                 ),
                 payload_layout=self._payload_layout,
+                numerics=self._expected_numerics,
             )
 
             # Prepare metadata
@@ -4372,6 +4435,7 @@ class PagedSSDCacheManager(CacheManager):
         *,
         turboquant_kv_bits: float | None = None,
         cachelist_subtypes: dict[str, list[str]] | None = None,
+        numerics: str | None = None,
     ) -> bool:
         """Set the live layer-cache signature, replacing stale expectations.
 
@@ -4383,6 +4447,9 @@ class PagedSSDCacheManager(CacheManager):
         TurboQuant is inactive). A bit-depth change alone also triggers the
         sweep: blocks written at another depth have a different packed state
         width and would crash batch concatenation if mixed (#2045).
+
+        ``numerics`` is the live model's numerics revision; blocks computed
+        under another revision are swept.
 
         Returns True when the canonical signature changed and a stale-signature
         sweep should run. Returns False for empty input or a canonical no-op.
@@ -4403,10 +4470,12 @@ class PagedSSDCacheManager(CacheManager):
             subtypes_changed = (
                 cachelist_subtypes != self._expected_cachelist_subtypes
             )
+            numerics_changed = numerics != self._expected_numerics
             if (
                 old_canonical == new_canonical
                 and not bits_changed
                 and not subtypes_changed
+                and not numerics_changed
             ):
                 if old_signature != new_signature:
                     self._expected_layer_cache_types = new_signature
@@ -4415,16 +4484,18 @@ class PagedSSDCacheManager(CacheManager):
             self._expected_layer_cache_types = new_signature
             self._expected_turboquant_kv_bits = new_bits
             self._expected_cachelist_subtypes = cachelist_subtypes
+            self._expected_numerics = numerics
             self._signature_sweep_completed = False
 
         logger.info(
             "PagedSSDCacheManager updated layer cache signature "
             "(%d layers, %d unique types, turboquant_kv_bits=%s, "
-            "cachelist_subtypes=%s)",
+            "cachelist_subtypes=%s, numerics=%s)",
             len(new_signature),
             len(set(new_canonical or ())),
             new_bits,
             "yes" if cachelist_subtypes else "no",
+            numerics,
         )
         return True
 
@@ -4486,6 +4557,9 @@ class PagedSSDCacheManager(CacheManager):
                     stale.append(h)
                     continue
                 if not self._signature_bits_match(meta.cache_signature):
+                    stale.append(h)
+                    continue
+                if not self._signature_numerics_match(meta.cache_signature):
                     stale.append(h)
                     continue
                 if self._expected_cachelist_subtypes is not None and (

@@ -2325,6 +2325,8 @@ async def cluster_complete_worker_join(
         last_seen_at=now,
     )
     try:
+        # Pin first: complete() persists the node and consumes the session,
+        # so a later pin failure would leave an enrolled node with no retry.
         await asyncio.to_thread(
             pin_enrolled_host_key,
             hostname=primary_address,
@@ -3881,8 +3883,51 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
     }
 
 
+@router.delete("/forget")
+async def forget_cluster(node_id: str | None = None):
+    """Forget one peer, or leave the entire cluster, without remote contact.
+
+    A signed model placement cannot survive losing a rank. Remove affected
+    deployments after verified local teardown; retain all other peer trust.
+    Omitting node_id, or selecting this Mac, leaves the whole local cluster.
+    """
+    from .pairing_routes import PairingError, _manager, _pairing_http_error
+
+    manager = _manager()
+    peers = await asyncio.to_thread(manager.list_paired)
+    deployments = await asyncio.to_thread(get_cluster_registry().list)
+    forget_all = node_id is None or node_id == manager.node_id
+    affected = [
+        deployment
+        for deployment in deployments
+        if forget_all or any(host.node_id == node_id for host in deployment.hosts)
+    ]
+    targets = [
+        peer["node_id"] for peer in peers if forget_all or peer["node_id"] == node_id
+    ]
+    if not forget_all and not targets and not affected:
+        raise HTTPException(status_code=404, detail="cluster member not found")
+    # Do not revoke peer trust if local teardown fails or a request is active.
+    for deployment in affected:
+        await deactivate_cluster_deployment(deployment.deployment_id, local_only=True)
+    results = []
+    try:
+        for target in targets:
+            results.append(await asyncio.to_thread(manager.unpair, target))
+    except PairingError as exc:
+        raise _pairing_http_error(exc) from exc
+    return {
+        "ok": True,
+        "local_only": True,
+        "stopped": False,
+        "forgotten_node_ids": targets,
+        "removed_deployment_ids": [item.deployment_id for item in affected],
+        "revocations": results,
+    }
+
+
 @router.delete("/deployments/{deployment_id}")
-async def deactivate_cluster_deployment(deployment_id: str):
+async def deactivate_cluster_deployment(deployment_id: str, local_only: bool = False):
     """Stop the resident cluster, then disable future distributed loads."""
 
     registry = get_cluster_registry()
@@ -3896,8 +3941,14 @@ async def deactivate_cluster_deployment(deployment_id: str):
         except ModelNotFoundError:
             model_id = None
         if model_id is not None:
-            await pool.prepare_cluster_reload(model_id)
-        await asyncio.to_thread(stop_deployment_processes, deployment)
+            await pool.prepare_cluster_reload(
+                model_id, **({"local_only": True} if local_only else {})
+            )
+        await asyncio.to_thread(
+            stop_deployment_processes,
+            deployment,
+            **({"local_only": True} if local_only else {}),
+        )
         removed = await asyncio.to_thread(registry.remove, deployment_id)
         unregister = getattr(pool, "unregister_cluster_model", None)
         if model_id is not None and callable(unregister):
@@ -3917,7 +3968,8 @@ async def deactivate_cluster_deployment(deployment_id: str):
     return {
         "ok": True,
         "deployment_id": deployment_id,
-        "stopped": True,
+        "stopped": not local_only,
+        "local_only": local_only,
     }
 
 

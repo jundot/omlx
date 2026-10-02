@@ -737,7 +737,9 @@ def _is_audio_tensor(name: str) -> bool:
 
 def _is_moe_router(path: str) -> bool:
     """Detect MoE router/gate layers (distinct from gate_proj)."""
-    if path.endswith(("mlp.gate", ".router", ".router.layer", ".v_router")):
+    if path.endswith(
+        ("mlp.gate", ".router", ".router.layer", ".v_router", ".router.proj")
+    ):
         return True
     if path.endswith(".gate") and "gate_proj" not in path:
         return True
@@ -3009,19 +3011,8 @@ class _DiscoveredPlan:
         if meta is None:
             raise KeyError(f"source tensor {src_key!r} not in lazy index")
         sf_path, data_offset, start, end, shape, dtype = meta
-        if len(shape) == 0:
-            import numpy as _np
-
-            with open(sf_path, "rb") as f:
-                f.seek(data_offset + start)
-                raw = f.read(end - start)
-            lt_tmp = _LazyTensor(sf_path, data_offset, start, end, (1,), dtype)
-            np_view = _np.frombuffer(raw, dtype=lt_tmp._np_view_dtype())
-            arr = mx.array(np_view).view(lt_tmp._mlx_dtype()).reshape(())
-            mx.eval(arr)
-            return arr
         lt = _LazyTensor(sf_path, data_offset, start, end, shape, dtype)
-        arr = lt[:]
+        arr = lt.load()
         mx.eval(arr)
         return arr
 
@@ -4901,8 +4892,8 @@ class _LazyTensorIndex:
         s_lt = _LazyTensor(
             s_meta[0], s_meta[1], s_meta[2], s_meta[3], s_meta[4], s_meta[5]
         )
-        weight_raw = w_lt[:]
-        scale_raw = s_lt[:]
+        weight_raw = w_lt.load()
+        scale_raw = s_lt.load()
         mx.eval(weight_raw, scale_raw)
         info = self._src_quant.get(wk)
         if info is not None and info["kind"] == "mxfp4":
@@ -5017,7 +5008,7 @@ class _LazyTensorIndex:
     def _load_raw(self, key):
         sf_path, data_offset, start, end, shape, dtype = self._index[key]
         lt = _LazyTensor(sf_path, data_offset, start, end, shape, dtype)
-        return lt[:]
+        return lt.load()
 
     def __getitem__(self, key):
         if key in self._overrides:
@@ -5088,7 +5079,7 @@ class _LazyTensorIndex:
             return result
         sf_path, data_offset, start, end, shape, dtype = self._index.pop(key)
         lt = _LazyTensor(sf_path, data_offset, start, end, shape, dtype)
-        arr = lt[:]
+        arr = lt.load()
         mx.eval(arr)
         return arr
 
@@ -5196,12 +5187,22 @@ class _LazyTensor:
         mx.eval(result)
         return result
 
+    def load(self):
+        """Read the whole tensor. Unlike ``[:]``, also handles 0-dim scalars
+        (e.g. Gemma 4's audio-tower clamp bounds)."""
+        if self.ndim == 0:
+            with open(self._sf_path, "rb") as f:
+                f.seek(self._data_offset + self._start)
+                raw = f.read(self._end - self._start)
+            arr = _np.frombuffer(raw, dtype=self._np_view_dtype())
+            t = mx.array(arr).view(self._mlx_dtype()).reshape(())
+            mx.eval(t)
+            return t
+        return self._load_rows(0, self.shape[0])
+
     def __getitem__(self, idx):
         if len(self.shape) == 0:
-            raise IndexError(
-                "0-dim _LazyTensor cannot be indexed; caller should use "
-                "_materialize_source scalar path"
-            )
+            raise IndexError("0-dim _LazyTensor cannot be indexed; use load()")
         if isinstance(idx, tuple):
             return self._load_rows(0, self.shape[0])[idx]
         if isinstance(idx, slice):

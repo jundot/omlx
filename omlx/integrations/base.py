@@ -7,7 +7,7 @@ import os
 import shutil
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -29,6 +29,11 @@ class IntegrationContext:
     tools_profile: str = "coding"
     extra_args: tuple[str, ...] = ()
     cross_session: bool = False
+    # Per-model status/capacity map the launcher pre-fetched from
+    # GET /v1/models/status (keys: model id and model_alias). Integrations
+    # read it instead of fetching the status again themselves; empty for
+    # direct constructions.
+    models_status_map: dict[str, dict] = field(default_factory=dict)
 
     @property
     def base_url(self) -> str:
@@ -56,6 +61,12 @@ class Integration:
     type: str  # "env_var" or "config_file"
     install_check: str  # binary name to check with `which`
     install_hint: str  # installation instructions
+
+    # Whether `omlx launch <tool>` must interactively pick a model. Tools
+    # that configure one model into their config need a pick; tools that
+    # register the server's whole model catalog (dsh) do not, and resolve
+    # their optional default from `--model` / the saved per-tool setting.
+    requires_model_selection: bool = True
 
     def get_command(self, ctx: IntegrationContext) -> str:
         """Generate the command string for clipboard/display."""
@@ -174,23 +185,32 @@ class Integration:
                 print("Creating new config file.")
                 existing = {}
 
-            # Create timestamped backup
-            timestamp = int(time.time())
-            backup = config_path.with_suffix(f".{timestamp}.bak")
-            try:
-                shutil.copy2(config_path, backup)
-                print(f"Backup: {backup}")
-            except OSError as e:
-                print(f"Warning: could not create backup: {e}")
-
         updater(existing)
 
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(
-            json.dumps(existing, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        print(f"Config written: {config_path}")
+        payload = json.dumps(existing, indent=2, ensure_ascii=False) + "\n"
+        backup_then_write(config_path, payload)
+
+
+def backup_then_write(
+    path: Path, text: str, *, failure: str = "could not create backup",
+    note: str = "Config written",
+) -> None:
+    """Back up an existing config, then write ``text`` over it.
+
+    Best effort: a config that cannot be backed up is still written, and a
+    failed copy only earns a warning.
+    """
+    if path.exists():
+        backup = path.with_suffix(f".{int(time.time())}.bak")
+        try:
+            shutil.copy2(path, backup)
+            print(f"Backup: {backup}")
+        except OSError as e:
+            print(f"Warning: {failure}: {e}")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    print(f"{note}: {path}")
 
 
 def _select_model_curses(models_info: list[dict], tool_name: str) -> str:
