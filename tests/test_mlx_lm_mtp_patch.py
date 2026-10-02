@@ -4517,6 +4517,53 @@ def test_multi_request_mtp_or_singleton_only_matches_standard(
         mlx_lm_mtp.set_mtp_depth(depth)
 
 
+@pytest.mark.parametrize("family", ["qwen", "qwen4"])
+def test_context_copy_drafts_keep_greedy_output(family, monkeypatch):
+    """Copied drafts never change greedy output, whichever of them is wrong.
+
+    The proposer is replaced by the true continuation with one token flipped
+    at a position that moves every cycle, so the widest (16-row) windows are
+    verified with accepted lengths from none to all.
+    """
+    from omlx.patches.mlx_lm_mtp import context_copy
+
+    widest = context_copy.MAX_COPY
+    flips = (0, 1, 7, widest - 1, widest)  # ``widest``: nothing flipped
+    previous = mlx_lm_mtp.is_mtp_active()
+    try:
+        mlx_lm_mtp.set_mtp_active(True)
+        mx.random.seed(173)
+        model = _model(family)
+        mx.eval(model.parameters())
+        host = getattr(
+            model, "_language_model", getattr(model, "language_model", model)
+        )
+        prompt = [3, 4, 5, 6, 7, 8, 9, 10]
+        host._omlx_mtp_decode_enabled = False
+        expected, _ = generate(model, [prompt], [64])
+        host._omlx_mtp_decode_enabled = True
+        accepted = []
+
+        def propose(self, limit):
+            done = len(self._ids) - len(prompt)
+            copied = list(expected[0][done : done + min(limit, widest)])
+            wrong = flips[len(accepted) % len(flips)]
+            if wrong < len(copied):
+                copied[wrong] ^= 1
+            return copied if len(copied) >= 2 else []
+
+        def observe(self, count, drafted):
+            accepted.append(count)
+
+        monkeypatch.setattr(context_copy.ContextCopy, "propose", propose)
+        monkeypatch.setattr(context_copy.ContextCopy, "observe", observe)
+        actual, _ = generate(model, [prompt], [64])
+        assert actual == expected
+        assert set(flips) <= set(accepted)
+    finally:
+        mlx_lm_mtp.set_mtp_active(previous)
+
+
 @pytest.mark.parametrize("size", [2, 4])
 @pytest.mark.parametrize("late_join", [False, True])
 def test_initialization_uses_one_forward_without_cache_extraction(

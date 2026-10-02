@@ -24,6 +24,7 @@ import mlx.nn as nn
 import numpy as np
 
 from omlx.patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import register_ple_resource
+from omlx.patches import row_exact_qmv
 from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
 
 from .cache import BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
@@ -48,7 +49,7 @@ from .qsa_fast import (
     masked_decode_sdpa,
     pool_completed_index_keys,
 )
-from . import hc_fused
+from . import attn_fused, hc_fused
 from .hc_projection import env_enabled
 
 logger = logging.getLogger(__name__)
@@ -1111,6 +1112,17 @@ _MTP_ONE_ROW_STEP: ContextVar[bool] = ContextVar(
 _NORM_SCALE_CACHE_DISABLED = not env_enabled("OMLX_QWEN4_NORM_SCALE_CACHE")
 
 
+def _fused_tile(rows: int) -> tuple[int, int, bool]:
+    """(rows per threadgroup, columns per simdgroup, unrolled tile) of the
+    grouped projection and ``o_proj`` launches; every tile gives each row its
+    one-row bits. One row keeps stock ``qmv_fast``'s rolled loop with half its
+    columns per simdgroup (more threadgroups stream the weights); verify rows
+    take the unrolled tile inside ``unrolled_tile_ok``."""
+    if rows == 1:
+        return 1, 2, False
+    return (2, 4, True) if rows % 2 == 0 else (1, 4, True)
+
+
 class Qwen4ExpRMSNorm(nn.Module):
     """Qwen4 RMSNorm, whose checkpoint weights are centered at zero.
 
@@ -1990,17 +2002,28 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         batch, length, _ = x.shape
         indexer = self.indexer
         past_len = cache.offset
+        # One launch for the four projections and one for the q/k norms and
+        # MRoPE when attn_fused serves the layout (same bits).
+        fused = length <= attn_fused.MAX_ROWS and self._fused_projections_ready(
+            x, position_ids
+        )
+        if fused:
+            q_out, projected, v_out, queries, new_keys, index_positions = (
+                self._fused_prologue(x, past_len, position_ids)
+            )
+        else:
+            projected = _target_verify_linear(indexer.index_qk_proj, x)
+            index_positions = (
+                position_ids
+                if position_ids is not None
+                else indexer._default_position_ids(batch, past_len, length)
+            )
         # The indexer half of ``indexer.from_projected`` for all rows.
-        projected = _target_verify_linear(indexer.index_qk_proj, x).reshape(
+        projected = projected.reshape(
             batch, length, indexer.n_heads + indexer.kv_heads, indexer.head_dim
         )
         index_queries = indexer.q_layernorm(projected[:, :, : indexer.n_heads]).transpose(
             0, 2, 1, 3
-        )
-        index_positions = (
-            position_ids
-            if position_ids is not None
-            else indexer._default_position_ids(batch, past_len, length)
         )
         cache.update_indexer(projected[:, :, indexer.n_heads :].squeeze(2), index_positions)
         index_queries = indexer._apply_rope(index_queries, index_positions)
@@ -2014,12 +2037,22 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             axis=1,
         ).astype(mx.float32)
 
-        q_proj_output, keys, values = _VERIFIER._linears(
-            (self.q_proj, self.k_proj, self.v_proj), x
-        )
-        queries, keys, values, gate, _ = self._prepare_projected_qkv(
-            q_proj_output, keys, values, cache, position_ids, None, None
-        )
+        if fused:
+            values = v_out.reshape(batch, length, self.num_key_value_heads, -1).transpose(
+                0, 2, 1, 3
+            )
+            keys, values = cache.update_and_fetch(new_keys, values)
+            gate = mx.sigmoid(
+                q_out.reshape(length, self.num_attention_heads, 2, -1)[:, :, 1]
+            ).reshape(batch, length, -1)
+        else:
+            q_proj_output, keys, values = _VERIFIER._linears(
+                (self.q_proj, self.k_proj, self.v_proj), x
+            )
+            queries, keys, values, gate, _ = self._prepare_projected_qkv(
+                q_proj_output, keys, values, cache, position_ids, None, None
+            )
+            gate = mx.sigmoid(gate)
 
         outputs = []
         for row in range(length):
@@ -2048,8 +2081,10 @@ class Qwen4ExpAttention(Qwen3_5Attention):
                 )
             outputs.append(output)
         output = mx.concatenate(outputs, axis=2).transpose(0, 2, 1, 3)
-        output = output.reshape(batch, length, -1)
-        return _VERIFIER._linear(self.o_proj, output * mx.sigmoid(gate))
+        output = output.reshape(batch, length, -1) * gate
+        if fused:
+            return self._fused_output(output, length)
+        return _VERIFIER._linear(self.o_proj, output)
 
     def __call__(
         self,
@@ -2112,6 +2147,13 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             cache._omlx_last_prefill_gathered = False
             return self._row_exact_masked_verify(x, cache, position_ids)
 
+        if rows := self._fused_rows(
+            x, mask, cache, position_ids, position_embeddings, target_verify
+        ):
+            if rows > 1:
+                cache._omlx_last_prefill_gathered = False
+            return self._fused_forward(x, cache, position_ids)
+
         if cache is not None and x.ndim == 3 and x.shape[1] > 1:
             cache._omlx_last_prefill_gathered = False
         qsa_mask = self.indexer(
@@ -2151,6 +2193,186 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             position_ids=position_ids,
             position_embeddings=position_embeddings,
         )
+
+    def _fused_rows(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[Any],
+        position_ids: Optional[mx.array],
+        position_embeddings: Optional[tuple[mx.array, mx.array]],
+        target_verify: bool,
+    ) -> int:
+        """Rows of a call the generic path below runs as ``_fused_forward``
+        reproduces it -- one decode row (dense or ``_masked_decode``), or a
+        row-exact verify window whose indexer selects every block; 0 otherwise."""
+
+        causal_mask = mask is None or (isinstance(mask, str) and mask == "causal")
+        if not (
+            causal_mask
+            and x.ndim == 3
+            and x.shape[0] == 1
+            and x.dtype in (mx.bfloat16, mx.float16)
+            and type(cache) is QSAKVCache
+            and isinstance(cache.offset, int)
+            and position_embeddings is None
+        ):
+            return 0
+        rows = x.shape[1]
+        if target_verify:
+            if not (2 <= rows <= attn_fused.MAX_ROWS and _row_exact_verify_armed()):
+                return 0
+        elif rows != 1:
+            return 0
+        if position_ids is not None and tuple(position_ids.shape) not in (
+            (1, rows),
+            (3, 1, rows),
+        ):
+            return 0
+        indexer = self.indexer
+        past = cache.offset
+        # The indexer returns no mask while its blocks fit the budget; past it
+        # only a decode row gets here (_masked_decode).
+        dense = (cache._index_offset + rows) // indexer.compress_ratio <= indexer.block_topk
+        if not (dense or rows == 1):
+            return 0
+        if (
+            dense
+            and attn_fused.row_plan(past + 1, past + rows) is None
+            or not self._fused_projections_ready(x, position_ids)
+        ):
+            return 0
+        return rows
+
+    def _fused_projections_ready(self, x: mx.array, position_ids: Optional[mx.array]) -> bool:
+        """Whether ``_fused_prologue`` runs these rows: the grouped projection
+        launch takes the four projections and the kernels this layout."""
+        rotary = self.rotary_emb
+        return (
+            rotary.fused_apply
+            and rotary.pairing == "half_split"
+            and self.q_norm.group_size is None
+            and self.k_norm.group_size is None
+            and self.q_norm.eps == self.k_norm.eps
+            and attn_fused.ready(
+                x.dtype,
+                self.num_attention_heads,
+                self.num_key_value_heads,
+                self.head_dim,
+                rotary.dim,
+                3 if position_ids is None else position_ids.ndim,
+            )
+            # The grouped launch reads quantized weights; dense projections keep the MLX ops.
+            and all(
+                isinstance(proj, nn.QuantizedLinear)
+                for proj in (self.q_proj, self.k_proj, self.v_proj, self.indexer.index_qk_proj)
+            )
+            and row_exact_qmv._group_plan(
+                (self.q_proj, self.k_proj, self.v_proj, self.indexer.index_qk_proj),
+                x,
+                x.shape[0] * x.shape[1],
+                _fused_tile(x.shape[0] * x.shape[1]),
+            )
+            is not None
+        )
+
+    def _fused_prologue(self, x: mx.array, past: int, position_ids: Optional[mx.array]):
+        """The four projections in one launch, then the q/k norms and MRoPE in
+        one: ``(q_out [R, heads * 2 * D], index_out, v_out, queries, keys,
+        index_positions)``, each value as the MLX ops compute it."""
+        rows = x.shape[1]
+        indexer = self.indexer
+        q_out, k_out, v_out, index_out = row_exact_qmv.quantized_linears_tiled(
+            (self.q_proj, self.k_proj, self.v_proj, indexer.index_qk_proj),
+            x,
+            *_fused_tile(rows),
+        )
+        if position_ids is None:
+            # What the indexer and _prepare_projected_qkv build.
+            index_positions = indexer._default_position_ids(1, past, rows)
+            rope_positions = mx.tile(
+                mx.expand_dims(mx.arange(past, past + rows), axis=0), (3, 1, 1)
+            )
+        else:
+            index_positions = rope_positions = position_ids
+        q_out = q_out.reshape(rows, -1)
+        rotary = self.rotary_emb
+        queries, keys = attn_fused.prep_qk(
+            q_out,
+            k_out.reshape(rows, -1),
+            self.q_norm._scale(),
+            self.k_norm._scale(),
+            self.q_norm.eps,
+            rope_positions,
+            rotary.inv_freq,
+            rotary.position_selector,
+            heads=self.num_attention_heads,
+            kv_heads=self.num_key_value_heads,
+            rotary_dim=rotary.dim,
+        )
+        return q_out, index_out, v_out, queries, keys, index_positions
+
+    def _fused_output(self, output: mx.array, rows: int) -> mx.array:
+        """``o_proj`` of the gated rows in one launch (each row's one-row bits)."""
+        projected = row_exact_qmv.quantized_linears_tiled(
+            (self.o_proj,), output, *_fused_tile(rows)
+        )
+        if projected is not None:
+            return projected[0]
+        return self.o_proj(output) if rows == 1 else _VERIFIER._linear(self.o_proj, output)
+
+    def _fused_forward(
+        self,
+        x: mx.array,
+        cache: QSAKVCache,
+        position_ids: Optional[mx.array],
+    ) -> mx.array:
+        """The generic path's result for ``_fused_rows``' calls in five
+        launches (the four projections; q/k norms and MRoPE; SDPA with the
+        gate in two; o_proj) plus the four cache appends and the gate's
+        sigmoid; a masked decode row keeps the indexer's selection and the
+        selected-keys SDPA. Every value takes the float operations of the MLX
+        ops it replaces, in their order."""
+
+        rows = x.shape[1]
+        indexer = self.indexer
+        past = cache.offset
+        dense = (cache._index_offset + rows) // indexer.compress_ratio <= indexer.block_topk
+        q_out, index_out, v_out, queries, keys, index_positions = self._fused_prologue(
+            x, past, position_ids
+        )
+        if dense:
+            # indexer.from_projected's append; it then selects every block.
+            index_out = index_out.reshape(
+                1, rows, indexer.n_heads + indexer.kv_heads, indexer.head_dim
+            )
+            cache.update_indexer(index_out[:, :, indexer.n_heads :].squeeze(2), index_positions)
+            qsa_mask = None
+        else:
+            qsa_mask = indexer.from_projected(index_out, cache, index_positions)
+        values = v_out.reshape(1, rows, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
+        keys, values = cache.update_and_fetch(keys, values)
+        # MLX's own sigmoid of each head's gate half.
+        gate = mx.sigmoid(q_out.reshape(rows, self.num_attention_heads, 2, -1)[:, :, 1])
+        if qsa_mask is None:
+            output = attn_fused.dense_sdpa_gate(
+                queries,
+                keys,
+                values,
+                gate,
+                self.scale,
+                attn_fused.row_plan(past + 1, past + rows),
+            )
+        else:
+            output = masked_decode_sdpa(queries, keys, values, qsa_mask, self.scale)
+            if output is None:
+                output = q35_language.scaled_dot_product_attention(
+                    queries, keys, values, cache=cache, scale=self.scale, mask=qsa_mask
+                )
+            output = output.transpose(0, 2, 1, 3).reshape(1, rows, -1) * gate.reshape(
+                1, rows, -1
+            )
+        return self._fused_output(output.reshape(1, rows, -1), rows)
 
     def _masked_decode(
         self,

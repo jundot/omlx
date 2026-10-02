@@ -130,11 +130,15 @@ def test_fused_decode_is_bit_identical(hidden, inter, bits, group_size, monkeypa
     assert not routed._DISABLED
 
 
-def test_bf16_shared_expert_stays_composed_and_bit_identical():
-    block = _block(2560, 640, bits=5, quantized_shared=False)
+@pytest.mark.parametrize("experts", [EXPERTS, 512])
+def test_bf16_shared_expert_stays_composed_and_bit_identical(experts):
+    # 512 experts select inside the gate+up launch, 32 in the routing launch.
+    block = _block(2560, 640, bits=5, quantized_shared=False, experts=experts)
     for step in range(4):
         x = (mx.random.normal((1, 1, 2560)) * (0.5 + step)).astype(mx.bfloat16)
-        assert not routed.routed_decode_plan(block, x).fold
+        plan = routed.routed_decode_plan(block, x)
+        assert not plan.fold
+        assert routed._topk_folds(plan, block.gate(x)) == (experts == 512)
         ref, out = _pair(block, x)
         assert _same_bits(ref, out)
     assert routed._PROVEN and not routed._DISABLED
@@ -218,6 +222,65 @@ def test_fp32_kernels_match_mlx_mat_vecs(bits):
             )[0]
             # The +0 folds of the combine turn -0 into +0, so compare values.
             assert mx.array_equal(row, ref_down[j] if j < top_k else ref_shared).item()
+
+
+@pytest.mark.parametrize("bits", [4, 5])
+def test_fp32_folded_routing_matches_the_routing_launch(bits):
+    """The gate+up launch that selects its rows' experts itself, in FP32 (BF16
+    outputs hide one-ulp differences): per row, the selection and scores of
+    the routing launch, and the gate+up rows of the launch fed with them.
+    Router logits repeat, so probabilities tie."""
+    from omlx.patches import qwen35_moe_router as router
+
+    hidden, inter, gs, experts, rows, top_k = 1024, 384, 64, 128, 3, routed.TOP_K
+    f32 = mx.float32
+    mx.random.seed(50 + bits)
+
+    def quantized(shape, group_size, b):
+        return mx.quantize(mx.random.normal(shape) * 0.05, group_size, b)
+
+    experts_gate_up = quantized((experts, 2 * inter, hidden), gs, bits)
+    shared = quantized((inter, hidden), 128, 8) + quantized((inter, hidden), 128, 8)
+    gate_row = quantized((1, hidden), 64, 8)
+    fmt = routed._Format
+    formats = (fmt(bits, gs, True), fmt(8, 128, True), fmt(8, 64, False))
+    x = mx.random.normal((rows, hidden))
+    logits = mx.random.normal((rows, experts // 2)) * 2
+    logits = mx.concatenate([logits, logits[:, ::-1]], axis=-1)
+    template = [
+        ("T", f32), ("K", hidden), ("NI", inter), ("RPS", 2), ("NSG", 2), ("NS", inter),
+    ]
+    width = top_k * inter + inter + 1
+    blocks = 1 + inter // 4 + top_k * inter // 4
+    h, inds, scores = routed._gate_up_topk_kernel(*formats)(
+        inputs=[x, *experts_gate_up, logits, *shared, *gate_row],
+        template=template + [("NE", experts), ("M", rows), ("YW", width)],
+        grid=(32, 2 * blocks * rows, 1),
+        threadgroup=(32, 2, 1),
+        output_shapes=[(rows, width), (rows, top_k), (rows, top_k)],
+        output_dtypes=[f32, mx.uint32, f32],
+    )
+    mx.eval(router.softmax_topk_rows(logits.astype(mx.bfloat16), top_k))
+    ref_inds, ref_scores = router._SOFTMAX_TOPK_ROWS_KERNEL(
+        inputs=[logits],
+        template=[("T", f32), ("NE", experts), ("K", top_k)],
+        grid=(32, rows, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(rows, top_k), (rows, top_k)],
+        output_dtypes=[mx.uint32, f32],
+    )
+    assert mx.array_equal(inds, ref_inds).item()
+    assert mx.array_equal(scores.view(mx.uint32), ref_scores.view(mx.uint32)).item()
+    for r in range(rows):
+        ref_h = routed._gate_up_kernel(*formats)(
+            inputs=[x[r], *experts_gate_up, ref_inds[r], *shared, *gate_row],
+            template=template,
+            grid=(32, 2 * blocks, 1),
+            threadgroup=(32, 2, 1),
+            output_shapes=[(width,)],
+            output_dtypes=[f32],
+        )[0]
+        assert mx.array_equal(h[r].view(mx.uint32), ref_h.view(mx.uint32)).item()
 
 
 def test_experts_past_the_bound_view_are_read_from_the_stacked_weights():
