@@ -1580,6 +1580,19 @@ _ms_downloader = None
 _oq_manager = None
 _hf_uploader = None
 
+# GlobalSettings.save() performs an fsync'd atomic file write. Running it
+# inline in async handlers blocked the event loop for the write duration;
+# these saves now go through asyncio.to_thread. The lock preserves the
+# serialization the event loop used to provide implicitly, so one save can
+# never snapshot the settings singleton mid-mutation by another handler.
+_settings_save_lock = asyncio.Lock()
+
+
+async def _save_global_settings_async(global_settings) -> None:
+    """Persist global settings off the event loop, serialized."""
+    async with _settings_save_lock:
+        await asyncio.to_thread(global_settings.save)
+
 
 def set_admin_getters(
     state_getter,
@@ -2017,7 +2030,7 @@ async def setup_api_key(
 
     # Persist to file
     try:
-        global_settings.save()
+        await _save_global_settings_async(global_settings)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
 
@@ -2139,7 +2152,7 @@ async def create_sub_key(
     global_settings.auth.sub_keys.append(entry)
 
     try:
-        global_settings.save()
+        await _save_global_settings_async(global_settings)
     except Exception as e:
         # Rollback
         global_settings.auth.sub_keys.pop()
@@ -2173,7 +2186,7 @@ async def delete_sub_key(
         if sk.key and compare_keys(request.key, sk.key):
             removed = global_settings.auth.sub_keys.pop(i)
             try:
-                global_settings.save()
+                await _save_global_settings_async(global_settings)
             except Exception as e:
                 global_settings.auth.sub_keys.insert(i, removed)
                 raise HTTPException(
@@ -5789,7 +5802,7 @@ async def update_global_settings(
 
     # Persist to file
     try:
-        global_settings.save()
+        await _save_global_settings_async(global_settings)
     except Exception as e:
         if previous_embedding_batch_size is not None:
             global_settings.scheduler.embedding_batch_size = (
@@ -5956,8 +5969,8 @@ async def get_logs(
 
     log_dir = global_settings.logging.get_log_dir(global_settings.base_path)
 
-    # Get available log files
-    available_files = _get_available_log_files(log_dir)
+    # Get available log files (directory scan + stats, offloaded)
+    available_files = await asyncio.to_thread(_get_available_log_files, log_dir)
 
     # Determine which file to read
     if file:
@@ -5971,9 +5984,11 @@ async def get_logs(
         # Default to current log file
         log_file = log_dir / "server.log"
 
-    # Read log content
+    # Read log content. Offloaded to a thread: the tail scans the whole
+    # file, and a large rotated log would otherwise block the event loop
+    # (stalling the keep-alive heartbeats of in-flight streams).
     if log_file.exists():
-        content, total_lines = _tail_file(log_file, lines)
+        content, total_lines = await asyncio.to_thread(_tail_file, log_file, lines)
     else:
         content = ""
         total_lines = 0
