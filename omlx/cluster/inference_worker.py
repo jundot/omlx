@@ -524,6 +524,7 @@ def _execution_settings(args: argparse.Namespace) -> ExecutionSettings:
         ),
         sampling_rank_only=args.sampling_rank_only,
         async_overlap=args.async_overlap,
+        mtp=bool(getattr(args, "mtp", False)),
         ring_connections_per_ip=args.ring_connections_per_ip,
         tuning_reason=args.tuning_reason,
     )
@@ -1353,7 +1354,27 @@ def run_worker(args: argparse.Namespace) -> int:
             assignments=[_runtime_assignment(item) for item in assignments],
         )
 
-        maybe_apply_pre_load_patches(args.model)
+        mtp = bool(getattr(args, "mtp", False))
+        if mtp:
+            # Same settings the single-host engine passes when Lightning MTP is
+            # on; every other optional patch stays off in a cluster rank.
+            mtp_settings = SimpleNamespace(
+                mtp_enabled=True,
+                mtp_adaptive_max_depth=None,
+                mtp_fixed_depth=None,
+                vlm_mtp_enabled=False,
+                dflash_enabled=False,
+                moe_expert_offload_enabled=False,
+                specprefill_enabled=False,
+            )
+            maybe_apply_pre_load_patches(args.model, mtp_settings)
+            if world_size > 1:
+                # Ranks must agree on the adaptive draft depth or they deadlock.
+                from omlx.patches.mlx_lm_mtp import distributed_sync
+
+                distributed_sync.install()
+        else:
+            maybe_apply_pre_load_patches(args.model)
         # MLX-LM's pipeline shard selection rejects any parameter absent
         # from the safetensors index, though it loads with strict=False
         # moments later. Architectures oMLX patches in (glm_moe_dsa's
@@ -1657,6 +1678,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt-cache-ssd", action="store_true")
     parser.add_argument("--prompt-cache-ssd-max-bytes", type=int, default=20 * 1024**3)
     parser.add_argument("--sampling-rank-only", action="store_true")
+    parser.add_argument(
+        "--mtp",
+        action="store_true",
+        help="Lightning MTP on every rank (SPMD, rank-0-authoritative draft depth)",
+    )
     parser.add_argument("--async-overlap", action="store_true")
     parser.add_argument("--ring-connections-per-ip", type=int, default=1)
     parser.add_argument(

@@ -614,7 +614,8 @@ def _patch_text_model(q35: Any) -> None:
         unsplit. Returns False if any layer lacks the state needed (caller
         falls back to the standard step).
         """
-        layers = self.model.layers
+        # Pipeline-aware: the cache list is per LOCAL layer (``pipeline_layers``).
+        layers = self.model.pipeline_layers
         if len(cache) != len(layers):
             return False
         trim_n = num_drafts - accepted

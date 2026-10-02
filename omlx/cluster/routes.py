@@ -497,6 +497,7 @@ class ClusterDeploymentRequest(BaseModel):
     allocation: Literal["balanced", "proportional"] = "balanced"
     auto_tune: bool = True
     sampling_rank_only: bool = True
+    mtp: bool = False
     async_overlap: bool = True
     cache_affinity: bool = True
     prompt_cache_ssd: bool = True
@@ -915,6 +916,7 @@ class ClusterAutoconfigureRequest(BaseModel):
     # have already been copied.
     measure_performance: bool = False
     sampling_rank_only: bool = True
+    mtp: bool = False
     async_overlap: bool = True
     cache_affinity: bool = True
     prompt_cache_ssd: bool = True
@@ -1548,6 +1550,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             "execution_profile": request.execution_profile,
             "auto_tune": request.auto_tune,
             "sampling_rank_only": request.sampling_rank_only,
+            "mtp": request.mtp,
             "async_overlap": request.async_overlap,
             "cache_affinity": request.cache_affinity,
             "prompt_cache_ssd": request.prompt_cache_ssd,
@@ -2779,6 +2782,12 @@ def _execution_for_request(
             request.ring_connections_per_ip or requested.ring_connections_per_ip
         ),
     )
+    if getattr(request, "mtp", False):
+        # Lightning MTP runs the same draft/verify cycle on every rank; the
+        # rank-zero-only sampler would bypass it.
+        requested = replace(
+            requested, mtp=True, sampling_rank_only=False, async_overlap=False
+        )
     return tune_execution_settings(
         requested,
         assignments,
@@ -3687,6 +3696,7 @@ class ClusterReplanRequest(BaseModel):
     execution_profile: Literal["interactive", "balanced", "throughput"] = "balanced"
     auto_tune: bool = False
     sampling_rank_only: bool = True
+    mtp: bool = False
     async_overlap: bool = True
     cache_affinity: bool = True
     prompt_cache_ssd: bool = True
@@ -3809,6 +3819,7 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
             execution_profile=request.execution_profile,
             auto_tune=request.auto_tune,
             sampling_rank_only=request.sampling_rank_only,
+            mtp=request.mtp,
             async_overlap=request.async_overlap,
             cache_affinity=request.cache_affinity,
             prompt_cache_ssd=request.prompt_cache_ssd,
