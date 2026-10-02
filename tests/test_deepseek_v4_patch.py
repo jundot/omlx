@@ -3,6 +3,7 @@
 
 import inspect
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -103,6 +104,71 @@ class TestUtilsPatch:
         # the new attributes around it.
         assert hasattr(utils_mod, "_load_safetensors")
         assert hasattr(utils_mod, "SAFETENSORS_DTYPE_FALLBACKS")
+
+    def test_source_gate_accepts_current_upstream(self):
+        """The pinned mlx-lm's load_model source passes the fingerprint.
+
+        Extracts load_model from the upstream module file with AST rather
+        than inspect.getsource: by the time this runs, the module-scoped
+        fixture may already have replaced mlx_lm.utils.load_model with the
+        closure, whose source obviously differs from upstream.
+        """
+        import ast
+        import hashlib
+
+        import mlx_lm.utils as utils_mod
+        from omlx.patches.deepseek_v4 import utils_patch
+
+        module_path = Path(utils_mod.__file__)
+        module_source = module_path.read_text()
+        tree = ast.parse(module_source)
+        fn = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "load_model"
+        )
+        source = ast.get_source_segment(module_source, fn)
+        assert source is not None
+        digest = hashlib.sha256(source.strip().encode()).hexdigest()
+        assert digest in utils_patch._ACCEPTED_LOAD_MODEL_SOURCE_SHA256
+
+    def test_source_gate_rejects_foreign_source(self, monkeypatch):
+        """A load_model defined anywhere else fails the fingerprint."""
+        from omlx.patches.deepseek_v4 import utils_patch
+
+        def fake_load_model(*args, **kwargs):  # pragma: no cover - identity only
+            raise AssertionError("not callable")
+
+        monkeypatch.setattr(utils_patch._utils, "load_model", fake_load_model)
+        assert utils_patch._load_model_source_matches() is False
+
+    def test_apply_refuses_when_source_gate_fails(
+        self, applied_patch, monkeypatch, caplog
+    ):
+        """An unrecognized upstream load_model is left in charge, loudly."""
+        import mlx_lm.utils as utils_mod
+        from omlx.patches.deepseek_v4 import utils_patch
+
+        # The module-scoped fixture already applied the patch; force the
+        # gate to be consulted again as if this were a fresh process.
+        monkeypatch.setattr(utils_patch, "_PATCHED", False)
+        monkeypatch.setattr(utils_patch, "_load_model_source_matches", lambda: False)
+
+        def _explode():
+            raise AssertionError("gate must prevent the replacement build")
+
+        monkeypatch.setattr(utils_patch, "_build_patched_load_model", _explode)
+
+        with caplog.at_level("WARNING"):
+            assert utils_patch.apply_utils_patch() is False
+
+        assert any(
+            "does not match the source" in r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        )
+        # The process-wide bindings were not touched.
+        assert hasattr(utils_mod, "_load_safetensors")
 
     def test_dtype_fallback_map(self, applied_patch):
         import mlx_lm.utils as utils_mod

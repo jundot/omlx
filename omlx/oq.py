@@ -4070,7 +4070,7 @@ def _build_model_sanitizer(
 
                 apply_mlx_vlm_qwen4_exp_compat_patch()
         except Exception as patch_err:
-            logger.debug("Qwen4-Exp quantization patch not applied: %s", patch_err)
+            logger.warning("Qwen4-Exp quantization patch not applied: %s", patch_err)
 
     if is_vlm:
         try:
@@ -4113,7 +4113,7 @@ def _build_model_sanitizer(
 
                         glm5_next_vlm_runtime.apply()
             except Exception as patch_err:
-                logger.debug(f"mlx-vlm compatibility patch not applied: {patch_err}")
+                logger.warning(f"mlx-vlm compatibility patch not applied: {patch_err}")
 
             from mlx_vlm.utils import get_model_and_args, sanitize_weights
 
@@ -4129,7 +4129,7 @@ def _build_model_sanitizer(
 
                 apply_mlx_vlm_mtp_patch()
             except Exception as patch_err:
-                logger.debug(f"mlx-vlm MTP patch not applied: {patch_err}")
+                logger.warning(f"mlx-vlm MTP patch not applied: {patch_err}")
 
             # Remap language_model.model.visual.* -> vision_tower.* for
             # Qwen3.6-35B-A3B's nested ViT layout. Wraps whichever
@@ -4142,7 +4142,7 @@ def _build_model_sanitizer(
 
                 apply_qwen3_6_nested_visual_patch()
             except Exception as patch_err:
-                logger.debug(f"qwen3_6 nested-visual patch not applied: {patch_err}")
+                logger.warning(f"qwen3_6 nested-visual patch not applied: {patch_err}")
 
             model_module, _ = get_model_and_args(config)
             model_config_cls = model_module.ModelConfig
@@ -4267,7 +4267,7 @@ def _build_model_sanitizer(
             )
             return _vlm_sanitize
         except Exception as e:
-            logger.debug(f"mlx-vlm sanitizer not available: {e}")
+            logger.warning(f"mlx-vlm sanitizer not available for a VLM config: {e}")
 
     try:
         from mlx_lm.utils import _get_classes
@@ -4278,7 +4278,7 @@ def _build_model_sanitizer(
 
                 apply_glm_moe_dsa_patch()
             except Exception as patch_err:
-                logger.debug(f"glm_moe_dsa patch not applied: {patch_err}")
+                logger.warning(f"glm_moe_dsa patch not applied: {patch_err}")
 
         # DeepSeek-V4 isn't in stock mlx-lm — its model class is injected
         # into ``sys.modules`` by oMLX's base patch. Trigger that here so
@@ -4290,7 +4290,7 @@ def _build_model_sanitizer(
 
                 apply_deepseek_v4_patch()
             except Exception as patch_err:
-                logger.debug(f"deepseek_v4 base patch not applied: {patch_err}")
+                logger.warning(f"deepseek_v4 base patch not applied: {patch_err}")
 
         # Laguna is likewise vendored into ``sys.modules`` by its pre-load
         # patch; register it so sanitizer/proxy builds resolve the class.
@@ -4300,7 +4300,7 @@ def _build_model_sanitizer(
 
                 apply_laguna_patch()
             except Exception as patch_err:
-                logger.debug(f"laguna patch not applied: {patch_err}")
+                logger.warning(f"laguna patch not applied: {patch_err}")
 
         # Hy3 is vendored into ``sys.modules`` like Laguna, but its published
         # Hy-MT2 checkpoints also use the legacy root-level ``rope_theta``
@@ -4315,7 +4315,7 @@ def _build_model_sanitizer(
                 normalize_hy_v3_rope_config(config)
                 apply_hy_v3_patch()
             except Exception as patch_err:
-                logger.debug(f"hy_v3 patch not applied: {patch_err}")
+                logger.warning(f"hy_v3 patch not applied: {patch_err}")
 
         if config.get("model_type") in {"mimo_v2", "mimo_v2_flash"}:
             try:
@@ -4323,7 +4323,7 @@ def _build_model_sanitizer(
 
                 apply_mimo_v2_patch()
             except Exception as patch_err:
-                logger.debug(f"mimo_v2 patch not applied: {patch_err}")
+                logger.warning(f"mimo_v2 patch not applied: {patch_err}")
 
         if config.get("model_type") == "bailing_hybrid":
             try:
@@ -4331,7 +4331,7 @@ def _build_model_sanitizer(
 
                 apply_bailing_hybrid_patch()
             except Exception as patch_err:
-                logger.debug(f"bailing_hybrid patch not applied: {patch_err}")
+                logger.warning(f"bailing_hybrid patch not applied: {patch_err}")
 
         # Apply mlx-lm MTP patch so the patched __init__/sanitize handle
         # mtp.* tensors correctly. Idempotent — apply() is a no-op once
@@ -4346,7 +4346,7 @@ def _build_model_sanitizer(
             apply_mlx_lm_mtp_patch()
             _have_mtp_patch = True
         except Exception as patch_err:
-            logger.debug(f"mlx-lm MTP patch not applied: {patch_err}")
+            logger.warning(f"mlx-lm MTP patch not applied: {patch_err}")
             _have_mtp_patch = False
 
         model_class, model_args_class = _get_classes(config)
