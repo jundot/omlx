@@ -6416,6 +6416,9 @@ class Scheduler:
                 stop_sequences=[state.sm],
             )
         if uids:
+            # The generator owns the restored cache now. Keeping the request's
+            # alias pins its old full-window banks after batching copies them.
+            request.prompt_cache = None
             _register_uid_rows(self.model, uids, [state.sampler], [per_row_lps])
             uid = uids[0]
             _mtp_priming.bind_uid(self.model, request.request_id, uid)
@@ -10022,6 +10025,7 @@ class Scheduler:
             max_tokens=request.sampling_params.max_tokens,
             stop_token_ids=set(eos_ids),
         )
+        request.prompt_cache = None
         logger.info(
             "vlm_mtp decode started: request=%s uid=%d block_size=%s",
             request.request_id,
@@ -12080,6 +12084,8 @@ class Scheduler:
                     stop_sequences=[sm],
                 )
             if uids:
+                # As in the chunked path, transfer ownership after insertion.
+                request.prompt_cache = None
                 _register_uid_rows(self.model, uids, [sampler], [per_row_lps])
                 uid = uids[0]
                 _mtp_priming.bind_uid(self.model, request.request_id, uid)
