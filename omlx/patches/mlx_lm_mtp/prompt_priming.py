@@ -378,7 +378,7 @@ def _cache_at_offset(cache: List[Any], target: int) -> Optional[List[Any]]:
     return cloned if saw_offset else None
 
 
-def _snapshot_arrays(snapshot: _MtpPrefixSnapshot) -> list[Any]:
+def _snapshot_arrays(snapshot: _MtpPrefixSnapshot | _PrimeCtx) -> list[Any]:
     """Arrays that must be materialized to sever the live prefill graph."""
     import mlx.core as mx
 
@@ -659,7 +659,7 @@ def _prepare_prefix_context(
     )
     setattr(host, _CTX_ATTR, ctx)
     try:
-        arrays = [pending_hidden, *_snapshot_arrays(snapshot)]
+        arrays = _snapshot_arrays(ctx)
         if arrays:
             mx.async_eval(arrays)
     except Exception as exc:
