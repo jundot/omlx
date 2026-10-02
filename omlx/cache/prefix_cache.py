@@ -5231,6 +5231,16 @@ class BlockAwarePrefixCache(CacheManager):
         self._prefix_index.clear()
         with self._mtp_prefix_snapshot_lock:
             self._mtp_prefix_snapshots.clear()
+        # Session-scoped lineage state is tied to the block lifecycle: with
+        # every block wiped, stale entries would misclassify freshly stored
+        # blocks during recovery — e.g. a surviving store-tip hash makes the
+        # next store record lineage against a block that no longer exists,
+        # and a later supersede then strips a block that is still a live
+        # walk-back point (rewriting its SSD payload).
+        self._tip_lineage.clear()
+        self._store_tip_hashes.clear()
+        self._backfill_checked_hashes.clear()
+        self._tail_hashes.clear()
         self.paged_cache.clear()
         self.reset_stats()
         return cleared_count

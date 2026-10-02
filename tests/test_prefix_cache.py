@@ -658,6 +658,26 @@ class TestBlockAwarePrefixCache:
         assert len(prefix_cache._prefix_index) == 0
         assert prefix_cache._hits == 0
 
+    def test_clear_resets_session_lineage_state(self, prefix_cache, paged_cache):
+        """clear() must wipe session-scoped lineage state along with blocks.
+
+        Stale entries would misclassify freshly stored blocks after a
+        recovery clear(): a surviving store-tip hash records lineage against
+        a wiped block, and a later supersede then strips a live walk-back
+        point (rewriting its SSD payload).
+        """
+        prefix_cache._tip_lineage[b"a"] = b"b"
+        prefix_cache._store_tip_hashes.add(b"c")
+        prefix_cache._backfill_checked_hashes.add(b"d")
+        prefix_cache._tail_hashes.add(b"e")
+
+        prefix_cache.clear()
+
+        assert prefix_cache._tip_lineage == {}
+        assert prefix_cache._store_tip_hashes == set()
+        assert prefix_cache._backfill_checked_hashes == set()
+        assert prefix_cache._tail_hashes == set()
+
     def test_len(self, prefix_cache):
         """Test __len__ returns number of request entries."""
         assert len(prefix_cache) == 0
