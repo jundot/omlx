@@ -326,6 +326,31 @@ class TestExtractImagesFromMessages:
         assert len(audio) == 1
         assert hasattr(audio[0], "read")
 
+    def test_input_audio_rejects_oversized_payload(self, monkeypatch):
+        """Inline input_audio.data enforces the configured audio limit."""
+        import base64 as b64mod
+
+        from omlx.utils import image as image_mod
+
+        monkeypatch.setattr(image_mod, "get_max_audio_bytes", lambda: 1024)
+        raw = b"\x00\x01" * 4096  # 8 KiB decoded, well past the 1 KiB limit
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": b64mod.b64encode(raw).decode(),
+                            "format": "wav",
+                        },
+                    },
+                ],
+            },
+        ]
+        with pytest.raises(InvalidRequestError, match="exceeds the maximum"):
+            extract_images_from_messages(messages)
+
     def test_input_audio_bytes_data(self):
         """Messages with bytes input_audio.data extract audio."""
         raw_bytes = b"\x00\x01\x02\x03" * 16

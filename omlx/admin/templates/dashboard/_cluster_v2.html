@@ -18,6 +18,17 @@
             </div>
         </div>
 
+        <div x-show="pairedDevices().length || configuredDeployment()" x-cloak class="mb-4 flex flex-wrap gap-2">
+            <button type="button" @click="forgetCluster()"
+                    :disabled="clusterLifecycleBusy"
+                    class="px-3 py-1.5 text-xs font-medium rounded-lg border border-neutral-200 text-neutral-600 disabled:opacity-40"
+                    data-cluster-v2-forget-all>
+                <span x-text="confirmForgetFor === 'all' ? window.t('cluster.v2.active.confirm_forget_local') : window.t('cluster.v2.active.forget_local')"></span>
+            </button>
+            <p x-show="confirmForgetFor"
+               class="w-full text-xs text-amber-800" role="status">{{ t('cluster.v2.active.forget_local_warning') }}</p>
+        </div>
+
         <div x-show="join.cleanup_pending" x-cloak
              class="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800"
              role="status" data-cluster-v2-join-cleanup>
@@ -308,6 +319,7 @@
                             <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[10px] font-semibold whitespace-nowrap"
                                   :class="deviceStateTone(device)"
                                   x-text="deviceStateLabel(device)"></span>
+
                         </div>
                         <div class="flex items-center gap-3 mt-3 text-[11px] text-neutral-500">
                             <span class="inline-flex items-center gap-1">
@@ -338,14 +350,15 @@
                         </div>
 
                         <div class="mt-4" x-show="!device.is_self && device.paired">
-                            <button type="button" @click="unpairDevice(device)"
+                            <button type="button" @click="forgetCluster(device)"
+                                    :disabled="clusterLifecycleBusy"
                                     class="inline-flex items-center gap-1.5 px-2.5 py-1 text-[10px] font-medium rounded-lg border"
-                                    :class="confirmUnpairFor === device.node_id
+                                    :class="confirmForgetFor === 'node:' + device.node_id
                                         ? 'text-red-700 border-red-300 bg-red-50 hover:bg-red-100'
                                         : 'text-neutral-500 border-neutral-200 hover:bg-neutral-50'"
                                     data-cluster-v2-unpair>
                                 <i data-lucide="unlink" class="w-3 h-3"></i>
-                                <span x-text="confirmUnpairFor === device.node_id ? window.t('cluster.v2.device.unpair_confirm') : window.t('cluster.v2.device.unpair')"></span>
+                                <span x-text="confirmForgetFor === 'node:' + device.node_id ? window.t('cluster.v2.active.confirm_forget_mac') : window.t('cluster.v2.active.forget_mac')"></span>
                             </button>
                         </div>
                     </div>
@@ -1306,6 +1319,13 @@
                             <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[10px] font-semibold"
                                   :class="deviceStateTone(device)"
                                   x-text="deviceStateLabel(device)"></span>
+                            <button type="button" @click="forgetCluster(device)"
+                                    x-show="device.node_id === selfDevice()?.node_id || pairedDevices().some(peer => peer.node_id === device.node_id)"
+                                    :disabled="clusterLifecycleBusy"
+                                    class="px-2 py-1 text-xs rounded-lg border border-neutral-200 disabled:opacity-40"
+                                    data-cluster-v2-forget-device>
+                                <span x-text="confirmForgetFor === 'node:' + device.node_id ? window.t('cluster.v2.active.confirm_forget_mac') : (device.node_id === selfDevice()?.node_id ? window.t('cluster.v2.active.leave_cluster') : window.t('cluster.v2.active.forget_mac'))"></span>
+                            </button>
                         </div>
                     </template>
                 </div>
@@ -1359,6 +1379,7 @@
                         <i data-lucide="octagon-x" class="w-3 h-3"></i>
                         <span x-text="confirmDeactivateFor === configuredDeployment()?.deployment_id ? window.t('cluster.v2.active.confirm_remove') : window.t('cluster.v2.active.remove_setup')"></span>
                     </button>
+
                 </div>
 
                 <div x-show="confirmChangeModelFor === configuredDeployment()?.deployment_id"
