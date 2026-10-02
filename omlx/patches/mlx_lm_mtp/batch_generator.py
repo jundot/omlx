@@ -1229,11 +1229,23 @@ def _replace_cache_rows(
 ) -> None:
     if not replacements:
         return
-    row_caches = [
-        replacements.get(idx) or gen_batch.extract_cache(idx)
-        for idx in range(len(gen_batch.uids))
-    ]
-    gen_batch.prompt_cache = _merge_row_caches(row_caches)
+    # Consume private replacement rows one layer at a time. Extracting all
+    # untouched rows first kept the old batch, row copies and joined batch
+    # alive together for the entire model.
+    for layer_idx, old in enumerate(gen_batch.prompt_cache):
+        rows = [
+            (
+                [replacements[idx][layer_idx]]
+                if idx in replacements
+                else [old.extract(idx)]
+            )
+            for idx in range(len(gen_batch.uids))
+        ]
+        layer = _merge_row_caches(rows)[0]
+        gen_batch.prompt_cache[layer_idx] = layer
+        for replacement in replacements.values():
+            replacement[layer_idx] = None
+        del old, rows
 
 
 def _initial_batch_forward(gen_batch):

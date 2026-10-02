@@ -4525,6 +4525,64 @@ def test_initialization_uses_one_forward_without_cache_extraction(
         mlx_lm_mtp.set_mtp_active(active)
 
 
+@pytest.mark.parametrize("backend", ["lm", "vlm"])
+def test_replace_cache_rows_preserves_state_and_releases_each_layer(
+    backend, monkeypatch
+):
+    import weakref
+
+    from mlx_lm.models import cache as lm_cache
+    from mlx_vlm.models import cache as vlm_cache
+
+    caches = lm_cache if backend == "lm" else vlm_cache
+    layers = []
+    for layer in range(3):
+        rows = []
+        for idx, length in enumerate([11, 9, 7]):
+            row = caches.KVCache()
+            x = mx.full((1, 2, length, 4), layer * 10 + idx, mx.float32)
+            row.update_and_fetch(x, x + 1)
+            rows.append(row)
+        layers.append(caches.BatchKVCache.merge(rows))
+    batch = SimpleNamespace(uids=[0, 1, 2], prompt_cache=layers)
+    replacements = {1: [layer.extract(1) for layer in layers]}
+    for layer in replacements[1]:
+        x = mx.full((1, 2, 3, 4), 42, mx.float32)
+        layer.update_and_fetch(x, x + 1)
+    del layer
+    expected = bg._merge_row_caches(
+        [
+            replacements.get(idx) or [layer.extract(idx) for layer in layers]
+            for idx in range(3)
+        ]
+    )
+    old = [weakref.ref(layer) for layer in layers]
+    merge = bg._merge_row_caches
+    calls = 0
+
+    def checked_merge(rows):
+        nonlocal calls
+        if calls:
+            assert old[calls - 1]() is None
+            assert replacements[1][calls - 1] is None
+        calls += 1
+        return merge(rows)
+
+    monkeypatch.setattr(bg, "_merge_row_caches", checked_merge)
+    bg._replace_cache_rows(batch, replacements)
+    assert calls == 3
+    assert all(ref() is None for ref in old)
+    assert replacements[1] == [None] * 3
+    for actual, reference in zip(batch.prompt_cache, expected):
+        for (_, value), (_, target) in zip(
+            tree_flatten(actual.state), tree_flatten(reference.state)
+        ):
+            if isinstance(value, mx.array):
+                assert mx.array_equal(value, target)
+            else:
+                assert value == target
+
+
 def calibrated(batch=4, depth=2):
     policy = BatchPolicy(range(batch), depth)
     for cost in [100, 50, 10, 10, 10]:
