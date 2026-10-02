@@ -3089,6 +3089,7 @@ function clusterV2Wizard() {
                 execution_profile: profile,
                 auto_tune: execution.auto_tune !== false,
                 sampling_rank_only: execution.sampling_rank_only !== false,
+                mtp: execution.mtp === true,
                 async_overlap: execution.async_overlap !== false,
                 cache_affinity: execution.cache_affinity !== false,
                 prompt_cache_ssd: execution.prompt_cache_ssd === true,
@@ -3331,6 +3332,7 @@ function clusterV2Wizard() {
                             measure_performance: true,
                             sampling_rank_only:
                                 execution.sampling_rank_only !== false,
+                            mtp: execution.mtp === true,
                             async_overlap: execution.async_overlap !== false,
                             cache_affinity: execution.cache_affinity !== false,
                             prompt_cache_ssd:

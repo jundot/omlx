@@ -3696,7 +3696,9 @@ class ClusterReplanRequest(BaseModel):
     execution_profile: Literal["interactive", "balanced", "throughput"] = "balanced"
     auto_tune: bool = False
     sampling_rank_only: bool = True
-    mtp: bool = False
+    # None keeps whatever the current deployment runs: a replan that only
+    # changes the profile must not silently turn Lightning MTP off.
+    mtp: bool | None = None
     async_overlap: bool = True
     cache_affinity: bool = True
     prompt_cache_ssd: bool = True
@@ -3819,7 +3821,11 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
             execution_profile=request.execution_profile,
             auto_tune=request.auto_tune,
             sampling_rank_only=request.sampling_rank_only,
-            mtp=request.mtp,
+            mtp=(
+                request.mtp
+                if request.mtp is not None
+                else current.execution.mtp if current is not None else False
+            ),
             async_overlap=request.async_overlap,
             cache_affinity=request.cache_affinity,
             prompt_cache_ssd=request.prompt_cache_ssd,

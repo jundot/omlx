@@ -572,3 +572,63 @@ def test_replan_path_map_matches_resident_engine(
     assert pool.entry.engine.deployment.path_map == new_paths
     assert registry.get(current.deployment_id).path_map == new_paths
     assert (pool.entry.engine is previous_engine) == (old_paths == new_paths)
+
+
+def _activate_with_mtp(tmp_path, monkeypatch):
+    configure_cluster_registry(tmp_path)
+    model_path = tmp_path / "models" / "nemotron"
+    model_path.mkdir(parents=True)
+    _install_layout(monkeypatch)
+    pool = _RecordingPool(model_path)
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    body = _deployment_payload(model_path)
+    body["mtp"] = True
+    body["approved_placement"] = _approval_for(body)
+    response = _client().post("/admin/api/cluster/deployments", json=body)
+    assert response.status_code == 200, response.json()
+    assert response.json()["deployment"]["execution"]["mtp"] is True
+    return response.json()["deployment"]["deployment_id"]
+
+
+def _replan_mtp(deployment_id, **extra):
+    """Preview, then apply, a profile change the way the dashboard posts it."""
+
+    body = {
+        "deployment_id": deployment_id,
+        "execution_profile": "throughput",
+        # What the dashboard sends back from the running deployment: MTP needs
+        # the lockstep sampler, so these two are already false.
+        "sampling_rank_only": False,
+        "async_overlap": False,
+        **extra,
+    }
+    preview = _client().post("/admin/api/cluster/replan", json=body)
+    assert preview.status_code == 200, preview.json()
+    applied = _client().post(
+        "/admin/api/cluster/replan",
+        json={
+            **body,
+            "approved_placement": preview.json()["plan"]["placement_signature"],
+        },
+    )
+    assert applied.status_code == 200, applied.json()
+    return routes.get_cluster_registry().get(
+        applied.json()["deployment"]["deployment_id"]
+    )
+
+
+def test_replan_keeps_mtp_when_only_the_profile_changes(tmp_path, monkeypatch):
+    deployment_id = _activate_with_mtp(tmp_path, monkeypatch)
+
+    replanned = _replan_mtp(deployment_id)
+
+    assert replanned.execution.profile == "throughput"
+    assert replanned.execution.mtp is True
+
+
+def test_replan_can_still_turn_mtp_off_explicitly(tmp_path, monkeypatch):
+    deployment_id = _activate_with_mtp(tmp_path, monkeypatch)
+
+    replanned = _replan_mtp(deployment_id, mtp=False)
+
+    assert replanned.execution.mtp is False
