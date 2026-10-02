@@ -69,6 +69,7 @@ def _fresh_fa256_patch(monkeypatch):
     monkeypatch.delenv("OMLX_FA256_K_BLOCK", raising=False)
     monkeypatch.delenv("OMLX_FA256_DEBUG", raising=False)
     monkeypatch.delenv("OMLX_FA256_DISPATCH_BUDGET", raising=False)
+    monkeypatch.delenv("OMLX_FA256_STREAM_FOLD", raising=False)
     yield
     monkeypatch.setattr(patch, "_PATCHED", False, raising=False)
     memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
@@ -112,7 +113,15 @@ def test_vlm_patch_routes_and_passes_through(monkeypatch):
     calls = []
 
     def fake_kernel(
-        q, k, v, scale, causal=True, q_block=32, k_block=8, dispatch_budget=0
+        q,
+        k,
+        v,
+        scale,
+        causal=True,
+        q_block=32,
+        k_block=8,
+        dispatch_budget=0,
+        stream_fold=False,
     ):
         calls.append(
             (q.shape, k.shape, scale, causal, q_block, k_block, dispatch_budget)
@@ -184,7 +193,15 @@ def test_dispatch_budget_env_and_capability_gate(monkeypatch):
     calls = []
 
     def fake_kernel(
-        q, k, v, scale, causal=True, q_block=32, k_block=8, dispatch_budget=0
+        q,
+        k,
+        v,
+        scale,
+        causal=True,
+        q_block=32,
+        k_block=8,
+        dispatch_budget=0,
+        stream_fold=False,
     ):
         calls.append(dispatch_budget)
         return "steel"
@@ -209,7 +226,15 @@ def test_dispatch_budget_auto_calibration_used_when_env_unset(monkeypatch):
     calls = []
 
     def fake_kernel(
-        q, k, v, scale, causal=True, q_block=32, k_block=8, dispatch_budget=0
+        q,
+        k,
+        v,
+        scale,
+        causal=True,
+        q_block=32,
+        k_block=8,
+        dispatch_budget=0,
+        stream_fold=False,
     ):
         calls.append(dispatch_budget)
         return "steel"
@@ -237,7 +262,15 @@ def test_dispatch_budget_zeroed_on_old_extension(monkeypatch):
     calls = []
 
     def fake_kernel(
-        q, k, v, scale, causal=True, q_block=32, k_block=8, dispatch_budget=0
+        q,
+        k,
+        v,
+        scale,
+        causal=True,
+        q_block=32,
+        k_block=8,
+        dispatch_budget=0,
+        stream_fold=False,
     ):
         calls.append(dispatch_budget)
         return "steel"
@@ -361,3 +394,197 @@ def test_native_fa256_chunked_matches_single_dispatch(q_len, kv_len):
     diff = mx.max(mx.abs(single.astype(mx.float32) - chunked.astype(mx.float32))).item()
     assert not mx.isnan(chunked.astype(mx.float32)).any().item()
     assert diff < 5e-3
+
+
+# --- Phase 3.1 / §B1: streaming chunk fold ---------------------------------
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal is required")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize(
+    "q_len,kv_len,n_chunks",
+    [
+        (2048, 8192, 8),  # chunked-prefill shape kL >> qL
+        (4096, 4096, 8),  # square: later chunks causally dead for early rows
+        (2048, 8001, 8),  # unaligned kL -> align_K on the last chunk
+        (1024, 32768, 48),  # large n_chunks: slot ~12MB, exercises the tail
+        (2048, 8192, 2),  # n_chunks == 2 boundary
+    ],
+)
+def test_native_fa256_stream_fold_matches_legacy(q_len, kv_len, n_chunks, dtype):
+    # The streaming fold merges each chunk into a running fp32 accumulator
+    # instead of materializing all partials. It must match the legacy batched
+    # fold near-bit-identically (same partials, same logsumexp weights; only
+    # the fp32 association order differs) and never produce NaN — including the
+    # causally-dead-chunk (square) shape whose dead-chunk pass-through is the
+    # subtle case in the single-slot design.
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    if not fast.has_symbol("qwen35_fa256_attention"):
+        pytest.skip("native qwen35_fa256_attention is unavailable")
+    if not fast.fa256_supports_dispatch_budget():
+        pytest.skip("extension predates chunked dispatch")
+    if not fast.fa256_supports_stream_fold():
+        pytest.skip("extension predates the streaming fold")
+
+    q, k, v = _qkv(q_len, kv_len, dtype=dtype)
+    scale = 1.0 / math.sqrt(256)
+    budget = (24 * q_len * kv_len) // n_chunks
+    legacy = fast.qwen35_fa256_attention(
+        q, k, v, scale, causal=True, dispatch_budget=budget, stream_fold=False
+    )
+    stream = fast.qwen35_fa256_attention(
+        q, k, v, scale, causal=True, dispatch_budget=budget, stream_fold=True
+    )
+    single = fast.qwen35_fa256_attention(q, k, v, scale, causal=True, dispatch_budget=0)
+    mx.eval(legacy, stream, single)
+
+    assert not mx.isnan(stream.astype(mx.float32)).any().item()
+    vs_legacy = mx.max(
+        mx.abs(stream.astype(mx.float32) - legacy.astype(mx.float32))
+    ).item()
+    vs_single = mx.max(
+        mx.abs(stream.astype(mx.float32) - single.astype(mx.float32))
+    ).item()
+    # Near-bit-identical to the legacy fold; the single-dispatch comparison
+    # uses the same 5e-3 anchor as the chunked-vs-single test above.
+    assert vs_legacy < 1e-3
+    assert vs_single < 5e-3
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal is required")
+def test_native_fa256_stream_fold_n_chunks_one_is_untouched():
+    # n_chunks <= 1 takes the single-dispatch fast path, which stream_fold does
+    # not alter; the flag must be a no-op there.
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    if not fast.has_symbol("qwen35_fa256_attention"):
+        pytest.skip("native qwen35_fa256_attention is unavailable")
+    if not fast.fa256_supports_stream_fold():
+        pytest.skip("extension predates the streaming fold")
+
+    q, k, v = _qkv(128, 512)
+    scale = 1.0 / math.sqrt(256)
+    off = fast.qwen35_fa256_attention(
+        q, k, v, scale, causal=True, dispatch_budget=0, stream_fold=False
+    )
+    on = fast.qwen35_fa256_attention(
+        q, k, v, scale, causal=True, dispatch_budget=0, stream_fold=True
+    )
+    mx.eval(off, on)
+    assert mx.array_equal(off, on).item()
+
+
+def test_stream_fold_disabled_on_old_extension(monkeypatch):
+    # An extension built before the streaming fold rejects the stream_fold
+    # kwarg; with the capability probe False the patch must pass stream_fold
+    # False regardless of the env, so the routed call stays on the legacy path.
+    import omlx.patches.qwen35_fa256_attention as patch
+
+    base, _ = _install_fake_vlm_base(monkeypatch)
+    calls = []
+
+    def fake_kernel(
+        q,
+        k,
+        v,
+        scale,
+        causal=True,
+        q_block=32,
+        k_block=8,
+        dispatch_budget=0,
+        stream_fold=False,
+    ):
+        calls.append(stream_fold)
+        return "steel"
+
+    monkeypatch.setenv("OMLX_FA256_STREAM_FOLD", "1")
+    monkeypatch.setattr(patch, "_native_kernel", lambda: fake_kernel)
+    monkeypatch.setattr(
+        patch._fa256_fast, "fa256_supports_dispatch_budget", lambda: True
+    )
+    monkeypatch.setattr(
+        patch._fa256_fast, "fa256_supports_stream_fold", lambda: False
+    )
+    monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
+
+    assert patch.apply_qwen35_fa256_attention_patch(min_kv_len=16)
+    q, k, v = _qkv(32, 32)
+    base.scaled_dot_product_attention(q, k, v, None, 0.0625, "causal")
+    assert calls == [False]
+
+
+def test_stream_fold_default_on_when_supported(monkeypatch):
+    # With the capability probe True and no env override, the patch defaults
+    # stream_fold ON (Phase 3.1 flip) and forwards stream_fold=True.
+    import omlx.patches.qwen35_fa256_attention as patch
+
+    base, _ = _install_fake_vlm_base(monkeypatch)
+    calls = []
+
+    def fake_kernel(
+        q,
+        k,
+        v,
+        scale,
+        causal=True,
+        q_block=32,
+        k_block=8,
+        dispatch_budget=0,
+        stream_fold=False,
+    ):
+        calls.append(stream_fold)
+        return "steel"
+
+    # OMLX_FA256_STREAM_FOLD is delenv'd by the autouse fixture.
+    monkeypatch.setattr(patch, "_native_kernel", lambda: fake_kernel)
+    monkeypatch.setattr(
+        patch._fa256_fast, "fa256_supports_dispatch_budget", lambda: True
+    )
+    monkeypatch.setattr(
+        patch._fa256_fast, "fa256_supports_stream_fold", lambda: True
+    )
+    monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
+
+    assert patch.apply_qwen35_fa256_attention_patch(min_kv_len=16)
+    q, k, v = _qkv(32, 32)
+    base.scaled_dot_product_attention(q, k, v, None, 0.0625, "causal")
+    assert calls == [True]
+
+
+def test_stream_fold_env_off_forces_legacy(monkeypatch):
+    # OMLX_FA256_STREAM_FOLD=0 forces the legacy slab path even when the
+    # extension supports streaming.
+    import omlx.patches.qwen35_fa256_attention as patch
+
+    base, _ = _install_fake_vlm_base(monkeypatch)
+    calls = []
+
+    def fake_kernel(
+        q,
+        k,
+        v,
+        scale,
+        causal=True,
+        q_block=32,
+        k_block=8,
+        dispatch_budget=0,
+        stream_fold=False,
+    ):
+        calls.append(stream_fold)
+        return "steel"
+
+    monkeypatch.setenv("OMLX_FA256_STREAM_FOLD", "0")
+    monkeypatch.setattr(patch, "_native_kernel", lambda: fake_kernel)
+    monkeypatch.setattr(
+        patch._fa256_fast, "fa256_supports_dispatch_budget", lambda: True
+    )
+    monkeypatch.setattr(
+        patch._fa256_fast, "fa256_supports_stream_fold", lambda: True
+    )
+    monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
+
+    assert patch.apply_qwen35_fa256_attention_patch(min_kv_len=16)
+    q, k, v = _qkv(32, 32)
+    base.scaled_dot_product_attention(q, k, v, None, 0.0625, "causal")
+    assert calls == [False]

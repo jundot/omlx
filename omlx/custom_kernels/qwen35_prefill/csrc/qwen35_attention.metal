@@ -33,3 +33,11 @@ instantiate_kernel(
     "omlx_qwen35_fa256_chunk_reduce_bfloat16",
     attention_chunk_reduce,
     bfloat16_t);
+instantiate_kernel(
+    "omlx_qwen35_fa256_chunk_fold_float16",
+    attention_chunk_fold,
+    half);
+instantiate_kernel(
+    "omlx_qwen35_fa256_chunk_fold_bfloat16",
+    attention_chunk_fold,
+    bfloat16_t);
