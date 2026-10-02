@@ -166,3 +166,61 @@ const chats = await exportedChats();
 console.log(JSON.stringify({chats, alerts}));
 """)
     assert result == {"chats": None, "alerts": ["chat.no_chats_to_export"]}
+
+
+_TWO_CHATS_THEN_QUOTA = """
+const systemPrompt = 'context '.repeat(1000);
+const newSession = () => ({messages: [], model: 'model', systemPrompt, modelSettingsByModel: {}});
+const say = (id, text) => {
+    const s = app.chatSessions[id];
+    s.messages.push({id: id + '_u' + s.messages.length, role: 'user', content: text});
+    s.messages.push({id: id + '_a' + s.messages.length, role: 'assistant', content: 're: ' + text,
+                     meta: {systemPrompt}});
+    app.saveCurrentChat(id, s.messages, s.model, systemPrompt);
+};
+app.systemPrompt = systemPrompt;
+app.chatSessions.chat_old = newSession();
+say('chat_old', 'earlier question');
+"""
+
+
+def _summary(chats):
+    return sorted((c["id"], [m["content"] for m in c["messages"]]) for c in chats)
+
+
+def test_export_keeps_older_chats_when_the_quota_trims_them():
+    """Trimming to fit the quota may drop older chats from storage, but the
+    export is the backup path and must still contain them."""
+    result = _run(_TWO_CHATS_THEN_QUOTA + """
+app.chatSessions.chat_1 = newSession();
+app.currentChatId = 'chat_1';
+say('chat_1', 'first');
+localStorage.quota = localStorage.getItem(CHAT_HISTORY_STORAGE_KEY).length + 100;
+say('chat_1', 'second');
+const chats = await exportedChats();
+console.log(JSON.stringify({chats}));
+""")
+    assert _summary(result["chats"]) == [
+        ("chat_1", ["first", "re: first", "second", "re: second"]),
+        ("chat_old", ["earlier question", "re: earlier question"]),
+    ]
+
+
+def test_export_keeps_the_current_chat_when_another_chat_is_pinned():
+    """Pinned chats sort first, so trimming used to evict the chat in use."""
+    result = _run(_TWO_CHATS_THEN_QUOTA + """
+app.chatHistory.find(c => c.id === 'chat_old').pinned = true;
+app.sortChatHistory();
+app.saveChatHistory();
+app.chatSessions.chat_1 = newSession();
+app.currentChatId = 'chat_1';
+say('chat_1', 'first');
+localStorage.quota = localStorage.getItem(CHAT_HISTORY_STORAGE_KEY).length + 100;
+say('chat_1', 'second');
+const chats = await exportedChats();
+console.log(JSON.stringify({chats}));
+""")
+    assert _summary(result["chats"]) == [
+        ("chat_1", ["first", "re: first", "second", "re: second"]),
+        ("chat_old", ["earlier question", "re: earlier question"]),
+    ]
