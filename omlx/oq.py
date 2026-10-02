@@ -9,6 +9,7 @@ Supported levels: oQ2, oQ2.5, oQ2.7, oQ3, oQ3.5, oQ4, oQ5, oQ6, oQ8
 base bits and add targeted routed-expert protection plus a higher bpw budget.
 """
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -1528,13 +1529,26 @@ def combine_gemma4_assistant_mtp(
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
     """Atomically replace a JSON file (tmp write + rename)."""
-    with tempfile.NamedTemporaryFile(
-        "w", dir=path.parent, prefix=f"{path.name}.tmp.", delete=False
-    ) as tmp:
-        json.dump(payload, tmp, indent=2)
-        tmp.flush()
-        temp_name = tmp.name
-    Path(temp_name).replace(path)
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", dir=path.parent, prefix=f"{path.name}.tmp.", delete=False
+        ) as tmp:
+            json.dump(payload, tmp, indent=2)
+            tmp.flush()
+            # Durable before the rename: without the fsync a crash can
+            # commit the rename while the file's data is still only in the
+            # page cache, leaving a truncated/zero-filled index behind.
+            os.fsync(tmp.fileno())
+            temp_name = tmp.name
+        Path(temp_name).replace(path)
+        temp_name = None
+    finally:
+        # json.dump raises (non-serializable payload) leave delete=False
+        # temps behind otherwise; quantized output dirs accumulated them.
+        if temp_name is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temp_name)
 
 
 def _write_mtp_shard_and_merge_index(

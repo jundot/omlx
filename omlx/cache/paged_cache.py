@@ -783,6 +783,15 @@ class PagedCacheManager(CacheManager):
                     self.cached_block_hash_to_block.pop(block.block_hash, block.block_id)
                     self._notify_hash_dropped(block.block_hash)
 
+                # Preserve the "free-queue blocks carry no hash" invariant:
+                # cold_block_count() and the ref-count distribution count
+                # blocks by block_hash, and _maybe_evict_cached_block() at
+                # reallocation relies on a stale hash never surviving a free
+                # (mirrors evict_block_permanently's reset_hash).
+                block.reset_hash()
+                self.stats.total_tokens_cached -= block.token_count
+                block.token_count = 0
+
                 # Remove from allocated
                 del self.allocated_blocks[block_id]
 
@@ -791,7 +800,6 @@ class PagedCacheManager(CacheManager):
 
                 self.stats.allocated_blocks -= 1
                 self.stats.free_blocks += 1
-                self.stats.total_tokens_cached -= block.token_count
 
                 return True
 
@@ -822,11 +830,16 @@ class PagedCacheManager(CacheManager):
                         self.cached_block_hash_to_block.pop(block.block_hash, block.block_id)
                         self._notify_hash_dropped(block.block_hash)
 
+                    # Same invariant as free_block(): no stale hash or
+                    # token_count survives into the free queue.
+                    block.reset_hash()
+                    self.stats.total_tokens_cached -= block.token_count
+                    block.token_count = 0
+
                     del self.allocated_blocks[block.block_id]
                     to_free.append(block)
                     self.stats.allocated_blocks -= 1
                     self.stats.free_blocks += 1
-                    self.stats.total_tokens_cached -= block.token_count
 
             # Add to free queue (back = MRU, evicted last)
             self.free_block_queue.append_n(to_free)

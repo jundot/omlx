@@ -848,8 +848,11 @@ class TestBlockAwarePrefixCacheWithSSD:
         result = prefix_cache_with_ssd.reconstruct_cache(table)
 
         assert result is None
+        # free_block() reset the block's hash before this assertion runs, so
+        # capture the expected hash up front rather than reading the live
+        # attribute after the fact.
         prefix_cache_with_ssd.paged_ssd_cache.forget_block.assert_called_once_with(
-            block.block_hash
+            b"\xcd" * 32
         )
         prefix_cache_with_ssd.paged_ssd_cache.delete_block.assert_not_called()
 

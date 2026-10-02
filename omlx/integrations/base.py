@@ -193,12 +193,15 @@ class Integration:
 
 def backup_then_write(
     path: Path, text: str, *, failure: str = "could not create backup",
-    note: str = "Config written",
+    note: str = "Config written", mode: int | None = None,
 ) -> None:
     """Back up an existing config, then write ``text`` over it.
 
     Best effort: a config that cannot be backed up is still written, and a
-    failed copy only earns a warning.
+    failed copy only earns a warning. ``mode`` applies only to first
+    creation, so secret-bearing configs can be created 0600 instead of
+    umask-default and only later chmod'ed (which leaves a brief
+    world-readable window).
     """
     if path.exists():
         backup = path.with_suffix(f".{int(time.time())}.bak")
@@ -209,7 +212,18 @@ def backup_then_write(
             print(f"Warning: {failure}: {e}")
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    if mode is not None:
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        except FileExistsError:
+            # Lost a create race or rewriting an existing file: write_text
+            # truncates in place and preserves the existing mode.
+            path.write_text(text, encoding="utf-8")
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+    else:
+        path.write_text(text, encoding="utf-8")
     print(f"{note}: {path}")
 
 

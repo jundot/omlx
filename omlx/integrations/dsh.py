@@ -526,10 +526,15 @@ def _validate_patch(
             raise ValueError("agent-default-model was not rewritten")
 
 
-def _write_config(path: Path, text: str) -> None:
+def _write_config(path: Path, text: str, *, secret: bool = False) -> None:
     """Back up, then write — dsh's own messages, naming the file in the warning."""
-    backup_then_write(path, text, failure=f"could not create backup for {path}",
-                      note="Config updated")
+    backup_then_write(
+        path,
+        text,
+        failure=f"could not create backup for {path}",
+        note="Config updated",
+        mode=0o600 if secret else None,
+    )
 
 
 def write_dsh_patch(
@@ -613,8 +618,11 @@ def write_credentials_ref(credentials_path: Path, ref_name: str, value: str) -> 
         )
 
     # The harness refuses to load a credential store with group/other bits.
+    # Create with 0600 up front so the plaintext key is never briefly
+    # world-readable under the default umask; chmod stays for rewrites of
+    # a pre-existing file with looser bits.
     credentials_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    _write_config(credentials_path, text)
+    _write_config(credentials_path, text, secret=True)
     credentials_path.chmod(0o600)
 
 
