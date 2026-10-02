@@ -1610,7 +1610,7 @@ def test_strategy_picker_renders_between_models_and_roles():
     assert ":title=\"option.disabledReason\"" in picker
 
 
-def test_persistent_prompt_cache_is_visible_opt_in_and_replans():
+def test_persistent_prompt_cache_defaults_on_and_can_be_disabled():
     template = _read(TEMPLATE)
     javascript = _read(JAVASCRIPT)
 
@@ -1620,7 +1620,7 @@ def test_persistent_prompt_cache_is_visible_opt_in_and_replans():
     assert "data-cluster-v2-active-cache-mode" in template
     assert 'x-model="promptCacheSsd"' in template
     assert '@change="runPlan()"' in template
-    assert "promptCacheSsd: false" in javascript
+    assert "promptCacheSsd: true" in javascript
     assert "promptCacheSsdMaxGiB: 20" in javascript
     assert "prompt_cache_ssd: this.promptCacheSsd" in javascript
     assert "prompt_cache_ssd_max_bytes" in javascript
@@ -1648,7 +1648,7 @@ component.selectedModelPath = '/models/m';
 (async () => {
   const defaultValue = component.promptCacheSsd;
   await component.runPlan();
-  component.promptCacheSsd = true;
+  component.promptCacheSsd = false;
   await component.runPlan();
   process.stdout.write(JSON.stringify({
     defaultValue,
@@ -1664,8 +1664,8 @@ component.selectedModelPath = '/models/m';
 """,
     )
 
-    assert result["defaultValue"] is False
-    assert result["posted"] == [False, True]
+    assert result["defaultValue"] is True
+    assert result["posted"] == [True, False]
     assert "persistent SSD snapshots" in result["enabledLabel"]
     assert "SSD snapshots off" in result["disabledLabel"]
 
@@ -2588,6 +2588,25 @@ process.stdout.write(JSON.stringify({state: component.wizardState(), active: com
     template = _read(TEMPLATE)
     assert "data-cluster-v2-join-cleanup" in template
     assert 'x-show="join.cleanup_pending"' in template
+
+
+@pytest.mark.parametrize(
+    "deployment,expected",
+    [
+        ({}, True),
+        ({"execution": {}}, True),
+        ({"execution": {"prompt_cache_ssd": False}}, False),
+        ({"prompt_cache_ssd": False}, False),
+        ({"execution": {"prompt_cache_ssd": False}, "prompt_cache_ssd": True}, False),
+        ({"execution": {"prompt_cache_ssd": True}, "prompt_cache_ssd": False}, True),
+    ],
+)
+def test_ssd_hydration_defaults_on_but_preserves_explicit_choice(deployment, expected):
+    result = _run_wizard(
+        "component.hydratePlannerFromDeployment(" + json.dumps(deployment) + ");"
+        "console.log(JSON.stringify({enabled: component.promptCacheSsd}));"
+    )
+    assert result["enabled"] is expected
 
 
 @pytest.mark.parametrize("login", ["", "remote_user@"])

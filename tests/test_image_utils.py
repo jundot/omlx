@@ -16,6 +16,7 @@ from omlx.utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
     extract_images_from_messages,
+    extract_media_from_messages,
     load_image,
 )
 
@@ -466,6 +467,35 @@ def test_video_input_is_rejected():
 
     with pytest.raises(InvalidRequestError, match="Video input is not supported"):
         extract_images_from_messages(messages)
+
+
+def test_extract_media_keeps_video_uris_in_order():
+    first = "data:video/mp4;base64,AAAA"
+    second = "data:video/quicktime;base64,BBBB"
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "video_url", "video_url": {"url": first}},
+                {"type": "text", "text": "Compare"},
+                {"type": "video_url", "video_url": second},
+            ],
+        }
+    ]
+
+    text_msgs, images, audio, videos = extract_media_from_messages(messages)
+
+    assert videos == [first, second]
+    assert images == []
+    assert audio == []
+    assert text_msgs == [{"role": "user", "content": "Compare"}]
+
+
+def test_extract_media_rejects_video_part_without_url():
+    messages = [{"role": "user", "content": [{"type": "video_url"}]}]
+
+    with pytest.raises(InvalidRequestError, match="missing video_url"):
+        extract_media_from_messages(messages)
 
 
 # =============================================================================

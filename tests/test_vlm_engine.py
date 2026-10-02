@@ -13,6 +13,7 @@ Tests cover:
 import base64
 import io
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -3341,3 +3342,212 @@ def test_deepseek_v4_packed_vision_features_round_trip():
     assert mx.array_equal(restored[1], second)
     with pytest.raises(ValueError, match="image grids"):
         engine._split_vision_features(packed[:4], 2, metadata)
+
+
+# ---------------------------------------------------------------------------
+# Native video (Qwen3.5 / Qwen3.6 / Qwen3.8)
+# ---------------------------------------------------------------------------
+
+_VIDEO_URI = "data:video/mp4;base64,AAAA"
+
+
+def _video_part(url: str = _VIDEO_URI) -> dict:
+    return {"type": "video_url", "video_url": {"url": url}}
+
+
+class _DictVisionCache:
+    def __init__(self):
+        self.entries = {}
+
+    def get(self, key, model_name):
+        return self.entries.get((key, model_name))
+
+    def put(self, key, model_name, features, grid=None):
+        self.entries[(key, model_name)] = features
+
+
+class TestNativeVideo:
+    def _engine(self, native=True):
+        engine = _make_loaded_engine(model_type="qwen3_5")
+        engine._native_video = native
+        return engine
+
+    def test_video_is_rejected_without_native_support(self):
+        from omlx.exceptions import InvalidRequestError
+
+        engine = self._engine(native=False)
+        messages = [{"role": "user", "content": [_video_part()]}]
+
+        with pytest.raises(InvalidRequestError, match="Video input is not supported"):
+            engine._extract_request_media(messages)
+
+    def test_native_video_is_extracted_as_uri(self):
+        engine = self._engine()
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "Describe"}, _video_part()],
+            }
+        ]
+
+        media, text, images, audio, videos = engine._extract_request_media(messages)
+
+        assert media is messages
+        assert text == [{"role": "user", "content": "Describe"}]
+        assert (images, audio, videos) == ([], [], [_VIDEO_URI])
+
+    def test_video_mixed_with_image_is_rejected(self):
+        from omlx.exceptions import InvalidRequestError
+
+        engine = self._engine()
+        messages = [{"role": "user", "content": [_image_part(32, 32), _video_part()]}]
+
+        with pytest.raises(InvalidRequestError, match="cannot be combined"):
+            engine._extract_request_media(messages)
+
+    def test_format_places_video_where_the_user_put_it(self):
+        engine = self._engine()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Before"},
+                    _video_part(),
+                    {"type": "text", "text": "After"},
+                ],
+            },
+            {"role": "assistant", "content": "A crowd."},
+            {"role": "user", "content": "What changes?"},
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=0, num_videos=1
+        )
+
+        assert formatted[0] == {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Before"},
+                {"type": "video"},
+                {"type": "text", "text": "After"},
+            ],
+        }
+        assert all("video" not in str(msg["content"]) for msg in formatted[1:])
+        assert image_ranges == []
+
+    def test_video_cache_identity_covers_content_and_sampling(self):
+        engine = self._engine()
+        video = SimpleNamespace(
+            fps=2.0, min_frames=4, max_frames=64, min_pixels=4096, max_pixels=25165824
+        )
+        engine._processor = SimpleNamespace(video_processor=video)
+
+        identity = engine._video_cache_identity(["a" * 64])
+
+        assert identity == engine._video_cache_identity(["a" * 64])
+        assert identity != engine._video_cache_identity(["b" * 64])
+        video.fps = 1.0
+        assert identity != engine._video_cache_identity(["a" * 64])
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_video_cache_ranges_start_at_each_clip(self):
+        engine = self._engine()
+        engine._vlm_model.config.video_token_id = 7
+        engine._processor = SimpleNamespace(video_processor=None)
+        # text, clip A (two temporal patches), text, clip B (one patch)
+        token_ids = [1, 2, 9, 7, 7, 8, 3, 9, 7, 7, 8, 4, 5, 9, 7, 8, 6]
+        grids = mx.array([[2, 2, 2], [1, 2, 2]])
+
+        ranges = engine._video_cache_key_ranges(token_ids, grids, ["a", "b"])
+
+        assert ranges == [
+            (3, engine._video_cache_identity(["a"])),
+            (14, engine._video_cache_identity(["a", "b"])),
+        ]
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_video_cache_ranges_fall_back_when_tokens_disagree(self):
+        engine = self._engine()
+        engine._vlm_model.config.video_token_id = 7
+        engine._processor = SimpleNamespace(video_processor=None)
+        # The grid declares two temporal patches; the prompt has one run.
+        token_ids = [1, 9, 7, 7, 8, 2]
+        grids = mx.array([[2, 2, 2]])
+
+        assert engine._video_cache_key_ranges(token_ids, grids, ["a"]) == []
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_video_features_are_encoded_once_per_clip(self):
+        engine = self._engine()
+        engine._vlm_model.config.video_token_id = 7
+        engine._vision_cache = _DictVisionCache()
+        engine._vision_cache_enabled = True
+        features = mx.ones((3, 4))
+        engine._compute_vision_features = MagicMock(return_value=features)
+        input_ids = mx.array([[1, 7, 7, 7, 2]])
+        extra = {"pixel_values_videos": mx.zeros((12, 8)), "video_grid_thw": "grid"}
+
+        first = engine._cached_video_features("clip", input_ids, extra)
+        second = engine._cached_video_features("clip", input_ids, extra)
+
+        assert first is features and second is features
+        engine._compute_vision_features.assert_called_once_with(
+            extra["pixel_values_videos"], {"image_grid_thw": "grid"}
+        )
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_video_features_with_wrong_token_count_are_not_used(self):
+        engine = self._engine()
+        engine._vlm_model.config.video_token_id = 7
+        engine._vision_cache = _DictVisionCache()
+        engine._vision_cache_enabled = True
+        engine._compute_vision_features = MagicMock(return_value=mx.ones((2, 4)))
+        input_ids = mx.array([[1, 7, 7, 7, 2]])
+        extra = {"pixel_values_videos": mx.zeros((12, 8)), "video_grid_thw": "grid"}
+
+        assert engine._cached_video_features("clip", input_ids, extra) is None
+        assert engine._vision_cache.entries == {}
+
+    def test_temporary_video_files_are_removed_when_preprocessing_fails(self):
+        engine = self._engine()
+        engine._processor = SimpleNamespace(video_processor=object())
+        written = []
+
+        def fake_prepare(*args, **kwargs):
+            written.extend(kwargs["videos"])
+            raise RuntimeError("vision tower failed")
+
+        engine._prepare_vision_inputs = MagicMock(side_effect=fake_prepare)
+        messages = [{"role": "user", "content": [_video_part()]}]
+
+        with (
+            patch("omlx.engine.vlm.probe_video"),
+            patch("omlx.engine.vlm.native_video_token_count"),
+            pytest.raises(RuntimeError, match="vision tower failed"),
+        ):
+            engine._process_chat_messages(messages, tools=None, kwargs={})
+
+        assert len(written) == 1
+        assert not Path(written[0]).exists()
+
+    @pytest.mark.asyncio
+    async def test_preflight_counts_video_tokens(self):
+        engine = self._engine()
+        engine._apply_chat_template = MagicMock(return_value="prompt")
+        engine._tokenizer = SimpleNamespace(encode=lambda text: [1, 2])
+        engine._processor = SimpleNamespace(
+            image_processor=_QWEN_IP, video_processor=object()
+        )
+        engine._engine = SimpleNamespace(engine=SimpleNamespace(scheduler=object()))
+        engine._preflight_or_raise_with_eviction = AsyncMock()
+        messages = [{"role": "user", "content": [_video_part(), _video_part()]}]
+
+        with patch(
+            "omlx.engine.vlm.estimate_native_video_tokens", return_value=500
+        ) as estimate:
+            await engine.preflight_chat(messages)
+
+        assert estimate.call_count == 2
+        kwargs = engine._preflight_or_raise_with_eviction.call_args.kwargs
+        assert kwargs["num_prompt_tokens"] == 1002
+        assert kwargs["text_only"] is False

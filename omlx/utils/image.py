@@ -21,6 +21,7 @@ from PIL import Image, ImageOps
 
 from ..exceptions import InvalidRequestError
 from ..settings import get_settings
+from .video import _video_url
 
 DEFAULT_MAX_IMAGE_BYTES = 50 * 1024 * 1024  # 50 MiB
 DEFAULT_MAX_IMAGE_SIDE_LENGTH = 2048  # 2048 px
@@ -303,6 +304,31 @@ def _load_image_bytes(
 def extract_images_from_messages(
     messages: List[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], List[Image.Image], List]:
+    """Extract images and audio; video parts are rejected.
+
+    See :func:`extract_media_from_messages` for models with native video input.
+    """
+    return _extract_media(messages, videos=None)
+
+
+def extract_media_from_messages(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[Image.Image], list, list[str]]:
+    """Like :func:`extract_images_from_messages`, but also collects videos.
+
+    Returns ``(text_messages, images, audio, videos)``, where ``videos`` holds
+    the inline ``data:video/...`` URIs in order of appearance. Decoding is left
+    to the caller, which needs the clip as a file for frame sampling.
+    """
+    videos: list[str] = []
+    text_messages, images, audio = _extract_media(messages, videos=videos)
+    return text_messages, images, audio, videos
+
+
+def _extract_media(
+    messages: list[dict[str, Any]],
+    videos: list[str] | None,
+) -> tuple[list[dict[str, Any]], list[Image.Image], list]:
     """
     Extract images and audio from OpenAI-format messages.
 
@@ -314,6 +340,8 @@ def extract_images_from_messages(
         messages: List of OpenAI-format chat messages. Each message may have
             content as a string or a list of content parts
             (text/image_url/input_audio).
+        videos: List that receives video data URIs in order of appearance, or
+            ``None`` to reject video parts.
 
     Returns:
         Tuple of (text_messages, images, audio):
@@ -413,10 +441,18 @@ def extract_images_from_messages(
                         audio.append(data)
 
             elif part_type in ("video", "video_url", "input_video"):
-                raise InvalidRequestError(
-                    "Video input is not supported by oMLX.",
-                    field="messages",
-                )
+                if videos is None:
+                    raise InvalidRequestError(
+                        "Video input is not supported by oMLX.",
+                        field="messages",
+                    )
+                url = _video_url(part)
+                if not url:
+                    raise InvalidRequestError(
+                        "Video content part is missing video_url.",
+                        field="messages",
+                    )
+                videos.append(url)
 
         new_msg = {"role": role, "content": "\n".join(text_parts) if text_parts else ""}
         # Preserve extra fields

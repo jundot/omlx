@@ -71,6 +71,7 @@ class ContentPart(BaseModel):
     text: Optional[str] = None
     image_url: Optional[ImageURL] = None
     video_url: Optional[ImageURL] = None
+    input_video: Optional[Union[ImageURL, str]] = None
     input_audio: Optional[InputAudio] = None
     file: Optional[FileContent] = None
 
