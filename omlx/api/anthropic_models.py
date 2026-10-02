@@ -8,9 +8,16 @@ These models define the request and response schemas for:
 - Tool calling in Anthropic format
 """
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Discriminator,
+    Field,
+    Tag,
+    model_validator,
+)
 
 from omlx.api.shared_models import IDPrefix, generate_id
 
@@ -84,16 +91,74 @@ class ContentBlockInputAudio(BaseModel):
     input_audio: dict[str, Any]  # {"data": "<base64>", "format": "wav"}
 
 
-# Union type for all content blocks
-ContentBlock = (
-    ContentBlockText
-    | ContentBlockImage
-    | ContentBlockToolUse
-    | ContentBlockToolResult
-    | ContentBlockThinking
-    | ContentBlockDocument
-    | ContentBlockInputAudio
+class ContentBlockUnknown(BaseModel):
+    """Forward-compat catch-all for content block types not otherwise modeled.
+
+    Claude Code emits blocks such as ``tool_addition`` (with a nested
+    ``tool_reference``) when deferred/MCP tools load mid-session. The
+    converters in ``anthropic_utils`` already skip unrecognized blocks, so
+    accepting one here keeps the rest of the conversation working instead of
+    failing the whole request with 422 (issue #3754).
+
+    Only reached via :data:`_content_block_tag`, which routes *unknown* ``type``
+    values here. Malformed blocks of a *known* type still fail validation.
+    """
+
+    type: str
+    model_config = ConfigDict(extra="allow")
+
+
+# Every ``type`` value that has a strictly-validated model above. Anything else
+# routes to ContentBlockUnknown.
+_KNOWN_CONTENT_BLOCK_TYPES: frozenset[str] = frozenset(
+    {
+        "text",
+        "image",
+        "tool_use",
+        "tool_result",
+        "thinking",
+        "document",
+        "input_audio",
+    }
 )
+
+
+def _content_block_tag(value: Any) -> str:
+    """Callable discriminator: known ``type`` -> its strict model, else catch-all.
+
+    A plain union plus a catch-all (``union_mode="left_to_right"``) would let a
+    *malformed* known block such as ``{"type": "text"}`` (no ``text`` field)
+    fall through and validate. The converter then does ``block_dict.get("text",
+    "")``, so the client gets a 200 with a silently degraded prompt instead of a
+    422 naming the bad field. Routing on ``type`` first keeps that 422.
+
+    One deliberate tightening vs. the old plain union: a block with a missing,
+    null or non-string ``type`` is now rejected. Every variant declared
+    ``type: Literal[...] = "..."`` with a default, so the smart union used to
+    infer one from the remaining fields; ``type`` is required by the Anthropic
+    API, and nothing in oMLX sends it omitted.
+    """
+    if isinstance(value, dict):
+        block_type = value.get("type")
+    else:
+        block_type = getattr(value, "type", None)
+    if isinstance(block_type, str) and block_type in _KNOWN_CONTENT_BLOCK_TYPES:
+        return block_type
+    return "unknown"
+
+
+# Union type for all content blocks
+ContentBlock = Annotated[
+    Annotated[ContentBlockText, Tag("text")]
+    | Annotated[ContentBlockImage, Tag("image")]
+    | Annotated[ContentBlockToolUse, Tag("tool_use")]
+    | Annotated[ContentBlockToolResult, Tag("tool_result")]
+    | Annotated[ContentBlockThinking, Tag("thinking")]
+    | Annotated[ContentBlockDocument, Tag("document")]
+    | Annotated[ContentBlockInputAudio, Tag("input_audio")]
+    | Annotated[ContentBlockUnknown, Tag("unknown")],
+    Discriminator(_content_block_tag),
+]
 
 
 # =============================================================================

@@ -268,6 +268,144 @@ class TestAnthropicMessage:
             AnthropicMessage(role="invalid_role", content="x")
 
 
+class TestContentBlockForwardCompat:
+    """Forward-compat content blocks (issue #3754).
+
+    Claude Code emits ``tool_addition`` blocks (nested ``tool_reference``) when
+    deferred/MCP tools load mid-session. ``ContentBlock`` used to be a plain
+    7-way union with no fallback, so such a block failed every branch and the
+    whole ``/v1/messages`` request was rejected with 422.
+
+    The catch-all must stay narrow: only genuinely *unknown* ``type`` values may
+    fall through to it. A malformed *known* block must still 422, otherwise a
+    client bug turns into a silently degraded prompt.
+    """
+
+    def test_tool_addition_block_accepted(self):
+        """A tool_addition block must not 422 the whole request (issue #3754)."""
+        request = MessagesRequest(
+            model="test-model",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        ContentBlockToolResult(
+                            tool_use_id="toolu_123",
+                            content="file created",
+                        ),
+                        {
+                            "type": "tool_addition",
+                            "tool": {
+                                "type": "tool_reference",
+                                "name": "mcp__example__some_tool",
+                            },
+                            "cache_control": {"type": "ephemeral"},
+                        },
+                    ],
+                ),
+            ],
+        )
+
+        assert len(request.messages) == 1
+        assert len(request.messages[0].content) == 2
+
+    def test_tool_addition_block_maps_to_unknown_variant(self):
+        """Unknown types land on the catch-all model, keeping their extras."""
+        from omlx.api.anthropic_models import ContentBlockUnknown
+
+        msg = AnthropicMessage(
+            role="user",
+            content=[
+                {
+                    "type": "tool_addition",
+                    "tool": {
+                        "type": "tool_reference",
+                        "name": "mcp__example__some_tool",
+                    },
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ],
+        )
+
+        block = msg.content[0]
+        assert isinstance(block, ContentBlockUnknown)
+        assert block.type == "tool_addition"
+        # extra="allow": forward-compat fields survive round-trip.
+        assert block.model_dump()["tool"]["name"] == "mcp__example__some_tool"
+
+    @pytest.mark.parametrize(
+        "block_type",
+        ["tool_addition", "tool_deletion", "server_tool_use", "future_block"],
+    )
+    def test_unknown_block_types_accepted(self, block_type):
+        """Any unrecognized type string is forward-compatible."""
+        msg = AnthropicMessage(role="user", content=[{"type": block_type}])
+
+        assert msg.content[0].type == block_type
+
+    @pytest.mark.parametrize(
+        ("block", "expected_cls"),
+        [
+            ({"type": "text", "text": "hi"}, ContentBlockText),
+            (
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": "ok",
+                },
+                ContentBlockToolResult,
+            ),
+            (
+                {"type": "tool_use", "id": "toolu_2", "name": "f", "input": {}},
+                ContentBlockToolUse,
+            ),
+            ({"type": "document", "source": {"type": "base64"}}, ContentBlockDocument),
+        ],
+    )
+    def test_known_block_types_keep_strict_models(self, block, expected_cls):
+        """Known types route to their strict model, never the catch-all."""
+        msg = AnthropicMessage(role="user", content=[block])
+
+        assert type(msg.content[0]) is expected_cls
+
+    @pytest.mark.parametrize(
+        "block",
+        [
+            # The canonical case: a known type missing its required field.
+            {"type": "text"},
+            {"type": "tool_result", "content": "missing tool_use_id"},
+            {"type": "tool_use", "name": "f", "input": {}},
+            {"type": "image"},
+            {"type": "thinking"},
+            {"type": "document"},
+            {"type": "input_audio"},
+            # Wrong-typed required fields must still be rejected.
+            {"type": "text", "text": 123},
+            {"type": "tool_use", "id": 1, "name": "f", "input": {}},
+            # A missing/null/non-string `type` is invalid, not "unknown":
+            # `type` is required on every Anthropic content block.
+            {"text": "hi"},
+            {},
+            {"type": None},
+            {"type": 123},
+        ],
+    )
+    def test_malformed_known_blocks_still_rejected(self, block):
+        """Regression guard: the catch-all must not swallow broken known blocks.
+
+        With a naive ``union_mode="left_to_right"`` catch-all these all validate
+        and the converter then emits an empty text part / a tool message with
+        ``tool_call_id: ""``. Measured against this fix's converter: a type-less
+        ``{"text": "hi"}`` becomes ``{"role": "user", "content": ""}`` and a
+        ``tool_result`` without ``tool_use_id`` becomes
+        ``{"role": "tool", "tool_call_id": "", ...}`` -- a 200 with a silently
+        degraded prompt instead of a 422 that names the bad field.
+        """
+        with pytest.raises(ValidationError):
+            AnthropicMessage(role="user", content=[block])
+
+
 class TestAnthropicTool:
     """Tests for AnthropicTool model."""
 
