@@ -208,3 +208,20 @@ def test_empty_thinking_content_is_not_rendered_or_replayed():
     assert "reasoning_content: this.hasVisibleThinking(stream.streamingThinking)" in stream
     assert 'x-if="hasVisibleThinking(msg._thinking)"' in html
     assert 'x-show="hasVisibleThinking(currentStream()?.streamingThinking)"' in html
+
+
+def test_regenerate_with_model_promotes_override_to_active_model():
+    """#2729: "Regenerate with <model>" must update the header/picker and load
+    the override model's settings instead of leaving the stale failed model
+    active."""
+    method = _section(
+        _template(),
+        '// "Regenerate with <model>" promotes the override to this chat\'s active',
+        "await this.streamResponse({",
+    )
+
+    assert "this.currentModel = gatewayId;" in method
+    assert "session.model = gatewayId;" in method
+    assert "this.loadModelSettingsForModel(session, gatewayId)" in method
+    assert "this.ensureSessionModelSettings(session, gatewayId)" in method
+    assert "this.saveModelSettingsForModel(session, gatewayId)" in method
