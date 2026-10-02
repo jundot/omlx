@@ -57,6 +57,7 @@ from ..utils.image import (
     compute_per_image_hashes,
     extract_images_from_messages,
 )
+from ..utils.request_id import valid_request_id
 from ..utils.video import expand_video_parts
 from .base import (
     BaseEngine,
@@ -4746,6 +4747,10 @@ class VLMBatchedEngine(BaseEngine):
         request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            # The server's correlation id when it supplied one, so this
+            # request is identifiable in logs and admin stats. An unusable
+            # value falls back to the engine's own minted id.
+            request_id=valid_request_id(kwargs.pop("_request_id", None)),
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,

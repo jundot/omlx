@@ -406,6 +406,38 @@ class TestBatchedEngineStreamingCleanup:
 
         assert fake_engine.add_request_kwargs["tools"] == tools
 
+    @pytest.mark.asyncio
+    async def test_stream_generate_forwards_correlation_id_to_request(self):
+        """The server's x-request-id must become the engine request id."""
+        from omlx.engine.batched import BatchedEngine
+
+        fake_engine = FakeStreamingCore()
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = fake_engine
+
+        stream = engine.stream_generate("hello", _request_id="client-trace-1")
+        await stream.__anext__()
+        await stream.aclose()
+
+        assert fake_engine.add_request_kwargs["request_id"] == "client-trace-1"
+
+    @pytest.mark.asyncio
+    async def test_stream_generate_ignores_unusable_correlation_id(self):
+        """An unusable id falls back to the engine's own minted one."""
+        from omlx.engine.batched import BatchedEngine
+
+        fake_engine = FakeStreamingCore()
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = fake_engine
+
+        stream = engine.stream_generate("hello", _request_id="bad id")
+        await stream.__anext__()
+        await stream.aclose()
+
+        assert fake_engine.add_request_kwargs["request_id"] is None
+
 
 class TestBatchedEngineApplyChatTemplate:
     """Tests for BatchedEngine._apply_chat_template()."""
