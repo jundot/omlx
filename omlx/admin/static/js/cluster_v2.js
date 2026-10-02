@@ -1696,20 +1696,27 @@ function clusterV2Wizard() {
         },
 
         sshTargetFor(device) {
-            // Pairing enrollment records the SSH target; the devices payload
-            // surfaces it as ssh_target on paired rows. Fall back to the
-            // first verified probe address when no enrollment exists yet.
-            const user = device?.ssh_user;
+            const enrolled = String(device?.ssh_target || '');
+            const separator = enrolled.lastIndexOf('@');
+            const user = device?.ssh_user || (separator > 0 ? enrolled.slice(0, separator) : '');
             const withUser = (target) => user
                 ? `${user}@${String(target).replace(/^[^@]+@/, '')}`
                 : String(target);
-            if (device?.ssh_target) return withUser(device.ssh_target);
             const addrs = Array.isArray(device?.addrs) ? device.addrs : [];
             // A bare fe80:: link-local address has no scope id here, so SSH
             // to it has no route — prefer any routable address first.
             const usable = addrs.filter(
                 (addr) => addr && addr.ip && !String(addr.ip).startsWith('fe80::'),
             );
+            // Pairing pins every address. Select a verified address before
+            // falling back to the enrolled target, keeping the same login.
+            const verified = usable.find(
+                // The shared SSH policy forces AddressFamily=inet.
+                (addr) => !String(addr.ip).includes(':')
+                    && device?.address_health?.[addr.ip]?.state === 'verified',
+            );
+            if (verified) return withUser(verified.ip);
+            if (device?.ssh_target) return withUser(device.ssh_target);
             const first = usable[0] || addrs.find((addr) => addr && addr.ip);
             return withUser(first ? first.ip : this.deviceName(device));
         },

@@ -2587,6 +2587,47 @@ process.stdout.write(JSON.stringify({state: component.wizardState(), active: com
     assert 'x-show="join.cleanup_pending"' in template
 
 
+@pytest.mark.parametrize("login", ["", "remote_user@"])
+@pytest.mark.parametrize("verified", [True, False])
+def test_wizard_selects_verified_address_without_ssh_user(login, verified):
+    original = login + "192.0.2.1"
+    expected = login + ("192.0.2.2" if verified else "192.0.2.1")
+    result = _run_wizard(
+        """
+const peer = {
+    node_id: 'peer', paired: true, ssh_target: ORIGINAL,
+    addrs: [{ip: '192.0.2.1'}, {ip: '192.0.2.2'}, {ip: '192.0.2.3'}],
+    address_health: {
+        '192.0.2.1': {state: 'stale'},
+        '192.0.2.2': {state: STATE},
+        '192.0.2.3': {state: STATE},
+    },
+};
+component.devicesPayload = {self: null, paired: [peer], discovered: []};
+component.planProposal = {activation: {hosts: [{ssh: ORIGINAL}]}};
+let probed;
+component.apiFetch = async (url, options) => {
+    probed = JSON.parse(options.body).ssh;
+    return {};
+};
+(async () => {
+    await component.probePeer(peer);
+    console.log(JSON.stringify({target: component.sshTargetFor(peer),
+        host: component.deploymentHosts()[0].ssh, probed,
+        original: component.planProposal.activation.hosts[0].ssh}));
+})();
+""".replace("ORIGINAL", json.dumps(original)).replace(
+            "STATE", json.dumps("verified" if verified else "stale")
+        )
+    )
+    assert result == {
+        "target": expected,
+        "host": expected,
+        "probed": expected,
+        "original": original,
+    }
+
+
 def test_explicit_ssh_user_follows_peer_addresses_and_deployment_hosts():
     result = _run_wizard("""
 const peer = {node_id: 'worker', paired: true, ssh_user: 'remote_user',
@@ -2708,3 +2749,132 @@ def test_forget_member_and_entire_cluster_have_separate_confirmations():
     template = _read(TEMPLATE)
     assert 'data-cluster-v2-forget-device' in template
     assert 'data-cluster-v2-forget-all' in template
+
+
+@pytest.mark.parametrize(
+    "device, expected",
+    [
+        pytest.param(
+            {"ssh_target": "192.0.2.1", "ssh_user": "paired_user"},
+            "paired_user@192.0.2.2",
+            id="pairing-account",
+        ),
+        pytest.param(
+            {"ssh_target": "old_user@192.0.2.1", "ssh_user": "saved_user"},
+            "saved_user@192.0.2.2",
+            id="saved-account-overrides-enrollment",
+        ),
+        pytest.param(
+            {"ssh_target": "enrolled_user@192.0.2.1"},
+            "enrolled_user@192.0.2.2",
+            id="enrolled-account",
+        ),
+        pytest.param({}, "192.0.2.2", id="no-enrolled-target-or-account"),
+        pytest.param(
+            {"ssh_target": "192.0.2.1", "address_health": {}},
+            "192.0.2.1",
+            id="no-verified-address-keeps-enrollment",
+        ),
+        pytest.param(
+            {"ssh_target": "192.0.2.1", "address_health": None},
+            "192.0.2.1",
+            id="legacy-peer-without-health",
+        ),
+        pytest.param(
+            {
+                "ssh_target": "old_user@192.0.2.1",
+                "ssh_user": "saved_user",
+                "address_health": {},
+            },
+            "saved_user@192.0.2.1",
+            id="fallback-keeps-account-override",
+        ),
+        pytest.param(
+            {"address_health": {}},
+            "192.0.2.1",
+            id="legacy-address-fallback",
+        ),
+        pytest.param(
+            {"ssh_target": "192.0.2.1", "addrs": []},
+            "192.0.2.1",
+            id="health-address-must-be-advertised",
+        ),
+        pytest.param(
+            {"ssh_target": "192.0.2.1", "addrs": None},
+            "192.0.2.1",
+            id="missing-address-list",
+        ),
+        pytest.param(
+            {
+                "address_health": {
+                    "192.0.2.1": {"state": "verified"},
+                    "192.0.2.2": {"state": "verified"},
+                }
+            },
+            "192.0.2.1",
+            id="first-verified-address-is-stable",
+        ),
+        pytest.param(
+            {
+                "addrs": [None, {}, {"ip": "fe80::1"}, {"ip": "192.0.2.2"}],
+                "address_health": {
+                    "fe80::1": {"state": "verified"},
+                    "192.0.2.2": {"state": "verified"},
+                },
+            },
+            "192.0.2.2",
+            id="ignore-unscoped-link-local-and-malformed-entries",
+        ),
+        pytest.param(
+            {
+                "address_health": {
+                    "192.0.2.1": {"state": "unverified"},
+                    "192.0.2.2": {"state": "stale"},
+                    "192.0.2.3": {"state": "verified"},
+                }
+            },
+            "192.0.2.3",
+            id="skip-unverified-and-stale-addresses",
+        ),
+        pytest.param(
+            {
+                "addrs": [{"ip": "2001:db8::1"}, {"ip": "192.0.2.2"}],
+                "address_health": {
+                    "2001:db8::1": {"state": "verified"},
+                    "192.0.2.2": {"state": "verified"},
+                },
+            },
+            "192.0.2.2",
+            id="verified-ipv4-matches-ssh-policy",
+        ),
+        pytest.param(
+            {
+                "ssh_target": "192.0.2.1",
+                "addrs": [{"ip": "2001:db8::1"}],
+                "address_health": {"2001:db8::1": {"state": "verified"}},
+            },
+            "192.0.2.1",
+            id="ipv6-only-health-keeps-enrollment",
+        ),
+    ],
+)
+def test_wizard_verified_address_selection_preserves_login_and_fallback(
+    device, expected
+):
+    peer = {
+        "node_id": "peer",
+        "paired": True,
+        "addrs": [{"ip": "192.0.2.1"}, {"ip": "192.0.2.2"}, {"ip": "192.0.2.3"}],
+        "address_health": {
+            "192.0.2.1": {"state": "stale"},
+            "192.0.2.2": {"state": "verified"},
+            "192.0.2.3": {"state": "verified"},
+        },
+        **device,
+    }
+    result = _run_wizard(
+        "console.log(JSON.stringify(component.sshTargetFor(PEER)));".replace(
+            "PEER", json.dumps(peer)
+        )
+    )
+    assert result == expected

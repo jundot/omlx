@@ -365,8 +365,12 @@ def _set_serve_release(
             else _REMOTE_SERVE_MARKER_SCRIPT
         )
         arguments = [remote_path] if encoded is None else [remote_path, encoded]
+        # Absolute interpreter like the staging transfers: a bare "python3"
+        # resolves through the remote login shell's PATH, where a modified
+        # environment can shadow it. The marker script is stdlib-only, so
+        # /usr/bin/python3 suffices.
         command = " ".join(
-            ["python3", "-c", shlex.quote(script)]
+            ["/usr/bin/python3", "-c", shlex.quote(script)]
             + [shlex.quote(item) for item in arguments]
         )
         completed = _run_cluster_ssh(

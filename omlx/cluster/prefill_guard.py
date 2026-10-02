@@ -69,6 +69,12 @@ def rank_monitor(
     # Pipeline: this rank stores KV for its own layers only.
     stage_layers = int(layer_count) if layer_count else num_layers
     stage_layers = max(1, min(stage_layers, num_layers or stage_layers))
+    # Hybrid stacks (gated-delta-net + full attention) only grow a KV cache in the
+    # full-attention layers. ``set_model_info_from_model`` classified them from
+    # ``model.make_cache()``, which on a pipeline stage covers this rank's layers;
+    # never charge more KV layers than that, and never more than the stage holds.
+    kv_layers = int(getattr(monitor, "_num_kv_cache_layers", 0) or 0)
+    stage_kv_layers = min(stage_layers, kv_layers) if kv_layers else stage_layers
 
     # Tensor parallel: heads are split across ranks, so both the KV this rank
     # stores and the attention transient it computes shrink with the shard.
@@ -85,7 +91,7 @@ def rank_monitor(
         head_dim=head_dim,
         dtype_size=dtype_size,
         num_attention_heads=heads,
-        num_kv_cache_layers=stage_layers,
+        num_kv_cache_layers=stage_kv_layers,
         kv_bytes_per_token=kv_override,
     )
     return monitor
