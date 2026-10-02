@@ -1,13 +1,9 @@
 """Tests for the enable_thinking toggle and detect_thinking_default heuristic."""
 
 import json
-from pathlib import Path
-
-import pytest
 
 from omlx.model_discovery import detect_preserve_thinking, detect_thinking_default
 from omlx.model_settings import ModelSettings
-
 
 # ---------------------------------------------------------------------------
 # detect_thinking_default
@@ -34,6 +30,16 @@ class TestDetectThinkingDefault:
         (tmp_path / "chat_template.jinja").write_text(template)
         assert detect_thinking_default(tmp_path) is False
 
+    def test_explicit_default_true_pattern_returns_true(self, tmp_path):
+        """Laguna S-2.1 pattern: enable_thinking | default(true) means ON even
+        when another flag in the same template defaults to false."""
+        template = (
+            "{%- set enable_thinking = enable_thinking | default(true) -%}\n"
+            "{%- set preserve_thinking = preserve_thinking | default(false) -%}"
+        )
+        (tmp_path / "chat_template.jinja").write_text(template)
+        assert detect_thinking_default(tmp_path) is True
+
     def test_enable_thinking_paren_pattern_returns_false(self, tmp_path):
         """Template that references enable_thinking) returns False."""
         template = "{%- if default(enable_thinking) -%}think{%- endif -%}"
@@ -48,6 +54,28 @@ class TestDetectThinkingDefault:
 
     def test_no_template_files_returns_none(self, tmp_path):
         """Directory without any template file returns None."""
+        assert detect_thinking_default(tmp_path) is None
+
+    def test_laguna_template_uses_recommended_serving_default(self, tmp_path):
+        """Laguna's effective default follows Poolside's serving recommendation."""
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": "laguna"}))
+        (tmp_path / "chat_template.jinja").write_text(
+            "{%- set enable_thinking = enable_thinking | default(false) -%}\n"
+            "{%- if not enable_thinking -%}</think>{%- else -%}<think>{%- endif -%}"
+        )
+
+        assert detect_thinking_default(tmp_path) is True
+
+    def test_laguna_without_thinking_template_returns_none(self, tmp_path):
+        """A Laguna config alone is not evidence that its template accepts the flag."""
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": "laguna"}))
+
+        assert detect_thinking_default(tmp_path) is None
+
+    def test_non_laguna_config_without_thinking_template_returns_none(self, tmp_path):
+        """Reading config metadata must not enable thinking for other models."""
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": "llama"}))
+
         assert detect_thinking_default(tmp_path) is None
 
     def test_jinja_file_takes_priority_over_tokenizer_config(self, tmp_path):

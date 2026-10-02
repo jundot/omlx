@@ -85,10 +85,14 @@ class RerankerEngine(BaseNonStreamingEngine):
             return
 
         logger.info(f"Stopping reranker engine: {self._model_name}")
+        model = self._model
+        loop = asyncio.get_running_loop()
+        close = getattr(model, "close", None)
+        if callable(close):
+            await loop.run_in_executor(get_mlx_executor(), close)
         self._model = None
 
         gc.collect()
-        loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
         )
@@ -111,8 +115,8 @@ class RerankerEngine(BaseNonStreamingEngine):
                 'image' keys.
             top_n: Number of top results to return (None = all)
             max_length: Maximum token length for each query-document pair.
-                If None, uses model-appropriate default (512 for encoder,
-                8192 for CausalLM).
+                If None, uses model-appropriate default (the tokenizer limit
+                for encoders, 8192 for CausalLM).
 
         Returns:
             RerankOutput with scores, sorted indices, and token count

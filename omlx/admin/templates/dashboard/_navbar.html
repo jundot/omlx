@@ -25,15 +25,22 @@
 
             <!-- Mobile hamburger button -->
             <button @click="mobileMenuOpen = !mobileMenuOpen"
-                    class="lg:hidden p-2 rounded-lg text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 transition-all">
+                    class="lg:hidden ml-auto p-2 rounded-lg text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 transition-all">
                 <i x-show="!mobileMenuOpen" data-lucide="menu" class="w-5 h-5"></i>
                 <i x-show="mobileMenuOpen" data-lucide="x" class="w-5 h-5" x-cloak></i>
             </button>
 
             <!-- Center Navigation -->
-            <div class="hidden lg:flex items-center gap-1 bg-neutral-100 rounded-full p-1 absolute left-1/2 -translate-x-1/2">
+            <div class="hidden lg:flex items-center gap-1 bg-neutral-100 rounded-full p-1 absolute left-1/2 -translate-x-1/2"
+                 role="tablist" aria-label="{{ t('navbar.tablist_label') }}"
+                 @keydown="handleMainTabKeydown($event)">
                 <button
                     @click="setMainTab('status')"
+                    id="tab-status"
+                    :aria-selected="mainTab === 'status'"
+                    :tabindex="mainTab === 'status' ? 0 : -1"
+                    role="tab"
+                    aria-controls="panel-status"
                     :class="mainTab === 'status'
                         ? 'bg-white text-neutral-900 shadow-sm'
                         : 'text-neutral-600 hover:text-neutral-900'"
@@ -42,9 +49,31 @@
                     <i data-lucide="bar-chart-3" class="w-4 h-4"></i>
                     {{ t('navbar.tab.status') }}
                 </button>
+                <button
+                    x-show="globalSettings.server.distributed_inference_active"
+                    x-cloak
+                    @click="setMainTab('cluster')"
+                    role="tab"
+                    id="tab-cluster"
+                    aria-controls="panel-cluster"
+                    :aria-selected="mainTab === 'cluster'"
+                    :tabindex="mainTab === 'cluster' ? 0 : -1"
+                    :class="mainTab === 'cluster'
+                        ? 'bg-white text-neutral-900 shadow-sm'
+                        : 'text-neutral-600 hover:text-neutral-900'"
+                    class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
+                >
+                    <i data-lucide="network" class="w-4 h-4"></i>
+                    {{ t('navbar.tab.cluster') }}
+                </button>
                 <div class="relative" @mouseenter="modelsDropdown = true" @mouseleave="modelsDropdown = false">
                     <button
                         @click="setMainTab('models')"
+                        role="tab"
+                        id="tab-models"
+                        aria-controls="panel-models"
+                        :aria-selected="mainTab === 'models'"
+                        :tabindex="mainTab === 'models' ? 0 : -1"
                         :class="mainTab === 'models'
                             ? 'bg-white text-neutral-900 shadow-sm'
                             : 'text-neutral-600 hover:text-neutral-900'"
@@ -115,6 +144,11 @@
                 <div class="relative" @mouseenter="settingsDropdown = true" @mouseleave="settingsDropdown = false">
                     <button
                         @click="setMainTab('settings')"
+                        role="tab"
+                        id="tab-settings"
+                        aria-controls="panel-settings"
+                        :aria-selected="mainTab === 'settings'"
+                        :tabindex="mainTab === 'settings' ? 0 : -1"
                         :class="mainTab === 'settings'
                             ? 'bg-white text-neutral-900 shadow-sm'
                             : 'text-neutral-600 hover:text-neutral-900'"
@@ -132,7 +166,7 @@
                         x-transition:leave="transition ease-in duration-100"
                         x-transition:leave-start="opacity-100 translate-y-0"
                         x-transition:leave-end="opacity-0 translate-y-1"
-                        class="absolute left-1/2 -translate-x-1/2 mt-1.5 w-44 bg-white rounded-xl shadow-lg border border-neutral-200 py-1.5 z-[60]"
+                        class="absolute left-1/2 -translate-x-1/2 mt-1.5 w-52 bg-white rounded-xl shadow-lg border border-neutral-200 py-1.5 z-[60]"
                         x-cloak
                     >
                         <button
@@ -155,10 +189,25 @@
                             <i data-lucide="cpu" class="w-3.5 h-3.5"></i>
                             {{ t('navbar.dropdown.model_settings') }}
                         </button>
+                        <button
+                            @click="setSettingsTab('integrations'); settingsDropdown = false"
+                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            :class="mainTab === 'settings' && activeTab === 'integrations'
+                                ? 'text-neutral-900 bg-neutral-100'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
+                        >
+                            <i data-lucide="plug" class="w-3.5 h-3.5"></i>
+                            {{ t('navbar.dropdown.integration_settings') }}
+                        </button>
                     </div>
                 </div>
                 <button
                     @click="setMainTab('logs')"
+                    role="tab"
+                    id="tab-logs"
+                    aria-controls="panel-logs"
+                    :aria-selected="mainTab === 'logs'"
+                    :tabindex="mainTab === 'logs' ? 0 : -1"
                     :class="mainTab === 'logs'
                         ? 'bg-white text-neutral-900 shadow-sm'
                         : 'text-neutral-600 hover:text-neutral-900'"
@@ -170,6 +219,11 @@
                 <div class="relative" @mouseenter="benchDropdown = true" @mouseleave="benchDropdown = false">
                     <button
                         @click="setMainTab('bench')"
+                        role="tab"
+                        id="tab-bench"
+                        aria-controls="panel-bench"
+                        :aria-selected="mainTab === 'bench'"
+                        :tabindex="mainTab === 'bench' ? 0 : -1"
                         :class="mainTab === 'bench'
                             ? 'bg-white text-neutral-900 shadow-sm'
                             : 'text-neutral-600 hover:text-neutral-900'"
@@ -209,6 +263,16 @@
                             <i data-lucide="target" class="w-3.5 h-3.5"></i>
                             {{ t('navbar.dropdown.accuracy') }}
                         </button>
+                        <button
+                            @click="setBenchTab('context'); benchDropdown = false;"
+                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            :class="mainTab === 'bench' && benchTab === 'context'
+                                ? 'text-neutral-900 bg-neutral-100'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
+                        >
+                            <i data-lucide="ruler" class="w-3.5 h-3.5"></i>
+                            {{ t('navbar.dropdown.context') }}
+                        </button>
                     </div>
                 </div>
                 <a
@@ -220,11 +284,34 @@
                 </a>
             </div>
 
-            <!-- Right: Theme Select + Logout -->
+            <!-- Right: Customize Dashboard + Theme Select + Logout -->
             <div class="hidden lg:flex items-center gap-2 ml-auto">
+                <!-- Customize Dashboard (status tab, view mode only) -->
+                <button type="button"
+                        x-show="mainTab === 'status' && !dashEditing && dashEditAvailable"
+                        x-cloak
+                        @click="startDashboardEdit()"
+                        class="nav-tooltip p-2 rounded-full transition-all duration-200 cursor-pointer"
+                        :class="activeTheme === 'dark'
+                            ? 'text-amber-400 hover:bg-neutral-700'
+                            : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
+                        :data-tooltip="window.t('status.layout.customize')"
+                        :aria-label="window.t('status.layout.customize')">
+                    <i data-lucide="settings-2" class="w-4 h-4"></i>
+                </button>
                 <!-- Theme Select -->
-                <div class="relative" @mouseenter="themeDropdown = true" @mouseleave="themeDropdown = false">
-                    <button class="p-2 rounded-full transition-all duration-200 cursor-pointer"
+                <div class="relative"
+                     @mouseenter="themeDropdown = true"
+                     @mouseleave="themeDropdown = false"
+                     @focusin="themeDropdown = true"
+                     @focusout="if (!$el.contains($event.relatedTarget)) themeDropdown = false"
+                     @keydown.escape="themeDropdown = false">
+                    <button type="button"
+                            @click="themeDropdown = true"
+                            aria-haspopup="true"
+                            aria-controls="dashboard-theme-menu"
+                            :aria-expanded="themeDropdown ? 'true' : 'false'"
+                            class="p-2 rounded-full transition-all duration-200 cursor-pointer"
                             :class="activeTheme === 'dark'
                                 ? 'text-amber-400 hover:bg-neutral-700'
                                 : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
@@ -234,6 +321,7 @@
                         <i data-lucide="moon" class="w-4 h-4" x-show="theme === 'dark'"></i>
                     </button>
                     <div
+                        id="dashboard-theme-menu"
                         x-show="themeDropdown"
                         x-transition:enter="transition ease-out duration-150"
                         x-transition:enter-start="opacity-0 translate-y-1"
@@ -241,7 +329,7 @@
                         x-transition:leave="transition ease-in duration-100"
                         x-transition:leave-start="opacity-100 translate-y-0"
                         x-transition:leave-end="opacity-0 translate-y-1"
-                        class="absolute right-0 mt-1.5 w-40 bg-white rounded-xl shadow-lg border border-neutral-200 py-1.5 z-[60]"
+                        class="absolute right-0 mt-1.5 w-64 bg-white rounded-xl shadow-lg border border-neutral-200 py-1.5 z-[60]"
                         x-cloak
                     >
                         <button
@@ -274,6 +362,21 @@
                             <i data-lucide="moon" class="w-3.5 h-3.5"></i>
                             {{ t('navbar.theme.dark_mode') }}
                         </button>
+                        <div class="border-t border-neutral-100 my-1.5"></div>
+                        <button
+                            type="button"
+                            @click="setEnhancedReadability(!enhancedReadability)"
+                            :aria-pressed="enhancedReadability ? 'true' : 'false'"
+                            :title="window.t('chat.enhanced_readability_desc')"
+                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            :class="enhancedReadability
+                                ? 'text-neutral-900 bg-neutral-100'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
+                        >
+                            <i data-lucide="eye" class="w-3.5 h-3.5"></i>
+                            <span class="flex-1">{{ t('chat.enhanced_readability') }}</span>
+                            <i data-lucide="check" class="w-3.5 h-3.5" x-show="enhancedReadability" x-cloak></i>
+                        </button>
                     </div>
                 </div>
 
@@ -304,6 +407,14 @@
                         class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2">
                     <i data-lucide="bar-chart-3" class="w-4 h-4"></i>
                     {{ t('navbar.tab.status') }}
+                </button>
+                <button x-show="globalSettings.server.distributed_inference_active"
+                        x-cloak
+                        @click="setMainTab('cluster'); mobileMenuOpen = false"
+                        :class="mainTab === 'cluster' ? 'bg-neutral-100 text-neutral-900' : 'text-neutral-600'"
+                        class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2">
+                    <i data-lucide="network" class="w-4 h-4"></i>
+                    {{ t('navbar.tab.cluster') }}
                 </button>
                 <button @click="setMainTab('models'); mobileMenuOpen = false"
                         :class="mainTab === 'models' ? 'bg-neutral-100 text-neutral-900' : 'text-neutral-600'"
@@ -338,6 +449,13 @@
                     <i data-lucide="message-circle" class="w-4 h-4"></i>
                     {{ t('navbar.tab.chat') }}
                 </a>
+                <button x-show="mainTab === 'status' && !dashEditing && dashEditAvailable"
+                        x-cloak
+                        @click="startDashboardEdit(); mobileMenuOpen = false"
+                        class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2 text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50">
+                    <i data-lucide="settings-2" class="w-4 h-4"></i>
+                    {{ t('status.layout.customize') }}
+                </button>
                 <div class="border-t border-neutral-100 pt-2 mt-2 flex items-center justify-between px-2">
                     <div class="flex items-center gap-1">
                         <button @click="setTheme('auto')"
@@ -365,6 +483,20 @@
                         {{ t('navbar.logout') }}
                     </button>
                 </div>
+                <button
+                    type="button"
+                    @click="setEnhancedReadability(!enhancedReadability)"
+                    :aria-pressed="enhancedReadability ? 'true' : 'false'"
+                    :title="window.t('chat.enhanced_readability_desc')"
+                    class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2"
+                    :class="enhancedReadability
+                        ? 'bg-neutral-100 text-neutral-900'
+                        : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
+                >
+                    <i data-lucide="eye" class="w-4 h-4"></i>
+                    <span class="flex-1 text-left">{{ t('chat.enhanced_readability') }}</span>
+                    <i data-lucide="check" class="w-4 h-4" x-show="enhancedReadability" x-cloak></i>
+                </button>
             </div>
         </div>
     </nav>

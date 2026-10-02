@@ -1,16 +1,205 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for omlx.server module - sampling parameter resolution and exception handlers."""
 
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from omlx.exceptions import ModelNotFoundError
+import omlx.server as srv
+from omlx.engine_pool import EngineEntry
+from omlx.exceptions import (
+    InvalidRequestError,
+    ModelNotFoundError,
+    ModelUnavailableError,
+)
 from omlx.model_settings import ModelSettings, ModelSettingsManager
-from omlx.server import EngineType, SamplingDefaults, ServerState, app, get_engine, get_sampling_params
-from omlx.settings import GlobalSettings, ModelSettings as GlobalModelSettings
+from omlx.server import (
+    EngineType,
+    SamplingDefaults,
+    ServerState,
+    _format_generation_speed_for_log,
+    _reject_diffusion_structured_outputs,
+    _reset_boundary_snapshots_for_server,
+    _resolve_metric_durations,
+    app,
+    get_engine,
+    get_max_context_window,
+    get_sampling_params,
+)
+from omlx.settings import GlobalSettings
+
+
+class TestBoundarySnapshotLifecycle:
+    def test_reset_helper_uses_engine_pool_cache_dir(self, tmp_path):
+        from types import SimpleNamespace
+
+        stale_dir = tmp_path / "_boundary_snapshots" / "stale-session"
+        stale_dir.mkdir(parents=True)
+        (stale_dir / "old.safetensors").write_text("stale")
+
+        state = ServerState()
+        state.engine_pool = SimpleNamespace(
+            _scheduler_config=SimpleNamespace(paged_ssd_cache_dir=tmp_path)
+        )
+
+        with patch("omlx.server._server_state", state):
+            _reset_boundary_snapshots_for_server()
+
+        assert (tmp_path / "_boundary_snapshots").exists()
+        assert not stale_dir.exists()
+
+    def test_reset_helper_skips_no_cache(self, tmp_path):
+        from types import SimpleNamespace
+
+        stale_dir = tmp_path / "_boundary_snapshots" / "stale-session"
+        stale_dir.mkdir(parents=True)
+        (stale_dir / "old.safetensors").write_text("stale")
+
+        state = ServerState()
+        state.engine_pool = SimpleNamespace(
+            _scheduler_config=SimpleNamespace(paged_ssd_cache_dir=None)
+        )
+
+        with patch("omlx.server._server_state", state):
+            _reset_boundary_snapshots_for_server()
+
+        assert stale_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_text_completion_stream_forwards_transport_request_id():
+    from omlx.api.openai_models import CompletionRequest
+    from omlx.server import stream_completion
+
+    class Engine:
+        tokenizer = None
+
+        def __init__(self):
+            self.kwargs = None
+
+        async def stream_generate(self, **kwargs):
+            self.kwargs = kwargs
+            if False:
+                yield None
+
+    engine = Engine()
+    request = CompletionRequest(model="model", prompt="hello", stream=True)
+
+    chunks = [
+        chunk
+        async for chunk in stream_completion(
+            engine,
+            "hello",
+            request,
+            prompt_token_ids=[],
+            inference_request_id="transport-completion-1",
+        )
+    ]
+
+    assert chunks == ["data: [DONE]\n\n"]
+    assert engine.kwargs["_request_id"] == "transport-completion-1"
+
+
+class TestDiffusionStructuredOutputGuard:
+    class _DiffusionEngine:
+        is_diffusion_model = True
+
+    def test_allows_plain_text_response_format(self):
+        _reject_diffusion_structured_outputs(
+            self._DiffusionEngine(),
+            response_format={"type": "text"},
+        )
+
+    def test_allows_json_response_format_degrades_to_prompt(self):
+        # response_format degrades to prompt-injected JSON (with the
+        # #1241 Warning header) instead of being rejected — the same
+        # fallback used when xgrammar is not installed.
+        _reject_diffusion_structured_outputs(
+            self._DiffusionEngine(),
+            response_format={"type": "json_object"},
+        )
+
+    def test_rejects_structured_outputs(self):
+        with pytest.raises(InvalidRequestError, match="structured_outputs"):
+            _reject_diffusion_structured_outputs(
+                self._DiffusionEngine(),
+                structured_outputs={"json_schema": {"type": "object"}},
+            )
+
+    def test_rejects_guided_grammar(self):
+        with pytest.raises(InvalidRequestError, match="guided grammar"):
+            _reject_diffusion_structured_outputs(
+                self._DiffusionEngine(),
+                guided_grammar='root ::= "ok"',
+            )
+
+
+class TestGenerationSpeedLog:
+    def test_formats_plain_generation_speed(self):
+        assert (
+            _format_generation_speed_for_log(object(), 12.345, is_diffusion=False)
+            == "12.3 tok/s"
+        )
+
+    def test_formats_diffusion_native_stats(self):
+        from types import SimpleNamespace
+
+        output = SimpleNamespace(
+            generation_tps=25.37,
+            diffusion_canvas_tps=25.37,
+            prompt_tps=2293.3,
+            diffusion_work_tps=1179.8,
+            diffusion_denoising_steps=93,
+        )
+
+        text = _format_generation_speed_for_log(output, 18.716, is_diffusion=True)
+
+        assert text == (
+            "18.7 tok/s e2e, output=25.4 tok/s, canvas=25.4 tok/s, "
+            "prompt=2293.3 tok/s, work=1179.8 tok/s, steps=93"
+        )
+
+    def test_formats_diffusion_canvas_speed_for_early_eos(self):
+        from types import SimpleNamespace
+
+        output = SimpleNamespace(
+            generation_tps=19.2,
+            diffusion_canvas_tps=24.6,
+            prompt_tps=2293.7,
+            diffusion_work_tps=1179.8,
+            diffusion_denoising_steps=96,
+        )
+
+        text = _format_generation_speed_for_log(output, 14.3, is_diffusion=True)
+
+        assert text == (
+            "14.3 tok/s e2e, output=19.2 tok/s, canvas=24.6 tok/s, "
+            "prompt=2293.7 tok/s, work=1179.8 tok/s, steps=96"
+        )
+
+    def test_resolves_diffusion_native_durations(self):
+        from types import SimpleNamespace
+
+        output = SimpleNamespace(
+            prompt_tokens=16384,
+            completion_tokens=512,
+            prompt_tps=2048.0,
+            generation_tps=32.0,
+        )
+
+        prefill, generation = _resolve_metric_durations(
+            output,
+            is_diffusion=True,
+            prefill_duration=99.0,
+            generation_duration=99.0,
+        )
+
+        assert prefill == 8.0
+        assert generation == 16.0
 
 
 class TestGetSamplingParams:
@@ -32,7 +221,18 @@ class TestGetSamplingParams:
 
     def test_defaults(self):
         """Test default values with no request or model params."""
-        temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_prob, xtc_thresh = get_sampling_params(None, None)
+        (
+            temp,
+            top_p,
+            top_k,
+            rep_penalty,
+            min_p,
+            presence_penalty,
+            frequency_penalty,
+            max_tokens,
+            xtc_prob,
+            xtc_thresh,
+        ) = get_sampling_params(None, None)
         assert temp == 1.0
         assert top_p == 0.95
         assert top_k == 0
@@ -44,14 +244,31 @@ class TestGetSamplingParams:
 
     def test_request_overrides(self):
         """Test request params override global defaults."""
-        temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_prob, xtc_thresh = get_sampling_params(
-            0.5, 0.8, req_min_p=0.1, req_presence_penalty=0.5, req_frequency_penalty=0.3,
+        (
+            temp,
+            top_p,
+            top_k,
+            rep_penalty,
+            min_p,
+            presence_penalty,
+            frequency_penalty,
+            max_tokens,
+            xtc_prob,
+            xtc_thresh,
+        ) = get_sampling_params(
+            0.5,
+            0.8,
+            req_top_k=40,
+            req_repetition_penalty=1.15,
+            req_min_p=0.1,
+            req_presence_penalty=0.5,
+            req_frequency_penalty=0.3,
             req_max_tokens=1024,
         )
         assert temp == 0.5
         assert top_p == 0.8
-        assert top_k == 0  # not overridable via request
-        assert rep_penalty == 1.0
+        assert top_k == 40
+        assert rep_penalty == 1.15
         assert min_p == 0.1
         assert presence_penalty == 0.5
         assert frequency_penalty == 0.3
@@ -66,7 +283,10 @@ class TestGetSamplingParams:
     def test_xtc_request_passthrough(self):
         """Test XTC params pass through from request values."""
         *_, xtc_prob, xtc_thresh = get_sampling_params(
-            None, None, req_xtc_probability=0.5, req_xtc_threshold=0.1,
+            None,
+            None,
+            req_xtc_probability=0.5,
+            req_xtc_threshold=0.1,
         )
         assert xtc_prob == 0.5
         assert xtc_thresh == 0.1
@@ -74,7 +294,9 @@ class TestGetSamplingParams:
     def test_xtc_partial_override(self):
         """Test setting only xtc_probability uses safe default threshold."""
         *_, xtc_prob, xtc_thresh = get_sampling_params(
-            None, None, req_xtc_probability=0.3,
+            None,
+            None,
+            req_xtc_probability=0.3,
         )
         assert xtc_prob == 0.3
         assert xtc_thresh == 0.1
@@ -87,15 +309,28 @@ class TestGetSamplingParams:
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = ModelSettingsManager(Path(tmpdir))
             settings = ModelSettings(
-                temperature=0.3, top_k=50, repetition_penalty=1.2,
-                min_p=0.05, presence_penalty=0.3, max_tokens=2048,
+                temperature=0.3,
+                top_k=50,
+                repetition_penalty=1.2,
+                min_p=0.05,
+                presence_penalty=0.3,
+                max_tokens=2048,
             )
             manager.set_settings("test-model", settings)
             self._state.settings_manager = manager
 
-            temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_prob, xtc_thresh = get_sampling_params(
-                None, None, "test-model"
-            )
+            (
+                temp,
+                top_p,
+                top_k,
+                rep_penalty,
+                min_p,
+                presence_penalty,
+                frequency_penalty,
+                max_tokens,
+                xtc_prob,
+                xtc_thresh,
+            ) = get_sampling_params(None, None, "test-model")
             assert temp == 0.3
             assert top_p == 0.95  # falls back to global
             assert top_k == 50
@@ -112,14 +347,39 @@ class TestGetSamplingParams:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = ModelSettingsManager(Path(tmpdir))
-            settings = ModelSettings(temperature=0.3, min_p=0.05, max_tokens=2048)
+            settings = ModelSettings(
+                temperature=0.3,
+                top_k=50,
+                repetition_penalty=1.2,
+                min_p=0.05,
+                max_tokens=2048,
+            )
             manager.set_settings("test-model", settings)
             self._state.settings_manager = manager
 
-            temp, top_p, top_k, rep_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_prob, xtc_thresh = get_sampling_params(
-                0.7, None, "test-model", req_min_p=0.1, req_max_tokens=4096,
+            (
+                temp,
+                top_p,
+                top_k,
+                rep_penalty,
+                min_p,
+                presence_penalty,
+                frequency_penalty,
+                max_tokens,
+                xtc_prob,
+                xtc_thresh,
+            ) = get_sampling_params(
+                0.7,
+                None,
+                "test-model",
+                req_top_k=10,
+                req_repetition_penalty=1.05,
+                req_min_p=0.1,
+                req_max_tokens=4096,
             )
             assert temp == 0.7  # request wins
+            assert top_k == 10  # request wins over model
+            assert rep_penalty == 1.05  # request wins over model
             assert min_p == 0.1  # request wins over model
             assert max_tokens == 4096  # request wins over model
 
@@ -134,7 +394,9 @@ class TestGetSamplingParams:
             manager.set_settings("test-model", settings)
             self._state.settings_manager = manager
 
-            _, _, _, rep_penalty, _, _, _, _, _, _ = get_sampling_params(None, None, "test-model")
+            _, _, _, rep_penalty, _, _, _, _, _, _ = get_sampling_params(
+                None, None, "test-model"
+            )
             assert rep_penalty == 1.5
 
     def test_global_repetition_penalty(self):
@@ -145,7 +407,7 @@ class TestGetSamplingParams:
         assert rep_penalty == 1.3
 
     def test_force_sampling(self):
-        """Test force_sampling ignores request params."""
+        """Test force_sampling ignores sampling params but honors max_tokens."""
         self._state.sampling = SamplingDefaults(
             temperature=0.5, top_p=0.8, max_tokens=4096, force_sampling=True
         )
@@ -155,10 +417,10 @@ class TestGetSamplingParams:
         )
         assert temp == 0.5  # forced, not request
         assert top_p == 0.8  # forced, not request
-        assert max_tokens == 4096  # forced, not request
+        assert max_tokens == 8192  # output cap, not forced sampling
 
-    def test_force_sampling_model_max_tokens(self):
-        """Test force_sampling with model-level max_tokens overrides global."""
+    def test_force_sampling_request_max_tokens_overrides_model(self):
+        """Test request max_tokens wins over model settings in force mode."""
         import tempfile
         from pathlib import Path
 
@@ -171,7 +433,23 @@ class TestGetSamplingParams:
             _, _, _, _, _, _, _, max_tokens, _, _ = get_sampling_params(
                 None, None, "test-model", req_max_tokens=1024
             )
-            assert max_tokens == 8192  # model setting wins in force mode
+            assert max_tokens == 1024  # request cap wins even in force mode
+
+    def test_force_sampling_without_request_uses_model_max_tokens(self):
+        """Test force_sampling falls back to model max_tokens when request omits it."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ModelSettingsManager(Path(tmpdir))
+            settings = ModelSettings(max_tokens=8192, force_sampling=True)
+            manager.set_settings("test-model", settings)
+            self._state.settings_manager = manager
+
+            _, _, _, _, _, _, _, max_tokens, _, _ = get_sampling_params(
+                None, None, "test-model"
+            )
+            assert max_tokens == 8192  # model setting wins when request omits cap
 
     def test_max_tokens_no_request_uses_model_settings(self):
         """Test that model max_tokens is used when request doesn't specify it."""
@@ -197,7 +475,17 @@ class TestExceptionHandlers:
     @pytest.fixture
     def client(self):
         """Create a test client for the FastAPI app."""
-        return TestClient(app, raise_server_exceptions=False)
+        from omlx.server import _server_state
+
+        original_key = _server_state.api_key
+        original_settings = _server_state.global_settings
+        _server_state.api_key = None
+        _server_state.global_settings = None
+        try:
+            yield TestClient(app, raise_server_exceptions=False)
+        finally:
+            _server_state.api_key = original_key
+            _server_state.global_settings = original_settings
 
     def test_http_exception_logged(self, client, caplog):
         """Test that HTTPException responses are logged."""
@@ -242,6 +530,47 @@ class TestExceptionHandlers:
         data = response.json()
         assert "detail" in data
 
+    def test_non_api_validation_error_with_value_error_ctx_returns_422(self):
+        """A ValueError-raising validator on a non-/v1/ route must 422, not 500.
+
+        Pydantic v2 stashes the raw exception in ``ctx``, which ``JSONResponse``
+        cannot serialize, so the admin handler used to die building the body
+        ("Object of type ValueError is not JSON serializable") and the client
+        saw a 500 with no detail.
+        """
+        import json
+
+        from fastapi.exceptions import RequestValidationError
+        from pydantic import BaseModel, ValidationError, field_validator
+
+        from omlx.server import validation_exception_handler
+
+        class _ExternalApiLike(BaseModel):
+            base_url: str
+
+            @field_validator("base_url")
+            @classmethod
+            def _validate_base_url(cls, v: str) -> str:
+                if not v.startswith(("http://", "https://")):
+                    raise ValueError("base_url must start with http:// or https://")
+                return v
+
+        with pytest.raises(ValidationError) as exc_info:
+            _ExternalApiLike(base_url="ftp://x")
+        errors = exc_info.value.errors()
+        assert isinstance(errors[0].get("ctx", {}).get("error"), ValueError)
+
+        request = SimpleNamespace(
+            method="PUT",
+            url=SimpleNamespace(path="/admin/api/models/x/settings"),
+        )
+        response = asyncio.run(
+            validation_exception_handler(request, RequestValidationError(errors))
+        )
+        assert response.status_code == 422
+        body = json.loads(response.body.decode())
+        assert body["detail"][0]["loc"][-1] == "base_url"
+
 
 class TestModelFallback:
     """Tests for model fallback to default when requested model not found."""
@@ -269,9 +598,7 @@ class TestModelFallback:
 
             pool.get_engine = AsyncMock(side_effect=mock_get_engine)
         else:
-            pool.get_engine = AsyncMock(
-                side_effect=ModelNotFoundError("unknown", [])
-            )
+            pool.get_engine = AsyncMock(side_effect=ModelNotFoundError("unknown", []))
 
         self._state.engine_pool = pool
         return pool
@@ -323,6 +650,25 @@ class TestModelFallback:
             await get_engine("unknown-model", EngineType.EMBEDDING)
         assert exc_info.value.status_code == 404
 
+    @pytest.mark.asyncio
+    async def test_model_unavailable_returns_409(self):
+        """Cached model load failures return 409 instead of an unhandled 500."""
+        self._state.global_settings = GlobalSettings()
+        self._state.global_settings.model.model_fallback = False
+        self._state.default_model = "default-model"
+
+        pool = MagicMock()
+        pool.resolve_model_id.side_effect = lambda mid, _sm: mid
+        pool.get_engine = AsyncMock(
+            side_effect=ModelUnavailableError("broken-model", "cached failure")
+        )
+        self._state.engine_pool = pool
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_engine("broken-model", EngineType.LLM)
+
+        assert exc_info.value.status_code == 409
+
 
 class TestGetEngineLLMTypeValidation:
     """LLM endpoints must reject non-LLM engines with a clean 400 (#507).
@@ -353,6 +699,7 @@ class TestGetEngineLLMTypeValidation:
     async def test_llm_rejects_stt_engine(self):
         """Requesting an STT model on an LLM endpoint returns HTTP 400, not 500."""
         from omlx.engine.stt import STTEngine
+
         stt = MagicMock(spec=STTEngine)
         self._pool_returning(stt)
 
@@ -360,12 +707,15 @@ class TestGetEngineLLMTypeValidation:
             await get_engine("whisper-large-v3-turbo", EngineType.LLM)
         assert exc_info.value.status_code == 400
         detail = str(exc_info.value.detail).lower()
-        assert "not an llm" in detail or "not a chat" in detail or "not a text" in detail
+        assert (
+            "not an llm" in detail or "not a chat" in detail or "not a text" in detail
+        )
 
     @pytest.mark.asyncio
     async def test_llm_rejects_tts_engine(self):
         """Requesting a TTS model on an LLM endpoint returns HTTP 400."""
         from omlx.engine.tts import TTSEngine
+
         tts = MagicMock(spec=TTSEngine)
         self._pool_returning(tts)
 
@@ -377,6 +727,7 @@ class TestGetEngineLLMTypeValidation:
     async def test_llm_rejects_sts_engine(self):
         """Requesting an STS model on an LLM endpoint returns HTTP 400."""
         from omlx.engine.sts import STSEngine
+
         sts = MagicMock(spec=STSEngine)
         self._pool_returning(sts)
 
@@ -388,6 +739,7 @@ class TestGetEngineLLMTypeValidation:
     async def test_llm_rejects_embedding_engine(self):
         """Requesting an embedding model on an LLM endpoint returns HTTP 400."""
         from omlx.engine.embedding import EmbeddingEngine
+
         emb = MagicMock(spec=EmbeddingEngine)
         self._pool_returning(emb)
 
@@ -399,6 +751,7 @@ class TestGetEngineLLMTypeValidation:
     async def test_llm_rejects_reranker_engine(self):
         """Requesting a reranker model on an LLM endpoint returns HTTP 400."""
         from omlx.engine.reranker import RerankerEngine
+
         rr = MagicMock(spec=RerankerEngine)
         self._pool_returning(rr)
 
@@ -410,8 +763,389 @@ class TestGetEngineLLMTypeValidation:
     async def test_llm_accepts_llm_engine(self):
         """A genuine LLM engine passes validation and is returned as-is."""
         from omlx.engine.base import BaseEngine
+
         llm = MagicMock(spec=BaseEngine)
         self._pool_returning(llm)
 
         engine = await get_engine("llama-3", EngineType.LLM)
         assert engine is llm
+
+
+class TestGetMaxContextWindow:
+    """Tests for get_max_context_window precedence rule (#1308).
+
+    Resolution order:
+        1. Explicit per-model setting (admin / settings.json).
+        2. Context length discovered from the model's config.json at
+           startup (EngineEntry.model_context_length).
+        3. Global SamplingDefaults.max_context_window (32K).
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup_server_state(self):
+        state = ServerState()
+        with patch("omlx.server._server_state", state):
+            self._state = state
+            yield
+
+    @staticmethod
+    def _entry(model_id: str, ctx_length: int | None) -> EngineEntry:
+        return EngineEntry(
+            model_id=model_id,
+            model_path=f"/fake/{model_id}",
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=0,
+            model_context_length=ctx_length,
+        )
+
+    def _mount_pool(self, entries: dict):
+        pool = MagicMock()
+        pool.resolve_model_id.side_effect = lambda mid, _sm: mid
+        pool.get_entry.side_effect = lambda mid: entries.get(mid)
+        self._state.engine_pool = pool
+
+    def _mount_settings(self, overrides: dict):
+        """Mount a settings_manager that returns the given per-model overrides."""
+        manager = MagicMock()
+        manager.get_settings.side_effect = lambda mid: overrides.get(mid)
+        manager.get_settings_for_request.side_effect = (
+            lambda mid, resolved_model_id=None: overrides.get(resolved_model_id or mid)
+        )
+        self._state.settings_manager = manager
+
+    def test_global_default_when_nothing_discovered(self):
+        """No model context, no per-model override → global default.
+
+        Fallback default kept at 32768 so existing ``settings.json``
+        files carrying the historical default keep working unchanged.
+        Operators who want a real server-wide cap set
+        ``max_context_window_policy`` instead — see TestPolicyCap below.
+        """
+        self._mount_pool({"llama-3": self._entry("llama-3", None)})
+        assert get_max_context_window("llama-3") == 32768
+
+    def test_discovered_context_returned_when_no_override(self):
+        """Model config declares 262144 → /v1/models reports 262144, not 32K (#1308)."""
+        self._mount_pool({"qwen3-coder": self._entry("qwen3-coder", 262144)})
+        assert get_max_context_window("qwen3-coder") == 262144
+
+    def test_per_model_override_wins_over_discovery(self):
+        """Admin set 16384 → that wins over the model's declared 262144."""
+        self._mount_pool({"qwen3-coder": self._entry("qwen3-coder", 262144)})
+        self._mount_settings({"qwen3-coder": ModelSettings(max_context_window=16384)})
+        assert get_max_context_window("qwen3-coder") == 16384
+
+    def test_per_model_override_wins_over_global(self):
+        """Override of 8192 wins even when the model didn't declare a value."""
+        self._mount_pool({"llama-3": self._entry("llama-3", None)})
+        self._mount_settings({"llama-3": ModelSettings(max_context_window=8192)})
+        assert get_max_context_window("llama-3") == 8192
+
+    def test_no_model_id_returns_global_default(self):
+        """A bare /v1/messages-style call with no model id falls to the default."""
+        assert get_max_context_window(None) == 32768
+
+    def test_unknown_model_id_returns_global_default(self):
+        """An unknown model id doesn't crash — falls through to the default."""
+        self._mount_pool({})
+        assert get_max_context_window("ghost-model") == 32768
+
+
+class TestExposedProfileModels:
+    """Server behavior for profiles exposed as API-visible models."""
+
+    class _FakePool:
+        def get_status(self):
+            return {
+                "models": [
+                    {
+                        "id": "qwen-base",
+                        "loaded": True,
+                        "pinned": False,
+                        "engine_type": "vlm",
+                        "model_type": "vlm",
+                        "config_model_type": "gemma4",
+                    }
+                ]
+            }
+
+        def resolve_model_id(self, model_id, settings_manager=None):
+            if settings_manager is not None:
+                source = settings_manager.get_exposed_profile_source_model_id(model_id)
+                if source:
+                    return source
+            return model_id
+
+    @staticmethod
+    def _save_exposed_profile(manager, settings):
+        return manager.save_profile(
+            model_id="qwen-base",
+            name="thinking",
+            display_name="Thinking",
+            description=None,
+            settings=settings,
+            expose_as_model=True,
+        )
+
+    @pytest.fixture
+    def manager(self, tmp_path):
+        """Swap a real ModelSettingsManager into the live server state."""
+        import omlx.server as server_module
+
+        original_pool = server_module._server_state.engine_pool
+        original_settings_manager = server_module._server_state.settings_manager
+        manager = ModelSettingsManager(tmp_path)
+        server_module._server_state.settings_manager = manager
+        try:
+            yield manager
+        finally:
+            server_module._server_state.engine_pool = original_pool
+            server_module._server_state.settings_manager = original_settings_manager
+
+    @pytest.mark.asyncio
+    async def test_v1_models_includes_exposed_profile_models(self, manager):
+        import omlx.server as server_module
+
+        manager.set_settings("qwen-base", ModelSettings(max_context_window=100000))
+        self._save_exposed_profile(
+            manager, {"max_context_window": 4096, "enable_thinking": True}
+        )
+        server_module._server_state.engine_pool = self._FakePool()
+
+        response = await server_module.list_models(True)
+
+        model_ids = {model.id for model in response.data}
+        assert "qwen-base:thinking" in model_ids
+        profile_model = next(m for m in response.data if m.id == "qwen-base:thinking")
+        assert profile_model.max_model_len == 4096
+
+    @pytest.mark.asyncio
+    async def test_v1_models_status_includes_exposed_profile_capabilities(
+        self, manager
+    ):
+        import omlx.server as server_module
+
+        manager.set_settings(
+            "qwen-base",
+            ModelSettings(max_context_window=100000, max_tokens=8192),
+        )
+        self._save_exposed_profile(
+            manager,
+            {
+                "max_context_window": 4096,
+                "max_tokens": 1024,
+                "enable_thinking": True,
+            },
+        )
+        server_module._server_state.engine_pool = self._FakePool()
+
+        status = await server_module.list_models_status(True)
+
+        profile_model = next(
+            m for m in status["models"] if m["id"] == "qwen-base:thinking"
+        )
+        assert profile_model["source_model_id"] == "qwen-base"
+        assert profile_model["model_type"] == "vlm"
+        assert profile_model["engine_type"] == "vlm"
+        assert profile_model["config_model_type"] == "gemma4"
+        assert profile_model["max_context_window"] == 4096
+        assert profile_model["max_tokens"] == 1024
+
+    @pytest.mark.asyncio
+    async def test_v1_models_advertises_alias_form_for_exposed_profiles(self, manager):
+        """With a base-model alias set, the catalog lists <alias>:<profile> —
+        consistent with the base model being listed under its alias."""
+        import omlx.server as server_module
+
+        manager.set_settings(
+            "qwen-base", ModelSettings(model_alias="gpt-4", max_context_window=100000)
+        )
+        self._save_exposed_profile(manager, {"max_context_window": 4096})
+        server_module._server_state.engine_pool = self._FakePool()
+
+        response = await server_module.list_models(True)
+
+        model_ids = {model.id for model in response.data}
+        assert "gpt-4" in model_ids
+        assert "gpt-4:thinking" in model_ids
+        assert "qwen-base:thinking" not in model_ids
+        profile_model = next(m for m in response.data if m.id == "gpt-4:thinking")
+        assert profile_model.max_model_len == 4096
+
+    def test_sampling_params_use_exposed_profile_settings(self, manager):
+        """Runtime settings come from the requested profile model, not its source."""
+        import omlx.server as server_module
+        from omlx.engine_pool import EnginePool
+
+        pool = EnginePool()
+        pool._entries["qwen-base"] = object()
+        manager.set_settings("qwen-base", ModelSettings(temperature=0.1))
+        self._save_exposed_profile(manager, {"temperature": 0.9})
+        server_module._server_state.engine_pool = pool
+
+        temperature, *_ = get_sampling_params(None, None, "qwen-base:thinking")
+
+        assert temperature == 0.9
+
+    @pytest.mark.asyncio
+    async def test_get_engine_passes_exposed_profile_runtime_settings(self, manager):
+        import omlx.server as server_module
+
+        class RuntimePool:
+            def __init__(self):
+                self.calls = []
+
+            async def get_engine(self, model_id, **kwargs):
+                self.calls.append((model_id, kwargs))
+                return MagicMock(spec=server_module.BaseEngine)
+
+        pool = RuntimePool()
+        manager.set_settings(
+            "qwen-base",
+            ModelSettings(temperature=0.1, mtp_enabled=False),
+        )
+        self._save_exposed_profile(
+            manager,
+            {"temperature": 0.9, "mtp_enabled": True},
+        )
+        server_module._server_state.engine_pool = pool
+
+        await server_module.get_engine("qwen-base:thinking")
+
+        assert pool.calls[0][0] == "qwen-base"
+        runtime_settings = pool.calls[0][1]["runtime_settings"]
+        assert runtime_settings.temperature == 0.9
+        assert runtime_settings.mtp_enabled is True
+        assert manager.get_settings("qwen-base").temperature == 0.1
+        assert manager.get_settings("qwen-base").mtp_enabled is False
+
+    def test_thinking_budget_uses_exposed_profile_settings(self, manager):
+        import omlx.server as server_module
+        from omlx.engine_pool import EnginePool
+
+        pool = EnginePool()
+        pool._entries["qwen-base"] = object()
+        manager.set_settings(
+            "qwen-base",
+            ModelSettings(thinking_budget_enabled=True, thinking_budget_tokens=64),
+        )
+        self._save_exposed_profile(
+            manager,
+            {"thinking_budget_enabled": True, "thinking_budget_tokens": 512},
+        )
+        server_module._server_state.engine_pool = pool
+
+        budget = server_module._resolve_thinking_budget(object(), "qwen-base:thinking")
+
+        assert budget == 512
+
+    def test_max_context_window_uses_exposed_profile_settings(self, manager):
+        import omlx.server as server_module
+        from omlx.engine_pool import EnginePool
+
+        pool = EnginePool()
+        pool._entries["qwen-base"] = object()
+        manager.set_settings("qwen-base", ModelSettings(max_context_window=100000))
+        self._save_exposed_profile(manager, {"max_context_window": 4096})
+        server_module._server_state.engine_pool = pool
+
+        max_context = get_max_context_window("qwen-base:thinking")
+
+        assert max_context == 4096
+
+
+class TestHealthPreloadReadiness:
+    """/health must answer 503 "loading" during the startup pinned preload
+    and 200 "healthy" after, so port watchdogs see liveness instead of a
+    closed port while a large pinned model loads (#2184)."""
+
+    @pytest.mark.asyncio
+    async def test_health_503_while_preloading(self):
+        from fastapi import Response
+
+        from omlx import server as server_mod
+
+        old = server_mod._server_state.pinned_preload_complete
+        try:
+            server_mod._server_state.pinned_preload_complete = False
+            resp = Response()
+            body = await server_mod.health(resp)
+            assert resp.status_code == 503
+            assert body["status"] == "loading"
+        finally:
+            server_mod._server_state.pinned_preload_complete = old
+
+    @pytest.mark.asyncio
+    async def test_health_200_after_preload(self):
+        from fastapi import Response
+
+        from omlx import server as server_mod
+
+        old = server_mod._server_state.pinned_preload_complete
+        try:
+            server_mod._server_state.pinned_preload_complete = True
+            resp = Response()
+            body = await server_mod.health(resp)
+            assert resp.status_code == 200
+            assert body["status"] == "healthy"
+        finally:
+            server_mod._server_state.pinned_preload_complete = old
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "model_type, template_default, kwargs, forced, expected",
+    [
+        ("qwen3_5", True, {}, None, True),
+        ("qwen3_5", True, {"preserve_thinking": False}, None, False),
+        ("qwen3_5", True, {"preserve_thinking": False}, True, True),
+        ("minimax_m3", None, {}, None, True),
+        ("minimax_m3", None, {}, False, False),
+        ("llama", None, {}, None, False),
+    ],
+)
+def test_responses_reasoning_cache_policy(
+    monkeypatch, stream, model_type, template_default, kwargs, forced, expected
+):
+    """Exercise cache policy through the real route before generation starts."""
+    engine = MagicMock()
+    engine.model_type = model_type
+    engine.is_diffusion_model = False
+    engine.preflight_chat = AsyncMock(
+        side_effect=HTTPException(status_code=418, detail="Policy captured")
+    )
+    engine.start = AsyncMock()
+    engine.count_chat_tokens.return_value = 128
+    pool = MagicMock()
+    pool.preload_pinned_models = AsyncMock()
+    pool.check_ttl_expirations = AsyncMock()
+    pool.shutdown = AsyncMock()
+    pool.get_entry.return_value = SimpleNamespace(
+        config_model_type=model_type,
+        preserve_thinking_default=template_default,
+    )
+    monkeypatch.setattr(srv._server_state, "engine_pool", pool)
+    monkeypatch.setattr(srv, "get_engine_for_model", AsyncMock(return_value=engine))
+    monkeypatch.setattr(srv, "resolve_model_id", lambda name: name)
+    monkeypatch.setattr(srv, "validate_context_window", lambda *a, **k: None)
+    monkeypatch.setattr(
+        srv,
+        "get_model_settings_for_request",
+        lambda name: ModelSettings(cache_reasoning_output=forced),
+    )
+    monkeypatch.setitem(
+        srv.app.dependency_overrides, srv.verify_inference_api_key, lambda: True
+    )
+    with TestClient(srv.app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Hello",
+                "stream": stream,
+                "chat_template_kwargs": kwargs,
+            },
+        )
+    assert response.status_code == 418, response.text
+    assert engine.preflight_chat.call_args.kwargs["preserve_reasoning"] is expected

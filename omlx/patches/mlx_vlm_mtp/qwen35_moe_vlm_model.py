@@ -3,8 +3,8 @@
 
 Same fix as ``qwen35_vlm_model.py`` but for the MoE variant in
 ``mlx_vlm/models/qwen3_5_moe/qwen3_5_moe.py``. The expert weight repacking
-(``gate_up_proj`` split into ``gate_proj`` / ``up_proj``) is preserved
-verbatim from the upstream body.
+(``gate_up_proj`` split into ``gate_proj`` / ``up_proj``) follows the pinned
+upstream sanitize body.
 """
 
 from __future__ import annotations
@@ -44,20 +44,42 @@ def apply() -> bool:
         if self.config.text_config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
-        # Expert repack: gate_up_proj → gate_proj + up_proj per layer.
+        num_experts = int(getattr(self.config.text_config, "num_experts", 0) or 0)
+
+        # Expert repack: normalise to switch_mlp form.
+        # Two source formats are seen in the wild:
+        #   - Fused ``experts.gate_up_proj`` (Qwen3.6 checkpoints)
+        #   - Per-expert ``experts.{N}.{gate,up,down}_proj.weight`` (Ornith / Qwen3.5)
         def _unfuse_layer_experts(prefix):
+            if f"{prefix}.switch_mlp.gate_proj.weight" in weights:
+                return  # already in switch_mlp form
             gate_up_key = f"{prefix}.experts.gate_up_proj"
-            if gate_up_key not in weights:
-                return
-            gate_up_weight = weights.pop(gate_up_key)
-            gate_weight, up_weights = mx.split(gate_up_weight, 2, axis=-2)
-            weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_weight
-            weights[f"{prefix}.switch_mlp.up_proj.weight"] = up_weights
-            down_key = f"{prefix}.experts.down_proj"
-            if down_key in weights:
-                weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
-                    down_key
-                )
+            if gate_up_key in weights:
+                gate_up_weight = weights.pop(gate_up_key)
+                gate_weight, up_weights = mx.split(gate_up_weight, 2, axis=-2)
+                weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_weight
+                weights[f"{prefix}.switch_mlp.up_proj.weight"] = up_weights
+                down_key = f"{prefix}.experts.down_proj"
+                if down_key in weights:
+                    weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
+                        down_key
+                    )
+            elif num_experts > 0 and f"{prefix}.experts.0.gate_proj.weight" in weights:
+                # Also stack quantization metadata (.scales, .biases) so a
+                # per-expert *quantized* checkpoint loads cleanly. Without this,
+                # only .weight is stacked and the per-expert scales/biases
+                # survive as orphan keys -> "Received N parameters not in model".
+                for n in ("gate_proj", "up_proj", "down_proj"):
+                    for suffix in ("weight", "scales", "biases"):
+                        first_key = f"{prefix}.experts.0.{n}.{suffix}"
+                        if first_key not in weights:
+                            continue
+                        weights[f"{prefix}.switch_mlp.{n}.{suffix}"] = mx.stack(
+                            [
+                                weights.pop(f"{prefix}.experts.{e}.{n}.{suffix}")
+                                for e in range(num_experts)
+                            ]
+                        )
 
         for layer_idx in range(self.config.text_config.num_hidden_layers):
             _unfuse_layer_experts(f"model.language_model.layers.{layer_idx}.mlp")
@@ -85,20 +107,7 @@ def apply() -> bool:
             prefix = f"mtp.layers.{layer_idx}.mlp"
             if f"{prefix}.switch_mlp.gate_proj.weight" in weights:
                 continue  # already in switch_mlp form
-            gate_up_key = f"{prefix}.experts.gate_up_proj"
-            if gate_up_key in weights:
-                _unfuse_layer_experts(prefix)
-            elif num_experts > 0 and f"{prefix}.experts.0.gate_proj.weight" in weights:
-                # Per-expert form — stack into switch_mlp tensors so the
-                # oQ pipeline emits one quantized tensor per projection
-                # (rather than 256 tiny tensors each with its own scales).
-                for n in ("gate_proj", "up_proj", "down_proj"):
-                    weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(
-                        [
-                            weights.pop(f"{prefix}.experts.{e}.{n}.weight")
-                            for e in range(num_experts)
-                        ]
-                    )
+            _unfuse_layer_experts(prefix)
 
         norm_keys = (
             ".input_layernorm.weight",
@@ -115,9 +124,7 @@ def apply() -> bool:
         for key, value in weights.items():
             if "model" in key:
                 if "model.language_model" in key:
-                    key = key.replace(
-                        "model.language_model", "language_model.model"
-                    )
+                    key = key.replace("model.language_model", "language_model.model")
                 elif "model.visual" in key:
                     key = key.replace("model.visual", "vision_tower")
             elif "lm_head" in key:
@@ -128,18 +135,22 @@ def apply() -> bool:
                 key = "language_model." + key
 
             if key.startswith("language_model.model.visual."):
-                key = "vision_tower." + key[len("language_model.model.visual."):]
+                key = "vision_tower." + key[len("language_model.model.visual.") :]
 
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 # mx.moveaxis goes through the streaming-discovery
                 # monkey-patch in omlx.oq when called with _TrackedTensor;
                 # the instance method on the tracker doesn't exist.
                 value = mx.moveaxis(value, 2, 1)
-            if should_shift_norm_weights and any(
-                key.endswith(sfx) for sfx in norm_keys
+            # Head norms follow the backbone: raw-HF shifts every gamma by
+            # +1, MLX-format is loaded as stored. Legacy mixed heads are
+            # repaired in ``norm_repair`` at load_weights time (see #3742).
+            if (
+                should_shift_norm_weights
+                and value.ndim == 1
+                and any(key.endswith(sfx) for sfx in norm_keys)
             ):
-                if value.ndim == 1:
-                    value = value + 1.0
+                value = value + 1.0
 
             sanitized_weights[key] = value
 

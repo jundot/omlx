@@ -23,6 +23,15 @@ from omlx.output_collector import RequestOutputCollector, RequestStreamState
 from omlx.request import RequestOutput
 
 
+async def _wait_for_waiting_consumers(expected: int, timeout: float = 1.0):
+    """Wait until the collector counter reflects a scheduled waiter."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while RequestOutputCollector._waiting_consumers != expected:
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("Timed out waiting for output collector waiter")
+        await asyncio.sleep(0)
+
+
 class TestRequestStreamState:
     """Tests for RequestStreamState dataclass."""
 
@@ -297,8 +306,7 @@ class TestRequestOutputCollectorGet:
         # Start get task
         task = asyncio.create_task(get_with_delay())
 
-        # Give time for task to start waiting
-        await asyncio.sleep(0.01)
+        await _wait_for_waiting_consumers(initial_count + 1)
 
         # Check counter incremented
         assert RequestOutputCollector._waiting_consumers > initial_count
@@ -411,6 +419,30 @@ class TestRequestOutputCollectorMergeOutputs:
 
         assert result.tool_calls == [{"name": "test_tool", "arguments": "{}"}]
 
+    def test_merge_preserves_generated_time_range(self):
+        """Aggregated chunks keep the producer-side token time range."""
+        collector = RequestOutputCollector()
+
+        existing = RequestOutput(
+            request_id="test-001",
+            new_token_ids=[100],
+            completion_tokens=1,
+            generated_at=10.0,
+            generated_until=10.0,
+        )
+        new = RequestOutput(
+            request_id="test-001",
+            new_token_ids=[101],
+            completion_tokens=2,
+            generated_at=11.0,
+            generated_until=11.0,
+        )
+
+        result = collector._merge_outputs(existing, new)
+
+        assert result.generated_at == 10.0
+        assert result.generated_until == 11.0
+
 
 class TestRequestOutputCollectorHasWaitingConsumers:
     """Tests for RequestOutputCollector.has_waiting_consumers()."""
@@ -453,7 +485,7 @@ class TestRequestOutputCollectorHasWaitingConsumers:
                 return await collector.get()
 
             task = asyncio.create_task(wait_for_output())
-            await asyncio.sleep(0.01)  # Let task start waiting
+            await _wait_for_waiting_consumers(1)
 
             assert RequestOutputCollector.has_waiting_consumers() is True
 

@@ -17,6 +17,8 @@ class EmbeddingInputItem(BaseModel):
     """Structured input item for multimodal embeddings."""
 
     text: Optional[str] = None
+    # Image values are request-facing and must be inline data URIs. Remote URLs
+    # and filesystem paths are rejected before processor-specific preparation.
     image: Optional[str] = None
 
     model_config = {"extra": "forbid"}
@@ -56,6 +58,17 @@ class EmbeddingRequest(BaseModel):
     """
     The number of dimensions the output embeddings should have.
     Only supported by some models. If not supported, returns full dimensions.
+    """
+
+    max_length: Optional[int] = Field(default=None, gt=0)
+    """
+    Optional maximum token length for each input text. When omitted, the
+    server uses the model's effective context window.
+    """
+
+    truncation: bool = True
+    """
+    Whether to truncate inputs longer than max_length.
     """
 
     @model_validator(mode="after")

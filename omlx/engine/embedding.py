@@ -10,6 +10,7 @@ streaming or chat completion.
 import asyncio
 import gc
 import logging
+import time
 from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
@@ -17,8 +18,18 @@ import mlx.core as mx
 from ..engine_core import get_mlx_executor
 from ..models.embedding import EmbeddingOutput, MLXEmbeddingModel
 from .base import BaseNonStreamingEngine
+from .forward_fairness import ForwardFairnessGate
 
 logger = logging.getLogger(__name__)
+
+
+def _input_length(item: Union[str, Dict[str, str]]) -> int:
+    """Approximate token cost of one embedding input, used only to group similar sizes."""
+    if isinstance(item, str):
+        return len(item)
+    if isinstance(item, dict):
+        return sum(len(v) for v in item.values() if isinstance(v, str))
+    return 0
 
 
 class EmbeddingEngine(BaseNonStreamingEngine):
@@ -32,7 +43,14 @@ class EmbeddingEngine(BaseNonStreamingEngine):
     since embeddings are computed in a single forward pass.
     """
 
-    def __init__(self, model_name: str, trust_remote_code: bool = False):
+    def __init__(
+        self,
+        model_name: str,
+        trust_remote_code: bool = False,
+        batch_size: int | None = None,
+        *,
+        scheduler_config: Any | None = None,
+    ):
         """
         Initialize the embedding engine.
 
@@ -40,11 +58,27 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             model_name: HuggingFace model name or local path
             trust_remote_code: Allow loaders to execute custom Python shipped
                 with the model repo. Off by default for security (issue #926).
+            batch_size: Explicit per-forward input chunk size override.
+            scheduler_config: Shared scheduler configuration. Embedding uses
+                embedding_batch_size as its per-forward input chunk size.
         """
         super().__init__()
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
+        if batch_size is None:
+            batch_size = (
+                getattr(scheduler_config, "embedding_batch_size", 32)
+                if scheduler_config is not None
+                else 32
+            )
+        self._batch_size = max(1, int(batch_size))
         self._model: Optional[MLXEmbeddingModel] = None
+        self._fairness = ForwardFairnessGate(
+            f"embed:{model_name}:{id(self):x}", scheduler_config
+        )
+
+    def set_memory_soft_limit(self, soft_limit_bytes: int) -> None:
+        self._fairness.set_memory_soft_limit(soft_limit_bytes)
 
     @property
     def model_name(self) -> str:
@@ -84,19 +118,18 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             return
 
         logger.info(f"Stopping embedding engine: {self._model_name}")
+        model = self._model
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(get_mlx_executor(), model.close)
         self._model = None
 
         gc.collect()
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
-        )
         logger.info(f"Embedding engine stopped: {self._model_name}")
 
     async def embed(
         self,
         texts: Union[List[str], List[Dict[str, str]]],
-        max_length: int = 512,
+        max_length: int | None = None,
         padding: bool = True,
         truncation: bool = True,
     ) -> EmbeddingOutput:
@@ -105,7 +138,8 @@ class EmbeddingEngine(BaseNonStreamingEngine):
 
         Args:
             texts: List of input texts
-            max_length: Maximum token length for each text
+            max_length: Maximum token length for each text. If omitted, the
+                model resolves its configured limit.
             padding: Whether to pad shorter sequences
             truncation: Whether to truncate longer sequences
 
@@ -116,24 +150,80 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             raise RuntimeError("Engine not started. Call start() first.")
 
         model = self._model
+        input_items = [texts] if isinstance(texts, str) else list(texts)
 
-        def _embed_sync():
-            return model.embed(
-                inputs=texts,
-                max_length=max_length,
-                padding=padding,
-                truncation=truncation,
-            )
+        if not input_items:
+            return EmbeddingOutput(embeddings=[], total_tokens=0, dimensions=0)
 
+        batch_size = self._batch_size
         activity_id = self._begin_activity(
             "embedding",
             detail="Embedding",
-            total_items=len(texts),
-            metadata={"input_count": len(texts)},
+            total_items=len(input_items),
+            metadata={"input_count": len(input_items), "batch_size": batch_size},
         )
         try:
             loop = asyncio.get_running_loop()
-            output = await loop.run_in_executor(get_mlx_executor(), _embed_sync)
+            embeddings: List[List[float]] = []
+            total_tokens = 0
+            dimensions = 0
+
+            # A batch pads every input to its longest member, so a batch of mixed lengths spends
+            # most of its compute on padding. Group similar lengths together and restore the
+            # caller's order before returning, which leaves the response contract unchanged.
+            order = sorted(range(len(input_items)), key=lambda i: _input_length(input_items[i]))
+            ordered_items = [input_items[i] for i in order]
+
+            fairness = self._fairness
+            index = 0
+            while index < len(ordered_items):
+                # Limit each forward while another engine is decoding.
+                cap = fairness.chunk_cap()
+                size = batch_size if cap is None else max(1, min(batch_size, cap))
+                batch = ordered_items[index:index + size]
+                index += len(batch)
+
+                def _embed_sync(batch=batch):
+                    contended = fairness.wait_turn()
+                    start_ts = time.perf_counter()
+                    try:
+                        return model.embed(
+                            inputs=batch,
+                            max_length=max_length,
+                            padding=padding,
+                            truncation=truncation,
+                        )
+                    finally:
+                        mx.synchronize()
+                        fairness.settle(
+                            time.perf_counter() - start_ts, len(batch), contended
+                        )
+                        if fairness.should_clear_cache():
+                            mx.clear_cache()
+
+                output = await loop.run_in_executor(get_mlx_executor(), _embed_sync)
+                embeddings.extend(output.embeddings)
+                total_tokens += output.total_tokens
+                if output.dimensions:
+                    dimensions = output.dimensions
+                self._update_activity(
+                    activity_id,
+                    completed_items=min(index, len(input_items)),
+                    token_count=total_tokens,
+                    dimensions=dimensions,
+                )
+
+            if len(embeddings) == len(order):
+                restored: List[List[float]] = [[]] * len(order)
+                for position, original_index in enumerate(order):
+                    restored[original_index] = embeddings[position]
+                embeddings = restored
+
+            output = EmbeddingOutput(
+                embeddings=embeddings,
+                total_tokens=total_tokens,
+                dimensions=dimensions,
+            )
             self._update_activity(
                 activity_id,
                 token_count=output.total_tokens,
@@ -141,7 +231,7 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             )
             return output
         finally:
-            await self._finish_activity(activity_id)
+            self._end_activity(activity_id)
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""
@@ -149,6 +239,7 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             "model_name": self._model_name,
             "loaded": self._model is not None,
             "hidden_size": self.hidden_size,
+            "batch_size": self._batch_size,
         }
 
     def get_model_info(self) -> Dict[str, Any]:

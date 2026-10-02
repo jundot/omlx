@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from omlx.model_settings import ModelSettings, ModelSettingsManager
+from omlx.model_settings import (
+    SETTINGS_VERSION,
+    ModelSettings,
+    ModelSettingsManager,
+    resolve_qwen35_prefill_conflicts,
+    resolve_vlm_mtp_conflicts,
+)
 
 
 class TestModelSettings:
@@ -25,6 +31,7 @@ class TestModelSettings:
         assert settings.force_sampling is False
         assert settings.is_pinned is False
         assert settings.is_default is False
+        assert settings.is_favorite is False
         # Issue #926: opt-in per model. Default off.
         assert settings.trust_remote_code is False
 
@@ -35,6 +42,58 @@ class TestModelSettings:
         assert d["trust_remote_code"] is True
         restored = ModelSettings.from_dict(d)
         assert restored.trust_remote_code is True
+
+    def test_is_favorite_roundtrip(self):
+        """Test is_favorite field survives to_dict -> from_dict roundtrip."""
+        original = ModelSettings(is_favorite=True)
+        d = original.to_dict()
+        assert d["is_favorite"] is True
+        restored = ModelSettings.from_dict(d)
+        assert restored.is_favorite is True
+
+    def test_moe_expert_offload_defaults(self):
+        """Expert offload is opt-in, at 25% residency."""
+        settings = ModelSettings()
+        assert settings.moe_expert_offload_enabled is False
+        assert settings.moe_expert_offload_resident_fraction == 0.25
+
+    def test_moe_expert_offload_roundtrip(self):
+        """Both offload fields survive to_dict -> from_dict."""
+        original = ModelSettings(
+            moe_expert_offload_enabled=True,
+            moe_expert_offload_resident_fraction=0.5,
+        )
+        d = original.to_dict()
+        assert d["moe_expert_offload_enabled"] is True
+        restored = ModelSettings.from_dict(d)
+        assert restored.moe_expert_offload_enabled is True
+        assert restored.moe_expert_offload_resident_fraction == 0.5
+
+    def test_moe_expert_offload_fraction_out_of_range_rejected(self):
+        """Residency outside (0, 1] fails at construction, not at load."""
+        with pytest.raises(ValueError, match="resident_fraction"):
+            ModelSettings(moe_expert_offload_resident_fraction=0.0)
+        with pytest.raises(ValueError, match="resident_fraction"):
+            ModelSettings(moe_expert_offload_resident_fraction=1.5)
+
+    def test_guided_grammar_defaults(self):
+        """Test guided grammar defaults to disabled."""
+        settings = ModelSettings()
+        assert settings.guided_grammar_enabled is False
+        assert settings.guided_grammar is None
+
+    def test_guided_grammar_roundtrip(self):
+        """Test guided grammar survives to_dict -> from_dict roundtrip."""
+        original = ModelSettings(
+            guided_grammar_enabled=True,
+            guided_grammar='root ::= "YES"',
+        )
+        d = original.to_dict()
+        assert d["guided_grammar_enabled"] is True
+        assert d["guided_grammar"] == 'root ::= "YES"'
+        restored = ModelSettings.from_dict(d)
+        assert restored.guided_grammar_enabled is True
+        assert restored.guided_grammar == 'root ::= "YES"'
 
     def test_trust_remote_code_excluded_from_profiles(self):
         """Security flag must never propagate via profiles or templates."""
@@ -196,6 +255,75 @@ class TestModelSettings:
         settings = ModelSettings()
         d = settings.to_dict()
         assert "model_type_override" not in d
+
+    def test_turboquant_kv_bits_default(self):
+        """Default bit depth = 4."""
+        settings = ModelSettings()
+        assert settings.turboquant_kv_bits == 4
+
+    def test_turboquant_kv_bits_roundtrip(self):
+        original = ModelSettings(turboquant_kv_bits=2.5)
+        d = original.to_dict()
+        assert d["turboquant_kv_bits"] == 2.5
+        restored = ModelSettings.from_dict(d)
+        assert restored.turboquant_kv_bits == 2.5
+
+    def test_turboquant_kv_bits_always_in_to_dict(self):
+        """Non-Optional field with a default must always serialize."""
+        settings = ModelSettings()
+        assert "turboquant_kv_bits" in settings.to_dict()
+
+    def test_turboquant_skip_last_default(self):
+        """Default = True — protects sensitive models from last-layer corruption."""
+        settings = ModelSettings()
+        assert settings.turboquant_skip_last is True
+
+    def test_turboquant_skip_last_roundtrip(self):
+        original = ModelSettings(turboquant_skip_last=False)
+        d = original.to_dict()
+        assert d["turboquant_skip_last"] is False
+        restored = ModelSettings.from_dict(d)
+        assert restored.turboquant_skip_last is False
+
+    def test_native_mtp_allows_turboquant(self):
+        settings = ModelSettings(mtp_enabled=True, turboquant_kv_enabled=True)
+        assert settings.mtp_enabled is True
+        assert settings.turboquant_kv_enabled is True
+
+    def test_vlm_mtp_rejects_turboquant(self):
+        with pytest.raises(ValueError, match="vlm_mtp_enabled.*turboquant"):
+            ModelSettings(vlm_mtp_enabled=True, turboquant_kv_enabled=True)
+
+    def test_vlm_mtp_draft_model_default(self):
+        settings = ModelSettings()
+        assert settings.vlm_mtp_draft_model is None
+
+    def test_vlm_mtp_draft_model_roundtrip(self):
+        original = ModelSettings(vlm_mtp_draft_model="gemma-4-26B-A4B-it-assistant")
+        d = original.to_dict()
+        assert d["vlm_mtp_draft_model"] == "gemma-4-26B-A4B-it-assistant"
+        restored = ModelSettings.from_dict(d)
+        assert restored.vlm_mtp_draft_model == "gemma-4-26B-A4B-it-assistant"
+
+    def test_vlm_mtp_draft_model_excluded_when_none(self):
+        settings = ModelSettings()
+        assert "vlm_mtp_draft_model" not in settings.to_dict()
+
+    def test_vlm_mtp_draft_block_size_default(self):
+        """None means 'use mlx-vlm default'."""
+        settings = ModelSettings()
+        assert settings.vlm_mtp_draft_block_size is None
+
+    def test_vlm_mtp_draft_block_size_roundtrip(self):
+        original = ModelSettings(vlm_mtp_draft_block_size=8)
+        d = original.to_dict()
+        assert d["vlm_mtp_draft_block_size"] == 8
+        restored = ModelSettings.from_dict(d)
+        assert restored.vlm_mtp_draft_block_size == 8
+
+    def test_vlm_mtp_draft_block_size_excluded_when_none(self):
+        settings = ModelSettings()
+        assert "vlm_mtp_draft_block_size" not in settings.to_dict()
 
 
 class TestModelSettingsManager:
@@ -490,6 +618,71 @@ class TestModelSettingsManager:
         restored = ModelSettings.from_dict(d)
         assert restored.forced_ct_kwargs == ["enable_thinking", "reasoning_effort"]
 
+    def test_merge_chat_template_request_kwargs_request_overrides_model(self):
+        """Request kwargs override model chat-template defaults."""
+        from omlx.model_settings import merge_chat_template_request_kwargs
+
+        settings = ModelSettings(
+            chat_template_kwargs={
+                "enable_thinking": True,
+                "custom_flag": "model",
+            }
+        )
+
+        merged = merge_chat_template_request_kwargs(
+            settings,
+            {"enable_thinking": False},
+        )
+
+        assert merged == {"enable_thinking": False, "custom_flag": "model"}
+
+    def test_merge_chat_template_request_kwargs_dedicated_overrides_raw(self):
+        """Dedicated model fields override model raw chat-template kwargs."""
+        from omlx.model_settings import merge_chat_template_request_kwargs
+
+        settings = ModelSettings(
+            chat_template_kwargs={"enable_thinking": False},
+            enable_thinking=True,
+        )
+
+        assert merge_chat_template_request_kwargs(settings) == {
+            "enable_thinking": True
+        }
+
+    def test_merge_chat_template_request_kwargs_respects_forced_keys(self):
+        """Forced keys block request-level chat-template overrides."""
+        from omlx.model_settings import merge_chat_template_request_kwargs
+
+        settings = ModelSettings(
+            chat_template_kwargs={
+                "enable_thinking": True,
+                "custom_flag": "model",
+            },
+            forced_ct_kwargs=["enable_thinking"],
+        )
+
+        merged = merge_chat_template_request_kwargs(
+            settings,
+            {"enable_thinking": False, "custom_flag": "request"},
+        )
+
+        assert merged == {"enable_thinking": True, "custom_flag": "request"}
+
+    @pytest.mark.parametrize("budget", [None, 0, 1])
+    @pytest.mark.parametrize("enabled", [None, True, False])
+    def test_budget_respects_explicit_thinking_mode(self, budget, enabled):
+        from omlx.model_settings import merge_chat_template_kwargs
+
+        kwargs = {} if enabled is None else {"enable_thinking": enabled}
+        expected = {"enable_thinking": True} if not kwargs and budget == 1 else kwargs
+        assert merge_chat_template_kwargs(None, kwargs, thinking_budget=budget) == expected
+
+    def test_zero_thinking_budget_does_not_enable_thinking(self):
+        """Zero means no thinking budget activation at template-render time."""
+        from omlx.model_settings import merge_chat_template_kwargs
+
+        assert merge_chat_template_kwargs(None, thinking_budget=0) == {}
+
     def test_thread_safety(self):
         """Test thread-safe access."""
         import threading
@@ -513,3 +706,229 @@ class TestModelSettingsManager:
                 t.join()
 
             assert len(errors) == 0
+
+
+class TestVlmMtpProcessorExclusivity:
+    """#2399: vlm_mtp_enabled is mutually exclusive with settings that
+    materialize as per-request logits processors."""
+
+    def test_neutral_values_do_not_conflict(self):
+        settings = ModelSettings(
+            vlm_mtp_enabled=True,
+            repetition_penalty=1.0,
+            presence_penalty=0.0,
+        )
+        assert settings.vlm_mtp_enabled is True
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("repetition_penalty", 1.2),
+            ("presence_penalty", 0.5),
+            ("guided_grammar_enabled", True),
+        ],
+    )
+    def test_conflicting_setting_raises(self, field, value):
+        with pytest.raises(ValueError, match="vlm_mtp_enabled cannot be combined"):
+            ModelSettings(vlm_mtp_enabled=True, **{field: value})
+
+    def test_thinking_budget_no_longer_conflicts(self):
+        """Thinking budget is applied on the vlm_mtp path at verify time
+        (MTPProcessingSampler), so the combo is allowed."""
+        settings = ModelSettings(
+            vlm_mtp_enabled=True,
+            thinking_budget_enabled=True,
+        )
+        assert settings.vlm_mtp_enabled is True
+        assert settings.thinking_budget_enabled is True
+
+    def test_conflicts_ignored_when_vlm_mtp_off(self):
+        settings = ModelSettings(
+            repetition_penalty=1.2,
+            thinking_budget_enabled=True,
+            guided_grammar_enabled=True,
+        )
+        assert settings.vlm_mtp_enabled is False
+
+    def test_resolve_helper_clears_vlm_mtp(self):
+        data, conflicts = resolve_vlm_mtp_conflicts(
+            {"vlm_mtp_enabled": True, "guided_grammar_enabled": True}
+        )
+        assert data["vlm_mtp_enabled"] is False
+        assert conflicts == ["guided_grammar_enabled"]
+
+    def test_resolve_helper_no_conflict_passthrough(self):
+        original = {"vlm_mtp_enabled": True, "repetition_penalty": 1.0}
+        data, conflicts = resolve_vlm_mtp_conflicts(original)
+        assert data is original
+        assert conflicts == []
+
+    def test_load_migrates_legacy_conflict_preserving_settings(self):
+        """A pre-rule settings file combining vlm_mtp with a penalty must load
+        with vlm_mtp disabled and every other field intact, instead of the
+        whole blob being dropped by the load-time except."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_file = Path(tmpdir) / "model_settings.json"
+            settings_file.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "models": {
+                            "legacy-model": {
+                                "vlm_mtp_enabled": True,
+                                "vlm_mtp_draft_model": "gemma-assistant",
+                                "repetition_penalty": 1.3,
+                                "max_context_window": 8192,
+                                "is_pinned": True,
+                            }
+                        },
+                    }
+                )
+            )
+
+            manager = ModelSettingsManager(Path(tmpdir))
+            loaded = manager.get_settings("legacy-model")
+
+            assert loaded.vlm_mtp_enabled is False
+            assert loaded.repetition_penalty == 1.3
+            assert loaded.max_context_window == 8192
+            assert loaded.is_pinned is True
+            assert loaded.vlm_mtp_draft_model == "gemma-assistant"
+
+
+# --------------------------------------------------------------------------
+# oQ A8 prefill kernels
+# --------------------------------------------------------------------------
+
+
+def test_oq_a8_defaults_to_off():
+    """It changes inference numerics, so it must be opt-in."""
+    settings = ModelSettings()
+    assert settings.qwen35_oq_a8_enabled is False
+    assert settings.qwen35_oq_a8_min_tokens == 128
+
+
+def test_oq_a8_and_ane_prefill_cannot_both_be_enabled():
+    """Both wrap Qwen3_5MLP.__call__, so the pair is a silent no-op for
+    whichever patches first rather than two accelerators stacking. Constructing
+    the combination has to raise so the clash reaches the caller."""
+    with pytest.raises(ValueError, match="cannot"):
+        ModelSettings(qwen35_oq_a8_enabled=True, qwen35_ane_prefill_enabled=True)
+
+    # Either one alone is fine.
+    assert ModelSettings(qwen35_oq_a8_enabled=True).qwen35_oq_a8_enabled is True
+    assert (
+        ModelSettings(qwen35_ane_prefill_enabled=True).qwen35_ane_prefill_enabled
+        is True
+    )
+
+
+def test_prefill_conflict_resolution_keeps_ane_and_reports_it():
+    """A dict is downgraded rather than rejected: it may be a whole saved
+    profile, and dropping every other field in it to punish one clash is worse
+    than turning the losing accelerator off and saying so."""
+    resolved, conflicts = resolve_qwen35_prefill_conflicts(
+        {
+            "qwen35_oq_a8_enabled": True,
+            "qwen35_ane_prefill_enabled": True,
+            "max_tokens": 4096,
+        }
+    )
+    assert resolved["qwen35_oq_a8_enabled"] is False
+    assert resolved["qwen35_ane_prefill_enabled"] is True
+    assert resolved["max_tokens"] == 4096
+    assert conflicts == ["qwen35_ane_prefill_enabled"]
+    # The resolved dict has to be constructible -- that is the whole point.
+    assert ModelSettings.from_dict(resolved).qwen35_oq_a8_enabled is False
+
+
+def test_prefill_conflict_resolution_leaves_clean_dicts_alone():
+    for data in (
+        {},
+        {"qwen35_oq_a8_enabled": True},
+        {"qwen35_ane_prefill_enabled": True},
+        {"qwen35_oq_a8_enabled": False, "qwen35_ane_prefill_enabled": True},
+    ):
+        resolved, conflicts = resolve_qwen35_prefill_conflicts(data)
+        assert conflicts == []
+        # Unchanged dicts are returned as-is, not copied.
+        assert resolved is data
+
+
+def test_a_saved_profile_with_both_accelerators_still_loads(tmp_path):
+    """The load path has to survive a settings file written by an older build
+    or hand-edited: the model keeps its settings, minus the losing toggle."""
+    path = tmp_path / "model_settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": SETTINGS_VERSION,
+                "models": {
+                    "clash/model": {
+                        "qwen35_oq_a8_enabled": True,
+                        "qwen35_ane_prefill_enabled": True,
+                        "qwen35_oq_a8_min_tokens": 512,
+                    }
+                },
+            }
+        )
+    )
+    manager = ModelSettingsManager(tmp_path)
+    settings = manager.get_settings("clash/model")
+    assert settings.qwen35_ane_prefill_enabled is True
+    assert settings.qwen35_oq_a8_enabled is False
+    # The rest of the blob survives the downgrade.
+    assert settings.qwen35_oq_a8_min_tokens == 512
+
+
+def test_oq_a8_exposes_no_kernel_choice():
+    """There is one kernel, so there is nothing for a user to pick.
+
+    The tile is chosen per bit width by the dispatcher from a measured
+    default. Keeping it out of ModelSettings means a saved profile cannot pin
+    a variant that a later build no longer instantiates.
+    """
+    assert not hasattr(ModelSettings(), "qwen35_oq_a8_variant")
+
+
+def test_a_stale_saved_variant_is_ignored_rather_than_fatal():
+    """A settings blob carrying an unknown key must still load.
+
+    from_dict filters to known fields, so the stray key is dropped instead of
+    raising and taking the model's whole settings blob with it.
+    """
+    restored = ModelSettings.from_dict(
+        {
+            "qwen35_oq_a8_enabled": True,
+            "qwen35_oq_a8_variant": 706,
+            "qwen35_oq_a8_min_tokens": 512,
+        }
+    )
+    assert restored.qwen35_oq_a8_enabled is True
+    assert restored.qwen35_oq_a8_min_tokens == 512
+    assert not hasattr(restored, "qwen35_oq_a8_variant")
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_oq_a8_rejects_non_positive_min_tokens(value):
+    with pytest.raises(ValueError, match="qwen35_oq_a8_min_tokens"):
+        ModelSettings(qwen35_oq_a8_enabled=True, qwen35_oq_a8_min_tokens=value)
+
+
+def test_oq_a8_round_trips_through_dict():
+    settings = ModelSettings(
+        qwen35_oq_a8_enabled=True,
+        qwen35_oq_a8_min_tokens=1024,
+    )
+    restored = ModelSettings.from_dict(settings.to_dict())
+    assert restored.qwen35_oq_a8_enabled is True
+    assert restored.qwen35_oq_a8_min_tokens == 1024
+
+
+def test_oq_a8_is_a_model_specific_profile_field():
+    """Never a template field: it is tied to one checkpoint's quantization."""
+    from omlx.model_profiles import MODEL_SPECIFIC_PROFILE_FIELDS, UNIVERSAL_FIELDS_SET
+
+    for name in ("qwen35_oq_a8_enabled", "qwen35_oq_a8_min_tokens"):
+        assert name in MODEL_SPECIFIC_PROFILE_FIELDS
+        assert name not in UNIVERSAL_FIELDS_SET

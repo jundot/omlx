@@ -3,35 +3,48 @@
 ``server_aliases`` save/validate path in /admin/api/global-settings."""
 
 import asyncio
+import threading
+import time
 from contextlib import contextmanager
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 
-import omlx.server  # noqa: F401 — ensure server module is imported first (triggers set_admin_getters)
 import omlx.admin.routes as admin_routes
+import omlx.server  # noqa: F401 — ensure server module is imported first (triggers set_admin_getters)
+import omlx.utils.network as network
 from omlx.admin.routes import GlobalSettingsRequest
+from omlx.settings import GlobalSettings
 from omlx.utils.network import (
     detect_server_aliases,
+    is_loopback_bind,
+    is_loopback_bind_host,
     is_valid_alias,
+    is_valid_bind_host,
     is_valid_hostname,
     is_valid_ip,
+    network_auth_error,
 )
-
 
 # =============================================================================
 # Helpers
 # =============================================================================
 
 
-def _make_global_settings(server_aliases: list[str] | None = None, host: str = "127.0.0.1"):
+def _make_global_settings(
+    server_aliases: list[str] | None = None, host: str = "127.0.0.1"
+):
     """Build a MagicMock GlobalSettings with the fields the alias paths touch."""
     gs = MagicMock()
     gs.server.host = host
     gs.server.port = 8000
     gs.server.log_level = "info"
     gs.server.server_aliases = list(server_aliases or [])
+    gs.server.preserve_mid_system_cache = True
+    gs.auth.api_key = None
+    gs.auth.skip_api_key_verification = False
     # Validation is invoked at the end of update_global_settings; return no errors.
     gs.validate.return_value = []
     gs.save.return_value = None
@@ -41,6 +54,13 @@ def _make_global_settings(server_aliases: list[str] | None = None, host: str = "
 @contextmanager
 def _patched_global_settings(gs):
     """Patch the module-level _get_global_settings getter without disturbing others."""
+    if isinstance(gs, MagicMock):
+        if not isinstance(gs.server.host, str):
+            gs.server.host = "127.0.0.1"
+        if not isinstance(gs.auth.api_key, (str, type(None))):
+            gs.auth.api_key = None
+        if not isinstance(gs.auth.skip_api_key_verification, bool):
+            gs.auth.skip_api_key_verification = False
     original = admin_routes._get_global_settings
     admin_routes._get_global_settings = lambda: gs
     try:
@@ -65,6 +85,54 @@ class TestNetworkValidation:
         assert is_valid_ip("::1")
         assert is_valid_ip("fe80::1")
 
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "localhost",
+            "LOCALHOST.",
+            "127.0.0.1",
+            "127.42.0.9",
+            "::1",
+            "::ffff:127.0.0.1",
+        ],
+    )
+    def test_recognizes_loopback_bind_hosts(self, host):
+        assert is_loopback_bind_host(host)
+
+    @pytest.mark.parametrize(
+        "host",
+        ["0.0.0.0", "::", "192.168.1.10", "host.local", "example.com", ""],
+    )
+    def test_rejects_non_loopback_bind_hosts(self, host):
+        assert not is_loopback_bind_host(host)
+
+    def test_network_bind_requires_api_key(self):
+        error = network_auth_error("0.0.0.0", None, False)
+
+        assert error is not None
+        assert "API key is required" in error
+
+    def test_mixed_bind_list_requires_api_key(self):
+        error = network_auth_error("127.0.0.1,192.168.1.10", None, False)
+
+        assert error is not None
+        assert "API key is required" in error
+
+    def test_authenticated_network_bind_is_allowed(self):
+        assert network_auth_error("0.0.0.0", "secret-key", False) is None
+
+    def test_loopback_bind_requires_every_configured_host_to_be_loopback(self):
+        assert is_loopback_bind("127.0.0.1, ::1")
+        assert not is_loopback_bind("127.0.0.1, 192.168.1.10")
+        assert not is_loopback_bind("")
+
+    def test_auth_bypass_is_loopback_only(self):
+        assert network_auth_error("127.0.0.1,::1", None, True) is None
+        error = network_auth_error("0.0.0.0", "secret-key", True)
+
+        assert error is not None
+        assert "cannot be skipped" in error
+
     def test_rejects_unspecified_ipv4(self):
         """0.0.0.0 parses as a valid IP but is not routable as an alias."""
         assert not is_valid_ip("0.0.0.0")
@@ -81,12 +149,26 @@ class TestNetworkValidation:
         assert is_valid_hostname("example.local")
         assert is_valid_hostname("my-mac")
         assert is_valid_hostname("a.b.c.d")
+        assert is_valid_hostname("web1.local")
 
     def test_rejects_invalid_hostname(self):
         assert not is_valid_hostname("")
         assert not is_valid_hostname("with space")
         assert not is_valid_hostname("-leading-dash")
         assert not is_valid_hostname("a" * 300)
+
+    def test_rejects_all_numeric_last_label_in_dotted_names(self):
+        # For dotted (multi-label) names: IANA never delegates numeric TLDs,
+        # so an all-digit rightmost label signals an IP-shaped string.
+        # Mirrors the approach used by the ``validators`` PyPI library.
+        assert not is_valid_hostname("999.999.999.999")
+        assert not is_valid_hostname("1.2.3.4")
+        assert not is_valid_hostname("host.123")
+
+    def test_accepts_single_label_without_letters(self):
+        # Single-label names (no dots) are local hostnames — no TLD constraint.
+        assert is_valid_hostname("192-168-1-1")
+        assert is_valid_hostname("web1")
 
     def test_alias_accepts_either(self):
         assert is_valid_alias("localhost")
@@ -101,6 +183,141 @@ class TestNetworkValidation:
     def test_alias_rejects_non_string(self):
         assert not is_valid_alias(None)  # type: ignore[arg-type]
         assert not is_valid_alias(123)  # type: ignore[arg-type]
+
+
+class TestIsValidBindHost:
+    """is_valid_bind_host() accepts IPs (including unspecified) and hostnames,
+    but must reject IP-shaped values that fail IP parsing."""
+
+    # ------------------------------------------------------------------
+    # Valid IPv4 — including unspecified/wildcard addresses that are
+    # rejected by is_valid_alias() but are legitimate bind targets.
+    # ------------------------------------------------------------------
+
+    def test_accepts_regular_ipv4(self):
+        assert is_valid_bind_host("127.0.0.1")
+        assert is_valid_bind_host("192.168.1.10")
+        assert is_valid_bind_host("10.0.0.255")
+        assert is_valid_bind_host("255.255.255.255")
+
+    def test_accepts_wildcard_ipv4(self):
+        assert is_valid_bind_host("0.0.0.0")
+
+    # ------------------------------------------------------------------
+    # Valid IPv6 — the ip-shaped guard uses a digit+dot regex so it
+    # never interferes with colon-containing IPv6 addresses.
+    # ------------------------------------------------------------------
+
+    def test_accepts_wildcard_ipv6(self):
+        assert is_valid_bind_host("::")
+
+    def test_accepts_loopback_ipv6(self):
+        assert is_valid_bind_host("::1")
+
+    def test_accepts_link_local_ipv6(self):
+        assert is_valid_bind_host("fe80::1")
+
+    def test_accepts_full_ipv6(self):
+        assert is_valid_bind_host("2001:db8::1")
+
+    def test_accepts_ipv4_mapped_ipv6(self):
+        # ::ffff:192.168.1.1 is valid IPv6 and contains dots, but the
+        # colon means it reaches ipaddress.ip_address() first and parses fine.
+        assert is_valid_bind_host("::ffff:192.168.1.1")
+
+    # ------------------------------------------------------------------
+    # Valid hostnames
+    # ------------------------------------------------------------------
+
+    def test_accepts_simple_hostname(self):
+        assert is_valid_bind_host("localhost")
+        assert is_valid_bind_host("my-host")
+
+    def test_accepts_fqdn(self):
+        assert is_valid_bind_host("my-host.local")
+        assert is_valid_bind_host("example.com")
+
+    def test_accepts_hostname_with_leading_digit_label(self):
+        # Numeric-prefixed labels are valid hostnames (e.g. "web1.local")
+        assert is_valid_bind_host("web1.local")
+
+    def test_accepts_hostname_with_dashes_instead_of_dots(self):
+        # "192-168-1-1" looks IP-like but uses dashes — valid hostname,
+        # does not match the digit-dot regex.
+        assert is_valid_bind_host("192-168-1-1")
+
+    def test_accepts_all_letter_dotted_hostname(self):
+        # Labels a.b.c.d contain letters so they don't match the ip-shaped guard.
+        assert is_valid_bind_host("a.b.c.d")
+
+    # ------------------------------------------------------------------
+    # Rejected: IP-shaped strings that fail IP parsing
+    # The bug: ipaddress.ip_address() raises ValueError, and digit-only
+    # dotted labels also match the hostname regex — so without the guard
+    # they would be accepted silently.
+    # ------------------------------------------------------------------
+
+    def test_rejects_ipv4_all_octets_out_of_range(self):
+        assert not is_valid_bind_host("999.999.999.999")
+
+    def test_rejects_ipv4_first_octet_out_of_range(self):
+        assert not is_valid_bind_host("256.0.0.1")
+
+    def test_rejects_ipv4_last_octet_out_of_range(self):
+        assert not is_valid_bind_host("1.2.3.999")
+
+    def test_rejects_ip_shaped_too_few_octets(self):
+        # 3-part and 2-part dotted numeric strings look IP-shaped but are
+        # not valid IPs and must not slip through as hostnames.
+        assert not is_valid_bind_host("1.2.3")
+        assert not is_valid_bind_host("1.2")
+
+    def test_rejects_ip_shaped_too_many_octets(self):
+        assert not is_valid_bind_host("1.2.3.4.5")
+
+    # ------------------------------------------------------------------
+    # Rejected: malformed hostnames
+    # ------------------------------------------------------------------
+
+    def test_rejects_leading_dash(self):
+        assert not is_valid_bind_host("-bad-host")
+
+    def test_rejects_hostname_with_space(self):
+        assert not is_valid_bind_host("with space")
+
+    def test_rejects_label_too_long(self):
+        assert not is_valid_bind_host("a" * 64 + ".local")
+
+    def test_rejects_value_too_long(self):
+        assert not is_valid_bind_host("a." * 127 + "b")
+
+    def test_rejects_invalid_ipv6_form(self):
+        # Colon-containing but not a valid IP — falls through to hostname,
+        # which rejects colons.
+        assert not is_valid_bind_host(":invalid:")
+        assert not is_valid_bind_host("[::1]")
+
+    # ------------------------------------------------------------------
+    # Rejected: empty / wrong types
+    # ------------------------------------------------------------------
+
+    def test_rejects_empty_string(self):
+        assert not is_valid_bind_host("")
+
+    def test_rejects_whitespace_only(self):
+        assert not is_valid_bind_host("   ")
+
+    def test_rejects_non_string(self):
+        assert not is_valid_bind_host(None)  # type: ignore[arg-type]
+        assert not is_valid_bind_host(8080)  # type: ignore[arg-type]
+
+    # ------------------------------------------------------------------
+    # Whitespace stripping
+    # ------------------------------------------------------------------
+
+    def test_strips_surrounding_whitespace(self):
+        assert is_valid_bind_host("  127.0.0.1  ")
+        assert is_valid_bind_host("  localhost  ")
 
 
 class TestDetectServerAliases:
@@ -120,6 +337,38 @@ class TestDetectServerAliases:
     def test_returns_unique_values(self):
         aliases = detect_server_aliases()
         assert len(aliases) == len(set(aliases))
+
+    def test_comma_separated_host_includes_loopback(self):
+        """Comma-separated bind hosts containing a loopback must not drop localhost aliases."""
+        aliases = detect_server_aliases(host="127.0.0.1, ::1")
+        assert "localhost" in aliases
+        assert "127.0.0.1" in aliases
+
+    def test_comma_separated_wildcard_includes_loopback(self):
+        aliases = detect_server_aliases(host="0.0.0.0, ::1")
+        assert "localhost" in aliases
+        assert "127.0.0.1" in aliases
+
+    def test_comma_separated_non_loopback_skips_loopback(self):
+        """If no part of the comma-separated host is a loopback/wildcard, no loopback aliases."""
+        aliases = detect_server_aliases(host="192.168.1.10, 10.0.0.1")
+        assert "localhost" not in aliases
+
+    def test_slow_reverse_lookup_does_not_block(self, monkeypatch):
+        """A resolver that never answers costs the FQDN alias, not server startup."""
+        release = threading.Event()
+        monkeypatch.setattr(network, "_FQDN_TIMEOUT_S", 0.05)
+        monkeypatch.setattr(
+            network.socket, "getfqdn", lambda: release.wait(5) and "slow.example"
+        )
+        try:
+            start = time.monotonic()
+            aliases = detect_server_aliases(host="127.0.0.1")
+            assert time.monotonic() - start < 1.0
+            assert "localhost" in aliases
+            assert "slow.example" not in aliases
+        finally:
+            release.set()
 
 
 # =============================================================================
@@ -258,3 +507,874 @@ class TestUpdateGlobalSettingsAliases:
             )
 
         assert gs.server.server_aliases == []
+
+
+class TestUpdateGlobalSettingsNetworkAuth:
+    """Network-facing binds cannot be saved without enforced authentication."""
+
+    def test_rejects_network_bind_without_api_key_before_mutation(self):
+        gs = _make_global_settings(host="127.0.0.1")
+        request = GlobalSettingsRequest(host="0.0.0.0")
+
+        with (
+            _patched_global_settings(gs),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert exc_info.value.status_code == 400
+        assert "API key is required" in exc_info.value.detail
+        assert gs.server.host == "127.0.0.1"
+        gs.save.assert_not_called()
+
+    def test_accepts_api_key_and_network_bind_in_one_update(self):
+        gs = _make_global_settings(host="127.0.0.1")
+        request = GlobalSettingsRequest(host="0.0.0.0", api_key="secret-key")
+        server_state = SimpleNamespace(api_key=None)
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(omlx.server, "_server_state", server_state),
+        ):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert gs.server.host == "0.0.0.0"
+        assert gs.auth.api_key == "secret-key"
+        assert server_state.api_key == "secret-key"
+        gs.save.assert_called_once()
+
+    def test_rejects_auth_bypass_on_network_bind_before_mutation(self):
+        gs = _make_global_settings(host="0.0.0.0")
+        gs.auth.api_key = "secret-key"
+        request = GlobalSettingsRequest(skip_api_key_verification=True)
+
+        with (
+            _patched_global_settings(gs),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert exc_info.value.status_code == 400
+        assert "cannot be skipped" in exc_info.value.detail
+        assert gs.auth.skip_api_key_verification is False
+        gs.save.assert_not_called()
+
+    def test_rejects_auth_bypass_until_loopback_restart(self):
+        gs = _make_global_settings(host="0.0.0.0")
+        gs.auth.api_key = "secret-key"
+        server_state = SimpleNamespace(
+            global_settings=gs,
+            bind_host="0.0.0.0",
+        )
+        request = GlobalSettingsRequest(
+            host="127.0.0.1",
+            skip_api_key_verification=True,
+        )
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(admin_routes, "_get_server_state", lambda: server_state),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert exc_info.value.status_code == 400
+        assert "running server" in exc_info.value.detail
+        assert gs.server.host == "0.0.0.0"
+        assert gs.auth.skip_api_key_verification is False
+        gs.save.assert_not_called()
+
+    def test_allows_auth_bypass_on_loopback(self):
+        gs = _make_global_settings(host="127.0.0.1, ::1")
+        request = GlobalSettingsRequest(skip_api_key_verification=True)
+
+        with _patched_global_settings(gs):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert gs.auth.skip_api_key_verification is True
+        gs.save.assert_called_once()
+
+
+class TestUpdateGlobalSettingsHotCache:
+    """update_global_settings: validate hot cache size before runtime apply."""
+
+    def test_rejects_hot_cache_auto_with_400(self):
+        gs = _make_global_settings()
+        gs.cache.enabled = True
+        gs.cache.hot_cache_max_size = "0"
+        request = GlobalSettingsRequest(cache_enabled=False, hot_cache_max_size="auto")
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "hot_cache_max_size" in exc_info.value.detail
+        assert "auto" in exc_info.value.detail
+        assert gs.cache.enabled is True
+        assert gs.cache.hot_cache_max_size == "0"
+        gs.save.assert_not_called()
+
+
+class TestUpdateGlobalSettingsGdnSplit:
+    """update_global_settings: persist GDN split cache plumbing safely."""
+
+    def test_saves_gdn_split_settings(self):
+        gs = _make_global_settings()
+        gs.cache.hot_cache_only = False
+        gs.cache.gdn_ssd_split_enabled = False
+        gs.cache.gdn_ssd_pending_max_size = "512MB"
+        request = GlobalSettingsRequest(
+            gdn_ssd_split_enabled=True,
+            gdn_ssd_pending_max_size="1GB",
+        )
+
+        with _patched_global_settings(gs):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert gs.cache.gdn_ssd_split_enabled is True
+        assert gs.cache.gdn_ssd_pending_max_size == "1GB"
+        gs.save.assert_called_once()
+
+    def test_rejects_split_with_hot_cache_only(self):
+        gs = _make_global_settings()
+        gs.cache.hot_cache_only = True
+        gs.cache.gdn_ssd_split_enabled = False
+        request = GlobalSettingsRequest(gdn_ssd_split_enabled=True)
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "hot_cache_only" in exc_info.value.detail
+        assert gs.cache.gdn_ssd_split_enabled is False
+        gs.save.assert_not_called()
+
+    def test_rejects_invalid_pending_size(self):
+        gs = _make_global_settings()
+        gs.cache.hot_cache_only = False
+        request = GlobalSettingsRequest(gdn_ssd_pending_max_size="not-a-size")
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "gdn_ssd_pending_max_size" in exc_info.value.detail
+        gs.save.assert_not_called()
+
+    def test_saves_auto_storage_policy_with_explicit_rht_int16(self):
+        gs = GlobalSettings()
+        gs.save = MagicMock()
+        gs.cache.gdn_ssd_split_enabled = False
+        gs.cache.gdn_sidecar_state_dtype = "fp32"
+        request = GlobalSettingsRequest(
+            gdn_snapshot_storage="auto",
+            gdn_sidecar_precision="rht_int16",
+        )
+
+        with _patched_global_settings(gs):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert gs.cache.gdn_ssd_split_enabled is None
+        assert gs.cache.get_gdn_snapshot_storage() == "auto"
+        assert gs.cache.get_gdn_ssd_split_enabled() is True
+        assert gs.cache.gdn_sidecar_state_dtype == "rht_int16"
+        gs.save.assert_called_once()
+
+    def test_auto_storage_falls_back_to_embedded_in_hot_only_mode(self):
+        gs = GlobalSettings()
+        gs.save = MagicMock()
+        request = GlobalSettingsRequest(
+            hot_cache_only=True,
+            gdn_snapshot_storage="auto",
+        )
+
+        with _patched_global_settings(gs):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert gs.cache.gdn_ssd_split_enabled is None
+        assert gs.cache.get_gdn_ssd_split_enabled() is False
+        gs.save.assert_called_once()
+
+    def test_rejects_conflicting_new_mode_and_legacy_bool(self):
+        gs = GlobalSettings()
+        gs.save = MagicMock()
+        request = GlobalSettingsRequest(
+            gdn_snapshot_storage="embedded",
+            gdn_ssd_split_enabled=True,
+        )
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "cannot be combined" in exc_info.value.detail
+        gs.save.assert_not_called()
+
+
+class TestGetGlobalSettingsGdnSplit:
+    """get_global_settings: expose GDN split fields to the dashboard."""
+
+    def test_returns_gdn_split_settings(self):
+        gs = GlobalSettings()
+        gs.cache.gdn_ssd_split_enabled = True
+        gs.cache.gdn_ssd_pending_max_size = "768MB"
+        gs.server.max_audio_upload_size = "500MB"
+
+        memory_info = {
+            "total_bytes": 16 * 1024**3,
+            "total_formatted": "16GB",
+            "auto_limit_formatted": "10GB",
+            "available_bytes": 8 * 1024**3,
+            "omlx_phys_footprint_bytes": 2 * 1024**3,
+            "free_memory_bytes": 4 * 1024**3,
+            "inactive_memory_bytes": 2 * 1024**3,
+            "active_memory_bytes": 2 * 1024**3,
+            "iogpu_wired_limit_bytes": 0,
+            "omlx_wired_limit_request_bytes": 0,
+            "memory_guard_preview": {},
+        }
+        disk_info = {"total_bytes": 100 * 1024**3, "total_formatted": "100GB"}
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(admin_routes, "get_system_memory_info", return_value=memory_info),
+            patch.object(admin_routes, "get_ssd_disk_info", return_value=disk_info),
+        ):
+            result = asyncio.run(admin_routes.get_global_settings(is_admin=True))
+
+        assert result["cache"]["gdn_ssd_split_enabled"] is True
+        assert result["cache"]["gdn_snapshot_storage"] == "ssd_sidecar"
+        assert result["cache"]["gdn_ssd_pending_max_size"] == "768MB"
+        assert result["server"]["max_audio_upload_size"] == "500MB"
+
+
+class TestUpdateGlobalSettingsAudioUpload:
+    """update_global_settings: persist the audio upload size cap."""
+
+    def test_saves_max_audio_upload_size(self):
+        gs = _make_global_settings()
+        gs.server.max_audio_upload_size = "100MB"
+        request = GlobalSettingsRequest(max_audio_upload_size="250MB")
+
+        with _patched_global_settings(gs):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert "max_audio_upload_size" in result["runtime_applied"]
+        assert gs.server.max_audio_upload_size == "250MB"
+        gs.save.assert_called_once()
+
+    @pytest.mark.parametrize("value", ["bogus", "1e999MB"])
+    def test_rejects_invalid_max_audio_upload_size(self, value):
+        gs = _make_global_settings()
+        request = GlobalSettingsRequest(max_audio_upload_size=value)
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "max_audio_upload_size" in exc_info.value.detail
+        gs.save.assert_not_called()
+
+
+class TestApplyCacheSettingsRuntimeGdn:
+    """Runtime cache rebuild uses the newly persisted GDN policy."""
+
+    def test_syncs_effective_mode_codec_and_limits_to_pool_template(self):
+        from omlx.scheduler import SchedulerConfig
+        from omlx.server import _server_state
+
+        gs = GlobalSettings()
+        gs.cache.ssd_cache_max_size = "1GB"
+        gs.cache.hot_cache_only = False
+        gs.cache.gdn_ssd_split_enabled = None
+        gs.cache.gdn_ssd_pending_max_size = "768MB"
+        gs.cache.gdn_sidecar_state_dtype = "rht_int16"
+        gs.cache.initial_cache_blocks = 1024
+
+        pool = MagicMock()
+        pool._scheduler_config = SchedulerConfig()
+        pool.get_loaded_model_ids.return_value = []
+
+        with patch.object(_server_state, "engine_pool", pool):
+            success, _message = asyncio.run(
+                admin_routes._apply_cache_settings_runtime(
+                    None,
+                    None,
+                    None,
+                    gs,
+                )
+            )
+
+        assert success is True
+        assert pool._scheduler_config.gdn_ssd_split_enabled is True
+        assert pool._scheduler_config.gdn_ssd_pending_max_bytes == 768 * 1024**2
+        assert pool._scheduler_config.gdn_sidecar_state_dtype == "rht_int16"
+        assert pool._scheduler_config.initial_cache_blocks == 1024
+
+
+class TestUpdateGlobalSettingsMidSystemCache:
+    """update_global_settings: save the mid-system prefix-cache fallback toggle."""
+
+    def test_saves_disabled_mid_system_cache_fallback(self):
+        gs = _make_global_settings()
+        request = GlobalSettingsRequest(preserve_mid_system_cache=False)
+
+        with _patched_global_settings(gs):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert "preserve_mid_system_cache" in result["runtime_applied"]
+        assert gs.server.preserve_mid_system_cache is False
+        gs.save.assert_called_once()
+
+
+class TestUpdateGlobalSettingsSampling:
+    """update_global_settings: saving and hot-applying sampling defaults."""
+
+    @staticmethod
+    def _make_sampling_settings(policy: int | None = None):
+        return SimpleNamespace(
+            max_context_window=32768,
+            max_context_window_policy=policy,
+            max_tokens=32768,
+            temperature=1.0,
+            top_p=0.95,
+            top_k=0,
+            repetition_penalty=1.0,
+        )
+
+    def test_saves_and_hot_applies_context_window_policy(self):
+        gs = MagicMock()
+        gs.sampling = self._make_sampling_settings()
+        gs.validate.return_value = []
+        gs.save.return_value = None
+        server_state = SimpleNamespace(sampling=self._make_sampling_settings())
+        request = GlobalSettingsRequest(sampling_max_context_window_policy=128000)
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(
+                omlx.server,
+                "_server_state",
+                server_state,
+            ),
+        ):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert "sampling" in result["runtime_applied"]
+        assert gs.sampling.max_context_window_policy == 128000
+        assert server_state.sampling.max_context_window_policy == 128000
+        gs.save.assert_called_once()
+
+    def test_explicit_null_clears_context_window_policy(self):
+        gs = MagicMock()
+        gs.sampling = self._make_sampling_settings(policy=128000)
+        gs.validate.return_value = []
+        gs.save.return_value = None
+        server_state = SimpleNamespace(
+            sampling=self._make_sampling_settings(policy=128000)
+        )
+        request = GlobalSettingsRequest(sampling_max_context_window_policy=None)
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(
+                omlx.server,
+                "_server_state",
+                server_state,
+            ),
+        ):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert "sampling_max_context_window_policy" in request.model_fields_set
+        assert result["success"] is True
+        assert "sampling" in result["runtime_applied"]
+        assert gs.sampling.max_context_window_policy is None
+        assert server_state.sampling.max_context_window_policy is None
+        gs.save.assert_called_once()
+
+
+class TestUpdateGlobalSettingsEmbeddingBatchSize:
+    """update_global_settings: saving and hot-applying embedding batch size."""
+
+    def _make_scheduler_settings(self):
+        return SimpleNamespace(
+            max_concurrent_requests=8,
+            embedding_batch_size=32,
+            chunked_prefill=False,
+        )
+
+    def test_saves_and_hot_applies_embedding_batch_size(self):
+        gs = MagicMock()
+        gs.scheduler = self._make_scheduler_settings()
+        gs.validate.return_value = []
+        gs.save.return_value = None
+
+        pool = SimpleNamespace(apply_embedding_batch_size=AsyncMock())
+        server_state = SimpleNamespace(engine_pool=pool)
+        request = GlobalSettingsRequest(embedding_batch_size=5)
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(
+                omlx.server,
+                "_server_state",
+                server_state,
+            ),
+        ):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert "embedding_batch_size" in result["runtime_applied"]
+        assert gs.scheduler.embedding_batch_size == 5
+        pool.apply_embedding_batch_size.assert_awaited_once_with(5)
+        gs.save.assert_called_once()
+
+    def test_rejects_invalid_embedding_batch_size(self):
+        gs = MagicMock()
+        gs.scheduler = self._make_scheduler_settings()
+        gs.validate.return_value = []
+        gs.save.return_value = None
+        request = GlobalSettingsRequest(embedding_batch_size=0)
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "embedding_batch_size" in exc_info.value.detail
+        gs.save.assert_not_called()
+
+    def test_does_not_hot_apply_embedding_batch_size_when_validation_fails(self):
+        gs = MagicMock()
+        gs.scheduler = self._make_scheduler_settings()
+        gs.validate.return_value = ["invalid unrelated setting"]
+        gs.save.return_value = None
+        pool = SimpleNamespace(apply_embedding_batch_size=AsyncMock())
+        server_state = SimpleNamespace(engine_pool=pool)
+        request = GlobalSettingsRequest(embedding_batch_size=5)
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(
+                omlx.server,
+                "_server_state",
+                server_state,
+            ),
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        pool.apply_embedding_batch_size.assert_not_awaited()
+        assert gs.scheduler.embedding_batch_size == 32
+        gs.save.assert_not_called()
+
+    def test_does_not_mutate_embedding_batch_size_when_api_key_is_invalid(self):
+        gs = MagicMock()
+        gs.scheduler = self._make_scheduler_settings()
+        gs.validate.return_value = []
+        gs.save.return_value = None
+        pool = SimpleNamespace(apply_embedding_batch_size=AsyncMock())
+        server_state = SimpleNamespace(engine_pool=pool)
+        request = GlobalSettingsRequest(embedding_batch_size=5, api_key="abc")
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(
+                omlx.server,
+                "_server_state",
+                server_state,
+            ),
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        pool.apply_embedding_batch_size.assert_not_awaited()
+        assert gs.scheduler.embedding_batch_size == 32
+        gs.save.assert_not_called()
+
+    def test_does_not_hot_apply_embedding_batch_size_when_save_fails(self):
+        gs = MagicMock()
+        gs.scheduler = self._make_scheduler_settings()
+        gs.validate.return_value = []
+        gs.save.side_effect = OSError("disk full")
+        pool = SimpleNamespace(apply_embedding_batch_size=AsyncMock())
+        server_state = SimpleNamespace(engine_pool=pool)
+        request = GlobalSettingsRequest(embedding_batch_size=5)
+
+        with (
+            _patched_global_settings(gs),
+            patch.object(
+                omlx.server,
+                "_server_state",
+                server_state,
+            ),
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 500
+        pool.apply_embedding_batch_size.assert_not_awaited()
+        assert gs.scheduler.embedding_batch_size == 32
+
+
+class TestUpdateGlobalSettingsMaxConcurrentRequests:
+    """update_global_settings: saving and hot-applying max concurrent requests."""
+
+    def _setup(self, validate_errors=()):
+        gs = MagicMock()
+        gs.scheduler = SimpleNamespace(
+            max_concurrent_requests=1,
+            embedding_batch_size=32,
+            chunked_prefill=False,
+        )
+        gs.validate.return_value = list(validate_errors)
+        gs.save.return_value = None
+        return gs, SimpleNamespace(apply_max_concurrent_requests=AsyncMock())
+
+    def _save(self, gs, pool, value):
+        request = GlobalSettingsRequest(max_concurrent_requests=value)
+        with (
+            _patched_global_settings(gs),
+            patch.object(
+                omlx.server, "_server_state", SimpleNamespace(engine_pool=pool)
+            ),
+        ):
+            return asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+    def test_saves_and_hot_applies_max_concurrent_requests(self):
+        gs, pool = self._setup()
+
+        result = self._save(gs, pool, 4)
+
+        assert "max_concurrent_requests" in result["runtime_applied"]
+        assert gs.scheduler.max_concurrent_requests == 4
+        pool.apply_max_concurrent_requests.assert_awaited_once_with(4)
+
+    def test_unchanged_value_is_not_hot_applied(self):
+        gs, pool = self._setup()
+
+        result = self._save(gs, pool, 1)
+
+        assert "max_concurrent_requests" not in result["runtime_applied"]
+        pool.apply_max_concurrent_requests.assert_not_awaited()
+
+    def test_does_not_hot_apply_when_validation_fails(self):
+        gs, pool = self._setup(validate_errors=["invalid max_concurrent_requests"])
+
+        with pytest.raises(HTTPException) as exc_info:
+            self._save(gs, pool, 0)
+
+        assert exc_info.value.status_code == 400
+        assert gs.scheduler.max_concurrent_requests == 1
+        pool.apply_max_concurrent_requests.assert_not_awaited()
+        gs.save.assert_not_called()
+
+
+class TestUpdateGlobalSettingsGdnSidecarStateDtype:
+    """update_global_settings: GDN sidecar precision invariants.
+
+    The split-disabled + reduced-dtype invariant is owned by the layers where
+    the operator states intent (settings validation and this route). The cache
+    manager/store constructors stay permissive: they are internal, and the
+    scheduler already coerces reduced -> fp32 when split is off.
+    """
+
+    def test_ignores_v060_request_field_name(self):
+        request = GlobalSettingsRequest(
+            **{"gdn_sidecar_state_dtype": "rht_int16"}
+        )
+
+        assert request.gdn_sidecar_precision is None
+
+    def test_accepts_rht_int8_with_split_enabled(self):
+        gs = _make_global_settings()
+        gs.cache.hot_cache_only = False
+        gs.cache.gdn_ssd_split_enabled = True
+        gs.cache.gdn_sidecar_state_dtype = "fp32"
+        request = GlobalSettingsRequest(gdn_sidecar_precision="rht_int8")
+
+        with _patched_global_settings(gs):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert gs.cache.gdn_sidecar_state_dtype == "rht_int8"
+        gs.save.assert_called_once()
+
+    def test_accepts_dormant_reduced_dtype_when_embedded(self):
+        gs = _make_global_settings()
+        gs.cache.hot_cache_only = False
+        gs.cache.gdn_ssd_split_enabled = False
+        gs.cache.gdn_sidecar_state_dtype = "fp32"
+        request = GlobalSettingsRequest(gdn_sidecar_precision="rht_int8")
+
+        with _patched_global_settings(gs):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert gs.cache.gdn_sidecar_state_dtype == "rht_int8"
+        gs.save.assert_called_once()
+
+    def test_accepts_embedded_mode_while_a_reduced_dtype_is_dormant(self):
+        gs = _make_global_settings()
+        gs.cache.hot_cache_only = False
+        gs.cache.gdn_ssd_split_enabled = True
+        gs.cache.gdn_sidecar_state_dtype = "rht_int8"
+        request = GlobalSettingsRequest(gdn_ssd_split_enabled=False)
+
+        with _patched_global_settings(gs):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert gs.cache.gdn_ssd_split_enabled is False
+        assert gs.cache.gdn_sidecar_state_dtype == "rht_int8"
+        gs.save.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "value", ["RHT_INT8", "Rht_Int8", "RHT_INT16", "INT8", "BF16"]
+    )
+    def test_normalizes_case(self, value):
+        gs = _make_global_settings()
+        gs.cache.hot_cache_only = False
+        gs.cache.gdn_ssd_split_enabled = True
+        gs.cache.gdn_sidecar_state_dtype = "fp32"
+        request = GlobalSettingsRequest(gdn_sidecar_precision=value)
+
+        with _patched_global_settings(gs):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert gs.cache.gdn_sidecar_state_dtype == value.lower()
+
+    @pytest.mark.parametrize("value", ["fp8", "int4", "rht", "", "rht_int8 "])
+    def test_rejects_unknown_dtype_without_mutating(self, value):
+        gs = _make_global_settings()
+        gs.cache.hot_cache_only = False
+        gs.cache.gdn_ssd_split_enabled = True
+        gs.cache.gdn_sidecar_state_dtype = "int8"
+        request = GlobalSettingsRequest(gdn_sidecar_precision=value)
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "gdn_sidecar_precision" in exc_info.value.detail
+        assert gs.cache.gdn_sidecar_state_dtype == "int8"
+        gs.save.assert_not_called()
+
+    def test_invalid_dtype_leaves_other_fields_in_the_same_request_untouched(self):
+        """Validation runs before any field is applied."""
+        gs = _make_global_settings()
+        gs.cache.hot_cache_only = False
+        gs.cache.gdn_ssd_split_enabled = True
+        gs.cache.gdn_sidecar_state_dtype = "fp32"
+        gs.cache.gdn_ssd_pending_max_size = "512MB"
+        gs.cache.enabled = True
+        request = GlobalSettingsRequest(
+            cache_enabled=False,
+            gdn_ssd_pending_max_size="1GB",
+            gdn_sidecar_precision="fp8",
+        )
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException):
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert gs.cache.enabled is True
+        assert gs.cache.gdn_ssd_pending_max_size == "512MB"
+        assert gs.cache.gdn_sidecar_state_dtype == "fp32"
+        gs.save.assert_not_called()
+
+
+def test_global_defaults_ignore_overrides_and_do_not_write(tmp_path, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    gs = GlobalSettings(base_path=tmp_path)
+    gs.server.port = 9123
+    gs.memory.prefill_memory_guard = False
+    gs.cache.ssd_cache_max_size = "321GB"
+    gs.auth.api_key = "keep-key"
+    gs.model.model_dirs = [str(tmp_path / "models")]
+    gs.save()
+    original = (tmp_path / "settings.json").read_bytes()
+    monkeypatch.setenv("OMLX_PORT", "9456")
+    app = FastAPI()
+    app.include_router(admin_routes.router)
+    app.dependency_overrides[admin_routes.require_admin] = lambda: True
+    with _patched_global_settings(gs), TestClient(app) as client:
+        response = client.get("/admin/api/global-settings/defaults")
+    assert response.status_code == 200
+    data = response.json()
+    defaults = GlobalSettings()
+    assert data["server"]["port"] == defaults.server.port
+    assert data["memory"]["prefill_memory_guard"] is True
+    assert data["cache"]["ssd_cache_max_size"] == "auto"
+    assert data["sampling"] == defaults.sampling.to_dict()
+    assert data["auth"]["api_key"] == ""
+    assert gs.server.port == 9123
+    assert gs.auth.api_key == "keep-key"
+    assert gs.model.model_dirs == [str(tmp_path / "models")]
+    assert (tmp_path / "settings.json").read_bytes() == original
+
+
+@pytest.mark.parametrize("cache_size", ["auto", "1536MB"])
+def test_cache_settings_roundtrip_preserves_engines(tmp_path, cache_size):
+    from omlx.scheduler import SchedulerConfig
+    from omlx.server import _server_state
+
+    gs = GlobalSettings(base_path=tmp_path)
+    gs.save = MagicMock()
+    gs.cache.ssd_cache_max_size = cache_size
+    pool = MagicMock()
+    pool._scheduler_config = SchedulerConfig()
+    pool.get_loaded_model_ids.return_value = ["loaded-model"]
+    pool._unload_engine = AsyncMock()
+
+    with _patched_global_settings(gs), patch.object(_server_state, "engine_pool", pool):
+        data = asyncio.run(admin_routes.get_global_settings(is_admin=True))
+        payload = dict(data["cache"])
+        payload["cache_enabled"] = payload.pop("enabled")
+        payload.pop("gdn_ssd_split_enabled")
+        payload.pop("ane_compile_cache")
+        result = asyncio.run(
+            admin_routes.update_global_settings(
+                GlobalSettingsRequest(**payload), is_admin=True
+            )
+        )
+        assert "cache" not in result["runtime_applied"]
+        pool._unload_engine.assert_not_awaited()
+        assert gs.cache.ssd_cache_dir is None
+        assert gs.cache.ssd_cache_max_size == cache_size
+
+        payload["initial_cache_blocks"] = 512
+        result = asyncio.run(
+            admin_routes.update_global_settings(
+                GlobalSettingsRequest(**payload), is_admin=True
+            )
+        )
+        assert "cache" in result["runtime_applied"]
+        pool._unload_engine.assert_awaited_once_with("loaded-model")
+        assert pool._scheduler_config.paged_ssd_cache_auto_size == (
+            cache_size == "auto"
+        )
+        assert pool._scheduler_config.initial_cache_blocks == 512
+
+
+@pytest.mark.parametrize("alias, split", [("ssd", True), ("hot", False)])
+def test_gdn_storage_alias_only_rebuilds_on_policy_change(alias, split):
+    gs = GlobalSettings()
+    gs.save = MagicMock()
+    gs.cache.gdn_ssd_split_enabled = split
+    request = GlobalSettingsRequest(gdn_snapshot_storage=alias)
+
+    with (
+        _patched_global_settings(gs),
+        patch.object(
+            admin_routes,
+            "_apply_cache_settings_runtime",
+            new_callable=AsyncMock,
+            return_value=(True, "applied"),
+        ) as apply_cache,
+    ):
+        asyncio.run(admin_routes.update_global_settings(request, is_admin=True))
+        apply_cache.assert_not_awaited()
+        gs.cache.gdn_ssd_split_enabled = not split
+        asyncio.run(admin_routes.update_global_settings(request, is_admin=True))
+        apply_cache.assert_awaited_once()
+        assert gs.cache.gdn_ssd_split_enabled is split
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_qwen4_decode_setting_updates_future_model_loads(enabled):
+    from omlx.scheduler import SchedulerConfig
+    from omlx.server import _server_state
+
+    gs = _make_global_settings()
+    gs.server.qwen4_gdn_decode_wide_proj = not enabled
+    pool = SimpleNamespace(
+        _scheduler_config=SchedulerConfig(qwen4_gdn_decode_wide_proj=not enabled)
+    )
+    request = GlobalSettingsRequest(qwen4_gdn_decode_wide_proj=enabled)
+    with _patched_global_settings(gs), patch.object(_server_state, "engine_pool", pool):
+        result = asyncio.run(
+            admin_routes.update_global_settings(request=request, is_admin=True)
+        )
+    assert result["success"] is True
+    assert "qwen4_gdn_decode_wide_proj" not in result["runtime_applied"]
+    assert gs.server.qwen4_gdn_decode_wide_proj is enabled
+    assert pool._scheduler_config.qwen4_gdn_decode_wide_proj is enabled
+    gs.save.assert_called_once()

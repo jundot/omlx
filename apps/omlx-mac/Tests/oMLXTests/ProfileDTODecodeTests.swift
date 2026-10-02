@@ -17,6 +17,53 @@ final class ProfileDTODecodeTests: XCTestCase {
         return d
     }()
 
+    func testOptimalCandidatesAndApplyResultDecode() throws {
+        let candidates = """
+        {
+            "found": true, "model_name": "Qwen3.8-27B-4bit", "context_length": 4096,
+            "device": {"chip_name": "M5", "chip_variant": "Max", "memory_gb": 128},
+            "by_pp": [{"benchmark_id": "p5x3r8d2",
+                       "benchmark_url": "https://omlx.ai/benchmarks/performance/p5x3r8d2",
+                       "pp_tps": 1309.1, "tg_tps": 59.6, "quantization": "4bit",
+                       "omlx_version": "0.7.0", "created_at": "2026-09-10 01:02:03",
+                       "context_profile": "code_python", "memory_gb": 64}],
+            "by_tg": [],
+            "search_url": "https://omlx.ai/benchmarks/performance?device=%5B%22M5%22%2C+%22Max%22%5D"
+        }
+        """.data(using: .utf8)!
+        let list = try decoder.decode(OptimalCandidatesDTO.self, from: candidates)
+        XCTAssertTrue(list.found)
+        XCTAssertEqual(list.byPp.first?.id, "p5x3r8d2")
+        XCTAssertEqual(list.byPp.first?.ppTps, 1309.1)
+        XCTAssertEqual(list.byPp.first?.memoryGb, 64)
+        XCTAssertTrue(list.byTg.isEmpty)
+
+        let none = try decoder.decode(OptimalCandidatesDTO.self, from: """
+        {"found": false, "by_pp": [], "by_tg": [], "search_url": "https://omlx.ai/benchmarks/performance?x=1"}
+        """.data(using: .utf8)!)
+        XCTAssertFalse(none.found)
+        XCTAssertEqual(none.searchUrl?.hasPrefix("https://omlx.ai/benchmarks/performance?"), true)
+
+        let applied = """
+        {
+            "success": true, "model_id": "m",
+            "benchmark_id": "p5x3r8d2",
+            "benchmark_url": "https://omlx.ai/benchmarks/performance/p5x3r8d2",
+            "pp_tps": 1309.1, "tg_tps": 59.6, "quantization": "4bit",
+            "requires_reload": false, "auto_unloaded": false, "auto_reloaded": false,
+            "changed": true,
+            "applied": {"temperature": 0.6, "turboquant_kv_enabled": true, "top_k": 20},
+            "skipped": [{"feature": "dflash", "reason": "draft model 'x' is not installed"}],
+            "settings": {"temperature": 0.6, "turboquant_kv_enabled": true}
+        }
+        """.data(using: .utf8)!
+        let result = try decoder.decode(SettingsApplyResultDTO.self, from: applied)
+        XCTAssertEqual(result.benchmarkId, "p5x3r8d2")
+        XCTAssertEqual(result.skipped?.first?.feature, "dflash")
+        XCTAssertEqual(result.settings?.temperature, 0.6)
+        XCTAssertEqual(result.applied?["top_k"], AnyCodable(20))
+    }
+
     func testTemplateWithNullTimestampsDecodes() throws {
         // Templates with null `created_at`/`updated_at` (legacy disk
         // state from before timestamps were required) must still
@@ -101,6 +148,47 @@ final class ProfileDTODecodeTests: XCTestCase {
         XCTAssertEqual(resp.templates[0].isBuiltin, true)
         XCTAssertEqual(resp.templates[1].isBuiltin, false)
         XCTAssertEqual(resp.templates[1].createdAt, "2026-05-12T10:00:00+00:00")
+    }
+
+    func testModelProfileWithExposeAsModelDecodes() throws {
+        // /api/models/{id}/profiles carries `expose_as_model` plus the
+        // server-derived `model_id` and `has_engine_fields` — the server
+        // owns the engine-field classification, the client never mirrors it.
+        let json = """
+        {
+            "name": "thinking",
+            "display_name": "Thinking",
+            "description": null,
+            "created_at": "2026-06-10T10:00:00+00:00",
+            "updated_at": "2026-06-10T10:00:00+00:00",
+            "settings": {"enable_thinking": true, "dflash_enabled": true},
+            "expose_as_model": true,
+            "model_id": "qwen-base:thinking",
+            "has_engine_fields": true
+        }
+        """.data(using: .utf8)!
+
+        let dto = try decoder.decode(ProfileDTO.self, from: json)
+        XCTAssertEqual(dto.exposeAsModel, true)
+        XCTAssertEqual(dto.modelId, "qwen-base:thinking")
+        XCTAssertEqual(dto.hasEngineFields, true)
+    }
+
+    func testUpdateRequestOmitsExposeAsModelWhenNil() throws {
+        // The server merges only the fields present in the body, so a
+        // settings-only update must NOT carry `expose_as_model` — sending
+        // it would clobber exposure state set from the web dashboard.
+        let encoder = JSONEncoder()
+
+        let settingsOnly = try JSONSerialization.jsonObject(
+            with: encoder.encode(UpdateProfileRequest(settings: [:]))
+        ) as! [String: Any]
+        XCTAssertNil(settingsOnly["expose_as_model"])
+
+        let exposeToggle = try JSONSerialization.jsonObject(
+            with: encoder.encode(UpdateProfileRequest(exposeAsModel: true))
+        ) as! [String: Any]
+        XCTAssertEqual(exposeToggle["expose_as_model"] as? Bool, true)
     }
 
     func testLegacyResponseMissingIsBuiltinStillDecodes() throws {

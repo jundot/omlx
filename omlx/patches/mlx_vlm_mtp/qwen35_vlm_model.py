@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import logging
 
+from .qwen38_fp8 import dequantize_fp8_weights
+
 logger = logging.getLogger(__name__)
 
 _APPLIED = False
@@ -45,6 +47,8 @@ def apply() -> bool:
         return True
 
     def sanitize(self, weights):
+        weights = dequantize_fp8_weights(weights)
+
         # Detect raw-HF input via unsanitized conv1d shape (matches
         # mlx_lm_mtp/qwen35_model.py). Already-sanitized checkpoints
         # (e.g. an oQ output passed through this sanitize again) keep
@@ -95,11 +99,15 @@ def apply() -> bool:
 
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 value = value.moveaxis(2, 1)
-            if should_shift_norm_weights and any(
-                key.endswith(sfx) for sfx in norm_keys
+            # Head norms follow the backbone: raw-HF shifts every gamma by
+            # +1, MLX-format is loaded as stored. Legacy mixed heads are
+            # repaired in ``norm_repair`` at load_weights time (see #3742).
+            if (
+                should_shift_norm_weights
+                and value.ndim == 1
+                and any(key.endswith(sfx) for sfx in norm_keys)
             ):
-                if value.ndim == 1:
-                    value = value + 1.0
+                value = value + 1.0
 
             sanitized_weights[key] = value
 

@@ -8,7 +8,13 @@ the oMLX codebase.
 
 from .tokenizer import get_tokenizer_config, apply_qwen3_fix
 from .formatting import format_bytes as format_bytes_util
-from .install import get_cli_prefix, get_install_method, is_app_bundle, is_homebrew
+from .install import (
+    get_cli_command_prefix,
+    get_cli_prefix,
+    get_install_method,
+    is_app_bundle,
+    is_homebrew,
+)
 from .hardware import (
     HardwareInfo,
     detect_hardware,
@@ -46,6 +52,7 @@ __all__ = [
     "format_bytes",
     "DEFAULT_MEMORY_BYTES",
     # Install detection
+    "get_cli_command_prefix",
     "get_cli_prefix",
     "get_install_method",
     "is_app_bundle",

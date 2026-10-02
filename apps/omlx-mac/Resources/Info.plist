@@ -37,7 +37,9 @@
 	<false/>
 	<!--
 	  URL scheme used by AppDelegate.presentAppView() to ask SwiftUI's
-	  Window scene (id "main") to instantiate on first invocation.
+	  Window scene (id "main") to instantiate on first invocation. The
+	  request targets this exact app bundle so another registered copy
+	  cannot handle it.
 	  The scene's `.handlesExternalEvents(matching: ["main"])` consumes
 	  `omlxapp://main`. Once the NSWindow exists, subsequent shows go
 	  through `makeKeyAndOrderFront` directly.
@@ -60,6 +62,7 @@
 		<string>zh-Hant</string>
 		<string>ja</string>
 		<string>ko</string>
+		<string>ru</string>
 	</array>
 </dict>
 </plist>

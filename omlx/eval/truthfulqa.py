@@ -72,6 +72,7 @@ class TruthfulQABenchmark(BaseBenchmark):
 
         logger.info(f"TruthfulQA: loaded {len(items)} questions")
 
+        self.dataset_total = len(items)
         if sample_size == 0:
             return items
 

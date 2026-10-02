@@ -76,6 +76,53 @@ class TestStatusEndpoint:
         assert "GB" in data["model_memory_used_formatted"]
         assert "GB" in data["model_memory_max_formatted"]
 
+    def test_status_ignores_memory_ceiling_error(self, client):
+        """Memory telemetry failures should not break status polling."""
+        pool = MagicMock(spec=[
+            "model_count", "loaded_model_count", "get_loaded_model_ids",
+            "current_model_memory", "_entries",
+        ])
+        pool.model_count = 1
+        pool.loaded_model_count = 1
+        pool.get_loaded_model_ids.return_value = ["model-a"]
+        pool.current_model_memory = 16 * 1024**3
+        pool._entries = {}
+        enforcer = MagicMock(spec=["get_final_ceiling"])
+        enforcer.get_final_ceiling.side_effect = RuntimeError(
+            "host_statistics64 failed"
+        )
+        self._state.engine_pool = pool
+        self._state.process_memory_enforcer = enforcer
+
+        resp = client.get("/api/status")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["model_memory_max"] is None
+        assert data["model_memory_max_formatted"] == "unlimited"
+
+    def test_health_ignores_memory_ceiling_error(self, client):
+        """Health should stay healthy when optional memory telemetry fails."""
+        pool = MagicMock(spec=[
+            "model_count", "loaded_model_count", "current_model_memory",
+        ])
+        pool.model_count = 1
+        pool.loaded_model_count = 1
+        pool.current_model_memory = 16 * 1024**3
+        enforcer = MagicMock(spec=["get_final_ceiling"])
+        enforcer.get_final_ceiling.side_effect = RuntimeError(
+            "host_statistics64 failed"
+        )
+        self._state.engine_pool = pool
+        self._state.process_memory_enforcer = enforcer
+
+        resp = client.get("/health")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "healthy"
+        assert data["engine_pool"]["final_ceiling"] == 0
+
     def test_aggregates_active_waiting_requests(self, client):
         """Active/waiting request counts are summed across loaded engines."""
         # Build a mock engine with scheduler
@@ -157,3 +204,59 @@ class TestStatusEndpoint:
         data = resp.json()
         assert data["model_memory_max"] is None
         assert data["model_memory_max_formatted"] == "unlimited"
+
+
+class TestStatusCustomKernels:
+    """/api/status reports native custom kernel availability.
+
+    Diagnosability for silently-degraded source installs: without the
+    native extensions the affected model families fall back to much slower
+    generic paths (issue #2137), and this block makes that detectable by
+    external polling instead of only a log line.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup_server_state(self):
+        state = ServerState()
+        with patch("omlx.server._server_state", state):
+            yield
+
+    def test_custom_kernels_block_lists_every_package(self, client):
+        from omlx.custom_kernels import NATIVE_KERNEL_PACKAGES
+
+        resp = client.get("/api/status")
+        assert resp.status_code == 200
+        kernels = resp.json()["custom_kernels"]
+        assert set(kernels) == set(NATIVE_KERNEL_PACKAGES)
+        for report in kernels.values():
+            assert set(report) == {"available", "import_error"}
+            assert isinstance(report["available"], bool)
+            assert report["import_error"] is None or isinstance(
+                report["import_error"], str
+            )
+
+    def test_available_packages_report_no_import_error(self, client):
+        resp = client.get("/api/status")
+        for name, report in resp.json()["custom_kernels"].items():
+            if report["available"]:
+                assert report["import_error"] is None, name
+            else:
+                assert report["import_error"], name
+
+    def test_native_kernel_status_never_raises_on_broken_package(self):
+        from omlx import custom_kernels
+
+        real_import = custom_kernels.importlib.import_module
+
+        def broken_import(name, *args, **kwargs):
+            if name.endswith(".fast"):
+                raise RuntimeError("simulated native import explosion")
+            return real_import(name, *args, **kwargs)
+
+        with patch.object(
+            custom_kernels.importlib, "import_module", side_effect=broken_import
+        ):
+            status = custom_kernels.native_kernel_status()
+        for name, report in status.items():
+            assert report["available"] is False, name
+            assert "simulated native import explosion" in report["import_error"]

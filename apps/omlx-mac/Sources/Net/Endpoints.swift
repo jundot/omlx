@@ -14,6 +14,7 @@ enum AdminAPI {
     static let login           = "\(prefix)/login"
     static let globalSettings  = "\(prefix)/global-settings"
     static let serverInfo      = "\(prefix)/server-info"
+    static let usage           = "\(prefix)/usage"
     static let stats           = "\(prefix)/stats"
     static let statsClear      = "\(prefix)/stats/clear"
     static let statsClearAlltime = "\(prefix)/stats/clear-alltime"
@@ -25,6 +26,10 @@ enum AdminAPI {
     static func loadModel(_ id: String) -> String   { "\(models)/\(id)/load" }
     static func unloadModel(_ id: String) -> String { "\(models)/\(id)/unload" }
     static func modelSettings(_ id: String) -> String { "\(models)/\(id)/settings" }
+    // Settings snapshots: reset to defaults, omlx.ai benchmark candidates, pasted recipe.
+    static func modelSettingsReset(_ id: String) -> String { "\(modelSettings(id))/reset" }
+    static func modelSettingsOptimal(_ id: String) -> String { "\(modelSettings(id))/optimal" }
+    static func modelSettingsRecipe(_ id: String) -> String { "\(modelSettings(id))/recipe" }
     static let reloadModels    = "\(prefix)/reload"
 
     static func modelProfiles(_ id: String) -> String { "\(models)/\(id)/profiles" }
@@ -33,6 +38,9 @@ enum AdminAPI {
     }
     static func applyModelProfile(_ id: String, _ name: String) -> String {
         "\(models)/\(id)/profiles/\(name)/apply"
+    }
+    static func applyModelTemplate(_ id: String, _ name: String) -> String {
+        "\(models)/\(id)/profile-templates/\(name)/apply"
     }
     static let profileTemplates = "\(prefix)/profile-templates"
     static func profileTemplate(_ name: String) -> String {
@@ -50,6 +58,7 @@ enum AdminAPI {
     static func hfTask(_ taskId: String) -> String   { "\(prefix)/hf/task/\(taskId)" }
     static let hfRecommended   = "\(prefix)/hf/recommended"
     static let hfSearch        = "\(prefix)/hf/search"
+    static let hfModelInfo     = "\(prefix)/hf/model-info"
     static func hfModel(_ name: String) -> String { "\(prefix)/hf/models/\(name)" }
 
     // Phase 2 — ModelScope downloader (mirrors the /hf/* surface 1:1, just
@@ -62,6 +71,7 @@ enum AdminAPI {
     static func msTask(_ taskId: String) -> String   { "\(prefix)/ms/task/\(taskId)" }
     static let msRecommended   = "\(prefix)/ms/recommended"
     static let msSearch        = "\(prefix)/ms/search"
+    static let msModelInfo     = "\(prefix)/ms/model-info"
 
     // PR 9
     static let setupApiKey     = "\(prefix)/setup-api-key"
@@ -88,6 +98,13 @@ enum AdminAPI {
     static let benchStart      = "\(prefix)/bench/start"
     static func benchResults(_ benchId: String) -> String { "\(prefix)/bench/\(benchId)/results" }
     static func benchCancel(_ benchId: String) -> String  { "\(prefix)/bench/\(benchId)/cancel" }
+    static let aneTuneStart = "\(prefix)/bench/ane-tune/start"
+    static func aneTuneResults(_ tuningId: String) -> String {
+        "\(prefix)/bench/ane-tune/\(tuningId)/results"
+    }
+    static func aneTuneCancel(_ tuningId: String) -> String {
+        "\(prefix)/bench/ane-tune/\(tuningId)/cancel"
+    }
 
     // PR 13 — Accuracy bench
     static let accuracyQueueAdd    = "\(prefix)/bench/accuracy/queue/add"
@@ -96,4 +113,9 @@ enum AdminAPI {
     static let accuracyResults     = "\(prefix)/bench/accuracy/results"
     static let accuracyReset       = "\(prefix)/bench/accuracy/results/reset"
     static let accuracyCancel      = "\(prefix)/bench/accuracy/cancel"
+
+    // Context bench
+    static let contextBenchStart   = "\(prefix)/bench/context/start"
+    static func contextBenchResults(_ benchId: String) -> String { "\(prefix)/bench/context/\(benchId)/results" }
+    static func contextBenchCancel(_ benchId: String) -> String  { "\(prefix)/bench/context/\(benchId)/cancel" }
 }

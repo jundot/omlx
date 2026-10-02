@@ -8,6 +8,25 @@
 
 import Foundation
 
+/// Explicit-null wrapper for Int patch fields. The property stays
+/// `PatchOptionalInt?`: `nil` = omit the key entirely, `.null` = send
+/// JSON `null`, `.value(n)` = send the integer.
+enum PatchOptionalInt: Equatable, Sendable {
+    case null, value(Int)
+}
+
+extension PatchOptionalInt: Encodable {
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .null:
+            try container.encodeNil()
+        case .value(let n):
+            try container.encode(n)
+        }
+    }
+}
+
 struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     let basePath: String?
     let server: ServerSettings
@@ -31,6 +50,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     let claudeCode: ClaudeCodeSettings?
     let integrations: IntegrationsSettings?
     let mcp: MCPSettings?
+    let usage: UsageSettings?
 
     struct ServerSettings: Codable, Equatable, Sendable {
         let host: String
@@ -38,17 +58,23 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let logLevel: String
         let serverAliases: [String]
         let sseKeepaliveMode: String?
+        let autoStartOnLaunch: Bool?
+        let maxAudioUploadSize: String?
     }
 
     struct ModelSettings: Codable, Equatable, Sendable {
         let modelDirs: [String]?
-        let maxModelMemory: String?
+        let modelDir: String?
         let modelFallback: Bool?
     }
 
     struct SchedulerSettings: Codable, Equatable, Sendable {
         let maxConcurrentRequests: Int
+        let embeddingBatchSize: Int?
         let chunkedPrefill: Bool?
+        /// "context" (default) | "speed" — what the prefill memory guard
+        /// optimizes under pressure.
+        let prefillPriority: String?
     }
 
     struct CacheSettings: Codable, Equatable, Sendable {
@@ -61,12 +87,12 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     }
 
     /// Mirrors the `memory.*` block of GET /admin/api/global-settings.
-    /// `max_process_memory` accepts "auto", "disabled", or "NN%". The
-    /// prefill guard is a runtime-applied bool — when on, the server
-    /// preflights prefill memory before kicking the engine.
+    /// The prefill guard and tier are runtime-applied. When enabled, the
+    /// server preflights prefill memory before kicking the engine.
     struct MemorySettings: Codable, Equatable, Sendable {
-        let maxProcessMemory: String?
         let prefillMemoryGuard: Bool?
+        let memoryGuardTier: String?
+        let memoryGuardCustomCeilingGb: Double?
     }
 
     /// Mirrors the `idle_timeout.*` block. `idle_timeout_seconds == nil`
@@ -83,9 +109,40 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let subKeys: [SubKeyDTO]?
     }
 
+    /// Slice of the `system.*` block. The memory-layer fields feed the
+    /// Performance screen's effective-ceiling preview (min(static, dynamic,
+    /// metal cap)) so a clamped Custom ceiling is visible before the guard
+    /// aborts anything — same data the web dashboard breakdown uses.
     struct SystemInfo: Codable, Equatable, Sendable {
         let totalMemoryBytes: Int64?
         let totalMemory: String?
+        /// oMLX process phys_footprint at fetch time.
+        let omlxPhysFootprintBytes: Int64?
+        /// macOS vm_stat layers; zero on read failure.
+        let freeMemoryBytes: Int64?
+        let inactiveMemoryBytes: Int64?
+        let activeMemoryBytes: Int64?
+        /// Effective Metal cap: kernel iogpu.wired_limit_mb when set,
+        /// else Apple's max_recommended_working_set_size.
+        let iogpuWiredLimitBytes: Int64?
+        /// What oMLX asked Metal to allow at start (static ceiling clamped
+        /// below physical RAM). Kernel cap below this = red warning.
+        let omlxWiredLimitRequestBytes: Int64?
+        /// Ceiling each memory guard tier would set right now, keyed by tier.
+        var memoryGuardPreview: [String: MemoryGuardTierPreview]? = nil
+    }
+
+    /// One tier of `system.memory_guard_preview` (server-side enforcer math).
+    struct MemoryGuardTierPreview: Codable, Equatable, Sendable {
+        let reserveBytes: Int64?
+        let freeBytes: Int64?
+        let inactiveBytes: Int64?
+        let otherAppsBytes: Int64?
+        let staticBytes: Int64?
+        let dynamicBytes: Int64?
+        let metalCapBytes: Int64?
+        let ceilingBytes: Int64?
+        let binding: String?
     }
 
     /// Mirrors `omlx.settings.HuggingFaceSettings`. Empty string means
@@ -93,6 +150,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     /// the value via env var (HF_ENDPOINT) so the HF library picks it up.
     struct HuggingFaceDTO: Codable, Equatable, Sendable {
         let endpoint: String
+        let hfCacheEnabled: Bool?
     }
 
     /// Mirrors `omlx.settings.SamplingSettings`. The full server surface
@@ -109,8 +167,6 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     }
 
     struct ClaudeCodeSettings: Codable, Equatable, Sendable {
-        let contextScalingEnabled: Bool?
-        let targetContextSize: Int?
         let mode: String?
         let opusModel: String?
         let sonnetModel: String?
@@ -125,6 +181,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let openclawToolsProfile: String?
         let hermesModel: String?
         let copilotModel: String?
+        let dshModel: String?
     }
 
     /// Mirrors `omlx.settings.MCPSettings`. The server stores a single path to
@@ -132,6 +189,14 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     /// Code, OpenClaw, Hermes, …). Empty / nil means no MCP server is wired.
     struct MCPSettings: Codable, Equatable, Sendable {
         let configPath: String?
+    }
+
+    /// Mirrors `omlx.settings.UsageSettings`. `usage_history` switches the
+    /// local hourly serving history behind Status → Usage History. Patched
+    /// via the flat `usage_history` key; the server applies it live and keeps
+    /// the existing usage.sqlite3 when it is turned off.
+    struct UsageSettings: Codable, Equatable, Sendable {
+        let usageHistory: Bool?
     }
 
     /// Mirrors `omlx.settings.ModelScopeSettings`. Empty string means
@@ -160,6 +225,7 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var port: Int? = nil
     var logLevel: String? = nil
     var maxConcurrentRequests: Int? = nil
+    var embeddingBatchSize: Int? = nil
 
     // Server — Advanced (Phase 4).
     /// Extra host names the server identifies as for cookie/host-header
@@ -169,10 +235,11 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     /// SSE keep-alive line strategy: `"chunk"` (default), `"comment"`, or
     /// `"off"`. Server rejects anything else with a 400.
     var sseKeepaliveMode: String? = nil
+    var autoStartOnLaunch: Bool? = nil
+    /// Human-readable cap such as `100MB` or `1GB`. Applied immediately.
+    var maxAudioUploadSize: String? = nil
 
     // Claude Code (PR 9)
-    var claudeCodeContextScalingEnabled: Bool? = nil
-    var claudeCodeTargetContextSize: Int? = nil
     var claudeCodeMode: String? = nil
     var claudeCodeOpusModel: String? = nil
     var claudeCodeSonnetModel: String? = nil
@@ -186,11 +253,17 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var integrationsOpenclawToolsProfile: String? = nil
     var integrationsHermesModel: String? = nil
     var integrationsCopilotModel: String? = nil
+    var integrationsDshModel: String? = nil
 
     /// Path to an MCP server config file. Empty string clears the field on
     /// the server (`global_settings.mcp.config_path = None`). Shared across
     /// every integration launcher.
     var mcpConfig: String? = nil
+
+    /// Record local usage history (Status → Usage History). Applied at
+    /// runtime; turning it off keeps the existing usage.sqlite3 so turning
+    /// it back on resumes the same history.
+    var usageHistory: Bool? = nil
 
     // Auth (PR 9)
     var skipApiKeyVerification: Bool? = nil
@@ -215,6 +288,9 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     /// HF_ENDPOINT env var to the HF default (huggingface.co). Patches in-
     /// place via `omlx/admin/routes.py:2804`.
     var hfEndpoint: String? = nil
+    /// Discover MLX-compatible models from the standard Hugging Face Hub
+    /// local cache. Server default is true.
+    var hfCacheEnabled: Bool? = nil
 
     /// ModelScope mirror endpoint. Empty string = use modelscope.cn.
     /// Patched via `ms_endpoint` (encoder converts to snake_case).
@@ -232,22 +308,25 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     //
     // All flat (snake-cased on the wire by `convertToSnakeCase`). Server
     // applies live wherever possible — see `omlx/admin/routes.py` for the
-    // per-field apply paths. `initial_cache_blocks` and `max_process_memory`
-    // are persisted but only take effect on restart; everything else is
-    // hot-applied.
+    // per-field apply paths. `initial_cache_blocks` requires restart;
+    // memory guard settings are hot-applied.
 
-    /// Free-form memory limit. Accepts `"auto"`, `"disabled"`, or `"NN%"`.
-    var maxProcessMemory: String? = nil
     var memoryPrefillMemoryGuard: Bool? = nil
+    /// Memory guard tier: `"safe"`, `"balanced"`, `"aggressive"`, or
+    /// `"custom"`. For custom, pair with `memoryGuardCustomCeilingGb`.
+    var memoryGuardTier: String? = nil
+    var memoryGuardCustomCeilingGb: Double? = nil
 
-    /// Max bytes the engine pool will hold (`"24GB"`, `"50%"`, etc.).
-    var maxModelMemory: String? = nil
     /// When the requested model isn't loaded, fall back to any loaded
     /// model rather than 404.
     var modelFallback: Bool? = nil
+    /// Ordered model roots. The first directory is the primary download
+    /// target; all entries are scanned for local models.
+    var modelDirs: [String]? = nil
 
     /// Multi-block prefill — splits long prompts across scheduler ticks.
     var chunkedPrefill: Bool? = nil
+    var prefillPriority: String? = nil
 
     var cacheEnabled: Bool? = nil
     var hotCacheOnly: Bool? = nil
@@ -258,10 +337,9 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var initialCacheBlocks: Int? = nil
 
     /// Server-wide model auto-unload after N seconds idle. Server enforces
-    /// `>= 60`. Pass `nil` to leave unchanged; the Swift VM models the
-    /// "disabled" case separately (server-side disable isn't a patch op
-    /// today — see PerformanceScreen).
-    var idleTimeoutSeconds: Int? = nil
+    /// `>= 60`. `nil` (default) leaves it unchanged, `.null` disables
+    /// auto-unload, `.value(n)` sets it.
+    var idleTimeoutSeconds: PatchOptionalInt? = nil
 }
 
 struct UpdateGlobalSettingsResponse: Decodable, Sendable {

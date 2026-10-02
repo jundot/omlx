@@ -2,6 +2,7 @@
     "models": [
         {
             "id": "Qwen3.6-27B-UD-MLX-4bit",
+            "display_name": "deepsweet/Qwen3.6-27B-UD-MLX-4bit",
             "model_path": "/Users/test/.omlx/models/Qwen3.6-27B-UD-MLX-4bit",
             "loaded": false,
             "is_loading": false,
@@ -67,6 +68,7 @@
                 "dflash_ssd_cache_max_bytes": 21474836480,
                 "dflash_draft_window_size": null,
                 "dflash_draft_sink_size": null,
+                "dflash_block_size": null,
                 "dflash_verify_mode": null,
                 "mtp_enabled": false,
                 "vlm_mtp_enabled": false,

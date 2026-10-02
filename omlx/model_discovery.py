@@ -17,6 +17,8 @@ Supports:
 import contextlib
 import json
 import logging
+import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -28,6 +30,7 @@ EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "au
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
+    "deepseek_v41",
     "qwen2_vl",
     "qwen2_5_vl",
     "qwen3_vl",
@@ -35,6 +38,8 @@ VLM_MODEL_TYPES = {
     "qwen3_5_moe",
     "gemma3",
     "gemma4",
+    "gemma4_unified",
+    "diffusion_gemma",
     "llava",
     "llava_next",
     "llava-qwen2",
@@ -53,13 +58,97 @@ VLM_MODEL_TYPES = {
     "florence2",
     "deepseekocr",
     "deepseekocr_2",
+    "unlimited_ocr",
     "dots_ocr",
     "glm_ocr",
+    "minimax_m3_vl",
     "minicpmv",
     "phi4_siglip",
     "phi4mm",
     "youtu_vl",
+    "inkling",
+    "inkling_mm_model",  # config model_type of Inkling Small checkpoints
+    "muse_glimmer",
+    "glm5_next",
 }
+
+# Text-only model families that are implemented in mlx-vlm rather than
+# mlx-lm. They still use the VLM engine because that path loads mlx-vlm
+# models and adapts their language model to oMLX's scheduler.
+VLM_NATIVE_TEXT_MODEL_TYPES = {
+    "cohere2_moe",
+    # mlx-lm ships its own deepseek_v41 without the oMLX cache and kernels.
+    "deepseek_v41",
+    "glm5_next",
+    "minimax_m3",
+}
+
+# Multimodal checkpoints whose currently vendored mlx-lm implementation only
+# exposes the text backbone. Route them directly to BatchedEngine instead of
+# deliberately failing an mlx-vlm load and relying on the engine-pool fallback.
+# Remove a family once mlx-vlm provides its multimodal implementation.
+MLX_LM_TEXT_ONLY_MODEL_TYPES = {
+    "mimo_v2",
+    "mimo_v2_flash",
+}
+
+_MIMO_VISION_SIDECAR = Path("omnimodal/vision_encoder.safetensors")
+_MIMO_OMNIMODAL_CONFIG = Path("omnimodal/config.json")
+
+# Speculative-decoding "helper" checkpoints (dFlash / MTP / assistant drafters)
+# are never meant to be served as standalone chat models. Some declare a
+# distinctive top-level model_type — an ``*_assistant`` (e.g. gemma4_assistant)
+# or ``*_mtp`` (e.g. qwen3_5_mtp) marker — but DFlash draft checkpoints declare
+# a plain model_type (e.g. ``qwen3``) and are only distinguishable by their
+# architecture name (``DFlashDraftModel``) or a drafter-only config block
+# (``dflash_config``). Keep these in sync with the drafter resolution in
+# engine_pool.py (~1498) and the dflash gate in engine/dflash.py when new
+# drafter families are added.
+HELPER_CONFIG_MODEL_TYPE_SUFFIXES = ("_assistant", "_mtp")
+_HELPER_ARCH_TOKENS = ("draft", "assistant", "mtp")
+_HELPER_CONFIG_KEYS = ("dflash_config",)
+
+
+def is_helper_config_model_type(config_model_type: str | None) -> bool:
+    """True when ``config_model_type`` marks a speculative-decoding drafter.
+
+    These are the raw top-level ``model_type`` values from a checkpoint's
+    config.json (e.g. ``gemma4_assistant``, ``qwen3_5_mtp``). Note this misses
+    DFlash drafts, whose model_type is a plain ``qwen3`` — use
+    :func:`is_helper_model_config` when the full config dict is available.
+    """
+    if not isinstance(config_model_type, str) or not config_model_type:
+        return False
+    mt = config_model_type.lower()
+    return mt.endswith(HELPER_CONFIG_MODEL_TYPE_SUFFIXES)
+
+
+def is_helper_model_config(config: dict) -> bool:
+    """True when a parsed config.json marks a speculative-decoding drafter.
+
+    Catches three intrinsic signals, any of which is definitive:
+    an ``*_assistant`` / ``*_mtp`` model_type, a drafter architecture name
+    (e.g. ``DFlashDraftModel``), or a drafter-only config block
+    (e.g. ``dflash_config``). These are helper checkpoints backing
+    dFlash / MTP / assistant speculative decoding, not chat models.
+    """
+    if not isinstance(config, dict):
+        return False
+    if is_helper_config_model_type(config.get("model_type")):
+        return True
+    if any(key in config for key in _HELPER_CONFIG_KEYS):
+        return True
+    architectures = config.get("architectures") or []
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    elif not isinstance(architectures, list | tuple | set):
+        return False
+    for arch in architectures:
+        arch_lower = str(arch).lower()
+        if any(token in arch_lower for token in _HELPER_ARCH_TOKENS):
+            return True
+    return False
+
 
 # Known VLM architectures
 VLM_ARCHITECTURES = {
@@ -79,6 +168,12 @@ VLM_ARCHITECTURES = {
     "Molmo2ForConditionalGeneration",
     "LlavaQwen2ForCausalLM",  # apple/FastVLM (all sizes)
     "Florence2ForConditionalGeneration",
+    "UnlimitedOCRForCausalLM",  # baidu/Unlimited-OCR
+    "InklingForConditionalGeneration",  # thinkingmachines/Inkling-Small
+    "MuseGlimmerForConditionalGeneration",  # meta-models/Muse-Glimmer-30B
+    "Glm5NextForConditionalGeneration",  # zai-org/GLM-5.3-Flash
+    "HfMoondream",  # vikhyatk/moondream2 (2025 revisions), moondream/moondream3-preview
+    "Moondream",  # vikhyatk/moondream2 (2024 revisions)
 }
 
 # Known embedding model types from mlx-embeddings
@@ -90,7 +185,6 @@ EMBEDDING_MODEL_TYPES = {
     "siglip",
     "colqwen2_5",
     "colqwen2-5",
-    "lfm2",
 }
 
 # Model types that have both embedding and LLM variants.
@@ -99,6 +193,7 @@ AMBIGUOUS_EMBEDDING_MODEL_TYPES = {
     "qwen3",
     "gemma3-text",
     "gemma3_text",
+    "lfm2",
 }
 
 # Known embedding architectures
@@ -134,6 +229,9 @@ CAUSAL_LM_RERANKER_ARCHITECTURES = {
 # (no lm_head weights). Detected by architecture + directory name heuristic.
 CAUSAL_LM_EMBEDDING_ARCHITECTURES = {
     "Qwen3ForCausalLM",  # Qwen3-Embedding uses CausalLM arch without lm_head
+    "Qwen2ForCausalLM",  # jina-code-embeddings & similar; only treated as an
+    # embedding when the dir-name heuristic (_is_causal_lm_embedding) also
+    # matches, so Qwen2/Qwen2.5 chat models are unaffected.
 }
 
 # Multimodal (VLM-based) reranker architectures.
@@ -264,6 +362,19 @@ AUDIO_STS_ARCHITECTURES = {
     "LFM2AudioModel",
 }
 
+# STT families whose mlx-audio implementations accept incremental audio
+# input (push-based realtime decoding): whisper via the AlignAtt
+# StreamingDecoder, voxtral_realtime via VoxtralStreamingSession. Gates
+# the realtime transcription WebSocket and the admin chat mic button.
+REALTIME_STT_MODEL_TYPES = {"whisper", "voxtral_realtime"}
+
+
+def is_realtime_stt_model(model_type: str, config_model_type: str) -> bool:
+    """True when an audio_stt model supports push-based realtime decoding."""
+    if model_type != "audio_stt":
+        return False
+    return (config_model_type or "").lower() in REALTIME_STT_MODEL_TYPES
+
 
 @dataclass
 class DiscoveredModel:
@@ -274,9 +385,23 @@ class DiscoveredModel:
     model_type: ModelType  # "llm", "vlm", "embedding", or "reranker"
     engine_type: EngineType  # "batched", "vlm", "embedding", or "reranker"
     estimated_size: int  # Estimated memory usage in bytes
+    text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
+    model_context_length: int | None = None  # Declared context length from config.json (None if unknown)
+    source_type: str = "local"  # "local" or "hf_cache"
+    source_repo_id: str | None = None  # HuggingFace repo id for cache-backed models
+    is_helper: bool = False  # Speculative-decoding drafter (dFlash/Assistant/MTP)
+
+
+@dataclass(frozen=True)
+class HfCacheEntry:
+    """Resolved HuggingFace Hub cache entry."""
+
+    snapshot_path: Path
+    model_id: str
+    source_repo_id: str
 
 
 def _is_unsupported_model(model_path: Path) -> bool:
@@ -310,6 +435,21 @@ def _is_unsupported_model(model_path: Path) -> bool:
     return normalized in UNSUPPORTED_MODEL_TYPES or model_type in UNSUPPORTED_MODEL_TYPES
 
 
+def _model_name_hint(model_path: Path) -> str:
+    """
+    Return the lowercased name used by the directory-name heuristics.
+
+    HF Hub cache snapshots live at ``models--Org--Name/snapshots/<commit>``,
+    so their directory name is a commit hash. Use the repo name there,
+    otherwise the model directory name.
+    """
+    if model_path.parent.name == "snapshots":
+        decoded = _decode_hf_cache_model_id(model_path.parent.parent)
+        if decoded is not None:
+            return decoded[1].rsplit("/", 1)[-1].lower()
+    return model_path.name.lower()
+
+
 def _is_causal_lm_reranker(model_path: Path) -> bool:
     """
     Heuristic check for CausalLM models fine-tuned as rerankers.
@@ -319,7 +459,7 @@ def _is_causal_lm_reranker(model_path: Path) -> bool:
     scoring. We detect them by checking the model directory name for "reranker"
     or "rerank" keywords, since config.json is identical to a standard LLM.
     """
-    name_lower = model_path.name.lower()
+    name_lower = _model_name_hint(model_path)
     return "reranker" in name_lower or "rerank" in name_lower
 
 
@@ -332,7 +472,7 @@ def _is_causal_lm_embedding(model_path: Path) -> bool:
     weights. We detect them by checking the model directory name for "embedding"
     or "embed" keywords, since config.json is identical to a standard LLM.
     """
-    name_lower = model_path.name.lower()
+    name_lower = _model_name_hint(model_path)
     return "embedding" in name_lower or "embed" in name_lower
 
 
@@ -372,27 +512,106 @@ def _has_sentence_transformers_embedding_pipeline(model_path: Path) -> bool:
     )
 
 
+def _looks_like_kokoro_config(config: dict) -> bool:
+    """Return True for Kokoro exports that omit HF ``model_type``.
+
+    mlx-community Kokoro conversions (e.g. Kokoro-82M-bf16) keep the original
+    Kokoro config — top-level ``istftnet`` + ``plbert`` sections and a
+    ``vocab`` table — with no HF-style ``model_type``/``architectures``.
+    mlx-audio loads them fine, but oMLX must classify them as TTS during
+    discovery or they fall through to the LLM engine, whose loader only
+    matches ``model*.safetensors`` and fails with a misleading
+    "No safetensors found" error.
+    """
+    if not isinstance(config, dict):
+        return False
+    return (
+        isinstance(config.get("istftnet"), dict)
+        and isinstance(config.get("plbert"), dict)
+        and isinstance(config.get("vocab"), dict)
+    )
+
+
+def _looks_like_nemo_asr_config(config: dict) -> bool:
+    """Return True for NeMo ASR exports that omit HF ``model_type``.
+
+    NVIDIA Parakeet TDT/CTC MLX conversions keep the original NeMo ASR
+    training config instead of a HuggingFace-style ``model_type`` or
+    ``architectures`` field.  mlx-audio can load these models by name, but
+    oMLX must still classify them as STT during discovery or they fall through
+    to the LLM engine and fail with a misleading ``'model_type'`` error.
+
+    Only top-level NeMo ASR module targets are considered so multimodal models
+    with nested ``audio_config`` sections are not misclassified.
+    """
+    if not isinstance(config, dict):
+        return False
+
+    module_targets: list[str] = []
+    for key in ("preprocessor", "encoder", "decoder", "joint"):
+        value = config.get(key)
+        if isinstance(value, dict):
+            target = value.get("_target_")
+            if isinstance(target, str):
+                module_targets.append(target.lower())
+
+    if not any("nemo.collections.asr" in target for target in module_targets):
+        return False
+
+    # NeMo ASR configs include an audio preprocessor plus tokenizer/decoder
+    # metadata.  Requiring these keeps the heuristic narrow while covering
+    # Parakeet TDT exports whose config has no model_type at all.
+    preprocessor = config.get("preprocessor")
+    has_audio_preprocessor = isinstance(preprocessor, dict) and (
+        "audio" in str(preprocessor.get("_target_", "")).lower()
+        or "melspectrogram" in str(preprocessor.get("_target_", "")).lower()
+    )
+    has_asr_head = isinstance(config.get("decoder"), dict) or isinstance(
+        config.get("joint"), dict
+    )
+    has_tokenizer = isinstance(config.get("tokenizer"), dict)
+    return has_audio_preprocessor and has_asr_head and has_tokenizer
+
+
 def _has_vision_subconfig(config: dict) -> bool:
     """
     Return True if ``config`` carries evidence of a vision sub-config.
 
-    Three keys cover the conventions in the wild:
+    Vision configuration conventions:
 
+    - ``vision_n_layers`` - DeepSeek V4 uses a positive layer count.
     - ``vision_config`` — most VLMs (Qwen2-VL, Gemma3, LLaVA-Next, ...).
     - ``vit_config`` — Molmo / Molmo2 family.
     - ``mm_vision_tower`` — older LLaVA family including FastVLM's
-      ``llava_qwen2``. The check is non-empty-only: a config-stub text-only
-      quant could in principle declare a tower path it doesn't ship weights
-      for, but in practice bf16 FastVLM ships a real path string.
+      ``llava_qwen2``.
+
+    The nested configurations use non-empty checks: text-only quants of VLM families can
+    leave an empty ``vision_config: {}`` stub behind after stripping the
+    vision tower (#2385), and key presence alone would misclassify them
+    as VLM.
 
     Used by the VLM classifier in :func:`detect_model_type` and by other
     paths (``oq``, admin model info) that need to ask "is this a VLM?".
     """
     return (
-        "vision_config" in config
-        or "vit_config" in config
+        (
+            config.get("model_type") == "deepseek_v4"
+            and (config.get("vision_n_layers") or 0) > 0
+        )
+        or bool(config.get("vision_config"))
+        or bool(config.get("vit_config"))
         or bool(config.get("mm_vision_tower"))
     )
+
+
+def _architecture_indicates_causal_lm(architectures: list[str]) -> bool:
+    """True when ``architectures`` describe a text causal LM (not mlx-audio STS).
+
+    Liquid LFM text checkpoints (LFM2, LFM2.5 MoE, etc.) use ``lfm*`` model
+    types and ``*ForCausalLM`` classes. mlx-audio LFM STS uses ``LFM2AudioModel``
+    and is handled earlier via :data:`AUDIO_STS_ARCHITECTURES`.
+    """
+    return any("causallm" in arch.lower() for arch in architectures)
 
 
 def detect_model_type(model_path: Path) -> ModelType:
@@ -487,6 +706,29 @@ def detect_model_type(model_path: Path) -> ModelType:
             "— treating as LLM"
         )
 
+    if normalized_type in MLX_LM_TEXT_ONLY_MODEL_TYPES:
+        has_mimo_vision = (
+            normalized_type in {"mimo_v2", "mimo_v2_flash"}
+            and (model_path / _MIMO_VISION_SIDECAR).is_file()
+            and (model_path / _MIMO_OMNIMODAL_CONFIG).is_file()
+        )
+        if has_mimo_vision:
+            logger.info("%s detected with MiMo omnimodal vision sidecar", model_type)
+            return "vlm"
+        if _has_vision_subconfig(config):
+            logger.warning(
+                "%s carries multimodal configuration, but no supported vision "
+                "sidecar is present; using the LLM engine",
+                model_type,
+            )
+        return "llm"
+
+    if normalized_type in VLM_NATIVE_TEXT_MODEL_TYPES:
+        logger.info(
+            f"{model_type} detected as mlx-vlm native text model"
+        )
+        return "vlm"
+
     # Check for VLM: architectures field
     # Some text-only quants (e.g., unsloth/gemma-4-31b-it-MLX-8bit) keep the VLM
     # architecture name but strip vision_config and vision weights.
@@ -507,8 +749,15 @@ def detect_model_type(model_path: Path) -> ModelType:
 
     # Check for VLM: model_type field (only if vision capabilities are present)
     # Some model families (e.g., qwen3_5_moe) have both VLM and text-only variants.
-    # Text-only quants won't carry a vision sub-config.
+    # Text-only quants won't carry a vision sub-config. gemma4_unified and
+    # diffusion_gemma are exceptions: they are served by mlx-vlm regardless of
+    # vision_config presence in config.json.
     if normalized_type in VLM_MODEL_TYPES:
+        if normalized_type in {"gemma4_unified", "diffusion_gemma"}:
+            logger.info(
+                f"{model_type} detected as VLM (mlx-vlm native model)"
+            )
+            return "vlm"
         if _has_vision_subconfig(config):
             return "vlm"
         logger.info(
@@ -530,6 +779,15 @@ def detect_model_type(model_path: Path) -> ModelType:
     for arch in architectures:
         if arch in AUDIO_STT_ARCHITECTURES:
             return "audio_stt"
+
+    # NeMo ASR exports such as mlx-community/parakeet-tdt-0.6b-v3 ship a
+    # NeMo training config without HF model_type/architectures.  They are
+    # still STT models and mlx-audio can load them by directory/repo name.
+    if _looks_like_nemo_asr_config(config):
+        return "audio_stt"
+    # Kokoro exports similarly ship a bare original config (istftnet/plbert).
+    if _looks_like_kokoro_config(config):
+        return "audio_tts"
     for arch in architectures:
         if arch in AUDIO_TTS_ARCHITECTURES:
             return "audio_tts"
@@ -546,21 +804,27 @@ def detect_model_type(model_path: Path) -> ModelType:
         return "audio_stt"
     if normalized_type in AUDIO_STS_MODEL_TYPES or model_type in AUDIO_STS_MODEL_TYPES:
         return "audio_sts"
-    # LFM2 audio: model_type starts with "lfm" and is not an embedding
+    # mlx-audio LFM STS may use an "lfm*" model_type without a known architecture
+    # string yet. Liquid LFM *text* checkpoints share that prefix — disambiguate
+    # with CausalLM architecture names (LFM2 / LFM2.5 MoE, future lfm* LMs).
     if normalized_type.startswith("lfm") and normalized_type not in EMBEDDING_MODEL_TYPES:
+        if _architecture_indicates_causal_lm(architectures):
+            return "llm"
         return "audio_sts"
 
     return "llm"
 
 
 def detect_thinking_default(model_path: Path) -> bool | None:
-    """Detect whether a model's chat template enables thinking by default.
+    """Detect a model's effective thinking default from local metadata.
 
     Inspects the Jinja chat template for ``enable_thinking`` references and
-    determines the default behaviour:
+    determines the default behaviour, including narrow model-family serving
+    recommendations when the raw template deliberately defaults to opt-in:
 
     * **True** — model thinks by default (e.g. Qwen 3.x: only suppresses
-      thinking when ``enable_thinking is false``).
+      thinking when ``enable_thinking is false``; Laguna: Poolside recommends
+      servers pass ``enable_thinking=true`` by default).
     * **False** — model suppresses thinking by default (e.g. Gemma 4: only
       enables thinking when ``enable_thinking`` is truthy,
       ``default(false)``).
@@ -587,14 +851,107 @@ def detect_thinking_default(model_path: Path) -> bool | None:
     if not template_text or "enable_thinking" not in template_text:
         return None
 
+    # Laguna's Jinja initializes the flag to false for direct tokenizer calls,
+    # while Poolside's serving recipe explicitly sets the default to true. Keep
+    # discovery, the admin "Auto" toggle, and API request policy consistent.
+    try:
+        with (model_path / "config.json").open(encoding="utf-8") as config_file:
+            model_config = json.load(config_file)
+    except (OSError, json.JSONDecodeError):
+        model_config = {}
+    if model_config.get("model_type") == "laguna":
+        return True
+
     # Heuristic: if the template only disables thinking when explicitly
     # ``enable_thinking is false``, then thinking is ON by default.
     # If the template requires ``enable_thinking`` to be truthy or uses
     # ``default(false)``, then thinking is OFF by default.
     if "enable_thinking is false" in template_text:
         return True  # ON by default (Qwen pattern)
+    # An explicit ``enable_thinking | default(true)`` filter states the ON
+    # default directly. It must be anchored and checked before the broad
+    # ``default(false)`` scan: a template may default *other* flags to false
+    # (e.g. ``preserve_thinking | default(false)``, Laguna S-2.1) without
+    # changing its thinking default.
+    if re.search(r"enable_thinking\s*\|\s*default\(true\)", template_text):
+        return True
     if "default(false)" in template_text or "enable_thinking)" in template_text:
         return False  # OFF by default (Gemma pattern)
+
+    return None
+
+
+# Context-length keys, in priority order. Order mirrors HuggingFace
+# Transformers conventions: ``max_position_embeddings`` is the canonical
+# field for decoder-only LLMs; ``max_seq_len`` / ``seq_length`` show up on
+# Llama / Mistral / Qwen forks; ``n_positions`` is the GPT-2 lineage.
+_CONTEXT_LENGTH_KEYS = (
+    "max_position_embeddings",
+    "max_seq_len",
+    "max_seq_length",
+    "seq_length",
+    "n_positions",
+)
+
+# tokenizer_config.json's ``model_max_length`` is Transformers' fallback
+# field. Transformers seeds it with ``int(1e30)`` when the tokenizer has
+# no real cap, and downstream code distinguishes that sentinel from a
+# real long context. Anything above ~1e18 is treated as the sentinel.
+_TOKENIZER_MAX_LENGTH_SENTINEL = 10**18
+
+
+def _read_model_context_length(model_path: Path) -> int | None:
+    """Discover the declared context length from a model's config files.
+
+    Resolution order:
+
+    1. Top-level ``config.json`` keys (``max_position_embeddings`` first,
+       then the rest of :data:`_CONTEXT_LENGTH_KEYS`).
+    2. Nested ``text_config`` / ``language_config`` keys (used by VLM
+       wrappers and Qwen-style MoE configs that put the language head in
+       a sub-object).
+    3. ``tokenizer_config.json``'s ``model_max_length`` — but only when
+       it is a finite positive integer, since Transformers seeds it with
+       ``int(1e30)`` as a "no cap" sentinel.
+
+    Returns:
+        Positive integer context length, or ``None`` when no usable
+        value was found in any of the above.
+    """
+    config_path = model_path / "config.json"
+    if config_path.exists():
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                model_config = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.debug(f"Failed to read config.json for {model_path}: {e}")
+            model_config = {}
+
+        for key in _CONTEXT_LENGTH_KEYS:
+            value = model_config.get(key)
+            if isinstance(value, int) and value > 0:
+                return value
+
+        for nest_key in ("text_config", "language_config"):
+            nested = model_config.get(nest_key)
+            if isinstance(nested, dict):
+                for key in _CONTEXT_LENGTH_KEYS:
+                    value = nested.get(key)
+                    if isinstance(value, int) and value > 0:
+                        return value
+
+    tc_path = model_path / "tokenizer_config.json"
+    if tc_path.exists():
+        try:
+            with open(tc_path, encoding="utf-8") as f:
+                tc = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.debug(f"Failed to read tokenizer_config.json for {model_path}: {e}")
+            tc = {}
+
+        value = tc.get("model_max_length")
+        if isinstance(value, int) and 0 < value < _TOKENIZER_MAX_LENGTH_SENTINEL:
+            return value
 
     return None
 
@@ -675,6 +1032,87 @@ def estimate_model_size(model_path: Path) -> int:
     return int(total_size * overhead_factor)
 
 
+# Weight-name prefixes that the text-only (mlx-lm) loaders drop when serving a
+# VLM-shaped checkpoint: qwen3_5(_moe) sanitize strips ``vision_tower.*`` and
+# ``model.visual.*``; the projector/vision-model spellings cover the other
+# families that ship text-only loadable checkpoints.
+_VISION_WEIGHT_PREFIXES = (
+    "vision_tower.",
+    "model.vision_tower.",
+    "visual.",
+    "model.visual.",
+    "vision_model.",
+    "model.vision_model.",
+    "multi_modal_projector.",
+    "model.multi_modal_projector.",
+)
+
+_SAFETENSORS_DTYPE_BYTES = {
+    "F64": 8, "I64": 8, "U64": 8,
+    "F32": 4, "I32": 4, "U32": 4,
+    "F16": 2, "BF16": 2, "I16": 2, "U16": 2,
+    "F8_E4M3": 1, "F8_E5M2": 1, "I8": 1, "U8": 1, "BOOL": 1,
+}
+
+
+def _vision_weight_bytes(model_path: Path) -> int:
+    """Sum tensor bytes under known vision prefixes from safetensors headers.
+
+    Reads only each shard's JSON header (dtype x shape per tensor), never the
+    weight data. Returns 0 when no shard parses or nothing matches.
+    """
+    import struct
+
+    total = 0
+    for shard in model_path.glob("*.safetensors"):
+        try:
+            with open(shard, "rb") as f:
+                (header_len,) = struct.unpack("<Q", f.read(8))
+                if header_len > 512 * 1024 * 1024:  # corrupt / not safetensors
+                    continue
+                header = json.loads(f.read(header_len))
+        except (OSError, ValueError, struct.error):
+            continue
+        for name, meta in header.items():
+            if name == "__metadata__" or not name.startswith(
+                _VISION_WEIGHT_PREFIXES
+            ):
+                continue
+            try:
+                dtype_size = _SAFETENSORS_DTYPE_BYTES.get(meta["dtype"], 0)
+                numel = 1
+                for dim in meta["shape"]:
+                    numel *= dim
+                total += numel * dtype_size
+            except (KeyError, TypeError):
+                continue
+    return total
+
+
+def estimate_text_only_model_size(model_path: Path) -> int:
+    """
+    Estimate memory usage when only the language part of a VLM-shaped
+    checkpoint is loaded (force_lm / model_type_override): the text loaders
+    drop the vision tower, so admission by the full file size over-charges by
+    the vision weights (#2385).
+
+    Returns 0 when there are no vision weights to subtract (plain text
+    checkpoints, unreadable shards) — callers fall back to
+    :func:`estimate_model_size`.
+    """
+    try:
+        vision_bytes = _vision_weight_bytes(model_path)
+        if vision_bytes <= 0:
+            return 0
+        full = estimate_model_size(model_path)
+    except (OSError, ValueError):
+        return 0
+    text_only = full - int(vision_bytes * 1.05)
+    if 0 < text_only < full:
+        return text_only
+    return 0
+
+
 def _is_adapter_dir(path: Path) -> bool:
     """Check if a directory contains a LoRA/PEFT adapter (has adapter_config.json)."""
     return (path / "adapter_config.json").exists()
@@ -685,39 +1123,471 @@ def _is_model_dir(path: Path) -> bool:
     return (path / "config.json").exists() and not _is_adapter_dir(path)
 
 
-def _resolve_hf_cache_entry(path: Path) -> tuple[Path, str] | None:
-    """Resolve an HF Hub cache entry (models--Org--Name/) to its active snapshot.
+_SHARD_FILE_RE = re.compile(r"-(\d+)-of-(\d+)\.safetensors$")
 
-    Returns (snapshot_path, model_name) or None if not a valid HF cache entry.
+
+def _missing_weight_shards(model_dir: Path) -> tuple[int, list[str], str] | None:
+    """Detect weight shards missing from an incompletely downloaded checkpoint.
+
+    An interrupted download leaves config.json (fetched first) plus a subset of
+    the weight shards, so the directory would otherwise register as a normal,
+    load-ready model. Verify the numbered weight shard set against the
+    checkpoint's own manifest: model.safetensors.index.json when it is
+    readable, else the ``-NNNNN-of-NNNNN`` shard filename numbering (the index
+    file itself may not have been downloaded yet).
+
+    Returns (missing count, up to 3 example names, manifest description), or
+    None when the directory is complete or makes no shard promises.
     """
-    name = path.name
-    if not name.startswith("models--") or name.count("--") < 2:
-        return None
-
-    # "models--Org--Name" → "Name"
-    model_name = name.split("--", 2)[2]
+    idx_path = model_dir / "model.safetensors.index.json"
+    index_missing: tuple[int, list[str]] | None = None
+    if idx_path.is_file():
+        try:
+            index = json.loads(idx_path.read_text())
+        except (OSError, ValueError):
+            # Unreadable/corrupt index (a non-UTF-8 file raises
+            # UnicodeDecodeError, a ValueError): fall back to the filename
+            # numbering below — loaders surface the index defect itself.
+            index = None
+        weight_map = index.get("weight_map") if isinstance(index, dict) else None
+        if isinstance(weight_map, dict) and weight_map:
+            # The index may also list auxiliary safetensors that are not part
+            # of the numbered model shard set. In particular, mlx-lm downloads
+            # ``model*.safetensors`` into the shared HF cache, while OptiQ
+            # indexes can also list ``optiq/optiq_vision.safetensors``. Treat
+            # only numbered shard references as completeness promises so an
+            # intentionally filtered, text-loadable cache remains discoverable
+            # (#2742).
+            referenced_shards = {
+                value
+                for value in weight_map.values()
+                if isinstance(value, str) and _SHARD_FILE_RE.search(value)
+            }
+            if referenced_shards:
+                # Resolve shard values against the model dir (the HF index
+                # convention), so ./-prefixed or subpath entries are handled.
+                missing = sorted(
+                    {
+                        value
+                        for value in referenced_shards
+                        if not (model_dir / value).is_file()
+                    }
+                )
+                if not missing:
+                    return None
+                referenced_count = len(referenced_shards)
+                if len(missing) < referenced_count:
+                    return len(missing), missing[:3], "model.safetensors.index.json"
+                # Every shard the index references is absent. An interrupted
+                # download keeps the shards it already fetched, so
+                # zero-of-referenced is not that shape — it is a stale index
+                # describing a different sharding of the same checkpoint (seen
+                # in the wild: a 4-shard weight_map shipped over 2 actual
+                # shards). Loaders glob model*.safetensors and never consult
+                # the index, so fall through and judge by the shard files
+                # actually present.
+                index_missing = (len(missing), missing[:3])
 
     try:
-        commit_hash = (path / "refs" / "main").read_text().strip()
+        shard_names = [
+            f.name
+            for f in model_dir.iterdir()
+            if f.is_file() and f.suffix == ".safetensors"
+        ]
     except OSError:
         return None
+    groups: dict[tuple[str, str], set[int]] = {}
+    for name in shard_names:
+        m = _SHARD_FILE_RE.search(name)
+        if m:
+            key = (name[: m.start()], m.group(2))
+            groups.setdefault(key, set()).add(int(m.group(1)))
+    missing_count = 0
+    examples: list[str] = []
+    for (prefix, total), present in sorted(groups.items()):
+        expected_total = int(total)
+        # Count distinct in-range indices so stray or duplicate-padding names
+        # can't mask a gap; tolerate 0-based numbering alongside the 1-based
+        # HF convention.
+        base = 1
+        present_n = len({i for i in present if 1 <= i <= expected_total})
+        zero_based_n = len({i for i in present if 0 <= i < expected_total})
+        if zero_based_n > present_n:
+            base, present_n = 0, zero_based_n
+        if present_n >= expected_total:
+            continue
+        missing_count += expected_total - present_n
+        width = len(total)
+        for i in range(base, base + expected_total):
+            if len(examples) >= 3:
+                break
+            if i not in present:
+                examples.append(
+                    f"{prefix}-{str(i).zfill(width)}-of-{total}.safetensors"
+                )
+    if missing_count:
+        return (
+            missing_count,
+            examples,
+            (
+                "shard filename numbering (no shard referenced by the stale "
+                "index exists; judging by the shards present)"
+                if index_missing is not None
+                else "shard filename numbering (no index file)"
+            ),
+        )
+    if index_missing is not None:
+        if groups or (model_dir / "model.safetensors").is_file():
+            # A self-consistent complete shard set (or a consolidated
+            # single-file checkpoint) is present: the index is stale, the
+            # weights are whole. Register the model; loaders read the shard
+            # files directly and never consult the index.
+            n_missing, examples = index_missing
+            logger.warning(
+                f"Model at {model_dir} ships a stale "
+                f"model.safetensors.index.json: none of the {n_missing} "
+                f"shard(s) it references exist (e.g. {', '.join(examples)}), "
+                f"but the weight files present form a complete set — "
+                f"registering the model anyway."
+            )
+            return None
+        # No weight files at all: config + index landed first, shards did not
+        # (interrupted download before the first shard finished) — skip, and
+        # report against the only manifest available.
+        n_missing, examples = index_missing
+        return n_missing, examples, "model.safetensors.index.json"
+    return None
 
-    snapshot = path / "snapshots" / commit_hash
-    if not snapshot.is_dir():
+
+def model_directory_access_error(path: Path) -> str | None:
+    """Return a user-facing error if a model directory cannot be scanned."""
+    try:
+        if not path.exists():
+            return f"Model directory does not exist: {path}"
+        if not path.is_dir():
+            return f"Model directory is not a directory: {path}"
+        next(path.iterdir(), None)
+    except OSError as e:
+        return (
+            f"Model directory is not readable: {path} "
+            f"({type(e).__name__}: {e})"
+        )
+    return None
+
+
+def model_directory_write_error(path: Path, *, create: bool = False) -> str | None:
+    """Return a user-facing error if a model directory cannot be written."""
+    try:
+        if not path.exists():
+            if create:
+                path.mkdir(parents=True, exist_ok=True)
+            else:
+                return f"Model directory does not exist: {path}"
+        if not path.is_dir():
+            return f"Model directory is not a directory: {path}"
+    except OSError as e:
+        return (
+            f"Model directory is not writable: {path} "
+            f"({type(e).__name__}: {e})"
+        )
+
+    access_error = model_directory_access_error(path)
+    if access_error is not None:
+        return access_error
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=".omlx-write-test-",
+            dir=path,
+            delete=True,
+        ) as f:
+            f.write(b"")
+            f.flush()
+    except OSError as e:
+        return (
+            f"Model directory is not writable: {path} "
+            f"({type(e).__name__}: {e})"
+        )
+
+    return None
+
+
+def _iter_readable_entries(path: Path, context: str) -> list[Path]:
+    """Return sorted directory entries, or an empty list when scanning fails."""
+    try:
+        return sorted(path.iterdir())
+    except OSError as e:
+        logger.warning(
+            "Skipping unreadable %s %s: %s: %s",
+            context,
+            path,
+            type(e).__name__,
+            e,
+        )
+        return []
+
+
+def _is_readable_dir(path: Path, context: str) -> bool:
+    try:
+        return path.is_dir()
+    except OSError as e:
+        logger.warning(
+            "Skipping inaccessible %s %s: %s: %s",
+            context,
+            path,
+            type(e).__name__,
+            e,
+        )
+        return False
+
+
+def _decode_hf_cache_model_id(path: Path) -> tuple[str, str] | None:
+    """Decode models--org--repo into (route_safe_id, repo_id)."""
+    name = path.name
+    if not name.startswith("models--"):
         return None
 
-    return snapshot, model_name
+    encoded = name[len("models--"):]
+    if not encoded:
+        return None
+
+    parts = encoded.split("--")
+    if len(parts) == 1:
+        return parts[0], parts[0]
+
+    repo_name = "--".join(parts[1:])
+    return f"{parts[0]}--{repo_name}", f"{parts[0]}/{repo_name}"
+
+
+def _resolve_hf_cache_entry(path: Path) -> HfCacheEntry | None:
+    """Resolve an HF Hub cache entry (models--Org--Name/) to its active snapshot.
+
+    Returns an HfCacheEntry or None if not a valid HF model cache entry.
+    """
+    decoded = _decode_hf_cache_model_id(path)
+    if decoded is None:
+        return None
+    model_id, source_repo_id = decoded
+
+    snapshots_dir = path / "snapshots"
+    if not snapshots_dir.is_dir():
+        return None
+
+    for ref_name in ("main", "master"):
+        try:
+            commit_hash = (path / "refs" / ref_name).read_text().strip()
+        except OSError:
+            continue
+        snapshot = snapshots_dir / commit_hash
+        if snapshot.is_dir():
+            return HfCacheEntry(snapshot, model_id, source_repo_id)
+
+    snapshots = [
+        p
+        for p in _iter_readable_entries(snapshots_dir, "HF cache snapshots")
+        if _is_readable_dir(p, "HF cache snapshot")
+    ]
+    if not snapshots:
+        return None
+    if len(snapshots) == 1:
+        return HfCacheEntry(snapshots[0], model_id, source_repo_id)
+
+    snapshot = max(snapshots, key=lambda p: p.stat().st_mtime)
+    return HfCacheEntry(snapshot, model_id, source_repo_id)
+
+
+def _safetensors_has_mlx_metadata(path: Path) -> bool:
+    """Return True if any model safetensors shard declares MLX format."""
+    try:
+        from safetensors import safe_open
+    except Exception as e:
+        logger.debug(f"safetensors import failed while checking {path}: {e}")
+        return False
+
+    for shard in sorted(path.glob("model*.safetensors")):
+        try:
+            with safe_open(str(shard), framework="numpy") as f:
+                metadata = f.metadata() or {}
+        except Exception as e:
+            logger.debug(f"Could not read safetensors metadata from {shard}: {e}")
+            continue
+        if str(metadata.get("format", "")).lower() == "mlx":
+            return True
+    return False
+
+
+_MLX_NAME_RE = re.compile(r"(^|[-_/])mlx($|[-_/])", re.IGNORECASE)
+
+# Speculative-decoding helper checkpoints (e.g. z-lab/Qwen3.6-27B-DFlash) are
+# MLX-loadable drafts even though their safetensors are saved in PyTorch ("pt")
+# format and the repo name carries no "mlx" token, so the HF-cache MLX
+# heuristic must recognise them explicitly or they vanish from the draft-model
+# picker (#1643). Detection delegates to is_helper_model_config so the drafter
+# markers stay in sync with helper flagging and engine_pool's drafter
+# resolution.
+def _is_helper_checkpoint(model_path: Path) -> bool:
+    """True if ``model_path`` is a speculative-decoding helper checkpoint.
+
+    Must never raise on an unreadable entry: unlike the config reads inside
+    _register_model, this runs outside discover_models' per-model guard, so
+    an escaped exception would abort the whole scan. UnicodeDecodeError from
+    a non-UTF-8 config.json is a ValueError, not a JSONDecodeError.
+    """
+    config_path = model_path / "config.json"
+    if not config_path.exists():
+        return False
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        return False
+    return is_helper_model_config(config)
+
+
+def _is_deepseek_v41_loadable_config(config) -> bool:
+    """Recognize official, oMLX-converted, and declared affine V4.1 checkpoints.
+
+    This also admits checkpoints without MLX shard metadata or repo names.
+    False leaves generic discovery heuristics in control; it does not reject loading.
+    """
+    if not isinstance(config, dict) or config.get("model_type") != "deepseek_v41":
+        return False
+    spec = config.get("omlx_deepseek_v41")
+    if isinstance(spec, dict):
+        return spec.get("version") == 1
+    if spec is not None:
+        return False
+    quantization = config.get("quantization")
+    if quantization is None:
+        return True
+    if not isinstance(quantization, dict):
+        return False
+    bits = quantization.get("bits")
+    group_size = quantization.get("group_size")
+    if quantization.get("mode", "affine") != "affine":
+        return False
+    if not _declared_int(bits) or not _declared_int(group_size):
+        return False
+    # `source_quantization_spec` rejects a non-affine per-module override too.
+    return not any(
+        isinstance(entry, dict) and entry.get("mode", "affine") != "affine"
+        for entry in quantization.values()
+    )
+
+
+def _declared_int(value) -> bool:
+    """JSON booleans are ints in Python; a declared width/group is not one."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
+    """Heuristic for HF cache entries that can be loaded without conversion."""
+    if not _is_model_dir(model_dir):
+        return False
+    try:
+        config = json.loads((model_dir / "config.json").read_text())
+    except (OSError, ValueError):
+        config = {}
+    if (
+        isinstance(config, dict)
+        and config.get("model_type") == "k2_horizon"
+        and not config.get("model_file")
+    ):
+        try:
+            from .patches.k2_horizon.checkpoint import checkpoint_files
+
+            checkpoint_files(model_dir)
+            return True
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            logger.debug("Invalid K2 cache checkpoint %s: %s", source_repo_id, error)
+            return False
+    if not list(model_dir.glob("model*.safetensors")):
+        logger.debug(f"Skipping HF cache model without model*.safetensors: {source_repo_id}")
+        return False
+    if _is_deepseek_v41_loadable_config(config):
+        logger.info(
+            "Treating HF cache model as MLX-compatible DeepSeek V4.1 checkpoint: "
+            f"{source_repo_id}"
+        )
+        return True
+    if _safetensors_has_mlx_metadata(model_dir):
+        return True
+
+    repo_lower = source_repo_id.lower()
+    if repo_lower.startswith("mlx-community/") or _MLX_NAME_RE.search(source_repo_id):
+        logger.info(
+            f"Treating HF cache model as MLX-compatible by repo name: {source_repo_id}"
+        )
+        return True
+
+    if _is_helper_checkpoint(model_dir):
+        logger.info(
+            f"Treating HF cache model as MLX-compatible speculative-decoding "
+            f"helper: {source_repo_id}"
+        )
+        return True
+
+    logger.debug(f"Skipping non-MLX HF cache model: {source_repo_id}")
+    return False
+
+
+def _gemma4_text_only_wants_vlm_engine(config: dict) -> bool:
+    """True for a text-only gemma4 whose merged MTP head only mlx-vlm drives."""
+    model_type = str(config.get("model_type") or "").lower().replace("-", "_")
+    if model_type != "gemma4":
+        return False
+    if _has_vision_subconfig(config):
+        return False
+    return _has_merged_mtp_head(config)
+
+
+def _has_merged_mtp_head(config: dict) -> bool:
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        return False
+    return isinstance(text_config.get("mtp_assistant_config"), dict)
+
+
+def _gemma4_text_only_prefers_llm_engine(config: dict) -> bool:
+    """True for a text-only Gemma 4 with no MTP head; mlx-lm serves it cheaper."""
+    model_type = str(config.get("model_type") or "").lower().replace("-", "_")
+    if model_type not in ("gemma4", "gemma4_unified"):
+        return False
+    if _has_vision_subconfig(config) or config.get("audio_config") is not None:
+        return False
+    return not _has_merged_mtp_head(config)
 
 
 def _register_model(
     models: dict[str, DiscoveredModel],
     model_dir: Path,
     model_id: str,
+    *,
+    source_type: str = "local",
+    source_repo_id: str | None = None,
 ) -> None:
     """Try to register a single model directory into the models dict."""
+    if model_id in models:
+        logger.warning(
+            f"Duplicate model_id '{model_id}' found in {model_dir}, "
+            f"keeping version from {models[model_id].model_path}"
+        )
+        return
     try:
         if _is_unsupported_model(model_dir):
             logger.info(f"Skipping unsupported model: {model_id}")
+            return
+
+        incomplete = _missing_weight_shards(model_dir)
+        if incomplete:
+            n_missing, examples, manifest = incomplete
+            logger.warning(
+                f"Skipping incomplete model '{model_id}': {n_missing} weight "
+                f"shard(s) referenced by {manifest} are missing from "
+                f"{model_dir} (e.g. {', '.join(examples)}) — likely an "
+                f"interrupted or still-running download; re-run the download "
+                f"to resume it (finished shards are kept and reused)."
+            )
             return
 
         model_type = detect_model_type(model_dir)
@@ -736,18 +1606,49 @@ def _register_model(
         else:
             engine_type = "batched"
         estimated_size = estimate_model_size(model_dir)
+        text_only_size = (
+            estimate_text_only_model_size(model_dir) if model_type == "vlm" else 0
+        )
 
         # Read raw config model_type for sub-type detection (e.g., OCR models)
+        # and flag speculative-decoding drafters (dFlash/Assistant/MTP).
         config_model_type = ""
+        is_helper = False
+        # The routing below reads this even when config.json does not parse.
+        _config: dict = {}
         try:
             import json
             with open(model_dir / "config.json") as f:
-                config_model_type = json.load(f).get("model_type", "")
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                _config = loaded
+            config_model_type = _config.get("model_type", "")
+            is_helper = is_helper_model_config(_config)
         except Exception:
             pass
 
+        # Keep text-only capability metadata when selecting the VLM MTP engine.
+        if model_type == "llm" and _gemma4_text_only_wants_vlm_engine(_config):
+            engine_type = "vlm"
+            logger.info(
+                "%s is text-only Gemma 4 with a merged MTP head; serving it "
+                "on the VLM engine, which can drive that head",
+                model_id,
+            )
+        elif engine_type == "vlm" and _gemma4_text_only_prefers_llm_engine(_config):
+            # Integrations use model_type to advertise image support.
+            engine_type = "batched"
+            model_type = "llm"
+            text_only_size = 0
+            logger.info(
+                "%s is text-only Gemma 4 with no merged MTP head; serving it "
+                "on the LLM engine, which carries less overhead",
+                model_id,
+            )
+
         thinking_default = detect_thinking_default(model_dir)
         preserve_thinking_default = detect_preserve_thinking(model_dir)
+        model_context_length = _read_model_context_length(model_dir)
 
         models[model_id] = DiscoveredModel(
             model_id=model_id,
@@ -755,18 +1656,74 @@ def _register_model(
             model_type=model_type,
             engine_type=engine_type,
             estimated_size=estimated_size,
+            text_only_size=text_only_size,
             config_model_type=config_model_type,
             thinking_default=thinking_default,
             preserve_thinking_default=preserve_thinking_default,
+            model_context_length=model_context_length,
+            source_type=source_type,
+            source_repo_id=source_repo_id,
+            is_helper=is_helper,
         )
 
         size_gb = estimated_size / (1024**3)
+        text_only_note = (
+            f", text-only: {text_only_size / (1024 ** 3):.2f}GB"
+            if text_only_size
+            else ""
+        )
         logger.info(
             f"Discovered model: {model_id} "
-            f"(type: {model_type}, engine: {engine_type}, size: {size_gb:.2f}GB)"
+            f"(type: {model_type}, engine: {engine_type}, "
+            f"size: {size_gb:.2f}GB{text_only_note})"
         )
     except Exception as e:
         logger.error(f"Failed to discover model {model_id}: {e}")
+
+
+def model_display_name(
+    model_id: str,
+    model_path: str | Path | None,
+    model_dirs: list[Path],
+    *,
+    source_repo_id: str | None = None,
+) -> str:
+    """Return the org-qualified display name for a discovered model.
+
+    Prefers the HF repo id when one is known, then falls back to the
+    org/leaf relative path under a configured model dir (the organized
+    two-level layout), then to the bare model id. This is what the models
+    UI shows and what benchmark uploads publish, so two releases with the
+    same leaf directory name stay distinguishable.
+    """
+    repo_id = (source_repo_id or "").strip()
+    if "/" in repo_id:
+        return repo_id
+
+    if not model_path:
+        return model_id
+
+    path_text = str(model_path)
+    if "://" in path_text:
+        return model_id
+
+    try:
+        path = Path(path_text).expanduser().resolve()
+    except (OSError, RuntimeError):
+        path = Path(path_text).expanduser()
+
+    for model_dir in model_dirs:
+        try:
+            rel = path.relative_to(model_dir.expanduser().resolve())
+        except (OSError, RuntimeError, ValueError):
+            continue
+
+        parts = rel.parts
+        if len(parts) >= 2:
+            return f"{parts[0]}/{parts[1]}"
+        return model_id
+
+    return model_id
 
 
 def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
@@ -799,16 +1756,17 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
     Returns:
         Dictionary mapping model_id to DiscoveredModel
     """
-    if not model_dir.exists():
-        raise ValueError(f"Model directory does not exist: {model_dir}")
-
-    if not model_dir.is_dir():
-        raise ValueError(f"Model directory is not a directory: {model_dir}")
+    access_error = model_directory_access_error(model_dir)
+    if access_error is not None:
+        if "not readable" in access_error:
+            logger.warning("Skipping directory %s: %s", model_dir, access_error)
+            return {}
+        raise ValueError(access_error)
 
     models: dict[str, DiscoveredModel] = {}
 
-    for subdir in sorted(model_dir.iterdir()):
-        if not subdir.is_dir() or subdir.name.startswith("."):
+    for subdir in _iter_readable_entries(model_dir, "model directory"):
+        if not _is_readable_dir(subdir, "model entry") or subdir.name.startswith("."):
             continue
 
         if _is_adapter_dir(subdir):
@@ -823,15 +1781,26 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
             # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
             hf_resolved = _resolve_hf_cache_entry(subdir)
             if hf_resolved is not None:
-                snapshot_path, model_name = hf_resolved
-                if _is_model_dir(snapshot_path):
-                    _register_model(models, snapshot_path, model_name)
+                if _is_hf_cache_mlx_compatible(
+                    hf_resolved.snapshot_path,
+                    hf_resolved.source_repo_id,
+                ):
+                    _register_model(
+                        models,
+                        hf_resolved.snapshot_path,
+                        hf_resolved.model_id,
+                        source_type="hf_cache",
+                        source_repo_id=hf_resolved.source_repo_id,
+                    )
                 continue
 
             # Level 2: organization folder — scan children
             has_children = False
-            for child in sorted(subdir.iterdir()):
-                if not child.is_dir() or child.name.startswith("."):
+            for child in _iter_readable_entries(subdir, "model group"):
+                if (
+                    not _is_readable_dir(child, "model group entry")
+                    or child.name.startswith(".")
+                ):
                     continue
                 if _is_adapter_dir(child):
                     logger.info(
@@ -875,11 +1844,9 @@ def discover_models_from_dirs(
     merged: dict[str, DiscoveredModel] = {}
 
     for model_dir in model_dirs:
-        if not model_dir.exists():
-            logger.warning(f"Model directory does not exist, skipping: {model_dir}")
-            continue
-        if not model_dir.is_dir():
-            logger.warning(f"Not a directory, skipping: {model_dir}")
+        access_error = model_directory_access_error(model_dir)
+        if access_error is not None:
+            logger.warning(f"Skipping directory {model_dir}: {access_error}")
             continue
 
         try:

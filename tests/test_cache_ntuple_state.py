@@ -17,6 +17,18 @@ test establishes the contract those changes must keep stable.
 
 from __future__ import annotations
 
+import time
+from pathlib import Path
+
+
+def _wait_for_file(path: Path, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
 
 class TestCacheStateAxisInfoDefault:
     """Default axis_info matches the legacy 2-tuple (keys, values) contract."""
@@ -103,12 +115,15 @@ class TestDeserializeStateLegacyContract:
         )
         h = KVCacheHandler()
         elements = h.serialize_state(original)
-        restored = h.deserialize_state(elements, meta_state=original.meta_state)
+        restored = h.deserialize_state(
+            elements, meta_state=h.serialize_meta_state(original)
+        )
         assert restored is not None
-        # Compare trimmed state tuples (KVCache.state returns sliced view
-        # without internal padding chunks).
-        orig_keys, orig_values = original.state
-        rest_keys, rest_values = restored.state
+        assert original.keys.shape[2] > original.offset
+        assert len(elements) == 2
+        assert elements[0].shape[2] == original.offset == restored.offset
+        orig_keys, orig_values = original.keys_and_values()
+        rest_keys, rest_values = restored.keys_and_values()
         assert orig_keys.shape == rest_keys.shape
         assert mx.max(mx.abs(rest_keys - orig_keys)).item() == 0.0
         assert mx.max(mx.abs(rest_values - orig_values)).item() == 0.0
@@ -170,8 +185,6 @@ class TestPagedSSDV3Format:
         """``(keys, values)`` legacy input round-trips as 2-tuple after V3
         polyfill on save and unwrap on load. Existing callers see no
         behavioral change."""
-        import time
-
         import mlx.core as mx
 
         manager = self._make_manager(tmp_path)
@@ -184,11 +197,7 @@ class TestPagedSSDV3Format:
         manager.save_block(
             block_hash, [(original_keys, original_values)], token_count=16
         )
-        # Wait for background write to settle so we exercise the disk path.
-        for _ in range(50):
-            if manager._get_file_path(block_hash).exists():
-                break
-            time.sleep(0.05)
+        assert _wait_for_file(manager._get_file_path(block_hash))
 
         loaded = manager.load_block(block_hash)
         assert loaded is not None
@@ -205,8 +214,6 @@ class TestPagedSSDV3Format:
     def test_v3_three_tuple_state_preserved_as_marker(self, tmp_path):
         """3-tuple state surfaces as ``__nstate__`` marker on load — the
         third element (which V2 silently dropped) is preserved."""
-        import time
-
         import mlx.core as mx
 
         manager = self._make_manager(tmp_path)
@@ -223,10 +230,7 @@ class TestPagedSSDV3Format:
         layer_marker = ("__nstate__", "PoolingCache", [elem0, elem1, elem2])
         manager.save_block(block_hash, [layer_marker], token_count=16)
 
-        for _ in range(50):
-            if manager._get_file_path(block_hash).exists():
-                break
-            time.sleep(0.05)
+        assert _wait_for_file(manager._get_file_path(block_hash))
 
         loaded = manager.load_block(block_hash)
         assert loaded is not None
@@ -249,8 +253,6 @@ class TestPagedSSDV3Format:
     def test_v3_safetensors_keys_use_state_k_naming(self, tmp_path):
         """V3 stores elements as ``layer_{i}_state_{k}`` with a count meta
         entry rather than the V2 ``layer_{i}_keys`` / ``layer_{i}_values``."""
-        import time
-
         import mlx.core as mx
 
         manager = self._make_manager(tmp_path)
@@ -258,12 +260,8 @@ class TestPagedSSDV3Format:
 
         cache_data = [(mx.zeros((1, 4, 4, 8)), mx.ones((1, 4, 4, 8)))]
         manager.save_block(block_hash, cache_data, token_count=4)
-        for _ in range(50):
-            file_path = manager._get_file_path(block_hash)
-            if file_path.exists():
-                break
-            time.sleep(0.05)
-        assert file_path.exists()
+        file_path = manager._get_file_path(block_hash)
+        assert _wait_for_file(file_path)
 
         loaded, meta = mx.load(str(file_path), return_metadata=True)
         # New V3 format
@@ -280,8 +278,6 @@ class TestPagedSSDV3Format:
     def test_unsupported_format_version_rejected(self, tmp_path):
         """Blocks declaring a format version outside the readable set are
         rejected on load (e.g. a future V4 block read by this V3 code)."""
-        import time
-
         import mlx.core as mx
         from safetensors import safe_open  # noqa: F401  # ensure pkg present
 
@@ -295,10 +291,7 @@ class TestPagedSSDV3Format:
             [(mx.zeros((1, 4, 4, 8)), mx.zeros((1, 4, 4, 8)))],
             token_count=4,
         )
-        for _ in range(50):
-            if manager._get_file_path(block_hash).exists():
-                break
-            time.sleep(0.05)
+        assert _wait_for_file(manager._get_file_path(block_hash))
 
         # Load file, inspect metadata. We cannot easily mutate the on-disk
         # safetensors header here without re-implementing the format, so
@@ -383,8 +376,26 @@ class TestPrefixCacheNTupleSubState:
             }
         ]
 
+        # A1 fix: is_last_block alone no longer justifies using live state
+        # for non-sliceable sub-caches -- a matching boundary snapshot is
+        # required (docs/qwen35-hardening-and-optimization.md A1). This test
+        # is about the CacheList slicing/marker path itself, not about
+        # boundary-snapshot sourcing, so provide a snapshot mirroring the
+        # live state to keep exercising that path.
+        snapshot_cache_data = [
+            {
+                "state": [
+                    (rot_keys, rot_values),
+                    (buf_kv, buf_gate, pooled),
+                ],
+            }
+        ]
         block_slices = prefix_cache._extract_block_tensor_slice(
-            cache_data, start_idx=0, end_idx=16, is_last_block=True
+            cache_data,
+            start_idx=0,
+            end_idx=16,
+            is_last_block=True,
+            snapshot_cache_data=snapshot_cache_data,
         )
         assert block_slices is not None
         assert len(block_slices) == 1
@@ -508,17 +519,23 @@ class TestPrefixCacheNTupleSubState:
         store.shutdown()
 
     def test_pooling_cache_handler_axis_info(self):
-        """PoolingCacheHandler exposes 3-element axis_info, all non-sliceable."""
+        """PoolingCacheHandler exposes all persisted state as non-sliceable."""
         from omlx.patches.deepseek_v4.cache_handlers import PoolingCacheHandler
 
         info = PoolingCacheHandler().get_state_axis_info()
-        assert len(info) == 3
-        assert [i.name for i in info] == ["buf_kv", "buf_gate", "pooled"]
+        assert len(info) == 5
+        assert [i.name for i in info] == [
+            "buf_kv",
+            "buf_gate",
+            "pooled",
+            "prev_win_kv",
+            "prev_win_gate",
+        ]
         assert all(i.sequence_axis == 1 for i in info)
         assert all(i.sliceable is False for i in info)
 
-    def test_pooling_cache_deserialize_3tuple_round_trip(self):
-        """PoolingCacheHandler.deserialize_state preserves all 3 elements."""
+    def test_pooling_cache_deserialize_state_round_trip(self):
+        """PoolingCacheHandler preserves overlap state and reads legacy state."""
         import mlx.core as mx
 
         from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
@@ -537,18 +554,34 @@ class TestPrefixCacheNTupleSubState:
         buf_kv = mx.zeros((1, ratio, 8))
         buf_gate = mx.zeros((1, ratio, 8))
         pooled = mx.arange(1 * 12 * 8, dtype=mx.float32).reshape(1, 12, 8)
-        mx.eval(buf_kv, buf_gate, pooled)
-        original.state = (None, None, pooled)  # remainder buffers empty
+        prev_win_kv = mx.ones((1, 1, ratio, 8))
+        prev_win_gate = mx.full((1, 1, ratio, 8), 2.0)
+        mx.eval(buf_kv, buf_gate, pooled, prev_win_kv, prev_win_gate)
+        original.state = (
+            None,
+            None,
+            pooled,
+            prev_win_kv,
+            prev_win_gate,
+        )
 
         h = PoolingCacheHandler()
         elements = h.serialize_state(original)
-        assert len(elements) == 3
-        restored = h.deserialize_state(elements, meta_state=ratio)
+        assert len(elements) == 5
+        restored = h.deserialize_state(
+            elements, meta_state=h.serialize_meta_state(original)
+        )
         assert restored is not None
         assert restored.ratio == ratio
-        # The pooled tensor must round-trip byte-equal — V4 fix verification.
-        rest_kv, rest_gate, rest_pool = restored.state
+        rest_kv, rest_gate, rest_pool, rest_prev_kv, rest_prev_gate = restored.state
         assert mx.max(mx.abs(rest_pool - pooled)).item() == 0.0
+        assert mx.max(mx.abs(rest_prev_kv - prev_win_kv)).item() == 0.0
+        assert mx.max(mx.abs(rest_prev_gate - prev_win_gate)).item() == 0.0
+
+        legacy = h.deserialize_state((None, None, pooled), meta_state=ratio)
+        assert legacy is not None
+        assert legacy.prev_win_kv is None
+        assert legacy.prev_win_gate is None
 
     def test_pooling_cache_deserialize_legacy_2tuple_input(self):
         """Tolerates length-2 input (e.g. coming from a legacy V2 polyfill)
@@ -575,13 +608,8 @@ class TestPrefixCacheNTupleSubState:
         assert [i.name for i in info] == ["buf_kv", "buf_gate", "pooled"]
         assert all(i.sliceable is False for i in info)
 
-    def test_extract_cache_states_preserves_pooling_cache_3tuple(self):
-        """scheduler._extract_cache_states preserves PoolingCache's 3-tuple
-        state without dropping the third element. This is the topmost entry
-        point on the prefill → store_cache path; if state[2] survives here
-        and the downstream serializers (paged_ssd, boundary_snapshot,
-        prefix_cache) preserve it, V4 multi-session corruption is fully
-        prevented."""
+    def test_extract_cache_states_preserves_pooling_cache_state(self):
+        """Scheduler extraction preserves pooled and overlap state tensors."""
         import mlx.core as mx
 
         from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
@@ -593,8 +621,10 @@ class TestPrefixCacheNTupleSubState:
         # Build a PoolingCache with a populated pooled tensor.
         cache = PoolingCache(ratio=4)
         pooled = mx.arange(1 * 8 * 16, dtype=mx.float32).reshape(1, 8, 16)
-        mx.eval(pooled)
-        cache.state = (None, None, pooled)
+        prev_win_kv = mx.ones((1, 1, 4, 16))
+        prev_win_gate = mx.full((1, 1, 4, 16), 2.0)
+        mx.eval(pooled, prev_win_kv, prev_win_gate)
+        cache.state = (None, None, pooled, prev_win_kv, prev_win_gate)
 
         # Drive _extract_cache_states with a single-layer raw cache list.
         # We use Scheduler.__new__ to avoid full init (no engine needed).
@@ -603,10 +633,11 @@ class TestPrefixCacheNTupleSubState:
         assert extracted is not None
         assert len(extracted) == 1
         layer_state = extracted[0]
-        # State must be a 3-tuple — third element preserved.
         assert isinstance(layer_state["state"], tuple)
-        assert len(layer_state["state"]) == 3
+        assert len(layer_state["state"]) == 5
         assert mx.max(mx.abs(layer_state["state"][2] - pooled)).item() == 0.0
+        assert mx.max(mx.abs(layer_state["state"][3] - prev_win_kv)).item() == 0.0
+        assert mx.max(mx.abs(layer_state["state"][4] - prev_win_gate)).item() == 0.0
 
     def test_cache_list_legacy_two_tuple_unchanged(self):
         """CacheList with all 2-tuple sub_states (legacy) round-trips
@@ -646,3 +677,25 @@ class TestPrefixCacheNTupleSubState:
             assert isinstance(sub, tuple)
             assert len(sub) == 2
             assert mx.max(mx.abs(sub[0] - keys)).item() == 0.0
+
+
+def test_chunked_cache_round_trip_preserves_trimmed_absolute_positions():
+    import mlx.core as mx
+    from mlx_lm.models.cache import ChunkedKVCache
+    from omlx.cache.type_registry import CacheTypeRegistry
+
+    original = ChunkedKVCache(chunk_size=4)
+    values = mx.arange(48).reshape(1, 1, 12, 4).astype(mx.float32)
+    original.update_and_fetch(values, values)
+    original.maybe_trim_front()
+    handler = CacheTypeRegistry.get_handler_for_object(original)
+    assert not handler.supports_block_slicing
+    restored = handler.deserialize_state(
+        handler.serialize_state(original), handler.serialize_meta_state(original)
+    )
+    assert (restored.offset, restored.start_position, restored.chunk_size) == (12, 8, 4)
+    for entry in (original, restored):
+        entry.update_and_fetch(values[:, :, :1], values[:, :, :1])
+        entry.maybe_trim_front()
+    assert mx.array_equal(original.keys_and_values()[0], restored.keys_and_values()[0])
+    assert original.offset == restored.offset == 13

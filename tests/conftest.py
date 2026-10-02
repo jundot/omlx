@@ -1,3 +1,11 @@
+import os
+import subprocess
+import sys
+
+# MLX 0.32.2 runs fp32 GPU matmuls at TF32 precision on M5-class tensor units;
+# the fp32 parity tests assert 2e-5, which TF32 cannot hold. Test session only.
+os.environ.setdefault("MLX_ENABLE_TF32", "0")
+
 # SPDX-License-Identifier: Apache-2.0
 """
 Pytest configuration and fixtures for oMLX tests.
@@ -11,7 +19,60 @@ from unittest.mock import MagicMock
 
 import pytest
 
+# Install the torch stub before any test imports xgrammar (e.g. via @patch
+# decorators that resolve the target at collection time). When real torch is
+# present this is a no-op; in the DMG layout it satisfies xgrammar's
+# import-time torch references so the package can load.
+from omlx._torch_stub import install as _install_torch_stub
+_install_torch_stub()
+
+# Run tests under the same M5 sorted gather_qmm reroute the server
+# installs at model load (issue #2267). Without it, kernel-sensitive
+# tests (e.g. the SwitchGLU fusion bit-exactness test, whose inter=32
+# down_proj runs at K=32) fail on M5 hardware. No-op elsewhere.
+from omlx.patches.m5_gather_qmm import apply_m5_gather_qmm_workaround
+apply_m5_gather_qmm_workaround()
+
+from omlx.custom_kernels.nax import is_nax_available
 from omlx.request import Request, SamplingParams
+
+
+@pytest.fixture
+def glm5_fused_decode():
+    """GLM-5.3's fused decode/verify kernels, which run (and replay the
+    reference bit for bit) only on NAX GPUs."""
+    if not is_nax_available():
+        pytest.skip("the fused GLM-5.3 decode kernels run on M5 (NAX) GPUs")
+    from omlx.patches.mlx_vlm_glm5_next_compat import (
+        apply_mlx_vlm_glm5_next_compat_patch,
+    )
+
+    apply_mlx_vlm_glm5_next_compat_patch()
+    from mlx_vlm.models.glm5_next import language
+
+    assert language._DECODE_FUSION
+    return language
+
+
+@pytest.fixture(autouse=True)
+def cluster_home(tmp_path, monkeypatch):
+    from omlx.cluster import ssh_keys, worker_shim
+
+    home = tmp_path / "cluster-home"
+    publish = worker_shim.ensure_cluster_python_shim
+
+    def publish_shim(**kwargs):
+        if kwargs.get("home") is None:
+            kwargs["home"] = home
+        return publish(**kwargs)
+
+    monkeypatch.setattr(worker_shim, "ensure_cluster_python_shim", publish_shim)
+    # SSH paths are resolved at import time, before test fixtures run.
+    ssh_dir = home / ".ssh"
+    monkeypatch.setattr(ssh_keys, "_SSH_DIR", ssh_dir)
+    monkeypatch.setattr(ssh_keys, "_SSH_KEY_PATH", ssh_dir / "omlx_cluster")
+    monkeypatch.setattr(ssh_keys, "_SSH_PUBKEY_PATH", ssh_dir / "omlx_cluster.pub")
+    return home
 
 
 class MockTokenizer:
@@ -97,11 +158,36 @@ class MockModel:
         """Return model parameters."""
         return self._parameters
 
+    def make_cache(self) -> list:
+        """Build the per-layer prompt cache, like a real mlx-lm model.
+
+        The scheduler probes this to decide whether a stored prefix can be
+        rebuilt faithfully, so the double has to answer it. A plain llama-style
+        model builds ``KVCache`` layers; tests that need another cache class
+        override this attribute.
+        """
+        from mlx_lm.models.cache import KVCache
+
+        return [KVCache() for _ in range(self.config.num_hidden_layers)]
+
 
 @pytest.fixture
 def mock_tokenizer() -> MockTokenizer:
     """Provide a mock tokenizer for tests."""
     return MockTokenizer()
+
+
+@pytest.fixture
+def mock_cluster_ssh(monkeypatch):
+    from omlx.cluster import launch
+
+    runner = MagicMock(
+        return_value=subprocess.CompletedProcess(
+            [], 0, stdout='{"action": "no-marker"}', stderr=""
+        )
+    )
+    monkeypatch.setattr(launch, "_run_cluster_ssh", runner)
+    return runner
 
 
 @pytest.fixture
@@ -170,3 +256,44 @@ def real_model_dir() -> Path:
     and should be marked with @pytest.mark.slow.
     """
     return Path.home() / "Workspace" / "models"
+
+
+@pytest.fixture(autouse=True)
+def _reset_decode_activity_registry():
+    """Keep the process-global decode-activity registry hermetic per test.
+
+    Schedulers publish to it from step(); entries live for a short TTL, so
+    without this a scheduler stepped in one test reads as cross-engine
+    decode contention in the next.
+    """
+    from omlx.decode_activity import get_decode_activity
+
+    get_decode_activity().clear()
+    yield
+    get_decode_activity().clear()
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_metal_release_accounting(monkeypatch):
+    """Keep the graphics footprint and its release-lag history test-local.
+
+    Tests feed synthetic phys_footprint values. The test process's real
+    graphics ledger and earlier tests' samples would otherwise split or
+    discount them unpredictably. Tests of the split patch these explicitly.
+    """
+    for name in (
+        "omlx.scheduler",
+        "omlx.process_memory_enforcer",
+        "omlx.utils.metal_sync",
+    ):
+        module = sys.modules.get(name)
+        if module is not None and hasattr(module, "get_graphics_footprint"):
+            monkeypatch.setattr(module, "get_graphics_footprint", lambda: 0)
+    metal_sync = sys.modules.get("omlx.utils.metal_sync")
+    if metal_sync is not None:
+        metal_sync._residuals.clear()
+        metal_sync._last_unreleased = (0.0, 0)
+    yield
+    if metal_sync is not None:
+        metal_sync._residuals.clear()
+        metal_sync._last_unreleased = (0.0, 0)

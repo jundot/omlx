@@ -5,17 +5,39 @@ Tests for tool calling parsing and conversion utilities.
 Tests JSON schema validation, JSON extraction, and tool conversion functions.
 """
 
+import ast
+import importlib
 import json
 import logging
-import pytest
-
+import re
+import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
+from omlx.api.openai_models import (
+    FunctionCall,
+    ResponseFormat,
+    ResponseFormatJsonSchema,
+    ToolCall,
+    ToolDefinition,
+)
 from omlx.api.tool_calling import (
     ToolCallStreamFilter,
+    _coerce_param_value,
     _gemma4_args_to_json_robust,
+    _json_value_end,
+    _marker_payloads,
+    _parse_attribute_function_tool_calls,
     _parse_gemma4_tool_call_fallback,
+    _parse_hermes_tool_calls,
+    _parse_namespaced_tool_calls,
+    _parse_xml_tool_calls,
+    _remap_tool_call_names,
+    _repair_json_value,
     _serialize_tool_call_arguments,
+    _strip_marker_spans,
     build_json_system_prompt,
     convert_tools_for_template,
     enrich_tool_params_for_gemma4,
@@ -23,17 +45,13 @@ from omlx.api.tool_calling import (
     extract_tool_calls_with_thinking,
     format_tool_call_for_message,
     parse_json_output,
+    parse_qwen_tool_calls,
     parse_tool_calls,
     parse_tool_calls_with_thinking_fallback,
+    repair_parameter_open_tags,
     restore_gemma4_param_names,
+    sanitize_tool_call_markup,
     validate_json_schema,
-)
-from omlx.api.openai_models import (
-    FunctionCall,
-    ResponseFormat,
-    ResponseFormatJsonSchema,
-    ToolCall,
-    ToolDefinition,
 )
 
 
@@ -352,6 +370,44 @@ class TestParseJsonOutput:
         assert error is not None
         assert "validation failed" in error.lower()
 
+    def test_json_schema_format_explicit_none_schema(self):
+        """Explicit json_schema=None must behave like a missing key.
+
+        Regression test: clients may send
+        response_format={"type": "json_schema", "json_schema": null}; the
+        explicit null bypasses dict.get()'s default and previously raised
+        AttributeError ('NoneType' has no attribute 'get'). With no schema
+        available, the output is treated like json_object: extracted but
+        not validated.
+        """
+        text = '{"name": "John"}'
+        response_format = {"type": "json_schema", "json_schema": None}
+
+        cleaned, parsed, is_valid, error = parse_json_output(text, response_format)
+
+        assert cleaned == text
+        assert parsed == {"name": "John"}
+        assert is_valid is True
+        assert error is None
+
+    def test_json_schema_format_explicit_none_schema_wire_path(self):
+        """Explicit json_schema=None via the ResponseFormat object (real wire path).
+
+        A real client request arrives as a ResponseFormat, not a raw dict, so it
+        takes the isinstance branch, which sets rf_dict["json_schema"] to None.
+        The raw-dict test above skips that normalization, so this pins the
+        production path directly: it must degrade like a missing schema, not raise.
+        """
+        text = '{"name": "John"}'
+        response_format = ResponseFormat(type="json_schema", json_schema=None)
+
+        cleaned, parsed, is_valid, error = parse_json_output(text, response_format)
+
+        assert cleaned == text
+        assert parsed == {"name": "John"}
+        assert is_valid is True
+        assert error is None
+
     def test_json_schema_with_pydantic_model(self):
         """Test with ResponseFormat Pydantic model."""
         text = '{"message": "hello"}'
@@ -431,6 +487,34 @@ class TestBuildJsonSystemPrompt:
         assert "person" in result
         assert "A person object" in result
 
+    def test_json_schema_format_explicit_none_schema(self):
+        """Explicit json_schema=None must behave like a missing key.
+
+        Regression test: the explicit null bypasses dict.get()'s default
+        and previously raised AttributeError. The prompt falls back to the
+        default schema name 'response' with an empty schema.
+        """
+        response_format = {"type": "json_schema", "json_schema": None}
+
+        result = build_json_system_prompt(response_format)
+
+        assert result is not None
+        assert "response" in result
+
+    def test_json_schema_format_explicit_none_schema_wire_path(self):
+        """Explicit json_schema=None via the ResponseFormat object (real wire path).
+
+        A real client request arrives as a ResponseFormat whose isinstance branch
+        sets rf_dict["json_schema"] to None; the raw-dict test above skips that
+        normalization. Falls back to the default schema name 'response'.
+        """
+        response_format = ResponseFormat(type="json_schema", json_schema=None)
+
+        result = build_json_system_prompt(response_format)
+
+        assert result is not None
+        assert "response" in result
+
     def test_json_schema_format_with_pydantic(self):
         """Test with ResponseFormat Pydantic model."""
         response_format = ResponseFormat(
@@ -450,6 +534,67 @@ class TestBuildJsonSystemPrompt:
 
 class TestConvertToolsForTemplate:
     """Tests for convert_tools_for_template function."""
+
+    @pytest.mark.parametrize("render_properties", [False, True])
+    def test_schema_key_order_does_not_change_rendered_tools(self, render_properties):
+        """Equivalent JSON object orders must produce the same prompt prefix."""
+        from jinja2 import Environment, StrictUndefined
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search text"},
+                "filters": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "days": {"type": "integer", "minimum": 1},
+                        },
+                    },
+                },
+            },
+            "required": ["query", "filters"],
+            "anyOf": [{"type": "string"}, {"type": "number"}],
+        }
+
+        def reverse_object_keys(value):
+            if isinstance(value, dict):
+                return {
+                    key: reverse_object_keys(child)
+                    for key, child in reversed(list(value.items()))
+                }
+            if isinstance(value, list):
+                return [reverse_object_keys(child) for child in value]
+            return value
+
+        tools, reordered_tools = (
+            [{"type": "function", "function": {"name": "search", "parameters": params}}]
+            for params in (schema, reverse_object_keys(schema))
+        )
+        originals = [json.dumps(tools), json.dumps(reordered_tools)]
+        converted = convert_tools_for_template(tools)
+        reordered = convert_tools_for_template(reordered_tools)
+
+        # Qwen templates serialize objects or iterate properties directly.
+        env = Environment(undefined=StrictUndefined)
+        env.policies["json.dumps_kwargs"] = {"sort_keys": False}
+        template = env.from_string(
+            "{% for tool in tools %}"
+            + (
+                "{% for name, spec in tool.function.parameters.properties.items() %}"
+                "{{ name }}:{{ spec | tojson }}{% endfor %}"
+                if render_properties
+                else "{{ tool | tojson }}"
+            )
+            + "{% endfor %}"
+        )
+        assert template.render(tools=converted) == template.render(tools=reordered)
+        assert [json.dumps(tools), json.dumps(reordered_tools)] == originals
+        parameters = converted[0]["function"]["parameters"]
+        assert parameters["required"] == ["query", "filters"]
+        assert [item["type"] for item in parameters["anyOf"]] == ["string", "number"]
 
     def test_none_tools(self):
         """Test with None tools."""
@@ -579,6 +724,81 @@ class TestConvertToolsForTemplate:
             "properties": {},
         }
 
+    def test_missing_descriptions_are_template_safe(self):
+        """Missing function and parameter descriptions render under strict Jinja."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "filters": {
+                                "type": "object",
+                                "properties": {
+                                    "limit": {"type": "integer"},
+                                },
+                            },
+                        },
+                    },
+                },
+            }
+        ]
+
+        result = convert_tools_for_template(tools)
+
+        assert result is not None
+        func = result[0]["function"]
+        assert func["description"] == ""
+        props = func["parameters"]["properties"]
+        assert props["query"]["description"] == ""
+        assert props["filters"]["description"] == ""
+        assert props["filters"]["properties"]["limit"]["description"] == ""
+
+        from jinja2 import Environment, StrictUndefined
+
+        template = Environment(undefined=StrictUndefined).from_string(
+            "{% for tool in tools %}"
+            "{% set tool = tool.function %}"
+            "{{ '// ' + tool.description }}"
+            "{% for param_name, param_spec in tool.parameters.properties.items() %}"
+            "{{ '// ' + param_spec.description }}"
+            "{% endfor %}"
+            "{% endfor %}"
+        )
+        template.render(tools=result)
+
+    def test_schema_defaults_do_not_mutate_input(self):
+        """Template safety normalization copies the input schema."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ]
+
+        result = convert_tools_for_template(tools)
+
+        assert result is not None
+        assert (
+            "description"
+            not in tools[0]["function"]["parameters"]["properties"]["query"]
+        )
+        assert (
+            result[0]["function"]["parameters"]["properties"]["query"]["description"]
+            == ""
+        )
+
 
 class TestFormatToolCallForMessage:
     """Tests for format_tool_call_for_message function."""
@@ -626,6 +846,90 @@ def _make_tokenizer(tool_call_start=""):
 
 class TestToolCallStreamFilter:
     """Tests for ToolCallStreamFilter."""
+
+    def test_complete_envelope_is_exposed_once_for_structured_streaming(self):
+        f = ToolCallStreamFilter(
+            _make_tokenizer(),
+            capture_ordered_segments=True,
+        )
+        assert f.feed("<tool_call><function=get_weather>") == ""
+        assert f.envelope_open
+        assert f.take_completed_envelopes() == []
+        assert (
+            f.feed(
+                "<parameter=city>Seattle</parameter>"
+                "</function></tool_call>"
+            )
+            == ""
+        )
+        assert not f.envelope_open
+        assert f.take_completed_envelopes() == [
+            "<tool_call><function=get_weather>"
+            "<parameter=city>Seattle</parameter>"
+            "</function></tool_call>"
+        ]
+        assert f.take_completed_envelopes() == []
+
+    def test_ordered_segments_preserve_content_call_content_fifo(self):
+        f = ToolCallStreamFilter(
+            _make_tokenizer(),
+            capture_ordered_segments=True,
+        )
+        envelope = (
+            "<tool_call><function=get_weather>"
+            "<parameter=city>Oslo</parameter></function></tool_call>"
+        )
+        assert f.feed("before " + envelope + " after") == "before  after"
+        segments = f.take_ordered_segments()
+        assert [(segment.kind, segment.text) for segment in segments] == [
+            ("content", "before "),
+            ("envelope", envelope),
+            ("content", " after"),
+        ]
+
+    def test_default_filter_does_not_retain_completed_envelope_copies(self):
+        f = ToolCallStreamFilter(_make_tokenizer())
+        envelope = '<tool_call>{"name":"f","arguments":{}}</tool_call>'
+        assert f.feed(envelope) == ""
+        assert f.take_completed_envelopes() == []
+        assert f.take_ordered_segments() == []
+
+    def test_seventeenth_queued_envelope_latches_off_eighteenth(self):
+        f = ToolCallStreamFilter(
+            _make_tokenizer(),
+            capture_ordered_segments=True,
+        )
+
+        def envelope(index):
+            return f"<tool_call>{{\"name\":\"f\",\"arguments\":{{\"i\":{index}}}}}</tool_call>"
+
+        assert f.feed("".join(envelope(i) for i in range(17))) == ""
+        assert f.completed_envelope_overflowed
+        assert f.take_completed_envelopes() == []
+        assert f.take_ordered_segments() == []
+        assert f.feed(envelope(17)) == ""
+        assert f.take_completed_envelopes() == []
+        assert f.take_ordered_segments() == []
+
+    def test_oversize_envelope_latches_off_later_valid_envelope(self):
+        f = ToolCallStreamFilter(
+            _make_tokenizer(),
+            capture_ordered_segments=True,
+        )
+        oversize = (
+            "<tool_call>"
+            + ("x" * (f._COMPLETED_ENVELOPE_MAX_BYTES + 1))
+            + "</tool_call>"
+        )
+        assert f.feed(oversize) == ""
+        assert f.completed_envelope_overflowed
+        assert f.take_completed_envelopes() == []
+        assert f.take_ordered_segments() == []
+
+        later = '<tool_call>{"name":"f","arguments":{}}</tool_call>'
+        assert f.feed(later) == ""
+        assert f.take_completed_envelopes() == []
+        assert f.take_ordered_segments() == []
 
     def test_no_marker_passthrough(self):
         """Without tokenizer marker, fallback envelopes are still active."""
@@ -696,6 +1000,7 @@ class TestToolCallStreamFilter:
         r1 = f.feed("<tool")
         r2 = f.finish()
         assert r1 + r2 == ""
+        assert f.take_recovery_candidate() == ""
 
     def test_suppressing_blocks_finish(self):
         """An unresolved open envelope keeps buffered control text suppressed at finish()."""
@@ -734,6 +1039,14 @@ class TestToolCallStreamFilter:
         result = f.feed(
             'Before <tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call> After'
         )
+        result += f.finish()
+        assert result == "Before  After"
+
+    def test_minimax_tool_call_suppresses_envelope_but_preserves_trailing_text(self):
+        """MiniMax M3 namespaced envelope suppression should not eat prose."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        result = f.feed('Before ]<]minimax[>[<tool_call><invoke name="x">')
+        result += f.feed("]<]minimax[>[</invoke>]<]minimax[>[</tool_call> After")
         result += f.finish()
         assert result == "Before  After"
 
@@ -815,6 +1128,37 @@ class TestToolCallStreamFilter:
         assert "[Tool call:" not in result
         assert result == "Before  unfinished and then  done"
 
+    def test_hermes_marker_pair_suppressed_without_tokenizer_metadata(self):
+        """Hermes markers should not leak in streams when tokenizer lacks marker attrs."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        chunks = [
+            "Before ",
+            "<|tool_call_start|>",
+            "[execute_code(command='x', timeout=1)]",
+            "<|tool_call_end|>",
+            " After",
+        ]
+        result = "".join(f.feed(chunk) for chunk in chunks)
+        result += f.finish()
+        assert "<|tool_call_start|>" not in result
+        assert "execute_code" not in result
+        assert result == "Before  After"
+
+    def test_orphan_hermes_end_marker_is_suppressed(self):
+        """A closing Hermes marker without a visible open marker must not leak."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        result = f.feed("Before <|tool_call_end|> After")
+        result += f.finish()
+        assert result == "Before  After"
+
+    def test_split_orphan_hermes_end_marker_is_suppressed(self):
+        """Split closing Hermes markers must be buffered until classified."""
+        f = ToolCallStreamFilter(_make_tokenizer())
+        chunks = ["Before ", "<|tool_call_en", "d|>", " After"]
+        result = "".join(f.feed(chunk) for chunk in chunks)
+        result += f.finish()
+        assert result == "Before  After"
+
     def test_finish_preserves_non_tool_angle_identifier_suffix_literal(self):
         """Non-tool literal tails like '<alpha' should not be dropped at stream end."""
         f = ToolCallStreamFilter(_make_tokenizer())
@@ -890,6 +1234,147 @@ class TestToolCallStreamFilter:
         assert f.finish() == ""
 
 
+_DSML_START = "<｜DSML｜tool_calls>"
+_DSML_END = "</｜DSML｜tool_calls>"
+
+
+def _make_dsml_filter():
+    return ToolCallStreamFilter(_make_tokenizer_with_end(_DSML_START, _DSML_END))
+
+
+class TestToolCallStreamFilterDsmlSeparator:
+    """DeepSeek V4's "\\n\\n" separator belongs to the DSML envelope.
+
+    The reference decoder's stop token is the literal string
+    "\\n\\n<｜DSML｜tool_calls", so the separator before a tool-call block
+    is control markup, not content. The filter consumes it with the
+    envelope; content deltas never carry it.
+    """
+
+    def test_separator_consumed_before_tool_call(self):
+        f = _make_dsml_filter()
+        r = f.feed("I'll run it.\n\n" + _DSML_START + '{"name":"x"}')
+        assert r == "I'll run it."
+        assert f.feed(_DSML_END) == ""
+        assert f.finish() == ""
+
+    def test_separator_split_across_feeds(self):
+        f = _make_dsml_filter()
+        out = f.feed("answer.")
+        out += f.feed("\n")
+        out += f.feed("\n")
+        out += f.feed("<｜DSML｜tool_")
+        out += f.feed('calls>{"name":"x"}')
+        out += f.feed(_DSML_END)
+        out += f.finish()
+        assert out == "answer."
+
+    def test_marker_without_separator_still_suppressed(self):
+        f = _make_dsml_filter()
+        r = f.feed("answer." + _DSML_START + '{"name":"x"}' + _DSML_END)
+        r += f.finish()
+        assert r == "answer."
+
+    def test_only_final_two_newlines_belong_to_envelope(self):
+        # The reference decoder's str.find match consumes exactly the last
+        # two newlines of a longer run; the rest is content.
+        f = _make_dsml_filter()
+        r = f.feed("a.\n\n\n" + _DSML_START + '{"name":"x"}' + _DSML_END)
+        r += f.finish()
+        assert r == "a.\n"
+
+    def test_trailing_newlines_without_tool_call_survive_finish(self):
+        # Newlines held back as a potential envelope prefix are literal
+        # content when the stream ends without a tool call.
+        f = _make_dsml_filter()
+        r1 = f.feed("done.\n\n")
+        r2 = f.finish()
+        assert r1 == "done."
+        assert r1 + r2 == "done.\n\n"
+
+    def test_newlines_before_prose_pass_through(self):
+        f = _make_dsml_filter()
+        r1 = f.feed("a\n\n")
+        r2 = f.feed("b")
+        r3 = f.finish()
+        assert r1 + r2 + r3 == "a\n\nb"
+
+    def test_separator_hold_disabled_for_thinking_channel(self):
+        # Filters watching the reasoning channel opt out: trailing newlines
+        # flush in place, never as a late delta after the channel closed.
+        f = ToolCallStreamFilter(
+            _make_tokenizer_with_end(_DSML_START, _DSML_END),
+            consume_dsml_separator=False,
+        )
+        assert f.feed("thinking...\n\n") == "thinking...\n\n"
+        assert f.finish() == ""
+
+    def test_opted_out_filter_keeps_separator_but_still_suppresses(self):
+        # With the opt-out, a separator-preceded envelope is suppressed via
+        # the bare pair and the separator stays visible -- byte-identical
+        # to pre-change behavior for the thinking channel.
+        f = ToolCallStreamFilter(
+            _make_tokenizer_with_end(_DSML_START, _DSML_END),
+            consume_dsml_separator=False,
+        )
+        r = f.feed("think\n\n" + _DSML_START + '{"name":"x"}' + _DSML_END)
+        r += f.finish()
+        assert r == "think\n\n"
+
+    def test_multiple_envelopes_with_prose_between(self):
+        f = _make_dsml_filter()
+        r = f.feed(
+            "a\n\n"
+            + _DSML_START
+            + "x"
+            + _DSML_END
+            + "b\n\n"
+            + _DSML_START
+            + "y"
+            + _DSML_END
+            + "c"
+        )
+        r += f.finish()
+        assert r == "abc"
+
+    def test_single_newline_held_then_released(self):
+        f = _make_dsml_filter()
+        r1 = f.feed("a\n")
+        r2 = f.feed("b")
+        r3 = f.finish()
+        assert r1 + r2 + r3 == "a\nb"
+
+    def test_truncated_open_marker_drops_held_separator_at_finish(self):
+        # A stream cut mid-marker is malformed; strict mode drops the
+        # partial-marker tail, and the held separator goes with it --
+        # intended: the separator belongs to the (broken) envelope.
+        f = _make_dsml_filter()
+        r = f.feed("a\n\n<")
+        r += f.finish()
+        assert r == "a"
+
+    def test_unclosed_envelope_recovery_includes_separator(self):
+        # The recovery candidate carries the exact withheld bytes,
+        # separator included -- nothing streamed is duplicated, nothing
+        # withheld is lost.
+        f = _make_dsml_filter()
+        assert f.feed("a\n\n" + _DSML_START + "payload") == "a"
+        assert f.finish() == ""
+        assert (
+            f.take_recovery_candidate() == "\n\n" + _DSML_START + "payload"
+        )
+
+    def test_sanitize_markup_preserves_thinking_separator(self):
+        # sanitize_tool_call_markup cleans thinking-channel text at every
+        # call site; it must match the streamed reasoning deltas, which
+        # keep the separator (the opt-out above).
+        tok = _make_tokenizer_with_end(_DSML_START, _DSML_END)
+        cleaned = sanitize_tool_call_markup(
+            "a\n\n" + _DSML_START + '{"name":"x"}' + _DSML_END + "b", tok
+        )
+        assert cleaned == "a\n\nb"
+
+
 class TestToolCallStreamFilterBracketPartialPrefix:
     """Tests for bracket partial prefix detection at token boundaries."""
 
@@ -946,6 +1431,348 @@ def _make_tokenizer_with_end(tool_call_start="", tool_call_end=""):
     return tok
 
 
+def _feed_chunked(f, text, chunk_size):
+    """Feed text whole (chunk_size 0) or in fixed-size chunks."""
+    if chunk_size == 0:
+        return f.feed(text)
+    return "".join(
+        f.feed(text[i : i + chunk_size]) for i in range(0, len(text), chunk_size)
+    )
+
+
+def _paired_envelope_cases():
+    return [
+        ("<tool_call>", "</tool_call>", _make_tokenizer()),
+        (
+            "<|tool_call_start|>",
+            "<|tool_call_end|>",
+            _make_tokenizer(),
+        ),
+        (
+            "<|tool_call>",
+            "<tool_call|>",
+            _make_tokenizer_with_end("<|tool_call>", "<tool_call|>"),
+        ),
+        (
+            "]<]minimax[>[<tool_call>",
+            "]<]minimax[>[</tool_call>",
+            _make_tokenizer(),
+        ),
+        (
+            "<vendor-x:tool_call>",
+            "</vendor-x:tool_call>",
+            _make_tokenizer(),
+        ),
+        (
+            "<custom-call>",
+            "</custom-call>",
+            _make_tokenizer_with_end("<custom-call>", "</custom-call>"),
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("start_marker", "end_marker", "tokenizer"),
+    _paired_envelope_cases(),
+)
+def test_unclosed_paired_envelope_is_available_for_conditional_recovery(
+    start_marker, end_marker, tokenizer, caplog
+):
+    """Every recognized paired format preserves its exact withheld EOF suffix."""
+    f = ToolCallStreamFilter(tokenizer)
+    suffix = start_marker + "payload" + end_marker[:-1]
+    text = "Before " + suffix
+
+    with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+        visible = "".join(f.feed(ch) for ch in text)
+        visible += f.finish()
+
+    assert visible == "Before "
+    assert f.take_recovery_candidate() == suffix
+    assert f.take_recovery_candidate() == ""
+    assert caplog.text.count("Unclosed tool-call envelope at end of stream") == 1
+
+
+@pytest.mark.parametrize(
+    ("start_marker", "end_marker", "tokenizer"),
+    _paired_envelope_cases(),
+)
+def test_closed_paired_envelope_never_creates_recovery_candidate(
+    start_marker, end_marker, tokenizer, caplog
+):
+    """Completed envelopes retain the existing clean streaming behavior."""
+    f = ToolCallStreamFilter(tokenizer)
+    text = "Before " + start_marker + "payload" + end_marker + " After"
+
+    with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+        visible = "".join(f.feed(ch) for ch in text)
+        visible += f.finish()
+
+    assert visible == "Before  After"
+    assert f.take_recovery_candidate() == ""
+    assert "Unclosed tool-call envelope" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("start_marker", "end_marker", "tokenizer"),
+    _paired_envelope_cases(),
+)
+@pytest.mark.parametrize("chunked", [False, True])
+def test_malformed_payload_keeps_prose_after_a_real_close_marker(
+    start_marker, end_marker, tokenizer, chunked
+):
+    """A payload that never parses must not swallow the prose after its close.
+
+    The payload scan cannot confirm where a malformed value ends, but the
+    literal close marker still bounds the envelope, so trailing text stays
+    visible instead of being withheld to EOF.
+    """
+    f = ToolCallStreamFilter(tokenizer)
+    text = "Before " + start_marker + '{"name":"f"' + end_marker + " After"
+
+    if chunked:
+        visible = "".join(f.feed(ch) for ch in text)
+    else:
+        visible = f.feed(text)
+    visible += f.finish()
+
+    assert visible == "Before  After"
+    assert f.take_recovery_candidate() == ""
+
+
+def test_embedded_close_marker_still_bounds_the_envelope():
+    """The #2507 case must not regress: a marker inside JSON is not the close."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'Before <tool_call>{"name":"f","arguments":'
+        '{"x":"</tool_call>"}}</tool_call> After'
+    )
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "Before  After"
+
+
+@pytest.mark.parametrize("chunk_size", [0, 1, 7])
+def test_array_payload_with_embedded_close_marker_is_suppressed(chunk_size):
+    """A ``[{...}]`` array payload gets the same #2507 protection as an object.
+
+    Classifying every leading ``[`` as the Hermes bracket dialect made the
+    filter fall back to first-marker splitting, so an embedded close marker
+    leaked the array's tail as visible content while the non-streaming parser
+    recovered the call.
+    """
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'A <tool_call>[{"name":"f","arguments":'
+        '{"s":"a </tool_call> b"}}]</tool_call> AFTER'
+    )
+
+    visible = _feed_chunked(f, text, chunk_size) + f.finish()
+
+    assert visible == "A  AFTER"
+    assert f.take_recovery_candidate() == ""
+
+
+def test_array_payload_with_leading_whitespace_is_suppressed():
+    """Whitespace between ``[`` and ``{`` still classifies as a JSON array."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'A <tool_call>[ {"name":"f","arguments":'
+        '{"s":"</tool_call>"}} ]</tool_call> AFTER'
+    )
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "A  AFTER"
+    assert f.take_recovery_candidate() == ""
+
+
+def test_unterminated_array_payload_becomes_recovery_candidate():
+    """An array payload that never closes stays withheld like an object."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+
+    visible = "".join(f.feed(ch) for ch in 'A <tool_call>[{"x"') + f.finish()
+
+    assert visible == "A "
+    assert f.take_recovery_candidate() == '<tool_call>[{"x"'
+
+
+def test_object_payload_with_nested_array_and_embedded_marker():
+    """Array depth tracking must not break object payloads with inner arrays."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'A <tool_call>{"name":"f","arguments":'
+        '{"a":[1,2],"s":"</tool_call>"}}</tool_call> AFTER'
+    )
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "A  AFTER"
+    assert f.take_recovery_candidate() == ""
+
+
+def test_payload_without_any_close_marker_is_still_withheld():
+    """No close marker at all means the envelope tail stays hidden."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+
+    visible = f.feed('Before <tool_call>{"name":"f" After') + f.finish()
+
+    assert visible == "Before "
+    assert f.take_recovery_candidate() == '<tool_call>{"name":"f" After'
+
+
+def test_close_marker_fallback_rescans_the_recovered_tail():
+    """Prose recovered after a close marker is re-filtered, not emitted raw."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'A <tool_call>{"name":"f"</tool_call> B '
+        "<|tool_call_start|>second<|tool_call_end|> C"
+    )
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "A  B  C"
+    assert f.take_recovery_candidate() == ""
+
+
+def test_only_last_unclosed_envelope_becomes_recovery_candidate():
+    """Completed earlier calls stay hidden when a later call is unterminated."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        "Before <tool_call>first</tool_call> middle "
+        "<tool_call>second</tool_"
+    )
+
+    visible = "".join(f.feed(ch) for ch in text)
+    visible += f.finish()
+
+    assert visible == "Before  middle "
+    assert f.take_recovery_candidate() == "<tool_call>second</tool_"
+
+
+@pytest.mark.parametrize("chunk_size", [0, 1, 3, 7, 16])
+def test_prose_between_two_malformed_envelopes_is_preserved(chunk_size):
+    """The EOF unwind must split each envelope at its own close marker.
+
+    Splitting at the LAST close marker in the withheld text deletes the
+    prose sitting between two malformed envelopes of the same pair.
+    """
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'A <tool_call>{"name":"f"</tool_call> B '
+        '<tool_call>{"name":"g"</tool_call> C'
+    )
+
+    visible = _feed_chunked(f, text, chunk_size) + f.finish()
+
+    assert visible == "A  B  C"
+    assert f.take_recovery_candidate() == ""
+
+
+@pytest.mark.parametrize("chunk_size", [0, 1, 7])
+def test_literal_close_marker_in_trailing_prose_is_preserved(chunk_size):
+    """A literal XML close marker in prose is not a malformed envelope's end.
+
+    XML-style closers may appear as ordinary prose, so the unwind must not
+    treat a later literal occurrence as the envelope boundary and delete
+    everything before it.
+    """
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = 'A <tool_call>{"name":"f"</tool_call> B literal </tool_call> C'
+
+    visible = _feed_chunked(f, text, chunk_size) + f.finish()
+
+    assert visible == "A  B literal </tool_call> C"
+    assert f.take_recovery_candidate() == ""
+
+
+@pytest.mark.parametrize("chunk_size", [0, 1, 7])
+def test_valid_call_with_embedded_marker_after_malformed_envelope(chunk_size):
+    """A valid call after a malformed one keeps its #2507 protection at EOF.
+
+    The unwind uses the same span primitive as the non-streaming parser, so
+    the valid payload ends at its structural boundary and its embedded close
+    marker neither splits it nor leaks its tail as content.
+    """
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'A <tool_call>{"x"</tool_call> B <tool_call>'
+        '{"name":"g","arguments":{"x":"</tool_call>"}}</tool_call> C'
+    )
+
+    visible = _feed_chunked(f, text, chunk_size) + f.finish()
+
+    assert visible == "A  B  C"
+    assert f.take_recovery_candidate() == ""
+
+
+def test_unwind_preserves_prose_between_malformed_namespaced_envelopes():
+    """The unwind resolves dynamic namespaced close markers per envelope."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = (
+        'A <foo:tool_call>{"x"</foo:tool_call> B '
+        '<foo:tool_call>{"y"</foo:tool_call> C'
+    )
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "A  B  C"
+    assert f.take_recovery_candidate() == ""
+
+
+def test_unwind_swallows_bracket_call_in_recovered_tail():
+    """A self-contained bracket call inside the unwound tail stays hidden."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = 'A <tool_call>{"x"</tool_call> B [Calling tool: foo] C'
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "A  B  C"
+    assert f.take_recovery_candidate() == ""
+
+
+def test_unwind_reopened_envelope_becomes_recovery_candidate():
+    """A second unterminated envelope in the unwound tail is withheld whole."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = 'A <tool_call>{"x"</tool_call> B <tool_call>{"y"'
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "A  B "
+    assert f.take_recovery_candidate() == '<tool_call>{"y"'
+
+
+def test_unwind_drops_partial_open_marker_in_trailing_prose():
+    """Strict-mode tail rules still apply to prose recovered by the unwind."""
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = 'A <tool_call>{"x"</tool_call> B <tool_ca'
+
+    visible = "".join(f.feed(ch) for ch in text) + f.finish()
+
+    assert visible == "A  B "
+    assert f.take_recovery_candidate() == ""
+
+
+def test_unwind_stays_linear_on_repeated_malformed_envelopes():
+    """The EOF unwind must not do quadratic work on marker-repeating output.
+
+    A re-feed loop that copies the remaining text once per malformed envelope
+    took ~9 s on this input; the single-pass unwind takes well under a
+    second, so the generous bound only trips on a complexity regression.
+    """
+    f = ToolCallStreamFilter(_make_tokenizer())
+    text = "PRE " + '<tool_call>{"x"</tool_call> ' * 4000 + "POST"
+
+    start = time.perf_counter()
+    visible = f.feed(text) + f.finish()
+    elapsed = time.perf_counter() - start
+
+    assert visible.startswith("PRE ")
+    assert visible.endswith("POST")
+    assert elapsed < 5.0
+
+
 class TestToolCallStreamFilterSuppressAfterMarker:
     """Tests for one-sided markers (e.g. Mistral [TOOL_CALLS] with no end marker)."""
 
@@ -955,6 +1782,7 @@ class TestToolCallStreamFilterSuppressAfterMarker:
         result = f.feed('[TOOL_CALLS]func_name[ARGS]{"key":"val"}')
         result += f.finish()
         assert result == ""
+        assert f.take_recovery_candidate() == ""
 
     def test_suppress_after_marker_with_preceding_text(self):
         """Text before one-sided marker should pass through."""
@@ -1146,6 +1974,51 @@ class TestParseToolCallsSyntaxError:
         assert args["path"] == "/etc/hosts"
         assert args["lines"] == 10  # json.loads converts numeric string
 
+    def test_json_fallback_recovers_raw_control_chars(self):
+        """Model-generated JSON tool calls may contain raw tabs or newlines."""
+
+        def failing_parser(text, tools):
+            raise json.JSONDecodeError("Invalid control character at", text, 90)
+
+        tok = self._qwen_tok(failing_parser)
+        old_string = (
+            "\t\t// Check if second word is a subcommand.\n"
+            "\t\tif len(ce.Args) > 1 && isSubcommand(ce.Args[1]) {"
+        )
+        text = (
+            '<tool_call>{"name": "edit", "arguments": {'
+            '"file_path": "/Users/user/project/file.go", '
+            f'"old_string": "{old_string}", '
+            '"new_string": "x"}}</tool_call>'
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+
+        assert cleaned == ""
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "edit"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["old_string"] == old_string
+
+    def test_generic_xml_json_fallback_recovers_raw_control_chars(self):
+        """The non-native XML JSON fallback should recover the same malformed JSON."""
+
+        tok = _make_tokenizer()
+        old_string = "\tindent\nnext line"
+        text = (
+            '<tool_call>{"name": "edit", "arguments": {'
+            f'"old_string": "{old_string}", '
+            '"new_string": "x"}}</tool_call>'
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+
+        assert cleaned == ""
+        assert tool_calls is not None
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args == {"old_string": old_string, "new_string": "x"}
+
     def test_unparseable_body_logs_and_drops(self, caplog):
         """Fully unparseable body drops gracefully and logs a warning."""
 
@@ -1201,6 +2074,136 @@ class TestParseToolCallsSyntaxError:
         # but the outer code must still complete gracefully.
         _, tool_calls = parse_tool_calls(text, tok)
         assert tool_calls is None or len(tool_calls) == 0
+
+
+_QWEN_PARSER_MODULES = [
+    "mlx_lm.tool_parsers.qwen3_coder",
+    "mlx_vlm.tools.parsers.qwen3_coder",
+    None,
+]
+
+
+def _qwen_parser_tokenizer(parser_module):
+    if parser_module is None:
+        return None
+    parser = importlib.import_module(parser_module)
+    return SimpleNamespace(
+        has_tool_calling=True,
+        tool_call_start=parser.tool_call_start,
+        tool_call_end=parser.tool_call_end,
+        tool_parser=parser.parse_tool_call,
+    )
+
+
+class TestParameterOpenTagMissingGt:
+    """Empty Qwen parameters whose open tag lost its ``>``."""
+
+    BASH_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "proxy": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": [],
+            },
+        },
+    }
+
+    def test_repair_leaves_valid_tags_untouched(self):
+        for good in (
+            "<parameter=proxy>\n</parameter>",
+            "<parameter=proxy>http://host:port</parameter>",
+            "<function=bash>\n<parameter=command>ls -la</parameter>",
+        ):
+            assert repair_parameter_open_tags(good) == good
+
+    @pytest.mark.parametrize("parser_module", _QWEN_PARSER_MODULES)
+    @pytest.mark.parametrize("open_tag", ["<parameter=proxy=", "<parameter=proxy"])
+    def test_empty_argument_is_kept(self, parser_module, open_tag):
+        text = (
+            f"<tool_call>\n<function=bash>\n{open_tag}\n</parameter>\n"
+            "<parameter=description>\nlist files\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        _, tool_calls = parse_tool_calls(
+            text, _qwen_parser_tokenizer(parser_module), [self.BASH_TOOL]
+        )
+        assert len(tool_calls) == 1
+        assert json.loads(tool_calls[0].function.arguments) == {
+            "proxy": "",
+            "description": "list files",
+        }
+
+    @pytest.mark.parametrize("parser_module", _QWEN_PARSER_MODULES)
+    @pytest.mark.parametrize("with_call", [False, True])
+    def test_prose_is_not_rewritten(self, parser_module, with_call):
+        call = (
+            "<tool_call>\n<function=bash>\n<parameter=description>\nls\n"
+            "</parameter>\n</function>\n</tool_call>\n"
+        )
+        text = (call if with_call else "") + "The open tag is <parameter=name"
+        tokenizer = _qwen_parser_tokenizer(parser_module)
+        content, _ = parse_tool_calls(text, tokenizer, [self.BASH_TOOL])
+        qwen_content, _, _ = parse_qwen_tool_calls(
+            text, tokenizer, [self.BASH_TOOL], "stop"
+        )
+        assert content.endswith("<parameter=name")
+        assert qwen_content.endswith("<parameter=name")
+
+
+class TestParseNakedQwenFunctionCalls:
+    """Regression coverage for Qwen-Coder omitting the outer <tool_call> tag."""
+
+    def _qwen_tok(self):
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = None
+        return tok
+
+    def test_naked_function_call_is_recovered(self):
+        tok = self._qwen_tok()
+
+        text = (
+            "I'll inspect it.\n"
+            "<function=read_file>\n"
+            "<parameter=path>/tmp/example.py</parameter>\n"
+            "<parameter=limit>20</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+
+        assert cleaned == "I'll inspect it."
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "read_file"
+        assert json.loads(tool_calls[0].function.arguments) == {
+            "path": "/tmp/example.py",
+            "limit": 20,
+        }
+
+    def test_multiple_naked_function_calls_are_recovered(self):
+        tok = self._qwen_tok()
+
+        text = (
+            "<function=first><parameter=value>true</parameter></function>"
+            "<function=second><parameter=name>alpha</parameter></function>"
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+
+        assert cleaned == ""
+        assert tool_calls is not None
+        assert [tc.function.name for tc in tool_calls] == ["first", "second"]
+        assert json.loads(tool_calls[0].function.arguments) == {"value": True}
+        assert json.loads(tool_calls[1].function.arguments) == {"name": "alpha"}
 
 
 class TestParseBracketToolCalls:
@@ -1272,6 +2275,68 @@ class TestParseBracketToolCalls:
         cleaned, tool_calls = _parse_bracket_tool_calls(text)
         assert tool_calls is None
         assert cleaned == text
+
+    def test_hermes_multi_call_block_parses_python_keyword_arguments(self):
+        """Hermes blocks may contain multiple Python-style calls in one list."""
+        text = (
+            "┊ 🐍 preparing execute_code…\n"
+            "<|tool_call_start|>"
+            "[execute_code(command='python3 diversify_hermes.py --model "
+            "\"Qwen3.6-35B-A3B-ConfigI-MLX\" --timeout 180 && echo "
+            "\"Hermes mode completed\"', timeout=400), "
+            "execute_code(command='python3 diversify_v2.py --runs 50 --per-run 54 "
+            "--timeout 300 && echo \"v2 dynamic completed\"', timeout=400)]"
+            "<|tool_call_end|>"
+        )
+        result = extract_tool_calls_with_thinking(
+            "",
+            text,
+            tokenizer=_make_tokenizer(),
+            tools=[{"type": "function", "function": {"name": "execute_code"}}],
+        )
+        assert result.cleaned_text == "┊ 🐍 preparing execute_code…"
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 2
+        assert [tc.function.name for tc in result.tool_calls] == [
+            "execute_code",
+            "execute_code",
+        ]
+        first_args = json.loads(result.tool_calls[0].function.arguments)
+        second_args = json.loads(result.tool_calls[1].function.arguments)
+        assert first_args["timeout"] == 400
+        assert second_args["timeout"] == 400
+        assert "diversify_hermes.py" in first_args["command"]
+        assert "diversify_v2.py" in second_args["command"]
+
+    def test_hermes_fallback_runs_when_native_parser_rejects_bracket_payload(self):
+        """Tokenizer native parser failures should fall through to Hermes fallback."""
+
+        class NativeRejectingTokenizer:
+            has_tool_calling = True
+            tool_call_start = "<|tool_call_start|>"
+            tool_call_end = "<|tool_call_end|>"
+
+            @staticmethod
+            def tool_parser(text, tools):
+                raise ValueError("native parser rejected Hermes bracket payload")
+
+        text = (
+            "Before <|tool_call_start|>"
+            "[execute_code(command='python3 script.py', timeout=400)]"
+            "<|tool_call_end|>"
+        )
+        result = extract_tool_calls_with_thinking(
+            "",
+            text,
+            tokenizer=NativeRejectingTokenizer(),
+            tools=[{"type": "function", "function": {"name": "execute_code"}}],
+        )
+        assert result.cleaned_text == "Before"
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].function.name == "execute_code"
+        args = json.loads(result.tool_calls[0].function.arguments)
+        assert args == {"command": "python3 script.py", "timeout": 400}
 
 
 class TestParseToolCallsWithThinkingFallback:
@@ -1650,6 +2715,40 @@ class TestParseGemma4ToolCallFallback:
         assert result["name"] == "search"
         assert result["arguments"] == {"query": "hello world"}
 
+    def test_unbalanced_open_brace_in_json_string(self):
+        """A lone ``{`` inside a JSON string must not unbalance the span
+        (#1854). Before the string-aware scan this drove brace depth above
+        zero so the span never closed and the whole call was dropped."""
+        result = _parse_gemma4_tool_call_fallback(
+            'call:ns:create{"content": "open { brace"}'
+        )
+        assert result["name"] == "ns:create"
+        assert result["arguments"] == {"content": "open { brace"}
+
+    def test_multi_call_with_brace_in_first_args(self):
+        """A ``}`` inside the first call's JSON string must not corrupt the
+        consumed-span bookkeeping that separates sibling calls (#1854).
+        Pre-fix the first span truncated early, so the second call's head
+        landed inside the supposed-consumed region."""
+        result = _parse_gemma4_tool_call_fallback(
+            'call:ns:create{"a": "x } y"}call:foo{"b": 1}'
+        )
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert result[0]["name"] == "ns:create"
+        assert result[0]["arguments"] == {"a": "x } y"}
+        assert result[1]["name"] == "foo"
+        assert result[1]["arguments"] == {"b": 1}
+
+    def test_escaped_backslash_before_closing_quote(self):
+        """A value ending in an escaped backslash (Windows path) closes on
+        the following quote, not on the backslash-escaped one (#1854)."""
+        result = _parse_gemma4_tool_call_fallback(
+            r'call:ns:create{"path": "C:\\tmp\\"}'
+        )
+        assert result["name"] == "ns:create"
+        assert result["arguments"] == {"path": "C:\\tmp\\"}
+
     def test_empty_args(self):
         result = _parse_gemma4_tool_call_fallback("call:get_time{}")
         assert result["name"] == "get_time"
@@ -1667,6 +2766,48 @@ class TestParseGemma4ToolCallFallback:
     def test_no_match_raises(self):
         with pytest.raises(ValueError):
             _parse_gemma4_tool_call_fallback("not a tool call")
+
+    def test_degenerate_prefix_missing_colon(self):
+        """Diffusion lane can drop the colon: ``calldone{...}``."""
+        result = _parse_gemma4_tool_call_fallback('calldone{answer: ok}')
+        assert result["name"] == "done"
+        assert result["arguments"] == {"answer": "ok"}
+
+    def test_degenerate_prefix_missing_call(self):
+        """Diffusion lane can drop ``call``: ``:done{...}``."""
+        result = _parse_gemma4_tool_call_fallback(':done{answer: ok}')
+        assert result["name"] == "done"
+        assert result["arguments"] == {"answer": "ok"}
+
+    def test_long_bare_value_with_commas_and_newlines(self):
+        """Key-anchored capture recovers markdown-laden bare values
+        (observed live: hindsight reflect ``done`` calls whose ``answer``
+        contains tables, commas, and newlines)."""
+        text = (
+            "calldone{answer:# Title\n\n"
+            "| A | B |\n| :--- | :--- |\n| x, y | z |\n"
+            ",directive_compliance:1. ok. 2. fine."
+            ",memory_ids:[mm-abc123]"
+            ",mental_model_ids:[]"
+            ",observation_ids:[]}"
+        )
+        result = _parse_gemma4_tool_call_fallback(text)
+        assert result["name"] == "done"
+        args = result["arguments"]
+        assert set(args.keys()) == {
+            "answer",
+            "directive_compliance",
+            "memory_ids",
+            "mental_model_ids",
+            "observation_ids",
+        }
+        assert args["answer"].startswith("# Title")
+        assert "x, y" in args["answer"]
+        assert args["observation_ids"] == []
+
+    def test_prose_without_braces_still_raises(self):
+        with pytest.raises(ValueError):
+            _parse_gemma4_tool_call_fallback("just words, no payload")
 
 
 class TestParseToolCallsGemma4Integration:
@@ -1697,6 +2838,90 @@ class TestParseToolCallsGemma4Integration:
         args = json.loads(tool_calls[0].function.arguments)
         assert args["location"] == "Tokyo"
         # Markers should be stripped from cleaned_text
+        assert "<|tool_call>" not in cleaned
+        assert "<tool_call|>" not in cleaned
+
+    def test_fallback_parses_parenthesized_variant(self):
+        """End-to-end: the paren kwargs variant (#1846) reaches the Gemma 4
+        fallback (native parser raises) and is extracted instead of stripped.
+
+        Before the fix the block was deleted: native parser fails, the
+        curly-only fallback also fails, and the client gets empty content.
+        """
+        tok = self._make_gemma4_tokenizer()
+        text = (
+            '<|tool_call>\n'
+            'call:todo(todos=[{content:<|"|>Draft the plan<|"|>,'
+            'id:<|"|>todo-1<|"|>,status:<|"|>pending<|"|>}])\n'
+            '<tool_call|>'
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, None)
+
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "todo"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["todos"][0]["content"] == "Draft the plan"
+        assert args["todos"][0]["status"] == "pending"
+        assert "<|tool_call>" not in cleaned
+        assert "<tool_call|>" not in cleaned
+
+    def test_brace_in_json_string_survives_remap(self):
+        """A ``}`` inside a JSON double-quoted value must not truncate the
+        args span, even when the parse then remaps onto a registered tool
+        (#1854). Before the fix the span scanner stopped at the brace inside
+        the string, the legacy recovery produced a corrupted ``{"content":
+        "has }`` parse, and the suffix remap turned ``ns:create`` into an
+        executable ``create`` call carrying silently mangled arguments. The
+        full content must round-trip intact."""
+        tok = self._make_gemma4_tokenizer()
+        tools = [{"type": "function", "function": {"name": "create"}}]
+        text = (
+            '<|tool_call>\n'
+            'call:ns:create{"content": "has } brace"}\n'
+            '<tool_call|>'
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, tools)
+
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        # Remap fired: ns:create -> registered create.
+        assert tool_calls[0].function.name == "create"
+        # ...and the brace inside the string did not corrupt the value.
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["content"] == "has } brace"
+        assert "<|tool_call>" not in cleaned
+        assert "<tool_call|>" not in cleaned
+
+    def test_escaped_quote_in_json_string_does_not_close_early(self):
+        """An escaped ``\\"`` inside a JSON value must not be read as the
+        closing quote, so a following ``}`` stays string content (#1854)."""
+        tok = self._make_gemma4_tokenizer()
+        tools = [{"type": "function", "function": {"name": "create"}}]
+        text = (
+            '<|tool_call>\n'
+            'call:ns:create{"content": "a \\" } b"}\n'
+            '<tool_call|>'
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, tools)
+
+        assert tool_calls is not None
+        assert tool_calls[0].function.name == "create"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["content"] == 'a " } b'
+
+    def test_deep_standard_json_failure_strips_markers(self):
+        """Deep valid JSON args are dropped cleanly, not surfaced as 500s."""
+        tok = self._make_gemma4_tokenizer()
+        args = '{"a": ' * 80 + "1" + "}" * 80
+        text = f"<|tool_call>\ncall:ns:create{args}\n<tool_call|>"
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, None)
+
+        assert tool_calls is None
         assert "<|tool_call>" not in cleaned
         assert "<tool_call|>" not in cleaned
 
@@ -1751,6 +2976,445 @@ class TestParseToolCallsGemma4Integration:
         assert tool_calls is not None
         assert len(tool_calls) == 1
         assert tool_calls[0].function.name == "search"
+
+
+class TestGemma4SingleQuotedArgs:
+    """Single-quoted and structurally hard Gemma 4 args (#1830).
+
+    Table-driven round-trips: each row is (rendered args, expected dict).
+    """
+
+    @pytest.mark.parametrize(
+        "rendered,expected",
+        [
+            # Issue #1830's reported shape: single-quoted values
+            (
+                "{filename: 'output.pdf', title: 'My Doc'}",
+                {"filename": "output.pdf", "title": "My Doc"},
+            ),
+            # Commas and colons inside a quoted value must not shred keys
+            (
+                "{content: 'a, b: and more', x: 1}",
+                {"content": "a, b: and more", "x": 1},
+            ),
+            # Braces inside a quoted value must not truncate or nest
+            (
+                "{content: 'has a { brace and } close'}",
+                {"content": "has a { brace and } close"},
+            ),
+            # Apostrophes inside a quoted value (anchored close)
+            (
+                "{msg: 'don't worry, be happy'}",
+                {"msg": "don't worry, be happy"},
+            ),
+            # Apostrophes in BARE values must not pair across values
+            (
+                "{a: it's ok, b: don't}",
+                {"a": "it's ok", "b": "don't"},
+            ),
+            # Brace inside a <|"|> string (gap vs mlx-lm's own regex)
+            (
+                '{a: <|"|>has a { brace<|"|>}',
+                {"a": "has a { brace"},
+            ),
+            # Arrays of quoted strings and of numbers
+            (
+                "{files: ['a.txt', 'b.txt'], counts: [1, 2]}",
+                {"files": ["a.txt", "b.txt"], "counts": [1, 2]},
+            ),
+            # Nested object with a quoted value containing a comma
+            (
+                "{opts: {size: 'a4, landscape', deep: {x: 1}}}",
+                {"opts": {"size": "a4, landscape", "deep": {"x": 1}}},
+            ),
+            # Mixed delimiter styles in one call
+            (
+                '{a: <|"|>x<|"|>, b: \'y\', c: bare, d: 5, e: true}',
+                {"a": "x", "b": "y", "c": "bare", "d": 5, "e": True},
+            ),
+            # Capitalized booleans normalize (models emit True/False)
+            ("{flag: True}", {"flag": True}),
+        ],
+    )
+    def test_round_trip(self, rendered, expected):
+        assert _gemma4_args_to_json_robust(rendered) == expected
+
+    def test_nul_bytes_cannot_forge_references(self):
+        """Literal NUL bytes in model output are data, not placeholders.
+
+        The previous implementation substituted \\x00N\\x00 placeholders for
+        captured strings; bare NULs in output forged those references and
+        cross-contaminated argument values.
+        """
+        result = _gemma4_args_to_json_robust(
+            '{a: <|"|>captured<|"|>, b: \x000\x00}'
+        )
+        assert result["a"] == "captured"
+        assert result["b"] == "\x000\x00"  # literal, NOT a copy of a
+
+    def test_deep_nesting_fails_cleanly(self):
+        """Depth bound surfaces as ValueError, never RecursionError.
+
+        RecursionError is a RuntimeError subclass that no except tuple in
+        the parse chain catches; it would escape as a 500.
+        """
+        deep = "call:f" + "{a: " * 80 + "1" + "}" * 80
+        with pytest.raises(ValueError):
+            _parse_gemma4_tool_call_fallback(deep)
+
+    def test_deep_standard_json_nesting_fails_cleanly(self):
+        """Valid JSON args must not bypass the Gemma 4 depth bound."""
+        deep = "call:f" + '{"a": ' * 80 + "1" + "}" * 80
+        with pytest.raises(ValueError):
+            _parse_gemma4_tool_call_fallback(deep)
+
+    def test_oversized_args_fail_cleanly(self):
+        """Args beyond the length cap are a clean no-match, not a hang."""
+        huge = "call:f{a: " + "x" * 300_000 + "}"
+        with pytest.raises(ValueError):
+            _parse_gemma4_tool_call_fallback(huge)
+
+    def test_issue_1830_exact_format(self):
+        """The reporter's namespaced-name + single-quoted-args emission."""
+        result = _parse_gemma4_tool_call_fallback(
+            "call:google:mcp:text_generation:create-pdf-file"
+            "{filename: 'output.pdf', title: 'Quarterly Report', "
+            "content: 'Revenue grew 12%, costs fell: margins improved. "
+            "Don't forget the appendix {tables}.'}"
+        )
+        assert result["name"] == "google:mcp:text_generation:create-pdf-file"
+        assert result["arguments"]["filename"] == "output.pdf"
+        assert result["arguments"]["title"] == "Quarterly Report"
+        assert result["arguments"]["content"] == (
+            "Revenue grew 12%, costs fell: margins improved. "
+            "Don't forget the appendix {tables}."
+        )
+
+    def test_call_inside_quoted_value_not_double_parsed(self):
+        result = _parse_gemma4_tool_call_fallback(
+            "call:a{x: 1}\ncall:b{note: 'use call:c{y: 2} later'}"
+        )
+        assert isinstance(result, list)
+        assert [r["name"] for r in result] == ["a", "b"]
+        assert result[1]["arguments"]["note"] == "use call:c{y: 2} later"
+
+    def test_one_malformed_call_does_not_drop_siblings(self):
+        result = _parse_gemma4_tool_call_fallback(
+            "call:bad{:::}\ncall:good{x: 1}"
+        )
+        assert result == {"name": "good", "arguments": {"x": 1}}
+
+
+class TestGemma4ParenthesizedArgs:
+    """Tests for the parenthesized ``call:name(key=value, ...)`` variant.
+
+    Gemma 4 26B reproducibly degrades to this Python-kwargs form under
+    instruction-dense agentic load (#1846).  The nested grammar is identical
+    to the canonical curly form, so these tests focus on the new outer shell
+    (``()`` instead of ``{}``, ``=`` instead of ``:``) and on confirming the
+    #1854 security invariants hold on the new path.
+    """
+
+    def test_issue_1846_exact_format(self):
+        """The reporter's verbatim emission (3/3 captured samples)."""
+        result = _parse_gemma4_tool_call_fallback(
+            'call:todo(todos=[{content:<|"|>Clarify goal and draft labor '
+            'graph for t_77d3100f<|"|>,id:<|"|>todo-1<|"|>,'
+            'status:<|"|>pending<|"|>}])'
+        )
+        assert result == {
+            "name": "todo",
+            "arguments": {
+                "todos": [
+                    {
+                        "content": (
+                            "Clarify goal and draft labor graph "
+                            "for t_77d3100f"
+                        ),
+                        "id": "todo-1",
+                        "status": "pending",
+                    }
+                ]
+            },
+        }
+
+    def test_simple_kwargs_with_trailing_bare_value(self):
+        # The trailing bare value must not swallow the closing ``)``.
+        result = _parse_gemma4_tool_call_fallback(
+            'call:get_weather(location=<|"|>Tokyo<|"|>, units=metric)'
+        )
+        assert result == {
+            "name": "get_weather",
+            "arguments": {"location": "Tokyo", "units": "metric"},
+        }
+
+    def test_empty_paren_call(self):
+        result = _parse_gemma4_tool_call_fallback("call:ping()")
+        assert result == {"name": "ping", "arguments": {}}
+
+    def test_scalar_value_mix(self):
+        result = _parse_gemma4_tool_call_fallback(
+            'call:f(a=1, b=<|"|>two<|"|>, c=true, d=null, e=3.5)'
+        )
+        assert result == {
+            "name": "f",
+            "arguments": {
+                "a": 1, "b": "two", "c": True, "d": None, "e": 3.5
+            },
+        }
+
+    def test_array_of_scalars(self):
+        result = _parse_gemma4_tool_call_fallback("call:f(items=[1, 2, 3])")
+        assert result == {"name": "f", "arguments": {"items": [1, 2, 3]}}
+
+    def test_namespaced_name_with_paren(self):
+        # Name grammar is shared with the curly head; remap is a later step.
+        result = _parse_gemma4_tool_call_fallback("call:google:mcp:todo(x=1)")
+        assert result == {"name": "google:mcp:todo", "arguments": {"x": 1}}
+
+    def test_mixed_curly_and_paren_siblings(self):
+        result = _parse_gemma4_tool_call_fallback("call:a{x: 1}\ncall:b(y=2)")
+        assert result == [
+            {"name": "a", "arguments": {"x": 1}},
+            {"name": "b", "arguments": {"y": 2}},
+        ]
+
+    def test_close_paren_inside_string_does_not_close_span(self):
+        result = _parse_gemma4_tool_call_fallback(
+            'call:note(text=<|"|>smile :) and (parens)<|"|>)'
+        )
+        assert result == {
+            "name": "note",
+            "arguments": {"text": "smile :) and (parens)"},
+        }
+
+    def test_equals_inside_string_value_preserved(self):
+        result = _parse_gemma4_tool_call_fallback(
+            'call:f(expr=<|"|>a=b=c<|"|>)'
+        )
+        assert result == {"name": "f", "arguments": {"expr": "a=b=c"}}
+
+    def test_curly_value_with_parens_unaffected(self):
+        # Regression guard: ``)`` is ordinary content in the curly form, so a
+        # value may contain parentheses.  This is why ``)`` is a bare-value
+        # terminator only when a paren container is open.
+        result = _gemma4_args_to_json_robust("{expr: f(x)}")
+        assert result == {"expr": "f(x)"}
+
+    def test_single_quoted_value_before_close_paren(self):
+        # The degeneration is a Python-kwargs shell, so single-quoted strings
+        # are its native string form (observed live on gemma-4-26b).  When such
+        # a value is the last argument its closing quote sits right before the
+        # call's ``)``, so ``)`` must anchor a single-quote close exactly as
+        # ``,``/``}``/``]`` do; otherwise the quotes leak into the value.
+        result = _parse_gemma4_tool_call_fallback(
+            "call:create_todo(content='clarify the goal')"
+        )
+        assert result == {
+            "name": "create_todo",
+            "arguments": {"content": "clarify the goal"},
+        }
+
+    def test_single_quoted_values_parity_curly_and_paren(self):
+        # Both shells normalize single-quoted values identically; the paren
+        # form must not retain the quotes the curly form strips.
+        curly = _gemma4_args_to_json_robust("{a: 'x', b: 'y'}")
+        paren = _parse_gemma4_tool_call_fallback("call:f(a='x', b='y')")
+        assert curly == {"a": "x", "b": "y"}
+        assert paren == {"name": "f", "arguments": {"a": "x", "b": "y"}}
+
+    def test_oversized_paren_args_fail_cleanly(self):
+        """Args beyond the length cap are a clean no-match, not a hang.
+
+        Guards the #1854 ReDoS: the paren head's optional/tolerant prefix on
+        the ``re`` module would backtrack O(n^2) hunting an opening ``(``.
+        """
+        huge = "call:f(a=" + "x" * 300_000 + ")"
+        with pytest.raises(ValueError):
+            _parse_gemma4_tool_call_fallback(huge)
+
+    def test_deep_paren_nesting_fails_cleanly(self):
+        """Depth bound surfaces as ValueError, never RecursionError."""
+        deep = "call:f(" + "a={" * 80 + "1" + "}" * 80 + ")"
+        with pytest.raises(ValueError):
+            _parse_gemma4_tool_call_fallback(deep)
+
+    def test_nul_bytes_cannot_forge_references_paren(self):
+        """The NUL-placeholder forge vector stays closed on the paren path."""
+        result = _gemma4_args_to_json_robust(
+            '(a=<|"|>captured<|"|>, b=\x000\x00)'
+        )
+        assert result["a"] == "captured"
+        assert result["b"] == "\x000\x00"  # literal, NOT a copy of a
+
+    def test_paren_call_inside_quoted_value_not_double_parsed(self):
+        result = _parse_gemma4_tool_call_fallback(
+            'call:a(x=1)\ncall:b(note=<|"|>use call:c(y=2) later<|"|>)'
+        )
+        assert isinstance(result, list)
+        assert [r["name"] for r in result] == ["a", "b"]
+        assert result[1]["arguments"]["note"] == "use call:c(y=2) later"
+
+
+class TestRemapToolCallNames:
+    """Tests for _remap_tool_call_names() (#1830)."""
+
+    @staticmethod
+    def _call(name):
+        return ToolCall(
+            id="call_test",
+            type="function",
+            function=FunctionCall(name=name, arguments="{}"),
+        )
+
+    @staticmethod
+    def _tools(*names):
+        return [{"type": "function", "function": {"name": n}} for n in names]
+
+    def test_namespaced_name_remaps_to_unique_suffix(self, caplog):
+        calls = [self._call("google:mcp:text_generation:create-pdf-file")]
+        with caplog.at_level(logging.INFO, logger="omlx.api.tool_calling"):
+            _remap_tool_call_names(calls, self._tools("create-pdf-file"))
+        assert calls[0].function.name == "create-pdf-file"
+        assert any("Remapped" in msg for msg in caplog.messages)
+
+    def test_exact_match_is_untouched(self):
+        calls = [self._call("tavily:search")]
+        _remap_tool_call_names(calls, self._tools("tavily:search", "search"))
+        assert calls[0].function.name == "tavily:search"
+
+    def test_ambiguous_suffixes_keep_verbatim(self):
+        """Two registered suffix candidates: refuse to guess."""
+        calls = [self._call("ns:text_generation:create-pdf-file")]
+        _remap_tool_call_names(
+            calls,
+            self._tools("text_generation:create-pdf-file", "create-pdf-file"),
+        )
+        assert calls[0].function.name == "ns:text_generation:create-pdf-file"
+
+    def test_endswith_attack_does_not_remap(self):
+        """Boundary-aligned matching: 'evilcreate-pdf-file' must not coerce
+        into 'create-pdf-file' (no ':' boundary), and neither must a
+        namespaced name whose last segment merely ENDS with a registered
+        name."""
+        calls = [self._call("evilcreate-pdf-file")]
+        _remap_tool_call_names(calls, self._tools("create-pdf-file"))
+        assert calls[0].function.name == "evilcreate-pdf-file"
+
+        calls = [self._call("evil:xcreate-pdf-file")]
+        _remap_tool_call_names(calls, self._tools("create-pdf-file"))
+        assert calls[0].function.name == "evil:xcreate-pdf-file"
+
+    def test_no_suffix_match_keeps_verbatim(self):
+        calls = [self._call("ns:unknown-tool")]
+        _remap_tool_call_names(calls, self._tools("create-pdf-file"))
+        assert calls[0].function.name == "ns:unknown-tool"
+
+    def test_no_tools_is_noop(self):
+        calls = [self._call("ns:create-pdf-file")]
+        _remap_tool_call_names(calls, None)
+        assert calls[0].function.name == "ns:create-pdf-file"
+        _remap_tool_call_names(calls, [])
+        assert calls[0].function.name == "ns:create-pdf-file"
+
+
+class TestParseToolCallsGemma4RealParser:
+    """E2e through parse_tool_calls with mlx-lm's REAL Gemma 4 parser.
+
+    Uses the real parser and real PAIRED markers (tool_call_end is
+    "<tool_call|>"; parse_tool_calls takes a different extraction branch
+    for paired vs one-sided markers, so a mock without the end marker
+    would test the wrong branch).  This also pins the dispatch contract:
+    if a future mlx-lm bump makes the native parser accept colon names,
+    test_native_parser_rejects_namespaced_names fails and tells us the
+    fallback is no longer exercised.
+    """
+
+    ISSUE_PAYLOAD = (
+        "call:google:mcp:text_generation:create-pdf-file"
+        "{filename: 'output.pdf', content: 'Revenue grew 12%, costs "
+        "fell: margins improved.'}"
+    )
+
+    @staticmethod
+    def _make_real_gemma4_tokenizer():
+        from mlx_lm.tool_parsers import gemma4 as mlx_gemma4
+
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = mlx_gemma4.tool_call_start
+        tok.tool_call_end = mlx_gemma4.tool_call_end
+        tok.tool_parser = mlx_gemma4.parse_tool_call
+        return tok
+
+    @staticmethod
+    def _pdf_tool():
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "create-pdf-file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "filename": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ]
+
+    def test_native_parser_rejects_namespaced_names(self):
+        """Dispatch contract: mlx-lm's parser raises on colon names, which
+        is what routes #1830's emission into the oMLX fallback."""
+        from mlx_lm.tool_parsers import gemma4 as mlx_gemma4
+
+        with pytest.raises(ValueError):
+            mlx_gemma4.parse_tool_call(self.ISSUE_PAYLOAD)
+
+    def test_issue_1830_end_to_end(self):
+        """Marker-wrapped issue payload parses and remaps end to end."""
+        tok = self._make_real_gemma4_tokenizer()
+        text = (
+            f"{tok.tool_call_start}{self.ISSUE_PAYLOAD}{tok.tool_call_end}"
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, self._pdf_tool())
+
+        assert tool_calls is not None and len(tool_calls) == 1
+        assert tool_calls[0].function.name == "create-pdf-file"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["filename"] == "output.pdf"
+        assert args["content"] == (
+            "Revenue grew 12%, costs fell: margins improved."
+        )
+        assert tok.tool_call_start not in cleaned
+        assert tok.tool_call_end not in cleaned
+
+    def test_thinking_path_promotes_remapped_call(self):
+        """Defect #4: a namespaced call in THINKING content must survive
+        extract_tool_calls_with_thinking's exact-name validity filter.
+        Without post-parse remapping, the filter silently drops the
+        cleanly parsed call because the emitted name matches no tool."""
+        tok = self._make_real_gemma4_tokenizer()
+        thinking = (
+            f"{tok.tool_call_start}"
+            "call:google:mcp:text_generation:create-pdf-file"
+            "{filename: 'output.pdf'}"
+            f"{tok.tool_call_end}"
+        )
+
+        extraction = extract_tool_calls_with_thinking(
+            thinking_content=thinking,
+            regular_content="Some unrelated prose.",
+            tokenizer=tok,
+            tools=self._pdf_tool(),
+        )
+
+        assert extraction.tool_calls is not None
+        assert extraction.tool_calls[0].function.name == "create-pdf-file"
+        assert extraction.tool_calls_from_thinking
 
 
 class TestEnrichToolParamsForGemma4:
@@ -2018,3 +3682,2037 @@ class TestSerializeToolCallArguments:
             result = _serialize_tool_call_arguments("[1, 2]")
         assert result == "{}"
         assert any("non-dict" in r.message for r in caplog.records)
+
+
+class TestToolCallStreamFilterGemma4StrayClose:
+    """Stray closing-marker suppression for Gemma 4 <|tool_call>/<tool_call|>."""
+
+    def _make_filter(self):
+        return ToolCallStreamFilter(
+            _make_tokenizer_with_end("<|tool_call>", "<tool_call|>")
+        )
+
+    def test_stray_close_marker_alone_dropped(self):
+        """Bare <tool_call|> with no preceding open is suppressed."""
+        f = self._make_filter()
+        result = f.feed("<tool_call|>")
+        result += f.finish()
+        assert result == ""
+
+    def test_stray_close_after_text_dropped(self):
+        """Text before a stray close passes through; the close itself is dropped."""
+        f = self._make_filter()
+        result = f.feed("hello<tool_call|>")
+        result += f.finish()
+        assert result == "hello"
+
+    def test_stray_close_split_across_feeds_dropped(self):
+        """Stray close split across two feed() calls is dropped."""
+        f = self._make_filter()
+        r1 = f.feed("<tool_call")
+        r2 = f.feed("|>")
+        result = r1 + r2 + f.finish()
+        assert result == ""
+
+    def test_normal_open_close_pair_still_suppressed(self):
+        """Regression: a valid open/close pair is still fully suppressed."""
+        f = self._make_filter()
+        result = f.feed('<|tool_call>call:search{"q":"test"}<tool_call|>')
+        result += f.finish()
+        assert result == ""
+
+    def test_multiple_stray_closes_in_one_delta_all_dropped(self):
+        """Multiple stray close tokens in a single delta are all removed."""
+        f = self._make_filter()
+        result = f.feed("a<tool_call|>b<tool_call|>c")
+        result += f.finish()
+        assert result == "abc"
+
+    def test_default_xml_close_in_prose_passes_through(self):
+        """Prose containing </tool_call> (hardcoded fallback pair) is not stripped.
+
+        The stray-close strip is scoped to the tokenizer-configured marker only.
+        A model discussing XML tag syntax must not have its output corrupted.
+        """
+        f = self._make_filter()
+        result = f.feed("The closing tag is </tool_call> here.")
+        result += f.finish()
+        assert result == "The closing tag is </tool_call> here."
+
+    def test_configured_xml_close_in_prose_passes_through(self):
+        """Configured XML close markers are not treated like Gemma 4 stray closes."""
+        f = ToolCallStreamFilter(
+            _make_tokenizer_with_end("<tool_call>", "</tool_call>")
+        )
+        result = f.feed("The closing tag is </tool_call> here.")
+        result += f.finish()
+        assert result == "The closing tag is </tool_call> here."
+
+    def test_configured_namespaced_close_in_prose_passes_through(self):
+        """Configured namespaced close markers are preserved in prose."""
+        f = ToolCallStreamFilter(
+            _make_tokenizer_with_end(
+                "<minimax:tool_call>",
+                "</minimax:tool_call>",
+            )
+        )
+        result = f.feed("The marker </minimax:tool_call> is a close marker.")
+        result += f.finish()
+        assert result == "The marker </minimax:tool_call> is a close marker."
+
+    def test_stray_close_split_after_pipe_dropped(self):
+        """Stray close split at the | boundary (<tool_call| + >) is reassembled and dropped."""
+        f = self._make_filter()
+        r1 = f.feed("<tool_call|")
+        r2 = f.feed(">")
+        result = r1 + r2 + f.finish()
+        assert result == ""
+
+    def test_stray_close_split_after_pipe_with_prose_dropped(self):
+        """Prose-wrapped stray close split at the | boundary: prose passes, marker dropped."""
+        f = self._make_filter()
+        r1 = f.feed("hello<tool_call|")
+        r2 = f.feed("> world")
+        result = r1 + r2 + f.finish()
+        assert result == "hello world"
+
+    def test_valid_pair_plus_stray_close_in_same_delta(self):
+        """Valid open/close pair suppressed; trailing stray close in same delta dropped."""
+        f = self._make_filter()
+        result = f.feed('<|tool_call>call()<tool_call|> extra<tool_call|>')
+        result += f.finish()
+        assert result == " extra"
+
+
+class TestSchemaAwareFallbackCoercion:
+    """Regression tests for issue #2332.
+
+    The XML fallback parsers used to parse each parameter value with a
+    bare json.loads and keep the raw string on failure, so a slightly
+    malformed array/object param silently degraded to a string. With the
+    tool schema threaded through, declared container params get a
+    bracket-repair pass and declared string params are no longer
+    json-coerced.
+    """
+
+    MALFORMED_EDITS = '[{"range": ["3#8C", "3#8C"], "lines": ["    value: 100,"}]}'
+    REPAIRED_EDITS = [{"range": ["3#8C", "3#8C"], "lines": ["    value: 100,"]}]
+
+    EDIT_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "edit",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "edits": {"type": "array"},
+                },
+            },
+        },
+    }
+
+    def _qwen_text(self, edits_val):
+        return (
+            "<tool_call>\n<function=edit>\n"
+            "<parameter=path>\nconfig.py\n</parameter>\n"
+            f"<parameter=edits>\n{edits_val}\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+
+    def test_qwen_branch_repairs_malformed_array(self):
+        _, calls = _parse_xml_tool_calls(
+            self._qwen_text(self.MALFORMED_EDITS), [self.EDIT_TOOL]
+        )
+        args = json.loads(calls[0].function.arguments)
+        assert args["edits"] == self.REPAIRED_EDITS
+        assert args["path"] == "config.py"
+
+    def test_glm_branch_repairs_malformed_array(self):
+        text = (
+            "<tool_call>edit<arg_key>edits</arg_key>"
+            f"<arg_value>{self.MALFORMED_EDITS}</arg_value></tool_call>"
+        )
+        _, calls = _parse_xml_tool_calls(text, [self.EDIT_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["edits"] == self.REPAIRED_EDITS
+
+    def test_namespaced_branch_repairs_malformed_array(self):
+        text = (
+            '<minimax:tool_call><invoke name="edit">'
+            f'<parameter name="edits">{self.MALFORMED_EDITS}</parameter>'
+            "</invoke></minimax:tool_call>"
+        )
+        _, calls = _parse_namespaced_tool_calls(text, "minimax", [self.EDIT_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["edits"] == self.REPAIRED_EDITS
+
+    FRAGMENTED = '["a"]\n["b"]\n["c"]'
+    REC_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "submit_recommendations",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "recommendations": {"type": "array", "items": {"type": "string"}},
+                    "matrix": {"type": "array", "items": {"type": "array"}},
+                    "note": {"type": "string"},
+                },
+            },
+        },
+    }
+
+    def _rec_text(self, param, val):
+        return (
+            "<tool_call>\n<function=submit_recommendations>\n"
+            f"<parameter={param}>\n{val}\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+
+    def test_line_separated_arrays_merge_into_declared_array(self):
+        """One-element arrays on separate lines concatenate when items are scalars."""
+        _, calls = _parse_xml_tool_calls(self._rec_text("recommendations", self.FRAGMENTED), [self.REC_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["recommendations"] == ["a", "b", "c"]
+
+    def test_line_separated_arrays_wrap_when_items_are_arrays(self):
+        _, calls = _parse_xml_tool_calls(self._rec_text("matrix", self.FRAGMENTED), [self.REC_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["matrix"] == [["a"], ["b"], ["c"]]
+
+    def test_line_separated_scalars_wrap_into_declared_array(self):
+        _, calls = _parse_xml_tool_calls(self._rec_text("recommendations", '"a"\n"b"'), [self.REC_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["recommendations"] == ["a", "b"]
+
+    def test_fragments_with_trailing_prose_keep_raw_string(self):
+        val = '["a"]\n["b"] and that is all'
+        _, calls = _parse_xml_tool_calls(self._rec_text("recommendations", val), [self.REC_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["recommendations"] == val
+
+    def test_mixed_fragments_keep_raw_string(self):
+        val = '["a"]\n{"k": 1}'
+        _, calls = _parse_xml_tool_calls(self._rec_text("recommendations", val), [self.REC_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["recommendations"] == val
+
+    def test_fragments_never_merge_for_declared_string_param(self):
+        _, calls = _parse_xml_tool_calls(self._rec_text("note", self.FRAGMENTED), [self.REC_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["note"] == self.FRAGMENTED
+
+    def test_declared_string_param_not_json_coerced(self):
+        """A numeric-looking value for a declared string param stays a string."""
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "edit",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                },
+            },
+        }
+        text = (
+            "<tool_call>\n<function=edit>\n"
+            "<parameter=path>123</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        _, calls = _parse_xml_tool_calls(text, [tool])
+        args = json.loads(calls[0].function.arguments)
+        assert args["path"] == "123"
+
+    def test_no_tools_keeps_legacy_behavior(self):
+        """Without tools, malformed values still fall back to the raw string."""
+        _, calls = _parse_xml_tool_calls(self._qwen_text(self.MALFORMED_EDITS))
+        args = json.loads(calls[0].function.arguments)
+        assert args["edits"] == self.MALFORMED_EDITS
+        # And valid JSON values still get best-effort parsed.
+        _, calls = _parse_xml_tool_calls(self._qwen_text('[{"a": 1}]'))
+        args = json.loads(calls[0].function.arguments)
+        assert args["edits"] == [{"a": 1}]
+
+    def test_undeclared_param_keeps_legacy_behavior(self):
+        """Params missing from the schema keep the best-effort JSON parse."""
+        text = (
+            "<tool_call>\n<function=edit>\n"
+            "<parameter=extra>42</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        _, calls = _parse_xml_tool_calls(text, [self.EDIT_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["extra"] == 42
+
+    def test_unrepairable_container_keeps_raw_string(self):
+        """When repair fails the raw string survives so the call is not lost."""
+        text = self._qwen_text('[{"a": 1 &&& oops')
+        _, calls = _parse_xml_tool_calls(text, [self.EDIT_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["edits"] == '[{"a": 1 &&& oops'
+
+    def test_python_literal_container_accepted(self):
+        """A Python-literal dict/list (single quotes) parses via literal_eval."""
+        text = self._qwen_text("[{'a': True, 'b': None}]")
+        _, calls = _parse_xml_tool_calls(text, [self.EDIT_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["edits"] == [{"a": True, "b": None}]
+
+    def test_native_failure_fallback_gets_tools(self):
+        """parse_tool_calls threads tools into the per-match XML fallback."""
+
+        def failing_parser(text, tools):
+            raise SyntaxError("invalid syntax (<unknown>, line 1)")
+
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = failing_parser
+        _, calls = parse_tool_calls(
+            self._qwen_text(self.MALFORMED_EDITS), tok, [self.EDIT_TOOL]
+        )
+        assert calls is not None
+        args = json.loads(calls[0].function.arguments)
+        assert args["edits"] == self.REPAIRED_EDITS
+
+    def test_int_and_number_coercion(self):
+        props = {
+            "count": {"type": "integer"},
+            "ratio": {"type": "number"},
+            "flag": {"type": "boolean"},
+        }
+        assert _coerce_param_value("7", "count", props, "t") == 7
+        assert _coerce_param_value("2.5", "ratio", props, "t") == 2.5
+        assert _coerce_param_value("3.0", "ratio", props, "t") == 3
+        assert _coerce_param_value("true", "flag", props, "t") is True
+        assert _coerce_param_value("null", "count", props, "t") is None
+
+    def test_string_type_decodes_json_quoted_literal(self):
+        """A JSON-quoted value for a string param decodes to the bare string."""
+        props = {"city": {"type": "string"}}
+        # Quoted literals (e.g. MiniMax) drop their JSON encoding.
+        assert _coerce_param_value('"SF"', "city", props, "t") == "SF"
+        assert _coerce_param_value('""', "city", props, "t") == ""
+        assert _coerce_param_value('"he said \\"hi\\""', "city", props, "t") == 'he said "hi"'
+        # Plain values that merely look like JSON stay verbatim as strings.
+        assert _coerce_param_value("SF", "city", props, "t") == "SF"
+        assert _coerce_param_value("42", "city", props, "t") == "42"
+        assert _coerce_param_value('{"a": 1}', "city", props, "t") == '{"a": 1}'
+        # An unbalanced quote is not a JSON literal; keep it raw.
+        assert _coerce_param_value('"unterminated', "city", props, "t") == '"unterminated'
+
+    def test_union_type_list_respects_declared_types(self):
+        """A nullable string must not be converted to an undeclared number."""
+        props = {"v": {"type": ["string", "null"]}}
+        assert _coerce_param_value("hello", "v", props, "t") == "hello"
+        assert _coerce_param_value("123", "v", props, "t") == "123"
+
+    def test_repair_json_value(self):
+        assert _repair_json_value('[{"a": [1, 2}]}') == [{"a": [1, 2]}]
+        assert _repair_json_value('{"a": "unterminated') == {"a": "unterminated"}
+        assert _repair_json_value("not json at all") is None
+
+
+class TestToolCallMarkerInArguments:
+    """Literal tool-call markers inside argument strings (#2507).
+
+    A non-greedy ``start(.*?)end`` match stops at the first close marker, so a
+    call whose argument embeds that marker was truncated mid-JSON and dropped
+    silently. Payload boundaries are now found via JSON decoding.
+    """
+
+    PAYLOAD = "text with a literal </tool_call> inside"
+
+    @staticmethod
+    def _raw(body):
+        inner = json.dumps(
+            {"name": "note_write", "arguments": {"title": "t", "body": body}},
+            ensure_ascii=False,
+        )
+        return f"<tool_call>\n{inner}\n</tool_call>"
+
+    @staticmethod
+    def _tokenizer():
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = lambda text, tools: json.loads(text)
+        return tok
+
+    def test_marker_span_helpers_span_the_embedded_marker(self):
+        text = self._raw(self.PAYLOAD)
+        payloads = _marker_payloads(text, "<tool_call>", "</tool_call>")
+        assert len(payloads) == 1
+        assert json.loads(payloads[0])["arguments"]["body"] == self.PAYLOAD
+        assert _strip_marker_spans(text, "<tool_call>", "</tool_call>").strip() == ""
+
+    def test_native_path_preserves_argument_with_close_marker(self):
+        cleaned, calls = parse_tool_calls(self._raw(self.PAYLOAD), self._tokenizer())
+        assert calls is not None and len(calls) == 1
+        assert json.loads(calls[0].function.arguments)["body"] == self.PAYLOAD
+        # The whole envelope is consumed, so no markup leaks into content.
+        assert cleaned == ""
+
+    def test_xml_fallback_preserves_argument_with_close_marker(self):
+        cleaned, calls = _parse_xml_tool_calls(self._raw(self.PAYLOAD))
+        assert calls is not None and len(calls) == 1
+        assert json.loads(calls[0].function.arguments)["body"] == self.PAYLOAD
+        assert cleaned == ""
+
+    def test_hermes_payload_with_close_marker(self):
+        inner = json.dumps(
+            {"name": "note_write", "arguments": {"body": "a <|tool_call_end|> b"}}
+        )
+        text = f"<|tool_call_start|>{inner}<|tool_call_end|>"
+        cleaned, calls = _parse_hermes_tool_calls(text)
+        assert calls is not None and len(calls) == 1
+        assert json.loads(calls[0].function.arguments)["body"] == "a <|tool_call_end|> b"
+        assert cleaned == ""
+
+    def test_streaming_does_not_leak_tail_as_content(self):
+        """The stream filter must not end the envelope on the embedded marker."""
+        raw = self._raw(self.PAYLOAD)
+        for chunk in (1, 3, 7, 64):
+            filt = ToolCallStreamFilter(self._tokenizer())
+            emitted = "".join(
+                filt.feed(raw[i : i + chunk]) for i in range(0, len(raw), chunk)
+            )
+            emitted += filt.finish()
+            assert emitted == "", f"leaked at chunk size {chunk}: {emitted!r}"
+
+    def test_multiple_calls_still_split(self):
+        a = json.dumps({"name": "f", "arguments": {"s": "has </tool_call> inside"}})
+        b = json.dumps({"name": "g", "arguments": {"y": 2}})
+        text = f"pre <tool_call>{a}</tool_call> mid <tool_call>{b}</tool_call> post"
+        payloads = _marker_payloads(text, "<tool_call>", "</tool_call>")
+        assert [json.loads(p)["name"] for p in payloads] == ["f", "g"]
+        assert (
+            _strip_marker_spans(text, "<tool_call>", "</tool_call>")
+            == "pre  mid  post"
+        )
+
+    def test_non_json_dialect_keeps_first_match_behaviour(self):
+        """GLM-style payloads are not JSON, so boundary detection must not change them."""
+        text = (
+            "<tool_call>myfunc<arg_key>k</arg_key>"
+            "<arg_value>v</arg_value></tool_call>"
+        )
+        assert _marker_payloads(text, "<tool_call>", "</tool_call>") == [
+            "myfunc<arg_key>k</arg_key><arg_value>v</arg_value>"
+        ]
+
+    def test_unterminated_envelope_yields_no_span(self):
+        text = '<tool_call>{"name": "f", "arguments": {}}'
+        assert _marker_payloads(text, "<tool_call>", "</tool_call>") == []
+        assert _strip_marker_spans(text, "<tool_call>", "</tool_call>") == text
+
+    def test_incomplete_json_falls_back_to_first_marker(self):
+        """Never-completing JSON must not swallow the rest of the message."""
+        text = '<tool_call>{"name": "f", "arguments": {"s": "oops </tool_call>'
+        assert _marker_payloads(text, "<tool_call>", "</tool_call>") == [
+            '{"name": "f", "arguments": {"s": "oops '
+        ]
+
+    def test_boundary_scan_never_raises_on_deep_nesting(self):
+        """Boundary detection must degrade, not explode, on hostile nesting.
+
+        ``raw_decode`` recurses per nesting level, so deeply nested output
+        raises RecursionError rather than a decode error. A boundary hint must
+        never turn into an exception escaping the parse chain.
+        """
+        deep = "[" * 100_000
+        assert _json_value_end(deep, 0) is None
+        text = f"<tool_call>{deep}</tool_call>"
+        assert _marker_payloads(text, "<tool_call>", "</tool_call>") == [deep]
+
+    def test_boundary_scan_stays_linear_on_adversarial_output(self):
+        """Guard the linear-time rule for untrusted model output.
+
+        Locating the payload end must not re-scan the accumulated buffer once
+        per chunk: an unterminated JSON object stuffed with close markers
+        would then cost quadratic time. Model output is attacker-influenceable
+        via prompt injection, so this is a DoS surface, not just a slowdown.
+        """
+        import time
+
+        def elapsed(markers):
+            evil = (
+                "<tool_call>"
+                + '{"name":"f","arguments":{"s":"'
+                + "</tool_call>" * markers
+            )
+            filt = ToolCallStreamFilter(self._tokenizer())
+            start = time.perf_counter()
+            for i in range(0, len(evil), 64):
+                filt.feed(evil[i : i + 64])
+            filt.finish()
+            return time.perf_counter() - start
+
+        elapsed(400)  # warm up the interpreter before timing
+        small = max(elapsed(400), 1e-4)
+        large = elapsed(3200)
+        # 8x the input: linear would be ~8x, quadratic ~64x. Allow generous
+        # headroom for a loaded CI box while still catching quadratic growth.
+        assert large / small < 24, f"superlinear growth: {small=} {large=}"
+
+
+class TestQwen3CoderMarkerInArguments:
+    """qwen3_coder XML dialect with literal markers in a value (#2507).
+
+    Qwen3.5/3.6 builds using the ``qwen3_coder`` parser wrap XML rather than
+    JSON in the envelope, so the JSON boundary cannot bound them. The envelope
+    is bounded by the ``</function>`` that precedes the close marker instead.
+    """
+
+    @staticmethod
+    def _raw(body, title="t"):
+        return (
+            "<tool_call>\n<function=note_write>\n"
+            f"<parameter=title>\n{title}\n</parameter>\n"
+            f"<parameter=body>\n{body}\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+
+    @staticmethod
+    def _tokenizer():
+        def qwen_parser(text, tools):
+            m = re.match(r"\s*<function=(\w+)>(.*)</function>\s*$", text, re.DOTALL)
+            if not m:
+                raise ValueError("No function provided.")
+            args = {
+                k: v.strip()
+                for k, v in re.findall(
+                    r"<parameter=(\w+)>(.*?)</parameter>", m.group(2), re.DOTALL
+                )
+            }
+            return {"name": m.group(1), "arguments": args}
+
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = qwen_parser
+        return tok
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "plain text",
+            "text with a literal </tool_call> inside",
+            "text with a literal </parameter> inside",
+            "text with a literal </function> inside",
+            "text with a literal <parameter=x> inside",
+            "evil </function>\n</tool_call> tail",
+        ],
+        ids=[
+            "control",
+            "close-marker",
+            "parameter-close",
+            "function-close",
+            "parameter-open",
+            "full-terminator-sequence",
+        ],
+    )
+    def test_xml_fallback_preserves_value(self, body):
+        cleaned, calls = _parse_xml_tool_calls(self._raw(body))
+        assert calls is not None and len(calls) == 1
+        args = json.loads(calls[0].function.arguments)
+        assert args["body"] == body
+        assert args["title"] == "t"
+        assert cleaned == ""
+
+    def test_native_path_preserves_value(self):
+        body = "text with a literal </tool_call> inside"
+        cleaned, calls = parse_tool_calls(self._raw(body), self._tokenizer())
+        assert calls is not None and len(calls) == 1
+        assert json.loads(calls[0].function.arguments)["body"] == body
+        assert cleaned == ""
+
+    def test_streaming_does_not_leak_tail(self):
+        raw = self._raw("text with a literal </tool_call> inside")
+        for chunk in (1, 2, 3, 7, 11, 64):
+            filt = ToolCallStreamFilter(self._tokenizer())
+            emitted = "".join(
+                filt.feed(raw[i : i + chunk]) for i in range(0, len(raw), chunk)
+            )
+            emitted += filt.finish()
+            assert emitted == "", f"leaked at chunk size {chunk}: {emitted!r}"
+
+    def test_concatenated_calls_still_split(self):
+        second = (
+            "<tool_call>\n<function=other>\n<parameter=x>\n1\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        cleaned, calls = _parse_xml_tool_calls(
+            self._raw("has </tool_call> inside") + "\n" + second
+        )
+        assert [c.function.name for c in calls] == ["note_write", "other"]
+        assert cleaned == ""
+
+    def test_parameter_open_inside_value_is_not_a_new_parameter(self):
+        """A literal <parameter=x> in a value must not create a bogus argument."""
+        cleaned, calls = _parse_xml_tool_calls(
+            self._raw("see <parameter=nope> here")
+        )
+        args = json.loads(calls[0].function.arguments)
+        assert set(args) == {"title", "body"}
+        assert args["body"] == "see <parameter=nope> here"
+
+    def test_streaming_still_emits_prose_containing_no_envelope(self):
+        filt = ToolCallStreamFilter(self._tokenizer())
+        out = "".join(filt.feed(c) for c in ["hello ", "world"]) + filt.finish()
+        assert out == "hello world"
+
+    def test_envelope_scan_stays_linear_on_fake_terminators(self):
+        """Same linear-time rule as the JSON path, for the XML boundary.
+
+        A value stuffed with fake ``</function></tool_call>`` sequences is the
+        worst case: every one is a candidate envelope end that has to be
+        rejected. That must not become quadratic.
+        """
+        import time
+
+        def elapsed(count):
+            evil = (
+                "<tool_call>\n<function=f>\n<parameter=b>\n"
+                + "</function>\n</tool_call> " * count
+            )
+            filt = ToolCallStreamFilter(self._tokenizer())
+            start = time.perf_counter()
+            for i in range(0, len(evil), 64):
+                filt.feed(evil[i : i + 64])
+            filt.finish()
+            return time.perf_counter() - start
+
+        elapsed(400)  # warm up before timing
+        small = max(elapsed(400), 1e-4)
+        large = elapsed(3200)
+        # 8x the input: linear is ~8x, quadratic ~64x. Generous headroom for a
+        # loaded CI box while still catching quadratic growth.
+        assert large / small < 24, f"superlinear growth: {small=} {large=}"
+
+
+class TestDeepNestingNeverEscapesParseChain:
+    """Deep nesting must degrade to a parse failure, not raise (#2545).
+
+    The interpreter decides *which* error deep input produces, and it varies
+    by version: on 3.14 ``json.loads`` already returns a JSONDecodeError that
+    the old excepts caught, while ``ast`` raises SyntaxError. On earlier
+    versions RecursionError is the mode. Testing with genuinely deep input
+    therefore proves nothing portable, so these tests inject the error at the
+    decoder instead and assert the chain still degrades cleanly on every
+    version.
+    """
+
+    ERRORS = [RecursionError, SyntaxError]
+
+    @staticmethod
+    def _tokenizer(parser):
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = parser
+        return tok
+
+    @pytest.mark.parametrize("error", ERRORS)
+    def test_native_parser_raising_does_not_escape(self, error):
+        """A real parser hitting the limit internally must not escape.
+
+        This is the path #2545 is really about: glm47, kimi_k2 and
+        qwen3_coder call ``json.loads`` inside the parser, so the error
+        surfaces at the parser call rather than at a decode site in this
+        module. Recovering via the XML fallback is a fine outcome; raising
+        is not.
+        """
+        def boom(text, tools):
+            raise error("nested too deeply")
+
+        # Recoverable payload: the fallback picks it up, nothing escapes.
+        _, calls = parse_tool_calls(
+            '<tool_call>{"name": "f"}</tool_call>', self._tokenizer(boom)
+        )
+        assert calls is not None and calls[0].function.name == "f"
+
+        # Unrecoverable payload: drops to no tool calls, still no raise.
+        _, calls = parse_tool_calls(
+            "<tool_call>" + "[" * 500 + "</tool_call>", self._tokenizer(boom)
+        )
+        assert calls is None
+
+    @pytest.mark.parametrize("error", ERRORS)
+    def test_json_loads_raising_does_not_escape(self, monkeypatch, error):
+        """Every json.loads site in the chain sits behind a guard."""
+        import omlx.api.tool_calling as mod
+
+        real = json.loads
+
+        def boom(s, *a, **k):
+            raise error("nested too deeply")
+
+        monkeypatch.setattr(mod.json, "loads", boom)
+        try:
+            # Each of these reaches a different decode site. The third runs a
+            # real parser so a decoder is actually exercised: an earlier
+            # version of this test passed plain text with tool_parser=None,
+            # which reached no decoder at all (caught by DiscoStew6082).
+            mod._parse_xml_tool_calls("<tool_call>{}</tool_call>")
+            mod.extract_json_from_text('{"a": 1}')
+            parse_tool_calls(
+                '<tool_call>{"name": "f", "arguments": {}}</tool_call>',
+                self._tokenizer(lambda text, tools: real(text)),
+            )
+        finally:
+            monkeypatch.setattr(mod.json, "loads", real)
+
+    @pytest.mark.parametrize("error", ERRORS)
+    def test_gemma4_args_reject_hard_instead_of_retrying_legacy(
+        self, monkeypatch, error
+    ):
+        """Deep nesting must not fall through to the unbounded legacy parser.
+
+        The legacy path ignores the length/depth bounds on purpose, so routing
+        a payload that broke a decoder into it would hand the exact input the
+        bounds exist to stop to the parser that does not apply them.
+        """
+        import omlx.api.tool_calling as mod
+
+        def boom(_args):
+            raise error("nested too deeply")
+
+        called = []
+        monkeypatch.setattr(mod, "_gemma4_transcode_to_json", boom)
+        monkeypatch.setattr(
+            mod,
+            "_gemma4_args_to_json_legacy",
+            lambda a: called.append(a) or {},
+        )
+
+        with pytest.raises(mod._Gemma4ArgsTooComplexError):
+            mod._gemma4_args_to_json_robust('{"a": 1}')
+        assert called == [], "legacy parser must not see deep-nested args"
+
+    @pytest.mark.parametrize("error", ERRORS)
+    def test_gemma4_legacy_raising_is_converted(self, monkeypatch, error):
+        """The legacy parser is unbounded, so guard its decoders too."""
+        import omlx.api.tool_calling as mod
+
+        def transcode_fails(_args):
+            raise ValueError("ambiguous, retry with legacy")
+
+        def legacy_boom(_args):
+            raise error("nested too deeply")
+
+        monkeypatch.setattr(mod, "_gemma4_transcode_to_json", transcode_fails)
+        monkeypatch.setattr(mod, "_gemma4_args_to_json_legacy", legacy_boom)
+
+        with pytest.raises(mod._Gemma4ArgsTooComplexError):
+            mod._gemma4_args_to_json_robust('{"a": 1}')
+
+    def test_reported_repro_does_not_raise(self):
+        """The issue's original repro, kept as a smoke test.
+
+        It no longer raises on 3.14 because json.loads returns a decode error
+        there, so it is a regression guard rather than the proof.
+        """
+        tok = self._tokenizer(lambda text, tools: json.loads(text))
+        cleaned, calls = parse_tool_calls(
+            "<tool_call>" + "[" * 100000 + "</tool_call>", tok
+        )
+        assert calls is None
+
+
+@pytest.mark.parametrize("error", [RecursionError, SyntaxError])
+def test_deep_nesting_does_not_take_down_a_neighboring_tool_call(error):
+    """One unparseable call must not lose the valid call beside it (#2545).
+
+    The parse loop runs per match, so a payload that breaks the decoder has
+    to fail that match alone and leave the rest of the batch intact.
+    """
+    def parser(text, tools):
+        if "[" in text:
+            raise error("nested too deeply")
+        return json.loads(text)
+
+    tok = MagicMock(spec=[])
+    tok.has_tool_calling = True
+    tok.tool_call_start = "<tool_call>"
+    tok.tool_call_end = "</tool_call>"
+    tok.tool_parser = parser
+
+    cleaned, calls = parse_tool_calls(
+        "<tool_call>" + "[" * 500 + "</tool_call>"
+        '<tool_call>{"name": "good", "arguments": {"a": 1}}</tool_call>',
+        tok,
+    )
+
+    assert [c.function.name for c in calls] == ["good"]
+    # The broken envelope's markup must not leak into content either.
+    assert cleaned == ""
+
+
+@pytest.mark.parametrize("error", [RecursionError, SyntaxError])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "<tool_call><function=f><parameter=x>{}</parameter></function></tool_call>",
+        "<tool_call>\n<function=f>\n<parameter=x>\n{}\n</parameter>\n"
+        "</function>\n</tool_call>",
+        "<tool_call>f\n<arg_key>x</arg_key>\n<arg_value>{}</arg_value>\n</tool_call>",
+        # Real namespaced grammar. An earlier version of this fixture used
+        # <function=..><parameter=..>, which _parse_namespaced_tool_calls does
+        # not accept, so it parsed zero calls and exercised nothing
+        # (caught by DiscoStew6082).
+        '<ns:tool_call><invoke name="f"><parameter name="x">{}</parameter>'
+        "</invoke></ns:tool_call>",
+    ],
+    ids=["xml-fallback", "qwen-xml", "glm-xml", "namespaced-xml"],
+)
+def test_serialization_after_a_successful_decode_does_not_escape(
+    monkeypatch, error, text
+):
+    """The re-serialize step is a second decode from a deeper frame (#2545).
+
+    ``json.dumps`` recurses per nesting level just as the decoders do, and it
+    runs *after* a value has already parsed, further down the stack. A value
+    nested just under the limit when it decoded can therefore breach it here.
+    DiscoStew6082 hit this at depth ~987 on 3.11, past the first guard.
+
+    Injecting at ``json.dumps`` rather than nesting for real keeps this
+    meaningful on 3.14, where the interpreter does not raise at these depths.
+    """
+    import omlx.api.tool_calling as mod
+
+    nested = "[" * 400 + "0" + "]" * 400
+    real_dumps = json.dumps
+
+    def boom(*args, **kwargs):
+        raise error("nested too deeply")
+
+    payload = text.replace("{}", nested)
+    monkeypatch.setattr(mod.json, "dumps", boom)
+    try:
+        # Must not raise. Dropping the call is fine; escaping is not.
+        if "ns:tool_call" in payload:
+            mod._parse_namespaced_tool_calls(payload, "ns")
+        else:
+            mod._parse_xml_tool_calls(payload)
+    finally:
+        monkeypatch.setattr(mod.json, "dumps", real_dumps)
+
+
+@pytest.mark.parametrize("error", [RecursionError, SyntaxError])
+def test_serialize_arguments_raises_so_the_caller_can_drop(monkeypatch, error):
+    """``_serialize_tool_call_arguments`` propagates rather than emptying.
+
+    An earlier version of this test asserted it returned "{}" here. That was
+    wrong: it produced a runnable tool call with its arguments silently
+    removed. The failure has to reach ``_build_tool_call`` so the call is
+    dropped (jundot's review on #2593).
+    """
+    import omlx.api.tool_calling as mod
+
+    real_dumps = json.dumps
+
+    def boom(*args, **kwargs):
+        raise error("nested too deeply")
+
+    monkeypatch.setattr(mod.json, "dumps", boom)
+    try:
+        with pytest.raises(error):
+            mod._serialize_tool_call_arguments({"x": 1})
+        with pytest.raises(error):
+            mod._serialize_tool_call_arguments('{"x": 1}')
+    finally:
+        monkeypatch.setattr(mod.json, "dumps", real_dumps)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "<tool_call><function=f><parameter=x>{}</parameter></function></tool_call>",
+        "<tool_call>\n<function=f>\n<parameter=x>\n{}\n</parameter>\n"
+        "</function>\n</tool_call>",
+        '<ns:tool_call><invoke name="f"><parameter name="x">{}</parameter>'
+        "</invoke></ns:tool_call>",
+    ],
+    ids=["compact-xml", "qwen-xml", "namespaced-xml"],
+)
+def test_balanced_depth_sweep_through_public_entry(template):
+    """Real nesting swept across the recursion boundary (#2545).
+
+    Unlike the injected tests, this uses genuinely deep input and so only
+    bites on Python 3.11 through 3.13, where ``json.loads`` still raises
+    RecursionError. CI covers exactly those versions. It sweeps rather than
+    picking a depth because the boundary moves with how much stack the caller
+    has already used, which is why a single hand-picked depth reproduced for
+    DiscoStew6082 and not for me.
+
+    Any outcome except an escaping exception is acceptable: parsing the call,
+    or dropping it with a warning.
+    """
+    tok = MagicMock(spec=[])
+    tok.has_tool_calling = True
+    tok.tool_call_start = "<tool_call>"
+    tok.tool_call_end = "</tool_call>"
+    tok.tool_parser = None
+
+    for depth in range(940, 1041):
+        nested = "[" * depth + "0" + "]" * depth
+        try:
+            parse_tool_calls(template.replace("{}", nested), tok)
+        except (RecursionError, SyntaxError) as exc:
+            pytest.fail(f"escaped at depth {depth}: {type(exc).__name__}: {exc}")
+
+
+@pytest.mark.parametrize("error", [RecursionError, SyntaxError, ValueError])
+@pytest.mark.parametrize(
+    "template",
+    [
+        "<tool_call><function=f><parameter=x>{}</parameter></function></tool_call>",
+        "<tool_call>\n<function=f>\n<parameter=x>\n{}\n</parameter>\n"
+        "</function>\n</tool_call>",
+        "<tool_call>f\n<arg_key>x</arg_key>\n<arg_value>{}</arg_value>\n</tool_call>",
+        '<ns:tool_call><invoke name="f"><parameter name="x">{}</parameter>'
+        "</invoke></ns:tool_call>",
+        '<|tool_call_start|>{"name": "f", "arguments": {"x": 1}}<|tool_call_end|>',
+    ],
+    ids=["compact-xml", "qwen-xml", "glm-xml", "namespaced-xml", "hermes"],
+)
+def test_functioncall_validation_failure_drops_one_call(
+    monkeypatch, error, template
+):
+    """The third decode lives in openai_models, not this module (#2545).
+
+    ``FunctionCall`` re-parses the arguments string while validating it, from
+    a deeper frame than either the parse or the serialize that preceded it, so
+    a value fine at both can still breach the limit there. DiscoStew6082 hit
+    this on 3.11 at depth ~989 after the serialize guard was already in place.
+
+    Injected here because the real-depth version only bites on 3.11 to 3.13.
+    ValueError is included because that is what the validator raises for
+    ordinary malformed arguments, and it escaped the parse chain too.
+    """
+    import omlx.api.openai_models as om
+
+    def boom(_v):
+        raise error("nested too deeply")
+
+    monkeypatch.setattr(om, "_coerce_tool_call_arguments", boom)
+
+    tok = MagicMock(spec=[])
+    tok.has_tool_calling = True
+    tok.tool_call_start = "<tool_call>"
+    tok.tool_call_end = "</tool_call>"
+    tok.tool_parser = None
+
+    # Must not raise. Dropping the call with a warning is the contract.
+    _, calls = parse_tool_calls(template.replace("{}", "1"), tok)
+    assert not calls
+
+
+@pytest.mark.parametrize("chain", [200, 400, 800])
+def test_hermes_chained_expression_does_not_escape(chain):
+    """`ast.unparse` recurses too, and runs after `ast.parse` succeeded (#2545).
+
+    A long chained expression parses fine, fails `ast.literal_eval` because it
+    is not a literal, then breaches the limit in the `ast.unparse` fallback
+    that renders it back to source. jundot found this on the Hermes path after
+    the decoder, serializer and validator layers were all guarded.
+
+    Real nesting rather than injection, so it only bites on 3.11 to 3.13,
+    which is what CI runs.
+    """
+    expr = "+".join(["1"] * chain)
+    text = f"<|tool_call_start|>f(x={expr})<|tool_call_end|>"
+
+    tok = MagicMock(spec=[])
+    tok.has_tool_calling = True
+    tok.tool_call_start = "<tool_call>"
+    tok.tool_call_end = "</tool_call>"
+    tok.tool_parser = None
+
+    # Must not raise through the public entry point.
+    parse_tool_calls(text, tok)
+
+
+@pytest.mark.parametrize("error", [RecursionError, SyntaxError])
+def test_unrepresentable_argument_drops_the_call(monkeypatch, error):
+    """An argument we cannot render drops the call, not just the argument."""
+    import omlx.api.tool_calling as mod
+
+    real_unparse = ast.unparse
+
+    def boom(node):
+        raise error("nested too deeply")
+
+    monkeypatch.setattr(mod.ast, "unparse", boom)
+    # `1+1` is not a literal, so literal_eval fails and unparse is the fallback.
+    cleaned, calls = mod._parse_hermes_tool_calls(
+        "<|tool_call_start|>f(x=1+1)<|tool_call_end|>"
+    )
+    monkeypatch.setattr(mod.ast, "unparse", real_unparse)
+
+    assert not calls, "a call missing an argument must not be emitted"
+
+
+@pytest.mark.parametrize("error", [RecursionError, SyntaxError])
+def test_serialization_failure_drops_the_call_rather_than_emptying_it(
+    monkeypatch, error
+):
+    """A serialize failure must not yield a runnable call with no arguments.
+
+    Coercing to "{}" here would hand back a tool call that still executes with
+    its arguments silently removed, so a `write_file` would fire with nothing
+    to write. That is worse than dropping it. Distinct from the non-object
+    coercion below, which is a benign parser quirk (jundot's review on #2593).
+    """
+    import omlx.api.tool_calling as mod
+
+    real_dumps = json.dumps
+
+    def boom(*args, **kwargs):
+        raise error("nested too deeply")
+
+    monkeypatch.setattr(mod.json, "dumps", boom)
+    try:
+        built = mod._build_tool_call("write_file", {"path": "a", "content": "b"})
+    finally:
+        monkeypatch.setattr(mod.json, "dumps", real_dumps)
+
+    assert built is None, "must drop, not emit a call with emptied arguments"
+
+
+def test_non_object_arguments_still_coerce_to_empty_object():
+    """The benign coercion is unchanged: a parser quirk, not lost data."""
+    import omlx.api.tool_calling as mod
+
+    assert mod._serialize_tool_call_arguments([1, 2]) == "{}"
+    assert mod._serialize_tool_call_arguments("not json") == "{}"
+    assert mod._serialize_tool_call_arguments({"a": 1}) == '{"a": 1}'
+
+
+@pytest.mark.parametrize("error", [RecursionError, SyntaxError])
+def test_string_parser_output_that_cannot_decode_drops_the_call(
+    monkeypatch, error
+):
+    """The string branch loses arguments the same way the dict branch did.
+
+    Parsers that follow the OpenAI spec hand back a JSON-object *string*
+    (mlx-vlm and mlx-lm's gemma4 do). If decoding that string breaches the
+    limit, catching the error here would fall through to the "{}" coercion and
+    emit a runnable call without its arguments. Caught by DiscoStew6082 on
+    #2593 after the dict branch was already fixed.
+
+    The decode is made to fail only for this exact payload, so the downstream
+    validator still works and the drop is attributable to this branch.
+    """
+    import omlx.api.tool_calling as mod
+
+    payload = '{"path": "notes.xml", "content": "IMPORTANT"}'
+    real_loads = json.loads
+
+    def selective(s, *args, **kwargs):
+        if s == payload:
+            raise error("nested too deeply")
+        return real_loads(s, *args, **kwargs)
+
+    monkeypatch.setattr(mod.json, "loads", selective)
+    try:
+        built = mod._build_tool_call("write_file", payload)
+    finally:
+        monkeypatch.setattr(mod.json, "loads", real_loads)
+
+    assert built is None, "must drop, not emit a call with emptied arguments"
+
+
+def test_malformed_string_arguments_still_coerce():
+    """Undecodable-but-shallow input stays a benign coercion, not a drop."""
+    import omlx.api.tool_calling as mod
+
+    assert mod._serialize_tool_call_arguments("not json at all") == "{}"
+    assert mod._serialize_tool_call_arguments('{"a": 1}') == '{"a": 1}'
+
+
+@pytest.mark.parametrize(
+    "literal",
+    ["{1, 2}", "b'abc'", "1+2j"],
+    ids=["set", "bytes", "complex"],
+)
+def test_hermes_non_json_literal_drops_only_bad_call(literal):
+    """Python literals that JSON cannot represent must not escape the parser."""
+    tok = MagicMock(spec=[])
+    tok.has_tool_calling = False
+    text = "<|tool_call_start|>[bad(x=" + literal + "), good(x=1)]<|tool_call_end|>"
+
+    cleaned, calls = parse_tool_calls(text, tok)
+
+    assert cleaned == ""
+    assert [call.function.name for call in calls] == ["good"]
+
+
+def test_bracket_deep_decode_never_runs_raw_arguments():
+    """A recursion-bound breach must drop the call, not run its raw payload."""
+    tok = MagicMock(spec=[])
+    tok.has_tool_calling = False
+
+    for depth in range(900, 1051):
+        nested = "[" * depth + "0" + "]" * depth
+        text = '[Tool call: bad({"x":' + nested + '})][Tool call: good({"x":1})]'
+
+        cleaned, calls = parse_tool_calls(text, tok)
+        names = [call.function.name for call in calls or []]
+
+        assert cleaned == ""
+        assert names.count("good") == 1
+        for call in calls or []:
+            if call.function.name == "bad":
+                assert not call.function.arguments.startswith('{"raw":')
+
+
+# ======================================================================
+
+# _parse_xml_tool_calls / _parse_namespaced_tool_calls bug fixes
+#
+# (1) unconditional json.loads() coercion of parsed XML param values, which
+#     silently turns a string-typed schema param whose value looks like
+#     "123"/"true" into an int/bool. TestSchemaAwareFallbackCoercion above
+#     covers the qwen/GLM XML branches and namespaced malformed-array
+#     repair (_coerce_param_value); the two classes below add the plain
+#     string-not-coerced case for the namespaced parser and the
+#     native-tool_parser passthrough contract, which aren't covered there.
+# (2) a \w+-based regex for the tool/function name that rejects hyphens and
+#     dots, so a hyphenated or dotted tool name that is otherwise valid per
+#     the model's own schema/output would fail to parse. Covered by
+#     TestParseXmlToolCallsHyphenatedName below.
+# ======================================================================
+
+
+class TestParseXmlToolCallsHyphenatedName:
+    """Regex fix: <function=NAME> must accept hyphens and dots in NAME."""
+
+    @pytest.mark.parametrize("function_name", ["123lookup", "날씨", "get-weather"])
+    @pytest.mark.parametrize("parameter_name", ["123", "도시", "filter.lang"])
+    def test_existing_names_survive_xml_fallback(self, function_name, parameter_name):
+        text = (
+            f"<tool_call><function={function_name}>"
+            f"<parameter={parameter_name}>Paris</parameter>"
+            "</function></tool_call>"
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, None)
+
+        assert cleaned == ""
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == function_name
+        assert json.loads(tool_calls[0].function.arguments) == {parameter_name: "Paris"}
+
+    def test_hyphenated_function_name_parses(self):
+        text = (
+            "<tool_call>\n<function=get-weather>\n"
+            "<parameter=location>\nParis\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        cleaned, tool_calls = _parse_xml_tool_calls(text)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "get-weather"
+
+    def test_dotted_function_name_parses(self):
+        text = (
+            "<tool_call>\n<function=web.search>\n"
+            "<parameter=query>\nhello\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        cleaned, tool_calls = _parse_xml_tool_calls(text)
+        assert tool_calls is not None
+        assert tool_calls[0].function.name == "web.search"
+
+    def test_plain_underscored_name_still_parses(self):
+        """Regression guard: the common \\w+ case (underscores) still works."""
+        text = (
+            "<tool_call>\n<function=get_weather>\n"
+            "<parameter=location>\nParis\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        cleaned, tool_calls = _parse_xml_tool_calls(text)
+        assert tool_calls is not None
+        assert tool_calls[0].function.name == "get_weather"
+
+    def test_hyphenated_parameter_name_round_trips(self):
+        """Sibling bug: _XML_PARAMETER_OPEN_RE had the same \\w+ regex, so a
+        hyphenated *parameter* name (not just a hyphenated function name)
+        would fail to match and the whole <parameter=...> element -- name
+        AND value -- was silently dropped, leaving `arguments` empty even
+        though the tool name parsed fine.
+        """
+        text = (
+            "<tool_call>\n<function=get-weather>\n"
+            "<parameter=unit-type>\ncelsius\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        cleaned, tool_calls = _parse_xml_tool_calls(text)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "get-weather"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args == {"unit-type": "celsius"}
+
+    def test_dotted_parameter_name_round_trips(self):
+        text = (
+            "<tool_call>\n<function=web.search>\n"
+            "<parameter=filter.lang>\nen\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        cleaned, tool_calls = _parse_xml_tool_calls(text)
+        assert tool_calls is not None
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args == {"filter.lang": "en"}
+
+
+class TestParseNamespacedToolCallsStringCoercion:
+    """String-not-coerced case for the namespaced (MiniMax-style) parser.
+
+    TestSchemaAwareFallbackCoercion above covers this scenario for the
+    qwen/GLM XML branches (and malformed-array repair for all three
+    branches, including namespaced), but not the plain string-not-coerced
+    case specifically through _parse_namespaced_tool_calls.
+    """
+
+    STRING_PARAM_TOOLS = [{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+            },
+        },
+    }]
+
+    def test_numeric_looking_string_param_stays_string(self):
+        text = (
+            '<minimax:tool_call>'
+            '<invoke name="get_weather">'
+            '<parameter name="location">123</parameter>'
+            '</invoke>'
+            '</minimax:tool_call>'
+        )
+        _, tool_calls = _parse_namespaced_tool_calls(
+            text, "minimax", tools=self.STRING_PARAM_TOOLS
+        )
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["location"] == "123"
+        assert isinstance(args["location"], str)
+
+
+class TestParseToolCallsNativeParserPreservesTypes:
+    """GLM (and other mlx-lm-native) tool calls go through parse_tool_calls'
+    ``tokenizer.tool_parser`` branch first, *not* through
+    ``_parse_xml_tool_calls`` -- that fallback only runs when the tokenizer
+    has no native tool parser configured. This is not a second, unpatched
+    coercion path: mlx-lm's own tool parsers (e.g. ``glm47.py``) already do
+    their own schema-aware string-vs-bare-token coercion internally, and
+    parse_tool_calls trusts whatever typed ``arguments`` dict the native
+    parser returns without re-coercing it. These tests pin that contract
+    down so a future change to parse_tool_calls doesn't introduce a second,
+    naive ``json.loads`` pass on top of an already-typed native result.
+    """
+
+    def test_native_parser_string_value_passed_through_unmodified(self):
+        """A native tool_parser that already preserved a numeric-looking
+        string (per its own schema awareness) must not be re-coerced by
+        parse_tool_calls."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = lambda text, tools: {
+            "name": "get_weather",
+            "arguments": {"location": "123"},  # native parser kept it a str
+        }
+
+        text = "<tool_call>get_weather<arg_key>location</arg_key><arg_value>123</arg_value></tool_call>"
+        _, tool_calls = parse_tool_calls(text, tok)
+
+        assert tool_calls is not None
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["location"] == "123"
+        assert isinstance(args["location"], str)
+
+    def test_native_parser_numeric_value_passed_through_unmodified(self):
+        """A genuinely numeric argument from the native parser is untouched too."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = lambda text, tools: {
+            "name": "get_weather",
+            "arguments": {"count": 42},
+        }
+
+        text = "<tool_call>get_weather<arg_key>count</arg_key><arg_value>42</arg_value></tool_call>"
+        _, tool_calls = parse_tool_calls(text, tok)
+
+        assert tool_calls is not None
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["count"] == 42
+        assert isinstance(args["count"], int)
+
+
+class TestNakedQwenFollowup:
+    @staticmethod
+    def tokenizer():
+        from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = parse_tool_call
+        return tok
+
+    @staticmethod
+    def tools():
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "count": {"type": "integer"},
+                            "enabled": {"type": "boolean"},
+                            "items": {"type": "array"},
+                        },
+                    },
+                },
+            }
+        ]
+
+    @staticmethod
+    def block(value):
+        return f"<function=write><parameter=content>{value}</parameter></function>"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "123",
+            "true",
+            '{"a": 1}',
+            'print("</function>")',
+            'print("</parameter>")',
+            "see <parameter=x> here",
+            "literal </function></tool_call> tail",
+            "한글 日本語 😀",
+        ],
+    )
+    @pytest.mark.parametrize("chunk_size", [1, 7, 4096])
+    def test_arguments_and_stream_boundaries(self, value, chunk_size):
+        raw = "Before " + self.block(value) + "\n</tool_call> After"
+        cleaned, calls = parse_tool_calls(raw, self.tokenizer(), self.tools())
+        assert cleaned == "Before  After"
+        assert len(calls) == 1
+        assert json.loads(calls[0].function.arguments) == {"content": value}
+        filt = ToolCallStreamFilter(self.tokenizer(), capture_ordered_segments=True)
+        emitted = (
+            "".join(
+                filt.feed(raw[i : i + chunk_size])
+                for i in range(0, len(raw), chunk_size)
+            )
+            + filt.finish()
+        )
+        assert emitted == "Before  After"
+        envelopes = filt.take_completed_envelopes()
+        assert envelopes == [self.block(value)]
+
+    def test_schema_types_and_mixed_repeated_calls(self):
+        first = (
+            "<function=write><parameter=count>20</parameter>"
+            "<parameter=enabled>true</parameter>"
+            "<parameter=items>[1,2]</parameter></function>"
+        )
+        second = self.block("123")
+        raw = first + "<tool_call>" + second + "</tool_call>" + second
+        cleaned, calls = parse_tool_calls(raw, self.tokenizer(), self.tools())
+        assert cleaned == ""
+        assert [json.loads(c.function.arguments) for c in calls] == [
+            {"count": 20, "enabled": True, "items": [1, 2]},
+            {"content": "123"},
+            {"content": "123"},
+        ]
+        assert len({c.id for c in calls}) == 3
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "<function=ping></function>",
+            "<function=ping>\n</function>\n</tool_call>",
+            "<function=ping>" + " " * 1000 + "</function>",
+        ],
+    )
+    def test_zero_argument_calls(self, raw):
+        cleaned, calls = parse_tool_calls(raw, self.tokenizer())
+        assert cleaned == ""
+        assert json.loads(calls[0].function.arguments) == {}
+        filt = ToolCallStreamFilter(self.tokenizer())
+        assert "".join(filt.feed(c) for c in raw) + filt.finish() == ""
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            '<function=write><parameter=content>print("</function>")',
+            "<function=write><parameter=content>unfinished",
+        ],
+    )
+    def test_incomplete_call_is_recoverable_without_execution(self, raw):
+        cleaned, calls = parse_tool_calls(raw, self.tokenizer(), self.tools())
+        assert calls is None
+        assert cleaned == raw
+        filt = ToolCallStreamFilter(self.tokenizer())
+        assert "".join(filt.feed(c) for c in raw) + filt.finish() == ""
+        assert filt.take_recovery_candidate() == raw
+
+    def test_unrelated_close_tag_in_prose_is_preserved(self):
+        raw = self.block("ok") + " After mentioning </tool_call> in prose."
+        cleaned, calls = parse_tool_calls(raw, self.tokenizer(), self.tools())
+        assert cleaned == "After mentioning </tool_call> in prose."
+        filt = ToolCallStreamFilter(self.tokenizer())
+        assert "".join(filt.feed(c) for c in raw) + filt.finish() == " " + cleaned
+
+
+@pytest.fixture
+def final_qwen_parser():
+    from types import SimpleNamespace
+
+    from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+    tok = SimpleNamespace(
+        has_tool_calling=True,
+        tool_call_start="<tool_call>",
+        tool_call_end="</tool_call>",
+        tool_parser=parse_tool_call,
+    )
+    tools = [
+        {
+            "function": {
+                "name": "write",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"content": {"type": "string"}},
+                    "required": ["content"],
+                },
+            }
+        }
+    ]
+    return tok, tools
+
+
+@pytest.mark.parametrize(
+    "parser_module",
+    [
+        "mlx_lm.tool_parsers.qwen3_coder",
+        "mlx_vlm.tools.parsers.qwen3_coder",
+    ],
+)
+@pytest.mark.parametrize(
+    "value",
+    [
+        "안녕하세요 🌍",
+        "literal </tool_call> and </function> tags",
+        "<parameter=x>literal</parameter>",
+        'quote " and slash \\',
+        "x" * 50000,
+    ],
+)
+def test_final_qwen_outer_recovery_preserves_parameter_bytes(
+    final_qwen_parser, monkeypatch, parser_module, value
+):
+    tok, tools = final_qwen_parser
+    monkeypatch.setattr(tok.tool_parser, "__module__", parser_module)
+    raw = (
+        f"<tool_call><function=write><parameter=content>{value}</parameter></function>"
+    )
+    result = extract_tool_calls_with_thinking("", raw, tok, tools, finish_reason="stop")
+    assert not result.parse_errors
+    assert json.loads(result.tool_calls[0].function.arguments) == {"content": value}
+    assert result.cleaned_text == ""
+
+
+@pytest.mark.parametrize("suffix", ["", "</tool_call>"])
+def test_final_qwen_naked_function_does_not_leave_orphan_close(
+    final_qwen_parser, suffix
+):
+    tok, tools = final_qwen_parser
+    raw = "<function=write><parameter=content>ok</parameter></function>" + suffix
+    result = extract_tool_calls_with_thinking("", raw, tok, tools, finish_reason="stop")
+    assert result.cleaned_text == ""
+    assert len(result.tool_calls) == 1
+
+
+def test_final_qwen_does_not_promote_unknown_reasoning_call(final_qwen_parser):
+    tok, tools = final_qwen_parser
+    thinking = "<tool_call><function=unknown></function></tool_call>"
+    result = extract_tool_calls_with_thinking(
+        thinking, "Answer", tok, tools, finish_reason="stop"
+    )
+    assert not result.tool_calls
+    assert result.cleaned_text == "Answer"
+
+
+@pytest.mark.parametrize("parameter", ["", '<parameter=content>{"x": 1</parameter>'])
+def test_final_qwen_recovery_requires_complete_schema_valid_arguments(
+    final_qwen_parser, parameter
+):
+    tok, tools = final_qwen_parser
+    tools[0]["function"]["parameters"]["properties"]["content"]["type"] = "object"
+    raw = f"<tool_call><function=write>{parameter}</function>"
+    result = extract_tool_calls_with_thinking("", raw, tok, tools, finish_reason="stop")
+    assert not result.tool_calls
+    assert result.parse_errors == ("malformed",)
+
+
+class TestAttributeStyleFunctionDialect:
+    """Tests for the attribute-style <function name="..."> dialect (#3429).
+
+    MiniCPM5-family chat templates emit
+    ``<function name="name"><param name="key">value</param></function>``,
+    combining the ``<invoke name="...">`` attribute convention with the
+    ``<function=...>`` element name — previously the one unhandled
+    combination, both bare and wrapped in ``<tool_call>``.
+    """
+
+    READ_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "read",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["path"],
+            },
+        },
+    }
+
+    BARE_CALL = (
+        '<function name="read"><param name="path">/workspace/TASK.md</param>'
+        "</function>"
+    )
+
+    def _tokenizer(self):
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = False
+        return tok
+
+    def test_bare_element_parses_with_declared_tool(self):
+        cleaned, calls = parse_tool_calls(
+            self.BARE_CALL, self._tokenizer(), [self.READ_TOOL]
+        )
+        assert cleaned == ""
+        assert len(calls) == 1
+        assert calls[0].function.name == "read"
+        assert json.loads(calls[0].function.arguments) == {
+            "path": "/workspace/TASK.md"
+        }
+
+    def test_bare_element_keeps_surrounding_prose(self):
+        text = f"I'll read the file. {self.BARE_CALL} Standing by."
+        cleaned, calls = parse_tool_calls(
+            text, self._tokenizer(), [self.READ_TOOL]
+        )
+        assert calls is not None
+        assert "function" not in cleaned
+        assert "I'll read the file." in cleaned
+        assert "Standing by." in cleaned
+
+    def test_parameter_spelling_variant(self):
+        text = (
+            '<function name="read"><parameter name="path">/x</parameter>'
+            "</function>"
+        )
+        _, calls = parse_tool_calls(text, self._tokenizer(), [self.READ_TOOL])
+        assert json.loads(calls[0].function.arguments) == {"path": "/x"}
+
+    def test_wrapped_in_tool_call_envelope(self):
+        text = f"<tool_call>{self.BARE_CALL}</tool_call>"
+        cleaned, calls = parse_tool_calls(
+            text, self._tokenizer(), [self.READ_TOOL]
+        )
+        assert cleaned == ""
+        assert calls[0].function.name == "read"
+
+    def test_wrapped_form_needs_no_tools(self):
+        # Inside a <tool_call> envelope the wrapper is the anchor, matching
+        # the other wrapped branches: no tool declarations required.
+        text = f"<tool_call>{self.BARE_CALL}</tool_call>"
+        _, calls = _parse_xml_tool_calls(text)
+        assert calls[0].function.name == "read"
+
+    def test_multiple_bare_calls(self):
+        text = (
+            '<function name="read"><param name="path">/a</param></function>\n'
+            '<function name="read"><param name="path">/b</param></function>'
+        )
+        cleaned, calls = parse_tool_calls(
+            text, self._tokenizer(), [self.READ_TOOL]
+        )
+        assert cleaned == ""
+        assert [json.loads(c.function.arguments)["path"] for c in calls] == [
+            "/a",
+            "/b",
+        ]
+
+    def test_schema_coercion_of_integer_param(self):
+        text = (
+            '<function name="read"><param name="path">/x</param>'
+            '<param name="limit">5</param></function>'
+        )
+        _, calls = parse_tool_calls(text, self._tokenizer(), [self.READ_TOOL])
+        assert json.loads(calls[0].function.arguments) == {
+            "path": "/x",
+            "limit": 5,
+        }
+
+    def test_cdata_wrapped_value_is_unwrapped(self):
+        # The MiniCPM5 template asks for CDATA around values containing
+        # "<", "&" or newlines; the argument must carry the literal value.
+        text = (
+            '<function name="read"><param name="path">'
+            "<![CDATA[/dir with <odd> & chars/TASK.md]]></param></function>"
+        )
+        _, calls = parse_tool_calls(text, self._tokenizer(), [self.READ_TOOL])
+        assert json.loads(calls[0].function.arguments) == {
+            "path": "/dir with <odd> & chars/TASK.md"
+        }
+
+    def test_undeclared_name_is_left_untouched(self):
+        text = '<function name="evil"><param name="path">/x</param></function>'
+        cleaned, calls = parse_tool_calls(
+            text, self._tokenizer(), [self.READ_TOOL]
+        )
+        assert calls is None
+        assert cleaned == text
+
+    def test_bare_parser_inert_without_tools(self):
+        for tools in (None, []):
+            cleaned, calls = _parse_attribute_function_tool_calls(
+                self.BARE_CALL, tools
+            )
+            assert calls is None
+            assert cleaned == self.BARE_CALL
+
+    def test_stream_filter_suppresses_bare_dialect_across_chunks(self):
+        f = ToolCallStreamFilter(_make_tokenizer(), tools=[self.READ_TOOL])
+        chunks = [
+            "Sure. ",
+            "<funct",
+            'ion name="read"><param name="pa',
+            'th">/x</param></funct',
+            "ion>",
+            " Done.",
+        ]
+        out = "".join(f.feed(chunk) for chunk in chunks) + f.finish()
+        assert out == "Sure.  Done."
+
+    def test_stream_filter_flushes_incomplete_marker_prose(self):
+        # "<function " (no name attribute) can never complete the open
+        # marker, so withheld prose must flush rather than vanish.
+        f = ToolCallStreamFilter(_make_tokenizer())
+        out = f.feed("see <function") + f.feed(" docs for details") + f.finish()
+        assert out == "see <function docs for details"
+
+    def test_cdata_containing_literal_param_tags(self):
+        # CDATA must protect nested <param> tags from premature truncation.
+        text = (
+            '<function name="read"><param name="path">config.xml</param>'
+            '<param name="content"><![CDATA['
+            '<param name="nested">inside</param>'
+            ']]></param></function>'
+        )
+        _, calls = parse_tool_calls(text, self._tokenizer(), [self.READ_TOOL])
+        args = json.loads(calls[0].function.arguments)
+        assert args["path"] == "config.xml"
+        assert args["content"] == '<param name="nested">inside</param>'
+
+    def test_unclosed_preceding_tag_does_not_swallow_valid_call(self):
+        # A preceding unclosed <function> tag in prose must not swallow
+        # subsequent registered tool calls.
+        text = (
+            'Example: <function name="unclosed"> not closed. '
+            f'Real call: {self.BARE_CALL}'
+        )
+        cleaned, calls = parse_tool_calls(text, self._tokenizer(), [self.READ_TOOL])
+        assert calls is not None
+        assert len(calls) == 1
+        assert calls[0].function.name == "read"
+        assert 'Example: <function name="unclosed"> not closed.' in cleaned
+
+    def test_tag_whitespace_tolerance(self):
+        # Whitespace before closing '>' in tags should be tolerated.
+        text = (
+            '<function name="read" ><param name="path" >/x</param></function>'
+        )
+        _, calls = parse_tool_calls(text, self._tokenizer(), [self.READ_TOOL])
+        assert calls is not None
+        assert json.loads(calls[0].function.arguments) == {"path": "/x"}
+
+    def test_no_argument_call(self):
+        ping_tool = {
+            "type": "function",
+            "function": {"name": "ping", "parameters": {"type": "object"}},
+        }
+        text = '<function name="ping"></function>'
+        _, calls = parse_tool_calls(text, self._tokenizer(), [ping_tool])
+        assert calls is not None
+        assert calls[0].function.name == "ping"
+        assert json.loads(calls[0].function.arguments) == {}
+
+    def test_stream_filter_preserves_undeclared_function_in_prose(self):
+        # Gap 1: undeclared function markup in prose must not be suppressed
+        # during streaming, aligning with non-streaming behavior.
+        f = ToolCallStreamFilter(_make_tokenizer(), tools=[self.READ_TOOL])
+        text = 'Here is an example: <function name="example"><param name="k">v</param></function> in prose.'
+        out = f.feed(text) + f.finish()
+        assert out == text
+
+    def test_stream_filter_inert_for_bare_dialect_without_tools(self):
+        # Bare dialect is inert when no tools are declared.
+        for tools in (None, []):
+            f = ToolCallStreamFilter(_make_tokenizer(), tools=tools)
+            text = f"Prose {self.BARE_CALL} end."
+            out = f.feed(text) + f.finish()
+            assert out == text
+
+    def test_cdata_with_literal_function_close_tag(self):
+        # Gap 2: literal </function> inside CDATA must not truncate the call
+        # or produce empty arguments.
+        literal_code = 'def test():\n    return "</function>"\n'
+        text = (
+            '<function name="read"><param name="path"><![CDATA['
+            f'{literal_code}'
+            ']]></param></function>'
+        )
+        _, calls = parse_tool_calls(text, self._tokenizer(), [self.READ_TOOL])
+        assert calls is not None
+        assert len(calls) == 1
+        assert calls[0].function.name == "read"
+        assert json.loads(calls[0].function.arguments) == {"path": literal_code}
+
+    def test_cdata_with_embedded_function_call_example(self):
+        # Gap 2: a complete function call example inside CDATA should be
+        # preserved verbatim as argument value without triggering nested call extraction.
+        inner_example = '<function name="read"><param name="path">nested.py</param></function>'
+        text = (
+            f'Output: <function name="read"><param name="path"><![CDATA['
+            f'{inner_example}'
+            ']]></param></function> End.'
+        )
+        cleaned, calls = parse_tool_calls(text, self._tokenizer(), [self.READ_TOOL])
+        assert calls is not None
+        assert len(calls) == 1
+        assert calls[0].function.name == "read"
+        assert json.loads(calls[0].function.arguments) == {"path": inner_example}
+        assert "Output:" in cleaned
+        assert "End." in cleaned
+        assert "nested.py" not in cleaned
+
+    def test_stream_filter_cdata_with_literal_function_close_across_chunks(self):
+        # Gap 2 streaming: literal </function> inside CDATA across chunk boundaries
+        # must not end suppression prematurely or leak subsequent XML into visible output.
+        f = ToolCallStreamFilter(_make_tokenizer(), tools=[self.READ_TOOL])
+        chunks = [
+            "Before call. ",
+            '<function name="read"><param name="path"><![CDATA[',
+            'def foo():\n    return "</func',
+            'tion>"\n',
+            ']]></param></function>',
+            " After call.",
+        ]
+        out = "".join(f.feed(chunk) for chunk in chunks) + f.finish()
+        assert out == "Before call.  After call."
+
+    def test_stream_filter_cdata_delimiters_split_across_chunks(self):
+        # Gap 2 streaming: <![CDATA[ and ]]> delimiters split across chunks
+        f = ToolCallStreamFilter(_make_tokenizer(), tools=[self.READ_TOOL])
+        chunks = [
+            "Prefix: ",
+            '<function name="read"><param name="path"><![CD',
+            'ATA[</function>]]',
+            '></param></function>',
+            " Suffix.",
+        ]
+        out = "".join(f.feed(chunk) for chunk in chunks) + f.finish()
+        assert out == "Prefix:  Suffix."
+
+    def test_stream_filter_multiple_spaces_in_tag(self):
+        # Gap 3: multiple spaces in opening tag must be suppressed during streaming.
+        f = ToolCallStreamFilter(_make_tokenizer(), tools=[self.READ_TOOL])
+        chunks = [
+            "Start ",
+            '<function  ',
+            ' name="read"  ><param  name="path">/test.py</param></function>',
+            " End",
+        ]
+        out = "".join(f.feed(chunk) for chunk in chunks) + f.finish()
+        assert out == "Start  End"
+
+    def test_stream_filter_capture_ordered_segments(self):
+        # Verify capture_ordered_segments retains the complete envelope
+        f = ToolCallStreamFilter(
+            _make_tokenizer(),
+            tools=[self.READ_TOOL],
+            capture_ordered_segments=True,
+        )
+        raw_call = '<function name="read"><param name="path">/x</param></function>'
+        chunks = ["Hello ", raw_call, " world"]
+        out = "".join(f.feed(c) for c in chunks) + f.finish()
+        assert out == "Hello  world"
+        envelopes = f.take_completed_envelopes()
+        assert envelopes == [raw_call]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Use <tool_call> for calls",
+        '<tool_call>{"name":"read","arguments":{"path":"/example"}}</tool_call>',
+        '<minimax:tool_call><invoke name="read"><parameter name="path">'
+        "/example</parameter></invoke></minimax:tool_call>",
+        "<function=read><parameter=path>/example</parameter></function>",
+    ],
+)
+def test_attribute_cdata_does_not_select_an_embedded_dialect(value):
+    tools = [TestAttributeStyleFunctionDialect.READ_TOOL]
+    raw = (
+        '<function name="read"><param name="path"><![CDATA['
+        + value
+        + "]]></param></function>"
+    )
+    cleaned, calls = parse_tool_calls(raw, _make_tokenizer(), tools)
+    assert cleaned == ""
+    assert len(calls) == 1
+    assert calls[0].function.name == "read"
+    assert json.loads(calls[0].function.arguments) == {"path": value}
+
+
+@pytest.mark.parametrize("dialect", ["json", "qwen", "namespaced"])
+def test_attribute_example_does_not_override_outer_dialect(dialect):
+    value = TestAttributeStyleFunctionDialect.BARE_CALL
+    tools = [TestAttributeStyleFunctionDialect.READ_TOOL]
+    if dialect == "json":
+        raw = (
+            "<tool_call>"
+            + json.dumps({"name": "read", "arguments": {"path": value}})
+            + "</tool_call>"
+        )
+    elif dialect == "qwen":
+        raw = (
+            "<tool_call><function=read><parameter=path>"
+            + value
+            + "</parameter></function></tool_call>"
+        )
+    else:
+        raw = (
+            '<minimax:tool_call><invoke name="read"><parameter name="path">'
+            + value
+            + "</parameter></invoke></minimax:tool_call>"
+        )
+    cleaned, calls = parse_tool_calls(raw, _make_tokenizer(), tools)
+    assert cleaned == ""
+    assert len(calls) == 1
+    assert json.loads(calls[0].function.arguments) == {"path": value}
+
+
+def test_attribute_call_preserves_following_other_dialect_call():
+    first = TestAttributeStyleFunctionDialect.BARE_CALL
+    second = '<tool_call>{"name":"read","arguments":{"path":"/second"}}</tool_call>'
+    cleaned, calls = parse_tool_calls(
+        "Before " + first + " Between " + second + " After",
+        _make_tokenizer(),
+        [TestAttributeStyleFunctionDialect.READ_TOOL],
+    )
+    assert cleaned == "Before  Between  After"
+    assert [json.loads(call.function.arguments)["path"] for call in calls] == [
+        "/workspace/TASK.md",
+        "/second",
+    ]
+
+
+@pytest.mark.parametrize(
+    "parser_module",
+    [
+        "mlx_lm.tool_parsers.qwen3_coder",
+        "mlx_vlm.tools.parsers.qwen3_coder",
+    ],
+)
+@pytest.mark.parametrize("keyword", ["oneOf", "anyOf"])
+def test_qwen_untyped_tool_parameter(monkeypatch, parser_module, keyword):
+    tokenizer = TestNakedQwenFollowup.tokenizer()
+    monkeypatch.setattr(tokenizer.tool_parser, "__module__", parser_module)
+    schema = {
+        "type": "object",
+        "properties": {
+            "plugin": {
+                keyword: [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"const": "new"},
+                            "idPrefix": {"type": "string"},
+                        },
+                        "required": ["kind", "idPrefix"],
+                    },
+                    {"type": "array", "items": {"type": "string"}},
+                ]
+            },
+            "literal": {"type": "string"},
+            "count": {"type": "integer"},
+        },
+        "required": ["plugin", "literal", "count"],
+    }
+    tools = [{"type": "function", "function": {"name": "f", "parameters": schema}}]
+    raw = (
+        '<tool_call><function=f><parameter=plugin>{"kind":"new","idPrefix":"abc"}'
+        "</parameter><parameter=literal>123</parameter><parameter=count>7</parameter>"
+        "</function></tool_call>"
+    )
+    result = extract_tool_calls_with_thinking(
+        "", raw, tokenizer, tools, finish_reason="stop"
+    )
+    assert not result.parse_errors
+    args = json.loads(result.tool_calls[0].function.arguments)
+    assert args == {
+        "plugin": {"kind": "new", "idPrefix": "abc"},
+        "literal": "123",
+        "count": 7,
+    }
+    assert validate_json_schema(args, schema)[0]
+
+
+@pytest.mark.parametrize(
+    "spec, raw, expected",
+    [
+        (
+            {"anyOf": [{"type": "array"}, {"type": "null"}]},
+            "[true, null]",
+            [True, None],
+        ),
+        ({"oneOf": [{"type": "string"}, {"type": "object"}]}, '"123"', "123"),
+        (
+            {"oneOf": [{"type": "string"}, {"type": "object"}]},
+            "plain text",
+            "plain text",
+        ),
+        ({"type": "string"}, '{"a":1}', '{"a":1}'),
+        ({}, '{"unfinished":', '{"unfinished":'),
+    ],
+)
+def test_qwen_untyped_parameter_conversion_boundaries(spec, raw, expected):
+    tools = [{"function": {"name": "f", "parameters": {"properties": {"v": spec}}}}]
+    _, calls = parse_tool_calls(
+        f"<tool_call><function=f><parameter=v>{raw}</parameter></function></tool_call>",
+        TestNakedQwenFollowup.tokenizer(),
+        tools,
+    )
+    assert json.loads(calls[0].function.arguments)["v"] == expected
+
+
+@pytest.mark.parametrize("spec", [{}, {"type": ["string", "null"]}])
+def test_qwen_parameter_is_not_decoded_twice(monkeypatch, spec):
+    from mlx_lm.tool_parsers import qwen3_coder
+
+    monkeypatch.setattr(
+        qwen3_coder, "_convert_param_value", lambda value, *args: json.loads(value)
+    )
+    tools = [{"function": {"name": "f", "parameters": {"properties": {"v": spec}}}}]
+    _, calls = parse_tool_calls(
+        '<tool_call><function=f><parameter=v>"123"</parameter></function></tool_call>',
+        TestNakedQwenFollowup.tokenizer(),
+        tools,
+    )
+    assert json.loads(calls[0].function.arguments)["v"] == "123"
+
+
+@pytest.mark.parametrize("parser_module", _QWEN_PARSER_MODULES)
+@pytest.mark.parametrize(
+    "types, raw, expected",
+    [
+        (
+            ["object", "null"],
+            '{"enabled":true,"missing":null}',
+            {"enabled": True, "missing": None},
+        ),
+        (["array", "null"], "[true,null]", [True, None]),
+        (["boolean", "null"], "true", True),
+        (["string", "null"], "123", "123"),
+        (["string", "null"], "true", "true"),
+        (["string", "null"], '{"enabled":true}', '{"enabled":true}'),
+        (["string", "null"], '"123"', "123"),
+        (["string", "null"], "null", None),
+        (["number", "null"], "1.25", 1.25),
+        (["integer", "null"], "1.0", 1.0),
+        (["string", "integer"], "1.25", "1.25"),
+        (["string"], "null", "null"),
+        (["string", "null"], '"null"', "null"),
+        (["number", "string"], "42", 42),
+    ],
+)
+def test_xml_union_parameter_preserves_declared_value_type(
+    parser_module, types, raw, expected
+):
+    schema = {"type": "object", "properties": {"v": {"type": types}}, "required": ["v"]}
+    tools = [{"function": {"name": "f", "parameters": schema}}]
+    _, calls = parse_tool_calls(
+        f"<tool_call><function=f><parameter=v>{raw}</parameter></function></tool_call>",
+        _qwen_parser_tokenizer(parser_module),
+        tools,
+    )
+    assert calls and len(calls) == 1
+    arguments = json.loads(calls[0].function.arguments)
+    assert arguments["v"] == expected
+    assert type(arguments["v"]) is type(expected)
+    assert validate_json_schema(arguments, schema)[0]
+
+
+@pytest.mark.parametrize("types", [["unknown"], [None], []])
+def test_invalid_union_type_declarations_keep_best_effort_parsing(types):
+    assert _coerce_param_value("123", "v", {"v": {"type": types}}, "f") == 123
+
+
+@pytest.mark.parametrize(
+    "parser_module",
+    ["mlx_lm.tool_parsers.qwen3_coder", "mlx_vlm.tools.parsers.qwen3_coder"],
+)
+@pytest.mark.parametrize(
+    "types, raw, expected",
+    [
+        (["array", "null"], "(1, 2)", [1, 2]),
+        (["object", "null"], "{'enabled': True}", {"enabled": True}),
+    ],
+)
+def test_native_union_parameter_keeps_correct_python_literal_values(
+    parser_module, types, raw, expected
+):
+    tools = [
+        {
+            "function": {
+                "name": "f",
+                "parameters": {"properties": {"v": {"type": types}}},
+            }
+        }
+    ]
+    _, calls = parse_tool_calls(
+        f"<tool_call><function=f><parameter=v>{raw}</parameter></function></tool_call>",
+        _qwen_parser_tokenizer(parser_module),
+        tools,
+    )
+    assert json.loads(calls[0].function.arguments)["v"] == expected

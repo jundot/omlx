@@ -9,10 +9,22 @@ from pathlib import Path
 
 import yaml
 
-from omlx.integrations.base import Integration
-from omlx.utils.install import get_cli_prefix
+from omlx.integrations.base import Integration, IntegrationContext
+from omlx.utils.install import get_cli_command_prefix
 
 HERMES_MIN_CONTEXT_LENGTH = 64_000
+
+
+def hermes_agent_model_disabled_reason(model_info: dict) -> str | None:
+    context_window = model_info.get("max_context_window")
+    if not isinstance(context_window, int):
+        return None
+    if context_window >= HERMES_MIN_CONTEXT_LENGTH:
+        return None
+    return (
+        "Hermes Agent requires at least 64K effective context "
+        f"(configured: {context_window:,} tokens)"
+    )
 
 
 class HermesIntegration(Integration):
@@ -33,13 +45,14 @@ class HermesIntegration(Integration):
             ),
         )
 
-    def get_command(
-        self, port: int, api_key: str, model: str, host: str = "127.0.0.1"
-    ) -> str:
+    def get_command(self, ctx: IntegrationContext) -> str:
         return (
-            f"{get_cli_prefix()} "
-            f"launch hermes --model {model or 'select-a-model'}"
+            f"{get_cli_command_prefix()} "
+            f"launch hermes --model {ctx.model or 'select-a-model'}"
         )
+
+    def model_disabled_reason(self, model_info: dict) -> str | None:
+        return hermes_agent_model_disabled_reason(model_info)
 
     def _read_config(self, config_path: Path) -> dict:
         existing: dict = {}
@@ -74,15 +87,7 @@ class HermesIntegration(Integration):
         except OSError as e:
             print(f"Warning: could not create backup: {e}")
 
-    def configure(
-        self,
-        port: int,
-        api_key: str,
-        model: str,
-        host: str = "127.0.0.1",
-        context_window: int | None = None,
-        max_tokens: int | None = None,
-    ) -> None:
+    def configure(self, ctx: IntegrationContext) -> None:
         config_path = self.CONFIG_PATH
         config = self._read_config(config_path)
         self._create_backup(config_path)
@@ -98,13 +103,13 @@ class HermesIntegration(Integration):
         provider_config.update(
             {
                 "name": "oMLX",
-                "base_url": f"http://{host}:{port}/v1",
-                "api_key": api_key or "omlx",
+                "base_url": ctx.openai_base_url,
+                "api_key": ctx.auth_token,
                 "api_mode": "chat_completions",
             }
         )
-        if model:
-            provider_config["default_model"] = model
+        if ctx.model:
+            provider_config["default_model"] = ctx.model
         providers["omlx"] = provider_config
 
         model_config = config.get("model", {})
@@ -113,25 +118,14 @@ class HermesIntegration(Integration):
         for stale_key in ("base_url", "api_key", "api", "api_mode", "transport"):
             model_config.pop(stale_key, None)
         model_config["provider"] = "omlx"
-        if model:
-            model_config["default"] = model
-        if context_window is not None:
-            if context_window < HERMES_MIN_CONTEXT_LENGTH:
-                print(
-                    "Warning: Hermes Agent requires at least "
-                    f"{HERMES_MIN_CONTEXT_LENGTH:,} context tokens; "
-                    f"oMLX reports {context_window:,}. Writing the Hermes "
-                    "minimum so the agent can start. Increase oMLX Sampling "
-                    "max_context_window for long sessions."
-                )
-            model_config["context_length"] = max(
-                context_window,
-                HERMES_MIN_CONTEXT_LENGTH,
-            )
+        if ctx.model:
+            model_config["default"] = ctx.model
+        if ctx.context_window is not None:
+            model_config["context_length"] = ctx.context_window
         else:
             model_config.pop("context_length", None)
-        if max_tokens is not None:
-            model_config["max_tokens"] = max_tokens
+        if ctx.max_tokens is not None:
+            model_config["max_tokens"] = ctx.max_tokens
         else:
             model_config.pop("max_tokens", None)
         config["model"] = model_config
@@ -144,32 +138,33 @@ class HermesIntegration(Integration):
         )
         print(f"Config written: {config_path}")
 
-    def launch(
-        self,
-        port: int,
-        api_key: str,
-        model: str,
-        host: str = "127.0.0.1",
-        **kwargs,
-    ) -> None:
-        context_window = kwargs.pop("context_window", None)
-        max_tokens = kwargs.pop("max_tokens", None)
-        self.configure(
-            port,
-            api_key,
-            model,
-            host=host,
-            context_window=context_window,
-            max_tokens=max_tokens,
+    def launch(self, ctx: IntegrationContext) -> None:
+        self.configure(ctx)
+
+        disabled_reason = self.model_disabled_reason(
+            {"id": ctx.model, "max_context_window": ctx.context_window}
         )
+        if disabled_reason:
+            print(f"Cannot launch Hermes Agent with model '{ctx.model}'.")
+            print(disabled_reason)
+            print(
+                "Choose a model with at least 64K effective context, or increase "
+                "its configured max_context_window only when the model and "
+                "available memory support it."
+            )
+            raise SystemExit(1)
 
         env = self._scrubbed_env()
 
         # Hermes Agent v0.12.0's classic prompt_toolkit REPL registers an
         # invalid Ctrl+Shift+C keybinding ("c-S-c") on startup. The modern TUI
         # path avoids that startup crash and is the supported interactive UX.
-        args = ["hermes", "--provider", "omlx", "--tui"]
-        if model:
-            args.extend(["--model", model])
+        # --provider is a subcommand flag on `hermes chat`, not a top-level
+        # flag, and "omlx" is not a valid CLI provider value — the provider is
+        # read from ~/.hermes/config.yaml which configure() already wrote above.
+        args = ["hermes", "chat", "--tui"]
+        if ctx.model:
+            args.extend(["-m", ctx.model])
+        args.extend(ctx.extra_args)
 
         os.execvpe("hermes", args, env)

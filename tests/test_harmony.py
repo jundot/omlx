@@ -1,22 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for Harmony streaming parser (omlx.adapter.harmony)."""
 
-import pytest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from openai_harmony import load_harmony_encoding, StreamableParser
+import pytest
 
 from omlx.adapter.harmony import (
     HarmonyStreamingParser,
+    load_harmony_gpt_oss_encoding,
     parse_tool_calls_from_tokens,
     preprocess_harmony_messages,
 )
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def encoding():
     """Load HarmonyGptOss encoding."""
-    return load_harmony_encoding("HarmonyGptOss")
+    return load_harmony_gpt_oss_encoding()
 
 
 @pytest.fixture
@@ -101,6 +102,39 @@ class TestToolCallParsing:
         _, stream_token, visible_token, _ = last
         assert stream_token is None
         assert visible_token is None
+
+    def test_get_tool_calls_channel_rules(self):
+        """Commentary always counts; analysis counts only with JSON arguments."""
+        parser = object.__new__(HarmonyStreamingParser)
+        parser._parser = SimpleNamespace(
+            messages=[
+                SimpleNamespace(
+                    channel="analysis",
+                    recipient="functions.Read",
+                    content=[SimpleNamespace(text="analysis-noise")],
+                ),
+                SimpleNamespace(
+                    channel="analysis",
+                    recipient="functions.Read",
+                    content=[SimpleNamespace(text='{"path":"from-analysis.py"}')],
+                ),
+                SimpleNamespace(
+                    channel="commentary",
+                    recipient="functions.Read",
+                    content=[SimpleNamespace(text='{"path":"ok.py"}')],
+                ),
+                SimpleNamespace(
+                    channel="final",
+                    recipient="functions.Read",
+                    content=[SimpleNamespace(text="final-noise")],
+                ),
+            ]
+        )
+
+        assert parser.get_tool_calls() == [
+            {"name": "Read", "arguments": '{"path":"from-analysis.py"}'},
+            {"name": "Read", "arguments": '{"path":"ok.py"}'},
+        ]
 
 
 # ── Multi-message sequences ──────────────────────────────────────────
@@ -210,6 +244,26 @@ class TestPassthroughMode:
         _, _, _, is_stop = parser.process_token(stop_token)
         assert is_stop is True
 
+    def test_analysis_end_does_not_stop_generation(self, tokenizer, encoding):
+        """Ending analysis closes thinking but lets the final channel continue."""
+        parser = HarmonyStreamingParser(tokenizer=tokenizer)
+
+        tokens = encoding.encode(
+            "<|channel|>analysis<|message|>thinking<|end|>",
+            allowed_special="all",
+        )
+
+        result = None
+        for token_id in tokens:
+            result = parser.process_token(token_id)
+
+        assert result is not None
+        control_text, stream_token, visible_token, is_stop = result
+        assert "</think>\n" in control_text
+        assert stream_token is None
+        assert visible_token is None
+        assert is_stop is False
+
     def test_passthrough_closes_think_tag(self, tokenizer, encoding):
         """Passthrough activation while in analysis channel closes think tag."""
         parser = HarmonyStreamingParser(tokenizer=tokenizer)
@@ -311,3 +365,116 @@ class TestParseToolCallsFromTokens:
         )
         assert analysis_text == ""
         assert "Hello world" in output_text
+
+    def test_unknown_channel_without_recipient_falls_back_to_final(self, encoding):
+        """Malformed channel names without recipients remain visible."""
+        tokens = encoding.encode(
+            "<|channel|>mardown<|message|>visible text<|return|>",
+            allowed_special="all",
+        )
+
+        output_text, analysis_text, tool_calls = parse_tool_calls_from_tokens(
+            tokens, prepend_start=True
+        )
+
+        assert "visible text" in output_text
+        assert analysis_text == ""
+        assert tool_calls == []
+
+    def test_does_not_prepend_duplicate_start_header(self, encoding):
+        """Budget-forced Harmony completions may already include the start header."""
+        tokens = encoding.encode(
+            "<|start|>assistant<|channel|>analysis<|message|>thinking<|end|>",
+            allowed_special="all",
+        )
+        output_text, analysis_text, tool_calls = parse_tool_calls_from_tokens(
+            tokens, prepend_start=True
+        )
+        assert output_text == ""
+        assert "thinking" in analysis_text
+        assert tool_calls == []
+
+    def test_channel_rules_for_function_recipient(self, monkeypatch):
+        """Commentary and JSON-argument analysis recipients become tool calls."""
+        messages = [
+            SimpleNamespace(
+                channel="analysis",
+                recipient="functions.Read",
+                content=[SimpleNamespace(text="analysis-noise")],
+            ),
+            SimpleNamespace(
+                channel="analysis",
+                recipient="functions.Read",
+                content=[SimpleNamespace(text='{"path":"from-analysis.py"}')],
+            ),
+            SimpleNamespace(
+                channel="commentary",
+                recipient="functions.Read",
+                content=[SimpleNamespace(text='{"path":"ok.py"}')],
+            ),
+            SimpleNamespace(
+                channel="final",
+                recipient="functions.Read",
+                content=[SimpleNamespace(text="final-noise")],
+            ),
+            SimpleNamespace(
+                channel="other",
+                recipient="functions.Read",
+                content=[SimpleNamespace(text="other-noise")],
+            ),
+        ]
+
+        class FakeEncoding:
+            def encode(self, text, allowed_special="all"):
+                return [1, 2] if text == "<|start|>assistant" else [3]
+
+            def decode(self, token_ids):
+                return "decoded"
+
+            def parse_messages_from_completion_tokens(self, token_ids, role, strict):
+                return messages
+
+        monkeypatch.setattr(
+            "omlx.adapter.harmony.load_harmony_gpt_oss_encoding",
+            lambda: FakeEncoding(),
+        )
+
+        output_text, analysis_text, tool_calls = parse_tool_calls_from_tokens([99])
+
+        assert analysis_text == "analysis-noise"
+        assert output_text == "final-noise"
+        assert tool_calls == [
+            {"name": "Read", "arguments": '{"path":"from-analysis.py"}'},
+            {"name": "Read", "arguments": '{"path":"ok.py"}'},
+        ]
+
+    def test_analysis_channel_tool_call_with_recipient(self, encoding):
+        """Analysis-channel tool calls with explicit recipients are honored (#2216)."""
+        tokens = encoding.encode(
+            "<|channel|>analysis<|message|>Now need files.<|end|>"
+            "<|start|>assistant<|channel|>analysis to=functions.read code"
+            '<|message|>{"filePath": "/tmp/x.py", "offset": 1}<|call|>',
+            allowed_special="all",
+        )
+        output_text, analysis_text, tool_calls = parse_tool_calls_from_tokens(
+            tokens, prepend_start=True
+        )
+        assert tool_calls == [
+            {"name": "read", "arguments": '{"filePath": "/tmp/x.py", "offset": 1}'}
+        ]
+        assert "Now need files." in analysis_text
+        assert "filePath" not in analysis_text
+
+    def test_analysis_recipient_with_prose_stays_reasoning(self, encoding):
+        """Analysis messages addressed to a tool without JSON args stay reasoning."""
+        tokens = encoding.encode(
+            "<|channel|>analysis<|message|>ok<|end|>"
+            "<|start|>assistant<|channel|>analysis to=functions.read code"
+            "<|message|>maybe I should read the file<|call|>",
+            allowed_special="all",
+        )
+        output_text, analysis_text, tool_calls = parse_tool_calls_from_tokens(
+            tokens, prepend_start=True
+        )
+        assert tool_calls == []
+        assert "maybe I should read the file" in analysis_text

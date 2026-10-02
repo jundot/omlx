@@ -1041,12 +1041,8 @@ def test_full_integration(model_path):
 
     from mlx_lm import load
 
-    from omlx.patches.gated_delta_advance import apply_gated_delta_advance_patch
-
     with _track_peak_memory("LLM model load"):
         model, tokenizer = load(model_path)
-        patch_applied = apply_gated_delta_advance_patch(model)
-    print(f"  GatedDeltaNet patch: {'applied' if patch_applied else 'skipped'}")
 
     try:
         with _track_peak_memory("Test 1 - 9K cache consistency"):
@@ -1085,9 +1081,6 @@ def test_full_integration(model_path):
 
     adapter = VLMModelAdapter(vlm_model)
     vlm_tokenizer = getattr(processor, "tokenizer", processor)
-
-    patch_applied = apply_gated_delta_advance_patch(adapter._language_model)
-    print(f"  VLM GatedDeltaNet patch: {'applied' if patch_applied else 'skipped'}")
 
     try:
         with _track_peak_memory("Test 4 - VLM engine basics"):

@@ -39,6 +39,66 @@ final class DTOFixtureTests: XCTestCase {
         return try Data(contentsOf: url)
     }
 
+    func testUsageHistoryDecodesCanonicalModelAndUnknownSpeed() throws {
+        let json = """
+        {"available": true, "dropped_requests": 0,
+         "totals": {"requests": 2, "total_tokens": 120, "prompt_tokens": 100,
+                    "completion_tokens": 20, "cached_tokens": 60,
+                    "generation_tps": 10.0, "cache_efficiency": 0.6},
+         "models": [{"model_id": "canonical-model", "requests": 2,
+                     "total_tokens": 120, "prompt_tokens": 100,
+                     "completion_tokens": 20, "cached_tokens": 60,
+                     "generation_tps": null, "cache_efficiency": 0.6}],
+         "heatmap": [{"date": "2026-09-08", "tokens": [0, 120]}]}
+        """
+        let usage = try Self.makeDecoder().decode(UsageHistoryDTO.self, from: Data(json.utf8))
+        XCTAssertEqual(usage.totals.totalTokens, 120)
+        XCTAssertEqual(usage.models.first?.modelId, "canonical-model")
+        XCTAssertNil(usage.models.first?.generationTps)
+        XCTAssertEqual(usage.heatmap.first?.tokens.reduce(0, +), 120)
+        XCTAssertNil(usage.enabled)
+    }
+
+    func testUsageHistoryDecodesDisabledState() throws {
+        let json = """
+        {"enabled": false, "available": true, "dropped_requests": 0,
+         "totals": {"requests": 0, "total_tokens": 0, "prompt_tokens": 0,
+                    "completion_tokens": 0, "cached_tokens": 0,
+                    "generation_tps": null, "cache_efficiency": 0.0},
+         "models": [], "heatmap": []}
+        """
+        let usage = try Self.makeDecoder().decode(UsageHistoryDTO.self, from: Data(json.utf8))
+        XCTAssertEqual(usage.enabled, false)
+        XCTAssertTrue(usage.models.isEmpty)
+        XCTAssertEqual(usage.totals.requests, 0)
+    }
+
+    // MARK: - oQ quantization
+
+    func testOQStartRequestEncodesEnhancedOptions() throws {
+        let request = OQStartRequest(
+            modelPath: "/Users/test/models/model",
+            oqLevel: 4,
+            groupSize: 64,
+            sensitivityModelPath: "",
+            textOnly: false,
+            dtype: "bfloat16",
+            preserveMtp: false,
+            enhanced: true,
+            imatrixCachePath: "/Users/test/cache/imatrix.npz",
+            imatrixReuseCache: true,
+            imatrixStrict: true
+        )
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let body = try JSONSerialization.jsonObject(with: encoder.encode(request)) as? [String: Any]
+
+        XCTAssertEqual(body?["enhanced"] as? Bool, true)
+        XCTAssertEqual(body?["imatrix_cache_path"] as? String, "/Users/test/cache/imatrix.npz")
+        XCTAssertEqual(body?["imatrix_reuse_cache"] as? Bool, true)
+        XCTAssertEqual(body?["imatrix_strict"] as? Bool, true)
+    }
+
     // MARK: - Stats
 
     func testStatsSessionFixtureDecodes() throws {
@@ -81,6 +141,8 @@ final class DTOFixtureTests: XCTestCase {
         XCTAssertNotNil(settings.auth,          "auth block missing")
         XCTAssertNotNil(settings.claudeCode,    "claude_code block missing")
         XCTAssertNotNil(settings.integrations,  "integrations block missing")
+        XCTAssertEqual(settings.scheduler?.embeddingBatchSize, 32)
+        XCTAssertEqual(settings.huggingface?.hfCacheEnabled, true)
     }
 
     // MARK: - Models list
@@ -96,6 +158,7 @@ final class DTOFixtureTests: XCTestCase {
         // Sanity-check the first entry's shape if present.
         if let first = list.models.first {
             XCTAssertFalse(first.id.isEmpty, "ModelDTO.id must be non-empty.")
+            XCTAssertEqual(first.displayName, "deepsweet/Qwen3.6-27B-UD-MLX-4bit")
         }
     }
 
@@ -117,5 +180,52 @@ final class DTOFixtureTests: XCTestCase {
         // configured on the dev server). Just exercise the decoder so a
         // server-side rename of `templates` → `items` would fail loudly.
         XCTAssertNotNil(resp.templates)
+    }
+
+    // MARK: - Download tasks (live transfer speed)
+
+    func testHFTaskDecodesSpeedAndFormatsIt() throws {
+        let json = """
+        {"task_id": "t1", "repo_id": "mlx-community/model", "status": "downloading",
+         "progress": 45.5, "total_size": 1073741824, "downloaded_size": 536870912,
+         "speed_bps": 45298483.2, "error": "", "created_at": 1.0, "started_at": 1.0,
+         "completed_at": 0.0, "retry_count": 0}
+        """
+        let task = try Self.makeDecoder().decode(HFTaskDTO.self, from: Data(json.utf8))
+        XCTAssertEqual(task.speedBps, 45298483.2)
+        XCTAssertEqual(task.speedText, "43.2 MB/s")
+    }
+
+    func testHFTaskWithoutSpeedKeepsOldServerCompatible() throws {
+        // A server that predates the speed field must still decode, and
+        // must not render a rate at all.
+        let json = """
+        {"task_id": "t1", "repo_id": "mlx-community/model", "status": "completed",
+         "progress": 100.0, "total_size": 100, "downloaded_size": 100,
+         "error": "", "created_at": 1.0, "started_at": 1.0,
+         "completed_at": 2.0, "retry_count": 0}
+        """
+        let task = try Self.makeDecoder().decode(HFTaskDTO.self, from: Data(json.utf8))
+        XCTAssertNil(task.speedBps)
+        XCTAssertNil(task.speedText)
+    }
+
+    func testHFTaskZeroSpeedReadsExplicitZero() throws {
+        // A stopped row shows "0 B/s"; only a missing field hides it.
+        let stopped = HFTaskDTO(
+            taskId: "t1", repoId: "mlx-community/model", status: "downloading",
+            progress: 45.5, totalSize: 100, downloadedSize: 50,
+            speedBps: 0, error: "", createdAt: 1.0, startedAt: 1.0,
+            completedAt: 0.0, retryCount: 0
+        )
+        XCTAssertEqual(stopped.speedText, "0 B/s")
+
+        let active = HFTaskDTO(
+            taskId: "t2", repoId: "mlx-community/model", status: "downloading",
+            progress: 45.5, totalSize: 100, downloadedSize: 50,
+            speedBps: 512, error: "", createdAt: 1.0, startedAt: 1.0,
+            completedAt: 0.0, retryCount: 0
+        )
+        XCTAssertEqual(active.speedText, "512 B/s")
     }
 }

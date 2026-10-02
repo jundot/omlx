@@ -108,8 +108,8 @@ def _resolve_mlx_version(toml_path: Path) -> str:
     req_file = (
         SCRIPT_DIR
         / "requirements"
-        / "framework-mlx-framework"
-        / "requirements-framework-mlx-framework-macosx_arm64.txt"
+        / "framework-mlx-base"
+        / "requirements-framework-mlx-base-macosx_arm64.txt"
     )
     if req_file.exists():
         import re as _re
@@ -143,7 +143,7 @@ def swap_platform_wheels(
 
     site_packages = (
         export_dir
-        / "framework-mlx-framework"
+        / "framework-mlx-base"
         / "lib"
         / f"python{python_version}"
         / "site-packages"
@@ -411,11 +411,12 @@ def _write_engine_commits(omlx_pkg_dir: Path):
         "mlx-lm": "https://github.com/ml-explore/mlx-lm",
         "mlx-vlm": "https://github.com/Blaizzy/mlx-vlm",
         "mlx-embeddings": "https://github.com/Blaizzy/mlx-embeddings",
+        "mlx-audio": "https://github.com/Blaizzy/mlx-audio",
     }
 
     commits = {}
     for full_req, git_url in git_reqs:
-        pkg_name = full_req.split("@")[0].strip().lower()
+        pkg_name = full_req.split("@")[0].strip().lower().split("[", 1)[0]
         # git_url format: git+https://github.com/ml-explore/mlx-lm@bcf6306...
         if "@" in git_url:
             commit = git_url.rsplit("@", 1)[1]
@@ -442,7 +443,7 @@ def _write_engine_commits(omlx_pkg_dir: Path):
 # normalized). [bundle] last means a bundle-specific [audio]-extra entry
 # wins over [project]'s plain entry for the same package.
 _LAYER_REQUIREMENTS_SOURCES = {
-    "mlx-framework": ["project", "bundle"],
+    "mlx-base": ["project", "bundle"],
 }
 
 
@@ -596,54 +597,35 @@ def _venvstacks_driver() -> list[str]:
     """Pick an available venvstacks driver as a command prefix.
 
     Resolution order (first that works wins):
-      1. `venvstacks` directly on PATH — installed via the dev extra in
-         pyproject.toml, fastest path with no extra startup overhead.
-      2. `uvx venvstacks` — uv's pipx-equivalent. Already available to
-         anyone using uv for development setup.
-      3. `pipx run venvstacks` — historical default; works if pipx is
-         installed on the host.
+      1. `<sys.executable> -m venvstacks` when venvstacks is importable
+         from the Python running build.py.
+      2. `uvx venvstacks` — uv's pipx-equivalent.
+      3. `pipx run venvstacks` — historical default.
+      4. `venvstacks` on PATH as a last resort.
 
-    Aborts with a clear remediation message if none are available, so a
-    contributor with neither uv nor pipx nor a dev-installed venvstacks
-    gets actionable guidance instead of a cryptic "command not found".
+    Why -m first: the PATH-installed `venvstacks` script's shebang may
+    point at a dotted interpreter like `.../python3.11`. venvstacks 0.7
+    computes `Path(sys.executable).suffix` to derive the runtime binary
+    extension; on `python3.11` that returns ".11", producing a bogus
+    `bin/python.11` path and breaking `pip --python`. Running via the
+    current interpreter (typically `.../python3`, suffix "") sidesteps
+    the bug. See https://github.com/lmstudio-ai/venvstacks/issues/ for
+    the upstream report.
     """
-    if shutil.which("venvstacks") is not None:
-        return ["venvstacks"]
+    try:
+        subprocess.run(
+            [sys.executable, "-c", "import venvstacks"],
+            check=True, capture_output=True,
+        )
+        return [sys.executable, "-m", "venvstacks"]
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
     if shutil.which("uvx") is not None:
         return ["uvx", "venvstacks"]
     if shutil.which("pipx") is not None:
         return ["pipx", "run", "venvstacks"]
-    print(
-        "  ✗ No venvstacks driver found. Install with one of:\n"
-        "      pip install -e \".[dev]\"     (pip-managed venv)\n"
-        "      uv sync --dev                (uv-managed venv)\n"
-        "      pipx install venvstacks       (host-global tool)",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-
-def _venvstacks_driver() -> list[str]:
-    """Pick an available venvstacks driver as a command prefix.
-
-    Resolution order (first that works wins):
-      1. `venvstacks` directly on PATH — installed via the dev extra in
-         pyproject.toml, fastest path with no extra startup overhead.
-      2. `uvx venvstacks` — uv's pipx-equivalent. Already available to
-         anyone using uv for development setup.
-      3. `pipx run venvstacks` — historical default; works if pipx is
-         installed on the host.
-
-    Aborts with a clear remediation message if none are available, so a
-    contributor with neither uv nor pipx nor a dev-installed venvstacks
-    gets actionable guidance instead of a cryptic "command not found".
-    """
     if shutil.which("venvstacks") is not None:
         return ["venvstacks"]
-    if shutil.which("uvx") is not None:
-        return ["uvx", "venvstacks"]
-    if shutil.which("pipx") is not None:
-        return ["pipx", "run", "venvstacks"]
     print(
         "  ✗ No venvstacks driver found. Install with one of:\n"
         "      pip install -e \".[dev]\"     (pip-managed venv)\n"
@@ -721,8 +703,7 @@ def build_venvstacks():
         resolved_toml.unlink()
 
     # Install mlx-audio separately: build wheel from git, install --no-deps.
-    # mlx-audio pins mlx-lm==0.31.1 which conflicts with our git-pinned mlx-lm,
-    # so it can't go through venvstacks' uv resolver.
+    # Its runtime dependencies are resolved in the shared bundle layer.
     _install_mlx_audio(EXPORT_DIR)
 
     # Install paroquant --no-deps. The official [mlx] extra requires
@@ -730,6 +711,11 @@ def build_venvstacks():
     # end-to-end on 0.1.14. All real deps (mlx, mlx-lm, mlx-vlm, numpy,
     # huggingface_hub) are already in the framework layer.
     _install_paroquant(EXPORT_DIR)
+
+    # Install xgrammar + apache-tvm-ffi --no-deps; oMLX uses the non-torch
+    # paths only, and omlx/_torch_stub.py satisfies xgrammar's import-time
+    # references to torch so the runtime torch dep is unnecessary.
+    _install_xgrammar(EXPORT_DIR)
 
     # Bundle spacy language model for Kokoro TTS.
     # misaki's en.G2P tries spacy.cli.download() at runtime, which fails in
@@ -744,7 +730,7 @@ def build_venvstacks():
 
 
 # mlx-audio git commit — aligned with pyproject.toml [audio] extra
-_MLX_AUDIO_GIT = "git+https://github.com/Blaizzy/mlx-audio@51753266e0a4f766fd5e6fbc46652224efc23981"
+_MLX_AUDIO_GIT = "git+https://github.com/Blaizzy/mlx-audio@49596ac8b69b9ed377db311a73df838795f38a3d"
 
 
 def _install_mlx_audio(export_dir: Path):
@@ -765,7 +751,7 @@ def _install_mlx_audio(export_dir: Path):
     # Install into framework site-packages
     fw_site = (
         export_dir
-        / "framework-mlx-framework"
+        / "framework-mlx-base"
         / "lib"
         / "python3.11"
         / "site-packages"
@@ -804,7 +790,7 @@ def _install_paroquant(export_dir: Path):
 
     fw_site = (
         export_dir
-        / "framework-mlx-framework"
+        / "framework-mlx-base"
         / "lib"
         / "python3.11"
         / "site-packages"
@@ -821,6 +807,110 @@ def _install_paroquant(export_dir: Path):
 
     shutil.rmtree(paro_wheels)
     print("  ✓ paroquant installed")
+
+
+# xgrammar / tvm-ffi versions — single source of truth lives in
+# omlx/_torch_stub.py (the stub MUST track the actually-installed versions
+# or imports fail). Importing keeps the two files from drifting apart.
+try:
+    from omlx._torch_stub import (
+        _TARGET_TVM_FFI_VERSIONS,
+        _TARGET_XGRAMMAR_VERSIONS,
+    )
+
+    _XGRAMMAR_VERSION = _TARGET_XGRAMMAR_VERSIONS[0]
+    _TVM_FFI_VERSION = _TARGET_TVM_FFI_VERSIONS[0]
+except Exception:  # pragma: no cover — build runs may not have omlx on path yet
+    _XGRAMMAR_VERSION = "0.2.3"
+    _TVM_FFI_VERSION = "0.1.11"
+
+
+def _install_xgrammar(export_dir: Path):
+    """Install xgrammar + apache-tvm-ffi --no-deps into framework site-packages.
+
+    xgrammar declares torch>=1.10.0 as a runtime dep, but oMLX only exercises
+    its non-torch paths (numpy bitmasks + MLX kernel). Shipping torch would
+    add ~500 MB to the bundle. omlx/_torch_stub.py satisfies xgrammar's
+    import-time torch references so the package loads without real torch.
+
+    Idempotent: a sentinel file is written after the last extract; if it's
+    present we skip. Trusting both ``xgrammar/`` and ``tvm_ffi/`` to exist
+    isn't enough — an interruption between the two extracts would otherwise
+    leave a half-installed state the next run accepts.
+    """
+    fw_site = (
+        export_dir
+        / "framework-mlx-base"
+        / "lib"
+        / "python3.11"
+        / "site-packages"
+    )
+    sentinel = fw_site / (
+        f"_omlx_xgrammar_{_XGRAMMAR_VERSION}_tvmffi_{_TVM_FFI_VERSION}.installed"
+    )
+    if sentinel.exists():
+        print("  ✓ xgrammar + apache-tvm-ffi already installed, skipping")
+        return
+
+    print("\n  Downloading xgrammar wheels...")
+    xgr_wheels = SCRIPT_DIR / "_xgrammar_wheels"
+    if xgr_wheels.exists():
+        shutil.rmtree(xgr_wheels)
+    xgr_wheels.mkdir()
+
+    # Explicit platform tags so the build host's Python version doesn't matter.
+    run_cmd([
+        sys.executable, "-m", "pip", "download",
+        "--no-deps", "--dest", str(xgr_wheels),
+        "--python-version", "3.11",
+        "--platform", "macosx_11_0_arm64",
+        "--only-binary=:all:",
+        f"xgrammar=={_XGRAMMAR_VERSION}",
+        f"apache-tvm-ffi=={_TVM_FFI_VERSION}",
+    ])
+
+    if not fw_site.exists():
+        print(f"  ✗ site-packages not found: {fw_site}")
+        return
+
+    import zipfile
+    for whl in xgr_wheels.glob("*.whl"):
+        print(f"    Installing {whl.name} (--no-deps)")
+        with zipfile.ZipFile(whl) as zf:
+            zf.extractall(fw_site)
+
+    shutil.rmtree(xgr_wheels)
+
+    # Integrity check before sentinel-write: zipfile.extractall is not
+    # atomic per file, so a build-host interrupt (SIGKILL, ENOSPC,
+    # inode exhaustion) mid-extract can leave truncated __init__.py
+    # files on disk. ``sentinel.exists()`` would still accept the next
+    # run, masking the partial install. Verify the package roots
+    # exist with non-empty __init__.py before writing the sentinel.
+    integrity_checks = (
+        ("xgrammar", fw_site / "xgrammar" / "__init__.py"),
+        ("tvm_ffi", fw_site / "tvm_ffi" / "__init__.py"),
+    )
+    for pkg_name, init_path in integrity_checks:
+        if not init_path.exists() or init_path.stat().st_size == 0:
+            print(
+                f"  ✗ {pkg_name} install incomplete ({init_path}); refusing "
+                "to write sentinel — next run will retry"
+            )
+            return
+
+    # Atomic sentinel write: write to a tmp file in the same directory
+    # then ``os.replace`` (POSIX-atomic on the same filesystem). A bare
+    # ``Path.write_text`` is open+write+close and can itself be interrupted
+    # mid-write, leaving a zero-length sentinel that ``sentinel.exists()``
+    # would still accept — exactly the failure mode this sentinel is
+    # supposed to guard against.
+    sentinel_tmp = sentinel.with_suffix(sentinel.suffix + ".tmp")
+    sentinel_tmp.write_text(
+        f"xgrammar=={_XGRAMMAR_VERSION}\napache-tvm-ffi=={_TVM_FFI_VERSION}\n"
+    )
+    os.replace(sentinel_tmp, sentinel)
+    print("  ✓ xgrammar + apache-tvm-ffi installed")
 
 
 # spacy language model — required by misaki (Kokoro TTS G2P)
@@ -841,7 +931,7 @@ def _install_spacy_model(export_dir: Path):
 
     fw_site = (
         export_dir
-        / "framework-mlx-framework"
+        / "framework-mlx-base"
         / "lib"
         / "python3.11"
         / "site-packages"
@@ -868,13 +958,13 @@ def _install_spacy_model(export_dir: Path):
 
 
 # Packages to strip from the app bundle. These are transitive dependencies
-# pulled in by modelscope (datasets→pyarrow/pandas) and mlx-vlm (opencv)
-# but are NOT needed for inference at runtime. torch/sympy kept as safety
-# net in case any future dependency pulls them in transitively.
+# pulled in by modelscope (datasets→pyarrow/pandas) but are NOT needed for
+# inference at runtime. torch/sympy kept as safety net in case any future
+# dependency pulls them in transitively. OpenCV (from mlx-vlm) stays because
+# video input decodes frames with cv2.
 _STRIP_PACKAGES = [
     "torch",
     "sympy",           # torch dep (safety net)
-    "cv2",             # opencv-python, mlx-vlm only uses it for image loading (Pillow suffices)
     "pyarrow",         # datasets dep
     "pandas",          # datasets dep
     "datasets",        # modelscope dep, not used at inference
@@ -883,7 +973,7 @@ _STRIP_PACKAGES = [
 
 # Prefixes for dist-info directories to remove alongside the packages above.
 _STRIP_DIST_PREFIXES = [
-    "torch-", "sympy-", "opencv_python-", "pyarrow-", "pandas-", "datasets-",
+    "torch-", "sympy-", "pyarrow-", "pandas-", "datasets-",
 ]
 
 
@@ -891,7 +981,7 @@ def _strip_unused_packages(export_dir: Path):
     """Remove large packages not needed for inference from exported framework."""
     fw_site = (
         export_dir
-        / "framework-mlx-framework"
+        / "framework-mlx-base"
         / "lib"
         / "python3.11"
         / "site-packages"
@@ -918,6 +1008,41 @@ def _strip_unused_packages(export_dir: Path):
             print(f"    Removed {name} ({size / 1024 / 1024:.0f} MB)")
 
     print(f"  ✓ Stripped {saved / 1024 / 1024:.0f} MB total")
+
+    # venvstacks records native libraries in share/venv/dynlib as symlinks.
+    # Removing packages such as PyArrow leaves those links dangling,
+    # which makes codesign --verify reject the otherwise valid application
+    # bundle. Prune only links whose targets disappeared during stripping.
+    framework_dir = export_dir / "framework-mlx-base"
+    broken_links = [
+        path
+        for path in framework_dir.rglob("*")
+        if path.is_symlink() and not path.exists()
+    ]
+    for path in broken_links:
+        path.unlink()
+    if broken_links:
+        print(f"    Removed {len(broken_links)} dangling native-library links")
+
+    # Post-strip invariant: no torch artifact must survive. A partial torch
+    # (some files but not enough for xgrammar) would be the worst possible
+    # outcome — _torch_stub.find_spec("torch") would return a real spec,
+    # install() would short-circuit, and xgrammar would import the broken
+    # half-torch and fail at runtime with confusing errors. Fail fast.
+    surviving_torch = [
+        p.name for p in fw_site.iterdir()
+        if p.name == "torch"
+        or p.name.startswith("torch-")
+        or p.name.startswith("torch_")
+    ]
+    if surviving_torch:
+        raise RuntimeError(
+            "Post-strip integrity check failed: torch artifacts survived "
+            f"the strip step: {surviving_torch}. _torch_stub.find_spec would "
+            "see a real torch and short-circuit install(), leaving xgrammar "
+            "to fail at runtime against a half-installed torch. Add the "
+            "leftover names to _STRIP_PACKAGES / _STRIP_DIST_PREFIXES."
+        )
 
 
 
@@ -968,6 +1093,11 @@ def main():
                         help="Print the donor fingerprint and exit. "
                              "`build.sh` uses this to detect drift between "
                              "sources and the cached `_export/`.")
+    parser.add_argument("--write-engine-commits",
+                        metavar="OMLX_PACKAGE_DIR",
+                        help="Write _engine_commits.json into the given "
+                             "staged omlx package directory and exit. "
+                             "`build.sh` uses this after copying Resources/omlx.")
     parser.add_argument("--macos-target",
                         help="Target macOS version for mlx/mlx-metal wheels "
                              "(e.g. 26.0). Downloads platform-specific wheels "
@@ -976,6 +1106,10 @@ def main():
 
     if args.print_fingerprint:
         print(_compute_donor_fingerprint())
+        return
+
+    if args.write_engine_commits:
+        _write_engine_commits(Path(args.write_engine_commits))
         return
 
     print(f"Building {APP_NAME} v{VERSION}")

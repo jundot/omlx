@@ -48,6 +48,7 @@ class MMLUProBenchmark(BaseBenchmark):
 
         logger.info(f"MMLU-Pro: loaded {len(normalized)} questions")
 
+        self.dataset_total = len(normalized)
         if sample_size == 0:
             return normalized
 

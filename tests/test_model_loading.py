@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for omlx.utils.model_loading.maybe_load_custom_quantization."""
 
+import json
 import sys
 import types
 from unittest.mock import MagicMock
@@ -9,8 +10,10 @@ import pytest
 
 from omlx.utils import model_loading
 from omlx.utils.model_loading import (
+    ensure_model_code_trusted,
     maybe_apply_pre_load_patches,
     maybe_load_custom_quantization,
+    preflight_text_remote_code,
 )
 
 
@@ -26,10 +29,89 @@ def _write_mtp_index(tmp_path, has_mtp: bool) -> None:
     if has_mtp:
         keys["language_model.mtp.fc.weight"] = "model.safetensors"
     (tmp_path / "model.safetensors.index.json").write_text(
-        '{"metadata": {}, "weight_map": '
-        + str(keys).replace("'", '"')
-        + "}"
+        '{"metadata": {}, "weight_map": ' + str(keys).replace("'", '"') + "}"
     )
+
+
+class TestRemoteCodePreflight:
+    @pytest.mark.parametrize("trusted", [False, True])
+    def test_final_tokenizer_load_uses_the_configured_trust_setting(
+        self, monkeypatch, trusted
+    ):
+        monkeypatch.setattr(model_loading, "preflight_text_remote_code", MagicMock())
+        loader = MagicMock(return_value=("MODEL", "TOKENIZER"))
+        monkeypatch.setitem(sys.modules, "mlx_lm", types.SimpleNamespace(load=loader))
+        options = {"trust_remote_code": not trusted, "tool_parser_type": "k2_horizon"}
+        model_loading.lm_load_compat(
+            "K2", trust_remote_code=trusted, tokenizer_config=options
+        )
+        actual = loader.call_args.kwargs
+        assert actual["tokenizer_config"] == {
+            "trust_remote_code": trusted, "tool_parser_type": "k2_horizon"
+        }
+        assert actual["trust_remote_code"] is trusted
+        assert options["trust_remote_code"] is not trusted
+
+    def test_custom_model_file_is_rejected_before_weight_loading(self, tmp_path):
+        with pytest.raises(ValueError, match="Enable Trust Remote Code"):
+            ensure_model_code_trusted(
+                {"model_file": "modeling_custom.py"},
+                model_path=tmp_path,
+                trust_remote_code=False,
+            )
+
+    def test_tokenizer_trust_failure_happens_before_mlx_lm_load(
+        self, tmp_path, monkeypatch
+    ):
+        (tmp_path / "config.json").write_text(
+            '{"model_type": "llama", "auto_map": {"AutoConfig": "x.Y"}}'
+        )
+        (tmp_path / "tokenizer_config.json").write_text(
+            '{"auto_map": {"AutoTokenizer": ["tokenization_x.X", null]}}'
+        )
+
+        tokenizer_load = MagicMock(
+            side_effect=ValueError("trust_remote_code=True is required")
+        )
+        fake_utils = types.SimpleNamespace(
+            _download=MagicMock(return_value=tmp_path),
+            load_config=MagicMock(
+                return_value={
+                    "model_type": "llama",
+                    "auto_map": {"AutoConfig": "x.Y"},
+                }
+            ),
+            load_tokenizer=tokenizer_load,
+        )
+        model_load = MagicMock()
+        fake_mlx_lm = types.ModuleType("mlx_lm")
+        fake_mlx_lm.utils = fake_utils
+        fake_mlx_lm.load = model_load
+        monkeypatch.setitem(sys.modules, "mlx_lm", fake_mlx_lm)
+
+        with pytest.raises(ValueError, match="trust_remote_code=True"):
+            model_loading.lm_load_compat(str(tmp_path), trust_remote_code=False)
+
+        model_load.assert_not_called()
+        tokenizer_load.assert_called_once()
+        assert tokenizer_load.call_args.args[1]["trust_remote_code"] is False
+
+    def test_safe_metadata_does_not_load_the_tokenizer_twice(
+        self, tmp_path, monkeypatch
+    ):
+        (tmp_path / "config.json").write_text('{"model_type": "llama"}')
+        fake_utils = types.SimpleNamespace(
+            _download=MagicMock(return_value=tmp_path),
+            load_config=MagicMock(return_value={"model_type": "llama"}),
+            load_tokenizer=MagicMock(),
+        )
+        fake_mlx_lm = types.ModuleType("mlx_lm")
+        fake_mlx_lm.utils = fake_utils
+        monkeypatch.setitem(sys.modules, "mlx_lm", fake_mlx_lm)
+
+        preflight_text_remote_code(str(tmp_path), trust_remote_code=False)
+
+        fake_utils.load_tokenizer.assert_not_called()
 
 
 class TestNoDispatch:
@@ -160,6 +242,59 @@ class TestParoquantDispatch:
         assert captured["called"] is True
 
 
+class TestLlama4PreLoadDispatch:
+    @pytest.mark.parametrize(
+        "body",
+        [
+            '{"model_type": "llama4", "text_config": {}}',
+            '{"model_type": "mllama", "text_config": {"model_type": "llama4"}}',
+        ],
+    )
+    def test_llama4_attention_patch_applies(self, tmp_path, monkeypatch, body):
+        monkeypatch.setattr(model_loading, "_patch_mlx_lm_load_config", lambda: None)
+        monkeypatch.setitem(
+            sys.modules,
+            "omlx.patches.mlx_lm_mtp",
+            MagicMock(set_mtp_active=MagicMock()),
+        )
+        apply_mock = MagicMock(return_value=True)
+        monkeypatch.setitem(
+            sys.modules,
+            "omlx.patches.llama4_attention",
+            MagicMock(apply_llama4_attention_patch=apply_mock),
+        )
+
+        path = _write_config(tmp_path, body)
+        maybe_apply_pre_load_patches(path)
+
+        apply_mock.assert_called_once_with()
+
+
+class TestLoadTextModel:
+    def test_forwards_trust_remote_code(self, tmp_path, monkeypatch):
+        path = _write_config(tmp_path, '{"model_type": "llama"}')
+        maybe_apply = MagicMock()
+        monkeypatch.setattr(model_loading, "maybe_apply_pre_load_patches", maybe_apply)
+
+        load_mock = MagicMock(return_value=("MODEL", "TOKENIZER"))
+        monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(load=load_mock))
+
+        settings = types.SimpleNamespace(trust_remote_code=True)
+        result = model_loading.load_text_model(
+            path,
+            tokenizer_config={"trust_remote_code": True},
+            model_settings=settings,
+        )
+
+        assert result == ("MODEL", "TOKENIZER")
+        maybe_apply.assert_called_once_with(path, model_settings=settings)
+        load_mock.assert_called_once_with(
+            path,
+            tokenizer_config={"trust_remote_code": True},
+            trust_remote_code=True,
+        )
+
+
 class TestVlmMtpPreLoadDispatch:
     """maybe_apply_pre_load_patches must wire the mlx-vlm MTP sanitize
     patch alongside the runtime patch for MTP-capable VLM checkpoints.
@@ -181,7 +316,9 @@ class TestVlmMtpPreLoadDispatch:
         mocks."""
         calls: list[str] = []
         sanitize_mock = MagicMock(side_effect=lambda: calls.append("sanitize") or True)
-        runtime_mock = MagicMock(side_effect=lambda: calls.append("runtime") or True)
+        runtime_mock = MagicMock(
+            side_effect=lambda *_a: calls.append("runtime") or True
+        )
         attach_mock = MagicMock(
             side_effect=lambda enabled: calls.append(f"attach={enabled}")
         )
@@ -229,6 +366,25 @@ class TestVlmMtpPreLoadDispatch:
         # Ordering matters: the dense runtime patch assumes sanitize was
         # already installed by apply_mlx_vlm_mtp_patch.
         assert calls == ["attach=True", "sanitize", "runtime"]
+
+    def test_runtime_patch_is_scoped_to_the_loaded_model_type(
+        self, tmp_path, monkeypatch
+    ):
+        # The runtime patches rebind methods on shared parent classes, so a
+        # sweep over every architecture rewrites models this load has nothing
+        # to do with. The dispatcher passes the model_type it resolved.
+        _, _, runtime_mock, _ = self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "glm5_next", "vision_config": {}, '
+            '"text_config": {"num_nextn_predict_layers": 1}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(mtp_enabled=True)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        runtime_mock.assert_called_once_with("glm5_next")
 
     def test_vlm_patches_applied_when_mtp_disabled_for_vlm(self, tmp_path, monkeypatch):
         # Issue #1404: persisted ``mtp.*`` weights must still get a binding
@@ -306,6 +462,168 @@ class TestVlmMtpPreLoadDispatch:
         runtime_mock.assert_not_called()
         assert calls == []
 
+    def test_gemma4_merged_assistant_dispatch(self, tmp_path, monkeypatch):
+        # Gemma 4 merged-assistant checkpoints (assistant weights under
+        # language_model.mtp.* + text_config.mtp_assistant_config) route
+        # through the same VLM MTP pre-load dispatch as Qwen3.5/3.6.
+        calls, sanitize_mock, runtime_mock, attach_mock = self._stub_patches(
+            monkeypatch
+        )
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "gemma4", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 4}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(mtp_enabled=True)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        sanitize_mock.assert_called_once()
+        runtime_mock.assert_called_once()
+        attach_mock.assert_called_once_with(True)
+        assert calls == ["attach=True", "sanitize", "runtime"]
+
+    def test_gemma4_default_depth_is_eight(self, tmp_path, monkeypatch):
+        # The fused multi-row verify kernel keeps gemma4 verify forwards
+        # near-flat in L, so the default depth ceiling is 8 there; the
+        # adaptive controller still settles shallow when accept is low.
+        self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "gemma4", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 4}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(mtp_enabled=True)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        stub = sys.modules["omlx.patches.mlx_lm_mtp"]
+        stub.set_mtp_depth.assert_called_once_with(8)
+
+    def test_gemma4_unified_merged_assistant_dispatch(self, tmp_path, monkeypatch):
+        # Unified Gemma 4 exports share the Gemma 4 language runtime but use
+        # their own top-level config and TextConfig subclass.
+        calls, sanitize_mock, runtime_mock, attach_mock = self._stub_patches(
+            monkeypatch
+        )
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "gemma4_unified", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 4}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(mtp_enabled=True)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        sanitize_mock.assert_called_once()
+        runtime_mock.assert_called_once()
+        attach_mock.assert_called_once_with(True)
+        assert calls == ["attach=True", "sanitize", "runtime"]
+
+    def test_gemma4_explicit_depth_overrides_default(self, tmp_path, monkeypatch):
+        self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "gemma4", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 4}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(mtp_enabled=True, mtp_adaptive_max_depth=2)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        stub = sys.modules["omlx.patches.mlx_lm_mtp"]
+        stub.set_mtp_depth.assert_called_once_with(2)
+
+    def test_fixed_depth_takes_precedence_over_adaptive_max(
+        self, tmp_path, monkeypatch
+    ):
+        self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "gemma4", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 4}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(
+            mtp_enabled=True, mtp_adaptive_max_depth=6, mtp_fixed_depth=2
+        )
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        stub = sys.modules["omlx.patches.mlx_lm_mtp"]
+        stub.set_mtp_depth.assert_called_once_with(2, fixed=True)
+
+    @pytest.mark.parametrize(
+        ("nax", "depth", "expected"),
+        [(True, None, 4), (False, None, 3), (True, 3, 3), (True, 5, 5), (True, 6, 6)],
+    )
+    def test_dense_qwen_default_depth_follows_nax(
+        self, tmp_path, monkeypatch, nax, depth, expected
+    ):
+        self._stub_patches(monkeypatch)
+        monkeypatch.setattr(model_loading, "_nax_available", lambda: nax)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "qwen3_5", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 1}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(mtp_enabled=True, mtp_adaptive_max_depth=depth)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        stub = sys.modules["omlx.patches.mlx_lm_mtp"]
+        stub.set_mtp_depth.assert_called_once_with(expected)
+
+    @pytest.mark.parametrize("nax", [True, False])
+    @pytest.mark.parametrize("for_vlm", [True, False])
+    @pytest.mark.parametrize("depth", [None, 3, 4, 5, 6])
+    def test_qwen_27b_adaptive_ceiling_has_floor_four(
+        self, tmp_path, monkeypatch, nax, for_vlm, depth
+    ):
+        self._stub_patches(monkeypatch)
+        monkeypatch.setattr(model_loading, "_nax_available", lambda: nax)
+        text = {
+            "mtp_num_hidden_layers": 1,
+            "hidden_size": 5120,
+            "num_hidden_layers": 64,
+        }
+        config = {"model_type": "qwen3_5"}
+        if for_vlm:
+            config.update(vision_config={}, text_config=text)
+        else:
+            config.update(text)
+        path = _write_config(tmp_path, json.dumps(config))
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(mtp_enabled=True, mtp_adaptive_max_depth=depth)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=for_vlm)
+
+        stub = sys.modules["omlx.patches.mlx_lm_mtp"]
+        stub.set_mtp_depth.assert_called_once_with(max(4, depth or 4))
+
+    def test_gemma4_without_mtp_heads_skips_mtp_patches(self, tmp_path, monkeypatch):
+        # Plain gemma4 VLMs (no merged assistant) must stay untouched by
+        # the MTP dispatch — no declared heads, no runtime patch.
+        calls, sanitize_mock, runtime_mock, attach_mock = self._stub_patches(
+            monkeypatch
+        )
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "gemma4", "vision_config": {}, "text_config": {}}',
+        )
+        settings = types.SimpleNamespace(mtp_enabled=False)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        runtime_mock.assert_not_called()
+        attach_mock.assert_not_called()
+        assert "runtime" not in calls
+
     def test_qwen36_moe_vlm_sanitize_when_no_mtp_heads(self, tmp_path, monkeypatch):
         # mlx-lm Qwen3.6 MoE VLMs without MTP heads still need the mlx-vlm
         # sanitize replacement so pre-converted switch_mlp weights load.
@@ -373,6 +691,10 @@ class TestCheckpointHasMtpWeights:
             },
         )
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
+        assert (
+            model_loading._checkpoint_qwen4_mtp_weight_prefix(str(tmp_path))
+            == "language_model.mtp."
+        )
 
     def test_returns_true_when_index_has_bare_mtp(self, tmp_path):
         self._write_index(
@@ -380,6 +702,9 @@ class TestCheckpointHasMtpWeights:
             {"mtp.layers.0.self_attn.q_proj.weight": "model.safetensors"},
         )
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
+        assert (
+            model_loading._checkpoint_qwen4_mtp_weight_prefix(str(tmp_path)) == "mtp."
+        )
 
     def test_returns_true_when_index_has_model_language_model_mtp(self, tmp_path):
         # mlx-vlm HF-source layout before sanitize-time remap (oQ writes this).
@@ -388,6 +713,10 @@ class TestCheckpointHasMtpWeights:
             {"model.language_model.mtp.norm.weight": "model.safetensors"},
         )
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
+        assert (
+            model_loading._checkpoint_qwen4_mtp_weight_prefix(str(tmp_path))
+            == "model.language_model.mtp."
+        )
 
     def test_returns_false_when_index_lacks_mtp(self, tmp_path):
         # Unsloth Qwen3.6 UD MLX layout: vision_tower + language_model.model.*
@@ -401,6 +730,66 @@ class TestCheckpointHasMtpWeights:
             },
         )
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is False
+        assert model_loading._checkpoint_qwen4_mtp_weight_prefix(str(tmp_path)) is None
+
+    @pytest.mark.parametrize(
+        "prefix",
+        (
+            "model.layers.78",
+            "language_model.model.layers.78",
+            "model.language_model.layers.78",
+        ),
+    )
+    def test_returns_true_for_nextn_layout(self, tmp_path, prefix):
+        # DeepSeek-V3-style checkpoints (GLM-5.2) keep the MTP head as an
+        # extra decoder layer past num_hidden_layers, not under mtp.*.
+        import json as _json
+
+        (tmp_path / "config.json").write_text(
+            _json.dumps({"num_hidden_layers": 78, "num_nextn_predict_layers": 1})
+        )
+        self._write_index(
+            tmp_path,
+            {
+                "model.layers.0.self_attn.q_a_proj.weight": "model.safetensors",
+                f"{prefix}.eh_proj.weight": "model.safetensors",
+            },
+        )
+        assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
+        assert model_loading._checkpoint_qwen4_mtp_weight_prefix(str(tmp_path)) is None
+
+    def test_returns_false_for_qwen4_nextn_layout(self, tmp_path):
+        import json as _json
+
+        (tmp_path / "config.json").write_text(
+            _json.dumps(
+                {
+                    "model_type": "qwen4_exp",
+                    "text_config": {
+                        "num_hidden_layers": 78,
+                        "num_nextn_predict_layers": 1,
+                    },
+                }
+            )
+        )
+        self._write_index(
+            tmp_path,
+            {"model.layers.78.eh_proj.weight": "model.safetensors"},
+        )
+        assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is False
+
+    def test_returns_false_for_nextn_config_without_weights(self, tmp_path):
+        # Config declares nextn layers but the checkpoint stripped them.
+        import json as _json
+
+        (tmp_path / "config.json").write_text(
+            _json.dumps({"num_hidden_layers": 78, "num_nextn_predict_layers": 1})
+        )
+        self._write_index(
+            tmp_path,
+            {"model.layers.0.self_attn.q_a_proj.weight": "model.safetensors"},
+        )
+        assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is False
 
     def test_returns_false_for_empty_dir(self, tmp_path):
         # No index, no shards — caller treats as "no MTP weights".
@@ -408,9 +797,7 @@ class TestCheckpointHasMtpWeights:
 
     def test_returns_false_for_nonexistent_path(self, tmp_path):
         assert (
-            model_loading._checkpoint_has_mtp_weights(
-                str(tmp_path / "does-not-exist")
-            )
+            model_loading._checkpoint_has_mtp_weights(str(tmp_path / "does-not-exist"))
             is False
         )
 
@@ -419,3 +806,370 @@ class TestCheckpointHasMtpWeights:
         # Falls through to safetensors-header scan; no shards exist, so
         # the helper conservatively returns False.
         assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is False
+
+    def test_returns_true_when_later_shard_has_mtp(self, tmp_path):
+        from safetensors.numpy import save_file
+        import numpy as np
+
+        save_file(
+            {
+                "language_model.model.embed_tokens.weight": np.zeros(
+                    (1,), dtype=np.float16
+                )
+            },
+            str(tmp_path / "model-00001-of-00002.safetensors"),
+        )
+        save_file(
+            {"language_model.mtp.fc.weight": np.zeros((1,), dtype=np.float16)},
+            str(tmp_path / "model-00002-of-00002.safetensors"),
+        )
+
+        assert model_loading._checkpoint_has_mtp_weights(str(tmp_path)) is True
+        assert (
+            model_loading._checkpoint_qwen4_mtp_weight_prefix(str(tmp_path))
+            == "language_model.mtp."
+        )
+
+
+class TestExpandPerLayerQuantKeys:
+    """expand_per_layer_quant_keys adds runtime module-tree key variants."""
+
+    def test_adds_language_model_prefix_for_bare_key(self):
+        cfg = {
+            "quantization": {
+                "bits": 6,
+                "group_size": 64,
+                "lm_head": {"bits": 8, "group_size": 64},
+            }
+        }
+
+        model_loading.expand_per_layer_quant_keys(cfg)
+
+        assert cfg["quantization"]["language_model.lm_head"] == {
+            "bits": 8,
+            "group_size": 64,
+        }
+
+    def test_adds_swapped_prefix_variant_for_model_language_model_key(self):
+        key = "model.language_model.layers.0.linear_attn.in_proj_qkv"
+        cfg = {
+            "quantization": {
+                "bits": 6,
+                "group_size": 64,
+                key: {"bits": 8, "group_size": 64},
+            }
+        }
+
+        model_loading.expand_per_layer_quant_keys(cfg)
+
+        swapped = "language_model.model.layers.0.linear_attn.in_proj_qkv"
+        assert swapped in cfg["quantization"]
+        assert cfg["quantization"][swapped]["bits"] == 8
+
+    def test_adds_gate_proj_variant_for_laguna_router_overrides(self):
+        """Laguna checkpoints key router quant overrides as ``mlp.gate``.
+
+        The model's runtime module path is ``mlp.gate.proj`` (the router
+        ``nn.Linear`` is ``LagunaTopKRouter.proj``).  Without the ``.proj``
+        variant, ``nn.quantize`` falls back to the global bits and builds
+        the router at the wrong width, causing a shape mismatch on load.
+        """
+        cfg = {
+            "quantization": {
+                "bits": 4,
+                "group_size": 64,
+                "model.layers.1.mlp.gate": {"bits": 8, "group_size": 64},
+                "model.layers.2.mlp.gate": {"bits": 8, "group_size": 64},
+            }
+        }
+
+        model_loading.expand_per_layer_quant_keys(cfg)
+
+        assert (
+            cfg["quantization"]["model.layers.1.mlp.gate.proj"]
+            == {"bits": 8, "group_size": 64}
+        )
+        assert (
+            cfg["quantization"]["model.layers.2.mlp.gate.proj"]
+            == {"bits": 8, "group_size": 64}
+        )
+        # The original key is preserved (other code paths may still use it)
+        assert "model.layers.1.mlp.gate" in cfg["quantization"]
+
+    def test_minimax_overrides_follow_the_mlx_lm_adapter_root(self):
+        gate = "language_model.model.layers.50.block_sparse_moe.gate"
+        spec = {"bits": 8, "group_size": 64, "mode": "affine"}
+        cfg = {
+            "model_type": "minimax_m3_vl",
+            "quantization": {
+                "bits": 4,
+                "group_size": 64,
+                "mode": "affine",
+                gate: spec,
+            },
+        }
+
+        model_loading.expand_per_layer_quant_keys(cfg)
+
+        assert cfg["quantization"][f"inner.{gate}"] == spec
+
+
+class TestMaterializeLazyState:
+    def test_evaluates_arrays_in_bounded_chunks(self, monkeypatch):
+        import mlx.core as mx
+        import mlx.nn as nn
+
+        class _Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.tensor_list = [mx.array(i) * 2 for i in range(17)]
+
+        chunk_sizes = []
+        monkeypatch.setattr(
+            model_loading.mx,
+            "eval",
+            lambda arrays: chunk_sizes.append(len(arrays)),
+        )
+
+        model_loading.materialize_lazy_state(_Model())
+
+        assert chunk_sizes == [8, 8, 1]
+
+    def test_covers_arrays_in_plain_helper_objects(self):
+        """Lazy arrays hidden in non-Module helpers must be materialized.
+
+        Mirrors mlx-vlm's PixtralRotaryEmbedding: a plain class attribute on
+        a module holding a lazy array built on the loader thread. Without
+        the plain-object scan, evaluating that array from another thread
+        raises "There is no Stream(gpu, N) in current thread" (issue #2263
+        follow-up; same class as #1304).
+        """
+        import threading
+
+        import mlx.core as mx
+        import mlx.nn as nn
+
+        from omlx.utils.model_loading import materialize_lazy_state
+
+        class _PlainRotary:
+            def __init__(self):
+                freqs = 1.0 / (10000.0 ** (mx.arange(0, 8, 2) / 8.0))
+                self.inv_freq = mx.concatenate([freqs, freqs], axis=-1)
+
+        class _Vision(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.rotary = _PlainRotary()
+                self.rotary_list = [_PlainRotary()]
+                self._hidden = mx.arange(4) * 2.0
+
+        errors = []
+
+        def _build_and_materialize(box):
+            model = _Vision()
+            materialize_lazy_state(model)
+            box.append(model)
+
+        def _eval_elsewhere(model):
+            try:
+                mx.eval(model.rotary.inv_freq)
+                mx.eval(model.rotary_list[0].inv_freq)
+                mx.eval(model._hidden)
+            except RuntimeError as exc:
+                errors.append(exc)
+
+        box: list = []
+        t0 = threading.Thread(target=_build_and_materialize, args=(box,))
+        t0.start()
+        t0.join()
+
+        t1 = threading.Thread(target=_eval_elsewhere, args=(box[0],))
+        t1.start()
+        t1.join()
+
+        assert not errors, f"cross-thread eval failed: {errors}"
+
+
+class TestMoondreamCompatibility:
+    @pytest.fixture
+    def moondream(self, tmp_path, monkeypatch):
+        from mlx_vlm.models.moondream2 import Model, ModelConfig
+        from mlx_vlm.models.moondream2.processing_moondream2 import Moondream2Processor
+
+        monkeypatch.setattr(Model, "sanitize", Model.sanitize)
+        monkeypatch.setattr(
+            Moondream2Processor,
+            "from_pretrained",
+            Moondream2Processor.__dict__["from_pretrained"],
+        )
+        _write_config(tmp_path, '{"model_type": "moondream2"}')
+        return Model, ModelConfig, Moondream2Processor
+
+    @pytest.mark.parametrize("layout", ["legacy", "current", "converted"])
+    def test_checkpoint_layout_loads_strictly(self, tmp_path, moondream, layout):
+        from mlx.utils import tree_flatten
+
+        model_cls, config_cls, _ = moondream
+        maybe_apply_pre_load_patches(str(tmp_path), for_vlm=True)
+        model = model_cls(
+            config_cls.from_dict(
+                {
+                    "text_config": {
+                        "num_hidden_layers": 1,
+                        "hidden_size": 32,
+                        "intermediate_size": 64,
+                        "num_attention_heads": 2,
+                        "num_key_value_heads": 2,
+                        "vocab_size": 64,
+                    },
+                    "vision_config": {
+                        "num_hidden_layers": 1,
+                        "hidden_size": 32,
+                        "intermediate_size": 64,
+                        "num_attention_heads": 2,
+                        "proj_inner_dim": 64,
+                        "proj_out_dim": 32,
+                    },
+                }
+            )
+        )
+        weights = dict(tree_flatten(model.parameters()))
+        legacy = {
+            "text.model.embed_tokens.weight": "text_model.transformer.embd.wte.weight",
+            "text.model.layers.0.attn.qkv.weight": "text_model.transformer.h.0.mixer.Wqkv.weight",
+            "text.model.layers.0.attn.proj.weight": "text_model.transformer.h.0.mixer.out_proj.weight",
+            "text.model.post_ln.weight": "text_model.lm_head.ln.weight",
+            "text.lm_head.weight": "text_model.lm_head.linear.weight",
+            "vision.encoder.patch_emb.weight": "vision_encoder.encoder.model.visual.patch_embed.linear.weight",
+            "vision.encoder.pos_emb": "vision_encoder.encoder.model.visual.pos_embed",
+            "vision.encoder.blocks.0.ln1.weight": "vision_encoder.encoder.model.visual.blocks.0.norm1.weight",
+            "vision.encoder.blocks.0.ln2.weight": "vision_encoder.encoder.model.visual.blocks.0.norm2.weight",
+            "vision.encoder.post_ln.weight": "vision_encoder.encoder.model.visual.norm.weight",
+            "vision.proj_mlp.fc1.weight": "vision_encoder.projection.mlp.fc1.weight",
+        }
+        current = {
+            "text.model.embed_tokens.weight": "model.text.wte",
+            "text.model.layers.0.attn.qkv.weight": "model.text.blocks.0.attn.qkv.weight",
+            "text.model.post_ln.weight": "model.text.post_ln.weight",
+            "text.lm_head.weight": "model.text.lm_head.weight",
+            "vision.encoder.patch_emb.weight": "model.vision.patch_emb.weight",
+            "vision.proj_mlp.fc1.weight": "model.vision.proj_mlp.fc1.weight",
+        }
+        mapping = {"legacy": legacy, "current": current, "converted": {}}[layout]
+        for target, source in mapping.items():
+            weights[source] = weights.pop(target)
+        if layout != "converted":
+            prefix = "region_model" if layout == "legacy" else "model.region"
+            weights[f"{prefix}.unused.weight"] = next(iter(weights.values()))
+        model.load_weights(list(model.sanitize(weights).items()), strict=True)
+
+    @staticmethod
+    def _tokenizer(starmie=True):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast
+
+        vocab = (
+            {
+                "<|endoftext|>": 0,
+                "<unk>": 1,
+                "hello": 2,
+                "<|md_reserved_2|>": 3,
+                "<|md_reserved_3|>": 4,
+            }
+            if starmie
+            else {"<unk>": 0, "hello": 1, "<|endoftext|>": 2}
+        )
+        return PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(WordLevel(vocab, unk_token="<unk>")),
+            eos_token="<|endoftext|>",
+        )
+
+    @pytest.mark.parametrize("model_type", ["moondream1", "moondream2"])
+    def test_local_starmie_loads_offline(
+        self, tmp_path, monkeypatch, moondream, model_type
+    ):
+        from mlx_vlm.utils import load_processor
+        from transformers import AutoTokenizer
+
+        self._tokenizer().save_pretrained(tmp_path)
+        _write_config(tmp_path, '{"model_type": "' + model_type + '"}')
+        original = AutoTokenizer.from_pretrained
+
+        def local_only(path, **kwargs):
+            assert str(path) == str(tmp_path)
+            assert kwargs["local_files_only"] is True
+            assert kwargs["trust_remote_code"] is False
+            return original(path, **kwargs)
+
+        monkeypatch.setattr(AutoTokenizer, "from_pretrained", local_only)
+        maybe_apply_pre_load_patches(str(tmp_path), for_vlm=True)
+        processor = load_processor(
+            tmp_path,
+            add_detokenizer=False,
+            local_files_only=True,
+            trust_remote_code=False,
+        )
+        assert processor.tokenizer.encode("hello", add_special_tokens=False) == [2]
+
+    def test_legacy_phi_checkpoint_uses_bundled_tokenizer_and_prompt(
+        self, tmp_path, monkeypatch, moondream
+    ):
+        from mlx_vlm.utils import load_processor
+        from PIL import Image
+        from transformers import AutoTokenizer
+
+        self._tokenizer(starmie=False).save_pretrained(tmp_path)
+        _write_config(
+            tmp_path,
+            '{"model_type": "moondream1", "architectures": ["Moondream"],'
+            ' "text_config": {"model_type": "phi"}}',
+        )
+        original = AutoTokenizer.from_pretrained
+        sources = []
+
+        def record(path, **kwargs):
+            sources.append(str(path))
+            return original(path, **kwargs)
+
+        monkeypatch.setattr(AutoTokenizer, "from_pretrained", record)
+        maybe_apply_pre_load_patches(str(tmp_path), for_vlm=True)
+        processor = load_processor(tmp_path, add_detokenizer=False)
+        assert sources == [str(tmp_path)]
+        bos = processor.tokenizer.bos_token_id
+        question = processor.tokenizer.encode(
+            "\n\nQuestion: hello\n\nAnswer:", add_special_tokens=False
+        )
+        with_image = processor(text="hello", images=[Image.new("RGB", (64, 64))])
+        assert with_image["input_ids"][0].tolist() == [bos] + [0] * 729 + question
+        assert with_image["pixel_values"].shape[0] == with_image["num_crops"][0]
+        assert processor(text="hello")["input_ids"].tolist() == [[bos, 1]]
+
+    @pytest.mark.parametrize("stale_local", [False, True])
+    def test_external_starmie_preserves_load_options(
+        self, tmp_path, monkeypatch, moondream, stale_local
+    ):
+        from transformers import AutoTokenizer
+
+        if stale_local:
+            self._tokenizer(starmie=False).save_pretrained(tmp_path)
+        loader = MagicMock(return_value=self._tokenizer())
+        monkeypatch.setattr(AutoTokenizer, "from_pretrained", loader)
+        maybe_apply_pre_load_patches(str(tmp_path), for_vlm=True)
+        processor = moondream[2].from_pretrained(
+            tmp_path,
+            local_files_only=True,
+            trust_remote_code=False,
+            cache_dir="/tmp/tokenizer-cache",
+            token="test-token",
+            revision="model-revision",
+            eos_token_ids=[0],
+        )
+        loader.assert_called_once_with(
+            "moondream/starmie-v1",
+            local_files_only=True,
+            trust_remote_code=False,
+            cache_dir="/tmp/tokenizer-cache",
+            token="test-token",
+        )
+        assert processor.tokenizer.convert_tokens_to_ids("<|md_reserved_2|>") == 3

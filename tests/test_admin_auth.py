@@ -3,6 +3,7 @@
 
 import asyncio
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -251,16 +252,18 @@ class TestSkipAdminAuth:
         finally:
             admin_auth._get_global_settings = original
 
-    def test_require_admin_skipped_on_any_host(self):
-        """require_admin should skip auth when skip_api_key_verification=True regardless of host."""
+    def test_require_admin_not_skipped_on_network_host(self):
+        """The no-auth switch must not bypass admin auth on a network bind."""
         gs = self._mock_gs(skip=True, host="0.0.0.0")
         original = admin_auth._get_global_settings
         admin_auth._get_global_settings = lambda: gs
         try:
             mock_request = MagicMock()
             mock_request.cookies.get.return_value = None
-            result = asyncio.run(admin_auth.require_admin(mock_request))
-            assert result is True
+            mock_request.headers.get.return_value = "application/json"
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(admin_auth.require_admin(mock_request))
+            assert exc_info.value.status_code == 401
         finally:
             admin_auth._get_global_settings = original
 
@@ -292,6 +295,43 @@ class TestSkipAdminAuth:
                 result = asyncio.run(admin_routes.login_page(request=mock_request))
                 assert result.status_code == 302
                 assert result.headers["location"] == "/admin/dashboard"
+        finally:
+            _restore_getter(original)
+
+    def test_login_page_does_not_skip_login_on_network_host(self):
+        gs = MagicMock()
+        gs.auth.skip_api_key_verification = True
+        gs.auth.api_key = "test-key"
+        gs.server.host = "0.0.0.0"
+        original = _patch_getter(gs)
+        rendered = MagicMock()
+        try:
+            mock_request = MagicMock()
+            with (
+                patch("omlx.admin.auth.verify_session", return_value=False),
+                patch.object(
+                    admin_routes.templates,
+                    "TemplateResponse",
+                    return_value=rendered,
+                ),
+            ):
+                result = asyncio.run(admin_routes.login_page(request=mock_request))
+
+            assert result is rendered
+        finally:
+            _restore_getter(original)
+
+    def test_load_auth_bypass_is_restricted_to_loopback(self):
+        gs = self._mock_gs(skip=True, host="0.0.0.0")
+        original = _patch_getter(gs)
+        try:
+            mock_request = MagicMock()
+            mock_request.cookies.get.return_value = None
+            mock_request.headers.get.return_value = ""
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(admin_routes._require_admin_or_bearer(mock_request))
+
+            assert exc_info.value.status_code == 401
         finally:
             _restore_getter(original)
 
@@ -436,8 +476,11 @@ class TestCheckUpdate:
     """Tests for update-check version filtering."""
 
     def setup_method(self):
-        admin_routes._update_cache = None
-        admin_routes._update_cache_time = 0.0
+        admin_routes._update_cache = {}
+        admin_routes._update_cache_time = {}
+        admin_routes._UPDATE_PREFS_PATH = Path(
+            "/tmp/omlx-test-missing-update-prefs.json"
+        )
 
     @pytest.mark.asyncio
     async def test_prerelease_not_shown(self):

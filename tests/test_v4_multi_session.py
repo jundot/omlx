@@ -65,15 +65,17 @@ def test_pooling_cache_round_trip_through_paged_ssd(applied_patch, tmp_path):
 
     # Build a representative PoolingCache state. buf_kv / buf_gate are
     # zero-length placeholders (remainder cleared); pooled holds the
-    # accumulated compressed sequence — this is the element the bug
-    # used to drop.
+    # accumulated compressed sequence, and prev_win_* carries the raw
+    # overlap window used by ratio-4 compressors.
     from mlx_lm.models.cache import PoolingCache
 
     ratio = 4
     cache = PoolingCache(ratio=ratio)
     pooled = mx.arange(1 * 16 * 12, dtype=mx.float32).reshape(1, 16, 12)
-    mx.eval(pooled)
-    cache.state = (None, None, pooled)
+    prev_win_kv = mx.arange(ratio * 12, dtype=mx.float32).reshape(1, 1, ratio, 12)
+    prev_win_gate = prev_win_kv + 1000
+    mx.eval(pooled, prev_win_kv, prev_win_gate)
+    cache.state = (None, None, pooled, prev_win_kv, prev_win_gate)
 
     # Serialize via the handler exactly as scheduler /
     # prefix_cache will after Commit 1.
@@ -95,11 +97,13 @@ def test_pooling_cache_round_trip_through_paged_ssd(applied_patch, tmp_path):
     assert marker[0] == "__nstate__"
     assert marker[1] == "PoolingCache"
     restored_elements = marker[2]
-    assert len(restored_elements) == 3
+    assert len(restored_elements) == 5
 
-    # Critical: the third element survives byte-equal.
+    # Critical: the pooled and overlap elements survive byte-equal.
     rest_pooled = restored_elements[2]
     assert mx.max(mx.abs(rest_pooled - pooled)).item() == 0.0
+    assert mx.max(mx.abs(restored_elements[3] - prev_win_kv)).item() == 0.0
+    assert mx.max(mx.abs(restored_elements[4] - prev_win_gate)).item() == 0.0
 
     # And the handler can rebuild a PoolingCache from those elements.
     restored_cache = handler.deserialize_state(
@@ -107,8 +111,12 @@ def test_pooling_cache_round_trip_through_paged_ssd(applied_patch, tmp_path):
     )
     assert restored_cache is not None
     assert restored_cache.ratio == ratio
-    _, _, restored_pool_tensor = restored_cache.state
+    _, _, restored_pool_tensor, restored_prev_kv, restored_prev_gate = (
+        restored_cache.state
+    )
     assert mx.max(mx.abs(restored_pool_tensor - pooled)).item() == 0.0
+    assert mx.max(mx.abs(restored_prev_kv - prev_win_kv)).item() == 0.0
+    assert mx.max(mx.abs(restored_prev_gate - prev_win_gate)).item() == 0.0
 
     manager.close()
 
@@ -138,8 +146,16 @@ def test_two_session_simulation_pooled_preserved(applied_patch, tmp_path):
     # Session 1: build a PoolingCache and store it.
     session1_cache = PoolingCache(ratio=ratio)
     pooled_s1 = mx.arange(1 * 24 * 16, dtype=mx.float32).reshape(1, 24, 16)
-    mx.eval(pooled_s1)
-    session1_cache.state = (None, None, pooled_s1)
+    prev_win_kv_s1 = mx.arange(ratio * 16, dtype=mx.float32).reshape(1, 1, ratio, 16)
+    prev_win_gate_s1 = prev_win_kv_s1 + 1000
+    mx.eval(pooled_s1, prev_win_kv_s1, prev_win_gate_s1)
+    session1_cache.state = (
+        None,
+        None,
+        pooled_s1,
+        prev_win_kv_s1,
+        prev_win_gate_s1,
+    )
 
     s1_elements = handler.serialize_state(session1_cache)
     manager.save_block(
@@ -157,12 +173,14 @@ def test_two_session_simulation_pooled_preserved(applied_patch, tmp_path):
     s2_cache = handler.deserialize_state(tuple(s2_marker[2]), meta_state=ratio)
     assert s2_cache is not None
 
-    # Session 2's pooled state must match session 1's exactly.
-    _, _, s2_pooled = s2_cache.state
+    # Session 2's pooled and overlap state must match session 1's exactly.
+    _, _, s2_pooled, s2_prev_kv, s2_prev_gate = s2_cache.state
     assert (
         s2_pooled is not None
     ), "pooled element was dropped — V4 corruption regression"
     assert s2_pooled.shape == pooled_s1.shape
     assert mx.max(mx.abs(s2_pooled - pooled_s1)).item() == 0.0
+    assert mx.max(mx.abs(s2_prev_kv - prev_win_kv_s1)).item() == 0.0
+    assert mx.max(mx.abs(s2_prev_gate - prev_win_gate_s1)).item() == 0.0
 
     manager.close()

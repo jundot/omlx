@@ -14,29 +14,33 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 import mlx_vlm.utils as _vu
+import pytest
 
 from omlx.engine.vlm import (
     _AUDIO_CONFIG_KEYS,
+    _drop_gemma4_mlx_shared_kv_extras_on_load,
     _has_audio_weights,
     _strip_audio_config_if_orphaned,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixture builders
 # ---------------------------------------------------------------------------
 
 
-def _write_safetensors(path: Path, keys: list[str]) -> None:
+def _write_safetensors(
+    path: Path,
+    keys: list[str],
+    *,
+    metadata: dict[str, str] | None = None,
+) -> None:
     """Write a tiny safetensors file with the given parameter keys."""
-    from safetensors.numpy import save_file
     import numpy as np
+    from safetensors.numpy import save_file
 
     payload = {k: np.zeros((1,), dtype=np.float32) for k in keys}
-    save_file(payload, str(path))
+    save_file(payload, str(path), metadata=metadata)
 
 
 def _build_model_dir(
@@ -45,6 +49,7 @@ def _build_model_dir(
     name: str,
     has_audio_config: bool,
     has_audio_weights: bool,
+    audio_key_prefix: str = "",
 ) -> Path:
     model_dir = tmp_path / name
     model_dir.mkdir()
@@ -65,10 +70,44 @@ def _build_model_dir(
 
     keys = ["language_model.model.layers.0.self_attn.q_proj.weight"]
     if has_audio_weights:
-        keys.append("audio_tower.layers.0.feed_forward1.linear.weight")
-        keys.append("embed_audio.embedding_projection.weight")
+        keys.append(
+            f"{audio_key_prefix}audio_tower.layers.0.feed_forward1.linear.weight"
+        )
+        keys.append(f"{audio_key_prefix}embed_audio.embedding_projection.weight")
     _write_safetensors(model_dir / "model.safetensors", keys)
 
+    return model_dir
+
+
+def _build_gemma4_shared_kv_dir(
+    tmp_path: Path,
+    *,
+    name: str = "gemma4",
+    model_type: str = "gemma4",
+    text_model_type: str = "gemma4_text",
+    num_hidden_layers: int = 4,
+    num_kv_shared_layers: int = 2,
+    mlx_format: bool = True,
+) -> Path:
+    model_dir = tmp_path / name
+    model_dir.mkdir()
+    config = {
+        "architectures": ["Gemma4ForConditionalGeneration"],
+        "model_type": model_type,
+        "text_config": {
+            "model_type": text_model_type,
+            "num_hidden_layers": num_hidden_layers,
+            "num_kv_shared_layers": num_kv_shared_layers,
+        },
+        "vision_config": {"hidden_size": 16},
+    }
+    (model_dir / "config.json").write_text(json.dumps(config))
+    metadata = {"format": "mlx"} if mlx_format else None
+    _write_safetensors(
+        model_dir / "model.safetensors",
+        ["language_model.model.layers.0.self_attn.q_proj.weight"],
+        metadata=metadata,
+    )
     return model_dir
 
 
@@ -90,10 +129,47 @@ class TestHasAudioWeights:
         )
         assert _has_audio_weights(model_dir) is False
 
+    def test_returns_true_for_mimo_audio_sidecar(self, tmp_path: Path):
+        model_dir = _build_model_dir(
+            tmp_path, name="mimo", has_audio_config=True, has_audio_weights=False,
+        )
+        sidecar = model_dir / "omnimodal" / "audio_encoder.safetensors"
+        sidecar.parent.mkdir()
+        _write_safetensors(sidecar, ["audio_encoder.projection.weight"])
+
+        assert _has_audio_weights(model_dir) is True
+
     def test_returns_false_for_empty_dir(self, tmp_path: Path):
         empty = tmp_path / "empty"
         empty.mkdir()
         assert _has_audio_weights(empty) is False
+
+    def test_returns_true_for_hf_prefixed_audio_tower(self, tmp_path: Path):
+        # google/gemma-4-E4B-it* ship HF names; sanitize strips `model.` later.
+        model_dir = tmp_path / "hf"
+        model_dir.mkdir()
+        _write_safetensors(
+            model_dir / "model.safetensors",
+            [
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                "model.audio_tower.layers.0.lconv1d.depthwise_conv1d.weight",
+                "model.embed_audio.embedding_projection.weight",
+            ],
+        )
+        assert _has_audio_weights(model_dir) is True
+
+    def test_returns_true_for_hf_prefixed_embed_audio_only(self, tmp_path: Path):
+        # gemma4_unified has no audio tower; embed_audio is its audio path.
+        model_dir = tmp_path / "hf_unified"
+        model_dir.mkdir()
+        _write_safetensors(
+            model_dir / "model.safetensors",
+            [
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                "model.embed_audio.embedding_projection.weight",
+            ],
+        )
+        assert _has_audio_weights(model_dir) is True
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +193,16 @@ class TestStripAudioConfigIfOrphaned:
         model_dir = _build_model_dir(
             tmp_path, name="full",
             has_audio_config=True, has_audio_weights=True,
+        )
+        with _strip_audio_config_if_orphaned(model_dir):
+            cfg = _vu.load_config(model_dir)
+        assert cfg.get("audio_config") is not None
+
+    def test_passthrough_when_audio_weights_use_hf_names(self, tmp_path: Path):
+        model_dir = _build_model_dir(
+            tmp_path, name="hf_full",
+            has_audio_config=True, has_audio_weights=True,
+            audio_key_prefix="model.",
         )
         with _strip_audio_config_if_orphaned(model_dir):
             cfg = _vu.load_config(model_dir)
@@ -197,3 +283,100 @@ class TestStripAudioConfigIfOrphaned:
         # cfg returned unchanged — audio_config still a dict, not None.
         assert cfg["audio_config"] == {"hidden_size": 99}
         assert cfg["audio_token_id"] == 12345
+
+
+# ---------------------------------------------------------------------------
+# _drop_gemma4_mlx_shared_kv_extras_on_load
+# ---------------------------------------------------------------------------
+
+
+class TestDropGemma4MlxSharedKvExtrasOnLoad:
+    def _capture_load_weights(self, monkeypatch):
+        import mlx.nn as nn
+
+        captured = {}
+
+        def fake_load_weights(self, weights_items, *args, **kwargs):
+            captured["items"] = list(weights_items)
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return "loaded"
+
+        monkeypatch.setattr(nn.Module, "load_weights", fake_load_weights)
+        return nn, captured, fake_load_weights
+
+    def test_drops_only_shared_kv_extra_weights(self, tmp_path: Path, monkeypatch):
+        model_dir = _build_gemma4_shared_kv_dir(tmp_path)
+        nn, captured, fake_load_weights = self._capture_load_weights(monkeypatch)
+        weights = [
+            ("language_model.model.layers.0.self_attn.k_proj.weight", 1),
+            ("language_model.model.layers.2.self_attn.k_proj.weight", 2),
+            ("language_model.model.layers.2.self_attn.v_proj.scales", 3),
+            ("language_model.model.layers.3.self_attn.k_norm.weight", 4),
+            ("language_model.model.layers.3.self_attn.v_norm.weight", 5),
+            ("language_model.model.layers.3.self_attn.q_proj.weight", 6),
+            ("language_model.model.layers.3.mlp.up_proj.weight", 7),
+            ("vision_tower.encoder.layers.3.self_attn.k_proj.weight", 8),
+        ]
+
+        with _drop_gemma4_mlx_shared_kv_extras_on_load(model_dir):
+            result = nn.Module.load_weights(object(), weights, strict=True)
+
+        assert result == "loaded"
+        assert nn.Module.load_weights is fake_load_weights
+        assert captured["kwargs"] == {"strict": True}
+        assert [k for k, _ in captured["items"]] == [
+            "language_model.model.layers.0.self_attn.k_proj.weight",
+            "language_model.model.layers.3.self_attn.q_proj.weight",
+            "language_model.model.layers.3.mlp.up_proj.weight",
+            "vision_tower.encoder.layers.3.self_attn.k_proj.weight",
+        ]
+
+    def test_noop_when_gemma4_has_no_shared_kv(self, tmp_path: Path, monkeypatch):
+        model_dir = _build_gemma4_shared_kv_dir(
+            tmp_path,
+            num_hidden_layers=4,
+            num_kv_shared_layers=0,
+        )
+        nn, captured, _ = self._capture_load_weights(monkeypatch)
+        weights = [("language_model.model.layers.3.self_attn.k_proj.weight", 1)]
+
+        with _drop_gemma4_mlx_shared_kv_extras_on_load(model_dir):
+            nn.Module.load_weights(object(), weights)
+
+        assert captured["items"] == weights
+
+    def test_noop_for_non_gemma4_model(self, tmp_path: Path, monkeypatch):
+        model_dir = _build_gemma4_shared_kv_dir(
+            tmp_path,
+            model_type="qwen3_vl",
+            text_model_type="qwen3",
+        )
+        nn, captured, _ = self._capture_load_weights(monkeypatch)
+        weights = [("language_model.model.layers.3.self_attn.k_proj.weight", 1)]
+
+        with _drop_gemma4_mlx_shared_kv_extras_on_load(model_dir):
+            nn.Module.load_weights(object(), weights)
+
+        assert captured["items"] == weights
+
+    def test_noop_for_non_mlx_format_checkpoint(self, tmp_path: Path, monkeypatch):
+        model_dir = _build_gemma4_shared_kv_dir(tmp_path, mlx_format=False)
+        nn, captured, _ = self._capture_load_weights(monkeypatch)
+        weights = [("language_model.model.layers.3.self_attn.k_proj.weight", 1)]
+
+        with _drop_gemma4_mlx_shared_kv_extras_on_load(model_dir):
+            nn.Module.load_weights(object(), weights)
+
+        assert captured["items"] == weights
+
+    def test_load_weights_restored_on_exception(self, tmp_path: Path, monkeypatch):
+        model_dir = _build_gemma4_shared_kv_dir(tmp_path)
+        nn, _, fake_load_weights = self._capture_load_weights(monkeypatch)
+
+        with pytest.raises(
+            RuntimeError, match="boom"
+        ), _drop_gemma4_mlx_shared_kv_extras_on_load(model_dir):
+            raise RuntimeError("boom")
+
+        assert nn.Module.load_weights is fake_load_weights

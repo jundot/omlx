@@ -15,6 +15,12 @@ class TestExtractThinking:
         assert thinking == "reasoning"
         assert content == "Answer"
 
+    def test_minimax_m3_tag_separation(self):
+        """MiniMax M3 <mm:think> tags are treated as thinking tags."""
+        thinking, content = extract_thinking("<mm:think>reasoning</mm:think>Answer")
+        assert thinking == "reasoning"
+        assert content == "Answer"
+
     def test_no_thinking(self):
         """No think tags in text."""
         thinking, content = extract_thinking("Just a normal answer")
@@ -393,6 +399,11 @@ class TestCleanSpecialTokens:
         result = clean_special_tokens("<|im_end|>Hello<|endoftext|>")
         assert result == "Hello"
 
+    def test_removes_minimax_m3_special_tokens(self):
+        from omlx.api.utils import clean_special_tokens
+        result = clean_special_tokens("]~!b[]~b]Hello[e~[]!p~[]!d~[")
+        assert result == "Hello"
+
     def test_removes_special_preserves_think(self):
         from omlx.api.utils import clean_special_tokens
         result = clean_special_tokens(
@@ -418,3 +429,26 @@ class TestCleanOutputTextBackwardCompat:
         from omlx.api.utils import clean_output_text
         result = clean_output_text("<|im_end|>Hello<|endoftext|>")
         assert result == "Hello"
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("<think>unfinished", ("unfinished", "")),
+        ("<think>unfinished</thi", ("unfinished</thi", "")),
+        ("<think>done</think>answer", ("done", "answer")),
+        ("<think>first</think>answer<think>second", ("first\nsecond", "answer")),
+        ("plain answer", ("", "plain answer")),
+    ],
+)
+def test_extract_truncated_thinking_preserves_channels(text, expected):
+    assert extract_thinking(text, truncated=True) == expected
+
+
+@pytest.mark.parametrize("prompt_opened", [False, True])
+def test_truncated_stream_flushes_partial_tag_only_as_thinking(prompt_opened):
+    parser = ThinkingParser(start_in_thinking=prompt_opened)
+    prefix = "" if prompt_opened else "<think>"
+    assert parser.feed(prefix + "unfinished</thi") == ("unfinished", "")
+    assert parser.finish(truncated=True) == ("</thi", "")
+    assert parser.finish(truncated=True) == ("", "")

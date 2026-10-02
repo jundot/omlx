@@ -3,7 +3,7 @@
 // State machine
 //   stopped ─start()→ starting ─/health 200→ running ─/health fail×3→ unresponsive
 //                       │                       │ ↑                       │
-//                       │                       │ └─/health 200───────────┘
+//                       │                       │ └─/health or status OK──┘
 //                       │                       │
 //                       │                       └─process exit → auto-restart
 //                       └─process exit during startup → auto-restart
@@ -26,7 +26,45 @@
 // PR 6) the AppView shell can react without owning the lifecycle.
 
 import Foundation
+import AppKit
 import Darwin
+
+struct AutoRestartBudget {
+    let maxAttempts: Int
+    let stableThreshold: TimeInterval
+
+    private(set) var attempts = 0
+    private(set) var healthySince: Date?
+
+    mutating func recordHealthy(at date: Date) {
+        if healthySince == nil {
+            healthySince = date
+        }
+        if attempts > 0,
+           let since = healthySince,
+           date.timeIntervalSince(since) >= stableThreshold {
+            attempts = 0
+            healthySince = date
+        }
+    }
+
+    mutating func consumeRestart(at date: Date) -> Int? {
+        if let since = healthySince,
+           date.timeIntervalSince(since) >= stableThreshold {
+            attempts = 0
+        }
+        healthySince = nil
+
+        guard attempts < maxAttempts else { return nil }
+        attempts += 1
+        return attempts
+    }
+
+    mutating func reset() {
+        attempts = 0
+        healthySince = nil
+    }
+}
 
 // @unchecked Sendable: state mutations either happen on the main thread
 // (start, stop, force restart, callbacks dispatched via main) or inside
@@ -55,14 +93,18 @@ final class ServerProcess: @unchecked Sendable {
         case portConflict(PortConflict)
     }
 
-    enum StartError: Error, CustomStringConvertible {
+    enum StartError: Error, LocalizedError, CustomStringConvertible {
         case spawnFailed(String)
+        case invalidPort
 
         var description: String {
             switch self {
             case .spawnFailed(let m): return "Spawn failed: \(m)"
+            case .invalidPort: return "Port must be a number between 1 and 65535."
             }
         }
+
+        var errorDescription: String? { description }
     }
 
     static let stateDidChangeNotification = Notification.Name("OMLXServerProcessStateDidChange")
@@ -70,7 +112,12 @@ final class ServerProcess: @unchecked Sendable {
 
     // Inputs
 
-    private(set) var host: String
+    private(set) var bindAddress: String
+    /// The connectable host — normalises `0.0.0.0` → `127.0.0.1` because
+    /// `0.0.0.0` is a bind wildcard, not a connectable address.
+    var host: String {
+        AppConfig.connectableHost(for: bindAddress)
+    }
     private(set) var port: Int
     private(set) var basePath: URL
     private let runtime: PythonRuntime
@@ -82,14 +129,14 @@ final class ServerProcess: @unchecked Sendable {
     /// process so a stale resolver / spawn args can never reach a running
     /// uvicorn.
     enum ReconfigureError: Error { case serverIsLive }
-    func reconfigure(host: String? = nil, port: Int? = nil, basePath: URL? = nil) throws {
+    func reconfigure(bindAddress: String? = nil, port: Int? = nil, basePath: URL? = nil) throws {
         switch state {
         case .running, .starting, .stopping, .unresponsive:
             throw ReconfigureError.serverIsLive
         case .stopped, .failed:
             break
         }
-        if let host { self.host = host }
+        if let bindAddress { self.bindAddress = bindAddress }
         if let port { self.port = port }
         if let basePath { self.basePath = basePath }
         self.resolver = PortConflictResolver(host: self.host, port: self.port)
@@ -99,34 +146,40 @@ final class ServerProcess: @unchecked Sendable {
 
     private let healthCheckInterval: TimeInterval = 5
     private let maxHealthFailures = 3
-    private let maxAutoRestarts   = 3
-    private let stableThreshold: TimeInterval = 60   // seconds before counter resets
+    private let auxiliaryHealthFreshness: TimeInterval = 15
     private let stopGraceSeconds: TimeInterval = 10
 
     // State
 
     private(set) var state: State = .stopped
     private var process: Process?
+    private(set) var startupNoticeURL: URL?
     private var logHandle: FileHandle?
     private var healthTask: Task<Void, Never>?
     private var consecutiveFailures = 0
-    private var autoRestartCount    = 0
-    private var lastHealthyAt: Date?
+    private var autoRestartBudget = AutoRestartBudget(
+        maxAttempts: 3,
+        stableThreshold: 60
+    )
+    private var lastAuxiliaryHealthyAt: Date?
     private var expectingExit       = false   // set by stop()/forceRestart() so terminationHandler doesn't trigger auto-restart
     private let logURL: URL
 
     init(
         runtime: PythonRuntime,
-        host: String = "127.0.0.1",
-        port: Int = 8080,
+        bindAddress: String = "127.0.0.1",
+        port: Int = 8000,
         basePath: URL = ServerProcess.defaultBasePath()
     ) {
         self.runtime  = runtime
-        self.host     = host
+        self.bindAddress = bindAddress
         self.port     = port
         self.basePath = basePath
         self.logURL   = ServerProcess.defaultLogURL()
-        self.resolver = PortConflictResolver(host: host, port: port)
+        self.resolver = PortConflictResolver(
+            host: AppConfig.connectableHost(for: bindAddress),
+            port: port
+        )
     }
 
     // MARK: - Public surface
@@ -138,10 +191,11 @@ final class ServerProcess: @unchecked Sendable {
     }
 
     var pid: Int32? { process?.processIdentifier }
+    var serverLogURL: URL { logURL }
 
     /// Start the server. Returns .started on success, .alreadyRunning if
-    /// already up, or .portConflict if the port is busy. Throws only on
-    /// spawn-syscall failure.
+    /// already up, or .portConflict if the port is busy. Throws on invalid
+    /// persisted settings or spawn failure.
     @discardableResult
     func start() throws -> StartResult {
         switch state {
@@ -150,6 +204,17 @@ final class ServerProcess: @unchecked Sendable {
         default:
             break
         }
+
+        // Web settings may have changed since the previous child was launched.
+        let saved = try AppConfig.readSettings(basePath: basePath.path)
+        let env = ProcessInfo.processInfo.environment
+        let nextHost = env["OMLX_HOST"].flatMap { $0.isEmpty ? nil : $0 }
+            ?? saved.bindAddress ?? bindAddress
+        let nextPort = env["OMLX_PORT"].flatMap(Int.init) ?? saved.port ?? port
+        guard (1...65535).contains(nextPort) else {
+            throw StartError.invalidPort
+        }
+        try reconfigure(bindAddress: nextHost, port: nextPort)
 
         // Sync probe — fast enough on local connect refused.
         if resolver.isPortInUseSync() {
@@ -196,6 +261,7 @@ final class ServerProcess: @unchecked Sendable {
         }
         expectingExit = false
         process = nil
+        lastAuxiliaryHealthyAt = nil
         closeLog()
     }
 
@@ -214,11 +280,33 @@ final class ServerProcess: @unchecked Sendable {
         }
         process = nil
         closeLog()
-        autoRestartCount = 0
+        autoRestartBudget.reset()
         consecutiveFailures = 0
+        lastAuxiliaryHealthyAt = nil
         expectingExit = false
         update(.stopped)
         return try start()
+    }
+
+    /// Called by lightweight menubar status polling when the server answers
+    /// `/api/status`. Under heavy generation load this keeps the UI from
+    /// declaring the managed process unresponsive solely because `/health`
+    /// was delayed.
+    @MainActor
+    func recordAuxiliaryHealthSuccess(at date: Date = Date()) {
+        lastAuxiliaryHealthyAt = date
+        autoRestartBudget.recordHealthy(at: date)
+        consecutiveFailures = 0
+        switch state {
+        case .starting:
+            if let pid = process?.processIdentifier {
+                update(.running(pid: pid))
+            }
+        case .unresponsive(let pid):
+            update(.running(pid: pid))
+        default:
+            break
+        }
     }
 
     /// Synchronous SIGTERM-then-SIGKILL of the child, used by signal
@@ -241,6 +329,8 @@ final class ServerProcess: @unchecked Sendable {
     private func doStart() throws {
         try ensureDir(basePath)
         try ensureDir(logURL.deletingLastPathComponent())
+        consecutiveFailures = 0
+        lastAuxiliaryHealthyAt = nil
 
         if !FileManager.default.fileExists(atPath: logURL.path) {
             FileManager.default.createFile(atPath: logURL.path, contents: nil)
@@ -252,7 +342,11 @@ final class ServerProcess: @unchecked Sendable {
         let proc = Process()
         proc.executableURL = runtime.executable
         proc.arguments = makeArguments()
-        proc.environment = runtime.makeEnvironment()
+        // A per-launch notice keeps Python migration and the native alert in sync.
+        var environment = runtime.makeEnvironment()
+        let noticeURL = prepareStartupNotice()
+        environment["OMLX_STARTUP_NOTICE_PATH"] = noticeURL.path
+        proc.environment = environment
         proc.standardOutput = handle
         proc.standardError  = handle
         proc.terminationHandler = { [weak self] term in
@@ -278,6 +372,7 @@ final class ServerProcess: @unchecked Sendable {
         expectingExit = false
         process = nil
         closeLog()
+        Task { @MainActor [weak self] in self?.presentStartupNotice() }
 
         if wasExpectingExit {
             update(.stopped)
@@ -296,23 +391,22 @@ final class ServerProcess: @unchecked Sendable {
     }
 
     private func tryAutoRestart(reason: String) {
-        // Reset counter if last healthy was > stableThreshold ago.
-        if let last = lastHealthyAt,
-           Date().timeIntervalSince(last) >= stableThreshold {
-            autoRestartCount = 0
-        }
-
-        if autoRestartCount >= maxAutoRestarts {
-            update(.failed(message: "\(reason). Auto-restart failed after \(maxAutoRestarts) attempts."))
+        guard let attempt = autoRestartBudget.consumeRestart(at: Date()) else {
+            update(.failed(
+                message: "\(reason). Auto-restart failed after " +
+                         "\(autoRestartBudget.maxAttempts) attempts."
+            ))
             return
         }
 
-        autoRestartCount += 1
         consecutiveFailures = 0
-        let attempt = autoRestartCount
+        lastAuxiliaryHealthyAt = nil
         let backoff = TimeInterval(5 * (1 << (attempt - 1)))   // 5, 10, 20s
 
-        NSLog("oMLX: auto-restart \(attempt)/\(maxAutoRestarts) in \(Int(backoff))s — \(reason)")
+        NSLog(
+            "oMLX: auto-restart \(attempt)/\(autoRestartBudget.maxAttempts) " +
+            "in \(Int(backoff))s — \(reason)"
+        )
         update(.starting)
 
         Task { @MainActor [weak self] in
@@ -322,7 +416,8 @@ final class ServerProcess: @unchecked Sendable {
             guard case .starting = self.state else { return }
 
             do {
-                try self.doStart()
+                self.update(.stopped)
+                try self.start()
             } catch {
                 self.update(.failed(message: "Auto-restart failed: \(error)"))
             }
@@ -330,6 +425,41 @@ final class ServerProcess: @unchecked Sendable {
     }
 
     // MARK: - Internal — health check
+
+    func prepareStartupNotice() -> URL {
+        if let previous = startupNoticeURL {
+            try? FileManager.default.removeItem(at: previous)
+        }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omlx-startup-\(UUID().uuidString).txt")
+        startupNoticeURL = url
+        return url
+    }
+
+    @MainActor
+    func consumeStartupNotice() -> String? {
+        guard let url = startupNoticeURL,
+              let message = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        try? FileManager.default.removeItem(at: url)
+        startupNoticeURL = nil
+        bindAddress = "127.0.0.1"
+        resolver = PortConflictResolver(host: host, port: port)
+        NotificationCenter.default.post(name: Self.stateDidChangeNotification, object: self)
+        return message
+    }
+
+    @MainActor
+    private func presentStartupNotice() {
+        guard let message = consumeStartupNotice() else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Server access is now limited to this Mac"
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        alert.window.level = .floating
+        alert.runModal()
+    }
 
     private func startHealthCheckLoop() {
         cancelHealthLoop()
@@ -350,22 +480,32 @@ final class ServerProcess: @unchecked Sendable {
     @MainActor
     private func tickHealth() async {
         switch state {
+        case .starting, .running, .unresponsive:
+            break
+        default:
+            return
+        }
+
+        presentStartupNotice()
+        let probe = await resolver.probeHealth()
+        let now = Date()
+        switch state {
         case .starting:
-            if await resolver.isHealthy() {
+            if probe.ok || hasRecentAuxiliaryHealth(now: now) {
                 let pid = process?.processIdentifier ?? 0
-                consecutiveFailures = 0
-                lastHealthyAt = Date()
-                update(.running(pid: pid))
+                markHealthy(pid: pid, at: now)
+            } else {
+                logHealthProbeFailure(probe, failures: consecutiveFailures, suppressed: false)
             }
         case .running(let pid), .unresponsive(let pid):
-            if await resolver.isHealthy() {
-                consecutiveFailures = 0
-                lastHealthyAt = Date()
-                if case .unresponsive = state {
-                    update(.running(pid: pid))
-                }
+            if probe.ok {
+                markHealthy(pid: pid, at: now)
+            } else if hasRecentAuxiliaryHealth(now: now) {
+                logHealthProbeFailure(probe, failures: consecutiveFailures, suppressed: true)
+                markHealthy(pid: pid, at: now)
             } else {
                 consecutiveFailures += 1
+                logHealthProbeFailure(probe, failures: consecutiveFailures, suppressed: false)
                 if consecutiveFailures >= maxHealthFailures,
                    case .running = state {
                     update(.unresponsive(pid: pid))
@@ -376,12 +516,41 @@ final class ServerProcess: @unchecked Sendable {
         }
     }
 
+    @MainActor
+    private func markHealthy(pid: Int32, at date: Date) {
+        consecutiveFailures = 0
+        autoRestartBudget.recordHealthy(at: date)
+        switch state {
+        case .starting, .unresponsive:
+            update(.running(pid: pid))
+        default:
+            break
+        }
+    }
+
+    private func hasRecentAuxiliaryHealth(now: Date) -> Bool {
+        guard let lastAuxiliaryHealthyAt else { return false }
+        return now.timeIntervalSince(lastAuxiliaryHealthyAt) <= auxiliaryHealthFreshness
+    }
+
+    private func logHealthProbeFailure(
+        _ result: HealthProbeResult,
+        failures: Int,
+        suppressed: Bool
+    ) {
+        let status = result.statusCode.map(String.init) ?? "none"
+        let error = result.errorDescription ?? "none"
+        NSLog(
+            "oMLX: health probe failed url=\(result.url) latency_ms=\(result.latencyMs) status=\(status) error=\(error) failures=\(failures) suppressed_by_recent_status=\(suppressed)"
+        )
+    }
+
     // MARK: - Internal — helpers
 
     private func makeArguments() -> [String] {
         let env = ProcessInfo.processInfo.environment
         if let dev = env["OMLX_DEV_SERVER_SCRIPT"], !dev.isEmpty {
-            return [dev, "--host", host, "--port", String(port)]
+            return [dev, "--host", bindAddress, "--port", String(port)]
         }
         return [
             "-m", "omlx.cli", "serve",

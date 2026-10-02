@@ -272,8 +272,10 @@ class TestSkipApiKeyVerification:
         import asyncio
 
         original_key = _server_state.api_key
+        original_host = _server_state.bind_host
         original_gs = _server_state.global_settings
         _server_state.api_key = "test-key"
+        _server_state.bind_host = "127.0.0.1"
         _server_state.global_settings = self._make_global_settings(
             host="127.0.0.1", skip=True
         )
@@ -283,25 +285,90 @@ class TestSkipApiKeyVerification:
             assert result is True
         finally:
             _server_state.api_key = original_key
+            _server_state.bind_host = original_host
             _server_state.global_settings = original_gs
 
-    def test_skip_verification_on_any_host(self):
-        """Skip verification when enabled regardless of host."""
-        from omlx.server import verify_api_key, _server_state
+    def test_skip_verification_is_ignored_on_network_host(self):
+        """The no-auth switch must not bypass API auth on a network bind."""
         import asyncio
 
+        from fastapi import HTTPException
+
+        from omlx.server import _server_state, verify_api_key
+
         original_key = _server_state.api_key
+        original_host = _server_state.bind_host
         original_gs = _server_state.global_settings
         _server_state.api_key = "test-key"
+        _server_state.bind_host = "0.0.0.0"
         _server_state.global_settings = self._make_global_settings(
             host="0.0.0.0", skip=True
         )
 
         try:
-            result = asyncio.run(verify_api_key(request=_mock_request(), credentials=None))
-            assert result is True
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    verify_api_key(request=_mock_request(), credentials=None)
+                )
+            assert exc_info.value.status_code == 401
         finally:
             _server_state.api_key = original_key
+            _server_state.bind_host = original_host
+            _server_state.global_settings = original_gs
+
+    def test_network_host_without_configured_key_requires_auth(self):
+        """A missing key cannot turn a network-facing API into no-auth mode."""
+        import asyncio
+
+        from fastapi import HTTPException
+
+        from omlx.server import _server_state, verify_api_key
+
+        original_key = _server_state.api_key
+        original_host = _server_state.bind_host
+        original_gs = _server_state.global_settings
+        _server_state.api_key = None
+        _server_state.bind_host = "0.0.0.0"
+        _server_state.global_settings = self._make_global_settings(
+            host="0.0.0.0", skip=False
+        )
+
+        try:
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    verify_api_key(request=_mock_request(), credentials=None)
+                )
+            assert exc_info.value.status_code == 401
+        finally:
+            _server_state.api_key = original_key
+            _server_state.bind_host = original_host
+            _server_state.global_settings = original_gs
+
+    def test_saved_loopback_host_does_not_change_live_network_auth(self):
+        """A pending host change cannot disable auth before restart."""
+        import asyncio
+
+        from fastapi import HTTPException
+
+        from omlx.server import _server_state, verify_api_key
+
+        original_key = _server_state.api_key
+        original_host = _server_state.bind_host
+        original_gs = _server_state.global_settings
+        settings = self._make_global_settings(host="127.0.0.1", skip=True)
+        _server_state.api_key = "test-key"
+        _server_state.bind_host = "0.0.0.0"
+        _server_state.global_settings = settings
+
+        try:
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    verify_api_key(request=_mock_request(), credentials=None)
+                )
+            assert exc_info.value.status_code == 401
+        finally:
+            _server_state.api_key = original_key
+            _server_state.bind_host = original_host
             _server_state.global_settings = original_gs
 
     def test_skip_verification_disabled_by_default(self):
@@ -340,13 +407,9 @@ class TestAdminAuth:
     def test_verify_session_token_expired(self):
         """Test expired session token verification."""
         from omlx.admin.auth import create_session_token, verify_session_token
-        import time
 
         token = create_session_token()
-        # Wait a moment and verify with very short max_age
-        time.sleep(0.1)
-        # With max_age=0, token should be expired after any delay
-        # Note: itsdangerous rounds to nearest second, so we use a small delay
+        # A negative max_age is expired immediately and does not need a delay.
         assert verify_session_token(token, max_age=-1) is False
 
     def test_verify_api_key_constant_time(self):
@@ -364,3 +427,293 @@ class TestAdminAuth:
 
         # Empty key
         assert verify_api_key("", server_key) is False
+
+
+class TestNonAsciiApiKeys:
+    """Regression tests for #1717: non-ASCII keys must yield 401, not 500.
+
+    secrets.compare_digest raises TypeError for str arguments containing
+    non-ASCII characters, which surfaced as an unhandled 500 on every
+    authenticated endpoint. compare_keys compares UTF-8 bytes instead.
+    """
+
+    def test_compare_keys_non_ascii_mismatch(self):
+        """Non-ASCII client key against ASCII server key returns False."""
+        from omlx.admin.auth import compare_keys
+
+        assert compare_keys("café-key", "secret123") is False
+
+    def test_compare_keys_non_ascii_match(self):
+        """Matching non-ASCII keys compare equal."""
+        from omlx.admin.auth import compare_keys
+
+        assert compare_keys("clé-secrète-héhé", "clé-secrète-héhé") is True
+
+    def test_verify_api_key_non_ascii_client_key(self):
+        """verify_api_key must not raise on a non-ASCII client key."""
+        from omlx.admin.auth import verify_api_key
+
+        assert verify_api_key("café", "secret123") is False
+
+    def test_verify_api_key_non_ascii_server_key(self):
+        """A configured non-ASCII key compares without raising.
+
+        Function-level only: over HTTP, Starlette decodes header values as
+        latin-1, so a client sending UTF-8 non-ASCII bytes will not match a
+        configured non-ASCII key anyway. The point here is no TypeError.
+        """
+        from omlx.admin.auth import verify_api_key
+
+        assert verify_api_key("pässwörd", "pässwörd") is True
+        assert verify_api_key("password", "pässwörd") is False
+
+    def test_compare_keys_lone_surrogate(self):
+        """Lone surrogates (json.loads can produce them) must not raise.
+
+        Strict UTF-8 encoding rejects lone surrogates, which would revive
+        the 500 on any JSON route that compares keys without validating
+        printability first (delete_sub_key).
+        """
+        import json
+
+        from omlx.admin.auth import compare_keys
+
+        surrogate_key = json.loads('"\\ud800abcd"')
+        assert compare_keys(surrogate_key, "secret123") is False
+        assert compare_keys("secret123", surrogate_key) is False
+        assert compare_keys(surrogate_key, surrogate_key) is True
+
+    def test_verify_any_api_key_non_ascii_sub_keys(self):
+        """verify_any_api_key must not raise when sub keys are checked."""
+        from omlx.admin.auth import verify_any_api_key
+        from unittest.mock import MagicMock
+
+        sub_key = MagicMock()
+        sub_key.key = "sub-key-1"
+
+        assert verify_any_api_key("café", "main-key", [sub_key]) is False
+        sub_key.key = "clé-única"
+        assert verify_any_api_key("clé-única", "main-key", [sub_key]) is True
+
+    def test_server_dependency_non_ascii_bearer_returns_401(self):
+        """The server auth dependency turns a non-ASCII bearer into 401, not 500."""
+        from omlx.server import verify_api_key, _server_state
+        from fastapi import HTTPException
+        from fastapi.security import HTTPAuthorizationCredentials
+        import asyncio
+
+        original_key = _server_state.api_key
+        _server_state.api_key = "correct-key"
+
+        try:
+            credentials = HTTPAuthorizationCredentials(
+                scheme="Bearer", credentials="smart-quote-’key’"
+            )
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    verify_api_key(request=_mock_request(), credentials=credentials)
+                )
+            assert exc_info.value.status_code == 401
+        finally:
+            _server_state.api_key = original_key
+
+
+class TestRejectedKeyFingerprint:
+    """Regression tests for #1440 (item 4): a rejected API key must never be
+    logged verbatim. The auth path logs a short, non-reversible SHA-256
+    fingerprint instead, so operators can correlate repeated bad keys without
+    the secret landing in server.log.
+    """
+
+    def test_fingerprint_key_short_hex(self):
+        """fingerprint_key returns 8 lowercase hex characters."""
+        from omlx.admin.auth import fingerprint_key
+
+        fp = fingerprint_key("super-secret-key")
+        assert len(fp) == 8
+        assert all(c in "0123456789abcdef" for c in fp)
+
+    def test_fingerprint_key_deterministic(self):
+        """The same key always fingerprints to the same value."""
+        from omlx.admin.auth import fingerprint_key
+
+        assert fingerprint_key("abc123") == fingerprint_key("abc123")
+
+    def test_fingerprint_key_does_not_contain_secret(self):
+        """The fingerprint never leaks the raw key material."""
+        from omlx.admin.auth import fingerprint_key
+
+        secret = "sk-live-0123456789abcdef"
+        fp = fingerprint_key(secret)
+        assert secret not in fp
+        assert fp not in secret
+
+    def test_fingerprint_key_distinguishes_keys(self):
+        """Different keys produce different fingerprints."""
+        from omlx.admin.auth import fingerprint_key
+
+        assert fingerprint_key("key-a") != fingerprint_key("key-b")
+
+    def test_fingerprint_key_non_ascii_and_surrogate(self):
+        """fingerprint_key tolerates any str the auth path accepts (no raise).
+
+        Mirrors compare_keys: non-ASCII and lone surrogates (which json.loads
+        can produce) must fingerprint without a UnicodeEncodeError.
+        """
+        import json
+
+        from omlx.admin.auth import fingerprint_key
+
+        assert len(fingerprint_key("clé-secrète-héhé")) == 8
+        assert len(fingerprint_key("")) == 8
+        surrogate_key = json.loads('"\\ud800abcd"')
+        assert len(fingerprint_key(surrogate_key)) == 8
+
+    def test_rejected_key_logged_as_fingerprint_not_verbatim(self, caplog):
+        """The auth dependency logs the fingerprint, not the raw rejected key."""
+        import asyncio
+        import logging
+
+        from fastapi import HTTPException
+        from fastapi.security import HTTPAuthorizationCredentials
+
+        from omlx.admin.auth import fingerprint_key
+        from omlx.server import verify_api_key, _server_state
+
+        original_key = _server_state.api_key
+        _server_state.api_key = "correct-key"
+        bad_key = "sk-leaky-supersecret-0xCAFE"
+
+        try:
+            credentials = HTTPAuthorizationCredentials(
+                scheme="Bearer", credentials=bad_key
+            )
+            with caplog.at_level(logging.WARNING, logger="omlx.server"):
+                with pytest.raises(HTTPException) as exc_info:
+                    asyncio.run(
+                        verify_api_key(request=_mock_request(), credentials=credentials)
+                    )
+            assert exc_info.value.status_code == 401
+
+            rejection_logs = "\n".join(
+                r.getMessage()
+                for r in caplog.records
+                if "Rejected API key" in r.getMessage()
+            )
+            assert rejection_logs, "expected a rejection log line"
+            assert bad_key not in rejection_logs
+            assert fingerprint_key(bad_key) in rejection_logs
+        finally:
+            _server_state.api_key = original_key
+
+
+class TestUnauthenticatedInference:
+    @pytest.fixture
+    def configured_server(self, monkeypatch, tmp_path):
+        from omlx import server
+        from omlx.admin import auth
+        from omlx.settings import GlobalSettings
+
+        settings = GlobalSettings(base_path=tmp_path)
+        settings.server.host = "0.0.0.0"
+        settings.auth.api_key = "management-key"
+        settings.auth.allow_unauthenticated_inference = True
+        monkeypatch.setattr(server._server_state, "global_settings", settings)
+        monkeypatch.setattr(server._server_state, "api_key", "management-key")
+        monkeypatch.setattr(server._server_state, "bind_host", "0.0.0.0")
+        monkeypatch.setattr(auth, "_get_global_settings", lambda: settings)
+        return server, settings
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/messages",
+            "/v1/messages/count_tokens",
+            "/v1/embeddings",
+            "/v1/rerank",
+            "/v1/responses",
+            "/v1/audio/speech",
+        ],
+    )
+    def test_http_inference_auth_gate(self, configured_server, path):
+        server, settings = configured_server
+        client = TestClient(server.app)
+        settings.auth.allow_unauthenticated_inference = False
+        assert client.post(path, json={}).status_code == 401
+        response = client.post(
+            path, json={}, headers={"Authorization": "Bearer management-key"}
+        )
+        assert response.status_code == 422
+        settings.auth.allow_unauthenticated_inference = True
+        # An empty payload reaches request validation only after auth succeeds.
+        assert client.post(path, json={}).status_code == 422
+
+    @pytest.mark.parametrize(
+        "method,path",
+        [
+            ("GET", "/api/status"),
+            ("GET", "/v1/models/status"),
+            ("POST", "/v1/models/example/load"),
+            ("POST", "/v1/models/example/unload"),
+            ("GET", "/admin/api/global-settings"),
+            ("POST", "/admin/api/server/restart"),
+        ],
+    )
+    def test_management_routes_still_reject_anonymous_requests(
+        self, configured_server, method, path
+    ):
+        server, _ = configured_server
+        response = TestClient(server.app).request(method, path)
+        assert response.status_code == 401
+
+    def test_tool_routes_execute_without_key(self, configured_server, monkeypatch):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        from omlx.api import mcp_routes, websearch_routes
+
+        server, _ = configured_server
+        result = SimpleNamespace(
+            tool_name="example", content=[], is_error=False, error_message=None
+        )
+        manager = SimpleNamespace(execute_tool=AsyncMock(return_value=result))
+        monkeypatch.setattr(mcp_routes, "_get_mcp_manager", lambda: manager)
+        search = AsyncMock(return_value={"ok": True, "results": []})
+        monkeypatch.setattr(websearch_routes, "run_web_search", search)
+        monkeypatch.setattr(
+            websearch_routes,
+            "_get_global_settings",
+            lambda: server._server_state.global_settings,
+        )
+        client = TestClient(server.app)
+        response = client.post(
+            "/v1/mcp/execute", json={"tool_name": "example", "arguments": {}}
+        )
+        assert response.status_code == 200
+        manager.execute_tool.assert_awaited_once_with("example", {})
+        assert client.post("/v1/web/search", json={"query": "example"}).json()["ok"]
+        search.assert_awaited_once()
+
+    def test_stored_responses_can_be_read_and_deleted(
+        self, configured_server, monkeypatch
+    ):
+        from omlx.api.responses_utils import ResponseStore
+
+        server, _ = configured_server
+        store = ResponseStore()
+        store.put("resp_test", {"id": "resp_test", "object": "response"})
+        monkeypatch.setattr(server._server_state, "responses_store", store)
+        client = TestClient(server.app)
+        assert client.get("/v1/responses/resp_test").json()["id"] == "resp_test"
+        assert client.delete("/v1/responses/resp_test").json()["deleted"] is True
+        assert client.get("/v1/responses/resp_test").status_code == 404
+
+    def test_realtime_audio_uses_manual_opt_in(self, configured_server):
+        from omlx.api.audio_routes import _verify_ws_api_key
+
+        _, settings = configured_server
+        assert _verify_ws_api_key(None) is True
+        settings.auth.allow_unauthenticated_inference = False
+        assert _verify_ws_api_key(None) is False
+        assert _verify_ws_api_key("management-key") is True

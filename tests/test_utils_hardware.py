@@ -12,6 +12,7 @@ from omlx.utils.hardware import (
     HardwareInfo,
     format_bytes,
     get_chip_name,
+    get_max_working_set_bytes,
     get_total_memory_bytes,
     get_total_memory_gb,
     is_apple_silicon,
@@ -133,6 +134,28 @@ class TestGetTotalMemoryGb:
         ):
             result = get_total_memory_gb()
             assert abs(result - 18.5) < 0.01
+
+
+class TestGetMaxWorkingSetBytes:
+    """Test cases for get_max_working_set_bytes function."""
+
+    def test_uses_mlx_max_working_set_when_available(self):
+        with patch("omlx.utils.hardware.HAS_MLX", True), patch(
+            "omlx.utils.hardware.mx"
+        ) as mock_mx:
+            mock_mx.metal.is_available.return_value = True
+            mock_mx.device_info.return_value = {
+                "max_recommended_working_set_size": 36 * 1024**3
+            }
+
+            assert get_max_working_set_bytes() == 36 * 1024**3
+
+    def test_falls_back_to_total_memory_without_psutil(self):
+        with patch("omlx.utils.hardware.HAS_MLX", False), patch(
+            "omlx.utils.hardware.get_total_memory_bytes",
+            return_value=64 * 1024**3,
+        ):
+            assert get_max_working_set_bytes() == 48 * 1024**3
 
 
 class TestIsAppleSilicon:

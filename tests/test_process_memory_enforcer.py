@@ -2,11 +2,23 @@
 """Tests for ProcessMemoryEnforcer."""
 
 import asyncio
+import base64
+import io
+from contextlib import suppress
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from PIL import Image
 
-from omlx.process_memory_enforcer import ProcessMemoryEnforcer
+import omlx.process_memory_enforcer as pme
+import omlx.utils.image as images
+import omlx.utils.psutil_compat as psutil_compat
+from omlx.decode_activity import get_decode_activity
+from omlx.engine.embedding import EmbeddingEngine
+from omlx.engine.tts import TTSEngine
+from omlx.process_memory_enforcer import ProcessMemoryEnforcer, tier_reserve_bytes
+from omlx.scheduler import SchedulerConfig
 
 
 def _make_enforcer(
@@ -16,14 +28,19 @@ def _make_enforcer(
     poll_interval: float = 0.1,
     soft_threshold: float = 1.0,
     hard_threshold: float = 1.0,
+    breakdown: dict | None = None,
     **kwargs,
 ) -> ProcessMemoryEnforcer:
     """Build an enforcer with a deterministic hard ceiling.
 
     The new enforcer derives its ceiling from system_memory + tier +
-    psutil.virtual_memory().available, which is impractical to mock per
-    test. We replace `_get_hard_limit_bytes` with a constant so tests can
-    exercise the watermark logic without juggling system mocks.
+    live available memory, which is impractical to mock per
+    test. We replace `_get_hard_limit_bytes` AND `_get_ceiling_breakdown`
+    with constants so tests can exercise the watermark logic without
+    juggling system mocks. Pass ``breakdown`` to distinguish the three
+    component ceilings (static/dynamic/metal_cap) for propagation tests;
+    omit to use the same ``ceiling`` for all three (equivalent old
+    behavior).
 
     Passing `ceiling=0` disables the limit.
     """
@@ -35,7 +52,16 @@ def _make_enforcer(
         hard_threshold=hard_threshold,
         **kwargs,
     )
+    enforcer._soft_threshold = soft_threshold
     enforcer._get_hard_limit_bytes = lambda: int(ceiling)
+    if breakdown is None:
+        breakdown = {
+            "static": int(ceiling),
+            "dynamic": int(ceiling),
+            "metal_cap": int(ceiling),
+            "hard_limit": int(ceiling),
+        }
+    enforcer._get_ceiling_breakdown = lambda: dict(breakdown)
     return enforcer
 
 
@@ -59,6 +85,39 @@ def _cycling(values):
     return _next
 
 
+def test_embedding_watermark_and_live_hot_cache_accounting(mock_engine_pool):
+    config = SchedulerConfig()
+    config.hot_cache_budget = SimpleNamespace(total_bytes=2 * 1024**3)
+    engine = EmbeddingEngine("embedding-fixture", scheduler_config=config)
+    mock_engine_pool._entries = {"embedding": _make_entry("embedding", engine)}
+    enforcer = _make_enforcer(mock_engine_pool, ceiling=10 * 1024**3)
+    enforcer._hot_cache_reserved_bytes = lambda: 3 * 1024**3
+    enforcer._hot_cache_used_bytes = lambda: config.hot_cache_budget.total_bytes
+    registry = get_decode_activity()
+    registry.publish("chat-fixture", 1)
+    try:
+        enforcer._propagate_memory_limit()
+        with (
+            patch("omlx.engine.forward_fairness.mx") as fake_mx,
+            patch(
+                "omlx.engine.forward_fairness.get_phys_footprint",
+                return_value=8 * 1024**3,
+            ),
+        ):
+            fake_mx.get_active_memory.return_value = 4 * 1024**3
+            # The 7 GiB watermark excludes the reserved hot-cache budget.
+            assert not engine._fairness.should_clear_cache()
+            # Read the current byte count, without waiting for an enforcer tick.
+            config.hot_cache_budget.total_bytes = 0
+            assert engine._fairness.should_clear_cache()
+            enforcer._get_ceiling_breakdown = lambda: {"hard_limit": 0}
+            enforcer._propagate_memory_limit()
+            assert engine._fairness._memory_soft_limit_bytes == 0
+            assert engine._fairness.should_clear_cache()
+    finally:
+        registry.remove("chat-fixture")
+
+
 def _make_entry(model_id, engine=None, is_loading=False, is_pinned=False):
     """Create a mock EngineEntry."""
     entry = MagicMock()
@@ -67,6 +126,10 @@ def _make_entry(model_id, engine=None, is_loading=False, is_pinned=False):
     entry.is_loading = is_loading
     entry.is_pinned = is_pinned
     entry.abort_loading = False
+    entry.in_use = 0
+    entry.last_access = 0.0
+    entry.pending_unload_reason = None
+    entry.abort_requested = False
     return entry
 
 
@@ -82,6 +145,58 @@ def _close_coro(coro):
     return MagicMock()
 
 
+class TestMacOSVMStats:
+    """Tests for the host_statistics64 telemetry adapter."""
+
+    def test_uses_layout_compatible_host_info64_count(self):
+        class FakeLibc:
+            def host_statistics64(self, host, flavor, stats, count):
+                assert host == 123
+                assert flavor == psutil_compat._HOST_VM_INFO64
+                requested = count._obj.value
+                assert requested <= 40
+                # The kernel returns complete revisions, not partial fields.
+                count._obj.value = 38 if requested >= 38 else 24
+                stats[0] = 10
+                stats[1] = 20
+                stats[2] = 30
+                stats[3] = 40
+                stats[psutil_compat._VM_SPECULATIVE_INDEX] = 50
+                if count._obj.value >= 38:
+                    stats[psutil_compat._VM_COMPRESSOR_INDEX] = 60
+                    stats[psutil_compat._VM_EXTERNAL_INDEX] = 70
+                return 0
+
+        with (
+            patch.object(psutil_compat, "_libc", FakeLibc()),
+            patch.object(psutil_compat, "_MACH_HOST", 123),
+            patch.object(psutil_compat, "_VM_PAGE_SIZE", 4096),
+        ):
+            stats = pme.get_macos_vm_stats()
+
+        assert stats == {
+            "free": 10 * 4096,
+            "active": 20 * 4096,
+            "inactive": 30 * 4096,
+            "wired": 40 * 4096,
+            "speculative": 50 * 4096,
+            "compressed": 60 * 4096,
+            "external": 70 * 4096,
+        }
+
+    def test_short_host_info64_response_returns_none(self):
+        class FakeLibc:
+            def host_statistics64(self, host, flavor, stats, count):
+                count._obj.value = 3
+                return 0
+
+        with (
+            patch.object(psutil_compat, "_libc", FakeLibc()),
+            patch.object(psutil_compat, "_MACH_HOST", 123),
+        ):
+            assert pme.get_macos_vm_stats() is None
+
+
 @pytest.fixture
 def mock_engine_pool():
     """Create a mock EnginePool with required methods."""
@@ -90,6 +205,77 @@ def mock_engine_pool():
     pool._find_lru_victim = MagicMock(return_value="model-a")
     pool._unload_engine = AsyncMock()
     pool._entries = {}
+
+    def _entry_busy(entry):
+        if getattr(entry, "in_use", 0) > 0:
+            return True
+        engine = getattr(entry, "engine", None)
+        has_active = getattr(engine, "has_active_requests", None)
+        if callable(has_active):
+            return has_active() is True
+        return False
+
+    def _find_pending_unload_ready_locked():
+        candidates = []
+        for mid, entry in pool._entries.items():
+            if not getattr(entry, "pending_unload_reason", None):
+                continue
+            if (
+                getattr(entry, "engine", None) is None
+                or getattr(entry, "is_loading", False)
+                or getattr(entry, "is_pinned", False)
+                or _entry_busy(entry)
+            ):
+                continue
+            candidates.append((getattr(entry, "last_access", 0.0), mid))
+        if not candidates:
+            return None
+        candidates.sort()
+        return candidates[0][1]
+
+    async def _unload_pending_if_idle_locked(model_id):
+        entry = pool._entries.get(model_id)
+        if (
+            entry is None
+            or getattr(entry, "engine", None) is None
+            or not getattr(entry, "pending_unload_reason", None)
+            or getattr(entry, "is_loading", False)
+            or getattr(entry, "is_pinned", False)
+            or _entry_busy(entry)
+        ):
+            return False
+        entry.pending_unload_reason = None
+        entry.abort_requested = False
+        await pool._unload_engine(model_id)
+        return True
+
+    def _mark_pending_unload_locked(model_id, reason, *, abort_requested=False):
+        entry = pool._entries.get(model_id)
+        if (
+            entry is None
+            or getattr(entry, "engine", None) is None
+            or getattr(entry, "is_loading", False)
+            or getattr(entry, "is_pinned", False)
+        ):
+            return False
+        entry.pending_unload_reason = reason
+        if abort_requested:
+            entry.abort_requested = True
+        return True
+
+    pool._find_pending_unload_ready_locked = MagicMock(
+        side_effect=_find_pending_unload_ready_locked
+    )
+    pool._unload_pending_if_idle_locked = AsyncMock(
+        side_effect=_unload_pending_if_idle_locked
+    )
+    pool._mark_pending_unload_locked = MagicMock(
+        side_effect=_mark_pending_unload_locked
+    )
+    pool._scheduled_pending_unloads = []
+    pool._schedule_pending_unload_locked = MagicMock(
+        side_effect=pool._scheduled_pending_unloads.append
+    )
     return pool
 
 
@@ -102,6 +288,82 @@ def enforcer(mock_engine_pool):
     2-watermark tests construct their own enforcer with default thresholds.
     """
     return _make_enforcer(mock_engine_pool, ceiling=10 * 1024**3)
+
+
+class TestAdaptivePolling:
+    """Tests for adaptive ProcessMemoryEnforcer polling cadence."""
+
+    def test_no_loaded_or_loading_models_uses_unloaded_idle_interval(self, enforcer):
+        enforcer._engine_pool._entries = {
+            f"model-{i}": _make_entry(f"model-{i}") for i in range(3)
+        }
+
+        assert enforcer._select_poll_interval() == 30.0
+
+    def test_loading_model_uses_active_interval(self, enforcer):
+        enforcer._engine_pool._entries = {
+            "loading": _make_entry("loading", is_loading=True)
+        }
+
+        assert enforcer._select_poll_interval() == enforcer._active_poll_interval
+
+    def test_loaded_idle_model_uses_loaded_idle_interval(self, enforcer):
+        engine = MagicMock()
+        engine.has_active_requests.return_value = False
+        enforcer._engine_pool._entries = {
+            "loaded": _make_entry("loaded", engine=engine)
+        }
+
+        assert enforcer._select_poll_interval() == 10.0
+
+    def test_loaded_active_model_uses_active_interval(self, enforcer):
+        engine = MagicMock()
+        engine.has_active_requests.return_value = True
+        enforcer._engine_pool._entries = {
+            "active": _make_entry("active", engine=engine)
+        }
+
+        assert enforcer._select_poll_interval() == enforcer._active_poll_interval
+
+    def test_pressure_uses_active_interval(self, enforcer):
+        enforcer._pressure_level = "soft"
+
+        assert enforcer._select_poll_interval() == enforcer._active_poll_interval
+
+    def test_activity_hint_uses_active_interval(self, enforcer):
+        enforcer._engine_pool._entries = {}
+        enforcer.wake(active=True)
+
+        assert enforcer._select_poll_interval() == enforcer._active_poll_interval
+
+    @pytest.mark.asyncio
+    async def test_wake_interrupts_idle_sleep(self, enforcer):
+        enforcer._engine_pool._entries = {}
+        enforcer._running = True
+        enforcer._check_and_enforce = AsyncMock()
+        enforcer._check_ttl = AsyncMock()
+
+        task = asyncio.create_task(enforcer._enforcement_loop())
+        try:
+            for _ in range(20):
+                if enforcer._check_and_enforce.await_count >= 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert enforcer._check_and_enforce.await_count >= 1
+
+            enforcer.wake()
+            for _ in range(20):
+                if enforcer._check_and_enforce.await_count >= 2:
+                    break
+                await asyncio.sleep(0.01)
+
+            assert enforcer._check_and_enforce.await_count >= 2
+        finally:
+            enforcer._running = False
+            enforcer.wake()
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
 
 class TestCheckAndEnforce:
@@ -145,11 +407,13 @@ class TestCheckAndEnforce:
         enforcer._engine_pool._unload_engine.side_effect = fake_unload
 
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
-            mock_mx.get_active_memory.side_effect = _cycling([
-                15 * 1024**3,  # Initial check (over limit)
-                15 * 1024**3,  # Re-check before eviction loop
-                8 * 1024**3,  # After eviction (under limit)
-            ])
+            mock_mx.get_active_memory.side_effect = _cycling(
+                [
+                    15 * 1024**3,  # Initial check (over limit)
+                    15 * 1024**3,  # Re-check before eviction loop
+                    8 * 1024**3,  # After eviction (under limit)
+                ]
+            )
             await enforcer._check_and_enforce()
         enforcer._engine_pool._unload_engine.assert_called_once_with("model-a")
 
@@ -158,15 +422,20 @@ class TestCheckAndEnforce:
         """Stops eviction when all models are pinned (no victim)."""
         enforcer._engine_pool._find_lru_victim.return_value = None
         # Add a pinned loaded model so the log says "pinned"
-        entry = _make_entry("pinned-model", engine=MagicMock(), is_pinned=True)
+        engine = MagicMock()
+        engine.abort_all_requests = AsyncMock(return_value=3)
+        entry = _make_entry("pinned-model", engine=engine, is_pinned=True)
         enforcer._engine_pool._entries = {"pinned-model": entry}
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
-            mock_mx.get_active_memory.side_effect = _cycling([
-                15 * 1024**3,  # Initial check
-                15 * 1024**3,  # Re-check in loop
-            ])
+            mock_mx.get_active_memory.side_effect = _cycling(
+                [
+                    11 * 1024**3,  # Initial check, over ceiling but not emergency
+                    11 * 1024**3,  # Re-check in loop
+                ]
+            )
             await enforcer._check_and_enforce()
         enforcer._engine_pool._unload_engine.assert_not_called()
+        engine.abort_all_requests.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_evicts_multiple_models(self, enforcer):
@@ -197,12 +466,14 @@ class TestCheckAndEnforce:
         enforcer._engine_pool._unload_engine.side_effect = fake_unload
 
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
-            mock_mx.get_active_memory.side_effect = _cycling([
-                20 * 1024**3,  # Initial check
-                20 * 1024**3,  # Re-check (still over)
-                15 * 1024**3,  # After first eviction (still over)
-                8 * 1024**3,  # After second eviction (under limit)
-            ])
+            mock_mx.get_active_memory.side_effect = _cycling(
+                [
+                    20 * 1024**3,  # Initial check
+                    20 * 1024**3,  # Re-check (still over)
+                    15 * 1024**3,  # After first eviction (still over)
+                    8 * 1024**3,  # After second eviction (under limit)
+                ]
+            )
             await enforcer._check_and_enforce()
         assert enforcer._engine_pool._unload_engine.call_count == 2
 
@@ -210,16 +481,16 @@ class TestCheckAndEnforce:
     async def test_aborts_loading_model_when_no_lru_victim(self, enforcer):
         """Aborts a loading model when no LRU victim is available."""
         enforcer._engine_pool._find_lru_victim.return_value = None
-        loading_entry = _make_entry(
-            "loading-model", engine=None, is_loading=True
-        )
+        loading_entry = _make_entry("loading-model", engine=None, is_loading=True)
         enforcer._engine_pool._entries = {"loading-model": loading_entry}
 
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
-            mock_mx.get_active_memory.side_effect = _cycling([
-                15 * 1024**3,  # Initial check
-                15 * 1024**3,  # Re-check in loop
-            ])
+            mock_mx.get_active_memory.side_effect = _cycling(
+                [
+                    15 * 1024**3,  # Initial check
+                    15 * 1024**3,  # Re-check in loop
+                ]
+            )
             await enforcer._check_and_enforce()
 
         assert loading_entry.abort_loading is True
@@ -235,9 +506,7 @@ class TestCheckAndEnforce:
         engine_b.abort_all_requests = AsyncMock(return_value=0)
         entry_a = _make_entry("model-a", engine=engine_a)
         entry_b = _make_entry("model-b", engine=engine_b)
-        loading_entry = _make_entry(
-            "loading-model", engine=None, is_loading=True
-        )
+        loading_entry = _make_entry("loading-model", engine=None, is_loading=True)
         enforcer._engine_pool._entries = {
             "model-a": entry_a,
             "model-b": entry_b,
@@ -256,11 +525,13 @@ class TestCheckAndEnforce:
         ]
 
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
-            mock_mx.get_active_memory.side_effect = _cycling([
-                20 * 1024**3,  # Initial check
-                20 * 1024**3,  # Re-check (still over)
-                15 * 1024**3,  # After eviction (still over)
-            ])
+            mock_mx.get_active_memory.side_effect = _cycling(
+                [
+                    20 * 1024**3,  # Initial check
+                    20 * 1024**3,  # Re-check (still over)
+                    15 * 1024**3,  # After eviction (still over)
+                ]
+            )
             await enforcer._check_and_enforce()
 
         # LRU victim evicted first
@@ -275,12 +546,87 @@ class TestCheckAndEnforce:
         enforcer._engine_pool._entries = {}
 
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
-            mock_mx.get_active_memory.side_effect = _cycling([
-                15 * 1024**3,  # Initial check
-                15 * 1024**3,  # Re-check
-            ])
+            mock_mx.get_active_memory.side_effect = _cycling(
+                [
+                    15 * 1024**3,  # Initial check
+                    15 * 1024**3,  # Re-check
+                ]
+            )
             await enforcer._check_and_enforce()
         # Should not raise, just log warning
+
+
+class TestCurrentUsageTelemetry:
+    """Tests for enforcer memory telemetry threading behavior."""
+
+    def test_idle_usage_keeps_direct_mlx_telemetry(self, enforcer):
+        """Idle accounting preserves the legacy max(active, phys_footprint)."""
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch(
+                "omlx.process_memory_enforcer.get_phys_footprint",
+                return_value=3 * 1024**3,
+            ),
+        ):
+            mock_mx.get_active_memory.return_value = 5 * 1024**3
+            assert enforcer._current_usage_bytes() == 5 * 1024**3
+        mock_mx.get_active_memory.assert_called_once()
+
+    def test_active_usage_uses_cached_executor_sample_without_mlx(self, enforcer):
+        """Active decode ticks must not call MLX from the enforcer thread."""
+        scheduler = MagicMock()
+        scheduler.get_cached_mlx_active_memory_bytes.return_value = 7 * 1024**3
+        engine = MagicMock()
+        engine.has_active_requests.return_value = True
+        engine.scheduler = scheduler
+        enforcer._engine_pool._entries = {"m": _make_entry("m", engine=engine)}
+
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch(
+                "omlx.process_memory_enforcer.get_phys_footprint",
+                return_value=5 * 1024**3,
+            ),
+        ):
+            mock_mx.get_active_memory.side_effect = AssertionError(
+                "background enforcer touched MLX during active decode"
+            )
+            assert enforcer._current_usage_bytes() == 7 * 1024**3
+        mock_mx.get_active_memory.assert_not_called()
+
+    def test_active_usage_keeps_phys_footprint_when_it_dominates(self, enforcer):
+        scheduler = MagicMock()
+        scheduler.get_cached_mlx_active_memory_bytes.return_value = 4 * 1024**3
+        engine = MagicMock()
+        engine.has_active_requests.return_value = True
+        engine.scheduler = scheduler
+        enforcer._engine_pool._entries = {"m": _make_entry("m", engine=engine)}
+
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch(
+                "omlx.process_memory_enforcer.get_phys_footprint",
+                return_value=9 * 1024**3,
+            ),
+        ):
+            assert enforcer._current_usage_bytes() == 9 * 1024**3
+        mock_mx.get_active_memory.assert_not_called()
+
+    def test_hard_limit_reuses_cached_metal_cap(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="custom",
+            memory_guard_custom_ceiling_gb=1024.0,
+        )
+        enforcer._effective_metal_cap_bytes = 48 * 1024**3
+        with (
+            patch("omlx.settings.get_system_memory", return_value=64 * 1024**3),
+            patch(
+                "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+                side_effect=AssertionError("Metal cap cache was bypassed"),
+            ),
+        ):
+            assert enforcer._get_hard_limit_bytes() == 48 * 1024**3
 
 
 class TestDisabledWhenCeilingZero:
@@ -313,11 +659,18 @@ class TestDisabledWhenCeilingZero:
         mock_engine_pool._unload_engine.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_propagate_zero_disables_inline_prefill_check(
-        self, mock_engine_pool
-    ):
+    async def test_propagate_zero_disables_inline_prefill_check(self, mock_engine_pool):
         """Propagating ceiling=0 sets scheduler limit to 0 (disabled)."""
-        enforcer = _make_enforcer(mock_engine_pool, ceiling=0)
+        enforcer = _make_enforcer(
+            mock_engine_pool,
+            ceiling=0,
+            breakdown={
+                "static": 0,
+                "dynamic": 0,
+                "metal_cap": 0,
+                "hard_limit": 0,
+            },
+        )
         bg = MagicMock(spec=[])
         bg._memory_limit_bytes = 999
         bg._memory_hard_limit_bytes = 999
@@ -336,6 +689,175 @@ class TestDisabledWhenCeilingZero:
         assert scheduler._memory_hard_limit_bytes == 0
         assert bg._memory_limit_bytes == 0
         assert bg._memory_hard_limit_bytes == 0
+
+    @pytest.mark.asyncio
+    async def test_propagate_marks_guard_state_trustworthy(self, mock_engine_pool):
+        """Propagation must reach the scheduler even when the guard is
+        disabled and every ceiling propagates as 0."""
+        enforcer = _make_enforcer(
+            mock_engine_pool,
+            ceiling=0,
+            prefill_memory_guard=False,
+            breakdown={
+                "static": 0,
+                "dynamic": 0,
+                "metal_cap": 0,
+                "hard_limit": 0,
+            },
+        )
+        scheduler = MagicMock(spec=[])
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        mock_engine_pool._entries = {"model-a": entry}
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._prefill_memory_guard is False
+        assert scheduler._memory_hard_limit_bytes == 0
+
+    @pytest.mark.asyncio
+    async def test_propagate_ceiling_components_to_scheduler(self, mock_engine_pool):
+        """All three component ceilings + the tier name must reach the
+        scheduler so the binding-aware rejection message has the inputs
+        it needs to identify which knob the operator should turn."""
+        static_b = 64 * 1024**3
+        dynamic_b = 16 * 1024**3
+        metal_b = 48 * 1024**3
+        enforcer = _make_enforcer(
+            mock_engine_pool,
+            tier="custom",
+            ceiling=min(static_b, dynamic_b, metal_b),
+            breakdown={
+                "static": static_b,
+                "dynamic": dynamic_b,
+                "metal_cap": metal_b,
+                "hard_limit": min(static_b, dynamic_b, metal_b),
+            },
+        )
+        scheduler = MagicMock(spec=[])
+        scheduler._memory_limit_bytes = 0
+        scheduler._memory_hard_limit_bytes = 0
+        scheduler._memory_static_ceiling_bytes = 0
+        scheduler._memory_dynamic_ceiling_bytes = 0
+        scheduler._memory_metal_cap_bytes = 0
+        scheduler._memory_guard_tier = "balanced"
+        scheduler._prefill_headroom_safety = 0.0
+        scheduler.batch_generator = None
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        mock_engine_pool._entries = {"model-a": entry}
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._memory_static_ceiling_bytes == static_b
+        assert scheduler._memory_dynamic_ceiling_bytes == dynamic_b
+        assert scheduler._memory_metal_cap_bytes == metal_b
+        assert scheduler._memory_hot_cache_reserved_bytes == 0
+        assert scheduler._memory_guard_tier == "custom", (
+            "tier name must reach the scheduler so the advice ladder can "
+            "distinguish dynamic-on-custom (raise custom_ceiling_bytes) "
+            "from dynamic-on-reclaim-tier (close other apps)"
+        )
+        assert scheduler._prefill_headroom_safety == 0.95
+        assert (
+            scheduler._memory_hard_limit_bytes == dynamic_b
+        ), "hard limit must be min of the three components"
+
+    @pytest.mark.asyncio
+    async def test_propagates_hot_cache_reservation_for_binding_messages(
+        self, mock_engine_pool
+    ):
+        """The scheduler hard limit subtracts hot-cache reservation, so the
+        rejection formatter needs the same reservation to identify which
+        original component is binding."""
+        static_b = 64 * 1024**3
+        dynamic_b = 32 * 1024**3
+        metal_b = 16 * 1024**3
+        hot_reserved_b = 2 * 1024**3
+        enforcer = _make_enforcer(
+            mock_engine_pool,
+            ceiling=metal_b,
+            breakdown={
+                "static": static_b,
+                "dynamic": dynamic_b,
+                "metal_cap": metal_b,
+                "hard_limit": metal_b,
+            },
+        )
+        enforcer._hot_cache_reserved_bytes = lambda: hot_reserved_b
+        scheduler = MagicMock(spec=[])
+        scheduler._memory_limit_bytes = 0
+        scheduler._memory_hard_limit_bytes = 0
+        scheduler._memory_hard_watermark_bytes = 0
+        scheduler._memory_static_ceiling_bytes = 0
+        scheduler._memory_dynamic_ceiling_bytes = 0
+        scheduler._memory_metal_cap_bytes = 0
+        scheduler._memory_hot_cache_reserved_bytes = 0
+        scheduler.batch_generator = None
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        mock_engine_pool._entries = {"model-a": entry}
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._memory_hard_limit_bytes == metal_b - hot_reserved_b
+        assert scheduler._memory_hard_watermark_bytes == int(
+            (metal_b - hot_reserved_b) * enforcer._hard_threshold
+        )
+        assert scheduler._memory_static_ceiling_bytes == static_b
+        assert scheduler._memory_dynamic_ceiling_bytes == dynamic_b
+        assert scheduler._memory_metal_cap_bytes == metal_b
+        assert scheduler._memory_hot_cache_reserved_bytes == hot_reserved_b
+
+    async def test_propagates_hot_cache_used_for_usage_side_exclusion(
+        self, mock_engine_pool
+    ):
+        """Targets whose usage read is raw phys_footprint (the DFlash primary
+        guard) need the used-bytes counterpart of the reservation, or the
+        hot cache is charged twice: once in the reserved ceiling, once in
+        phys. The enforcer propagates the exact used figure each tick."""
+        metal_b = 16 * 1024**3
+        hot_used_b = 3 * 1024**3
+        enforcer = _make_enforcer(mock_engine_pool, ceiling=metal_b)
+        enforcer._hot_cache_reserved_bytes = lambda: hot_used_b + 512 * 1024**2
+        enforcer._hot_cache_used_bytes = lambda: hot_used_b
+        scheduler = MagicMock(spec=[])
+        scheduler._memory_hot_cache_used_bytes = 0
+        scheduler.batch_generator = None
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        mock_engine_pool._entries = {"model-a": entry}
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._memory_hot_cache_used_bytes == hot_used_b
+
+    async def test_propagated_hot_cache_used_clamped_to_reservation(
+        self, mock_engine_pool
+    ):
+        """A transient overshoot (live hot-cache bytes past max_bytes) must not
+        exclude more usage than the reservation removed from the ceiling —
+        that would net-weaken the guard exactly under pressure."""
+        metal_b = 16 * 1024**3
+        reserved_b = 3 * 1024**3  # capped at max_bytes
+        enforcer = _make_enforcer(mock_engine_pool, ceiling=metal_b)
+        enforcer._hot_cache_reserved_bytes = lambda: reserved_b
+        enforcer._hot_cache_used_bytes = lambda: 5 * 1024**3  # overshoot
+        scheduler = MagicMock(spec=[])
+        scheduler._memory_hot_cache_used_bytes = 0
+        scheduler.batch_generator = None
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        mock_engine_pool._entries = {"model-a": entry}
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._memory_hot_cache_used_bytes == reserved_b
 
 
 class TestPrefillMemoryGuardToggle:
@@ -374,89 +896,179 @@ class TestPrefillMemoryGuardToggle:
 
 
 class TestStaticCeiling:
-    """Tier-driven static ceiling (`total_ram - tier.static_reserve`).
+    """Static ceiling = total RAM minus the tier reserve for other apps."""
 
-    >= 16 GB systems use a tier-scaled reserve. < 16 GB systems always
-    use 4 GB regardless of tier.
-    """
+    GB = 1024**3
 
     @pytest.mark.parametrize(
-        "tier,expected_reserve_gb",
-        [("safe", 12), ("balanced", 8), ("aggressive", 6)],
+        "tier,total_gb,expected_reserve",
+        [
+            ("safe", 16, 6 * 1024**3),
+            ("safe", 64, int(64 * 1024**3 * 0.20)),
+            ("safe", 128, 16 * 1024**3),
+            ("balanced", 16, 3 * 1024**3),
+            ("balanced", 64, int(64 * 1024**3 * 0.08)),
+            ("balanced", 128, 8 * 1024**3),
+            ("aggressive", 16, int(1.5 * 1024**3)),
+            ("aggressive", 128, int(128 * 1024**3 * 0.02)),
+            ("aggressive", 512, 4 * 1024**3),
+        ],
     )
-    def test_large_system_tier_reserve(
-        self, mock_engine_pool, tier, expected_reserve_gb
-    ):
+    def test_tier_reserve(self, mock_engine_pool, tier, total_gb, expected_reserve):
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, memory_guard_tier=tier
         )
         with patch("omlx.settings.get_system_memory") as mock_mem:
-            mock_mem.return_value = 96 * 1024**3
+            mock_mem.return_value = total_gb * self.GB
             result = enforcer._get_static_ceiling()
-        assert result == (96 - expected_reserve_gb) * 1024**3
+        assert result == total_gb * self.GB - expected_reserve
 
-    @pytest.mark.parametrize("tier", ["safe", "balanced", "aggressive"])
-    def test_small_system_uses_4gb_reserve_regardless_of_tier(
-        self, mock_engine_pool, tier
-    ):
+    def test_custom_uses_2gb_reserve_on_large_system(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
-            engine_pool=mock_engine_pool, memory_guard_tier=tier
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="custom",
+            memory_guard_custom_ceiling_gb=50.0,
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 64 * 1024**3
+            result = enforcer._get_static_ceiling()
+        assert result == 62 * 1024**3
+
+    def test_custom_uses_2gb_reserve_on_small_system(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="custom",
+            memory_guard_custom_ceiling_gb=8.0,
         )
         with patch("omlx.settings.get_system_memory") as mock_mem:
             mock_mem.return_value = 12 * 1024**3
             result = enforcer._get_static_ceiling()
-        assert result == 8 * 1024**3
+        assert result == 10 * 1024**3
 
 
-class TestDynamicCeilingActiveRatio:
-    """Dynamic ceiling sums free + inactive + active * tier ratio
-    (host_statistics64 path) for safe / balanced / aggressive."""
+class TestDynamicCeilingReserve:
+    """Dynamic ceiling = phys + free + inactive + ratio * other apps' active
+    - tier reserve (host_statistics64 path)."""
 
-    @pytest.mark.parametrize(
-        "tier,ratio",
-        [("safe", 0.2), ("balanced", 0.5), ("aggressive", 0.8)],
-    )
-    def test_active_ratio_per_tier(self, mock_engine_pool, tier, ratio):
+    GB = 1024**3
+    STATS = {
+        "free": 10 * 1024**3,
+        "inactive": 4 * 1024**3,
+        "active": 8 * 1024**3,
+        "wired": 2 * 1024**3,
+    }
+
+    def _dynamic(
+        self, mock_engine_pool, tier, *, phys, graphics=0, total=64, stats=None
+    ):
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, memory_guard_tier=tier
         )
-        with patch(
-            "omlx.process_memory_enforcer.get_phys_footprint",
-            return_value=1 * 1024**3,
-        ), patch(
-            "omlx.process_memory_enforcer.get_macos_vm_stats",
-            return_value={
-                "free": 10 * 1024**3,
-                "inactive": 4 * 1024**3,
-                "active": 8 * 1024**3,
-                "wired": 2 * 1024**3,
-            },
+        with (
+            patch("omlx.settings.get_system_memory", return_value=total * self.GB),
+            patch(
+                "omlx.process_memory_enforcer.get_phys_footprint",
+                return_value=phys,
+            ),
+            patch(
+                "omlx.process_memory_enforcer.get_graphics_footprint",
+                return_value=graphics,
+            ),
+            patch(
+                "omlx.process_memory_enforcer.get_macos_vm_stats",
+                return_value=stats or self.STATS,
+            ),
         ):
-            result = enforcer._get_dynamic_ceiling()
-        expected = (
-            1 * 1024**3
-            + 10 * 1024**3
-            + 4 * 1024**3
-            + int(8 * 1024**3 * ratio)
-        )
-        assert result == expected
+            return enforcer._get_dynamic_ceiling()
 
-    def test_non_macos_falls_back_to_psutil_available(self, mock_engine_pool):
+    @pytest.mark.parametrize("tier", ["safe", "balanced"])
+    def test_reserve_is_kept_free_without_squeezing_other_apps(
+        self, mock_engine_pool, tier
+    ):
+        result = self._dynamic(mock_engine_pool, tier, phys=1 * self.GB)
+        reserve = tier_reserve_bytes(tier, 64 * self.GB)
+        assert result == 1 * self.GB + 10 * self.GB + 4 * self.GB - reserve
+
+    def test_aggressive_compresses_half_of_other_apps_active(self, mock_engine_pool):
+        # 3 GB of oMLX's 5 GB footprint is Metal (wired); its 2 GB CPU part
+        # sits in the active count and is not another app's memory.
+        result = self._dynamic(
+            mock_engine_pool, "aggressive", phys=5 * self.GB, graphics=3 * self.GB
+        )
+        reserve = tier_reserve_bytes("aggressive", 64 * self.GB)
+        other_active = 8 * self.GB - 2 * self.GB
+        assert result == (
+            5 * self.GB + 10 * self.GB + 4 * self.GB + other_active // 2 - reserve
+        )
+
+    def test_active_file_cache_counts_as_reclaimable(self, mock_engine_pool):
+        """A model file just read sits in the active queue but drops freely."""
+        result = self._dynamic(
+            mock_engine_pool,
+            "safe",
+            phys=1 * self.GB,
+            stats={**self.STATS, "external": 12 * self.GB},
+        )
+        reserve = tier_reserve_bytes("safe", 64 * self.GB)
+        # 12 GB of file cache, 4 GB of it already inactive.
+        assert result == 1 * self.GB + 10 * self.GB + 12 * self.GB - reserve
+
+    def test_safer_tier_never_allows_more(self, mock_engine_pool):
+        ceilings = [
+            self._dynamic(mock_engine_pool, tier, phys=1 * self.GB)
+            for tier in ("safe", "balanced", "aggressive")
+        ]
+        assert ceilings[0] < ceilings[1] < ceilings[2]
+
+    def test_macos_vm_stat_failure_uses_compat_available(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, memory_guard_tier="balanced"
         )
-        with patch(
-            "omlx.process_memory_enforcer.get_phys_footprint",
-            return_value=2 * 1024**3,
-        ), patch(
-            "omlx.process_memory_enforcer.get_macos_vm_stats",
-            return_value=None,
-        ), patch(
-            "omlx.process_memory_enforcer.psutil"
-        ) as mock_psutil:
-            mock_psutil.virtual_memory.return_value.available = 15 * 1024**3
+        with (
+            patch("omlx.settings.get_system_memory", return_value=64 * self.GB),
+            patch(
+                "omlx.process_memory_enforcer.get_phys_footprint",
+                return_value=2 * 1024**3,
+            ),
+            patch(
+                "omlx.process_memory_enforcer.get_macos_vm_stats",
+                return_value=None,
+            ),
+            patch(
+                "omlx.process_memory_enforcer.psutil_compat.virtual_memory",
+                return_value=SimpleNamespace(available=15 * 1024**3),
+            ) as mock_virtual_memory,
+        ):
             result = enforcer._get_dynamic_ceiling()
-        assert result == 2 * 1024**3 + 15 * 1024**3
+
+        reserve = tier_reserve_bytes("balanced", 64 * self.GB)
+        assert result == 2 * 1024**3 + 15 * 1024**3 - reserve
+        mock_virtual_memory.assert_called_once()
+
+    def test_compat_failure_falls_back_to_static_ceiling(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier="balanced"
+        )
+        with (
+            patch(
+                "omlx.process_memory_enforcer.get_phys_footprint",
+                return_value=2 * 1024**3,
+            ),
+            patch(
+                "omlx.process_memory_enforcer.get_macos_vm_stats",
+                return_value=None,
+            ),
+            patch(
+                "omlx.process_memory_enforcer.psutil_compat.virtual_memory",
+                side_effect=RuntimeError(
+                    "host_statistics64(HOST_VM_INFO64) syscall failed"
+                ),
+            ),
+            patch("omlx.settings.get_system_memory", return_value=64 * 1024**3),
+        ):
+            result = enforcer._get_dynamic_ceiling()
+
+        assert result == 64 * self.GB - tier_reserve_bytes("balanced", 64 * self.GB)
 
 
 class TestDynamicCeilingCustom:
@@ -487,16 +1099,81 @@ class TestDynamicCeilingCustom:
             memory_guard_tier="custom",
             memory_guard_custom_ceiling_gb=1024.0,  # absurdly large
         )
-        with patch(
-            "omlx.settings.get_system_memory", return_value=64 * 1024**3
-        ), patch(
-            "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
-            return_value=48 * 1024**3,
+        with (
+            patch("omlx.settings.get_system_memory", return_value=64 * 1024**3),
+            patch(
+                "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+                return_value=48 * 1024**3,
+            ),
         ):
             ceiling = enforcer._get_hard_limit_bytes()
-        # static = 64 - 8 = 56 GB; metal = 48 GB; custom = 1024 GB
+        # static = 64 - 2 = 62 GB; metal = 48 GB; custom = 1024 GB
         # → clamped to metal 48 GB
         assert ceiling == 48 * 1024**3
+
+
+class TestUsageAfterPoolRelease:
+    def test_idle_usage_discounts_released_pool(self, mock_engine_pool):
+        """The enforcer must not read a just-cleared pool as pressure."""
+        gb = 1024**3
+        enforcer = ProcessMemoryEnforcer(engine_pool=mock_engine_pool)
+        mock_engine_pool._entries = {}
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch(
+                "omlx.process_memory_enforcer.get_phys_footprint",
+                return_value=40 * gb,
+            ),
+            patch(
+                "omlx.utils.metal_sync.get_graphics_footprint",
+                return_value=30 * gb,
+            ),
+        ):
+            mock_mx.get_active_memory.return_value = 22 * gb
+            mock_mx.get_cache_memory.side_effect = [8 * gb, 0]
+            assert enforcer._current_usage_bytes() == 40 * gb
+            assert enforcer._current_usage_bytes() == 32 * gb
+
+    def test_busy_usage_reuses_the_last_fresh_lag(self, mock_engine_pool):
+        """With requests running the enforcer has only cached MLX samples."""
+        from omlx.utils import metal_sync
+
+        gb = 1024**3
+        enforcer = ProcessMemoryEnforcer(engine_pool=mock_engine_pool)
+        with (
+            patch.object(enforcer, "_has_active_requests", return_value=True),
+            patch.object(
+                enforcer,
+                "_cached_executor_mlx_memory_bytes",
+                return_value=(22 * gb, 22 * gb),
+            ),
+            patch(
+                "omlx.process_memory_enforcer.get_phys_footprint",
+                return_value=40 * gb,
+            ),
+            patch("omlx.utils.metal_sync.time.monotonic", return_value=100.0),
+        ):
+            metal_sync._last_unreleased = (99.0, 8 * gb)
+            assert enforcer._current_usage_bytes() == 32 * gb
+            metal_sync._last_unreleased = (90.0, 8 * gb)
+            assert enforcer._current_usage_bytes() == 40 * gb
+
+
+class TestCustomCeilingUnset:
+    def test_unset_custom_ceiling_keeps_static_and_metal_limits(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="custom",
+            memory_guard_custom_ceiling_gb=0.0,
+        )
+        with (
+            patch("omlx.settings.get_system_memory", return_value=64 * 1024**3),
+            patch(
+                "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+                return_value=48 * 1024**3,
+            ),
+        ):
+            assert enforcer._get_hard_limit_bytes() == 48 * 1024**3
 
 
 class TestHardLimitCalculation:
@@ -506,51 +1183,133 @@ class TestHardLimitCalculation:
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, memory_guard_tier="balanced"
         )
-        with patch("omlx.settings.get_system_memory") as mock_mem, patch(
-            "omlx.process_memory_enforcer.get_phys_footprint",
-            return_value=2 * 1024**3,
-        ), patch(
-            "omlx.process_memory_enforcer.get_macos_vm_stats",
-            return_value={
-                "free": 30 * 1024**3,
-                "inactive": 10 * 1024**3,
-                "active": 5 * 1024**3,
-                "wired": 1 * 1024**3,
-            },
-        ), patch(
-            "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
-            return_value=100 * 1024**3,
+        with (
+            patch("omlx.settings.get_system_memory") as mock_mem,
+            patch(
+                "omlx.process_memory_enforcer.get_phys_footprint",
+                return_value=2 * 1024**3,
+            ),
+            patch(
+                "omlx.process_memory_enforcer.get_macos_vm_stats",
+                return_value={
+                    "free": 40 * 1024**3,
+                    "inactive": 10 * 1024**3,
+                    "active": 5 * 1024**3,
+                    "wired": 1 * 1024**3,
+                },
+            ),
+            patch(
+                "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+                return_value=100 * 1024**3,
+            ),
         ):
-            mock_mem.return_value = 48 * 1024**3  # static = 40 GB
-            # dynamic balanced = 2 + 30 + 10 + 5*0.5 = 44.5 GB
-            # static (40) wins → final ceiling is 40 GB
-            assert enforcer._get_hard_limit_bytes() == 40 * 1024**3
+            mock_mem.return_value = 48 * 1024**3
+            reserve = tier_reserve_bytes("balanced", 48 * 1024**3)
+            # dynamic = 2 + 40 + 10 - reserve is above static = 48 - reserve.
+            assert enforcer._get_hard_limit_bytes() == 48 * 1024**3 - reserve
 
     def test_picks_dynamic_when_smaller(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, memory_guard_tier="balanced"
         )
-        with patch("omlx.settings.get_system_memory") as mock_mem, patch(
-            "omlx.process_memory_enforcer.get_phys_footprint",
-            return_value=1 * 1024**3,
-        ), patch(
-            "omlx.process_memory_enforcer.get_macos_vm_stats",
-            return_value={
-                "free": 5 * 1024**3,
-                "inactive": 2 * 1024**3,
-                "active": 4 * 1024**3,
-                "wired": 1 * 1024**3,
-            },
-        ), patch(
-            "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
-            return_value=100 * 1024**3,
+        with (
+            patch("omlx.settings.get_system_memory") as mock_mem,
+            patch(
+                "omlx.process_memory_enforcer.get_phys_footprint",
+                return_value=1 * 1024**3,
+            ),
+            patch(
+                "omlx.process_memory_enforcer.get_macos_vm_stats",
+                return_value={
+                    "free": 5 * 1024**3,
+                    "inactive": 2 * 1024**3,
+                    "active": 4 * 1024**3,
+                    "wired": 1 * 1024**3,
+                },
+            ),
+            patch(
+                "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+                return_value=100 * 1024**3,
+            ),
         ):
-            mock_mem.return_value = 48 * 1024**3  # static = 40 GB
-            # dynamic balanced = 1 + 5 + 2 + int(4 * 0.5) = 10 GB
-            # → dynamic wins
-            assert enforcer._get_hard_limit_bytes() == 10 * 1024**3
+            mock_mem.return_value = 48 * 1024**3
+            reserve = tier_reserve_bytes("balanced", 48 * 1024**3)
+            # dynamic balanced = 1 + 5 + 2 - reserve → dynamic wins
+            assert enforcer._get_hard_limit_bytes() == 8 * 1024**3 - reserve
 
-    def test_zero_when_guard_disabled(self, mock_engine_pool):
+
+class TestAbortLimitCalculation:
+    """`_get_abort_limit_bytes` = min(static, metal_cap); ignores the jittery
+    dynamic ceiling so a transient dip can't kill an in-flight prefill."""
+
+    def test_ignores_dynamic_ceiling(self, mock_engine_pool):
+        """Even when the dynamic ceiling is tiny, the abort limit stays at the
+        stable min(static, metal_cap)."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier="balanced"
+        )
+        with (
+            patch("omlx.settings.get_system_memory") as mock_mem,
+            patch(
+                "omlx.process_memory_enforcer.get_phys_footprint",
+                return_value=1 * 1024**3,
+            ),
+            patch(
+                "omlx.process_memory_enforcer.get_macos_vm_stats",
+                return_value={  # dynamic would compute to ~10 GB (depressed)
+                    "free": 5 * 1024**3,
+                    "inactive": 2 * 1024**3,
+                    "active": 4 * 1024**3,
+                    "wired": 1 * 1024**3,
+                },
+            ),
+            patch(
+                "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+                return_value=100 * 1024**3,
+            ),
+        ):
+            mock_mem.return_value = 48 * 1024**3
+            reserve = tier_reserve_bytes("balanced", 48 * 1024**3)
+            # dynamic (~4 GB) is far below, but the abort limit ignores it.
+            assert enforcer._get_abort_limit_bytes() == 48 * 1024**3 - reserve
+            # Sanity: the (jittery) hard limit DID drop to dynamic.
+            assert enforcer._get_hard_limit_bytes() == 8 * 1024**3 - reserve
+
+    def test_picks_metal_cap_when_smaller_than_static(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier="balanced"
+        )
+        with (
+            patch("omlx.settings.get_system_memory", return_value=64 * 1024**3),
+            patch(
+                "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+                return_value=43 * 1024**3,
+            ),
+        ):
+            # static = 64 - 5.12 = 58.88 GB; metal = 43 GB → min = 43 GB
+            assert enforcer._get_abort_limit_bytes() == 43 * 1024**3
+
+    def test_falls_back_to_static_when_metal_cap_unknown(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier="aggressive"
+        )
+        with (
+            patch("omlx.settings.get_system_memory", return_value=48 * 1024**3),
+            patch(
+                "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+                return_value=0,  # unknown
+            ),
+        ):
+            # aggressive reserve = 1.5 GB floor → static = 46.5 GB
+            assert enforcer._get_abort_limit_bytes() == int(46.5 * 1024**3)
+
+    def test_abort_limit_zero_when_guard_disabled(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, prefill_memory_guard=False
+        )
+        assert enforcer._get_abort_limit_bytes() == 0
+
+    def test_hard_limit_zero_when_guard_disabled(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool,
             memory_guard_tier="balanced",
@@ -566,107 +1325,181 @@ class TestHardLimitCalculation:
         assert enforcer.memory_guard_tier == "balanced"
 
 
-class TestMetalWiredLimit:
-    """enforcer.start() raises the per-process Metal wired memory limit
-    via mx.set_wired_limit so allocations within the ceiling don't bounce
-    off Apple's default cap.
-    """
+class TestAdmissionCeiling:
+    """#2290: the pre-load admission ceiling survives disabling the guard."""
 
-    def test_start_calls_set_wired_limit_with_static_ceiling(
+    def test_guard_on_matches_final_ceiling(self, mock_engine_pool):
+        enforcer = _make_enforcer(mock_engine_pool, ceiling=10 * 1024**3)
+        assert enforcer.get_admission_ceiling() == enforcer.get_final_ceiling()
+        assert enforcer.get_admission_ceiling() == 10 * 1024**3
+
+    def test_guard_off_falls_back_to_static_ceiling(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="balanced",
+            prefill_memory_guard=False,
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 128 * 1024**3
+            assert enforcer.get_final_ceiling() == 0
+            assert enforcer.get_admission_ceiling() == 120 * 1024**3
+
+    def test_guard_off_ignores_metal_cap(self, mock_engine_pool):
+        """Guard off leaves allocations pageable; the Metal cap must not
+        shrink the best-effort admission ceiling."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="balanced",
+            prefill_memory_guard=False,
+        )
+        enforcer._get_effective_metal_cap_bytes = lambda: 96 * 1024**3
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 128 * 1024**3
+            assert enforcer.get_admission_ceiling() == 120 * 1024**3
+
+
+class TestAdmissionSoftTarget:
+    """#2319: pre-load eviction targets the soft watermark, not the ceiling."""
+
+    def test_guard_on_scales_admission_ceiling_by_soft_threshold(
         self, mock_engine_pool
     ):
+        enforcer = _make_enforcer(
+            mock_engine_pool, ceiling=10 * 1024**3, soft_threshold=0.9
+        )
+        assert enforcer.get_admission_soft_target() == int(10 * 1024**3 * 0.9)
+
+    def test_guard_off_scales_static_fallback(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="balanced",
+            prefill_memory_guard=False,
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 128 * 1024**3
+            expected = int(120 * 1024**3 * enforcer._soft_threshold)
+            assert enforcer.get_admission_soft_target() == expected
+
+    def test_no_admission_ceiling_returns_zero(self, mock_engine_pool):
+        enforcer = _make_enforcer(mock_engine_pool, ceiling=10 * 1024**3)
+        enforcer.get_admission_ceiling = lambda: 0
+        assert enforcer.get_admission_soft_target() == 0
+
+
+class TestMetalWiredLimit:
+    """enforcer.start() applies MLX wired limits only for explicit sysctl caps."""
+
+    def test_start_calls_set_wired_limit_with_static_ceiling(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, memory_guard_tier="balanced"
         )
-        with patch(
-            "omlx.settings.get_system_memory", return_value=48 * 1024**3
-        ), patch(
-            "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
-            return_value=64 * 1024**3,  # cap above static ceiling
-        ), patch(
-            "omlx.process_memory_enforcer.mx"
-        ) as mock_mx, patch.object(
-            asyncio, "create_task", side_effect=_close_coro
+        with (
+            patch("omlx.settings.get_system_memory", return_value=48 * 1024**3),
+            patch(
+                "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+                return_value=64 * 1024**3,  # cap above static ceiling
+            ),
+            patch(
+                "omlx.process_memory_enforcer.get_iogpu_wired_limit_bytes",
+                return_value=64 * 1024**3,
+            ),
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch.object(asyncio, "create_task", side_effect=_close_coro),
         ):
             mock_mx.set_wired_limit.return_value = 36 * 1024**3
             enforcer.start()
-        # balanced @ 48 GB => static_ceiling = 40 GB
-        mock_mx.set_wired_limit.assert_called_once_with(40 * 1024**3)
+        # balanced @ 48 GB => static_ceiling = 48 - 3.84 GB
+        static = 48 * 1024**3 - tier_reserve_bytes("balanced", 48 * 1024**3)
+        mock_mx.set_wired_limit.assert_called_once_with(static)
         # Stored value is the desired ceiling (not the post-clamp value)
         # so the admin UI can detect a kernel cap that's below the
         # request and surface the sysctl-raise hint.
-        assert enforcer._metal_wired_limit_request == 40 * 1024**3
+        assert enforcer._metal_wired_limit_request == static // 1024**2 * 1024**2
 
     def test_start_clamps_to_effective_cap_when_lower(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, memory_guard_tier="aggressive"
         )
-        with patch(
-            "omlx.settings.get_system_memory", return_value=64 * 1024**3
-        ), patch(
-            "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
-            return_value=42 * 1024**3,  # cap < static ceiling
-        ), patch(
-            "omlx.process_memory_enforcer.get_iogpu_wired_limit_bytes",
-            return_value=42 * 1024**3,
-        ), patch(
-            "omlx.process_memory_enforcer.mx"
-        ) as mock_mx, patch.object(
-            asyncio, "create_task", side_effect=_close_coro
+        with (
+            patch("omlx.settings.get_system_memory", return_value=64 * 1024**3),
+            patch(
+                "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+                return_value=42 * 1024**3,  # cap < static ceiling
+            ),
+            patch(
+                "omlx.process_memory_enforcer.get_iogpu_wired_limit_bytes",
+                return_value=42 * 1024**3,
+            ),
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch.object(asyncio, "create_task", side_effect=_close_coro),
         ):
             mock_mx.set_wired_limit.return_value = 48 * 1024**3
             enforcer.start()
-        # aggressive @ 64 GB static = 58 GB, clamped to cap 42 GB
+        # aggressive @ 64 GB static = 62.5 GB, clamped to cap 42 GB
         mock_mx.set_wired_limit.assert_called_once_with(42 * 1024**3)
-        # Desired (58 GB) is stored, not the post-clamp 42 GB.
-        assert enforcer._metal_wired_limit_request == 58 * 1024**3
+        # The recommendation (static, clamped to RAM - 5%) is stored, not the
+        # post-clamp 42 GB.
+        total = 64 * 1024**3
+        assert enforcer._metal_wired_limit_request == (
+            (total - total // 20) // 1024**2 * 1024**2
+        )
 
-    def test_start_clamps_to_apple_default_when_sysctl_unset(
-        self, mock_engine_pool
+    def test_start_skips_set_wired_limit_when_sysctl_unset(
+        self, mock_engine_pool, caplog
     ):
-        """sysctl=0 path: fall back to mx.device_info()'s working set size."""
+        """sysctl=0 path: plan against Apple cap, but don't touch MLX state."""
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, memory_guard_tier="balanced"
         )
-        with patch(
-            "omlx.settings.get_system_memory", return_value=512 * 1024**3
-        ), patch(
-            "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
-            return_value=128 * 1024**3,  # Apple default below static ceiling
-        ), patch(
-            "omlx.process_memory_enforcer.get_iogpu_wired_limit_bytes",
-            return_value=0,  # sysctl unset; cap comes from working set
-        ), patch(
-            "omlx.process_memory_enforcer.mx"
-        ) as mock_mx, patch.object(
-            asyncio, "create_task", side_effect=_close_coro
-        ):
-            mock_mx.set_wired_limit.return_value = 0
-            enforcer.start()
-        # balanced @ 512 GB static = 504 GB, clamped to working set 128 GB
-        mock_mx.set_wired_limit.assert_called_once_with(128 * 1024**3)
-        assert enforcer._metal_wired_limit_request == 504 * 1024**3
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            with (
+                patch("omlx.settings.get_system_memory", return_value=512 * 1024**3),
+                patch(
+                    "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+                    return_value=128 * 1024**3,  # Apple default below static ceiling
+                ),
+                patch(
+                    "omlx.process_memory_enforcer.get_iogpu_wired_limit_bytes",
+                    return_value=0,  # sysctl unset; cap comes from working set
+                ),
+                patch("omlx.process_memory_enforcer.mx") as mock_mx,
+                patch.object(asyncio, "create_task", side_effect=_close_coro),
+            ):
+                enforcer.start()
+        # balanced @ 512 GB static = 506 GB, clamped to the 5%-of-RAM
+        # recommendation reserve for the admin banner (#2184). The scheduler
+        # still clamps to the 128 GB effective cap, but MLX's wired limit is
+        # left untouched.
+        mock_mx.set_wired_limit.assert_not_called()
+        total = 512 * 1024**3
+        expected = (total - total // 20) // (1024**2) * 1024**2
+        assert enforcer._metal_wired_limit_request == expected
+        assert "leaving Apple's default Metal cap active" in caplog.text
 
     def test_start_handles_set_wired_limit_error(self, mock_engine_pool):
         """Older macOS (<15) raises on the call; enforcer keeps going."""
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, memory_guard_tier="balanced"
         )
-        with patch(
-            "omlx.settings.get_system_memory", return_value=48 * 1024**3
-        ), patch(
-            "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
-            return_value=0,
-        ), patch(
-            "omlx.process_memory_enforcer.mx"
-        ) as mock_mx, patch.object(
-            asyncio, "create_task", side_effect=_close_coro
+        with (
+            patch("omlx.settings.get_system_memory", return_value=48 * 1024**3),
+            patch(
+                "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+                return_value=64 * 1024**3,
+            ),
+            patch(
+                "omlx.process_memory_enforcer.get_iogpu_wired_limit_bytes",
+                return_value=64 * 1024**3,
+            ),
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch.object(asyncio, "create_task", side_effect=_close_coro),
         ):
             mock_mx.set_wired_limit.side_effect = RuntimeError("unsupported")
             enforcer.start()  # must not raise
         # We store the desired static_ceiling even when the call fails,
         # so the admin UI can still surface a warning.
-        assert enforcer._metal_wired_limit_request == 40 * 1024**3
+        static = 48 * 1024**3 - tier_reserve_bytes("balanced", 48 * 1024**3)
+        assert enforcer._metal_wired_limit_request == static // 1024**2 * 1024**2
 
     def test_start_skips_when_guard_disabled(self, mock_engine_pool):
         """Guard off means we should not touch Metal limits either."""
@@ -675,63 +1508,140 @@ class TestMetalWiredLimit:
             memory_guard_tier="balanced",
             prefill_memory_guard=False,
         )
-        with patch(
-            "omlx.process_memory_enforcer.mx"
-        ) as mock_mx, patch.object(
-            asyncio, "create_task", side_effect=_close_coro
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch.object(asyncio, "create_task", side_effect=_close_coro),
         ):
             enforcer.start()
         mock_mx.set_wired_limit.assert_not_called()
 
 
 class TestSingleModelMemoryPressure:
-    """Tests for single-model memory pressure handling (Issue #62).
+    """Tests for hard-pressure single-model memory handling.
 
-    Verifies three scenarios:
-    1. Two models, one inferring: evict idle LRU, inference continues
-    2. Single model: abort requests, keep model loaded
-    3. Two models both inferring: evict LRU, then abort remaining
+    Hard pressure must reduce resident model memory quickly. Idle models are
+    evicted immediately, including the final non-pinned model. Busy models are
+    aborted first and kept loaded unless pressure reaches the emergency tier.
     """
 
     @pytest.mark.asyncio
-    async def test_single_model_aborts_not_evicts(self, enforcer):
-        """Scenario 2: Single model aborts requests instead of evicting."""
+    async def test_single_idle_model_unloads_at_hard_pressure(self, enforcer):
+        """A final idle non-pinned model is unloaded at hard pressure."""
         engine = MagicMock()
-        engine.abort_all_requests = AsyncMock(return_value=3)
-        entry = _make_entry("big-model", engine=engine)
-        enforcer._engine_pool._entries = {"big-model": entry}
-        enforcer._engine_pool._find_lru_victim.return_value = "big-model"
-
-        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
-            mock_mx.get_active_memory.side_effect = _cycling([
-                15 * 1024**3,  # Initial check
-                15 * 1024**3,  # While loop check
-            ])
-            await enforcer._check_and_enforce()
-
-        engine.abort_all_requests.assert_awaited_once()
-        enforcer._engine_pool._unload_engine.assert_not_awaited()
-        assert entry.engine is not None
-
-    @pytest.mark.asyncio
-    async def test_single_model_no_active_requests(self, enforcer):
-        """Scenario 2 variant: No requests to abort, model still kept."""
-        engine = MagicMock()
+        engine.has_active_requests.return_value = False
         engine.abort_all_requests = AsyncMock(return_value=0)
         entry = _make_entry("big-model", engine=engine)
         enforcer._engine_pool._entries = {"big-model": entry}
         enforcer._engine_pool._find_lru_victim.return_value = "big-model"
 
+        async def fake_unload(model_id):
+            enforcer._engine_pool._entries[model_id].engine = None
+
+        enforcer._engine_pool._unload_engine.side_effect = fake_unload
+
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
-            mock_mx.get_active_memory.side_effect = _cycling([
-                15 * 1024**3,
-                15 * 1024**3,
-            ])
+            mock_mx.get_active_memory.side_effect = _cycling(
+                [
+                    15 * 1024**3,  # Initial check
+                    15 * 1024**3,  # While loop check
+                    8 * 1024**3,  # After unload
+                ]
+            )
+            await enforcer._check_and_enforce()
+
+        engine.abort_all_requests.assert_awaited_once()
+        enforcer._engine_pool._unload_engine.assert_awaited_once_with("big-model")
+        assert entry.engine is None
+
+    @pytest.mark.asyncio
+    async def test_single_busy_model_aborts_and_keeps_model_at_hard_pressure(
+        self, enforcer
+    ):
+        """Hard pressure aborts the request first; the final busy model stays loaded."""
+        engine = MagicMock()
+        engine.has_active_requests.return_value = False
+        engine.abort_all_requests = AsyncMock(return_value=3)
+        entry = _make_entry("big-model", engine=engine)
+        entry.in_use = 1
+        enforcer._engine_pool._entries = {"big-model": entry}
+        enforcer._engine_pool._find_lru_victim.return_value = None
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.get_active_memory.side_effect = _cycling(
+                [
+                    11 * 1024**3,
+                    11 * 1024**3,
+                ]
+            )
             await enforcer._check_and_enforce()
 
         engine.abort_all_requests.assert_awaited_once()
         enforcer._engine_pool._unload_engine.assert_not_awaited()
         assert entry.engine is not None
+        assert entry.pending_unload_reason is None
+        assert entry.abort_requested is False
+
+    @pytest.mark.asyncio
+    async def test_single_busy_model_pending_unload_at_emergency_pressure(
+        self, enforcer
+    ):
+        """Emergency pressure can still unload the final busy model after drain."""
+        engine = MagicMock()
+        engine.has_active_requests.return_value = False
+        engine.abort_all_requests = AsyncMock(return_value=3)
+        entry = _make_entry("big-model", engine=engine)
+        entry.in_use = 1
+        enforcer._engine_pool._entries = {"big-model": entry}
+        enforcer._engine_pool._find_lru_victim.return_value = None
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.get_active_memory.side_effect = _cycling(
+                [
+                    13 * 1024**3,
+                    13 * 1024**3,
+                ]
+            )
+            await enforcer._check_and_enforce()
+
+        engine.abort_all_requests.assert_awaited_once()
+        enforcer._engine_pool._unload_engine.assert_not_awaited()
+        assert entry.engine is not None
+        assert entry.pending_unload_reason == "hard memory pressure"
+        assert entry.abort_requested is True
+
+        entry.in_use = 0
+        await enforcer._engine_pool._unload_pending_if_idle_locked("big-model")
+        enforcer._engine_pool._unload_engine.assert_awaited_once_with("big-model")
+
+    @pytest.mark.asyncio
+    async def test_single_busy_model_schedules_retry_when_still_busy_after_abort(
+        self, enforcer
+    ):
+        """The pending-unload latch must not depend on a later manual drain check.
+
+        _check_and_enforce()'s while loop is not revisited once pressure recovers
+        to "ok" (an earlier branch returns before reaching it), so if the busy
+        victim has not drained by the time this tick's single inline
+        _unload_pending_if_idle_locked call runs, nothing else will ever retry it.
+        """
+        engine = MagicMock()
+        engine.has_active_requests.return_value = False
+        engine.abort_all_requests = AsyncMock(return_value=3)
+        entry = _make_entry("big-model", engine=engine)
+        entry.in_use = 1
+        enforcer._engine_pool._entries = {"big-model": entry}
+        enforcer._engine_pool._find_lru_victim.return_value = None
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.get_active_memory.side_effect = _cycling(
+                [13 * 1024**3, 13 * 1024**3]
+            )
+            await enforcer._check_and_enforce()
+
+        assert entry.pending_unload_reason == "hard memory pressure"
+        enforcer._engine_pool._schedule_pending_unload_locked.assert_called_once_with(
+            "big-model"
+        )
 
     @pytest.mark.asyncio
     async def test_two_models_one_inferring_evicts_idle(self, enforcer):
@@ -741,12 +1651,8 @@ class TestSingleModelMemoryPressure:
         engine_idle = MagicMock()
         engine_idle.abort_all_requests = AsyncMock(return_value=0)
 
-        entry_active = _make_entry(
-            "active-model", engine=engine_active
-        )
-        entry_idle = _make_entry(
-            "idle-model", engine=engine_idle
-        )
+        entry_active = _make_entry("active-model", engine=engine_active)
+        entry_idle = _make_entry("idle-model", engine=engine_idle)
         enforcer._engine_pool._entries = {
             "active-model": entry_active,
             "idle-model": entry_idle,
@@ -759,16 +1665,16 @@ class TestSingleModelMemoryPressure:
         enforcer._engine_pool._unload_engine.side_effect = fake_unload
 
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
-            mock_mx.get_active_memory.side_effect = _cycling([
-                15 * 1024**3,  # Initial check
-                15 * 1024**3,  # While loop check
-                8 * 1024**3,  # After eviction (under limit)
-            ])
+            mock_mx.get_active_memory.side_effect = _cycling(
+                [
+                    15 * 1024**3,  # Initial check
+                    15 * 1024**3,  # While loop check
+                    8 * 1024**3,  # After eviction (under limit)
+                ]
+            )
             await enforcer._check_and_enforce()
 
-        enforcer._engine_pool._unload_engine.assert_awaited_once_with(
-            "idle-model"
-        )
+        enforcer._engine_pool._unload_engine.assert_awaited_once_with("idle-model")
         # Idle model's requests aborted before eviction (0 requests)
         engine_idle.abort_all_requests.assert_awaited_once()
         # Active model's requests NOT aborted
@@ -776,45 +1682,40 @@ class TestSingleModelMemoryPressure:
         assert entry_active.engine is not None
 
     @pytest.mark.asyncio
-    async def test_two_models_both_inferring_evict_then_abort(self, enforcer):
-        """Scenario 3: Both models inferring. Evict LRU, abort remaining."""
+    async def test_two_busy_models_abort_lru_without_pending_at_hard_pressure(
+        self, enforcer
+    ):
+        """Hard pressure aborts the LRU busy model without scheduling unload."""
         engine_a = MagicMock()
+        engine_a.has_active_requests.return_value = False
         engine_a.abort_all_requests = AsyncMock(return_value=2)
         engine_b = MagicMock()
+        engine_b.has_active_requests.return_value = False
         engine_b.abort_all_requests = AsyncMock(return_value=1)
 
         entry_a = _make_entry("model-a", engine=engine_a)
         entry_b = _make_entry("model-b", engine=engine_b)
+        entry_a.in_use = 1
+        entry_b.in_use = 1
+        entry_a.last_access = 20
+        entry_b.last_access = 10
         enforcer._engine_pool._entries = {
             "model-a": entry_a,
             "model-b": entry_b,
         }
-        # First iteration: model-b is LRU. After eviction: model-a is sole.
-        enforcer._engine_pool._find_lru_victim.side_effect = [
-            "model-b",
-            "model-a",
-        ]
-
-        async def fake_unload(model_id):
-            enforcer._engine_pool._entries[model_id].engine = None
-
-        enforcer._engine_pool._unload_engine.side_effect = fake_unload
+        enforcer._engine_pool._find_lru_victim.return_value = None
 
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
             # Memory stays over limit throughout
-            mock_mx.get_active_memory.return_value = 15 * 1024**3
+            mock_mx.get_active_memory.return_value = 11 * 1024**3
             await enforcer._check_and_enforce()
 
-        # model-b evicted (requests aborted before eviction)
-        enforcer._engine_pool._unload_engine.assert_awaited_once_with(
-            "model-b"
-        )
-        # model-b's requests aborted before eviction
         engine_b.abort_all_requests.assert_awaited_once()
-        # model-a's requests aborted (single-model path, second iteration)
-        engine_a.abort_all_requests.assert_awaited_once()
-        # model-a still loaded
-        assert entry_a.engine is not None
+        engine_a.abort_all_requests.assert_not_awaited()
+        enforcer._engine_pool._unload_engine.assert_not_awaited()
+        assert entry_b.pending_unload_reason is None
+        assert entry_b.abort_requested is False
+        assert entry_a.pending_unload_reason is None
 
 
 class TestMemoryLimitPropagation:
@@ -826,8 +1727,6 @@ class TestMemoryLimitPropagation:
         bg._memory_limit_bytes = 0
         bg._memory_hard_limit_bytes = 0
         scheduler = MagicMock(spec=[])
-        scheduler._memory_limit_bytes = 0
-        scheduler._memory_hard_limit_bytes = 0
         scheduler.batch_generator = bg
         engine = MagicMock(spec=[])
         engine.scheduler = scheduler
@@ -843,14 +1742,101 @@ class TestMemoryLimitPropagation:
         assert scheduler._memory_hard_limit_bytes == 10 * 1024**3
         assert bg._memory_hard_limit_bytes == 10 * 1024**3
 
+    def test_propagate_reserves_hot_cache_used_plus_slack(self, mock_engine_pool):
+        """Scheduler limits reserve actual hot-cache bytes plus slack."""
+        budget = SimpleNamespace(
+            total_bytes=int(5.5 * 1024**3),
+            max_bytes=6 * 1024**3,
+        )
+        mock_engine_pool._scheduler_config = SimpleNamespace(hot_cache_budget=budget)
+        enforcer = _make_enforcer(
+            mock_engine_pool,
+            ceiling=30 * 1024**3,
+            soft_threshold=0.92,
+        )
+        enforcer._get_abort_limit_bytes = lambda: 30 * 1024**3
+
+        bg = MagicMock(spec=[])
+        bg._memory_limit_bytes = 0
+        bg._memory_hard_limit_bytes = 0
+        scheduler = MagicMock(spec=[])
+        scheduler.batch_generator = bg
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        mock_engine_pool._entries = {"model-a": _make_entry("model-a", engine=engine)}
+
+        enforcer._propagate_memory_limit()
+
+        expected_hard = 24 * 1024**3
+        expected_soft = int(expected_hard * 0.92)
+        assert scheduler._memory_hard_limit_bytes == expected_hard
+        assert scheduler._memory_limit_bytes == expected_soft
+        assert scheduler._memory_abort_limit_bytes == expected_hard
+        assert bg._memory_hard_limit_bytes == expected_hard
+        assert bg._memory_limit_bytes == expected_soft
+
+    def test_propagate_charges_only_slack_when_hot_cache_empty(self, mock_engine_pool):
+        budget = SimpleNamespace(total_bytes=0, max_bytes=6 * 1024**3)
+        mock_engine_pool._scheduler_config = SimpleNamespace(hot_cache_budget=budget)
+        enforcer = _make_enforcer(mock_engine_pool, ceiling=30 * 1024**3)
+        enforcer._get_abort_limit_bytes = lambda: 30 * 1024**3
+
+        scheduler = MagicMock(spec=[])
+        scheduler.batch_generator = None
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        mock_engine_pool._entries = {"model-a": _make_entry("model-a", engine=engine)}
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._memory_hard_limit_bytes == int(29.5 * 1024**3)
+
+    def test_propagate_scheduler_limit_clamps_to_one_byte(self, mock_engine_pool):
+        budget = SimpleNamespace(total_bytes=80 * 1024**3, max_bytes=80 * 1024**3)
+        mock_engine_pool._scheduler_config = SimpleNamespace(hot_cache_budget=budget)
+        enforcer = _make_enforcer(mock_engine_pool, ceiling=30 * 1024**3)
+        enforcer._get_abort_limit_bytes = lambda: 30 * 1024**3
+
+        scheduler = MagicMock(spec=[])
+        scheduler.batch_generator = None
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        mock_engine_pool._entries = {"model-a": _make_entry("model-a", engine=engine)}
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._memory_hard_limit_bytes == 1
+        assert scheduler._memory_abort_limit_bytes == 1
+
+    def test_propagate_with_guard_disabled(self, enforcer):
+        """When the guard is disabled the field reflects it; hard limit is
+        still propagated for observability — the reader's early-return on
+        ``prefill_memory_guard=False`` makes the value moot for the
+        rejection path."""
+        scheduler = MagicMock(spec=[])
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        enforcer._engine_pool._entries = {"model-a": entry}
+        enforcer._prefill_memory_guard = False
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._prefill_memory_guard is False
+        # Hard limit is still propagated for observability — the reader's
+        # early-return on ``prefill_memory_guard=False`` makes the value
+        # moot for the rejection path. (The fixture's monkey-patched
+        # ceiling stays at 10 GB; the production ``_get_hard_limit_bytes``
+        # would return 0 when the guard is disabled, but the fixture
+        # bypasses that branch — see ``_make_enforcer``.)
+        assert scheduler._memory_hard_limit_bytes == 10 * 1024**3
+
     def test_propagates_on_tier_change(self, enforcer):
         """Changing the tier at runtime triggers re-propagation."""
         bg = MagicMock(spec=[])
         bg._memory_limit_bytes = 0
         bg._memory_hard_limit_bytes = 0
         scheduler = MagicMock(spec=[])
-        scheduler._memory_limit_bytes = 0
-        scheduler._memory_hard_limit_bytes = 0
         scheduler.batch_generator = bg
         engine = MagicMock(spec=[])
         engine.scheduler = scheduler
@@ -858,12 +1844,21 @@ class TestMemoryLimitPropagation:
         enforcer._engine_pool._entries = {"model-a": entry}
 
         enforcer._running = True
-        # Simulate the ceiling shrinking after the tier flip.
-        enforcer._get_hard_limit_bytes = lambda: 20 * 1024**3
+        # Simulate the ceiling shrinking after the tier flip. The new
+        # propagation path reads from ``_get_ceiling_breakdown``, not
+        # ``_get_hard_limit_bytes`` — patch both for completeness.
+        new_ceiling = 20 * 1024**3
+        enforcer._get_hard_limit_bytes = lambda: new_ceiling
+        enforcer._get_ceiling_breakdown = lambda: {
+            "static": new_ceiling,
+            "dynamic": new_ceiling,
+            "metal_cap": new_ceiling,
+            "hard_limit": new_ceiling,
+        }
         enforcer.memory_guard_tier = "safe"
 
-        assert scheduler._memory_limit_bytes == 20 * 1024**3
-        assert bg._memory_limit_bytes == 20 * 1024**3
+        assert scheduler._memory_limit_bytes == new_ceiling
+        assert bg._memory_limit_bytes == new_ceiling
 
     def test_skips_engine_without_scheduler(self, enforcer):
         """Gracefully skips engines without scheduler attribute."""
@@ -883,7 +1878,6 @@ class TestMemoryLimitPropagation:
             bg = MagicMock(spec=[])
             bg._memory_limit_bytes = 0
             scheduler = MagicMock(spec=[])
-            scheduler._memory_limit_bytes = 0
             scheduler.batch_generator = bg
             schedulers.append(scheduler)
             engine = MagicMock(spec=[])
@@ -896,6 +1890,280 @@ class TestMemoryLimitPropagation:
 
         for scheduler in schedulers:
             assert scheduler._memory_limit_bytes == 10 * 1024**3
+
+    async def test_check_and_enforce_propagates_every_poll(self, enforcer):
+        """Regression: a fresh engine loaded AFTER enforcer.start() must pick
+        up its limits within one poll interval — even when pressure stays
+        "ok" the whole time.
+
+        Before this guarantee the propagation only fired on pressure-level
+        changes. On a host where the first prefill stayed below soft until
+        a few seconds in, the scheduler kept _prefill_memory_guard=False /
+        _memory_hard_limit_bytes=0 (their __init__ defaults), the guard
+        short-circuited, the request entered prefill, and the underlying
+        Apple IOGPUFamily bug (FB22091885) panicked the kernel mid-chunk.
+        """
+        # Engine pool starts empty (mirrors real startup: lazy load on first
+        # request, well after enforcer.start()).
+        enforcer._engine_pool._entries = {}
+        # Engine loads at t1 — the enforcer hasn't seen it yet.
+        bg = MagicMock(spec=[])
+        bg._memory_limit_bytes = 0
+        bg._memory_hard_limit_bytes = 0
+        scheduler = MagicMock(spec=[])
+        scheduler.batch_generator = bg
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        enforcer._engine_pool._entries = {"model-a": entry}
+
+        # One poll iteration with pressure well below soft — pressure level
+        # does NOT change. Before the fix this returned without propagating.
+        with patch.object(enforcer, "_current_usage_bytes", return_value=1 * 1024**3):
+            await enforcer._check_and_enforce()
+
+        # Within one poll, the freshly-loaded engine has the user-configured
+        # ceiling and the guard flag.
+        assert scheduler._memory_hard_limit_bytes == 10 * 1024**3
+        assert scheduler._memory_limit_bytes == 10 * 1024**3
+        assert scheduler._prefill_memory_guard is True
+
+    def test_propagates_through_batched_engine_wrapper(self, enforcer):
+        """Regression: live engines in EnginePool don't expose ``.scheduler``
+        on the top-level wrapper — BatchedEngine and VLMBatchedEngine both
+        hold the real Scheduler at ``self._engine.engine.scheduler``. The
+        propagation must traverse that chain, otherwise the prefill memory
+        guard flag never reaches the scheduler and the guard short-circuits
+        on every request (observed end-to-end 2026-05-15: three kernel
+        panics from 110k-token Qwen3.6-VL prefills the guard "should" have
+        rejected).
+        """
+        # Build the real wrapper shape:
+        #   entry.engine                  → BatchedEngine / VLMBatchedEngine
+        #   entry.engine._engine          → AsyncEngineCore
+        #   entry.engine._engine.engine   → EngineCore
+        #   entry.engine._engine.engine.scheduler → Scheduler  ← target
+        scheduler = MagicMock(spec=[])
+        scheduler.batch_generator = None
+        engine_core = MagicMock(spec=["scheduler"])
+        engine_core.scheduler = scheduler
+        async_engine_core = MagicMock(spec=["engine"])
+        async_engine_core.engine = engine_core
+        # Wrapper deliberately does NOT expose top-level ``.scheduler`` — only
+        # ``._engine`` like the real BatchedEngine.
+        wrapper = MagicMock(spec=["_engine"])
+        wrapper._engine = async_engine_core
+
+        entry = _make_entry("model-a", engine=wrapper)
+        enforcer._engine_pool._entries = {"model-a": entry}
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._memory_limit_bytes == 10 * 1024**3
+        assert scheduler._memory_hard_limit_bytes == 10 * 1024**3
+        assert scheduler._prefill_memory_guard is True
+
+    def test_unresolvable_scheduler_logs_warning_once(self, enforcer, caplog):
+        """If the wrapper-chain traversal fails (no ``scheduler`` anywhere
+        in the chain), ``_propagate_memory_limit`` must log a WARNING
+        naming the engine type so the silent no-op failure mode that
+        originally hid the dead memory guard is loud in CI / oncall. The
+        warning is rate-limited per engine type so a misconfigured
+        engine polled every second doesn't spam.
+        """
+        # Wrapper chain that bottoms out without a scheduler.
+        wrapper = MagicMock(spec=["_engine"])
+        wrapper._engine = MagicMock(spec=["engine"])
+        wrapper._engine.engine = MagicMock(spec=[])  # no .scheduler
+        wrapper.__class__.__name__ = "BrokenEngine"
+
+        entry = _make_entry("model-broken", engine=wrapper)
+        enforcer._engine_pool._entries = {"model-broken": entry}
+
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            enforcer._propagate_memory_limit()
+            # Second call: no extra log line — rate limit holds.
+            enforcer._propagate_memory_limit()
+
+        matching = [
+            r for r in caplog.records if "could not resolve scheduler" in r.message
+        ]
+        assert (
+            len(matching) == 1
+        ), f"expected 1 warning, got {[r.message for r in matching]}"
+
+
+class TestUnresolvableSchedulerWarning:
+    """``_propagate_memory_limit`` must complain when a wrapper-chain
+    change makes the scheduler unreachable via ``_resolve_scheduler``.
+
+    Silent no-op was the failure mode that originally hid the
+    dead-memory-guard bug for months — surfacing it as a per-engine-type
+    rate-limited warning closes that gap without spamming logs at
+    request rate.
+    """
+
+    def test_warns_once_per_engine_type(self, enforcer, caplog):
+        """Three propagation calls with an unreachable scheduler emit
+        exactly one WARNING (not three)."""
+        # Engine wrapper with no resolvable scheduler chain: spec=[]
+        # blocks both ``.scheduler`` and ``._engine`` lookups so
+        # ``_resolve_scheduler`` returns None.
+        engine = MagicMock(spec=[])
+        entry = _make_entry("model-broken", engine=engine)
+        enforcer._engine_pool._entries = {"model-broken": entry}
+
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            enforcer._propagate_memory_limit()
+            enforcer._propagate_memory_limit()
+            enforcer._propagate_memory_limit()
+
+        warnings = [
+            r for r in caplog.records if "could not resolve scheduler" in r.getMessage()
+        ]
+        assert len(warnings) == 1, (
+            f"Expected exactly one warning per engine type per lifetime, "
+            f"got {len(warnings)}"
+        )
+
+    def test_diffusion_engine_without_scheduler_does_not_warn(self, enforcer, caplog):
+        """Diffusion VLMs intentionally bypass AsyncEngineCore schedulers."""
+        engine = MagicMock(spec=["is_diffusion_model"])
+        engine.is_diffusion_model = True
+        entry = _make_entry("model-diffusion", engine=engine)
+        enforcer._engine_pool._entries = {"model-diffusion": entry}
+
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            enforcer._propagate_memory_limit()
+
+        warnings = [
+            r for r in caplog.records if "could not resolve scheduler" in r.getMessage()
+        ]
+        assert warnings == []
+
+    def test_externally_managed_guard_without_scheduler_does_not_warn(
+        self, enforcer, caplog
+    ):
+        """Distributed coordinators delegate the guard to rank processes."""
+        engine = MagicMock(spec=["_prefill_memory_guard_managed_externally"])
+        engine._prefill_memory_guard_managed_externally = True
+        entry = _make_entry("model-distributed", engine=engine)
+        enforcer._engine_pool._entries = {"model-distributed": entry}
+
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            enforcer._propagate_memory_limit()
+
+        warnings = [
+            r for r in caplog.records if "could not resolve scheduler" in r.getMessage()
+        ]
+        assert warnings == []
+
+    def test_non_streaming_engine_without_scheduler_does_not_warn(
+        self, enforcer, caplog
+    ):
+        """TTS/STT/STS/Embedding/Reranker engines have no Scheduler by
+        design (they run on the MLX executor), so the wrapper-break
+        warning must not fire for them — it misreads as a memory guard
+        regression (#2312)."""
+        engine = TTSEngine("dummy-tts-model")
+        entry = _make_entry("model-tts", engine=engine)
+        enforcer._engine_pool._entries = {"model-tts": entry}
+
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            enforcer._propagate_memory_limit()
+
+        warnings = [
+            r for r in caplog.records if "could not resolve scheduler" in r.getMessage()
+        ]
+        assert warnings == [], (
+            "Non-streaming engines must not trigger the unresolvable-"
+            f"scheduler warning, got {[r.message for r in warnings]}"
+        )
+
+    def test_unresolvable_does_not_block_other_engines(self, enforcer):
+        """If engine A is unresolvable but engine B has a real scheduler,
+        B must still receive the propagation."""
+        # A: unresolvable (no .scheduler / no ._engine).
+        engine_a = MagicMock(spec=[])
+        entry_a = _make_entry("model-a", engine=engine_a)
+
+        # B: real scheduler chain.
+        scheduler_b = MagicMock(spec=[])
+        scheduler_b._memory_limit_bytes = 0
+        scheduler_b._memory_hard_limit_bytes = 0
+        scheduler_b._prefill_memory_guard = False
+        scheduler_b._admission_paused = False
+        scheduler_b._prefill_safe_zone_ratio = 0.0
+        scheduler_b._prefill_min_chunk_tokens = 0
+        scheduler_b.batch_generator = None
+        engine_b = MagicMock(spec=[])
+        engine_b.scheduler = scheduler_b
+        entry_b = _make_entry("model-b", engine=engine_b)
+
+        enforcer._engine_pool._entries = {
+            "model-a": entry_a,
+            "model-b": entry_b,
+        }
+
+        enforcer._propagate_memory_limit()
+
+        # B got it; A's resolve-failure didn't poison the loop.
+        assert scheduler_b._memory_limit_bytes == 10 * 1024**3
+        assert scheduler_b._prefill_memory_guard is True
+
+    def test_no_warning_for_unloaded_engine(self, enforcer, caplog):
+        """A discovered-but-unloaded entry (``engine is None``) is a normal
+        state, not a wrapper break, so it must not emit the warning. The
+        pool keeps these entries for every model it has discovered but not
+        yet loaded, so warning here would fire on a routine startup."""
+        entry = _make_entry("model-unloaded", engine=None)
+        enforcer._engine_pool._entries = {"model-unloaded": entry}
+
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            enforcer._propagate_memory_limit()
+            enforcer._propagate_memory_limit()
+
+        warnings = [
+            r for r in caplog.records if "could not resolve scheduler" in r.getMessage()
+        ]
+        assert (
+            warnings == []
+        ), f"Unloaded engine must not warn, got {len(warnings)} warning(s)"
+
+    def test_no_warning_for_stopped_engine_during_unload(self, enforcer, caplog):
+        """During EnginePool unload there is a short window where the engine
+        object still sits on the entry but its scheduler has already been
+        released. That is teardown, not a broken wrapper chain.
+        """
+        engine = MagicMock(spec=["_loaded"])
+        engine._loaded = False
+        entry = _make_entry("model-stopped", engine=engine)
+        enforcer._engine_pool._entries = {"model-stopped": entry}
+
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            enforcer._propagate_memory_limit()
+
+        warnings = [
+            r for r in caplog.records if "could not resolve scheduler" in r.getMessage()
+        ]
+        assert warnings == []
+
+    def test_no_warning_for_dflash_without_fallback(self, enforcer, caplog):
+        """DFlash normal mode has no scheduler until fallback is started."""
+
+        class DFlashEngine:
+            _fallback_engine = None
+
+        entry = _make_entry("model-dflash", engine=DFlashEngine())
+        enforcer._engine_pool._entries = {"model-dflash": entry}
+
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            enforcer._propagate_memory_limit()
+
+        warnings = [
+            r for r in caplog.records if "could not resolve scheduler" in r.getMessage()
+        ]
+        assert warnings == []
 
 
 class TestStoreCacheCapWalk:
@@ -937,8 +2205,9 @@ class TestStoreCacheCapWalk:
         engine.scheduler = scheduler
         enforcer._engine_pool._entries = {"m": _make_entry("m", engine=engine)}
 
-        with patch("omlx.process_memory_enforcer.mx") as mock_mx, patch(
-            "omlx.process_memory_enforcer.get_phys_footprint", return_value=0
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch("omlx.process_memory_enforcer.get_phys_footprint", return_value=0),
         ):
             mock_mx.get_active_memory.return_value = 1 * 1024**3  # ok
             await enforcer._check_and_enforce()
@@ -956,8 +2225,9 @@ class TestStoreCacheCapWalk:
         enforcer._engine_pool._entries = {"m": _make_entry("m", engine=engine)}
         enforcer._engine_pool._find_lru_victim = MagicMock(return_value=None)
 
-        with patch("omlx.process_memory_enforcer.mx") as mock_mx, patch(
-            "omlx.process_memory_enforcer.get_phys_footprint", return_value=0
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch("omlx.process_memory_enforcer.get_phys_footprint", return_value=0),
         ):
             mock_mx.get_active_memory.return_value = 9 * 1024**3  # soft
             await enforcer._check_and_enforce()
@@ -1050,6 +2320,9 @@ class TestTwoWatermarkPressureLevels:
         p._lock = asyncio.Lock()
         p._find_lru_victim = MagicMock(return_value=None)
         p._unload_engine = AsyncMock()
+        p._find_pending_unload_ready_locked = MagicMock(return_value=None)
+        p._unload_pending_if_idle_locked = AsyncMock(return_value=False)
+        p._mark_pending_unload_locked = MagicMock(return_value=False)
         p._entries = {}
         return p
 
@@ -1066,6 +2339,80 @@ class TestTwoWatermarkPressureLevels:
         assert enforcer_2wm._soft_bytes() == int(100 * 1024**3 * 0.85)
         assert enforcer_2wm._hard_bytes() == int(100 * 1024**3 * 0.95)
 
+    def test_prefill_abort_margin_is_tier_specific(self, pool):
+        balanced = _make_enforcer(pool, tier="balanced")
+        aggressive = _make_enforcer(pool, tier="aggressive")
+        custom = _make_enforcer(pool, tier="custom")
+
+        assert balanced._get_prefill_abort_margin() == 0.93
+        assert aggressive._get_prefill_abort_margin() == 0.97
+        assert custom._get_prefill_abort_margin() == 0.95
+
+    @pytest.mark.parametrize(
+        "tier,expected",
+        [("safe", 0.85), ("balanced", 0.90), ("aggressive", 0.95)],
+    )
+    def test_legacy_default_soft_threshold_is_tier_specific(self, pool, tier, expected):
+        enforcer = ProcessMemoryEnforcer(
+            pool,
+            memory_guard_tier=tier,
+            soft_threshold=0.85,
+        )
+        assert enforcer._soft_threshold == expected
+
+    def test_legacy_default_hard_threshold_uses_the_tier_default(self, pool):
+        enforcer = ProcessMemoryEnforcer(
+            pool,
+            memory_guard_tier="aggressive",
+            hard_threshold=0.95,
+        )
+        assert enforcer._hard_threshold == 0.98
+
+    def test_explicit_soft_threshold_override_is_preserved(self, pool):
+        enforcer = ProcessMemoryEnforcer(
+            pool,
+            memory_guard_tier="aggressive",
+            soft_threshold=0.92,
+        )
+        assert enforcer._soft_threshold == 0.92
+
+    def test_tier_change_refreshes_wired_limit_recommendation(self, pool):
+        enforcer = ProcessMemoryEnforcer(pool, memory_guard_tier="safe")
+        enforcer._running = True
+        with (
+            patch("omlx.settings.get_system_memory", return_value=64 * 1024**3),
+            patch(
+                "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+                return_value=52 * 1024**3,
+            ),
+            patch.object(enforcer, "_propagate_memory_limit"),
+        ):
+            enforcer.memory_guard_tier = "aggressive"
+        total = 64 * 1024**3
+        # aggressive static (62.5 GB) is clamped to the RAM - 5% suggestion.
+        assert enforcer._metal_wired_limit_request == (
+            (total - total // 20) // 1024**2 * 1024**2
+        )
+
+    def test_tier_change_refreshes_soft_threshold_and_prefill_headroom(self, pool):
+        enforcer = ProcessMemoryEnforcer(pool, memory_guard_tier="safe")
+
+        assert enforcer._soft_threshold == 0.85
+        assert enforcer._get_prefill_headroom_safety() == 0.90
+
+        enforcer.memory_guard_tier = "aggressive"
+
+        assert enforcer._soft_threshold == 0.95
+        assert enforcer._hard_threshold == 0.98
+        assert enforcer._get_prefill_headroom_safety() == 0.97
+
+    def test_prefill_headroom_safety_is_tier_specific(self, pool):
+        balanced = ProcessMemoryEnforcer(pool, memory_guard_tier="balanced")
+        aggressive = ProcessMemoryEnforcer(pool, memory_guard_tier="aggressive")
+
+        assert balanced._get_prefill_headroom_safety() == 0.92
+        assert aggressive._get_prefill_headroom_safety() == 0.97
+
     def test_get_pressure_level_when_not_running(self, enforcer_2wm):
         # _running=False → always ok regardless of cached level
         enforcer_2wm._pressure_level = "hard"
@@ -1078,8 +2425,10 @@ class TestTwoWatermarkPressureLevels:
 
     @pytest.mark.asyncio
     async def test_ok_when_below_soft(self, enforcer_2wm):
-        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
-             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf,
+        ):
             mock_mx.get_active_memory.return_value = 50 * 1024**3
             gpf.return_value = 50 * 1024**3
             await enforcer_2wm._check_and_enforce()
@@ -1089,8 +2438,10 @@ class TestTwoWatermarkPressureLevels:
     @pytest.mark.asyncio
     async def test_soft_when_active_low_but_phys_high(self, enforcer_2wm):
         """phys_footprint dominates active — the #702 case."""
-        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
-             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf,
+        ):
             # active well below soft, phys above soft but below hard
             mock_mx.get_active_memory.return_value = 50 * 1024**3
             gpf.return_value = 88 * 1024**3
@@ -1099,28 +2450,73 @@ class TestTwoWatermarkPressureLevels:
 
     @pytest.mark.asyncio
     async def test_hard_when_phys_at_hard_threshold(self, enforcer_2wm):
-        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
-             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf,
+        ):
             mock_mx.get_active_memory.return_value = 60 * 1024**3
             gpf.return_value = 98 * 1024**3
             await enforcer_2wm._check_and_enforce()
         assert enforcer_2wm._pressure_level == "hard"
 
     @pytest.mark.asyncio
+    async def test_hard_pressure_without_reachable_scheduler_shrinks_hot_cache(
+        self, mock_engine_pool
+    ):
+        budget = MagicMock()
+        budget.total_bytes = 20 * 1024**3
+        budget.max_bytes = 20 * 1024**3
+        budget.shrink_to.return_value = 8 * 1024**3
+        mock_engine_pool._scheduler_config = SimpleNamespace(hot_cache_budget=budget)
+        enforcer = _make_enforcer(
+            mock_engine_pool,
+            ceiling=100 * 1024**3,
+            soft_threshold=0.90,
+            hard_threshold=0.95,
+        )
+        to_thread_calls = []
+
+        async def run_inline(fn, *args, **kwargs):
+            to_thread_calls.append((fn, args, kwargs))
+            return fn(*args, **kwargs)
+
+        with (
+            patch.object(
+                enforcer,
+                "_current_usage_bytes",
+                side_effect=[98 * 1024**3, 80 * 1024**3],
+            ),
+            patch(
+                "omlx.process_memory_enforcer.asyncio.to_thread",
+                side_effect=run_inline,
+            ),
+        ):
+            await enforcer._check_and_enforce()
+
+        assert to_thread_calls
+        assert any(
+            call[0] == enforcer._shrink_hot_cache_for_pressure
+            for call in to_thread_calls
+        )
+        budget.shrink_to.assert_called_once()
+        target_hot = budget.shrink_to.call_args.args[0]
+        assert target_hot == 12 * 1024**3
+        assert enforcer._pressure_level == "ok"
+        mock_engine_pool._unload_engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_propagates_admission_paused_on_soft(self, enforcer_2wm, pool):
         # Wire a scheduler-like mock so propagate has something to set.
         engine = MagicMock()
         scheduler = MagicMock()
-        scheduler._memory_limit_bytes = 0
-        scheduler._memory_hard_limit_bytes = 0
-        scheduler._prefill_memory_guard = False
-        scheduler._admission_paused = False
         engine.scheduler = scheduler
         entry = _make_entry("m", engine=engine)
         pool._entries = {"m": entry}
 
-        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
-             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf,
+        ):
             mock_mx.get_active_memory.return_value = 50 * 1024**3
             gpf.return_value = 88 * 1024**3
             await enforcer_2wm._check_and_enforce()
@@ -1131,9 +2527,6 @@ class TestTwoWatermarkPressureLevels:
     async def test_clears_admission_paused_on_recovery(self, enforcer_2wm, pool):
         engine = MagicMock()
         scheduler = MagicMock()
-        scheduler._memory_limit_bytes = 0
-        scheduler._memory_hard_limit_bytes = 0
-        scheduler._prefill_memory_guard = False
         scheduler._admission_paused = True
         engine.scheduler = scheduler
         entry = _make_entry("m", engine=engine, is_pinned=True)
@@ -1142,8 +2535,10 @@ class TestTwoWatermarkPressureLevels:
         # Force into soft first
         enforcer_2wm._pressure_level = "soft"
 
-        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
-             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf,
+        ):
             mock_mx.get_active_memory.return_value = 30 * 1024**3
             gpf.return_value = 40 * 1024**3
             await enforcer_2wm._check_and_enforce()
@@ -1152,18 +2547,71 @@ class TestTwoWatermarkPressureLevels:
         assert scheduler._admission_paused is False
 
     @pytest.mark.asyncio
-    async def test_hard_aborts_in_flight_when_all_pinned(self, enforcer_2wm, pool):
+    async def test_propagates_abort_limit_to_scheduler(self, enforcer_2wm, pool):
+        """The stable abort ceiling is pushed to scheduler._memory_abort_limit_bytes
+        every tick, independent of the (jittery) dynamic hard limit."""
+        engine = MagicMock()
+        scheduler = MagicMock()
+        scheduler._memory_limit_bytes = 0
+        scheduler._memory_hard_limit_bytes = 0
+        scheduler._memory_abort_limit_bytes = 0
+        scheduler._prefill_memory_guard = False
+        scheduler._admission_paused = False
+        engine.scheduler = scheduler
+        pool._entries = {"m": _make_entry("m", engine=engine)}
+
+        # Stub the abort ceiling to a known stable value.
+        enforcer_2wm._get_abort_limit_bytes = lambda: 42 * 1024**3
+
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf,
+        ):
+            mock_mx.get_active_memory.return_value = 50 * 1024**3
+            gpf.return_value = 50 * 1024**3
+            await enforcer_2wm._check_and_enforce()
+
+        assert scheduler._memory_abort_limit_bytes == 42 * 1024**3
+
+    @pytest.mark.asyncio
+    async def test_propagates_prefill_abort_margin_to_scheduler(self, pool):
+        enforcer = _make_enforcer(pool, ceiling=100 * 1024**3, tier="custom")
+        engine = MagicMock()
+        scheduler = MagicMock()
+        scheduler._memory_limit_bytes = 0
+        scheduler._memory_hard_limit_bytes = 0
+        scheduler._memory_abort_limit_bytes = 0
+        scheduler._prefill_abort_margin = 0.90
+        scheduler._prefill_memory_guard = False
+        scheduler._admission_paused = False
+        engine.scheduler = scheduler
+        pool._entries = {"m": _make_entry("m", engine=engine)}
+
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf,
+        ):
+            mock_mx.get_active_memory.return_value = 50 * 1024**3
+            gpf.return_value = 50 * 1024**3
+            await enforcer._check_and_enforce()
+
+        assert scheduler._prefill_abort_margin == 0.95
+
+    @pytest.mark.asyncio
+    async def test_hard_below_ceiling_does_not_abort_all_pinned(
+        self, enforcer_2wm, pool
+    ):
         engine = MagicMock()
         engine.abort_all_requests = AsyncMock(return_value=3)
         entry = _make_entry("pinned", engine=engine, is_pinned=True)
         pool._entries = {"pinned": entry}
-        pool._find_lru_victim.return_value = "pinned"  # single non-pinned would route through abort_all; here all pinned route through loading abort. We test the single-non-pinned hard branch separately below.
-
         # Single pinned model means find_lru_victim returns None (pinned not victim).
         pool._find_lru_victim.return_value = None
 
-        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
-             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf,
+        ):
             mock_mx.get_active_memory.return_value = 60 * 1024**3
             gpf.return_value = 99 * 1024**3
             await enforcer_2wm._check_and_enforce()
@@ -1171,6 +2619,62 @@ class TestTwoWatermarkPressureLevels:
         # No in-progress loads to abort, all pinned → enforcer just logs warning,
         # doesn't crash.
         assert enforcer_2wm._pressure_level == "hard"
+        engine.abort_all_requests.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_emergency_margin_aborts_all_pinned_requests(
+        self, enforcer_2wm, pool
+    ):
+        engine = MagicMock()
+        engine.abort_all_requests = AsyncMock(return_value=3)
+        entry = _make_entry("pinned", engine=engine, is_pinned=True)
+        pool._entries = {"pinned": entry}
+        pool._find_lru_victim.return_value = None
+
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf,
+        ):
+            mock_mx.get_active_memory.return_value = 60 * 1024**3
+            gpf.return_value = 103 * 1024**3
+            await enforcer_2wm._check_and_enforce()
+
+        engine.abort_all_requests.assert_awaited_once()
+        pool._unload_engine.assert_not_awaited()
+        assert entry.engine is engine
+
+    @pytest.mark.asyncio
+    async def test_emergency_consecutive_over_ceiling_polls_abort_all_pinned(
+        self, enforcer_2wm, pool
+    ):
+        engine = MagicMock()
+        engine.abort_all_requests = AsyncMock(return_value=2)
+        entry = _make_entry("pinned", engine=engine, is_pinned=True)
+        pool._entries = {"pinned": entry}
+        pool._find_lru_victim.return_value = None
+
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf,
+        ):
+            mock_mx.get_active_memory.return_value = 60 * 1024**3
+            gpf.return_value = 101 * 1024**3
+            await enforcer_2wm._check_and_enforce()
+
+        engine.abort_all_requests.assert_not_awaited()
+        engine.abort_all_requests.reset_mock()
+
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf,
+        ):
+            mock_mx.get_active_memory.return_value = 60 * 1024**3
+            gpf.return_value = 101 * 1024**3
+            await enforcer_2wm._check_and_enforce()
+
+        engine.abort_all_requests.assert_awaited_once()
+        pool._unload_engine.assert_not_awaited()
+        assert entry.engine is engine
 
     @pytest.mark.asyncio
     async def test_soft_does_not_abort_loading(self, enforcer_2wm, pool):
@@ -1178,8 +2682,10 @@ class TestTwoWatermarkPressureLevels:
         pool._entries = {"loading": loading_entry}
         pool._find_lru_victim.return_value = None
 
-        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
-             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf,
+        ):
             mock_mx.get_active_memory.return_value = 50 * 1024**3
             gpf.return_value = 88 * 1024**3  # soft
             await enforcer_2wm._check_and_enforce()
@@ -1192,8 +2698,10 @@ class TestTwoWatermarkPressureLevels:
         pool._entries = {"loading": loading_entry}
         pool._find_lru_victim.return_value = None
 
-        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
-             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf,
+        ):
             mock_mx.get_active_memory.return_value = 60 * 1024**3
             gpf.return_value = 99 * 1024**3  # hard
             await enforcer_2wm._check_and_enforce()
@@ -1204,11 +2712,544 @@ class TestTwoWatermarkPressureLevels:
         """get_status must report the same value enforcer compares against,
         so admin UI / /health utilization matches the watermark logic."""
         enforcer_2wm._running = True
-        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
-             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf,
+        ):
             mock_mx.get_active_memory.return_value = 50 * 1024**3
             gpf.return_value = 88 * 1024**3  # phys dominates
             status = enforcer_2wm.get_status()
         assert status["current_bytes"] == 88 * 1024**3
         # Utilization computed against the max value
         assert abs(status["utilization"] - 0.88) < 0.01
+
+
+class TestDFlashGuardPropagation:
+    """The enforcer must reach DFlash's primary-mode guard target.
+
+    DFlash bypasses the scheduler: in primary mode it exposes a lightweight
+    ``_prefill_guard``; in fallback mode its ``scheduler`` property resolves
+    the fallback engine's real scheduler (covered by test_dflash_engine.py).
+    Without the ``_prefill_guard`` arm in ``_resolve_scheduler`` the watermarks
+    never reach a primary-mode DFlash and the prefill guard stays dead.
+    """
+
+    def test_resolves_primary_guard(self, enforcer):
+        guard = MagicMock(spec=[])
+        engine = MagicMock(spec=["_prefill_guard"])
+        engine._prefill_guard = guard
+        entry = _make_entry("dflash", engine=engine)
+        enforcer._engine_pool._entries = {"dflash": entry}
+
+        assert enforcer._resolve_scheduler(entry) is guard
+
+        enforcer._propagate_memory_limit()
+        assert guard._memory_hard_limit_bytes == 10 * 1024**3
+        assert guard._prefill_memory_guard == enforcer._prefill_memory_guard
+
+    def test_dflash_primary_does_not_warn(self, enforcer, caplog):
+        engine = MagicMock(spec=["_prefill_guard"])
+        engine._prefill_guard = MagicMock(spec=[])
+        entry = _make_entry("dflash", engine=engine)
+        enforcer._engine_pool._entries = {"dflash": entry}
+
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            enforcer._propagate_memory_limit()
+
+        assert not [
+            r for r in caplog.records if "could not resolve scheduler" in r.message
+        ]
+
+    def test_non_dflash_resolution_unchanged(self, enforcer):
+        """A standard engine with a direct ``.scheduler`` still resolves via the
+        existing chain — the DFlash arm must not interfere."""
+        scheduler = MagicMock(spec=[])
+        engine = MagicMock(spec=["scheduler"])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        assert enforcer._resolve_scheduler(entry) is scheduler
+
+
+class TestWiredLimitSuggestionClamp:
+    """The recommended iogpu.wired_limit_mb must leave the OS headroom (#2184)."""
+
+    def _with_total(self, total):
+        return patch("omlx.settings.get_system_memory", return_value=total)
+
+    def test_suggestion_below_reserve_unchanged(self):
+        total = 512 * 1024**3
+        desired = 400 * 1024**3
+        with self._with_total(total):
+            assert pme._wired_limit_suggestion_bytes(desired) == desired
+
+    def test_near_physical_suggestion_clamped(self):
+        total = 512 * 1024**3
+        desired = total - 8 * 1024**3  # safe-tier static ceiling: 504 GiB
+        with self._with_total(total):
+            clamped = pme._wired_limit_suggestion_bytes(desired)
+        # 5% of 512 GiB = 25.6 GiB reserve
+        expected = (total - total // 20) // (1024**2) * 1024**2
+        assert clamped == expected
+        assert clamped < desired
+
+    def test_small_mac_recommendation_unchanged(self):
+        """Small-memory Macs keep the tier recommendation: 5% of RAM stays
+        below the tier static reserve there, so the clamp does not bite and
+        users can wire as much as before (#2184 targets large boxes)."""
+        total = 32 * 1024**3
+        desired = total - 2 * 1024**3  # custom tier ceiling: RAM - 2 GiB
+        with self._with_total(total):
+            assert pme._wired_limit_suggestion_bytes(desired) == desired
+
+    def test_desired_above_cap_clamps_to_cap(self):
+        total = 4 * 1024**3
+        with self._with_total(total):
+            clamped = pme._wired_limit_suggestion_bytes(8 * 1024**3)
+        expected = (total - total // 20) // (1024**2) * 1024**2
+        assert clamped == expected
+
+    def test_128_gib_suggestion_floors_to_whole_mib(self):
+        """The sysctl accepts whole MiB, so the 95% threshold must not be
+        rounded up past the safe byte limit in the admin UI."""
+        total = 128 * 1024**3
+        desired = 122 * 1024**3
+        with self._with_total(total):
+            suggestion = pme._wired_limit_suggestion_bytes(desired)
+        assert suggestion == 124518 * 1024**2
+
+    def test_log_hint_uses_clamped_value(self, caplog):
+        total = 512 * 1024**3
+        desired = total - 8 * 1024**3
+        with (
+            self._with_total(total),
+            patch.object(pme, "get_iogpu_wired_limit_bytes", return_value=0),
+            patch.object(
+                pme,
+                "_get_max_metal_working_set_bytes",
+                return_value=384 * 1024**3,
+            ),
+            caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"),
+        ):
+            pme._apply_metal_wired_limit(desired)
+        hints = [r for r in caplog.records if "iogpu.wired_limit_mb=" in r.message]
+        assert hints
+        suggested_mb = (total - total // 20) // (1024**2)
+        assert f"iogpu.wired_limit_mb={suggested_mb}" in hints[0].getMessage()
+
+    def test_reasonable_user_cap_not_nagged(self, caplog):
+        """A user cap at the recommended level must not trigger the raise hint
+        even when the static ceiling is higher (the #2184 report followed the
+        old hint into a jetsam crash-loop)."""
+        total = 128 * 1024**3
+        desired = 122 * 1024**3
+        user_cap = 124518 * 1024**2  # highest whole-MiB value below 95%
+        with (
+            self._with_total(total),
+            patch.object(
+                pme, "get_iogpu_wired_limit_bytes", return_value=user_cap
+            ),
+            patch.object(pme.mx, "set_wired_limit", return_value=0),
+            caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"),
+        ):
+            pme._apply_metal_wired_limit(desired)
+        assert not [r for r in caplog.records if "Raise it with" in r.message]
+
+    def test_near_physical_user_cap_warns_jetsam(self, caplog):
+        total = 512 * 1024**3
+        user_cap = total - 2 * 1024**3  # 510 GiB, the crash-loop setting
+        with (
+            self._with_total(total),
+            patch.object(
+                pme, "get_iogpu_wired_limit_bytes", return_value=user_cap
+            ),
+            patch.object(pme.mx, "set_wired_limit", return_value=0),
+            caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"),
+        ):
+            pme._apply_metal_wired_limit(400 * 1024**3)
+        assert [r for r in caplog.records if "jetsam" in r.message]
+
+
+class TestPressureCacheReclaim:
+    """_request_scheduler_cache_reclaim — the under-load drain trigger."""
+
+    def _enforcer(self, schedulers):
+        pool = MagicMock()
+        pool._entries = {
+            f"model-{i}": SimpleNamespace(engine=SimpleNamespace(scheduler=s))
+            for i, s in enumerate(schedulers)
+        }
+        return _make_enforcer(engine_pool=pool)
+
+    def test_fires_when_shrink_freed_refs(self):
+        schedulers = [MagicMock(), MagicMock()]
+        enforcer = self._enforcer(schedulers)
+        with patch.object(pme.mx, "get_cache_memory", return_value=0):
+            requested = enforcer._request_scheduler_cache_reclaim(1 * 1024**3)
+        for s in schedulers:
+            s.request_pressure_reclaim.assert_called_once()
+        assert requested == 2
+
+    def test_skips_when_nothing_reclaimable(self):
+        schedulers = [MagicMock()]
+        enforcer = self._enforcer(schedulers)
+        with patch.object(pme.mx, "get_cache_memory", return_value=1 * 1024**3):
+            requested = enforcer._request_scheduler_cache_reclaim(0)
+        schedulers[0].request_pressure_reclaim.assert_not_called()
+        assert requested == 0
+
+    def test_fires_on_stranded_pool_without_hot_cache(self):
+        """The already-wedged case: hot cache empty, bytes parked in the pool."""
+        schedulers = [MagicMock()]
+        enforcer = self._enforcer(schedulers)
+        with patch.object(pme.mx, "get_cache_memory", return_value=3 * 1024**3):
+            requested = enforcer._request_scheduler_cache_reclaim(0)
+        schedulers[0].request_pressure_reclaim.assert_called_once()
+        assert requested == 1
+
+    def test_tolerates_non_numeric_pool_reading(self):
+        """A wholesale-mocked mx (as the wider suite uses) must not break
+        enforcement — a non-numeric cache reading is treated as empty."""
+        schedulers = [MagicMock()]
+        enforcer = self._enforcer(schedulers)
+        with patch.object(pme.mx, "get_cache_memory", return_value=object()):
+            requested = enforcer._request_scheduler_cache_reclaim(0)
+        schedulers[0].request_pressure_reclaim.assert_not_called()
+        assert requested == 0
+
+
+class TestPublicCeilingBreakdown:
+    """`get_ceiling_breakdown()` is what the engine pool reads to name the
+    ceiling that refused a load, so it has to describe the same computation
+    `get_final_ceiling()` returns."""
+
+    def _enforcer(self, tier: str) -> ProcessMemoryEnforcer:
+        pool = MagicMock()
+        pool._entries = {}
+        return ProcessMemoryEnforcer(engine_pool=pool, memory_guard_tier=tier)
+
+    def test_components_agree_with_the_final_ceiling(self):
+        """A 16 GB Mac on `safe` is dynamic-bound well below its static and
+        Metal caps — the case the load-refusal message has to explain."""
+        with (
+            patch("omlx.settings.get_system_memory", return_value=16 * 1024**3),
+            patch.object(pme, "get_phys_footprint", return_value=0),
+            patch.object(
+                pme.psutil_compat,
+                "get_macos_vm_stats",
+                return_value={
+                    "free": 3 * 1024**3,
+                    "inactive": 6 * 1024**3,
+                    "active": 7 * 1024**3,
+                    "wired": 4 * 1024**3,
+                },
+            ),
+            patch.object(
+                pme, "get_effective_metal_cap_bytes", return_value=12 * 1024**3
+            ),
+        ):
+            enforcer = self._enforcer("safe")
+            breakdown = enforcer.get_ceiling_breakdown()
+            ceiling = enforcer.get_final_ceiling()
+
+        # safe keeps 6 GB (its floor) free on a 16 GB Mac.
+        assert breakdown["static"] == 10 * 1024**3
+        assert breakdown["metal_cap"] == 12 * 1024**3
+        # free + inactive - reserve; safe never squeezes other apps' active.
+        assert breakdown["dynamic"] == 3 * 1024**3
+        assert breakdown["hard_limit"] == breakdown["dynamic"] == ceiling
+
+    def test_reserve_above_available_keeps_guard_enabled(self):
+        """Other apps holding the reserve must not read as guard disabled."""
+        with (
+            patch("omlx.settings.get_system_memory", return_value=16 * 1024**3),
+            patch.object(pme, "get_phys_footprint", return_value=0),
+            patch.object(
+                pme.psutil_compat,
+                "get_macos_vm_stats",
+                return_value={
+                    "free": 1 * 1024**3,
+                    "inactive": 2 * 1024**3,
+                    "active": 9 * 1024**3,
+                    "wired": 4 * 1024**3,
+                },
+            ),
+            patch.object(
+                pme, "get_effective_metal_cap_bytes", return_value=12 * 1024**3
+            ),
+        ):
+            ceiling = self._enforcer("safe").get_final_ceiling()
+        assert 0 < ceiling < 1024**2
+
+    def test_metal_cap_limits_gpu_memory_only(self):
+        """The CPU footprint rides on top of the Metal cap (#3917)."""
+        with (
+            patch("omlx.settings.get_system_memory", return_value=64 * 1024**3),
+            patch.object(pme, "get_phys_footprint", return_value=40 * 1024**3),
+            patch.object(pme, "get_graphics_footprint", return_value=32 * 1024**3),
+            patch.object(
+                pme.psutil_compat,
+                "get_macos_vm_stats",
+                return_value={
+                    "free": 20 * 1024**3,
+                    "inactive": 4 * 1024**3,
+                    "active": 4 * 1024**3,
+                    "wired": 36 * 1024**3,
+                },
+            ),
+            patch.object(
+                pme, "get_effective_metal_cap_bytes", return_value=48 * 1024**3
+            ),
+        ):
+            breakdown = self._enforcer("aggressive").get_ceiling_breakdown()
+        assert breakdown["metal_cap"] == 56 * 1024**3
+
+    def test_disabled_guard_reports_zero_components(self):
+        enforcer = self._enforcer("balanced")
+        enforcer._prefill_memory_guard = False
+        assert enforcer.get_ceiling_breakdown() == {
+            "static": 0,
+            "dynamic": 0,
+            "metal_cap": 0,
+            "hard_limit": 0,
+        }
+
+
+class TestPressureReclaimGrace:
+    """Reclaim-first grace gives pooled Metal buffers a bounded chance to
+    drain before destructive hot-cache shrinking or request aborts."""
+
+    def _busy_setup(self, enforcer):
+        engine = MagicMock()
+        engine.has_active_requests.return_value = False
+        engine.abort_all_requests = AsyncMock(return_value=1)
+        entry = _make_entry("big-model", engine=engine)
+        entry.in_use = 1
+        enforcer._engine_pool._entries = {"big-model": entry}
+        enforcer._engine_pool._find_lru_victim.return_value = None
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_reclaim_defers_hot_cache_shrink_and_abort(self, enforcer):
+        engine = self._busy_setup(enforcer)
+        scheduler = engine.scheduler
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch.object(
+                enforcer, "_shrink_hot_cache_for_pressure", return_value=0
+            ) as shrink,
+        ):
+            # Fixture thresholds are 1.0: 11GB is over the 10GB watermark
+            # but not emergency (needs ceiling + 2GB or 2 polls over).
+            mock_mx.get_active_memory.return_value = 11 * 1024**3
+            mock_mx.get_cache_memory.return_value = 3 * 1024**3
+            await enforcer._check_and_enforce()
+        engine.abort_all_requests.assert_not_awaited()
+        scheduler.request_pressure_reclaim.assert_called_once()
+        scheduler.adjust_store_cache_cap.assert_called_once_with("hard")
+        shrink.assert_not_called()
+        mock_mx.get_cache_memory.assert_called()
+        assert enforcer._pressure_reclaim_grace_polls == 1
+
+    @pytest.mark.asyncio
+    async def test_destructive_enforcement_fires_after_grace_exhausted(self, enforcer):
+        engine = self._busy_setup(enforcer)
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch.object(
+                enforcer, "_shrink_hot_cache_for_pressure", return_value=0
+            ) as shrink,
+        ):
+            enforcer._soft_threshold = 0.90
+            enforcer._hard_threshold = 0.95
+            mock_mx.get_active_memory.return_value = int(9.6 * 1024**3)
+            mock_mx.get_cache_memory.return_value = 3 * 1024**3
+            for _ in range(enforcer._PRESSURE_RECLAIM_GRACE_POLLS_MAX):
+                await enforcer._check_and_enforce()
+
+            engine.abort_all_requests.assert_not_awaited()
+            shrink.assert_not_called()
+            assert enforcer._pressure_reclaim_grace_polls == (
+                enforcer._PRESSURE_RECLAIM_GRACE_POLLS_MAX
+            )
+
+            await enforcer._check_and_enforce()
+        engine.abort_all_requests.assert_awaited_once()
+        shrink.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_destructive_enforcement_is_immediate_when_pool_below_floor(
+        self, enforcer
+    ):
+        """Nothing worth draining means no deferral."""
+        engine = self._busy_setup(enforcer)
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch.object(
+                enforcer, "_shrink_hot_cache_for_pressure", return_value=0
+            ) as shrink,
+        ):
+            mock_mx.get_active_memory.return_value = 11 * 1024**3
+            mock_mx.get_cache_memory.return_value = 1 * 1024**3
+            await enforcer._check_and_enforce()
+        engine.abort_all_requests.assert_awaited_once()
+        shrink.assert_called_once()
+        assert enforcer._pressure_reclaim_grace_polls == 0
+
+    @pytest.mark.asyncio
+    async def test_soft_pressure_reclaims_pool_before_evicting_idle_model(
+        self, mock_engine_pool
+    ):
+        """A pool that a clear can return must not evict an idle model (#3338)."""
+        gb = 1024**3
+        enforcer = _make_enforcer(
+            mock_engine_pool, ceiling=100 * gb, soft_threshold=0.85, hard_threshold=0.95
+        )
+        engine = MagicMock()
+        engine.has_active_requests.return_value = False
+        mock_engine_pool._entries = {
+            "model-a": _make_entry("model-a", engine=engine),
+            "model-b": _make_entry("model-b", engine=MagicMock()),
+        }
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch(
+                "omlx.process_memory_enforcer.get_phys_footprint",
+                return_value=90 * gb,
+            ),
+        ):
+            mock_mx.get_active_memory.return_value = 60 * gb
+            mock_mx.get_cache_memory.return_value = 20 * gb
+            await enforcer._check_and_enforce()
+
+        assert enforcer._pressure_level == "soft"
+        engine.scheduler.request_pressure_reclaim.assert_called_once()
+        mock_engine_pool._unload_engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_grace_counter_resets_on_recovery(self, enforcer):
+        self._busy_setup(enforcer)
+        enforcer._pressure_reclaim_grace_polls = 3
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.get_active_memory.return_value = 1 * 1024**3
+            mock_mx.get_cache_memory.return_value = 0
+            await enforcer._check_and_enforce()
+        assert enforcer._pressure_reclaim_grace_polls == 0
+
+    @pytest.mark.asyncio
+    async def test_grace_counter_resets_when_stopped(self, enforcer):
+        enforcer._pressure_reclaim_grace_polls = 3
+
+        await enforcer.stop()
+
+        assert enforcer._pressure_reclaim_grace_polls == 0
+
+    @pytest.mark.asyncio
+    async def test_emergency_aborts_despite_pool(self, enforcer):
+        """At/over the ceiling the grace never applies."""
+        engine = self._busy_setup(enforcer)
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch.object(
+                enforcer, "_shrink_hot_cache_for_pressure", return_value=0
+            ) as shrink,
+        ):
+            # 13GB: >= ceiling + 2GB -> emergency on the first poll.
+            mock_mx.get_active_memory.return_value = 13 * 1024**3
+            mock_mx.get_cache_memory.return_value = 3 * 1024**3
+            await enforcer._check_and_enforce()
+        engine.abort_all_requests.assert_awaited()
+        shrink.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_disabled_reclaim_falls_through_to_shrink_and_abort(
+        self, enforcer, monkeypatch
+    ):
+        engine = self._busy_setup(enforcer)
+        scheduler = engine.scheduler
+        monkeypatch.setenv("OMLX_DISABLE_PRESSURE_RECLAIM", "1")
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch.object(
+                enforcer, "_shrink_hot_cache_for_pressure", return_value=0
+            ) as shrink,
+        ):
+            mock_mx.get_active_memory.return_value = 11 * 1024**3
+            mock_mx.get_cache_memory.return_value = 3 * 1024**3
+            await enforcer._check_and_enforce()
+        scheduler.request_pressure_reclaim.assert_not_called()
+        shrink.assert_called_once()
+        engine.abort_all_requests.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_reachable_scheduler_falls_through_to_shrink_and_abort(
+        self, enforcer
+    ):
+        engine = SimpleNamespace(
+            has_active_requests=lambda: False,
+            abort_all_requests=AsyncMock(return_value=1),
+        )
+        entry = _make_entry("big-model", engine=engine)
+        entry.in_use = 1
+        enforcer._engine_pool._entries = {"big-model": entry}
+        enforcer._engine_pool._find_lru_victim.return_value = None
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch.object(
+                enforcer, "_shrink_hot_cache_for_pressure", return_value=0
+            ) as shrink,
+        ):
+            mock_mx.get_active_memory.return_value = 11 * 1024**3
+            mock_mx.get_cache_memory.return_value = 3 * 1024**3
+            await enforcer._check_and_enforce()
+        shrink.assert_called_once()
+        engine.abort_all_requests.assert_awaited_once()
+
+
+@pytest.mark.parametrize("initial_usage", [95_000, 105_000])
+async def test_image_cache_reclaimed_before_model_eviction(
+    mock_engine_pool, initial_usage
+):
+    images.clear_image_decode_cache()
+    buffer = io.BytesIO()
+    Image.new("RGB", (120, 120), "red").save(buffer, format="PNG")
+    source = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    images.load_image(source)
+    retained_bytes = images._image_decode_cache_bytes
+    enforcer = _make_enforcer(
+        mock_engine_pool, ceiling=100_000, soft_threshold=0.9, hard_threshold=1.0
+    )
+    try:
+        # Simulate the footprint dropping when unowned cache entries are released.
+        with patch.object(
+            enforcer,
+            "_current_usage_bytes",
+            side_effect=lambda: initial_usage
+            - retained_bytes
+            + images._image_decode_cache_bytes,
+        ):
+            await enforcer._check_and_enforce()
+        assert not images._image_decode_cache
+        assert enforcer._pressure_level == "ok"
+        mock_engine_pool._unload_engine.assert_not_called()
+    finally:
+        images.clear_image_decode_cache()
+
+
+async def test_image_cache_reclaim_remeasures_retained_request_memory(mock_engine_pool):
+    images.clear_image_decode_cache()
+    buffer = io.BytesIO()
+    Image.new("RGB", (120, 120), "blue").save(buffer, format="PNG")
+    source = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    active_image = images.load_image(source)
+    enforcer = _make_enforcer(
+        mock_engine_pool, ceiling=100_000, soft_threshold=0.9, hard_threshold=1.0
+    )
+    try:
+        # The request still owns the pixels, so dropping the cache frees no RAM.
+        with patch.object(enforcer, "_current_usage_bytes", return_value=95_000):
+            await enforcer._check_and_enforce()
+        assert not images._image_decode_cache
+        assert enforcer._pressure_level == "soft"
+        assert active_image.getpixel((0, 0)) == (0, 0, 255)
+    finally:
+        images.clear_image_decode_cache()

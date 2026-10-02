@@ -21,6 +21,7 @@ from typing import Optional
 
 import pytest
 
+from omlx.admin import accuracy_benchmark
 from omlx.admin.benchmark import (
     BenchmarkRequest,
     BenchmarkRun,
@@ -33,7 +34,6 @@ from omlx.admin.accuracy_benchmark import (
     AccuracyBenchmarkRun,
     _send_event as acc_send_event,
 )
-
 
 # --- Test helpers -----------------------------------------------------------
 
@@ -56,8 +56,9 @@ async def _drain(
         async with run.cond:
             while seen >= len(run.events) and not run.terminal:
                 try:
-                    await asyncio.wait_for(run.cond.wait(), timeout=timeout)
-                except asyncio.TimeoutError:
+                    async with asyncio.timeout(timeout):
+                        await run.cond.wait()
+                except TimeoutError:
                     break
             new = list(run.events[seen:])
             seen = len(run.events)
@@ -139,6 +140,28 @@ class TestBenchmarkSSEReplay:
 
         assert events[-1]["type"] == "upload_done"
         assert elapsed < 0.5, "stream blocked after terminal event"
+
+    @pytest.mark.asyncio
+    async def test_upload_skipped_is_also_terminal(self):
+        """External-endpoint runs end on upload_skipped, never upload_done.
+
+        Before upload_skipped joined the terminal set, a subscriber to an
+        external run waited for an upload_done that was never coming and hung
+        until the client timed out.
+        """
+        run = _bench_run()
+        await bench_send_event(run, {"type": "progress", "n": 1})
+        await bench_send_event(
+            run, {"type": "upload_skipped", "reason": "external_endpoint"}
+        )
+
+        start = asyncio.get_event_loop().time()
+        events = await _drain(run, timeout=5.0)
+        elapsed = asyncio.get_event_loop().time() - start
+
+        assert events[-1]["type"] == "upload_skipped"
+        assert run.terminal is True
+        assert elapsed < 0.5, "stream blocked after upload_skipped"
 
     @pytest.mark.asyncio
     async def test_error_is_also_terminal(self):
@@ -256,6 +279,40 @@ class TestAccuracyBenchmarkSSEReplay:
         assert r1 == r2
 
     @pytest.mark.asyncio
+    async def test_stream_disconnect_leaves_condition_released(self):
+        """A disconnect must not leave run.cond held by a finished task (#3960).
+
+        Starlette cancels a disconnected stream more than once. Here a producer
+        holds the lock across the first cancel and releases it before the
+        stream resumes from the second one.
+        """
+        from omlx.admin import routes as admin_routes
+
+        run = _acc_run()
+        accuracy_benchmark._accuracy_runs[run.bench_id] = run
+        try:
+            response = await admin_routes.stream_accuracy_benchmark(
+                run.bench_id, is_admin=True
+            )
+            reader = asyncio.create_task(response.body_iterator.__anext__())
+            for _ in range(3):
+                await asyncio.sleep(0)
+
+            await run.cond.acquire()
+            reader.cancel()
+            for _ in range(3):
+                await asyncio.sleep(0)
+            reader.cancel()
+            run.cond.release()
+            with pytest.raises(StopAsyncIteration):
+                await reader
+
+            await asyncio.wait_for(acc_send_event(run, {"type": "done"}), 1.0)
+            assert not run.cond.locked()
+        finally:
+            accuracy_benchmark._accuracy_runs.pop(run.bench_id, None)
+
+    @pytest.mark.asyncio
     async def test_last_progress_still_tracked(self):
         # The queue/status REST endpoint relies on `last_progress` for
         # the reconnect hint. The SSE refactor must preserve that.
@@ -314,7 +371,12 @@ class TestActiveBenchEndpoint:
     def test_returns_not_running_when_idle(self, bench_client):
         r = bench_client.get("/admin/api/bench/active")
         assert r.status_code == 200
-        assert r.json() == {"running": False, "bench_id": None, "model_id": None}
+        assert r.json() == {
+            "running": False,
+            "bench_id": None,
+            "model_id": None,
+            "context_profile": None,
+        }
 
     def test_returns_running_run_payload(self, bench_client):
         run = BenchmarkRun(
@@ -330,6 +392,9 @@ class TestActiveBenchEndpoint:
             "running": True,
             "bench_id": "bench-abc",
             "model_id": "model-x",
+            "context_profile": "code_python",
+            "force_lm_engine": False,
+            "external": False,
         }
 
 
@@ -347,10 +412,13 @@ class TestConcurrentStartRejection:
         existing.status = "running"
         _benchmark_runs[existing.bench_id] = existing
 
-        r = bench_client.post("/admin/api/bench/start", json={
-            "model_id": "model-x",
-            "prompt_lengths": [1024],
-        })
+        r = bench_client.post(
+            "/admin/api/bench/start",
+            json={
+                "model_id": "model-x",
+                "prompt_lengths": [1024],
+            },
+        )
         assert r.status_code == 409
         body = r.json()
         assert "already running" in body["detail"].lower()
@@ -377,8 +445,11 @@ class TestConcurrentStartRejection:
 
         monkeypatch.setattr(bench_module, "run_benchmark", _noop)
 
-        r = bench_client.post("/admin/api/bench/start", json={
-            "model_id": "model-x",
-            "prompt_lengths": [1024],
-        })
+        r = bench_client.post(
+            "/admin/api/bench/start",
+            json={
+                "model_id": "model-x",
+                "prompt_lengths": [1024],
+            },
+        )
         assert r.status_code == 200, r.text

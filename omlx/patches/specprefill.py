@@ -9,7 +9,7 @@ Based on arxiv.org/abs/2502.02789 and waybarrios/vllm-mlx PR #180.
 
 Pipeline:
   1. score_tokens()  — draft model scores token importance via attention
-  2. select_chunks() — chunk-based top-K% selection
+  2. select_chunks() — chunk-based top-K% selection + mandatory tail window
   3. sparse_prefill() — target prefill with manual RoPE at original positions
   4. cleanup_rope()  — restore original RoPE after generation
 
@@ -229,6 +229,79 @@ def _build_layer_to_cache_map(model) -> Dict[int, int]:
     return layer_to_cache
 
 
+class IndeterminateCacheOffsetError(RuntimeError):
+    """A populated cache has no readable token position."""
+
+
+def _leaf_cache_offset(cache_entry: Any) -> int | None:
+    """Read an integer token offset, descending into composite caches."""
+    for sub in getattr(cache_entry, "caches", None) or ():
+        offset = _leaf_cache_offset(sub)
+        if offset is not None:
+            return offset
+    offset = getattr(cache_entry, "offset", None)
+    # bool is a subclass of int, and would otherwise read as position 0 or 1.
+    if isinstance(offset, bool) or not isinstance(offset, int):
+        return None
+    return offset
+
+
+def _cache_entry_is_bounded(cache_entry: Any) -> bool:
+    """Detect bounded caches, including composite members."""
+    subs = getattr(cache_entry, "caches", None)
+    if isinstance(subs, (list, tuple)):
+        return any(_cache_entry_is_bounded(sub) for sub in subs)
+    return getattr(cache_entry, "max_size", None) is not None
+
+
+def _cache_entry_is_empty(cache_entry: Any) -> bool:
+    """Require a successful empty() probe before treating a cache as empty."""
+    empty = getattr(cache_entry, "empty", None)
+    if not callable(empty):
+        return False
+    try:
+        return bool(empty())
+    except Exception:
+        return False
+
+
+def _logical_cache_offset(model, cache: list[Any]) -> int:
+    """Read the sequence position from mapped attention caches."""
+    held: list[int] = []
+    bounded: list[int] = []
+
+    def _record(entry: Any) -> None:
+        offset = _leaf_cache_offset(entry)
+        if offset is not None:
+            (bounded if _cache_entry_is_bounded(entry) else held).append(offset)
+
+    layer_to_cache = _build_layer_to_cache_map(model)
+    for layer_idx, _layer in _find_attention_layers(model):
+        cache_idx = layer_to_cache.get(layer_idx, layer_idx)
+        if 0 <= cache_idx < len(cache):
+            _record(cache[cache_idx])
+
+    # Prefer unbounded layer offsets; use bounded layers only when necessary.
+    offsets = held or bounded
+
+    if not offsets:
+        if any(not _cache_entry_is_empty(entry) for entry in cache):
+            raise IndeterminateCacheOffsetError(
+                f"cache of {len(cache)} layers holds state but reports no "
+                f"token offset; refusing to assume 0"
+            )
+        return 0
+
+    lowest = min(offsets)
+    if lowest != max(offsets):
+        logger.warning(
+            "SpecPrefill: cache layers disagree on sequence position %s, using %d",
+            sorted(set(offsets)),
+            lowest,
+        )
+    return max(0, lowest)
+
+
 def _linear_output_dims(linear) -> Optional[int]:
     """Best-effort output dimension lookup for Linear / QuantizedLinear layers."""
     if linear is None:
@@ -342,6 +415,80 @@ def _unpatch_attention_capture(model, originals):
     """Restore original attention modules after capture."""
     for layer_idx, orig in originals:
         _set_attn_module(model.layers[layer_idx], orig)
+
+
+def _cache_leaves(cache: list[Any]) -> list[Any]:
+    """Leaf caches of *cache*, descending into composites such as CacheList."""
+    leaves: list[Any] = []
+    for entry in cache:
+        subs = getattr(entry, "caches", None)
+        if isinstance(subs, (list, tuple)):
+            leaves.extend(_cache_leaves(list(subs)))
+        else:
+            leaves.append(entry)
+    return leaves
+
+
+def _is_sliceable_kv(leaf: Any) -> bool:
+    """Whether *leaf* is an unbounded KV cache the lookahead trim can slice back."""
+    return hasattr(leaf, "keys") and not _cache_entry_is_bounded(leaf)
+
+
+class _HeldObject:
+    """An object nested in a cache leaf, with its attributes as they were."""
+
+    __slots__ = ("obj", "attrs")
+
+    def __init__(self, obj: Any, attrs: dict[str, Any]) -> None:
+        self.obj = obj
+        self.attrs = attrs
+
+
+def _hold_value(value: Any, seen: set[int]) -> Any:
+    if isinstance(value, mx.array):
+        return mx.array(value)
+    if isinstance(value, (list, tuple)):
+        return type(value)(_hold_value(v, seen) for v in value)
+    if isinstance(value, dict):
+        return {k: _hold_value(v, seen) for k, v in value.items()}
+    # Visit each nested object once to preserve aliases and avoid object cycles.
+    if hasattr(value, "__dict__") and not callable(value) and id(value) not in seen:
+        return _HeldObject(value, _hold_leaf_state(value, seen))
+    return value
+
+
+def _restore_value(held: Any) -> Any:
+    if isinstance(held, _HeldObject):
+        vars(held.obj).update(
+            {k: _restore_value(v) for k, v in held.attrs.items()}
+        )
+        return held.obj
+    if isinstance(held, (list, tuple)):
+        return type(held)(_restore_value(v) for v in held)
+    if isinstance(held, dict):
+        return {k: _restore_value(v) for k, v in held.items()}
+    return held
+
+
+def _hold_leaf_state(leaf: Any, seen: set[int] | None = None) -> dict[str, Any]:
+    """Copy mutable cache state, including nested wrapper objects."""
+    seen = set() if seen is None else seen
+    seen.add(id(leaf))
+    return {k: _hold_value(v, seen) for k, v in vars(leaf).items()}
+
+
+def _undo_lookahead(
+    leaves: list[Any], held_states: list[Any], pre_lookahead_offset: int
+) -> None:
+    """Trim unbounded KV and restore the saved state of all other leaves."""
+    for leaf, held in zip(leaves, held_states):
+        if held is not None:
+            vars(leaf).update({k: _restore_value(v) for k, v in held.items()})
+        elif getattr(leaf, "offset", 0) > pre_lookahead_offset:
+            if leaf.keys is not None:
+                leaf.keys = leaf.keys[..., :pre_lookahead_offset, :]
+                leaf.values = leaf.values[..., :pre_lookahead_offset, :]
+            leaf.offset = pre_lookahead_offset
 
 
 def _prefill_draft(model, tokens, cache, step_size=2048, progress_callback=None):
@@ -505,24 +652,25 @@ def score_tokens(
     # Phase 1: Prefill (full or suffix-only if cache provided)
     if existing_cache is not None:
         cache = existing_cache
-        cached_len = cache[0].offset if hasattr(cache[0], "offset") else 0
-        suffix = tokens[cached_len:]
-        if suffix:
-            logits = _prefill_draft(
-                model,
-                suffix,
-                cache,
-                step_size=prefill_step_size,
-                progress_callback=(
-                    (lambda processed, total: progress_callback(cached_len + processed, n_prompt, "scoring"))
-                    if progress_callback is not None
-                    else None
-                ),
+        cached_len = _logical_cache_offset(model, cache)
+        # The final prompt token must run once to produce the lookahead logits.
+        if cached_len >= n_prompt:
+            raise ValueError(
+                f"existing_cache holds {cached_len} tokens but the prompt has "
+                f"{n_prompt}; leave at least the last prompt token uncached"
             )
-        else:
-            # Exact cache hit — run last token to get logits
-            logits = model(mx.array([tokens[-1]])[None], cache=cache)
-            mx.eval(logits)
+        suffix = tokens[cached_len:]
+        logits = _prefill_draft(
+            model,
+            suffix,
+            cache,
+            step_size=prefill_step_size,
+            progress_callback=(
+                (lambda processed, total: progress_callback(cached_len + processed, n_prompt, "scoring"))
+                if progress_callback is not None
+                else None
+            ),
+        )
     else:
         cache = make_prompt_cache(model)
         logits = _prefill_draft(
@@ -537,10 +685,18 @@ def score_tokens(
             ),
         )
 
-    # Record cache offset before lookahead so we can trim afterwards.
-    # Lookahead decode appends n_lookahead+1 tokens to the cache which
-    # must NOT be persisted when the caller stores the cache to SSD.
-    pre_lookahead_offset = cache[0].offset if hasattr(cache[0], "offset") else n_prompt
+    # The returned cache must exclude lookahead tokens.
+    try:
+        pre_lookahead_offset = _logical_cache_offset(model, cache)
+    except IndeterminateCacheOffsetError:
+        pre_lookahead_offset = n_prompt
+
+    # Recurrent state and wrapped rotating buffers cannot be trimmed like KV.
+    leaves = _cache_leaves(cache)
+    held_states = [
+        None if _is_sliceable_kv(leaf) else _hold_leaf_state(leaf)
+        for leaf in leaves
+    ]
 
     # Phase 2: Lookahead decode with query capture
     query_buffer = [[] for _ in range(n_attn_layers)]
@@ -570,16 +726,7 @@ def score_tokens(
     if progress_callback is not None:
         progress_callback(n_prompt, n_prompt, "importance")
 
-    # Trim lookahead tokens from cache before returning.
-    # KVCache stores keys/values as contiguous tensors; slicing back
-    # to pre_lookahead_offset removes the lookahead-generated entries.
-    for c in cache:
-        if hasattr(c, "offset") and c.offset > pre_lookahead_offset:
-            trim = c.offset - pre_lookahead_offset
-            if hasattr(c, "keys") and c.keys is not None:
-                c.keys = c.keys[..., :pre_lookahead_offset, :]
-                c.values = c.values[..., :pre_lookahead_offset, :]
-            c.offset = pre_lookahead_offset
+    _undo_lookahead(leaves, held_states, pre_lookahead_offset)
 
     del logits, query_buffer, attn_caches
     mx.clear_cache()
@@ -588,14 +735,32 @@ def score_tokens(
 
 
 def select_chunks(
-    importance: mx.array, keep_pct: float = 0.3, chunk_size: int = 32
+    importance: mx.array,
+    keep_pct: float = 0.3,
+    chunk_size: int = 32,
+    tail_tokens: int = 512,
 ) -> mx.array:
     """Select top-K% token chunks by average importance.
+
+    The final ``ceil(tail_tokens / chunk_size)`` chunks are always selected
+    (covering at least ``tail_tokens - chunk_size + 1`` trailing tokens).
+    Chat templates end with structural markers (tool-result closers,
+    end-of-turn, the generation prompt) whose chunks can lose the
+    importance ranking; when they do, the target model is left
+    mid-structure and emits malformed output (e.g. a bare </tool_response>
+    then EOS) instead of an answer. The mandatory tail chunks are drawn
+    from the normal keep budget first: when the budget covers the tail
+    (keep_n >= 16 chunks at the defaults, i.e. scored regions >= 2,401
+    tokens at keep_pct=0.2) the selected count is unchanged and only the
+    composition shifts; on smaller inputs the floor takes precedence over
+    ``keep_pct``.
 
     Args:
         importance: (M,) per-token importance scores
         keep_pct: fraction of chunks to keep (default 0.3)
         chunk_size: tokens per chunk (default 32)
+        tail_tokens: trailing-token window always selected, rounded up to
+            whole chunks (default 512, 0 disables the floor)
 
     Returns:
         sorted mx.array of kept token indices
@@ -606,16 +771,22 @@ def select_chunks(
 
     n_chunks = math.ceil(M / chunk_size)
     keep_n = max(1, math.ceil(n_chunks * keep_pct))
+    n_tail_chunks = (
+        min(n_chunks, math.ceil(tail_tokens / chunk_size)) if tail_tokens > 0 else 0
+    )
+    ranked_end = n_chunks - n_tail_chunks
 
     chunk_scores = []
-    for i in range(n_chunks):
+    for i in range(ranked_end):
         start = i * chunk_size
         end = min(start + chunk_size, M)
         chunk_scores.append(mx.mean(importance[start:end]).item())
 
-    top_chunks = sorted(range(n_chunks), key=lambda i: chunk_scores[i], reverse=True)[
-        :keep_n
+    budget = max(0, keep_n - n_tail_chunks)
+    top_chunks = sorted(range(ranked_end), key=lambda i: chunk_scores[i], reverse=True)[
+        :budget
     ]
+    top_chunks.extend(range(ranked_end, n_chunks))
     top_chunks.sort()
 
     indices = []
@@ -659,10 +830,34 @@ def manual_rope(x, positions, dims, base=10000.0, scale=1.0):
 def manual_rope_with_freqs(x, positions, dims, freqs, pre_scale=1.0):
     """Apply RoPE at arbitrary positions using pre-computed frequencies.
 
-    For custom RoPE variants (Llama3, Yarn, SuScaled) that store _freqs.
+    For custom RoPE variants (Llama3, Yarn, SuScaled) that store ``_freqs``,
+    and for partial-rotary models that report ``dims`` = full head_dim while
+    their frequency table covers only a rotary sub-slice (e.g. Gemma 4, whose
+    local/global attention heads differ).
+
+    The model's real RoPE (mlx-vlm ``ProportionalRoPE`` / HF ``rotate_half``)
+    pairs dim ``i`` with dim ``i + dims // 2`` over the FULL head, and only the
+    first ``len(freqs)`` of those pairs actually rotate -- the remaining pairs
+    pass through unchanged. We reproduce that exactly by zero-padding the
+    inverse frequencies up to ``dims // 2`` (angle 0 is the identity rotation:
+    ``cos 0 = 1``, ``sin 0 = 0``), so the non-rotating pairs are untouched.
+
+    Bit-exact for full-rotary custom-``_freqs`` models (``len(freqs) == dims //
+    2``, no padding added) and correct for the partial-rotary / mixed-head
+    case. An earlier version derived the width as ``2 * len(freqs)`` and rotated
+    the contiguous first ``2 * len(freqs)`` dims (pairing ``i`` with ``i +
+    len(freqs)``), which rotated the wrong lanes and wrote misrotated KV on
+    every global layer (jundot, PR #2295).
     """
     half = dims // 2
+    n = int(freqs.shape[-1])
     inv_freq = (1.0 / freqs).astype(mx.float32)
+    if n < half:
+        # Zero-pad the unrotated pairs: angle 0 keeps them identity, matching
+        # the model's partial rotary exactly.
+        inv_freq = mx.concatenate(
+            [inv_freq, mx.zeros((half - n,), dtype=mx.float32)], axis=-1
+        )
     angles = positions[:, None].astype(mx.float32) * inv_freq[None, :]
     cos_a = mx.cos(angles)[None, None, :, :]
     sin_a = mx.sin(angles)[None, None, :, :]
@@ -706,7 +901,7 @@ class _PositionMappedRoPE:
             self._dims = _get_dims(original_rope)
             self._pre_scale = _get_pre_scale(original_rope)
         else:
-            self._dims = original_rope.dims
+            self._dims = _get_dims(original_rope)
             self._base = original_rope.base
             self._scale = original_rope.scale
 
@@ -735,6 +930,24 @@ class _OffsetAdjustedRoPE:
 
     def __call__(self, x, offset=0):
         return self._original(x, offset=offset + self._adjustment)
+
+    def __getattr__(self, name):
+        # Delegate unknown attrs (e.g. .dims, .base, ._freqs) to the wrapped
+        # rope so this wrapper is transparent if it is ever re-wrapped. See #766.
+        return getattr(object.__getattribute__(self, "_original"), name)
+
+
+def _unwrap_rope(rope):
+    """Peel any sparse-prefill RoPE wrappers down to the genuine module.
+
+    If a prior sparse_prefill left an _OffsetAdjustedRoPE installed (cleanup_rope
+    not called between multi-turn requests), re-wrapping it would nest wrappers
+    and, before this fix, crash in _PositionMappedRoPE. Always start from the
+    genuine rope. See #766.
+    """
+    while isinstance(rope, (_OffsetAdjustedRoPE, _PositionMappedRoPE)):
+        rope = rope._original
+    return rope
 
 
 def _get_dims(rope_module):
@@ -835,9 +1048,13 @@ def sparse_prefill(
     if has_rope:
         for layer_idx, layer in attn_layers:
             attn = _get_attn_module(layer)
-            original_ropes[layer_idx] = attn.rope
+            # Start from the genuine rope: a prior sparse_prefill may have left
+            # an _OffsetAdjustedRoPE installed if cleanup_rope wasn't called
+            # (multi-turn + partial cache hit). See #766.
+            genuine = _unwrap_rope(attn.rope)
+            original_ropes[layer_idx] = genuine
             attn.rope = _PositionMappedRoPE(
-                attn.rope, selected_positions, cache_start=cache_start
+                genuine, selected_positions, cache_start=cache_start
             )
 
     try:
@@ -892,9 +1109,9 @@ def cleanup_rope(model):
         attn = _get_attn_module(layer)
         if attn is None or not hasattr(attn, "rope"):
             continue
-        rope = attn.rope
-        if isinstance(rope, (_OffsetAdjustedRoPE, _PositionMappedRoPE)):
-            attn.rope = rope._original
+        genuine = _unwrap_rope(attn.rope)
+        if genuine is not attn.rope:
+            attn.rope = genuine
 
 
 # ===========================================================================

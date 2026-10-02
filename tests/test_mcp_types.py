@@ -124,6 +124,26 @@ class TestMCPServerConfig:
         )
         assert config.timeout == 120.0
 
+    def test_stdio_config_with_cwd(self):
+        """Test stdio config accepts a working directory (#1111)."""
+        config = MCPServerConfig(
+            name="cwd-server",
+            transport=MCPTransport.STDIO,
+            command="node",
+            args=["server.js"],
+            cwd="/srv/mcp/cwd-server",
+        )
+        assert config.cwd == "/srv/mcp/cwd-server"
+
+    def test_cwd_defaults_to_none(self):
+        """Test cwd defaults to None when omitted."""
+        config = MCPServerConfig(
+            name="no-cwd",
+            transport=MCPTransport.STDIO,
+            command="python",
+        )
+        assert config.cwd is None
+
 
 class TestMCPConfig:
     """Tests for MCPConfig dataclass."""
@@ -185,6 +205,25 @@ class TestMCPConfig:
         assert config.servers["web-server"].url == "http://localhost:3000/mcp"
         assert config.max_tool_calls == 20
         assert config.default_timeout == 45.0
+
+    def test_from_dict_server_with_cwd(self):
+        """Test 'cwd' survives the **server_data expansion (#1111).
+
+        Before the fix the unknown kwarg made MCPServerConfig raise
+        TypeError, which disabled MCP for the whole config.
+        """
+        data = {
+            "servers": {
+                "local-tools": {
+                    "transport": "stdio",
+                    "command": "node",
+                    "args": ["server.js"],
+                    "cwd": "/srv/mcp/local-tools",
+                },
+            },
+        }
+        config = MCPConfig.from_dict(data)
+        assert config.servers["local-tools"].cwd == "/srv/mcp/local-tools"
 
 
 class TestMCPTool:

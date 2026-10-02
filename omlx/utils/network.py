@@ -12,6 +12,7 @@ import ipaddress
 import logging
 import re
 import socket
+import threading
 from collections.abc import Iterable
 
 logger = logging.getLogger(__name__)
@@ -19,6 +20,12 @@ logger = logging.getLogger(__name__)
 # RFC 1123 hostname label: letters, digits, hyphens; 1-63 chars per label.
 # Allows trailing dot. Total length capped at 253.
 _HOSTNAME_LABEL = re.compile(r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)$")
+# The rightmost label must contain at least one letter.  IANA has never
+# delegated a purely numeric TLD, so an all-digit final label (e.g. the
+# "999" in "999.999.999.999") indicates an IP-shaped string masquerading
+# as a hostname, not a real DNS name.  This mirrors the approach used by
+# the ``validators`` library (python-validators on PyPI).
+_HOSTNAME_LAST_LABEL_HAS_LETTER = re.compile(r"[A-Za-z]")
 
 
 def is_valid_hostname(value: str) -> bool:
@@ -26,7 +33,15 @@ def is_valid_hostname(value: str) -> bool:
     if not value or len(value) > 253:
         return False
     candidate = value[:-1] if value.endswith(".") else value
-    return all(_HOSTNAME_LABEL.match(label) for label in candidate.split("."))
+    labels = candidate.split(".")
+    # For dotted names only: the rightmost label must contain at least one
+    # letter.  IANA has never delegated a purely numeric TLD, so an all-digit
+    # final label (e.g. "999" in "999.999.999.999") signals an IP-shaped
+    # string masquerading as a hostname.  Single-label names (no dots) are
+    # local hostnames and are not subject to this TLD constraint.
+    if len(labels) > 1 and not _HOSTNAME_LAST_LABEL_HAS_LETTER.search(labels[-1]):
+        return False
+    return all(_HOSTNAME_LABEL.match(label) for label in labels)
 
 
 def is_valid_ip(value: str) -> bool:
@@ -62,6 +77,90 @@ def is_valid_alias(value: str) -> bool:
     except ValueError:
         return is_valid_hostname(value)
     return is_valid_ip(value)
+
+
+def is_valid_bind_host(value: str) -> bool:
+    """Return True if ``value`` is a valid host to bind a server socket to.
+
+    Accepts any parseable IP address (including ``0.0.0.0`` and ``::``) and
+    valid DNS hostnames. Unlike :func:`is_valid_alias`, unspecified addresses
+    are allowed because they are legitimate bind targets.
+    """
+    if not isinstance(value, str):
+        return False
+    value = value.strip()
+    if not value:
+        return False
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        pass
+    # Fast-path rejection for IP-shaped strings that failed IP parsing
+    # (e.g. "999.999.999.999").  is_valid_hostname() would also reject them
+    # via the last-label letter requirement, but this regex short-circuits
+    # before the per-label loop.
+    if re.match(r"^\d+(\.\d+)+$", value):
+        return False
+    return is_valid_hostname(value)
+
+
+def is_loopback_bind_host(value: str) -> bool:
+    """Return whether a bind host is explicitly limited to loopback."""
+
+    if not isinstance(value, str):
+        return False
+    candidate = value.strip()
+    if not candidate:
+        return False
+    if candidate.rstrip(".").lower() == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        return False
+    if address.is_loopback:
+        return True
+    return bool(
+        isinstance(address, ipaddress.IPv6Address)
+        and address.ipv4_mapped is not None
+        and address.ipv4_mapped.is_loopback
+    )
+
+
+def is_loopback_bind(value: str) -> bool:
+    """Return whether every configured bind host is loopback-only."""
+
+    if not isinstance(value, str):
+        return False
+    bind_hosts = [part.strip() for part in value.split(",") if part.strip()]
+    return bool(bind_hosts) and all(
+        is_loopback_bind_host(part) for part in bind_hosts
+    )
+
+
+def network_auth_error(
+    host: str,
+    api_key: str | None,
+    skip_api_key_verification: bool,
+) -> str | None:
+    """Reject unauthenticated servers that bind beyond loopback."""
+
+    if not isinstance(host, str):
+        return "Server host must be a string."
+    if is_loopback_bind(host):
+        return None
+    if skip_api_key_verification:
+        return (
+            "API key verification cannot be skipped when binding to a "
+            f"non-loopback host ({host})."
+        )
+    if not isinstance(api_key, str) or not api_key.strip():
+        return (
+            f"An API key is required when binding to a non-loopback host ({host}). "
+            "Set --api-key or OMLX_API_KEY, or bind to 127.0.0.1."
+        )
+    return None
 
 
 def _local_ipv4_addresses() -> list[str]:
@@ -103,6 +202,29 @@ def _local_ipv4_addresses() -> list[str]:
     return addresses
 
 
+# getfqdn() is a reverse DNS lookup; with a broken resolver it blocks for 35 s
+# or more, and server startup calls detect_server_aliases().
+_FQDN_TIMEOUT_S = 2.0
+
+
+def _fqdn() -> str | None:
+    """``socket.getfqdn()``, or None when it does not answer in time."""
+    result: list[str] = []
+
+    def lookup() -> None:
+        try:
+            result.append(socket.getfqdn())
+        except OSError as exc:
+            logger.debug("getfqdn failed: %s", exc)
+
+    worker = threading.Thread(target=lookup, name="omlx-getfqdn", daemon=True)
+    worker.start()
+    worker.join(_FQDN_TIMEOUT_S)
+    if worker.is_alive():
+        logger.debug("getfqdn timed out after %.1fs", _FQDN_TIMEOUT_S)
+    return result[0] if result else None
+
+
 def _dedupe_preserve_order(items: Iterable[str]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
@@ -128,7 +250,10 @@ def detect_server_aliases(host: str = "127.0.0.1") -> list[str]:
     candidates: list[str] = []
 
     # Always offer loopback first when bound to localhost or all interfaces.
-    if host in ("127.0.0.1", "localhost", "0.0.0.0", "::"):
+    # `host` may be a comma-separated list (e.g. "127.0.0.1, ::1"), so check
+    # each part individually to avoid dropping loopback aliases.
+    _bind_hosts = {h.strip() for h in host.split(",")}
+    if _bind_hosts & {"127.0.0.1", "localhost", "0.0.0.0", "::"}:
         candidates.append("localhost")
         candidates.append("127.0.0.1")
 
@@ -142,14 +267,11 @@ def detect_server_aliases(host: str = "127.0.0.1") -> list[str]:
     except OSError as exc:
         logger.debug("gethostname failed: %s", exc)
 
-    try:
-        fqdn = socket.getfqdn()
-        # Skip reverse-DNS PTR records (e.g. "...ip6.arpa", "...in-addr.arpa")
-        # which are not user-friendly and not routable as URLs.
-        if fqdn and not fqdn.endswith((".ip6.arpa", ".in-addr.arpa")):
-            candidates.append(fqdn)
-    except OSError as exc:
-        logger.debug("getfqdn failed: %s", exc)
+    fqdn = _fqdn()
+    # Skip reverse-DNS PTR records (e.g. "...ip6.arpa", "...in-addr.arpa")
+    # which are not user-friendly and not routable as URLs.
+    if fqdn and not fqdn.endswith((".ip6.arpa", ".in-addr.arpa")):
+        candidates.append(fqdn)
 
     candidates.extend(_local_ipv4_addresses())
 

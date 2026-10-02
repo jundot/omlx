@@ -1,19 +1,17 @@
-// Top-level sections rendered by AppView's TabView. Each case becomes one
-// `Tab` value in `TabView(selection:)`, with `title` driving the visible
-// label (localized with a `defaultValue` fallback so the catalog isn't
-// load-bearing) and `symbol` driving the SF Symbol on the tab.
+// Top-level sections rendered by AppView's settings sidebar. Each case becomes
+// one selectable row, with `title` driving the visible label (localized with a
+// `defaultValue` fallback so the catalog isn't load-bearing) and `symbol`
+// driving the SF Symbol on the row.
 //
-// Section groupings (Server / Models / Benchmark / General) live inline
-// in AppView via `TabSection` blocks — there's no separate `SidebarGroup`
-// enum anymore; the visual grouping is purely a layout decision in the
-// TabView body.
+// Section groupings (Server / Models / Benchmark / General) live inline in
+// AppView; the visual grouping is purely a layout decision in the shell.
 
 import SwiftUI
 
 enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
-    case server, status, network, performance, logs
+    case server, status, appearance, network, performance, logs
     case models, downloads, integrations, quantization
-    case throughputBench, accuracyBench
+    case throughputBench, accuracyBench, contextBench
     case security, about
 
     var id: String { rawValue }
@@ -36,6 +34,10 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
             return String(localized: "sidebar.status",
                           defaultValue: "Status",
                           comment: "Sidebar row label / navigation title for the Status section")
+        case .appearance:
+            return String(localized: "sidebar.appearance",
+                          defaultValue: "Appearance",
+                          comment: "Sidebar row label / navigation title for the Appearance section")
         case .logs:
             return String(localized: "sidebar.logs",
                           defaultValue: "Logs",
@@ -64,6 +66,10 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
             return String(localized: "sidebar.accuracyBench",
                           defaultValue: "Accuracy",
                           comment: "Sidebar row label / navigation title for the Accuracy benchmark section")
+        case .contextBench:
+            return String(localized: "sidebar.contextBench",
+                          defaultValue: "Context",
+                          comment: "Sidebar row label / navigation title for the Context benchmark section")
         case .security:
             return String(localized: "sidebar.security",
                           defaultValue: "Security",
@@ -81,6 +87,7 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
         case .network:         return "network"
         case .performance:     return "bolt.fill"
         case .status:          return "gauge.with.dots.needle.50percent"
+        case .appearance:      return "paintbrush"
         case .logs:            return "scroll"
         case .models:          return "cube.transparent"
         case .downloads:       return "icloud.and.arrow.down"
@@ -88,6 +95,7 @@ enum AppSection: String, Hashable, CaseIterable, Identifiable, Sendable {
         case .quantization:    return "sparkles"
         case .throughputBench: return "speedometer"
         case .accuracyBench:   return "target"
+        case .contextBench:    return "ruler"
         case .security:        return "lock"
         case .about:           return "info.circle"
         }

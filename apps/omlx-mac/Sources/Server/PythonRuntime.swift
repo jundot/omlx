@@ -3,15 +3,16 @@
 //
 // Resolution order (first match wins):
 //   1. OMLX_PYTHON_OVERRIDE env var — dev escape hatch.
-//   2. Bundle.main/Contents/Frameworks/cpython-3.11/bin/python3 — production.
+//   2. Bundle.main/Contents/Resources/Python/cpython-3.11/bin/python3 — production.
 //      Layout matches the venvstacks export tree, which
 //      apps/omlx-mac/Scripts/build.sh copies verbatim into the Swift .app.
+//   3. Legacy bundle layouts under Contents/Python or Contents/Frameworks.
 //
 // In the bundled case the spawn environment also sets:
-//   PYTHONHOME = Contents/Frameworks/cpython-3.11
+//   PYTHONHOME = Contents/Resources/Python/cpython-3.11
 //     so the relocated interpreter finds its stdlib without grepping the
 //     host system's /usr/lib.
-//   PYTHONPATH = Contents/Resources : framework-mlx-framework/site-packages
+//   PYTHONPATH = Contents/Resources : framework-mlx-base/site-packages
 //     : __venvstacks__/site-customize
 //     so `python -m omlx.cli` resolves both the omlx package (shipped as a
 //     pure source tree in Resources/omlx/, matching today's Python build)
@@ -19,6 +20,9 @@
 //   PYTHONDONTWRITEBYTECODE = 1
 //     so the read-only app bundle doesn't try to scribble .pyc files into
 //     itself at first import.
+//   OMLX_SUPERVISED = menubar
+//     so the admin restart endpoint knows the parent app can respawn the
+//     server after its delayed self-SIGTERM.
 
 import Foundation
 
@@ -64,14 +68,23 @@ struct PythonRuntime {
         }
 
         let bundleRoot = Bundle.main.bundleURL
-        let frameworks = bundleRoot.appendingPathComponent("Contents/Frameworks")
-        let cpython = frameworks.appendingPathComponent("cpython-3.11")
-        let bundled = cpython.appendingPathComponent("bin/python3")
-        tried.append(bundled.path)
-        if FileManager.default.isExecutableFile(atPath: bundled.path) {
-            let resources = bundleRoot.appendingPathComponent("Contents/Resources")
-            let mlxFramework = frameworks
-                .appendingPathComponent("framework-mlx-framework/lib/python3.11/site-packages")
+        let resources = bundleRoot.appendingPathComponent("Contents/Resources")
+        let pythonRoots = [
+            resources.appendingPathComponent("Python"),
+            bundleRoot.appendingPathComponent("Contents/Python"),
+            bundleRoot.appendingPathComponent("Contents/Frameworks"),
+        ]
+
+        for pythonRoot in pythonRoots {
+            let cpython = pythonRoot.appendingPathComponent("cpython-3.11")
+            let bundled = cpython.appendingPathComponent("bin/python3")
+            tried.append(bundled.path)
+            guard FileManager.default.isExecutableFile(atPath: bundled.path) else {
+                continue
+            }
+
+            let mlxFramework = pythonRoot
+                .appendingPathComponent("framework-mlx-base/lib/python3.11/site-packages")
             return PythonRuntime(
                 executable: bundled,
                 homebrewPaths: defaultHomebrewPaths,
@@ -84,12 +97,17 @@ struct PythonRuntime {
         throw ResolutionError.notFound(triedPaths: tried)
     }
 
-    /// Build the spawn environment: parent env + Homebrew PATH + PYTHONPATH +
-    /// PYTHONHOME. `PYTHONDONTWRITEBYTECODE=1` is set in bundled mode so the
-    /// read-only app bundle doesn't try to scribble `__pycache__/` into
-    /// itself.
+    /// Build the spawn environment: parent env + supervisor marker +
+    /// Homebrew PATH + PYTHONPATH + PYTHONHOME. `PYTHONDONTWRITEBYTECODE=1`
+    /// is set in bundled mode so the read-only app bundle doesn't try to
+    /// scribble `__pycache__/` into itself.
     func makeEnvironment() -> [String: String] {
         var env = ProcessInfo.processInfo.environment
+        env["OMLX_SUPERVISED"] = "menubar"
+        // macOS malloc otherwise keeps large empty arenas resident after
+        // repeated model load/unload cycles. This must be set before Python
+        // starts; setting it inside omlx.cli is too late for malloc init.
+        env["MallocSpaceEfficient"] = env["MallocSpaceEfficient"] ?? "1"
 
         var path = env["PATH"] ?? ""
         for prefix in homebrewPaths.reversed() where !path.contains(prefix) {

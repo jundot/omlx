@@ -1,11 +1,55 @@
 # SPDX-License-Identifier: Apache-2.0
 """Compatibility patches for mlx-embeddings."""
 
+import functools
 import logging
+from typing import Any
+
+from ..utils.image import load_image
 
 logger = logging.getLogger(__name__)
 
 _QWEN3_VL_PROCESSOR_PATCHED = False
+
+_QWEN3_VL_POSIDS_PATCHED = False
+
+
+def _flatten_images(images: Any) -> list[Any]:
+    """Flatten the per-sample nested image batch transformers hands to processors.
+
+    Text-only items contribute empty slots, which must be dropped rather than
+    forwarded as zero-length arrays.
+    """
+    if isinstance(images, (list, tuple)):
+        flat: list[Any] = []
+        for item in images:
+            flat.extend(_flatten_images(item))
+        return flat
+    return [] if images is None else [images]
+
+
+def _build_contract_compliant_processor(base_cls):
+    """Restore the transformers image-processor contract on mlx-vlm's torch-free port.
+
+    transformers delegates image loading to ``image_processor.fetch_images`` and
+    passes visuals nested per sample. The upstream port overrides ``fetch_images``
+    with a non-recursive, file-path-only version, so a data URI reaches
+    ``_process_one`` as a numpy string array and a nested batch as a 4-D array,
+    both of which fail the ``C, H, W = image.shape`` unpack.
+    """
+
+    class ContractCompliantImageProcessor(base_cls):
+        def fetch_images(self, image_url_or_urls):
+            if isinstance(image_url_or_urls, (list, tuple)):
+                return [self.fetch_images(item) for item in image_url_or_urls]
+            if isinstance(image_url_or_urls, str):
+                return load_image(image_url_or_urls, field="image")
+            return image_url_or_urls
+
+        def __call__(self, images, **kwargs):
+            return super().__call__(_flatten_images(images), **kwargs)
+
+    return ContractCompliantImageProcessor
 
 
 def _ensure_qwen3_vl_mm_token_ids(processor):
@@ -41,6 +85,7 @@ def patch_qwen3_vl_processor_for_torch_free_image_loading() -> None:
     original_auto_image_processor = getattr(
         qwen3_vl_processor, "AutoImageProcessor", None
     )
+    image_processor_cls = _build_contract_compliant_processor(Qwen3VLImageProcessor)
 
     class TorchFreeQwen3VLAutoImageProcessor:
         _omlx_original_auto_image_processor = original_auto_image_processor
@@ -52,7 +97,7 @@ def patch_qwen3_vl_processor_for_torch_free_image_loading() -> None:
                 pretrained_model_name_or_path,
                 default_patch_size=16,
             )
-            return Qwen3VLImageProcessor(**image_kwargs)
+            return image_processor_cls(**image_kwargs)
 
     qwen3_vl_processor.AutoImageProcessor = TorchFreeQwen3VLAutoImageProcessor
 
@@ -73,3 +118,46 @@ def patch_qwen3_vl_processor_for_torch_free_image_loading() -> None:
 
     _QWEN3_VL_PROCESSOR_PATCHED = True
     logger.debug("Applied torch-free image loader patch for mlx-embeddings Qwen3-VL")
+
+
+def patch_qwen3_vl_position_ids_recompute() -> None:
+    """Drop the mlx-embeddings Qwen3-VL position-id cache before each forward.
+
+    mlx-embeddings caches position ids on the language model and re-slices
+    them for later requests with ``_position_ids[:, :, :seq_len]``. mlx-vlm's
+    ``get_rope_index`` now returns 2-D text position ids, so a cached value
+    can be 2-D and the 3-D re-slice fails with "Too many indices for array
+    with 2 dimensions" (jundot/omlx#3731). A cache that survives across
+    single-shot embedding requests also carries stale shapes and is mutated
+    inside ``mx.compile`` traces, which leaves a captured tracer behind for
+    the next compiled call. Recompute position ids from each request's
+    inputs instead of reusing the cache.
+    """
+    global _QWEN3_VL_POSIDS_PATCHED
+    if _QWEN3_VL_POSIDS_PATCHED:
+        return
+
+    try:
+        from mlx_embeddings.models.qwen3_vl import model as qwen3_vl_model
+    except Exception as exc:
+        logger.debug("Qwen3-VL position-ids recompute patch skipped: %s", exc)
+        _QWEN3_VL_POSIDS_PATCHED = True
+        return
+
+    original = getattr(qwen3_vl_model, "compute_qwen3_vl_hidden_states", None)
+    if original is None or getattr(original, "_omlx_patched", False):
+        _QWEN3_VL_POSIDS_PATCHED = True
+        return
+
+    @functools.wraps(original)
+    def compute_recomputing_position_ids(*args, **kwargs):
+        model = kwargs.get("model", args[0] if args else None)
+        language_model = getattr(model, "language_model", None)
+        if language_model is not None:
+            language_model._position_ids = None
+        return original(*args, **kwargs)
+
+    compute_recomputing_position_ids._omlx_patched = True
+    qwen3_vl_model.compute_qwen3_vl_hidden_states = compute_recomputing_position_ids
+    _QWEN3_VL_POSIDS_PATCHED = True
+    logger.debug("Applied position-ids recompute patch for mlx-embeddings Qwen3-VL")

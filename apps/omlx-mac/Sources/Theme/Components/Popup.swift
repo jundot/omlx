@@ -1,4 +1,5 @@
-// PR 3 — dropdown picker styled to match the JSX `Popup`.
+// PR 3 — dropdown picker. Renders the native macOS menu picker so selects
+// share one bezel, height, and font with the rest of the system controls.
 
 import SwiftUI
 
@@ -10,84 +11,53 @@ struct PopupOption<Value: Hashable>: Identifiable {
 
 struct Popup<Value: Hashable>: View {
     @Binding var selection: Value
+    var titleKey: LocalizedStringKey
     let options: [PopupOption<Value>]
     let width: CGFloat?
 
-    @Environment(\.omlxTheme) private var theme
-
-    init(selection: Binding<Value>, width: CGFloat? = nil, options: [PopupOption<Value>]) {
+    init(_ titleKey: LocalizedStringKey = "", selection: Binding<Value>, width: CGFloat? = nil, options: [PopupOption<Value>]) {
+        self.titleKey = titleKey
         self._selection = selection
         self.options = options
         self.width = width
     }
 
-    init(
-        selection: Binding<Value>,
-        width: CGFloat? = nil,
-        options: [(Value, String)]
-    ) {
+    init(_ titleKey: LocalizedStringKey = "", selection: Binding<Value>, width: CGFloat? = nil, options: [(Value, String)]) {
+        self.titleKey = titleKey
         self._selection = selection
         self.options = options.map { PopupOption(value: $0.0, label: $0.1) }
         self.width = width
     }
 
     var body: some View {
-        Menu {
+        Picker(titleKey, selection: $selection) {
             ForEach(options) { opt in
-                Button {
-                    selection = opt.value
-                } label: {
-                    HStack {
-                        Text(opt.label)
-                        if opt.value == selection {
-                            Spacer()
-                            Image(systemName: "checkmark")
-                        }
-                    }
-                }
+                Text(opt.label)
+                    .tag(opt.value)
             }
-        } label: {
-            HStack(spacing: 8) {
-                Text(currentLabel)
-                    .font(.omlxText(13, weight: .medium))
-                    .foregroundStyle(theme.text)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                Spacer(minLength: 4)
-                Image(systemName: "chevron.up.chevron.down")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(theme.textSecondary)
-            }
-            .padding(.horizontal, 10)
-            .frame(height: 28)
-            .frame(maxWidth: width)
-            .background(theme.inputBg)
-            .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .strokeBorder(theme.inputBorder, lineWidth: 0.5)
-            )
-            .contentShape(Rectangle())
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-    }
-
-    private var currentLabel: String {
-        options.first(where: { $0.value == selection })?.label ?? "—"
+        .labelsHidden()
+        .pickerStyle(.menu)
+        // The native popup bezel hugs its label, and a bare `maxWidth` frame
+        // would center it — leaving air on both sides. Pin it trailing so
+        // select bezels end flush with the other controls in the column;
+        // `width` stays the cap that keeps long labels from sprawling.
+        .frame(maxWidth: width, alignment: .trailing)
     }
 }
 
 #Preview("Popup") {
     @Previewable @State var host = "127.0.0.1"
     @Previewable @State var quant = "q4"
-    return VStack(alignment: .leading, spacing: 14) {
-        Popup(selection: $host, width: 220, options: [
+
+    VStack(alignment: .leading, spacing: 14) {
+        Popup(selection: $host, width: .controlMedium, options: [
             ("127.0.0.1", "127.0.0.1 (Local only)"),
-            ("0.0.0.0", "0.0.0.0 (All networks)"),
+            ("0.0.0.0", "0.0.0.0 (IPv4 only)"),
+            ("::", "0.0.0.0 & :: (All Networks)"),
             ("localhost", "localhost"),
         ])
-        Popup(selection: $quant, width: 120, options: [
+        Popup(selection: $quant, width: .controlCompact, options: [
             ("auto", "Auto"), ("q4", "q4"), ("q5", "q5"), ("q6", "q6"), ("q8", "q8"), ("fp16", "fp16"),
         ])
     }

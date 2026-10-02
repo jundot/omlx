@@ -1,0 +1,425 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for the supported MoE gate+up fusion patch (issue #2238)."""
+
+from __future__ import annotations
+
+import mlx.core as mx
+import pytest
+from mlx_lm.models.switch_layers import SwitchGLU
+
+import omlx.patches.qwen35_moe_gate_up as patch_mod
+from omlx.patches.qwen35_moe_gate_up import apply_qwen35_moe_gate_up_fusion
+
+E, TOPK, HIDDEN, INTER = 8, 2, 64, 32
+
+
+class _FakeQwenModel:
+    # Module path carries the family token used by the gate.
+    pass
+
+
+_FakeQwenModel.__module__ = "mlx_lm.models.qwen3_5_moe"
+
+
+class _FakeQwen4Model:
+    pass
+
+
+_FakeQwen4Model.__module__ = "mlx_vlm.models.qwen4_exp.qwen4_exp"
+
+
+class _FakeOtherModel:
+    pass
+
+
+_FakeOtherModel.__module__ = "mlx_lm.models.deepseek_v3"
+
+
+class _FakeHyV3Model:
+    pass
+
+
+_FakeHyV3Model.__module__ = "mlx_lm.models.hy_v3"
+
+
+def _make_model(
+    quantize=True,
+    model_cls=_FakeQwenModel,
+    n_blocks=2,
+    group_size=32,
+    bits=4,
+):
+    mx.random.seed(7)
+    blocks = []
+    for _ in range(n_blocks):
+        glu = SwitchGLU(HIDDEN, INTER, E)
+        if quantize:
+            glu.gate_proj = glu.gate_proj.to_quantized(group_size, bits)
+            glu.up_proj = glu.up_proj.to_quantized(group_size, bits)
+            glu.down_proj = glu.down_proj.to_quantized(32, 4)
+        blocks.append(glu)
+    model = model_cls()
+    model.blocks = blocks
+    model.named_modules = lambda: [(f"blocks.{i}", b) for i, b in enumerate(blocks)]
+    return model
+
+
+@pytest.fixture(autouse=True)
+def _restore_call(monkeypatch):
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+
+    monkeypatch.delenv("OMLX_QWEN35_MOE_GATE_UP", raising=False)
+    orig = getattr(SwitchGLU, "_omlx_gate_up_original_call", SwitchGLU.__call__)
+    monkeypatch.setattr(
+        Qwen3_5BatchInvariantForward,
+        "_switch_glu",
+        Qwen3_5BatchInvariantForward._switch_glu,
+    )
+    yield
+    SwitchGLU.__call__ = orig
+    for attr in ("_omlx_gate_up_fused_call", "_omlx_gate_up_original_call"):
+        if hasattr(SwitchGLU, attr):
+            delattr(SwitchGLU, attr)
+    patch_mod._CALL_PATCHED = False
+
+
+def _forward_all(model, x, indices):
+    return [blk(x, indices) for blk in model.blocks]
+
+
+@pytest.mark.parametrize("quantize", [True, False])
+def test_fused_output_bit_exact(quantize):
+    model = _make_model(quantize=quantize)
+    x = (mx.random.normal(shape=(1, 1, HIDDEN)) * 0.5).astype(mx.bfloat16)
+    idx_decode = mx.random.randint(0, E, shape=(1, 1, TOPK))
+    # 40 tokens x top-2 = 80 indices >= 64 exercises the sorted branch.
+    x_sorted = (mx.random.normal(shape=(1, 40, HIDDEN)) * 0.5).astype(mx.bfloat16)
+    idx_sorted = mx.random.randint(0, E, shape=(1, 40, TOPK))
+
+    ref_decode = _forward_all(model, x, idx_decode)
+    ref_prefill = _forward_all(model, x_sorted, idx_sorted)
+    mx.eval(ref_decode, ref_prefill)
+
+    fused = apply_qwen35_moe_gate_up_fusion(model)
+    assert fused == 2
+    for blk in model.blocks:
+        assert hasattr(blk, "gate_up_proj")
+        assert not hasattr(blk, "gate_proj")
+        assert not hasattr(blk, "up_proj")
+
+    out_decode = _forward_all(model, x, idx_decode)
+    out_prefill = _forward_all(model, x_sorted, idx_sorted)
+    mx.eval(out_decode, out_prefill)
+
+    for ref, out in zip(ref_decode, out_decode):
+        assert mx.array_equal(ref, out).item()
+    for ref, out in zip(ref_prefill, out_prefill):
+        assert mx.array_equal(ref, out).item()
+
+
+def test_laguna_family_fused_bit_exact():
+    """The vendored laguna model fuses its nvfp4 SwitchGLU experts."""
+    from omlx.patches.laguna import apply_laguna_patch
+
+    apply_laguna_patch()
+
+    from mlx_lm.models import laguna
+
+    args = laguna.ModelArgs(
+        model_type="laguna",
+        vocab_size=256,
+        hidden_size=HIDDEN,
+        intermediate_size=INTER,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        max_position_embeddings=128,
+        layer_types=["full_attention", "full_attention"],
+        mlp_only_layers=[],
+        num_experts=E,
+        num_experts_per_tok=TOPK,
+        moe_intermediate_size=INTER,
+        shared_expert_intermediate_size=INTER,
+    )
+    mx.random.seed(11)
+    model = laguna.Model(args)
+    for layer in model.model.layers:
+        sw = layer.mlp.switch_mlp
+        sw.gate_proj = sw.gate_proj.to_quantized(16, 4, mode="nvfp4")
+        sw.up_proj = sw.up_proj.to_quantized(16, 4, mode="nvfp4")
+        sw.down_proj = sw.down_proj.to_quantized(16, 4, mode="nvfp4")
+
+    x = mx.array([[3, 1, 4, 1, 5]])
+    ref = model(x)
+    mx.eval(ref)
+
+    fused = apply_qwen35_moe_gate_up_fusion(model)
+    assert fused == 2
+    for layer in model.model.layers:
+        assert hasattr(layer.mlp.switch_mlp, "gate_up_proj")
+        assert layer.mlp.switch_mlp.gate_up_proj.mode == "nvfp4"
+
+    out = model(x)
+    mx.eval(out)
+    assert mx.array_equal(ref, out).item()
+
+
+@pytest.mark.parametrize("bits", [5, 6, 8])
+def test_hy_v3_family_fused_bit_exact(bits):
+    """HyV3 uses stock SwitchGLU and receives the same bit-exact fusion."""
+    model = _make_model(model_cls=_FakeHyV3Model, group_size=64, bits=bits)
+    x = (mx.random.normal(shape=(1, 1, HIDDEN)) * 0.5).astype(mx.bfloat16)
+    indices = mx.random.randint(0, E, shape=(1, 1, TOPK))
+
+    ref = _forward_all(model, x, indices)
+    mx.eval(ref)
+
+    assert apply_qwen35_moe_gate_up_fusion(model) == 2
+    out = _forward_all(model, x, indices)
+    mx.eval(out)
+
+    for expected, actual in zip(ref, out):
+        assert mx.array_equal(expected, actual).item()
+
+
+def test_qwen4_exp_family_is_eligible_for_gate_up_fusion():
+    model = _make_model(model_cls=_FakeQwen4Model, n_blocks=1)
+
+    assert apply_qwen35_moe_gate_up_fusion(model) == 1
+    assert hasattr(model.blocks[0], "gate_up_proj")
+
+
+def test_env_kill_switch(monkeypatch):
+    monkeypatch.setenv("OMLX_QWEN35_MOE_GATE_UP", "0")
+    model = _make_model()
+    assert apply_qwen35_moe_gate_up_fusion(model) == 0
+    assert hasattr(model.blocks[0], "gate_proj")
+
+
+def test_unsupported_family_skipped():
+    model = _make_model(model_cls=_FakeOtherModel)
+    assert apply_qwen35_moe_gate_up_fusion(model) == 0
+    assert hasattr(model.blocks[0], "gate_proj")
+
+
+def test_per_layer_pool_drain(monkeypatch):
+    calls = []
+    monkeypatch.setattr(patch_mod, "_sync_and_clear_cache", lambda: calls.append(1))
+
+    skipped = _make_model(model_cls=_FakeOtherModel)
+    assert apply_qwen35_moe_gate_up_fusion(skipped) == 0
+    assert not calls
+
+    model = _make_model(n_blocks=3)
+    assert apply_qwen35_moe_gate_up_fusion(model) == 3
+    assert len(calls) == 3
+
+
+def test_idempotent():
+    model = _make_model()
+    assert apply_qwen35_moe_gate_up_fusion(model) == 2
+    assert apply_qwen35_moe_gate_up_fusion(model) == 0
+
+
+def test_mismatched_quant_params_skipped():
+    model = _make_model(quantize=False, n_blocks=1)
+    glu = model.blocks[0]
+    glu.gate_proj = glu.gate_proj.to_quantized(32, 4)
+    glu.up_proj = glu.up_proj.to_quantized(32, 8)
+    glu.down_proj = glu.down_proj.to_quantized(32, 4)
+    assert apply_qwen35_moe_gate_up_fusion(model) == 0
+    assert hasattr(glu, "gate_proj")
+
+
+@pytest.mark.parametrize("length", [1, 3, 64])
+def test_vlm_fused_experts_preserve_decode_verify_and_prefill(length):
+    from mlx_vlm.models.switch_layers import SwitchGLU as VLMSwitchGLU
+
+    mx.random.seed(7)
+    glu = VLMSwitchGLU(HIDDEN, INTER, E)
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        setattr(glu, name, getattr(glu, name).to_quantized(32, 4))
+    glu.eval()
+    model = _FakeQwen4Model()
+    model.named_modules = lambda: [("experts", glu)]
+    x = (mx.random.normal((2, length, HIDDEN)) * 0.5).astype(mx.bfloat16)
+    idx = mx.random.randint(0, E, shape=(2, length, TOPK))
+    weights = mx.full((2, length, TOPK), 0.5)
+    shared = mx.zeros_like(x)
+    ref = glu(x, idx, weights, shared)
+    mx.eval(ref)
+
+    assert apply_qwen35_moe_gate_up_fusion(model) == 1
+    out = glu(x, idx, weights, shared)
+    mx.eval(out)
+    assert mx.array_equal(ref, out).item()
+
+
+def test_weighted_sum_route_accepts_fused_layout():
+    from omlx.patches.qwen35_moe_weighted_sum import _should_route
+
+    model = _make_model(n_blocks=1)
+    apply_qwen35_moe_gate_up_fusion(model)
+
+    class _Block:
+        top_k = 8
+        sharding_group = None
+        switch_mlp = model.blocks[0]
+
+    if not mx.metal.is_available():
+        pytest.skip("Metal required for _should_route")
+    x = mx.zeros((1, 2048, HIDDEN), dtype=mx.bfloat16)
+    assert _should_route(_Block(), x, target_verify=False, min_tokens=1024)
+
+
+def test_vlm_fused_projection_views_cross_execution_threads():
+    from concurrent.futures import ThreadPoolExecutor
+
+    from mlx_vlm.models.switch_layers import SwitchGLU as VLMSwitchGLU
+
+    def load():
+        with mx.stream(mx.new_thread_local_stream(mx.gpu)):
+            glu = VLMSwitchGLU(HIDDEN, INTER, E)
+            glu.gate_proj = glu.gate_proj.to_quantized(32, 4)
+            glu.up_proj = glu.up_proj.to_quantized(32, 4)
+            mx.eval(glu.parameters())
+            patch_mod._fuse_one(glu)
+            return glu
+
+    def verify(glu):
+        with mx.stream(mx.new_thread_local_stream(mx.gpu)):
+            x = mx.ones((1, 1, 1, HIDDEN))
+            indices = mx.zeros((1, TOPK), dtype=mx.uint32)
+            outputs = [glu.gate_proj(x, indices), glu.up_proj(x, indices)]
+            mx.eval(outputs)
+            return all(bool(mx.all(mx.isfinite(value)).item()) for value in outputs)
+
+    with ThreadPoolExecutor(max_workers=1) as loader:
+        glu = loader.submit(load).result()
+    with ThreadPoolExecutor(max_workers=1) as decoder:
+        assert decoder.submit(verify, glu).result()
+
+
+@pytest.mark.parametrize("bits,dtype", [(4, mx.bfloat16), (5, mx.float16)])
+@pytest.mark.parametrize("batch,length", [(1, 3), (2, 6), (16, 2)])
+def test_vlm_fused_short_block_matches_verifier_without_copying_views(
+    monkeypatch, bits, dtype, batch, length
+):
+    from mlx_vlm.models import fast_ops
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+    from mlx_vlm.models.switch_layers import SwitchGLU as VLMSwitchGLU
+
+    mx.random.seed(19)
+    glu = VLMSwitchGLU(512, 64, 8)
+    glu.set_dtype(dtype)
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        setattr(glu, name, getattr(glu, name).to_quantized(32, bits))
+    glu.eval()
+    verifier = Qwen3_5BatchInvariantForward()
+    x = mx.random.normal((batch, length, 512)).astype(dtype)
+    indices = mx.random.randint(0, 8, (batch, length, 6))
+    expected_head = glu(x, indices)
+    expected_verify = verifier._switch_glu(glu, x, indices)
+    mx.eval(expected_head, expected_verify)
+
+    model = _FakeQwen4Model()
+    model.named_modules = lambda: [("experts", glu)]
+    assert apply_qwen35_moe_gate_up_fusion(model) == 1
+
+    def reject_view_kernel(*args):
+        pytest.fail("Fused verification must not materialize gate/up views")
+
+    monkeypatch.setattr(fast_ops, "exact_affine_switch_gate_up", reject_view_kernel)
+    head = glu(x, indices)
+    verified = verifier._switch_glu(glu, x, indices)
+    mx.eval(head, verified)
+    assert mx.array_equal(head, expected_head).item()
+    assert mx.array_equal(verified, expected_verify).item()
+
+
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+def test_expert_ordered_verify_gather_matches_gather_qmm(bits):
+    from mlx_vlm.models.switch_layers import SwitchLinear as VLMSwitchLinear
+
+    from omlx.patches import moe_verify_gather
+
+    mx.random.seed(bits)
+    experts, top_k = 16, 10
+    # K = 1024 takes the qmv_fast traversal, K = 320 the qmv one with a tail.
+    for k, n in ((1024, 64), (320, 1024)):
+        linear = VLMSwitchLinear(k, n, experts, bias=False)
+        linear.set_dtype(mx.bfloat16)
+        linear = linear.to_quantized(group_size=32, bits=bits)
+        assert moe_verify_gather.supported(linear, mx.bfloat16)
+        for rows in (2, 8):
+            indices = mx.stack(
+                [mx.random.permutation(experts)[:top_k] for _ in range(rows)]
+            ).astype(mx.uint32)
+            x = mx.random.normal((rows, k)).astype(mx.bfloat16)
+            expected = mx.gather_qmm(
+                mx.expand_dims(x, (-2, -3)),
+                linear["weight"],
+                linear["scales"],
+                linear["biases"],
+                rhs_indices=indices,
+                transpose=True,
+                group_size=32,
+                bits=bits,
+            ).reshape(rows * top_k, n)
+            got = moe_verify_gather.gather_qmv(linear, x, indices.reshape(-1), top_k)
+            assert mx.array_equal(got, expected).item()
+
+
+def _vlm_decode_switch(bits, seed):
+    from mlx_vlm.models.switch_layers import SwitchGLU as VLMSwitchGLU
+
+    mx.random.seed(seed)
+    glu = VLMSwitchGLU(2560, 640, 16)
+    glu.set_dtype(mx.bfloat16)
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        setattr(glu, name, getattr(glu, name).to_quantized(64, bits))
+    glu.eval()
+    model = _FakeQwen4Model()
+    model.named_modules = lambda: [("experts", glu)]
+    assert apply_qwen35_moe_gate_up_fusion(model) == 1
+    return glu
+
+
+def _assert_decode_plan_matches_per_call(monkeypatch, glu, seed):
+    mx.random.seed(seed)
+    for batch in (1, 3):
+        x = (mx.random.normal((batch, 1, 2560)) * 0.5).astype(mx.bfloat16)
+        idx = mx.random.randint(0, 16, shape=(batch, 1, 10)).astype(mx.uint32)
+        monkeypatch.setattr(patch_mod, "_DECODE_PLAN_ENABLED", False)
+        ref = glu(x, idx)
+        mx.eval(ref)
+        monkeypatch.setattr(patch_mod, "_DECODE_PLAN_ENABLED", True)
+        out = glu(x, idx)
+        mx.eval(out)
+        assert out.shape == ref.shape and out.dtype == ref.dtype == mx.bfloat16
+        assert mx.array_equal(out.view(mx.uint16), ref.view(mx.uint16)).item()
+
+
+@pytest.mark.parametrize("bits", [4, 5])
+@pytest.mark.parametrize("seed", [1, 2])
+def test_vlm_decode_plan_is_bit_identical_to_per_call_path(monkeypatch, bits, seed):
+    glu = _vlm_decode_switch(bits, seed)
+    _assert_decode_plan_matches_per_call(monkeypatch, glu, seed)
+
+
+def test_vlm_decode_plan_follows_replaced_experts(monkeypatch):
+    from mlx_vlm.models.switch_layers import SwitchLinear as VLMSwitchLinear
+
+    glu = _vlm_decode_switch(5, 3)
+    _assert_decode_plan_matches_per_call(monkeypatch, glu, 3)
+    down = VLMSwitchLinear(640, 2560, 16, bias=False)
+    down.set_dtype(mx.bfloat16)
+    glu.down_proj = down.to_quantized(64, 4)
+    _assert_decode_plan_matches_per_call(monkeypatch, glu, 4)
+    gate_up = glu.gate_up_proj
+    gate_up.weight = mx.random.randint(
+        0, 2**32 - 1, gate_up.weight.shape, dtype=mx.uint32
+    )
+    gate_up.scales = (gate_up.scales * 0.5).astype(gate_up.scales.dtype)
+    _assert_decode_plan_matches_per_call(monkeypatch, glu, 5)

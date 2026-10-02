@@ -163,7 +163,7 @@ def _register_chat_template_and_parser_modules() -> None:
 
 
 def _is_deepseek_v4_model(model_path) -> bool:
-    """Return True if ``model_path/config.json`` declares deepseek_v4."""
+    """Return True if ``model_path/config.json`` declares deepseek_v4*."""
     import json
     from pathlib import Path
 
@@ -171,7 +171,9 @@ def _is_deepseek_v4_model(model_path) -> bool:
     if not p.exists():
         return False
     try:
-        return json.loads(p.read_text()).get("model_type") == "deepseek_v4"
+        return str(json.loads(p.read_text()).get("model_type", "")).startswith(
+            "deepseek_v4"
+        )
     except Exception:
         return False
 
@@ -216,6 +218,13 @@ def apply_load_patch() -> bool:
         if wrapper._chat_template is None:
             wrapper._chat_template = _ct.apply_chat_template
             wrapper.has_chat_template = True
+        if wrapper._chat_template is _ct.apply_chat_template:
+            wrapper._omlx_supports_mid_system_messages = (
+                _ct.supports_mid_system_messages
+            )
+            wrapper._omlx_relocate_mid_system_messages = (
+                _ct.relocate_mid_system_messages
+            )
         if wrapper._tool_parser is None:
             wrapper._tool_parser = _tp.parse_tool_call
             wrapper._tool_call_start = _tp.tool_call_start

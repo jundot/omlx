@@ -30,14 +30,21 @@ class CacheType(Enum):
     """Supported cache types from mlx-lm."""
 
     KVCACHE = "KVCache"
+    CHUNKED_KVCACHE = "ChunkedKVCache"
     ROTATING_KVCACHE = "RotatingKVCache"
     BATCH_KVCACHE = "BatchKVCache"
     BATCH_ROTATING_KVCACHE = "BatchRotatingKVCache"
     ARRAYS_CACHE = "ArraysCache"
+    DEEPSEEK_V41 = "DeepseekV41Cache"
     QUANTIZED_KVCACHE = "QuantizedKVCache"
     CACHE_LIST = "CacheList"
     POOLING_CACHE = "PoolingCache"
     BATCH_POOLING_CACHE = "BatchPoolingCache"
+    MINIMAX_M3_KVCACHE = "MiniMaxM3KVCache"
+    MINIMAX_M3_BATCH_KVCACHE = "MiniMaxM3BatchKVCache"
+    QWEN4_QSA_KVCACHE = "QSAKVCache"
+    QWEN4_QSA_QUANTIZED_KVCACHE = "QSAQuantizedKVCache"
+    QWEN4_BATCH_QSA_KVCACHE = "BatchQSAKVCache"
 
 
 @dataclass
@@ -187,7 +194,7 @@ class CacheTypeHandler(ABC):
     #
     # The legacy interface (extract_state/reconstruct_cache with a dict
     # of "keys"/"values") only models 2-tuple state. mlx-lm caches like
-    # BatchKVCache (4-tuple) and DeepSeek V4's PoolingCache (3-tuple)
+    # BatchKVCache (4-tuple) and DeepSeek V4's PoolingCache (5-tuple)
     # carry more elements that omlx core needs to preserve through the
     # prefix-cache, boundary-snapshot, and SSD round-trip without
     # silently dropping elements past index 1.
@@ -200,9 +207,9 @@ class CacheTypeHandler(ABC):
     # ------------------------------------------------------------------
 
     def get_state_axis_info(self) -> tuple[CacheStateAxisInfo, ...]:
-        """Per-element metadata of ``cache_obj.state``.
+        """Per-element metadata of the stable serialized tensor layout.
 
-        Length and order match the tuple returned by ``cache_obj.state``.
+        Length and order match the tuple returned by ``serialize_state()``.
         Default = legacy 2-tuple ``(keys, values)`` with sequence_axis=2
         and sliceable=True (matches KVCache and friends).
         """
@@ -212,18 +219,70 @@ class CacheTypeHandler(ABC):
         )
 
     def serialize_state(self, cache_obj: Any) -> tuple[Any, ...]:
-        """Return the raw state tuple from ``cache_obj.state``.
+        """Return the stable SSD tensor layout for this cache.
 
         omlx core uses this to serialize state element-by-element instead
         of going through the legacy ``extract_state`` dict (which is still
         supported via the default ``deserialize_state`` below).
 
-        Default = pass-through ``cache_obj.state`` cast to tuple.
+        Core caches use the stable SSD tensor layout, without buffer capacity
+        or batch bookkeeping. Custom cache layouts retain their own state.
         """
+        from mlx_lm.models.cache import (
+            ArraysCache,
+            BatchKVCache,
+            BatchRotatingKVCache,
+            KVCache,
+            RotatingKVCache,
+        )
+
+        inner = (
+            cache_obj._inner if isinstance(cache_obj, SizedArraysCache) else cache_obj
+        )
+        if isinstance(inner, ArraysCache):
+            return tuple(inner.cache)
+        if isinstance(inner, (BatchKVCache, BatchRotatingKVCache)):
+            keys, values = (
+                inner.keys_and_values() if inner.keys is not None else (None, None)
+            )
+            return keys, values, inner.offset, inner.left_padding
+        if isinstance(inner, (KVCache, RotatingKVCache)):
+            return inner.keys_and_values() if inner.keys is not None else (None, None)
         state = getattr(cache_obj, "state", None)
         if isinstance(state, (list, tuple)):
             return tuple(state)
         return ()
+
+    def serialize_meta_state(self, cache_obj: Any) -> Any:
+        """Return JSON-safe metadata for ``cache_obj``.
+
+        Core cache metadata is read from live attributes. Normalize custom
+        string metadata so snapshot storage does not iterate its characters.
+        """
+        from mlx_lm.models.cache import BatchRotatingKVCache, RotatingKVCache
+
+        if isinstance(cache_obj, BatchRotatingKVCache):
+            return (
+                cache_obj.max_size,
+                cache_obj._offset,
+                cache_obj._idx,
+                cache_obj.rotated,
+            )
+        if isinstance(cache_obj, RotatingKVCache):
+            return (
+                cache_obj.keep,
+                cache_obj.max_size,
+                cache_obj.offset,
+                cache_obj._idx,
+            )
+        meta_state = getattr(cache_obj, "meta_state", ())
+        if meta_state in (None, ""):
+            return ()
+        if isinstance(meta_state, tuple):
+            return meta_state
+        if isinstance(meta_state, list):
+            return tuple(meta_state)
+        return (meta_state,)
 
     def deserialize_state(
         self,
@@ -235,7 +294,7 @@ class CacheTypeHandler(ABC):
         Default behavior maps elements to the legacy ``keys``/``values``
         dict by zipping with ``get_state_axis_info()`` names, then calls
         ``reconstruct_cache``. Handlers whose state cannot be expressed
-        as ``(keys, values)`` (e.g. PoolingCacheHandler with 3 elements)
+        as ``(keys, values)`` (e.g. PoolingCacheHandler with 5 elements)
         should override this method.
         """
         axis_info = self.get_state_axis_info()
@@ -302,7 +361,7 @@ class KVCacheHandler(CacheTypeHandler):
 
     def extract_state(self, cache_obj: Any) -> dict[str, Any]:
         """Extract state from KVCache object."""
-        keys, values = cache_obj.state
+        keys, values = self.serialize_state(cache_obj)
         return {
             "keys": keys,
             "values": values,
@@ -405,6 +464,57 @@ class KVCacheHandler(CacheTypeHandler):
         return cache
 
 
+class ChunkedKVCacheHandler(KVCacheHandler):
+    """Preserve the absolute position of a front-trimmed attention cache."""
+
+    @property
+    def cache_type(self):
+        return CacheType.CHUNKED_KVCACHE
+
+    @property
+    def supports_block_slicing(self):
+        return False
+
+    def get_state_axis_info(self):
+        return (
+            CacheStateAxisInfo("keys", 2, False),
+            CacheStateAxisInfo("values", 2, False),
+        )
+
+    def serialize_state(self, cache_obj):
+        if cache_obj.keys is None:
+            return None, None
+        length = cache_obj.offset - cache_obj.start_position
+        return (
+            cache_obj.keys[..., :length, :],
+            cache_obj.values[..., :length, :],
+        )
+
+    def serialize_meta_state(self, cache_obj):
+        return (cache_obj.chunk_size, cache_obj.start_position, cache_obj.offset)
+
+    def extract_state(self, cache_obj):
+        state = super().extract_state(cache_obj)
+        state["meta_state"] = self.serialize_meta_state(cache_obj)
+        return state
+
+    def slice_state(self, state, start_idx, end_idx):
+        return state
+
+    def concatenate_states(self, states):
+        return states[-1] if states else {}
+
+    def reconstruct_cache(self, state, meta_state=None):
+        from mlx_lm.models.cache import ChunkedKVCache
+
+        if not meta_state or len(meta_state) != 3:
+            raise ValueError("ChunkedKVCache requires its window and absolute position")
+        chunk_size, start, offset = map(int, meta_state)
+        return ChunkedKVCache.from_state(
+            (state["keys"], state["values"], offset, chunk_size, start)
+        )
+
+
 class RotatingKVCacheHandler(CacheTypeHandler):
     """Handler for RotatingKVCache (sliding window attention).
 
@@ -441,10 +551,10 @@ class RotatingKVCacheHandler(CacheTypeHandler):
 
     def extract_state(self, cache_obj: Any) -> dict[str, Any]:
         """Extract state from RotatingKVCache object."""
-        keys, values = cache_obj.state
+        keys, values = self.serialize_state(cache_obj)
 
         # Get meta_state: (keep, max_size, offset, _idx)
-        meta_state = getattr(cache_obj, "meta_state", ())
+        meta_state = self.serialize_meta_state(cache_obj)
 
         return {
             "keys": keys,
@@ -541,9 +651,25 @@ class RotatingKVCacheHandler(CacheTypeHandler):
         if meta_state and len(meta_state) >= 4:
             keep, max_size, offset, _idx_unused = map(int, meta_state[:4])
         else:
-            keep = state.get("keep", 0)
-            max_size = state.get("max_size", keys.shape[2])
-            offset = state.get("offset", keys.shape[2])
+            # Live-path states carry the window fields explicitly
+            # (extract_state / slice_state / concatenate_states all emit
+            # them). A restored state without them and without meta_state
+            # has unknown window geometry: guessing offset/max_size from
+            # the buffer shape silently shifts RoPE positions once the
+            # window has rotated (true offset > buffer length) and shrinks
+            # the window. Reject so the caller re-prefills instead.
+            keep = state.get("keep")
+            max_size = state.get("max_size")
+            offset = state.get("offset")
+            if keep is None or max_size is None or offset is None:
+                logger.warning(
+                    "RotatingKVCache reconstruction is missing meta_state "
+                    "and explicit window fields (keep/max_size/offset). "
+                    "Rejecting the cached state instead of guessing the "
+                    "window geometry from the buffer shape."
+                )
+                return None
+            keep, max_size, offset = int(keep), int(max_size), int(offset)
 
         # Trim oversized prefill-internal snapshots back to max_size.
         # Boundary snapshots can hold seq_len = max_size + chunk_size - 1
@@ -745,7 +871,7 @@ class ArraysCacheHandler(CacheTypeHandler):
         inner = (
             cache_obj._inner if isinstance(cache_obj, SizedArraysCache) else cache_obj
         )
-        state_list = inner.state if hasattr(inner, "state") else inner.cache
+        state_list = self.serialize_state(inner)
 
         return {
             "states": list(state_list) if state_list else [],
@@ -778,6 +904,17 @@ class ArraysCacheHandler(CacheTypeHandler):
         # Use latest state
         return states[-1]
 
+    def deserialize_state(
+        self,
+        elements: tuple[Any, ...],
+        meta_state: Any | None = None,
+    ) -> Any:
+        """Reconstruct every element of a variable-length ArraysCache state."""
+        return self.reconstruct_cache(
+            {"states": list(elements)},
+            meta_state,
+        )
+
     def reconstruct_cache(
         self,
         state: dict[str, Any],
@@ -802,6 +939,10 @@ class ArraysCacheHandler(CacheTypeHandler):
             return None
 
         states = state.get("states", [])
+        if meta_state and tuple(meta_state) == ("deepseek_v41", "2"):
+            from ..patches.deepseek_v41.cache import DeepseekV41Cache
+
+            return DeepseekV41Cache.from_state(states, meta_state)
         cache = ArraysCache(size=len(states))
         for i, s in enumerate(states):
             cache.cache[i] = s
@@ -848,6 +989,18 @@ class CacheListHandler(CacheTypeHandler):
     def supports_block_slicing(self) -> bool:
         return False  # Mixed sub-cache types prevent slicing
 
+    def serialize_state(self, cache_obj: Any) -> tuple[Any, ...]:
+        return tuple(self.extract_state(cache_obj)["sub_states"])
+
+    def deserialize_state(
+        self, elements: tuple[Any, ...], meta_state: Any | None = None
+    ) -> Any:
+        return self.reconstruct_cache({"sub_states": list(elements)}, meta_state)
+
+    def serialize_meta_state(self, cache_obj: Any) -> tuple[Any, ...]:
+        state = self.extract_state(cache_obj)
+        return (state["sub_class_names"], state["sub_meta_states"])
+
     def extract_state(self, cache_obj: Any) -> dict[str, Any]:
         """Extract state from CacheList object.
 
@@ -872,12 +1025,11 @@ class CacheListHandler(CacheTypeHandler):
         sub_class_names = []
         sub_meta_states = []
 
+        from .type_registry import CacheTypeRegistry
+
         for sc in sub_caches:
-            # Get state
-            if hasattr(sc, "state"):
-                sub_states.append(sc.state)
-            else:
-                sub_states.append(())
+            handler = CacheTypeRegistry.get_handler_for_object(sc)
+            sub_states.append(handler.serialize_state(sc))
 
             # Get class name (normalize SizedArraysCache → ArraysCache)
             raw_name = type(sc).__name__
@@ -888,7 +1040,7 @@ class CacheListHandler(CacheTypeHandler):
             sub_class_names.append(normalized)
 
             # Get meta_state
-            sub_meta_states.append(getattr(sc, "meta_state", ()))
+            sub_meta_states.append(handler.serialize_meta_state(sc))
 
         return {
             "sub_states": sub_states,
@@ -944,9 +1096,10 @@ class CacheListHandler(CacheTypeHandler):
     ) -> Any:
         """Reconstruct CacheList from stored state.
 
-        Tries new mlx-lm CacheList.from_state() first, then falls back to
-        manual sub-cache reconstruction using CacheTypeRegistry (local import
-        to avoid circular dependency).
+        Rebuild sub-caches through omlx handlers. This is required for
+        restored nested caches whose local contracts differ from mlx-lm's raw
+        constructor, notably RotatingKVCache snapshots that must be trimmed into
+        PrefillReadyRotatingKVCache before reuse.
 
         Args:
             state: Dict with 'sub_states' key containing per-sub-cache states.
@@ -977,28 +1130,6 @@ class CacheListHandler(CacheTypeHandler):
             )
             return None
 
-        # Sanitize sub_meta_states for sub-cache types that don't support
-        # meta_state (inherit _BaseCache's strict setter which rejects
-        # truthy values).  Use "" to match _BaseCache.meta_state getter.
-        _NO_META_STATE_TYPES = frozenset(
-            {"KVCache", "ConcatenateKVCache", "ArraysCache"}
-        )
-        sanitized_sub_meta_states = [
-            "" if cls_name in _NO_META_STATE_TYPES else sub_meta
-            for cls_name, sub_meta in zip(class_names, sub_meta_states)
-        ]
-
-        # Try new mlx-lm CacheList.from_state() first
-        try:
-            from mlx_lm.models.cache import CacheList
-
-            return CacheList.from_state(
-                sub_states, (class_names, sanitized_sub_meta_states)
-            )
-        except (ImportError, AttributeError, TypeError, KeyError, Exception) as e:
-            logger.debug(f"CacheList.from_state() unavailable or failed: {e}")
-
-        # Fallback: manually reconstruct sub-caches
         # NOTE: CacheTypeRegistry must be imported locally to avoid circular import
         # (type_handlers.py is imported by type_registry.py)
         try:
@@ -1009,59 +1140,805 @@ class CacheListHandler(CacheTypeHandler):
 
         from .type_registry import CacheTypeRegistry as _Registry  # local import
 
+        handler_reconstruct_failed = False
         sub_caches = []
-        for sub_state, cls_name, sub_meta in zip(
-            sub_states, class_names, sub_meta_states
-        ):
-            # Normalize class name for handler lookup
-            normalized_name = self._CLASS_NAME_NORMALIZE.get(cls_name, cls_name)
-            sub_handler = _Registry.get_handler_by_class_name(normalized_name)
+        try:
+            for sub_state, cls_name, sub_meta in zip(
+                sub_states, class_names, sub_meta_states
+            ):
+                # Normalize class name for handler lookup
+                normalized_name = self._CLASS_NAME_NORMALIZE.get(cls_name, cls_name)
+                sub_handler = _Registry.get_handler_by_class_name(normalized_name)
 
-            try:
-                if normalized_name in ("ArraysCache", "SizedArraysCache"):
-                    sub_cache = sub_handler.reconstruct_cache(
-                        {"states": list(sub_state)}, sub_meta
+                try:
+                    if normalized_name in ("ArraysCache", "SizedArraysCache"):
+                        sub_cache = sub_handler.reconstruct_cache(
+                            {"states": list(sub_state)}, sub_meta
+                        )
+                    elif isinstance(sub_state, (list, tuple)):
+                        # Generic N-tuple dispatch via the new deserialize_state
+                        # interface. Handlers that have a 3-tuple state (e.g.
+                        # PoolingCache: buf_kv, buf_gate, pooled) override
+                        # deserialize_state to consume all elements; default
+                        # implementation maps the first two to (keys, values)
+                        # which matches the legacy contract for KVCache /
+                        # RotatingKVCache.
+                        sub_cache = sub_handler.deserialize_state(
+                            tuple(sub_state), sub_meta
+                        )
+                    else:
+                        logger.debug(
+                            f"CacheList handler reconstruction skipped: "
+                            f"unexpected sub_state format for {cls_name}"
+                        )
+                        handler_reconstruct_failed = True
+                        break
+                except Exception as e:
+                    logger.debug(
+                        f"CacheList handler reconstruction failed for {cls_name}: {e}"
                     )
-                elif isinstance(sub_state, (list, tuple)):
-                    # Generic N-tuple dispatch via the new deserialize_state
-                    # interface. Handlers that have a 3-tuple state (e.g.
-                    # PoolingCache: buf_kv, buf_gate, pooled) override
-                    # deserialize_state to consume all elements; default
-                    # implementation maps the first two to (keys, values)
-                    # which matches the legacy contract for KVCache /
-                    # RotatingKVCache.
-                    sub_cache = sub_handler.deserialize_state(
-                        tuple(sub_state), sub_meta
+                    handler_reconstruct_failed = True
+                    break
+
+                if sub_cache is None:
+                    logger.debug(
+                        f"CacheList handler reconstruction failed: "
+                        f"sub-cache {cls_name} returned None"
                     )
-                else:
-                    logger.error(
-                        f"CacheList fallback: unexpected sub_state format "
-                        f"for {cls_name}"
-                    )
-                    return None
-            except Exception as e:
-                logger.error(
-                    f"CacheList fallback: failed to reconstruct {cls_name}: {e}"
-                )
-                return None
+                    handler_reconstruct_failed = True
+                    break
 
-            if sub_cache is None:
-                logger.error(f"CacheList fallback: sub-cache {cls_name} returned None")
-                return None
+                # Unwrap SizedArraysCache for CacheList (CacheList expects raw ArraysCache)
+                if isinstance(sub_cache, SizedArraysCache):
+                    sub_cache = sub_cache._inner
 
-            # Unwrap SizedArraysCache for CacheList (CacheList expects raw ArraysCache)
-            if isinstance(sub_cache, SizedArraysCache):
-                sub_cache = sub_cache._inner
+                sub_caches.append(sub_cache)
+        except Exception as e:
+            logger.debug(f"CacheList handler reconstruction failed: {e}")
+            handler_reconstruct_failed = True
 
-            sub_caches.append(sub_cache)
+        if not handler_reconstruct_failed:
+            return CacheList(*sub_caches)
 
-        return CacheList(*sub_caches)
+        logger.error("CacheList reconstruction failed for a nested cache")
+        return None
 
     def _get_state_keys(self) -> tuple[str, ...]:
         return ("sub_states", "sub_class_names", "sub_meta_states")
 
     def _get_meta_state_keys(self) -> tuple[str, ...]:
         return ("class_names", "sub_meta_states")
+
+
+def _minimax_index_offset(index_keys: Any, meta_state: Any | None = None) -> int:
+    if (
+        index_keys is not None
+        and hasattr(index_keys, "shape")
+        and len(index_keys.shape) >= 3
+    ):
+        return int(index_keys.shape[2])
+    if isinstance(meta_state, str):
+        try:
+            return int(meta_state)
+        except ValueError:
+            pass
+    if isinstance(meta_state, (list, tuple)) and meta_state:
+        try:
+            return int(meta_state[0])
+        except (TypeError, ValueError):
+            pass
+    return 0
+
+
+class _MiniMaxM3CacheHandlerBase(CacheTypeHandler):
+    """Shared MiniMax M3 sparse-cache serialization helpers."""
+
+    @property
+    def supports_block_slicing(self) -> bool:
+        return False
+
+    def get_state_axis_info(self) -> tuple[CacheStateAxisInfo, ...]:
+        return (
+            CacheStateAxisInfo("keys", 2, False),
+            CacheStateAxisInfo("values", 2, False),
+            CacheStateAxisInfo("index_keys", 2, False),
+        )
+
+    def serialize_meta_state(self, cache_obj: Any) -> tuple[Any, ...]:
+        return (int(getattr(cache_obj, "index_offset", 0) or 0),)
+
+    def get_seq_len(self, state: dict[str, Any]) -> int:
+        keys = state.get("keys")
+        if keys is not None and hasattr(keys, "shape") and len(keys.shape) >= 3:
+            return int(keys.shape[2])
+        index_keys = state.get("index_keys")
+        if (
+            index_keys is not None
+            and hasattr(index_keys, "shape")
+            and len(index_keys.shape) >= 3
+        ):
+            return int(index_keys.shape[2])
+        return 0
+
+    def slice_state(
+        self,
+        state: dict[str, Any],
+        start_idx: int,
+        end_idx: int,
+    ) -> dict[str, Any] | None:
+        return {
+            **state,
+            "is_full_state": True,
+            "cache_type": self.cache_type.value,
+        }
+
+    def concatenate_states(self, states: list[dict[str, Any]]) -> dict[str, Any]:
+        return states[-1] if states else {}
+
+    def _get_state_keys(self) -> tuple[str, ...]:
+        return ("keys", "values", "index_keys")
+
+    def _get_meta_state_keys(self) -> tuple[str, ...]:
+        return ("index_offset",)
+
+
+class MiniMaxM3KVCacheHandler(_MiniMaxM3CacheHandlerBase):
+    """Handler for MiniMax M3 sparse attention side-index caches."""
+
+    @property
+    def cache_type(self) -> CacheType:
+        return CacheType.MINIMAX_M3_KVCACHE
+
+    @property
+    def supports_block_slicing(self) -> bool:
+        return True
+
+    def get_state_axis_info(self) -> tuple[CacheStateAxisInfo, ...]:
+        return (
+            CacheStateAxisInfo("keys", 2, True),
+            CacheStateAxisInfo("values", 2, True),
+            CacheStateAxisInfo("index_keys", 2, True),
+        )
+
+    def serialize_state(self, cache_obj: Any) -> tuple[Any, ...]:
+        kv_state, index_state = cache_obj.state
+        if kv_state is None:
+            return (None, None, index_state)
+        if isinstance(kv_state, (list, tuple)) and len(kv_state) >= 2:
+            return (kv_state[0], kv_state[1], index_state)
+        return (None, None, index_state)
+
+    def extract_state(self, cache_obj: Any) -> dict[str, Any]:
+        keys, values, index_keys = self.serialize_state(cache_obj)
+        return {
+            "keys": keys,
+            "values": values,
+            "index_keys": index_keys,
+            "states": (keys, values, index_keys),
+            "cache_type": self.cache_type.value,
+        }
+
+    def slice_state(
+        self,
+        state: dict[str, Any],
+        start_idx: int,
+        end_idx: int,
+    ) -> dict[str, Any] | None:
+        if not HAS_MLX:
+            return None
+
+        keys = state.get("keys")
+        values = state.get("values")
+        index_keys = state.get("index_keys")
+        if keys is None or values is None:
+            return None
+
+        try:
+            seq_len = int(keys.shape[2])
+            actual_end = min(end_idx, seq_len)
+            if start_idx >= actual_end:
+                return None
+
+            keys_slice = keys[:, :, start_idx:actual_end, :]
+            values_slice = values[:, :, start_idx:actual_end, :]
+            if index_keys is not None:
+                index_end = min(actual_end, int(index_keys.shape[2]))
+                index_slice = index_keys[:, :, start_idx:index_end, :]
+            else:
+                index_slice = None
+
+            return {
+                "keys": keys_slice,
+                "values": values_slice,
+                "index_keys": index_slice,
+                "states": (keys_slice, values_slice, index_slice),
+                "cache_type": self.cache_type.value,
+            }
+        except Exception as e:
+            logger.warning("Failed to slice MiniMax M3 cache state: %s", e)
+            return None
+
+    def concatenate_states(self, states: list[dict[str, Any]]) -> dict[str, Any]:
+        if not HAS_MLX or not states:
+            return {}
+
+        keys_list = [s.get("keys") for s in states if s.get("keys") is not None]
+        values_list = [s.get("values") for s in states if s.get("values") is not None]
+        index_list = [
+            s.get("index_keys") for s in states if s.get("index_keys") is not None
+        ]
+        if not keys_list or not values_list:
+            return {}
+
+        keys = mx.concatenate(keys_list, axis=2)
+        values = mx.concatenate(values_list, axis=2)
+        index_keys = mx.concatenate(index_list, axis=2) if index_list else None
+        return {
+            "keys": keys,
+            "values": values,
+            "index_keys": index_keys,
+            "states": (keys, values, index_keys),
+            "cache_type": self.cache_type.value,
+        }
+
+    def deserialize_state(
+        self,
+        elements: tuple[Any, ...],
+        meta_state: Any | None = None,
+    ) -> Any:
+        try:
+            from ..patches.mlx_vlm_minimax_m3_compat import (
+                apply_mlx_vlm_minimax_m3_compat_patch,
+            )
+
+            apply_mlx_vlm_minimax_m3_compat_patch()
+
+            from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
+        except Exception as e:  # noqa: BLE001
+            logger.error("mlx-vlm MiniMaxM3KVCache unavailable: %s", e)
+            return None
+
+        keys = elements[0] if len(elements) > 0 else None
+        values = elements[1] if len(elements) > 1 else None
+        index_keys = elements[2] if len(elements) > 2 else None
+
+        cache = MiniMaxM3KVCache()
+        if keys is not None and values is not None:
+            cache.kv_cache.keys = keys
+            cache.kv_cache.values = values
+            cache.kv_cache.offset = keys.shape[2]
+        cache.index_keys = index_keys
+        cache.index_offset = _minimax_index_offset(index_keys, meta_state)
+        return cache
+
+    def reconstruct_cache(
+        self,
+        state: dict[str, Any],
+        meta_state: tuple | None = None,
+    ) -> Any:
+        elements = state.get("states")
+        if elements is None:
+            elements = (
+                state.get("keys"),
+                state.get("values"),
+                state.get("index_keys"),
+            )
+        return self.deserialize_state(tuple(elements), meta_state)
+
+
+class MiniMaxM3BatchKVCacheHandler(_MiniMaxM3CacheHandlerBase):
+    """Handler for batched MiniMax M3 sparse attention caches."""
+
+    @property
+    def cache_type(self) -> CacheType:
+        return CacheType.MINIMAX_M3_BATCH_KVCACHE
+
+    def get_state_axis_info(self) -> tuple[CacheStateAxisInfo, ...]:
+        return (
+            CacheStateAxisInfo("keys", 2, False),
+            CacheStateAxisInfo("values", 2, False),
+            CacheStateAxisInfo("offset", None, False),
+            CacheStateAxisInfo("left_padding", None, False),
+            CacheStateAxisInfo("index_keys", 2, False),
+        )
+
+    def serialize_state(self, cache_obj: Any) -> tuple[Any, ...]:
+        kv_state, index_state = cache_obj.state
+        if isinstance(kv_state, (list, tuple)) and len(kv_state) >= 4:
+            return (
+                kv_state[0],
+                kv_state[1],
+                kv_state[2],
+                kv_state[3],
+                index_state,
+            )
+        return (None, None, None, None, index_state)
+
+    def extract_state(self, cache_obj: Any) -> dict[str, Any]:
+        keys, values, offset, left_padding, index_keys = self.serialize_state(cache_obj)
+        return {
+            "keys": keys,
+            "values": values,
+            "offset": offset,
+            "left_padding": left_padding,
+            "index_keys": index_keys,
+            "states": (keys, values, offset, left_padding, index_keys),
+            "is_full_state": True,
+            "cache_type": self.cache_type.value,
+        }
+
+    def deserialize_state(
+        self,
+        elements: tuple[Any, ...],
+        meta_state: Any | None = None,
+    ) -> Any:
+        try:
+            from ..patches.mlx_vlm_minimax_m3_compat import (
+                apply_mlx_vlm_minimax_m3_compat_patch,
+            )
+
+            apply_mlx_vlm_minimax_m3_compat_patch()
+
+            from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3BatchKVCache
+        except Exception as e:  # noqa: BLE001
+            logger.error("mlx-vlm MiniMaxM3BatchKVCache unavailable: %s", e)
+            return None
+
+        keys = elements[0] if len(elements) > 0 else None
+        values = elements[1] if len(elements) > 1 else None
+        offset = elements[2] if len(elements) > 2 else None
+        left_padding = elements[3] if len(elements) > 3 else None
+        index_keys = elements[4] if len(elements) > 4 else None
+
+        left_padding_arg = left_padding if left_padding is not None else [0]
+        cache = MiniMaxM3BatchKVCache(left_padding_arg)
+        cache.state = ((keys, values, offset, left_padding_arg), index_keys)
+        cache.index_offset = _minimax_index_offset(index_keys, meta_state)
+        return cache
+
+    def reconstruct_cache(
+        self,
+        state: dict[str, Any],
+        meta_state: tuple | None = None,
+    ) -> Any:
+        elements = state.get("states")
+        if elements is None:
+            elements = (
+                state.get("keys"),
+                state.get("values"),
+                state.get("offset"),
+                state.get("left_padding"),
+                state.get("index_keys"),
+            )
+        return self.deserialize_state(tuple(elements), meta_state)
+
+
+def _serialize_qsa_positions(position_ids: Any) -> Any:
+    """Normalize text/MRoPE positions to a fixed ``[B, C, S]`` layout."""
+    if position_ids is None or not hasattr(position_ids, "ndim"):
+        return position_ids
+    if position_ids.ndim == 2:
+        return position_ids[:, None, :]
+    if position_ids.ndim == 3:
+        return position_ids.transpose(1, 0, 2)
+    raise ValueError(
+        "QSA position IDs must be [B, S] or [3, B, S], got " f"{position_ids.shape}."
+    )
+
+
+def _deserialize_qsa_positions(position_ids: Any) -> Any:
+    """Restore the model-facing text/MRoPE position layout."""
+    if position_ids is None or not hasattr(position_ids, "ndim"):
+        return position_ids
+    if position_ids.ndim != 3:
+        raise ValueError(
+            "Serialized QSA position IDs must be [B, C, S], got "
+            f"{position_ids.shape}."
+        )
+    channels = int(position_ids.shape[1])
+    if channels not in (1, 3):
+        raise ValueError(
+            "Serialized QSA position IDs require 1 text channel or 3 "
+            f"MRoPE channels, got {position_ids.shape}."
+        )
+    if channels == 1:
+        return position_ids[:, 0, :]
+    return position_ids.transpose(1, 0, 2)
+
+
+def _normalize_qsa_position_states(position_states: list[Any]) -> list[Any]:
+    """Promote mixed text/MRoPE QSA positions to [B, 3, S].
+
+    Qwen4 represents text positions as [B, S] and MRoPE positions as
+    [3, B, S]. Serialization stores those as [B, 1, S] and [B, 3, S]
+    respectively. The model's indexer cache promotes the text form by
+    broadcasting it across all three MRoPE coordinates when the two forms
+    meet, so block reconstruction must perform the equivalent operation
+    before concatenating along the sequence axis.
+    """
+    if not position_states:
+        return position_states
+
+    batch_size = None
+    channels: set[int] = set()
+    for position_state in position_states:
+        if not hasattr(position_state, "ndim") or position_state.ndim != 3:
+            shape = getattr(position_state, "shape", None)
+            raise ValueError(
+                "Serialized QSA position IDs must be [B, C, S], " f"got {shape}."
+            )
+        current_batch, current_channels, _ = position_state.shape
+        if current_channels not in (1, 3):
+            raise ValueError(
+                "Serialized QSA position IDs require 1 text channel or 3 "
+                f"MRoPE channels, got {position_state.shape}."
+            )
+        if batch_size is None:
+            batch_size = current_batch
+        elif current_batch != batch_size:
+            raise ValueError(
+                "Serialized QSA position IDs must have a consistent batch "
+                f"dimension, got {batch_size} and {current_batch}."
+            )
+        channels.add(current_channels)
+
+    # Preserve both homogeneous paths without introducing broadcast views.
+    if len(channels) == 1:
+        return position_states
+
+    return [
+        (
+            mx.broadcast_to(state, (state.shape[0], 3, state.shape[2]))
+            if state.shape[1] == 1
+            else state
+        )
+        for state in position_states
+    ]
+
+
+class Qwen4QSAKVCacheHandler(CacheTypeHandler):
+    """Handler for Qwen4 QSA caches with raw index keys and positions."""
+
+    @property
+    def cache_type(self) -> CacheType:
+        return CacheType.QWEN4_QSA_KVCACHE
+
+    @property
+    def supports_block_slicing(self) -> bool:
+        return True
+
+    def get_state_axis_info(self) -> tuple[CacheStateAxisInfo, ...]:
+        return (
+            CacheStateAxisInfo("keys", 2, True),
+            CacheStateAxisInfo("values", 2, True),
+            CacheStateAxisInfo("index_keys", 1, True),
+            CacheStateAxisInfo("index_position_ids", 2, True),
+        )
+
+    def _get_state_keys(self) -> tuple[str, ...]:
+        return tuple(info.name for info in self.get_state_axis_info())
+
+    @staticmethod
+    def _validate_serialized_state(elements: tuple[Any, ...]) -> int:
+        """Validate one complete, serialized QSA cache state."""
+        if len(elements) != 4:
+            raise ValueError(
+                "Serialized QSA cache state requires keys, values, index keys, "
+                "and index positions"
+            )
+
+        keys, values, index_keys, position_ids = elements
+        present = tuple(element is not None for element in elements)
+        if not any(present):
+            return 0
+        if not all(present):
+            raise ValueError(
+                "Non-empty QSA cache blocks require complete QSA auxiliary state"
+            )
+
+        shapes = tuple(getattr(element, "shape", None) for element in elements)
+        if any(shape is None for shape in shapes):
+            raise ValueError("Serialized QSA cache state must contain tensors")
+        if len(shapes[3]) != 3:
+            raise ValueError(
+                "Serialized QSA position IDs must be [B, C, S], got " f"{shapes[3]}."
+            )
+        if len(shapes[0]) != 4 or len(shapes[1]) != 4 or len(shapes[2]) != 3:
+            raise ValueError(
+                "Serialized QSA cache state requires 4-D K/V and 3-D index "
+                f"keys, got {shapes[:3]}"
+            )
+
+        channels = int(shapes[3][1])
+        if channels not in (1, 3):
+            raise ValueError(
+                "Serialized QSA position IDs require 1 text channel or 3 "
+                f"MRoPE channels, got {shapes[3]}."
+            )
+
+        batch_sizes = tuple(int(shape[0]) for shape in shapes)
+        if len(set(batch_sizes)) != 1:
+            raise ValueError(
+                "Serialized QSA state requires a consistent batch dimension, "
+                f"got {batch_sizes}."
+            )
+
+        lengths = (
+            int(shapes[0][2]),
+            int(shapes[1][2]),
+            int(shapes[2][1]),
+            int(shapes[3][2]),
+        )
+        if len(set(lengths)) != 1:
+            raise ValueError(
+                "Serialized QSA K/V and auxiliary state must have the same "
+                f"sequence length, got {lengths}."
+            )
+        return lengths[0]
+
+    def get_state_seq_len_from_tuple(self, state_tuple: tuple[Any, ...]) -> int:
+        return self._validate_serialized_state(tuple(state_tuple))
+
+    def serialize_state(self, cache_obj: Any) -> tuple[Any, ...]:
+        keys, values, index_keys, position_ids = cache_obj.state
+        elements = (
+            keys,
+            values,
+            index_keys,
+            _serialize_qsa_positions(position_ids),
+        )
+        self._validate_serialized_state(elements)
+        return elements
+
+    def extract_state(self, cache_obj: Any) -> dict[str, Any]:
+        elements = self.serialize_state(cache_obj)
+        return {
+            "keys": elements[0],
+            "values": elements[1],
+            "index_keys": elements[2],
+            "index_position_ids": elements[3],
+            "states": elements,
+            "offset": getattr(cache_obj, "offset", 0),
+            "cache_type": self.cache_type.value,
+        }
+
+    def get_seq_len(self, state: dict[str, Any]) -> int:
+        keys = state.get("keys")
+        return int(keys.shape[2]) if keys is not None else 0
+
+    def slice_state(
+        self,
+        state: dict[str, Any],
+        start_idx: int,
+        end_idx: int,
+    ) -> dict[str, Any] | None:
+        if not HAS_MLX:
+            return None
+        elements = state.get("states")
+        if elements is None:
+            elements = tuple(
+                state.get(info.name) for info in self.get_state_axis_info()
+            )
+        seq_len = self.get_state_seq_len_from_tuple(tuple(elements))
+        actual_end = min(end_idx, seq_len)
+        if seq_len <= 0 or start_idx >= actual_end:
+            return None
+        sliced = []
+        for info, element in zip(self.get_state_axis_info(), elements):
+            if element is None:
+                sliced.append(None)
+                continue
+            slices = [slice(None)] * element.ndim
+            slices[info.sequence_axis] = slice(start_idx, actual_end)
+            sliced.append(element[tuple(slices)])
+        return {
+            **{
+                info.name: value
+                for info, value in zip(self.get_state_axis_info(), sliced)
+            },
+            "states": tuple(sliced),
+            "cache_type": self.cache_type.value,
+        }
+
+    def concatenate_states(self, states: list[dict[str, Any]]) -> dict[str, Any]:
+        if not HAS_MLX or not states:
+            return {}
+        grouped: list[list[Any]] = [[] for _ in self.get_state_axis_info()]
+        state_lengths = []
+        for state in states:
+            elements = state.get("states")
+            if elements is None:
+                elements = tuple(
+                    state.get(info.name) for info in self.get_state_axis_info()
+                )
+            elements = tuple(elements)
+            state_lengths.append(self._validate_serialized_state(elements))
+            for index, element in enumerate(elements):
+                if element is not None:
+                    grouped[index].append(element)
+        if any(length == 0 for length in state_lengths) and any(
+            length > 0 for length in state_lengths
+        ):
+            raise ValueError(
+                "Non-empty QSA prefix chains cannot contain empty cache blocks"
+            )
+        concatenated = []
+        for info, elements in zip(self.get_state_axis_info(), grouped):
+            if info.name == "index_position_ids":
+                elements = _normalize_qsa_position_states(elements)
+            concatenated.append(
+                mx.concatenate(elements, axis=info.sequence_axis) if elements else None
+            )
+        return {
+            **{
+                info.name: value
+                for info, value in zip(self.get_state_axis_info(), concatenated)
+            },
+            "states": tuple(concatenated),
+            "cache_type": self.cache_type.value,
+        }
+
+    def deserialize_state(
+        self,
+        elements: tuple[Any, ...],
+        meta_state: Any | None = None,
+    ) -> Any:
+        del meta_state
+        try:
+            from ..patches.mlx_vlm_qwen4_exp_compat import (
+                apply_mlx_vlm_qwen4_exp_compat_patch,
+            )
+
+            apply_mlx_vlm_qwen4_exp_compat_patch()
+            from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Qwen4 QSAKVCache unavailable: %s", exc)
+            return None
+
+        elements = tuple(elements)
+        self._validate_serialized_state(elements)
+        keys, values, index_keys, position_ids = elements
+        cache = QSAKVCache()
+        cache.state = (
+            keys,
+            values,
+            index_keys,
+            _deserialize_qsa_positions(position_ids),
+        )
+        return cache
+
+    def reconstruct_cache(
+        self,
+        state: dict[str, Any],
+        meta_state: tuple | None = None,
+    ) -> Any:
+        elements = state.get("states")
+        if elements is None:
+            elements = tuple(
+                state.get(info.name) for info in self.get_state_axis_info()
+            )
+        return self.deserialize_state(tuple(elements), meta_state)
+
+
+class Qwen4QSAQuantizedKVCacheHandler(Qwen4QSAKVCacheHandler):
+    """Store Qwen4 quantized QSA caches as dense APC-compatible blocks."""
+
+    @property
+    def cache_type(self) -> CacheType:
+        return CacheType.QWEN4_QSA_QUANTIZED_KVCACHE
+
+    def serialize_state(self, cache_obj: Any) -> tuple[Any, ...]:
+        keys, values = cache_obj.dequantize_for_apc()
+        elements = (
+            keys,
+            values,
+            cache_obj.index_keys,
+            _serialize_qsa_positions(cache_obj.index_position_ids),
+        )
+        self._validate_serialized_state(elements)
+        return elements
+
+
+class Qwen4BatchQSAKVCacheHandler(CacheTypeHandler):
+    """Full-state handler for batched Qwen4 QSA caches."""
+
+    @property
+    def cache_type(self) -> CacheType:
+        return CacheType.QWEN4_BATCH_QSA_KVCACHE
+
+    @property
+    def supports_block_slicing(self) -> bool:
+        return False
+
+    def get_state_axis_info(self) -> tuple[CacheStateAxisInfo, ...]:
+        return (
+            CacheStateAxisInfo("keys", 2, False),
+            CacheStateAxisInfo("values", 2, False),
+            CacheStateAxisInfo("offset", None, False),
+            CacheStateAxisInfo("left_padding", None, False),
+            CacheStateAxisInfo("index_keys", 1, False),
+            CacheStateAxisInfo("index_position_ids", 2, False),
+        )
+
+    def serialize_state(self, cache_obj: Any) -> tuple[Any, ...]:
+        kv_state, index_keys, position_ids = cache_obj.state
+        keys, values, offset, left_padding = kv_state
+        return (
+            keys,
+            values,
+            offset,
+            left_padding,
+            index_keys,
+            _serialize_qsa_positions(position_ids),
+        )
+
+    def extract_state(self, cache_obj: Any) -> dict[str, Any]:
+        elements = self.serialize_state(cache_obj)
+        return {
+            **{
+                info.name: value
+                for info, value in zip(self.get_state_axis_info(), elements)
+            },
+            "states": elements,
+            "is_full_state": True,
+            "cache_type": self.cache_type.value,
+        }
+
+    def get_seq_len(self, state: dict[str, Any]) -> int:
+        keys = state.get("keys")
+        return int(keys.shape[2]) if keys is not None else 0
+
+    def slice_state(
+        self,
+        state: dict[str, Any],
+        start_idx: int,
+        end_idx: int,
+    ) -> dict[str, Any] | None:
+        del start_idx, end_idx
+        return {**state, "is_full_state": True}
+
+    def concatenate_states(self, states: list[dict[str, Any]]) -> dict[str, Any]:
+        return states[-1] if states else {}
+
+    def deserialize_state(
+        self,
+        elements: tuple[Any, ...],
+        meta_state: Any | None = None,
+    ) -> Any:
+        del meta_state
+        try:
+            from ..patches.mlx_vlm_qwen4_exp_compat import (
+                apply_mlx_vlm_qwen4_exp_compat_patch,
+            )
+
+            apply_mlx_vlm_qwen4_exp_compat_patch()
+            from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Qwen4 BatchQSAKVCache unavailable: %s", exc)
+            return None
+
+        padded = tuple(elements) + (None,) * max(0, 6 - len(elements))
+        keys, values, offset, left_padding, index_keys, position_ids = padded[:6]
+        left_padding_arg = left_padding if left_padding is not None else [0]
+        cache = BatchQSAKVCache(left_padding_arg)
+        cache.state = (
+            (keys, values, offset, left_padding_arg),
+            index_keys,
+            _deserialize_qsa_positions(position_ids),
+        )
+        return cache
+
+    def reconstruct_cache(
+        self,
+        state: dict[str, Any],
+        meta_state: tuple | None = None,
+    ) -> Any:
+        elements = state.get("states")
+        if elements is None:
+            elements = tuple(
+                state.get(info.name) for info in self.get_state_axis_info()
+            )
+        return self.deserialize_state(tuple(elements), meta_state)
 
 
 # Default handler for unknown types - falls back to KVCache behavior

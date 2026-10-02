@@ -3,8 +3,6 @@
 
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 
 class TestBuildLayerPattern:
     """Test _build_layer_pattern function."""
@@ -84,6 +82,15 @@ class TestApplyIndexCache:
         from omlx.patches.index_cache import apply_index_cache
 
         model = MagicMock(spec=[])
+        assert apply_index_cache(model, 4) is False
+
+    def test_glm_moe_dsa_returns_false(self):
+        """GLM-5.2 uses its native indexer_types schedule, not IndexCache."""
+        from omlx.patches.index_cache import apply_index_cache
+
+        model = MagicMock(spec=[])
+        model.args = MagicMock(spec=[])
+        model.args.model_type = "glm_moe_dsa"
         assert apply_index_cache(model, 4) is False
 
     def test_freq_less_than_2_returns_false(self):
@@ -187,3 +194,20 @@ class TestApplyPostLoadTransforms:
         result = apply_post_load_transforms(model, settings)
         mock_apply.assert_not_called()
         assert result is model
+
+
+class TestPatchedAttentionSdpaBinding:
+    """The patched attention must not freeze the SDPA it saw at patch time."""
+
+    def test_sdpa_resolved_through_module_at_call_time(self):
+        from omlx.patches.index_cache import _make_patched_attention_call
+
+        patched = _make_patched_attention_call(MagicMock())
+        code = patched.__code__
+
+        # apply_post_load_transforms runs this patch before the engine installs
+        # the TurboQuant dispatcher, so a frozen binding would route TurboQuant
+        # caches into the plain mlx-lm SDPA for the rest of the process (#2372).
+        assert "scaled_dot_product_attention" not in code.co_freevars
+        assert "mlx_lm_base" in code.co_names
+        assert "scaled_dot_product_attention" in code.co_names

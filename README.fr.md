@@ -55,7 +55,7 @@
 
 ### Application macOS
 
-Téléchargez le `.dmg` depuis les [Releases](https://github.com/jundot/omlx/releases), glissez-le dans Applications, c'est tout. L'application inclut une mise à jour automatique intégrée, les futures mises à jour se font en un clic. À noter que l'application macOS n'installe pas la commande CLI `omlx`. Pour une utilisation en terminal, installez via Homebrew ou depuis les sources.
+Téléchargez le `.dmg` depuis les [Releases](https://github.com/jundot/omlx/releases), glissez-le dans Applications, c'est tout. L'application inclut une mise à jour automatique intégrée, les futures mises à jour se font en un clic. L'application macOS installe aussi un shim CLI léger dans `~/.omlx/bin/omlx`, ce qui permet de contrôler le serveur géré par l'app depuis le terminal ou Apple Shortcuts.
 
 ### Homebrew
 
@@ -73,6 +73,12 @@ brew services start omlx
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
 ```
 
+Les kernels natifs personnalisés optionnels pour GLM-5.2 / MiniMax M3 nécessitent actuellement un build HEAD :
+
+```bash
+brew install omlx --HEAD --with-custom-kernel
+```
+
 ### Depuis les sources
 
 ```bash
@@ -80,15 +86,18 @@ git clone https://github.com/jundot/omlx.git
 cd omlx
 pip install -e .          # Core uniquement
 pip install -e ".[mcp]"   # Avec support MCP (Model Context Protocol)
+
+# Optionnel : kernels natifs personnalisés GLM-5.2 / MiniMax M3
+OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 ```
 
-Nécessite macOS 15.0+ (Sequoia), Python 3.10+, et Apple Silicon (M1/M2/M3/M4).
+Nécessite macOS 15.0+ (Sequoia), Python 3.10+, et Apple Silicon (M1/M2/M3/M4/M5).
 
 ## Démarrage rapide
 
 ### Application macOS
 
-Lancez oMLX depuis votre dossier Applications. L'écran de bienvenue vous guide en trois étapes — répertoire des modèles, démarrage du serveur, et premier téléchargement de modèle. C'est tout. Pour connecter OpenClaw, OpenCode, Codex ou Hermes Agent, voir [Intégrations](#intégrations).
+Lancez oMLX depuis votre dossier Applications. L'écran de bienvenue vous guide en trois étapes — répertoire des modèles, démarrage du serveur, et premier téléchargement de modèle. C'est tout. Pour connecter OpenClaw, OpenCode, Codex, Hermes Agent, Copilot ou DeepSeek Harness, voir [Intégrations](#intégrations).
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.36.32.png" alt="oMLX Welcome Screen" width="360">
@@ -153,7 +162,7 @@ Gère les requêtes concurrentes via le BatchGenerator de mlx-lm. Le nombre maxi
 
 ### Optimisation Claude Code
 
-Support du context scaling pour faire tourner des modèles avec un contexte réduit avec Claude Code. Ajuste les compteurs de tokens reportés pour que l'auto-compactage se déclenche au bon moment, et un keep-alive SSE évite les timeouts de lecture pendant les longs prefills.
+Fait tourner des modèles à contexte réduit avec Claude Code en transmettant la fenêtre de contexte réelle du modèle à l'auto-compactage au lieu de mettre à l'échelle les compteurs de tokens, et un keep-alive SSE évite les timeouts de lecture pendant les longs prefills.
 
 ### Service multi-modèles
 
@@ -171,6 +180,7 @@ Configurez les paramètres d'échantillonnage, les kwargs du template de chat, l
 
 - **Alias de modèle** : définissez un nom personnalisé visible par l'API. `/v1/models` retourne l'alias, et les requêtes acceptent l'alias comme le nom du répertoire.
 - **Type de modèle** : forcez manuellement un modèle en LLM ou VLM indépendamment de l'auto-détection.
+- **Profils** : enregistrez des ensembles nommés de paramètres par modèle et basculez entre eux depuis le panneau d'admin. Un profil peut éventuellement être exposé comme son propre modèle : `/v1/models` liste alors aussi `<modèle>:<profil>` (par ex. `qwen3-8b:thinking`), qui s'exécute sur le même moteur que le modèle de base avec les paramètres du profil appliqués à chaque requête — sans mémoire supplémentaire ni rechargement. Lorsque le modèle de base possède un alias, l'identifiant exposé est annoncé sous la forme `<alias>:<profil>` ; la forme avec le nom du répertoire continue de fonctionner, comme pour le modèle de base.
 
 <p align="center">
   <img src="docs/images/omlx_ChatTemplateKwargs.png" alt="oMLX Chat Template Kwargs" width="480">
@@ -194,7 +204,7 @@ Recherchez et téléchargez des modèles MLX depuis HuggingFace directement dans
 
 ### Intégrations
 
-Configurez OpenClaw, OpenCode, Codex, Hermes Agent et Pi directement depuis le tableau de bord en un clic. Aucune édition manuelle de config requise.
+Configurez OpenClaw, OpenCode, Codex, Hermes Agent, Copilot, Pi et DeepSeek Harness directement depuis le tableau de bord en un clic. Aucune édition manuelle de config requise.
 
 <p align="center">
   <img src="docs/images/omlx_integrations.png" alt="oMLX Integrations" width="720">
@@ -349,6 +359,9 @@ open apps/omlx-mac/build/Stage/oMLX.app
 
 # Forcer une reconstruction de venvstacks (sinon mis en cache par empreinte)
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
+
+# Préparer avec les kernels natifs personnalisés optionnels GLM-5.2 / MiniMax M3
+apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 
 Le premier build à froid prend 10–20 minutes (assemblage des couches Python venvstacks). Les builds suivants réutilisent `packaging/_export/` et finissent en environ 4 minutes. Voir [packaging/README.md](packaging/README.md) pour la configuration des couches et [apps/omlx-mac/](apps/omlx-mac/) pour les sources Swift.

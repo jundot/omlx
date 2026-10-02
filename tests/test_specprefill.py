@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for SpecPrefill (attention-based sparse prefill)."""
 
-import math
+import logging
 
 import pytest
 
@@ -16,20 +16,20 @@ pytestmark = pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 
 
 class TestSelectChunks:
-    """Tests for select_chunks() — chunk-based top-K% selection."""
+    """Tests for select_chunks() — top-K% selection with a mandatory tail."""
 
     def test_basic_selection(self):
         from omlx.patches.specprefill import select_chunks
 
-        # 128 tokens, importance peaks in the first 32 tokens
-        importance = mx.zeros(128)
+        # 4096 tokens (128 chunks), importance peaks in the first chunk.
+        importance = mx.zeros(4096)
         importance = importance.at[:32].add(1.0)
         selected = select_chunks(importance, keep_pct=0.25, chunk_size=32)
-        # Should keep 1 chunk (25% of 4 chunks)
-        assert selected.shape[0] == 32
-        # Should be the first chunk (indices 0-31)
-        assert selected[0].item() == 0
-        assert selected[-1].item() == 31
+        # Keeps 32 chunks (25% of 128): the tail window plus top-ranked ones.
+        assert selected.shape[0] == 32 * 32
+        indices = set(selected.tolist())
+        # The high-importance first chunk wins a ranked slot.
+        assert set(range(32)) <= indices
 
     def test_keep_100_percent(self):
         from omlx.patches.specprefill import select_chunks
@@ -41,12 +41,11 @@ class TestSelectChunks:
     def test_sorted_output(self):
         from omlx.patches.specprefill import select_chunks
 
-        # Make middle and end chunks important
-        importance = mx.zeros(128)
+        # Make two early chunks important; 4096 tokens total.
+        importance = mx.zeros(4096)
         importance = importance.at[32:64].add(2.0)
         importance = importance.at[96:128].add(1.0)
-        selected = select_chunks(importance, keep_pct=0.5, chunk_size=32)
-        # Should select 2 chunks, sorted by position
+        selected = select_chunks(importance, keep_pct=0.25, chunk_size=32)
         indices = selected.tolist()
         assert indices == sorted(indices)
         assert 32 in indices
@@ -63,14 +62,70 @@ class TestSelectChunks:
     def test_non_divisible_chunks(self):
         from omlx.patches.specprefill import select_chunks
 
-        # 100 tokens with chunk_size=32 → 4 chunks (last has 4 tokens)
-        importance = mx.ones(100)
+        # 4100 tokens with chunk_size=32 → 129 chunks (last has 4 tokens).
+        # keep_n = 65 chunks; 64 full chunks + the 4-token final chunk.
+        importance = mx.ones(4100)
         selected = select_chunks(importance, keep_pct=0.5, chunk_size=32)
-        n_chunks = math.ceil(100 / 32)
-        keep_n = math.ceil(n_chunks * 0.5)
-        expected_tokens = min(keep_n * 32, 100)
-        # Allow for last chunk being smaller
-        assert selected.shape[0] <= expected_tokens + 32
+        assert selected.shape[0] == 64 * 32 + 4
+
+    def test_tail_floor_kept_when_unimportant(self):
+        from omlx.patches.specprefill import select_chunks
+
+        # Importance mass entirely in the front half; the tail scores zero.
+        # Without the mandatory tail window the final chunks (chat-template
+        # closers + generation prompt) would be dropped — the 2439 failure.
+        importance = mx.zeros(8192)
+        importance = importance.at[:2048].add(1.0)
+        selected = select_chunks(importance, keep_pct=0.2, chunk_size=32)
+        indices = set(selected.tolist())
+        assert set(range(8192 - 512, 8192)) <= indices
+
+    def test_tail_floor_within_budget_at_scale(self):
+        from omlx.patches.specprefill import select_chunks
+
+        # When the keep budget covers the tail, the tail comes out of the
+        # budget and the selected-token count matches the plain top-K
+        # formula: 8192 tokens → 256 chunks, keep 20% → 52 chunks → 1664.
+        importance = (mx.arange(8192) % 97).astype(mx.float32)
+        selected = select_chunks(importance, keep_pct=0.2, chunk_size=32)
+        assert selected.shape[0] == 1664
+
+    def test_tail_floor_dominates_small_input(self):
+        from omlx.patches.specprefill import select_chunks
+
+        # Just above the admission threshold with a small keep budget the
+        # floor wins over keep_pct: exactly the 16 tail chunks (512 tokens,
+        # indices 544..1055) are selected — keep_n (4) is below the tail.
+        importance = mx.zeros(1056)
+        selected = select_chunks(importance, keep_pct=0.1, chunk_size=32)
+        indices = set(selected.tolist())
+        assert indices == set(range(1056 - 512, 1056))
+
+    def test_tail_floor_non_aligned_input(self):
+        from omlx.patches.specprefill import select_chunks
+
+        # Non-chunk-aligned M: the tail window is chunk-aligned, so it
+        # covers the final partial chunk plus the 15 full chunks before it
+        # (481 trailing tokens here — at least tail_tokens - chunk_size + 1).
+        importance = mx.zeros(8193)
+        importance = importance.at[:2048].add(1.0)
+        selected = select_chunks(importance, keep_pct=0.2, chunk_size=32)
+        indices = set(selected.tolist())
+        assert set(range(241 * 32, 8193)) <= indices
+
+    def test_tail_floor_disabled(self):
+        from omlx.patches.specprefill import select_chunks
+
+        # tail_tokens=0 restores pure top-K: an unimportant tail is dropped
+        # and the budget is exactly keep_n chunks (32 of 128 → 1024 tokens).
+        importance = mx.zeros(4096)
+        importance = importance.at[:2048].add(1.0)
+        selected = select_chunks(
+            importance, keep_pct=0.25, chunk_size=32, tail_tokens=0
+        )
+        indices = set(selected.tolist())
+        assert (4096 - 1) not in indices
+        assert selected.shape[0] == 32 * 32
 
 
 class TestManualRoPE:
@@ -108,6 +163,103 @@ class TestManualRoPE:
         result = manual_rope(x, positions, dims=dims)
         # Unrotated portion should be unchanged
         assert mx.allclose(result[..., dims:], x[..., dims:])
+
+
+class TestManualRopeWithFreqs:
+    """Tests for manual_rope_with_freqs() — RoPE from a precomputed freq table."""
+
+    @staticmethod
+    def _reference_partial_rotary(x, positions, dims, freqs):
+        """Independent oracle for the model's real partial rotary, written as an
+        explicit per-pair rotation in numpy so it shares NO code with the MLX
+        implementation under test. Pairs dim ``j`` with dim ``j + dims // 2``
+        over the full head and rotates ONLY the first ``len(freqs)`` pairs;
+        every other lane passes through. The old contiguous ``2 * len(freqs)``
+        pairing diverges from this by construction, which is what caught the
+        bug (jundot, PR #2295)."""
+        import numpy as np
+
+        xn = np.array(x, dtype=np.float64)
+        half = dims // 2
+        n = int(freqs.shape[-1])
+        inv = 1.0 / np.array(freqs, dtype=np.float64)
+        pos = np.array(positions, dtype=np.float64)
+        out = xn.copy()
+        for j in range(n):
+            ang = pos * inv[j]
+            c, s = np.cos(ang), np.sin(ang)
+            a = xn[..., j]
+            b = xn[..., j + half]
+            out[..., j] = a * c - b * s
+            out[..., j + half] = a * s + b * c
+        return out
+
+    def test_partial_rotary_matches_reference_rope(self):
+        # The corrected fix must match the model's real rope: pair dim i with
+        # dim i + dims//2 and rotate only the first len(freqs) pairs. The earlier
+        # 2*len(freqs) contiguous pairing diverged by ~5.9 abs and wrote
+        # misrotated KV on every Gemma-4 global layer.
+        import numpy as np
+
+        from omlx.patches.specprefill import manual_rope_with_freqs
+
+        B, n_heads, L, head_dim = 1, 2, 8, 256
+        n_freqs = 64  # rotary sub-dim 128 < head_dim 256 (Gemma-4 style)
+        freqs = mx.arange(1, n_freqs + 1, dtype=mx.float32) * 1000.0
+        x = mx.random.normal((B, n_heads, L, head_dim))
+        positions = mx.arange(L)
+
+        got = np.array(
+            manual_rope_with_freqs(x, positions, dims=head_dim, freqs=freqs),
+            dtype=np.float64,
+        )
+        want = self._reference_partial_rotary(x, positions, head_dim, freqs)
+        assert got.shape == tuple(x.shape)
+        assert np.max(np.abs(got - want)) < 1e-4
+
+    def test_partial_rotary_rotates_only_first_freqs_of_each_half(self):
+        # Exactly the lanes the real rope touches change, and no others: for
+        # head_dim 256 (half 128, n_freqs 64), dims [0:64] and [128:192] rotate;
+        # [64:128] and [192:256] pass through (the zero-angle, unrotated pairs).
+        from omlx.patches.specprefill import manual_rope_with_freqs
+
+        B, n_heads, L, head_dim = 1, 2, 8, 256
+        n_freqs, half = 64, 128
+        freqs = mx.arange(1, n_freqs + 1, dtype=mx.float32) * 1000.0
+        x = mx.random.normal((B, n_heads, L, head_dim))
+        result = manual_rope_with_freqs(x, mx.arange(L), dims=head_dim, freqs=freqs)
+
+        assert result.shape == x.shape
+        # Rotated lanes: the first n_freqs of each half of the head.
+        assert not mx.allclose(result[..., 0:n_freqs], x[..., 0:n_freqs])
+        assert not mx.allclose(
+            result[..., half : half + n_freqs], x[..., half : half + n_freqs]
+        )
+        # Untouched lanes: the remainder of each half.
+        assert mx.allclose(result[..., n_freqs:half], x[..., n_freqs:half])
+        assert mx.allclose(result[..., half + n_freqs :], x[..., half + n_freqs :])
+
+    def test_full_rotary_matches_reference_rope(self):
+        # Full rotary (len(freqs) == dims//2): no zero-padding path, every pair
+        # rotates, and it still matches the independent oracle exactly -- proving
+        # the fix is a no-op for full-rotary custom-_freqs models.
+        import numpy as np
+
+        from omlx.patches.specprefill import manual_rope_with_freqs
+
+        B, n_heads, L, head_dim = 1, 2, 4, 64
+        n_freqs = head_dim // 2
+        freqs = mx.arange(1, n_freqs + 1, dtype=mx.float32) * 1000.0
+        x = mx.random.normal((B, n_heads, L, head_dim))
+        positions = mx.arange(L)
+
+        got = np.array(
+            manual_rope_with_freqs(x, positions, dims=head_dim, freqs=freqs),
+            dtype=np.float64,
+        )
+        want = self._reference_partial_rotary(x, positions, head_dim, freqs)
+        assert got.shape == tuple(x.shape)
+        assert np.max(np.abs(got - want)) < 1e-4
 
 
 class TestAvgPool1d:
@@ -496,6 +648,28 @@ class TestRoPEWrappers:
         cleanup_rope(model)
         assert layer.self_attn.rope is original_rope
 
+    def test_cleanup_rope_unwraps_nested(self):
+        from unittest.mock import MagicMock
+
+        from omlx.patches.specprefill import (
+            _OffsetAdjustedRoPE,
+            cleanup_rope,
+        )
+
+        original_rope = MagicMock()
+        nested = _OffsetAdjustedRoPE(
+            _OffsetAdjustedRoPE(original_rope, adjustment=3), adjustment=5
+        )
+
+        model = MagicMock()
+        layer = MagicMock()
+        layer.self_attn = MagicMock()
+        layer.self_attn.rope = nested
+        model.layers = [layer]
+
+        cleanup_rope(model)
+        assert layer.self_attn.rope is original_rope
+
 
 class TestModelSettings:
     """Tests for SpecPrefill fields in ModelSettings."""
@@ -608,3 +782,291 @@ class TestEngineCorePropagation:
         req = core.scheduler.add_request.call_args[0][0]
         assert not hasattr(req, "_specprefill_threshold")
         assert not hasattr(req, "_specprefill_keep_pct")
+
+
+class TestRoPEReWrap:
+    """Regression tests for #766 — re-wrapping a leftover _OffsetAdjustedRoPE.
+
+    If a prior sparse_prefill left an _OffsetAdjustedRoPE installed (cleanup_rope
+    not called, e.g. an aborted request or a multi-turn partial cache hit), the
+    next sparse_prefill used to capture that wrapper as `original` and re-wrap it
+    in _PositionMappedRoPE, whose __init__ dereferenced `original_rope.dims` and
+    raised `'_OffsetAdjustedRoPE' object has no attribute 'dims'`.
+    """
+
+    class _GenuineRoPE:
+        dims = 128
+        base = 10000.0
+        scale = 1.0
+
+        def __call__(self, x, offset=0):
+            return x
+
+    def test_offset_adjusted_delegates_attrs(self):
+        from omlx.patches.specprefill import _OffsetAdjustedRoPE
+
+        wrapped = _OffsetAdjustedRoPE(self._GenuineRoPE(), adjustment=5)
+        # unknown attrs delegate to the wrapped rope
+        assert wrapped.dims == 128
+        assert wrapped.base == 10000.0
+
+    def test_unwrap_peels_to_genuine(self):
+        from omlx.patches.specprefill import (
+            _OffsetAdjustedRoPE,
+            _PositionMappedRoPE,
+            _unwrap_rope,
+        )
+
+        genuine = self._GenuineRoPE()
+        positions = mx.arange(16)
+        assert _unwrap_rope(genuine) is genuine
+        assert _unwrap_rope(_OffsetAdjustedRoPE(genuine, 5)) is genuine
+        nested = _PositionMappedRoPE(_OffsetAdjustedRoPE(genuine, 5), positions)
+        assert _unwrap_rope(nested) is genuine
+
+    def test_rewrap_leftover_does_not_crash(self):
+        from omlx.patches.specprefill import (
+            _OffsetAdjustedRoPE,
+            _PositionMappedRoPE,
+        )
+
+        genuine = self._GenuineRoPE()
+        leftover = _OffsetAdjustedRoPE(genuine, adjustment=5)
+        # Previously raised AttributeError on original_rope.dims (#766)
+        pm = _PositionMappedRoPE(leftover, mx.arange(16))
+        assert pm._dims == 128
+
+
+class TestTargetPrefillLeftoverCleanup:
+    """run_specprefill_target_prefill restores RoPE at entry (#766 follow-up).
+
+    A stale _OffsetAdjustedRoPE left by an aborted specprefill request must be
+    removed before the system prompt prefill runs, otherwise system KV is
+    written at offset-shifted positions.
+    """
+
+    def test_leftover_unwrapped_before_prefill(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import omlx.patches.specprefill as patches
+        import omlx.specprefill.target as target_mod
+        from omlx.specprefill.planning import SpecPrefillTargetPlan
+
+        class FakeRoPE:
+            dims = 64
+            base = 10000.0
+            scale = 1.0
+
+            def __call__(self, x, offset=0):
+                return x
+
+        genuine = FakeRoPE()
+        layer = MagicMock()
+        layer.self_attn = MagicMock()
+        layer.self_attn.rope = patches._OffsetAdjustedRoPE(genuine, adjustment=7)
+        model = MagicMock()
+        model.layers = [layer]
+
+        seen = {}
+
+        def fake_sparse_prefill(m, tokens, selected, cache, **kwargs):
+            seen["rope"] = layer.self_attn.rope
+            return mx.zeros((1, 1))
+
+        monkeypatch.setattr(patches, "sparse_prefill", fake_sparse_prefill)
+        monkeypatch.setattr(target_mod, "make_prompt_cache", lambda m: [])
+
+        plan = SpecPrefillTargetPlan(
+            system_token_count=0,
+            conversation_tokens=list(range(8)),
+            conversation_token_count=8,
+            generation_kickoff_index=7,
+            remove_kickoff_index=False,
+            sparse_selected_token_count=4,
+            total_tracker_prefill_count=4,
+            position_offset=0,
+        )
+        request = MagicMock()
+        request.num_prompt_tokens = 8
+        request.cached_tokens = 0
+
+        target_mod.run_specprefill_target_prefill(
+            target_model=model,
+            request=request,
+            plan=plan,
+            all_tokens=list(range(8)),
+            selected_indices=mx.array([0, 2, 4, 7]),
+            prefill_step_size=4,
+            stream=mx.cpu,
+            check_abort=lambda n: None,
+            report_system_progress=lambda p, t: None,
+            report_sparse_progress=lambda p, t: None,
+            sync_and_clear_cache=lambda: None,
+            log=MagicMock(),
+        )
+
+        # Entry cleanup must restore the genuine rope before prefill runs
+        assert seen["rope"] is genuine
+        assert layer.self_attn.rope is genuine
+
+
+class TestLogicalCacheOffset:
+    @staticmethod
+    def _model(kinds):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            layers=[
+                (
+                    SimpleNamespace(self_attn=object())
+                    if kind == "a"
+                    else SimpleNamespace()
+                )
+                for kind in kinds
+            ]
+        )
+
+    @pytest.mark.parametrize("populated", [False, True])
+    def test_hybrid_and_composite_caches(self, populated):
+        from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
+
+        from omlx.patches.specprefill import _logical_cache_offset
+
+        recurrent, kv = ArraysCache(1), KVCache()
+        if populated:
+            recurrent[0] = mx.ones((1, 2, 4))
+            kv.update_and_fetch(mx.zeros((1, 2, 12, 8)), mx.zeros((1, 2, 12, 8)))
+        expected = 12 if populated else 0
+        assert _logical_cache_offset(self._model("a"), [kv]) == expected
+        assert _logical_cache_offset(self._model("ra"), [recurrent, kv]) == expected
+        assert (
+            _logical_cache_offset(self._model("a"), [CacheList(kv, recurrent)])
+            == expected
+        )
+
+    @pytest.mark.parametrize("offsets", [(40, 40), (40, 64)])
+    def test_unbounded_offset_disagreement_is_logged(self, offsets, caplog):
+        from mlx_lm.models.cache import KVCache
+
+        from omlx.patches.specprefill import _logical_cache_offset
+
+        caches = [KVCache(), KVCache()]
+        for cache, offset in zip(caches, offsets):
+            cache.offset = offset
+        with caplog.at_level(logging.WARNING, logger="omlx.patches.specprefill"):
+            assert _logical_cache_offset(self._model("aa"), caches) == 40
+        assert bool(caplog.records) == (offsets[0] != offsets[1])
+
+    def test_bounded_offsets_are_used_only_without_unbounded_layers(self):
+        from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+        from omlx.patches.specprefill import _logical_cache_offset
+
+        kv = KVCache()
+        kv.offset = 40
+        rotating = RotatingKVCache(max_size=8)
+        rotating.offset = 64
+        assert _logical_cache_offset(self._model("aa"), [kv, rotating]) == 40
+        assert _logical_cache_offset(self._model("a"), [rotating]) == 64
+
+    @pytest.mark.parametrize("probe", ["empty", "populated", "missing", "raises"])
+    def test_missing_offset_requires_proven_empty_cache(self, probe):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from omlx.patches.specprefill import (
+            IndeterminateCacheOffsetError,
+            _logical_cache_offset,
+        )
+
+        cache = SimpleNamespace()
+        if probe == "raises":
+            cache.empty = Mock(side_effect=RuntimeError("unreadable"))
+        elif probe != "missing":
+            cache.empty = lambda: probe == "empty"
+        if probe == "empty":
+            assert _logical_cache_offset(self._model("a"), [cache]) == 0
+        else:
+            with pytest.raises(IndeterminateCacheOffsetError):
+                _logical_cache_offset(self._model("a"), [cache])
+
+
+class TestUndoLookahead:
+
+    @staticmethod
+    def _kv(n, seed):
+        return mx.random.normal((1, 2, n, 4), key=mx.random.key(seed))
+
+    @staticmethod
+    def _snapshot(leaf):
+        from mlx.utils import tree_flatten
+
+        from omlx.patches.specprefill import _is_sliceable_kv
+
+        if _is_sliceable_kv(leaf):
+            arrays = [
+                leaf.keys[..., : leaf.offset, :],
+                leaf.values[..., : leaf.offset, :],
+            ]
+            return [a.tolist() for a in arrays], leaf.offset
+        return [
+            (name, v.tolist() if isinstance(v, mx.array) else v)
+            for name, v in tree_flatten(leaf.state)
+        ], {k: v for k, v in vars(leaf).items() if isinstance(v, int)}
+
+    def test_round_trip_restores_every_leaf(self):
+        from mlx_lm.models.cache import (
+            ArraysCache,
+            CacheList,
+            KVCache,
+            RotatingKVCache,
+        )
+
+        from omlx.cache.type_handlers import SizedArraysCache
+        from omlx.patches.specprefill import (
+            _cache_leaves,
+            _hold_leaf_state,
+            _is_sliceable_kv,
+            _undo_lookahead,
+        )
+
+        recurrent = ArraysCache(2)
+        recurrent[0] = mx.ones((1, 3))
+        recurrent[1] = mx.ones((1, 3)) * 2
+        restored = SizedArraysCache(ArraysCache(2), token_count=12)
+        restored[0] = mx.ones((1, 3)) * 3
+        restored[1] = mx.ones((1, 3)) * 4
+        window = RotatingKVCache(max_size=8)
+        window.update_and_fetch(self._kv(11, 1), self._kv(11, 2))
+        window.update_and_fetch(self._kv(1, 7), self._kv(1, 8))
+        nested_kv = KVCache()
+        nested_kv.update_and_fetch(self._kv(12, 3), self._kv(12, 4))
+        plain_kv = KVCache()
+        plain_kv.update_and_fetch(self._kv(12, 5), self._kv(12, 6))
+        cache = [
+            CacheList(recurrent, window),
+            CacheList(nested_kv),
+            plain_kv,
+            restored,
+        ]
+
+        leaves = _cache_leaves(cache)
+        assert leaves == [recurrent, window, nested_kv, plain_kv, restored]
+        before = [self._snapshot(leaf) for leaf in leaves]
+        held = [
+            None if _is_sliceable_kv(leaf) else _hold_leaf_state(leaf)
+            for leaf in leaves
+        ]
+
+        for step in range(3):
+            recurrent[0] = recurrent[0] + 1
+            restored[0] = restored[0] + 1
+            for leaf in (window, nested_kv, plain_kv):
+                leaf.update_and_fetch(self._kv(1, 10 + step), self._kv(1, 20 + step))
+
+        _undo_lookahead(leaves, held, pre_lookahead_offset=12)
+
+        assert [self._snapshot(leaf) for leaf in leaves] == before
+        assert cache[0].caches[1] is window
+        assert restored[0].tolist() == [[3.0, 3.0, 3.0]]
+        assert window._idx == before[1][1]["_idx"]

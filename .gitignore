@@ -5,6 +5,8 @@ __pycache__/
 
 # C extensions
 *.so
+*.dylib
+*.metallib
 
 # Distribution / packaging
 .Python
@@ -43,6 +45,7 @@ htmlcov/
 .cache
 nosetests.xml
 coverage.xml
+test-results.xml
 *.cover
 *.py,cover
 .hypothesis/
@@ -119,3 +122,11 @@ docs/native_app_architecture.md
 
 # UV lockfile
 uv.lock
+# generated TurboQuant memory report (machine-specific)
+tq_batch_memory.md
+
+# Local working notes and session tooling — never part of a PR
+.audit/
+.claude/
+issues.md
+clusterPlan.md

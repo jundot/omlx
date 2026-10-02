@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for accuracy evaluation modules."""
 
+from unittest.mock import MagicMock
+
 import pytest
 
+from omlx.eval.base import BaseBenchmark
 from omlx.eval.datasets import deterministic_sample, stratified_sample
 from omlx.eval.gsm8k import GSM8KBenchmark, _extract_numeric_answer, _normalize_number
 from omlx.eval.hellaswag import HellaSwagBenchmark
@@ -49,6 +52,16 @@ class TestMMLU:
     def test_extract_answer_last_letter(self):
         """When no 'answer is' pattern, use last valid letter."""
         assert self.bench.extract_answer("Looking at A and B, B is correct", {}) == "B"
+
+    def test_extract_answer_stated_answer_beats_later_letter(self):
+        """An explicit 'answer is X' wins even when another letter comes after it."""
+        assert self.bench.extract_answer("The answer is B. Note that A is a distractor.", {}) == "B"
+        assert self.bench.extract_answer("Answer: C. Option D looks similar.", {}) == "C"
+
+    def test_extract_answer_stated_answer_any_case(self):
+        """The 'answer is' cue is matched whatever casing the model used."""
+        assert self.bench.extract_answer("ANSWER IS D. A is incorrect.", {}) == "D"
+        assert self.bench.extract_answer("the answer is a, not b", {}) == "A"
 
     def test_check_answer_correct(self):
         assert self.bench.check_answer("A", {"answer": "A"}) is True
@@ -154,6 +167,23 @@ class TestGSM8K:
         assert _extract_numeric_answer("The answer is 42.") == "42"
         assert _extract_numeric_answer("She has 15 apples and 20 oranges, so 35 total.") == "35"
 
+    def test_extract_numeric_answer_trailing_comma_after_last_number(self):
+        # A bare "," is not a number: punctuation after the final digit must
+        # not become the extracted answer.
+        assert _extract_numeric_answer("The total is 72 clips, altogether.") == "72"
+        assert (
+            _extract_numeric_answer("Thus, the answer is 18, which is the total.")
+            == "18"
+        )
+        assert _extract_numeric_answer("He gave away 8 lollipops,") == "8"
+
+    def test_extract_numeric_answer_keeps_thousands_separator(self):
+        assert _extract_numeric_answer("The final total is 1,234 dollars.") == "1234"
+        assert _extract_numeric_answer("That comes to 1,234.50, in the end.") == "1234.50"
+
+    def test_extract_numeric_answer_commas_only(self):
+        assert _extract_numeric_answer("Well, hmm, no idea,") == ""
+
     def test_extract_numeric_answer_empty(self):
         assert _extract_numeric_answer("I don't know") == ""
         assert _extract_numeric_answer("") == ""
@@ -253,6 +283,30 @@ class TestHumanEval:
         passed, error = _execute_with_tests(code, test, "add")
         assert passed is False
 
+    def test_close_only_thinking_draft_does_not_pollute_answer(self):
+        from omlx.eval.humaneval import HumanEvalBenchmark
+
+        benchmark = HumanEvalBenchmark()
+        item = {
+            "prompt": "def add(a, b):\n    ",
+            "test": "def check(candidate):\n    assert candidate(1, 2) == 3",
+            "entry_point": "add",
+        }
+        response = (
+            "I should draft an implementation.\n"
+            "def draft(a, b):\n"
+            "    this is not valid Python\n"
+            "</think>\n"
+            "def add(a, b):\n"
+            "    return a + b"
+        )
+
+        visible = benchmark._strip_think_tags(response)
+        code = benchmark.extract_answer(visible, item)
+
+        assert code == "def add(a, b):\n    return a + b"
+        assert benchmark.check_answer(code, item) is True
+
 
 # --- Think Tag Stripping Tests ---
 
@@ -266,6 +320,12 @@ class TestStripThinkTags:
     def test_strip_empty_think(self):
         from omlx.eval.base import BaseBenchmark
         assert BaseBenchmark._strip_think_tags("<think></think>B") == "B"
+
+    def test_strip_think_block_with_open_tag_in_prompt(self):
+        from omlx.eval.base import BaseBenchmark
+
+        text = "reasoning draft\n</think>\nfinal answer"
+        assert BaseBenchmark._strip_think_tags(text) == "final answer"
 
     def test_no_think_tags(self):
         from omlx.eval.base import BaseBenchmark
@@ -317,6 +377,79 @@ class TestThinkingMode:
         result = BaseBenchmark._strip_think_tags(text)
         assert "<think>" not in result
         assert "The answer is A" in result
+
+
+class TestLocalStopReason:
+    """Local runs keep the engine's stop reason and token count (#3772)."""
+
+    class _Bench(MMLUBenchmark):
+        def format_prompt(self, item):
+            return [{"role": "user", "content": item["id"]}]
+
+    class _Engine:
+        is_external_api = False
+        model_type = None
+
+        async def chat(self, messages, **kwargs):
+            from omlx.engine.base import GenerationOutput
+
+            if messages[0]["content"] == "cut":
+                return GenerationOutput(
+                    text="<think>still reasoning", prompt_tokens=40,
+                    completion_tokens=8192, finish_reason="length",
+                )
+            if messages[0]["content"] == "cut-after-answer":
+                return GenerationOutput(
+                    text="The answer is A. To explain, first", prompt_tokens=40,
+                    completion_tokens=128, finish_reason="length",
+                )
+            if messages[0]["content"] == "boom":
+                raise RuntimeError("engine failed")
+            return GenerationOutput(
+                text="The answer is A", prompt_tokens=40,
+                completion_tokens=300, finish_reason="stop",
+            )
+
+    @pytest.mark.asyncio
+    async def test_budget_limited_answer_recorded(self):
+        items = [
+            {"id": "done", "answer": "A"},
+            {"id": "cut", "answer": "A"},
+        ]
+        result = await self._Bench().run(self._Engine(), items, enable_thinking=True)
+        by_id = {qr.question_id: qr for qr in result.question_results}
+        assert by_id["done"].finish_reason == "stop"
+        assert by_id["done"].completion_tokens == 300
+        assert by_id["done"].correct is True
+        assert by_id["cut"].finish_reason == "length"
+        assert by_id["cut"].completion_tokens == 8192
+        assert by_id["cut"].correct is False
+        # Local answers stay on the legacy scoring path.
+        assert by_id["cut"].status is None
+
+    @pytest.mark.asyncio
+    async def test_truncated_answer_can_score_correct(self):
+        # Scoring is unchanged: an answer stated before the cut still counts.
+        items = [{"id": "cut-after-answer", "answer": "A"}]
+        result = await self._Bench().run(self._Engine(), items)
+        qr = result.question_results[0]
+        assert qr.finish_reason == "length"
+        assert qr.correct is True
+
+    @pytest.mark.asyncio
+    async def test_engine_error_has_no_stop_reason(self):
+        items = [{"id": "boom", "answer": "A"}]
+        result = await self._Bench().run(self._Engine(), items)
+        qr = result.question_results[0]
+        assert qr.finish_reason is None
+        assert qr.completion_tokens == 0
+        assert qr.correct is False
+
+    def test_output_without_stop_reason(self):
+        diagnostics = BaseBenchmark._local_diagnostics(MagicMock(spec=["text"]))
+        assert diagnostics == {
+            "finish_reason": None, "prompt_tokens": 0, "completion_tokens": 0,
+        }
 
 
 # --- Dataset Sampling Tests ---
@@ -401,6 +534,176 @@ def _registered_benchmark_names():
 async def test_load_sample_per_benchmark(name):
     """Each registered benchmark loads a 10-row sample without crashing."""
     from omlx.eval import BENCHMARKS
-    items = await BENCHMARKS[name]().load_dataset(sample_size=10)
+    bench = BENCHMARKS[name]()
+    items = await bench.load_dataset(sample_size=10)
     assert items, f"{name} returned empty list"
     assert len(items) <= 10, f"{name} returned {len(items)} items"
+    # Recorded before sampling; the omlx.ai upload renders "n of total".
+    assert bench.dataset_total is not None, f"{name} did not set dataset_total"
+    assert bench.dataset_total >= len(items)
+
+
+class TestEvalSingleSampling:
+    """_eval_single fills benchmark-neutral sampling defaults but lets a
+    caller-supplied sampling_kwargs (the "model_settings" profile) override
+    temperature/penalties; max_tokens stays benchmark-controlled regardless."""
+
+    async def _captured_chat_kwargs(self, sampling_kwargs):
+        bench = MMLUBenchmark()
+        captured = {}
+
+        async def fake_chat(**kwargs):
+            captured.update(kwargs)
+            return MagicMock(text="A")
+
+        engine = MagicMock()
+        engine.chat = fake_chat
+        engine.model_type = "llm"
+        item = {
+            "question": "What is 2+2?",
+            "choices": ["1", "2", "3", "4"],
+            "answer": 3,
+            "subject": "math",
+        }
+        await bench._eval_single(
+            engine, item, 0, sampling_kwargs=sampling_kwargs, enable_thinking=False
+        )
+        return captured
+
+    async def test_defaults_to_greedy_when_empty(self):
+        kwargs = await self._captured_chat_kwargs({})
+        assert kwargs["temperature"] == 0.0
+        assert kwargs["presence_penalty"] == 0.0
+        assert kwargs["repetition_penalty"] == 1.0
+
+    async def test_caller_sampling_overrides_defaults(self):
+        kwargs = await self._captured_chat_kwargs(
+            {"temperature": 0.7, "presence_penalty": 0.3, "repetition_penalty": 1.1}
+        )
+        assert kwargs["temperature"] == 0.7
+        assert kwargs["presence_penalty"] == 0.3
+        assert kwargs["repetition_penalty"] == 1.1
+
+    async def test_max_tokens_always_benchmark_controlled(self):
+        kwargs = await self._captured_chat_kwargs({"max_tokens": 5})
+        assert kwargs["max_tokens"] != 5
+
+
+class TestExternalEvalDiagnostics:
+    @staticmethod
+    def _item():
+        return {
+            "question": "Which option is correct?",
+            "choices": ["one", "two", "three", "four"],
+            "answer": "A",
+            "subject": "test",
+        }
+
+    async def _run(self, output):
+        from unittest.mock import AsyncMock
+
+        from omlx.eval.cmmlu import CMMLUBenchmark
+
+        engine = MagicMock(is_external_api=True, model_type=None)
+        engine.chat = AsyncMock(return_value=output)
+        result = await CMMLUBenchmark().run(engine, [self._item()], batch_size=1)
+        return result, engine
+
+    @pytest.mark.parametrize(
+        ("text", "external_status", "expected_status", "correct"),
+        [
+            ("A", "ok", "correct", True),
+            ("B", "ok", "wrong", False),
+            ("no option", "ok", "parse_error", False),
+            ("", "timeout", "timeout", False),
+        ],
+    )
+    async def test_external_outcomes_are_classified(
+        self, text, external_status, expected_status, correct
+    ):
+        from types import SimpleNamespace
+
+        output = SimpleNamespace(
+            text=text,
+            external_status=external_status,
+            finish_reason="stop",
+            reasoning_fields_present=(),
+            reasoning_fields_nonempty=(),
+            prompt_tokens=11,
+            completion_tokens=2,
+            error_message="timed out" if external_status == "timeout" else "",
+        )
+        result, _ = await self._run(output)
+        question = result.question_results[0]
+
+        assert question.status == expected_status
+        assert question.correct is correct
+        assert question.prompt_tokens == 11
+        assert question.completion_tokens == 2
+
+    async def test_external_output_does_not_trigger_local_thinking_retry(self):
+        from types import SimpleNamespace
+
+        output = SimpleNamespace(
+            text="<think>hidden</think>A",
+            external_status="ok",
+            finish_reason="stop",
+            reasoning_fields_present=(),
+            reasoning_fields_nonempty=(),
+            prompt_tokens=11,
+            completion_tokens=2,
+            error_message="",
+        )
+        result, engine = await self._run(output)
+
+        assert result.thinking_used is False
+        assert engine.chat.await_count == 1
+
+    def test_missing_extracted_answer_is_parse_error(self):
+        from omlx.eval.cmmlu import CMMLUBenchmark
+
+        benchmark = CMMLUBenchmark()
+        benchmark.extract_answer = MagicMock(return_value=None)
+
+        predicted, correct, status = benchmark._classify_response(
+            "unparseable", self._item(), {"status": "ok"}
+        )
+
+        assert predicted == ""
+        assert correct is False
+        assert status == "parse_error"
+
+
+@pytest.mark.parametrize(
+    "benchmark_name",
+    ["humaneval", "livecodebench", "mbpp"],
+)
+async def test_code_benchmark_custom_runners_accept_diagnostic_result(
+    benchmark_name, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    from omlx.eval.humaneval import HumanEvalBenchmark
+    from omlx.eval.livecodebench import LiveCodeBenchBenchmark
+    from omlx.eval.mbpp import MBPPBenchmark
+
+    benchmark_classes = {
+        "humaneval": HumanEvalBenchmark,
+        "livecodebench": LiveCodeBenchBenchmark,
+        "mbpp": MBPPBenchmark,
+    }
+    benchmark = benchmark_classes[benchmark_name]()
+    monkeypatch.setattr(
+        benchmark,
+        "format_prompt",
+        lambda item: [{"role": "user", "content": "write code"}],
+    )
+    monkeypatch.setattr(benchmark, "extract_answer", lambda response, item: "code")
+    monkeypatch.setattr(benchmark, "check_answer", lambda predicted, item: True)
+    engine = MagicMock(is_external_api=False, model_type=None)
+    engine.chat = AsyncMock(return_value=MagicMock(text="code"))
+
+    result = await benchmark.run(engine, [{"id": "one"}], batch_size=1)
+
+    assert result.correct_count == 1
+    assert result.question_results[0].status is None

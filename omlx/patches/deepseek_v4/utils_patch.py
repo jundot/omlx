@@ -6,13 +6,15 @@ Two surgical changes from PR 1192 are applied:
 1. Weight loading goes through ``_load_safetensors`` instead of ``mx.load`` so
    safetensors files declaring the F8_E8M0 dtype (used by DeepSeek V4 fp8
    block-scale tensors) can be reinterpreted as U8 in-place.
-2. The ``elif quant_method == "fp8" and model_type == "deepseek_v4"`` branch
+2. The ``elif quant_method == "fp8" and model_type.startswith("deepseek_v4")``
+   branch
    in the quantization config dispatch builds the per-layer quantization
    spec via ``deepseek_v4.make_quantization_config``.
 
 The rest of ``load_model``'s body is identical to the v0.31.3 (``ed1fca4``)
-upstream — copied verbatim from PR 1192 head ``5c10538``. mlx-lm is pinned
-to a commit, so the body is stable.
+upstream — copied verbatim from PR 1192 head ``5c10538``. Other model types
+go to the original ``load_model``, so the process-wide replacement does not
+freeze the upstream loader for them.
 
 When mlx-lm merges PR 1192 upstream this patch should be removed.
 """
@@ -39,6 +41,35 @@ logger = logging.getLogger(__name__)
 SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
 
 _PATCHED = False
+
+
+def _native_ratio128_attention_enabled(config: dict[str, Any]) -> bool:
+    """Keep the native ratio-128 attention path off for sub-4-bit V4."""
+    if not str(config.get("model_type", "")).startswith("deepseek_v4"):
+        return True
+
+    quantizations = [config.get("quantization"), config.get("quantization_config")]
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict):
+        quantizations.extend(
+            [text_config.get("quantization"), text_config.get("quantization_config")]
+        )
+
+    # Per-layer overrides can be nested below a four-bit default.
+    while quantizations:
+        quantization = quantizations.pop()
+        bits = quantization.get("bits") if isinstance(quantization, dict) else None
+        if (
+            isinstance(bits, (int, float))
+            and not isinstance(bits, bool)
+            and float(bits) < 4
+        ):
+            return False
+        if isinstance(quantization, dict):
+            quantizations.extend(quantization.values())
+        elif isinstance(quantization, list):
+            quantizations.extend(quantization)
+    return True
 
 
 def _load_safetensors(path: str) -> dict:
@@ -101,6 +132,7 @@ def _build_patched_load_model() -> Callable:
     they pick up any other patches applied to ``mlx_lm.utils``.
     """
     default_get_classes = _utils._get_classes
+    original_load_model = _utils.load_model
 
     def patched_load_model(
         model_path: Path,
@@ -108,10 +140,31 @@ def _build_patched_load_model() -> Callable:
         strict: bool = True,
         model_config: dict[str, Any] | None = None,
         get_model_classes: Callable = default_get_classes,
+        trust_remote_code: bool = False,
     ) -> tuple[nn.Module, dict]:
         config = _utils.load_config(model_path)
         if model_config is not None:
             config.update(model_config)
+
+        if (
+            (model_file := config.get("model_file")) is not None
+            and not trust_remote_code
+        ):
+            raise ValueError(
+                f"The model at {model_path} requires executing custom model "
+                f"code ({model_file!r}). Pass trust_remote_code=True if you "
+                "trust this model."
+            )
+
+        if not str(config.get("model_type", "")).startswith("deepseek_v4"):
+            return original_load_model(
+                model_path,
+                lazy=lazy,
+                strict=strict,
+                model_config=model_config,
+                get_model_classes=get_model_classes,
+                trust_remote_code=trust_remote_code,
+            )
 
         weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
@@ -122,7 +175,7 @@ def _build_patched_load_model() -> Callable:
         for wf in weight_files:
             weights.update(_load_safetensors(wf))  # PR 1192 change
 
-        if (model_file := config.get("model_file")) is not None:
+        if model_file is not None:
             spec = importlib.util.spec_from_file_location(
                 "custom_model",
                 model_path / model_file,
@@ -137,6 +190,10 @@ def _build_patched_load_model() -> Callable:
             text_config = config.get("text_config", {})
             if "quantization_config" in text_config:
                 config["quantization_config"] = text_config["quantization_config"]
+
+        config["use_native_ratio128_attention"] = bool(
+            config.get("use_native_ratio128_attention", True)
+        ) and _native_ratio128_attention_enabled(config)
 
         model_args = model_args_class.from_dict(config)
         model = model_class(model_args)
@@ -185,10 +242,7 @@ def _build_patched_load_model() -> Callable:
                 config["quantization"] = quantization
                 config["quantization_config"] = quantization
                 _quantize(quantization)
-            elif (
-                quant_method == "fp8"
-                and config.get("model_type", None) == "deepseek_v4"
-            ):  # PR 1192 new branch
+            elif quant_method == "fp8":  # PR 1192 new branch
                 from mlx_lm.models.deepseek_v4 import make_quantization_config
 
                 quantization = make_quantization_config(model)

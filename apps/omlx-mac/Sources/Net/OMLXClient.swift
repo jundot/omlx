@@ -45,7 +45,7 @@ final class OMLXClient: ObservableObject {
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
 
-    init(host: String = "127.0.0.1", port: Int = 8080, apiKey: String? = nil) {
+    init(host: String = "127.0.0.1", port: Int = 8000, apiKey: String? = nil, session: URLSession? = nil) {
         self.host = host
         self.port = port
         self.apiKey = apiKey
@@ -56,7 +56,7 @@ final class OMLXClient: ObservableObject {
         cfg.httpCookieAcceptPolicy = .always
         cfg.timeoutIntervalForRequest = 15
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
-        self.session = URLSession(configuration: cfg)
+        self.session = session ?? URLSession(configuration: cfg)
 
         let enc = JSONEncoder()
         enc.keyEncodingStrategy = .convertToSnakeCase
@@ -79,12 +79,23 @@ final class OMLXClient: ObservableObject {
         try await get("/admin/api/global-settings")
     }
 
+    func getGlobalSettingsDefaults() async throws -> GlobalSettingsDTO {
+        try await get("/admin/api/global-settings/defaults")
+    }
+
     func updateGlobalSettings(_ patch: GlobalSettingsPatch) async throws -> UpdateGlobalSettingsResponse {
         try await post("/admin/api/global-settings", body: patch)
     }
 
     func getServerInfo() async throws -> ServerInfoDTO {
         try await get("/admin/api/server-info")
+    }
+
+    func getUsage(range: String = "today", model: String = "") async throws -> UsageHistoryDTO {
+        try await get(AdminAPI.usage, query: [
+            URLQueryItem(name: "range", value: range),
+            URLQueryItem(name: "model", value: model),
+        ])
     }
 
     func getStats(scope: String = "session", model: String = "") async throws -> StatsDTO {
@@ -148,6 +159,24 @@ final class OMLXClient: ObservableObject {
         try await put(AdminAPI.modelSettings(id), body: patch)
     }
 
+    func resetModelSettings(id: String) async throws -> SettingsApplyResultDTO {
+        try await postEmpty(AdminAPI.modelSettingsReset(id))
+    }
+
+    /// Server-side lookup of the best omlx.ai benchmarks for this device
+    /// and model (proxied like the preset refresh).
+    func listOptimalCandidates(id: String) async throws -> OptimalCandidatesDTO {
+        try await get(AdminAPI.modelSettingsOptimal(id))
+    }
+
+    func applyOptimalCandidate(id: String, benchmarkId: String) async throws -> SettingsApplyResultDTO {
+        try await post(AdminAPI.modelSettingsOptimal(id), body: ApplyOptimalRequest(benchmarkId: benchmarkId))
+    }
+
+    func applyRecipe(id: String, recipe: String) async throws -> SettingsApplyResultDTO {
+        try await post(AdminAPI.modelSettingsRecipe(id), body: ApplyRecipeRequest(recipe: recipe))
+    }
+
     func listModelProfiles(id: String) async throws -> ProfileListResponse {
         try await get(AdminAPI.modelProfiles(id))
     }
@@ -168,6 +197,10 @@ final class OMLXClient: ObservableObject {
     @discardableResult
     func applyModelProfile(id: String, name: String) async throws -> ApplyProfileResponse {
         try await postEmpty(AdminAPI.applyModelProfile(id, name))
+    }
+
+    func applyModelTemplate(id: String, name: String) async throws -> ApplyProfileResponse {
+        try await postEmpty(AdminAPI.applyModelTemplate(id, name))
     }
 
     func listProfileTemplates() async throws -> TemplateListResponse {
@@ -243,6 +276,18 @@ final class OMLXClient: ObservableObject {
         ])
     }
 
+    /// Fetch the README for a Hugging Face repo, the same payload the
+    /// browser admin renders in its model-card slide-over. Cache-aware
+    /// on the server (uses `hf_hub_download` under the hood), so post-
+    /// download lookups skip the network. Returns an empty
+    /// `modelCard` string when the upstream repo has no README — that
+    /// is a "no card" state, not an error.
+    func getHFModelCard(repoId: String) async throws -> ModelCardDTO {
+        try await get(AdminAPI.hfModelInfo, query: [
+            URLQueryItem(name: "repo_id", value: repoId),
+        ])
+    }
+
     // MARK: - ModelScope (Phase 2)
     //
     // 1:1 mirror of the /hf/* surface above, pointed at the parallel
@@ -303,6 +348,15 @@ final class OMLXClient: ObservableObject {
         ])
     }
 
+    /// ModelScope mirror of `getHFModelCard(repoId:)`. Returns the same
+    /// shape (`{model_card: "<markdown>"}`); empty string when the
+    /// upstream repo has no README.
+    func getMSModelCard(modelId: String) async throws -> ModelCardDTO {
+        try await get(AdminAPI.msModelInfo, query: [
+            URLQueryItem(name: "model_id", value: modelId),
+        ])
+    }
+
     /// Delete a downloaded model directory from disk. The server unloads
     /// the engine first if it's currently loaded, then rmtree's the model
     /// directory and refreshes the pool. 404 if the name doesn't resolve.
@@ -345,7 +399,7 @@ final class OMLXClient: ObservableObject {
         oqLevel: Double,
         preserveMtp: Bool = false
     ) async throws -> OQEstimateResponse {
-        // `oq_level` accepts ints (2,3,4,5,6,8) and 3.5. Send it without a
+        // `oq_level` accepts ints and fractional levels. Send it without a
         // trailing `.0` so the server parses an int when the user picked one.
         let levelStr: String = (oqLevel.rounded() == oqLevel)
             ? String(Int(oqLevel))
@@ -425,6 +479,20 @@ final class OMLXClient: ObservableObject {
         try await postEmpty(AdminAPI.benchCancel(benchId))
     }
 
+    @discardableResult
+    func startANETuning(_ body: ANETuningStartRequest) async throws -> ANETuningStartResponse {
+        try await post(AdminAPI.aneTuneStart, body: body)
+    }
+
+    func getANETuningResults(tuningId: String) async throws -> ANETuningStatusResponse {
+        try await get(AdminAPI.aneTuneResults(tuningId))
+    }
+
+    @discardableResult
+    func cancelANETuning(tuningId: String) async throws -> ANETuningCancelResponse {
+        try await postEmpty(AdminAPI.aneTuneCancel(tuningId))
+    }
+
     // PR 13 — Accuracy bench
 
     @discardableResult
@@ -453,6 +521,22 @@ final class OMLXClient: ObservableObject {
     @discardableResult
     func cancelAccuracyBench() async throws -> SimpleStatusResponse {
         try await postEmpty(AdminAPI.accuracyCancel)
+    }
+
+    // Context bench
+
+    @discardableResult
+    func startContextBench(_ body: ContextBenchStartRequest) async throws -> ContextBenchStartResponse {
+        try await post(AdminAPI.contextBenchStart, body: body)
+    }
+
+    func getContextBenchStatus(benchId: String) async throws -> ContextBenchStatusResponse {
+        try await get(AdminAPI.contextBenchResults(benchId))
+    }
+
+    @discardableResult
+    func cancelContextBench(benchId: String) async throws -> BenchCancelResponse {
+        try await postEmpty(AdminAPI.contextBenchCancel(benchId))
     }
 
     // MARK: - Core request

@@ -1,5 +1,16 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = [
+    "setuptools>=61.0",
+    "wheel",
+    "cmake>=3.27",
+    # Pin nanobind to match the ABI version MLX 0.32.2 was built with
+    # (MLX pins nanobind v2.15.0 via FetchContent in its CMakeLists.txt).
+    # A mismatched nanobind isolates the `mlx` NB_DOMAIN, so custom kernel
+    # extensions (omlx.custom_kernels.*) reject every mlx.core.array at the
+    # type caster with `incompatible function arguments`.
+    "nanobind==2.15.0",
+    "mlx==0.32.2",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +19,7 @@ dynamic = ["version"]
 description = "LLM inference server, optimized for your Mac"
 readme = "README.md"
 license = {text = "Apache-2.0"}
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 authors = [
     {name = "omlx contributors"}
 ]
@@ -28,15 +39,22 @@ classifiers = [
 ]
 
 dependencies = [
-    "mlx>=0.31.2",
-    # mlx-lm from commit (ed1fca4, v0.31.3) - thread-local generation stream + ArraysCache batch dim fixes + think token None safety
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd",
+    # Vanilla MLX v0.32.2; optional custom kernels live under
+    # omlx.custom_kernels.* when built for release. The bundled kernel
+    # binaries are ABI-coupled to this exact mlx version — bumping the pin
+    # requires rebuilding them (OMLX_WITH_CUSTOM_KERNEL=1 setup.py build_ext).
+    "mlx==0.32.2",
+    # mlx-lm main after 0.32.0. setuptools-scm derives the version from the
+    # v0.31.3 tag, so it reports 0.31.4.devN; the 0.32.0 features are present.
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@94cdcae13b266c337bcaca09b97b9c5a9c0e2cde",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
     # mlx-embeddings from latest commit (32981fa)
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
     # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
-    "transformers>=5.0.0",
+    # The mlx-lm pin above includes the NewlineTokenizer registration fix
+    # required by transformers 5.13+. mlx-vlm requires the 5.14 processor API.
+    "transformers>=5.14.0,<5.18",
     # transformers 5.x's tokenization_mistral_common module imports
     # ReasoningEffort from mistral_common (added in 1.10). The audio extras
     # transitively pull mistral-common via mlx-audio[stt], which historically
@@ -47,21 +65,40 @@ dependencies = [
     # See pmarreck/omlx#1 for full repro and root cause.
     "mistral-common>=1.10",
     "tokenizers>=0.19.0",
-    "huggingface-hub>=0.23.0",
-    "numpy>=1.24.0",
+    # The admin downloader calls snapshot_download(dry_run=True) (1.0.0+)
+    # and cancels xet transfers via utils._xet.abort_xet_session, which was
+    # added in 1.19.0 together with the session-based xet download path
+    # (and drags in hf-xet>=1.5.1). Declare the floor directly instead of
+    # leaning on transformers' transitive hub requirement.
+    "huggingface-hub>=1.19.0",
+    "numpy>=1.24.0,<2.4",
     "tqdm>=4.66.0",
     "pyyaml>=6.0",
     "itsdangerous>=2.0",
     "jinja2>=3.0",
+    # mlx-lm 0.31.3 imports rich from mlx_lm.cli_ui for chat/lora entrypoints.
+    "rich>=13.0.0",
     "sentencepiece",
     "tiktoken",
     "protobuf",
     "requests>=2.28.0",
+    # OpenAI-compatible external endpoint client for admin benchmarks.
+    # Already a transitive dep via huggingface-hub; pinned direct so
+    # omlx.admin.external_api can import it unconditionally at module top.
+    "httpx>=0.27.0,<1",
     # SOCKS proxy support (used by httpx via huggingface-hub)
     "socksio>=1.0.0",
+    # DuckDuckGo backend for the chat web_search tool. Pinned to 9.14.1:
+    # the last release inside packaging/venvstacks.toml's exclude-newer
+    # cutoff (2026-04-23), and the last with the minimal dep tree
+    # (click/primp/lxml only; 9.14.2+ adds fake-useragent and httpx
+    # extras). Bump together with the cutoff.
+    "ddgs==9.16.0",
     "tabulate>=0.9.0",
     # Resource monitoring
     "psutil>=5.9.0",
+    # Native process title support (shows as omlx-server instead of python)
+    "setproctitle>=1.3.3",
     # Server
     "fastapi>=0.108.0",
     "uvicorn>=0.23.0",
@@ -72,52 +109,87 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Harmony format parser for gpt-oss models
     "openai-harmony",
-    # mlx-vlm from commit (f96138e) - Gemma4 MTP server batching (PR #1166), speculative utils refactor (PR #1169), Qwen native MTP drafter, MiniCPM-V 4.6
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@f96138eef1f5ce7fb5d97f8dd41a664a195b5659",
+    # Cohere Command/Cohere2 output parser for reasoning and tool calls
+    "cohere_melody>=0.9.0",
+    # mlx-vlm from commit ea79808. oMLX model implementations remain registered
+    # by their pre-load patches.
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@ea79808ce1e9a19fcb915a96b0c70e37ad393a99",
+    # mlx-vlm now requires mlx-audio in the shared runtime.
+    "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@49596ac8b69b9ed377db311a73df838795f38a3d",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.7 (1ba6713) — bstnxbt repo. Qwen thinking/GDN exactness fix, GQA SDPA reshape, DDTree + CopySpec decode path, prefix cache identity hardening, fp16 draft on old Apple chips
-    "dflash-mlx @ git+https://github.com/bstnxbt/dflash-mlx@1ba671372b289c025b435c1a13aabb4bfb80b183",
+    # dflash-mlx v0.1.10+omlx.9 (71f7c2c) - jundot fork of bstnxbt 0.1.10 (9ca0028).
+    # Carries the trimmed-sidecar prefix cache fix (repeat-prompt L1 hits never
+    # fired upstream), the single-host-sync decode cycle (one D2H transfer
+    # per cycle instead of four syncs plus a hard eval), Gemma 4 unified
+    # target exports, and Muse Glimmer target/drafter support (bundled
+    # text-only mlx-lm module + MuseGlimmerAssistantModel dispatch), plus
+    # FP32 Muse Glimmer query scaling parity with mlx-vlm, DFlash 2 runtime
+    # support (sampling params + candidate selector, PR 6), min_p with the
+    # mlx-lm sampler filter order, the sink=0 empty-chunk L2 write fix,
+    # repetition penalty support across speculative and fallback sampling,
+    # Muse Glimmer target registration and live KV snapshots on mlx-lm 0.32
+    # (PR 11), Muse Glimmer prefix snapshots (PR 5), and GDN verify q/k
+    # normalization that follows mlx-lm normalize_qk.
+    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@71f7c2cae42a968ddc981972a8ad35368dc587a9",
+    "markitdown[pdf,docx,pptx]==0.1.8",
 ]
 
 [project.optional-dependencies]
 grammar = [
     # Grammar-constrained decoding for structured output (requires torch ~2GB)
-    "xgrammar>=0.1.32",
+    # Keep this native pair aligned with omlx/_torch_stub.py and the DMG
+    # build. xgrammar 0.2.3 crashes at import with apache-tvm-ffi 0.1.13
+    # on macOS arm64, so an open-ended resolver can break Homebrew installs
+    # without any oMLX source change (#2428).
+    "xgrammar==0.2.3",
+    "apache-tvm-ffi==0.1.11",
 ]
 mcp = [
-    "mcp>=1.0.0",
+    "mcp>=2.0.0,<3",
+]
+cluster = [
+    # mDNS advertise/browse for cluster v2 peer discovery (_omlx._tcp.local.).
+    # Pure-Python; works in launchd agents. Absence disables mDNS only — the
+    # IPv6 multicast fallback, manual peer add, and Tailscale paths keep
+    # working (see omlx/cluster/discovery.py).
+    "zeroconf>=0.131.0",
 ]
 modelscope = [
     "modelscope>=1.10.0",
 ]
 audio = [
-    # mlx-audio from commit (5175326) with tts/stt/sts extras
-    # tts extra: misaki, num2words, spacy, phonemizer-fork, espeakng-loader, sentencepiece
-    # stt extra: tiktoken, mistral-common[audio]
-    # sts extra: tts deps + stt deps + webrtcvad
-    "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@51753266e0a4f766fd5e6fbc46652224efc23981",
+    # mlx-audio from commit (49596ac, v0.4.8) with tts/stt/sts extras
+    "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@49596ac8b69b9ed377db311a73df838795f38a3d",
+    # Keep dependencies for existing audio models removed from upstream extras.
+    "espeakng-loader>=0.2.4",
+    "librosa==0.11.0",
+    "misaki>=0.9.4",
+    "num2words>=0.5.14",
+    "numba>=0.60.0",
+    "phonemizer-fork>=3.3.2",
+    "pyloudnorm>=0.2.0",
+    "spacy>=3.8.4",
+    # WebSocket protocol impl for uvicorn (realtime STT endpoint). Pure
+    # python; uvicorn's ws="auto" picks it up when installed.
+    "wsproto==1.2.0",
 ]
 paroquant = [
     # ParoQuant runtime loader for paroquant-quantized models. Installed
     # with --no-deps semantics here because the official [mlx] extra pulls
     # torchvision, which the load path doesn't actually use (verified end
     # to end on 0.1.14). The DMG build installs the same pin via build.py.
-    "paroquant==0.1.14; python_version >= '3.11'",
+    "paroquant==0.1.16; python_version >= '3.11'",
 ]
 # Internal extra consumed by packaging/build.py to populate the
-# venvstacks mlx-framework layer's requirements list. Listed here as the
+# venvstacks mlx-base layer's requirements list. Listed here as the
 # single source of truth so the layer-template venvstacks.toml stays
 # version-free. End-users don't `pip install omlx[bundle]`; this is for
 # the macOS .app build pipeline.
 #
-# mlx-audio[tts,stt,sts]'s 12 transitive deps appear explicitly because
-# venvstacks 0.7.0's internal `uv pip compile` runs with --no-config and
-# doesn't propagate pyproject.toml's `tool.uv.override-dependencies`,
-# so it can't resolve mlx-audio's `mlx-lm==0.31.1` pin against our
-# git-pinned mlx-lm (v0.31.3). build.py installs mlx-audio + paroquant
-# separately via --no-deps post-resolution.
+# Audio runtime dependencies are explicit because build.py installs the audio wheel
+# separately with --no-deps after the shared layer resolves.
 bundle = [
-    "mcp>=1.0.0",
+    "mcp>=2.0.0,<3",
     "modelscope>=1.10.0",
     # mlx-audio[tts,stt,sts] transitives:
     "scipy>=1.11.0",
@@ -134,6 +206,8 @@ bundle = [
     "webrtcvad>=2.0.10",
     # [audio] extra on top of pyproject's plain mistral-common>=1.10
     "mistral-common[audio]>=1.10",
+    # realtime STT WebSocket endpoint
+    "wsproto==1.2.0",
 ]
 dev = [
     "pytest>=7.0.0",
@@ -141,8 +215,19 @@ dev = [
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
-    "mcp>=1.0.0",
+    "mcp>=2.0.0,<3",
     "venvstacks>=0.7.0",
+    # The torch-stub smoke test (tests/test_torch_stub.py) gates
+    # xgrammar / tvm-ffi version bumps. It skips when these aren't
+    # importable, which silently hides regressions — install no-deps
+    # in the dev environment so the test actually runs.
+    #
+    # Held at 0.2.3: xgrammar 0.2.4/0.2.5 cap transformers at <5,
+    # which conflicts with our transformers>=5.12.1 pin and makes
+    # pip/uv dev installs unresolvable (#2289). Bump again once
+    # upstream lifts the cap.
+    "xgrammar==0.2.3",
+    "apache-tvm-ffi==0.1.11",
 ]
 # PEP 735 dependency groups — consumed by `uv sync --dev`.
 # Keep in sync with [project.optional-dependencies] dev above
@@ -154,8 +239,10 @@ dev = [
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
-    "mcp>=1.0.0",
+    "mcp>=2.0.0,<3",
     "venvstacks>=0.7.0",
+    "xgrammar==0.2.3",
+    "apache-tvm-ffi==0.1.11",
 ]
 
 [project.urls]
@@ -174,15 +261,26 @@ where = ["."]
 include = ["omlx*"]
 
 [tool.setuptools.package-data]
-"omlx" = ["oq_calibration_data.json"]
-"omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
+"omlx" = ["oq_calibration_data.json", "oqe_calibration_data.json"]
+"omlx.admin" = [
+    "templates/**/*.html",
+    "static/**/*",
+    "i18n/*.json",
+    "bench_corpora/*",
+]
 "omlx.eval" = ["data/*.jsonl"]
+"omlx.patches.deepseek_v41" = ["LICENSE"]
+"omlx.custom_kernels.glm_moe_dsa" = ["*.metallib", "*.dylib", "*.so"]
+"omlx.custom_kernels.decode_fast" = ["*.metallib", "*.dylib", "*.so"]
+"omlx.custom_kernels.minimax_m3" = ["*.metallib", "*.dylib", "*.so"]
+"omlx.custom_kernels.qwen35_prefill" = ["*.metallib", "*.dylib", "*.so"]
 
 [tool.uv]
-# mlx-lm is pinned to a git commit; override transitive pins
-# (e.g. mlx-audio → mlx-lm==0.31.1) so the resolver accepts it.
+# mlx and mlx-lm are git-pinned; override transitive pins
+# so dependency resolution retains the selected runtime versions.
 override-dependencies = [
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd",
+    "mlx==0.32.2",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@94cdcae13b266c337bcaca09b97b9c5a9c0e2cde",
 ]
 
 [tool.black]
@@ -193,6 +291,9 @@ target-version = ["py310", "py311", "py312", "py313"]
 line-length = 88
 select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
 ignore = ["E501", "B905"]
+# Vendored upstream files (mlx-vlm copies under patches) keep their
+# original formatting for pin-bump diffability.
+extend-exclude = ["omlx/patches/*/vendor"]
 
 [tool.mypy]
 python_version = "3.10"

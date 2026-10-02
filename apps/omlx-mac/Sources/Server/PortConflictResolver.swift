@@ -4,12 +4,22 @@
 import Foundation
 import Darwin
 
+struct HealthProbeResult: Sendable, Equatable {
+    let ok: Bool
+    let url: String
+    let latencyMs: Int
+    let statusCode: Int?
+    let errorDescription: String?
+}
+
 struct PortConflictResolver: Sendable {
     let host: String
     let port: Int
 
+    private let healthTimeout: TimeInterval = 5
+
     private var healthURL: URL {
-        URL(string: "http://\(host):\(port)/health")!
+        AppConfig.httpURL(host: host, port: port, path: "/health")!
     }
 
     // MARK: - Sync probes (cheap; called from start() before spawn)
@@ -30,8 +40,7 @@ struct PortConflictResolver: Sendable {
         addr.sin_port = in_port_t(port).bigEndian
         addr.sin_addr.s_addr = inet_addr(host)
         if addr.sin_addr.s_addr == INADDR_NONE {
-            // host wasn't a literal IPv4 — try IN6 / DNS… for our case
-            // (host is always 127.0.0.1) just bail.
+            // Non-literal hosts are not expected after AppConfig normalization.
             return false
         }
 
@@ -87,10 +96,10 @@ struct PortConflictResolver: Sendable {
         return pid_t(line.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
-    /// Sync /health probe: 2s timeout, single shot.
+    /// Sync /health probe: 5s timeout, single shot.
     func isOMLXOnPortSync() -> Bool {
         var req = URLRequest(url: healthURL)
-        req.timeoutInterval = 2
+        req.timeoutInterval = healthTimeout
         req.httpMethod = "GET"
 
         let semaphore = DispatchSemaphore(value: 0)
@@ -101,27 +110,40 @@ struct PortConflictResolver: Sendable {
             }
             semaphore.signal()
         }.resume()
-        _ = semaphore.wait(timeout: .now() + 3)
+        let waitMs = Int((healthTimeout + 1) * 1000)
+        _ = semaphore.wait(timeout: .now() + .milliseconds(waitMs))
         return result.value
     }
 
     // MARK: - Async probes (used by health-check loop)
 
-    /// Async equivalent for the periodic health check.
-    func isHealthy() async -> Bool {
+    func probeHealth() async -> HealthProbeResult {
+        let url = healthURL
+        let started = Date()
         var req = URLRequest(url: healthURL)
-        req.timeoutInterval = 2
+        req.timeoutInterval = healthTimeout
         req.httpMethod = "GET"
         req.cachePolicy = .reloadIgnoringLocalCacheData
         do {
             let (_, response) = try await URLSession.shared.data(for: req)
-            if let http = response as? HTTPURLResponse, http.statusCode == 200 {
-                return true
-            }
+            let latencyMs = Self.latencyMs(since: started)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode
+            return HealthProbeResult(
+                ok: statusCode == 200,
+                url: url.absoluteString,
+                latencyMs: latencyMs,
+                statusCode: statusCode,
+                errorDescription: nil
+            )
         } catch {
-            // network failure / refused — treat as unhealthy
+            return HealthProbeResult(
+                ok: false,
+                url: url.absoluteString,
+                latencyMs: Self.latencyMs(since: started),
+                statusCode: nil,
+                errorDescription: String(describing: error)
+            )
         }
-        return false
     }
 
     // MARK: - Kill external owner
@@ -139,6 +161,10 @@ struct PortConflictResolver: Sendable {
         kill(pid, SIGKILL)
         try? await Task.sleep(for: .milliseconds(500))
         return kill(pid, 0) != 0
+    }
+
+    private static func latencyMs(since started: Date) -> Int {
+        max(0, Int(Date().timeIntervalSince(started) * 1000))
     }
 }
 

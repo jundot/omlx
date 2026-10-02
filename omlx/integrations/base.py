@@ -7,8 +7,49 @@ import os
 import shutil
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
+
+@dataclass(frozen=True)
+class IntegrationContext:
+    """Resolved launch/configuration inputs for an external tool integration."""
+
+    host: str
+    port: int
+    api_key: str = ""
+    model: str = ""
+    opus_model: str | None = None
+    sonnet_model: str | None = None
+    haiku_model: str | None = None
+    context_window: int | None = None
+    max_tokens: int | None = None
+    model_type: str | None = None
+    reasoning: bool | None = None
+    tools_profile: str = "coding"
+    extra_args: tuple[str, ...] = ()
+    cross_session: bool = False
+    # Per-model status/capacity map the launcher pre-fetched from
+    # GET /v1/models/status (keys: model id and model_alias). Integrations
+    # read it instead of fetching the status again themselves; empty for
+    # direct constructions.
+    models_status_map: dict[str, dict] = field(default_factory=dict)
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    @property
+    def openai_base_url(self) -> str:
+        return f"{self.base_url}/v1"
+
+    @property
+    def auth_token(self) -> str:
+        return self.api_key or "omlx"
+
+    @property
+    def supports_images(self) -> bool:
+        return self.model_type == "vlm"
 
 
 @dataclass
@@ -21,23 +62,31 @@ class Integration:
     install_check: str  # binary name to check with `which`
     install_hint: str  # installation instructions
 
-    def get_command(
-        self, port: int, api_key: str, model: str, host: str = "127.0.0.1"
-    ) -> str:
+    # Whether `omlx launch <tool>` must interactively pick a model. Tools
+    # that configure one model into their config need a pick; tools that
+    # register the server's whole model catalog (dsh) do not, and resolve
+    # their optional default from `--model` / the saved per-tool setting.
+    requires_model_selection: bool = True
+
+    def get_command(self, ctx: IntegrationContext) -> str:
         """Generate the command string for clipboard/display."""
         raise NotImplementedError
 
-    def configure(self, port: int, api_key: str, model: str, host: str = "127.0.0.1") -> None:
+    def configure(self, ctx: IntegrationContext) -> None:
         """Configure the tool (write config files, etc.)."""
         pass
 
-    def launch(self, port: int, api_key: str, model: str, host: str = "127.0.0.1", **kwargs) -> None:
+    def launch(self, ctx: IntegrationContext) -> None:
         """Configure and launch the tool."""
         raise NotImplementedError
 
     def is_installed(self) -> bool:
         """Check if the tool binary is available."""
         return shutil.which(self.install_check) is not None
+
+    def model_disabled_reason(self, model_info: dict) -> str | None:
+        """Return why a model cannot be selected for this integration."""
+        return None
 
     def _scrubbed_env(self) -> dict[str, str]:
         """Return an os.environ copy with bundled-Python vars removed.
@@ -65,7 +114,20 @@ class Integration:
         if not models_info:
             return ""
 
+        annotated_models = []
+        for model_info in models_info:
+            model_info = dict(model_info)
+            reason = self.model_disabled_reason(model_info)
+            if reason:
+                model_info["disabled_reason"] = reason
+            annotated_models.append(model_info)
+        models_info = annotated_models
+
         if len(models_info) == 1:
+            reason = models_info[0].get("disabled_reason")
+            if reason:
+                print(f"Cannot select {models_info[0]['id']}: {reason}")
+                sys.exit(1)
             return models_info[0]["id"]
 
         name = tool_name or "Tool"
@@ -86,12 +148,18 @@ class Integration:
         for i, m in enumerate(models_info, 1):
             ctx = m.get("max_context_window")
             ctx_str = f"  [{ctx:,} ctx]" if ctx else ""
-            print(f"  {i}. {m['id']}{ctx_str}")
+            reason = m.get("disabled_reason")
+            unavailable = f"  [unavailable: {reason}]" if reason else ""
+            print(f"  {i}. {m['id']}{ctx_str}{unavailable}")
         while True:
             try:
                 choice = input("Select model number: ").strip()
                 idx = int(choice) - 1
                 if 0 <= idx < len(models_info):
+                    reason = models_info[idx].get("disabled_reason")
+                    if reason:
+                        print(f"Cannot select {models_info[idx]['id']}: {reason}")
+                        continue
                     return models_info[idx]["id"]
                 print(f"Please enter 1-{len(models_info)}")
             except (ValueError, EOFError):
@@ -117,23 +185,32 @@ class Integration:
                 print("Creating new config file.")
                 existing = {}
 
-            # Create timestamped backup
-            timestamp = int(time.time())
-            backup = config_path.with_suffix(f".{timestamp}.bak")
-            try:
-                shutil.copy2(config_path, backup)
-                print(f"Backup: {backup}")
-            except OSError as e:
-                print(f"Warning: could not create backup: {e}")
-
         updater(existing)
 
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(
-            json.dumps(existing, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        print(f"Config written: {config_path}")
+        payload = json.dumps(existing, indent=2, ensure_ascii=False) + "\n"
+        backup_then_write(config_path, payload)
+
+
+def backup_then_write(
+    path: Path, text: str, *, failure: str = "could not create backup",
+    note: str = "Config written",
+) -> None:
+    """Back up an existing config, then write ``text`` over it.
+
+    Best effort: a config that cannot be backed up is still written, and a
+    failed copy only earns a warning.
+    """
+    if path.exists():
+        backup = path.with_suffix(f".{int(time.time())}.bak")
+        try:
+            shutil.copy2(path, backup)
+            print(f"Backup: {backup}")
+        except OSError as e:
+            print(f"Warning: {failure}: {e}")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    print(f"{note}: {path}")
 
 
 def _select_model_curses(models_info: list[dict], tool_name: str) -> str:
@@ -166,6 +243,7 @@ def _select_model_curses(models_info: list[dict], tool_name: str) -> str:
         idx = 0
         scroll = 0
         hint = "↑↓ navigate   PgUp/PgDn page   Enter launch   q cancel"
+        warning = ""
         while True:
             max_y, max_x = stdscr.getmaxyx()
             # Layout: row 0 title, row 1 blank, rows [items_top, items_bottom)
@@ -193,17 +271,21 @@ def _select_model_curses(models_info: list[dict], tool_name: str) -> str:
                     bullet = "●" if m.get("loaded", False) else "○"
                     ctx = m.get("max_context_window")
                     ctx_str = f"  {ctx // 1000}k" if ctx else ""
-                    line = f"  {bullet}  {m['id']}{ctx_str}"
+                    unavailable = "  unavailable" if m.get("disabled_reason") else ""
+                    line = f"  {bullet}  {m['id']}{ctx_str}{unavailable}"
                     # Leave 2 cols on the right for scroll indicators.
                     line = line[: max(0, max_x - 4)]
                     attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
+                    if m.get("disabled_reason"):
+                        attr |= curses.A_DIM
                     stdscr.addstr(items_top + row_offset, 1, line, attr)
                 # Scroll indicators on the right edge.
                 if scroll > 0:
                     stdscr.addstr(items_top, max_x - 2, "▲", curses.A_DIM)
                 if visible_end < len(ordered):
                     stdscr.addstr(items_bottom - 1, max_x - 2, "▼", curses.A_DIM)
-                stdscr.addstr(max_y - 1, 1, hint[: max_x - 2], curses.A_DIM)
+                footer = warning or hint
+                stdscr.addstr(max_y - 1, 1, footer[: max_x - 2], curses.A_DIM)
             except curses.error:
                 # Window too small to render the full picker; keep going so
                 # the user can resize and the next loop redraws cleanly.
@@ -212,18 +294,28 @@ def _select_model_curses(models_info: list[dict], tool_name: str) -> str:
 
             key = stdscr.getch()
             if key in (curses.KEY_UP, ord("k")):
+                warning = ""
                 idx = (idx - 1) % len(ordered)
             elif key in (curses.KEY_DOWN, ord("j")):
+                warning = ""
                 idx = (idx + 1) % len(ordered)
             elif key == curses.KEY_PPAGE:
+                warning = ""
                 idx = max(0, idx - max(1, visible_count - 1))
             elif key == curses.KEY_NPAGE:
+                warning = ""
                 idx = min(len(ordered) - 1, idx + max(1, visible_count - 1))
             elif key == curses.KEY_HOME:
+                warning = ""
                 idx = 0
             elif key == curses.KEY_END:
+                warning = ""
                 idx = len(ordered) - 1
             elif key in (curses.KEY_ENTER, 10, 13):
+                reason = ordered[idx].get("disabled_reason")
+                if reason:
+                    warning = f"Cannot select {ordered[idx]['id']}: {reason}"
+                    continue
                 selected.append(ordered[idx]["id"])
                 return
             elif key in (ord("q"), 27):  # q or ESC

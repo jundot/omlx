@@ -108,6 +108,66 @@ class TestAnthropicAdapter:
         assert internal.messages[0].content == "You are a helpful assistant."
         assert internal.messages[1].role == "user"
 
+    def test_parse_request_in_messages_system(self, adapter):
+        """role="system" entries inside messages[] are lifted into the
+        canonical system position (claude-code 2.1.154+ behavior)."""
+        request = MessagesRequest(
+            model="claude-3-sonnet",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="user", content="Hi there"),
+                AnthropicMessage(role="system", content="Be terse."),
+                AnthropicMessage(role="assistant", content="ok"),
+            ],
+        )
+
+        internal = adapter.parse_request(request)
+
+        assert internal.messages[0].role == "system"
+        assert internal.messages[0].content == "Be terse."
+        roles = [m.role for m in internal.messages[1:]]
+        assert roles == ["user", "assistant"]
+
+    def test_parse_request_system_field_and_in_messages_merge(self, adapter):
+        """System field and in-messages system content merge into one block,
+        with the canonical system field first and inlined parts appended."""
+        request = MessagesRequest(
+            model="claude-3-sonnet",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="system", content="Be terse."),
+                AnthropicMessage(role="user", content="Hi"),
+            ],
+            system="You are a helpful assistant.",
+        )
+
+        internal = adapter.parse_request(request)
+
+        assert internal.messages[0].role == "system"
+        assert internal.messages[0].content == (
+            "You are a helpful assistant.\n\nBe terse."
+        )
+        assert internal.messages[1].role == "user"
+
+    def test_parse_request_multiple_in_messages_system(self, adapter):
+        """Multiple inline role="system" entries concatenate in source order."""
+        request = MessagesRequest(
+            model="claude-3-sonnet",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="system", content="First."),
+                AnthropicMessage(role="user", content="Hi"),
+                AnthropicMessage(role="system", content="Second."),
+            ],
+        )
+
+        internal = adapter.parse_request(request)
+
+        assert internal.messages[0].role == "system"
+        assert internal.messages[0].content == "First.\nSecond."
+        # The user message survives and no stray system entries remain.
+        assert [m.role for m in internal.messages[1:]] == ["user"]
+
     # =========================================================================
     # parse_request Tests - Generation Parameters
     # =========================================================================
@@ -619,3 +679,227 @@ class TestAnthropicToolUseConversion:
         # Must use [Calling tool: ...] not [Tool call: ...]
         assert "[Calling tool: get_weather(" in content
         assert "[Tool call:" not in content
+
+
+class TestAnthropicAudioConversion:
+    """Tests for input_audio block handling in convert_anthropic_to_internal."""
+
+    def test_input_audio_block_preserved_with_preserve_images(self):
+        """input_audio blocks should be passed through when preserve_images=True."""
+        from omlx.api.anthropic_utils import convert_anthropic_to_internal
+        from omlx.api.anthropic_models import MessagesRequest, AnthropicMessage
+
+        import base64
+        fake_audio = base64.b64encode(b"\x00" * 100).decode()
+
+        request = MessagesRequest(
+            model="gemma4-unified",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        {"type": "text", "text": "What sound is this?"},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": fake_audio,
+                                "format": "wav",
+                            },
+                        },
+                    ],
+                ),
+            ],
+        )
+
+        messages = convert_anthropic_to_internal(
+            request, preserve_images=True
+        )
+
+        assert len(messages) == 1
+        content = messages[0]["content"]
+        assert isinstance(content, list)
+
+        # Should have both text and audio parts
+        audio_parts = [p for p in content if p.get("type") == "input_audio"]
+        assert len(audio_parts) == 1
+        assert audio_parts[0]["input_audio"]["data"] == fake_audio
+        assert audio_parts[0]["input_audio"]["format"] == "wav"
+
+        text_parts = [p for p in content if p.get("type") == "text"]
+        assert len(text_parts) == 1
+
+    def test_input_audio_block_dropped_without_preserve_images(self):
+        """input_audio blocks should be dropped when preserve_images=False."""
+        from omlx.api.anthropic_utils import convert_anthropic_to_internal
+        from omlx.api.anthropic_models import MessagesRequest, AnthropicMessage
+
+        import base64
+        fake_audio = base64.b64encode(b"\x00" * 100).decode()
+
+        request = MessagesRequest(
+            model="gemma4-unified",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        {"type": "text", "text": "What sound is this?"},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": fake_audio,
+                                "format": "wav",
+                            },
+                        },
+                    ],
+                ),
+            ],
+        )
+
+        messages = convert_anthropic_to_internal(
+            request, preserve_images=False
+        )
+
+        content = messages[0]["content"]
+        # Without preserve_images, content should be string, not list
+        assert isinstance(content, str)
+        assert "input_audio" not in str(content).lower()
+
+    def test_audio_only_message(self):
+        """A message with only audio blocks should still produce valid output."""
+        from omlx.api.anthropic_utils import convert_anthropic_to_internal
+        from omlx.api.anthropic_models import MessagesRequest, AnthropicMessage
+
+        import base64
+        fake_audio = base64.b64encode(b"\x00" * 100).decode()
+
+        request = MessagesRequest(
+            model="gemma4-unified",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": fake_audio,
+                                "format": "wav",
+                            },
+                        },
+                    ],
+                ),
+            ],
+        )
+
+        messages = convert_anthropic_to_internal(
+            request, preserve_images=True
+        )
+
+        assert len(messages) == 1
+        content = messages[0]["content"]
+        assert isinstance(content, list)
+        assert len(content) == 1
+        assert content[0]["type"] == "input_audio"
+
+
+class TestClientBudgetMarkerStripping:
+    """Tests for Claude Code `<total_tokens>` budget-marker stripping.
+
+    Claude Code appends a freshly decremented
+    `<total_tokens>N tokens left</total_tokens>` block to the system prompt
+    on every request, which mutates the prompt head and defeats prefix
+    caching. The markers are informational only and are stripped like the
+    billing header blocks.
+    """
+
+    def test_strip_from_system_string(self):
+        from omlx.api.anthropic_utils import convert_anthropic_to_internal
+
+        request = MessagesRequest(
+            model="minimax-m3-6bit",
+            max_tokens=64,
+            system=(
+                "You are a helpful assistant."
+                "\n\n<total_tokens>15000000 tokens left</total_tokens>"
+                "\n\n<total_tokens>14999436 tokens left</total_tokens>"
+            ),
+            messages=[AnthropicMessage(role="user", content="Hello")],
+        )
+
+        messages = convert_anthropic_to_internal(request)
+
+        assert messages[0]["role"] == "system"
+        assert messages[0]["content"] == "You are a helpful assistant."
+
+    def test_strip_from_system_blocks(self):
+        from omlx.api.anthropic_utils import _extract_system_text
+
+        text = _extract_system_text(
+            [
+                {"type": "text", "text": "Identity line."},
+                {
+                    "type": "text",
+                    "text": "Body.\n\n<total_tokens>123 tokens left</total_tokens>",
+                },
+            ]
+        )
+
+        assert text == "Identity line.\nBody."
+
+    def test_system_without_marker_is_untouched(self):
+        from omlx.api.anthropic_utils import _extract_system_text
+
+        text = "Plain system prompt.\nNo markers here."
+
+        assert _extract_system_text(text) == text
+
+    def test_strip_from_inline_system_message(self):
+        from omlx.api.anthropic_utils import convert_anthropic_to_internal
+
+        request = MessagesRequest(
+            model="minimax-m3-6bit",
+            max_tokens=64,
+            messages=[
+                AnthropicMessage(
+                    role="system",
+                    content=(
+                        "Inline system."
+                        "\n\n<total_tokens>42 tokens left</total_tokens>"
+                    ),
+                ),
+                AnthropicMessage(role="user", content="Hello"),
+            ],
+        )
+
+        messages = convert_anthropic_to_internal(
+            request, consolidate_system_messages=False
+        )
+
+        system_contents = [
+            m["content"] for m in messages if m["role"] == "system"
+        ]
+        assert any(c == "Inline system." for c in system_contents)
+        assert all("<total_tokens>" not in c for c in system_contents)
+
+    def test_marker_in_user_content_is_preserved(self):
+        from omlx.api.anthropic_utils import convert_anthropic_to_internal
+
+        request = MessagesRequest(
+            model="minimax-m3-6bit",
+            max_tokens=64,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=(
+                        "Quoting a log line: "
+                        "<total_tokens>7 tokens left</total_tokens>"
+                    ),
+                ),
+            ],
+        )
+
+        messages = convert_anthropic_to_internal(request)
+
+        assert "<total_tokens>7 tokens left</total_tokens>" in messages[-1]["content"]

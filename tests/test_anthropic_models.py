@@ -255,14 +255,17 @@ class TestAnthropicMessage:
         assert len(msg.content) == 2
 
     def test_message_role_validation(self):
-        """Test that message role must be user or assistant."""
-        # Valid roles
+        """Test that message role accepts user / assistant / system."""
+        # Valid roles (claude-code 2.1.154+ inlines role="system" entries
+        # in messages[] alongside the canonical system field, so the schema
+        # accepts them and the adapter normalizes them downstream).
         AnthropicMessage(role="user", content="Hello")
         AnthropicMessage(role="assistant", content="Hi")
+        AnthropicMessage(role="system", content="System")
 
         # Invalid role
         with pytest.raises(ValidationError):
-            AnthropicMessage(role="system", content="System")
+            AnthropicMessage(role="invalid_role", content="x")
 
 
 class TestAnthropicTool:

@@ -126,7 +126,7 @@ def get_max_working_set_bytes() -> int:
 
     Fallback chain:
     1. mlx.metal.device_info()["max_recommended_working_set_size"]
-    2. psutil.virtual_memory().total * 0.75
+    2. total system memory * 0.75
     3. DEFAULT_MEMORY_BYTES (8GB)
 
     Returns:
@@ -143,14 +143,9 @@ def get_max_working_set_bytes() -> int:
         except Exception:
             pass
 
-    # Fallback: psutil with 75% heuristic
-    try:
-        import psutil
-
-        total_ram = psutil.virtual_memory().total
+    total_ram = get_total_memory_bytes()
+    if total_ram > 0:
         return int(total_ram * 0.75)
-    except ImportError:
-        pass
 
     # Last resort: default
     logger.warning(
@@ -218,6 +213,10 @@ def is_mlx_available() -> bool:
 
 def get_mlx_version() -> str:
     """Get MLX version string."""
+    if HAS_MLX:
+        core_version = getattr(mx, "__version__", None)
+        if core_version:
+            return str(core_version)
     try:
         import mlx
 

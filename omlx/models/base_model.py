@@ -11,6 +11,10 @@ from typing import Optional
 
 import mlx.core as mx
 
+# Padded tokens per encoder forward. Bounds activation memory and keeps eager
+# softmax rows (heads x tokens) far below the Metal 2^32-thread grid limit.
+ENCODER_BATCH_TOKEN_BUDGET = 32768
+
 
 @dataclass
 class BaseModelArgs:
@@ -36,6 +40,24 @@ class BaseModelOutput:
     """All hidden states if output_hidden_states=True."""
 
 
+def token_budget_batches(lengths: list[int], budget: int) -> list[list[int]]:
+    """Group indices by ascending length so each padded batch fits ``budget``.
+
+    An item longer than ``budget`` gets a batch of its own.
+    """
+    batches: list[list[int]] = []
+    batch: list[int] = []
+    for index in sorted(range(len(lengths)), key=lengths.__getitem__):
+        # Ascending order makes this item's length the batch's padded length.
+        if batch and (len(batch) + 1) * lengths[index] > budget:
+            batches.append(batch)
+            batch = []
+        batch.append(index)
+    if batch:
+        batches.append(batch)
+    return batches
+
+
 def mean_pooling(hidden_states: mx.array, attention_mask: mx.array) -> mx.array:
     """
     Perform mean pooling over sequence with attention mask.
@@ -57,6 +79,36 @@ def mean_pooling(hidden_states: mx.array, attention_mask: mx.array) -> mx.array:
     sum_mask = mx.clip(mx.sum(mask_expanded, axis=1), a_min=1e-9, a_max=None)
 
     return sum_embeddings / sum_mask
+
+
+def last_token_pool(
+    hidden_states: mx.array, attention_mask: Optional[mx.array] = None
+) -> mx.array:
+    """
+    Pool the last *non-pad* token of each sequence (mask-aware).
+
+    Decoder embedding models (Qwen2/Qwen3, gte-Qwen2, jina-code) represent a
+    sequence by its final token's hidden state. The pool must be
+    mask-aware because these tokenizers may pad on either side: a hardcoded
+    ``[:, -1]`` is only correct under left padding and silently corrupts vectors
+    under right padding.
+
+    Args:
+        hidden_states: Shape (batch_size, seq_len, hidden_size)
+        attention_mask: Shape (batch_size, seq_len). If None, uses the last
+            position.
+
+    Returns:
+        Pooled output of shape (batch_size, hidden_size)
+    """
+    if attention_mask is None:
+        return hidden_states[:, -1]
+
+    # Locate the final unmasked position per row without evaluating an array
+    # in Python, which keeps this helper safe to trace with ``mx.compile``.
+    reverse_indices = mx.argmax(attention_mask[:, ::-1], axis=1)
+    sequence_lengths = attention_mask.shape[1] - reverse_indices - 1
+    return hidden_states[mx.arange(hidden_states.shape[0]), sequence_lengths]
 
 
 def normalize_embeddings(embeddings: mx.array) -> mx.array:

@@ -28,7 +28,8 @@ import hashlib
 import logging
 import threading
 import time
-from collections.abc import Iterable
+from collections import OrderedDict
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, NewType, Optional, Tuple
 
@@ -73,6 +74,11 @@ def resolve_block_extra_keys(
     ):
         return extra_keys
     return None
+
+
+# Tail index bounds. Entries are advisory and verified on every lookup.
+_TAIL_INDEX_PER_PARENT = 8
+_TAIL_INDEX_MAX_PARENTS = 4096
 
 
 def compute_block_hash(
@@ -562,6 +568,18 @@ class PagedCacheManager(CacheManager):
         # paged SSD cache manager for storage (set via set_paged_ssd_cache_manager)
         self._paged_ssd_cache_manager: Optional[Any] = None
 
+        # Lifecycle hooks for hash-keyed side indexes (e.g. the prefix index
+        # in BlockAwarePrefixCache). on_block_hash_dropped fires when a
+        # (hash -> block) association ceases to exist; on_hash_map_cleared
+        # fires after a wholesale hash-map clear. Callbacks may run with
+        # self._lock held and must not call back into this manager.
+        self.on_block_hash_dropped: Callable[[BlockHash], None] | None = None
+        self.on_hash_map_cleared: Callable[[], None] | None = None
+
+        # Tail blocks by chain parent (None for a root). A tail is shorter
+        # than a block, so the grid walk cannot derive its hash.
+        self._tail_index: Dict[Optional[BlockHash], "OrderedDict[BlockHash, int]"] = {}
+
         logger.info(
             f"PagedCacheManager initialized: block_size={block_size}, "
             f"initial_blocks={initial_count}, max_blocks={max_blocks}, "
@@ -699,6 +717,21 @@ class PagedCacheManager(CacheManager):
 
             return blocks
 
+    def _notify_hash_dropped(self, block_hash: BlockHash | None) -> None:
+        """Fire on_block_hash_dropped once a hash maps to no block at all.
+
+        Called from every path that can kill a (hash -> block) association —
+        the internal free/evict paths hold self._lock, while the prefix
+        cache's own map pops call it lock-free (dict reads and the callback's
+        dict.pop are GIL-atomic). The get_block re-check keeps hybrid models
+        correct: the same hash can map to several blocks (one per KV cache
+        group), and the association only dies with the last one.
+        """
+        if block_hash is None or self.on_block_hash_dropped is None:
+            return
+        if self.cached_block_hash_to_block.get_block(block_hash) is None:
+            self.on_block_hash_dropped(block_hash)
+
     def _maybe_evict_cached_block(self, block: CacheBlock) -> bool:
         """
         Evict a block from the hash cache if present.
@@ -715,9 +748,9 @@ class PagedCacheManager(CacheManager):
         if block.block_hash is None:
             return False
 
-        evicted = self.cached_block_hash_to_block.pop(
-            block.block_hash, block.block_id
-        )
+        block_hash = block.block_hash
+        evicted = self.cached_block_hash_to_block.pop(block_hash, block.block_id)
+        self._notify_hash_dropped(block_hash)
 
         if evicted:
             block.reset_hash()
@@ -748,6 +781,7 @@ class PagedCacheManager(CacheManager):
                 # Remove from hash cache
                 if block.block_hash is not None:
                     self.cached_block_hash_to_block.pop(block.block_hash, block.block_id)
+                    self._notify_hash_dropped(block.block_hash)
 
                 # Remove from allocated
                 del self.allocated_blocks[block_id]
@@ -786,6 +820,7 @@ class PagedCacheManager(CacheManager):
                     # Remove from hash cache
                     if block.block_hash is not None:
                         self.cached_block_hash_to_block.pop(block.block_hash, block.block_id)
+                        self._notify_hash_dropped(block.block_hash)
 
                     del self.allocated_blocks[block.block_id]
                     to_free.append(block)
@@ -838,6 +873,37 @@ class PagedCacheManager(CacheManager):
                 self.stats.shared_blocks += 1
 
             return True
+
+    def acquire_cached_block(
+        self, block_id: int, expected_hash: BlockHash
+    ) -> CacheBlock | None:
+        """Atomically take a reference on a block iff it still holds a hash.
+
+        Prefix-index entries can outlive the blocks they point at (a block
+        may have been freed and reused for other content). Checking the hash
+        and taking the reference under the same lock keeps a concurrent
+        eviction from slipping in between the two steps.
+
+        Args:
+            block_id: Physical block index to acquire.
+            expected_hash: Chain hash the block must still hold.
+
+        Returns:
+            The block on success, None when it is gone or reassigned.
+        """
+        with self._lock:
+            block = self.allocated_blocks.get(block_id)
+            if (
+                block is None
+                or block.is_null
+                or block.block_hash != expected_hash
+            ):
+                return None
+            block.ref_count += 1
+            block.touch()
+            if block.ref_count == 2:
+                self.stats.shared_blocks += 1
+            return block
 
     def decrement_ref(self, block_id: int) -> bool:
         """Decrement reference count (alias for free_block)."""
@@ -1026,6 +1092,22 @@ class PagedCacheManager(CacheManager):
                 num_cached_tokens += self.block_size
                 self.stats.hits += 1
 
+            # A tail under the last matched block (or the root) may still
+            # cover the tokens that follow the grid walk.
+            if num_cached_tokens < len(token_ids):
+                tail_block = self._match_tail_block(
+                    token_ids,
+                    parent_hash,
+                    num_cached_tokens,
+                    extra_keys=extra_keys,
+                    extra_key_token_start=extra_key_token_start,
+                    extra_key_ranges=extra_key_ranges,
+                )
+                if tail_block is not None:
+                    cached_blocks.append(tail_block)
+                    num_cached_tokens += tail_block.token_count
+                    self.stats.hits += 1
+
             return cached_blocks, num_cached_tokens
 
     # =========================================================================
@@ -1093,6 +1175,90 @@ class PagedCacheManager(CacheManager):
             block.block_hash = block_hash
             self.cached_block_hash_to_block.insert(block_hash, block)
 
+    def register_tail_block(
+        self,
+        parent_hash: Optional[BlockHash],
+        tail_hash: BlockHash,
+        token_count: int,
+    ) -> None:
+        """Index a tail block under its chain parent for later lookup."""
+        if token_count <= 0:
+            return
+        with self._lock:
+            if (
+                parent_hash not in self._tail_index
+                and len(self._tail_index) >= _TAIL_INDEX_MAX_PARENTS
+            ):
+                self._tail_index.clear()
+            tails = self._tail_index.setdefault(parent_hash, OrderedDict())
+            tails.pop(tail_hash, None)
+            tails[tail_hash] = token_count
+            while len(tails) > _TAIL_INDEX_PER_PARENT:
+                tails.popitem(last=False)
+
+    def seed_tail_blocks(
+        self, entries: Iterable[Tuple[Optional[BlockHash], BlockHash, int]]
+    ) -> int:
+        """Rebuild the tail index from persisted block metadata."""
+        seeded = 0
+        for parent_hash, tail_hash, token_count in entries:
+            self.register_tail_block(parent_hash, tail_hash, token_count)
+            seeded += 1
+        return seeded
+
+    def _match_tail_block(
+        self,
+        token_ids: List[int],
+        parent_hash: Optional[BlockHash],
+        start: int,
+        extra_keys: Optional[Tuple[Any, ...]] = None,
+        extra_key_token_start: Optional[int] = None,
+        extra_key_ranges: Optional[List[Tuple[int, Tuple[Any, ...]]]] = None,
+    ) -> Optional[CacheBlock]:
+        """Find the longest tail block that prefixes ``token_ids[start:]``.
+
+        Stale entries are dropped on the way. Called with ``self._lock`` held.
+        """
+        tails = self._tail_index.get(parent_hash)
+        if not tails:
+            return None
+        remaining = len(token_ids) - start
+        for tail_hash, length in sorted(tails.items(), key=lambda kv: -kv[1]):
+            if length > remaining:
+                continue
+            end = start + length
+            expected = compute_block_hash(
+                parent_hash,
+                token_ids[start:end],
+                extra_keys=resolve_block_extra_keys(
+                    end,
+                    extra_keys=extra_keys,
+                    extra_key_token_start=extra_key_token_start,
+                    extra_key_ranges=extra_key_ranges,
+                ),
+                model_name=self.model_name,
+            )
+            if expected != tail_hash:
+                continue
+            block = self.cached_block_hash_to_block.get_block(tail_hash)
+            if block is None:
+                ssd = self._paged_ssd_cache_manager
+                if ssd is None or not ssd.has_block(tail_hash):
+                    tails.pop(tail_hash, None)
+                    if not tails:
+                        self._tail_index.pop(parent_hash, None)
+                    continue
+                block = self.allocate_block()
+                if block is None:
+                    return None
+                block.block_hash = tail_hash
+                block.token_count = length
+                block.ref_count = 0
+                self.cached_block_hash_to_block.insert(tail_hash, block)
+            tails.move_to_end(tail_hash)
+            return block
+        return None
+
     # =========================================================================
     # Block Table Management
     # =========================================================================
@@ -1147,11 +1313,18 @@ class PagedCacheManager(CacheManager):
         extra_keys: Optional[Tuple[Any, ...]] = None,
         extra_key_token_start: Optional[int] = None,
         extra_key_ranges: Optional[List[Tuple[int, Tuple[Any, ...]]]] = None,
-    ) -> Tuple[List[int], List[int]]:
+    ) -> Tuple[List[int], List[Optional[BlockHash]], List[int]]:
         """
         Find shared prefix blocks for a token sequence.
 
-        Uses get_computed_blocks for consistent chain-hash lookup.
+        Uses get_computed_blocks for consistent chain-hash lookup. Returns
+        each block's hash as observed at lookup time alongside its id, so
+        the caller can acquire it with acquire_cached_block(id, hash)
+        instead of a membership-only increment_ref -- closing the TOCTOU
+        window between this lookup (outside any lock the caller holds) and
+        the caller taking a reference, where a concurrent eviction +
+        reallocation could otherwise splice a foreign block's content into
+        the returned chain (docs/qwen35-hardening-and-optimization.md A2).
         """
         cached_blocks, num_cached_tokens = self.get_computed_blocks(
             tokens,
@@ -1161,9 +1334,10 @@ class PagedCacheManager(CacheManager):
         )
 
         shared_block_ids = [b.block_id for b in cached_blocks]
+        shared_block_hashes = [b.block_hash for b in cached_blocks]
         remaining_tokens = tokens[num_cached_tokens:]
 
-        return shared_block_ids, remaining_tokens
+        return shared_block_ids, shared_block_hashes, remaining_tokens
 
     def fork_block_table(
         self,
@@ -1258,43 +1432,6 @@ class PagedCacheManager(CacheManager):
     # Eviction
     # =========================================================================
 
-    def evict_lru_blocks(self, num_blocks: int) -> int:
-        """
-        Evict least recently used blocks.
-
-        With the doubly linked list, LRU blocks are already at the front
-        of the free queue. We just need to pop from front.
-        """
-        with self._lock:
-            evicted = 0
-
-            # Get evictable blocks from free queue (they're already LRU ordered)
-            for _ in range(min(num_blocks, self.free_block_queue.num_free_blocks)):
-                try:
-                    block = self.free_block_queue.popleft()
-                    self._maybe_evict_cached_block(block)
-                    # Put back at end (now available for allocation)
-                    self.free_block_queue.append(block)
-                    evicted += 1
-                except ValueError:
-                    break
-
-            if evicted > 0:
-                logger.info(f"Evicted {evicted} LRU blocks from cache")
-
-            return evicted
-
-    def handle_memory_pressure(self, requested_blocks: int) -> bool:
-        """Handle memory pressure by evicting blocks."""
-        with self._lock:
-            if self.free_block_queue.num_free_blocks >= requested_blocks:
-                return True
-
-            needed = requested_blocks - self.free_block_queue.num_free_blocks
-            self.evict_lru_blocks(needed)
-
-            return self.free_block_queue.num_free_blocks >= requested_blocks
-
     # =========================================================================
     # Statistics and Properties
     # =========================================================================
@@ -1347,26 +1484,6 @@ class PagedCacheManager(CacheManager):
             self.stats.cow_copies = 0
             self.stats.evictions = 0
 
-    def reset_prefix_cache(self) -> bool:
-        """Reset the prefix cache."""
-        with self._lock:
-            num_used = self.max_blocks - self.free_block_queue.num_free_blocks
-            if num_used > 1:  # null_block is always "used"
-                logger.warning(f"Cannot reset cache: {num_used - 1} blocks in use")
-                return False
-
-            self.cached_block_hash_to_block.clear()
-
-            for block in self.blocks:
-                block.reset_hash()
-
-            self.stats.evictions = 0
-            self.stats.hits = 0
-            self.stats.misses = 0
-
-            logger.info("Prefix cache reset successfully")
-            return True
-
     def clear(self) -> int:
         """
         Clear all cached data and reset to initial block count.
@@ -1389,6 +1506,9 @@ class PagedCacheManager(CacheManager):
             self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
 
             self.cached_block_hash_to_block.clear()
+            self._tail_index.clear()
+            if self.on_hash_map_cleared is not None:
+                self.on_hash_map_cleared()
             self.request_tables.clear()
             self.allocated_blocks.clear()
 
@@ -1534,6 +1654,7 @@ class PagedCacheManager(CacheManager):
             # Remove from hash cache
             if block.block_hash is not None:
                 self.cached_block_hash_to_block.pop(block.block_hash, block.block_id)
+                self._notify_hash_dropped(block.block_hash)
 
             # Clear metadata
             block.reset_hash()

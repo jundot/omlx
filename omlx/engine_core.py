@@ -14,68 +14,242 @@ The design follows vLLM's engine architecture adapted for MLX.
 
 import asyncio
 import concurrent.futures
+import gc
 import logging
+import os
+import threading
 import time
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import mlx.core as mx
 
-from .request import Request, RequestOutput, RequestStatus, SamplingParams
-from .scheduler import Scheduler, SchedulerConfig, SchedulerOutput
+from .exceptions import (
+    PrefillMemoryAbortedError,
+    PrefillMemoryExceededError,
+    describe_ceiling_binding,
+)
+from .model_registry import get_registry
 from .output_collector import RequestOutputCollector, RequestStreamState
-from .model_registry import get_registry, ModelOwnershipError
+from .request import Request, RequestOutput, SamplingParams
+from .scheduler import Scheduler, SchedulerConfig, _sync_and_clear_cache
+from .utils.fatal import (
+    FATAL_TEARDOWN_TIMEOUT_S,
+    exit_if_gpu_submissions_ignored,
+    fatal_exit,
+)
+from .utils.hardware import format_bytes
+from .utils.metal_sync import clear_thread_streams
 
 logger = logging.getLogger(__name__)
+
+
+class _EngineTeardown:
+    """Allow one extra minute only for recently successful SSD persistence."""
+
+    def __init__(self, engine_id: str, timeout: float = 60.0):
+        self.engine_id = engine_id
+        self.started = time.monotonic()
+        self.timeout = timeout
+        self.deadline = self.started + 2 * timeout
+        self.extended = False
+        self._phase = "shutdown"
+        self._progress: Callable[[], float | None] | None = None
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+        self._thread = threading.Thread(
+            target=self._watch, name=f"engine-close-{engine_id[:8]}", daemon=True
+        )
+
+    def set_phase(
+        self, phase: str, progress: Callable[[], float | None] | None = None
+    ) -> None:
+        with self._lock:
+            self._phase = phase
+            self._progress = progress
+
+    def remaining(self, *, mlx: bool = False) -> float:
+        remaining = max(0.0, self.deadline - time.monotonic())
+        return min(self.timeout, remaining) if mlx else remaining
+
+    def check(self, now: float) -> str | None:
+        """Return a fatal reason, or grant the single persistence extension."""
+        with self._lock:
+            phase, progress = self._phase, self._progress
+            if now < self.started + self.timeout:
+                return None
+            if now >= self.deadline:
+                return f"Engine {self.engine_id}: teardown exceeded {2 * self.timeout:g}s ({phase})"
+            if self.extended:
+                return None
+            last_success = progress() if progress is not None else None
+            # A write can finish between the time sample and this snapshot.
+            if (
+                last_success is not None
+                and last_success >= self.started
+                and now - last_success <= self.timeout / 2
+            ):
+                self.extended = True
+                logger.warning(
+                    "Engine %s: extending teardown to %gs for progressing SSD "
+                    "persistence (%s, last completed write %.1fs ago)",
+                    self.engine_id,
+                    2 * self.timeout,
+                    phase,
+                    now - last_success,
+                )
+                return None
+            return f"Engine {self.engine_id}: teardown timed out after {self.timeout:g}s ({phase}); no recent SSD persistence progress"
+
+    def _watch(self) -> None:
+        if self._done.wait(max(0.0, self.started + self.timeout - time.monotonic())):
+            return
+        try:
+            reason = self.check(time.monotonic())
+        except Exception:
+            logger.exception("Failed to inspect engine teardown progress")
+            reason = f"Engine {self.engine_id}: teardown progress check failed"
+        if reason is not None:
+            fatal_exit(reason)
+        while not self._done.wait(min(10.0, self.remaining())):
+            now = time.monotonic()
+            if now >= self.deadline:
+                fatal_exit(
+                    f"Engine {self.engine_id}: teardown exceeded {2 * self.timeout:g}s"
+                )
+                return
+            with self._lock:
+                phase, progress = self._phase, self._progress
+                try:
+                    last_success = progress() if progress is not None else None
+                except Exception:
+                    logger.exception("Failed to inspect engine teardown progress")
+                    last_success = None
+            detail = ""
+            if progress is not None:
+                detail = (
+                    f", last completed write {max(0.0, now - last_success):.1f}s ago"
+                    if last_success is not None
+                    else ", no recent successful SSD write confirmed"
+                )
+            logger.info(
+                "Engine %s: waiting for teardown (elapsed %.0fs/%gs, phase=%s%s)",
+                self.engine_id,
+                now - self.started,
+                2 * self.timeout,
+                phase,
+                detail,
+            )
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._done.set()
+        self._thread.join()
+        self.set_phase("closed")
+
+
+def _raise_request_output_error(output: RequestOutput) -> None:
+    if output.error_code in ("prefill_memory_exceeded", "prefill_memory_aborted"):
+        metadata = output.error_metadata or {}
+        request_id = metadata.get("request_id")
+        estimated_bytes = metadata.get("estimated_bytes")
+        limit_bytes = metadata.get("limit_bytes")
+        # Both are memory-guard outcomes and share the HTTP 400 mapping; the
+        # aborted subclass only changes the wording (admitted then killed
+        # mid-prefill vs rejected before it started).
+        error_type = (
+            PrefillMemoryAbortedError
+            if output.error_code == "prefill_memory_aborted"
+            else PrefillMemoryExceededError
+        )
+        raise error_type(
+            message=output.error or "Prefill memory exceeded",
+            request_id=str(request_id) if request_id is not None else output.request_id,
+            estimated_bytes=(
+                int(estimated_bytes) if estimated_bytes is not None else None
+            ),
+            limit_bytes=int(limit_bytes) if limit_bytes is not None else None,
+        )
+    raise RuntimeError(output.error)
+
 
 _global_mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
 
-def _init_mlx_thread() -> None:
-    """Replace generation_stream with a thread-local stream on the executor thread.
+def _final_engine_thread_reclaim(stream: Any) -> None:
+    """Drop Python cycles and reclaim MLX buffers on the engine worker thread."""
+    gc.collect()
+    _sync_and_clear_cache(stream)
+    gc.collect()
+    clear_thread_streams()
 
-    mlx-lm's module-level ``generation_stream`` is created at import time in
-    whichever thread imported it first (the main thread at server startup).
-    Arrays produced inside ``with mx.stream(generation_stream):`` blocks carry
-    that stream reference.  If the stream was created on the main thread,
-    subsequent ``.item()`` / ``mx.synchronize()`` calls from the executor
-    thread fail with "There is no Stream(gpu, 0) in current thread".
 
-    Fix: create a thread-local stream HERE and replace the module-level
-    ``generation_stream`` in mlx_lm.generate and omlx.scheduler.
-    """
-    import sys
-    import mlx.core as mx
-
-    stream = mx.new_thread_local_stream(mx.default_device())
-
-    gen_mod = sys.modules.get("mlx_lm.generate")
-    if gen_mod is not None:
-        gen_mod.generation_stream = stream
-
-    sched_mod = sys.modules.get("omlx.scheduler")
-    if sched_mod is not None:
-        sched_mod.generation_stream = stream
-
-    logger.info(f"MLX executor thread initialized: generation_stream = {stream}")
+def _final_global_mlx_thread_reclaim() -> None:
+    """Reclaim MLX state before the process-wide worker thread exits."""
+    gc.collect()
+    _sync_and_clear_cache()
+    gc.collect()
+    clear_thread_streams()
 
 
 def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:
     """Get or create the global MLX executor (lazy singleton).
 
-    mlx-lm's BatchGenerator uses a module-level Metal stream
-    (generation_stream), so ALL MLX GPU operations across all models
-    MUST be serialized onto one thread to prevent Metal command buffer
-    races that cause segfaults. See issue #85.
+    ALL MLX GPU operations across all models that share this executor are
+    serialized onto one thread to prevent Metal command buffer races that
+    cause segfaults. See issue #85. mlx-lm's ``generation_stream`` is a
+    thread-local stream, so work submitted here needs no stream setup.
     """
     global _global_mlx_executor
     if _global_mlx_executor is None:
         _global_mlx_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="mlx-global",
-            initializer=_init_mlx_thread,
+            max_workers=1,
+            thread_name_prefix="mlx-global",
         )
     return _global_mlx_executor
+
+
+def shutdown_mlx_executor() -> None:
+    """Shut down the global MLX worker after clearing its thread-local streams."""
+    global _global_mlx_executor
+    executor = _global_mlx_executor
+    if executor is None:
+        return
+
+    try:
+        future = executor.submit(_final_global_mlx_thread_reclaim)
+    except RuntimeError:
+        # An embedding application may have shut the executor down directly.
+        future = None
+
+    if future is not None:
+        try:
+            future.result(timeout=FATAL_TEARDOWN_TIMEOUT_S)
+        except concurrent.futures.TimeoutError:
+            fatal_exit(
+                "Global MLX executor teardown timed out after "
+                f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s"
+            )
+        except Exception as exc:
+            fatal_exit(f"Global MLX executor teardown failed: {exc!r}")
+
+    executor.shutdown(wait=False)
+    _global_mlx_executor = None
 
 
 @dataclass
@@ -84,8 +258,41 @@ class EngineConfig:
 
     model_name: str = ""
     scheduler_config: Optional[SchedulerConfig] = None
-    step_interval: float = 0.001  # 1ms between steps
+    step_interval: float = 0.05  # Idle wait timeout; requests wake the loop
     stream_interval: int = 1  # Tokens to batch before streaming (1=every token)
+    prefill_eviction_callback: Optional[Callable[[Any], Awaitable[bool]]] = None
+    # Decode burst: run several scheduler.step() calls per run_in_executor
+    # hand-off instead of one. Each decode token otherwise bounces back to the
+    # event loop, ping-ponging the GIL with the asyncio loop + uvicorn on the
+    # main thread; bursting keeps the MLX thread holding the GIL continuously.
+    # scheduler.step() services aborts/admission/finish every step, so
+    # correctness is unchanged and memory is identical (same tokens decoded,
+    # same KV cache; only a small list of K SchedulerOutputs is held per
+    # burst). The budget is a TIME ceiling so the event-loop pause (and thus
+    # new-request admission / abort / HTTP latency) is bounded consistently
+    # across hardware, and a slow prefill-chunk step ends the burst.
+    #
+    # Adaptive: with a single active request (the common local/single-user
+    # case) there is no concurrent request to stay responsive to, so we burst
+    # aggressively (decode_burst_budget_single_s). Once concurrent, we use the
+    # tight decode_burst_budget_s to keep admission/abort latency low.
+    # A request's first generated chunk always ends the burst so buffering
+    # later decode steps does not add to its time to first token.
+    # max_steps is a safety cap (bounds the host-side output list), NOT a
+    # memory knob. Set both budgets <= 0, or max_steps <= 1, to disable.
+    decode_burst_max_steps: int = field(
+        default_factory=lambda: int(os.environ.get("OMLX_DECODE_BURST_MAX_STEPS", "64"))
+    )
+    decode_burst_budget_single_s: float = field(
+        default_factory=lambda: float(
+            os.environ.get("OMLX_DECODE_BURST_BUDGET_SINGLE_S", "0.1")
+        )
+    )
+    decode_burst_budget_s: float = field(
+        default_factory=lambda: float(
+            os.environ.get("OMLX_DECODE_BURST_BUDGET_S", "0.03")
+        )
+    )
 
 
 class EngineCore:
@@ -122,6 +329,8 @@ class EngineCore:
         self._engine_id = engine_id or str(uuid.uuid4())
         self._owns_model = False
         self._closed = False
+        self._close_lock = threading.Lock()
+        self._closing = False
 
         # Acquire model ownership
         registry = get_registry()
@@ -155,12 +364,26 @@ class EngineCore:
         self._output_collectors: Dict[str, RequestOutputCollector] = {}
         self._stream_states: Dict[str, RequestStreamState] = {}
         self._finished_events: Dict[str, asyncio.Event] = {}
+        # Finish timestamps for orphan-collector reaping (#1154).
+        # Normally a consumer drains and removes its own collector, but if the
+        # client disconnects mid-stream the SSE generator chain is abandoned and
+        # its cleanup finally only runs at GC time, so the collector lingers and
+        # the dashboard keeps showing the request as "Generating".
+        self._finished_at: Dict[str, float] = {}
+        self._last_reap = 0.0
 
         # Engine state
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._wake_event: Optional[asyncio.Event] = None
         self._start_time: Optional[float] = None
         self._steps_executed = 0
+
+        # Drop transient aliases after ownership moves to the engine/scheduler
+        # graph, so close()/deep_reset() can make that graph unreachable.
+        model = None
+        tokenizer = None
 
         logger.debug(f"Engine {self._engine_id} initialized")
 
@@ -169,6 +392,8 @@ class EngineCore:
         if self._running:
             return
 
+        self._loop = asyncio.get_running_loop()
+        self._wake_event = asyncio.Event()
         self._running = True
         self._start_time = time.time()
         self._task = asyncio.create_task(self._engine_loop())
@@ -177,18 +402,90 @@ class EngineCore:
     async def stop(self) -> None:
         """Stop the engine loop."""
         self._running = False
+        if self._wake_event is not None:
+            self._wake_event.set()
         if self._task:
             self._task.cancel()
-            try:
+            with suppress(asyncio.CancelledError):
                 await self._task
-            except asyncio.CancelledError:
-                pass
             self._task = None
+        self._wake_event = None
+        self._loop = None
         logger.info("Engine stopped")
 
     def is_running(self) -> bool:
         """Check if engine is running."""
         return self._running
+
+    def _wake_engine_loop(self) -> None:
+        """Wake the idle engine loop after scheduler-visible state changes."""
+        event = getattr(self, "_wake_event", None)
+        loop = getattr(self, "_loop", None)
+        if event is None or loop is None or loop.is_closed():
+            return
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is loop:
+            event.set()
+        else:
+            loop.call_soon_threadsafe(event.set)
+
+    def _step_burst(self) -> list:
+        """Run scheduler.step() several times in one executor hand-off.
+
+        Each decode token otherwise bounces back to the event loop, which
+        ping-pongs the GIL with the asyncio loop + uvicorn on the main thread
+        (~1ms/token of contention). Chaining a few steps lets the MLX thread
+        hold the GIL continuously (in-process sync loop hits ~80 tok/s vs ~74
+        through the per-token async hand-off).
+
+        scheduler.step() services aborts/admission/finish every step, so
+        correctness is unchanged; the only cost is event-loop responsiveness,
+        bounded by decode_burst_budget_s. Stops early when no work remains, a
+        request produces its first chunk, a prefill eviction needs the (async)
+        callback, or the budget elapses —
+        the budget also ends the burst when a slow prefill-chunk step lands.
+
+        Runs on the MLX executor thread. Returns the SchedulerOutputs in order.
+        """
+        max_steps = self.config.decode_burst_max_steps
+        outputs = [self.scheduler.step()]
+        if max_steps <= 1:
+            return outputs
+        # Adaptive budget: single active request -> aggressive (nothing else to
+        # stay responsive to); concurrent -> tight to keep admission/abort low.
+        running = getattr(self.scheduler, "running", None)
+        single = running is None or len(running) <= 1
+        budget = (
+            self.config.decode_burst_budget_single_s
+            if single
+            else self.config.decode_burst_budget_s
+        )
+        if budget <= 0:
+            return outputs
+        deadline = time.monotonic() + budget
+        while len(outputs) < max_steps:
+            last = outputs[-1]
+            # Also release the first chunk of a request admitted mid-burst.
+            # Comparing cumulative and new tokens covers multi-token steps
+            # without per-request tracking. Later chunks retain normal bursts.
+            if any(
+                item.new_token_ids
+                and item.completion_tokens == len(item.new_token_ids)
+                for item in last.outputs
+            ):
+                break
+            if (
+                not last.has_work  # throttled/idle: stop and let the loop wait
+                or not self.scheduler.has_requests()
+                or last.prefill_eviction_request is not None
+                or time.monotonic() >= deadline
+            ):
+                break
+            outputs.append(self.scheduler.step())
+        return outputs
 
     async def _engine_loop(self) -> None:
         """Main engine loop - runs scheduler steps on the MLX executor.
@@ -202,22 +499,42 @@ class EngineCore:
 
         step_interval = self.config.step_interval
         stream_interval = self.config.stream_interval
-        use_simple_streaming = (stream_interval == 1)
+        use_simple_streaming = stream_interval == 1
 
         while self._running:
             try:
-                if self.scheduler.has_requests():
-                    output = await loop.run_in_executor(
-                        self._mlx_executor, self.scheduler.step
-                    )
-                    self._steps_executed += 1
+                # Sweep collectors orphaned by client disconnects (throttled).
+                now = time.monotonic()
+                if now - self._last_reap >= 1.0:
+                    self._last_reap = now
+                    self._reap_orphaned_collectors(now)
 
-                    # Fast path: distribute outputs to collectors
-                    outputs = output.outputs
-                    if outputs:
-                        collectors = self._output_collectors
-                        states = self._stream_states
-                        events = self._finished_events
+                if self.scheduler.has_requests():
+                    step_outputs = await loop.run_in_executor(
+                        self._mlx_executor, self._step_burst
+                    )
+                    self._steps_executed += len(step_outputs)
+
+                    # Distribute every step's outputs to collectors (one or
+                    # more decode tokens per burst). collector.put() runs on the
+                    # loop thread, keeping the asyncio.Event signalling
+                    # thread-safe and per-token streaming intact.
+                    collectors = self._output_collectors
+                    states = self._stream_states
+                    eviction_request = None
+                    distributed = False
+
+                    for output in step_outputs:
+                        if (
+                            eviction_request is None
+                            and output.prefill_eviction_request is not None
+                        ):
+                            eviction_request = output.prefill_eviction_request
+
+                        outputs = output.outputs
+                        if not outputs:
+                            continue
+                        distributed = True
 
                         for req_output in outputs:
                             rid = req_output.request_id
@@ -231,34 +548,89 @@ class EngineCore:
                                     state = states.get(rid)
                                     if state and state.should_send(
                                         req_output.completion_tokens,
-                                        req_output.finished
+                                        req_output.finished,
                                     ):
                                         collector.put(req_output)
                                         state.mark_sent(req_output.completion_tokens)
 
                             if req_output.finished:
-                                event = events.get(rid)
-                                if event:
-                                    event.set()
-                                # Note: cleanup is handled by stream_outputs() finally block
-                                # _delayed_cleanup() was causing double cleanup race condition
+                                self._mark_request_finished(rid)
+                                # Cleanup normally happens in the consumer
+                                # (stream_outputs()/generate()); collectors left
+                                # behind by a disconnected client are swept by
+                                # _reap_orphaned_collectors() via _finished_at.
 
+                    if distributed:
                         # Always yield to prevent event loop starvation.
                         # Without this, orphaned requests (client disconnected but
                         # request still in scheduler) block the entire event loop,
                         # making the server unresponsive to all HTTP requests.
                         await asyncio.sleep(0)
+
+                    if eviction_request is not None:
+                        callback = self.config.prefill_eviction_callback
+                        if callback is not None:
+                            logger.info(
+                                "Running prefill LRU eviction for request %s",
+                                eviction_request.request_id,
+                            )
+                            evicted = await callback(eviction_request)
+                            if evicted:
+                                logger.info(
+                                    "Prefill LRU eviction completed for request %s",
+                                    eviction_request.request_id,
+                                )
+                            else:
+                                logger.info(
+                                    "No idle model evicted for request %s; "
+                                    "scheduler will fall back to throttling",
+                                    eviction_request.request_id,
+                                )
+                        else:
+                            logger.debug(
+                                "Prefill eviction requested for %s but no callback "
+                                "is configured",
+                                eviction_request.request_id,
+                            )
+                        continue
+                    if not step_outputs[-1].has_work:
+                        # Requests may be queued while scheduler admission is
+                        # intentionally throttled by async cache cleanup. Avoid
+                        # spinning the engine loop, but still let new requests
+                        # wake the wait immediately.
+                        event = self._wake_event
+                        if event is None:
+                            await asyncio.sleep(step_interval)
+                        else:
+                            event.clear()
+                            with suppress(TimeoutError):
+                                await asyncio.wait_for(
+                                    event.wait(), timeout=step_interval
+                                )
                 else:
-                    # No work, yield control
-                    await asyncio.sleep(step_interval)
+                    event = self._wake_event
+                    if event is None:
+                        await asyncio.sleep(step_interval)
+                    else:
+                        event.clear()
+                        # Avoid losing a request that arrived between
+                        # has_requests() and clear().
+                        if self.scheduler.has_requests():
+                            continue
+                        with suppress(TimeoutError):
+                            await asyncio.wait_for(event.wait(), timeout=step_interval)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                exit_if_gpu_submissions_ignored(e)
                 import traceback
+
                 logger.error(f"Engine loop error: {e}\n{traceback.format_exc()}")
                 # Fail all requests and remove from scheduler to prevent
-                # infinite loop (has_requests() must return False).
+                # infinite loop (has_requests() must go False; a pending
+                # idle reclaim may hold it True for one extra step, which
+                # drains and clears it).
                 failed_ids = await loop.run_in_executor(
                     self._mlx_executor, self.scheduler.fail_all_requests
                 )
@@ -273,9 +645,7 @@ class EngineCore:
                                 error=str(e),
                             )
                         )
-                    event = self._finished_events.get(rid)
-                    if event:
-                        event.set()
+                    self._mark_request_finished(rid)
                 await asyncio.sleep(0.1)
 
     async def add_request(
@@ -294,6 +664,13 @@ class EngineCore:
         specprefill_keep_pct: Optional[float] = None,
         specprefill_threshold: Optional[int] = None,
         specprefill_system_end: Optional[int] = None,
+        generation_prompt_text: Optional[str] = None,
+        generation_prompt_persists: bool = False,
+        skip_cache_store: bool = False,
+        preserve_reasoning: bool = False,
+        benchmark_trace: bool = False,
+        benchmark_ane_sequence_length: int = 0,
+        tools: list[dict[str, Any]] | None = None,
     ) -> str:
         """
         Add a request for processing.
@@ -324,6 +701,7 @@ class EngineCore:
             request_id=request_id,
             prompt=prompt,
             sampling_params=sampling_params,
+            tools=tools,
             images=images,
             videos=videos,
             vlm_inputs_embeds=vlm_inputs_embeds,
@@ -331,6 +709,10 @@ class EngineCore:
             vlm_image_hash=vlm_image_hash,
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
+            skip_cache_store=skip_cache_store,
+            preserve_reasoning=preserve_reasoning,
+            benchmark_trace=benchmark_trace,
+            benchmark_ane_sequence_length=benchmark_ane_sequence_length,
         )
 
         # SpecPrefill: resolve per-request settings.
@@ -346,6 +728,9 @@ class EngineCore:
             request._specprefill_threshold = specprefill_threshold
         if specprefill_system_end is not None and specprefill_system_end > 0:
             request.specprefill_system_end = specprefill_system_end
+        if generation_prompt_text:
+            request.generation_prompt_text = generation_prompt_text
+            request.generation_prompt_persists = bool(generation_prompt_persists)
 
         # Setup output collector with stream_interval from config
         self._output_collectors[request_id] = RequestOutputCollector(aggregate=True)
@@ -357,10 +742,39 @@ class EngineCore:
         # Add to scheduler — route through the MLX executor so that
         # prefix cache reconstruction (mx.load, mx.concatenate) never
         # races with scheduler.step() on the Metal stream.  See #95.
+        #
+        # The scheduler may raise (PrefillMemoryExceededError, or other
+        # validation errors) before the request enters self.waiting. In
+        # that case the consumer in stream_outputs / generate never sees
+        # the request_id and its finally-block cleanup never fires —
+        # without the explicit cleanup below the per-rejection leak
+        # accumulates one collector + one stream_state + one
+        # asyncio.Event per refused request. Re-raise after cleanup so
+        # the typed exception still reaches the FastAPI 400 handler.
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            self._mlx_executor, self.scheduler.add_request, request
-        )
+        try:
+            await loop.run_in_executor(
+                self._mlx_executor, self.scheduler.add_request, request
+            )
+        except BaseException:
+            # If the caller is cancelled here (e.g. the client disconnected
+            # before the SSE stream began) — or the insert fails — the request
+            # never reaches stream_outputs()/generate()'s try/finally, so
+            # nothing would mark it finished or clean it up. The collector
+            # created above would then linger forever as a phantom the reaper
+            # cannot see (it was never stamped _finished_at), and the dashboard
+            # would show it as "Generating" indefinitely (#1154).
+            # Drop the tracking and abort any partial scheduler insert (the
+            # deferred abort is idempotent and harmless if it never landed).
+            try:
+                self.scheduler.abort_request(request_id)
+            except Exception as abort_exc:  # noqa: BLE001
+                logger.debug(
+                    f"Abort of partial insert for {request_id} failed: {abort_exc}"
+                )
+            self._cleanup_request(request_id)
+            raise
+        self._wake_engine_loop()
 
         return request_id
 
@@ -400,44 +814,102 @@ class EngineCore:
                     error="Request aborted",
                 )
             )
-        event = self._finished_events.get(request_id)
-        if event is not None:
-            event.set()
+        self._mark_request_finished(request_id)
+        self._wake_engine_loop()
 
         return result
 
-    async def abort_all_requests(self) -> int:
+    async def abort_all_requests(
+        self,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> int:
         """Abort all active requests without stopping the engine.
 
         Sends error output to all active collectors and marks requests
         for deferred abort in the scheduler. Cleanup is handled by
-        the consumer (stream_outputs/generate).
+        the consumer (stream_outputs/generate). Without an explicit reason,
+        preserve the memory-pressure error used by the process enforcer.
         """
         from .utils.proc_memory import get_phys_footprint
 
-        request_ids = list(self._output_collectors.keys())
+        # Only abort requests not already finished or pending abort. The
+        # enforcer calls this once per poll (1s) while pressure persists; a
+        # deferred abort can take many seconds to drain (it executes at the
+        # next step()/chunk boundary), so without this filter the same
+        # request is re-aborted every poll: duplicate [Error: ...] frames
+        # reach streaming clients and the returned count reports stale
+        # aborts as fresh progress, hiding a stuck scheduler from the
+        # enforcer's escalation logic.
+        pending_aborts: set[str] = set()
+        sched_for_filter = self.scheduler
+        if sched_for_filter is not None:
+            pending_aborts = set(
+                getattr(sched_for_filter, "_pending_abort_ids", None) or ()
+            )
+        request_ids = [
+            rid
+            for rid in self._output_collectors
+            if rid not in self._finished_at and rid not in pending_aborts
+        ]
         ceiling = 0
+        watermark = 0
         sched = self.scheduler
-        if sched is not None:
+        if reason is None and sched is not None:
             ceiling = int(getattr(sched, "_memory_hard_limit_bytes", 0) or 0)
-        usage = get_phys_footprint()
+            watermark = int(getattr(sched, "_memory_hard_watermark_bytes", 0) or 0)
+        usage = get_phys_footprint() if reason is None else 0
         usage_gb = usage / (1024**3)
         ceiling_gb = ceiling / (1024**3) if ceiling > 0 else 0.0
+        watermark_gb = watermark / (1024**3) if watermark > 0 else 0.0
+        # Name the component ceiling that actually produced this abort. A
+        # generic "loosen memory_guard_tier" leaves users who are already on
+        # `aggressive` with nothing to try (#2362); the ladder points at the
+        # constraint that is really binding, or falls back to the same
+        # generic advice when the enforcer has not propagated a breakdown.
+        binding = "effective"
+        advice = ""
+        if reason is None:
+            binding, advice = describe_ceiling_binding(
+                static=int(getattr(sched, "_memory_static_ceiling_bytes", 0) or 0),
+                dynamic=int(getattr(sched, "_memory_dynamic_ceiling_bytes", 0) or 0),
+                metal_cap=int(getattr(sched, "_memory_metal_cap_bytes", 0) or 0),
+                tier=str(getattr(sched, "_memory_guard_tier", "") or ""),
+                current=usage,
+                fmt=format_bytes,
+                tail="reduce context length",
+            )
+            advice = f"{advice}."
+        ceiling_label = f"{binding} ceiling" if binding != "effective" else "ceiling"
         for rid in request_ids:
             self.scheduler.abort_request(rid)
             collector = self._output_collectors.get(rid)
             if collector is not None:
-                if ceiling > 0:
+                # Name the watermark that actually tripped; printing only the
+                # ceiling reads as "usage below limit yet aborted" (#2321).
+                if reason is not None:
+                    error_msg = reason
+                elif watermark > 0 and ceiling > 0:
                     error_msg = (
                         f"Request aborted: process memory limit exceeded "
-                        f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
-                        "Reduce context size or lower memory_guard_tier."
+                        f"(usage {usage_gb:.1f} GB, abort threshold "
+                        f"(hard watermark) {watermark_gb:.1f} GB, "
+                        f"{ceiling_label} {ceiling_gb:.1f} GB). "
+                        f"{advice}"
+                    )
+                elif ceiling > 0:
+                    error_msg = (
+                        f"Request aborted: process memory limit exceeded "
+                        f"(usage {usage_gb:.1f} GB, "
+                        f"{ceiling_label} {ceiling_gb:.1f} GB). "
+                        f"{advice}"
                     )
                 else:
                     error_msg = (
                         f"Request aborted: process memory limit exceeded "
                         f"(usage {usage_gb:.1f} GB). "
-                        "Reduce context size or lower memory_guard_tier."
+                        f"{advice}"
                     )
                 collector.put(
                     RequestOutput(
@@ -446,16 +918,85 @@ class EngineCore:
                         finish_reason="error",
                         new_text=f"\n\n[Error: {error_msg}]",
                         error=error_msg,
+                        # Without a code this surfaced as a bare RuntimeError:
+                        # the JSON keepalive wrapper never saw a memory error,
+                        # so the response generator died mid-body and the
+                        # client got a truncated read plus a 500 traceback
+                        # instead of the same actionable 400 the pre-flight
+                        # guard returns.
+                        error_code=error_code or "prefill_memory_aborted",
+                        error_metadata={
+                            "request_id": rid,
+                            # Only the limit is reported: the exception's
+                            # estimated_bytes means "predicted peak", and this
+                            # abort fires on measured usage, which the message
+                            # already states.
+                            "limit_bytes": (
+                                watermark or ceiling or None
+                                if reason is None
+                                else None
+                            ),
+                        },
                     )
                 )
-            event = self._finished_events.get(rid)
-            if event is not None:
-                event.set()
+            self._mark_request_finished(rid)
         if request_ids:
-            logger.warning(
-                f"Aborted {len(request_ids)} requests due to memory pressure"
-            )
+            if reason is None:
+                logger.warning(
+                    f"Aborted {len(request_ids)} requests due to memory pressure"
+                )
+            else:
+                logger.warning("Aborted %d requests: %s", len(request_ids), reason)
+            self._wake_engine_loop()
         return len(request_ids)
+
+    def _mark_request_finished(self, request_id: str) -> None:
+        """Signal the consumer a request finished and stamp the finish time.
+
+        The timestamp lets _reap_orphaned_collectors() drop collectors whose
+        consumer never cleaned up (e.g. the client disconnected mid-stream and
+        the SSE generator chain was abandoned rather than closed).
+        """
+        self._finished_at.setdefault(request_id, time.monotonic())
+        event = self._finished_events.get(request_id)
+        if event is not None:
+            event.set()
+
+    def _reap_orphaned_collectors(self, now: float, grace: float = 5.0) -> int:
+        """Drop tracking for finished requests whose consumer never cleaned up.
+
+        stream_outputs()/generate() normally remove their own collector via
+        _cleanup_request() once the final output is drained. But when a client
+        disconnects mid-stream the SSE generator chain is abandoned instead of
+        closed, so that finally block only runs at non-deterministic GC time —
+        the collector lingers in _output_collectors and the request shows as
+        "Generating" forever on the dashboard (#1154).
+
+        This sweep removes the dict tracking for any request finished more than
+        ``grace`` seconds ago. It is intentionally pop-only and never calls
+        ``collector.clear()``: stream_outputs()/generate() hold their own
+        reference to the collector object, so dropping the dict entry cannot
+        truncate a slow-but-live consumer's output — only an over-eager clear()
+        could (which is what made the earlier _delayed_cleanup() approach race).
+        The grace period guarantees a live consumer (which drains in the same
+        event-loop turn the request finishes) has already self-cleaned.
+        """
+        if not self._finished_at:
+            return 0
+        stale = [rid for rid, ts in self._finished_at.items() if now - ts >= grace]
+        for rid in stale:
+            # pop-only — see docstring; never clear() the collector object.
+            self._output_collectors.pop(rid, None)
+            self._stream_states.pop(rid, None)
+            self._finished_events.pop(rid, None)
+            self._finished_at.pop(rid, None)
+        if stale:
+            logger.debug(
+                "Reaped %d orphaned output collector(s) after disconnect: %s",
+                len(stale),
+                stale,
+            )
+        return len(stale)
 
     def _cleanup_request(self, request_id: str) -> None:
         """Clean up request tracking.
@@ -469,6 +1010,7 @@ class EngineCore:
             collector.clear()
         self._stream_states.pop(request_id, None)
         self._finished_events.pop(request_id, None)
+        self._finished_at.pop(request_id, None)
 
     async def _delayed_cleanup(self, request_id: str, delay: float = 5.0) -> None:
         """
@@ -515,8 +1057,7 @@ class EngineCore:
                         output = collector.get_nowait()
                         if output is None:
                             output = await asyncio.wait_for(
-                                collector.get(),
-                                timeout=timeout
+                                collector.get(), timeout=timeout
                             )
                     else:
                         output = collector.get_nowait() or await collector.get()
@@ -524,7 +1065,7 @@ class EngineCore:
                     yield output
 
                     if output.error:
-                        raise RuntimeError(output.error)
+                        _raise_request_output_error(output)
 
                     if output.finished:
                         break
@@ -570,6 +1111,15 @@ class EngineCore:
         if event is None:
             raise RuntimeError(f"No event for request {request_id}")
 
+        # Capture the collector reference BEFORE awaiting, mirroring
+        # stream_outputs(): the orphan reaper is pop-only and may drop the dict
+        # entry once the request is finished, but a held reference still drains.
+        # Re-fetching after the await would race the reaper if this coroutine is
+        # starved past the grace window under heavy load (#1154).
+        collector = self._output_collectors.get(request_id)
+        if collector is None:
+            raise RuntimeError(f"No collector for request {request_id}")
+
         try:
             # Wait for the request to finish
             await event.wait()
@@ -581,17 +1131,15 @@ class EngineCore:
             self._cleanup_request(request_id)
             raise
 
-        # Get the final output from collector
-        collector = self._output_collectors.get(request_id)
-        if collector is None:
-            raise RuntimeError(f"No collector for request {request_id}")
-
-        # Drain all outputs and get the last one
+        # Drain all outputs and get the last one (using the captured reference)
         final_output = None
+        first_token_at = None
         while True:
             output = collector.get_nowait()
             if output is None:
                 break
+            if first_token_at is None and output.generated_at is not None:
+                first_token_at = output.generated_at
             final_output = output
 
         # Cleanup
@@ -601,8 +1149,9 @@ class EngineCore:
             raise RuntimeError(f"No output for request {request_id}")
 
         if final_output.error:
-            raise RuntimeError(final_output.error)
+            _raise_request_output_error(final_output)
 
+        final_output.first_token_at = first_token_at
         return final_output
 
     def generate_batch_sync(
@@ -624,8 +1173,9 @@ class EngineCore:
         Returns:
             List of RequestOutput in same order as prompts
         """
-        from .request import Request
         import uuid as uuid_module
+
+        from .request import Request
 
         if sampling_params is None:
             sampling_params = SamplingParams()
@@ -684,6 +1234,20 @@ class EngineCore:
             logger.debug(f"Engine {self._engine_id} released model ownership")
 
     def close(self) -> None:
+        """Close once, preserving SSD stores within a progress-gated budget."""
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closing = True
+            try:
+                with _EngineTeardown(
+                    self._engine_id, FATAL_TEARDOWN_TIMEOUT_S
+                ) as teardown:
+                    self._close(teardown)
+            finally:
+                self._closing = False
+
+    def _close(self, teardown) -> None:
         """
         Explicitly close the engine and release resources.
 
@@ -693,46 +1257,128 @@ class EngineCore:
         if self._closed:
             return
 
-        # Release model ownership BEFORE setting _closed
-        # (_release_model checks not self._closed)
-        if self._owns_model:
-            registry = get_registry()
-            registry.release(self.model, self._engine_id)
-            self._owns_model = False
-            logger.debug(f"Engine {self._engine_id} released model ownership")
-
-        self._closed = True
+        self.scheduler._engine_teardown = teardown
 
         # Both shutdown() and deep_reset() touch the engine stream (directly
         # or via _drain_pending_async_removes / _do_abort_request). The
         # stream is bound to the engine's executor thread, so dispatch both
-        # through the executor; fall back to a direct call if the executor
-        # is already shut down.
+        # through the executor. Rejection cannot safely move MLX cleanup
+        # onto the close caller's thread.
         for fn in (self.scheduler.shutdown, self.scheduler.deep_reset):
+            fn_name = getattr(fn, "__name__", repr(fn))
             try:
-                self._mlx_executor.submit(fn).result()
+                teardown.set_phase(fn_name)
+                self._mlx_executor.submit(fn).result(
+                    timeout=teardown.remaining(mlx=fn_name == "deep_reset")
+                )
+            except concurrent.futures.TimeoutError:
+                fatal_exit(
+                    f"Engine teardown timed out after "
+                    f"{time.monotonic() - teardown.started:.1f}s while running "
+                    f"{fn_name} for engine {self._engine_id}"
+                )
             except RuntimeError:
-                try:
-                    fn()
-                except RuntimeError:
-                    pass
+                fatal_exit(f"Engine {self._engine_id}: MLX teardown failed ({fn_name})")
+            except Exception:
+                # A failing shutdown/deep_reset must not abort close(), or the
+                # SSD cache manager below stays open and its writer thread keeps
+                # the manager (and its hot cache) alive until restart.
+                logger.warning(
+                    "Engine %s: %s raised during close()",
+                    self._engine_id,
+                    getattr(fn, "__name__", fn),
+                    exc_info=True,
+                )
 
-        if self._mlx_executor is not None:
-            self._mlx_executor.shutdown(wait=True)
-            self._mlx_executor = None
+        # Drop the last bound-method reference from the teardown loop before
+        # the final GC/reclaim pass below.
+        fn = None
 
-        # Clear output collectors
+        # Guarantee the SSD cache manager is released even if shutdown() did not
+        # reach its own close() above. The manager's writer thread holds a strong
+        # reference to it, so an unclosed manager leaks until restart.
+        manager = getattr(self.scheduler, "paged_ssd_cache_manager", None)
+        if manager is not None:
+            try:
+                teardown.set_phase("fallback_ssd", manager.persistence_progress)
+                manager.close(teardown=teardown)
+                teardown.set_phase("engine_cleanup")
+            except Exception:
+                logger.warning(
+                    "Engine %s: SSD cache manager close() failed during teardown",
+                    self._engine_id,
+                    exc_info=True,
+                )
+            writer = getattr(manager, "_writer_thread", None)
+            if writer is not None and writer.is_alive() is True:
+                fatal_exit("SSD cache writer survived engine teardown")
+            self.scheduler.paged_ssd_cache_manager = None
+        manager = None
+
+        teardown.set_phase("engine_cleanup")
+        # Clear output collectors before dropping model/scheduler references so
+        # any request-side caches they retain are eligible for the final reclaim.
         for collector in self._output_collectors.values():
             collector.clear()
         self._output_collectors.clear()
         self._stream_states.clear()
         self._finished_events.clear()
+        self._finished_at.clear()
 
-        # Release model and tokenizer references for GC
+        release_model_resources = getattr(self.model, "release_resources", None)
+        if callable(release_model_resources):
+            try:
+                release_model_resources()
+            except Exception:
+                logger.warning(
+                    "Engine %s: model resource release failed during close()",
+                    self._engine_id,
+                    exc_info=True,
+                )
+        release_model_resources = None
+
+        # Release model, tokenizer, and scheduler references before the final
+        # MLX reclaim. The reclaim must run on this engine's worker thread and
+        # stream; clearing on the global executor cannot reliably return this
+        # thread/stream-local Metal memory to MLX.
+        if self._owns_model:
+            get_registry().release(self.model, self._engine_id)
+            self._owns_model = False
         self.model = None
         self.tokenizer = None
         self.scheduler = None
 
+        if self._mlx_executor is not None:
+            try:
+                reclaim_future = self._mlx_executor.submit(
+                    _final_engine_thread_reclaim, self._mlx_stream
+                )
+            except RuntimeError:
+                reclaim_future = None
+
+            if reclaim_future is not None:
+                try:
+                    teardown.set_phase("mlx_reclaim")
+                    reclaim_future.result(timeout=teardown.remaining(mlx=True))
+                except concurrent.futures.TimeoutError:
+                    fatal_exit(
+                        f"Engine teardown timed out after "
+                        f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s while reclaiming "
+                        f"MLX memory for engine {self._engine_id}"
+                    )
+                except Exception as exc:
+                    fatal_exit(
+                        f"Engine {self._engine_id}: final MLX reclaim failed: "
+                        f"{exc!r}"
+                    )
+
+            # MLX 0.32.2 makes compiled AttachedData destruction GIL-safe, and
+            # _final_engine_thread_reclaim clears the worker's per-thread stream
+            # registry before ThreadPoolExecutor lets that worker exit.
+            self._mlx_executor.shutdown(wait=False)
+            self._mlx_executor = None
+
+        self._closed = True
         logger.debug(f"Engine {self._engine_id} closed")
 
     def __del__(self):
@@ -767,6 +1413,9 @@ class AsyncEngineCore:
         config: Optional[EngineConfig] = None,
     ):
         self.engine = EngineCore(model, tokenizer, config)
+        # Drop wrapper-local aliases after EngineCore takes ownership.
+        model = None
+        tokenizer = None
 
     @property
     def _mlx_executor(self):
@@ -817,12 +1466,17 @@ class AsyncEngineCore:
             return False
         return await engine.abort_request(request_id)
 
-    async def abort_all_requests(self) -> int:
+    async def abort_all_requests(
+        self,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> int:
         """Abort all active requests without stopping the engine."""
         engine = getattr(self, "engine", None)
         if engine is None:
             return 0
-        return await engine.abort_all_requests()
+        return await engine.abort_all_requests(reason=reason, error_code=error_code)
 
     async def stream_outputs(
         self,

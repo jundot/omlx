@@ -5,17 +5,122 @@
     const DSA_MODEL_TYPES = new Set([
         'deepseek_v32', 'glm_moe_dsa',
     ]);
-    const DASHBOARD_MAIN_TABS = new Set(['status', 'settings', 'models', 'logs', 'bench']);
-    const DASHBOARD_SETTINGS_TABS = new Set(['global', 'models']);
+    const DIFFUSION_CONFIG_MODEL_TYPES = new Set([
+        'diffusion_gemma',
+    ]);
+    // The API accepts fractions outside the UI range.
+    const MOE_EXPERT_OFFLOAD_MIN_PERCENT = 5;
+    const MOE_EXPERT_OFFLOAD_MAX_PERCENT = 95;
+    const DIFFUSION_UNSUPPORTED_PROFILE_FIELDS = new Set([
+        'top_p',
+        'top_k',
+        'min_p',
+        'repetition_penalty',
+        'presence_penalty',
+        'force_sampling',
+        'enable_thinking',
+        'preserve_thinking',
+        'thinking_budget_enabled',
+        'thinking_budget_tokens',
+        'reasoning_parser',
+        'guided_grammar_enabled',
+        'guided_grammar',
+        'max_tool_result_tokens',
+        'index_cache_freq',
+        'turboquant_kv_enabled',
+        'turboquant_kv_bits',
+        'turboquant_skip_last',
+        'qwen35_ane_prefill_enabled',
+        'qwen35_ane_prefill_sequence_length',
+        'qwen35_ane_prefill_tail_padding_min_tokens',
+        'qwen35_ane_prefill_fraction',
+        'qwen35_ane_prefill_fused_down',
+        'qwen35_ane_prefill_max_layers',
+        'qwen35_ane_prefill_dual_ane',
+        'qwen35_ane_prefill_gdn',
+        'qwen35_ane_prefill_gdn_fraction',
+        'qwen35_ane_prefill_gdn_max_layers',
+        'qwen35_ane_prefill_cpu_enabled',
+        'qwen35_ane_prefill_cpu_fraction',
+        'qwen35_ane_prefill_cpu_down_fraction',
+        'qwen35_ane_prefill_cpu_gdn_fraction',
+        'qwen35_ane_prefill_cpu_threads',
+        'qwen35_ane_prefill_cpu_shared_resource',
+        'moe_expert_offload_enabled',
+        'moe_expert_offload_resident_fraction',
+        'qwen35_oq_a8_enabled',
+        'qwen35_oq_a8_min_tokens',
+        'specprefill_enabled',
+        'specprefill_draft_model',
+        'specprefill_keep_pct',
+        'specprefill_threshold',
+        'dflash_enabled',
+        'dflash_draft_model',
+        'dflash_draft_quant_enabled',
+        'dflash_draft_quant_weight_bits',
+        'dflash_draft_quant_activation_bits',
+        'dflash_draft_quant_group_size',
+        'dflash_max_ctx',
+        'dflash_in_memory_cache',
+        'dflash_in_memory_cache_max_entries',
+        'dflash_in_memory_cache_max_bytes',
+        'dflash_ssd_cache',
+        'dflash_ssd_cache_max_bytes',
+        'dflash_draft_window_size',
+        'dflash_draft_sink_size',
+        'dflash_block_size',
+        'dflash_verify_mode',
+        'mtp_enabled',
+        'mtp_adaptive_max_depth',
+        'mtp_fixed_depth',
+        'qwen35_ane_prefill_shared_fraction',
+        'vlm_mtp_enabled',
+        'vlm_mtp_draft_model',
+        'vlm_mtp_draft_block_size',
+    ]);
+    const DIFFUSION_UNSUPPORTED_CT_KWARGS = new Set([
+        'enable_thinking',
+        'reasoning_effort',
+        'preserve_thinking',
+    ]);
+    const REASONING_EFFORT_PRESETS = new Set([
+        'low', 'medium', 'high', 'xhigh', 'max',
+    ]);
+    const VLM_MTP_DRAFTER_CONFIG_MODEL_TYPES = new Set([
+        'gemma4_assistant',
+        'gemma4_unified_assistant',
+        'qwen3_5_mtp',
+    ]);
+    // DFlash drafters that carry no "dflash" name token. Meta ships the Muse
+    // Glimmer DFlash drafter as "-assistant", which oMLX's name heuristics
+    // would otherwise route to the MTP/spec-prefill buckets.
+    const DFLASH_DRAFTER_CONFIG_MODEL_TYPES = new Set([
+        'muse_glimmer_assistant',
+    ]);
+    const DASHBOARD_MAIN_TABS = new Set(['status', 'cluster', 'settings', 'models', 'logs', 'bench']);
+    const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models']);
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
-    const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy']);
+    const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy', 'context']);
+    const THEME_STORAGE_KEY = 'omlx-chat-theme';
+    const ENHANCED_READABILITY_KEY = 'omlx-enhanced-readability';
+
+    // Default sort for the settings and manager model tables. Also the target
+    // state for the "reset sort" action.
+    const MODELS_SORT_DEFAULT = { by: 'id', order: 'asc' };
+    const MANAGER_SORT_DEFAULT = { by: 'name', order: 'asc' };
 
     function dashboard() {
+        // GridStack instance and helpers stay outside the reactive Alpine state.
+        let dashGrid = null;
+        let dashObserver = null;
+        let dashRefitFrame = null;
+        let dashRefitTimer = null;
         return {
             // Theme
-            theme: localStorage.getItem('omlx-chat-theme') || 'auto',
+            theme: localStorage.getItem(THEME_STORAGE_KEY) || 'auto',
             activeTheme: 'light', // Will be updated by applyTheme
             systemThemeListener: null,
+            enhancedReadability: localStorage.getItem(ENHANCED_READABILITY_KEY) === 'on',
 
             // Mobile menu
             mobileMenuOpen: false,
@@ -30,22 +135,50 @@
             // Global settings
             globalSettings: {
                 base_path: '',
-                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk' },
-                model: { model_dirs: [''] },
+                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, qwen4_gdn_decode_wide_proj: false, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
+                model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
-                scheduler: { max_concurrent_requests: 8 },
-                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256, hot_cache_only: false },
-                sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
-                mcp: { config_path: '' },
-                huggingface: { endpoint: '' },
+                scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
+                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', hot_cache_write_through: false, ane_compile_cache: false, initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_precision: 'fp32' },
+                sampling: { max_context_window: 32768, max_context_window_policy: null, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
+                mcp: { config_path: '', expose_tools: true },
+                usage: { usage_history: true },
+                huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
-                claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
-                integrations: { copilot_model: null, codex_model: null, opencode_model: null, openclaw_model: null, hermes_model: null, pi_model: null, openclaw_tools_profile: 'full' },
-                ui: { language: 'en' },
+                claude_code: { mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
+                integrations: {
+                    copilot_model: null,
+                    codex_model: null,
+                    opencode_model: null,
+                    openclaw_model: null,
+                    hermes_model: null,
+                    pi_model: null,
+                    dsh_model: null,
+                    openclaw_tools_profile: 'full',
+                    markitdown_enabled: true,
+                    markitdown_expose_model: false,
+                    markitdown_max_file_size_mb: 25,
+                    markitdown_max_files_per_request: 5,
+                    markitdown_pdf_processing_engine: 'markitdown',
+                    web_search_provider: 'ddgs',
+                    web_search_brave_api_key: '',
+                    web_search_searxng_url: '',
+                    web_search_ddgs_backends: '',
+                    web_search_max_results: 3,
+                    web_search_content_mode: 'snippet',
+                    web_search_content_truncate: true,
+                    web_search_content_max_chars: 20000,
+                },
+                ui: { language: 'en', dashboard_layout: null },
                 idle_timeout: { idle_timeout_seconds: null },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
             },
+
+            // Web search "Test search" button state
+            webSearchTest: { running: false, ok: null, message: '' },
+            // Engines selectable for the DDGS Custom provider (ddgs 9.14.1 text registry)
+            ddgsBackendList: ['brave', 'duckduckgo', 'grokipedia', 'mojeek', 'wikipedia', 'yahoo', 'yandex'],
 
             // Cache slider (0-100%)
             cachePercent: 10,
@@ -62,8 +195,14 @@
             models: [],
             loadingModels: false,
             reloading: false,
-            sortBy: 'id',
-            sortOrder: 'asc',
+            // Sort state persists across refreshes/restarts via localStorage.
+            sortBy: localStorage.getItem('omlx_models_sort_by') || MODELS_SORT_DEFAULT.by,
+            sortOrder: localStorage.getItem('omlx_models_sort_order') || MODELS_SORT_DEFAULT.order,
+            modelSearch: '',
+            // Manager tab (Browse Models > Local) sort + search state.
+            managerSortBy: localStorage.getItem('omlx_manager_sort_by') || MANAGER_SORT_DEFAULT.by,
+            managerSortOrder: localStorage.getItem('omlx_manager_sort_order') || MANAGER_SORT_DEFAULT.order,
+            managerSearch: '',
 
             // Auth UI state
             showApiKey: false,
@@ -99,11 +238,54 @@
                 enableToolResultLimit: false,
                 max_tool_result_tokens: null,
                 ctKwargEntries: [],
+                is_diffusion_model: false,
+                qwen35_ane_prefill_enabled: false,
+                qwen35_ane_prefill_sequence_length: 2048,
+                qwen35_ane_prefill_tail_padding_min_tokens: 0,
+                qwen35_ane_prefill_fraction: 0.53,
+                qwen35_ane_prefill_fused_down: false,
+                qwen35_ane_prefill_max_layers: 64,
+                qwen35_ane_prefill_dual_ane: true,
+                qwen35_ane_prefill_gdn: true,
+                qwen35_ane_prefill_gdn_fraction: 0.5,
+                qwen35_ane_prefill_gdn_max_layers: 48,
+                qwen35_ane_prefill_cpu_enabled: false,
+                qwen35_ane_prefill_cpu_fraction: 0.135,
+                qwen35_ane_prefill_cpu_down_fraction: 0,
+                qwen35_ane_prefill_cpu_gdn_fraction: 0,
+                qwen35_ane_prefill_cpu_threads: 8,
+                qwen35_ane_prefill_cpu_shared_resource: true,
+                moe_expert_offload_enabled: false,
+                moe_expert_offload_resident_fraction: 0.25,
+                qwen35_oq_a8_enabled: false,
+                qwen35_oq_a8_min_tokens: 128,
                 trust_remote_code: false,
             },
             savingModelSettings: false,
+            settingsApply: { open: false, mode: 'optimal', phase: 'input', recipeText: '', result: null, candidates: null, error: '' },
+            importingMtplx: false,
             loadingGenDefaults: false,
             reasoningParsers: [],
+            aneTuning: {
+                tuningId: null,
+                modelId: null,
+                running: false,
+                cancelling: false,
+                applying: false,
+                applied: false,
+                total: 0,
+                status: null,
+                error: '',
+            },
+            aneTuningOverrides: {
+                allowCpu: true,
+                allowCpuGate: true,
+                allowCpuDown: true,
+                allowAneGdn: true,
+                allowCpuGdn: true,
+                allowCpuSharedResource: true,
+            },
+            _aneTuningPollTimer: null,
 
             // Profile / template / preset state
             profiles: [],                // per-model profiles for selectedModel
@@ -117,7 +299,7 @@
             _applySeq: 0,               // monotonic counter for apply race guard
             profileError: '',
             showNewProfileForm: false,
-            newProfile: { name: '', display_name: '', description: '', also_as_template: false },
+            newProfile: { display_name: '', api_name: '', api_name_touched: false, description: '', also_as_template: false },
             showNewTemplateForm: false,
             newTemplate: { name: '', display_name: '', description: '' },
             editingProfile: null,        // profile name being edited inline
@@ -189,6 +371,14 @@
             },
 
             statsScope: 'session',
+            // Dashboard block layout (see dashboard_layout.js)
+            dashLayout: null,
+            dashDraft: null,
+            dashEditing: false,
+            dashSaving: false,
+            dashSaveError: '',
+            dashPlacedIds: [],
+            dashEditAvailable: true,
             selectedStatsModel: '',
             showClearStatsConfirm: false,
             showClearAlltimeConfirm: false,
@@ -236,6 +426,7 @@
             hfModelsLoaded: false,
             hfError: '',
             hfSuccess: '',
+            hfTokenInvalid: false,
             _hfRefreshTimer: null,
             hfDeleteConfirm: null,
 
@@ -334,6 +525,11 @@
             oqDtype: 'bfloat16',
             oqSensitivityModelPath: '',
             oqPreserveMtp: false,
+            oqMtpAssistantPath: '',
+            oqEnhanced: false,
+            oqeReuseImatrixCache: true,
+            oqeImatrixCachePath: '',
+            oqeStrictImatrix: false,
 
             // oQ Uploader state
             uploadHfToken: localStorage.getItem('omlx-hf-upload-token') || '',
@@ -361,8 +557,21 @@
 
             // Benchmark state
             benchModelId: '',
+            benchContextProfile: 'code_python',
+            benchAlignPromptToAne: false,
             benchPromptLengths: { 1024: true, 4096: true, 8192: false, 16384: false, 32768: false, 65536: false, 131072: false, 200000: false },
             benchBatchSizes: { 2: true, 4: true, 8: false },
+            benchForceLmEngine: false,
+            benchAdvancedOptionsOpen: false,
+            benchExternalEnabled: false,
+            // Shared external endpoint settings (persisted in localStorage,
+            // used by both the throughput and accuracy bench tabs)
+            externalBaseUrl: localStorage.getItem('omlx_bench_external_base_url') || '',
+            externalApiKey: localStorage.getItem('omlx_bench_external_api_key') || '',
+            externalModel: localStorage.getItem('omlx_bench_external_model') || '',
+            // { base_url, model } snapshot of the current run when external
+            // (no API key — used for the text export header)
+            benchRunExternal: null,
             benchRunning: false,
             benchBenchId: null,
             benchProgress: null,
@@ -378,7 +587,8 @@
             benchUploadResults: [],
             benchUploadDone: null,
             benchUploading: false,
-            benchUploadSkipped: null,  // { features: [...] } when upload was skipped due to experimental features
+            benchUploadSkipped: null,  // { reason } — only external-endpoint runs skip now
+            benchUploadFlags: [],      // [{key, label}] acceleration active during the run
             // { bench_id, model_id } when the server reports a running bench
             // that is NOT the one this tab is displaying. Drives the "another
             // bench is running" banner + disables Start so the user doesn't
@@ -389,55 +599,74 @@
             benchTab: 'throughput',
             benchDropdown: false,
 
+            // Context benchmark state
+            ctxBenchModelId: '',
+            ctxBenchTarget: 131072,
+            ctxBenchRunning: false,
+            ctxBenchBenchId: null,
+            ctxBenchProgress: null,   // { phase, progress, message }
+            ctxBenchResult: null,
+            ctxBenchError: '',
+            ctxBenchEventSource: null,
+
             // Accuracy benchmark state
             accModelId: '',
             accBenchmarks: { mmlu: true, mmlu_pro: false, kmmlu: false, cmmlu: false, jmmlu: false, hellaswag: false, truthfulqa: true, arc_challenge: false, winogrande: false, gsm8k: false, mathqa: false, humaneval: true, mbpp: false, livecodebench: false, bbq: false, safetybench: false },
             accSampleSizes: { mmlu: 1000, mmlu_pro: 300, kmmlu: 300, cmmlu: 300, jmmlu: 300, hellaswag: 200, truthfulqa: 0, arc_challenge: 300, winogrande: 300, gsm8k: 100, mathqa: 300, humaneval: 0, mbpp: 200, livecodebench: 100, bbq: 300, safetybench: 300 },
             accBenchmarkGroups: [
                 {
-                    name: 'Knowledge',
+                    name: window.t('acc_bench.benchmarks.group_knowledge'),
                     benchmarks: [
-                        { key: 'mmlu', label: 'MMLU', desc: 'Knowledge · 57 subjects', fullSize: 14042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
-                        { key: 'mmlu_pro', label: 'MMLU-Pro', desc: 'Hard knowledge · 14 subjects (10-way)', fullSize: 12032, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'mmlu', label: 'MMLU', desc: window.t('acc_bench.benchmarks.mmlu_desc'), fullSize: 14042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'mmlu_pro', label: 'MMLU-Pro', desc: window.t('acc_bench.benchmarks.mmlu_pro_desc'), fullSize: 12032, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                         { key: 'kmmlu', label: 'KMMLU', desc: '한국어 지식 · 45 과목', fullSize: 35030, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                         { key: 'cmmlu', label: 'CMMLU', desc: '中文知识 · 67 科目', fullSize: 11582, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                         { key: 'jmmlu', label: 'JMMLU', desc: '日本語知識 · 112 科目', fullSize: 7536, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                     ],
                 },
                 {
-                    name: 'Commonsense & Reasoning',
+                    name: window.t('acc_bench.benchmarks.group_commonsense'),
                     benchmarks: [
-                        { key: 'hellaswag', label: 'HellaSwag', desc: 'Commonsense reasoning', fullSize: 10042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
-                        { key: 'arc_challenge', label: 'ARC-C', desc: 'Science reasoning', fullSize: 1172, sizes: [30, 50, 100, 200, 300] },
-                        { key: 'winogrande', label: 'Winogrande', desc: 'Coreference resolution', fullSize: 1267, sizes: [30, 50, 100, 200, 300] },
-                        { key: 'truthfulqa', label: 'TruthfulQA', desc: 'Truthfulness', fullSize: 817, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'hellaswag', label: 'HellaSwag', desc: window.t('acc_bench.benchmarks.hellaswag_desc'), fullSize: 10042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'arc_challenge', label: 'ARC-C', desc: window.t('acc_bench.benchmarks.arc_desc'), fullSize: 1172, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'winogrande', label: 'Winogrande', desc: window.t('acc_bench.benchmarks.winogrande_desc'), fullSize: 1267, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'truthfulqa', label: 'TruthfulQA', desc: window.t('acc_bench.benchmarks.truthfulqa_desc'), fullSize: 817, sizes: [30, 50, 100, 200, 300] },
                     ],
                 },
                 {
-                    name: 'Math',
+                    name: window.t('acc_bench.benchmarks.group_math'),
                     benchmarks: [
-                        { key: 'gsm8k', label: 'GSM8K', desc: 'Math reasoning', fullSize: 1319, sizes: [30, 50, 100, 200, 300] },
-                        { key: 'mathqa', label: 'MathQA', desc: 'Quantitative reasoning · 5-way', fullSize: 2985, sizes: [30, 50, 100, 200, 300, 500, 1000] },
+                        { key: 'gsm8k', label: 'GSM8K', desc: window.t('acc_bench.benchmarks.gsm8k_desc'), fullSize: 1319, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'mathqa', label: 'MathQA', desc: window.t('acc_bench.benchmarks.mathqa_desc'), fullSize: 2985, sizes: [30, 50, 100, 200, 300, 500, 1000] },
                     ],
                 },
                 {
-                    name: 'Coding',
+                    name: window.t('acc_bench.benchmarks.group_coding'),
                     benchmarks: [
-                        { key: 'humaneval', label: 'HumanEval', desc: 'Function completion', fullSize: 164, sizes: [30, 50, 100] },
-                        { key: 'mbpp', label: 'MBPP', desc: 'Python problems', fullSize: 500, sizes: [30, 50, 100, 200, 300] },
-                        { key: 'livecodebench', label: 'LiveCodeBench', desc: 'Code generation', fullSize: 1055, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'humaneval', label: 'HumanEval', desc: window.t('acc_bench.benchmarks.humaneval_desc'), fullSize: 164, sizes: [30, 50, 100] },
+                        { key: 'mbpp', label: 'MBPP', desc: window.t('acc_bench.benchmarks.mbpp_desc'), fullSize: 500, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'livecodebench', label: 'LiveCodeBench', desc: window.t('acc_bench.benchmarks.livecodebench_desc'), fullSize: 1055, sizes: [30, 50, 100, 200, 300] },
                     ],
                 },
                 {
-                    name: 'Safety & Alignment',
+                    name: window.t('acc_bench.benchmarks.group_safety'),
                     benchmarks: [
-                        { key: 'bbq', label: 'BBQ', desc: 'Social bias · 11 categories', fullSize: 10864, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
-                        { key: 'safetybench', label: 'SafetyBench', desc: 'Safety · 7 categories', fullSize: 11435, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'bbq', label: 'BBQ', desc: window.t('acc_bench.benchmarks.bbq_desc'), fullSize: 10864, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'safetybench', label: 'SafetyBench', desc: window.t('acc_bench.benchmarks.safetybench_desc'), fullSize: 11435, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                     ],
                 },
             ],
             accBatchSize: 1,
             accEnableThinking: false,
+            accSamplingProfile: 'deterministic',
+            accAdvancedOptionsOpen: false,
+            accExternalEnabled: false,
+            // Provider-specific JSON is intentionally session-only.
+            accExternalExtraBody: '',
+            // Accuracy-only max_tokens floor; persisted like the shared
+            // endpoint settings because it is a simple number the user sets
+            // once per endpoint (thinking models need a larger budget).
+            accExternalMaxTokens: localStorage.getItem('omlx_acc_external_max_tokens') || '',
             accRunning: false,
             accCurrentModel: '',
             accCurrentBenchId: null,
@@ -470,6 +699,12 @@
                 // Watch for main tab changes to manage refresh timers
                 this.$watch('mainTab', (value) => {
                     this.handleMainTabChange(value);
+                });
+
+                this.$watch('globalSettings.server.host', (value) => {
+                    if (!this.isLoopbackBindHost(value)) {
+                        this.globalSettings.auth.skip_api_key_verification = false;
+                    }
                 });
 
                 // When the user returns to this browser tab after looking
@@ -509,6 +744,8 @@
                     this.applyTabStateFromUrl();
                 });
 
+                window.addEventListener('focus', () => this.refreshOpenModelSettings());
+
                 // Pause stats polling when tab is hidden to reduce server load
                 document.addEventListener('visibilitychange', () => {
                     if (document.hidden) {
@@ -524,6 +761,7 @@
                 if (value === 'status') {
                     await this.loadStats();
                     this.startStatsRefresh();
+                    this.$nextTick(() => this.ensureDashboardGrid());
                 } else {
                     this.stopStatsRefresh();
                 }
@@ -563,6 +801,7 @@
                     if (!this.benchDeviceInfo) await this.loadBenchDeviceInfo();
                     await this.loadBenchState();
                     await this.loadAccState();
+                    await this.loadCtxBenchState();
                 }
             },
 
@@ -607,8 +846,41 @@
 
             setMainTab(tab) {
                 if (!DASHBOARD_MAIN_TABS.has(tab)) return;
+                if (tab === 'cluster' && !this.globalSettings.server.distributed_inference_active) return;
                 this.mainTab = tab;
                 this.syncTabStateToUrl();
+            },
+
+            handleMainTabKeydown(event) {
+                if (!event.target.matches('[role="tab"]')
+                    || event.altKey || event.ctrlKey || event.metaKey) return;
+                if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+                const tabs = Array.from(event.currentTarget.querySelectorAll('[role="tab"]'))
+                    .filter(tab => !tab.disabled && tab.getClientRects().length);
+                const index = tabs.indexOf(event.target);
+                if (index < 0) return;
+                event.preventDefault();
+                let next;
+                if (event.key === 'Home') next = 0;
+                else if (event.key === 'End') next = tabs.length - 1;
+                else next = (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+                this.modelsDropdown = this.settingsDropdown = this.benchDropdown = false;
+                tabs[next].focus();
+                tabs[next].click();
+            },
+
+            trapDialogFocus(event) {
+                const dialog = event.currentTarget;
+                const controls = Array.from(dialog.querySelectorAll(
+                    'a[href], button, input, select, textarea, [tabindex]'
+                )).filter(el => el.tabIndex >= 0 && !el.matches(':disabled')
+                    && el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
+                const index = controls.indexOf(document.activeElement);
+                if (!controls.length || (event.shiftKey ? index <= 0 : index === controls.length - 1)) {
+                    event.preventDefault();
+                    const target = event.shiftKey ? controls.at(-1) : controls[0];
+                    (target || dialog.querySelector('[autofocus]')).focus();
+                }
             },
 
             setSettingsTab(tab) {
@@ -632,7 +904,7 @@
                 }
             },
 
-            async checkForUpdate() {
+           async checkForUpdate() {
                 try {
                     const resp = await fetch('/admin/api/update-check');
                     if (resp.ok) {
@@ -657,7 +929,72 @@
                 }
             },
 
+            loadingGlobalSettings: false,
+            resettingGlobalSettings: false,
+            showGlobalResetNotice: false,
+            globalResetSnapshot: null,
+            globalDefaultsPending: false,
+
+            async resetGlobalSettingsDefaults() {
+                if (this.saving || this.loadingGlobalSettings || this.resettingGlobalSettings || this.showGlobalResetNotice) return;
+                const previous = {
+                    globalSettings: JSON.parse(JSON.stringify(this.globalSettings)),
+                    globalDefaultsPending: this.globalDefaultsPending,
+                    idleTimeoutValue: this.idleTimeoutValue,
+                    cachePercent: this.cachePercent,
+                    hotCachePercent: this.hotCachePercent,
+                    saveSuccess: this.saveSuccess,
+                    saveError: this.saveError,
+                };
+                this.resettingGlobalSettings = true;
+                this.saveSuccess = false;
+                this.saveError = '';
+                try {
+                    const response = await fetch('/admin/api/global-settings/defaults');
+                    if (!response.ok) throw new Error('Failed to load defaults');
+                    const defaults = await response.json();
+                    this.globalResetSnapshot = previous;
+                    const s = this.globalSettings;
+                    for (const section of ['server', 'model', 'memory', 'scheduler', 'cache',
+                        'sampling', 'mcp', 'usage', 'huggingface', 'network', 'auth', 'idle_timeout']) {
+                        for (const key of Object.keys(s[section])) {
+                            if (['base_path', 'model_dirs', 'model_dir', 'effective_model_dirs',
+                                'ssd_cache_dir', 'config_path', 'hf_cache_path', 'ca_bundle',
+                                'api_key', 'api_key_set', 'sub_keys', 'endpoint',
+                                'distributed_inference_active'].includes(key)) continue;
+                            if (Object.hasOwn(defaults[section], key)) {
+                                s[section][key] = defaults[section][key];
+                            }
+                        }
+                    }
+                    this.idleTimeoutValue = s.idle_timeout.idle_timeout_seconds == null
+                        ? '' : String(s.idle_timeout.idle_timeout_seconds);
+                    this.cachePercent = this.parseCacheToPercent(
+                        s.cache.ssd_cache_max_size, s.system.ssd_total_bytes);
+                    this.hotCachePercent = this.parseHotCacheToPercent(
+                        s.cache.hot_cache_max_size, s.system.total_memory_bytes);
+                    s.ui.language = defaults.ui.language;
+                    this.globalDefaultsPending = true;
+                    this.showGlobalResetNotice = true;
+                } catch (err) {
+                    this.saveError = window.t('settings.global.reset_failed');
+                } finally {
+                    this.resettingGlobalSettings = false;
+                }
+            },
+
+            cancelGlobalSettingsReset() {
+                if (this.globalResetSnapshot) Object.assign(this, this.globalResetSnapshot);
+                this.confirmGlobalSettingsReset();
+            },
+
+            confirmGlobalSettingsReset() {
+                this.globalResetSnapshot = null;
+                this.showGlobalResetNotice = false;
+            },
+
             async loadGlobalSettings() {
+                this.loadingGlobalSettings = true;
                 try {
                     const response = await fetch('/admin/api/global-settings');
                     if (response.ok) {
@@ -677,6 +1014,7 @@
                             cache: { ...this.globalSettings.cache, ...data.cache },
                             sampling: { ...this.globalSettings.sampling, ...data.sampling },
                             mcp: { ...this.globalSettings.mcp, ...data.mcp },
+                            usage: { ...this.globalSettings.usage, ...data.usage },
                             huggingface: { ...this.globalSettings.huggingface, ...data.huggingface },
                             network: { ...this.globalSettings.network, ...data.network },
                             auth: { ...this.globalSettings.auth, ...data.auth },
@@ -685,7 +1023,19 @@
                             idle_timeout: { ...this.globalSettings.idle_timeout, ...data.idle_timeout },
                             system: { ...this.globalSettings.system, ...data.system },
                         };
-                        this.globalSettings.ui = data.ui || { language: 'en' };
+                        this.globalSettings.ui = { language: 'en', dashboard_layout: null, ...(data.ui || {}) };
+                        const layoutLib = this._dashLayoutLib();
+                        this.dashLayout = layoutLib
+                            ? layoutLib.normalizeLayout(this.globalSettings.ui.dashboard_layout)
+                            : null;
+                        if (dashGrid && !this.dashEditing) this.applyDashboardLayout(this.dashLayout);
+                        if (
+                            !this.globalSettings.server.distributed_inference_active
+                            && this.mainTab === 'cluster'
+                        ) {
+                            this.mainTab = 'status';
+                            this.syncTabStateToUrl();
+                        }
 
                         // Sync idle timeout select value
                         this.idleTimeoutValue = this.globalSettings.idle_timeout?.idle_timeout_seconds != null
@@ -703,10 +1053,11 @@
                             this.globalSettings.cache.ssd_cache_max_size,
                             this.globalSettings.system.ssd_total_bytes
                         );
-                        // Sync the cache string value from percent
-                        this.updateCacheFromSlider();
 
                         // Calculate hot cache percent from stored value
+                        this.globalSettings.cache.hot_cache_max_size = this.normalizeHotCacheMaxSize(
+                            this.globalSettings.cache.hot_cache_max_size
+                        );
                         this.hotCachePercent = this.parseHotCacheToPercent(
                             this.globalSettings.cache.hot_cache_max_size,
                             this.globalSettings.system.total_memory_bytes
@@ -716,10 +1067,42 @@
                     }
                 } catch (err) {
                     console.error('Failed to load global settings:', err);
+                } finally {
+                    this.loadingGlobalSettings = false;
                 }
             },
 
+            isLoopbackBindHost(value) {
+                const hosts = String(value || '')
+                    .split(',')
+                    .map(host => host.trim().toLowerCase())
+                    .filter(Boolean);
+                if (hosts.length === 0) return false;
+                return hosts.every(host => {
+                    if (host.replace(/\.+$/, '') === 'localhost') return true;
+                    if (!host.includes(':')) {
+                        const parts = host.split('.');
+                        return parts.length === 4 && parts[0] === '127'
+                            && parts.every(part => /^(0|[1-9]\d{0,2})$/.test(part)
+                                && Number(part) <= 255);
+                    }
+                    // Normalize IPv6, including expanded and IPv4-mapped forms.
+                    // A scope ID does not change whether an address is loopback.
+                    const [address, scope, extra] = host.split('%');
+                    if (extra !== undefined || scope === '') return false;
+                    if (!/^[0-9a-f:.]+$/.test(address)) return false;
+                    try {
+                        const normalized = new URL(`http://[${address}]/`).hostname;
+                        return normalized === '[::1]'
+                            || /^\[::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}\]$/.test(normalized);
+                    } catch {
+                        return false;
+                    }
+                });
+            },
+
             async saveGlobalSettings() {
+                if (this.resettingGlobalSettings) return;
                 this.saving = true;
                 this.saveSuccess = false;
                 this.saveError = '';
@@ -727,18 +1110,32 @@
                 // Validate required fields
                 const errors = [];
                 const s = this.globalSettings;
-                if (!s.server.host) errors.push('Host');
-                if (!s.server.port) errors.push('Port');
-                if (!s.model.model_dirs || !s.model.model_dirs.some(d => d.trim())) errors.push('Model Directory');
-                if (!s.scheduler.max_concurrent_requests) errors.push('Max Concurrent Requests');
-                if (!s.cache.ssd_cache_max_size) errors.push('Max Cache Size');
-                if (!s.sampling.max_context_window) errors.push('Max Context Window');
-                if (!s.sampling.max_tokens) errors.push('Max Tokens');
+                if (!s.server.host) errors.push(window.t('settings.server.host'));
+                if (!s.server.port) errors.push(window.t('settings.server.port'));
+                if (!s.server.max_audio_upload_size) errors.push(window.t('settings.advanced.max_audio_upload_size'));
+                if (!s.model.model_dirs || !s.model.model_dirs.some(d => d.trim())) errors.push(window.t('js.error.model_directory'));
+                if (!s.scheduler.max_concurrent_requests) errors.push(window.t('settings.resource.max_concurrent_requests'));
+                if (!s.scheduler.embedding_batch_size) errors.push(window.t('settings.resource.embedding_batch_size'));
+                if (!s.cache.ssd_cache_max_size) errors.push(window.t('js.error.max_cache_size'));
+                if (!s.sampling.max_context_window) errors.push(window.t('js.error.max_context_window'));
+                if (!s.sampling.max_tokens) errors.push(window.t('settings.generation.max_tokens'));
+                if (s.cache.gdn_snapshot_storage === 'ssd_sidecar' && s.cache.hot_cache_only) {
+                    errors.push(window.t('js.error.gdn_sidecar_hot_cache_conflict'));
+                }
 
                 if (errors.length > 0) {
                     this.saveError = window.t('js.error.required_fields').replace('{fields}', errors.join(', '));
                     this.saving = false;
                     return;
+                }
+
+                if (!this.isLoopbackBindHost(s.server.host)) {
+                    s.auth.skip_api_key_verification = false;
+                    if (!s.auth.api_key && !s.auth.api_key_set) {
+                        this.saveError = window.t('js.error.api_key_required_network');
+                        this.saving = false;
+                        return;
+                    }
                 }
 
                 // Validate API key if provided
@@ -760,30 +1157,51 @@
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
+                            ...(this.globalDefaultsPending ? { ui_language: s.ui.language } : {}),
                             host: this.globalSettings.server.host,
                             port: this.globalSettings.server.port,
                             log_level: this.globalSettings.server.log_level,
                             sse_keepalive_mode: this.globalSettings.server.sse_keepalive_mode,
+                            burst_decode_mode: this.globalSettings.server.burst_decode_mode,
+                            preserve_mid_system_cache: this.globalSettings.server.preserve_mid_system_cache,
+                            qwen4_gdn_decode_wide_proj: this.globalSettings.server.qwen4_gdn_decode_wide_proj,
+                            distributed_inference_enabled: this.globalSettings.server.distributed_inference_enabled,
+                            max_audio_upload_size: this.globalSettings.server.max_audio_upload_size,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
                             model_fallback: this.globalSettings.model.model_fallback,
+                            hide_helper_models: this.globalSettings.model.hide_helper_models,
                             memory_prefill_memory_guard: this.globalSettings.memory.prefill_memory_guard,
                             memory_guard_tier: this.globalSettings.memory.memory_guard_tier,
                             memory_guard_custom_ceiling_gb: this.globalSettings.memory.memory_guard_custom_ceiling_gb,
                             max_concurrent_requests: this.globalSettings.scheduler.max_concurrent_requests,
+                            embedding_batch_size: this.globalSettings.scheduler.embedding_batch_size,
                             chunked_prefill: this.globalSettings.scheduler.chunked_prefill,
+                            prefill_priority: this.globalSettings.scheduler.prefill_priority,
+                            decode_fairness: this.globalSettings.scheduler.decode_fairness,
                             cache_enabled: this.globalSettings.cache.enabled,
                             ssd_cache_dir: this.globalSettings.cache.ssd_cache_dir,
                             ssd_cache_max_size: this.globalSettings.cache.ssd_cache_max_size,
-                            hot_cache_max_size: this.globalSettings.cache.hot_cache_max_size,
+                            hot_cache_max_size: this.normalizeHotCacheMaxSize(
+                                this.globalSettings.cache.hot_cache_max_size
+                            ),
                             initial_cache_blocks: this.globalSettings.cache.initial_cache_blocks,
                             hot_cache_only: this.globalSettings.cache.hot_cache_only,
+                            hot_cache_write_through: this.globalSettings.cache.hot_cache_write_through,
+                            ane_compile_cache: this.globalSettings.cache.ane_compile_cache,
+                            gdn_snapshot_storage: this.globalSettings.cache.gdn_snapshot_storage,
+                            gdn_ssd_pending_max_size: this.globalSettings.cache.gdn_ssd_pending_max_size,
+                            gdn_sidecar_precision: this.globalSettings.cache.gdn_sidecar_precision,
                             sampling_max_context_window: this.globalSettings.sampling.max_context_window,
+                            sampling_max_context_window_policy: this.globalSettings.sampling.max_context_window_policy || null,
                             sampling_max_tokens: this.globalSettings.sampling.max_tokens,
                             sampling_temperature: this.globalSettings.sampling.temperature,
                             sampling_top_p: this.globalSettings.sampling.top_p,
                             sampling_top_k: this.globalSettings.sampling.top_k,
                             sampling_repetition_penalty: this.globalSettings.sampling.repetition_penalty,
                             mcp_config: this.globalSettings.mcp.config_path,
+                            mcp_expose_tools: this.globalSettings.mcp.expose_tools,
+                            usage_history: this.globalSettings.usage.usage_history,
+                            hf_cache_enabled: this.globalSettings.huggingface.hf_cache_enabled,
                             network_http_proxy: this.globalSettings.network.http_proxy,
                             network_https_proxy: this.globalSettings.network.https_proxy,
                             network_no_proxy: this.globalSettings.network.no_proxy,
@@ -797,16 +1215,20 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.saveSuccess = true;
-                        this.saveMessage = data.message || 'Settings saved successfully';
+                        this.saveMessage = data.message || window.t('js.success.settings_saved');
                         // Refresh stats and model list (cache changes unload models)
                         await this.loadStats();
                         await this.loadModels();
                         setTimeout(() => { this.saveSuccess = false; }, 5000);
+                        if (this.globalDefaultsPending) {
+                            this.globalDefaultsPending = false;
+                            window.location.reload();
+                        }
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        this.saveError = Array.isArray(data.detail) ? data.detail.join(', ') : (data.detail || window.t('js.error.save_settings_failed'));
+                        this.saveError = Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || window.t('js.error.save_settings_failed'));
                         // Reload settings to revert to server values
                         await this.loadGlobalSettings();
                     }
@@ -927,11 +1349,24 @@
                     });
 
                     if (response.ok) {
-                        if (field === 'is_default' && value === true) {
-                            this.models.forEach(m => { m.is_default = (m.id === modelId); });
+                        if (field === 'is_default') {
+                            if (value === true) {
+                                // Exactly this model is default now; every other
+                                // model's flag clears.
+                                this.models.forEach(m => { m.is_default = (m.id === modelId); });
+                            } else {
+                                const model = this.models.find(m => m.id === modelId);
+                                if (model) model.is_default = false;
+                            }
                         } else if (field === 'is_pinned') {
                             const model = this.models.find(m => m.id === modelId);
                             if (model) model.pinned = value;
+                        } else if (field === 'is_hidden') {
+                            const model = this.models.find(m => m.id === modelId);
+                            if (model) model.is_hidden = value;
+                        } else if (field === 'is_favorite') {
+                            const model = this.models.find(m => m.id === modelId);
+                            if (model) model.is_favorite = value;
                         }
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
@@ -976,8 +1411,9 @@
                         method: 'POST',
                     });
                     if (response.ok) {
+                        const data = await response.json();
                         const model = this.models.find(m => m.id === modelId);
-                        if (model) model.loaded = false;
+                        if (model && data.status === 'ok') model.loaded = false;
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
@@ -996,11 +1432,20 @@
             formValuesForProfile() {
                 const ms = this.modelSettings;
                 const out = {};
+                const isDiffusion = !!ms.is_diffusion_model;
 
                 for (const k of this.profileFields.universal.concat(this.profileFields.model_specific)) {
+                    if (k === 'enable_thinking' && this.selectedModel?.thinking_forced) continue;
                     if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') continue;  // handle below
+                    if (isDiffusion && this.isDiffusionUnsupportedProfileField(k)) continue;
                     if (k === 'thinking_budget_enabled') {
-                        if (ms.enableThinkingBudget) out.thinking_budget_tokens = ms.thinking_budget_tokens ?? null;
+                        if (ms.enableThinkingBudget) out.thinking_budget_enabled = true;
+                        continue;
+                    }
+                    if (k === 'thinking_budget_tokens') {
+                        if (ms.enableThinkingBudget && ms.thinking_budget_tokens) {
+                            out.thinking_budget_tokens = Number(ms.thinking_budget_tokens);
+                        }
                         continue;
                     }
                     if (k === 'index_cache_freq') {
@@ -1008,12 +1453,26 @@
                         continue;
                     }
                     if (k === 'max_tool_result_tokens') {
-                        if (ms.enableToolResultLimit) out.max_tool_result_tokens = ms.max_tool_result_tokens || null;
+                        if (ms.enableToolResultLimit && ms.max_tool_result_tokens) {
+                            out.max_tool_result_tokens = Number(ms.max_tool_result_tokens);
+                        }
                         continue;
                     }
-                    // Standard field: apply nullish coalescing; coerce string numerics
-                    let v = ms[k] ?? null;
-                    if (typeof v === 'string' && v !== '' && !isNaN(Number(v))) v = Number(v);
+                    if (k === 'guided_grammar_enabled') {
+                        out.guided_grammar_enabled = !!ms.guided_grammar_enabled;
+                        continue;
+                    }
+                    if (k === 'guided_grammar') {
+                        const g = ms.guided_grammar_enabled ? (ms.guided_grammar || '').trim() : '';
+                        if (g) out.guided_grammar = g;
+                        continue;
+                    }
+                    // Standard field: omit unset values entirely — the server
+                    // treats absent universal keys as "reset to default" when
+                    // the profile is applied (snapshot semantics).
+                    let v = ms[k];
+                    if (v === undefined || v === null || v === '') continue;
+                    if (typeof v === 'string' && !isNaN(Number(v))) v = Number(v);
                     out[k] = v;
                 }
 
@@ -1022,17 +1481,22 @@
                 const forced = [];
                 for (const e of (ms.ctKwargEntries || [])) {
                     if (e.type === 'enable_thinking') {
+                        if (isDiffusion) continue;
                         ctk.enable_thinking = e.value === 'true';
                         if (e.force) forced.push('enable_thinking');
                     } else if (e.type === 'reasoning_effort') {
-                        ctk.reasoning_effort = e.value;
-                        if (e.force) forced.push('reasoning_effort');
+                        if (isDiffusion) continue;
+                        const rawEffort = e.custom ? e.customValue : e.value;
+                        const effort = this.coerceKwargValue(rawEffort);
+                        if (String(effort).trim() !== '') {
+                            ctk.reasoning_effort = effort;
+                            if (e.force) forced.push('reasoning_effort');
+                        }
                     } else if (e.type === 'custom' && e.key && e.key.trim()) {
-                        let v = e.value;
-                        if (v === 'true') v = true;
-                        else if (v === 'false') v = false;
-                        else if (!isNaN(Number(v)) && String(v).trim() !== '') v = Number(v);
-                        ctk[e.key.trim()] = v;
+                        if (isDiffusion && this.isDiffusionUnsupportedCtKwarg(e.key.trim())) {
+                            continue;
+                        }
+                        ctk[e.key.trim()] = this.coerceKwargValue(e.value);
                         if (e.force) forced.push(e.key.trim());
                     }
                 }
@@ -1089,13 +1553,44 @@
                 }
                 return null;
             },
+            profileTooltip(profile) {
+                const lines = [];
+                if (profile?.expose_as_model && profile.model_id) {
+                    lines.push(profile.model_id);
+                }
+                const description = (profile?.description || '').trim();
+                if (description) lines.push(description);
+                return lines.join('\n');
+            },
+            matchingProfileTemplate(profile) {
+                if (!profile?.source_template) return null;
+                const template = this.templates.find(t => t.name === profile.source_template);
+                if (!template) return null;
+                const canonical = value => {
+                    if (Array.isArray(value)) return value.map(canonical);
+                    if (value && typeof value === 'object') {
+                        return Object.fromEntries(Object.keys(value).sort().map(k => [k, canonical(value[k])]));
+                    }
+                    return value;
+                };
+                return JSON.stringify(canonical(profile.settings || {})) === JSON.stringify(canonical(template.settings || {}))
+                    ? template : null;
+            },
+            get visibleModelProfiles() {
+                return this.profiles.filter(p => p.expose_as_model || !this.matchingProfileTemplate(p));
+            },
+            get activeTemplateName() {
+                const profile = this.profiles.find(p => p.name === this.activeProfileName);
+                return this.matchingProfileTemplate(profile)?.name || null;
+            },
             async loadProfilesForModel(modelId) {
+                const seq = this._applySeq;
                 this.profiles = [];
                 try {
                     const r = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/profiles`);
                     if (r.ok) {
                         const data = await r.json();
-                        this.profiles = data.profiles || [];
+                        if (seq === this._applySeq) this.profiles = data.profiles || [];
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -1179,6 +1674,12 @@
 
             showTip(el, text) {
                 if (!text) return;
+                // A tooltip must share the dialog's top layer to remain visible.
+                const tooltip = this.$refs.floatingTooltip;
+                const container = el.closest('dialog') || this.$root;
+                if (tooltip.parentElement !== container) {
+                    Alpine.mutateDom(() => container.appendChild(tooltip));
+                }
                 const rect = el.getBoundingClientRect();
                 this.tip = {
                     visible: true,
@@ -1189,6 +1690,314 @@
             },
             hideTip() {
                 this.tip.visible = false;
+            },
+
+            isDiffusionModel(model) {
+                const modelType = String(model?.config_model_type || '')
+                    .toLowerCase()
+                    .replace(/-/g, '_');
+                return DIFFUSION_CONFIG_MODEL_TYPES.has(modelType);
+            },
+
+            isDiffusionUnsupportedProfileField(field) {
+                return DIFFUSION_UNSUPPORTED_PROFILE_FIELDS.has(field);
+            },
+
+            isDiffusionUnsupportedCtKwarg(key) {
+                return DIFFUSION_UNSUPPORTED_CT_KWARGS.has(key);
+            },
+
+            draftModelSearchText(model) {
+                return [
+                    model?.id,
+                    model?.name,
+                    model?.model_path,
+                    model?.source_repo_id,
+                    model?.config_model_type,
+                ].filter(Boolean).join(' ').toLowerCase();
+            },
+
+            isDraftModelBaseCandidate(model) {
+                if (!model || model.virtual) return false;
+                if (model.id === this.selectedModel?.id) return false;
+                return model.model_type === 'llm' || model.model_type === 'vlm' || !model.model_type;
+            },
+
+            isDflashDraftModel(model) {
+                const configType = String(model?.config_model_type || '').toLowerCase();
+                if (DFLASH_DRAFTER_CONFIG_MODEL_TYPES.has(configType)) {
+                    return true;
+                }
+                // DFlash 2 checkpoints are versioned ("-DFlash2"), so allow an
+                // optional numeric suffix after the "dflash" token.
+                return /(^|[-_/\s])dflash[0-9]*($|[-_/\s])/i.test(this.draftModelSearchText(model));
+            },
+
+            isVlmMtpDraftModel(model) {
+                const configType = String(model?.config_model_type || '').toLowerCase();
+                if (configType) {
+                    return VLM_MTP_DRAFTER_CONFIG_MODEL_TYPES.has(configType);
+                }
+                return /assistant|(^|[-_/\s])mtp($|[-_/\s])/i.test(this.draftModelSearchText(model));
+            },
+
+            isSpecPrefillDraftModel(model) {
+                return !this.isDflashDraftModel(model)
+                    && !this.isVlmMtpDraftModel(model);
+            },
+
+            draftModelCandidates(filterFn, { fallbackToBase = true } = {}) {
+                const base = (this.models || []).filter((model) => (
+                    this.isDraftModelBaseCandidate(model)
+                ));
+                const filtered = base.filter(filterFn);
+                return (filtered.length > 0 || !fallbackToBase) ? filtered : base;
+            },
+
+            specPrefillDraftModelCandidates() {
+                return this.draftModelCandidates((model) => this.isSpecPrefillDraftModel(model));
+            },
+
+            dflashDraftModelCandidates() {
+                return this.draftModelCandidates((model) => this.isDflashDraftModel(model));
+            },
+
+            aneFractionOptions(current, presets) {
+                const options = (presets || []).map(value => ({value,
+                    label: value.toLocaleString(undefined, {style: 'percent', maximumFractionDigits: 0})}));
+                if (!options.some(option => option.value === current)) {
+                    options.unshift({value: current, label: current.toLocaleString(undefined,
+                        {style: 'percent', maximumFractionDigits: 2})});
+                }
+                return options;
+            },
+
+
+
+            vlmMtpDraftModelCandidates() {
+                return this.draftModelCandidates(
+                    (model) => this.isVlmMtpDraftModel(model),
+                    { fallbackToBase: false },
+                );
+            },
+
+            // Settings that materialize as per-request logits processors,
+            // which the VLM MTP decode path cannot apply (#2399). Mirrors
+            // vlm_mtp_processor_conflicts() in model_settings.py; neutral
+            // values (repetition 1.0, presence 0.0) do not conflict.
+            // Thinking budget is exempt: it is applied on the vlm_mtp path
+            // at verify time (MTPProcessingSampler).
+            vlmMtpProcessorConflict() {
+                const ms = this.modelSettings;
+                if (!ms) return false;
+                const num = (v) => (v === null || v === undefined || v === '' ? null : Number(v));
+                const rep = num(ms.repetition_penalty);
+                const pres = num(ms.presence_penalty);
+                return (rep !== null && rep !== 1.0)
+                    || (pres !== null && pres !== 0.0)
+                    || !!ms.guided_grammar_enabled;
+            },
+
+            // Coerce a raw kwarg string from the panel into its JSON type:
+            // 'true'/'false' -> boolean, finite numeric strings -> number.
+            coerceKwargValue(v) {
+                if (v === 'true') return true;
+                if (v === 'false') return false;
+                if (String(v).trim() !== '') {
+                    const numeric = Number(v);
+                    if (Number.isFinite(numeric)) return numeric;
+                }
+                return v;
+            },
+
+            buildCtKwargEntries(chatTemplateKwargs, forcedCtKwargs, isDiffusion = false) {
+                const ctk = chatTemplateKwargs || {};
+                const forced = new Set(forcedCtKwargs || []);
+                const entries = [];
+                for (const [key, value] of Object.entries(ctk)) {
+                    if (isDiffusion && this.isDiffusionUnsupportedCtKwarg(key)) {
+                        continue;
+                    }
+                    if (key === 'enable_thinking') {
+                        entries.push({
+                            type: 'enable_thinking',
+                            value: String(value),
+                            force: forced.has('enable_thinking'),
+                        });
+                    } else if (key === 'reasoning_effort') {
+                        const isPreset = typeof value === 'string'
+                            && REASONING_EFFORT_PRESETS.has(value);
+                        entries.push({
+                            type: 'reasoning_effort',
+                            value: isPreset ? value : 'low',
+                            custom: !isPreset,
+                            customValue: isPreset ? '' : String(value),
+                            force: forced.has('reasoning_effort'),
+                        });
+                    } else {
+                        entries.push({
+                            type: 'custom',
+                            key,
+                            value: String(value),
+                            force: forced.has(key),
+                        });
+                    }
+                }
+                return entries;
+            },
+
+            buildModelSettingsState(model, settings) {
+                const s = settings || {};
+                const isDiffusion = this.isDiffusionModel(model);
+                const ctKwargEntries = this.buildCtKwargEntries(
+                    s.chat_template_kwargs,
+                    s.forced_ct_kwargs,
+                    isDiffusion,
+                );
+                const isOcr = OCR_CONFIG_MODEL_TYPES.has(model?.config_model_type || '');
+                return {
+                    model_alias: s.model_alias || '',
+                    model_type_override: s.model_type_override || '',
+                    max_context_window: s.max_context_window || null,
+                    max_tokens: s.max_tokens || null,
+                    temperature: isOcr ? 0.0 : (s.temperature ?? null),
+                    top_p: s.top_p ?? null,
+                    top_k: s.top_k ?? null,
+                    repetition_penalty: s.repetition_penalty ?? null,
+                    min_p: s.min_p ?? null,
+                    presence_penalty: s.presence_penalty ?? null,
+                    force_sampling: s.force_sampling || false,
+                    enable_thinking: s.enable_thinking ?? null,
+                    thinking_default: model?.thinking_default ?? null,
+                    qwen4_ple_ssd_offload: model?.qwen4_ple_ssd_offload_forced === true
+                        || s.qwen4_ple_ssd_offload === true,
+                    qwen4_ple_ssd_offload_supported:
+                        model?.qwen4_ple_ssd_offload_supported === true,
+                    qwen4_ple_ssd_offload_forced:
+                        model?.qwen4_ple_ssd_offload_forced === true,
+                    deepseek_v41_ced_prefill_enabled:
+                        s.deepseek_v41_ced_prefill_enabled === true,
+                    deepseek_v41_ced_prefill_supported:
+                        String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_') === 'deepseek_v41',
+                    deepseek_v41_engram_ssd_offload: model?.deepseek_v41_engram_ssd_offload_forced === true
+                        || s.deepseek_v41_engram_ssd_offload === true,
+                    deepseek_v41_engram_ssd_offload_requested:
+                        s.deepseek_v41_engram_ssd_offload === true,
+                    deepseek_v41_engram_ssd_offload_supported:
+                        model?.deepseek_v41_engram_ssd_offload_supported === true,
+                    deepseek_v41_engram_ssd_offload_forced:
+                        model?.deepseek_v41_engram_ssd_offload_forced === true,
+                    enableThinkingBudget: !!(s.thinking_budget_tokens),
+                    thinking_budget_tokens: s.thinking_budget_tokens || null,
+                    guided_grammar_enabled: s.guided_grammar_enabled || false,
+                    guided_grammar: s.guided_grammar || '',
+                    enableToolResultLimit: !!(s.max_tool_result_tokens),
+                    max_tool_result_tokens: s.max_tool_result_tokens || null,
+                    reasoning_parser: s.reasoning_parser || '',
+                    ttl_seconds: s.ttl_seconds ?? null,
+                    enableIndexCache: !!(s.index_cache_freq),
+                    index_cache_freq: s.index_cache_freq || null,
+                    turboquant_kv_enabled: s.turboquant_kv_enabled || false,
+                    turboquant_kv_bits: s.turboquant_kv_bits || 4,
+                    moe_expert_offload_enabled: !isDiffusion && model?.moe_expert_offload_supported === true && !!s.moe_expert_offload_enabled,
+                    moe_expert_offload_resident_fraction: s.moe_expert_offload_resident_fraction ?? 0.25,
+                    moe_expert_offload_resident_percent: Number(((s.moe_expert_offload_resident_fraction ?? 0.25) * 100).toPrecision(15)),
+                    moe_expert_offload_resident_touched: false,
+                    moe_offload_allows_mtp: model?.moe_offload_allows_mtp === true,
+                    qwen35_oq_a8_enabled: s.qwen35_oq_a8_enabled || false,
+                    qwen35_oq_a8_min_tokens: s.qwen35_oq_a8_min_tokens ?? 128,
+                    qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
+                    qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048,
+                    qwen35_ane_prefill_tail_padding_min_tokens: s.qwen35_ane_prefill_tail_padding_min_tokens ?? 0,
+                    qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? model?.ane_prefill_default_fraction ?? 0.53,
+                    qwen35_ane_prefill_fused_down: s.qwen35_ane_prefill_fused_down || false,
+                    qwen35_ane_prefill_max_layers: s.qwen35_ane_prefill_max_layers || 64,
+                    qwen35_ane_prefill_dual_ane: s.qwen35_ane_prefill_dual_ane !== false,
+                    qwen35_ane_prefill_gdn: s.qwen35_ane_prefill_gdn !== false,
+                    qwen35_ane_prefill_gdn_fraction: s.qwen35_ane_prefill_gdn_fraction ?? 0.5,
+                    qwen35_ane_prefill_gdn_max_layers: s.qwen35_ane_prefill_gdn_max_layers ?? 48,
+                    qwen35_ane_prefill_cpu_enabled: s.qwen35_ane_prefill_cpu_enabled || false,
+                    qwen35_ane_prefill_cpu_fraction: s.qwen35_ane_prefill_cpu_fraction ?? 0.135,
+                    qwen35_ane_prefill_cpu_down_fraction: s.qwen35_ane_prefill_cpu_down_fraction ?? 0,
+                    qwen35_ane_prefill_cpu_gdn_fraction: s.qwen35_ane_prefill_cpu_gdn_fraction ?? 0,
+                    qwen35_ane_prefill_cpu_threads: s.qwen35_ane_prefill_cpu_threads ?? 8,
+                    qwen35_ane_prefill_cpu_shared_resource: s.qwen35_ane_prefill_cpu_shared_resource !== false,
+                    specprefill_enabled: s.specprefill_enabled || false,
+                    specprefill_draft_model: s.specprefill_draft_model || '',
+                    specprefill_keep_pct: s.specprefill_keep_pct ? String(s.specprefill_keep_pct) : '0.2',
+                    specprefill_threshold: s.specprefill_threshold || null,
+                    dflash_enabled: s.dflash_enabled || false,
+                    dflash_draft_model: s.dflash_draft_model || '',
+                    dflash_draft_quant_enabled: s.dflash_draft_quant_enabled || false,
+                    dflash_draft_quant_weight_bits: s.dflash_draft_quant_weight_bits || 4,
+                    dflash_draft_quant_activation_bits: s.dflash_draft_quant_activation_bits || 16,
+                    dflash_draft_quant_group_size: s.dflash_draft_quant_group_size || 64,
+                    dflash_max_ctx: s.dflash_max_ctx ?? null,
+                    dflash_in_memory_cache: s.dflash_in_memory_cache !== false,
+                    dflash_in_memory_cache_max_entries: s.dflash_in_memory_cache_max_entries || 4,
+                    dflash_in_memory_cache_max_gib: s.dflash_in_memory_cache_max_bytes
+                        ? Math.round(s.dflash_in_memory_cache_max_bytes / (1024 ** 3))
+                        : 8,
+                    dflash_ssd_cache: s.dflash_ssd_cache || false,
+                    dflash_ssd_cache_max_gib: s.dflash_ssd_cache_max_bytes
+                        ? Math.round(s.dflash_ssd_cache_max_bytes / (1024 ** 3))
+                        : 20,
+                    dflash_draft_window_size: s.dflash_draft_window_size ?? null,
+                    dflash_draft_sink_size: s.dflash_draft_sink_size ?? 0,
+                    dflash_block_size: s.dflash_block_size ?? null,
+                    dflash_verify_mode: s.dflash_verify_mode || 'adaptive',
+                    dflash_compatible: model?.dflash_compatible !== false,
+                    dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
+                    dflash_ssd_cache_available: !!model?.dflash_ssd_cache_available,
+                    mtp_enabled: s.mtp_enabled || false,
+                    mtp_adaptive_max_depth: [3, 4, 5, 6].includes(s.mtp_adaptive_max_depth)
+                        ? String(s.mtp_adaptive_max_depth) : '3',
+                    mtp_compatible: model?.mtp_compatible === true,
+                    mtp_compatibility_reason: model?.mtp_compatibility_reason || '',
+                    is_paroquant: model?.is_paroquant === true,
+                    paroquant_reason: model?.paroquant_reason || '',
+                    qwen35_ane_prefill_shared_fraction: s.qwen35_ane_prefill_shared_fraction ?? 1,
+                    vlm_mtp_enabled: s.vlm_mtp_enabled || false,
+                    vlm_mtp_draft_model: s.vlm_mtp_draft_model || '',
+                    vlm_mtp_draft_block_size: s.vlm_mtp_draft_block_size ?? null,
+                    ctKwargEntries,
+                    is_diffusion_model: isDiffusion,
+                    trust_remote_code: s.trust_remote_code || false,
+                };
+            },
+
+            moeExpertOffloadResidentInvalid() {
+                const percent = Number(this.modelSettings.moe_expert_offload_resident_percent);
+                return (
+                    !Number.isFinite(percent)
+                    || percent < MOE_EXPERT_OFFLOAD_MIN_PERCENT
+                    || percent > MOE_EXPERT_OFFLOAD_MAX_PERCENT
+                );
+            },
+
+            onMoeExpertOffloadResidentBlur() {
+                // Preserve untouched API values outside the UI range.
+                if (!this.modelSettings.moe_expert_offload_resident_touched) return;
+                if (this.moeExpertOffloadResidentInvalid()) {
+                    const percent = Number(this.modelSettings.moe_expert_offload_resident_percent);
+                    this.modelSettings.moe_expert_offload_resident_percent = Math.min(
+                        MOE_EXPERT_OFFLOAD_MAX_PERCENT,
+                        Math.max(
+                            MOE_EXPERT_OFFLOAD_MIN_PERCENT,
+                            Number.isFinite(percent) ? percent : MOE_EXPERT_OFFLOAD_MIN_PERCENT,
+                        ),
+                    );
+                }
+                this.onMoeExpertOffloadResidentPercent();
+            },
+
+            onMoeExpertOffloadResidentPercent() {
+                // Defer clamping until blur so partial input remains editable.
+                this.modelSettings.moe_expert_offload_resident_touched = true;
+                const percent = Number(this.modelSettings.moe_expert_offload_resident_percent);
+                if (!this.moeExpertOffloadResidentInvalid()) {
+                    this.modelSettings.moe_expert_offload_resident_fraction = Number((percent / 100).toPrecision(15));
+                }
             },
 
             _resetPresetApplicableFields() {
@@ -1206,6 +2015,8 @@
                 ms.max_context_window = null;
                 ms.max_tokens = null;
                 ms.reasoning_parser = null;
+                ms.guided_grammar_enabled = false;
+                ms.guided_grammar = '';
                 ms.ttl_seconds = null;
                 ms.enable_thinking = null;
                 ms.enableThinkingBudget = false;
@@ -1220,26 +2031,29 @@
                 this._resetPresetApplicableFields();
                 const s = preset.settings || {};
                 const ms = this.modelSettings;
+                const isDiffusion = !!ms.is_diffusion_model;
                 for (const k of Object.keys(s)) {
+                    if (isDiffusion
+                        && k !== 'chat_template_kwargs'
+                        && k !== 'forced_ct_kwargs'
+                        && this.isDiffusionUnsupportedProfileField(k)) {
+                        continue;
+                    }
                     if (k === 'thinking_budget_enabled') {
                         ms.enableThinkingBudget = !!s[k];
                     } else if (k === 'max_tool_result_tokens') {
                         ms.enableToolResultLimit = s[k] != null;
                         ms.max_tool_result_tokens = s[k] ?? null;
+                    } else if (k === 'guided_grammar_enabled') {
+                        ms.guided_grammar_enabled = !!s[k];
+                    } else if (k === 'guided_grammar') {
+                        ms.guided_grammar = s[k] || '';
                     } else if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') {
-                        const ctk = s.chat_template_kwargs || {};
-                        const forced = new Set(s.forced_ct_kwargs || []);
-                        const entries = [];
-                        for (const [key, value] of Object.entries(ctk)) {
-                            if (key === 'enable_thinking') {
-                                entries.push({type:'enable_thinking', value:String(value), force:forced.has('enable_thinking')});
-                            } else if (key === 'reasoning_effort') {
-                                entries.push({type:'reasoning_effort', value:String(value), force:forced.has('reasoning_effort')});
-                            } else {
-                                entries.push({type:'custom', key, value:String(value), force:forced.has(key)});
-                            }
-                        }
-                        ms.ctKwargEntries = entries;
+                        ms.ctKwargEntries = this.buildCtKwargEntries(
+                            s.chat_template_kwargs,
+                            s.forced_ct_kwargs,
+                            isDiffusion,
+                        );
                     } else {
                         ms[k] = s[k];
                     }
@@ -1253,23 +2067,49 @@
                 try { localStorage.setItem('omlx_profile_scope', scope); } catch (e) {}
             },
 
+            isValidProfileName(name) {
+                // Mirror of the backend rule (validate_profile_name) and the
+                // Mac app's isValidSlug. api_name is the exposed model ID
+                // suffix (<model>:<api_name>), so it must be a clean slug.
+                return /^[a-z0-9][a-z0-9_-]{0,31}$/.test((name || '').trim());
+            },
+            slugifyProfileApiName(value) {
+                let slug = (value || '')
+                    .normalize('NFKD')
+                    .replace(/[\u0300-\u036f]/g, '')
+                    .toLowerCase()
+                    .replace(/[^a-z0-9_-]+/g, '-')
+                    .replace(/-+/g, '-')
+                    .replace(/^[-_]+|[-_]+$/g, '')
+                    .slice(0, 32)
+                    .replace(/[-_]+$/g, '');
+                return slug || 'profile';
+            },
             async createProfile() {
+                const modelId = this.selectedModel?.id;
+                const seq = this._applySeq;
                 if (!this.selectedModel) return;
                 this.profileError = '';
-                const displayName = this.newProfile.display_name.trim();
+                const displayName = (this.newProfile.display_name || '').trim();
                 if (!displayName) {
-                    this.profileError = 'Name required';
+                    this.profileError = window.t('js.error.name_required');
                     return;
                 }
-                // Auto-generate short unique slug (matches backend ^[a-z0-9][a-z0-9_-]{0,31}$)
+                const apiName = (this.newProfile.api_name || this.slugifyProfileApiName(displayName)).trim();
+                if (!this.isValidProfileName(apiName)) {
+                    this.profileError = window.t('modal.model_settings.profiles.invalid_name');
+                    return;
+                }
                 const autoId = 'p-' + Date.now().toString(36) + '-' +
                                Math.random().toString(36).slice(2, 6);
                 const body = {
                     name: autoId,
                     display_name: displayName,
-                    description: this.newProfile.description.trim() || null,
+                    api_name: apiName,
+                    description: (this.newProfile.description || '').trim() || null,
                     settings: this.formValuesForProfile(),
                     also_save_as_template: false,
+                    expose_as_model: !!this.newProfile.expose_as_model,
                 };
                 try {
                     const r = await fetch(
@@ -1278,110 +2118,69 @@
                           body: JSON.stringify(body) }
                     );
                     if (r.ok) {
+                        const data = await r.json();
+                        if (this.selectedModel?.id !== modelId || seq !== this._applySeq) return;
+                        await this.applyProfileToForm(data.profile);
                         await this.loadProfilesForModel(this.selectedModel.id);
                         if (body.also_save_as_template) await this.loadTemplates();
                         this.showNewProfileForm = false;
-                        this.newProfile = { name: '', display_name: '', description: '', also_as_template: false };
+                        this.newProfile = { display_name: '', api_name: '', api_name_touched: false, description: '', also_as_template: false };
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to save profile';
+                        this.profileError = data.detail || window.t('js.error.save_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
                 }
             },
-            async applyProfileToForm(profile) {
-                // Merge all profile fields into the form (no server call — user clicks Save to persist).
-                const s = profile.settings || {};
-                const ms = this.modelSettings;
-                for (const k of this.profileFields.universal.concat(this.profileFields.model_specific)) {
-                    if (!(k in s)) continue;
-                    if (k === 'thinking_budget_enabled') {
-                        ms.enableThinkingBudget = !!s[k];
-                    } else if (k === 'index_cache_freq') {
-                        ms.enableIndexCache = !!s[k];
-                        ms.index_cache_freq = s[k] || null;
-                    } else if (k === 'max_tool_result_tokens') {
-                        ms.enableToolResultLimit = !!s[k];
-                        ms.max_tool_result_tokens = s[k] || null;
-                    } else if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') {
-                        // Rebuild ctKwargEntries
-                        const ctk = s.chat_template_kwargs || {};
-                        const forced = new Set(s.forced_ct_kwargs || []);
-                        const entries = [];
-                        for (const [key, value] of Object.entries(ctk)) {
-                            if (key === 'enable_thinking') {
-                                entries.push({type:'enable_thinking', value:String(value), force:forced.has('enable_thinking')});
-                            } else if (key === 'reasoning_effort') {
-                                entries.push({type:'reasoning_effort', value:String(value), force:forced.has('reasoning_effort')});
-                            } else {
-                                entries.push({type:'custom', key, value:String(value), force:forced.has(key)});
-                            }
-                        }
-                        ms.ctKwargEntries = entries;
-                    } else {
-                        ms[k] = s[k];
-                    }
-                }
-                // Persist active_profile_name to backend before updating UI state
+            async applyProfileToForm(profile, fromTemplate = false) {
+                const modelId = this.selectedModel?.id;
+                if (!modelId) return;
                 const seq = ++this._applySeq;
+                this.profileError = '';
                 try {
                     const r = await fetch(
-                        `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles/${encodeURIComponent(profile.name)}/apply`,
+                        `/admin/api/models/${encodeURIComponent(modelId)}/${fromTemplate ? "profile-templates" : "profiles"}/${encodeURIComponent(profile.name)}/apply`,
                         { method: 'POST' }
                     );
-                    if (seq !== this._applySeq) return;  // superseded by a newer click
+                    if (seq !== this._applySeq || this.selectedModel?.id !== modelId) return;  // superseded by a newer click
                     if (r.ok) {
-                        this.activeProfileName = profile.name;
+                        const data = await r.json();
+                        if (seq !== this._applySeq || this.selectedModel?.id !== modelId) return;
+                        const activeName = data.settings?.active_profile_name || profile.name;
+                        const settings = {
+                            ...(data.settings || {}),
+                            active_profile_name: activeName,
+                        };
+                        this.modelSettings = this.buildModelSettingsState(
+                            this.selectedModel,
+                            settings,
+                        );
+                        if (this.selectedModel) {
+                            this.selectedModel.settings = { ...settings };
+                        }
+                        this.activeProfileName = activeName;
                         this.profilesDrift = false;
+                        this._modelSettingsBaseline = JSON.stringify(this.modelSettings);
                         // Update the models list so the profile badge reflects the change
-                        const m = this.models.find(m => m.id === this.selectedModel.id);
-                        if (m) m.settings = { ...m.settings, active_profile_name: profile.name };
+                        const m = this.models.find(m => m.id === modelId);
+                        if (m) m.settings = { ...settings };
+                        await this.loadProfilesForModel(modelId);
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
+                    } else {
+                        const data = await r.json().catch(() => ({}));
+                        this.profileError = data.detail || window.t('js.error.apply_profile_failed');
                     }
                 } catch (e) {
+                    this.profileError = String(e);
                     console.error('Failed to apply profile:', e);
                 }
             },
             async applyTemplateToForm(template) {
-                // Check if a profile with this template's name already exists
-                const existingProfile = this.profiles.find(p => p.name === template.name);
-
-                if (existingProfile) {
-                    // Profile exists, just apply it (preserve user customizations)
-                    await this.applyProfileToForm(existingProfile);
-                } else {
-                    // Create a new profile from the template
-                    const body = {
-                        name: template.name,
-                        display_name: template.display_name,
-                        description: template.description || null,
-                        settings: template.settings,
-                        source_template: template.name,
-                    };
-                    
-                    try {
-                        const r = await fetch(
-                            `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles`,
-                            { method: 'POST', headers: {'Content-Type': 'application/json'},
-                              body: JSON.stringify(body) }
-                        );
-                        if (r.ok) {
-                            // Reload profiles first to include the new one
-                            await this.loadProfilesForModel(this.selectedModel.id);
-                            // Find the newly created profile in the refreshed list
-                            const newProfile = this.profiles.find(p => p.name === template.name);
-                            if (newProfile) {
-                                await this.applyProfileToForm(newProfile);
-                            }
-                        }
-                    } catch (e) {
-                        console.error('Failed to create profile from template:', e);
-                    }
-                }
+                await this.applyProfileToForm(template, true);
             },
             async deleteProfile(name) {
                 if (!this.selectedModel) return;
@@ -1402,8 +2201,40 @@
                     this.profileDeleteConfirm = null;
                 }
             },
+            updateProfileFromEdit(p) {
+                // Edit-dialog save. Internal profile name stays stable; api_name
+                // is the API-visible suffix used by exposed model IDs.
+                this.profileError = '';
+                const displayName = (p._editDisplayName ?? p.display_name ?? p.name).trim();
+                const apiName = (p._editApiName ?? p.api_name ?? p.name).trim();
+                const description = (p._editDescription ?? p.description ?? '').trim();
+                const exposeAsModel = !!(p._editExposeAsModel ?? p.expose_as_model);
+                if (!displayName) {
+                    this.profileError = window.t('js.error.name_required');
+                    return;
+                }
+                if (!this.isValidProfileName(apiName)) {
+                    this.profileError = window.t('modal.model_settings.profiles.invalid_name');
+                    return;
+                }
+                const patch = {
+                    display_name: displayName,
+                    api_name: apiName,
+                    description: description,
+                    expose_as_model: exposeAsModel,
+                };
+                return this.updateProfile(p.name, patch);
+            },
+            async updateProfileSettingsFromForm(p) {
+                const updated = await this.updateProfile(p.name, {
+                    settings: this.formValuesForProfile(),
+                });
+                if (updated && this.activeProfileName === p.name) {
+                    await this.applyProfileToForm(updated);
+                }
+            },
             async updateProfile(name, patch) {
-                // patch: { new_name?, display_name?, description?, settings?, also_save_as_template? }
+                // patch: { new_name?, display_name?, api_name?, description?, expose_as_model?, settings?, also_save_as_template? }
                 if (!this.selectedModel) return;
                 this.profileError = '';
                 try {
@@ -1425,17 +2256,19 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to update profile';
+                        this.profileError = data.detail || window.t('js.error.update_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
                 }
             },
             async createTemplate() {
+                const modelId = this.selectedModel?.id;
+                const seq = this._applySeq;
                 this.profileError = '';
                 const displayName = this.newTemplate.display_name.trim();
                 if (!displayName) {
-                    this.profileError = 'Name required';
+                    this.profileError = window.t('js.error.name_required');
                     return;
                 }
                 const autoId = 't-' + Date.now().toString(36) + '-' +
@@ -1454,14 +2287,17 @@
                         body: JSON.stringify(body),
                     });
                     if (r.ok) {
+                        const data = await r.json();
+                        if (this.selectedModel?.id !== modelId || seq !== this._applySeq) return;
                         await this.loadTemplates();
+                        await this.applyTemplateToForm(data.template);
                         this.showNewTemplateForm = false;
                         this.newTemplate = { name: '', display_name: '', description: '' };
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to save template';
+                        this.profileError = data.detail || window.t('js.error.save_template_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -1477,12 +2313,17 @@
                     );
                     if (r.ok) {
                         await this.loadTemplates();
+                        const active = this.profiles.find(p => p.name === this.activeProfileName);
+                        if (patch.settings && active?.source_template === name) {
+                            const template = this.templates.find(t => t.name === name);
+                            if (template) await this.applyTemplateToForm(template);
+                        }
                         this.editingTemplate = null;
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to update template';
+                        this.profileError = data.detail || window.t('js.error.update_template_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -1496,6 +2337,7 @@
                     );
                     if (r.ok) {
                         await this.loadTemplates();
+                        if (this.selectedModel) await this.loadProfilesForModel(this.selectedModel.id);
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -1506,7 +2348,310 @@
                 }
             },
 
-            async openModelSettings(model) {
+            aneTuningForSelectedModel() {
+                return !!this.selectedModel
+                    && this.aneTuning.modelId === this.selectedModel.id;
+            },
+
+            aneTuningProgressPercent() {
+                const current = Number(this.aneTuning.status?.current || 0);
+                const total = Number(
+                    this.aneTuning.status?.total || this.aneTuning.total || 0
+                );
+                if (total <= 0) return 0;
+                return Math.max(0, Math.min(100, current / total * 100));
+            },
+
+            aneTuningRecommendationText() {
+                const recommendation = this.aneTuning.status?.recommendation;
+                if (!recommendation) return '';
+                const measured = recommendation.processing_tps !== null
+                    && recommendation.processing_tps !== undefined;
+                const speed = Number(recommendation.processing_tps || 0).toFixed(1);
+                const speedSuffix = measured
+                    ? ` · ${speed} prompt tok/s`
+                    : '';
+                if (!recommendation.enabled) {
+                    return window.t('js.ane_tune.winner_gpu_only') + speedSuffix;
+                }
+                if (recommendation.backend === 'k2') {
+                    return window.t('js.ane_tune.winner_ane_dense')
+                        .replace('{mlp}', Math.round(recommendation.mlp_fraction * 100))
+                        .replace('{shared}', Math.round(recommendation.shared_fraction * 100))
+                        + speedSuffix;
+                }
+                const parts = [
+                    (recommendation.fused_down
+                        ? window.t('js.ane_tune.fused_mlp')
+                        : window.t('js.ane_tune.mlp')
+                    ).replace(
+                        '{pct}',
+                        Math.round(Number(recommendation.mlp_fraction) * 100),
+                    ),
+                ];
+                if (recommendation.gdn_enabled) {
+                    parts.push(
+                        window.t('js.ane_tune.gdn').replace(
+                            '{pct}',
+                            Math.round(Number(recommendation.gdn_fraction) * 100),
+                        )
+                    );
+                } else {
+                    parts.push(window.t('modal.model_settings.ane_gdn_off'));
+                }
+                if (recommendation.cpu_enabled) {
+                    parts.push(
+                        window.t('js.ane_tune.cpu_gate').replace(
+                            '{pct}',
+                            Math.round(Number(recommendation.cpu_fraction || 0) * 100),
+                        ),
+                        window.t('js.ane_tune.cpu_down').replace(
+                            '{pct}',
+                            Math.round(Number(recommendation.cpu_down_fraction || 0) * 100),
+                        ),
+                        window.t('js.ane_tune.cpu_gdn').replace(
+                            '{pct}',
+                            Math.round(Number(recommendation.cpu_gdn_fraction || 0) * 100),
+                        ),
+                    );
+                }
+                if (Number(recommendation.tail_padding_min_tokens || 0) > 0) {
+                    parts.push(
+                        window.t('js.ane_tune.pad_tails').replace(
+                            '{n}',
+                            Number(recommendation.tail_padding_min_tokens),
+                        )
+                    );
+                }
+                return window.t('js.ane_tune.winner_parts')
+                    .replace('{parts}', parts.join(' · '))
+                    + speedSuffix;
+            },
+
+            _scheduleANETuningPoll() {
+                if (this._aneTuningPollTimer) {
+                    clearTimeout(this._aneTuningPollTimer);
+                }
+                if (!this.aneTuning.running) return;
+                this._aneTuningPollTimer = setTimeout(
+                    () => this.pollANETuning(),
+                    1000,
+                );
+            },
+
+            async startANETuning() {
+                if (!this.selectedModel || this.aneTuning.running) return;
+                const modelId = this.selectedModel.id;
+                if (this._aneTuningPollTimer) {
+                    clearTimeout(this._aneTuningPollTimer);
+                    this._aneTuningPollTimer = null;
+                }
+                this.aneTuning = {
+                    tuningId: null,
+                    modelId,
+                    running: true,
+                    cancelling: false,
+                    applying: false,
+                    applied: false,
+                    total: 0,
+                    status: null,
+                    error: '',
+                };
+                try {
+                    const response = await fetch('/admin/api/bench/ane-tune/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            model_id: modelId,
+                            sequence_length: parseInt(
+                                this.modelSettings.qwen35_ane_prefill_sequence_length
+                            ) || 2048,
+                            repeats: 2,
+                            allow_cpu: this.aneTuningOverrides.allowCpu,
+                            allow_cpu_gate: this.aneTuningOverrides.allowCpu
+                                && this.aneTuningOverrides.allowCpuGate,
+                            allow_cpu_down: this.aneTuningOverrides.allowCpu
+                                && this.aneTuningOverrides.allowCpuDown,
+                            allow_ane_gdn: this.aneTuningOverrides.allowAneGdn,
+                            allow_cpu_gdn: this.aneTuningOverrides.allowCpu
+                                && this.aneTuningOverrides.allowAneGdn
+                                && this.aneTuningOverrides.allowCpuGdn,
+                            allow_cpu_shared_resource: this.aneTuningOverrides.allowCpu
+                                && this.aneTuningOverrides.allowCpuSharedResource,
+                        }),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!response.ok) {
+                        throw new Error(data.detail || window.t('js.error.start_ane_tuning_failed'));
+                    }
+                    this.aneTuning.tuningId = data.tuning_id;
+                    this.aneTuning.total = Number(data.total || 0);
+                    await this.pollANETuning();
+                } catch (error) {
+                    this.aneTuning.running = false;
+                    this.aneTuning.error = error.message || String(error);
+                }
+            },
+
+            async pollANETuning() {
+                const tuningId = this.aneTuning.tuningId;
+                if (!tuningId || !this.aneTuning.running) return;
+                try {
+                    const response = await fetch(
+                        `/admin/api/bench/ane-tune/${encodeURIComponent(tuningId)}/results`
+                    );
+                    const data = await response.json().catch(() => ({}));
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!response.ok) {
+                        throw new Error(data.detail || window.t('js.error.read_ane_tuning_progress_failed'));
+                    }
+                    if (this.aneTuning.tuningId !== tuningId) return;
+                    if (!data.termination_reason && data.status === 'error') {
+                        data.termination_reason = data.error || data.message || window.t('js.error.ane_tuning_failed');
+                    }
+                    this.aneTuning.status = data;
+                    this.aneTuning.total = Number(data.total || this.aneTuning.total || 0);
+                    this.aneTuning.running = data.status === 'running';
+                    this.aneTuning.cancelling = false;
+                    if (data.status === 'error' || data.status === 'cancelled') {
+                        // Early termination belongs beside the partial result
+                        // matrix. Keep this field for request/transport errors.
+                        this.aneTuning.error = '';
+                    }
+                    this._scheduleANETuningPoll();
+                } catch (error) {
+                    this.aneTuning.running = false;
+                    this.aneTuning.cancelling = false;
+                    this.aneTuning.error = error.message || String(error);
+                }
+            },
+
+            async cancelANETuning() {
+                const tuningId = this.aneTuning.tuningId;
+                if (!tuningId || !this.aneTuning.running || this.aneTuning.cancelling) return;
+                this.aneTuning.cancelling = true;
+                try {
+                    const response = await fetch(
+                        `/admin/api/bench/ane-tune/${encodeURIComponent(tuningId)}/cancel`,
+                        { method: 'POST' },
+                    );
+                    const data = await response.json().catch(() => ({}));
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!response.ok) {
+                        throw new Error(data.detail || window.t('js.error.cancel_ane_tuning_failed'));
+                    }
+                    await this.pollANETuning();
+                } catch (error) {
+                    this.aneTuning.cancelling = false;
+                    this.aneTuning.error = error.message || String(error);
+                }
+            },
+
+            async applyANETuningRecommendation() {
+                if (!this.selectedModel || !this.aneTuningForSelectedModel()) return;
+                const recommendation = this.aneTuning.status?.recommendation;
+                if (!recommendation || this.aneTuning.applying) return;
+                const patch = {
+                    qwen35_ane_prefill_enabled: !!recommendation.enabled,
+                    qwen35_ane_prefill_sequence_length: Number(recommendation.sequence_length),
+                };
+                if (recommendation.enabled) {
+                    patch.qwen35_ane_prefill_fraction = Number(recommendation.mlp_fraction);
+                }
+                if (recommendation.backend === 'k2') {
+                    if (recommendation.enabled) {
+                        patch.qwen35_ane_prefill_shared_fraction = Number(recommendation.shared_fraction);
+                    }
+                } else {
+                    patch.qwen35_ane_prefill_tail_padding_min_tokens = Number(recommendation.tail_padding_min_tokens || 0);
+                    if (recommendation.enabled) {
+                        patch.qwen35_ane_prefill_fused_down = !!recommendation.fused_down;
+                        patch.qwen35_ane_prefill_gdn = !!recommendation.gdn_enabled;
+                        if (recommendation.gdn_enabled) {
+                            patch.qwen35_ane_prefill_gdn_fraction = Number(
+                                recommendation.gdn_fraction
+                            );
+                        }
+                        patch.qwen35_ane_prefill_cpu_enabled = !!recommendation.cpu_enabled;
+                        patch.qwen35_ane_prefill_cpu_fraction = Number(
+                            recommendation.cpu_fraction || 0
+                        );
+                        patch.qwen35_ane_prefill_cpu_down_fraction = Number(
+                            recommendation.cpu_down_fraction || 0
+                        );
+                        patch.qwen35_ane_prefill_cpu_gdn_fraction = Number(
+                            recommendation.cpu_gdn_fraction || 0
+                        );
+                        if (recommendation.cpu_threads !== null
+                            && recommendation.cpu_threads !== undefined) {
+                            patch.qwen35_ane_prefill_cpu_threads = Number(
+                                recommendation.cpu_threads
+                            );
+                        }
+                        if (recommendation.cpu_shared_resource !== null
+                            && recommendation.cpu_shared_resource !== undefined) {
+                            patch.qwen35_ane_prefill_cpu_shared_resource =
+                                !!recommendation.cpu_shared_resource;
+                        }
+                    }
+                }
+                this.aneTuning.applying = true;
+                this.aneTuning.error = '';
+                try {
+                    const response = await fetch(
+                        `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/settings`,
+                        {
+                            method: 'PUT',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(patch),
+                        },
+                    );
+                    const data = await response.json().catch(() => ({}));
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!response.ok) {
+                        throw new Error(data.detail || window.t('js.error.apply_ane_tuning_result_failed'));
+                    }
+                    Object.assign(this.modelSettings, patch);
+                    const model = this.models.find(item => item.id === this.selectedModel.id);
+                    if (model && data.settings) {
+                        model.settings = { ...data.settings };
+                    }
+                    this.aneTuning.applied = true;
+                } catch (error) {
+                    this.aneTuning.error = error.message || String(error);
+                } finally {
+                    this.aneTuning.applying = false;
+                }
+            },
+
+            async refreshOpenModelSettings() {
+                if (!this.showModelSettingsModal || !this.selectedModel) return;
+                const modelId = this.selectedModel.id;
+                const baseline = this._modelSettingsBaseline;
+                if (JSON.stringify(this.modelSettings) !== baseline) return;
+                if (this.showNewProfileForm || this.showNewTemplateForm || this.editingProfile || this.editingTemplate) return;
+                await this.loadModels();
+                if (!this.showModelSettingsModal || this.selectedModel?.id !== modelId
+                    || JSON.stringify(this.modelSettings) !== baseline) return;
+                const model = this.models.find(m => m.id === modelId);
+                if (model) await this.openModelSettings(model, true);
+            },
+            async openModelSettings(model, preservingEdits = false) {
+                const baseline = JSON.stringify(this.modelSettings);
+                const seq = ++this._applySeq;
                 this.profileError = '';
                 this.showNewProfileForm = false;
                 this.showNewTemplateForm = false;
@@ -1514,108 +2659,186 @@
                 this.editingTemplate = null;
                 this.profileDeleteConfirm = null;
                 this.templateDeleteConfirm = null;
-                this.activeProfileName = (model.settings && model.settings.active_profile_name) || null;
-                try {
-                    const saved = localStorage.getItem('omlx_profile_scope');
-                    if (saved === 'preset' || saved === 'global' || saved === 'model') {
-                        this.profileScope = saved;
-                    }
-                } catch (e) {}
-                await Promise.all([
-                    this.loadProfilesForModel(model.id),
-                    this.loadTemplates(),
-                ]);
-                this.computeDrift();
-                if (this.reasoningParsers.length === 0) {
+                const isDiffusion = this.isDiffusionModel(model);
+                this.activeProfileName = isDiffusion
+                    ? null
+                    : ((model.settings && model.settings.active_profile_name) || null);
+                if (isDiffusion) {
+                    this.profiles = [];
+                    this.templates = [];
+                    this.profilesDrift = false;
+                } else {
                     try {
-                        const resp = await fetch('/admin/api/grammar/parsers');
-                        if (resp.ok) this.reasoningParsers = await resp.json();
-                        else if (resp.status === 401) window.location.href = '/admin';
-                    } catch (_) { /* network error */ }
-                }
-                this.selectedModel = model;
-                // Load existing settings if available
-                const settings = model.settings || {};
-                // Parse chat_template_kwargs into ctKwargEntries
-                const ctk = settings.chat_template_kwargs || {};
-                const forcedKeys = new Set(settings.forced_ct_kwargs || []);
-                const ctKwargEntries = [];
-                for (const [key, value] of Object.entries(ctk)) {
-                    if (key === 'enable_thinking') {
-                        ctKwargEntries.push({type: 'enable_thinking', value: String(value), force: forcedKeys.has('enable_thinking')});
-                    } else if (key === 'reasoning_effort') {
-                        ctKwargEntries.push({type: 'reasoning_effort', value: String(value), force: forcedKeys.has('reasoning_effort')});
-                    } else {
-                        ctKwargEntries.push({type: 'custom', key, value: String(value), force: forcedKeys.has(key)});
+                        const saved = localStorage.getItem('omlx_profile_scope');
+                        if (saved === 'preset' || saved === 'global' || saved === 'model') {
+                            this.profileScope = saved;
+                        }
+                    } catch (e) {}
+                    await Promise.all([
+                        this.loadProfilesForModel(model.id),
+                        this.loadTemplates(),
+                    ]);
+                    if (this.reasoningParsers.length === 0) {
+                        try {
+                            const resp = await fetch('/admin/api/grammar/parsers');
+                            if (resp.ok) this.reasoningParsers = await resp.json();
+                            else if (resp.status === 401) window.location.href = '/admin';
+                        } catch (_) { /* network error */ }
                     }
                 }
-                const isOcr = OCR_CONFIG_MODEL_TYPES.has(model.config_model_type || '');
-                this.modelSettings = {
-                    model_alias: settings.model_alias || '',
-                    model_type_override: settings.model_type_override || '',
-                    max_context_window: settings.max_context_window || null,
-                    max_tokens: settings.max_tokens || null,
-                    temperature: isOcr ? 0.0 : (settings.temperature ?? null),
-                    top_p: settings.top_p ?? null,
-                    top_k: settings.top_k ?? null,
-                    repetition_penalty: settings.repetition_penalty ?? null,
-                    min_p: settings.min_p ?? null,
-                    presence_penalty: settings.presence_penalty ?? null,
-                    force_sampling: settings.force_sampling || false,
-                    enable_thinking: settings.enable_thinking ?? null,
-                    thinking_default: model.thinking_default ?? null,
-                    enableThinkingBudget: !!(settings.thinking_budget_tokens),
-                    thinking_budget_tokens: settings.thinking_budget_tokens || null,
-                    enableToolResultLimit: !!(settings.max_tool_result_tokens),
-                    max_tool_result_tokens: settings.max_tool_result_tokens || null,
-                    reasoning_parser: settings.reasoning_parser || '',
-                    ttl_seconds: settings.ttl_seconds ?? null,
-                    enableIndexCache: !!(settings.index_cache_freq),
-                    index_cache_freq: settings.index_cache_freq || null,
-                    turboquant_kv_enabled: settings.turboquant_kv_enabled || false,
-                    turboquant_kv_bits: settings.turboquant_kv_bits || 4,
-                    specprefill_enabled: settings.specprefill_enabled || false,
-                    specprefill_draft_model: settings.specprefill_draft_model || '',
-                    specprefill_keep_pct: settings.specprefill_keep_pct ? String(settings.specprefill_keep_pct) : '0.2',
-                    specprefill_threshold: settings.specprefill_threshold || null,
-                    dflash_enabled: settings.dflash_enabled || false,
-                    dflash_draft_model: settings.dflash_draft_model || '',
-                    dflash_draft_quant_enabled: settings.dflash_draft_quant_enabled || false,
-                    dflash_draft_quant_weight_bits: settings.dflash_draft_quant_weight_bits || 4,
-                    dflash_draft_quant_activation_bits: settings.dflash_draft_quant_activation_bits || 16,
-                    dflash_draft_quant_group_size: settings.dflash_draft_quant_group_size || 64,
-                    dflash_max_ctx: settings.dflash_max_ctx ?? null,
-                    dflash_in_memory_cache: settings.dflash_in_memory_cache !== false,
-                    dflash_in_memory_cache_max_entries: settings.dflash_in_memory_cache_max_entries || 4,
-                    dflash_in_memory_cache_max_gib: settings.dflash_in_memory_cache_max_bytes
-                        ? Math.round(settings.dflash_in_memory_cache_max_bytes / (1024 ** 3))
-                        : 8,
-                    dflash_ssd_cache: settings.dflash_ssd_cache || false,
-                    dflash_ssd_cache_max_gib: settings.dflash_ssd_cache_max_bytes
-                        ? Math.round(settings.dflash_ssd_cache_max_bytes / (1024 ** 3))
-                        : 20,
-                    dflash_draft_window_size: settings.dflash_draft_window_size ?? null,
-                    dflash_draft_sink_size: settings.dflash_draft_sink_size ?? null,
-                    dflash_verify_mode: settings.dflash_verify_mode || 'adaptive',
-                    dflash_compatible: model.dflash_compatible !== false,
-                    dflash_compatibility_reason: model.dflash_compatibility_reason || '',
-                    dflash_ssd_cache_available: !!model.dflash_ssd_cache_available,
-                    mtp_enabled: settings.mtp_enabled || false,
-                    mtp_compatible: model.mtp_compatible === true,
-                    mtp_compatibility_reason: model.mtp_compatibility_reason || '',
-                    is_paroquant: model.is_paroquant === true,
-                    paroquant_reason: model.paroquant_reason || '',
-                    vlm_mtp_enabled: settings.vlm_mtp_enabled || false,
-                    vlm_mtp_draft_model: settings.vlm_mtp_draft_model || '',
-                    vlm_mtp_draft_block_size: settings.vlm_mtp_draft_block_size ?? null,
-                    ctKwargEntries,
-                    trust_remote_code: settings.trust_remote_code || false,
-                };
+                if (seq !== this._applySeq) return;
+                if (preservingEdits && (!this.showModelSettingsModal
+                    || this.selectedModel?.id !== model.id
+                    || JSON.stringify(this.modelSettings) !== baseline)) return;
+                this.selectedModel = model;
+                this.modelSettings = this.buildModelSettingsState(
+                    model,
+                    model.settings || {},
+                );
+                if (isDiffusion) {
+                    this.profilesDrift = false;
+                } else {
+                    this.computeDrift();
+                }
+                this._modelSettingsBaseline = JSON.stringify(this.modelSettings);
                 this.showModelSettingsModal = true;
+            },
+
+            async importMtplxSidecar() {
+                if (!this.selectedModel || this.importingMtplx) return;
+                this.importingMtplx = true;
+                try {
+                    const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/import-mtplx`, {
+                        method: 'POST',
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        alert(data.detail || window.t('js.error.mtplx_import_failed'));
+                        return;
+                    }
+                    if (data.message) alert(data.message);
+                    // Refresh so mtp_compatible flips and the toggle unlocks.
+                    await this.loadModels();
+                    const model = this.models.find(m => m.id === this.selectedModel.id);
+                    if (model) await this.openModelSettings(model);
+                } catch (e) {
+                    alert(window.t('js.error.mtplx_import_failed'));
+                } finally {
+                    this.importingMtplx = false;
+                }
+            },
+
+            isQwenOqA8Model(model) {
+                const type = String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_');
+                return ['qwen3_5', 'qwen3_6', 'qwen3_8'].some(prefix => type.startsWith(prefix));
+            },
+
+            validateQwenOqA8Settings() {
+                if (!this.modelSettings.qwen35_oq_a8_enabled) return null;
+                // Both wrap the same MLP call, so the combination silently
+                // disables one of them. Caught here so the modal explains it
+                // instead of surfacing the server's 400.
+                if (this.modelSettings.qwen35_ane_prefill_enabled) {
+                    return window.t('js.error.ane_oq_a8_conflict');
+                }
+                const minTokens = Number(this.modelSettings.qwen35_oq_a8_min_tokens);
+                if (!Number.isInteger(minTokens) || minTokens < 1) {
+                    return window.t('js.error.oq_a8_min_tokens_positive');
+                }
+                return null;
+            },
+
+            validateQwenAneSettings() {
+                if (!this.modelSettings.qwen35_ane_prefill_enabled
+                    || this.selectedModel?.ane_prefill_backend !== 'qwen') return null;
+
+                const integer = (value, label, minimum) => {
+                    if (value === '' || value === null || value === undefined) {
+                        return window.t('js.error.field_required').replace('{field}', label);
+                    }
+                    const number = Number(value);
+                    if (!Number.isInteger(number)) return window.t('js.error.field_integer').replace('{field}', label);
+                    if (number < minimum) return window.t('js.error.field_min').replace('{field}', label).replace('{min}', minimum);
+                    return null;
+                };
+                const fraction = (value, label, minimum, maximum) => {
+                    if (value === '' || value === null || value === undefined) {
+                        return window.t('js.error.field_required').replace('{field}', label);
+                    }
+                    const number = Number(value);
+                    if (!Number.isFinite(number)) return window.t('js.error.field_number').replace('{field}', label);
+                    if (number < minimum || number > maximum) {
+                        return window.t('js.error.field_range').replace('{field}', label).replace('{min}', minimum).replace('{max}', maximum);
+                    }
+                    return null;
+                };
+
+                const sequenceLength = Number(this.modelSettings.qwen35_ane_prefill_sequence_length);
+                let error = integer(sequenceLength, window.t('js.error.field.ane_prompt_block'), 1024);
+                if (!error && sequenceLength % 64 !== 0) {
+                    error = window.t('js.error.ane_prompt_block_multiple');
+                }
+                if (error) return error;
+                error = integer(
+                    this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens,
+                    window.t('js.error.field.ane_tail_padding'),
+                    0,
+                );
+                if (error) return error;
+                if (Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens) >= sequenceLength) {
+                    return window.t('js.error.ane_tail_padding_lt_prompt_block');
+                }
+                error = fraction(this.modelSettings.qwen35_ane_prefill_fraction, window.t('js.error.field.mlp_ane_fraction'), 0.05, 0.90);
+                if (error) return error;
+                error = integer(this.modelSettings.qwen35_ane_prefill_max_layers, window.t('js.error.field.ane_mlp_layers'), 1);
+                if (error) return error;
+
+                if (this.modelSettings.qwen35_ane_prefill_cpu_enabled) {
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_fraction, window.t('js.error.field.cpu_mlp_fraction'), 0, 0.25);
+                    if (error) return error;
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction, window.t('js.error.field.cpu_mlp_down_fraction'), 0, 0.50);
+                    if (error) return error;
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction, window.t('js.error.field.cpu_gdn_fraction'), 0, 0.50);
+                    if (error) return error;
+                    error = integer(this.modelSettings.qwen35_ane_prefill_cpu_threads, window.t('js.error.field.cpu_workers'), 0);
+                    if (error) return error;
+                    if (Number(this.modelSettings.qwen35_ane_prefill_cpu_threads) > 64) {
+                        return window.t('js.error.cpu_workers_range');
+                    }
+                    if (Number(this.modelSettings.qwen35_ane_prefill_fraction)
+                        + Number(this.modelSettings.qwen35_ane_prefill_cpu_fraction) >= 1) {
+                        return window.t('js.error.mlp_ane_cpu_total');
+                    }
+                }
+
+                if (this.modelSettings.qwen35_ane_prefill_gdn) {
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_gdn_fraction, window.t('js.error.field.gdn_ane_fraction'), 0.05, 0.90);
+                    if (error) return error;
+                    if (this.modelSettings.qwen35_ane_prefill_cpu_enabled
+                        && Number(this.modelSettings.qwen35_ane_prefill_gdn_fraction)
+                        + Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction) >= 1) {
+                        return window.t('js.error.gdn_ane_cpu_total');
+                    }
+                    error = integer(this.modelSettings.qwen35_ane_prefill_gdn_max_layers, window.t('js.error.field.ane_gdn_layers'), 0);
+                    if (error) return error;
+                }
+                return null;
             },
 
             async saveModelSettings() {
                 if (!this.selectedModel) return;
+
+                const qwenOqA8ValidationError = this.validateQwenOqA8Settings();
+                if (qwenOqA8ValidationError) {
+                    alert(qwenOqA8ValidationError);
+                    return;
+                }
+
+                const qwenAneValidationError = this.validateQwenAneSettings();
+                if (qwenAneValidationError) {
+                    alert(qwenAneValidationError);
+                    return;
+                }
 
                 this.savingModelSettings = true;
                 try {
@@ -1623,27 +2846,36 @@
                         method: 'PUT',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify((() => {
+                            const isDiffusion = !!this.modelSettings.is_diffusion_model;
                             // Build chat_template_kwargs and forced_ct_kwargs from ctKwargEntries
                             const chatTemplateKwargs = {};
                             const forcedCtKwargs = [];
                             for (const entry of this.modelSettings.ctKwargEntries) {
                                 if (entry.type === 'enable_thinking') {
+                                    if (isDiffusion) continue;
                                     chatTemplateKwargs.enable_thinking = entry.value === 'true';
                                     if (entry.force) forcedCtKwargs.push('enable_thinking');
                                 } else if (entry.type === 'reasoning_effort') {
-                                    chatTemplateKwargs.reasoning_effort = entry.value;
-                                    if (entry.force) forcedCtKwargs.push('reasoning_effort');
+                                    if (isDiffusion) continue;
+                                    const rawEffort = entry.custom
+                                        ? entry.customValue
+                                        : entry.value;
+                                    const effort = this.coerceKwargValue(rawEffort);
+                                    if (String(effort).trim() !== '') {
+                                        chatTemplateKwargs.reasoning_effort = effort;
+                                        if (entry.force) forcedCtKwargs.push('reasoning_effort');
+                                    }
                                 } else if (entry.type === 'custom' && entry.key && entry.key.trim()) {
-                                    let val = entry.value;
-                                    if (val === 'true') val = true;
-                                    else if (val === 'false') val = false;
-                                    else if (!isNaN(Number(val)) && val.trim() !== '') val = Number(val);
+                                    const val = this.coerceKwargValue(entry.value);
                                     const key = entry.key.trim();
+                                    if (isDiffusion && this.isDiffusionUnsupportedCtKwarg(key)) {
+                                        continue;
+                                    }
                                     chatTemplateKwargs[key] = val;
                                     if (entry.force) forcedCtKwargs.push(key);
                                 }
                             }
-                            return {
+                            const payload = {
                                 model_alias: this.modelSettings.model_alias?.trim() || null,
                                 model_type_override: this.modelSettings.model_type_override || null,
                                 max_context_window: this.modelSettings.max_context_window || null,
@@ -1660,11 +2892,23 @@
                                 index_cache_freq: this.modelSettings.enableIndexCache
                                     ? (this.modelSettings.index_cache_freq || 4)
                                     : 0,
-                                enable_thinking: this.modelSettings.enable_thinking,
+                                enable_thinking: this.selectedModel?.thinking_forced ? null : this.modelSettings.enable_thinking,
+                                qwen4_ple_ssd_offload:
+                                    !!this.modelSettings.qwen4_ple_ssd_offload,
+                                deepseek_v41_ced_prefill_enabled:
+                                    !!this.modelSettings.deepseek_v41_ced_prefill_enabled,
+                                deepseek_v41_engram_ssd_offload:
+                                    this.modelSettings.deepseek_v41_engram_ssd_offload_forced
+                                        ? !!this.modelSettings.deepseek_v41_engram_ssd_offload_requested
+                                        : !!this.modelSettings.deepseek_v41_engram_ssd_offload,
                                 thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
                                 thinking_budget_tokens: this.modelSettings.enableThinkingBudget
                                     ? (this.modelSettings.thinking_budget_tokens || null)
                                     : 0,
+                                guided_grammar_enabled: this.modelSettings.guided_grammar_enabled,
+                                guided_grammar: this.modelSettings.guided_grammar_enabled
+                                    ? (this.modelSettings.guided_grammar || null)
+                                    : null,
                                 max_tool_result_tokens: this.modelSettings.enableToolResultLimit
                                     ? (this.modelSettings.max_tool_result_tokens || null)
                                     : 0,
@@ -1676,6 +2920,38 @@
                                 turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
                                     ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
                                     : 4,
+                                moe_expert_offload_enabled: !isDiffusion && this.selectedModel?.moe_expert_offload_supported === true && !!this.modelSettings.moe_expert_offload_enabled,
+                                moe_expert_offload_resident_fraction: this.modelSettings.moe_expert_offload_resident_fraction ?? 0.25,
+                                qwen35_oq_a8_enabled: !!this.modelSettings.qwen35_oq_a8_enabled,
+                                qwen35_oq_a8_min_tokens: Number(this.modelSettings.qwen35_oq_a8_min_tokens) || 128,
+                                qwen35_ane_prefill_enabled: !!this.modelSettings.qwen35_ane_prefill_enabled,
+                                // Validation only runs when the feature is enabled, so a
+                                // blank numeric input must fall back to the server default
+                                // instead of coercing to 0 and failing an unrelated save.
+                                qwen35_ane_prefill_sequence_length: Number(this.modelSettings.qwen35_ane_prefill_sequence_length) || 2048,
+                                qwen35_ane_prefill_tail_padding_min_tokens: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens))
+                                    ? Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens)
+                                    : 0,
+                                qwen35_ane_prefill_fraction: Number(this.modelSettings.qwen35_ane_prefill_fraction),
+                                qwen35_ane_prefill_max_layers: Number(this.modelSettings.qwen35_ane_prefill_max_layers) || 64,
+                                qwen35_ane_prefill_dual_ane: !!this.modelSettings.qwen35_ane_prefill_dual_ane,
+                                qwen35_ane_prefill_gdn: !!this.modelSettings.qwen35_ane_prefill_gdn,
+                                qwen35_ane_prefill_gdn_fraction: Number(this.modelSettings.qwen35_ane_prefill_gdn_fraction) || 0.5,
+                                qwen35_ane_prefill_gdn_max_layers: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers))
+                                    ? Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers)
+                                    : 48,
+                                qwen35_ane_prefill_cpu_enabled: !!this.modelSettings.qwen35_ane_prefill_cpu_enabled,
+                                qwen35_ane_prefill_cpu_fraction: Number(this.modelSettings.qwen35_ane_prefill_cpu_fraction),
+                                qwen35_ane_prefill_cpu_down_fraction: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction))
+                                    ? Number(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction)
+                                    : 0,
+                                qwen35_ane_prefill_cpu_gdn_fraction: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction))
+                                    ? Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction)
+                                    : 0,
+                                qwen35_ane_prefill_cpu_threads: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_threads))
+                                    ? Number(this.modelSettings.qwen35_ane_prefill_cpu_threads)
+                                    : 8,
+                                qwen35_ane_prefill_cpu_shared_resource: !!this.modelSettings.qwen35_ane_prefill_cpu_shared_resource,
                                 specprefill_enabled: this.modelSettings.specprefill_enabled,
                                 specprefill_draft_model: this.modelSettings.specprefill_draft_model || null,
                                 specprefill_keep_pct: this.modelSettings.specprefill_enabled
@@ -1715,7 +2991,7 @@
                                 dflash_ssd_cache_max_bytes: this.modelSettings.dflash_enabled
                                     ? Math.max(1, parseInt(this.modelSettings.dflash_ssd_cache_max_gib) || 20) * (1024 ** 3)
                                     : 20 * (1024 ** 3),
-                                // Long-context tuning. Null → server keeps it null → dflash-mlx default.
+                                // Long-context tuning. Empty → oMLX default.
                                 dflash_draft_window_size: this.modelSettings.dflash_enabled
                                     && this.modelSettings.dflash_draft_window_size
                                     ? parseInt(this.modelSettings.dflash_draft_window_size)
@@ -1725,11 +3001,20 @@
                                     && this.modelSettings.dflash_draft_sink_size !== undefined
                                     && this.modelSettings.dflash_draft_sink_size !== ''
                                     ? parseInt(this.modelSettings.dflash_draft_sink_size)
+                                    : 0,
+                                dflash_block_size: this.modelSettings.dflash_enabled
+                                    && this.modelSettings.dflash_block_size
+                                    ? parseInt(this.modelSettings.dflash_block_size)
                                     : null,
                                 dflash_verify_mode: this.modelSettings.dflash_enabled
                                     ? (this.modelSettings.dflash_verify_mode || 'adaptive')
                                     : null,
                                 mtp_enabled: !!this.modelSettings.mtp_enabled,
+                                mtp_adaptive_max_depth: this.modelSettings.mtp_enabled
+                                    ? parseInt(this.modelSettings.mtp_adaptive_max_depth || '3')
+                                    : null,
+                                mtp_fixed_depth: null,
+                                qwen35_ane_prefill_shared_fraction: Number(this.modelSettings.qwen35_ane_prefill_shared_fraction),
                                 vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
                                 vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
                                     ? (this.modelSettings.vlm_mtp_draft_model || null)
@@ -1740,6 +3025,68 @@
                                     : null,
                                 trust_remote_code: this.modelSettings.trust_remote_code,
                             };
+                            if (isDiffusion) {
+                                Object.assign(payload, {
+                                    top_p: null,
+                                    top_k: null,
+                                    repetition_penalty: null,
+                                    min_p: null,
+                                    presence_penalty: null,
+                                    force_sampling: false,
+                                    reasoning_parser: null,
+                                    index_cache_freq: 0,
+                                    enable_thinking: null,
+                                    thinking_budget_enabled: false,
+                                    thinking_budget_tokens: 0,
+                                    guided_grammar_enabled: false,
+                                    guided_grammar: null,
+                                    max_tool_result_tokens: 0,
+                                    turboquant_kv_enabled: false,
+                                    turboquant_kv_bits: 4,
+                                    qwen35_ane_prefill_enabled: false,
+                                    qwen35_ane_prefill_sequence_length: 2048,
+                                    qwen35_ane_prefill_tail_padding_min_tokens: 0,
+                                    qwen35_ane_prefill_fraction: 0.53,
+                                    qwen35_ane_prefill_max_layers: 64,
+                                    qwen35_ane_prefill_dual_ane: true,
+                                    qwen35_ane_prefill_gdn: true,
+                                    qwen35_ane_prefill_gdn_fraction: 0.5,
+                                    qwen35_ane_prefill_gdn_max_layers: 48,
+                                    qwen35_ane_prefill_cpu_enabled: false,
+                                    qwen35_ane_prefill_cpu_fraction: 0.135,
+                                    qwen35_ane_prefill_cpu_down_fraction: 0,
+                                    qwen35_ane_prefill_cpu_gdn_fraction: 0,
+                                    qwen35_ane_prefill_cpu_threads: 8,
+                                    qwen35_ane_prefill_cpu_shared_resource: true,
+                                    specprefill_enabled: false,
+                                    specprefill_draft_model: null,
+                                    specprefill_keep_pct: null,
+                                    specprefill_threshold: null,
+                                    dflash_enabled: false,
+                                    dflash_draft_model: null,
+                                    dflash_draft_quant_enabled: false,
+                                    dflash_draft_quant_weight_bits: null,
+                                    dflash_draft_quant_activation_bits: null,
+                                    dflash_draft_quant_group_size: null,
+                                    dflash_max_ctx: null,
+                                    dflash_in_memory_cache: true,
+                                    dflash_in_memory_cache_max_entries: 4,
+                                    dflash_in_memory_cache_max_bytes: 8 * (1024 ** 3),
+                                    dflash_ssd_cache: false,
+                                    dflash_ssd_cache_max_bytes: 20 * (1024 ** 3),
+                                    dflash_draft_window_size: null,
+                                    dflash_draft_sink_size: null,
+                                    dflash_block_size: null,
+                                    dflash_verify_mode: null,
+                                    mtp_enabled: false,
+                                    mtp_adaptive_max_depth: null,
+                                    mtp_fixed_depth: null,
+                                    vlm_mtp_enabled: false,
+                                    vlm_mtp_draft_model: null,
+                                    vlm_mtp_draft_block_size: null,
+                                });
+                            }
+                            return payload;
                         })()),
                     });
 
@@ -1753,6 +3100,8 @@
                                 alert(window.t('js.info.model_settings_auto_reloaded'));
                             } else if (data.auto_unloaded) {
                                 alert(window.t('js.info.model_settings_auto_unloaded'));
+                            } else if (data.reload_deferred) {
+                                alert(window.t('js.info.model_settings_reload_deferred'));
                             } else {
                                 alert(window.t('js.info.model_type_reload_required'));
                             }
@@ -1768,6 +3117,164 @@
                     alert(window.t('js.error.save_model_settings_failed'));
                 } finally {
                     this.savingModelSettings = false;
+                }
+            },
+
+            // Snapshot actions in the settings modal header. All three go
+            // through server endpoints that decode, validate and persist, so
+            // the form is rebuilt from the returned settings.
+            openSettingsApply(mode) {
+                this.settingsApply = {
+                    open: true,
+                    mode,
+                    phase: mode === 'recipe' ? 'input' : (mode === 'reset' ? 'confirm' : 'loading'),
+                    recipeText: '',
+                    result: null,
+                    candidates: null,
+                    error: '',
+                };
+                if (mode === 'optimal') this.loadOptimalCandidates();
+            },
+
+            closeSettingsApply() {
+                if (this.settingsApply.phase === 'loading') return;
+                this.settingsApply.open = false;
+            },
+
+            async _settingsActionRequest(method, path, body) {
+                if (!this.selectedModel) return null;
+                const url = `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/settings/${path}`;
+                const init = { method };
+                if (body !== undefined) {
+                    init.headers = { 'Content-Type': 'application/json' };
+                    init.body = JSON.stringify(body);
+                }
+                this.settingsApply.phase = 'loading';
+                this.settingsApply.error = '';
+                try {
+                    const response = await fetch(url, init);
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return null;
+                    }
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        this.settingsApply.error = data.detail || window.t('js.error.settings_apply_failed');
+                        this.settingsApply.phase = 'error';
+                        return null;
+                    }
+                    return data;
+                } catch (err) {
+                    console.error('Settings snapshot request failed:', err);
+                    this.settingsApply.error = window.t('js.error.settings_apply_failed');
+                    this.settingsApply.phase = 'error';
+                    return null;
+                }
+            },
+
+            async loadOptimalCandidates() {
+                const data = await this._settingsActionRequest('GET', 'optimal');
+                if (!data) return;
+                this.settingsApply.result = data;
+                if (!data.found) {
+                    this.settingsApply.phase = 'none';
+                    return;
+                }
+                this.settingsApply.candidates = data;
+                this.settingsApply.phase = 'choose';
+            },
+
+            async applyOptimalCandidate(benchmarkId) {
+                const data = await this._settingsActionRequest('POST', 'optimal', { benchmark_id: benchmarkId });
+                if (!data) return;
+                this.settingsApply.result = data;
+                await this._applySettingsResponse(data);
+                this.settingsApply.phase = 'done';
+            },
+
+            async runSettingsApply() {
+                const mode = this.settingsApply.mode;
+                const data = mode === 'recipe'
+                    ? await this._settingsActionRequest('POST', 'recipe', { recipe: this.settingsApply.recipeText.trim() })
+                    : await this._settingsActionRequest('POST', 'reset');
+                if (!data) return;
+                this.settingsApply.result = data;
+                await this._applySettingsResponse(data);
+                this.settingsApply.phase = 'done';
+            },
+
+            settingsApplyTitle() {
+                const mode = this.settingsApply.mode;
+                if (mode === 'reset') return window.t('modal.model_settings.actions.reset');
+                if (mode === 'recipe') return window.t('modal.model_settings.actions.apply_title_recipe');
+                return window.t('modal.model_settings.actions.apply_title_optimal');
+            },
+
+            settingsApplyLoadingText() {
+                const mode = this.settingsApply.mode;
+                if (mode === 'reset') return window.t('modal.model_settings.actions.loading_reset');
+                if (mode === 'recipe') return window.t('modal.model_settings.actions.loading_recipe');
+                return this.settingsApply.candidates
+                    ? window.t('modal.model_settings.actions.loading_apply')
+                    : window.t('modal.model_settings.actions.loading_optimal');
+            },
+
+            settingsApplyDoneText() {
+                const mode = this.settingsApply.mode;
+                const result = this.settingsApply.result;
+                if (mode === 'reset') return window.t('modal.model_settings.actions.done_reset');
+                if (result && result.changed === false) return window.t('modal.model_settings.actions.no_change');
+                return mode === 'recipe'
+                    ? window.t('modal.model_settings.actions.done_recipe')
+                    : window.t('modal.model_settings.actions.done_optimal');
+            },
+
+            settingsApplyGroups() {
+                const c = this.settingsApply.candidates;
+                if (!c) return [];
+                return [
+                    { key: 'pp', label: window.t('modal.model_settings.actions.group_pp'), items: c.by_pp || [] },
+                    { key: 'tg', label: window.t('modal.model_settings.actions.group_tg'), items: c.by_tg || [] },
+                ].filter(g => g.items.length);
+            },
+
+            settingsApplyJson() {
+                const result = this.settingsApply.result;
+                return result && result.applied ? JSON.stringify(result.applied, null, 2) : '';
+            },
+
+            settingsApplyStats(item) {
+                if (!item || item.pp_tps == null) return '';
+                const parts = [`PP ${Number(item.pp_tps).toFixed(1)} tok/s`];
+                if (item.tg_tps != null) parts.push(`TG ${Number(item.tg_tps).toFixed(1)} tok/s`);
+                if (item.memory_gb != null) parts.push(`${item.memory_gb} GB`);
+                if (item.quantization) parts.push(item.quantization);
+                if (item.omlx_version) parts.push(`oMLX ${item.omlx_version}`);
+                if (item.created_at) parts.push(String(item.created_at).slice(0, 10));
+                return parts.join(' · ');
+            },
+
+            async _applySettingsResponse(data) {
+                if (data.settings && this.selectedModel) {
+                    this.modelSettings = this.buildModelSettingsState(this.selectedModel, data.settings);
+                    this.activeProfileName = data.settings.active_profile_name || null;
+                    if (!this.modelSettings.is_diffusion_model) this.computeDrift();
+                }
+                await this.loadModels();
+                if (this.selectedModel) {
+                    const fresh = (this.models || []).find(m => m.id === this.selectedModel.id);
+                    if (fresh) this.selectedModel = fresh;
+                }
+                if (data.requires_reload) {
+                    if (data.auto_reloaded) {
+                        alert(window.t('js.info.model_settings_auto_reloaded'));
+                    } else if (data.auto_unloaded) {
+                        alert(window.t('js.info.model_settings_auto_unloaded'));
+                    } else if (data.reload_deferred) {
+                        alert(window.t('js.info.model_settings_reload_deferred'));
+                    } else {
+                        alert(window.t('js.info.model_type_reload_required'));
+                    }
                 }
             },
 
@@ -1789,6 +3296,8 @@
                         this.modelSettings.presence_penalty = null;
                         this.modelSettings.force_sampling = false;
                         this.modelSettings.reasoning_parser = null;
+                        this.modelSettings.guided_grammar_enabled = false;
+                        this.modelSettings.guided_grammar = '';
                         this.modelSettings.ttl_seconds = null;
                         this.modelSettings.enableIndexCache = false;
                         this.modelSettings.index_cache_freq = 0;
@@ -1800,6 +3309,21 @@
                         this.modelSettings.ctKwargEntries = [];
                         this.modelSettings.turboquant_kv_enabled = false;
                         this.modelSettings.turboquant_kv_bits = 4;
+                        this.modelSettings.qwen35_ane_prefill_enabled = false;
+                        this.modelSettings.qwen35_ane_prefill_sequence_length = 2048;
+                        this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens = 0;
+                        this.modelSettings.qwen35_ane_prefill_fraction = this.selectedModel?.ane_prefill_default_fraction ?? 0.53;
+                        this.modelSettings.qwen35_ane_prefill_max_layers = 64;
+                        this.modelSettings.qwen35_ane_prefill_dual_ane = true;
+                        this.modelSettings.qwen35_ane_prefill_gdn = true;
+                        this.modelSettings.qwen35_ane_prefill_gdn_fraction = 0.5;
+                        this.modelSettings.qwen35_ane_prefill_gdn_max_layers = 48;
+                        this.modelSettings.qwen35_ane_prefill_cpu_enabled = false;
+                        this.modelSettings.qwen35_ane_prefill_cpu_fraction = 0.135;
+                        this.modelSettings.qwen35_ane_prefill_cpu_down_fraction = 0;
+                        this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction = 0;
+                        this.modelSettings.qwen35_ane_prefill_cpu_threads = 8;
+                        this.modelSettings.qwen35_ane_prefill_cpu_shared_resource = true;
                         this.modelSettings.specprefill_enabled = false;
                         this.modelSettings.specprefill_draft_model = null;
                         this.modelSettings.specprefill_keep_pct = 0.2;
@@ -1817,9 +3341,11 @@
                         this.modelSettings.dflash_ssd_cache = false;
                         this.modelSettings.dflash_ssd_cache_max_gib = 20;
                         this.modelSettings.dflash_draft_window_size = null;
-                        this.modelSettings.dflash_draft_sink_size = null;
+                        this.modelSettings.dflash_draft_sink_size = 0;
+                        this.modelSettings.dflash_block_size = null;
                         this.modelSettings.dflash_verify_mode = 'adaptive';
                         this.modelSettings.mtp_enabled = false;
+                        this.modelSettings.mtp_adaptive_max_depth = '3';
                         this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {
                         alert(window.t('js.error.no_config_defaults'));
@@ -2034,7 +3560,9 @@
                 parts.push(this.shellEnvAssign('ANTHROPIC_DEFAULT_HAIKU_MODEL', haikuModel));
                 parts.push('API_TIMEOUT_MS=3000000');
                 parts.push('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1');
-                parts.push('claude');
+                // Deny LSP: its schema joins the tools array mid-session and
+                // re-prefills the whole conversation on a caching server (#2349).
+                parts.push('claude --disallowedTools LSP');
                 return parts.join(' ');
             },
 
@@ -2044,8 +3572,6 @@
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
-                            claude_code_context_scaling_enabled: this.globalSettings.claude_code.context_scaling_enabled,
-                            claude_code_target_context_size: this.globalSettings.claude_code.target_context_size,
                             claude_code_mode: this.globalSettings.claude_code.mode,
                             claude_code_opus_model: this.globalSettings.claude_code.opus_model,
                             claude_code_sonnet_model: this.globalSettings.claude_code.sonnet_model,
@@ -2060,11 +3586,222 @@
                 }
             },
 
+            // ---- Dashboard block layout ----
+            _dashLayoutLib() {
+                return typeof DashboardLayout !== 'undefined' ? DashboardLayout : null;
+            },
+            get dashboardWidthClass() {
+                const lib = this._dashLayoutLib();
+                const width = this.dashEditing && this.dashDraft ? this.dashDraft.width : this.dashLayout?.width;
+                return lib ? lib.widthClass(width) : 'max-w-7xl';
+            },
+            get dashWidthOptions() {
+                const lib = this._dashLayoutLib();
+                if (!lib) return [];
+                return lib.WIDTH_IDS.map(id => ({ id, label: window.t(`status.layout.width_${id}`) }));
+            },
+            get dashTrayEmpty() {
+                const lib = this._dashLayoutLib();
+                return !!lib && this.dashPlacedIds.length >= lib.BLOCK_IDS.length;
+            },
+            dashPlaced(id) {
+                return this.dashPlacedIds.includes(id);
+            },
+            _dashBlockEl(id) {
+                return this.$refs.dashGrid?.querySelector(`.dash-block[data-block="${id}"]`) || null;
+            },
+            // Creates the grid the first time the status tab is visible; GridStack
+            // needs a measurable width. Later calls only refit block heights.
+            ensureDashboardGrid() {
+                const lib = this._dashLayoutLib();
+                if (!lib || typeof GridStack === 'undefined' || this.mainTab !== 'status') return;
+                if (dashGrid) {
+                    this.refitDashboardBlocks();
+                    return;
+                }
+                const el = this.$refs.dashGrid;
+                if (!el || !el.offsetWidth) return;
+                dashGrid = GridStack.init({
+                    column: lib.COLUMNS,
+                    cellHeight: 8,
+                    margin: 12,
+                    sizeToContent: true,
+                    float: false,
+                    animate: true,
+                    minRow: 1,
+                    disableDrag: true,
+                    disableResize: true,
+                    acceptWidgets: '.dash-tray-pill',
+                    draggable: { handle: '.dash-block-handle', appendTo: 'body' },
+                    resizable: { handles: 'e, w, se' },
+                    columnOpts: {
+                        columnMax: lib.COLUMNS,
+                        breakpointForWindow: true,
+                        breakpoints: [{ w: 752, c: 1, layout: 'list' }],
+                    },
+                }, el);
+                dashGrid.on('dropped', (event, previous, node) => this._onDashTrayDrop(node));
+                dashGrid.on('dragstop resizestop', () => this.refitDashboardBlocks());
+                GridStack.setupDragIn('.dash-tray-pill', { appendTo: 'body', helper: 'clone' });
+                if (typeof ResizeObserver !== 'undefined') {
+                    dashObserver = new ResizeObserver(() => this.refitDashboardBlocks());
+                    el.querySelectorAll('.dash-block-body').forEach(body => dashObserver.observe(body));
+                }
+                const narrow = window.matchMedia('(max-width: 751.98px)');
+                const syncNarrow = () => {
+                    this.dashEditAvailable = !narrow.matches;
+                    if (narrow.matches && this.dashEditing) this.cancelDashboardEdit();
+                };
+                narrow.addEventListener('change', syncNarrow);
+                syncNarrow();
+                this.applyDashboardLayout(this.dashLayout || lib.defaultLayout());
+            },
+            // Block heights follow their content (stats polling, x-show toggles).
+            // GridStack measures the item's current box, which is still mid-transition
+            // right after a move or resize, so run a second pass once it settles.
+            refitDashboardBlocks() {
+                if (!dashGrid || this.mainTab !== 'status') return;
+                const run = () => {
+                    if (!dashGrid || !this.$refs.dashGrid?.offsetWidth) return;
+                    dashGrid.getGridItems().forEach(item => dashGrid.resizeToContent(item));
+                };
+                if (!dashRefitFrame) {
+                    dashRefitFrame = requestAnimationFrame(() => {
+                        dashRefitFrame = null;
+                        run();
+                    });
+                }
+                clearTimeout(dashRefitTimer);
+                dashRefitTimer = setTimeout(run, 400);
+            },
+            _dashPark(el) {
+                dashGrid.removeWidget(el, false, false);
+                el.classList.add('dash-block-parked');
+            },
+            _dashPlace(id, pos) {
+                const lib = this._dashLayoutLib();
+                const el = this._dashBlockEl(id);
+                if (!el || el.gridstackNode) return null;
+                el.classList.remove('dash-block-parked');
+                dashGrid.makeWidget(el, { id, x: pos.x, y: pos.y, w: pos.w, h: 1, minW: lib.MIN_W });
+                dashGrid.resizeToContent(el);
+                if (!this.dashPlacedIds.includes(id)) this.dashPlacedIds = [...this.dashPlacedIds, id];
+                return el;
+            },
+            applyDashboardLayout(layout) {
+                const lib = this._dashLayoutLib();
+                if (!dashGrid || !lib) return;
+                layout = lib.normalizeLayout(layout);
+                // No transition while rebuilding: the first content measurement of a
+                // freshly placed item must see its final box, not an animating one.
+                dashGrid.setAnimation(false);
+                dashGrid.getGridItems().forEach(item => this._dashPark(item));
+                this.dashPlacedIds = [];
+                // Heights come from content, so saved y values only encode order. Pack
+                // each block under the tallest block already occupying its columns;
+                // a later block inserted at an occupied row would push earlier ones down.
+                const bottoms = new Array(lib.COLUMNS).fill(0);
+                [...layout.blocks]
+                    .sort((a, b) => a.y - b.y || a.x - b.x)
+                    .forEach(block => {
+                        const y = Math.max(...bottoms.slice(block.x, block.x + block.w));
+                        const el = this._dashPlace(block.id, { x: block.x, y, w: block.w });
+                        const h = el?.gridstackNode?.h || 1;
+                        for (let c = block.x; c < block.x + block.w; c++) bottoms[c] = y + h;
+                    });
+                dashGrid.setAnimation(true);
+                this.refitDashboardBlocks();
+            },
+            collectDashboardLayout() {
+                const lib = this._dashLayoutLib();
+                const blocks = dashGrid.save(false).map(n => ({ id: n.id, x: n.x, y: n.y, w: n.w }));
+                return lib.normalizeLayout({ version: 1, width: this.dashDraft?.width, blocks });
+            },
+            _onDashTrayDrop(node) {
+                const lib = this._dashLayoutLib();
+                if (!dashGrid || !lib || !node?.el) return;
+                const id = node.el.dataset.block;
+                const pos = { x: node.x, y: node.y, w: node.w };
+                // The dropped element is GridStack's clone of the tray pill.
+                dashGrid.removeWidget(node.el, true, false);
+                if (!lib.BLOCK_IDS.includes(id) || !this.dashEditing) return;
+                this._dashPlace(id, pos);
+                this.refitDashboardBlocks();
+            },
+            dashRemoveBlock(id) {
+                const el = this._dashBlockEl(id);
+                if (!dashGrid || !this.dashEditing || !el?.gridstackNode) return;
+                this._dashPark(el);
+                this.dashPlacedIds = this.dashPlacedIds.filter(placed => placed !== id);
+                dashGrid.compact();
+            },
+            _dashAfterLayoutChange() {
+                this.$nextTick(() => {
+                    dashGrid?.onResize();
+                    this.refitDashboardBlocks();
+                });
+            },
+            startDashboardEdit() {
+                if (!dashGrid || !this.dashLayout || !this.dashEditAvailable || this.dashEditing) return;
+                this.dashDraft = { width: this.dashLayout.width };
+                this.dashSaveError = '';
+                this.dashEditing = true;
+                dashGrid.enable();
+                this._dashAfterLayoutChange();
+            },
+            cancelDashboardEdit() {
+                if (!this.dashEditing) return;
+                this.dashEditing = false;
+                this.dashDraft = null;
+                this.dashSaveError = '';
+                if (dashGrid) {
+                    dashGrid.disable();
+                    this.applyDashboardLayout(this.dashLayout);
+                }
+                this._dashAfterLayoutChange();
+            },
+            resetDashboardLayout() {
+                const lib = this._dashLayoutLib();
+                if (!this.dashEditing || !lib) return;
+                this.dashDraft.width = 'default';
+                this.applyDashboardLayout(lib.defaultLayout());
+                this._dashAfterLayoutChange();
+            },
+            setDashboardWidth(width) {
+                const lib = this._dashLayoutLib();
+                if (!this.dashEditing || !lib || !lib.WIDTH_IDS.includes(width)) return;
+                this.dashDraft.width = width;
+                this._dashAfterLayoutChange();
+            },
+            async saveDashboardLayout() {
+                if (!dashGrid || !this.dashEditing || this.dashSaving) return;
+                const layout = this.collectDashboardLayout();
+                this.dashSaving = true;
+                this.dashSaveError = '';
+                try {
+                    const response = await fetch('/admin/api/global-settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ ui_dashboard_layout: layout }),
+                    });
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    this.dashLayout = layout;
+                    this.globalSettings.ui.dashboard_layout = layout;
+                    this.dashEditing = false;
+                    this.dashDraft = null;
+                    dashGrid.disable();
+                    this._dashAfterLayoutChange();
+                } catch (err) {
+                    console.error('Failed to save dashboard layout:', err);
+                    this.dashSaveError = window.t('status.layout.save_failed');
+                } finally {
+                    this.dashSaving = false;
+                }
+            },
+
             _launchCmd(tool) {
-                // cli_prefix is always "omlx" or an app-bundle path with no
-                // spaces, so skip shellQuote to avoid rendering `'omlx' launch ...`
-                // in the dashboard command display.
-                const cli = this.stats.cli_prefix || 'omlx';
+                const raw = this.stats.cli_prefix || 'omlx';
+                const cli = raw === 'omlx' ? raw : this.shellQuote(raw);
                 return `${cli} launch ${tool}`;
             },
 
@@ -2074,6 +3811,10 @@
 
             get codexCommand() {
                 return this._launchCmd('codex');
+            },
+
+            get codexAppCommand() {
+                return this._launchCmd('codex_app');
             },
 
             get copilotCommand() {
@@ -2097,6 +3838,22 @@
                 return this._launchCmd('pi');
             },
 
+            get dshCommand() {
+                return this._launchCmd('dsh');
+            },
+
+            get markitdownOcrModelMissing() {
+                const id = this.globalSettings.integrations.markitdown_pdf_processing_engine;
+                return id !== 'markitdown' && !(this.models || []).some(model => model.id === id);
+            },
+
+            get markitdownOcrModels() {
+                return (this.models || []).filter((model) => {
+                    const configType = String(model.config_model_type || '').toLowerCase();
+                    return configType.includes('ocr');
+                });
+            },
+
             async saveIntegrationSettings() {
                 try {
                     const response = await fetch('/admin/api/global-settings', {
@@ -2109,7 +3866,21 @@
                             integrations_openclaw_model: this.globalSettings.integrations.openclaw_model,
                             integrations_hermes_model: this.globalSettings.integrations.hermes_model,
                             integrations_pi_model: this.globalSettings.integrations.pi_model,
+                            integrations_dsh_model: this.globalSettings.integrations.dsh_model,
                             integrations_openclaw_tools_profile: this.globalSettings.integrations.openclaw_tools_profile,
+                            markitdown_enabled: this.globalSettings.integrations.markitdown_enabled,
+                            markitdown_expose_model: this.globalSettings.integrations.markitdown_expose_model,
+                            markitdown_max_file_size_mb: this.globalSettings.integrations.markitdown_max_file_size_mb,
+                            markitdown_max_files_per_request: this.globalSettings.integrations.markitdown_max_files_per_request,
+                            markitdown_pdf_processing_engine: this.globalSettings.integrations.markitdown_pdf_processing_engine,
+                            web_search_provider: this.globalSettings.integrations.web_search_provider,
+                            web_search_brave_api_key: this.globalSettings.integrations.web_search_brave_api_key,
+                            web_search_searxng_url: this.globalSettings.integrations.web_search_searxng_url,
+                            web_search_ddgs_backends: this.globalSettings.integrations.web_search_ddgs_backends,
+                            web_search_max_results: this.globalSettings.integrations.web_search_max_results,
+                            web_search_content_mode: this.globalSettings.integrations.web_search_content_mode,
+                            web_search_content_truncate: this.globalSettings.integrations.web_search_content_truncate,
+                            web_search_content_max_chars: this.globalSettings.integrations.web_search_content_max_chars,
                         }),
                     });
                     if (!response.ok) {
@@ -2117,6 +3888,58 @@
                     }
                 } catch (err) {
                     console.error('Failed to save integration settings:', err);
+                }
+            },
+
+            ddgsBackendChecked(name) {
+                return (this.globalSettings.integrations.web_search_ddgs_backends || '')
+                    .split(',').map(s => s.trim()).filter(Boolean).includes(name);
+            },
+
+            toggleDdgsBackend(name) {
+                const current = (this.globalSettings.integrations.web_search_ddgs_backends || '')
+                    .split(',').map(s => s.trim()).filter(Boolean);
+                const next = current.includes(name)
+                    ? current.filter(b => b !== name)
+                    : [...current, name];
+                this.globalSettings.integrations.web_search_ddgs_backends = next.join(',');
+                this.saveIntegrationSettings();
+            },
+
+            async testWebSearch() {
+                if (this.webSearchTest.running) return;
+                this.webSearchTest = { running: true, ok: null, message: '' };
+                try {
+                    const response = await fetch('/admin/api/web-search/test', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            provider: this.globalSettings.integrations.web_search_provider,
+                            brave_api_key: this.globalSettings.integrations.web_search_brave_api_key || '',
+                            searxng_url: this.globalSettings.integrations.web_search_searxng_url || '',
+                            ddgs_backends: this.globalSettings.integrations.web_search_ddgs_backends || '',
+                            max_results: this.globalSettings.integrations.web_search_max_results,
+                        }),
+                    });
+                    const payload = await response.json();
+                    if (payload.ok) {
+                        this.webSearchTest = {
+                            running: false,
+                            ok: true,
+                            message: window.t('settings.integrations.websearch.test_success')
+                                .replace('{count}', (payload.results || []).length),
+                        };
+                    } else {
+                        const message = payload.error?.message
+                            || window.t('settings.integrations.websearch.test_failed');
+                        this.webSearchTest = { running: false, ok: false, message };
+                    }
+                } catch (err) {
+                    this.webSearchTest = {
+                        running: false,
+                        ok: false,
+                        message: window.t('settings.integrations.websearch.test_failed'),
+                    };
                 }
             },
 
@@ -2295,6 +4118,31 @@
                 return String(n);
             },
 
+            formatDFlashSessionStats(totals) {
+                if (!totals || totals.requests <= 1) return '';
+
+                const parts = [];
+                if (totals.speculative_requests > 0) {
+                    parts.push(
+                        Math.round((totals.acceptance_ratio || 0) * 100) + '% ' +
+                        window.t('status.active_models.dflash_draft_share'),
+                        (totals.accepted_draft_tokens_per_cycle || 0).toFixed(2) + ' ' +
+                        window.t('status.active_models.dflash_accepted_draft_per_cycle'),
+                        (totals.tokens_per_cycle || 0).toFixed(2) + ' ' +
+                        window.t('status.active_models.dflash_output_per_cycle'),
+                        totals.speculative_requests + ' ' +
+                        window.t('status.active_models.dflash_speculative_requests'),
+                    );
+                }
+                if (totals.fallback_requests > 0) {
+                    parts.push(
+                        totals.fallback_requests + ' ' +
+                        window.t('status.active_models.dflash_fallback_requests'),
+                    );
+                }
+                return window.t('status.active_models.dflash_session') + ': ' + parts.join(' · ');
+            },
+
             formatDurationShort(seconds) {
                 if (seconds == null || !Number.isFinite(seconds)) return '—';
                 if (seconds < 1) return seconds.toFixed(1) + 's';
@@ -2308,7 +4156,7 @@
 
             formatActivityAge(seconds) {
                 if (seconds == null || !Number.isFinite(seconds)) return '';
-                return 'last token ' + this.formatDurationShort(seconds) + ' ago';
+                return window.t('status.active_models.last_token_ago').replace('{age}', this.formatDurationShort(seconds));
             },
 
             formatActivityMetadata(activity) {
@@ -2376,7 +4224,10 @@
                 if (!mp || !mp.enabled || !mp.hard_bytes) {
                     return window.t('status.active_models.enforcer_disabled');
                 }
-                return `${this.formatSizeBytes(mp.current_bytes)} / ${this.formatSizeBytes(mp.soft_bytes)} soft / ${this.formatSizeBytes(mp.hard_bytes)} hard`;
+                return window.t('status.active_models.pressure_label')
+                    .replace('{current}', this.formatSizeBytes(mp.current_bytes))
+                    .replace('{soft}', this.formatSizeBytes(mp.soft_bytes))
+                    .replace('{hard}', this.formatSizeBytes(mp.hard_bytes));
             },
 
             modelSizeLabel(model) {
@@ -2393,9 +4244,25 @@
                     return estimated;
                 }
                 if (!estimated || estimated === actual) {
-                    return `~${actual} obs`;
+                    return window.t('status.active_models.size_observed')
+                        .replace('{size}', actual);
                 }
-                return `~${actual} obs / ${estimated} est`;
+                return window.t('status.active_models.size_observed_estimated')
+                    .replace('{size}', actual)
+                    .replace('{estimated}', estimated);
+            },
+
+            clusterBadgeLabel(cluster) {
+                if (!cluster) return '';
+                const tensor = window.t('cluster.badge.tensor') + '×' + (cluster.tensor_parallel_size || 1);
+                const pipeline = window.t('cluster.badge.pipeline') + '×' + (cluster.pipeline_stages || 1);
+                let strategy = tensor;
+                if (cluster.strategy === 'pipeline') {
+                    strategy = pipeline;
+                } else if (cluster.strategy === 'hybrid') {
+                    strategy = tensor + '+' + pipeline;
+                }
+                return window.t('cluster.badge.label') + ' · ' + strategy;
             },
 
             copyToClipboard(text) {
@@ -2433,9 +4300,90 @@
                 }
             },
 
+            // Shared external endpoint settings (both bench tabs)
+            saveExternalEndpoint() {
+                localStorage.setItem('omlx_bench_external_base_url', this.externalBaseUrl.trim());
+                localStorage.setItem('omlx_bench_external_api_key', this.externalApiKey);
+                localStorage.setItem('omlx_bench_external_model', this.externalModel.trim());
+            },
+
+            externalConfigValid() {
+                return !!(this.externalBaseUrl.trim() && this.externalModel.trim());
+            },
+
+            externalRequestBody() {
+                return {
+                    base_url: this.externalBaseUrl.trim(),
+                    api_key: this.externalApiKey,
+                    model: this.externalModel.trim(),
+                };
+            },
+
+            parseAccuracyExtraBody() {
+                const raw = this.accExternalExtraBody.trim();
+                if (!raw) return {};
+
+                let value;
+                try {
+                    value = JSON.parse(raw);
+                } catch (_) {
+                    throw new Error(window.t('js.error.external_extra_body_invalid_json'));
+                }
+                if (value === null || Array.isArray(value) || typeof value !== 'object') {
+                    throw new Error(window.t('js.error.external_extra_body_object_required'));
+                }
+
+                const protectedFields = new Set([
+                    'model', 'messages', 'stream', 'stream_options',
+                    'max_tokens', 'temperature', 'api_key', 'authorization',
+                ]);
+                const blocked = Object.keys(value).filter(
+                    key => protectedFields.has(key.toLowerCase())
+                );
+                if (blocked.length > 0) {
+                    throw new Error(
+                        window.t('js.error.external_extra_body_protected')
+                            .replace('{fields}', blocked.sort().join(', '))
+                    );
+                }
+                return value;
+            },
+
+            saveAccExternalMaxTokens() {
+                localStorage.setItem('omlx_acc_external_max_tokens', this.accExternalMaxTokens.trim());
+            },
+
+            // Optional accuracy-only floor for per-question max_tokens.
+            // Returns null when unset; throws on invalid input.
+            parseAccuracyMaxTokens() {
+                const raw = this.accExternalMaxTokens.trim();
+                if (!raw) return null;
+                const value = Number(raw);
+                if (!Number.isInteger(value) || value < 1 || value > 1000000) {
+                    throw new Error(window.t('js.error.external_max_tokens_invalid'));
+                }
+                return value;
+            },
+
+            accuracyExternalRequestBody() {
+                const body = this.externalRequestBody();
+                const extraBody = this.parseAccuracyExtraBody();
+                if (Object.keys(extraBody).length > 0) body.extra_body = extraBody;
+                const maxTokens = this.parseAccuracyMaxTokens();
+                if (maxTokens !== null) body.max_tokens_override = maxTokens;
+                return body;
+            },
+
             // Benchmark functions
             async startBenchmark() {
-                if (!this.benchModelId) return;
+                if (this.benchExternalEnabled) {
+                    if (!this.externalConfigValid()) {
+                        this.benchError = window.t('js.error.external_endpoint_required');
+                        return;
+                    }
+                } else if (!this.benchModelId) {
+                    return;
+                }
 
                 // Collect selected prompt lengths
                 const promptLengths = Object.entries(this.benchPromptLengths)
@@ -2468,16 +4416,24 @@
                 this.benchUploadDone = null;
                 this.benchUploading = false;
                 this.benchUploadSkipped = null;
+                this.benchUploadFlags = [];
+                this.benchRunExternal = this.benchExternalEnabled
+                    ? { base_url: this.externalBaseUrl.trim(), model: this.externalModel.trim() }
+                    : null;
 
                 try {
                     const response = await fetch('/admin/api/bench/start', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
-                            model_id: this.benchModelId,
+                            model_id: this.benchExternalEnabled ? this.externalModel.trim() : this.benchModelId,
+                            context_profile: this.benchContextProfile,
+                            align_prompt_to_ane: this.benchAlignPromptToAne,
                             prompt_lengths: promptLengths,
                             generation_length: 128,
                             batch_sizes: batchSizes,
+                            force_lm_engine: this.benchExternalEnabled ? false : this.benchForceLmEngine,
+                            external: this.benchExternalEnabled ? this.externalRequestBody() : null,
                         }),
                     });
 
@@ -2529,7 +4485,8 @@
                             // (pp, tg); batch rows by batch_size.
                             if (data.data.test_type === 'single') {
                                 const exists = this.benchSingleResults.some(
-                                    r => r.pp === data.data.pp && r.tg === data.data.tg
+                                    r => this.benchRequestedPp(r) === this.benchRequestedPp(data.data)
+                                        && r.tg === data.data.tg
                                 );
                                 if (!exists) {
                                     this.benchSingleResults = [...this.benchSingleResults, data.data];
@@ -2547,7 +4504,7 @@
                             this.benchUploading = true;
                             this.benchProgress = {
                                 phase: 'upload',
-                                message: 'Uploading to community benchmarks...',
+                                message: window.t('bench.uploading_community'),
                                 current: 0,
                                 total: 0,
                             };
@@ -2562,13 +4519,17 @@
                             }
                         } else if (data.type === 'upload_done') {
                             this.benchUploadDone = data.data;
+                            this.benchUploadFlags = data.data.feature_flags || [];
                             this.benchUploading = false;
                             this.benchRunning = false;
                             this.benchProgress = null;
                             es.close();
                             this.benchEventSource = null;
                         } else if (data.type === 'upload_skipped') {
-                            this.benchUploadSkipped = { features: data.features || [] };
+                            this.benchUploadSkipped = {
+                                reason: data.reason || 'external_endpoint',
+                                features: data.features || [],
+                            };
                             this.benchUploading = false;
                             this.benchRunning = false;
                             this.benchProgress = null;
@@ -2610,10 +4571,247 @@
                 // SSE handler will update state when error/done event arrives
             },
 
+            // Context benchmark functions
+            async startContextBenchmark() {
+                if (!this.ctxBenchModelId || this.ctxBenchRunning) return;
+
+                this.ctxBenchRunning = true;
+                this.ctxBenchProgress = null;
+                this.ctxBenchResult = null;
+                this.ctxBenchError = '';
+                this.ctxBenchBenchId = null;
+
+                try {
+                    const response = await fetch('/admin/api/bench/context/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            model_id: this.ctxBenchModelId,
+                            target_tokens: this.ctxBenchTarget,
+                        }),
+                    });
+
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+
+                    if (!response.ok) {
+                        const data = await response.json();
+                        this.ctxBenchError = data.detail || window.t('js.error.start_context_bench_failed');
+                        this.ctxBenchRunning = false;
+                        return;
+                    }
+
+                    const data = await response.json();
+                    this.ctxBenchBenchId = data.bench_id;
+                    this.connectContextBenchSSE(data.bench_id);
+                } catch (err) {
+                    console.error('Failed to start context benchmark:', err);
+                    this.ctxBenchError = window.t('js.error.start_context_bench_failed');
+                    this.ctxBenchRunning = false;
+                }
+            },
+
+            connectContextBenchSSE(benchId) {
+                if (this.ctxBenchEventSource) {
+                    this.ctxBenchEventSource.close();
+                }
+
+                const es = new EventSource(`/admin/api/bench/context/${benchId}/stream`);
+                this.ctxBenchEventSource = es;
+
+                es.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+
+                        if (data.type === 'progress') {
+                            this.ctxBenchProgress = {
+                                phase: data.phase,
+                                progress: data.progress,
+                                message: data.message,
+                            };
+                        } else if (data.type === 'result') {
+                            this.ctxBenchResult = data.data;
+                        } else if (data.type === 'done') {
+                            this.ctxBenchRunning = false;
+                            this.ctxBenchProgress = null;
+                            es.close();
+                            this.ctxBenchEventSource = null;
+                            // The applied setting changed the model row.
+                            this.loadModels();
+                        } else if (data.type === 'error') {
+                            this.ctxBenchError = data.message;
+                            this.ctxBenchRunning = false;
+                            this.ctxBenchProgress = null;
+                            es.close();
+                            this.ctxBenchEventSource = null;
+                            this.loadModels();
+                        }
+                    } catch (err) {
+                        console.error('Failed to parse SSE event:', err);
+                    }
+                };
+
+                es.onerror = () => {
+                    if (this.ctxBenchRunning) {
+                        this.ctxBenchError = window.t('js.error.benchmark_connection_lost');
+                        this.ctxBenchRunning = false;
+                        this.ctxBenchProgress = null;
+                    }
+                    es.close();
+                    this.ctxBenchEventSource = null;
+                };
+            },
+
+            async cancelContextBenchmark() {
+                if (!this.ctxBenchBenchId) return;
+                try {
+                    await fetch(`/admin/api/bench/context/${this.ctxBenchBenchId}/cancel`, { method: 'POST' });
+                } catch (err) {
+                    console.error('Failed to cancel context benchmark:', err);
+                }
+                // SSE handler will update state when the error event arrives
+            },
+
+            async loadCtxBenchState() {
+                // Attach to an in-flight context bench (page refresh, other tab).
+                try {
+                    const resp = await fetch('/admin/api/bench/context/active');
+                    if (!resp.ok) return;
+                    const data = await resp.json();
+                    if (!data.running || !data.bench_id) return;
+                    if (this.ctxBenchBenchId === data.bench_id && this.ctxBenchEventSource) {
+                        return;
+                    }
+                    this.ctxBenchBenchId = data.bench_id;
+                    this.ctxBenchModelId = data.model_id;
+                    if (data.target_tokens) this.ctxBenchTarget = data.target_tokens;
+                    this.ctxBenchRunning = true;
+                    this.ctxBenchResult = null;
+                    this.ctxBenchError = '';
+                    this.connectContextBenchSSE(data.bench_id);
+                } catch (err) {
+                    console.error('Failed to load context bench state:', err);
+                }
+            },
+
+            ctxBenchCappedByLabel() {
+                const capped = this.ctxBenchResult?.capped_by;
+                if (capped === 'target') return window.t('ctx_bench.capped.target');
+                if (capped === 'native') return window.t('ctx_bench.capped.native');
+                return window.t('ctx_bench.capped.memory');
+            },
+
+            // Native context length of the selected bench model (0 = unknown).
+            ctxBenchNativeLimit() {
+                const m = this.models.find(m => m.id === this.ctxBenchModelId);
+                return (m && m.model_context_length) || 0;
+            },
+
+            // Target presets the selected model can actually reach. Unknown
+            // native -> full list; native below the smallest preset -> keep
+            // the smallest (the server caps the search at native anyway).
+            ctxBenchTargetOptions() {
+                const all = [16384, 32768, 65536, 131072, 262144, 524288];
+                const native = this.ctxBenchNativeLimit();
+                if (!native) return all;
+                const filtered = all.filter(t => t <= native);
+                return filtered.length ? filtered : [all[0]];
+            },
+
+            // Keep the selected target inside the model's reachable presets.
+            ctxBenchClampTarget() {
+                const options = this.ctxBenchTargetOptions();
+                if (!options.includes(this.ctxBenchTarget)) {
+                    this.ctxBenchTarget = options[options.length - 1];
+                }
+            },
+
+            // Narrow-patch save of the global Prefill Priority setting from
+            // the bench tab (mirrors the Settings row; applied live server-side).
+            async saveCtxBenchPriority(value) {
+                if (this.ctxBenchRunning) return;
+                const prev = this.globalSettings.scheduler.prefill_priority;
+                if (prev === value) return;
+                this.globalSettings.scheduler.prefill_priority = value;
+                try {
+                    const resp = await fetch('/admin/api/global-settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ prefill_priority: value }),
+                    });
+                    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                } catch (err) {
+                    console.error('Failed to save prefill priority:', err);
+                    this.globalSettings.scheduler.prefill_priority = prev;
+                    this.ctxBenchError = window.t('js.error.save_prefill_priority_failed');
+                }
+            },
+
             benchGetSpeedup(batchResult) {
-                const baseline = this.benchSingleResults.find(r => r.pp === 1024);
-                if (!baseline || !baseline.gen_tps || baseline.gen_tps <= 0) return 0;
+                const baseline = this.benchFindSingle(1024);
+                if (!baseline || !baseline.gen_tps || baseline.gen_tps <= 0) return null;
+                if (batchResult.tg_tps === null || batchResult.tg_tps === undefined) return null;
                 return batchResult.tg_tps / baseline.gen_tps;
+            },
+
+            benchRequestedPp(result) {
+                return result?.requested_pp ?? result?.pp;
+            },
+
+            benchFindSingle(requestedPp) {
+                return this.benchSingleResults.find(
+                    r => this.benchRequestedPp(r) === requestedPp
+                );
+            },
+
+            benchSingleTestLabel(result) {
+                const requested = this.benchRequestedPp(result);
+                const actual = result?.pp;
+                if (requested !== actual) {
+                    return window.t('bench.results.test.requested')
+                        .replace('{actual}', actual)
+                        .replace('{requested}', requested)
+                        .replace('{tg}', result.tg);
+                }
+                return window.t('bench.results.test.plain')
+                    .replace('{actual}', actual)
+                    .replace('{tg}', result.tg);
+            },
+
+            benchBatchPromptSummary() {
+                const result = this.benchBatchResults[0];
+                if (!result || result.requested_pp === undefined) {
+                    return window.t('bench.results.batch.subtitle');
+                }
+                const requested = result.requested_pp;
+                const minimum = result.prompt_tokens_min ?? result.pp;
+                const maximum = result.prompt_tokens_max ?? result.pp;
+                const actual = minimum === maximum
+                    ? window.t('bench.results.batch.actual_pp').replace('{pp}', minimum)
+                    : window.t('bench.results.batch.actual_pp_range')
+                        .replace('{min}', minimum)
+                        .replace('{max}', maximum);
+                return window.t('bench.results.batch.requested_summary')
+                    .replace('{requested}', requested)
+                    .replace('{actual}', actual)
+                    .replace('{tg}', result.tg);
+            },
+
+            // Unmeasured metrics (tpot_ms/gen_tps/tg_tps, plus ttft/pp when
+            // no content delta was ever observed) come through as null
+            // rather than a misleading 0.0 — render them as N/A.
+            benchFmtNum(value, decimals, suffix = '') {
+                if (value === null || value === undefined) return 'N/A';
+                return value.toFixed(decimals) + suffix;
+            },
+
+            // Per-request pp TPS, null when the aggregate itself is unmeasured.
+            benchPpPerReq(batchResult) {
+                const pp = batchResult.pp_tps;
+                if (pp === null || pp === undefined) return null;
+                return pp / batchResult.batch_size;
             },
 
             benchFormatMemory(bytes) {
@@ -2629,25 +4827,47 @@
                 const rpad = (s, w) => s.toString().padEnd(w);
                 let lines = [];
 
-                lines.push('oMLX - LLM inference, optimized for your Mac');
+                lines.push(
+                    window.t('bench.results.text_export.title')
+                        .replace('{tagline}', window.t('app.tagline'))
+                );
                 lines.push('https://github.com/jundot/omlx');
-                lines.push(`Benchmark Model: ${this.benchModelId}`);
+                if (this.benchRunExternal) {
+                    lines.push(
+                        window.t('bench.results.text_export.benchmark_model_endpoint')
+                            .replace('{model}', () => this.benchRunExternal.model)
+                            .replace('{url}', () => this.benchRunExternal.base_url)
+                    );
+                    lines.push(window.t('bench.results.text_export.engine_external'));
+                } else {
+                    lines.push(
+                        window.t('bench.results.text_export.benchmark_model')
+                            .replace('{model}', () => this.benchModelId)
+                    );
+                    lines.push(this.benchForceLmEngine
+                        ? window.t('bench.results.text_export.engine_force_lm')
+                        : window.t('bench.results.text_export.engine_auto'));
+                }
+                lines.push(
+                    window.t('bench.results.text_export.context')
+                        .replace('{context}', this.benchContextLabel(this.benchContextProfile))
+                );
                 lines.push('='.repeat(80));
 
                 // Single Request Results
                 if (this.benchSingleResults.length > 0) {
                     lines.push('');
-                    lines.push('Single Request Results');
+                    lines.push(window.t('bench.results.single.section_label'));
                     lines.push('-'.repeat(80));
-                    const hdr = [rpad('Test', 16), pad('TTFT(ms)', 10), pad('TPOT(ms)', 10), pad('pp TPS', 12), pad('tg TPS', 12), pad('E2E(s)', 10), pad('Throughput', 12), pad('Peak Mem', 10)];
+                    const hdr = [rpad(window.t('bench.results.single.test'), 32), pad('TTFT(ms)', 10), pad('TPOT(ms)', 10), pad('pp TPS', 12), pad('tg TPS', 12), pad('E2E(s)', 10), pad(window.t('bench.results.single.throughput'), 12), pad(window.t('bench.results.single.peak_mem'), 10)];
                     lines.push(hdr.join('  '));
                     for (const r of this.benchSingleResults) {
                         const row = [
-                            rpad(`pp${r.pp}/tg${r.tg}`, 16),
-                            pad(r.ttft_ms.toFixed(1), 10),
-                            pad(r.tpot_ms.toFixed(2), 10),
-                            pad(r.processing_tps.toFixed(1) + ' tok/s', 12),
-                            pad(r.gen_tps.toFixed(1) + ' tok/s', 12),
+                            rpad(this.benchSingleTestLabel(r), 32),
+                            pad(this.benchFmtNum(r.ttft_ms, 1), 10),
+                            pad(this.benchFmtNum(r.tpot_ms, 2), 10),
+                            pad(this.benchFmtNum(r.processing_tps, 1, ' tok/s'), 12),
+                            pad(this.benchFmtNum(r.gen_tps, 1, ' tok/s'), 12),
                             pad(r.e2e_latency_s.toFixed(3), 10),
                             pad(r.total_throughput.toFixed(1) + ' tok/s', 12),
                             pad(this.benchFormatMemory(r.peak_memory_bytes), 10),
@@ -2659,34 +4879,34 @@
                 // Helper for batch table text
                 const buildBatchText = (title, subtitle, results) => {
                     if (results.length === 0) return;
-                    const baseline = this.benchSingleResults.find(r => r.pp === 1024);
+                    const baseline = this.benchFindSingle(1024);
                     lines.push('');
                     lines.push(`${title}`);
                     lines.push(subtitle);
                     lines.push('-'.repeat(80));
-                    const hdr = [rpad('Batch', 8), pad('tg TPS', 12), pad('Speedup', 8), pad('pp TPS', 12), pad('pp TPS/req', 12), pad('TTFT(ms)', 10), pad('E2E(s)', 10)];
+                    const hdr = [rpad(window.t('bench.results.text_export.batch'), 8), pad('tg TPS', 12), pad(window.t('bench.results.batch.speedup'), 8), pad('pp TPS', 12), pad('pp TPS/req', 12), pad('TTFT(ms)', 10), pad('E2E(s)', 10)];
                     lines.push(hdr.join('  '));
                     if (baseline) {
                         const row = [
                             rpad('1x', 8),
-                            pad(baseline.gen_tps.toFixed(1) + ' tok/s', 12),
+                            pad(this.benchFmtNum(baseline.gen_tps, 1, ' tok/s'), 12),
                             pad('1.00x', 8),
-                            pad(baseline.processing_tps.toFixed(1) + ' tok/s', 12),
-                            pad(baseline.processing_tps.toFixed(1) + ' tok/s', 12),
-                            pad(baseline.ttft_ms.toFixed(1), 10),
+                            pad(this.benchFmtNum(baseline.processing_tps, 1, ' tok/s'), 12),
+                            pad(this.benchFmtNum(baseline.processing_tps, 1, ' tok/s'), 12),
+                            pad(this.benchFmtNum(baseline.ttft_ms, 1), 10),
                             pad(baseline.e2e_latency_s.toFixed(3), 10),
                         ];
                         lines.push(row.join('  '));
                     }
                     for (const r of results) {
-                        const speedup = baseline && baseline.gen_tps > 0 ? (r.tg_tps / baseline.gen_tps).toFixed(2) + 'x' : '-';
+                        const speedup = this.benchGetSpeedup(r);
                         const row = [
                             rpad(r.batch_size + 'x', 8),
-                            pad(r.tg_tps.toFixed(1) + ' tok/s', 12),
-                            pad(speedup, 8),
-                            pad(r.pp_tps.toFixed(1) + ' tok/s', 12),
-                            pad((r.pp_tps / r.batch_size).toFixed(1) + ' tok/s', 12),
-                            pad(r.avg_ttft_ms.toFixed(1), 10),
+                            pad(this.benchFmtNum(r.tg_tps, 1, ' tok/s'), 12),
+                            pad(speedup !== null ? speedup.toFixed(2) + 'x' : window.t('bench.results.text_export.not_available'), 8),
+                            pad(this.benchFmtNum(r.pp_tps, 1, ' tok/s'), 12),
+                            pad(this.benchFmtNum(this.benchPpPerReq(r), 1, ' tok/s'), 12),
+                            pad(this.benchFmtNum(r.avg_ttft_ms, 1), 10),
                             pad(r.e2e_latency_s.toFixed(3), 10),
                         ];
                         lines.push(row.join('  '));
@@ -2694,8 +4914,8 @@
                 };
 
                 buildBatchText(
-                    'Continuous Batching',
-                    'pp1024 / tg128',
+                    window.t('bench.results.batch.title'),
+                    this.benchBatchPromptSummary(),
                     this.benchBatchResults
                 );
 
@@ -2769,19 +4989,54 @@
                         this.benchOtherActive = {
                             bench_id: data.bench_id,
                             model_id: data.model_id,
+                            context_profile: data.context_profile || 'code_python',
+                            force_lm_engine: !!data.force_lm_engine,
+                            external: !!data.external,
                         };
                         return;
                     }
 
                     // Fresh slate: attach.
                     this.benchBenchId = data.bench_id;
-                    this.benchModelId = data.model_id;
+                    this._restoreBenchRunSource(data);
                     this.benchRunning = true;
                     this.benchOtherActive = null;
                     this.connectBenchSSE(data.bench_id);
                 } catch (err) {
                     console.error('Failed to load bench state:', err);
                 }
+            },
+
+            // Restore the config UI from an active run discovered via
+            // /api/bench/active. External model ids aren't in the local
+            // dropdown, so the external flag drives which controls light up.
+            _restoreBenchRunSource(data) {
+                this.benchContextProfile = data.context_profile || 'code_python';
+                if (data.external) {
+                    this.benchExternalEnabled = true;
+                    this.benchRunExternal = {
+                        // base_url is intentionally not exposed by the API;
+                        // fall back to this browser's stored setting.
+                        base_url: this.externalBaseUrl.trim(),
+                        model: data.model_id,
+                    };
+                } else {
+                    this.benchModelId = data.model_id;
+                    this.benchForceLmEngine = !!data.force_lm_engine;
+                    this.benchExternalEnabled = false;
+                    this.benchRunExternal = null;
+                }
+            },
+
+            benchContextLabel(profile) {
+                const keys = {
+                    code_python: 'bench.config.context.code_python',
+                    code_mixed: 'bench.config.context.code_mixed',
+                    novel_ko: 'bench.config.context.novel_ko',
+                    novel_en: 'bench.config.context.novel_en',
+                    novel_ja: 'bench.config.context.novel_ja',
+                };
+                return window.t(keys[profile] || keys.code_python);
             },
 
             // User clicked "View live" on the banner — clear the stale
@@ -2793,13 +5048,14 @@
                 const other = this.benchOtherActive;
                 this.benchOtherActive = null;
                 this.benchBenchId = other.bench_id;
-                this.benchModelId = other.model_id;
+                this._restoreBenchRunSource(other);
                 this.benchRunning = true;
                 this.benchSingleResults = [];
                 this.benchBatchResults = [];
                 this.benchUploadResults = [];
                 this.benchUploadDone = null;
                 this.benchUploadSkipped = null;
+                this.benchUploadFlags = [];
                 this.benchProgress = null;
                 this.benchError = '';
                 this.connectBenchSSE(other.bench_id);
@@ -2821,6 +5077,13 @@
                 if (tab === 'throughput') {
                     this.loadBenchDeviceInfo();
                     this.loadBenchState();
+                }
+                if (tab === 'context') {
+                    this.loadCtxBenchState();
+                    // The priority segment mirrors the global setting —
+                    // refresh in case it changed on the Settings tab or in
+                    // another window.
+                    this.loadGlobalSettings();
                 }
             },
 
@@ -2868,7 +5131,21 @@
             },
 
             async addToAccQueue() {
-                if (!this.accModelId) return;
+                let externalRequest = null;
+                if (this.accExternalEnabled) {
+                    if (!this.externalConfigValid()) {
+                        this.accError = window.t('js.error.external_endpoint_required');
+                        return;
+                    }
+                    try {
+                        externalRequest = this.accuracyExternalRequestBody();
+                    } catch (err) {
+                        this.accError = err.message;
+                        return;
+                    }
+                } else if (!this.accModelId) {
+                    return;
+                }
                 const selected = Object.entries(this.accBenchmarks)
                     .filter(([_, v]) => v)
                     .map(([k]) => k);
@@ -2881,17 +5158,19 @@
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
-                            model_id: this.accModelId,
+                            model_id: this.accExternalEnabled ? this.externalModel.trim() : this.accModelId,
                             benchmarks: Object.fromEntries(
                                 selected.map(k => [k, this.accSampleSizes[k]])
                             ),
                             batch_size: this.accBatchSize,
-                            enable_thinking: this.accEnableThinking,
+                            enable_thinking: this.accExternalEnabled ? false : this.accEnableThinking,
+                            sampling_profile: this.accSamplingProfile,
+                            external: externalRequest,
                         }),
                     });
                     if (!resp.ok) {
                         const err = await resp.json();
-                        throw new Error(err.detail || 'Failed to add to queue');
+                        throw new Error(err.detail || window.t('js.error.add_to_queue_failed'));
                     }
                     const data = await resp.json();
                     this.accQueue = data.queue || [];
@@ -2946,6 +5225,22 @@
                                     if (!exists) {
                                         data.data._showCategories = false;
                                         this.accAllResults.push(data.data);
+                                    }
+                                }
+                                break;
+                            case 'upload':
+                                // Community upload outcome for one suite. Idempotent
+                                // on replay: keyed to the same (model_id, benchmark)
+                                // as its result card. Array reassign for reactivity.
+                                {
+                                    const idx = this.accAllResults.findIndex(
+                                        r => r.model_id === data.data.model_id
+                                          && r.benchmark === data.data.benchmark
+                                    );
+                                    if (idx >= 0) {
+                                        const updated = { ...this.accAllResults[idx], upload: data.data };
+                                        this.accAllResults.splice(idx, 1, updated);
+                                        this.accAllResults = [...this.accAllResults];
                                     }
                                 }
                                 break;
@@ -3047,6 +5342,16 @@
                 }
             },
 
+            accLocalTruncationLine(r) {
+                return window.t('acc_bench.results.text_export.local_truncation_line')
+                    .replace('{truncated}', r.truncated_count)
+                    .replace('{total}', r.total)
+                    .replace('{truncated_correct}', r.truncated_correct_count)
+                    .replace('{accuracy}', r.finished_accuracy == null
+                        ? '—' : (r.finished_accuracy * 100).toFixed(1) + '%')
+                    .replace('{finished}', r.finished_count);
+            },
+
             accBuildText() {
                 if (this.accAllResults.length === 0) return '';
                 const pad = (s, w) => s.toString().padStart(w);
@@ -3076,11 +5381,11 @@
                 const benchWidth = Math.max(14, ...benchmarks.map(b => b.length + 2));
 
                 let lines = [];
-                lines.push('Intelligence Benchmark Comparison');
+                lines.push(window.t('acc_bench.results.comparison_title'));
                 lines.push('');
 
                 // Header row
-                let header = rpad('', benchWidth) + rpad('Mode', modeW) + rpad('Sampled', sampledW);
+                let header = rpad('', benchWidth) + rpad(window.t('acc_bench.results.text_export.mode'), modeW) + rpad(window.t('acc_bench.results.text_export.sampled'), sampledW);
                 for (const m of models) header += pad(m, modelWidth);
                 lines.push(header);
                 lines.push('-'.repeat(benchWidth + modeW + sampledW + models.length * modelWidth));
@@ -3092,7 +5397,9 @@
                     const total = sample?.total || 0;
                     const full = fullSizes[b] || 0;
                     const isFull = total >= full;
-                    const mode = isFull ? 'Full' : 'Sample';
+                    const mode = isFull
+                        ? window.t('acc_bench.results.text_export.full')
+                        : window.t('acc_bench.results.text_export.sample');
                     const sampledStr = isFull ? String(full) : (total + '/' + full);
 
                     let row = rpad(b.toUpperCase(), benchWidth) + rpad(mode, modeW) + rpad(sampledStr, sampledW);
@@ -3105,11 +5412,14 @@
 
                 // Detail section per model
                 lines.push('');
-                lines.push('--- Detail ---');
+                lines.push(window.t('acc_bench.results.text_export.detail'));
                 for (const m of models) {
                     lines.push('');
-                    lines.push('Model: ' + m);
-                    lines.push(rpad('Benchmark', 16) + pad('Accuracy', 10) + pad('Correct', 10) + pad('Total', 8) + pad('Time(s)', 10) + pad('Think', 8));
+                    lines.push(
+                        window.t('acc_bench.results.text_export.model')
+                            .replace('{model}', () => m)
+                    );
+                    lines.push(rpad(window.t('acc_bench.results.text_export.benchmark'), 16) + pad(window.t('acc_bench.results.text_export.accuracy'), 10) + pad(window.t('acc_bench.results.text_export.correct'), 10) + pad(window.t('acc_bench.results.text_export.total'), 8) + pad('Time(s)', 10) + pad(window.t('acc_bench.results.text_export.think'), 8));
                     lines.push('-'.repeat(62));
                     for (const r of this.accAllResults.filter(r => r.model_id === m)) {
                         lines.push(
@@ -3118,8 +5428,28 @@
                             pad(r.correct, 10) +
                             pad(r.total, 8) +
                             pad(r.time_s, 10) +
-                            pad(r.thinking_used ? 'Yes' : 'No', 8)
+                            pad(r.thinking_used
+                                ? window.t('acc_bench.results.text_export.yes')
+                                : window.t('acc_bench.results.text_export.no'), 8)
                         );
+                        if (r.external) {
+                            lines.push(
+                                window.t('acc_bench.results.text_export.external_detail')
+                                    .replace('{valid}', r.valid_response_count)
+                                    .replace('{total}', r.total)
+                                    .replace('{rate}', (r.valid_response_rate * 100).toFixed(1))
+                                    .replace('{accuracy}', (r.valid_answer_accuracy * 100).toFixed(1))
+                                    .replace('{empty}', r.empty_content_count)
+                                    .replace('{truncated}', r.truncated_count)
+                                    .replace('{timeout}', r.timeout_count)
+                                    .replace('{http}', r.http_error_count)
+                                    .replace('{connection}', r.connection_error_count)
+                                    .replace('{invalid}', r.invalid_response_count)
+                                    .replace('{parse}', r.parse_error_count)
+                            );
+                        } else if (r.truncated_count > 0) {
+                            lines.push('  ' + this.accLocalTruncationLine(r));
+                        }
                     }
                 }
 
@@ -3149,7 +5479,7 @@
                 const qr = r.question_results || [];
 
                 if (format === 'json') {
-                    content = JSON.stringify({
+                    const exportData = {
                         model_id: r.model_id,
                         benchmark: r.benchmark,
                         accuracy: r.accuracy,
@@ -3159,32 +5489,139 @@
                         thinking_used: r.thinking_used || false,
                         category_scores: r.category_scores || null,
                         questions: qr,
-                    }, null, 2);
+                    };
+                    if (r.external) {
+                        Object.assign(exportData, {
+                            valid_response_count: r.valid_response_count,
+                            empty_content_count: r.empty_content_count,
+                            truncated_count: r.truncated_count,
+                            timeout_count: r.timeout_count,
+                            http_error_count: r.http_error_count,
+                            connection_error_count: r.connection_error_count,
+                            invalid_response_count: r.invalid_response_count,
+                            parse_error_count: r.parse_error_count,
+                            wrong_count: r.wrong_count,
+                            valid_response_rate: r.valid_response_rate,
+                            valid_answer_accuracy: r.valid_answer_accuracy,
+                            reliability_warning: r.reliability_warning,
+                        });
+                    } else if (r.truncated_count !== undefined) {
+                        Object.assign(exportData, {
+                            truncated_count: r.truncated_count,
+                            truncated_correct_count: r.truncated_correct_count,
+                            finished_count: r.finished_count,
+                            finished_accuracy: r.finished_accuracy,
+                        });
+                    }
+                    content = JSON.stringify(exportData, null, 2);
                     mime = 'application/json';
                 } else if (format === 'csv') {
                     const esc = s => '"' + (s || '').replace(/"/g, '""') + '"';
-                    const lines = ['id,category,correct,expected,predicted,question,raw_response,time_s'];
+                    const lines = [r.external
+                        ? 'id,category,status,correct,expected,predicted,finish_reason,reasoning_fields,prompt_tokens,completion_tokens,error_message,question,raw_response,time_s'
+                        : 'id,category,correct,expected,predicted,question,raw_response,time_s,finish_reason,completion_tokens'];
                     for (const q of qr) {
-                        lines.push([q.id, esc(q.category || ''), q.correct, esc(q.expected), esc(q.predicted), esc(q.question), esc(q.raw_response), q.time_s].join(','));
+                        if (r.external) {
+                            lines.push([
+                                q.id, esc(q.category || ''), esc(q.status || ''), q.correct,
+                                esc(q.expected), esc(q.predicted), esc(q.finish_reason || ''),
+                                esc((q.reasoning_fields_nonempty || []).join('|')),
+                                q.prompt_tokens || 0, q.completion_tokens || 0,
+                                esc(q.error_message || ''), esc(q.question),
+                                esc(q.raw_response), q.time_s,
+                            ].join(','));
+                        } else {
+                            lines.push([q.id, esc(q.category || ''), q.correct, esc(q.expected), esc(q.predicted), esc(q.question), esc(q.raw_response), q.time_s, esc(q.finish_reason || ''), q.completion_tokens ?? ''].join(','));
+                        }
                     }
                     content = lines.join('\n');
                     mime = 'text/csv';
                 } else {
                     const lines = [
-                        `Model: ${r.model_id}`,
-                        `Benchmark: ${r.benchmark.toUpperCase()}`,
-                        `Accuracy: ${(r.accuracy * 100).toFixed(1)}% (${r.correct}/${r.total})`,
-                        `Time: ${r.time_s}s`,
+                        window.t('acc_bench.results.text_export.model')
+                            .replace('{model}', () => r.model_id),
+                        window.t('acc_bench.results.text_export.benchmark_line')
+                            .replace('{benchmark}', () => r.benchmark.toUpperCase()),
+                        window.t('acc_bench.results.text_export.accuracy_line')
+                            .replace('{accuracy}', (r.accuracy * 100).toFixed(1))
+                            .replace('{correct}', r.correct)
+                            .replace('{total}', r.total),
+                        window.t('acc_bench.results.text_export.time_line')
+                            .replace('{seconds}', r.time_s),
                         '',
                     ];
+                    if (r.external) {
+                        lines.splice(4, 0,
+                            window.t('acc_bench.results.text_export.valid_responses_line')
+                                .replace('{valid}', r.valid_response_count)
+                                .replace('{total}', r.total)
+                                .replace('{rate}', (r.valid_response_rate * 100).toFixed(1)),
+                            window.t('acc_bench.results.text_export.valid_answer_accuracy_line')
+                                .replace('{accuracy}', (r.valid_answer_accuracy * 100).toFixed(1)),
+                            window.t('acc_bench.results.text_export.external_summary')
+                                .replace('{empty}', r.empty_content_count)
+                                .replace('{truncated}', r.truncated_count)
+                                .replace('{timeout}', r.timeout_count)
+                                .replace('{http}', r.http_error_count)
+                                .replace('{connection}', r.connection_error_count)
+                                .replace('{invalid}', r.invalid_response_count)
+                                .replace('{parse}', r.parse_error_count)
+                        );
+                    } else if (r.truncated_count > 0) {
+                        lines.splice(4, 0, this.accLocalTruncationLine(r));
+                    }
                     for (const q of qr) {
-                        lines.push(`--- Q${q.id} [${q.correct ? 'CORRECT' : 'WRONG'}] ---`);
-                        if (q.category) lines.push(`Category: ${q.category}`);
-                        lines.push(`Question: ${q.question || ''}`);
-                        lines.push(`Expected: ${q.expected}`);
-                        lines.push(`Predicted: ${q.predicted}`);
-                        lines.push(`Raw response: ${q.raw_response || '(empty)'}`);
-                        lines.push(`Time: ${q.time_s}s`);
+                        const label = r.external ? (q.status || 'invalid_response').toUpperCase() : (q.correct ? 'CORRECT' : 'WRONG');
+                        lines.push(
+                            window.t('acc_bench.results.text_export.question_header')
+                                .replace('{id}', q.id)
+                                .replace('{label}', () => label)
+                        );
+                        if (q.category) {
+                            lines.push(
+                                window.t('acc_bench.results.text_export.category_line')
+                                    .replace('{category}', () => q.category)
+                            );
+                        }
+                        if (q.finish_reason && (r.external || q.finish_reason !== 'stop')) {
+                            lines.push(
+                                window.t('acc_bench.results.text_export.finish_reason_line')
+                                    .replace('{reason}', () => q.finish_reason)
+                            );
+                        }
+                        if (r.external && (q.reasoning_fields_nonempty || []).length) {
+                            lines.push(
+                                window.t('acc_bench.results.text_export.reasoning_fields_line')
+                                    .replace('{fields}', () => q.reasoning_fields_nonempty.join(', '))
+                            );
+                        }
+                        if (r.external && q.error_message) {
+                            lines.push(
+                                window.t('acc_bench.results.text_export.error_line')
+                                    .replace('{error}', () => q.error_message)
+                            );
+                        }
+                        lines.push(
+                            window.t('acc_bench.results.text_export.question_line')
+                                .replace('{question}', () => q.question || '')
+                        );
+                        lines.push(
+                            window.t('acc_bench.results.text_export.expected_line')
+                                .replace('{expected}', () => q.expected)
+                        );
+                        lines.push(
+                            window.t('acc_bench.results.text_export.predicted_line')
+                                .replace('{predicted}', () => q.predicted)
+                        );
+                        lines.push(
+                            window.t('acc_bench.results.text_export.raw_response_line')
+                                .replace('{response}', () => q.raw_response
+                                    || window.t('acc_bench.results.text_export.empty_value'))
+                        );
+                        lines.push(
+                            window.t('acc_bench.results.text_export.time_line')
+                                .replace('{seconds}', q.time_s)
+                        );
                         lines.push('');
                     }
                     content = lines.join('\n');
@@ -3218,9 +5655,11 @@
                 const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
                 const idx = LEVELS.indexOf(lvl);
                 const minIdx = LEVELS.indexOf(this.logMinLevel);
+                // Levels at or above the minimum are all shown dark so the
+                // included range is obvious; the selected minimum keeps the ring.
                 if (idx < minIdx) return 'bg-neutral-100 text-neutral-300';
                 if (idx === minIdx) return 'bg-neutral-900 text-white';
-                return 'bg-neutral-200 text-neutral-700';
+                return 'bg-neutral-700 text-white';
             },
 
             async loadLogs() {
@@ -3335,8 +5774,8 @@
             // Memory guard tier → live hard ceiling (GB) for the selected tier.
             // Mirrors ProcessMemoryEnforcer._get_hard_limit_bytes:
             //   static_ceiling  = total - tier.static_reserve
-            //   dynamic_ceiling = omlx_phys_footprint + system_available - tier.other_app_reserve
-            //   final = min(static, dynamic)
+            //   dynamic_ceiling = omlx_phys + free + inactive + active * ratio
+            //   final = min(static, dynamic, metal_cap)
             // The static / dynamic inputs come from the global-settings
             // response and reflect the moment that response was fetched.
             // Warning shown below the breakdown when the kernel
@@ -3397,12 +5836,10 @@
             },
 
             // Description text shown next to the Memory guard tier dropdown.
-            // safe / balanced / aggressive get a "free + inactive + N% of
-            // active (via macOS reclaim_method)" sentence. custom shows the
-            // user-supplied ceiling.
+            // Each tier says how much memory it leaves for other apps; the
+            // server computes it (ProcessMemoryEnforcer) for this Mac.
             get memoryGuardTierDescription() {
                 const tier = this.globalSettings.memory?.memory_guard_tier || 'balanced';
-                const tierLabel = window.t('settings.resource.guard_tier.' + tier);
                 if (tier === 'custom') {
                     const gb = Number(
                         this.globalSettings.memory?.memory_guard_custom_ceiling_gb || 0
@@ -3411,83 +5848,54 @@
                         .t('settings.resource.guard_tier.description_custom')
                         .replace('{custom_gb}', gb);
                 }
-                const pct = { safe: 20, balanced: 50, aggressive: 80 }[tier] ?? 50;
-                const method = window.t(
-                    'settings.resource.guard_tier.reclaim_method.' + tier
-                );
+                const preview = this.globalSettings.system?.memory_guard_preview?.[tier];
+                const reserveGB = Number((preview?.reserve_bytes || 0) / 1024 ** 3).toFixed(1);
                 return window
-                    .t('settings.resource.guard_tier.description_template')
-                    .replace('{tier}', tierLabel)
-                    .replace('{active_pct}', pct)
-                    .replace('{reclaim_method}', method);
+                    .t('settings.resource.guard_tier.description.' + tier)
+                    .replace('{reserve}', `${reserveGB} GB`);
             },
 
-            // Breakdown line. For ratio tiers: `Free X, inactive Y, active Z
-            // × N% = R → ceiling C`. For custom: `Custom ceiling X GB →
-            // effective ceiling C` (after clamp by static / metal cap).
+            // Breakdown line from the server preview. For reserve tiers:
+            // `Free X + inactive Y (+ Z of other apps' memory) - reserve R ->
+            // ceiling C`. For custom: `Custom ceiling X GB -> effective
+            // ceiling C` after the server's static / Metal clamp.
             get memoryGuardBreakdownHTML() {
                 const sys = this.globalSettings.system || {};
                 const GB = 1024 ** 3;
                 const tier = this.globalSettings.memory?.memory_guard_tier || 'balanced';
-                const fmt = (gb) => Number(gb).toFixed(1);
-                const bold = (gb) => `<strong>${fmt(gb)} GB</strong>`;
-
-                // Static / metal cap for the final clamp shown to the user.
-                const totalGB = (sys.total_memory_bytes || 0) / GB;
-                const staticReserveGB =
-                    totalGB < 16
-                        ? 4
-                        : { safe: 12, balanced: 8, aggressive: 6, custom: 8 }[tier] ?? 8;
-                const staticCeiling = Math.max(0, totalGB - staticReserveGB);
-                const metalCapGB = (sys.iogpu_wired_limit_bytes || 0) / GB;
-
-                // Helper: is the kernel iogpu.wired_limit_mb the smallest
-                // of the three candidates? When yes we swap "→ ceiling" for
-                // "/ effective ceiling X (kernel limit)" so the user knows
-                // why the value isn't what their tier math suggested.
-                const kernelBinds = (candidates, finalCeiling) =>
-                    metalCapGB > 0 &&
-                    Math.abs(metalCapGB - finalCeiling) < 1e-6 &&
-                    candidates.every((c) => c >= metalCapGB - 1e-6);
+                const preview = sys.memory_guard_preview?.[tier];
+                if (!preview) return '';
+                const bold = (bytes) => `<strong>${Number(bytes / GB).toFixed(1)} GB</strong>`;
 
                 if (tier === 'custom') {
-                    const custom = Number(
-                        this.globalSettings.memory?.memory_guard_custom_ceiling_gb || 0
-                    );
-                    const candidates = [custom, staticCeiling];
-                    if (metalCapGB > 0) candidates.push(metalCapGB);
-                    const ceiling = Math.max(0, Math.min(...candidates));
-                    const tmpl = kernelBinds([custom, staticCeiling], ceiling)
-                        ? 'settings.resource.guard_tier.breakdown_custom_kernel_limit'
-                        : 'settings.resource.guard_tier.breakdown_custom';
+                    const custom =
+                        Number(this.globalSettings.memory?.memory_guard_custom_ceiling_gb || 0) * GB;
+                    const limits = [preview.static_bytes, preview.metal_cap_bytes].filter((v) => v > 0);
+                    const ceiling = Math.max(0, Math.min(custom, ...limits));
+                    const kernelBinds =
+                        preview.metal_cap_bytes > 0 &&
+                        ceiling === preview.metal_cap_bytes &&
+                        ceiling < custom;
                     return window
-                        .t(tmpl)
+                        .t(
+                            kernelBinds
+                                ? 'settings.resource.guard_tier.breakdown_custom_kernel_limit'
+                                : 'settings.resource.guard_tier.breakdown_custom'
+                        )
                         .replace('{custom_gb}', bold(custom))
                         .replace('{ceiling}', bold(ceiling));
                 }
 
-                const freeGB = (sys.free_memory_bytes || 0) / GB;
-                const inactiveGB = (sys.inactive_memory_bytes || 0) / GB;
-                const activeGB = (sys.active_memory_bytes || 0) / GB;
-                const ratio = { safe: 0.2, balanced: 0.5, aggressive: 0.8 }[tier] ?? 0.5;
-                const pct = Math.round(ratio * 100);
-                const reclaim = activeGB * ratio;
-                const omlxGB = (sys.omlx_phys_footprint_bytes || 0) / GB;
-                const dynamicCeiling = omlxGB + freeGB + inactiveGB + reclaim;
-                const candidates = [dynamicCeiling, staticCeiling];
-                if (metalCapGB > 0) candidates.push(metalCapGB);
-                const ceiling = Math.max(0, Math.min(...candidates));
-                const tmpl = kernelBinds([dynamicCeiling, staticCeiling], ceiling)
+                const key = preview.binding === 'metal_cap'
                     ? 'settings.resource.guard_tier.breakdown_kernel_limit'
                     : 'settings.resource.guard_tier.breakdown';
                 return window
-                    .t(tmpl)
-                    .replace('{free}', bold(freeGB))
-                    .replace('{inactive}', bold(inactiveGB))
-                    .replace('{active}', bold(activeGB))
-                    .replace(/{active_pct}/g, pct)
-                    .replace('{reclaim}', bold(reclaim))
-                    .replace('{ceiling}', bold(ceiling));
+                    .t(key)
+                    .replace('{free}', bold(preview.free_bytes))
+                    .replace('{inactive}', bold(preview.inactive_bytes))
+                    .replace('{other}', bold(preview.other_apps_bytes))
+                    .replace('{reserve}', bold(preview.reserve_bytes))
+                    .replace('{ceiling}', bold(preview.ceiling_bytes));
             },
 
             // Computed hot cache size in GB (for manual input)
@@ -3522,7 +5930,10 @@
             // Computed cache size in GB (for manual input)
             get cacheSizeGB() {
                 const val = this.globalSettings.cache?.ssd_cache_max_size;
-                if (val && val !== 'auto') {
+                if (val === 'auto') {
+                    return Math.round((this.globalSettings.cache.ssd_cache_auto_size_bytes || 0) / 1024 ** 3);
+                }
+                if (val) {
                     const parsed = this._parseSettingsGB(val);
                     if (parsed !== null) return parsed;
                 }
@@ -3552,6 +5963,12 @@
             },
 
             // Parse hot cache size string to percent of total memory
+            normalizeHotCacheMaxSize(value) {
+                const normalized = String(value ?? '').trim();
+                if (!normalized || normalized.toLowerCase() === 'auto') return '0';
+                return normalized;
+            },
+
             parseHotCacheToPercent(hotCacheStr, totalBytes) {
                 if (!hotCacheStr || hotCacheStr === '0' || !totalBytes || totalBytes === 0) {
                     return 0;
@@ -3590,15 +6007,19 @@
                 return `${gb}GB`;
             },
 
-            // Sort models
+            // Filter + sort models
             get sortedModels() {
-                return [...this.models].sort((a, b) => {
+                return [...this.filterModelsByName(this.models, this.modelSearch)].sort((a, b) => {
+                    // Favorites always sort first, regardless of the active column.
+                    const favDiff = (b.is_favorite ? 1 : 0) - (a.is_favorite ? 1 : 0);
+                    if (favDiff !== 0) return favDiff;
+
                     let aVal, bVal;
 
                     switch (this.sortBy) {
                         case 'id':
-                            aVal = (a.id || '').toLowerCase();
-                            bVal = (b.id || '').toLowerCase();
+                            aVal = (a.display_name || a.id || '').toLowerCase();
+                            bVal = (b.display_name || b.id || '').toLowerCase();
                             break;
                         case 'type':
                             aVal = (a.model_type || 'llm').toLowerCase();
@@ -3620,6 +6041,10 @@
                             aVal = a.is_default ? 1 : 0;
                             bVal = b.is_default ? 1 : 0;
                             break;
+                        case 'is_hidden':
+                            aVal = a.is_hidden ? 1 : 0;
+                            bVal = b.is_hidden ? 1 : 0;
+                            break;
                         default:
                             return 0;
                     }
@@ -3637,13 +6062,130 @@
                     this.sortBy = column;
                     this.sortOrder = 'asc';
                 }
+                this.persistSort('omlx_models_sort_by', this.sortBy, 'omlx_models_sort_order', this.sortOrder);
+            },
+
+            resetSort() {
+                this.sortBy = MODELS_SORT_DEFAULT.by;
+                this.sortOrder = MODELS_SORT_DEFAULT.order;
+                try {
+                    localStorage.removeItem('omlx_models_sort_by');
+                    localStorage.removeItem('omlx_models_sort_order');
+                } catch (e) { /* storage disabled */ }
+            },
+
+            get isModelsSortDefault() {
+                return this.sortBy === MODELS_SORT_DEFAULT.by
+                    && this.sortOrder === MODELS_SORT_DEFAULT.order;
+            },
+
+            // ---- Manager (Browse Models > Local) filter + sort ----
+
+            // Cross-reference the richer /api/models entry (has model_type,
+            // settings) for a manager row keyed by its model name.
+            managerModelInfo(name) {
+                return this.models.find(m => m.id === name);
+            },
+
+            filterModelsByName(list, query) {
+                const q = (query || '').trim().toLowerCase();
+                if (!q) return list;
+                return list.filter(m => {
+                    const id = (m.id || m.name || '').toLowerCase();
+                    const display = (m.display_name || '').toLowerCase();
+                    const alias = (
+                        (m.settings && m.settings.model_alias)
+                        || (this.managerModelInfo(m.name) && this.managerModelInfo(m.name).settings
+                            && this.managerModelInfo(m.name).settings.model_alias)
+                        || ''
+                    ).toLowerCase();
+                    return id.includes(q) || display.includes(q) || alias.includes(q);
+                });
+            },
+
+            get sortedManagerModels() {
+                const list = this.filterModelsByName(this.hfModels, this.managerSearch);
+                return [...list].sort((a, b) => {
+                    // Favorites always sort first, regardless of the active column.
+                    const aFav = this.managerModelInfo(a.name)?.is_favorite ? 1 : 0;
+                    const bFav = this.managerModelInfo(b.name)?.is_favorite ? 1 : 0;
+                    if (aFav !== bFav) return bFav - aFav;
+
+                    let aVal, bVal;
+                    switch (this.managerSortBy) {
+                        case 'name':
+                            aVal = (a.display_name || a.name || '').toLowerCase();
+                            bVal = (b.display_name || b.name || '').toLowerCase();
+                            break;
+                        case 'type':
+                            aVal = (this.managerModelInfo(a.name)?.model_type || 'llm').toLowerCase();
+                            bVal = (this.managerModelInfo(b.name)?.model_type || 'llm').toLowerCase();
+                            break;
+                        case 'size':
+                            aVal = a.size || 0;
+                            bVal = b.size || 0;
+                            break;
+                        default:
+                            return 0;
+                    }
+                    if (aVal < bVal) return this.managerSortOrder === 'asc' ? -1 : 1;
+                    if (aVal > bVal) return this.managerSortOrder === 'asc' ? 1 : -1;
+                    return 0;
+                });
+            },
+
+            toggleManagerSort(column) {
+                if (this.managerSortBy === column) {
+                    this.managerSortOrder = this.managerSortOrder === 'asc' ? 'desc' : 'asc';
+                } else {
+                    this.managerSortBy = column;
+                    this.managerSortOrder = 'asc';
+                }
+                this.persistSort('omlx_manager_sort_by', this.managerSortBy, 'omlx_manager_sort_order', this.managerSortOrder);
+            },
+
+            resetManagerSort() {
+                this.managerSortBy = MANAGER_SORT_DEFAULT.by;
+                this.managerSortOrder = MANAGER_SORT_DEFAULT.order;
+                try {
+                    localStorage.removeItem('omlx_manager_sort_by');
+                    localStorage.removeItem('omlx_manager_sort_order');
+                } catch (e) { /* storage disabled */ }
+            },
+
+            get isManagerSortDefault() {
+                return this.managerSortBy === MANAGER_SORT_DEFAULT.by
+                    && this.managerSortOrder === MANAGER_SORT_DEFAULT.order;
+            },
+
+            persistSort(byKey, byVal, orderKey, orderVal) {
+                try {
+                    localStorage.setItem(byKey, byVal);
+                    localStorage.setItem(orderKey, orderVal);
+                } catch (e) { /* storage disabled */ }
+            },
+
+            // Deeplink from a manager row to that model's settings card (modal).
+            openModelSettingsFromManager(name) {
+                const model = this.managerModelInfo(name);
+                if (model) this.openModelSettings(model);
             },
 
             // Theme select
             setTheme(theme) {
                 this.theme = theme;
-                localStorage.setItem('omlx-chat-theme', this.theme);
+                localStorage.setItem(THEME_STORAGE_KEY, this.theme);
                 this.applyTheme();
+            },
+
+            setEnhancedReadability(enabled) {
+                this.enhancedReadability = enabled;
+                localStorage.setItem(ENHANCED_READABILITY_KEY, enabled ? 'on' : 'off');
+                if (enabled) {
+                    document.documentElement.setAttribute('data-enhanced-readability', '');
+                } else {
+                    document.documentElement.removeAttribute('data-enhanced-readability');
+                }
             },
 
             applyTheme() {
@@ -3696,7 +6238,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(Array.isArray(data.detail) ? data.detail.join(', ') : (data.detail || 'Failed to save'));
+                        alert(Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || window.t('js.error.save_failed')));
                     }
                 } catch (err) {
                     console.error('Failed to save HF mirror endpoint:', err);
@@ -3744,7 +6286,7 @@
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_timeout');
                     } else {
                         this.hfError = window.t('js.error.start_download_connection');
                     }
@@ -3822,7 +6364,7 @@
                         this.startHFRefresh();
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.hfError = data.detail || 'Retry failed';
+                        this.hfError = data.detail || window.t('js.error.retry_failed');
                         setTimeout(() => { this.hfError = ''; }, 5000);
                     }
                 } catch (err) {
@@ -3868,7 +6410,7 @@
                 this.stopHFRefresh();
                 this._hfRefreshTimer = setInterval(() => {
                     this.loadHFTasks();
-                }, 2000);
+                }, 500);
             },
 
             stopHFRefresh() {
@@ -3882,7 +6424,21 @@
                 const pct = Math.round(task.progress || 0);
                 const dlGB = (task.downloaded_size / (1024 ** 3)).toFixed(1);
                 const totalGB = (task.total_size / (1024 ** 3)).toFixed(1);
-                return `${pct}% \u00b7 ${dlGB} GB / ${totalGB} GB`;
+                const base = `${pct}% \u00b7 ${dlGB} GB / ${totalGB} GB`;
+                return `${base} \u00b7 ${this.formatSpeed(task)}`;
+            },
+
+            formatSpeed(task) {
+                const bps = task.speed_bps || 0;
+                const units = ['B/s', 'KB/s', 'MB/s', 'GB/s', 'TB/s'];
+                let value = bps;
+                let unit = 0;
+                while (value >= 1024 && unit < units.length - 1) {
+                    value /= 1024;
+                    unit += 1;
+                }
+                const digits = unit === 0 || value >= 100 ? 0 : 1;
+                return `${value.toFixed(digits)} ${units[unit]}`;
             },
 
             // =================================================================
@@ -3909,32 +6465,41 @@
                 this.oqSuccess = '';
                 this.oqStarting = true;
                 try {
+                    const payload = {
+                        model_path: this.oqSelectedModelPath,
+                        oq_level: this.oqLevel,
+                        group_size: 64,
+                        sensitivity_model_path: this.oqSensitivityModelPath,
+                        text_only: this.oqTextOnly,
+                        dtype: this.oqDtype,
+                        preserve_mtp: this.oqSelectedModelHasMtp() ? this.oqPreserveMtp : false,
+                        mtp_assistant_model_path: this.oqMtpAssistantCandidates().some(m => m.path === this.oqMtpAssistantPath)
+                            ? this.oqMtpAssistantPath : '',
+                    };
+                    if (this.oqEnhanced) {
+                        payload.enhanced = true;
+                        payload.imatrix_reuse_cache = this.oqeReuseImatrixCache;
+                        payload.imatrix_cache_path = this.oqeImatrixCachePath.trim();
+                        payload.imatrix_strict = this.oqeStrictImatrix;
+                    }
                     const response = await fetch('/admin/api/oq/start', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            model_path: this.oqSelectedModelPath,
-                            oq_level: this.oqLevel,
-                            group_size: 64,
-                            sensitivity_model_path: this.oqSensitivityModelPath,
-                            text_only: this.oqTextOnly,
-                            dtype: this.oqDtype,
-                            preserve_mtp: this.oqSelectedModelHasMtp() ? this.oqPreserveMtp : false,
-                        }),
+                        body: JSON.stringify(payload),
                     });
                     const data = await response.json().catch(() => ({}));
                     if (response.ok) {
                         const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                         const name = model ? model.name : this.oqSelectedModelPath;
-                        this.oqSuccess = `Quantization started: ${name} → oQ${this.oqLevel}`;
+                        this.oqSuccess = window.t('models.oq.quantization_started').replace('{name}', name).replace('{model}', 'oQ' + this.oqLevel + (this.oqEnhanced ? 'e' : ''));
                         await this.loadOQTasks();
                         this.startOQRefresh();
                         setTimeout(() => { this.oqSuccess = ''; }, 5000);
                     } else {
-                        this.oqError = data.detail || 'Failed to start quantization';
+                        this.oqError = data.detail || window.t('js.error.start_quantization_failed');
                     }
                 } catch (err) {
-                    this.oqError = 'Connection error. Server may be unavailable.';
+                    this.oqError = window.t('js.error.connection_error');
                 } finally {
                     this.oqStarting = false;
                 }
@@ -3996,7 +6561,8 @@
 
             formatOQProgress(task) {
                 const pct = Math.round(task.progress || 0);
-                return `${pct}% · ${task.phase || task.status}`;
+                const label = task.progress_detail || task.phase || task.status;
+                return `${pct}% · ${label}`;
             },
 
             formatOQElapsed(task) {
@@ -4017,6 +6583,60 @@
                     m.is_quantized &&
                     m.model_type === source.model_type
                 );
+            },
+
+            oqMtpAssistantCandidates() {
+                // Gemma 4 ships its MTP head as a separate gemma4_assistant
+                // checkpoint; offer to merge it into the quantized output.
+                // Qwen3.5/3.6 recipients can instead graft the native mtp.*
+                // head out of a same-geometry donor checkpoint (e.g. the
+                // base model of a fine-tune). Loose filter here; strict
+                // tokenizer/geometry validation happens server-side at
+                // submit.
+                if (!this.oqSelectedModelPath) return [];
+                const source = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                if (!source) return [];
+                if (source.model_type === 'gemma4') {
+                    return this.oqAllModels.filter(m => m.model_type === 'gemma4_assistant');
+                }
+                const family = this.oqMtpFamily(source.model_type);
+                if (!family) return [];
+                if (this.oqSelectedModelHasMtp() && this.oqPreserveMtp) return [];
+                return this.oqAllModels.filter(m =>
+                    m.path !== source.path &&
+                    m.has_mtp_heads &&
+                    this.oqMtpFamily(m.model_type) === family &&
+                    (!m.hidden_size || !source.hidden_size || m.hidden_size === source.hidden_size)
+                );
+            },
+
+            oqMtpFamily(modelType) {
+                if (!modelType) return null;
+                if (modelType.startsWith('qwen3_6')) return 'qwen3_6';
+                if (modelType.startsWith('qwen3_5')) return 'qwen3_5';
+                return null;
+            },
+
+            oqSelectedModelType() {
+                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                return model?.model_type || '';
+            },
+
+            oqAvailableLevels() {
+                return this.oqSelectedModelType() === 'deepseek_v41'
+                    ? [3, 4] : [2, 2.5, 2.7, 3, 3.5, 4, 5, 6, 8];
+            },
+
+            oqApplyModelPolicy() {
+                if (this.oqSelectedModelType() !== 'deepseek_v41') return;
+                if (!this.oqAvailableLevels().includes(this.oqLevel)) this.oqLevel = 4;
+                this.oqDtype = 'bfloat16';
+                this.oqTextOnly = false;
+                if (this.oqLevel === 4) this.oqSensitivityModelPath = '';
+            },
+
+            oqLevelLabel(level) {
+                return `oQ${level}${this.oqEnhanced ? 'e' : ''}`;
             },
 
             oqSelectedModelIsVLM() {
@@ -4111,7 +6731,7 @@
                         this.uploadTokenValidated = false;
                     }
                 } catch (err) {
-                    this.uploadError = 'Connection error. Server may be unavailable.';
+                    this.uploadError = window.t('js.error.connection_error');
                 } finally {
                     this.uploadTokenValidating = false;
                 }
@@ -4164,15 +6784,15 @@
                     const data = await response.json().catch(() => ({}));
                     if (response.ok) {
                         this.uploadModalOpen = false;
-                        this.uploadSuccess = `Upload queued: ${this.uploadModalModelName}`;
+                        this.uploadSuccess = window.t('models.uploader.upload_queued').replace('{name}', this.uploadModalModelName);
                         await this.loadUploadTasks();
                         this.startUploadRefresh();
                         setTimeout(() => { this.uploadSuccess = ''; }, 5000);
                     } else {
-                        this.uploadError = data.detail || 'Failed to start upload';
+                        this.uploadError = data.detail || window.t('js.error.start_upload_failed');
                     }
                 } catch (err) {
-                    this.uploadError = 'Connection error. Server may be unavailable.';
+                    this.uploadError = window.t('js.error.connection_error');
                 } finally {
                     this.uploadStarting = false;
                 }
@@ -4248,6 +6868,7 @@
                     const response = await fetch(`/admin/api/hf/recommended?mlx_only=${this.hfMlxOnly}`, { signal: controller.signal });
                     if (response.ok) {
                         const data = await response.json();
+                        this.hfTokenInvalid = !!data.hf_token_invalid;
                         // Attach original rank so the # column survives column-header re-sorts
                         this.hfRecommended = {
                             trending: (data.trending || []).map((m, i) => ({ ...m, rank: i + 1 })),
@@ -4263,14 +6884,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.hfError = data.detail || 'Failed to load recommended models';
+                        this.hfError = data.detail || window.t('js.error.load_recommended_failed');
                         setTimeout(() => { this.hfError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_timeout');
                     } else {
-                        this.hfError = 'Failed to connect to HuggingFace.';
+                        this.hfError = window.t('js.error.hf_connect_failed');
                     }
                     setTimeout(() => { this.hfError = ''; }, 5000);
                     console.error('Failed to load recommended models:', err);
@@ -4414,6 +7035,7 @@
                     const response = await fetch(`/admin/api/hf/search?${params}`, { signal: controller.signal });
                     if (response.ok) {
                         const data = await response.json();
+                        this.hfTokenInvalid = !!data.hf_token_invalid;
                         this.hfSearchResults = data.models || [];
                         this.hfSearchLoaded = true;
                         // Save to search history
@@ -4422,14 +7044,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.hfError = data.detail || 'Search failed';
+                        this.hfError = data.detail || window.t('js.error.search_failed');
                         setTimeout(() => { this.hfError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_timeout');
                     } else {
-                        this.hfError = 'Failed to connect to HuggingFace.';
+                        this.hfError = window.t('js.error.hf_connect_failed');
                     }
                     setTimeout(() => { this.hfError = ''; }, 5000);
                     console.error('Search failed:', err);
@@ -4500,14 +7122,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.hfError = data.detail || 'Failed to fetch model info';
+                        this.hfError = data.detail || window.t('js.error.fetch_model_info_failed');
                         setTimeout(() => { this.hfError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_timeout');
                     } else {
-                        this.hfError = 'Failed to connect to HuggingFace.';
+                        this.hfError = window.t('js.error.hf_connect_failed');
                     }
                     setTimeout(() => { this.hfError = ''; }, 5000);
                     console.error('Failed to fetch model info:', err);
@@ -4596,7 +7218,7 @@
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_timeout');
                     } else {
                         this.msError = window.t('js.error.start_download_connection');
                     }
@@ -4657,7 +7279,7 @@
                         this.startMSRefresh();
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.msError = data.detail || 'Retry failed';
+                        this.msError = data.detail || window.t('js.error.retry_failed');
                         setTimeout(() => { this.msError = ''; }, 5000);
                     }
                 } catch (err) {
@@ -4682,7 +7304,7 @@
                 this.stopMSRefresh();
                 this._msRefreshTimer = setInterval(() => {
                     this.loadMSTasks();
-                }, 2000);
+                }, 500);
             },
 
             stopMSRefresh() {
@@ -4714,14 +7336,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.msError = data.detail || 'Failed to load recommended models';
+                        this.msError = data.detail || window.t('js.error.load_recommended_failed');
                         setTimeout(() => { this.msError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_timeout');
                     } else {
-                        this.msError = 'Failed to connect to ModelScope.';
+                        this.msError = window.t('js.error.ms_connect_failed');
                     }
                     setTimeout(() => { this.msError = ''; }, 5000);
                     console.error('Failed to load MS recommended models:', err);
@@ -4779,14 +7401,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.msError = data.detail || 'Search failed';
+                        this.msError = data.detail || window.t('js.error.search_failed');
                         setTimeout(() => { this.msError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_timeout');
                     } else {
-                        this.msError = 'Failed to connect to ModelScope.';
+                        this.msError = window.t('js.error.ms_connect_failed');
                     }
                     setTimeout(() => { this.msError = ''; }, 5000);
                     console.error('MS search failed:', err);
@@ -4841,14 +7463,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.msError = data.detail || 'Failed to fetch model info';
+                        this.msError = data.detail || window.t('js.error.fetch_model_info_failed');
                         setTimeout(() => { this.msError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_timeout');
                     } else {
-                        this.msError = 'Failed to connect to ModelScope.';
+                        this.msError = window.t('js.error.ms_connect_failed');
                     }
                     setTimeout(() => { this.msError = ''; }, 5000);
                     console.error('Failed to fetch MS model info:', err);

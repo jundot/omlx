@@ -24,8 +24,8 @@ class RerankRequest(BaseModel):
     query: str | dict[str, str]
     """
     The search query to compare documents against. String for text-only
-    rerankers. Dict with 'text' and/or 'image' (URL, base64 data URI, or
-    local path) for multimodal rerankers like Qwen3-VL-Reranker.
+    rerankers. Dict with 'text' and/or 'image' (base64 data URI) for
+    multimodal rerankers like Qwen3-VL-Reranker.
     """
 
     documents: list[str] | list[dict[str, str]]
@@ -33,13 +33,19 @@ class RerankRequest(BaseModel):
     Documents to rerank. Can be:
     - List of strings
     - List of dicts with 'text' field (and optional 'image' for multimodal
-      rerankers). Image values accept URL, base64 data URI, or local path.
+      rerankers). Image values must be base64 data URIs.
     """
 
     top_n: int | None = None
     """
     Number of top results to return.
     If not specified, returns all documents.
+    """
+
+    max_length: int | None = Field(default=None, gt=0)
+    """
+    Maximum token length for each query-document pair. If not specified, the
+    model's own limit is used. Encoder rerankers cap it at the tokenizer limit.
     """
 
     return_documents: bool = True

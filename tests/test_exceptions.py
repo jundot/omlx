@@ -38,6 +38,7 @@ from omlx.exceptions import (
     ModelNotFoundError,
     ModelTooLargeError,
     InsufficientMemoryError,
+    describe_ceiling_binding,
     ModelLoadingError,
     # MCP exceptions
     MCPError,
@@ -469,3 +470,137 @@ class TestExceptionHierarchy:
 
         exc4 = ModelLoadingError("model")
         assert isinstance(exc4, OMLXError)
+
+
+class TestCeilingBindingAdvice:
+    """The memory-ceiling advice ladder.
+
+    A 16 GB Mac on the `safe` tier is dynamic-bound around 7 GB while the
+    static and Metal caps both sit at 12 GB. The load refusal used to say
+    "free system memory or lower memory_guard_tier" with no breakdown, and
+    the tier popup lists Safe first, so "lower" reads as "move to Safe" —
+    which shrinks the ceiling further. Every message must name the binding
+    ceiling and point up the ladder.
+    """
+
+    @staticmethod
+    def _fmt(value: int) -> str:
+        return f"{value / 1024**3:.2f}GB"
+
+    def test_dynamic_binding_names_apps_and_ladder_direction(self):
+        binding, advice = describe_ceiling_binding(
+            static=12 * 1024**3,
+            dynamic=7 * 1024**3,
+            metal_cap=12 * 1024**3,
+            tier="safe",
+            current=1 * 1024**3,
+            fmt=self._fmt,
+            tail="use a smaller model",
+        )
+        assert binding == "dynamic"
+        assert "close other apps" in advice.lower()
+        assert "raise memory_guard_tier (safe → balanced → aggressive)" in advice
+        assert "lower memory_guard_tier" not in advice
+        # Reclaimable headroom, not the whole dynamic ceiling.
+        assert "6.00GB is reclaimable" in advice
+        assert advice.endswith("or use a smaller model")
+
+    def test_metal_cap_binding_names_sysctl(self):
+        binding, advice = describe_ceiling_binding(
+            static=24 * 1024**3,
+            dynamic=16 * 1024**3,
+            metal_cap=8 * 1024**3,
+            tier="balanced",
+            current=0,
+            fmt=self._fmt,
+        )
+        assert binding == "metal_cap"
+        assert "iogpu.wired_limit_mb" in advice
+        assert "close other apps" not in advice.lower()
+
+    def test_dynamic_binding_under_custom_names_admin_setting(self):
+        binding, advice = describe_ceiling_binding(
+            static=24 * 1024**3,
+            dynamic=4 * 1024**3,
+            metal_cap=16 * 1024**3,
+            tier="custom",
+            current=0,
+            fmt=self._fmt,
+        )
+        assert binding == "dynamic"
+        assert "custom_ceiling_bytes" in advice
+        assert "close other apps" not in advice.lower()
+
+    def test_static_binding_falls_back_to_the_tier_lever(self):
+        binding, advice = describe_ceiling_binding(
+            static=8 * 1024**3,
+            dynamic=16 * 1024**3,
+            metal_cap=24 * 1024**3,
+            tier="safe",
+            current=0,
+            fmt=self._fmt,
+        )
+        assert binding == "static"
+        assert advice.startswith("Raise memory_guard_tier")
+        assert "iogpu.wired_limit_mb" not in advice
+
+    def test_a_component_the_cap_never_used_is_excluded(self):
+        """The prefill abort limit is min(static, metal_cap) by design, so
+        its rejection passes dynamic=0 — naming the dynamic ceiling there
+        would point at a knob that cannot move that cap."""
+        binding, advice = describe_ceiling_binding(
+            static=24 * 1024**3,
+            dynamic=0,
+            metal_cap=8 * 1024**3,
+            tier="safe",
+            current=0,
+            fmt=self._fmt,
+        )
+        assert binding == "metal_cap"
+        assert "close other apps" not in advice.lower()
+
+    def test_no_components_falls_back_to_generic_advice(self):
+        """Guard disabled or breakdown never propagated."""
+        binding, advice = describe_ceiling_binding(
+            static=0,
+            dynamic=0,
+            metal_cap=0,
+            tier="balanced",
+            current=0,
+            fmt=self._fmt,
+            tail="reduce context length",
+        )
+        assert binding == "effective"
+        assert advice == (
+            "Raise memory_guard_tier (safe → balanced → aggressive), "
+            "or reduce context length"
+        )
+
+    def test_multiple_tails_join_as_a_single_list(self):
+        _binding, advice = describe_ceiling_binding(
+            static=8 * 1024**3,
+            dynamic=16 * 1024**3,
+            metal_cap=24 * 1024**3,
+            tier="safe",
+            current=0,
+            fmt=self._fmt,
+            tail=["reduce context length", "lower hot_cache_max_size"],
+        )
+        assert advice.endswith("reduce context length, or lower hot_cache_max_size")
+
+    def test_model_too_large_default_advice_points_up_the_ladder(self):
+        message = str(ModelTooLargeError("m", 100 * 1024**3, 32 * 1024**3))
+        assert "raise memory_guard_tier (safe → balanced → aggressive)" in message
+        assert "lower memory_guard_tier" not in message
+
+    def test_model_too_large_carries_binding_and_advice(self):
+        error = ModelTooLargeError(
+            "m",
+            100 * 1024**3,
+            32 * 1024**3,
+            binding="dynamic",
+            advice="Close other apps to free RAM",
+        )
+        assert error.binding == "dynamic"
+        assert "dynamic memory ceiling" in str(error)
+        assert str(error).endswith("Close other apps to free RAM.")

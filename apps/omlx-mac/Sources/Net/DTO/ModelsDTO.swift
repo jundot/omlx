@@ -17,22 +17,37 @@ struct ListModelsResponse: Codable, Sendable {
 
 struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     let id: String
+    let displayName: String?
     let modelPath: String?
     let loaded: Bool
     let isLoading: Bool
     let estimatedSize: Int64
     let estimatedSizeFormatted: String?
+    let actualSize: Int64?
+    let actualSizeFormatted: String?
     let pinned: Bool?
     let isDefault: Bool?
+    let isFavorite: Bool?
     let engineType: String?
     let modelType: String?
     /// Lower-level config-derived model class (e.g. `deepseek_v32`,
     /// `glm_moe_dsa`). Used to gate the IndexCache row to DSA models.
     let configModelType: String?
+    /// Native context window from the model's config.json. The Context
+    /// Bench target selector hides presets beyond it.
+    let modelContextLength: Int?
     /// Server-side default for `enable_thinking` derived from the model
     /// (chat template, config). UI shows it as the inherited value when
     /// `enable_thinking` is unset and offers a one-click reset to it.
     let thinkingDefault: Bool?
+    var thinkingForced: Bool? = nil
+    var reasoningEffortOptions: [String]? = nil
+    var reasoningEffortDefault: String? = nil
+    var reasoningEffortCustom: Bool? = nil
+    var anePrefillBackend: String? = nil
+    var anePrefillDefaultFraction: Double? = nil
+    var anePrefillMlpFractions: [Double]? = nil
+    var anePrefillSharedFractions: [Double]? = nil
     /// True when the model is structurally compatible with DFlash (block
     /// diffusion speculative decoding). The toggle stays disabled when false.
     let dflashCompatible: Bool?
@@ -45,7 +60,26 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     /// True when the model is structurally compatible with native MTP.
     let mtpCompatible: Bool?
     let mtpCompatibilityReason: String?
+    /// Qwen4-Exp PLE mmap capability and server-side forced residency decision.
+    let qwen4PleSsdOffloadSupported: Bool?
+    let qwen4PleSsdOffloadForced: Bool?
+    let qwen4PleResidentBytes: Int64?
+    let qwen4PleMmapBytes: Int64?
+    /// True for builtin virtual entries (e.g. the MarkItDown document
+    /// converter) that have no real load/unload lifecycle.
+    let virtual: Bool?
     let settings: ModelSettingsDTO?
+}
+
+extension ModelDTO {
+    /// Single size figure for compact UI: the observed footprint once the
+    /// model has settled, the estimate while loading or before one exists.
+    var sizeLabel: String {
+        if isLoading {
+            return estimatedSizeFormatted ?? ""
+        }
+        return actualSizeFormatted ?? estimatedSizeFormatted ?? ""
+    }
 }
 
 struct ModelSettingsDTO: Codable, Equatable, Sendable {
@@ -62,12 +96,14 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let forceSampling: Bool?
     let maxToolResultTokens: Int?
     let enableThinking: Bool?
+    let qwen4PleSsdOffload: Bool?
     let thinkingBudgetEnabled: Bool?
     let thinkingBudgetTokens: Int?
     let reasoningParser: String?
     let ttlSeconds: Int?
     let isPinned: Bool?
     let isDefault: Bool?
+    let isFavorite: Bool?
     let displayName: String?
     let activeProfileName: String?
     // Security
@@ -80,6 +116,27 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     // Experimental: TurboQuant KV cache
     let turboquantKvEnabled: Bool?
     let turboquantKvBits: Double?
+    // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
+    var qwen35AnePrefillSharedFraction: Double? = nil
+    let qwen35AnePrefillEnabled: Bool?
+    let qwen35AnePrefillSequenceLength: Int?
+    let qwen35AnePrefillTailPaddingMinTokens: Int?
+    let qwen35AnePrefillFraction: Double?
+    let qwen35AnePrefillFusedDown: Bool?
+    let qwen35AnePrefillMaxLayers: Int?
+    let qwen35AnePrefillDualAne: Bool?
+    let qwen35AnePrefillGdn: Bool?
+    let qwen35AnePrefillGdnFraction: Double?
+    let qwen35AnePrefillGdnMaxLayers: Int?
+    let qwen35AnePrefillCpuEnabled: Bool?
+    let qwen35AnePrefillCpuFraction: Double?
+    let qwen35AnePrefillCpuDownFraction: Double?
+    let qwen35AnePrefillCpuGdnFraction: Double?
+    let qwen35AnePrefillCpuThreads: Int?
+    let qwen35AnePrefillCpuSharedResource: Bool?
+    // Experimental: oQ mixed-bit INT8-activation prefill kernels
+    let qwen35OqA8Enabled: Bool?
+    let qwen35OqA8MinTokens: Int?
     // Experimental: IndexCache (DSA models only)
     let indexCacheFreq: Int?
     // Experimental: SpecPrefill
@@ -90,15 +147,29 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     // Experimental: DFlash (block diffusion speculative decoding)
     let dflashEnabled: Bool?
     let dflashDraftModel: String?
-    let dflashDraftQuantBits: Int?
+    let dflashDraftQuantEnabled: Bool?
+    let dflashDraftQuantWeightBits: Int?
+    let dflashDraftQuantActivationBits: Int?
+    let dflashDraftQuantGroupSize: Int?
     let dflashMaxCtx: Int?
     let dflashInMemoryCache: Bool?
+    let dflashInMemoryCacheMaxEntries: Int?
     /// Stored in bytes server-side; the editor row exposes a GiB-scaled
     /// view via `DflashByteSize.gibToBytes` / `bytesToGib`.
     let dflashInMemoryCacheMaxBytes: Int64?
     let dflashSsdCache: Bool?
+    let dflashSsdCacheMaxBytes: Int64?
+    let dflashDraftWindowSize: Int?
+    let dflashDraftSinkSize: Int?
+    let dflashBlockSize: Int?
+    let dflashVerifyMode: String?
     // Experimental: native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     let mtpEnabled: Bool?
+    let mtpAdaptiveMaxDepth: Int?
+    // Experimental: VLM MTP (mlx-vlm assistant-drafter speculative decoding)
+    let vlmMtpEnabled: Bool?
+    let vlmMtpDraftModel: String?
+    let vlmMtpDraftBlockSize: Int?
 }
 
 /// Patch body for PUT /admin/api/models/{id}/settings. Flat snake-cased
@@ -116,12 +187,14 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var presencePenalty: Double? = nil
     var repetitionPenalty: Double? = nil
     var ttlSeconds: Int? = nil
-    var enableThinking: Bool? = nil
+    var enableThinking: Bool?? = nil // nil omits the key. .some(nil) sends JSON null.
+    var qwen4PleSsdOffload: Bool? = nil
     var thinkingBudgetEnabled: Bool? = nil
     var thinkingBudgetTokens: Int? = nil
     var maxToolResultTokens: Int? = nil
     var forceSampling: Bool? = nil
     var isPinned: Bool? = nil
+    var isFavorite: Bool? = nil
     // Security
     var trustRemoteCode: Bool? = nil
     var reasoningParser: String? = nil
@@ -131,6 +204,27 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     // Experimental: TurboQuant KV
     var turboquantKvEnabled: Bool? = nil
     var turboquantKvBits: Double? = nil
+    // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
+    var qwen35AnePrefillSharedFraction: Double? = nil
+    var qwen35AnePrefillEnabled: Bool? = nil
+    var qwen35AnePrefillSequenceLength: Int? = nil
+    var qwen35AnePrefillTailPaddingMinTokens: Int? = nil
+    var qwen35AnePrefillFraction: Double? = nil
+    var qwen35AnePrefillFusedDown: Bool? = nil
+    var qwen35AnePrefillMaxLayers: Int? = nil
+    var qwen35AnePrefillDualAne: Bool? = nil
+    var qwen35AnePrefillGdn: Bool? = nil
+    var qwen35AnePrefillGdnFraction: Double? = nil
+    var qwen35AnePrefillGdnMaxLayers: Int? = nil
+    var qwen35AnePrefillCpuEnabled: Bool? = nil
+    var qwen35AnePrefillCpuFraction: Double? = nil
+    var qwen35AnePrefillCpuDownFraction: Double? = nil
+    var qwen35AnePrefillCpuGdnFraction: Double? = nil
+    var qwen35AnePrefillCpuThreads: Int? = nil
+    var qwen35AnePrefillCpuSharedResource: Bool? = nil
+    // Experimental: oQ mixed-bit INT8-activation prefill kernels
+    var qwen35OqA8Enabled: Bool? = nil
+    var qwen35OqA8MinTokens: Int? = nil
     // Experimental: IndexCache
     var indexCacheFreq: Int? = nil
     // Experimental: SpecPrefill
@@ -141,13 +235,90 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     // Experimental: DFlash
     var dflashEnabled: Bool? = nil
     var dflashDraftModel: String? = nil
-    var dflashDraftQuantBits: Int? = nil
+    var dflashDraftQuantEnabled: Bool? = nil
+    var dflashDraftQuantWeightBits: Int? = nil
+    var dflashDraftQuantActivationBits: Int? = nil
+    var dflashDraftQuantGroupSize: Int? = nil
     var dflashMaxCtx: Int? = nil
     var dflashInMemoryCache: Bool? = nil
+    var dflashInMemoryCacheMaxEntries: Int? = nil
     var dflashInMemoryCacheMaxBytes: Int64? = nil
     var dflashSsdCache: Bool? = nil
+    var dflashSsdCacheMaxBytes: Int64? = nil
+    var dflashDraftWindowSize: Int? = nil
+    var dflashDraftSinkSize: Int? = nil
+    var dflashBlockSize: Int? = nil
+    var dflashVerifyMode: String? = nil
     // Experimental: native MTP
     var mtpEnabled: Bool? = nil
+    var mtpAdaptiveMaxDepth: Int? = nil
+    var mtpFixedDepth: Int?? = nil // .some(nil) sends JSON null (adaptive).
+    // Experimental: VLM MTP
+    var vlmMtpEnabled: Bool? = nil
+    var vlmMtpDraftModel: String? = nil
+    var vlmMtpDraftBlockSize: Int? = nil
+}
+
+/// Body for POST /admin/api/models/{id}/settings/recipe.
+struct ApplyRecipeRequest: Encodable, Sendable {
+    let recipe: String
+}
+
+/// Body for POST /admin/api/models/{id}/settings/optimal.
+struct ApplyOptimalRequest: Encodable, Sendable {
+    let benchmarkId: String
+}
+
+struct SkippedFeatureDTO: Codable, Equatable, Sendable {
+    let feature: String
+    let reason: String
+}
+
+/// One omlx.ai benchmark row offered by GET /settings/optimal.
+struct OptimalCandidateDTO: Decodable, Identifiable, Sendable {
+    let benchmarkId: String
+    let benchmarkUrl: String?
+    let ppTps: Double?
+    let tgTps: Double?
+    let quantization: String?
+    let omlxVersion: String?
+    let createdAt: String?
+    let contextProfile: String?
+    let memoryGb: Int?
+
+    var id: String { benchmarkId }
+}
+
+/// Response of GET /admin/api/models/{id}/settings/optimal: best rows by
+/// prompt processing and by token generation for this device and model.
+struct OptimalCandidatesDTO: Decodable, Sendable {
+    let found: Bool
+    let modelName: String?
+    let contextLength: Int?
+    let byPp: [OptimalCandidateDTO]
+    let byTg: [OptimalCandidateDTO]
+    let searchUrl: String?
+}
+
+/// Response of the settings snapshot endpoints (reset / recipe / optimal
+/// apply). Carries the persisted `settings` plus the scoped `applied` values
+/// and the features `skipped` on this machine; the optimal apply adds the
+/// benchmark summary.
+struct SettingsApplyResultDTO: Decodable, Sendable {
+    let success: Bool?
+    let benchmarkId: String?
+    let benchmarkUrl: String?
+    let ppTps: Double?
+    let tgTps: Double?
+    let quantization: String?
+    let omlxVersion: String?
+    let requiresReload: Bool?
+    let autoUnloaded: Bool?
+    let autoReloaded: Bool?
+    let changed: Bool?
+    let applied: [String: AnyCodable]?
+    let skipped: [SkippedFeatureDTO]?
+    let settings: ModelSettingsDTO?
 }
 
 /// Generic acknowledgment shape returned by non-streaming admin endpoints

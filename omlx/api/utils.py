@@ -10,6 +10,74 @@ from typing import Any, List
 
 from .openai_models import Message
 
+# Model families whose chat templates consume message.reasoning_content directly.
+_NATIVE_REASONING_MODEL_TYPES = {
+    "minimax_m3",
+    "minimax_m3_vl",
+    # Inkling's chat template renders history reasoning_content back into
+    # <|content_thinking|> blocks.
+    "inkling",
+    "inkling_mm_model",
+    # Muse Glimmer's chat template renders history reasoning_content into
+    # <|start|>assistant to=self<|message|> blocks.
+    "muse_glimmer",
+    # K2 requires a reasoning field for every assistant turn.
+    "k2_horizon",
+}
+
+
+def uses_native_reasoning_content(
+    model_name: str | None = None,
+    *,
+    config_model_type: str | None = None,
+    engine_model_type: str | None = None,
+    preserve_thinking_default: bool | None = None,
+) -> bool:
+    """Return whether history should keep reasoning in message fields."""
+    if preserve_thinking_default is True:
+        return True
+
+    if config_model_type in _NATIVE_REASONING_MODEL_TYPES:
+        return True
+    if engine_model_type in _NATIVE_REASONING_MODEL_TYPES:
+        return True
+    # The DeepSeek V4 family DSML encoders render history reasoning_content
+    # into <think> blocks themselves; inlining it into content would render
+    # a second, empty <think></think> ahead of it.
+    for model_type in (config_model_type, engine_model_type):
+        if model_type and model_type.startswith("deepseek_v4"):
+            return True
+
+    lowered = (model_name or "").lower()
+    return "minimax" in lowered and "m3" in lowered
+
+
+def cache_reasoning_output(
+    settings: Any,
+    *,
+    native_reasoning: bool,
+    chat_template_kwargs: dict[str, Any] | None,
+) -> bool:
+    """Whether a reasoning request's output tokens can prefix-match the next turn."""
+    forced = getattr(settings, "cache_reasoning_output", None)
+    if forced is not None:
+        return bool(forced)
+    preserve_thinking = (chat_template_kwargs or {}).get("preserve_thinking")
+    if preserve_thinking is False:
+        return False
+    return bool(native_reasoning) or preserve_thinking is True
+
+
+def merge_reasoning_effort_chat_template_kwargs(
+    chat_template_kwargs: dict[str, Any] | None,
+    reasoning_effort: Any | None,
+) -> dict[str, Any] | None:
+    """Forward an API reasoning effort without overriding explicit template kwargs."""
+    merged = dict(chat_template_kwargs or {})
+    if reasoning_effort is not None:
+        merged.setdefault("reasoning_effort", reasoning_effort)
+    return merged or None
+
 
 # =============================================================================
 # Partial Mode Detection
@@ -48,7 +116,10 @@ def detect_and_strip_partial(messages: list[dict]) -> bool:
 SPECIAL_TOKENS_PATTERN = re.compile(
     r"<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>|"
     r"<\|end\|>|<\|eot_id\|>|<\|start_header_id\|>|<\|end_header_id\|>|"
-    r"</s>|<s>|<pad>|\[PAD\]|\[SEP\]|\[CLS\]"
+    r"<\|image\|>|<\|audio\|>|"  # Gemma 4 VLM special tokens
+    r"\[e~\[|\]~b\]|\]~!b\[|\]!p~\[|\]!d~\[|"  # MiniMax M3 special tokens
+    r"</s>|<s>|<pad>|\[PAD\]|\[SEP\]|\[CLS\]|"
+    r"<eos>|<bos>|<end_of_turn>|<start_of_turn>"  # Gemma special tokens (fixes #1087)
 )
 
 
@@ -66,6 +137,13 @@ def clean_special_tokens(text: str) -> str:
     if not text:
         return text
     return SPECIAL_TOKENS_PATTERN.sub("", text).strip()
+
+
+def remove_special_tokens_preserve_whitespace(text: str) -> str:
+    """Remove special tokens without trimming surrounding whitespace."""
+    if not text:
+        return text
+    return SPECIAL_TOKENS_PATTERN.sub("", text)
 
 
 def clean_output_text(text: str) -> str:
@@ -117,9 +195,9 @@ def _extract_text_from_content_list(content: list) -> str:
 
 
 def _extract_multimodal_content_list(content: list) -> list:
-    """Extract text and image parts from a content array, preserving images.
+    """Extract text, image, and audio parts from a content array.
 
-    Keeps both text and image_url items for VLM processing.
+    Keeps text, image_url, and input_audio items for VLM processing.
     Other content types (tool_use, thinking, refusal, etc.) are dropped.
     """
     parts = []
@@ -175,6 +253,31 @@ def _extract_multimodal_content_list(content: list) -> list:
                             },
                         }
                     )
+            elif item_type == "input_audio":
+                # OpenAI audio format: pass through for engine-side decoding
+                input_audio = item.get("input_audio")
+                if input_audio and isinstance(input_audio, dict):
+                    parts.append(
+                        {
+                            "type": "input_audio",
+                            "input_audio": input_audio,
+                        }
+                    )
+            elif item_type in ("video_url", "input_video"):
+                # model_dump() keeps video_url=None on input_video parts.
+                video_url_value = item.get("video_url") or item.get("input_video")
+                url = None
+                if isinstance(video_url_value, str):
+                    url = video_url_value
+                elif isinstance(video_url_value, dict):
+                    url = video_url_value.get("url")
+                if url:
+                    parts.append(
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": url},
+                        }
+                    )
     return parts
 
 
@@ -186,6 +289,23 @@ _PRESERVE_BOUNDARY_KEY = "_preserve_role_boundary"
 
 # Match `role == "tool"` / `role == 'tool'` in a chat template.
 _TOOL_ROLE_CHECK_RE = re.compile(r"==\s*['\"]tool['\"]")
+
+_MID_SYSTEM_USER_MARKER = "__OMLX_MID_SYSTEM_PROBE_USER__"
+_MID_SYSTEM_TOOL_MARKER = "__OMLX_MID_SYSTEM_PROBE_TOOL__"
+_MID_SYSTEM_MARKER = "__OMLX_MID_SYSTEM_PROBE_SYSTEM__"
+_MID_SYSTEM_ASSISTANT_MARKER = "__OMLX_MID_SYSTEM_PROBE_ASSISTANT__"
+_MID_SYSTEM_PROBE_TOOL_CALL_ID = "omlx_mid_system_probe_call"
+_MID_SYSTEM_PROBE_TOOL = [
+    {
+        "type": "function",
+        "function": {
+            "name": "omlx_probe_tool",
+            "description": "oMLX chat-template probe tool.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+]
+_MID_SYSTEM_PROBE_CACHE: dict[tuple[Any, ...], bool] = {}
 
 
 def _chat_template_supports_tool_role(tokenizer: Any) -> bool:
@@ -212,6 +332,488 @@ def _chat_template_supports_tool_role(tokenizer: Any) -> bool:
     if not _TOOL_ROLE_CHECK_RE.search(chat_template):
         return False
     return "tool_calls" in chat_template
+
+
+def _freeze_template_value(value: Any) -> Any:
+    """Convert chat-template kwargs into a hashable cache-key value."""
+    if isinstance(value, dict):
+        return tuple(
+            sorted((str(k), _freeze_template_value(v)) for k, v in value.items())
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_template_value(v) for v in value)
+    if isinstance(value, set):
+        return tuple(sorted(_freeze_template_value(v) for v in value))
+    try:
+        hash(value)
+    except TypeError:
+        return repr(value)
+    return value
+
+
+def _mid_system_probe_cache_key(
+    tokenizer: Any,
+    *,
+    has_tools: bool,
+    chat_template_kwargs: dict[str, Any] | None,
+    preceding_role: str,
+    placement: str,
+    is_partial: bool,
+) -> tuple[Any, ...]:
+    chat_template = getattr(tokenizer, "chat_template", None)
+    if isinstance(chat_template, str):
+        template_fingerprint: Any = hash(chat_template)
+    else:
+        template_fingerprint = repr(chat_template)
+    return (
+        id(tokenizer),
+        template_fingerprint,
+        has_tools,
+        _freeze_template_value(chat_template_kwargs or {}),
+        preceding_role,
+        placement,
+        is_partial,
+    )
+
+
+def _apply_mid_system_probe_template(
+    tokenizer: Any,
+    probe_messages: list[dict],
+    *,
+    has_tools: bool,
+    chat_template_kwargs: dict[str, Any] | None,
+    is_partial: bool,
+) -> str:
+    template_kwargs: dict[str, Any] = {
+        "tokenize": False,
+        "add_generation_prompt": not is_partial,
+    }
+    if is_partial:
+        template_kwargs["continue_final_message"] = True
+    if has_tools:
+        template_kwargs["tools"] = _MID_SYSTEM_PROBE_TOOL
+    if chat_template_kwargs:
+        template_kwargs.update(chat_template_kwargs)
+
+    try:
+        rendered = tokenizer.apply_chat_template(probe_messages, **template_kwargs)
+    except TypeError:
+        if chat_template_kwargs:
+            for key in chat_template_kwargs:
+                template_kwargs.pop(key, None)
+        template_kwargs.pop("tools", None)
+        template_kwargs.pop("enable_thinking", None)
+        rendered = tokenizer.apply_chat_template(probe_messages, **template_kwargs)
+
+    if isinstance(rendered, str):
+        return rendered
+    if isinstance(rendered, list):
+        return " ".join(str(token) for token in rendered)
+    return str(rendered)
+
+
+def chat_template_preserves_mid_system(
+    tokenizer: Any | None,
+    *,
+    tools: list[dict] | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    preceding_role: str = "user",
+    placement: str = "tail",
+    is_partial: bool = False,
+) -> bool:
+    """Return whether the chat template renders a mid-system message in-place.
+
+    This does not prove model-level semantics. It only verifies that the
+    current tokenizer template keeps the system content after the requested
+    preceding role instead of raising, dropping it, or moving it to the front.
+    """
+    if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
+        return False
+    if placement not in {"tail", "between"}:
+        return False
+    if preceding_role not in {"user", "tool"}:
+        return False
+
+    explicit_capability = getattr(tokenizer, "_omlx_supports_mid_system_messages", None)
+    if explicit_capability is None:
+        template = getattr(tokenizer, "_chat_template", None)
+        explicit_capability = getattr(template, "supports_mid_system_messages", None)
+    if explicit_capability is False:
+        return False
+
+    has_tools = bool(tools)
+    cache_key = _mid_system_probe_cache_key(
+        tokenizer,
+        has_tools=has_tools,
+        chat_template_kwargs=chat_template_kwargs,
+        preceding_role=preceding_role,
+        placement=placement,
+        is_partial=is_partial,
+    )
+    cached = _MID_SYSTEM_PROBE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    probe_messages = [{"role": "user", "content": _MID_SYSTEM_USER_MARKER}]
+    preceding_marker = _MID_SYSTEM_USER_MARKER
+    if preceding_role == "tool":
+        probe_messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": _MID_SYSTEM_PROBE_TOOL_CALL_ID,
+                            "type": "function",
+                            "function": {
+                                "name": "omlx_probe_tool",
+                                "arguments": {},
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": _MID_SYSTEM_PROBE_TOOL_CALL_ID,
+                    "content": _MID_SYSTEM_TOOL_MARKER,
+                },
+            ]
+        )
+        preceding_marker = _MID_SYSTEM_TOOL_MARKER
+    probe_messages.append({"role": "system", "content": _MID_SYSTEM_MARKER})
+    if placement == "between":
+        probe_messages.append(
+            {"role": "assistant", "content": _MID_SYSTEM_ASSISTANT_MARKER}
+        )
+
+    try:
+        rendered = _apply_mid_system_probe_template(
+            tokenizer,
+            probe_messages,
+            has_tools=has_tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+        )
+    except Exception:
+        _MID_SYSTEM_PROBE_CACHE[cache_key] = False
+        return False
+
+    preceding_idx = rendered.find(preceding_marker)
+    system_idx = rendered.find(_MID_SYSTEM_MARKER)
+    assistant_idx = rendered.find(_MID_SYSTEM_ASSISTANT_MARKER)
+
+    supported = preceding_idx >= 0 and system_idx > preceding_idx
+    if placement == "between":
+        supported = supported and assistant_idx > system_idx
+
+    _MID_SYSTEM_PROBE_CACHE[cache_key] = supported
+    return supported
+
+
+def _system_content_as_text(content: Any) -> str:
+    if isinstance(content, list):
+        return _extract_text_from_content_list(content)
+    return content if isinstance(content, str) else str(content)
+
+
+def _is_system_role(role: Any) -> bool:
+    return role in {"system", "developer"}
+
+
+def _merge_consecutive_system_messages(messages: list[dict]) -> list[dict]:
+    """Merge adjacent system messages in-place without moving their position."""
+    merged: list[dict] = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if not _is_system_role(msg.get("role")):
+            merged.append(msg)
+            i += 1
+            continue
+
+        parts: list[str] = []
+        while i < len(messages) and _is_system_role(messages[i].get("role")):
+            content = messages[i].get("content", "")
+            if content:
+                text = _system_content_as_text(content)
+                if text:
+                    parts.append(text)
+            i += 1
+
+        if parts:
+            merged.append({"role": "system", "content": "\n\n".join(parts)})
+
+    return merged
+
+
+def _mid_system_placement_kinds(
+    messages: list[dict],
+) -> set[tuple[str, str]] | None:
+    """Classify supported cache-preserving mid-system placements.
+
+    Returns None when any non-leading system run has an unsupported position.
+    """
+    placements: set[tuple[str, str]] = set()
+    seen_non_system = False
+    i = 0
+    while i < len(messages):
+        role = messages[i].get("role")
+        if not _is_system_role(role):
+            seen_non_system = True
+            i += 1
+            continue
+
+        start = i
+        while i < len(messages) and _is_system_role(messages[i].get("role")):
+            i += 1
+
+        if not seen_non_system:
+            continue
+
+        prev_role = messages[start - 1].get("role") if start > 0 else None
+        next_role = messages[i].get("role") if i < len(messages) else None
+        if prev_role not in ("user", "tool"):
+            return None
+        if next_role is None:
+            placements.add((prev_role, "tail"))
+        elif next_role == "assistant":
+            placements.add((prev_role, "between"))
+        else:
+            return None
+
+    return placements
+
+
+def has_nonleading_system_message(messages: list[dict]) -> bool:
+    """Return True when a system message appears after a non-system turn."""
+    seen_non_system = False
+    for msg in messages:
+        if _is_system_role(msg.get("role")):
+            if seen_non_system:
+                return True
+        else:
+            seen_non_system = True
+    return False
+
+
+def _is_text_only_content_list(content: Any) -> bool:
+    if not isinstance(content, list):
+        return False
+    for part in content:
+        if not isinstance(part, dict):
+            return False
+        if part.get("type", "text") != "text":
+            return False
+        text = part.get("text", "")
+        if text is not None and not isinstance(text, str):
+            return False
+    return True
+
+
+def _is_safe_user_note_target(msg: dict | None) -> bool:
+    if not msg or msg.get("role") != "user":
+        return False
+    if msg.get(_PRESERVE_BOUNDARY_KEY):
+        return False
+    if msg.get("tool_calls") or msg.get("tool_call_id") or msg.get("tool_responses"):
+        return False
+    content = msg.get("content", "")
+    return (
+        content is None
+        or isinstance(content, str)
+        or _is_text_only_content_list(content)
+    )
+
+
+def _message_has_tool_calls(msg: dict | None) -> bool:
+    return bool(msg and msg.get("role") == "assistant" and msg.get("tool_calls"))
+
+
+def _format_system_note(parts: list[str]) -> str:
+    return "[System note]\n" + "\n\n".join(parts) + "\n[/System note]"
+
+
+def _merge_note_text(existing: str, note: str, *, placement: str) -> str:
+    if not existing:
+        return note
+    if placement == "prepend":
+        return f"{note}\n\n{existing}"
+    return f"{existing}\n\n{note}"
+
+
+def _rewrite_user_content_with_note(
+    msg: dict,
+    note: str,
+    *,
+    placement: str,
+) -> dict:
+    rewritten = dict(msg)
+    content = rewritten.get("content", "")
+    if isinstance(content, list):
+        parts = [dict(part) for part in content]
+        if not parts:
+            rewritten["content"] = [{"type": "text", "text": note}]
+            return rewritten
+        index = 0 if placement == "prepend" else len(parts) - 1
+        existing = parts[index].get("text") or ""
+        parts[index]["text"] = _merge_note_text(
+            existing,
+            note,
+            placement=placement,
+        )
+        rewritten["content"] = parts
+        return rewritten
+
+    existing = content if isinstance(content, str) else ""
+    rewritten["content"] = _merge_note_text(existing, note, placement=placement)
+    return rewritten
+
+
+def _downgrade_mid_system_to_user_notes(messages: list[dict]) -> list[dict] | None:
+    """Move unsupported non-leading system runs into adjacent safe user text.
+
+    This keeps the native chat template/tool rendering path intact while making
+    volatile tail notes cache-friendly. It deliberately refuses tool-call
+    boundaries and multimodal user content, where changing roles is too risky.
+    """
+    rewritten: list[dict] = []
+    seen_non_system = False
+    i = 0
+
+    while i < len(messages):
+        msg = messages[i]
+        if not _is_system_role(msg.get("role")):
+            rewritten.append(msg)
+            seen_non_system = True
+            i += 1
+            continue
+
+        start = i
+        parts: list[str] = []
+        while i < len(messages) and _is_system_role(messages[i].get("role")):
+            content = messages[i].get("content", "")
+            if content:
+                text = _system_content_as_text(content)
+                if text:
+                    parts.append(text)
+            i += 1
+
+        if not seen_non_system:
+            rewritten.extend(messages[start:i])
+            continue
+        if not parts:
+            continue
+
+        note = _format_system_note(parts)
+        next_msg = messages[i] if i < len(messages) else None
+        next_role = next_msg.get("role") if next_msg is not None else None
+
+        if _is_safe_user_note_target(rewritten[-1] if rewritten else None) and (
+            next_msg is None or next_role == "assistant"
+        ):
+            rewritten[-1] = _rewrite_user_content_with_note(
+                rewritten[-1],
+                note,
+                placement="append",
+            )
+            continue
+
+        if _is_safe_user_note_target(next_msg):
+            if _message_has_tool_calls(rewritten[-1] if rewritten else None):
+                return None
+            rewritten.append(
+                _rewrite_user_content_with_note(
+                    next_msg,
+                    note,
+                    placement="prepend",
+                )
+            )
+            seen_non_system = True
+            i += 1
+            continue
+
+        return None
+
+    return rewritten
+
+
+def prepare_system_messages_for_template(
+    messages: list[dict],
+    tokenizer: Any | None,
+    *,
+    tools: list[dict] | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    is_partial: bool = False,
+    merge_consecutive_roles: bool = True,
+    unsupported_mid_system_policy: str = "strict",
+) -> list[dict]:
+    """Preserve cache-friendly mid-system turns when the template supports them.
+
+    Model-specific templates may first relocate supported system turns to a
+    native reminder role. Unsupported placements or templates then use the
+    configured strict or user-note fallback.
+    """
+    messages = [dict(msg) for msg in messages]
+    if unsupported_mid_system_policy not in {"strict", "user_note_safe"}:
+        unsupported_mid_system_policy = "strict"
+
+    def strict_fallback() -> list[dict]:
+        prepared = _consolidate_system_messages(messages)
+        if merge_consecutive_roles:
+            prepared = _merge_consecutive_roles(prepared)
+        return prepared
+
+    def unsupported_fallback() -> list[dict]:
+        if unsupported_mid_system_policy == "user_note_safe":
+            prepared = _downgrade_mid_system_to_user_notes(messages)
+            if prepared is not None:
+                # _downgrade preserves leading system blocks as-is; merge
+                # consecutive system messages so strict templates (Qwen3.6+)
+                # that require a single leading system message don't fail.
+                prepared = _merge_consecutive_system_messages(prepared)
+                if merge_consecutive_roles:
+                    prepared = _merge_consecutive_roles(prepared)
+                return prepared
+        return strict_fallback()
+
+    if not is_partial and has_nonleading_system_message(messages):
+        relocator = getattr(tokenizer, "_omlx_relocate_mid_system_messages", None)
+        if relocator is None:
+            template = getattr(tokenizer, "_chat_template", None)
+            relocator = getattr(template, "relocate_mid_system_messages", None)
+        if callable(relocator):
+            try:
+                relocated = relocator(messages)
+            except Exception:
+                relocated = None
+            if relocated is not None:
+                messages = [dict(msg) for msg in relocated]
+
+    placements = _mid_system_placement_kinds(messages)
+    if not placements:
+        if placements is None:
+            return unsupported_fallback()
+        return _merge_consecutive_system_messages(messages)
+
+    if is_partial:
+        return strict_fallback()
+
+    can_preserve = all(
+        chat_template_preserves_mid_system(
+            tokenizer,
+            tools=tools,
+            chat_template_kwargs=chat_template_kwargs,
+            preceding_role=preceding_role,
+            placement=placement,
+            is_partial=is_partial,
+        )
+        for preceding_role, placement in placements
+    )
+    if can_preserve:
+        return _merge_consecutive_system_messages(messages)
+
+    return unsupported_fallback()
 
 
 def _drop_void_assistant_messages(messages: list[dict]) -> list[dict]:
@@ -249,7 +851,7 @@ def _consolidate_system_messages(messages: list[dict]) -> list[dict]:
     system_parts: list[str] = []
     non_system: list[dict] = []
     for msg in messages:
-        if msg.get("role") == "system":
+        if _is_system_role(msg.get("role")):
             content = msg.get("content", "")
             if content:
                 if isinstance(content, list):
@@ -338,6 +940,16 @@ def _apply_reasoning_reconstruction(
     string to attach as a ``reasoning_content`` field, or ``None`` to skip.
     """
     if role != "assistant" or not reasoning:
+        if role != "assistant" or not native:
+            return content, None
+        text = content if isinstance(content, str) else ""
+        if isinstance(content, list):
+            text = _extract_text_from_content_list(content)
+        from .thinking import extract_thinking
+
+        inline_reasoning, inline_content = extract_thinking(text)
+        if inline_reasoning:
+            return inline_content, inline_reasoning
         return content, None
     text = content if isinstance(content, str) else ""
     if isinstance(content, list):
@@ -352,6 +964,7 @@ def extract_text_content(
     max_tool_result_tokens: int | None = None,
     tokenizer: Any | None = None,
     native_reasoning_content: bool = False,
+    consolidate_system_messages: bool = True,
 ) -> List[dict]:
     """
     Extract text content from OpenAI-format messages.
@@ -369,6 +982,10 @@ def extract_text_content(
         native_reasoning_content: If True, pass ``reasoning_content`` through
             as a message-level field (Qwen 3.6+ templates).  If False, inline
             ``<think>...</think>`` into content as a fallback.
+        consolidate_system_messages: If True, preserve historical strict-template
+            behavior by moving system messages to the front. Server code can
+            set this to False and call ``prepare_system_messages_for_template``
+            after tools/template kwargs are known.
 
     Returns:
         List of {"role": str, "content": str}
@@ -523,9 +1140,10 @@ def extract_text_content(
             # Unknown format, try to convert
             processed_messages.append({"role": role, "content": str(content), **_extra})
 
-    return _merge_consecutive_roles(
-        _drop_void_assistant_messages(_consolidate_system_messages(processed_messages))
-    )
+    processed_messages = _drop_void_assistant_messages(processed_messages)
+    if consolidate_system_messages:
+        processed_messages = _consolidate_system_messages(processed_messages)
+    return _merge_consecutive_roles(processed_messages)
 
 
 def extract_multimodal_content(
@@ -533,6 +1151,7 @@ def extract_multimodal_content(
     max_tool_result_tokens: int | None = None,
     tokenizer: Any | None = None,
     native_reasoning_content: bool = False,
+    consolidate_system_messages: bool = True,
 ) -> List[dict]:
     """
     Extract content from messages, preserving image_url parts for VLM.
@@ -546,6 +1165,7 @@ def extract_multimodal_content(
         tokenizer: Tokenizer instance for token counting and truncation.
         native_reasoning_content: If True, pass ``reasoning_content`` through
             as a message-level field.  See ``extract_text_content``.
+        consolidate_system_messages: See ``extract_text_content``.
 
     Returns:
         List of message dicts. Messages with images have content as list.
@@ -678,10 +1298,13 @@ def extract_multimodal_content(
         if isinstance(content, str):
             processed_messages.append({"role": role, "content": content, **_extra})
         elif isinstance(content, list):
-            # Preserve image_url parts for VLM processing
+            # Preserve image, video, and audio parts for VLM processing.
             multimodal_parts = _extract_multimodal_content_list(content)
-            has_images = any(p.get("type") == "image_url" for p in multimodal_parts)
-            if has_images:
+            multimodal_types = {"image_url", "video_url", "input_audio"}
+            has_multimodal = any(
+                p.get("type") in multimodal_types for p in multimodal_parts
+            )
+            if has_multimodal:
                 # Keep as content list for VLM engine
                 processed_messages.append(
                     {"role": role, "content": multimodal_parts, **_extra}
@@ -695,9 +1318,10 @@ def extract_multimodal_content(
         else:
             processed_messages.append({"role": role, "content": str(content), **_extra})
 
-    return _drop_void_assistant_messages(
-        _consolidate_system_messages(processed_messages)
-    )
+    processed_messages = _drop_void_assistant_messages(processed_messages)
+    if consolidate_system_messages:
+        processed_messages = _consolidate_system_messages(processed_messages)
+    return processed_messages
 
 
 # =============================================================================
@@ -755,10 +1379,46 @@ def _wrap_truncated_for_harmony(truncated_text: str) -> dict:
     return {"output": truncated_text}
 
 
+_K2_THINKING_FIELDS = (
+    "think",
+    "think_fast",
+    "think_faster",
+    "reasoning",
+    "reasoning_content",
+)
+
+
+def extract_k2_horizon_messages(
+    messages: list[Any],
+    max_tool_result_tokens: int | None = None,
+    tokenizer: Any | None = None,
+    consolidate_system_messages: bool = True,
+) -> list[dict]:
+    """Give every assistant turn the thinking field the K2 Horizon template requires."""
+    if any(not isinstance(msg, dict) for msg in messages):
+        processed = extract_text_content(
+            messages,
+            max_tool_result_tokens,
+            tokenizer,
+            native_reasoning_content=True,
+            consolidate_system_messages=consolidate_system_messages,
+        )
+    else:
+        processed = [dict(msg) for msg in messages]
+
+    for msg in processed:
+        if msg.get("role") != "assistant":
+            continue
+        if not any(isinstance(msg.get(field), str) for field in _K2_THINKING_FIELDS):
+            msg["reasoning_content"] = ""
+    return processed
+
+
 def extract_harmony_messages(
     messages: list,
     max_tool_result_tokens: int | None = None,
     tokenizer: Any | None = None,
+    consolidate_system_messages: bool = True,
 ) -> List[dict]:
     """
     Extract messages for Harmony (gpt-oss) models.
@@ -782,6 +1442,7 @@ def extract_harmony_messages(
         messages: List of Message objects
         max_tool_result_tokens: Maximum token count for tool results.
         tokenizer: Tokenizer instance for token counting and truncation.
+        consolidate_system_messages: See ``extract_text_content``.
 
     Returns:
         List of message dicts with tool-related fields preserved
@@ -903,9 +1564,11 @@ def extract_harmony_messages(
                             {
                                 "id": getattr(tc, "id", ""),
                                 "function": {
-                                    "name": getattr(tc.function, "name", "")
-                                    if hasattr(tc, "function")
-                                    else "",
+                                    "name": (
+                                        getattr(tc.function, "name", "")
+                                        if hasattr(tc, "function")
+                                        else ""
+                                    ),
                                     "arguments": _try_parse_json(args_str),
                                 },
                             }
@@ -929,6 +1592,7 @@ def extract_harmony_messages(
         else:
             processed_messages.append({"role": role, "content": str(content)})
 
-    return _merge_consecutive_roles(
-        _drop_void_assistant_messages(_consolidate_system_messages(processed_messages))
-    )
+    processed_messages = _drop_void_assistant_messages(processed_messages)
+    if consolidate_system_messages:
+        processed_messages = _consolidate_system_messages(processed_messages)
+    return _merge_consecutive_roles(processed_messages)

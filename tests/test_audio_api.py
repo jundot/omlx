@@ -107,6 +107,7 @@ class TestModelsListAudio:
         with patch("omlx.server._server_state") as mock_state:
             mock_state.engine_pool = mock_pool
             mock_state.global_settings = None
+            mock_state.distributed_inference_enabled = False
             mock_state.process_memory_enforcer = None
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
@@ -114,7 +115,7 @@ class TestModelsListAudio:
             mock_state.api_key = None
             mock_state.settings_manager = MagicMock()
             mock_state.settings_manager.get_settings.return_value = MagicMock(
-                model_alias=None
+                model_alias=None, is_hidden=False
             )
             with TestClient(app, raise_server_exceptions=False) as client:
                 yield client, mock_pool
@@ -128,6 +129,7 @@ class TestModelsListAudio:
         with patch("omlx.server._server_state") as mock_state:
             mock_state.engine_pool = mock_pool
             mock_state.global_settings = None
+            mock_state.distributed_inference_enabled = False
             mock_state.process_memory_enforcer = None
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
@@ -135,15 +137,16 @@ class TestModelsListAudio:
             mock_state.api_key = None
             mock_state.settings_manager = MagicMock()
             mock_state.settings_manager.get_settings.return_value = MagicMock(
-                model_alias=None
+                model_alias=None, is_hidden=False
             )
             with TestClient(app, raise_server_exceptions=False) as client:
                 yield client, mock_pool
 
-    def test_models_list_returns_200(self, client_with_stt):
+    def test_models_list_returns_200(self, client_with_stt, cluster_home):
         client, _ = client_with_stt
         response = client.get("/v1/models")
         assert response.status_code == 200
+        assert (cluster_home / ".omlx/bin/omlx-cluster-python").is_file()
 
     def test_models_list_includes_stt_model(self, client_with_stt):
         """audio_stt model appears in /v1/models response."""

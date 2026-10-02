@@ -92,6 +92,13 @@ class PrefixCacheStats(BaseCacheStats):
     tokens_requested_total: int = 0
     retained_restore_walkbacks: int = 0
     placeholder_full_rejects: int = 0
+    exact_prefix_hits: int = 0
+    exact_prefix_misses: int = 0
+    exact_prefix_tokens_restored: int = 0
+    exact_prefix_stores: int = 0
+    exact_prefix_store_failures: int = 0
+    tail_blocks_stored: int = 0
+    tail_block_hits: int = 0
     _total_queries: int = field(default=0, repr=False)
 
     @property
@@ -119,6 +126,13 @@ class PrefixCacheStats(BaseCacheStats):
         self.tokens_requested_total = 0
         self.retained_restore_walkbacks = 0
         self.placeholder_full_rejects = 0
+        self.exact_prefix_hits = 0
+        self.exact_prefix_misses = 0
+        self.exact_prefix_tokens_restored = 0
+        self.exact_prefix_stores = 0
+        self.exact_prefix_store_failures = 0
+        self.tail_blocks_stored = 0
+        self.tail_block_hits = 0
         self._total_queries = 0
 
 
@@ -191,11 +205,21 @@ class PagedSSDCacheStats(BaseCacheStats):
     Extends base stats with storage-specific and hot cache metrics.
     """
 
-    # Operation counters
+    # ``saves`` counts blocks that PASSED the quota gate and were enqueued
+    # for the writer thread — it is incremented on the inference thread in
+    # ``save_block`` BEFORE the writer fsyncs the file, so a block whose
+    # background write later fails (ENOSPC, EDQUOT, OSError) still
+    # contributes 1 to ``saves`` and 1 to ``errors``. Use
+    # ``saves_persisted`` for the count of writes that actually landed on
+    # disk (incremented after the atomic rename in ``_writer_loop``);
+    # ``saves - saves_persisted`` is the steady-state in-flight depth.
     saves: int = 0
+    saves_persisted: int = 0
     loads: int = 0
     errors: int = 0
     ssd_write_drops: int = 0
+    ssd_inline_write_fallbacks: int = 0
+    evict_unlink_failures: int = 0
 
     # Storage capacity
     total_size_bytes: int = 0
@@ -210,6 +234,7 @@ class PagedSSDCacheStats(BaseCacheStats):
     hot_cache_hits: int = 0
     hot_cache_evictions: int = 0
     hot_cache_promotions: int = 0
+    hot_cache_promotion_failures: int = 0
 
     @property
     def save_rate(self) -> float:
@@ -236,9 +261,12 @@ class PagedSSDCacheStats(BaseCacheStats):
         """Reset runtime statistics."""
         super().reset()
         self.saves = 0
+        self.saves_persisted = 0
         self.loads = 0
         self.errors = 0
         self.ssd_write_drops = 0
+        self.ssd_inline_write_fallbacks = 0
+        self.evict_unlink_failures = 0
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert stats to dictionary."""

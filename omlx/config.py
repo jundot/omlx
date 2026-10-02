@@ -9,10 +9,15 @@ This module provides unified configuration management with:
 - Default values with sensible defaults
 """
 
+import logging
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+
+
+logger = logging.getLogger(__name__)
 
 
 def parse_size(size_str: str) -> int:
@@ -39,7 +44,10 @@ def parse_size(size_str: str) -> int:
         if size_str.endswith(unit):
             try:
                 value = float(size_str[: -len(unit)])
-                return int(value * multiplier)
+                byte_value = value * multiplier
+                if not math.isfinite(byte_value):
+                    raise ValueError
+                return int(byte_value)
             except ValueError:
                 pass
 
@@ -58,6 +66,8 @@ class ServerConfig:
     port: int = 8000
     log_level: str = "info"
     cors_origins: List[str] = field(default_factory=lambda: ["*"])
+    max_image_upload_size: str = "50MB"
+    max_image_side_length: int = 2048
 
 
 @dataclass
@@ -88,6 +98,7 @@ class SchedulerConfig:
 
     max_num_seqs: int = 8
     completion_batch_size: int = 8
+    embedding_batch_size: int = 32
     stream_interval: int = 1
     enable_thinking: Optional[bool] = None
 
@@ -109,6 +120,36 @@ class PagedSSDCacheConfig:
     cache_dir: Optional[Path] = None
     max_size: str = "100GB"
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
+    gdn_ssd_split_enabled: bool | None = None
+    gdn_ssd_pending_max_size: str = "512MB"
+    gdn_sidecar_state_dtype: str = "fp32"
+
+    @property
+    def gdn_snapshot_storage(self) -> str:
+        if self.gdn_ssd_split_enabled is None:
+            return "auto"
+        return "ssd_sidecar" if self.gdn_ssd_split_enabled else "embedded"
+
+    @gdn_snapshot_storage.setter
+    def gdn_snapshot_storage(self, mode: str) -> None:
+        normalized = str(mode).strip().lower()
+        if normalized == "auto":
+            self.gdn_ssd_split_enabled = None
+        elif normalized in {"ssd", "ssd_sidecar"}:
+            self.gdn_ssd_split_enabled = True
+        elif normalized in {"hot", "embedded"}:
+            self.gdn_ssd_split_enabled = False
+        else:
+            raise ValueError(
+                "gdn_snapshot_storage must be one of: "
+                "auto, ssd_sidecar, embedded"
+            )
+
+    @property
+    def effective_gdn_ssd_split_enabled(self) -> bool:
+        if self.gdn_ssd_split_enabled is not None:
+            return self.gdn_ssd_split_enabled
+        return self.enabled and not self.hot_cache_only
 
     @property
     def max_size_bytes(self) -> int:
@@ -162,6 +203,16 @@ class OMLXConfig:
         config.server.host = os.getenv("OMLX_HOST", config.server.host)
         config.server.port = int(os.getenv("OMLX_PORT", str(config.server.port)))
         config.server.log_level = os.getenv("OMLX_LOG_LEVEL", config.server.log_level)
+        config.server.max_image_upload_size = (
+            os.getenv("OMLX_MAX_IMAGE_UPLOAD_SIZE")
+            or os.getenv("OMLX_MAX_IMAGE_BYTES")
+            or config.server.max_image_upload_size
+        )
+        if side_len := os.getenv("OMLX_MAX_IMAGE_SIDE_LENGTH"):
+            try:
+                config.server.max_image_side_length = int(side_len)
+            except ValueError:
+                pass
 
         # Model settings
         config.model.model_name = os.getenv("OMLX_MODEL", config.model.model_name)
@@ -179,6 +230,24 @@ class OMLXConfig:
 
         # Paged SSD cache settings
         config.paged_ssd_cache.hot_cache_only = os.getenv("OMLX_HOT_CACHE_ONLY", "false").lower() == "true"
+        gdn_storage = os.getenv("OMLX_GDN_SNAPSHOT_STORAGE")
+        if gdn_storage:
+            try:
+                config.paged_ssd_cache.gdn_snapshot_storage = gdn_storage
+            except ValueError as exc:
+                logger.warning(str(exc))
+        elif "OMLX_GDN_SSD_SPLIT_ENABLED" in os.environ:
+            config.paged_ssd_cache.gdn_ssd_split_enabled = os.getenv(
+                "OMLX_GDN_SSD_SPLIT_ENABLED", "false"
+            ).lower() in ("true", "1", "yes")
+        config.paged_ssd_cache.gdn_ssd_pending_max_size = os.getenv(
+            "OMLX_GDN_SSD_PENDING_MAX_SIZE",
+            config.paged_ssd_cache.gdn_ssd_pending_max_size,
+        )
+        config.paged_ssd_cache.gdn_sidecar_state_dtype = os.getenv(
+            "OMLX_GDN_SIDECAR_STATE_DTYPE",
+            config.paged_ssd_cache.gdn_sidecar_state_dtype,
+        ).lower()
         paged_ssd_dir = os.getenv("OMLX_PAGED_SSD_CACHE_DIR")
         if paged_ssd_dir:
             config.paged_ssd_cache.enabled = True
@@ -220,6 +289,10 @@ class OMLXConfig:
             config.server.port = args.port
         if hasattr(args, "log_level") and args.log_level:
             config.server.log_level = args.log_level
+        if hasattr(args, "max_image_upload_size") and args.max_image_upload_size:
+            config.server.max_image_upload_size = args.max_image_upload_size
+        if hasattr(args, "max_image_side_length") and args.max_image_side_length is not None:
+            config.server.max_image_side_length = args.max_image_side_length
 
         if hasattr(args, "model") and args.model:
             config.model.model_name = args.model
@@ -296,5 +369,28 @@ class OMLXConfig:
         if self.paged_ssd_cache.enabled:
             if not self.paged_ssd_cache.cache_dir:
                 errors.append("Paged SSD cache enabled but no cache_dir specified")
-
+        if (
+            self.paged_ssd_cache.gdn_ssd_split_enabled is True
+            and self.paged_ssd_cache.hot_cache_only
+        ):
+            errors.append(
+                "gdn_ssd_split_enabled cannot be used with hot_cache_only"
+            )
+        try:
+            pending_size = parse_size(self.paged_ssd_cache.gdn_ssd_pending_max_size)
+            if pending_size <= 0:
+                errors.append("gdn_ssd_pending_max_size must be positive")
+        except (AttributeError, TypeError, ValueError) as exc:
+            errors.append(f"Invalid gdn_ssd_pending_max_size: {exc}")
+        if self.paged_ssd_cache.gdn_sidecar_state_dtype not in {
+            "fp32",
+            "bf16",
+            "int8",
+            "rht_int8",
+            "rht_int16",
+        }:
+            errors.append(
+                "gdn_sidecar_state_dtype must be one of: "
+                "fp32, bf16, int8, rht_int8, rht_int16"
+            )
         return errors
