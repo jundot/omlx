@@ -279,7 +279,16 @@ async def require_admin(request: Request) -> bool:
     if _get_global_settings is not None:
         gs = _get_global_settings()
         if gs is not None and gs.auth.skip_api_key_verification:
-            return True
+            from ..server import _server_state
+            from ..utils.network import is_loopback_bind
+
+            active_host = gs.server.host
+            if getattr(_server_state, "global_settings", None) is gs:
+                bind_host = getattr(_server_state, "bind_host", None)
+                if isinstance(bind_host, str):
+                    active_host = bind_host
+            if is_loopback_bind(active_host):
+                return True
 
     if not verify_session(request):
         # Browser requests (Accept: text/html) get redirected to login page

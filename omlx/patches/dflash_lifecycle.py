@@ -36,6 +36,7 @@ dflash never owns) to the pre-dflash ``__call__``.
 from __future__ import annotations
 
 import logging
+from contextlib import suppress
 from typing import Any
 
 import mlx.core as mx
@@ -65,6 +66,18 @@ def _wrap_installer(mod: Any, fn_name: str, flag_name: str) -> bool:
 
     def wrapped(module_target: Any) -> Any:
         cls = type(module_target)
+        current = cls.__dict__.get("__call__")
+        if getattr(cls, flag_name, False) and getattr(
+            current, "_omlx_mtp_call_marker", False
+        ):
+            # A Lightning MTP self-heal replaced dflash's hook while the
+            # idempotency flag stayed set (issue #2972): dflash's installer
+            # would skip re-installing and the engine would run without its
+            # speculative hook. Clear the stale flag and re-snapshot the
+            # current (MTP) __call__ as the base to restore/fall back to.
+            with suppress(AttributeError):
+                delattr(cls, flag_name)
+            _DFLASH_BACKUP[cls] = {"call": current, "flag": flag_name}
         if not getattr(cls, flag_name, False):
             # First time dflash installs on this class — snapshot the
             # current __call__ so restore can put it back unchanged.
@@ -105,12 +118,72 @@ def _install_batch_cache_guard(cls: type) -> None:
     def guarded_call(
         self: Any, x: Any, mask: Any = None, cache: Any = None, **kwargs: Any
     ) -> Any:
-        if isinstance(getattr(cache, "offset", None), mx.array):
-            return pre_dflash_call(self, x, mask=mask, cache=cache, **kwargs)
+        # Resolve the fallback base dynamically: a Lightning MTP load may
+        # legitimately swap the non-dflash implementation underneath this
+        # guard while a DFlash engine stays resident (issue #2972).
+        live = _DFLASH_BACKUP.get(cls)
+        base = live["call"] if live is not None else pre_dflash_call
+        if kwargs.get("n_confirmed") or isinstance(
+            getattr(cache, "offset", None), mx.array
+        ):
+            return base(self, x, mask=mask, cache=cache, **kwargs)
         return dflash_call(self, x, mask=mask, cache=cache, **kwargs)
 
     guarded_call._omlx_dflash_batch_guard = True  # type: ignore[attr-defined]
     cls.__call__ = guarded_call  # type: ignore[method-assign]
+
+
+def get_dflash_guard_base(cls: type) -> Any | None:
+    """Return the fallback base owned by an armed dflash guard."""
+    current = cls.__dict__.get("__call__")
+    if not getattr(current, "_omlx_dflash_batch_guard", False):
+        return None
+    info = _DFLASH_BACKUP.get(cls)
+    if info is None:
+        raise RuntimeError("dflash guard has no fallback base")
+    return info["call"]
+
+
+def set_dflash_guard_base(cls: type, new_call: Any) -> None:
+    """Replace the fallback base under an armed dflash guard."""
+    current = cls.__dict__.get("__call__")
+    info = _DFLASH_BACKUP.get(cls)
+    if not getattr(current, "_omlx_dflash_batch_guard", False) or info is None:
+        raise RuntimeError("dflash guard state changed during MTP patching")
+    info["call"] = new_call
+
+
+def _install_cache_serializer() -> None:
+    from dflash_mlx.cache import codecs
+    from mlx_lm.models.cache import KVCache
+
+    original = codecs.serialize_target_cache
+    if getattr(original, "_omlx_valid_kv", False):
+        return
+
+    def serialize(target_cache, *, clone=True):
+        fa, gdn = [], []
+        for entry in target_cache:
+            if isinstance(entry, KVCache):
+                if entry.keys is None:
+                    state = None
+                else:
+                    keys, values = entry.keys_and_values()
+                    if clone:
+                        keys, values = codecs._clone_array(keys), codecs._clone_array(
+                            values
+                        )
+                    state = (keys, values, int(entry.offset))
+                fa.append(state)
+                gdn.append(None)
+            else:
+                layer_fa, layer_gdn = original([entry], clone=clone)
+                fa.extend(layer_fa)
+                gdn.extend(layer_gdn)
+        return tuple(fa), tuple(gdn)
+
+    serialize._omlx_valid_kv = True
+    codecs.serialize_target_cache = serialize
 
 
 def install_dflash_lifecycle_wrap() -> bool:
@@ -119,6 +192,7 @@ def install_dflash_lifecycle_wrap() -> bool:
     Safe to call repeatedly — each installer is wrapped at most once.
     Returns True if at least one backend's installers were wrapped.
     """
+    _install_cache_serializer()
     wrapped_any = False
 
     try:
@@ -167,9 +241,6 @@ def restore_dflash_class_patches() -> None:
     DFlash engine load can re-install its hook freshly. Empties the
     backup table.
     """
-    if not _DFLASH_BACKUP:
-        return
-
     restored = 0
     for cls, info in list(_DFLASH_BACKUP.items()):
         try:
@@ -179,14 +250,22 @@ def restore_dflash_class_patches() -> None:
             continue
         flag = info["flag"]
         if flag in cls.__dict__:
-            try:
+            with suppress(AttributeError):
                 delattr(cls, flag)
-            except AttributeError:
-                pass
         restored += 1
 
     _DFLASH_BACKUP.clear()
-    logger.info("dflash class patches restored on %d class(es)", restored)
+    # GLM-5.3's KDA adapter owns a separate class hook because dflash-mlx has
+    # no upstream GLM module to wrap. Restore it at the same lifecycle
+    # boundary so a later VLM/MTP GLM load never inherits it.
+    try:
+        from .dflash_glm5 import restore_glm5_dflash_class_patches
+
+        restored += restore_glm5_dflash_class_patches()
+    except Exception:
+        logger.debug("GLM-5.3 dflash class restore skipped", exc_info=True)
+    if restored:
+        logger.info("dflash class patches restored on %d class(es)", restored)
 
 
 def get_backup_classes() -> list[type]:

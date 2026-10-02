@@ -164,6 +164,25 @@ struct DeepseekV4SparseAttentionParams {
   int64_t O_strides[3]; ///< Output strides (B, H, L, D = 1)
 };
 
+struct Qwen4QSASparseGQAParams {
+  int B; ///< Batch size (the current native ABI fixes this to one)
+  int q_heads; ///< Main-attention query heads
+  int kv_heads; ///< Main-attention key/value heads
+  int qL; ///< Query rows in this prefill tile
+  int kL; ///< Full cached key/value rows
+  int topk; ///< Fixed-width selected four-token block list per query
+  int gqa_factor; ///< Query heads sharing one key/value head
+  int q_offset; ///< Absolute position of query row zero
+
+  float scale; ///< Attention scale
+
+  int64_t Q_strides[3]; ///< Query strides (B, H, L, D = 1)
+  int64_t K_strides[3]; ///< Key strides (B, Hkv, L, D = 1)
+  int64_t V_strides[3]; ///< Value strides (B, Hkv, L, D = 1)
+  int64_t Topk_strides[3]; ///< Selected-token strides (B, 1, L, topk = 1)
+  int64_t O_strides[3]; ///< Output strides (B, H, L, D = 1)
+};
+
 struct AttnChunkReduceParams {
   int C; ///< Number of key chunks
   int H; ///< Heads

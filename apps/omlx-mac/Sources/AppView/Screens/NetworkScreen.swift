@@ -25,20 +25,36 @@ struct NetworkScreen: View {
             ProxiesSection(vm: vm)
             TLSSection(vm: vm)
 
-            HStack {
-                Spacer()
+            FooterBar(error: vm.lastError) {
+                Button(String(localized: "settings.button.reset_defaults",
+                              defaultValue: "Reset Defaults",
+                              comment: "Fill this screen with defaults before applying")) {
+                    Task { await vm.resetDefaults(client: services.client) }
+                }
+                .buttonStyle(.omlx(.normal))
+                .disabled(vm.isSaving || vm.isLoading || vm.isResetting)
+                .help(String(localized: "settings.reset_defaults.help",
+                             defaultValue: "Restore default values. Paths and API keys are kept. Click Apply to save."))
                 Button(String(localized: "network.button.apply",
                               defaultValue: "Apply",
                               comment: "Footer button on the Network screen that commits the edited proxy/TLS values to the server")) {
                     Task { await vm.save(client: services.client) }
                 }
                 .buttonStyle(.omlx(.primary))
-                .disabled(!vm.hasPendingChanges || vm.isSaving)
+                .disabled(!vm.hasPendingChanges || vm.isSaving || vm.isResetting)
             }
-            .padding(.horizontal, 18)
-            .padding(.top, 6)
-
-            HintFooter(error: vm.lastError)
+        }
+        .alert(String(localized: "settings.reset_defaults.title",
+                      defaultValue: "Settings Reset"), isPresented: $vm.showResetNotice) {
+            Button(String(localized: "common.cancel", defaultValue: "Cancel"), role: .cancel) {
+                vm.cancelReset()
+            }
+            Button(String(localized: "common.ok", defaultValue: "OK")) {
+                vm.confirmReset()
+            }
+        } message: {
+            Text(String(localized: "settings.reset_defaults.message",
+                        defaultValue: "Settings have been reset to defaults. Click Apply to save the changes."))
         }
         .task { await vm.load(client: services.client) }
     }
@@ -67,7 +83,7 @@ private struct ProxiesSection: View {
                     text: $vm.httpProxy,
                     placeholder: "http://proxy.local:8080",
                     mono: true,
-                    width: 320
+                    width: .controlWide
                 )
             }
             Row(label: String(localized: "network.row.https_proxy.label",
@@ -77,7 +93,7 @@ private struct ProxiesSection: View {
                     text: $vm.httpsProxy,
                     placeholder: "http://proxy.local:8080",
                     mono: true,
-                    width: 320
+                    width: .controlWide
                 )
             }
             Row(
@@ -93,7 +109,7 @@ private struct ProxiesSection: View {
                     text: $vm.noProxy,
                     placeholder: "localhost,127.0.0.1,*.internal",
                     mono: true,
-                    width: 320
+                    width: .controlWide
                 )
             }
         }
@@ -129,25 +145,11 @@ private struct TLSSection: View {
                     text: $vm.caBundle,
                     placeholder: "/etc/ssl/certs/ca-bundle.pem",
                     mono: true,
-                    width: 320
+                    width: .controlWide
                 )
             }
         }
     }
 }
 
-// MARK: - Hint footer
 
-private struct HintFooter: View {
-    let error: String?
-
-    var body: some View {
-        if let error {
-            Text(error)
-                .font(.omlxText(11))
-                .foregroundStyle(.red)
-                .padding(.horizontal, 18)
-                .padding(.top, 8)
-        }
-    }
-}

@@ -373,7 +373,7 @@ class TestResponsesEndpointReaches400:
 
         # Override the engine resolver and disable auth so the test
         # talks to the real route.
-        srv.app.dependency_overrides[srv.verify_api_key] = lambda: True
+        srv.app.dependency_overrides[srv.verify_inference_api_key] = lambda: True
         srv.get_engine_for_model = _get_engine_for_model  # type: ignore[assignment]
 
         return srv.app

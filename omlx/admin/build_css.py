@@ -75,7 +75,7 @@ def main() -> None:
         print("Watching for changes... (Ctrl+C to stop)")
 
     print(f"Building: {' '.join(cmd)}")
-    result = subprocess.run(cmd)
+    result = subprocess.run(cmd, cwd=ADMIN_DIR)
 
     if result.returncode == 0 and "--watch" not in sys.argv:
         size = output_css.stat().st_size

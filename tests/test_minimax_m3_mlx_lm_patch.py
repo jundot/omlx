@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """MiniMax-M3 must be loadable by mlx-lm, or the cluster cannot serve it.
 
-Every cluster rank is an ``mlx_lm.server``. Pinned mlx-lm has no
-``minimax_m3_vl``, so a 225 GiB model that fits two Macs with room to spare was
+Every cluster rank is an ``mlx_lm.server``. Before mlx-lm shipped its own
+``minimax_m3_vl``, a 225 GiB model that fits two Macs with room to spare was
 unservable across them while fitting one Mac only at ~1k tokens of context.
 """
 
@@ -49,18 +49,26 @@ def test_the_patch_reports_which_models_it_is_for():
     assert not is_minimax_m3({})
 
 
-def test_mlx_lm_cannot_load_minimax_without_the_patch():
-    """States the gap the patch closes, so its removal is noticed."""
+def test_the_patch_replaces_an_upstream_module_imported_first(monkeypatch):
+    """mlx-lm's own minimax_m3_vl lacks the oMLX cache, pipeline and quant paths."""
 
     import sys
+    from types import SimpleNamespace
 
-    if "mlx_lm.models.minimax_m3_vl" in sys.modules:
-        pytest.skip("patch already applied in this process")
+    import mlx_lm.models as models_pkg
 
-    from mlx_lm.utils import _get_classes
+    upstream = SimpleNamespace(__file__="/site-packages/mlx_lm/models/minimax_m3_vl.py")
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.minimax_m3_vl", upstream)
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.minimax_m3", upstream)
+    monkeypatch.setattr(models_pkg, "minimax_m3_vl", upstream, raising=False)
 
-    with pytest.raises(ValueError, match="not supported"):
-        _get_classes({"model_type": "minimax_m3_vl"})
+    assert apply_minimax_m3_mlx_lm_patch()
+
+    module = sys.modules["mlx_lm.models.minimax_m3_vl"]
+    assert module is not upstream
+    assert module.__file__.endswith("minimax_m3_vl_model.py")
+    assert sys.modules["mlx_lm.models.minimax_m3"] is module
+    assert models_pkg.minimax_m3_vl is module
 
 
 def test_mlx_lm_resolves_minimax_after_the_patch():

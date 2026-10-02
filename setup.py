@@ -55,6 +55,10 @@ def _custom_kernel_build_kwargs() -> dict:
                 sourcedir="omlx/custom_kernels/bonsai/csrc",
             ),
             extension.CMakeExtension(
+                "omlx.custom_kernels.decode_fast._ext",
+                sourcedir="omlx/custom_kernels/decode_fast/csrc",
+            ),
+            extension.CMakeExtension(
                 "omlx.custom_kernels.glm_moe_dsa._ext",
                 sourcedir="omlx/custom_kernels/glm_moe_dsa/csrc",
             ),

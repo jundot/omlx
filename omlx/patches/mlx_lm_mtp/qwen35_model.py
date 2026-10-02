@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Monkey-patch for ml-explore/mlx-lm PR #990 — Qwen3.5/3.6 native MTP.
+"""Monkey-patch for ml-explore/mlx-lm PR #990 — Qwen3.5/3.6 Lightning MTP.
 
 Adds an MTP head to ``mlx_lm.models.qwen3_5.TextModel`` (the language-model
 half) and a pass-through on ``mlx_lm.models.qwen3_5.Model`` (the VLM-outer
@@ -51,6 +51,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+from ..dflash_lifecycle import get_dflash_guard_base, set_dflash_guard_base
 from . import prompt_priming
 
 logger = logging.getLogger(__name__)
@@ -60,7 +61,7 @@ def _is_our_method(cls: Any, attr: str, marker: str) -> bool:
 
     Used as a self-healing idempotency check: when another patch (e.g.
     dflash's speculative hook) overwrites ``__call__`` between two
-    Native-MTP loads in the same process, the marker disappears and the
+    Lightning MTP loads in the same process, the marker disappears and the
     caller knows to re-apply. Reading from ``cls.__dict__`` instead of
     ``getattr`` avoids resolving inherited attributes — only what is
     actually defined on this class counts.
@@ -84,6 +85,7 @@ def apply() -> bool:
         logger.debug("mlx_lm.models.qwen3_5 not importable; skipping MTP patch")
         return False
 
+    q35.TextModel._omlx_mtp_multi_request = True
     # Skip if upstream already merged PR 990: TextModel already has mtp_forward.
     if hasattr(q35.TextModel, "mtp_forward") and not hasattr(
         q35.TextModel, "_omlx_mtp_patched"
@@ -238,10 +240,19 @@ def _patch_gated_delta_net(q35: Any) -> None:
     if _is_our_method(cls, "__call__", "_omlx_mtp_call_marker"):
         return
 
+    # dflash coexistence (issue #2972): if the dflash batch-cache guard owns
+    # ``cls.__call__``, do not clobber it — that silently strips the resident
+    # DFlash engine's speculative hook and its generations degenerate into
+    # repetition loops. Instead install our body as the guard's fallback
+    # base: dflash traffic keeps its hook, MTP/batched traffic gets ours.
+    dflash_base = get_dflash_guard_base(cls)
+    if getattr(dflash_base, "_omlx_mtp_call_marker", False):
+        return  # our body already sits under the dflash guard
+
     import mlx.core as mx
     import mlx.nn as nn
     from mlx.nn.layers.distributed import sum_gradients
-    from mlx_lm.models.gated_delta import gated_delta_update
+    from mlx_lm.models.gated_delta import gated_delta_update, normalize_qk
 
     def _process_chunk(
         self,
@@ -272,9 +283,7 @@ def _patch_gated_delta_net(q35: Any) -> None:
                 [self.head_k_dim, self.head_k_dim, self.head_v_dim],
             )
         ]
-        inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        q, k = normalize_qk(q, k, inv_scale=self.head_k_dim**-0.5, eps=1e-6)
 
         out, new_ssm_state = gated_delta_update(
             q,
@@ -356,7 +365,12 @@ def _patch_gated_delta_net(q35: Any) -> None:
 
     cls._process_chunk = _process_chunk
     __call__._omlx_mtp_call_marker = True
-    cls.__call__ = __call__
+    if dflash_base is not None:
+        # Compose with the armed dflash guard instead of replacing it
+        # (issue #2972): our body becomes the guard's fallback base.
+        set_dflash_guard_base(cls, __call__)
+    else:
+        cls.__call__ = __call__
 
 
 # ---------------------------------------------------------------------------
@@ -472,10 +486,11 @@ def _patch_text_model(q35: Any) -> None:
             self.mtp = q35.MTPModule(args)
             # Depth-k chained drafting is available on this model: the qwen
             # patch supports return_hidden mtp_forward + partial rollback.
-            from . import get_mtp_depth
+            from . import get_mtp_depth, is_mtp_depth_fixed
 
             self._omlx_mtp_chain = True
             self._omlx_mtp_depth = get_mtp_depth()
+            self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
 
     def __call__(
         self,
@@ -615,41 +630,6 @@ def _patch_text_model(q35: Any) -> None:
         )
         should_shift_norm_weights = has_unsanitized_conv1d
 
-        # MTP-head norms can use a *different* convention than the backbone,
-        # and can even be MIXED within the head itself. Observed in JANG MXFP4
-        # Qwen3.6 bundles: ``mtp.norm`` is already in MLX's +1 convention
-        # (mean ~= 1.27) while the per-layer head norms (input_layernorm /
-        # post_attention_layernorm / pre_fc_norm_*) are still in raw-HF
-        # convention (mean ~= 0). The backbone-only ``has_unsanitized_conv1d``
-        # signal evaluates False for such a checkpoint, so the +1 shift is
-        # never applied to the head norms; every RMSNorm in the head then
-        # multiplies by ~0, collapsing the head output to ~flat logits and
-        # driving MTP draft acceptance to ~0% (no speedup, MTP effectively
-        # disabled). A single global "shift or not" flag is wrong for the
-        # head, so decide PER-KEY for MTP norms from each weight's own
-        # magnitude: raw-HF RMSNorm weights center near 0, MLX-shifted near 1.
-        # The magnitude can't be read during oQ's streaming plan discovery
-        # (the weight is a no-data ``_TrackedTensor`` placeholder and
-        # ``mx.mean(...).item()`` raises), so emit a conditional replay
-        # transform there. A fixed fallback is wrong for Qwen3.6 sources
-        # where MTP norm conventions are mixed.
-        import mlx.core as _mx
-
-        def _is_oq_tracked_tensor(_w):
-            return (
-                _w.__class__.__name__ == "_TrackedTensor"
-                and hasattr(_w, "_clone")
-            )
-
-        def _mark_mtp_norm_conditional_add(_w):
-            return _w._clone(transform="add_if_mean_lt_0_5")
-
-        def _mtp_norm_is_raw_hf(_w, _fallback):
-            try:
-                return float(_mx.mean(_w.astype(_mx.float32)).item()) < 0.5
-            except Exception:
-                return _fallback
-
         if not hasattr(self, "mtp"):
             weights = {k: v for k, v in weights.items() if "mtp." not in k}
         elif not any("mtp." in k for k in weights):
@@ -680,31 +660,17 @@ def _patch_text_model(q35: Any) -> None:
         for k, v in list(weights.items()):
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
-            if v.ndim == 1 and any(k.endswith(sfx) for sfx in norm_keys):
-                # Note: keys may be prefixed (e.g. ``language_model.mtp.*``)
-                # when the outer Model wraps language_model, so test the
-                # ``mtp.`` substring rather than anchoring with startswith.
-                if "mtp." in k:
-                    if should_shift_norm_weights:
-                        # Raw-HF source: every Qwen3-Next RMSNorm gamma is
-                        # zero-centered, so head norms shift uniformly like
-                        # the backbone's. The mean heuristic below
-                        # misclassifies q_norm/k_norm (raw mean ~0.75) and
-                        # mtp.norm (raw ~1.27) as already-shifted, leaving
-                        # them -1 off — measured cost ~14pp of draft
-                        # acceptance on Qwen3.6-27B (prose 62.8% -> 76.3%).
-                        # ``v + 1.0`` also handles oQ _TrackedTensor (its
-                        # __add__ records an unconditional "add" transform).
-                        weights[k] = v + 1.0
-                    # Pre-converted checkpoints: per-key decision — a head
-                    # norm may still be raw-HF even when a sibling is
-                    # already +1 (JANG mixed bundles).
-                    elif _is_oq_tracked_tensor(v):
-                        weights[k] = _mark_mtp_norm_conditional_add(v)
-                    elif _mtp_norm_is_raw_hf(v, should_shift_norm_weights):
-                        weights[k] = v + 1.0
-                elif should_shift_norm_weights:
-                    weights[k] = v + 1.0
+            # MTP-head norms follow the backbone: a raw-HF checkpoint shifts
+            # every zero-centered gamma by +1, an MLX-format checkpoint is
+            # loaded as stored. Legacy mixed heads are repaired against the
+            # backbone in ``norm_repair`` at load_weights time; no per-tensor
+            # magnitude guess happens here (see #3742).
+            if (
+                should_shift_norm_weights
+                and v.ndim == 1
+                and any(k.endswith(sfx) for sfx in norm_keys)
+            ):
+                weights[k] = v + 1.0
         return weights
 
     def quant_predicate(self):
@@ -727,6 +693,10 @@ def _patch_text_model(q35: Any) -> None:
         cls.__init__ = __init__
         cls._omlx_mtp_init_wrapped = True
     __call__._omlx_mtp_call_marker = True
+    # Logits are lm_head(mtp(...)); draft chains may score candidates themselves.
+    mtp_forward._omlx_lm_head_logits = True
+    # The head reads only its own cache, so it can draft before the backbone commit.
+    mtp_forward._omlx_head_cache_only = True
     cls.__call__ = __call__
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache

@@ -4,6 +4,8 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from omlx.request import Request, SamplingParams
 from omlx.scheduler import Scheduler, SchedulerConfig
 
@@ -245,17 +247,25 @@ def test_cleanup_finished_stores_prompt_boundary_without_extracted_cache(
     assert kwargs["model_cache_config"] == "boundary-config"
 
 
+@pytest.mark.parametrize("skip_reason", ["request", "unsupported", "probe_failure"])
+@pytest.mark.parametrize("has_payload", [False, True])
 def test_cleanup_finished_skip_cache_store_takes_leak_guard_branch(
     mock_model,
     mock_tokenizer,
+    skip_reason,
+    has_payload,
 ):
-    """A skip_cache_store request must not prep or submit a store, but its
+    """A skipped store must not prepare a payload, but its
     blocks still go through the leak-guard release path."""
     scheduler = Scheduler(
         model=mock_model,
         tokenizer=mock_tokenizer,
         config=SchedulerConfig(paged_cache_block_size=4),
     )
+    if skip_reason == "unsupported":
+        mock_model.make_cache = lambda: [type("UnknownKVCache", (), {})()]
+    elif skip_reason == "probe_failure":
+        mock_model.make_cache = MagicMock(side_effect=RuntimeError("probe failed"))
     scheduler.block_aware_cache = MagicMock()
     scheduler.paged_cache_manager = None
 
@@ -263,12 +273,12 @@ def test_cleanup_finished_skip_cache_store_takes_leak_guard_branch(
         request_id="req-ctx-probe",
         prompt="prompt",
         sampling_params=SamplingParams(),
-        skip_cache_store=True,
+        skip_cache_store=skip_reason == "request",
     )
     request.prompt_token_ids = list(range(10))
     request.num_prompt_tokens = 10
     request.output_token_ids = [100]
-    request._extracted_cache = ["kv-live"]
+    request._extracted_cache = ["kv-live"] if has_payload else None
 
     scheduler.running[request.request_id] = request
     scheduler.requests[request.request_id] = request
@@ -288,3 +298,32 @@ def test_cleanup_finished_skip_cache_store_takes_leak_guard_branch(
     )
     assert request.request_id not in scheduler.running
     assert request.request_id not in scheduler.requests
+
+
+@pytest.mark.parametrize(
+    "preserve_reasoning, expected_sequence",
+    [(False, list(range(6))), (True, list(range(12)))],
+)
+def test_prompt_boundary_store_covers_output_when_reasoning_is_preserved(
+    preserve_reasoning, expected_sequence
+):
+    """A think-prefix request whose history keeps the reasoning stores prompt + output after a parser stop."""
+    scheduler = _scheduler()
+    request = SimpleNamespace(
+        prompt_token_ids=list(range(6)),
+        output_token_ids=list(range(6, 12)),
+        needs_think_prefix=True,
+        preserve_reasoning=preserve_reasoning,
+        specprefill_indices=None,
+    )
+    scheduler._get_boundary_store_override = MagicMock(return_value=None)
+    scheduler._detect_boundary_snapshot_need = MagicMock(return_value=False)
+    scheduler._extract_live_request_cache_for_store = MagicMock(
+        return_value=([{"state": ("kv",), "class_name": "KVCache", "cache_type": "KVCache"}], "cfg")
+    )
+
+    result = scheduler._prepare_prompt_boundary_cache_store("req", request, uid=3)
+
+    scheduler._get_boundary_store_override.assert_called_once_with("req", expected_sequence)
+    assert result is not None
+    assert result[0] == expected_sequence[: (len(expected_sequence) // 4) * 4]

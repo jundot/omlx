@@ -14,15 +14,23 @@ struct AppView: View {
     @State private var selection: AppSection? = .status
     @State private var presentedUpdate: AvailableUpdate?
 
+    @AppStorage(EnhancedReadability.enabledKey) private var enhancedReadability = false
+
     @Environment(\.colorScheme) private var scheme
     @Environment(AppServices.self) private var services
 
     var body: some View {
-        let theme = scheme == .dark ? OMLXTheme.dark : OMLXTheme.light
+        let theme = OMLXTheme.resolved(
+            for: scheme, enhancedReadability: enhancedReadability
+        )
         let section = selectedSection
 
-        NavigationSplitView {
+        // The sidebar is the only way to switch screens, so it must never
+        // collapse: pin visibility to `.all` and remove the toolbar toggle,
+        // matching System Settings.
+        NavigationSplitView(columnVisibility: .constant(.all)) {
             SettingsSidebar(selection: bindingForSelection())
+                .toolbar(removing: .sidebarToggle)
         } detail: {
             ContentScaffold(section: section, detailTitle: detailTitle) {
                 screen(for: section)
@@ -557,7 +565,34 @@ private struct ContentScaffold<Content: View>: View {
             }
         }
         .navigationTitle(titleText)
+        .modifier(ToolbarHeightKeeper())
         .background(theme.windowBg)
+    }
+}
+
+/// macOS collapses the unified toolbar to a compact title bar on panes
+/// that contribute no toolbar items. With the sidebar toggle removed,
+/// only screens with their own items (Logs, Model Settings) kept the
+/// full-height bar — so every screen contributes an invisible item to
+/// keep the height uniform. On macOS 26 the Liquid Glass capsule that
+/// toolbars draw around every item must be hidden explicitly, or the
+/// invisible item shows up as a small vertical bar.
+private struct ToolbarHeightKeeper: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            content.toolbar {
+                ToolbarItem {
+                    Color.clear.frame(width: 1, height: 1)
+                }
+                .sharedBackgroundVisibility(.hidden)
+            }
+        } else {
+            content.toolbar {
+                ToolbarItem {
+                    Color.clear.frame(width: 1, height: 1)
+                }
+            }
+        }
     }
 }
 

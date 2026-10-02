@@ -1,25 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Baidu Unlimited-OCR compatibility layer for the pinned mlx-vlm.
+"""Register oMLX Unlimited-OCR and its ring-cache implementation.
 
-The `unlimited_ocr` model package landed in mlx-vlm PR #1427 (commit
-`9909cee`, 2026-07-01), which is newer than oMLX's current mlx-vlm pin
-(`78b96eb`, 2026-06-28). Rather than bumping the whole pin (8 upstream
-commits, KEEP-patch re-verification), this vendors the model package and
-wires up only the discovery surface oMLX needs:
-
-- installs the vendored `mlx_vlm.models.unlimited_ocr` package onto the real
-  `mlx_vlm.models` namespace so `get_model_and_args` can import it (its own
-  relative imports `..deepseekocr`/`..base`/`..cache` resolve against the real
-  mlx-vlm package, which already ships `deepseekocr` at the pin),
-- adds the `unlimited-ocr -> unlimited_ocr` entry to `mlx_vlm.utils`'
-  `MODEL_REMAPPING` (without it, `get_model_and_args` tries to import the
-  literal dashed module name and falls through to the
-  `mlx_vlm.speculative.drafters.unlimited-ocr` lookup seen in issue #2314),
-- reproduces the PR's single-`<image>` multi-page prompt semantics
-  (`MessageFormat.SINGLE_IMAGE_TOKEN`) by wrapping `prompt_utils`'
-  `get_message_json` for the `unlimited-ocr` model type, without mutating the
-  frozen `MessageFormat` enum.
-"""
+Retain model-name mapping and single-image-token multi-page prompts."""
 
 from __future__ import annotations
 
@@ -82,7 +64,7 @@ def _append_package_path(package: Any, path: Path) -> None:
         return
     path_str = str(path)
     if path_str not in package_path:
-        package_path.append(path_str)
+        package_path.insert(0, path_str)
 
 
 def _import_vendor_modules() -> None:

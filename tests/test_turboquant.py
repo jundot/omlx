@@ -478,11 +478,50 @@ def test_attention_patch_routes_long_tq_prefill_to_quantized_attention(monkeypat
     )
 
     assert out.shape == queries.shape
-    assert prefill_calls == [(ks, vs)]
+    assert prefill_calls == []
     assert len(calls) == 1
     assert calls[0][0] is ks
     assert calls[0][1] is vs
     assert calls[0][2] == 256
+
+
+def test_attention_patch_keeps_short_prefill_fast_path(monkeypatch):
+    from mlx_lm.models import base as mlx_base
+
+    from omlx.patches import turboquant_attention as tq_attention
+
+    tq_attention.apply_turboquant_attention_patch()
+    monkeypatch.setattr(tq_attention, "_LONG_PREFILL_QUANTIZED_THRESHOLD", 4096)
+
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((1, 2, 8, 32)),
+        mx.random.normal((1, 2, 8, 32)),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
+    keys, values = tq.state
+    calls = []
+
+    def fake_prefill(self, queries, **kwargs):
+        calls.append("prefill")
+        return mx.zeros_like(queries)
+
+    def fake_quantized(self, queries, **kwargs):
+        calls.append("quantized")
+        return mx.zeros_like(queries)
+
+    monkeypatch.setattr(TurboQuantKVCache, "prefill_attention", fake_prefill)
+    monkeypatch.setattr(
+        TurboQuantKVCache, "quantized_attention", fake_quantized
+    )
+
+    queries = mx.random.normal((1, 4, 2, 32))
+    result = mlx_base.scaled_dot_product_attention(
+        queries, keys, values, tq, scale=32**-0.5, mask=None
+    )
+
+    assert result.shape == queries.shape
+    assert calls == ["prefill"]
 
 
 def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
@@ -500,22 +539,33 @@ def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
     )
     tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
     ks, vs = tq.state
-    calls = {"quantized": 0, "dequantize": 0}
+    calls = {"quantized": 0, "prefill": 0, "dequantize": 0}
 
     def failing_quantized_attention(self, *args, **kwargs):
         calls["quantized"] += 1
         raise RuntimeError("forced quantized prefill failure")
 
+    def none_prefill_attention(self, *args, **kwargs):
+        calls["prefill"] += 1
+        return None
+
     original_dequantize = TurboQuantKVCache.dequantize
+    dequant_kwargs = {}
 
     def spy_dequantize(self, *args, **kwargs):
         calls["dequantize"] += 1
+        dequant_kwargs.update(kwargs)
         return original_dequantize(self, *args, **kwargs)
 
     monkeypatch.setattr(
         TurboQuantKVCache,
         "quantized_attention",
         failing_quantized_attention,
+    )
+    monkeypatch.setattr(
+        TurboQuantKVCache,
+        "prefill_attention",
+        none_prefill_attention,
     )
     monkeypatch.setattr(TurboQuantKVCache, "dequantize", spy_dequantize)
 
@@ -526,7 +576,8 @@ def test_attention_patch_falls_back_when_quantized_prefill_fails(monkeypatch):
     mx.eval(out)
 
     assert out.shape == queries.shape
-    assert calls == {"quantized": 1, "dequantize": 1}
+    assert calls == {"quantized": 1, "prefill": 1, "dequantize": 1}
+    assert dequant_kwargs == {"keys_state": ks, "values_state": vs}
 
 
 @pytest.mark.parametrize("q_len", [2, 4, 9])
@@ -758,7 +809,7 @@ def test_vlm_target_verify_attention_handles_tq_proxies():
     queries = mx.random.normal((B, n_q, L, D)).astype(mx.float16)
     scale = D**-0.5
 
-    out = q35_lang._target_verify_left_padded_attention(
+    out = q35_lang._qwen3_5_left_padded_attention(
         queries, ks, vs, cache=tq, scale=scale, mask=None
     )
     mx.eval(out)
@@ -786,9 +837,9 @@ def test_vlm_target_verify_attention_handles_tq_proxies():
 
     # Non-TurboQuant caches keep the original helper behavior (declines
     # plain KVCache with no left padding -> caller uses its own path).
-    plain_ks, plain_vs = fp_cache.state
+    plain_ks, plain_vs = fp_cache.keys_and_values()
     assert (
-        q35_lang._target_verify_left_padded_attention(
+        q35_lang._qwen3_5_left_padded_attention(
             queries, plain_ks, plain_vs, cache=fp_cache, scale=scale, mask=None
         )
         is None
@@ -1318,3 +1369,112 @@ def test_batch_tq_state_restore_resets_phys_end():
         f"stale batch-mode _phys_end leaked through restore "
         f"({batch._phys_end} != 20)"
     )
+
+
+@pytest.mark.parametrize("retained", [[2, 2, 2], [1, 2, 2], [1, 2, 3]])
+def test_batch_tq_speculative_commit_matches_dense(retained):
+    from mlx_vlm.speculative.cache_state import start_speculative_cache
+
+    tq = BatchTurboQuantKVCache([0, 1, 2], bits=4.0)
+    dense = BatchKVCache([0, 1, 2])
+    mx.random.seed(3767)
+
+    def append(n):
+        k = mx.random.normal((3, 2, n, 64)).astype(mx.float16)
+        for cache in (tq, dense):
+            cache.update_and_fetch(k, k)
+
+    append(8)
+    transaction = start_speculative_cache([tq, dense], 3)
+    append(3)
+    transaction.commit(retained)
+    assert tq.offset.tolist() == dense.offset.tolist()
+    assert tq.left_padding.tolist() == dense.left_padding.tolist()
+    assert tq._phys_end == dense._idx
+    assert tq.make_mask(1).shape == dense.make_mask(1).shape
+    append(1)
+    for i in range(3):
+        got, _ = tq.extract(i).dequantize()
+        expected = dense.extract(i).state[0]
+        assert got.shape == expected.shape
+        assert mx.abs(got - expected).mean().item() < 0.2
+
+
+@pytest.mark.parametrize("advance", [0, 3])
+def test_batch_tq_speculative_abort_tracks_physical_position(advance):
+    from mlx_vlm.speculative.cache_state import start_speculative_cache
+
+    tq = BatchTurboQuantKVCache([0, 1, 2], bits=4.0)
+    dense = BatchKVCache([0, 1, 2])
+    k = mx.ones((3, 2, 8, 64), dtype=mx.float16)
+    for cache in (tq, dense):
+        cache.update_and_fetch(k, k)
+    transaction = start_speculative_cache([tq, dense], 3)
+    if advance:
+        for cache in (tq, dense):
+            cache.update_and_fetch(k[:, :, :advance], k[:, :, :advance])
+    if advance:
+        transaction.abort()
+    else:
+        transaction.commit([1, 1, 1])
+    assert tq.offset.tolist() == dense.offset.tolist()
+    assert tq._phys_end == dense._idx
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+def test_batch_tq_single_row_rollback_then_join(filtered):
+    from mlx_vlm.speculative.cache_state import start_speculative_cache
+
+    tq = BatchTurboQuantKVCache([0, 0] if filtered else [0], bits=4.0)
+    dense = BatchKVCache([0, 0] if filtered else [0])
+    k = mx.ones((2 if filtered else 1, 2, 8, 64), dtype=mx.float16)
+    for cache in (tq, dense):
+        cache.update_and_fetch(k, k)
+        if filtered:
+            cache.filter(mx.array([0]))
+    transaction = start_speculative_cache([tq, dense], 3)
+    k = k[:1, :, :3]
+    for cache in (tq, dense):
+        cache.update_and_fetch(k, k)
+    transaction.commit([2])
+    mask = tq.make_mask(2, return_array=True)
+    assert mask.shape[-1] == dense._idx + 2
+    assert tq.dequantize()[0].shape[2] == dense._idx
+
+    joining_tq = BatchTurboQuantKVCache([0], bits=4.0)
+    joining_dense = BatchKVCache([0])
+    for cache in (joining_tq, joining_dense):
+        cache.update_and_fetch(k, k)
+    tq.extend(joining_tq)
+    dense.extend(joining_dense)
+    assert tq.offset.tolist() == dense.offset.tolist()
+    assert tq.left_padding.tolist() == dense.left_padding.tolist()
+    assert tq._phys_end == dense._idx
+
+
+def test_batch_tq_qwen_mask_keeps_physical_width_with_shared_padding():
+    from types import SimpleNamespace
+
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5Attention
+
+    tq = BatchTurboQuantKVCache([2, 3, 4], bits=4.0)
+    k = mx.ones((3, 2, 8, 64), dtype=mx.float16)
+    tq.update_and_fetch(k, k)
+    attention = SimpleNamespace(
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        q_norm=lambda x: x,
+        k_norm=lambda x: x,
+        rotary_emb=SimpleNamespace(apply_rotary=lambda q, k, *a, **kw: (q, k)),
+    )
+    _, keys, _, _, mask = Qwen3_5Attention._prepare_projected_qkv(
+        attention,
+        mx.ones((3, 1, 256), dtype=mx.float16),
+        mx.ones((3, 1, 128), dtype=mx.float16),
+        mx.ones((3, 1, 128), dtype=mx.float16),
+        tq,
+        mx.zeros((3, 3, 1), dtype=mx.int32),
+        None,
+        tq.make_mask(1),
+    )
+    assert mask.shape[-1] == keys.shape[2] == 9

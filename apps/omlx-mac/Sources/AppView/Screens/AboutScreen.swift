@@ -50,7 +50,9 @@ private struct HeroCard: View {
                 .interpolation(.high)
                 .frame(width: 69, height: 69)
             VStack(alignment: .leading, spacing: 4) {
-                Text("oMLX")
+                Text(String(localized: "common.app_name",
+                            defaultValue: "oMLX",
+                            comment: "Product name shown as the About screen title"))
                     .font(.omlxText(22, weight: .semibold))
                     .foregroundStyle(theme.text)
                 Text(String(localized: "about.hero.tagline",
@@ -69,9 +71,9 @@ private struct HeroCard: View {
         .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(theme.groupBg)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous)
                 .strokeBorder(theme.groupBorder, lineWidth: 0.5)
         )
         .padding(.horizontal, 14)

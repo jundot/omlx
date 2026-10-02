@@ -1,0 +1,11 @@
+{
+  "_state": "pairing",
+  "_variant": "joiner",
+  "_comment": "GET /api/cluster/pair/join snapshot while THIS Mac awaits approval (joiner side, POST /pair/join already sent). The wizard renders the big code panel and keeps polling until the coordinator approves; the plaintext code exists only in this local admin snapshot.",
+  "state": "awaiting_approval",
+  "code": "482915",
+  "expires_at": 1782000600.0,
+  "seconds_remaining": 542,
+  "coordinator_addr": "192.168.1.11:8000",
+  "error": null
+}

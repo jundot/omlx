@@ -26,10 +26,13 @@ Usage:
 import asyncio
 import contextlib
 import copy
+import functools
+import hashlib
 import importlib
 import inspect
 import json
 import logging
+import os
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -45,18 +48,31 @@ from ..api.utils import (
 )
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
+from ..model_settings import ane_prefill_backend, ane_prefill_fraction
 from ..models.vlm import VLMModelAdapter
+from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
     extract_images_from_messages,
+    extract_media_from_messages,
+)
+from ..utils.video import (
+    NATIVE_VIDEO_MODEL_TYPES,
+    attach_native_video_processor,
+    estimate_native_video_tokens,
+    expand_video_parts,
+    native_video_token_count,
+    probe_video,
+    write_video_data_uri,
 )
 from .base import (
     BaseEngine,
     GenerationOutput,
     _clear_teardown_references,
+    _close_engine_core,
     _run_scheduler_preflight_with_cleanup_retry,
     _warn_scheduler_unreachable_once,
 )
@@ -105,6 +121,9 @@ COHERE2_MOE_MODEL_TYPE = "cohere2_moe"
 QWEN4_EXP_MODEL_TYPE = "qwen4_exp"
 MINIMAX_M3_VL_MODEL_TYPE = "minimax_m3_vl"
 MINIMAX_M3_MODEL_TYPES = {"minimax_m3", MINIMAX_M3_VL_MODEL_TYPE}
+# mlx-vlm's Gemma4Processor.apply_chat_template renders the messages again. It
+# moves audio markers to the last user turn and prints list system content.
+TOKENIZER_CHAT_TEMPLATE_MODEL_TYPES = {"gemma4", "gemma4_unified", "diffusion_gemma"}
 
 DIFFUSION_PREFILL_STEP_SIZE = 2048
 
@@ -169,6 +188,22 @@ def _is_missing_chat_template_error(exc: ValueError) -> bool:
         or "does not have a chat template" in message
         or "No chat template found" in message
     )
+
+
+def _capture_vlm_position_state(lm: Any, extra_kwargs: dict[str, Any]) -> None:
+    """Capture returned position metadata before consulting model-owned state.
+
+    Materialize it on the executor stream to prevent cross-stream ANE prefill deadlocks.
+    """
+    pid = extra_kwargs.get("position_ids", getattr(lm, "_position_ids", None))
+    if pid is not None and "position_ids" not in extra_kwargs:
+        extra_kwargs["position_ids"] = pid
+    rd = extra_kwargs.get("rope_deltas", getattr(lm, "_rope_deltas", None))
+    if rd is not None:
+        extra_kwargs["_captured_rope_deltas"] = rd
+    lazy_state = [v for v in (pid, rd) if isinstance(v, mx.array)]
+    if lazy_state:
+        mx.eval(*lazy_state)
 
 
 def _apply_minimax_m3_thinking_mode(
@@ -573,8 +608,65 @@ def _resolve_optiq_vision_sidecar(model_dir: Path) -> Path | None:
     return sidecar
 
 
+_AUDIO_WEIGHT_PREFIXES = ("audio_tower.", "embed_audio.", "audio_encoder.")
+
+
+def _is_audio_weight_key(key: str) -> bool:
+    """True for audio encoder weights under MLX or HF naming.
+
+    HF-named checkpoints keep a leading `model.` (`model.audio_tower.*`) that
+    mlx-vlm's sanitize strips only at load time.
+    """
+    if key.startswith("model."):
+        key = key[len("model.") :]
+    return key.startswith(_AUDIO_WEIGHT_PREFIXES)
+
+
 def _has_audio_weights(model_dir: Path) -> bool:
-    """Return True iff any safetensors shard contains audio_tower / embed_audio keys."""
+    """Return True iff checkpoint shards or MiMo's sidecar contain audio weights."""
+    import safetensors
+
+    weight_files = list(model_dir.glob("*.safetensors"))
+    sidecar = _resolve_optiq_vision_sidecar(model_dir)
+    if sidecar is not None and all(sf.resolve() != sidecar for sf in weight_files):
+        weight_files.append(sidecar)
+    mimo_audio_sidecar = model_dir / "omnimodal" / "audio_encoder.safetensors"
+    if mimo_audio_sidecar.is_file():
+        weight_files.append(mimo_audio_sidecar)
+
+    for sf in weight_files:
+        try:
+            with safetensors.safe_open(str(sf), framework="np") as f:
+                # safetensors.safe_open exposes keys() but is not a Mapping.
+                if any(_is_audio_weight_key(k) for k in f.keys()):  # noqa: SIM118
+                    return True
+        except Exception:
+            # Corrupt or unreadable shard — treat as no audio info, let
+            # downstream loader produce its own error.
+            return False
+    return False
+
+
+# Text-only oQ checkpoints can retain embed_vision without a vision tower.
+_VISION_TOWER_MARKER = "vision_tower"
+_VISION_TENSOR_MARKERS = (_VISION_TOWER_MARKER, "embed_vision")
+# Moondream stores its tower under `vision` (current, converted) or
+# `vision_encoder` (2024 revisions) and never declares a vision_config.
+_VISION_TOWER_PATH_MARKERS = (_VISION_TOWER_MARKER, "vision", "vision_encoder")
+
+
+def _is_vision_tensor_key(key: str) -> bool:
+    """True for parameter paths under `vision_tower` / `embed_vision`."""
+    return any(marker in key.split(".") for marker in _VISION_TENSOR_MARKERS)
+
+
+def _is_vision_tower_key(key: str) -> bool:
+    """Exclude orphan projection weights when detecting a vision tower."""
+    return any(marker in key.split(".") for marker in _VISION_TOWER_PATH_MARKERS)
+
+
+def _has_vision_tower_weights(model_dir: Path) -> bool:
+    """Return True iff any safetensors shard contains vision_tower weights."""
     import safetensors
 
     weight_files = list(model_dir.glob("*.safetensors"))
@@ -583,16 +675,25 @@ def _has_audio_weights(model_dir: Path) -> bool:
         weight_files.append(sidecar)
 
     for sf in weight_files:
-        try:
-            with safetensors.safe_open(str(sf), framework="np") as f:
-                for k in f.keys():
-                    if k.startswith(("audio_tower.", "embed_audio.")):
-                        return True
-        except Exception:
-            # Corrupt or unreadable shard — treat as no audio info, let
-            # downstream loader produce its own error.
-            return False
+        with safetensors.safe_open(str(sf), framework="np") as f:
+            # safetensors.safe_open exposes keys() but is not a Mapping.
+            if any(_is_vision_tower_key(k) for k in f.keys()):  # noqa: SIM118
+                return True
     return False
+
+
+def _vision_config_is_orphaned(model_dir: Path) -> bool:
+    """Require absent vision config and readable shards without a tower."""
+    try:
+        raw = json.loads((model_dir / "config.json").read_text())
+    except Exception:
+        return False
+    if raw.get("vision_config"):
+        return False
+    try:
+        return not _has_vision_tower_weights(model_dir)
+    except Exception:
+        return False
 
 
 @contextlib.contextmanager
@@ -654,6 +755,74 @@ def _strip_audio_config_if_orphaned(model_dir: Path):
         yield
     finally:
         _vu.load_config = original
+
+
+@contextlib.contextmanager
+def _strip_vision_config_if_orphaned(model_dir: Path):
+    """Suppress inferred vision modules and orphan weights for text-only loads."""
+    if not _vision_config_is_orphaned(model_dir):
+        yield
+        return
+
+    import mlx.nn as _nn
+    import mlx_vlm.utils as _vu
+
+    original_load_config = _vu.load_config
+    original_update_module_configs = _vu.update_module_configs
+    original_load_weights = _nn.Module.load_weights
+    warned = False
+
+    def _text_capable_load_config(path, **kwargs):
+        cfg = original_load_config(path, **kwargs)
+        # mlx-vlm's gemma4 builds a vision tower unconditionally; gemma4_unified
+        # shares its language_model layout and runs without one.
+        if cfg.get("model_type") == "gemma4":
+            cfg = {**cfg, "model_type": "gemma4_unified"}
+        return cfg
+
+    def _patched_update_module_configs(model_config, model_class, config, modules):
+        model_config = original_update_module_configs(
+            model_config, model_class, config, modules
+        )
+        # Clear the deserialized config; the raw dict must stay valid for quantization.
+        if hasattr(model_config, "vision_config") and not config.get(
+            "vision_config"
+        ):
+            model_config.vision_config = None
+        return model_config
+
+    def _vision_filtering_load_weights(self, weights_items, *args, **kwargs):
+        nonlocal warned
+        if isinstance(weights_items, str):
+            return original_load_weights(self, weights_items, *args, **kwargs)
+
+        # MLX-format checkpoints skip upstream sanitize, leaving orphan projections.
+        owned = {k for k, _ in _nn.utils.tree_flatten(self.parameters())}
+        kept = []
+        dropped = 0
+        for key, value in weights_items:
+            if _is_vision_tensor_key(key) and key not in owned:
+                dropped += 1
+                continue
+            kept.append((key, value))
+        if dropped and not warned:
+            warned = True
+            logger.warning(
+                "vision_tower weights missing for %s; loading without "
+                "vision support",
+                model_dir.name,
+            )
+        return original_load_weights(self, kept, *args, **kwargs)
+
+    _vu.load_config = _text_capable_load_config
+    _vu.update_module_configs = _patched_update_module_configs
+    _nn.Module.load_weights = _vision_filtering_load_weights
+    try:
+        yield
+    finally:
+        _vu.load_config = original_load_config
+        _vu.update_module_configs = original_update_module_configs
+        _nn.Module.load_weights = original_load_weights
 
 
 @contextlib.contextmanager
@@ -741,6 +910,112 @@ def _is_mlx_format_safetensors_dir(model_dir: Path) -> bool:
     except Exception:
         return False
     return isinstance(metadata, dict) and metadata.get("format") == "mlx"
+
+
+def _gemma4_global_kv_from_per_layer_config(config: dict) -> dict[str, int]:
+    """Derive Gemma4's legacy full-attention head fields from ``per_layer_config``.
+
+    Newer Gemma4 checkpoints (Transformers >= 5.15) record the ``head_dim`` /
+    ``num_key_value_heads`` overrides of the full-attention layers under
+    ``text_config.per_layer_config`` instead of the legacy global
+    ``global_head_dim`` / ``num_global_key_value_heads`` fields. The pinned
+    mlx-vlm Gemma4 loader reads only the legacy fields, so it sizes the
+    full-attention K/V projections with the sliding-window head count and
+    ``load_weights`` fails with a shape mismatch (#3537).
+
+    Returns the legacy fields that are absent from ``text_config`` and can be
+    derived unambiguously (every overridden full-attention layer agrees), or
+    an empty dict.
+    """
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        return {}
+    model_type = str(text_config.get("model_type") or config.get("model_type") or "")
+    if not model_type.startswith("gemma4"):
+        return {}
+    per_layer = text_config.get("per_layer_config")
+    if not isinstance(per_layer, dict) or not per_layer:
+        return {}
+    layer_types = text_config.get("layer_types")
+    if not isinstance(layer_types, list):
+        layer_types = None
+
+    derived: dict[str, int] = {}
+    for legacy_key, layer_key in (
+        ("global_head_dim", "head_dim"),
+        ("num_global_key_value_heads", "num_key_value_heads"),
+    ):
+        if text_config.get(legacy_key) is not None:
+            continue
+        values: set[int] = set()
+        for layer_id, overrides in per_layer.items():
+            if not isinstance(overrides, dict) or overrides.get(layer_key) is None:
+                continue
+            if layer_types is not None:
+                try:
+                    layer_idx = int(layer_id)
+                except (TypeError, ValueError):
+                    continue
+                if not 0 <= layer_idx < len(layer_types):
+                    continue
+                if layer_types[layer_idx] != "full_attention":
+                    continue
+            try:
+                values.add(int(overrides[layer_key]))
+            except (TypeError, ValueError):
+                continue
+        if len(values) == 1:
+            derived[legacy_key] = values.pop()
+    return derived
+
+
+@contextlib.contextmanager
+def _derive_gemma4_global_kv_on_load(model_dir: Path):
+    """Feed ``per_layer_config``-only Gemma4 head overrides to the mlx-vlm loader.
+
+    Wraps ``mlx_vlm.utils.load_config`` for one ``vlm_load(...)`` so the
+    config handed to the Gemma4 ``TextConfig`` carries ``global_head_dim`` /
+    ``num_global_key_value_heads`` derived from ``per_layer_config`` when the
+    checkpoint does not spell them out (#3537). Checkpoints that already
+    carry the legacy fields, and non-Gemma4 models, are untouched.
+    """
+    config_path = model_dir / "config.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except Exception:
+        yield
+        return
+    derived = (
+        _gemma4_global_kv_from_per_layer_config(config)
+        if isinstance(config, dict)
+        else {}
+    )
+    if not derived:
+        yield
+        return
+
+    import mlx_vlm.utils as _vu
+
+    original_load_config = _vu.load_config
+
+    def _patched_load_config(model_path, **kwargs):
+        loaded = original_load_config(model_path, **kwargs)
+        text_config = loaded.get("text_config") if isinstance(loaded, dict) else None
+        if isinstance(text_config, dict):
+            for key, value in derived.items():
+                if text_config.get(key) is None:
+                    text_config[key] = value
+        return loaded
+
+    logger.info(
+        "derive_gemma4_global_kv_on_load: per_layer_config -> %s",
+        ", ".join(f"{k}={v}" for k, v in derived.items()),
+    )
+    _vu.load_config = _patched_load_config
+    try:
+        yield
+    finally:
+        _vu.load_config = original_load_config
 
 
 @contextlib.contextmanager
@@ -907,6 +1182,20 @@ def _should_pack_minimax_m3_shared_expert(args: Any) -> bool:
     )
 
 
+def _model_shard_matcher(model_dir: Path):
+    """Return a predicate for safetensors shards directly under *model_dir*."""
+    target_dir = model_dir.resolve()
+
+    def matches(filename: object) -> bool:
+        try:
+            path = Path(filename)
+            return path.suffix == ".safetensors" and path.parent.resolve() == target_dir
+        except (TypeError, OSError, RuntimeError):
+            return False
+
+    return matches
+
+
 @contextlib.contextmanager
 def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
     """Force mlx-vlm's MiniMax M3 MoE sanitize path for MLX-format checkpoints.
@@ -933,7 +1222,7 @@ def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
 
     original_safe_open = safetensors.safe_open
     original_sanitize_moe_weights = _minimax_m3_vl._sanitize_moe_weights
-    target_dir = model_dir.resolve()
+    is_target_shard = _model_shard_matcher(model_dir)
 
     class _SafeOpenMetadataWrapper:
         def __init__(self, inner):
@@ -958,11 +1247,7 @@ def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
 
     def _patched_safe_open(filename, *args, **kwargs):
         handle = original_safe_open(filename, *args, **kwargs)
-        try:
-            path = Path(filename).resolve()
-        except TypeError:
-            return handle
-        if path.parent == target_dir and path.suffix == ".safetensors":
+        if is_target_shard(filename):
             return _SafeOpenMetadataWrapper(handle)
         return handle
 
@@ -1053,8 +1338,10 @@ def _force_qwen4_exp_sanitize_on_load(model_dir: Path):
 
     import safetensors
 
+    from ..patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import ple_load_resources
+
     original_safe_open = safetensors.safe_open
-    target_dir = model_dir.resolve()
+    is_target_shard = _model_shard_matcher(model_dir)
 
     class _SafeOpenMetadataWrapper:
         def __init__(self, inner):
@@ -1079,11 +1366,7 @@ def _force_qwen4_exp_sanitize_on_load(model_dir: Path):
 
     def _patched_safe_open(filename, *args, **kwargs):
         handle = original_safe_open(filename, *args, **kwargs)
-        try:
-            path = Path(filename).resolve()
-        except TypeError:
-            return handle
-        if path.parent == target_dir and path.suffix == ".safetensors":
+        if is_target_shard(filename):
             return _SafeOpenMetadataWrapper(handle)
         return handle
 
@@ -1094,7 +1377,8 @@ def _force_qwen4_exp_sanitize_on_load(model_dir: Path):
             model_type,
             model_dir.name,
         )
-        yield
+        with ple_load_resources():
+            yield
     finally:
         safetensors.safe_open = original_safe_open
 
@@ -1187,14 +1471,64 @@ def _uses_mrope(vlm_model) -> bool:
 _QWEN_VISION_MODELS = {
     "qwen3_5",
     "qwen3_5_moe",
+    "prism_hadamard_qwen35",  # Ternary Bonsai 2 keeps the Qwen3.5 vision tower.
     "qwen3_vl",
     "qwen3_vl_moe",
+    "qwen4_exp",  # Reuses the Qwen3.5/Qwen3-VL vision tower verbatim.
     "qwen2_vl",
     "qwen2_5_vl",
+    "mimo_v2",
+    "mimo_v2_flash",
 }
 
 # Grid-based VLMs whose flat vision features can be split with grid_thw.
 _GRID_VISION_MODELS = _QWEN_VISION_MODELS | {"glm5_next"}
+
+# Model types eligible for the processor-free cached-input path (see
+# ``VLMBatchedEngine._try_build_cached_vision_inputs``). mimo variants are
+# excluded: their audio-aware pipeline owns input assembly.
+_CACHED_INPUT_FAST_PREPARE_MODEL_TYPES = _QWEN_VISION_MODELS - {
+    "mimo_v2",
+    "mimo_v2_flash",
+}
+
+
+def _grid_row(image_grid_thw: Any, i: int) -> Optional[List[int]]:
+    """Row ``i`` of an ``image_grid_thw`` tensor as ``[t, h, w]``, or None."""
+    try:
+        row = [int(v) for v in image_grid_thw[i]]
+    except (IndexError, TypeError, ValueError):
+        return None
+    return row if len(row) == 3 else None
+
+
+def _grid_image_token_starts(
+    token_ids: list[int], image_grid_thw: Any, image_token_id: int, merge_size: int
+) -> list[int]:
+    """Locate each grid image in the final, expanded processor token sequence."""
+    grid = (
+        image_grid_thw.tolist()
+        if hasattr(image_grid_thw, "tolist")
+        else image_grid_thw
+    )
+    counts = []
+    for t, h, w in grid:
+        patches = int(t) * int(h) * int(w)
+        if merge_size <= 0 or patches <= 0 or patches % (merge_size**2):
+            raise ValueError("Invalid image grid for cache boundaries")
+        counts.append(patches // (merge_size**2))
+    positions = [i for i, token in enumerate(token_ids) if token == image_token_id]
+    if sum(counts) != len(positions):
+        raise ValueError("Image grids do not match the final image tokens")
+    starts = []
+    offset = 0
+    for count in counts:
+        start = positions[offset]
+        if positions[offset + count - 1] != start + count - 1:
+            raise ValueError("Image token span is not contiguous")
+        starts.append(start)
+        offset += count
+    return starts
 
 
 # Conservative fallback upper bound on image-placeholder tokens per image
@@ -1354,9 +1688,10 @@ def _count_image_tokens_real(
     processor: Any,
     *,
     upper_bound: int = _IMAGE_TOKEN_UPPER_BOUND_FALLBACK,
+    images: list[Any] | None = None,
 ) -> int:
-    """Sum the *real* per-image token contribution from actual image
-    dimensions, instead of charging every image the model's ``max_pixels``
+    """Sum per-image tokens using processed images when supplied, otherwise
+    source dimensions, instead of charging every image the model's ``max_pixels``
     ceiling. Falls back to ``upper_bound`` per image when the dimensions can't
     be read decode-free or the processor isn't a Qwen-style one, so the guard
     still never under-counts."""
@@ -1374,27 +1709,112 @@ def _count_image_tokens_real(
         and isinstance(getattr(ip, "max_image_tokens", None), int)
     )
 
+    if images is not None:
+        dimensions = [image.size for image in images]
+    else:
+        dimensions = []
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") not in ("image_url", "image", "input_image"):
+                    continue
+                dimensions.append(_read_image_dims(part))
+
     total = 0
-    for msg in messages:
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            if part.get("type") not in ("image_url", "image", "input_image"):
-                continue
-            wh = _read_image_dims(part) if qwen_ok or glm_ok else None
-            if wh is None:
+    for wh in dimensions:
+        if wh is None or not (qwen_ok or glm_ok):
+            total += upper_bound
+        elif glm_ok:
+            try:
+                total += int(patch_counter(wh[1], wh[0]) // (ms**2))
+            except Exception:
                 total += upper_bound
-            elif glm_ok:
-                try:
-                    total += int(patch_counter(wh[1], wh[0]) // (ms**2))
-                except Exception:
-                    total += upper_bound
-            else:
-                total += _smart_resize_tokens(wh[1], wh[0], ps, ms, minp, maxp)
+        else:
+            total += _smart_resize_tokens(wh[1], wh[0], ps, ms, minp, maxp)
     return total
+
+
+def _audio_feature_cache_key_ranges(
+    token_ids: list[int],
+    input_features: Any,
+    input_features_mask: Any,
+    audio_token_id: int | None,
+    image_ranges: list[tuple[int, str]],
+) -> list[tuple[int, str]]:
+    """Extend image cache boundaries with cumulative audio-clip identities.
+
+    Audio placeholder tokens only encode clip length, so without this two
+    different clips of equal length share prefix-cache blocks. Each clip is
+    hashed without its batch padding (clips are padded to the longest one in
+    the request), so a clip keeps its key when a later turn adds a longer one.
+    """
+    import hashlib
+
+    import numpy as np
+
+    def _to_np(value):
+        if isinstance(value, mx.array):
+            if value.dtype == mx.bfloat16:
+                value = value.astype(mx.float32)
+            return np.array(value)
+        return np.asarray(value)
+
+    features = _to_np(input_features)
+    mask = None if input_features_mask is None else _to_np(input_features_mask)
+
+    runs = []
+    position = 0
+    while audio_token_id is not None and position < len(token_ids):
+        if token_ids[position] != audio_token_id:
+            position += 1
+            continue
+        runs.append(position)
+        while position < len(token_ids) and token_ids[position] == audio_token_id:
+            position += 1
+
+    audio_hash = hashlib.sha256()
+    audio_events = []
+    if features.ndim >= 2 and len(runs) == features.shape[0]:
+        for i, start in enumerate(runs):
+            clip = features[i]
+            if mask is not None and mask.shape[:2] == features.shape[:2]:
+                valid = int(mask[i].sum())
+                # Trim only right padding; any other mask layout keeps the
+                # padded row, which can over-key but never collide.
+                if mask[i][:valid].all():
+                    clip = clip[:valid]
+            audio_hash.update(str(clip.shape).encode())
+            audio_hash.update(np.ascontiguousarray(clip).tobytes())
+            audio_events.append((start, audio_hash.hexdigest()))
+    else:
+        # Clips can't be matched to token runs: key everything from the
+        # first audio token on (or the whole request) on all audio input.
+        audio_hash.update(str(features.shape).encode())
+        audio_hash.update(np.ascontiguousarray(features).tobytes())
+        audio_events.append((runs[0] if runs else 0, audio_hash.hexdigest()))
+
+    events = [(start, key, None) for start, key in image_ranges]
+    events += [(start, None, key) for start, key in audio_events]
+    ranges = []
+    image_key = ""
+    audio_key = None
+    for start, image_update, audio_update in sorted(events, key=lambda e: e[0]):
+        if image_update is not None:
+            image_key = image_update
+        if audio_update is not None:
+            audio_key = audio_update
+        key = image_key
+        if audio_key is not None:
+            key = hashlib.sha256(f"audio:{image_key}:{audio_key}".encode()).hexdigest()
+        if ranges and ranges[-1][0] == start:
+            ranges[-1] = (start, key)
+        else:
+            ranges.append((start, key))
+    return ranges
 
 
 class VLMBatchedEngine(BaseEngine):
@@ -1426,6 +1846,8 @@ class VLMBatchedEngine(BaseEngine):
 
         self._vlm_model = None
         self._processor = None
+        # Set after load for checkpoints that take native video input.
+        self._native_video = False
         self._tokenizer = None
         self._adapter = None
         self._engine = None
@@ -1437,6 +1859,9 @@ class VLMBatchedEngine(BaseEngine):
         # Holds the loaded gemma4_assistant drafter when vlm_mtp_enabled.
         # Phase 2A: attached but not yet wired into the decode path.
         self._vlm_mtp_drafter: Any | None = None
+        # Holds the DFlash block drafter attached to Lightning MTP when
+        # dflash_enabled routes here instead of DFlashEngine.
+        self._dflash_drafter: Any | None = None
         self._diffusion_family: str | None = None
         self._diffusion_lock = asyncio.Lock()
         self._diffusion_active_requests = 0
@@ -1448,6 +1873,7 @@ class VLMBatchedEngine(BaseEngine):
         *,
         num_prompt_tokens: int,
         request_id: str | None,
+        text_only: bool = False,
     ) -> None:
         await _run_scheduler_preflight_with_cleanup_retry(
             scheduler,
@@ -1459,6 +1885,7 @@ class VLMBatchedEngine(BaseEngine):
                 "_mlx_executor",
                 None,
             ),
+            text_only=text_only,
         )
 
     @property
@@ -1468,6 +1895,21 @@ class VLMBatchedEngine(BaseEngine):
     @property
     def tokenizer(self) -> Any:
         return self._tokenizer
+
+    @property
+    def supports_early_tool_call_streaming(self) -> bool:
+        """Opt in only when the local scheduler has no structured parser."""
+
+        scheduler = getattr(
+            getattr(getattr(self, "_engine", None), "engine", None),
+            "scheduler",
+            None,
+        )
+        return bool(
+            scheduler is not None
+            and hasattr(scheduler, "_output_parser_factory")
+            and scheduler._output_parser_factory is None
+        )
 
     @property
     def model_type(self) -> str | None:
@@ -1566,25 +2008,14 @@ class VLMBatchedEngine(BaseEngine):
             return False
 
     def _detect_diffusion_family(self) -> str | None:
-        """Return the mlx-vlm diffusion generation family for loaded models."""
-        try:
-            from mlx_vlm.generate.diffusion import diffusion_generation_family
-
-            family = diffusion_generation_family(self._vlm_model)
-            if family == "block":
-                return family
-            if family is not None:
-                logger.warning(
-                    "Unsupported diffusion generation family for %s: %s",
-                    self._model_name,
-                    family,
-                )
-            return None
-        except Exception as e:
-            logger.debug("mlx-vlm diffusion family detection skipped: %s", e)
+        """Route canvas diffusion models to the serial generation lane."""
+        from mlx_vlm.generate.diffusion import is_diffusion_model
 
         config = getattr(self._vlm_model, "config", None)
-        if getattr(config, "canvas_length", None) is not None:
+        if (
+            getattr(config, "canvas_length", None) is not None
+            and is_diffusion_model(self._vlm_model)
+        ):
             return "block"
         return None
 
@@ -1636,6 +2067,8 @@ class VLMBatchedEngine(BaseEngine):
                 model_settings=self._model_settings,
                 for_vlm=True,
             )
+        except ValueError:
+            raise
         except Exception as e:
             logger.debug(f"pre-load patches skipped: {e}")
 
@@ -1647,9 +2080,12 @@ class VLMBatchedEngine(BaseEngine):
             _patch_video_processor_bug()
             _patch_torch_free_image_processor()
             apply_pixtral_torch_free_patch()
+            apply_gemma4_audio_patch()
             with (
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
+                _strip_vision_config_if_orphaned(Path(self._model_name)),
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
+                _derive_gemma4_global_kv_on_load(Path(self._model_name)),
                 _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
                 _force_qwen4_exp_sanitize_on_load(Path(self._model_name)),
                 _remap_nested_visual_on_load(Path(self._model_name)),
@@ -1657,6 +2093,22 @@ class VLMBatchedEngine(BaseEngine):
                     Path(self._model_name)
                 ),
             ):
+                model_type = _read_config_model_type(self._model_name)
+                if model_type in {"mimo_v2", "mimo_v2_flash"}:
+                    from ..patches.mimo_v2.omnimodal import (
+                        has_vision_sidecar,
+                    )
+                    from ..patches.mimo_v2.omnimodal import (
+                        load as load_mimo_omnimodal,
+                    )
+
+                    if has_vision_sidecar(self._model_name):
+                        return load_mimo_omnimodal(
+                            self._model_name,
+                            model_settings=self._model_settings,
+                            trust_remote_code=self._trust_remote_code,
+                        )
+
                 custom_loaded = maybe_load_custom_quantization(
                     self._model_name,
                     is_vlm=True,
@@ -1665,7 +2117,36 @@ class VLMBatchedEngine(BaseEngine):
                     model, processor = custom_loaded
                     return model, processor
 
-                model_type = _read_config_model_type(self._model_name)
+                if model_type == "deepseek_v41":
+                    from ..patches.deepseek_v41.loading import load
+
+                    return load(
+                        self._model_name,
+                        moe_expert_offload_resident_fraction=(
+                            self._model_settings.moe_expert_offload_resident_fraction
+                            if getattr(
+                                self._model_settings,
+                                "moe_expert_offload_enabled",
+                                False,
+                            )
+                            and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
+                            else None
+                        ),
+                        engram_ssd_offload=bool(
+                            getattr(
+                                self._model_settings,
+                                "deepseek_v41_engram_ssd_offload",
+                                False,
+                            )
+                        ),
+                        ced_prefill=bool(
+                            getattr(
+                                self._model_settings,
+                                "deepseek_v41_ced_prefill_enabled",
+                                False,
+                            )
+                        ),
+                    )
                 if model_type == COHERE2_MOE_MODEL_TYPE:
                     return _load_cohere2_moe_text_model(
                         self._model_name,
@@ -1679,6 +2160,14 @@ class VLMBatchedEngine(BaseEngine):
                     }
                     if model_type == QWEN4_EXP_MODEL_TYPE:
                         load_kwargs["lazy"] = True
+                    # Expert offload wraps BEFORE materialization so non-resident
+                    # experts never load; keep the load lazy only when the feature
+                    # is on. Threads into main's load_kwargs path (lazy is idempotent
+                    # with the QWEN4_EXP case above).
+                    if getattr(
+                        self._model_settings, "moe_expert_offload_enabled", False
+                    ):
+                        load_kwargs["lazy"] = True
                     loaded = vlm_load(
                         self._model_name,
                         **load_kwargs,
@@ -1689,6 +2178,17 @@ class VLMBatchedEngine(BaseEngine):
         self._vlm_model, self._processor = await loop.run_in_executor(
             get_mlx_executor(), _load_vlm_sync
         )
+
+        from ..models.vlm import restore_bonsai_quantized_modules
+
+        restored = restore_bonsai_quantized_modules(self._vlm_model)
+        if restored:
+            logger.info("Restored oMLX Bonsai kernel paths for %d modules", restored)
+
+        if self.model_type in NATIVE_VIDEO_MODEL_TYPES:
+            self._native_video = attach_native_video_processor(
+                self._processor, self._model_name
+            )
 
         if self.model_type == "unlimited-ocr":
             from ..utils.tokenizer import (
@@ -1713,6 +2213,54 @@ class VLMBatchedEngine(BaseEngine):
                     "in memory for %s",
                     self._model_name,
                 )
+
+        # MoE expert offload for the VLM path: Gemma 4 checkpoints are
+        # detected as VLMs, so this — not BatchedEngine — is their default
+        # engine. Same sequence as batched.py: wrap on the MLX executor
+        # BEFORE materialize so non-resident experts never load.
+        moe_offload_wrapped = 0
+        if getattr(self._model_settings, "moe_expert_offload_enabled", False):
+            from ..patches.moe_expert_offload import (
+                apply_moe_expert_offload,
+                materialize_offload_state,
+            )
+
+            fraction = float(
+                getattr(
+                    self._model_settings,
+                    "moe_expert_offload_resident_fraction",
+                    0.25,
+                )
+            )
+            # glm5_next Lightning MTP: the draft head's experts stay resident
+            # while the backbone streams (run_in_executor takes no kwargs,
+            # so bind with partial).
+            moe_offload_wrapped = await loop.run_in_executor(
+                get_mlx_executor(),
+                functools.partial(
+                    apply_moe_expert_offload,
+                    mtp_resident=bool(
+                        getattr(self._model_settings, "mtp_enabled", False)
+                    ),
+                ),
+                self._vlm_model,
+                self._model_name,
+                fraction,
+            )
+            if moe_offload_wrapped:
+                # The caches' slot maps and resident slots live on plain
+                # attributes outside the module tree, so the lazy-state
+                # materialization below never reaches them; left lazy they
+                # stay bound to the loader stream and the first request from
+                # an inference thread dies with "There is no Stream(gpu, N)
+                # in current thread". Same executor as the apply, so the
+                # arrays realize on the stream that created them.
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    materialize_offload_state,
+                    self._vlm_model,
+                )
+        self._moe_offload_wrapped = moe_offload_wrapped
 
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
         # loader thread so per-engine inference threads can read them (#1304).
@@ -1743,22 +2291,171 @@ class VLMBatchedEngine(BaseEngine):
         # MoE layer instead of 3 (issue #2238). Bit-exact; also swaps the
         # mlx-vlm target-verify helper for a fused-aware version. Runs on
         # the MLX executor because it rewrites weights in place.
-        if (
+        if getattr(self, "_moe_offload_wrapped", 0):
+            logger.info(
+                "moe expert offload active (%d layers): skipping gate/up "
+                "fusion on the VLM path",
+                self._moe_offload_wrapped,
+            )
+        elif (
             getattr(self._model_settings, "moe_gate_up_fusion_enabled", True)
             is not False
         ):
             try:
-                from ..patches.qwen35_moe_gate_up import (
-                    apply_qwen35_moe_gate_up_fusion,
-                )
+                from ..patches.moe_gate_up_fusion import apply_moe_gate_up_fusion
 
                 await loop.run_in_executor(
                     get_mlx_executor(),
-                    apply_qwen35_moe_gate_up_fusion,
+                    apply_moe_gate_up_fusion,
                     self._vlm_model,
                 )
             except Exception:
                 logger.debug("MoE gate+up fusion not applied", exc_info=True)
+
+        # Qwen ANE prefill compiles its slices from the stock QuantizedLinear
+        # layout, so build them before the packed projections replace it. The
+        # class hooks are installed later, outside the other Qwen class patches.
+        ane_count = 0
+        requested_ane_sequence_length = 2048
+        if (
+            getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)
+            and ane_prefill_backend(self.model_type) == "qwen"
+        ):
+            ane_fraction = ane_prefill_fraction(
+                self._model_settings.qwen35_ane_prefill_fraction, self.model_type
+            )
+            try:
+                from ..patches.qwen35_ane_prefill import enable_qwen35_ane_prefill
+
+                requested_ane_sequence_length = int(
+                    getattr(
+                        self._model_settings,
+                        "qwen35_ane_prefill_sequence_length",
+                        2048,
+                    )
+                )
+
+                def _enable_ane_prefill():
+                    return enable_qwen35_ane_prefill(
+                        self._vlm_model,
+                        sequence_length=requested_ane_sequence_length,
+                        tail_padding_min_tokens=int(
+                            getattr(
+                                self._model_settings,
+                                "qwen35_ane_prefill_tail_padding_min_tokens",
+                                0,
+                            )
+                            or 0
+                        ),
+                        fraction=ane_fraction,
+                        max_layers=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_max_layers",
+                            64,
+                        ),
+                        gdn=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn",
+                            True,
+                        ),
+                        gdn_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn_fraction",
+                            0.50,
+                        ),
+                        gdn_max_layers=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn_max_layers",
+                            48,
+                        ),
+                        dual_ane=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_dual_ane",
+                            True,
+                        ),
+                        ane_down_fraction=(
+                            ane_fraction
+                            if getattr(
+                                self._model_settings,
+                                "qwen35_ane_prefill_fused_down",
+                                False,
+                            )
+                            else 0.0
+                        ),
+                        fused_down=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_fused_down",
+                            False,
+                        ),
+                        cpu_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_fraction",
+                            0.135,
+                        )
+                        if getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_enabled",
+                            False,
+                        )
+                        else 0.0,
+                        cpu_down_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_down_fraction",
+                            0.0,
+                        )
+                        if getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_enabled",
+                            False,
+                        )
+                        else 0.0,
+                        cpu_gdn_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_gdn_fraction",
+                            0.0,
+                        )
+                        if getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_enabled",
+                            False,
+                        )
+                        else 0.0,
+                        cpu_threads=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_threads",
+                            8,
+                        ),
+                        cpu_shared_resource=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_shared_resource",
+                            True,
+                        ),
+                        install_dispatch=False,
+                    )
+
+                ane_count = await loop.run_in_executor(
+                    get_mlx_executor(),
+                    _enable_ane_prefill,
+                )
+            except Exception:
+                logger.warning("Qwen ANE prefill not enabled", exc_info=True)
+
+        # Dense Qwen3.5-family 4-bit projections -> tile-repacked layout for
+        # the M5 tensor units. Replaces the layers in place, so resident
+        # memory does not grow; runs on the MLX executor before any forward.
+        try:
+            from ..patches import qwen35_packed_linear
+
+            if qwen35_packed_linear.enabled(self._vlm_model):
+                packed = await loop.run_in_executor(
+                    get_mlx_executor(),
+                    qwen35_packed_linear.pack_model,
+                    self._vlm_model,
+                )
+                if packed:
+                    logger.info("Qwen packed 4-bit projections: %d layers", packed)
+        except Exception:
+            logger.warning("Qwen packed 4-bit projections not applied", exc_info=True)
 
         _fix_processor_none_pixels(self._processor)
         self._diffusion_family = self._detect_diffusion_family()
@@ -1779,7 +2476,9 @@ class VLMBatchedEngine(BaseEngine):
                 )
             self._vision_cache = VisionFeatureSSDCache(
                 cache_dir=vision_ssd_dir,
-                max_memory_entries=20,
+                # Agent sessions resend 20-90 screenshots; bound by bytes.
+                max_memory_entries=4096,
+                max_memory_bytes=1024**3,
             )
             logger.info(
                 "Vision feature cache enabled (SSD: %s)",
@@ -1824,6 +2523,16 @@ class VLMBatchedEngine(BaseEngine):
             if self._scheduler_config
             else SchedulerConfig()
         )
+        if (
+            self._adapter.model_type == "deepseek_v41"
+            and self._adapter.config.ced_prefill
+            and scheduler_config.paged_ssd_cache_dir
+        ):
+            # Approximate decoder states must not become hits in full-prefill
+            # mode (or vice versa) after reloading the model with new settings.
+            scheduler_config.paged_ssd_cache_dir = str(
+                Path(scheduler_config.paged_ssd_cache_dir) / "deepseek_v41_ced_v1"
+            )
 
         engine_config = EngineConfig(
             model_name=self._model_name,
@@ -1899,8 +2608,13 @@ class VLMBatchedEngine(BaseEngine):
         try:
             from ..patches.qwen35_gdn_prework import (
                 apply_qwen35_gdn_prework_patch,
+                configure_qwen4_decode,
             )
 
+            configure_qwen4_decode(
+                self._vlm_model,
+                wide_projections=scheduler_config.qwen4_gdn_decode_wide_proj,
+            )
             apply_qwen35_gdn_prework_patch()
         except Exception:
             logger.debug("Qwen GDN prework patch not applied", exc_info=True)
@@ -1949,7 +2663,7 @@ class VLMBatchedEngine(BaseEngine):
                 )
 
                 apply_qwen35_q4_mlp_patch()
-                apply_qwen35_q4_prefill_linear_patch()
+                apply_qwen35_q4_prefill_linear_patch(self._vlm_model)
                 # Muse Glimmer rides the same native qmm tile (MLP plus the
                 # q/gate/o attention projections); no-op unless the muse
                 # compat patch installed the vendored module.
@@ -1968,137 +2682,56 @@ class VLMBatchedEngine(BaseEngine):
         except Exception:
             logger.debug("Qwen MoE router patch not applied", exc_info=True)
 
-        if getattr(self._model_settings, "qwen35_ane_prefill_enabled", False):
+        # One-token routed experts: gate+up/SwiGLU and down/weighted-sum in
+        # two launches instead of five (bit-identical; needs the router patch).
+        try:
+            from ..patches.qwen35_moe_routed_decode import (
+                apply_qwen35_moe_routed_decode_patch,
+            )
+
+            apply_qwen35_moe_routed_decode_patch()
+        except Exception:
+            logger.debug("Qwen MoE routed decode patch not applied", exc_info=True)
+
+        # oQ mixed-bit QxA8 prefill kernels. Gated on the per-model setting
+        # because it quantizes activations to INT8, which changes numerics;
+        # the patch itself falls through for anything it cannot route.
+        if getattr(self._model_settings, "qwen35_oq_a8_enabled", False):
+            try:
+                from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
+
+                # The model itself is what gets opted in: the patch tags its
+                # modules, so a model loaded with the setting off is never
+                # routed even though the class wrapper is process-wide.
+                apply_qwen35_oq_a8_patch(
+                    self._vlm_model,
+                    min_tokens=int(
+                        getattr(self._model_settings, "qwen35_oq_a8_min_tokens", 128)
+                    ),
+                )
+            except Exception:
+                logger.debug("oQ A8 prefill patch not applied", exc_info=True)
+
+        if ane_count or getattr(self._vlm_model, "_omlx_ane_gdn_prefill_count", 0):
             try:
                 from ..patches.qwen35_ane_prefill import (
+                    ane_prefill_transient_bytes,
                     configure_qwen35_ane_prefill_scheduler,
-                    enable_qwen35_ane_prefill,
+                    install_qwen35_ane_prefill_dispatch,
                 )
 
-                requested_ane_sequence_length = int(
-                    getattr(
-                        self._model_settings,
-                        "qwen35_ane_prefill_sequence_length",
-                        2048,
-                    )
-                )
-
-                def _enable_ane_prefill():
-                    return enable_qwen35_ane_prefill(
-                        self._vlm_model,
-                        sequence_length=requested_ane_sequence_length,
-                        tail_padding_min_tokens=int(
-                            getattr(
-                                self._model_settings,
-                                "qwen35_ane_prefill_tail_padding_min_tokens",
-                                0,
-                            )
-                            or 0
-                        ),
-                        fraction=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_fraction",
-                            0.53,
-                        ),
-                        max_layers=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_max_layers",
-                            64,
-                        ),
-                        gdn=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_gdn",
-                            True,
-                        ),
-                        gdn_fraction=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_gdn_fraction",
-                            0.50,
-                        ),
-                        gdn_max_layers=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_gdn_max_layers",
-                            48,
-                        ),
-                        dual_ane=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_dual_ane",
-                            True,
-                        ),
-                        ane_down_fraction=(
-                            getattr(
-                                self._model_settings,
-                                "qwen35_ane_prefill_fraction",
-                                0.53,
-                            )
-                            if getattr(
-                                self._model_settings,
-                                "qwen35_ane_prefill_fused_down",
-                                False,
-                            )
-                            else 0.0
-                        ),
-                        fused_down=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_fused_down",
-                            False,
-                        ),
-                        cpu_fraction=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_fraction",
-                            0.135,
-                        )
-                        if getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_enabled",
-                            False,
-                        )
-                        else 0.0,
-                        cpu_down_fraction=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_down_fraction",
-                            0.0,
-                        )
-                        if getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_enabled",
-                            False,
-                        )
-                        else 0.0,
-                        cpu_gdn_fraction=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_gdn_fraction",
-                            0.0,
-                        )
-                        if getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_enabled",
-                            False,
-                        )
-                        else 0.0,
-                        cpu_threads=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_threads",
-                            8,
-                        ),
-                        cpu_shared_resource=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_shared_resource",
-                            True,
-                        ),
-                    )
-
-                ane_count = await loop.run_in_executor(
-                    get_mlx_executor(),
-                    _enable_ane_prefill,
-                )
-                if ane_count or getattr(
-                    self._vlm_model, "_omlx_ane_gdn_prefill_count", 0
-                ):
+                if install_qwen35_ane_prefill_dispatch():
                     configure_qwen35_ane_prefill_scheduler(
                         scheduler,
                         requested_ane_sequence_length,
                     )
+                    # Price the compiled I/O surfaces off the full model so
+                    # admission charges them while the banks are resident.
+                    monitor = getattr(scheduler, "memory_monitor", None)
+                    if monitor is not None:
+                        monitor.set_ane_prefill_transient_bytes(
+                            ane_prefill_transient_bytes(self._vlm_model)
+                        )
             except Exception:
                 logger.warning("Qwen ANE prefill not enabled", exc_info=True)
 
@@ -2145,6 +2778,8 @@ class VLMBatchedEngine(BaseEngine):
                 try:
                     from ..utils.model_loading import (
                         lm_load_compat as mlx_lm_load,
+                    )
+                    from ..utils.model_loading import (
                         maybe_load_custom_quantization,
                     )
                     from ..utils.tokenizer import get_tokenizer_config
@@ -2237,8 +2872,35 @@ class VLMBatchedEngine(BaseEngine):
     def vlm_mtp_drafter(self) -> Any | None:
         return self._vlm_mtp_drafter
 
+    @property
+    def vlm_model(self) -> Any | None:
+        """The loaded mlx-vlm model (target for external drafters)."""
+        return self._vlm_model
+
+    def set_dflash_drafter(self, drafter: Any) -> None:
+        """Attach a DFlash block drafter to the Lightning MTP decode path."""
+        from ..speculative.dflash_drafter import attach_drafter
+
+        language_model = getattr(self._adapter, "_language_model", None)
+        if language_model is None:
+            raise RuntimeError("VLM engine has no language model for the drafter")
+        attach_drafter(language_model, drafter)
+        self._dflash_drafter = drafter
+        logger.info(
+            "DFlash drafter attached to engine: %s (kind=%s, block=%d, layers=%s)",
+            self._model_name,
+            drafter.kind,
+            drafter.block_size,
+            drafter.target_layer_ids,
+        )
+
+    @property
+    def dflash_drafter(self) -> Any | None:
+        return self._dflash_drafter
+
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
+        cancelled = False
         engine = self._engine
 
         for cancel_event in getattr(self, "_diffusion_cancel_events", ()):
@@ -2257,7 +2919,9 @@ class VLMBatchedEngine(BaseEngine):
         # Drop wrapper-side references before EngineCore.close() performs its
         # final worker-thread MLX reclaim. Otherwise the VLM wrapper can keep
         # model weights or cached feature arrays alive until after the reclaim
-        # pass has already run.
+        # pass has already run. Mark unloaded first: the scheduler is no longer
+        # reachable once _engine is cleared.
+        self._loaded = False
         _clear_teardown_references(
             self,
             none_attrs=(
@@ -2268,6 +2932,7 @@ class VLMBatchedEngine(BaseEngine):
                 "_tokenizer",
                 "_grammar_compiler",
                 "_vlm_mtp_drafter",
+                "_dflash_drafter",
                 "_diffusion_family",
             ),
             false_attrs=("_grammar_compiler_init_attempted",),
@@ -2276,22 +2941,23 @@ class VLMBatchedEngine(BaseEngine):
         if engine:
             if hasattr(engine, "engine") and engine.engine is not None:
                 try:
-                    engine.engine.close()
+                    cancelled = await _close_engine_core(engine.engine)
                 except Exception as e:
                     logger.warning(f"Error closing engine: {e}")
         self._diffusion_cancel_events = set()
         self._diffusion_active_requests = 0
-        self._loaded = False
         logger.info("VLMBatchedEngine stopped")
+        if cancelled:
+            raise asyncio.CancelledError
 
     def _inject_tool_calling(self, tokenizer) -> None:
         """Inject tool calling attributes into VLM tokenizer.
 
         mlx-vlm's TokenizerWrapper lacks tool calling support (has_tool_calling,
-        tool_parser, etc). We prefer mlx_vlm.tool_parsers which is a superset of
+        tool_parser, etc). We prefer mlx_vlm.tools.parsers which is a superset of
         mlx_lm's — it recognises additional markers such as Gemma4's <|tool_call>
         and loads the correct per-model parser.  Falls back to mlx_lm if the
-        mlx_vlm.tool_parsers package is not present.
+        mlx_vlm.tools.parsers package is not present.
         """
         chat_template = getattr(tokenizer, "chat_template", None)
         if not chat_template:
@@ -2312,9 +2978,9 @@ class VLMBatchedEngine(BaseEngine):
             logger.info("VLM tool calling enabled: parser=minimax_m3")
             return
 
-        # Prefer mlx_vlm.tool_parsers (superset; knows about Gemma4 etc.)
+        # Prefer mlx_vlm.tools.parsers (superset; knows about Gemma4 etc.)
         try:
-            from mlx_vlm.tool_parsers import (
+            from mlx_vlm.tools.registry import (
                 _infer_tool_parser,
                 load_tool_module,
             )
@@ -2337,7 +3003,7 @@ class VLMBatchedEngine(BaseEngine):
                 )
             except ImportError:
                 return
-            tool_parser_type = _mlx_lm_infer(chat_template)
+            tool_parser_type = _mlx_lm_infer(tokenizer)
             if tool_parser_type is None:
                 return
             try:
@@ -2368,6 +3034,68 @@ class VLMBatchedEngine(BaseEngine):
 
         logger.info(f"VLM tool calling enabled: parser={tool_parser_type}")
 
+    def _chat_template_target(self, model_type: str) -> Any:
+        """Return the object that renders messages already formatted by oMLX."""
+        if model_type in TOKENIZER_CHAT_TEMPLATE_MODEL_TYPES or not hasattr(
+            self._processor, "apply_chat_template"
+        ):
+            return getattr(self._processor, "tokenizer", self._processor)
+        return self._processor
+
+    def _video_cache_identity(self, video_hashes: list[str]) -> str:
+        """Prefix-cache identity for a request's clips.
+
+        Sampling settings decide which frames reach the vision tower, so they
+        are part of the identity along with the clip contents.
+        """
+        processor = getattr(self._processor, "video_processor", None)
+        sampling = ":".join(
+            str(getattr(processor, name, None))
+            for name in ("fps", "min_frames", "max_frames", "min_pixels", "max_pixels")
+        )
+        return hashlib.sha256(
+            f"video:{sampling}:{','.join(video_hashes)}".encode()
+        ).hexdigest()
+
+    def _video_cache_key_ranges(
+        self, token_ids: list[int], video_grid_thw: Any, video_hashes: list[str]
+    ) -> list[tuple[int, str]]:
+        """Per-clip prefix-cache ranges, like the per-turn ranges for images.
+
+        Each clip's ``video_pad`` runs start where its key takes over, and the
+        key covers that clip and every earlier one. Text before the first clip
+        stays shareable, and a follow-up turn that adds a clip keeps the cached
+        prefix of the earlier ones. Returns ``[]`` (whole-request keying) when
+        the tokens do not line up with the grids.
+        """
+        config = getattr(self._vlm_model, "config", None)
+        video_token_id = getattr(config, "video_token_id", None)
+        if video_token_id is None or video_grid_thw is None:
+            return []
+        try:
+            grids = [int(row[0]) for row in video_grid_thw.tolist()]
+        except (AttributeError, TypeError, ValueError, IndexError):
+            return []
+        if len(grids) != len(video_hashes):
+            return []
+        # The processor emits one run of video_pad tokens per temporal patch.
+        run_starts = [
+            index
+            for index, token in enumerate(token_ids)
+            if token == video_token_id
+            and (index == 0 or token_ids[index - 1] != video_token_id)
+        ]
+        if len(run_starts) != sum(grids):
+            return []
+        ranges = []
+        run = 0
+        for clip, temporal_patches in enumerate(grids):
+            ranges.append(
+                (run_starts[run], self._video_cache_identity(video_hashes[: clip + 1]))
+            )
+            run += temporal_patches
+        return ranges
+
     @staticmethod
     def _count_content_parts(content: Any, part_types: set[str]) -> int:
         """Count multimodal parts in list content by type."""
@@ -2389,8 +3117,9 @@ class VLMBatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         num_images: int,
         num_audios: int = 0,
+        num_videos: int = 0,
     ) -> tuple[list[dict[str, Any]], list[tuple[int, int]]]:
-        """Format VLM messages with image/audio tokens on media-bearing user turns."""
+        """Format VLM messages with image/audio/video tokens on media-bearing user turns."""
         from mlx_vlm.prompt_utils import extract_text_from_content, get_message_json
 
         model_type = self.model_type or getattr(
@@ -2399,8 +3128,17 @@ class VLMBatchedEngine(BaseEngine):
         if not model_type:
             raise ValueError("Missing VLM model_type for chat template formatting")
 
+        if model_type == "deepseek_v41":
+            if num_audios:
+                raise ValueError("DeepSeek V4.1 supports text and images, not audio")
+            from ..patches.deepseek_v41.processing import format_messages
+
+            return format_messages(messages, num_images)
+
         image_part_types = {"image", "image_url", "input_image"}
         audio_part_types = {"input_audio"}
+        video_part_types = {"video", "video_url", "input_video"}
+        remaining_videos = num_videos
         has_explicit_images = any(
             isinstance(msg, dict)
             and self._count_content_parts(msg.get("content"), image_part_types) > 0
@@ -2430,6 +3168,13 @@ class VLMBatchedEngine(BaseEngine):
 
             msg_num_images = 0
             msg_num_audios = 0
+            msg_num_videos = 0
+            if role == "user" and remaining_videos > 0:
+                msg_num_videos = min(
+                    self._count_content_parts(raw_content, video_part_types),
+                    remaining_videos,
+                )
+                remaining_videos -= msg_num_videos
             if role == "user":
                 explicit_images = self._count_content_parts(
                     raw_content, image_part_types
@@ -2479,14 +3224,14 @@ class VLMBatchedEngine(BaseEngine):
                 )
             ):
                 formatted_messages.append(msg)
-            elif model_type == "glm5_next" and msg_num_images > 0:
-                # mlx-vlm does not yet register glm5_next in MODEL_CONFIG, so
-                # get_message_json() treats it as unsupported and its generic
-                # fallback strips image parts.  Preserve their relative order
-                # as template-visible markers; the checkpoint's native chat
-                # template expands each marker to the GLM image token triplet.
+            elif model_type == "glm5_next" and (
+                msg_num_images > 0 or msg_num_audios > 0
+            ):
+                # mlx-vlm does not register GLM-5 in MODEL_CONFIG. Preserve
+                # media parts and their relative order for its native template.
                 glm_content: list[Any] = []
                 inserted_images = 0
+                inserted_audios = 0
                 if isinstance(raw_content, list):
                     for item in raw_content:
                         if isinstance(item, dict):
@@ -2500,16 +3245,27 @@ class VLMBatchedEngine(BaseEngine):
                             if inserted_images < msg_num_images:
                                 glm_content.append({"type": "image"})
                                 inserted_images += 1
+                        elif item_type in audio_part_types:
+                            if inserted_audios < msg_num_audios:
+                                glm_content.append({"type": "audio"})
+                                inserted_audios += 1
                         elif item_type == "text":
                             glm_content.append({"type": "text", "text": item_text})
                         elif isinstance(item, str):
                             glm_content.append(item)
 
-                if inserted_images < msg_num_images:
-                    glm_content[:0] = [
+                missing_media = [
+                    *(
                         {"type": "image"}
                         for _ in range(msg_num_images - inserted_images)
-                    ]
+                    ),
+                    *(
+                        {"type": "audio"}
+                        for _ in range(msg_num_audios - inserted_audios)
+                    ),
+                ]
+                if missing_media:
+                    glm_content[:0] = missing_media
                 if not any(
                     isinstance(item, str)
                     or (isinstance(item, dict) and item.get("type") == "text")
@@ -2518,6 +3274,83 @@ class VLMBatchedEngine(BaseEngine):
                     glm_content.append({"type": "text", "text": content})
 
                 formatted_messages.append({"role": role, "content": glm_content})
+            elif model_type in {"mimo_v2", "mimo_v2_flash"}:
+                # mlx-vlm's get_message_json does not support MiMo, even for
+                # text-only history. Format every turn here so one earlier text
+                # message cannot trigger the fallback that drops image markers.
+                # Render media tokens before templates that drop media dicts.
+                mimo_content: list[str] = []
+                inserted_images = 0
+                inserted_audios = 0
+                inserted_text = False
+                if isinstance(raw_content, list):
+                    for item in raw_content:
+                        if isinstance(item, dict):
+                            item_type = item.get("type", "")
+                            item_text = item.get("text", "")
+                        else:
+                            item_type = getattr(item, "type", "")
+                            item_text = getattr(item, "text", "")
+
+                        if item_type in image_part_types:
+                            if inserted_images < msg_num_images:
+                                mimo_content.append(
+                                    "<|vision_start|><|image_pad|><|vision_end|>"
+                                )
+                                inserted_images += 1
+                        elif item_type in audio_part_types:
+                            if inserted_audios < msg_num_audios:
+                                mimo_content.append(
+                                    "<|mimo_audio_start|><|audio_pad|>"
+                                    "<|mimo_audio_end|>"
+                                )
+                                inserted_audios += 1
+                        elif item_type == "text":
+                            mimo_content.append(str(item_text))
+                            inserted_text = True
+                        elif isinstance(item, str):
+                            mimo_content.append(item)
+                            inserted_text = True
+
+                missing_media = [
+                    *(
+                        "<|vision_start|><|image_pad|><|vision_end|>"
+                        for _ in range(msg_num_images - inserted_images)
+                    ),
+                    *(
+                        "<|mimo_audio_start|><|audio_pad|><|mimo_audio_end|>"
+                        for _ in range(msg_num_audios - inserted_audios)
+                    ),
+                ]
+                if missing_media:
+                    mimo_content[:0] = missing_media
+                if not inserted_text:
+                    mimo_content.append(content)
+
+                formatted_messages.append(
+                    {"role": role, "content": "".join(mimo_content)}
+                )
+            elif msg_num_videos > 0:
+                # Qwen3-VL chat templates render {"type": "video"} as the
+                # vision_start/video_pad/vision_end block the processor expands
+                # into timestamped temporal patches. Keep the clip where the
+                # user placed it relative to the text.
+                video_content: list[dict[str, Any]] = []
+                inserted_videos = 0
+                for item in raw_content:
+                    if isinstance(item, dict):
+                        item_type = item.get("type", "")
+                        item_text = item.get("text", "")
+                    else:
+                        item_type = getattr(item, "type", "")
+                        item_text = getattr(item, "text", "")
+                    if item_type in video_part_types:
+                        if inserted_videos < msg_num_videos:
+                            video_content.append({"type": "video"})
+                            inserted_videos += 1
+                    elif item_type == "text" and item_text:
+                        video_content.append({"type": "text", "text": item_text})
+                formatted_messages.append({"role": role, "content": video_content})
             else:
                 formatted = get_message_json(
                     model_type,
@@ -2560,6 +3393,10 @@ class VLMBatchedEngine(BaseEngine):
         """
         model = self._vlm_model
         model_type = self.model_type or ""
+
+        if model_type == "deepseek_v4":
+            features = model.encode_images(pixel_values, **extra_model_inputs)
+            return mx.concatenate(features, axis=0)
 
         # Strategy 1: upstream encode_image (gemma4 and future models)
         if hasattr(model, "encode_image"):
@@ -2666,6 +3503,246 @@ class VLMBatchedEngine(BaseEngine):
         # Unsupported model: skip caching
         return None
 
+    def _encode_missing_vision_features(
+        self,
+        pixel_values: Any,
+        extra_model_inputs: dict,
+        cached_per_image: List[Any],
+        per_hashes: List[str],
+        image_token_count: Optional[int],
+    ) -> Optional[mx.array]:
+        """Encode only uncached images and combine with cached ones in order.
+
+        Qwen-style towers attend within each image, so a subset encodes
+        independently. Returns None when the request cannot be split safely.
+        """
+        model = self._vlm_model
+        model_type = self.model_type or ""
+        grid_thw = extra_model_inputs.get("image_grid_thw")
+        if (
+            model_type not in _QWEN_VISION_MODELS
+            or hasattr(model, "encode_image")
+            or grid_thw is None
+            or pixel_values is None
+            or not hasattr(pixel_values, "shape")
+            or pixel_values.ndim != 2
+        ):
+            return None
+
+        num_images = len(cached_per_image)
+        miss_idx = [i for i, f in enumerate(cached_per_image) if f is None]
+        if not miss_idx or len(miss_idx) == num_images:
+            return None
+
+        grids = [_grid_row(grid_thw, i) for i in range(num_images)]
+        if any(g is None for g in grids):
+            return None
+
+        rows = [t * h * w for t, h, w in grids]
+        if sum(rows) != pixel_values.shape[0]:
+            return None
+
+        vision_tower = getattr(model, "vision_tower", None)
+        merge_sq = getattr(vision_tower, "spatial_merge_size", 2) ** 2
+        # A token count mismatch means a different resize regime.
+        for f, (t, h, w) in zip(cached_per_image, grids):
+            if f is not None and f.shape[0] != (t * h * w) // merge_sq:
+                return None
+
+        try:
+            offsets = [0]
+            for r in rows:
+                offsets.append(offsets[-1] + r)
+            pv_miss = mx.concatenate(
+                [pixel_values[offsets[i] : offsets[i + 1]] for i in miss_idx],
+                axis=0,
+            )
+            grid_miss = mx.array([grids[i] for i in miss_idx])
+            miss_inputs = dict(extra_model_inputs)
+            miss_inputs["image_grid_thw"] = grid_miss
+            features_miss = self._compute_vision_features(pv_miss, miss_inputs)
+            if features_miss is None:
+                return None
+            mx.eval(features_miss)
+            split_miss = self._split_vision_features(
+                features_miss, len(miss_idx), miss_inputs
+            )
+            if split_miss is None or len(split_miss) != len(miss_idx):
+                return None
+
+            full = list(cached_per_image)
+            for i, f in zip(miss_idx, split_miss):
+                full[i] = f
+                self._vision_cache.put(
+                    per_hashes[i], self._model_name, f, grid=grids[i]
+                )
+            combined = mx.concatenate(full, axis=0)
+            if not self._vision_features_match_image_tokens(
+                combined, image_token_count
+            ):
+                return None
+            logger.debug(
+                "Vision feature cache partial hit: encoded %d of %d images",
+                len(miss_idx),
+                num_images,
+            )
+            return combined
+        except Exception:
+            logger.debug(
+                "Partial vision encoding failed, recomputing all images",
+                exc_info=True,
+            )
+            return None
+
+    def _try_build_cached_vision_inputs(
+        self,
+        prompt: str,
+        images: List[Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Build ``prepare_inputs``-style inputs, preprocessing only cache misses.
+
+        Splits the prompt on the vision marker, tokenizes the text chunks, and
+        expands each marker from the cached or fresh patch grid. Adds
+        ``cached_image_features``. Returns None to use the full path.
+        """
+        model_type = self.model_type or ""
+        if (
+            model_type not in _CACHED_INPUT_FAST_PREPARE_MODEL_TYPES
+            or self._vision_cache is None
+            or not self._vision_cache_enabled
+            or not images
+            or not isinstance(prompt, str)
+            or hasattr(self._vlm_model, "encode_image")
+        ):
+            return None
+        try:
+            processor = self._processor
+            tokenizer = getattr(processor, "tokenizer", None)
+            image_processor = getattr(processor, "image_processor", None)
+            config = self._vlm_model.config
+            vs_id = getattr(config, "vision_start_token_id", None)
+            ve_id = getattr(config, "vision_end_token_id", None)
+            it_id = getattr(config, "image_token_id", None)
+            if (
+                tokenizer is None
+                or image_processor is None
+                or vs_id is None
+                or ve_id is None
+                or it_id is None
+            ):
+                return None
+            merge_sq = int(getattr(image_processor, "merge_size", 2)) ** 2
+            vs_tok = tokenizer.convert_ids_to_tokens(vs_id)
+            it_tok = tokenizer.convert_ids_to_tokens(it_id)
+            ve_tok = tokenizer.convert_ids_to_tokens(ve_id)
+            if not all(isinstance(t, str) for t in (vs_tok, it_tok, ve_tok)):
+                return None
+            marker = vs_tok + it_tok + ve_tok
+            # Manual expansion is only equivalent to the processor when every
+            # placeholder in the prompt is the canonical marker triple.
+            if prompt.count(marker) != len(images):
+                return None
+
+            per_hashes = compute_per_image_hashes(images)
+            feats: List[Optional[mx.array]] = []
+            grids: List[Optional[List[int]]] = []
+            for h in per_hashes:
+                feat = self._vision_cache.get(h, self._model_name)
+                grid = self._vision_cache.get_grid(h, self._model_name)
+                # A row count mismatch means a different resize regime.
+                if (
+                    feat is not None
+                    and grid is not None
+                    and (grid[0] * grid[1] * grid[2]) % merge_sq == 0
+                    and feat.shape[0] == (grid[0] * grid[1] * grid[2]) // merge_sq
+                ):
+                    feats.append(feat)
+                    grids.append(grid)
+                else:
+                    feats.append(None)
+                    grids.append(None)
+            miss_idx = [i for i, f in enumerate(feats) if f is None]
+            if len(miss_idx) == len(images):
+                return None  # Nothing cached; the full path costs the same.
+
+            if miss_idx:
+                # Marker-only prompt; the real text is tokenized below.
+                from mlx_vlm.utils import prepare_inputs
+
+                miss_images = [images[i] for i in miss_idx]
+                miss_inputs = prepare_inputs(
+                    processor,
+                    images=miss_images,
+                    prompts=[marker * len(miss_idx)],
+                )
+                miss_pv = miss_inputs.get("pixel_values")
+                miss_grid = miss_inputs.get("image_grid_thw")
+                if miss_pv is None or miss_grid is None:
+                    return None
+                miss_grids = [
+                    _grid_row(miss_grid, k) for k in range(len(miss_idx))
+                ]
+                if any(g is None for g in miss_grids):
+                    return None
+                miss_kw = {"image_grid_thw": mx.array(miss_grids)}
+                features_miss = self._compute_vision_features(miss_pv, miss_kw)
+                if features_miss is None:
+                    return None
+                mx.eval(features_miss)
+                split_miss = self._split_vision_features(
+                    features_miss, len(miss_idx), miss_kw
+                )
+                if split_miss is None or len(split_miss) != len(miss_idx):
+                    return None
+                for k, i in enumerate(miss_idx):
+                    feats[i] = split_miss[k]
+                    grids[i] = miss_grids[k]
+                    self._vision_cache.put(
+                        per_hashes[i],
+                        self._model_name,
+                        split_miss[k],
+                        grid=miss_grids[k],
+                    )
+
+            token_ids: List[int] = []
+            chunks = prompt.split(marker)
+            for k, chunk in enumerate(chunks):
+                if chunk:
+                    enc = tokenizer(chunk, add_special_tokens=False)
+                    token_ids.extend(enc["input_ids"])
+                if k < len(chunks) - 1:
+                    t, h, w = grids[k]
+                    token_ids.append(vs_id)
+                    token_ids.extend([it_id] * ((t * h * w) // merge_sq))
+                    token_ids.append(ve_id)
+
+            combined = mx.concatenate(feats, axis=0)
+            pad_total = sum(1 for t in token_ids if t == it_id)
+            if pad_total != combined.shape[0]:
+                return None
+
+            pixel_values = (
+                miss_pv if miss_idx else mx.zeros((0, 1), dtype=mx.float32)
+            )
+            return {
+                "input_ids": mx.array([token_ids]),
+                "attention_mask": mx.ones((1, len(token_ids)), dtype=mx.int32),
+                # Non-None empty tensor keeps the model's multimodal branch
+                # taken; with cached_image_features the tower skips it anyway.
+                "pixel_values": pixel_values,
+                "image_grid_thw": mx.array(grids),
+                "mm_token_type_ids": mx.array(
+                    [[1 if t == it_id else 0 for t in token_ids]]
+                ),
+                "cached_image_features": combined,
+            }
+        except Exception:
+            logger.debug(
+                "Cached-input fast path failed; falling back to full preprocessing",
+                exc_info=True,
+            )
+            return None
+
     def _split_vision_features(
         self,
         features: mx.array,
@@ -2677,6 +3754,18 @@ class VLMBatchedEngine(BaseEngine):
         Returns a list of per-image feature tensors, or None if the model
         architecture does not support splitting.
         """
+        if self.model_type == "deepseek_v4":
+            grid = extra_model_inputs["image_grid_hw"].tolist()
+            ratio = self._vlm_model.config.vision_downsample_ratio
+            counts = [
+                ((h + ratio - 1) // ratio) * ((w + ratio - 1) // ratio)
+                for h, w in grid
+            ]
+            if len(counts) != num_images or sum(counts) != features.shape[0]:
+                raise ValueError("DeepSeek V4 cached features do not match image grids")
+            offsets = [sum(counts[:i + 1]) for i in range(len(counts))]
+            return list(mx.split(features, offsets[:-1], axis=0))
+
         if num_images <= 1:
             return [features]
 
@@ -2791,9 +3880,11 @@ class VLMBatchedEngine(BaseEngine):
             count *= int(dim)
         return count
 
-    def _image_token_count(self, input_ids: Any) -> Optional[int]:
+    def _image_token_count(
+        self, input_ids: Any, token_id_attr: str = "image_token_id"
+    ) -> Optional[int]:
         config = getattr(self._vlm_model, "config", None)
-        image_token_id = getattr(config, "image_token_id", None)
+        image_token_id = getattr(config, token_id_attr, None)
         if image_token_id is None:
             return None
 
@@ -2803,6 +3894,42 @@ class VLMBatchedEngine(BaseEngine):
         except Exception:
             logger.debug("Failed to count VLM image tokens", exc_info=True)
             return None
+
+    def _cached_video_features(
+        self, video_identity: str, input_ids: Any, extra_model_inputs: dict
+    ) -> mx.array | None:
+        """Vision features of a request's clips, through the vision feature cache.
+
+        Follow-up turns resend the same clip. Without the cache the vision
+        tower re-encodes every sampled frame on each turn, even when the prefix
+        cache already covers the whole prompt.
+        """
+        if self._vision_cache is None or not self._vision_cache_enabled:
+            return None
+        token_count = self._image_token_count(input_ids, "video_token_id")
+        features = self._vision_cache.get(video_identity, self._model_name)
+        if features is not None and self._vision_features_match_image_tokens(
+            features, token_count
+        ):
+            return features
+        try:
+            # The vision tower encodes a video grid exactly like an image grid.
+            features = self._compute_vision_features(
+                extra_model_inputs["pixel_values_videos"],
+                {"image_grid_thw": extra_model_inputs.get("video_grid_thw")},
+            )
+        except Exception:
+            logger.debug(
+                "Video feature computation failed, using full pipeline", exc_info=True
+            )
+            return None
+        if features is None or not self._vision_features_match_image_tokens(
+            features, token_count
+        ):
+            return None
+        mx.eval(features)
+        self._vision_cache.put(video_identity, self._model_name, features)
+        return features
 
     def _vision_features_match_image_tokens(
         self, features: Any, image_token_count: Optional[int]
@@ -2841,6 +3968,8 @@ class VLMBatchedEngine(BaseEngine):
         chat_template_kwargs: dict[str, Any] | None = None,
         tools: list[dict] | None = None,
         is_partial: bool | None = None,
+        videos: list[str] | None = None,
+        video_hashes: list[str] | None = None,
     ) -> Tuple[
         List[int],
         Optional[mx.array],
@@ -2860,6 +3989,8 @@ class VLMBatchedEngine(BaseEngine):
             messages: Chat messages (text-only, media already extracted)
             images: List of PIL Image objects
             audio: List of audio data (BytesIO buffers, tuples, or numpy arrays)
+            videos: Video file paths for checkpoints with native video input
+            video_hashes: Content hashes of ``videos``, for prefix-cache identity
             is_partial: Explicit partial-mode signal from the API server.
                 ``True``/``False`` — the server has already decided.  ``None``
                 (default) — auto-detect from ``messages`` for direct engine
@@ -2877,10 +4008,9 @@ class VLMBatchedEngine(BaseEngine):
             - token_ids: List of token IDs for BatchGenerator
             - inputs_embeds: Merged vision+text embeddings (or None if text-only)
             - extra_kwargs: Model-specific kwargs for language model
-            - image_hash: SHA256 hash of images for prefix cache
-            - image_cache_key_start: Token index where image-aware cache keying begins
-            - image_cache_key_ranges: Per-image-turn cache key boundaries with
-              cumulative image hashes
+            - image_hash: Image/audio identity for prefix cache
+            - image_cache_key_start: Token index where media-aware keying begins
+            - image_cache_key_ranges: Media boundaries with cumulative hashes
         """
         from mlx_vlm.prompt_utils import apply_chat_template, get_chat_template
         from mlx_vlm.utils import load_audio as _load_audio
@@ -2888,8 +4018,9 @@ class VLMBatchedEngine(BaseEngine):
 
         num_images = len(images)
         num_audios = len(audio) if audio else 0
+        num_videos = len(videos) if videos else 0
 
-        model_type = self.model_type or ""
+        model_type = self.model_type or _read_config_model_type(self._model_name) or ""
         if model_type == COHERE2_MOE_MODEL_TYPE and (
             num_images > 0 or num_audios > 0
         ):
@@ -2914,8 +4045,17 @@ class VLMBatchedEngine(BaseEngine):
                 )
 
                 ensure_mlx_audio_resample_export()
+            feature_extractor = getattr(self._processor, "feature_extractor", None)
+            target_sample_rate = (
+                getattr(feature_extractor, "sampling_rate", 16000)
+                if feature_extractor is not None
+                else 16000
+            )
+            if not isinstance(target_sample_rate, (int, float)):
+                target_sample_rate = 16000
             audio = [
-                _load_audio(a, 16000) if not isinstance(a, tuple) else a for a in audio
+                _load_audio(a, target_sample_rate) if not isinstance(a, tuple) else a
+                for a in audio
             ]
         # Validate multi-image support
         if num_images > 1 and model_type in SINGLE_IMAGE_ONLY_MODELS:
@@ -2933,9 +4073,14 @@ class VLMBatchedEngine(BaseEngine):
                     messages,
                     num_images=num_images,
                     num_audios=num_audios,
+                    num_videos=num_videos,
                 )
             )
         except Exception as e:
+            # The upstream formatter has no video placeholders; falling back
+            # would send frames the prompt never references.
+            if num_videos:
+                raise
             logger.debug(
                 "Falling back to mlx-vlm apply_chat_template for VLM formatting: %s",
                 e,
@@ -2983,10 +4128,7 @@ class VLMBatchedEngine(BaseEngine):
             template_kwargs.update(chat_template_kwargs)
         _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
 
-        # Use processor or its tokenizer for chat template application
-        template_target = self._processor
-        if not hasattr(template_target, "apply_chat_template"):
-            template_target = getattr(self._processor, "tokenizer", self._processor)
+        template_target = self._chat_template_target(model_type)
         try:
             prompt = apply_chat_template_with_reasoning_effort_fallback(
                 template_target,
@@ -3033,22 +4175,49 @@ class VLMBatchedEngine(BaseEngine):
                 **template_kwargs,
             )
 
-        # Tokenize text and preprocess images and audio
-        inputs = prepare_inputs(
-            self._processor,
-            images=images if images else None,
-            audio=audio if audio else None,
-            prompts=[prompt] if isinstance(prompt, str) else prompt,
-        )
+        # Images with cached features and grids skip the image processor.
+        fast_cached_features = None
+        inputs = None
+        if num_audios == 0 and num_videos == 0:
+            fast = self._try_build_cached_vision_inputs(prompt, images)
+            if fast is not None:
+                fast_cached_features = fast.pop("cached_image_features", None)
+                inputs = fast
+        if inputs is None:
+            # Tokenize text and preprocess images and audio
+            inputs = prepare_inputs(
+                self._processor,
+                images=images if images else None,
+                audio=audio if audio else None,
+                videos=videos if videos else None,
+                prompts=[prompt] if isinstance(prompt, str) else prompt,
+            )
 
         input_ids = inputs["input_ids"]
         pixel_values = inputs.get("pixel_values")
         attention_mask = inputs.get("attention_mask")
 
+        token_ids = input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
         image_cache_key_start = 0
         image_cache_key_ranges: list[Tuple[int, str]] = []
         if image_message_ranges:
             try:
+                image_starts = None
+                if (
+                    model_type in _GRID_VISION_MODELS
+                    and inputs.get("image_grid_thw") is not None
+                ):
+                    image_starts = _grid_image_token_starts(
+                        token_ids,
+                        inputs["image_grid_thw"],
+                        self._vlm_model.config.image_token_id,
+                        self._processor.image_processor.merge_size,
+                    )
+                    if (
+                        len(image_starts) != num_images
+                        or sum(count for _, count in image_message_ranges) != num_images
+                    ):
+                        raise ValueError("Image boundary count does not match images")
                 prefix_template_kwargs = {
                     "tokenize": False,
                     "add_generation_prompt": False,
@@ -3065,7 +4234,9 @@ class VLMBatchedEngine(BaseEngine):
                 for msg_idx, msg_num_images in image_message_ranges:
                     prefix_messages = formatted_messages[:msg_idx]
                     boundary_tokens = 0
-                    if prefix_messages:
+                    if image_starts is not None:
+                        boundary_tokens = image_starts[images_consumed]
+                    elif prefix_messages:
                         try:
                             prefix_prompt = (
                                 apply_chat_template_with_reasoning_effort_fallback(
@@ -3098,16 +4269,29 @@ class VLMBatchedEngine(BaseEngine):
                             ),
                         )
                         prefix_ids = prefix_inputs["input_ids"]
-                        boundary_tokens = (
-                            len(prefix_ids[0].tolist())
+                        prefix_tokens = (
+                            prefix_ids[0].tolist()
                             if prefix_ids.ndim > 1
-                            else len(prefix_ids.tolist())
+                            else prefix_ids.tolist()
                         )
+                        # Rendering a shorter conversation can retain reasoning
+                        # that the full template removes. Only a matching token
+                        # prefix is a valid position in the final model input.
+                        for actual, prefix in zip(token_ids, prefix_tokens):
+                            if actual != prefix:
+                                break
+                            boundary_tokens += 1
 
                     images_consumed += msg_num_images
                     cumulative_hash = compute_image_hash(images[:images_consumed])
                     image_cache_key_ranges.append((boundary_tokens, cumulative_hash))
 
+                # A later image's prefix can diverge earlier. Its cumulative
+                # hash must apply there, including all preceding images.
+                for i in range(len(image_cache_key_ranges) - 2, -1, -1):
+                    start, image_key = image_cache_key_ranges[i]
+                    next_start = image_cache_key_ranges[i + 1][0]
+                    image_cache_key_ranges[i] = (min(start, next_start), image_key)
                 image_cache_key_start = image_cache_key_ranges[0][0]
             except Exception:
                 logger.debug(
@@ -3130,14 +4314,22 @@ class VLMBatchedEngine(BaseEngine):
             and v is not None
         }
 
-        # Check for any multimodal inputs: images or audio
-        has_audio = "input_features" in extra_model_inputs
-        has_multimodal = (pixel_values is not None and num_images > 0) or has_audio
+        # Check for any multimodal inputs. Most processors expose audio as
+        # ``input_features``; MiMo's tokenizer produces discrete ``audio_codes``.
+        has_audio = any(
+            key in extra_model_inputs for key in ("input_features", "audio_codes")
+        )
+        has_video = extra_model_inputs.get("pixel_values_videos") is not None
+        has_multimodal = (
+            (pixel_values is not None and num_images > 0) or has_audio or has_video
+        )
 
         if has_multimodal:
             # Build call kwargs from extra_model_inputs (includes input_features
             # for audio, image_grid_thw, etc.)
             call_kwargs = dict(extra_model_inputs)
+            if fast_cached_features is not None:
+                call_kwargs["cached_image_features"] = fast_cached_features
 
             # Image-specific: compute hash and try vision feature cache
             image_hash = None
@@ -3145,26 +4337,60 @@ class VLMBatchedEngine(BaseEngine):
             if num_images > 0:
                 image_hash = compute_image_hash(images)
                 image_token_count = self._image_token_count(input_ids)
+            elif has_video:
+                image_cache_key_ranges = self._video_cache_key_ranges(
+                    token_ids,
+                    extra_model_inputs.get("video_grid_thw"),
+                    video_hashes or [],
+                )
+                if image_cache_key_ranges:
+                    image_cache_key_start = image_cache_key_ranges[0][0]
+                    image_hash = image_cache_key_ranges[-1][1]
+                else:
+                    image_cache_key_start = 0
+                    image_hash = self._video_cache_identity(video_hashes or [])
+                video_features = self._cached_video_features(
+                    image_hash, input_ids, extra_model_inputs
+                )
+                if video_features is not None:
+                    call_kwargs["cached_image_features"] = video_features
 
             if (
                 num_images > 0
                 and self._vision_cache is not None
                 and self._vision_cache_enabled
+                # Fast path already assembled the combined features.
+                and fast_cached_features is None
             ):
                 per_hashes = compute_per_image_hashes(images)
                 cached_per_image = [
                     self._vision_cache.get(h, self._model_name) for h in per_hashes
                 ]
 
+                # Per-image entries are keyed by the image alone, but the
+                # number of soft tokens an image encodes to depends on the
+                # resize regime, which depends on the *other* images in the
+                # request (Gemma 4 per-image resize: 1024x1024 -> 256 tokens,
+                # 1536x640 -> 250). Entries cached from separate single-image
+                # requests can therefore disagree, and mx.concatenate raises
+                # before _vision_features_match_image_tokens below ever gets to
+                # reject them. Check the shapes agree first and fall through to
+                # the whole-request entry (and then a recompute) when they do
+                # not.
+                per_image_usable = (
+                    all(f is not None for f in cached_per_image)
+                    and len({f.shape[1:] for f in cached_per_image}) == 1
+                )
+
                 cached_whole = None
-                if not all(f is not None for f in cached_per_image):
+                if not per_image_usable:
                     # Fallback: whole-request entry (stored when per-image split
                     # is unsupported, e.g. Gemma 4 multi-image with per-image
                     # resize). Mirrors the store-side branch below.
                     cached_whole = self._vision_cache.get(image_hash, self._model_name)
 
                 used_cached_features = False
-                if all(f is not None for f in cached_per_image):
+                if per_image_usable:
                     # All images cached individually — combine and use
                     combined = mx.concatenate(cached_per_image, axis=0)
                     if self._vision_features_match_image_tokens(
@@ -3188,6 +4414,20 @@ class VLMBatchedEngine(BaseEngine):
                         )
 
                 if not used_cached_features:
+                    # Partial hit: encode only the uncached images when the
+                    # vision tower supports per-image slicing.
+                    partial = self._encode_missing_vision_features(
+                        pixel_values,
+                        extra_model_inputs,
+                        cached_per_image,
+                        per_hashes,
+                        image_token_count,
+                    )
+                    if partial is not None:
+                        call_kwargs["cached_image_features"] = partial
+                        used_cached_features = True
+
+                if not used_cached_features:
                     # Some or all uncached — compute all, then cache per-image
                     try:
                         features = self._compute_vision_features(
@@ -3206,8 +4446,14 @@ class VLMBatchedEngine(BaseEngine):
                                 features, num_images, extra_model_inputs
                             )
                             if per_features is not None:
-                                for h, f in zip(per_hashes, per_features):
-                                    self._vision_cache.put(h, self._model_name, f)
+                                grid_thw = extra_model_inputs.get("image_grid_thw")
+                                for j, (h, f) in enumerate(
+                                    zip(per_hashes, per_features)
+                                ):
+                                    grid = _grid_row(grid_thw, j)
+                                    self._vision_cache.put(
+                                        h, self._model_name, f, grid=grid
+                                    )
                                 logger.debug(
                                     "Vision feature cache miss, stored %d per-image entries",
                                     len(per_features),
@@ -3226,6 +4472,14 @@ class VLMBatchedEngine(BaseEngine):
                             "Vision feature computation failed, using full pipeline",
                             exc_info=True,
                         )
+
+            if (
+                self.model_type == "deepseek_v4"
+                and "cached_image_features" in call_kwargs
+            ):
+                call_kwargs["cached_image_features"] = self._split_vision_features(
+                    call_kwargs["cached_image_features"], num_images, extra_model_inputs
+                )
 
             # Run vision encoder + embedding merge.
             # Pass attention_mask as 'mask' — mlx-vlm models (e.g. Gemma 3)
@@ -3266,19 +4520,42 @@ class VLMBatchedEngine(BaseEngine):
             # global state that gets overwritten by subsequent calls.
             # Storing per-request ensures correct position computation
             # when multiple VLM requests are batched.
-            lm = getattr(self._vlm_model, "language_model", None)
-            if lm is not None:
-                pid = getattr(lm, "_position_ids", None)
-                if pid is not None and "position_ids" not in extra_kwargs:
-                    extra_kwargs["position_ids"] = pid
-                rd = getattr(lm, "_rope_deltas", None)
-                if rd is not None:
-                    extra_kwargs["_captured_rope_deltas"] = rd
-
-            # Extract token IDs as list
-            token_ids = (
-                input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
+            _capture_vlm_position_state(
+                getattr(self._vlm_model, "language_model", None), extra_kwargs
             )
+
+            if model_type in {"mimo_v2", "mimo_v2_flash"} and has_audio:
+                from ..patches.mimo_v2.audio import audio_cache_key_ranges
+
+                # Keep vision-feature identities independent of audio inputs.
+                image_ranges = image_cache_key_ranges
+                if image_hash is not None and not image_ranges:
+                    image_ranges = [(0, image_hash)]
+                image_cache_key_ranges = audio_cache_key_ranges(
+                    token_ids,
+                    extra_model_inputs["audio_codes"],
+                    self._vlm_model.config.audio_token_id,
+                    image_ranges,
+                )
+                image_cache_key_start = image_cache_key_ranges[0][0]
+                image_hash = image_cache_key_ranges[-1][1]
+            elif has_audio and "input_features" in extra_model_inputs:
+                image_ranges = image_cache_key_ranges
+                if image_hash is not None and not image_ranges:
+                    image_ranges = [(0, image_hash)]
+                config = self._vlm_model.config
+                audio_token_id = getattr(config, "audio_token_id", None)
+                if audio_token_id is None:
+                    audio_token_id = getattr(config, "audio_token_index", None)
+                image_cache_key_ranges = _audio_feature_cache_key_ranges(
+                    token_ids,
+                    extra_model_inputs["input_features"],
+                    extra_model_inputs.get("input_features_mask"),
+                    audio_token_id,
+                    image_ranges,
+                )
+                image_cache_key_start = image_cache_key_ranges[0][0]
+                image_hash = image_cache_key_ranges[-1][1]
 
             return (
                 token_ids,
@@ -3290,9 +4567,6 @@ class VLMBatchedEngine(BaseEngine):
             )
         else:
             # Text-only (no images in this message)
-            token_ids = (
-                input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
-            )
             return token_ids, None, None, None, 0, []
 
     def _apply_chat_template(
@@ -3301,6 +4575,7 @@ class VLMBatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
         is_partial: bool | None = None,
+        add_generation_prompt: bool | None = None,
     ) -> str:
         """Apply chat template for text-only messages (no images).
 
@@ -3310,6 +4585,8 @@ class VLMBatchedEngine(BaseEngine):
                 ``partial`` key is cleaned from message dicts but no detection
                 is performed.  ``None`` (default) — auto-detect from messages
                 for direct engine callers.
+            add_generation_prompt: Overrides the partial-derived default, used
+                to render the same messages without the generation prompt.
         """
         if hasattr(self._tokenizer, "apply_chat_template"):
             if is_partial is None:
@@ -3319,9 +4596,11 @@ class VLMBatchedEngine(BaseEngine):
                 # so the chat template never sees the non-standard field.
                 for msg in messages:
                     msg.pop("partial", None)
+            if add_generation_prompt is None:
+                add_generation_prompt = not is_partial
             template_kwargs = {
                 "tokenize": False,
-                "add_generation_prompt": not is_partial,
+                "add_generation_prompt": add_generation_prompt,
             }
             if is_partial:
                 template_kwargs["continue_final_message"] = True
@@ -3366,7 +4645,7 @@ class VLMBatchedEngine(BaseEngine):
                 return get_chat_template(
                     self._processor,
                     messages,
-                    add_generation_prompt=True,
+                    add_generation_prompt=add_generation_prompt,
                 )
         else:
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
@@ -3387,6 +4666,8 @@ class VLMBatchedEngine(BaseEngine):
             "specprefill_keep_pct",
             "specprefill_threshold",
             "specprefill_system_end",
+            "generation_prompt_text",
+            "generation_prompt_persists",
         ):
             if kwargs.get(key) is not None:
                 specprefill_kwargs[key] = kwargs.pop(key)
@@ -3528,6 +4809,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             tools=tools,
+            preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             **specprefill_kwargs,
         )
 
@@ -3641,6 +4923,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
+            preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             benchmark_trace=bool(kwargs.get("benchmark_trace", False)),
             benchmark_ane_sequence_length=int(
                 kwargs.get("benchmark_ane_sequence_length", 0) or 0
@@ -3668,6 +4951,7 @@ class VLMBatchedEngine(BaseEngine):
                     cached_tokens=output.cached_tokens,
                     generated_at=getattr(output, "generated_at", None),
                     generated_until=getattr(output, "generated_until", None),
+                    first_token_at=getattr(output, "first_token_at", None),
                     benchmark_prefill_chunks=(
                         list(chunks)
                         if (chunks := getattr(output, "benchmark_prefill_chunks", []))
@@ -3737,6 +5021,9 @@ class VLMBatchedEngine(BaseEngine):
             )
 
         loop = asyncio.get_running_loop()
+        # _process_chat_messages pops these; the tail marker needs them too.
+        ct_kwargs = kwargs.get("chat_template_kwargs")
+        partial = kwargs.get("is_partial")
         (
             prompt,
             vlm_embeds,
@@ -3754,6 +5041,10 @@ class VLMBatchedEngine(BaseEngine):
 
         # SpecPrefill: protect the system-prompt region, mirroring stream_chat.
         self._inject_specprefill_system_end(messages, prompt, kwargs)
+        generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
+        if generation_prompt:
+            kwargs["generation_prompt_text"] = generation_prompt
+            kwargs["generation_prompt_persists"] = persists
 
         return await self.generate(
             prompt=prompt,
@@ -3837,7 +5128,16 @@ class VLMBatchedEngine(BaseEngine):
         # strips images first via ``extract_images_from_messages`` (see
         # ``_process_chat_messages``), so mirroring that here keeps
         # preflight and execution on the same template input.
-        text_messages, _, _ = extract_images_from_messages(messages)
+        _, text_messages, images, _, videos = self._extract_request_media(messages)
+        if (
+            images
+            and self.model_type in {"gemma4", "gemma4_unified"}
+            and self._vlm_model.config.vision_config is None
+        ):
+            raise InvalidRequestError(
+                "This text-only Gemma 4 model does not support image input.",
+                field="messages",
+            )
         prompt = self._apply_chat_template(
             text_messages,
             template_tools,
@@ -3860,21 +5160,33 @@ class VLMBatchedEngine(BaseEngine):
                 type(e).__name__,
             )
             return
-        # Count images from the ORIGINAL messages (the stripped
-        # ``text_messages`` no longer has the image content-parts).
-        num_tokens += _count_image_tokens_real(
+        # Use the decoded dimensions, including resizing and EXIF orientation,
+        # so the memory estimate matches the images passed to the processor.
+        image_tokens = _count_image_tokens_real(
             messages,
             getattr(self, "_processor", None),
+            images=images,
             upper_bound=_derive_image_token_upper_bound(
                 getattr(self, "_processor", None)
             ),
         )
+        num_tokens += image_tokens
+        video_tokens = 0
+        if videos:
+            video_processor = getattr(self._processor, "video_processor", None)
+            video_tokens = sum(
+                estimate_native_video_tokens(uri, video_processor) for uri in videos
+            )
+        num_tokens += video_tokens
         scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_chat")
             return
         await self._preflight_or_raise_with_eviction(
-            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
+            scheduler,
+            num_prompt_tokens=num_tokens,
+            request_id=request_id,
+            text_only=image_tokens == 0 and video_tokens == 0,
         )
 
     async def preflight_completion(
@@ -3907,7 +5219,10 @@ class VLMBatchedEngine(BaseEngine):
             _warn_scheduler_unreachable_once(self, "preflight_completion")
             return
         await self._preflight_or_raise_with_eviction(
-            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
+            scheduler,
+            num_prompt_tokens=num_tokens,
+            request_id=request_id,
+            text_only=True,
         )
 
     async def stream_chat(
@@ -3957,6 +5272,9 @@ class VLMBatchedEngine(BaseEngine):
         # uvicorn from managing HTTP keep-alive connections, causing
         # TransferEncodingError on the next request (issue #80).
         loop = asyncio.get_running_loop()
+        # _process_chat_messages pops these; the tail marker needs them too.
+        ct_kwargs = kwargs.get("chat_template_kwargs")
+        partial = kwargs.get("is_partial")
         (
             prompt,
             vlm_embeds,
@@ -3974,6 +5292,10 @@ class VLMBatchedEngine(BaseEngine):
 
         # SpecPrefill: protect the system-prompt region from token dropping.
         self._inject_specprefill_system_end(messages, prompt, kwargs)
+        generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
+        if generation_prompt:
+            kwargs["generation_prompt_text"] = generation_prompt
+            kwargs["generation_prompt_persists"] = persists
 
         async for output in self.stream_generate(
             prompt=prompt,
@@ -4049,6 +5371,38 @@ class VLMBatchedEngine(BaseEngine):
 
         return messages
 
+    def _extract_request_media(
+        self, messages: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list, list, list[str]]:
+        """Split a request into text and media, honoring each model's video path.
+
+        Returns ``(media_messages, text_messages, images, audio, videos)``.
+        MiMo consumes video as a bounded, chronological sequence of frames
+        through the same vision tower used for still images. Checkpoints with
+        native video input keep clips as inline URIs for the video processor.
+        Every other model rejects video parts.
+        """
+        media_messages = messages
+        model_type = self.model_type or _read_config_model_type(self._model_name)
+        if model_type in {"mimo_v2", "mimo_v2_flash"}:
+            media_messages = expand_video_parts(messages)
+        if not getattr(self, "_native_video", False):
+            text_messages, images, audio = extract_images_from_messages(media_messages)
+            return media_messages, text_messages, images, audio, []
+
+        text_messages, images, audio, videos = extract_media_from_messages(
+            media_messages
+        )
+        # mlx-vlm's Qwen3-VL embedding path takes the grid of one modality per
+        # call, so a request that mixes them would silently lose one.
+        if videos and (images or audio):
+            raise InvalidRequestError(
+                "Video input cannot be combined with image or audio input "
+                "in the same request.",
+                field="messages",
+            )
+        return media_messages, text_messages, images, audio, videos
+
     def _process_chat_messages(
         self,
         messages: list[dict[str, Any]],
@@ -4063,8 +5417,10 @@ class VLMBatchedEngine(BaseEngine):
         Returns:
             Tuple of (prompt_or_token_ids, vlm_embeds, vlm_kwargs, image_hash)
         """
-        # Extract images from messages
-        text_messages, images, audio = extract_images_from_messages(messages)
+        media_messages, text_messages, images, audio, videos = (
+            self._extract_request_media(messages)
+        )
+        model_type = self.model_type or _read_config_model_type(self._model_name)
 
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
@@ -4072,25 +5428,54 @@ class VLMBatchedEngine(BaseEngine):
         # Keep VLM-capable models on one prompt-rendering path, even before the
         # first image arrives. Otherwise the conversation switches prompt families
         # on the first image-bearing turn and invalidates early prefix blocks.
-        vlm_messages = self._apply_ocr_prompt(messages) if images else text_messages
-        template_tools = convert_tools_for_template(tools) if tools else None
-        (
-            token_ids,
-            vlm_embeds,
-            vlm_kwargs,
-            image_hash,
-            image_cache_key_start,
-            image_cache_key_ranges,
-        ) = self._prepare_vision_inputs(
-            vlm_messages,
-            images,
-            audio=audio if audio else None,
-            chat_template_kwargs=ct_kwargs,
-            tools=template_tools,
-            is_partial=partial,
-        )
-
         if images:
+            vlm_messages = self._apply_ocr_prompt(media_messages)
+        elif videos or (audio and model_type in {"mimo_v2", "mimo_v2_flash"}):
+            vlm_messages = media_messages
+        else:
+            vlm_messages = text_messages
+        template_tools = convert_tools_for_template(tools) if tools else None
+        # mlx-vlm samples frames from a file, so inline clips are written to
+        # temporary files that live only until preprocessing is done.
+        video_files: list[tuple[Path, str]] = []
+        try:
+            video_processor = getattr(self._processor, "video_processor", None)
+            for uri in videos:
+                video_files.append(write_video_data_uri(uri))
+                # Rejects undecodable or degenerate clips with a 400 before
+                # mlx-vlm samples them.
+                native_video_token_count(
+                    probe_video(video_files[-1][0]), video_processor
+                )
+            video_kwargs = (
+                {
+                    "videos": [str(path) for path, _ in video_files],
+                    "video_hashes": [digest for _, digest in video_files],
+                }
+                if video_files
+                else {}
+            )
+            (
+                token_ids,
+                vlm_embeds,
+                vlm_kwargs,
+                image_hash,
+                image_cache_key_start,
+                image_cache_key_ranges,
+            ) = self._prepare_vision_inputs(
+                vlm_messages,
+                images,
+                audio=audio if audio else None,
+                chat_template_kwargs=ct_kwargs,
+                tools=template_tools,
+                is_partial=partial,
+                **video_kwargs,
+            )
+        finally:
+            for path, _ in video_files:
+                path.unlink(missing_ok=True)
+
+        if images or videos:
             # Free Metal intermediates from vision encoding.
             mx.synchronize()
             mx.clear_cache()
@@ -4191,9 +5576,7 @@ class VLMBatchedEngine(BaseEngine):
             template_kwargs.update(chat_template_kwargs)
         _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
 
-        template_target = self._processor
-        if not hasattr(template_target, "apply_chat_template"):
-            template_target = getattr(self._processor, "tokenizer", self._processor)
+        template_target = self._chat_template_target(model_type)
         try:
             return template_target.apply_chat_template(
                 formatted_messages, **template_kwargs
@@ -4522,10 +5905,10 @@ class VLMBatchedEngine(BaseEngine):
         For VLM messages with images, this counts only the text tokens.
         Image tokens are added during vision encoding and vary by model.
         """
-        # Extract text-only version for token counting
-        from ..utils.image import extract_images_from_messages
-
-        text_messages, _, _ = extract_images_from_messages(messages)
+        # Extract text-only version for token counting through the same media
+        # split as the real request, so video parts are not rejected here
+        # before they reach the multimodal path.
+        _, text_messages, _, _, _ = self._extract_request_media(messages)
 
         template_tools = convert_tools_for_template(tools) if tools else None
         prompt = self._apply_chat_template(

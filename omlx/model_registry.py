@@ -82,6 +82,8 @@ class ModelRegistry:
                 owner = weak_ref()
 
                 if owner is not None and owner_id != engine_id:
+                    if getattr(owner, "_closing", False) is True:
+                        raise ModelOwnershipError("Previous owner is still closing")
                     if force:
                         # Reset the previous owner's scheduler
                         logger.warning(

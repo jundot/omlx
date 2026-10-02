@@ -117,9 +117,7 @@ class ModelFit:
         """Does memory, not the model, set the usable context?"""
 
         declared = self.declared_context_tokens
-        return bool(
-            self.fits and declared and self.max_context_tokens < declared
-        )
+        return bool(self.fits and declared and self.max_context_tokens < declared)
 
     def describe(self) -> str:
         """One line a person can act on."""
@@ -175,12 +173,17 @@ def _splits(
     *,
     tensor_parallel_ok: bool,
     pipeline_ok: bool = True,
+    prefer_tensor: bool = False,
 ) -> tuple[tuple[int, int], ...]:
     """Every (tensor_parallel_size, pipeline_stages) this cluster can form.
 
-    Ordered fewest-nodes-first, then pipeline before tensor parallelism at
-    equal width: pipeline loads faster, uses less memory, and survives a
-    slow link, so it is the better answer when both fit.
+    Ordered fewest-nodes-first. At equal width the default is pipeline before
+    tensor parallelism: pipeline loads faster, uses less memory, and survives
+    a slow link, so it is the better answer when both fit and nothing is
+    known about the link. ``prefer_tensor`` flips the tie-break for callers
+    that know every link is fast (JACCL/Thunderbolt): there, splitting each
+    layer's compute across the group cuts per-token latency, which is what a
+    user who just cabled two Macs together is after.
     """
 
     options: list[tuple[int, int]] = []
@@ -196,7 +199,15 @@ def _splits(
                 # weights and then fail at load.
                 continue
             options.append((tp, used // tp))
-    return tuple(sorted(options, key=lambda item: (item[0] * item[1], item[0])))
+    return tuple(
+        sorted(
+            options,
+            key=lambda item: (
+                item[0] * item[1],
+                -item[0] if prefer_tensor else item[0],
+            ),
+        )
+    )
 
 
 _SHORTFALL_RE = re.compile(r"\bat least (\d+) additional bytes required\b")
@@ -340,11 +351,14 @@ def assess_model(
     tensor_parallel_ok: bool | None = None,
     pipeline_ok: bool | None = None,
     workload_profile: str = "balanced",
+    prefer_tensor: bool = False,
 ) -> ModelFit:
     """Whether this model runs here, using the fewest nodes that work.
 
     ``tensor_parallel_ok`` defaults to what the layout already determined, so
     a model mlx-lm cannot shard is never offered a tensor-parallel plan.
+    ``prefer_tensor`` requests the tensor-parallel split when both strategies
+    fit at equal width — callers set it when every link is known-fast.
     """
 
     if tensor_parallel_ok is None:
@@ -361,6 +375,7 @@ def assess_model(
         len(nodes),
         tensor_parallel_ok=tensor_parallel_ok,
         pipeline_ok=pipeline_ok,
+        prefer_tensor=prefer_tensor,
     )
     for tp_size, stages in splits:
         used = tp_size * stages
@@ -368,9 +383,7 @@ def assess_model(
         # them, which is where the fast links were placed. Ranks are positional
         # to the planner and must be contiguous from zero, so a subset — or a
         # caller's single node that happened to be rank 1 — is renumbered.
-        subset = [
-            replace(node, rank=index) for index, node in enumerate(nodes[:used])
-        ]
+        subset = [replace(node, rank=index) for index, node in enumerate(nodes[:used])]
         plan, reason = _plan_or_none(
             layout,
             subset,
@@ -466,9 +479,7 @@ def assess_model(
         if standalone_node_id:
             failure_kind = "single_node_only"
             context = (
-                f" at up to {standalone_context:,} tokens"
-                if standalone_context
-                else ""
+                f" at up to {standalone_context:,} tokens" if standalone_context else ""
             )
             last_reason = (
                 "This model cannot combine Macs because mlx-lm supports neither "
@@ -508,6 +519,7 @@ def assess_model_path(
     nodes: Sequence[NodeBudget],
     *,
     workload_profile: str = "balanced",
+    prefer_tensor: bool = False,
 ) -> ModelFit:
     """Assess a model directory, reading its real layout and config."""
 
@@ -536,6 +548,7 @@ def assess_model_path(
         model_id=root.name,
         declared_context_tokens=declared,
         workload_profile=workload_profile,
+        prefer_tensor=prefer_tensor,
     )
 
 
@@ -544,6 +557,7 @@ def catalogue_for_cluster(
     nodes: Sequence[NodeBudget],
     *,
     workload_profile: str = "balanced",
+    prefer_tensor: bool = False,
 ) -> tuple[ModelFit, ...]:
     """Assess every model, largest first among those that fit.
 
@@ -553,7 +567,12 @@ def catalogue_for_cluster(
     """
 
     fits = [
-        assess_model_path(path, nodes, workload_profile=workload_profile)
+        assess_model_path(
+            path,
+            nodes,
+            workload_profile=workload_profile,
+            prefer_tensor=prefer_tensor,
+        )
         for path in model_paths
     ]
     runnable = sorted(

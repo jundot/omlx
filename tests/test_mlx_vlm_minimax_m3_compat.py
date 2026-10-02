@@ -20,7 +20,7 @@ def test_minimax_m3_compat_installs_vendor_modules():
     import mlx_vlm.models.minimax_m3_vl  # noqa: F401
     import mlx_vlm.models.minimax_m3_vl.language as language
     import mlx_vlm.models.minimax_m3_vl.msa as msa
-    import mlx_vlm.tool_parsers.minimax_m3 as parser
+    import mlx_vlm.tools.parsers.minimax_m3 as parser
 
     assert hasattr(language, "MiniMaxM3KVCache")
     assert hasattr(msa, "build_grouped_msa_topk")
@@ -143,6 +143,9 @@ def test_stopping_criteria_accepts_none_eos_ids():
 
     criteria = StoppingCriteria(None)
     assert criteria.eos_token_ids == []
+    tokenizer = SimpleNamespace(eos_token_id=7)
+    criteria = StoppingCriteria(None, tokenizer, additional_eos_token_ids=[9])
+    assert criteria.eos_token_ids == [9]
 
 
 def test_minimax_quantization_compat_restores_mxfp8_and_skip_module(tmp_path):

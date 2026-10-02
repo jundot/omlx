@@ -1,0 +1,36 @@
+{
+  "_state": "plan",
+  "_comment": "POST /admin/api/cluster/plan response (ShardPlan.to_dict() + placement_signature) rendered as the layer-split bar.",
+  "plan_hash": "9f2ab41cd0e1f7a3b5c6d8e9f0a1b2c3",
+  "placement_signature": "b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7",
+  "layer_count": 80,
+  "assignments": [
+    {
+      "rank": 0,
+      "node_id": "3f6f2a90-7d1c-4b55-9c2a-1f0e9a8b7c6d",
+      "start_layer": 0,
+      "end_layer": 34,
+      "layer_count": 34,
+      "planned_weight_bytes": 61847529062,
+      "headroom_bytes": 10307921510
+    },
+    {
+      "rank": 1,
+      "node_id": "a1b2c3d4-0001-4000-8000-000000000001",
+      "start_layer": 34,
+      "end_layer": 68,
+      "layer_count": 34,
+      "planned_weight_bytes": 61847529062,
+      "headroom_bytes": 10307921510
+    },
+    {
+      "rank": 2,
+      "node_id": "a1b2c3d4-0003-4000-8000-000000000003",
+      "start_layer": 68,
+      "end_layer": 80,
+      "layer_count": 12,
+      "planned_weight_bytes": 21828521984,
+      "headroom_bytes": 4294967296
+    }
+  ]
+}

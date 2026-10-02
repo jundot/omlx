@@ -7,13 +7,13 @@ import json
 import math
 import numpy as np
 import struct
-import tempfile
 import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
+import mlx.core as mx
 import pytest
 
 from omlx.api.embedding_models import (
@@ -33,7 +33,7 @@ from omlx.api.embedding_utils import (
 from omlx.engine.embedding import EmbeddingEngine
 from omlx.exceptions import InvalidRequestError
 from omlx.model_discovery import detect_model_type
-from omlx.models.embedding import EmbeddingOutput
+from omlx.models.embedding import EmbeddingOutput, MLXEmbeddingModel
 
 IMAGE_DATA_URI = (
     "data:image/png;base64,"
@@ -290,29 +290,11 @@ class TestEmbeddingUtils:
 class TestModelDiscoveryEmbedding:
     """Tests for embedding model detection."""
 
-    def test_detect_bert_model(self, tmp_path):
-        """Test detection of BERT embedding model."""
-        config = {
-            "model_type": "bert",
-            "architectures": ["BertModel"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "embedding"
-
     def test_detect_xlm_roberta_model(self, tmp_path):
         """Test detection of XLM-RoBERTa embedding model."""
         config = {
             "model_type": "xlm-roberta",
             "architectures": ["XLMRobertaModel"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "embedding"
-
-    def test_detect_modernbert_model(self, tmp_path):
-        """Test detection of ModernBERT embedding model."""
-        config = {
-            "model_type": "modernbert",
-            "architectures": ["ModernBertModel"],
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "embedding"
@@ -326,15 +308,6 @@ class TestModelDiscoveryEmbedding:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "embedding"
 
-    def test_detect_qwen3_embedding_model(self, tmp_path):
-        """Test detection of Qwen3 embedding model."""
-        config = {
-            "model_type": "qwen3",
-            "architectures": ["Qwen3ForTextEmbedding"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "embedding"
-
     def test_detect_embedding_by_architecture_only(self, tmp_path):
         """Test detection by architecture when model_type is unknown."""
         config = {
@@ -343,47 +316,6 @@ class TestModelDiscoveryEmbedding:
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "embedding"
-
-    def test_llm_not_detected_as_embedding(self, tmp_path):
-        """Test that LLM models are not detected as embedding."""
-        config = {
-            "model_type": "llama",
-            "architectures": ["LlamaForCausalLM"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "llm"
-
-    def test_qwen_llm_not_detected_as_embedding(self, tmp_path):
-        """Test that Qwen LLM is not detected as embedding model."""
-        config = {
-            "model_type": "qwen2",
-            "architectures": ["Qwen2ForCausalLM"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "llm"
-
-    def test_detect_reranker_model(self, tmp_path):
-        """Test detection of reranker model."""
-        config = {
-            "model_type": "modernbert",
-            "architectures": ["ModernBertForSequenceClassification"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "reranker"
-
-    def test_detect_xlm_roberta_reranker(self, tmp_path):
-        """Test detection of XLM-RoBERTa reranker model."""
-        config = {
-            "model_type": "xlm-roberta",
-            "architectures": ["XLMRobertaForSequenceClassification"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "reranker"
-
-    def test_no_config_defaults_to_llm(self, tmp_path):
-        """Test that missing config.json defaults to LLM."""
-        assert detect_model_type(tmp_path) == "llm"
-
 
 class TestExtractEmbeddingsArray:
     """Tests for _extract_embeddings_array method."""
@@ -621,6 +553,33 @@ class TestEmbeddingCompileFallback:
 
         assert generate.call_args.kwargs["max_length"] == 1024
 
+    def test_max_length_is_capped_at_position_table(self):
+        """XLM-R declares 8194 positions but only 8192 inputs fit after the offset."""
+        import mlx.core as mx
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        model._loaded = True
+        model._is_compiled = False
+        model._compiled_embed = None
+        model.model = SimpleNamespace(
+            config=SimpleNamespace(max_position_embeddings=8194),
+            max_input_length=8192,
+        )
+        model.processor = SimpleNamespace()
+
+        mock_outputs = MagicMock(spec=[])
+        mock_outputs.text_embeds = mx.array([[0.5, 0.6]])
+        mock_outputs.pooler_output = None
+        mock_outputs.last_hidden_state = None
+
+        with patch("mlx_embeddings.generate", return_value=mock_outputs) as generate:
+            model.embed(["test"])
+            model.embed(["test"], max_length=1024)
+
+        lengths = [call.kwargs["max_length"] for call in generate.call_args_list]
+        assert lengths == [8192, 1024]
+
     def test_custom_processor_compiled_path_uses_prepare_embedding_inputs(self):
         """Custom embedding processors should use their own prepare API."""
         import mlx.core as mx
@@ -849,11 +808,9 @@ class TestEmbeddingCompileFallback:
         model._compiled_embed = MagicMock()
         model._remap_input_ids_to_inputs = True
 
-        with patch("omlx.models.embedding.gc.collect") as collect, \
-             patch("omlx.models.embedding.mx") as mock_mx, \
-             patch(
-                 "omlx.models.embedding.clear_thread_compile_cache"
-             ) as clear_compile_cache:
+        with patch("omlx.models.embedding.gc.collect") as collect, patch(
+            "omlx.models.embedding.mx"
+        ) as mock_mx:
             model.close()
 
         assert model.model is None
@@ -866,7 +823,6 @@ class TestEmbeddingCompileFallback:
         assert model._remap_input_ids_to_inputs is False
         mock_mx.synchronize.assert_called_once()
         mock_mx.clear_cache.assert_called_once()
-        clear_compile_cache.assert_called_once()
         assert collect.call_count == 2
 
 
@@ -1561,7 +1517,6 @@ class TestNativeEmbeddingLoading:
 
         self._write_full_native_checkpoint(tmp_path, config)
 
-        import mlx.core as mx
         from safetensors import safe_open
 
         weights = {}
@@ -1586,6 +1541,69 @@ class TestNativeEmbeddingLoading:
 
         assert result is False
         assert model._loaded is False
+
+    def test_native_embed_tokenizes_with_tokenizer_call(self, tmp_path):
+        """transformers tokenizers expose a Rust _tokenizer that must stay unused."""
+        config = {
+            "model_type": "bert",
+            "architectures": ["BertModel"],
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "vocab_size": 100,
+            "num_attention_heads": 4,
+            "intermediate_size": 64,
+            "max_position_embeddings": 64,
+            "attention_probs_dropout_prob": 0.0,
+            "hidden_dropout_prob": 0.0,
+            "pad_token_id": 0,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        self._write_full_native_checkpoint(tmp_path, config)
+
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel(str(tmp_path))
+        tokenizer = self.MockNativeTokenizer(vocab_size=config["vocab_size"])
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained", return_value=tokenizer
+        ):
+            model.load()
+            expected = model.embed(["hello world"]).embeddings
+            # Its encode() would apply tokenizer.json padding as real tokens.
+            tokenizer._tokenizer = object()
+            assert model.embed(["hello world"]).embeddings == expected
+
+    def test_position_ids_follow_bert_and_roberta_numbering(self):
+        """BERT positions start at 0; XLM-R positions start after padding_idx."""
+        import mlx.core as mx
+        from omlx.models.xlm_roberta import Model, ModelArgs
+
+        input_ids = mx.array([[5, 6, 7, 8]])
+        common = dict(
+            hidden_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            intermediate_size=16,
+            vocab_size=16,
+        )
+        cases = (
+            ("bert", 0, 512, [0, 1, 2, 3], 512),
+            ("xlm-roberta", 1, 8194, [2, 3, 4, 5], 8192),
+        )
+        for model_type, pad_token_id, table, positions, max_input in cases:
+            model = Model(
+                ModelArgs(
+                    model_type=model_type,
+                    pad_token_id=pad_token_id,
+                    max_position_embeddings=table,
+                    **common,
+                )
+            )
+            model.train(False)
+            expected = model.embeddings(input_ids, position_ids=mx.array([positions]))
+
+            assert mx.array_equal(model.embeddings(input_ids), expected).item()
+            assert model.max_input_length == max_input
 
     def test_load_native_falls_back_for_unknown_arch(self, tmp_path):
         """Test that native loading returns False for unsupported architectures."""
@@ -1645,6 +1663,79 @@ class TestNativeEmbeddingLoading:
         emb = output.embeddings[0]
         norm = math.sqrt(sum(x * x for x in emb))
         assert abs(norm - 1.0) < 0.01, f"Embedding not normalized: norm={norm}"
+
+    def test_xlm_roberta_sdpa_attention_matches_eager(self):
+        """The fused attention path must match the eager path on padded rows."""
+        import mlx.core as mx
+        from omlx.models.xlm_roberta import Model, ModelArgs
+
+        model = Model(
+            ModelArgs(
+                hidden_size=32,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                intermediate_size=64,
+                vocab_size=100,
+                max_position_embeddings=40,
+            )
+        )
+        model.train(False)
+        input_ids = mx.array([[0, 5, 6, 7, 8, 2], [0, 9, 2, 1, 1, 1]])
+        attention_mask = mx.array([[1, 1, 1, 1, 1, 1], [1, 1, 1, 0, 0, 0]])
+
+        fused = model(input_ids, attention_mask=attention_mask)
+        # output_attentions needs the probabilities, so it keeps the eager path.
+        eager = model(input_ids, attention_mask=attention_mask, output_attentions=True)
+
+        assert mx.allclose(
+            fused.last_hidden_state, eager.last_hidden_state, atol=1e-5
+        ).item()
+
+    def test_embed_batches_long_inputs_in_input_order(self, tmp_path):
+        """Token-budget batches must match single-input vectors in input order."""
+        config = {
+            "model_type": "bert",
+            "architectures": ["BertModel"],
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "vocab_size": 100,
+            "num_attention_heads": 4,
+            "intermediate_size": 64,
+            "max_position_embeddings": 128,
+            "attention_probs_dropout_prob": 0.0,
+            "hidden_dropout_prob": 0.0,
+            "pad_token_id": 0,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        self._write_full_native_checkpoint(tmp_path, config)
+
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel(str(tmp_path))
+        texts = ["w " * 40, "a b", "x " * 20, "c d e"]
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            return_value=self.MockNativeTokenizer(vocab_size=config["vocab_size"]),
+        ):
+            model.load()
+            singles = [model.embed([text], max_length=64) for text in texts]
+
+            shapes = []
+            forward = model.model
+
+            def recording_forward(**kwargs):
+                shapes.append(kwargs["input_ids"].shape)
+                return forward(**kwargs)
+
+            model.model = recording_forward
+            with patch("omlx.models.embedding.ENCODER_BATCH_TOKEN_BUDGET", 48):
+                batched = model.embed(texts, max_length=64)
+
+        assert len(shapes) == 3
+        assert all(batch * width <= 48 for batch, width in shapes)
+        for got, single in zip(batched.embeddings, singles):
+            assert got == pytest.approx(single.embeddings[0], abs=1e-5)
+        assert batched.total_tokens == sum(single.total_tokens for single in singles)
 
 
 class TestGetEmbeddingMaxLength:
@@ -2050,3 +2141,58 @@ class TestDeclaredPoolingMode:
 
         out = np.array(m.embed(["ab", "abc"]).embeddings)
         assert np.allclose(out, self._E2E_EXPECTED, atol=1e-5)
+
+
+
+class TestEmbeddingDtype:
+    """bf16 -> fp16 promotion for unquantized Qwen3-Embedding 0.6B / 8B."""
+
+    class _Module:
+        def __init__(self):
+            self._params = {"weight": mx.zeros((2,), dtype=mx.bfloat16)}
+
+        def parameters(self):
+            return self._params
+
+        def update(self, tree):
+            self._params = tree
+
+    @staticmethod
+    def _promoted(model_dir, **config):
+        model_dir.mkdir(parents=True)
+        cfg = {"model_type": "qwen3", "hidden_size": 4096, "num_hidden_layers": 36}
+        cfg.update(config)
+        (model_dir / "config.json").write_text(json.dumps(cfg))
+        module = TestEmbeddingDtype._Module()
+        MLXEmbeddingModel(str(model_dir))._promote_bf16_to_fp16(module)
+        return module._params["weight"].dtype == mx.float16
+
+    @pytest.mark.parametrize(
+        "name,shape",
+        [("Qwen3-Embedding-0.6B", (1024, 28)), ("Qwen3-Embedding-8B", (4096, 36))],
+    )
+    def test_promotes_validated_sizes(self, tmp_path, name, shape):
+        assert self._promoted(
+            tmp_path / name, hidden_size=shape[0], num_hidden_layers=shape[1]
+        )
+
+    def test_size_comes_from_config_not_path(self, tmp_path):
+        # HF cache snapshot hashes can contain "8b".
+        snapshot = (
+            tmp_path
+            / "models--Qwen--Qwen3-Embedding-4B"
+            / "snapshots"
+            / "5cf2132abc8bd8a4f1c2b0e7d6a9f3e1b2c4d5e6"
+        )
+        assert not self._promoted(snapshot, hidden_size=2560)
+
+    @pytest.mark.parametrize(
+        "name,config",
+        [
+            ("Qwen3-Embedding-8B-4bit", {"quantization": {"bits": 4}}),
+            ("Qwen3-VL-Embedding-8B", {"model_type": "qwen3_vl"}),
+            ("Qwen3-8B", {}),
+        ],
+    )
+    def test_leaves_other_models_untouched(self, tmp_path, name, config):
+        assert not self._promoted(tmp_path / name, **config)

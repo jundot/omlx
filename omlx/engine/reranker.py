@@ -115,8 +115,8 @@ class RerankerEngine(BaseNonStreamingEngine):
                 'image' keys.
             top_n: Number of top results to return (None = all)
             max_length: Maximum token length for each query-document pair.
-                If None, uses model-appropriate default (512 for encoder,
-                8192 for CausalLM).
+                If None, uses model-appropriate default (the tokenizer limit
+                for encoders, 8192 for CausalLM).
 
         Returns:
             RerankOutput with scores, sorted indices, and token count

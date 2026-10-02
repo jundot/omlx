@@ -27,13 +27,7 @@ struct SecurityScreen: View {
             AuthenticationSection(vm: vm, client: services.client)
             SubKeysSection(vm: vm, client: services.client)
 
-            if let error = vm.lastError {
-                Text(error)
-                    .font(.omlxText(11))
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 18)
-                    .padding(.top, 8)
-            }
+            FooterBar(error: vm.lastError)
         }
         .task { await vm.load(client: services.client) }
     }
@@ -103,7 +97,7 @@ private struct APIKeyEditorRow: View {
                           comment: "Row label for the API key editor"),
             sublabel: sublabel, isLast: true) {
             HStack(spacing: 6) {
-                TextInput("security.api_key.row_label", text: $draft, placeholder: "sk-omlx-…", isSecure: !showKey, mono: true, width: 260)
+                TextInput("security.api_key.row_label", text: $draft, placeholder: "sk-omlx-…", isSecure: !showKey, mono: true, width: .controlMedium)
                     .onSubmit { Task { await save() } }
                 iconButton(systemName: showKey ? "eye.slash" : "eye",
                            help: showKey
@@ -216,10 +210,9 @@ private struct AuthenticationSection: View {
                                  comment: "Sublabel for the disable API key verification toggle"),
                 isLast: true
             ) {
-                Toggle("", isOn: vm.bind($vm.skipApiKeyVerification, save: {
+                RowSwitch(isOn: vm.bind($vm.skipApiKeyVerification, save: {
                     Task { await vm.saveSkipApiKeyVerification(client: client) }
                 }))
-                .labelsHidden().toggleStyle(.switch)
             }
         }
     }
@@ -270,7 +263,7 @@ private struct SubKeysSection: View {
                               placeholder: String(localized: "security.sub_keys.name_placeholder",
                                                   defaultValue: "Claude Code on laptop",
                                                   comment: "Placeholder text for sub-key name input"),
-                              width: 220)
+                              width: .controlMedium)
                 }
                 Row(label: String(localized: "security.sub_keys.key_label",
                                   defaultValue: "Key",
@@ -280,7 +273,7 @@ private struct SubKeysSection: View {
                                   placeholder: String(localized: "security.sub_keys.key_placeholder",
                                                       defaultValue: "sk-omlx-sub-…",
                                                       comment: "Placeholder text inside the sub-key value input"),
-                                  mono: true, width: 220)
+                                  mono: true, width: .controlMedium)
                         Button {
                             newKey = APIKeyGenerator.random()
                         } label: {

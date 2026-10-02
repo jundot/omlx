@@ -121,3 +121,38 @@ def test_oq_sanitizer_normalizes_legacy_hy_v3_config():
         "rope_theta": 11158840.0,
         "rope_type": "default",
     }
+
+
+_HY3_PREVIEW_TEMPLATE = (
+    "<tool_calls><tool_call>f<tool_sep><arg_key>k</arg_key></tool_call></tool_calls>"
+)
+_HY3_RELEASE_TEMPLATE = (
+    "<tool_calls:opensource><tool_call:opensource>f<tool_sep:opensource>"
+    "<arg_key:opensource>k</arg_key:opensource></tool_call:opensource>"
+)
+_GLM_TEMPLATE = "<tool_call>f<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>"
+
+
+@pytest.mark.parametrize(
+    ("template", "expected"),
+    [
+        (_HY3_PREVIEW_TEMPLATE, "hy_v3"),
+        (_HY3_RELEASE_TEMPLATE, "hy_v3_opensource"),
+        (_GLM_TEMPLATE, "glm47"),
+    ],
+)
+def test_tool_parser_inference_reads_the_tokenizer_template(
+    monkeypatch, template, expected
+):
+    """mlx-lm passes the tokenizer, so the wrapper must read its template."""
+    from types import SimpleNamespace
+
+    import mlx_lm.tokenizer_utils as tu
+
+    from omlx.patches import hy_v3
+
+    monkeypatch.setattr(tu, "_infer_tool_parser", tu._infer_tool_parser)
+    hy_v3._patch_infer_tool_parser()
+
+    tokenizer = SimpleNamespace(chat_template=template, get_vocab=lambda: {})
+    assert tu._infer_tool_parser(tokenizer) == expected

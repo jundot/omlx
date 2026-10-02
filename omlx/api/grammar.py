@@ -33,7 +33,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-def create_grammar_compiler(tokenizer, model):
+def create_grammar_compiler(tokenizer, model, *, cache_limit_bytes=-1):
     """Create an xgrammar GrammarCompiler for the given tokenizer and model.
 
     Returns None if vocab_size cannot be determined.
@@ -51,7 +51,24 @@ def create_grammar_compiler(tokenizer, model):
         kwargs["vocab_size"] = vocab_size
 
     tokenizer_info = xgr.TokenizerInfo.from_huggingface(hf_tokenizer, **kwargs)
-    return xgr.GrammarCompiler(tokenizer_info)
+    return xgr.GrammarCompiler(tokenizer_info, cache_limit_bytes=cache_limit_bytes)
+
+
+def mark_grammar_thinking_phase(compiled_grammar, *, enabled: bool):
+    """Record whether oMLX compiled a separate reasoning phase.
+
+    Metadata travels with the Python CompiledGrammar wrapper through every
+    engine path. Bare or externally compiled grammars are conservative by
+    default: their accepted tokens need not include a forced thinking close.
+    """
+    from .._torch_stub import install as _install_torch_stub
+
+    _install_torch_stub()
+    import xgrammar as xgr
+
+    if isinstance(compiled_grammar, xgr.CompiledGrammar):
+        compiled_grammar._omlx_has_thinking_phase = enabled
+    return compiled_grammar
 
 
 class GrammarConstraintProcessor:

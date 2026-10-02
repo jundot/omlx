@@ -244,7 +244,7 @@ def _guard_ready(scheduler: Any) -> bool:
 def _make_fits(scheduler: Any) -> Callable[[int], bool]:
     def fits(n: int) -> bool:
         try:
-            scheduler.preflight_or_raise(num_prompt_tokens=n)
+            scheduler.preflight_or_raise(num_prompt_tokens=n, text_only=True)
         except PrefillMemoryExceededError:
             return False
         return True
