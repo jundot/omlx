@@ -306,3 +306,64 @@ async def require_admin(request: Request) -> bool:
 class _RedirectToLogin(Exception):
     """Raised to trigger a redirect to the admin login page."""
     pass
+
+
+# ── Login brute-force throttle ──────────────────────────────────────────────
+
+# API keys may be as short as 4 characters (validate_api_key_format); without
+# a failure budget the unauthenticated login form is an online brute-force
+# oracle. Best-effort and in-memory: a restart clears the counters, which is
+# acceptable for a single-process local server.
+LOGIN_FAILURES_BEFORE_LOCKOUT = 8
+LOGIN_LOCKOUT_SECONDS = 30.0
+# Bound the tracking maps under spoofed-peer flooding (direct IP connections
+# can vary the claimed peer only per connection; clearing loses backoff state
+# but never locks out a legitimate peer that has not just failed).
+LOGIN_THROTTLE_MAX_TRACKED_PEERS = 1024
+
+
+class LoginThrottle:
+    """Per-peer failure budget for key-verification endpoints."""
+
+    def __init__(self) -> None:
+        import threading
+        import time
+
+        self._time = time
+        self._lock = threading.Lock()
+        self._failures: dict[str, int] = {}
+        self._locked_until: dict[str, float] = {}
+
+    def remaining_lockout(self, peer: str) -> float:
+        """Seconds left in peer's lockout (0.0 when allowed to try)."""
+        with self._lock:
+            remaining = self._locked_until.get(peer, 0.0) - self._time.monotonic()
+            if remaining <= 0:
+                self._locked_until.pop(peer, None)
+                return 0.0
+            return remaining
+
+    def record_failure(self, peer: str) -> None:
+        with self._lock:
+            failures = self._failures.get(peer, 0) + 1
+            if failures >= LOGIN_FAILURES_BEFORE_LOCKOUT:
+                self._locked_until[peer] = self._time.monotonic() + LOGIN_LOCKOUT_SECONDS
+                self._failures[peer] = 0
+            else:
+                self._failures[peer] = failures
+            if len(self._failures) > LOGIN_THROTTLE_MAX_TRACKED_PEERS:
+                self._failures.clear()
+
+    def record_success(self, peer: str) -> None:
+        with self._lock:
+            self._failures.pop(peer, None)
+            self._locked_until.pop(peer, None)
+
+    def reset(self) -> None:
+        """Clear all backoff state (tests and explicit unlock paths)."""
+        with self._lock:
+            self._failures.clear()
+            self._locked_until.clear()
+
+
+login_throttle = LoginThrottle()

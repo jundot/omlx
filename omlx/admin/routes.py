@@ -76,6 +76,7 @@ from .auth import (
     SESSION_MAX_AGE,
     compare_keys,
     create_session_token,
+    login_throttle,
     require_admin,
     validate_api_key,
     verify_api_key,
@@ -1904,23 +1905,45 @@ async def admin_static(path: str):
 
 
 @router.post("/api/login")
-async def login(request: LoginRequest, response: Response):
+async def login(
+    request: LoginRequest,
+    response: Response,
+    http_request: Request = None,
+):
     """
     Authenticate with API key and create session.
 
-    Requires an API key to be configured on the server. If no API key
-    is configured, returns 400 directing the user to set one up first.
+    Requires an API key to be configured on the server. If no API key is
+    configured, returns 400 directing the user to set one up first.
 
     Args:
         request: LoginRequest containing the API key.
         response: FastAPI response object for setting cookies.
+        http_request: Incoming request used for the login throttle's peer key.
 
     Returns:
         JSON response with success status.
 
     Raises:
-        HTTPException: 400 if no API key configured, 401 if invalid.
+        HTTPException: 400 if no API key configured, 401 if invalid,
+            429 while the peer is locked out after repeated failures.
     """
+    peer = (
+        http_request.client.host
+        if http_request is not None and http_request.client is not None
+        else "local"
+    )
+    lockout = login_throttle.remaining_lockout(peer)
+    if lockout > 0:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Too many failed login attempts. "
+                f"Try again in {int(lockout) + 1} seconds."
+            ),
+            headers={"Retry-After": str(int(lockout) + 1)},
+        )
+
     global_settings = _get_global_settings()
     server_api_key = global_settings.auth.api_key if global_settings else None
 
@@ -1933,10 +1956,12 @@ async def login(request: LoginRequest, response: Response):
 
     # Main key only — sub keys must not grant admin login
     if not verify_api_key(request.api_key, server_api_key):
+        login_throttle.record_failure(peer)
         raise HTTPException(
             status_code=401,
             detail="Invalid API key",
         )
+    login_throttle.record_success(peer)
 
     # Create session token and set cookie
     token = create_session_token(remember=request.remember)
@@ -2052,7 +2077,11 @@ async def logout(response: Response):
 
 
 @router.get("/auto-login")
-async def auto_login(key: str = "", redirect: str = "/admin/dashboard"):
+async def auto_login(
+    key: str = "",
+    redirect: str = "/admin/dashboard",
+    http_request: Request = None,
+):
     """
     Auto-login using API key and redirect to the target admin page.
 
@@ -2062,6 +2091,7 @@ async def auto_login(key: str = "", redirect: str = "/admin/dashboard"):
     Args:
         key: The API key for authentication.
         redirect: The path to redirect to after login. Must start with /admin.
+        http_request: Incoming request used for the login throttle's peer key.
 
     Returns:
         HTTP 302 redirect with session cookie set.
@@ -2069,12 +2099,26 @@ async def auto_login(key: str = "", redirect: str = "/admin/dashboard"):
     if not redirect.startswith("/admin"):
         raise HTTPException(status_code=400, detail="Invalid redirect path")
 
+    peer = (
+        http_request.client.host
+        if http_request is not None and http_request.client is not None
+        else "local"
+    )
+    # Share the login form's failure budget: the key arrives via a URL query
+    # here, so this endpoint is otherwise the cheaper brute-force oracle.
+    # A locked peer just gets the same silent redirect as a wrong key.
+    if login_throttle.remaining_lockout(peer) > 0:
+        return RedirectResponse(url="/admin", status_code=302)
+
     global_settings = _get_global_settings()
     server_api_key = global_settings.auth.api_key if global_settings else None
 
     # Main key only — sub keys must not grant admin login
     if not key or not server_api_key or not verify_api_key(key, server_api_key):
+        if key and server_api_key:
+            login_throttle.record_failure(peer)
         return RedirectResponse(url="/admin", status_code=302)
+    login_throttle.record_success(peer)
 
     token = create_session_token()
     response = RedirectResponse(url=redirect, status_code=302)
