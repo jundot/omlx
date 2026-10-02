@@ -199,4 +199,4 @@ Run `python -m pytest -q tests/test_video.py tests/test_image_utils.py tests/tes
 
 # Engine idle timing tests
 
-`python -m pytest -q tests/test_engine_idle_completion.py tests/test_engine_pool.py tests/test_active_models_visibility.py` checks that lease completion refreshes the LRU/TTL timestamp and that busy models report zero idle time. The regression cases include a request longer than its TTL, overlapping requests, pending unload, cancelled release, and redundant releases.
+Run `python -m pytest -q tests/test_engine_pool.py tests/test_active_models_visibility.py` to check that lease completion refreshes the LRU/TTL timestamp and that busy models report zero idle time. The cases cover a request longer than its TTL, release with a pending unload, cancelled release, redundant releases, and models with a held lease, an active request, or a waiting request.

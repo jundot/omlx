@@ -4241,13 +4241,38 @@ class TestEnginePoolInUseLease:
         entry.in_use = 1
         pool._entries = {"leased": entry}
 
-        await pool.release_engine("leased")
+        with patch("time.time", return_value=700.0):
+            await pool.release_engine("leased")
         assert entry.in_use == 0
+        assert entry.last_access == 700.0
         # Extra release is a no-op (floor at 0), not a negative count.
-        await pool.release_engine("leased")
+        with patch("time.time", return_value=705.0):
+            await pool.release_engine("leased")
         assert entry.in_use == 0
+        assert entry.last_access == 700.0
         # Unknown model id is a harmless no-op.
         await pool.release_engine("nope")
+
+    @pytest.mark.asyncio
+    async def test_release_starts_idle_ttl_at_completion(self):
+        """A request longer than the TTL still gets the full TTL after it ends."""
+        pool = _make_pool(ceiling=0)
+        entry = self._loaded_entry("leased", last_access=100.0)
+        entry.in_use = 1
+        pool._entries = {"leased": entry}
+        pool._unload_engine = AsyncMock()
+        settings_manager = MagicMock()
+        settings_manager.get_settings.return_value = SimpleNamespace(ttl_seconds=60)
+
+        with patch("time.time", return_value=700.0):
+            await pool.release_engine("leased")
+        with patch("time.time", return_value=701.0):
+            assert await pool.check_ttl_expirations(settings_manager) == []
+        pool._unload_engine.assert_not_awaited()
+
+        with patch("time.time", return_value=761.0):
+            assert await pool.check_ttl_expirations(settings_manager) == ["leased"]
+        pool._unload_engine.assert_awaited_once_with("leased")
 
     @pytest.mark.asyncio
     async def test_release_engine_survives_caller_cancellation_while_lock_waits(self):
@@ -4274,9 +4299,11 @@ class TestEnginePoolInUseLease:
         finally:
             pool._lock.release()
 
-        await pool._drain_lease_release_tasks()
+        with patch("time.time", return_value=700.0):
+            await pool._drain_lease_release_tasks()
 
         assert entry.in_use == 0
+        assert entry.last_access == 700.0
         assert pool._lease_release_tasks == set()
         assert pool._find_lru_victim() == "leased"
 
@@ -4310,9 +4337,11 @@ class TestEnginePoolInUseLease:
         pool._entries = {"leased": entry}
         pool._unload_engine = AsyncMock()
 
-        await pool.release_engine("leased")
+        with patch("time.time", return_value=700.0):
+            await pool.release_engine("leased")
 
         assert entry.in_use == 0
+        assert entry.last_access == 700.0
         assert entry.pending_unload_reason == "hard memory pressure"
         assert entry.abort_requested is True
         pool._unload_engine.assert_not_awaited()
