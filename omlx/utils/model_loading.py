@@ -514,6 +514,16 @@ def maybe_apply_pre_load_patches(
 
     set_mtp_active(False)
 
+    # Per-model Lightning MTP priming bound (head-cache memory cost);
+    # set on every load so unloads/reloads cannot leak a prior model's
+    # window. Env OMLX_MTP_PRIME_WINDOW still overrides inside
+    # prompt_priming.prime_window().
+    from ..patches.mlx_lm_mtp import prompt_priming as _prompt_priming
+
+    _prompt_priming.set_prime_window_config(
+        getattr(model_settings, "mtp_prime_window", 0) or 0
+    )
+
     _patch_mlx_lm_load_config()
 
     # Machine-conditioned, model-independent: reroute sorted gather_qmm

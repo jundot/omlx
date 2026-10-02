@@ -502,6 +502,55 @@ def test_guard_recovers_after_reclaim_frees_memory():
     assert n >= ns._prefill_min_chunk_tokens
 
 
+def test_guard_repolls_while_footprint_drains():
+    """A close-margin chunk survives Metal's post-clear drain lag.
+
+    The 1M rung rejected at 901,248 tokens: current=102.38GB against the
+    102.14GB cap, measured milliseconds after _reclaim_prefill_headroom —
+    while the enforcer's poll one second into a comparable episode showed
+    a 20.3GB pool drain (soft -> ok, 99.8 -> 79.5GB). The guard must
+    re-poll while the footprint is still falling instead of rejecting on
+    the first post-reclaim reading.
+    """
+    hard = int(107.5 * _GB)
+    ns = _throttle_ctx(current=0, hard=hard, samples_bpt=None)
+    cap = hard * Scheduler._PREFILL_ABORT_MARGIN
+    readings = iter(
+        [
+            cap + 2 * _GB,  # first probe: over → triggers the reclaim
+            cap + _GB // 3,  # post-reclaim: still over (drain lag)
+            cap - 3 * _GB,  # first re-poll: drained → fits
+        ]
+    )
+    ns._fake_current = 0
+    ns._reclaim_prefill_headroom = lambda: next(readings)
+    with (
+        patch.object(sched_mod.mx, "get_active_memory", return_value=0),
+        patch.object(sched_mod, "get_phys_footprint", side_effect=lambda: next(readings)),
+    ):
+        n = Scheduler._guard_prefill_chunk(
+            ns, 2048, kv_len=901_248, progress=901_248, loop_label="test"
+        )
+    assert n >= ns._prefill_min_chunk_tokens
+
+
+def test_guard_rejects_promptly_when_drain_stalls():
+    """A footprint that stops falling still rejects without riding the
+    full re-poll deadline."""
+    hard = int(107.5 * _GB)
+    ns = _throttle_ctx(current=0, hard=hard, samples_bpt=None)
+    stuck = hard  # far over the cap, and unmoving
+    ns._fake_current = stuck
+    with (
+        patch.object(sched_mod.mx, "get_active_memory", return_value=0),
+        patch.object(sched_mod, "get_phys_footprint", return_value=stuck),
+        pytest.raises(PrefillMemoryExceededError),
+    ):
+        Scheduler._guard_prefill_chunk(
+            ns, 256, kv_len=901_248, progress=901_248, loop_label="test"
+        )
+
+
 # --------------------------------------------------------------------------
 # Scheduler._predicted_chunk_transient
 # --------------------------------------------------------------------------
@@ -1285,6 +1334,7 @@ def test_step_prefill_reclaims_before_first_guard(
         _record_chunk_transient=MagicMock(),
         _maybe_record_fixed_state_bytes=MagicMock(),
         _reserve_qsa_index_capacity=MagicMock(),
+        _turboquant_kv_bits=None,
     )
     ns.running = {}
     ns._decode_fairness = True
@@ -1301,6 +1351,8 @@ def test_step_prefill_reclaims_before_first_guard(
         "_accrue_decode_debt",
         "_dflash_prefill_capture",
         "_dflash_seed_prefill",
+        "_tq_incremental_convert",
+        "_tq_pressure_fold_due",
     ):
         setattr(ns, _name, getattr(Scheduler, _name).__get__(ns, Scheduler))
     ns._step_prefill_chunk = Scheduler._step_prefill_chunk.__get__(ns, Scheduler)
@@ -2298,3 +2350,26 @@ def test_concurrent_admission_race_is_documented_not_fixed(monkeypatch):
         32, q_len, kv_len, 256, SDPA256_UNFUSED_SCORE_DTYPE_SIZE
     )
     assert 2 * bounded_charge < unfused
+
+
+def test_pool_trim_cadence_helpers(monkeypatch):
+    """Chunked-prefill pool trim: env cadence + boundary-cross predicate.
+
+    The periodic 512-step clear never fires inside a ~440-chunk million-
+    token prefill, so the pool ratchets to the enforcer's soft tier and
+    the tail rides at ~100GB (the 1M rung's close-margin rejection).
+    """
+    monkeypatch.delenv("OMLX_PREFILL_POOL_TRIM_TOKENS", raising=False)
+    assert sched_mod._prefill_pool_trim_tokens() == 131_072
+    monkeypatch.setenv("OMLX_PREFILL_POOL_TRIM_TOKENS", "0")
+    assert sched_mod._prefill_pool_trim_tokens() == 0
+    monkeypatch.setenv("OMLX_PREFILL_POOL_TRIM_TOKENS", "bogus")
+    assert sched_mod._prefill_pool_trim_tokens() == 131_072
+    monkeypatch.setenv("OMLX_PREFILL_POOL_TRIM_TOKENS", "65536")
+    assert sched_mod._prefill_pool_trim_tokens() == 65_536
+
+    due = Scheduler._pool_trim_due
+    assert due(131_072, 2_048, 131_072)  # crossed the boundary this chunk
+    assert not due(130_000, 2_048, 131_072)  # not yet
+    assert not due(262_144, 2_048, 0)  # disabled
+    assert due(1_000_000, 999_999, 131_072)  # huge chunk crossing several

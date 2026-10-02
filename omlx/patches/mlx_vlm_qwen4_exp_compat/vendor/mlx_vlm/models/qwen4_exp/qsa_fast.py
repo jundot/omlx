@@ -32,6 +32,40 @@ _NAX_QSA_MAIN_DISABLED = False
 _NAX_QSA_MAIN_PROVEN = False
 
 
+_NATIVE_QSA_TQ_DISABLED = False
+_NATIVE_QSA_TQ_PROVEN = False
+
+# Tensor-unit (NAX) packed-row arm: probe-and-memoize, same idiom as above.
+_NAX_QSA_TQ_DISABLED = False
+_NAX_QSA_TQ_PROVEN = False
+
+# Codec-bit pairs with native packed-row kernel instantiations. Fractional
+# cache widths quantize at floor/ceil codec bits (2.5 -> (2, 3), 3.5 ->
+# (3, 4)); every other supported width uses one integer pair.
+_TQ_NATIVE_BIT_PAIRS = frozenset(
+    {(2, 2), (2, 3), (3, 3), (3, 4), (4, 4), (6, 6), (8, 8)}
+)
+
+
+def _tq_native_bit_pair(bits: float) -> tuple[int, int] | None:
+    """Codec-bit pair a TurboQuant width quantizes at; None if not numeric.
+
+    Mirrors mlx_vlm.turboquant's split rule: widths that round to an integer
+    (within 1e-6) use one codec pair; genuinely fractional widths split into
+    floor/ceil codec bits.
+    """
+    try:
+        b = float(bits)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(b) or b < 1:
+        return None
+    if math.isclose(b, round(b), abs_tol=1e-6):
+        i = int(round(b))
+        return (i, i)
+    return int(math.floor(b)), int(math.ceil(b))
+
+
 def _min_rows(env: str, default: int) -> int:
     raw = os.environ.get(env, "").strip()
     if raw:
@@ -64,6 +98,24 @@ def _native_main_min_rows() -> int:
     """Query rows from which the native sparse GQA kernel engages; the gathered SDPA
     is faster below it (NAX: 0.7 vs 1.6 ms per layer at verify width)."""
     return _min_rows("OMLX_QWEN4_QSA_NATIVE_MAIN_MIN_ROWS", 24)
+
+
+@functools.lru_cache(maxsize=None)
+def _nax_tq_min_rows() -> int:
+    """Query rows from which the fused tensor-unit packed arm engages.
+
+    Deliberately lower than ``_native_main_min_rows``: that 24-row crossover
+    compares the compiled native kernel against a gathered SDPA, both of which
+    scale with query rows. The fused arm walks the selected blocks once
+    whatever the row count, so it is flat in chunk size while the fallback
+    climbs - measured at 6-bit, the dispatched path costs 1.4x (4 rows), 1.5x
+    (8 rows) and 4.9x (16 rows) the fused arm at 65k context, and the cliff
+    is what a prompt's tail chunk lands on whenever the length is not a
+    multiple of ``contiguous_causal_query_chunk``. Two rows is the kernel's own
+    floor: below that there is no tile to fill, so raise this only if a part
+    shows a genuine crossover here.
+    """
+    return _min_rows("OMLX_QWEN4_QSA_NAX_TQ_MIN_ROWS", 2)
 
 
 def contiguous_causal_query_chunk(key_tokens: int) -> int:
@@ -1028,6 +1080,250 @@ def _nax_sparse_gqa_attention(
         return None
 
 
+def native_qsa_tq_available(bits: float | None = None) -> bool:
+    """True when the packed-row native GQA kernel can dispatch.
+
+    The prefill eligibility gate consults this: the portable union-gather
+    arm is only competitive inside a measured context band, but the native
+    packed-row kernel runs at the dense arm's rate at any context, so the
+    band's ceiling must not push native-eligible shapes onto the mask path.
+
+    With ``bits`` (a cache's TurboQuant width), additionally require that
+    the width's codec-bit pair has kernel instantiations — lifting the
+    ceiling for a width that would bail to the portable arm would strand
+    the prefill above the measured band.
+    """
+    if _NATIVE_QSA_TQ_DISABLED:
+        return False
+    if (
+        bits is not None
+        and _tq_native_bit_pair(bits) not in _TQ_NATIVE_BIT_PAIRS
+    ):
+        return False
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        return bool(
+            fast.is_native_available()
+            and fast.has_symbol("qwen4_qsa_sparse_gqa_attention_tq")
+        )
+    except Exception:
+        return False
+
+
+def _nax_sparse_gqa_attention_tq(
+    queries: mx.array,
+    cache,
+    selected_blocks: mx.array,
+    *,
+    q_offset: int,
+) -> mx.array | None:
+    """Consume TurboQuant-packed rows in the NAX tensor-unit QSA kernel.
+
+    The dense arm gets the tensor units (``_nax_sparse_gqa_attention``) and the
+    packed arm did not: ``contiguous_causal_gathered_qsa_tq`` fell through to
+    the compiled simdgroup-MMA kernel, so enabling TurboQuant silently dropped
+    prefill off the tensor units on NAX parts. This arm keeps them, unpacking
+    the packed bitstream straight into the cooperative tensors, so there is
+    still no dequantized device copy.
+
+    Same contract as ``_native_sparse_gqa_attention_tq``: queries are rotated
+    into the key codec's RHT frame here, the kernel's fp32 output returns in
+    the value codec's rotated frame and is inverse-rotated here, and the result
+    is query-major ``[1, Lq, 24, 256]``. Returns ``None`` on anything unproven
+    so the caller falls through to the compiled kernel and then the portable
+    gather.
+    """
+    global _NAX_QSA_TQ_DISABLED, _NAX_QSA_TQ_PROVEN
+    if _NAX_QSA_TQ_DISABLED:
+        return None
+    from mlx_vlm.turboquant import TurboQuantMSEState
+
+    from . import qsa_nax
+
+    ks, vs = cache.state
+    ks = getattr(ks, "_state", ks)
+    vs = getattr(vs, "_state", vs)
+    if not isinstance(ks, TurboQuantMSEState) or not isinstance(
+        vs, TurboQuantMSEState
+    ):
+        return None
+    key_codec = getattr(cache, "key_codec", None)
+    value_codec = getattr(cache, "value_codec", None)
+    if key_codec is None or value_codec is None:
+        return None
+    key_bits = getattr(key_codec, "bits", None)
+    value_bits = getattr(value_codec, "bits", None)
+    if (
+        key_bits is None
+        or value_bits is None
+        or int(key_bits) != key_bits
+        or int(value_bits) != value_bits
+        or not qsa_nax.tq_supported(int(key_bits), int(value_bits))
+    ):
+        return None
+    chunk_tokens = queries.shape[2]
+    key_tokens = int(cache.offset)
+    if (
+        queries.ndim != 4
+        or queries.shape[0] != 1
+        or queries.shape[1] != 24
+        or queries.shape[-1] != 256
+        or queries.dtype != mx.bfloat16
+        or selected_blocks.ndim != 3
+        or tuple(selected_blocks.shape) != (1, chunk_tokens, 512)
+        or q_offset < 0
+        or chunk_tokens < _nax_tq_min_rows()
+        or key_tokens > ks.indices.shape[2]
+        or ks.indices.shape != (1, 2, key_tokens, 8 * int(key_bits))
+        or vs.indices.shape != (1, 2, key_tokens, 8 * int(value_bits))
+        or ks.norms.shape != (1, 2, key_tokens)
+        or vs.norms.shape != (1, 2, key_tokens)
+        or ks.norms.dtype != mx.float16
+        or ks.indices.dtype != mx.uint32
+    ):
+        return None
+    try:
+        q_rot = key_codec.prepare_queries(queries).astype(queries.dtype)
+        out_rot = qsa_nax.sparse_gqa_attention_tq(
+            q_rot,
+            ks.norms,
+            ks.indices,
+            vs.norms,
+            vs.indices,
+            key_codec.codebook,
+            value_codec.codebook,
+            selected_blocks,
+            key_tokens=key_tokens,
+            q_offset=q_offset,
+            k_bits=int(key_bits),
+            v_bits=int(value_bits),
+        )
+        if out_rot is None:
+            return None
+        output = value_codec._rotate_inverse(out_rot.transpose(0, 2, 1, 3)).astype(
+            queries.dtype
+        )
+        if not _NAX_QSA_TQ_PROVEN:
+            # Prove the JIT pipeline before the lazy graph advances cache state
+            # past a point where falling back is safe. The prove step also
+            # checks finiteness: the packed build stages FP16 operands, so an
+            # activation scale large enough to overflow them (norm x codebook
+            # > 65504) must retire the arm rather than poison the stream. In
+            # practice the cache's own FP16 norm field overflows at the same
+            # threshold, so this guards a boundary the format already shares -
+            # it is insurance, not a new exposure.
+            mx.eval(out_rot)
+            if not bool(mx.isfinite(out_rot).all().item()):
+                _NAX_QSA_TQ_DISABLED = True
+                return None
+            _NAX_QSA_TQ_PROVEN = True
+        return output.transpose(0, 2, 1, 3)
+    except Exception:
+        _NAX_QSA_TQ_DISABLED = True
+        return None
+
+
+def _native_sparse_gqa_attention_tq(
+    queries: mx.array,
+    cache,
+    selected_blocks: mx.array,
+    *,
+    q_offset: int,
+) -> mx.array | None:
+    """Consume TurboQuant-packed rows directly in the native GQA kernel.
+
+    MSE codecs at instantiated bit widths only — see _TQ_NATIVE_BIT_PAIRS
+    (the kernel unpacks LSB-first ``bits``-wide fields against 2^bits-entry
+    codebooks; fractional cache widths ride their floor/ceil codec pair).
+    Queries are rotated into the key codec's RHT frame on the host; the
+    fp32 output returns in the value codec's rotated frame and is
+    inverse-rotated here, so the calling arm sees exactly the dense native
+    kernel's contract.
+    """
+    global _NATIVE_QSA_TQ_DISABLED, _NATIVE_QSA_TQ_PROVEN
+    if _NATIVE_QSA_TQ_DISABLED:
+        return None
+    from mlx_vlm.turboquant import TurboQuantMSEState
+
+    ks, vs = cache.state
+    ks = getattr(ks, "_state", ks)
+    vs = getattr(vs, "_state", vs)
+    if not isinstance(ks, TurboQuantMSEState) or not isinstance(
+        vs, TurboQuantMSEState
+    ):
+        return None
+    key_codec = getattr(cache, "key_codec", None)
+    value_codec = getattr(cache, "value_codec", None)
+    if key_codec is None or value_codec is None:
+        return None
+    key_bits = getattr(key_codec, "bits", None)
+    value_bits = getattr(value_codec, "bits", None)
+    if (
+        key_bits is None
+        or value_bits is None
+        or int(key_bits) != key_bits
+        or int(value_bits) != value_bits
+        or (int(key_bits), int(value_bits)) not in _TQ_NATIVE_BIT_PAIRS
+    ):
+        return None
+    # D=256 is enforced by the query-shape gate below; a packed row carries
+    # 256*bits/32 = 8*bits uint32 words.
+    expected_k_words = 8 * int(key_bits)
+    expected_v_words = 8 * int(value_bits)
+    if (
+        queries.ndim != 4
+        or queries.shape[0] != 1
+        or queries.shape[1] != 24
+        or queries.shape[-1] != 256
+        or queries.dtype not in {mx.float16, mx.bfloat16}
+        or selected_blocks.ndim != 3
+        or selected_blocks.shape != (1, queries.shape[2], 512)
+        or q_offset < 0
+        or q_offset + queries.shape[2] > ks.norms.shape[2]
+        or queries.shape[2] < _native_main_min_rows()
+        or ks.indices.shape[-1] != expected_k_words
+        or vs.indices.shape[-1] != expected_v_words
+        or ks.norms.dtype != mx.float16
+        or ks.indices.dtype != mx.uint32
+    ):
+        return None
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        if not fast.is_native_available() or not fast.has_symbol(
+            "qwen4_qsa_sparse_gqa_attention_tq"
+        ):
+            _NATIVE_QSA_TQ_DISABLED = True
+            return None
+        q_rot = key_codec.prepare_queries(queries).astype(queries.dtype)
+        native_blocks = mx.contiguous(selected_blocks.astype(mx.uint32)[:, None])
+        out_rot = fast.qwen4_qsa_sparse_gqa_attention_tq(
+            q_rot,
+            ks.norms,
+            ks.indices,
+            vs.norms,
+            vs.indices,
+            key_codec.codebook,
+            value_codec.codebook,
+            native_blocks,
+            queries.shape[-1] ** -0.5,
+            q_offset,
+            key_tile=64,
+            dimension_tile=64,
+        )
+        output = value_codec._rotate_inverse(out_rot).astype(queries.dtype)
+        if not _NATIVE_QSA_TQ_PROVEN:
+            # Prove the rebuilt extension and Metal pipeline before the lazy
+            # graph advances cache state past a point where fallback is safe.
+            mx.eval(output)
+            _NATIVE_QSA_TQ_PROVEN = True
+        return output.transpose(0, 2, 1, 3)
+    except Exception:
+        _NATIVE_QSA_TQ_DISABLED = True
+        return None
+
+
 def _decode_qsa_sdpa(
     queries: mx.array,
     keys: mx.array,
@@ -1131,6 +1427,43 @@ def contiguous_causal_gathered_qsa_decode(
     if pooled_index_keys.shape != (1, max_blocks, indexer_head_dim):
         raise ValueError("QSA decode pooled index-key cache has the wrong shape")
 
+    selected_tokens = _qsa_decode_selected_tokens(
+        key_tokens,
+        index_queries,
+        pooled_index_keys,
+        indexer_head_dim,
+        compress_ratio,
+        token_budget,
+    )
+
+    selected_keys = _gather_kv_rows(keys, selected_tokens)
+    selected_values = _gather_kv_rows(values, selected_tokens)
+    output = _decode_qsa_sdpa(
+        queries,
+        selected_keys,
+        selected_values,
+        head_dim**-0.5,
+    )
+    return output.transpose(0, 2, 1, 3)
+
+
+def _qsa_decode_selected_tokens(
+    key_tokens: int,
+    index_queries: mx.array,
+    pooled_index_keys: mx.array,
+    indexer_head_dim: int,
+    compress_ratio: int,
+    token_budget: int,
+) -> mx.array:
+    """Chronological token rows for a gathered QSA decode step.
+
+    Selection reads only the indexer state (pooled keys + index queries),
+    never K/V — the dense and TurboQuant decode arms therefore gather
+    identical rows, so the KV storage format cannot perturb block choice.
+    Both arms call this one helper: one definition of which blocks a step
+    attends, whichever way the keys are stored.
+    """
+    block_budget = token_budget // compress_ratio
     block_scores = _native_indexer_scores(
         index_queries,
         pooled_index_keys,
@@ -1175,20 +1508,343 @@ def contiguous_causal_gathered_qsa_decode(
             + mx.arange(compress_ratio, dtype=mx.int32)
         ).reshape(1, block_budget * compress_ratio)
 
-        complete_key_len = max_blocks * compress_ratio
+        complete_key_len = (key_tokens // compress_ratio) * compress_ratio
         if complete_key_len < key_tokens:
             tail = mx.arange(complete_key_len, key_tokens, dtype=mx.int32)[None]
             selected_tokens = mx.concatenate((selected_tokens, tail), axis=-1)
+    return selected_tokens
 
-    selected_keys = _gather_kv_rows(keys, selected_tokens)
-    selected_values = _gather_kv_rows(values, selected_tokens)
+
+def contiguous_causal_gathered_qsa_decode_tq(
+    queries: mx.array,
+    cache,
+    index_queries: mx.array,
+    pooled_index_keys: mx.array,
+    *,
+    num_query_heads: int,
+    num_key_value_heads: int,
+    head_dim: int,
+    indexer_head_dim: int,
+    compress_ratio: int,
+    token_budget: int,
+) -> mx.array:
+    """TurboQuant counterpart of :func:`contiguous_causal_gathered_qsa_decode`.
+
+    Block selection is shared (indexer-side, dense); only the selected
+    ``token_budget + compress_ratio - 1`` packed rows are dequantized, so
+    per-step cost is O(budget), never O(context).
+    """
+    if queries.ndim != 4 or queries.shape[:3] != (1, num_query_heads, 1):
+        raise ValueError("gathered QSA decode requires [1, H, 1, D] queries")
+    if queries.shape[-1] != head_dim:
+        raise ValueError("QSA decode queries do not match the configured head dim")
+    if compress_ratio <= 0 or token_budget <= 0 or token_budget % compress_ratio:
+        raise ValueError("QSA decode token budget must contain complete blocks")
+    if num_query_heads % num_key_value_heads:
+        raise ValueError("QSA decode query heads must divide over K/V heads")
+    if (
+        index_queries.ndim != 4
+        or index_queries.shape[0] != 1
+        or index_queries.shape[1] != 1
+        or index_queries.shape[-1] != indexer_head_dim
+    ):
+        raise ValueError("QSA decode index queries must have shape [1, 1, H, D]")
+
+    key_tokens = int(cache.offset)
+    max_blocks = key_tokens // compress_ratio
+    block_budget = token_budget // compress_ratio
+    if max_blocks <= block_budget:
+        raise ValueError("gathered QSA decode requires a sparse block crossover")
+    if pooled_index_keys.shape != (1, max_blocks, indexer_head_dim):
+        raise ValueError("QSA decode pooled index-key cache has the wrong shape")
+
+    selected_tokens = _qsa_decode_selected_tokens(
+        key_tokens,
+        index_queries,
+        pooled_index_keys,
+        indexer_head_dim,
+        compress_ratio,
+        token_budget,
+    )
+    keys, values = cache.gather_dequantized_rows(selected_tokens)
     output = _decode_qsa_sdpa(
         queries,
-        selected_keys,
-        selected_values,
+        keys.astype(queries.dtype),
+        values.astype(queries.dtype),
         head_dim**-0.5,
     )
     return output.transpose(0, 2, 1, 3)
+
+
+def contiguous_causal_gathered_qsa_tq(
+    queries: mx.array,
+    cache,
+    index_queries: mx.array,
+    index_keys: mx.array,
+    index_position_ids: mx.array,
+    *,
+    num_query_heads: int,
+    num_key_value_heads: int,
+    head_dim: int,
+    indexer_head_dim: int,
+    compress_ratio: int,
+    token_budget: int,
+    index_key_norm: IndexKeyNorm,
+    apply_index_rope: IndexRoPE,
+    pooled_index_keys: mx.array | None = None,
+    query_chunk: int | None = None,
+) -> mx.array:
+    """TurboQuant counterpart of :func:`contiguous_causal_gathered_qsa`.
+
+    Block selection reads only the dense indexer sidecar and is identical
+    to the dense arm.  Each distinct packed row a chunk selects is
+    dequantized exactly once — O(min(query_chunk * budget, context)) codec
+    work per chunk, never the O(context * chunks) whole-cache dequant
+    that killed mlx-serve's TurboQuant.  The packed-row native kernel
+    (:func:`_native_sparse_gqa_attention_tq`) consumes the bitstream
+    directly and takes the chunk when its gates hold; the portable gathered
+    SDPA is the fallback, and its query chunk stays narrow on purpose —
+    widening it would grow the dequantized union, not just the kernel tile.
+    """
+    if queries.ndim != 4 or queries.shape[0] != 1 or queries.shape[2] <= 1:
+        raise ValueError(
+            "gathered QSA requires rank-four batch-one multi-token queries"
+        )
+    batch, actual_query_heads, query_tokens, actual_head_dim = queries.shape
+    if actual_query_heads != num_query_heads or actual_head_dim != head_dim:
+        raise ValueError("QSA queries do not match the configured geometry")
+    key_tokens = int(cache.offset)
+    if query_tokens > key_tokens:
+        raise ValueError("QSA query length cannot exceed cached key length")
+    if index_queries.ndim != 4 or index_queries.shape[:2] != (
+        batch,
+        query_tokens,
+    ):
+        raise ValueError("QSA index queries do not match the current prompt")
+    if index_queries.shape[-1] != indexer_head_dim:
+        raise ValueError("QSA index queries have the wrong head dimension")
+    if index_keys.shape != (batch, key_tokens, indexer_head_dim):
+        raise ValueError("QSA raw index keys do not match cached K/V")
+    if (
+        index_position_ids.ndim not in {2, 3}
+        or index_position_ids.shape[-1] != key_tokens
+    ):
+        raise ValueError("QSA index positions do not match cached K/V")
+    if compress_ratio <= 0 or token_budget <= 0 or token_budget % compress_ratio:
+        raise ValueError("QSA token budget must contain complete micro-blocks")
+    if num_query_heads % num_key_value_heads:
+        raise ValueError("QSA query heads must divide evenly over K/V heads")
+
+    if query_chunk is None:
+        query_chunk = contiguous_causal_query_chunk(key_tokens)
+    if query_chunk <= 0:
+        raise ValueError("QSA query chunk must be positive")
+
+    ratio = compress_ratio
+    max_blocks = key_tokens // ratio
+    block_budget = token_budget // ratio
+    query_start = key_tokens - query_tokens
+
+    if max_blocks:
+        if pooled_index_keys is None:
+            pooled = pool_completed_index_keys(
+                index_keys,
+                index_position_ids,
+                compress_ratio=ratio,
+                index_key_norm=index_key_norm,
+                apply_index_rope=apply_index_rope,
+            )
+        else:
+            if pooled_index_keys.shape != (batch, max_blocks, indexer_head_dim):
+                raise ValueError("QSA pooled index-key cache has the wrong shape")
+            pooled = pooled_index_keys
+    else:
+        if pooled_index_keys is not None and pooled_index_keys.shape != (
+            batch,
+            0,
+            indexer_head_dim,
+        ):
+            raise ValueError("QSA pooled index-key cache has the wrong shape")
+        pooled = None
+
+    outputs: list[mx.array] = []
+    groups = num_query_heads // num_key_value_heads
+    for start in range(0, query_tokens, query_chunk):
+        stop = min(start + query_chunk, query_tokens)
+        chunk_tokens = stop - start
+        absolute_queries = query_start + mx.arange(start, stop, dtype=mx.int32)
+        visible_counts = mx.broadcast_to(
+            (absolute_queries + 1)[None], (batch, chunk_tokens)
+        )
+        complete_counts = visible_counts // ratio
+
+        if max_blocks:
+            chunk_index_queries = index_queries[:, start:stop]
+            block_scores = _native_indexer_scores(
+                chunk_index_queries,
+                pooled,
+                head_dim=indexer_head_dim,
+                compress_ratio=ratio,
+                mask_q_offset=query_start + start,
+            )
+            if block_scores is None:
+                block_scores = _portable_indexer_scores(
+                    chunk_index_queries,
+                    pooled,
+                    indexer_head_dim,
+                )
+                valid_blocks = (
+                    mx.arange(max_blocks)[None, None, :]
+                    < complete_counts[..., None]
+                )
+                block_scores = mx.where(
+                    valid_blocks,
+                    block_scores,
+                    mx.finfo(block_scores.dtype).min,
+                )
+
+            selected_width = min(max_blocks, block_budget)
+            canonical = mx.broadcast_to(
+                mx.arange(selected_width, dtype=mx.int32)[None, None],
+                (batch, chunk_tokens, selected_width),
+            )
+            if max_blocks > block_budget:
+                ranked = _native_topk_indices(block_scores, block_budget)
+                if ranked is None:
+                    ranked = mx.argpartition(
+                        block_scores,
+                        kth=-block_budget,
+                        axis=-1,
+                    )[..., -block_budget:].astype(mx.int32)
+                selected_block_rows = mx.where(
+                    (complete_counts <= block_budget)[..., None],
+                    canonical,
+                    ranked,
+                )
+            else:
+                selected_block_rows = canonical
+
+            # The top-k set is unordered.  Restore chronological token
+            # order before the portable gathered SDPA's FP32 reduction.
+            selected_block_rows = mx.sort(selected_block_rows, axis=-1)
+
+            selected_count = mx.minimum(complete_counts, block_budget)
+
+            nax_tq_output = _nax_sparse_gqa_attention_tq(
+                queries[:, :, start:stop],
+                cache,
+                selected_block_rows,
+                q_offset=query_start + start,
+            )
+            if nax_tq_output is not None:
+                outputs.append(nax_tq_output)
+                continue
+
+            native_output = _native_sparse_gqa_attention_tq(
+                queries[:, :, start:stop],
+                cache,
+                selected_block_rows,
+                q_offset=query_start + start,
+            )
+            if native_output is not None:
+                outputs.append(native_output)
+                continue
+
+            selected_indices = (
+                selected_block_rows[..., None] * ratio
+                + mx.arange(ratio, dtype=mx.int32)
+            ).reshape(batch, chunk_tokens, selected_width * ratio)
+            selected_valid = mx.broadcast_to(
+                mx.arange(selected_width)[None, None, :, None]
+                < selected_count[..., None, None],
+                (batch, chunk_tokens, selected_width, ratio),
+            ).reshape(batch, chunk_tokens, selected_width * ratio)
+        else:
+            selected_indices = mx.zeros(
+                (batch, chunk_tokens, 0), dtype=mx.int32
+            )
+            selected_valid = mx.zeros(
+                (batch, chunk_tokens, 0), dtype=mx.bool_
+            )
+
+        # The zero-to-three visible tokens after the final complete block
+        # are always retained by the published QSA contract.
+        tail_width = ratio - 1
+        tail = complete_counts[..., None] * ratio + mx.arange(
+            tail_width, dtype=mx.int32
+        )
+        tail_valid = tail < visible_counts[..., None]
+        selected_indices = mx.concatenate((selected_indices, tail), axis=-1)
+        selected_valid = mx.concatenate((selected_valid, tail_valid), axis=-1)
+
+        safe_selected = mx.where(selected_valid, selected_indices, 0).astype(
+            mx.int32
+        )
+
+        # Dequantize each distinct selected row exactly once per chunk.
+        # MLX 0.32 has neither unique nor a boolean-compaction primitive,
+        # so the union is built with fixed-shape sort/scatter ops and no
+        # host sync: duplicates share the slot of their first occurrence
+        # and the padded tail decodes row 0 (never referenced by the
+        # remap).  The union width is bounded by min(chunk rows, context),
+        # so decode work never exceeds the mask arm's per-chunk dequant,
+        # while the gathered SDPA still scores selected_width rows per
+        # query instead of key_tokens.
+        flat = safe_selected.reshape(-1)
+        order = mx.argsort(flat)
+        sorted_flat = mx.take(flat, order)
+        first = mx.concatenate(
+            (
+                mx.ones((1,), dtype=mx.bool_),
+                sorted_flat[1:] != sorted_flat[:-1],
+            )
+        )
+        # Union slot of each sorted element; duplicates map to the first.
+        slots = mx.cumsum(first.astype(mx.int32)) - 1
+        union_width = min(flat.size, key_tokens)
+        union_rows = mx.put_along_axis(
+            mx.zeros((union_width,), dtype=mx.int32),
+            slots,
+            sorted_flat,
+            axis=0,
+        )
+        # Invert the argsort permutation by scatter: inverse[i] is the
+        # position of flat[i] inside sorted_flat.
+        inverse = mx.put_along_axis(
+            mx.zeros((flat.size,), dtype=mx.int32),
+            order,
+            mx.arange(flat.size, dtype=mx.int32),
+            axis=0,
+        )
+        remapped = mx.take(slots, inverse).reshape(safe_selected.shape)
+        union_keys, union_values = cache.gather_dequantized_rows(union_rows[None])
+        selected_keys = _gather_kv_rows(union_keys.astype(queries.dtype), remapped)
+        selected_values = _gather_kv_rows(union_values.astype(queries.dtype), remapped)
+
+        chunk_queries = queries[:, :, start:stop].transpose(0, 2, 1, 3)
+        grouped_queries = chunk_queries.reshape(
+            batch,
+            chunk_tokens,
+            num_key_value_heads,
+            groups,
+            head_dim,
+        )
+        scores = (
+            grouped_queries.astype(mx.float32)
+            @ selected_keys.astype(mx.float32).swapaxes(-1, -2)
+        ) / math.sqrt(head_dim)
+        scores = mx.where(
+            selected_valid[:, :, None, None, :],
+            scores,
+            mx.finfo(scores.dtype).min,
+        )
+        probabilities = mx.softmax(scores, axis=-1).astype(chunk_queries.dtype)
+        output = probabilities @ selected_values
+        outputs.append(
+            output.reshape(batch, chunk_tokens, num_query_heads, head_dim)
+        )
+
+    return mx.concatenate(outputs, axis=1)
 
 
 def contiguous_causal_gathered_qsa(
@@ -1462,8 +2118,11 @@ def contiguous_causal_gathered_qsa(
 __all__ = [
     "contiguous_causal_gathered_qsa",
     "contiguous_causal_gathered_qsa_decode",
+    "contiguous_causal_gathered_qsa_decode_tq",
+    "contiguous_causal_gathered_qsa_tq",
     "contiguous_causal_query_chunk",
     "decode_block_selection_mask",
     "masked_decode_sdpa",
+    "native_qsa_tq_available",
     "pool_completed_index_keys",
 ]

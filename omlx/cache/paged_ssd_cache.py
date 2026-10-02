@@ -243,6 +243,7 @@ def _canonicalize_layer_cache_types(
         # refresh_ssd_layer_signature — which always says
         # "TurboQuantKVCache" — from sweeping valid batch-form blocks.
         "BatchTurboQuantKVCache": "TurboQuantKVCache",
+        "BatchTurboQuantQSAKVCache": "TurboQuantQSAKVCache",
     }
     return [
         wrapper_to_canonical.get(cache_type, cache_type)
@@ -425,7 +426,11 @@ def _block_turboquant_bits(
     if not layer_cache_types or not layer_meta_states:
         return None
     for i, cache_type in enumerate(layer_cache_types):
-        if cache_type not in ("TurboQuantKVCache", "BatchTurboQuantKVCache"):
+        if cache_type not in (
+            "TurboQuantKVCache",
+            "BatchTurboQuantKVCache",
+            "TurboQuantQSAKVCache",
+        ):
             continue
         if i >= len(layer_meta_states):
             continue
@@ -3534,6 +3539,29 @@ class PagedSSDCacheManager(CacheManager):
                     cache_list_meta[f"layer_{i}_tq_value_type"] = type(vs).__name__
                     cache_list_meta[f"layer_{i}_tq_key_fields"] = ",".join(ks._fields)
                     cache_list_meta[f"layer_{i}_tq_value_fields"] = ",".join(vs._fields)
+                elif (
+                    isinstance(layer_data, tuple)
+                    and len(layer_data) == 2
+                    and isinstance(layer_data[0], str)
+                    and layer_data[0] == "__turboquant_qsa_v1__"
+                ):
+                    # TurboQuant QSA hybrid: packed K/V NamedTuple states plus
+                    # the dense indexer sidecar (raw keys, MRoPE positions).
+                    ks, vs, index_keys, index_positions = layer_data[1]
+                    for prefix, state in [("k", ks), ("v", vs)]:
+                        for field_name in state._fields:
+                            val = getattr(state, field_name)
+                            if isinstance(val, mx.array):
+                                arrays[f"layer_{i}_tq_{prefix}_{field_name}"] = val
+                    arrays[f"layer_{i}_qsa_index_keys"] = index_keys
+                    arrays[f"layer_{i}_qsa_index_positions"] = index_positions
+                    cache_list_meta[f"layer_{i}_turboquant_qsa_v1"] = "1"
+                    cache_list_meta[f"layer_{i}_tq_key_type"] = type(ks).__name__
+                    cache_list_meta[f"layer_{i}_tq_value_type"] = type(vs).__name__
+                    cache_list_meta[f"layer_{i}_tq_key_fields"] = ",".join(ks._fields)
+                    cache_list_meta[f"layer_{i}_tq_value_fields"] = ",".join(
+                        vs._fields
+                    )
                 else:
                     # V2 legacy: 2-tuple (keys, values). Upgrade to V3
                     # __nstate__ on disk so all readers see a uniform shape.
@@ -3908,6 +3936,46 @@ class PagedSSDCacheManager(CacheManager):
                     cache_data.append(("__turboquant_v2__", (ks, vs)))
                 except (KeyError, TypeError) as e:
                     logger.error(f"TurboQuant v2 layer {i}: reconstruction failed: {e}")
+                    return None
+            elif file_metadata and f"layer_{i}_turboquant_qsa_v1" in file_metadata:
+                # TurboQuant QSA hybrid: packed NamedTuple states + sidecar.
+                from ..turboquant_kv import (
+                    TurboQuantMSEState,
+                    TurboQuantPolarProdState,
+                    TurboQuantPolarState,
+                    TurboQuantProdState,
+                    TurboQuantSplitState,
+                )
+
+                key_type = file_metadata.get(f"layer_{i}_tq_key_type", "")
+                value_type = file_metadata.get(f"layer_{i}_tq_value_type", "")
+                key_fields = file_metadata.get(f"layer_{i}_tq_key_fields", "").split(
+                    ","
+                )
+                value_fields = file_metadata.get(
+                    f"layer_{i}_tq_value_fields", ""
+                ).split(",")
+                _type_map = {
+                    "TurboQuantMSEState": TurboQuantMSEState,
+                    "TurboQuantProdState": TurboQuantProdState,
+                    "TurboQuantPolarState": TurboQuantPolarState,
+                    "TurboQuantPolarProdState": TurboQuantPolarProdState,
+                    "TurboQuantSplitState": TurboQuantSplitState,
+                }
+                try:
+                    k_cls = _type_map[key_type]
+                    v_cls = _type_map[value_type]
+                    k_tensors = [arrays[f"layer_{i}_tq_k_{f}"] for f in key_fields]
+                    v_tensors = [arrays[f"layer_{i}_tq_v_{f}"] for f in value_fields]
+                    ks = k_cls(*k_tensors)
+                    vs = v_cls(*v_tensors)
+                    ik = arrays[f"layer_{i}_qsa_index_keys"]
+                    ip = arrays[f"layer_{i}_qsa_index_positions"]
+                    cache_data.append(("__turboquant_qsa_v1__", (ks, vs, ik, ip)))
+                except (KeyError, TypeError) as e:
+                    logger.error(
+                        f"TurboQuant QSA layer {i}: reconstruction failed: {e}"
+                    )
                     return None
             else:
                 # Standard cache layer (KVCache, RotatingKVCache,
@@ -4513,7 +4581,6 @@ class PagedSSDCacheManager(CacheManager):
 
         ``numerics`` is the live model's numerics revision; blocks computed
         under another revision are swept.
-
         ``yarn_context_length`` is the YaRN-scaled horizon in effect (None when
         the model serves unscaled). YaRN changes rotated KV/indexer content at
         an identical layer layout, so a rung change triggers the sweep; two

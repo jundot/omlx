@@ -86,6 +86,7 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "mtp_enabled",
     "mtp_adaptive_max_depth",
     "mtp_fixed_depth",
+    "mtp_prime_window",
     "vlm_mtp_enabled",
     "vlm_mtp_draft_model",
     "vlm_mtp_draft_block_size",

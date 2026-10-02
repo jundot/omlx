@@ -107,6 +107,7 @@ class BatchedEngine(BaseEngine):
         *,
         num_prompt_tokens: int,
         request_id: str | None,
+        prompt_token_ids: Any | None = None,
     ) -> None:
         await _run_scheduler_preflight_with_cleanup_retry(
             scheduler,
@@ -119,6 +120,7 @@ class BatchedEngine(BaseEngine):
                 None,
             ),
             text_only=True,
+            prompt_token_ids=prompt_token_ids,
         )
 
     @property
@@ -1355,7 +1357,8 @@ class BatchedEngine(BaseEngine):
         # through the existing handler chain so the response shape stays
         # consistent.
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            token_ids = self._tokenizer.encode(prompt)
+            num_tokens = len(token_ids)
         except Exception as e:
             logger.warning(
                 "BatchedEngine.preflight_chat: tokenizer.encode raised %s; "
@@ -1369,7 +1372,10 @@ class BatchedEngine(BaseEngine):
             _warn_scheduler_unreachable_once(self, "preflight_chat")
             return
         await self._preflight_or_raise_with_eviction(
-            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
+            scheduler,
+            num_prompt_tokens=num_tokens,
+            request_id=request_id,
+            prompt_token_ids=token_ids,
         )
 
     async def preflight_completion(
@@ -1385,7 +1391,8 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            token_ids = self._tokenizer.encode(prompt)
+            num_tokens = len(token_ids)
         except Exception as e:
             logger.warning(
                 "BatchedEngine.preflight_completion: tokenizer.encode raised "
@@ -1399,7 +1406,10 @@ class BatchedEngine(BaseEngine):
             _warn_scheduler_unreachable_once(self, "preflight_completion")
             return
         await self._preflight_or_raise_with_eviction(
-            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
+            scheduler,
+            num_prompt_tokens=num_tokens,
+            request_id=request_id,
+            prompt_token_ids=token_ids,
         )
 
     async def stream_chat(
