@@ -13,11 +13,15 @@ from mlx_vlm.models.pixtral.image_processing_pixtral import (
     PixtralImageProcessor,
     split_image_sizes_by_sample,
 )
+import os
+
 from PIL import Image
 
 from omlx.patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 
-DEVSTRAL_DIR = Path.home() / "Workspace/models/Devstral-Small-2-24B-Instruct-2512-4bit"
+# Override with OMLX_TEST_MODEL_DIR; the test skips when absent.
+_MODELS_DIR = Path(os.environ.get("OMLX_TEST_MODEL_DIR", Path.home() / "Workspace" / "models"))
+DEVSTRAL_DIR = _MODELS_DIR / "Devstral-Small-2-24B-Instruct-2512-4bit"
 
 
 def _make_image(h: int = 20, w: int = 20) -> Image.Image:

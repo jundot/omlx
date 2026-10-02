@@ -19,6 +19,7 @@ Run with: pytest tests/integration/test_boundary_cache_consistency.py -v -m slow
 
 import gc
 import shutil
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -34,19 +35,23 @@ pytestmark = [
     ),
 ]
 
+# Override with OMLX_TEST_MODEL_DIR; per-model existence skips keep the
+# suite green wherever the models are absent.
+_MODELS_DIR = Path(os.environ.get("OMLX_TEST_MODEL_DIR", Path.home() / "Workspace" / "models"))
+
 MODELS = {
     "kvcache": {
-        "path": "/Users/cryingneko/Workspace/models/Qwen3-4B-Instruct-2507-4bit",
+        "path": str(_MODELS_DIR / "Qwen3-4B-Instruct-2507-4bit"),
         "desc": "KVCache only (Qwen3-4B)",
         "expect_on_off_match": True,
     },
     "arrayscache_dense": {
-        "path": "/Users/cryingneko/Workspace/models/Qwen3.5-27B-8bit",
+        "path": str(_MODELS_DIR / "Qwen3.5-27B-8bit"),
         "desc": "ArraysCache hybrid non-MoE (Qwen3.5-27B)",
         "expect_on_off_match": True,
     },
     "arrayscache_moe": {
-        "path": "/Users/cryingneko/Workspace/models/Qwen3.5-35B-A3B-oQ4",
+        "path": str(_MODELS_DIR / "Qwen3.5-35B-A3B-oQ4"),
         "desc": "ArraysCache hybrid MoE (Qwen3.5-35B-A3B)",
         "expect_on_off_match": True,
     },
@@ -56,7 +61,7 @@ MODELS = {
         "expect_on_off_match": False,  # chunk size differs, quality-only check
     },
     "rotating_vlm": {
-        "path": "/Users/cryingneko/Workspace/models/gemma-3-12b-it-qat-4bit",
+        "path": str(_MODELS_DIR / "gemma-3-12b-it-qat-4bit"),
         "desc": "RotatingKVCache+KVCache VLM hybrid (Gemma3-12B-QAT)",
         "expect_on_off_match": False,  # chunk size differs for RotatingKVCache
     },

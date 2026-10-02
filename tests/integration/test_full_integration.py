@@ -19,6 +19,7 @@ Single model: pytest tests/integration/test_full_integration.py -v -m slow -s -k
 """
 
 import gc
+import os
 import shutil
 import sys
 import tempfile
@@ -37,14 +38,19 @@ pytestmark = [
     ),
 ]
 
+# Base directory for local real-model runs. Override with
+# OMLX_TEST_MODEL_DIR; the existing per-test existence skips keep the
+# suite green wherever the models are absent.
+_MODELS_DIR = Path(os.environ.get("OMLX_TEST_MODEL_DIR", Path.home() / "Workspace" / "models"))
+
 MODELS = [
-    "/Users/cryingneko/Workspace/models/gemma-4-26b-a4b-it-8bit",
-    "/Users/cryingneko/Workspace/models/gemma-4-26b-a4b-mxfp4",
-    "/Users/cryingneko/Workspace/models/gemma-4-31b-it-4bit",
-    "/Users/cryingneko/Workspace/models/Qwen3-4B-Instruct-2507-4bit",
-    "/Users/cryingneko/Workspace/models/Qwen3.5-35B-A3B-4bit",
-    "/Users/cryingneko/Workspace/models/Qwen3.5-27B-4bit",
-    "/Users/cryingneko/Workspace/models/Nemotron-Cascade-2-30B-A3B-4bit",
+    str(_MODELS_DIR / "gemma-4-26b-a4b-it-8bit"),
+    str(_MODELS_DIR / "gemma-4-26b-a4b-mxfp4"),
+    str(_MODELS_DIR / "gemma-4-31b-it-4bit"),
+    str(_MODELS_DIR / "Qwen3-4B-Instruct-2507-4bit"),
+    str(_MODELS_DIR / "Qwen3.5-35B-A3B-4bit"),
+    str(_MODELS_DIR / "Qwen3.5-27B-4bit"),
+    str(_MODELS_DIR / "Nemotron-Cascade-2-30B-A3B-4bit"),
 ]
 
 # Questions for batching tests (short, diverse prompts)

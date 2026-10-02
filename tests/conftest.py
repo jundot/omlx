@@ -255,7 +255,12 @@ def real_model_dir() -> Path:
     Note: Tests using this fixture may require actual model files
     and should be marked with @pytest.mark.slow.
     """
-    return Path.home() / "Workspace" / "models"
+    # Override with OMLX_TEST_MODEL_DIR for non-default model layouts.
+    return Path(
+        os.environ.get(
+            "OMLX_TEST_MODEL_DIR", str(Path.home() / "Workspace" / "models")
+        )
+    )
 
 
 @pytest.fixture(autouse=True)

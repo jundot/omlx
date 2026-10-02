@@ -10,6 +10,7 @@ contract (dict tool arguments, to=self reasoning, reasoning_strength).
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -24,8 +25,11 @@ except ImportError:
 pytestmark = pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 
 _CHECKPOINT = Path(
-    "~/Workspace/models/meta-models/Muse-Glimmer-30B"
-).expanduser()
+    os.environ.get(
+        "OMLX_TEST_MODEL_DIR",
+        str(Path.home() / "Workspace" / "models"),
+    )
+).expanduser() / "meta-models" / "Muse-Glimmer-30B"
 
 
 @pytest.fixture(scope="module")

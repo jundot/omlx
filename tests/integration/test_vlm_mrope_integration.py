@@ -20,6 +20,7 @@ Run with:
 
 import gc
 import shutil
+import os
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -36,16 +37,20 @@ pytestmark = [
     ),
 ]
 
+# Override with OMLX_TEST_MODEL_DIR; per-model existence skips keep the
+# suite green wherever the models are absent.
+_MODELS_DIR = Path(os.environ.get("OMLX_TEST_MODEL_DIR", Path.home() / "Workspace" / "models"))
+
 MROPE_MODELS = [
-    "/Users/cryingneko/Workspace/models/Qwen3-VL-30B-A3B-Instruct-3bit",
-    "/Users/cryingneko/Workspace/models/Qwen3.5-27B-4bit",
-    "/Users/cryingneko/Workspace/models/Qwen3.5-35B-A3B-4bit",
-    "/Users/cryingneko/Workspace/models/GLM-4.6V-Flash-4bit",
-    "/Users/cryingneko/Workspace/models/Qwen3.5-122B-A10B-oQ4",
-    "/Users/cryingneko/Workspace/models/gemma-4-26b-a4b-it-4bit",
-    "/Users/cryingneko/Workspace/models/gemma-3-12b-it-qat-4bit",
-    "/Users/cryingneko/Workspace/models/gemma-4-e2b-it-4bit",
-    "/Users/cryingneko/Workspace/models/Nemotron-Cascade-2-30B-A3B-4bit",
+    str(_MODELS_DIR / "Qwen3-VL-30B-A3B-Instruct-3bit"),
+    str(_MODELS_DIR / "Qwen3.5-27B-4bit"),
+    str(_MODELS_DIR / "Qwen3.5-35B-A3B-4bit"),
+    str(_MODELS_DIR / "GLM-4.6V-Flash-4bit"),
+    str(_MODELS_DIR / "Qwen3.5-122B-A10B-oQ4"),
+    str(_MODELS_DIR / "gemma-4-26b-a4b-it-4bit"),
+    str(_MODELS_DIR / "gemma-3-12b-it-qat-4bit"),
+    str(_MODELS_DIR / "gemma-4-e2b-it-4bit"),
+    str(_MODELS_DIR / "Nemotron-Cascade-2-30B-A3B-4bit"),
 ]
 
 TEXT_QUESTIONS = [
