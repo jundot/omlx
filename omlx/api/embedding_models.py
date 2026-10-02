@@ -128,3 +128,80 @@ class EmbeddingResponse(BaseModel):
 
     usage: EmbeddingUsage
     """Usage statistics."""
+
+
+class TokenEmbeddingRequest(BaseModel):
+    """
+    Request for per-token (late-interaction / MaxSim) embeddings.
+
+    Unlike ``/v1/embeddings`` the caller supplies the EXACT token ids — not
+    text — so the returned rows line up one-to-one with the text window the
+    caller already computed a pooled embedding over. This is used by the
+    offline ColBERT-style producers, which build the ids from the pinned
+    tokenizer (head-truncated, special tokens preserved).
+    """
+
+    model: str
+    """ID of the model to use."""
+
+    input_ids: List[List[int]]
+    """One list of token ids per input sequence. All sequences must be non-empty."""
+
+    @model_validator(mode="after")
+    def validate_input_ids(self) -> "TokenEmbeddingRequest":
+        """Reject an empty batch or a ragged/negative token id."""
+        if not self.input_ids:
+            raise ValueError("input_ids must not be empty")
+        for ids in self.input_ids:
+            if not ids:
+                raise ValueError("every input_ids entry must be non-empty")
+            for token_id in ids:
+                if not isinstance(token_id, int) or token_id < 0:
+                    raise ValueError(
+                        "token ids must be non-negative integers"
+                    )
+        return self
+
+
+class TokenEmbeddingData(BaseModel):
+    """A single per-token embedding result."""
+
+    object: str = "embedding"
+    """The object type, always "embedding"."""
+
+    index: int
+    """The index of the input sequence in the request."""
+
+    embedding: List[List[float]]
+    """One vector per token id of that sequence (padding is never included)."""
+
+    token_count: int
+    """Number of token vectors in `embedding`."""
+
+
+class TokenEmbeddingUsage(BaseModel):
+    """Token usage statistics for a per-token embedding request."""
+
+    total_tokens: int
+    """Total number of token vectors returned."""
+
+
+class TokenEmbeddingResponse(BaseModel):
+    """
+    Response from creating per-token embeddings.
+
+    OpenAI-shaped envelope (`object`/`data`/`model`/`usage`) so existing
+    clients can parse it with the same code as `/v1/embeddings`.
+    """
+
+    object: str = "list"
+    """The object type, always "list"."""
+
+    data: List[TokenEmbeddingData]
+    """List of per-token embedding objects, in request order."""
+
+    model: str
+    """The model used for embedding."""
+
+    usage: TokenEmbeddingUsage
+    """Usage statistics."""

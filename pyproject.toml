@@ -180,6 +180,14 @@ paroquant = [
     # to end on 0.1.14). The DMG build installs the same pin via build.py.
     "paroquant==0.1.16; python_version >= '3.11'",
 ]
+colbert-onnx = [
+    # Reads a pylate ColBERT projection (and encoder) out of the pinned ONNX
+    # export, for checkpoints whose ONNX and sentence-transformers weights are
+    # not the same numbers; see omlx/models/colbert_onnx_weights.py. Optional:
+    # absent, the ColBERT loader falls back to model.safetensors, and the
+    # ONNX-sourced tests skip.
+    "onnx>=1.16",
+]
 # Internal extra consumed by packaging/build.py to populate the
 # venvstacks mlx-base layer's requirements list. Listed here as the
 # single source of truth so the layer-template venvstacks.toml stays

@@ -177,3 +177,19 @@ def normalize_embedding_items(
     return normalized
 
 
+
+
+def find_non_finite_token_embeddings(sequences: List[List[List[float]]]) -> List[int]:
+    """Indices of input sequences holding a NaN/Inf token vector.
+
+    A NaN/Inf has no JSON representation: FastAPI would ship it as null-filled
+    arrays inside a 200 and a caller would store the corrupt vectors without
+    noticing (same failure the pooled check guards against).
+    """
+    bad: List[int] = []
+    for index, vectors in enumerate(sequences):
+        for vector in vectors:
+            if any(not math.isfinite(float(value)) for value in vector):
+                bad.append(index)
+                break
+    return bad

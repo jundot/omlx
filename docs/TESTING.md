@@ -58,6 +58,12 @@ Run `python -m pytest -q tests/test_cli.py tests/test_integrations.py` to check 
 
 Run `python -m pytest -q tests/test_modernbert_attention.py tests/test_embedding.py tests/test_mlx_embeddings_compat.py` to check finite padded attention, single-input equivalence, local-window masking, and embedding integration. The attention regression covers fp16, bf16, and fp32 at lengths around the affected SDPA tile boundaries.
 
+# ColBERT (per-token projected) tests
+
+Run `python -m pytest -q tests/test_colbert_projection.py` to check the pylate ColBERT layout predicate, the Dense projection recipe (a learned residual MatMul per layer, no residual on the last), the per-token L2, the width read from the last Dense module, the RoPE config dialect, and both weight sources. The ONNX-sourced cases call `pytest.importorskip("onnx")`, so they skip unless the optional `onnx` dependency is installed (`pip install omlx[colbert-onnx]`); everything else runs on the base install.
+
+A ColBERT export can carry two weight sets that are *not* the same numbers (the sentence-transformers `model.safetensors` and the exported `model.onnx`), so the loader records which one it used in `get_model_info()` and logs it at load. `OMLX_COLBERT_WEIGHT_SOURCE=onnx|safetensors` pins the choice for a directory that ships both; with nothing set, the ONNX graph is preferred when present. Serving the wrong one does not fail loudly on its own — it quietly moves every vector — so check `weight_source` when comparing against previously produced embeddings.
+
 # QSA reservation tests
 
 Run `python -m pytest -q tests/test_qwen4_qsa_reserved_capacity.py` to check QSA capacity reservations.

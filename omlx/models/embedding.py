@@ -22,6 +22,15 @@ from mlx.utils import tree_flatten, tree_map
 from ..patches.modernbert_attention import patch_modernbert_attention
 from ..utils.image import validate_image_data_uri
 from .base_model import last_token_pool, mean_pooling, normalize_embeddings
+from .colbert_projection import (
+    WEIGHT_SOURCE_ONNX,
+    ColbertLayout,
+    ColbertLayoutError,
+    ColbertProjection,
+    flatten_rope_parameters,
+    is_pylate_colbert_dir,
+    resolve_colbert_layout,
+)
 from .mlx_embeddings_compat import (
     patch_qwen3_vl_position_ids_recompute,
     patch_qwen3_vl_processor_for_torch_free_image_loading,
@@ -57,6 +66,37 @@ class EmbeddingOutput:
 
     dimensions: int = 0
     """Dimension of each embedding vector."""
+
+@dataclass
+class TokenEmbeddingOutput:
+    """Per-token (late-interaction / MaxSim) output for explicit token ids.
+
+    One entry per input sequence: the final hidden state of every token, with
+    padding positions already dropped, so ``len(token_embeddings[i])`` equals
+    ``len(ids_batch[i])`` exactly.
+    """
+
+    token_embeddings: List[List[List[float]]]
+    """Per input sequence, one vector per token id."""
+
+    total_tokens: int
+    """Total number of tokens returned (sum of the sequence lengths)."""
+
+    dimensions: int = 0
+    """Dimension of each token vector."""
+
+
+def _token_features(outputs) -> Optional[mx.array]:
+    """Per-token features from either an output object or a raw encoder dict.
+
+    mlx-embeddings' wrappers return a ``BaseModelOutput``; a raw encoder module
+    (which the ColBERT loader keeps in order not to lose per-token features to
+    pooling) returns its own dict. Both spell the tensor ``last_hidden_state``.
+    """
+    last_hidden = getattr(outputs, "last_hidden_state", None)
+    if last_hidden is None and isinstance(outputs, dict):
+        last_hidden = outputs.get("last_hidden_state")
+    return last_hidden
 
 
 class MLXEmbeddingModel:
@@ -101,6 +141,10 @@ class MLXEmbeddingModel:
         self._remap_input_ids_to_inputs = False
         self._pooling_mode: Optional[str] = None
         self._pooling_source: str = "not resolved"
+        # Set only for a pylate ColBERT export: its per-token contract is a
+        # projected, L2-normalized vector, not the raw hidden state.
+        self._colbert_projection: Optional[ColbertProjection] = None
+        self._colbert_layout: Optional[ColbertLayout] = None
 
     # (hidden_size, num_hidden_layers) of Qwen3-Embedding-0.6B and -8B.
     _FP16_PROMOTE_SHAPES = {(1024, 28), (4096, 36)}
@@ -347,6 +391,17 @@ class MLXEmbeddingModel:
         if self._loaded:
             return
 
+        # 0. pylate ColBERT export. Its projection is part of the model contract,
+        #    and mlx-embeddings cannot load the layout at all: load_model() globs
+        #    model*.safetensors recursively, picks up the 1_Dense/2_Dense/3_Dense
+        #    module weights and rejects their keys ("Received 5 parameters not in
+        #    model"). Detect the layout before every other path so a ColBERT
+        #    checkpoint can never be loaded as a plain embedder and served raw,
+        #    unprojected hidden states.
+        if is_pylate_colbert_dir(Path(self.model_name)):
+            self._load_pylate_colbert()
+            return
+
         self._pooling_mode, self._pooling_source = self._resolve_pooling_mode()
         if self._pooling_mode:
             logger.info(
@@ -403,6 +458,124 @@ class MLXEmbeddingModel:
         except Exception as e:
             logger.error(f"Failed to load embedding model: {e}")
             raise
+
+    def _load_pylate_colbert(self) -> None:
+        """Load a pylate ColBERT export: transformer encoder + Dense projection.
+
+        The encoder is built from mlx-embeddings' module for the declared
+        ``model_type``, but the *raw* encoder is kept: for every architecture
+        except ``*ForMaskedLM`` the wrapper replaces ``last_hidden_state`` with a
+        pooled (batch, hidden) tensor, which would leave ``embed_token_ids``
+        without per-token features at all.
+
+        The weights come from the source the layout resolved -- the ONNX graph by
+        preference, the sentence-transformers safetensors otherwise. They are not
+        interchangeable (see ``colbert_projection``), so the choice is logged and
+        reported by :meth:`get_model_info`.
+
+        Raises:
+            ColbertLayoutError: when the projection cannot be read (no usable
+                weight artifact) or the base architecture exposes no raw encoder.
+        """
+        model_path = Path(self.model_name)
+        layout = resolve_colbert_layout(model_path)
+        try:
+            with open(model_path / "config.json") as fh:
+                config_dict = json.load(fh)
+        except (OSError, ValueError) as e:
+            raise ColbertLayoutError(
+                f"ColBERT export at {model_path} has no readable config.json"
+            ) from e
+
+        model_type = str(config_dict.get("model_type", "")).lower()
+        from importlib import import_module
+
+        from transformers import AutoTokenizer
+
+        try:
+            module = import_module(f"mlx_embeddings.models.{model_type}")
+        except ImportError as e:
+            raise ColbertLayoutError(
+                f"ColBERT base model_type '{model_type}' is not supported by "
+                "mlx-embeddings, so its encoder cannot be loaded"
+            ) from e
+
+        # transformers>=5 declares RoPE through the nested `rope_parameters`
+        # dialect, which mlx-embeddings does not read; without the mapping the
+        # sliding-window layers run at the wrong base (see flatten_rope_parameters).
+        model_args = module.ModelArgs.from_dict(flatten_rope_parameters(config_dict))
+        wrapper = module.Model(model_args)
+        # The finite-mask patch needs the mlx-embeddings wrapper to reach the
+        # attention class; it patches the class, so it survives the wrapper.
+        patch_modernbert_attention(wrapper)
+        encoder = getattr(wrapper, "model", None)
+        if encoder is None:
+            raise ColbertLayoutError(
+                f"ColBERT base model_type '{model_type}' is not supported: "
+                f"mlx-embeddings' {type(wrapper).__name__} exposes no raw encoder "
+                "for per-token features"
+            )
+        del wrapper
+
+        if layout.weight_source == WEIGHT_SOURCE_ONNX:
+            from .colbert_onnx_weights import read_colbert_onnx
+
+            assert layout.onnx_graph is not None  # guaranteed by the resolver
+            onnx_weights = read_colbert_onnx(layout.onnx_graph, layout.dense)
+            weights = onnx_weights.encoder
+            projection = ColbertProjection.from_matrices(
+                layout.dense,
+                [module_weights.linear for module_weights in onnx_weights.projection],
+                [module_weights.residual for module_weights in onnx_weights.projection],
+            )
+            weights_note = f"onnx={onnx_weights.graph_path.name}"
+            if onnx_weights.quantized:
+                weights_note += " (int8 dequantized)"
+        else:
+            assert layout.encoder_weights is not None  # guaranteed by the resolver
+            weights = mx.load(str(layout.encoder_weights))
+            projection = ColbertProjection.from_layout(layout)
+            weights_note = f"safetensors={layout.encoder_weights.name}"
+
+        self._validate_native_weights(encoder, weights)
+        encoder.load_weights(list(weights.items()), strict=False)
+        self._apply_embedding_dtype(encoder)
+        mx.eval(encoder.parameters())
+        # Deterministic inference, as on every other embedding path.
+        encoder.train(False)
+
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                str(model_path),
+                use_fast=False,
+                trust_remote_code=self.trust_remote_code,
+            )
+        except Exception:
+            tokenizer = AutoTokenizer.from_pretrained(
+                str(model_path),
+                trust_remote_code=self.trust_remote_code,
+            )
+
+        self.model = encoder
+        self.processor = tokenizer
+        self._colbert_projection = projection
+        self._colbert_layout = layout
+        # The served per-token width, not the encoder width: this model has no
+        # pooled embedding, so the projected dimension is its only output.
+        self._hidden_size = projection.output_dim
+        self._using_native = True
+        self._is_compiled = False
+        self._compiled_embed = None
+        self._pooling_mode = None
+        self._pooling_source = "not applicable (ColBERT projection)"
+        self._loaded = True
+        logger.info(
+            f"ColBERT embedding model loaded: {self.model_name} "
+            f"(base={model_type}, weights={weights_note}, "
+            f"encoder_hidden={layout.encoder_input_dim}, "
+            f"projection={projection.output_dim}d over {projection.layer_count} "
+            "Dense modules)"
+        )
 
     def _extract_embeddings_array(self, outputs, attention_mask=None):
         """Extract embedding tensor from model outputs as a 2D (batch, hidden) array."""
@@ -780,6 +953,8 @@ class MLXEmbeddingModel:
         self._loaded = False
         self._using_native = False
         self._remap_input_ids_to_inputs = False
+        self._colbert_projection = None
+        self._colbert_layout = None
 
         gc.collect()
         mx.synchronize()
@@ -808,6 +983,19 @@ class MLXEmbeddingModel:
         """
         if not self._loaded:
             self.load()
+
+        # A pylate ColBERT model has no pooled sentence embedding: pooling the
+        # encoder's hidden states (or the projected ones) would be an invented
+        # vector that no downstream MaxSim score is defined against. Fail loudly
+        # instead of returning something plausible and wrong.
+        if self._colbert_projection is not None:
+            raise ValueError(
+                f"'{self.model_name}' is a late-interaction (ColBERT) model and "
+                "has no pooled sentence embedding: its contract is a projected, "
+                "per-token L2-normalized vector. Send token ids to "
+                "POST /v1/embeddings/tokens instead (the [Q]/[D] prefix marker "
+                "belongs to the caller and is tokenized from the text)."
+            )
 
         max_length = self._resolve_max_length(max_length)
         normalized_inputs = self._normalize_embedding_inputs(inputs)
@@ -933,6 +1121,94 @@ class MLXEmbeddingModel:
             dimensions=dimensions,
         )
 
+    def embed_token_ids(
+        self,
+        ids_batch: List[List[int]],
+    ) -> TokenEmbeddingOutput:
+        """Per-token vectors for EXACT token ids (late interaction / MaxSim).
+
+        Unlike :meth:`embed`, the caller owns the token window: the ids are used
+        verbatim, so the returned rows line up one-to-one with the text window
+        the pooled ``sentence_embedding`` was computed over (head truncation and
+        any appended special token are the caller's).
+
+        Two contracts are served, and which one applies is decided at load time:
+
+        * A plain embedder (Qwen3-Embedding and the like) returns the final hidden
+          state, before pooling and before L2 normalization — the tensor the
+          pinned ONNX export exposes as ``token_embeddings`` — so a caller that
+          needs the ColBERT/MaxSim convention normalizes the rows itself.
+        * A pylate ColBERT model applies its Dense projection chain and the
+          per-token L2, because both are folded into that checkpoint's own ONNX
+          graph and are therefore part of its output contract, not a caller
+          convention. Those vectors are already unit length.
+
+        The batch is right-padded to the longest sequence and each row is sliced
+        back to its own length with the attention mask, so padding never reaches
+        a returned vector (a causal model's real tokens all precede the pads; a
+        bidirectional encoder excludes them through the mask).
+        ``mx.compile`` is deliberately not used here: a compiled primitive
+        returns the pooled array only.
+
+        Args:
+            ids_batch: one list of token ids per input sequence.
+
+        Returns:
+            TokenEmbeddingOutput with ragged per-token vectors.
+        """
+        if not self._loaded:
+            self.load()
+
+        sequences = [list(ids) for ids in ids_batch]
+        if not sequences or any(not ids for ids in sequences):
+            raise ValueError(
+                "token-id embeddings require at least one non-empty sequence"
+            )
+
+        width = max(len(ids) for ids in sequences)
+        # The pad id is irrelevant: padding positions are dropped before
+        # returning and the attention mask keeps them out of every real token's
+        # receptive field.
+        padded = [ids + [0] * (width - len(ids)) for ids in sequences]
+        masks = [[1] * len(ids) + [0] * (width - len(ids)) for ids in sequences]
+        inputs = self._adapt_model_inputs_for_call(
+            {
+                "input_ids": mx.array(padded, dtype=mx.int32),
+                "attention_mask": mx.array(masks, dtype=mx.int32),
+            }
+        )
+
+        outputs = self.model(**inputs)
+        last_hidden = _token_features(outputs)
+        if last_hidden is None or last_hidden.ndim != 3:
+            raise ValueError(
+                "Model output does not expose per-token features "
+                "(last_hidden_state with shape (batch, seq_len, hidden)); "
+                f"got {type(last_hidden).__name__}"
+            )
+
+        last_hidden = last_hidden.astype(mx.float32)
+        if self._colbert_projection is not None:
+            last_hidden = self._colbert_projection(last_hidden)
+        mx.eval(last_hidden)
+
+        token_embeddings: List[List[List[float]]] = []
+        total_tokens = 0
+        for row, ids in enumerate(sequences):
+            vectors = last_hidden[row, : len(ids), :].tolist()
+            token_embeddings.append(vectors)
+            total_tokens += len(ids)
+
+        dimensions = 0
+        if token_embeddings and token_embeddings[0]:
+            dimensions = len(token_embeddings[0][0])
+
+        return TokenEmbeddingOutput(
+            token_embeddings=token_embeddings,
+            total_tokens=total_tokens,
+            dimensions=dimensions,
+        )
+
     def _count_tokens(
         self, inputs: Union[List[str], List[Dict[str, str]]]
     ) -> int:
@@ -1013,6 +1289,20 @@ class MLXEmbeddingModel:
             "native_implementation": self._using_native,
             "compiled": self._is_compiled,
         }
+
+        if self._colbert_layout is not None:
+            # Which artifact supplied the weights is part of the model identity
+            # here: the ONNX export and the safetensors hold different numbers.
+            info.update(
+                {
+                    "late_interaction": True,
+                    "projection_dim": self._colbert_layout.output_dim,
+                    "projection_layers": self._colbert_layout.layer_count,
+                    "encoder_hidden_size": self._colbert_layout.encoder_input_dim,
+                    "weight_source": self._colbert_layout.weight_source,
+                    "weight_file": self._colbert_layout.weights_path.name,
+                }
+            )
 
         if hasattr(self.model, "config"):
             config = self.model.config
