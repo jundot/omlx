@@ -3497,10 +3497,7 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
                 )
             else:
                 ms = sm.get_settings(source_model_id)
-            if source_model_id == model_id and model_id in active_aliases:
-                m["model_alias"] = active_aliases[model_id]
-            else:
-                m.pop("model_alias", None)
+            m.pop("model_alias", None)
             m["enable_thinking"] = merge_chat_template_request_kwargs(ms).get(
                 "enable_thinking", m["enable_thinking"]
             )

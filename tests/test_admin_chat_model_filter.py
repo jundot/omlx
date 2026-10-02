@@ -116,10 +116,11 @@ def test_status_metadata_prefers_model_id_when_alias_collides():
 @pytest.mark.asyncio
 async def test_models_status_exposes_model_alias_metadata():
     """/v1/models/status should include aliases for clients listing alias IDs."""
+    from omlx.engine_pool import EnginePool
     from omlx.server import ServerState, list_models_status
 
     state = ServerState()
-    state.engine_pool = MagicMock()
+    state.engine_pool = MagicMock(spec=EnginePool)
     state.engine_pool.get_status.return_value = {
         "models": [
             {
@@ -129,13 +130,16 @@ async def test_models_status_exposes_model_alias_metadata():
             }
         ]
     }
-    state.engine_pool.get_active_model_aliases.return_value = {
-        "raw-image-model": "friendly-image-name",
-    }
     state.settings_manager = MagicMock()
-    state.settings_manager.get_settings.return_value = ModelSettings(
-        model_alias="friendly-image-name"
-    )
+    settings = ModelSettings(model_alias="friendly-image-name", max_tokens=1234)
+    state.settings_manager.get_settings.return_value = settings
+    state.settings_manager.get_settings_for_request.return_value = settings
+    state.settings_manager.list_exposed_profile_models.return_value = [
+        {
+            "source_model_id": "raw-image-model",
+            "model_id": "image-profile",
+        }
+    ]
 
     with patch("omlx.server._server_state", state):
         status = await list_models_status()
@@ -143,6 +147,11 @@ async def test_models_status_exposes_model_alias_metadata():
     assert status["models"][0]["id"] == "raw-image-model"
     assert status["models"][0]["model_alias"] == "friendly-image-name"
     assert status["models"][0]["engine_type"] == "image"
+    assert status["models"][0]["max_tokens"] == 1234
+    profile = next(m for m in status["models"] if m["id"] == "image-profile")
+    assert "model_alias" not in profile
+    assert profile["source_model_id"] == "raw-image-model"
+    assert profile["max_tokens"] == 1234
 
 
 @pytest.mark.asyncio
