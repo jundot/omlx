@@ -1515,7 +1515,9 @@ def verify_link_reachability(
             if route.returncode != 0:
                 bound = run(
                     local.host,
-                    ("python3", "-c", script, local.address, remote.address),
+                    # Absolute like the other remote stdlib probes: a bare
+                    # python3 resolves through the login shell's PATH.
+                    ("/usr/bin/python3", "-c", script, local.address, remote.address),
                 )
                 if bound.returncode == 0:
                     continue
