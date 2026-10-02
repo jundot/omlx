@@ -240,6 +240,7 @@ class OQManager:
                             if not mt:
                                 continue
                             tc = config.get("text_config", {})
+                            is_v41 = config.get("model_type") == "deepseek_v41"
                             has_mtp = _has_mtp_heads(
                                 config
                             ) and _checkpoint_has_mtp_weights(path)
@@ -251,7 +252,8 @@ class OQManager:
                                 "size_formatted": _format_size(size),
                                 "model_type": config.get("model_type", "")
                                 or tc.get("model_type", ""),
-                                "is_quantized": "quantization" in config,
+                                "is_quantized": "quantization" in config
+                                or "omlx_deepseek_v41" in config,
                                 # Treat vision_config / vit_config / mm_vision_tower as VLM
                                 # evidence (Molmo / Molmo2 use vit_config; FastVLM uses
                                 # mm_vision_tower). Same predicate as model_discovery.
@@ -259,6 +261,7 @@ class OQManager:
                                 "has_mtp_heads": has_mtp,
                                 "hidden_size": tc.get("hidden_size")
                                 or config.get("hidden_size")
+                                or (tc.get("dim") if is_v41 else 0)
                                 or 0,
                             }
                             all_models.append(info)
@@ -270,6 +273,11 @@ class OQManager:
                                 info_full["num_experts"] = config.get(
                                     "num_local_experts", 0
                                 )
+                                if is_v41:
+                                    info_full["num_layers"] = (
+                                        info_full["num_layers"] or tc.get("n_layers", 0)
+                                    )
+                                    info_full["num_experts"] = tc.get("n_routed_experts", 0)
                                 info_full["memory_streaming"] = estimate_memory(size)
                                 source_models.append(info_full)
                         except Exception:
@@ -319,6 +327,7 @@ class OQManager:
             OQ_DTYPES,
             OQ_LEVELS,
             _validate_oq_dtype_for_model,
+            _validate_v41_oq_settings,
             resolve_output_name,
             validate_gemma4_assistant_pair,
             validate_mtp_donor_pair,
@@ -338,6 +347,8 @@ class OQManager:
 
         with open(source / "config.json") as f:
             config = json.load(f)
+        if config.get("model_type") == "deepseek_v41":
+            _validate_v41_oq_settings(oq_level, dtype, group_size)
         _validate_oq_dtype_for_model(config, dtype)
 
         source_size = _safetensors_size(source)

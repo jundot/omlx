@@ -188,8 +188,8 @@ def test_committed_prefix_matches_oneshot_oracle(runtime):
     ref = _reference_blocks(model, toks, table, f, 3)
     for j in range(3):
         valid = f - 1 - j
-        live_k, live_v = cache[j][0].state
-        ref_k, ref_v = ref[j][0].state
+        live_k, live_v = cache[j][0].keys_and_values()
+        ref_k, ref_v = ref[j][0].keys_and_values()
         assert live_k.shape[2] >= valid and ref_k.shape[2] >= valid
         dk = mx.max(mx.abs(live_k[:, :, :valid] - ref_k[:, :, :valid])).item()
         dv = mx.max(mx.abs(live_v[:, :, :valid] - ref_v[:, :, :valid])).item()
@@ -210,8 +210,8 @@ def test_full_rejection_gap_rewrite(runtime):
     ref = _reference_blocks(model, toks, table, f, 3)
     for j in range(3):
         valid = f - 1 - j
-        live_k, _ = cache[j][0].state
-        ref_k, _ = ref[j][0].state
+        live_k, _ = cache[j][0].keys_and_values()
+        ref_k, _ = ref[j][0].keys_and_values()
         dk = mx.max(mx.abs(live_k[:, :, :valid] - ref_k[:, :, :valid])).item()
         assert dk < 1e-4, f"block {j} diverged after gap rewrites: {dk}"
 
@@ -229,8 +229,8 @@ def test_variable_depth_lag_heals(runtime):
     ref = _reference_blocks(model, toks, table, f, 3)
     for j in range(3):
         valid = f - 1 - j
-        live_k, _ = cache[j][0].state
-        ref_k, _ = ref[j][0].state
+        live_k, _ = cache[j][0].keys_and_values()
+        ref_k, _ = ref[j][0].keys_and_values()
         dk = mx.max(mx.abs(live_k[:, :, :valid] - ref_k[:, :, :valid])).item()
         assert dk < 1e-4, f"block {j} did not heal after depth dip: {dk}"
 

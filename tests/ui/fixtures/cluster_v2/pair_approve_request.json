@@ -1,0 +1,5 @@
+{
+  "_comment": "POST /api/cluster/pair/approve request body (Module B). Code is the 6 digits shown on the joiner's screen; wrong code 3x = 10-minute lockout (403/429).",
+  "node_id": "a1b2c3d4-0001-4000-8000-000000000001",
+  "code": "482915"
+}

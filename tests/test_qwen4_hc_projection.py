@@ -28,9 +28,7 @@ def _production_module(bits: int):
         group_size=2560,
         eps=1e-6,
     )
-    module.hc_norm.weight = (
-        mx.random.normal((10240,)) * 0.02
-    ).astype(mx.bfloat16)
+    module.hc_norm.weight = (mx.random.normal((10240,)) * 0.02).astype(mx.bfloat16)
     module.input_mix_weight_down = nn.QuantizedLinear(
         10240,
         320,
@@ -67,14 +65,17 @@ def _production_module(bits: int):
 
 @pytest.mark.parametrize("bits", [4, 5, 6, 8])
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-def test_qwen4_exact_hybrid_raw_and_full_outputs_are_bit_exact(bits):
+def test_qwen4_exact_hybrid_raw_and_full_outputs_are_bit_exact(bits, monkeypatch):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp import hc_fused
     from mlx_vlm.models.qwen4_exp.hc_projection import hybrid_projection
     from mlx_vlm.models.qwen4_exp.language import (
         compile_hyper_connections,
         fuse_hyper_connection_projections,
     )
 
+    # Keep this bit-exact test on the hybrid path, below fused dispatch.
+    monkeypatch.setattr(hc_fused, "_DISABLED", True)
     mx.random.seed(20260900 + bits)
     module = _production_module(bits)
     down = module.input_mix_weight_down
@@ -115,9 +116,9 @@ def test_qwen4_exact_hybrid_raw_and_full_outputs_are_bit_exact(bits):
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 def test_qwen4_exact_hybrid_fallbacks_never_enter_native(monkeypatch):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
-    from mlx_vlm.models.qwen4_exp import hc_projection
-    from mlx_vlm.models.qwen4_exp import language
+    from mlx_vlm.models.qwen4_exp import hc_fused, hc_projection, language
 
+    monkeypatch.setattr(hc_fused, "_DISABLED", True)
     mx.random.seed(20261100)
     module = _production_module(5)
     assert language.fuse_hyper_connection_projections(module) == 1

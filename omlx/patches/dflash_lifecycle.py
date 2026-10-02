@@ -153,12 +153,46 @@ def set_dflash_guard_base(cls: type, new_call: Any) -> None:
     info["call"] = new_call
 
 
+def _install_cache_serializer() -> None:
+    from dflash_mlx.cache import codecs
+    from mlx_lm.models.cache import KVCache
+
+    original = codecs.serialize_target_cache
+    if getattr(original, "_omlx_valid_kv", False):
+        return
+
+    def serialize(target_cache, *, clone=True):
+        fa, gdn = [], []
+        for entry in target_cache:
+            if isinstance(entry, KVCache):
+                if entry.keys is None:
+                    state = None
+                else:
+                    keys, values = entry.keys_and_values()
+                    if clone:
+                        keys, values = codecs._clone_array(keys), codecs._clone_array(
+                            values
+                        )
+                    state = (keys, values, int(entry.offset))
+                fa.append(state)
+                gdn.append(None)
+            else:
+                layer_fa, layer_gdn = original([entry], clone=clone)
+                fa.extend(layer_fa)
+                gdn.extend(layer_gdn)
+        return tuple(fa), tuple(gdn)
+
+    serialize._omlx_valid_kv = True
+    codecs.serialize_target_cache = serialize
+
+
 def install_dflash_lifecycle_wrap() -> bool:
     """Monkey-patch dflash's hook installers to record pre-dflash class state.
 
     Safe to call repeatedly — each installer is wrapped at most once.
     Returns True if at least one backend's installers were wrapped.
     """
+    _install_cache_serializer()
     wrapped_any = False
 
     try:
@@ -207,9 +241,6 @@ def restore_dflash_class_patches() -> None:
     DFlash engine load can re-install its hook freshly. Empties the
     backup table.
     """
-    if not _DFLASH_BACKUP:
-        return
-
     restored = 0
     for cls, info in list(_DFLASH_BACKUP.items()):
         try:
@@ -224,7 +255,17 @@ def restore_dflash_class_patches() -> None:
         restored += 1
 
     _DFLASH_BACKUP.clear()
-    logger.info("dflash class patches restored on %d class(es)", restored)
+    # GLM-5.3's KDA adapter owns a separate class hook because dflash-mlx has
+    # no upstream GLM module to wrap. Restore it at the same lifecycle
+    # boundary so a later VLM/MTP GLM load never inherits it.
+    try:
+        from .dflash_glm5 import restore_glm5_dflash_class_patches
+
+        restored += restore_glm5_dflash_class_patches()
+    except Exception:
+        logger.debug("GLM-5.3 dflash class restore skipped", exc_info=True)
+    if restored:
+        logger.info("dflash class patches restored on %d class(es)", restored)
 
 
 def get_backup_classes() -> list[type]:

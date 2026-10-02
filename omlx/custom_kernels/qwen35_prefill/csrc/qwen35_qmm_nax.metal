@@ -99,11 +99,7 @@
   instantiate_qwen35_q_affine_qmm_t_nax(                                     \
       bits, group_suffix, float16_t, 64, 64, 64, 4, 1);                       \
   instantiate_qwen35_q_affine_qmm_t_nax(                                     \
-      bits, group_suffix, bfloat16_t, 64, 64, 64, 4, 1);                      \
-  instantiate_qwen35_q_affine_qmm_t_nax(                                     \
-      bits, group_suffix, float16_t, 64, 64, 64, 1, 4);                       \
-  instantiate_qwen35_q_affine_qmm_t_nax(                                     \
-      bits, group_suffix, bfloat16_t, 64, 64, 64, 1, 4)
+      bits, group_suffix, bfloat16_t, 64, 64, 64, 4, 1)
 
 define_qwen35_q_affine_qmm_t_nax(4, 64, )
 define_qwen35_q_affine_qmm_t_nax(5, 64, )

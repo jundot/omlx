@@ -1,110 +1,69 @@
 # Contributing to oMLX
 
-Thank you for your interest in contributing to oMLX! This guide will help you get started.
+Thank you for contributing! Bug fixes, performance improvements, model support, UI improvements, translations, and documentation are welcome.
 
 ## Getting Started
 
-1. Fork the repository on [GitHub](https://github.com/jundot/omlx)
-2. Clone your fork:
+oMLX requires Apple Silicon, macOS 15.0+, and Python 3.11–3.13. Fork the repository and create a branch from current `main`:
 
 ```bash
 git clone https://github.com/<your-username>/omlx.git
 cd omlx
+git checkout -b fix/describe-the-change
+python -m pip install -e ".[dev]"
 ```
 
-3. Install development dependencies:
+See [Development](../README.md#development) for app builds and [installation instructions](../README.md#from-source) for native kernel requirements.
+
+## Keep Changes Focused
+
+- Check existing issues and PRs first. Discuss large features, new dependencies, and changes to default behavior before starting a substantial implementation.
+- Keep each PR focused on one problem or coherent feature. Include the settings, API, and UI integration it needs, but separate unrelated changes. For stacked PRs, explain the dependency and merge order.
+- Fix the underlying problem and reuse existing code paths. Preserve supported behavior; explain any compatibility changes or performance tradeoffs.
+- Follow the existing style, Black formatting, and Ruff configuration. Keep unrelated formatting and development artifacts out of the diff. Preserve third-party license notices and use Apache-2.0 SPDX headers for new original code.
+
+## Test Your Change
+
+For bug fixes, provide a reproduction and a regression test where practical. The test should fail before the fix and pass afterward through the affected production code, rather than a copy of the implementation inside the test.
+
+Run the relevant tests, then the default suite for code changes:
 
 ```bash
-pip install -e ".[dev]"
+python -m pytest tests/test_config.py  # Replace with the affected test files
+python -m pytest                      # Excludes slow and integration tests
 ```
 
-> **Note**: oMLX requires Apple Silicon (M1/M2/M3/M4) and Python 3.10+.
+See [TESTING.md](TESTING.md) for additional checks. For inference or cache changes, include a representative real-model check when possible, covering affected features such as prefix reuse, streaming, or concurrent requests. State what you ran and what remains untested; CI or mocked tests do not replace hardware validation.
 
-## Development Workflow
-
-### Testing
-
-Run tests with:
+For visible UI changes, include screenshots and check the actual screen. Run relevant JavaScript tests and build the macOS app when those components change. After editing admin templates or JavaScript, rebuild CSS:
 
 ```bash
-# Fast tests only (recommended during development)
-pytest -m "not slow"
-
-# Run a specific test file
-pytest tests/test_config.py -v
-
-# Run slow tests (requires model files)
-pytest -m slow
+python omlx/admin/build_css.py
 ```
 
-**Test markers:**
+Use the existing translation catalogs and preserve placeholders. When web translation keys change, update `omlx/admin/i18n/en.json` and run:
 
-| Marker | Description |
-|--------|-------------|
-| `@pytest.mark.slow` | Tests that require loading models |
-| `@pytest.mark.integration` | Tests that require a running server |
-
-**Test file naming:** For a source file `omlx/<module>.py`, the test file should be `tests/test_<module>.py`.
-
-When modifying source code, always check if existing tests are affected and update them accordingly. New code should include corresponding tests.
-
-### License Header
-
-All source files should include the Apache 2.0 license identifier:
-
-```python
-# SPDX-License-Identifier: Apache-2.0
+```bash
+python scripts/normalize_i18n.py
 ```
 
-## Project Structure
+## Performance PRs
 
-```
-omlx/
-├── omlx/                 # Main package
-│   ├── api/              # API models and adapters (OpenAI, Anthropic)
-│   ├── cache/            # KV cache management (paged, prefix, SSD)
-│   ├── engine/           # Inference engines (simple, batched, embedding)
-│   ├── mcp/              # Model Context Protocol integration
-│   ├── models/           # Model wrappers (LLM, embedding)
-│   ├── utils/            # Utilities
-│   ├── server.py         # FastAPI server
-│   ├── scheduler.py      # Request scheduling with mlx-lm BatchGenerator
-│   ├── engine_core.py    # Core async inference engine
-│   ├── paged_cache.py    # Block-based KV cache with LRU eviction
-│   └── cli.py            # CLI entry point
-├── apps/omlx-mac/        # Native SwiftUI macOS app (menubar + admin UI)
-├── packaging/            # macOS .app bundle build pipeline (venvstacks)
-├── tests/                # Test suite
-└── docs/                 # Documentation
-```
+Include a before-and-after benchmark against the relevant implementation on `main`, using the same hardware, model, input, and settings. Provide:
 
-For a more detailed architecture overview, see the [Architecture](../README.md#architecture) section in the README.
+- **Setup:** commit IDs, Mac chip/RAM, model and quantization, input/output lengths, and relevant sampling, concurrency, cache, and acceleration settings.
+- **Results:** relevant throughput, time to first token, and memory measurements, including regressions or tradeoffs. State the run count and warm-up/cache conditions.
+- **Reproduction:** commands or a small harness. Verify that the changed path runs and rebuild native kernels when they change.
+- **Correctness:** appropriate output or quality checks when numerical behavior changes. A speedup alone is not enough; exact token equality is not required for every optimization.
 
-## Areas for Contribution
+Hardware-specific improvements are welcome. If you cannot run representative benchmarks, explain the limitation and what you verified. Keep concise results in the PR description; link or attach large logs and one-off experiment files instead of committing them.
 
-- **Bug fixes** — Check [open issues](https://github.com/jundot/omlx/issues) for reported bugs
-- **Performance** — Inference speed, memory efficiency, cache hit rates
-- **New features** — API endpoints, model format support, admin dashboard improvements
-- **Documentation** — Guides, examples, API references
-- **Model support** — Testing and fixing compatibility with new MLX models
-- **macOS app** — UI improvements, new settings, system integration
+## Submit for Review
 
-## Pull Request Process
+Describe the problem, your approach, related issues, and validation results. Update documentation for user-facing changes. Keep unfinished work in Draft; mark it ready when you want review, or ask a specific question for early feedback.
 
-1. **Fork & branch** — Create a feature branch from `main`:
-   ```bash
-   git checkout -b feature/your-feature
-   ```
+Address review comments or explain your disagreement, then request another review. After resolving conflicts, preserve fixes already on `main` and rerun relevant checks. CI must pass before merge.
 
-2. **Make changes** — Write code and tests following the style guidelines above.
+I maintain oMLX independently and normally squash-merge PRs. Review timing depends on scope and the validation needed; focused, reproducible changes help me review faster.
 
-3. **Test** — Ensure all related tests pass:
-   ```bash
-   pytest tests/test_<affected_module>.py -v
-   ```
-
-4. **Submit** — Push your branch and open a pull request against `main`. Describe what changed and why.
-
-## Support
-
-If you have questions or run into issues, please open an issue on [GitHub Issues](https://github.com/jundot/omlx/issues).
+For suspected vulnerabilities, follow [SECURITY.md](../SECURITY.md) and report privately.

@@ -37,10 +37,10 @@ MAX_SOURCE_EXTRACTED_BYTES = 128 * 1024 * 1024
 MAX_SOURCE_MEMBERS = 4096
 WORKER_REQUIREMENTS = (
     "numpy>=1.24.0,<2.4",
-    "mlx==0.32.0",
-    "mlx-cuda-13==0.32.0",
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ab1806e8f5d6aa035973af194a1b9198ab4754dc",
-    "transformers>=5.12.1,<5.13",
+    "mlx==0.32.2",
+    "mlx-cuda-13==0.32.2",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@94cdcae13b266c337bcaca09b97b9c5a9c0e2cde",
+    "transformers>=5.12.1,<5.18",
     "mistral-common>=1.10",
     "tokenizers>=0.19.0",
     "huggingface-hub>=1.19.0",

@@ -48,6 +48,7 @@ struct ProfileGroup: View {
     let scope: ProfileScope
     let label: String
     let names: [String]
+    var displayNames: [String: String] = [:]
     /// Name of the currently-active profile in this scope (or nil if the
     /// active profile lives in a different scope).
     let activeName: String?
@@ -212,7 +213,7 @@ struct ProfileGroup: View {
                         }
                     }
             } else {
-                Text(name)
+                Text(displayNames[name] ?? name)
                     .font(.omlxText(12, weight: .medium))
                     .foregroundStyle(isActive ? .white : theme.text)
             }
@@ -258,7 +259,7 @@ struct ProfileGroup: View {
 
     private func startRename(_ name: String) {
         renamingName = name
-        renameText = name
+        renameText = displayNames[name] ?? name
         // Focus on the next runloop tick so the @FocusState observer sees
         // the TextField after it's been mounted into the hierarchy.
         DispatchQueue.main.async { renameFieldFocused = true }
@@ -270,23 +271,12 @@ struct ProfileGroup: View {
         // to the original name without an error banner.
         defer { renamingName = nil }
         guard !trimmed.isEmpty,
-              trimmed != original,
-              !names.contains(trimmed),
-              Self.isValidSlug(trimmed)
+              trimmed != (displayNames[original] ?? original)
         else { return }
         onRename?(original, trimmed)
     }
 
-    /// Mirror of the server's profile-name slug rule
-    /// (`omlx/model_profiles.py:validate_profile_name`). Pre-checking
-    /// client-side avoids a doomed PUT round-trip for invalid names.
-    private static func isValidSlug(_ s: String) -> Bool {
-        guard let re = try? NSRegularExpression(
-            pattern: #"^[a-z0-9][a-z0-9_-]{0,31}$"#
-        ) else { return false }
-        let range = NSRange(s.startIndex..., in: s)
-        return re.firstMatch(in: s, range: range) != nil
-    }
+
 }
 
 // MARK: - ActiveProfileBanner
@@ -324,10 +314,10 @@ struct ActiveProfileBanner: View {
         .padding(.vertical, isSlim ? 10 : 12)
         .background(bannerBackground)
         .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous)
                 .strokeBorder(bannerBorder, lineWidth: 0.5)
         )
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous))
         .padding(.horizontal, 14)
         .padding(.bottom, 12)
     }
@@ -491,10 +481,10 @@ struct SaveAsPopover: View {
         .padding(12)
         .background(theme.groupBg)
         .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous)
                 .strokeBorder(theme.groupBorder, lineWidth: 0.5)
         )
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous))
         .padding(.horizontal, 14)
         .padding(.bottom, 12)
         .onAppear { nameFocused = true }
@@ -1067,7 +1057,9 @@ struct ProfileDetailCard: View {
                             .foregroundStyle(theme.textSecondary)
                     }
                     .toggleStyle(.switch)
-                    .controlSize(.mini)
+                    // Same switch size as `RowSwitch` so every switch in the
+                    // app reads as one control.
+                    .controlSize(.small)
                     if exposeAsModel, let exposedModelId {
                         Text(exposedModelId)
                             .font(.omlxMono(11))

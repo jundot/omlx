@@ -132,8 +132,23 @@ from .embedding_utils import (
     normalize_input,
 )
 
-# MCP routes
-from .mcp_routes import router as mcp_router, set_mcp_manager_getter
+
+# MCP routes import FastAPI. Cluster worker ranks import API helpers such as
+# ``omlx.api.thinking`` without the HTTP stack installed, and importing any
+# submodule runs this file first, so the routes load on first access (#3519).
+def __getattr__(name: str):
+    if name in ("mcp_router", "set_mcp_manager_getter"):
+        from . import mcp_routes
+
+        value = (
+            mcp_routes.router
+            if name == "mcp_router"
+            else mcp_routes.set_mcp_manager_getter
+        )
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     # Models

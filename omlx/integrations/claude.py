@@ -101,6 +101,8 @@ class ClaudeCodeIntegration(Integration):
         env["CLAUDE_CODE_ATTRIBUTION_HEADER"] = "0"
         # Large timeout for local model inference (model loading + generation).
         env["API_TIMEOUT_MS"] = "3000000"
+        if ctx.model:
+            env["ANTHROPIC_MODEL"] = ctx.model
 
         if ctx.cross_session:
             # Cross-session messaging (ListAgents/SendMessage) needs telemetry
@@ -159,6 +161,17 @@ class ClaudeCodeIntegration(Integration):
             env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(ctx.context_window)
 
         binary = self._find_claude_binary()
+        extra_args = list(ctx.extra_args)
+        # Local prefill can exceed the plan classifier's request deadline.
+        # Use manual approval during planning unless the caller supplies settings.
+        if not any(
+            a == "--settings" or a.startswith("--settings=") for a in extra_args
+        ):
+            extra_args = [
+                "--settings",
+                '{"useAutoModeDuringPlan":false}',
+                *extra_args,
+            ]
         # Deny the LSP tool. Claude Code attaches its full schema to the tools
         # array the moment a language server connects mid-session; tool schemas
         # render into the system region of the prompt, so that one insertion
@@ -167,7 +180,6 @@ class ClaudeCodeIntegration(Integration):
         # cache stability is the better default here. Skip it when the caller
         # already passes their own --disallowedTools so we never fight their
         # choice or duplicate the flag.
-        extra_args = list(ctx.extra_args)
         if not any(
             a in ("--disallowedTools", "--disallowed-tools") for a in extra_args
         ):

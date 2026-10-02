@@ -34,13 +34,7 @@ struct ModelsScreen: View {
                 onToggleFavorite: { id, fav in vm.setFavorite(id: id, favorite: fav, client: services.client) }
             )
 
-            if let error = vm.lastError {
-                Text(error)
-                    .font(.omlxText(11))
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 18)
-                    .padding(.top, 8)
-            }
+            FooterBar(error: vm.lastError)
         }
         .task { await vm.start(client: services.client) }
         .onDisappear { vm.stop() }

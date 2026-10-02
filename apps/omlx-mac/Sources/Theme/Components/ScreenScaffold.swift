@@ -66,7 +66,7 @@ struct MessageBanner: View {
                 row(icon: "checkmark.circle.fill", text: success, color: theme.greenDot)
             }
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, 14)
         .padding(.top, (hasError || hasSuccess) ? 6 : 0)
     }
 
@@ -106,6 +106,54 @@ struct HintLine: View {
             Text(text)
                 .font(.omlxText(11))
                 .foregroundStyle(theme.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
         }
+    }
+}
+
+/// Bottom action bar shared by screens with a trailing primary action
+/// (Apply and friends): optional hint on the left that wraps under width
+/// pressure, action buttons flush right, optional error line underneath.
+/// One component so the button/note relationship is identical everywhere.
+struct FooterBar<Actions: View>: View {
+    var hint: String? = nil
+    var error: String? = nil
+    @ViewBuilder var actions: () -> Actions
+
+    @Environment(\.omlxTheme) private var theme
+
+    private var hasHint: Bool { !(hint ?? "").isEmpty }
+    private var hasError: Bool { !(error ?? "").isEmpty }
+    private var hasActions: Bool { Actions.self != EmptyView.self }
+
+    var body: some View {
+        if hasHint || hasError || hasActions {
+            VStack(alignment: .leading, spacing: 6) {
+                if hasHint || hasActions {
+                    HStack(alignment: .center, spacing: 12) {
+                        if let hint, hasHint {
+                            HintLine(text: hint)
+                        }
+                        Spacer(minLength: 0)
+                        actions()
+                    }
+                }
+                if let error, hasError {
+                    Text(error)
+                        .font(.omlxText(11))
+                        .foregroundStyle(theme.redDot)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 8)
+        }
+    }
+}
+
+extension FooterBar where Actions == EmptyView {
+    /// Error-only (or hint-only) footer — the standard trailing status line
+    /// under a screen. Renders nothing while there is nothing to show.
+    init(hint: String? = nil, error: String? = nil) {
+        self.init(hint: hint, error: error) { EmptyView() }
     }
 }

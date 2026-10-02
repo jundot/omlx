@@ -1,46 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Inkling (Thinking Machines) compatibility layer for the pinned mlx-vlm.
-
-The `inkling` model package landed in mlx-vlm PR #1637 and was extended
-for Inkling Small in PR #1756 (pcuenca/mlx-vlm@73e4cb6), both newer than
-oMLX's mlx-vlm pin (`78b96eb`). This vendors the PR-head model package
-plus the three shared modules it imports that do not exist at the pin
-(`mlx_vlm.models.{mlp,switch_layers,activations}` — the pin sources
-SwitchGLU from mlx-lm, whose activation contract differs), and wires the
-discovery surface oMLX needs:
-
-- installs the vendored packages onto the real `mlx_vlm.models` namespace
-  (`__path__` append) so `get_model_and_args` can import them; relative
-  imports (`..base`, `..cache`) resolve against the real pinned mlx-vlm.
-  If a future pin bump ships these modules upstream, the real ones win
-  automatically (the vendor path is searched last).
-- adds `inkling_mm_model -> inkling` to `mlx_vlm.utils.MODEL_REMAPPING`
-  (checkpoints declare `model_type: "inkling_mm_model"`).
-- registers `inkling`/`inkling_mm_model` in `prompt_utils.MODEL_CONFIG`
-  and wraps `get_message_json` with LIST_WITH_IMAGE_FIRST semantics
-  (image parts first, then text), matching PR #1756. Audio parts are not
-  emitted yet: oMLX serves inkling text+vision first, and the vendored
-  processor rejects audio arrays with a clear error.
-- registers the vendored torch-free `InklingProcessor` with
-  `AutoProcessor` (the reference processors only exist in transformers
-  5.14+, above oMLX's <5.13 pin).
-- wraps `mlx_vlm.utils.load_config` to translate a ModelOpt
-  `hf_quant_config.json` (quant_algo NVFP4) into MLX quantization config
-  `{group_size: 16, bits: 4, mode: "nvfp4"}`, porting PR #1756's
-  `load_model` hunk, so the official NVFP4 checkpoint loads natively on
-  stock MLX 0.32 nvfp4 kernels.
-- forces `Model.sanitize` before quantization only when an MLX-format Inkling
-  checkpoint still carries source `model.llm.*`/`model.visual.*` keys. This
-  supports community affine conversions without re-sanitizing oMLX's native
-  QKVR/MTP output layout.
-"""
+"""Register oMLX Inkling, its processor, and checkpoint mapping."""
 
 from __future__ import annotations
 
 import importlib
 import json
 import logging
-from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -53,10 +18,6 @@ _MODEL_TYPES = ("inkling", "inkling_mm_model")
 _MODULE_NAME = "inkling"
 
 _APPLIED = False
-_FORCE_SANITIZE_DIR: ContextVar[Path | None] = ContextVar(
-    "omlx_inkling_force_sanitize_dir", default=None
-)
-_RAW_WEIGHT_PREFIXES = ("model.llm.", "model.visual.", "model.audio.", "model.mtp.")
 
 
 def apply_mlx_vlm_inkling_compat_patch() -> bool:
@@ -75,7 +36,6 @@ def apply_mlx_vlm_inkling_compat_patch() -> bool:
         _patch_model_remapping(vlm_utils)
         _patch_prompt_utils(prompt_utils)
         _patch_load_config(vlm_utils)
-        _patch_force_sanitize(vlm_utils)
         _register_auto_processor()
     except Exception as exc:  # noqa: BLE001
         logger.debug("Inkling mlx-vlm compat patch failed: %s", exc)
@@ -104,15 +64,12 @@ def _append_package_path(package: Any, path: Path) -> None:
         return
     path_str = str(path)
     if path_str not in package_path:
-        package_path.append(path_str)
+        package_path.insert(0, path_str)
 
 
 def _import_vendor_modules() -> None:
-    # The shared shims must be importable before the model package, whose
-    # language module does `from ..mlp import SwiGLUMLP` etc.
     importlib.import_module("mlx_vlm.models.activations")
     importlib.import_module("mlx_vlm.models.mlp")
-    importlib.import_module("mlx_vlm.models.switch_layers")
     importlib.import_module(f"mlx_vlm.models.{_MODULE_NAME}")
 
 
@@ -242,111 +199,6 @@ def _patch_load_config(vlm_utils: Any) -> None:
     patched_load_config._omlx_inkling_compat = True
     patched_load_config._omlx_original = original
     vlm_utils.load_config = patched_load_config
-
-
-def _has_raw_inkling_weights(model_path: Any) -> bool:
-    """Return whether an Inkling checkpoint still uses its source key layout."""
-    path = Path(model_path)
-    try:
-        config = json.loads((path / "config.json").read_text())
-        if config.get("model_type") not in _MODEL_TYPES:
-            return False
-
-        for index_path in sorted(path.glob("*.safetensors.index.json")):
-            index = json.loads(index_path.read_text())
-            keys = (index.get("weight_map") or {}).keys()
-            if any(key.startswith(_RAW_WEIGHT_PREFIXES) for key in keys):
-                return True
-
-        import safetensors
-
-        shards = sorted(
-            shard
-            for shard in path.glob("*.safetensors")
-            if not shard.name.endswith("consolidated.safetensors")
-        )
-        for shard in shards:
-            with safetensors.safe_open(shard, framework="np") as handle:
-                if any(
-                    key.startswith(_RAW_WEIGHT_PREFIXES)
-                    for key in handle.keys()  # noqa: SIM118 - safe_open is not a dict
-                ):
-                    return True
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Inkling raw-layout detection failed for %s: %s", path, exc)
-    return False
-
-
-def _patch_force_sanitize(vlm_utils: Any) -> None:
-    """Run the pinned mlx-vlm sanitizer for raw MLX-format Inkling weights.
-
-    The pinned loader trusts ``format=mlx`` and skips ``Model.sanitize``. Community
-    Inkling conversions retain the source ``model.llm.*`` naming despite that
-    marker, so their keys and quantization sidecars must still be remapped before
-    ``nn.quantize`` inspects the weight dictionary. The context-local directory
-    keeps the metadata override scoped to this checkpoint and safe across threads.
-    """
-    import safetensors
-
-    original_load_model = getattr(vlm_utils, "load_model", None)
-    if original_load_model is None or getattr(
-        original_load_model, "_omlx_inkling_force_sanitize", False
-    ):
-        return
-
-    original_safe_open = safetensors.safe_open
-
-    class _SafeOpenMetadataWrapper:
-        def __init__(self, inner):
-            self._inner = inner
-
-        def __enter__(self):
-            self._inner.__enter__()
-            return self
-
-        def __exit__(self, *args):
-            return self._inner.__exit__(*args)
-
-        def __getattr__(self, name):
-            return getattr(self._inner, name)
-
-        def metadata(self):
-            metadata = self._inner.metadata()
-            if isinstance(metadata, dict) and metadata.get("format") == "mlx":
-                metadata = dict(metadata)
-                metadata.pop("format", None)
-            return metadata
-
-    def patched_safe_open(filename, *args, **kwargs):
-        handle = original_safe_open(filename, *args, **kwargs)
-        target_dir = _FORCE_SANITIZE_DIR.get()
-        if target_dir is None:
-            return handle
-        try:
-            path = Path(filename).resolve()
-        except TypeError:
-            return handle
-        if path.parent == target_dir and path.suffix == ".safetensors":
-            return _SafeOpenMetadataWrapper(handle)
-        return handle
-
-    def patched_load_model(model_path, lazy=False, **kwargs):
-        if not _has_raw_inkling_weights(model_path):
-            return original_load_model(model_path, lazy=lazy, **kwargs)
-        target_dir = Path(model_path).resolve()
-        token = _FORCE_SANITIZE_DIR.set(target_dir)
-        try:
-            logger.info("Forcing sanitize for raw Inkling weights in %s", target_dir)
-            return original_load_model(model_path, lazy=lazy, **kwargs)
-        finally:
-            _FORCE_SANITIZE_DIR.reset(token)
-
-    patched_safe_open._omlx_inkling_force_sanitize = True
-    patched_safe_open._omlx_original = original_safe_open
-    patched_load_model._omlx_inkling_force_sanitize = True
-    patched_load_model._omlx_original = original_load_model
-    safetensors.safe_open = patched_safe_open
-    vlm_utils.load_model = patched_load_model
 
 
 def _register_auto_processor() -> None:

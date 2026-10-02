@@ -5,6 +5,7 @@
 // server defaults the Profiles tab and Server screen depend on.
 
 import XCTest
+import SwiftUI
 @testable import oMLX
 
 final class GlobalSettingsSamplingTests: XCTestCase {
@@ -21,6 +22,99 @@ final class GlobalSettingsSamplingTests: XCTestCase {
         e.outputFormatting = [.sortedKeys]
         return e
     }()
+
+    @MainActor
+    func testResetStagesEachScreenWithoutSavingOrReplacingPaths() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [SettingsDefaultsURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let client = OMLXClient(host: "127.0.0.1", port: 18159, session: session)
+        let server = ServerScreenVM()
+        let performance = PerformanceScreenVM()
+        let network = NetworkScreenVM()
+        await server.load(client: client)
+        await performance.load(client: client)
+        await network.load(client: client)
+        XCTAssertNil(server.lastError)
+        XCTAssertNil(performance.lastError)
+        XCTAssertNil(network.lastError)
+        server.basePathText = "/custom/base"
+        server.samplingTemperatureText = "0.23"
+        performance.maxConcurrentText = "42"
+        performance.idleTimeoutText = "900"
+        network.httpProxy = "http://unsaved-proxy:8080"
+        let modelDirs = server.modelDirTexts
+        let cacheDir = performance.ssdCacheDir
+        let caBundle = network.caBundle
+        let loadedConcurrent = performance.loadedMaxConcurrent
+        let loadedProxy = network.loadedHttpProxy
+
+        await server.resetDefaults(client: client)
+        await performance.resetDefaults(client: client)
+        await network.resetDefaults(client: client)
+
+        XCTAssertNil(server.lastError)
+        XCTAssertNil(performance.lastError)
+        XCTAssertNil(network.lastError)
+        XCTAssertTrue(server.showResetNotice)
+        XCTAssertTrue(performance.showResetNotice)
+        XCTAssertTrue(network.showResetNotice)
+        XCTAssertTrue(server.hasPendingDefaults)
+        XCTAssertTrue(performance.hasPendingChanges)
+        XCTAssertTrue(network.hasPendingChanges)
+        XCTAssertEqual(server.host, "127.0.0.1")
+        XCTAssertEqual(server.appliedBindAddress, "0.0.0.0")
+        XCTAssertEqual(server.basePathText, "/custom/base")
+        XCTAssertEqual(server.modelDirTexts, modelDirs)
+        XCTAssertEqual(performance.ssdCacheDir, cacheDir)
+        XCTAssertEqual(performance.loadedMaxConcurrent, loadedConcurrent)
+        XCTAssertEqual(performance.maxConcurrentText, "8")
+        XCTAssertEqual(network.caBundle, caBundle)
+        XCTAssertEqual(network.loadedHttpProxy, loadedProxy)
+        XCTAssertEqual(network.httpProxy, "")
+
+        let logBinding = server.bind(Binding(
+            get: { server.logLevel }, set: { server.logLevel = $0 }
+        ), save: { XCTFail("Reset drafts must wait for Apply") })
+        logBinding.wrappedValue = "debug"
+        XCTAssertEqual(server.logLevel, "debug")
+
+        server.cancelReset()
+        performance.cancelReset()
+        network.cancelReset()
+        XCTAssertFalse(server.showResetNotice)
+        XCTAssertFalse(performance.showResetNotice)
+        XCTAssertFalse(network.showResetNotice)
+        XCTAssertFalse(server.hasPendingDefaults)
+        XCTAssertEqual(server.host, "0.0.0.0")
+        XCTAssertEqual(server.samplingTemperatureText, "0.23")
+        XCTAssertEqual(server.logLevel, "info")
+        XCTAssertEqual(performance.maxConcurrentText, "42")
+        XCTAssertEqual(performance.idleTimeoutText, "900")
+        XCTAssertEqual(network.httpProxy, "http://unsaved-proxy:8080")
+        XCTAssertEqual(performance.loadedMaxConcurrent, loadedConcurrent)
+        XCTAssertEqual(network.loadedHttpProxy, loadedProxy)
+
+        await server.resetDefaults(client: client)
+        await performance.resetDefaults(client: client)
+        await network.resetDefaults(client: client)
+        server.confirmReset()
+        performance.confirmReset()
+        network.confirmReset()
+        server.cancelReset()
+        performance.cancelReset()
+        network.cancelReset()
+        XCTAssertTrue(server.hasPendingDefaults)
+        XCTAssertEqual(server.host, "127.0.0.1")
+        XCTAssertEqual(performance.maxConcurrentText, "8")
+        XCTAssertEqual(network.httpProxy, "")
+        server.samplingTemperatureText = "0.45"
+        await server.resetDefaults(client: client)
+        server.cancelReset()
+        XCTAssertTrue(server.hasPendingDefaults)
+        XCTAssertEqual(server.samplingTemperatureText, "0.45")
+    }
 
     // MARK: - Decode
 
@@ -202,6 +296,40 @@ final class GlobalSettingsSamplingTests: XCTestCase {
         XCTAssertFalse(str.contains("sampling_"))
     }
 
+    func testUsageDecodesFromNestedObjectAndIsOptional() throws {
+        // Mirrors `omlx.settings.UsageSettings.to_dict()` under the `usage`
+        // key; servers without the toggle omit the block entirely.
+        let json = """
+        {
+            "server": {"host": "127.0.0.1", "port": 8080, "log_level": "info", "server_aliases": []},
+            "usage": {"usage_history": false}
+        }
+        """.data(using: .utf8)!
+        XCTAssertEqual(try decoder.decode(GlobalSettingsDTO.self, from: json).usage?.usageHistory, false)
+
+        let legacy = """
+        {
+            "server": {"host": "127.0.0.1", "port": 8080, "log_level": "info", "server_aliases": []}
+        }
+        """.data(using: .utf8)!
+        XCTAssertNil(try decoder.decode(GlobalSettingsDTO.self, from: legacy).usage)
+    }
+
+    func testPatchEncodesUsageHistoryAsSnakeCaseFlatKey() throws {
+        var patch = GlobalSettingsPatch()
+        patch.usageHistory = false
+
+        let data = try encoder.encode(patch)
+        let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+
+        XCTAssertEqual(json["usage_history"] as? Bool, false)
+
+        let empty = try JSONSerialization.jsonObject(
+            with: try encoder.encode(GlobalSettingsPatch())
+        ) as! [String: Any]
+        XCTAssertNil(empty["usage_history"])
+    }
+
     func testServerDecodesAudioUploadSize() throws {
         let json = """
         {
@@ -228,4 +356,41 @@ final class GlobalSettingsSamplingTests: XCTestCase {
 
         XCTAssertEqual(json["max_audio_upload_size"] as? String, "1GB")
     }
+}
+
+
+private final class SettingsDefaultsURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool {
+        request.url?.host == "127.0.0.1" && request.url?.port == 18159
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        do {
+            XCTAssertEqual(request.httpMethod, "GET", "Reset must not save settings")
+            let path = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+                .appendingPathComponent("Fixtures/global-settings.json")
+            var json = try JSONSerialization.jsonObject(with: Data(contentsOf: path)) as! [String: Any]
+            if request.url?.path == "/admin/api/global-settings" {
+                var server = json["server"] as! [String: Any]
+                server["host"] = "0.0.0.0"
+                json["server"] = server
+                var scheduler = json["scheduler"] as! [String: Any]
+                scheduler["max_concurrent_requests"] = 64
+                json["scheduler"] = scheduler
+                json["network"] = ["http_proxy": "http://proxy:8080", "https_proxy": "",
+                                   "no_proxy": "localhost", "ca_bundle": "/custom/ca.pem"]
+            }
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200,
+                                           httpVersion: nil, headerFields: nil)!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: try JSONSerialization.data(withJSONObject: json))
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
 }

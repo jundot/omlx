@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+        ABCDEF012345678901234501 /* UsageHistoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABCDEF012345678901234502 /* UsageHistoryView.swift */; };
 		1DDDDDDDDDDDDDDDDDDDDDD1 /* oMLXApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC1 /* oMLXApp.swift */; };
 		1DDDDDDDDDDDDDDDDDDDDDD2 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC2 /* AppDelegate.swift */; };
 		1DDDDDDDDDDDDDDDDDDDDDD3 /* MenubarController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCCCCCCCCCCCCCCCCCCCC3 /* MenubarController.swift */; };
@@ -148,6 +149,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+        ABCDEF012345678901234502 /* UsageHistoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageHistoryView.swift; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC1 /* oMLXApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = oMLXApp.swift; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC2 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		1CCCCCCCCCCCCCCCCCCCCCC3 /* MenubarController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarController.swift; sourceTree = "<group>"; };
@@ -486,6 +488,7 @@
 			children = (
 				6CC000000000000000000004 /* ServerScreen.swift */,
 				6CC000000000000000000005 /* StatusScreen.swift */,
+                ABCDEF012345678901234502 /* UsageHistoryView.swift */,
 				6CC000000000000000000011 /* AppearanceScreen.swift */,
 				6CC000000000000000000006 /* LogsScreen.swift */,
 				6CC000000000000000000007 /* ModelsScreen.swift */,
@@ -729,6 +732,7 @@
 				6BB000000000000000000002 /* AppSection.swift in Sources */,
 				6BB000000000000000000004 /* ServerScreen.swift in Sources */,
 				6BB000000000000000000005 /* StatusScreen.swift in Sources */,
+                ABCDEF012345678901234501 /* UsageHistoryView.swift in Sources */,
 				6BB000000000000000000011 /* AppearanceScreen.swift in Sources */,
 				AAD9D51F2FE2843F00FAEA05 /* DownloadsScreenVM.swift in Sources */,
 				6BB000000000000000000006 /* LogsScreen.swift in Sources */,

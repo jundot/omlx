@@ -1,10 +1,14 @@
 #pragma once
 
+#include <vector>
+
 #include "mlx/array.h"
 #include "mlx/stream.h"
 #include "mlx/utils.h"
 
 namespace mx = mlx::core;
+
+#include <tuple>
 
 namespace omlx::qwen35_prefill_kernels {
 
@@ -12,6 +16,10 @@ namespace omlx::qwen35_prefill_kernels {
 // macOS >= 26.2 and an applegpu generation with tensor units (gen >= 17, or
 // >= 18 for 'p'-suffix parts).
 bool is_nax_available();
+
+// Sets MLX's per-command-buffer caps (ops, MB of inputs) on the GPU device and
+// returns the previous ones. MLX reads them on every commit decision.
+std::tuple<int, int> set_command_buffer_caps(int ops, int mb);
 
 // True when the NAX metallib was built next to the extension. Kernel launch
 // still degrades to the classic kernels if loading it fails at runtime.
@@ -90,10 +98,65 @@ mx::array qwen35_q8_affine_qmm_t(
     int group_size = 64,
     mx::StreamOrDevice s = {});
 
+// oQ mixed-bit QxA8 path (Q4/Q5, GS64, affine) on the M5 tensor units.
+
+// True when the INT8 NAX GEMM can actually run here: tensor units present,
+// the NAX metallib built next to the extension, and no earlier launch failure.
+bool oq_a8_kernels_available();
+
+// Stage A. Returns {Qa int8 [..., K], Sa float32, Ra int16 [..., K/64]}.
+// act_mode 0 gives one scale per row (Sa is [M]); act_mode 1 gives one scale
+// per group of 64 (Sa is [..., K/64]).
+std::vector<mx::array> qwen35_oq_a8_quantize(
+    const mx::array& x,
+    int act_mode = 0,
+    mx::StreamOrDevice s = {});
+
+// INT8 x INT8 -> INT32 GEMM against packed affine Q4/Q5 weights, with the
+// affine correction applied at every GS64 boundary. Output dtype follows
+// `scales`. `packed` reads Q4 weights and metadata in the PackedLinear tile
+// layout instead of row-major weights and [K/64, N] metadata.
+mx::array qwen35_oq_a8_qmm_t(
+    const mx::array& qa,
+    const mx::array& sa,
+    const mx::array& ra,
+    const mx::array& weight,
+    const mx::array& scales,
+    const mx::array& biases,
+    int bits,
+    int act_mode = 0,
+    int variant = 800,
+    bool packed = false,
+    mx::StreamOrDevice s = {});
+
+// Test helper: unpack Q4/Q5 codes to INT8 [N, group_count * 64]. Production
+// code never materializes this.
+mx::array qwen35_oq_a8_decode_weights(
+    const mx::array& weight,
+    int bits,
+    int group_count,
+    mx::StreamOrDevice s = {});
+
 mx::array qwen35_moe_weighted_sum(
     const mx::array& x_sorted,
     const mx::array& inv_order,
     const mx::array& scores,
+    mx::StreamOrDevice s = {});
+
+// True when the NAX sorted-expert gather kernel loaded on this machine.
+bool qwen35_gather_qmm_rhs_nax_ready();
+
+// Sorted-expert quantized gather matmul: y[r] = x[r] @ w[indices[r]].T for
+// row-contiguous x[..., K] whose rows match expert-sorted uint32 indices.
+// One dispatch for any row count (MLX 0.32.2's kernel overflows past 32767).
+mx::array qwen35_gather_qmm_rhs_t(
+    const mx::array& x,
+    const mx::array& weight,
+    const mx::array& scales,
+    const mx::array& biases,
+    const mx::array& indices,
+    int bits,
+    int group_size,
     mx::StreamOrDevice s = {});
 
 } // namespace omlx::qwen35_prefill_kernels

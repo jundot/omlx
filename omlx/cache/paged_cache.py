@@ -28,6 +28,7 @@ import hashlib
 import logging
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, NewType, Optional, Tuple
@@ -73,6 +74,11 @@ def resolve_block_extra_keys(
     ):
         return extra_keys
     return None
+
+
+# Tail index bounds. Entries are advisory and verified on every lookup.
+_TAIL_INDEX_PER_PARENT = 8
+_TAIL_INDEX_MAX_PARENTS = 4096
 
 
 def compute_block_hash(
@@ -569,6 +575,10 @@ class PagedCacheManager(CacheManager):
         # self._lock held and must not call back into this manager.
         self.on_block_hash_dropped: Callable[[BlockHash], None] | None = None
         self.on_hash_map_cleared: Callable[[], None] | None = None
+
+        # Tail blocks by chain parent (None for a root). A tail is shorter
+        # than a block, so the grid walk cannot derive its hash.
+        self._tail_index: Dict[Optional[BlockHash], "OrderedDict[BlockHash, int]"] = {}
 
         logger.info(
             f"PagedCacheManager initialized: block_size={block_size}, "
@@ -1082,6 +1092,22 @@ class PagedCacheManager(CacheManager):
                 num_cached_tokens += self.block_size
                 self.stats.hits += 1
 
+            # A tail under the last matched block (or the root) may still
+            # cover the tokens that follow the grid walk.
+            if num_cached_tokens < len(token_ids):
+                tail_block = self._match_tail_block(
+                    token_ids,
+                    parent_hash,
+                    num_cached_tokens,
+                    extra_keys=extra_keys,
+                    extra_key_token_start=extra_key_token_start,
+                    extra_key_ranges=extra_key_ranges,
+                )
+                if tail_block is not None:
+                    cached_blocks.append(tail_block)
+                    num_cached_tokens += tail_block.token_count
+                    self.stats.hits += 1
+
             return cached_blocks, num_cached_tokens
 
     # =========================================================================
@@ -1148,6 +1174,90 @@ class PagedCacheManager(CacheManager):
             )
             block.block_hash = block_hash
             self.cached_block_hash_to_block.insert(block_hash, block)
+
+    def register_tail_block(
+        self,
+        parent_hash: Optional[BlockHash],
+        tail_hash: BlockHash,
+        token_count: int,
+    ) -> None:
+        """Index a tail block under its chain parent for later lookup."""
+        if token_count <= 0:
+            return
+        with self._lock:
+            if (
+                parent_hash not in self._tail_index
+                and len(self._tail_index) >= _TAIL_INDEX_MAX_PARENTS
+            ):
+                self._tail_index.clear()
+            tails = self._tail_index.setdefault(parent_hash, OrderedDict())
+            tails.pop(tail_hash, None)
+            tails[tail_hash] = token_count
+            while len(tails) > _TAIL_INDEX_PER_PARENT:
+                tails.popitem(last=False)
+
+    def seed_tail_blocks(
+        self, entries: Iterable[Tuple[Optional[BlockHash], BlockHash, int]]
+    ) -> int:
+        """Rebuild the tail index from persisted block metadata."""
+        seeded = 0
+        for parent_hash, tail_hash, token_count in entries:
+            self.register_tail_block(parent_hash, tail_hash, token_count)
+            seeded += 1
+        return seeded
+
+    def _match_tail_block(
+        self,
+        token_ids: List[int],
+        parent_hash: Optional[BlockHash],
+        start: int,
+        extra_keys: Optional[Tuple[Any, ...]] = None,
+        extra_key_token_start: Optional[int] = None,
+        extra_key_ranges: Optional[List[Tuple[int, Tuple[Any, ...]]]] = None,
+    ) -> Optional[CacheBlock]:
+        """Find the longest tail block that prefixes ``token_ids[start:]``.
+
+        Stale entries are dropped on the way. Called with ``self._lock`` held.
+        """
+        tails = self._tail_index.get(parent_hash)
+        if not tails:
+            return None
+        remaining = len(token_ids) - start
+        for tail_hash, length in sorted(tails.items(), key=lambda kv: -kv[1]):
+            if length > remaining:
+                continue
+            end = start + length
+            expected = compute_block_hash(
+                parent_hash,
+                token_ids[start:end],
+                extra_keys=resolve_block_extra_keys(
+                    end,
+                    extra_keys=extra_keys,
+                    extra_key_token_start=extra_key_token_start,
+                    extra_key_ranges=extra_key_ranges,
+                ),
+                model_name=self.model_name,
+            )
+            if expected != tail_hash:
+                continue
+            block = self.cached_block_hash_to_block.get_block(tail_hash)
+            if block is None:
+                ssd = self._paged_ssd_cache_manager
+                if ssd is None or not ssd.has_block(tail_hash):
+                    tails.pop(tail_hash, None)
+                    if not tails:
+                        self._tail_index.pop(parent_hash, None)
+                    continue
+                block = self.allocate_block()
+                if block is None:
+                    return None
+                block.block_hash = tail_hash
+                block.token_count = length
+                block.ref_count = 0
+                self.cached_block_hash_to_block.insert(tail_hash, block)
+            tails.move_to_end(tail_hash)
+            return block
+        return None
 
     # =========================================================================
     # Block Table Management
@@ -1396,6 +1506,7 @@ class PagedCacheManager(CacheManager):
             self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
 
             self.cached_block_hash_to_block.clear()
+            self._tail_index.clear()
             if self.on_hash_map_cleared is not None:
                 self.on_hash_map_cleared()
             self.request_tables.clear()

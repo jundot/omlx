@@ -46,6 +46,28 @@ def _language_model(extra: dict | None = None):
     return LanguageModel(TextConfig.from_dict(params))
 
 
+@pytest.mark.parametrize(
+    "head_dim,query_len,gqa_factor,expected",
+    [
+        (256, 2, 8, True),
+        (256, 4, 8, True),
+        (256, 5, 8, False),
+        (192, 2, 8, False),
+        (96, 12, 8, True),
+        (512, 2, 8, False),
+    ],
+)
+def test_mlx0322_native_fused_shapes_are_not_intercepted(
+    head_dim, query_len, gqa_factor, expected
+):
+    assert (
+        gemma4_verify_attention._mlx0322_default_fused(
+            head_dim, query_len, gqa_factor
+        )
+        is expected
+    )
+
+
 def _run(lm, prompt_len: int, step_len: int, patched: bool):
     """Prefill ``prompt_len`` tokens then run one ``step_len`` forward."""
     mx.random.seed(7)

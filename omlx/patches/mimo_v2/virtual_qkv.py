@@ -66,7 +66,7 @@ def _model_args_class():
 
 
 def _is_fused_qkv_mimo(config) -> bool:
-    if str(config.get("model_type", "")).lower() != "mimo_v2":
+    if str(config.get("model_type", "")).lower() not in {"mimo_v2", "mimo_v2_flash"}:
         return False
     layout = config.get("attention_projection_layout")
     # Absent on older configs; the tensor scan below is the real gate.
@@ -170,19 +170,20 @@ def register(index, config) -> int:
     if not _is_fused_qkv_mimo(config):
         return 0
 
-    # Candidate keys come from the config rather than a scan of the index.
-    # That confines detection to the text backbone's own layers, so the MTP
-    # head (``model.mtp.layers.0.*``, which reuses SWA geometry while sitting
-    # at layer index 0) and the vision/audio towers can never reach the
-    # geometry check below. Scanning plus a layer-index regex would misread
-    # those and abort the run over tensors sanitize is about to discard.
+    # MTP heads always use sliding-window geometry, independent of their index.
     n_layers = int(config.get("num_hidden_layers") or 0)
     if n_layers <= 0:
         return 0
 
+    layers = [(fused_qkv_keys(i)[0], i) for i in range(n_layers)]
+    layers.extend(
+        (f"model.mtp.layers.{i}.self_attn", None)
+        for i in range(int(config.get("num_nextn_predict_layers") or 0))
+    )
     candidates = []
-    for layer_idx in range(n_layers):
-        prefix, qkv_key, scale_key = fused_qkv_keys(layer_idx)
+    for prefix, layer_idx in layers:
+        qkv_key = f"{prefix}.qkv_proj.weight"
+        scale_key = f"{qkv_key}_scale_inv"
         qkv_shape = index.source_shape(qkv_key)
         scale_shape = index.source_shape(scale_key)
         if qkv_shape is not None and scale_shape is not None:
@@ -197,7 +198,16 @@ def register(index, config) -> int:
     splitter = _ShardedQKVSplitter(index)
 
     for layer_idx, prefix, qkv_key, scale_key, qkv_shape, scale_shape in candidates:
-        n_h, n_kv, hd, vhd = layer_head_geometry(args, layer_idx)
+        n_h, n_kv, hd, vhd = (
+            (
+                args.swa_num_attention_heads,
+                args.swa_num_key_value_heads,
+                args.swa_head_dim,
+                args.swa_v_head_dim,
+            )
+            if layer_idx is None
+            else layer_head_geometry(args, layer_idx)
+        )
 
         # Refuse rather than guess: the declared geometry must reproduce the
         # on-disk shapes exactly, or we do not understand this checkpoint and
@@ -209,7 +219,7 @@ def register(index, config) -> int:
                 f"fused-qkv geometry mismatch for {qkv_key}: weight rows="
                 f"{qkv_shape[0]}, scale rows={scale_shape[0]} "
                 f"(block {FUSED_QKV_BLOCK_SIZE}) do not match the TP={tp} "
-                f"layout implied by the config for layer {layer_idx}"
+                f"layout implied by the config for {prefix}"
             )
 
         shapes = fused_qkv_split_shapes(n_h, n_kv, hd, vhd, tp, qkv_shape[1])

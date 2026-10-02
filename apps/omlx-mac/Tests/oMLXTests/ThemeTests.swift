@@ -35,6 +35,63 @@ final class ThemeTests: XCTestCase {
         XCTAssertLessThan(actual.alpha, 0.05)
     }
 
+    @MainActor
+    func testThemedViewUsesSavedReadabilityPreference() throws {
+        for scheme: ColorScheme in [.light, .dark] {
+            let base = scheme == .dark ? OMLXTheme.dark : OMLXTheme.light
+            for enabled in [false, true] {
+                let actual = try renderedTheme(scheme: scheme, readability: enabled)
+
+                XCTAssertEqual(actual.textSecondary, enabled ? base.text : base.textSecondary)
+                XCTAssertEqual(actual.textTertiary, enabled ? base.text : base.textTertiary)
+                XCTAssertEqual(actual.windowBg, base.windowBg)
+                XCTAssertEqual(actual.groupBg, base.groupBg)
+                if enabled {
+                    let appearance: NSAppearance.Name = scheme == .dark ? .darkAqua : .aqua
+                    let expected: RGBA
+                    if scheme == .dark {
+                        expected = (239 / 255.0, 91 / 255.0, 84 / 255.0, 1)
+                    } else {
+                        expected = (217 / 255.0, 45 / 255.0, 32 / 255.0, 1)
+                    }
+                    assertClose(resolvedRGBA(actual.redDot, appearance: appearance), expected)
+                    XCTAssertEqual(actual.warningText, actual.redDot)
+                } else {
+                    XCTAssertEqual(actual.redDot, base.redDot)
+                    XCTAssertEqual(actual.warningText, base.warningText)
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func renderedTheme(scheme: ColorScheme, readability: Bool) throws -> OMLXTheme {
+        let suiteName = "ThemeTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(readability, forKey: "OMLXEnhancedReadability")
+
+        var actual: OMLXTheme?
+        let renderer = ImageRenderer(content:
+            ThemeProbe { actual = $0 }
+                .omlxThemed()
+                .environment(\.colorScheme, scheme)
+                .defaultAppStorage(defaults)
+        )
+        XCTAssertNotNil(renderer.nsImage)
+        return try XCTUnwrap(actual)
+    }
+
+    private struct ThemeProbe: View {
+        @Environment(\.omlxTheme) private var theme
+        let record: (OMLXTheme) -> Void
+
+        var body: some View {
+            let _ = record(theme)
+            Color.clear.frame(width: 1, height: 1)
+        }
+    }
+
     private typealias RGBA = (
         red: CGFloat,
         green: CGFloat,

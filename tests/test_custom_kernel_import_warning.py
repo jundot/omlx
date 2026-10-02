@@ -55,3 +55,9 @@ def test_missing_native_extension_stays_silent(tmp_path, caplog, kernel):
         fast = _import_fast_copy(tmp_path, kernel, name, with_broken_ext=False)
     assert not fast.is_native_available()
     assert [r for r in caplog.records if r.name == f"{name}.fast"] == []
+
+
+@pytest.mark.parametrize("kernel", custom_kernels.NATIVE_KERNEL_PACKAGES)
+def test_kernel_links_relative_mlx_rpath(kernel):
+    cmake = Path(custom_kernels.__file__).parent / kernel / "csrc" / "CMakeLists.txt"
+    assert "-Wl,-rpath,@loader_path/../../../mlx/lib" in cmake.read_text()

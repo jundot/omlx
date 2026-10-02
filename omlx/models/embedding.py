@@ -17,12 +17,19 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map
 
-from ..utils.compile_cache import clear_thread_compile_cache
+from ..patches.modernbert_attention import patch_modernbert_attention
 from ..utils.image import validate_image_data_uri
-from .base_model import last_token_pool, mean_pooling, normalize_embeddings
+from .base_model import (
+    ENCODER_BATCH_TOKEN_BUDGET,
+    last_token_pool,
+    mean_pooling,
+    normalize_embeddings,
+    token_budget_batches,
+)
 from .mlx_embeddings_compat import (
+    patch_qwen3_vl_position_ids_recompute,
     patch_qwen3_vl_processor_for_torch_free_image_loading,
 )
 
@@ -100,6 +107,45 @@ class MLXEmbeddingModel:
         self._remap_input_ids_to_inputs = False
         self._pooling_mode: Optional[str] = None
         self._pooling_source: str = "not resolved"
+
+    # (hidden_size, num_hidden_layers) of Qwen3-Embedding-0.6B and -8B.
+    _FP16_PROMOTE_SHAPES = {(1024, 28), (4096, 36)}
+
+    def _should_promote_to_fp16(self) -> bool:
+        """Match an unquantized Qwen3-Embedding 0.6B or 8B checkpoint.
+
+        bf16 matmuls miss the 1e-3 fp32 conformance gate on these models
+        (max |delta| 0.0037 vs 0.0006 in fp16). Other sizes are not validated.
+        """
+        try:
+            with open(Path(self.model_name) / "config.json") as fh:
+                cfg = json.load(fh)
+        except (OSError, ValueError):
+            return False
+        if not isinstance(cfg, dict) or cfg.get("model_type") != "qwen3":
+            return False
+        if cfg.get("quantization") or cfg.get("quantization_config"):
+            return False
+        name = f"{self.model_name} {cfg.get('_name_or_path') or ''}".lower()
+        if "qwen3-embedding" not in name:
+            return False
+        shape = (cfg.get("hidden_size"), cfg.get("num_hidden_layers"))
+        return shape in self._FP16_PROMOTE_SHAPES
+
+    def _promote_bf16_to_fp16(self, module: Any) -> None:
+        if not self._should_promote_to_fp16():
+            return
+        params = module.parameters()
+        if not any(v.dtype == mx.bfloat16 for _, v in tree_flatten(params)):
+            return
+        module.update(
+            tree_map(
+                lambda a: a.astype(mx.float16) if a.dtype == mx.bfloat16 else a,
+                params,
+            )
+        )
+        mx.eval(module.parameters())
+        logger.info("Promoted bfloat16 parameters to float16 for %s", self.model_name)
 
     # Fallbacks for MLX conversions that dropped the sentence-transformers
     # metadata. Reviewed against the concrete checkpoints on the Hub: none of
@@ -321,6 +367,7 @@ class MLXEmbeddingModel:
         # 2. Fallback to mlx-embeddings
         try:
             patch_qwen3_vl_processor_for_torch_free_image_loading()
+            patch_qwen3_vl_position_ids_recompute()
             from mlx_embeddings import load
 
             logger.info(f"Loading embedding model via mlx-embeddings: {self.model_name}")
@@ -329,6 +376,8 @@ class MLXEmbeddingModel:
                 self.model_name,
                 tokenizer_config={"trust_remote_code": self.trust_remote_code},
             )
+            patch_modernbert_attention(self.model)
+            self._promote_bf16_to_fp16(self.model)
 
             if hasattr(self.model, "config"):
                 config = self.model.config
@@ -741,7 +790,6 @@ class MLXEmbeddingModel:
         gc.collect()
         mx.synchronize()
         mx.clear_cache()
-        clear_thread_compile_cache()
         gc.collect()
 
     def embed(
@@ -768,6 +816,10 @@ class MLXEmbeddingModel:
             self.load()
 
         max_length = self._resolve_max_length(max_length)
+        # Absolute position tables read out of range without an error.
+        position_limit = getattr(self.model, "max_input_length", None)
+        if isinstance(position_limit, int):
+            max_length = min(max_length, position_limit)
         normalized_inputs = self._normalize_embedding_inputs(inputs)
         for item in normalized_inputs:
             image_ref = item.get("image")
@@ -781,7 +833,14 @@ class MLXEmbeddingModel:
 
         processor = self.processor
         uses_custom_embedding_inputs = self._uses_custom_embedding_inputs(processor)
-        if hasattr(processor, "_tokenizer") and not uses_custom_embedding_inputs:
+        # Unwrap only mlx-embeddings' TokenizerWrapper. transformers tokenizers
+        # also have a Rust _tokenizer whose encode() applies tokenizer.json
+        # padding and truncation instead of this request's settings.
+        if (
+            type(processor).__name__ == "TokenizerWrapper"
+            and hasattr(processor, "_tokenizer")
+            and not uses_custom_embedding_inputs
+        ):
             processor = processor._tokenizer
 
         if has_image_inputs and (self._using_native or not uses_custom_embedding_inputs):
@@ -789,8 +848,77 @@ class MLXEmbeddingModel:
                 f"Embedding model '{self.model_name}' does not support image inputs"
             )
 
+        batches = [list(range(len(normalized_inputs)))]
+        if (
+            not uses_custom_embedding_inputs
+            and 1 < len(input_texts) == len(normalized_inputs)
+            and len(input_texts) * max_length > ENCODER_BATCH_TOKEN_BUDGET
+        ):
+            lengths = self._text_token_lengths(
+                processor, input_texts, max_length, truncation
+            )
+            batches = token_budget_batches(lengths, ENCODER_BATCH_TOKEN_BUDGET)
+
+        positions: list[int] = []
+        rows: list[list[float]] = []
+        total_tokens: int | None = 0
+        for batch in batches:
+            embeddings_array, batch_tokens = self._embed_batch(
+                processor,
+                [normalized_inputs[i] for i in batch],
+                max_length,
+                padding,
+                truncation,
+                uses_custom_embedding_inputs,
+            )
+            # Evaluate per batch so peak memory stays at one batch.
+            mx.eval(embeddings_array)
+            positions.extend(batch)
+            rows.extend(embeddings_array.tolist())
+            if total_tokens is not None and batch_tokens is not None:
+                total_tokens += batch_tokens
+            else:
+                total_tokens = None
+        embeddings = [
+            row for _, row in sorted(zip(positions, rows), key=lambda pair: pair[0])
+        ]
+        if total_tokens is None:
+            total_tokens = self._count_tokens(normalized_inputs)
+        dimensions = len(embeddings[0]) if embeddings else 0
+
+        return EmbeddingOutput(
+            embeddings=embeddings,
+            total_tokens=total_tokens,
+            dimensions=dimensions,
+        )
+
+    def _text_token_lengths(
+        self, processor, texts: list[str], max_length: int, truncation: bool
+    ) -> list[int]:
+        """Return the token count of each text as the batch tokenizer sees it."""
+        if callable(processor):
+            encoded = processor(
+                texts, padding=False, truncation=truncation, max_length=max_length
+            )
+            return [len(ids) for ids in encoded["input_ids"]]
+        lengths = [
+            len(processor.encode(text, add_special_tokens=True).ids) for text in texts
+        ]
+        return [min(n, max_length) for n in lengths] if truncation else lengths
+
+    def _embed_batch(
+        self,
+        processor,
+        normalized_inputs: list[dict[str, str]],
+        max_length: int,
+        padding: bool,
+        truncation: bool,
+        uses_custom_embedding_inputs: bool,
+    ) -> tuple[mx.array, int | None]:
+        """Run one padded batch and return its embeddings and token count."""
         embeddings_array = None
-        total_tokens: Optional[int] = None
+        total_tokens: int | None = None
+        input_texts = [item["text"] for item in normalized_inputs if "text" in item]
 
         if self._using_native:
             if hasattr(processor, "__call__"):
@@ -879,17 +1007,7 @@ class MLXEmbeddingModel:
                     )
                 embeddings_array = self._extract_embeddings_array(outputs, eager_mask)
 
-        mx.eval(embeddings_array)
-        embeddings = embeddings_array.tolist()
-        if total_tokens is None:
-            total_tokens = self._count_tokens(normalized_inputs)
-        dimensions = len(embeddings[0]) if embeddings else 0
-
-        return EmbeddingOutput(
-            embeddings=embeddings,
-            total_tokens=total_tokens,
-            dimensions=dimensions,
-        )
+        return embeddings_array, total_tokens
 
     def _count_tokens(
         self, inputs: Union[List[str], List[Dict[str, str]]]

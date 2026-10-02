@@ -127,7 +127,10 @@ class TestDisconnectGuard:
             )
 
     @pytest.mark.asyncio
-    async def test_stream_disconnect_releases_lease_after_pool_lock_clears(self):
+    @pytest.mark.parametrize("pending_unload", [False, True])
+    async def test_stream_disconnect_releases_lease_with_pool_lock_held(
+        self, pending_unload, monkeypatch
+    ):
         """ASGI cancellation must not permanently pin the streamed model."""
         pool = EnginePool()
         engine = MagicMock()
@@ -142,6 +145,9 @@ class TestDisconnectGuard:
             last_access=1.0,
             in_use=1,
         )
+        if pending_unload:
+            pool._entries["model"].pending_unload_reason = "manual unload"
+        unload = AsyncMock()
         lease = server._LLMEngineLease(model_id="model")
 
         async def blocked_stream():
@@ -152,6 +158,7 @@ class TestDisconnectGuard:
             async for _ in server._release_after_stream(blocked_stream(), lease):
                 pass
 
+        monkeypatch.setattr(pool, "_unload_pending_if_idle_locked", unload)
         await pool._lock.acquire()
         try:
             with patch.object(server, "get_engine_pool", return_value=pool):
@@ -161,12 +168,17 @@ class TestDisconnectGuard:
                     task_group.cancel_scope.cancel()
 
             assert lease.released is True
-            assert pool._entries["model"].in_use == 1
-            assert len(pool._lease_release_tasks) == 1
+            assert pool._entries["model"].in_use == int(pending_unload)
+            if pending_unload:
+                assert len(pool._lease_release_tasks) == 1
         finally:
             pool._lock.release()
 
         await pool._drain_lease_release_tasks()
 
         assert pool._entries["model"].in_use == 0
-        assert pool._find_lru_victim() == "model"
+        if pending_unload:
+            unload.assert_awaited_once_with("model")
+        else:
+            unload.assert_not_awaited()
+            assert pool._find_lru_victim() == "model"

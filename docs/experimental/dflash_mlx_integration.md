@@ -55,6 +55,8 @@ DFlashEngine is a `BaseEngine` implementation that:
 |------|------|
 | `omlx/engine/dflash.py` | DFlashEngine class — BaseEngine impl, event consumer, fallback routing |
 | `omlx/patches/dflash_laguna.py` | Laguna target adapter, gated drafter, fused-QKV loader, and mixed-cache rollback |
+| `omlx/patches/dflash_mimo_v2.py` | MiMo V2 target adapter, trained-mask loader, draft attention, and mixed-cache rollback |
+| `omlx/patches/dflash_glm5.py` | GLM-5.3 target adapter (mlx-vlm loader, MHC-contracted capture, chunked prefill, KDA replay + DSA pooling rollback) |
 | `omlx/engine/__init__.py` | DFlashEngine export (required dependency) |
 | `omlx/engine_pool.py` | DFlash routing: checks `dflash_enabled` before engine type switch |
 | `omlx/model_settings.py` | Per-model settings: `dflash_enabled`, `dflash_draft_model`, `dflash_draft_quant_bits` |
@@ -73,7 +75,7 @@ DFlashEngine is a `BaseEngine` implementation that:
 
 ### Supported models
 
-DFlash registers `QwenGdnTargetOps`, `Gemma4TargetOps`, and `MuseGlimmerTargetOps`. oMLX also registers a Laguna backend and the `DFlashLagunaForCausalLM` drafter used by Poolside's official checkpoints:
+DFlash registers `QwenGdnTargetOps`, `Gemma4TargetOps`, and `MuseGlimmerTargetOps`. oMLX also registers Laguna, MiMo V2, and GLM-5.3 target backends (plus the `DFlashLagunaForCausalLM` drafter used by Poolside's official checkpoints). The pinned runtime already contains the generic `DFlash2DraftModel` that GLM-5.3's drafter uses:
 
 | Target model | Draft checkpoint |
 |--------------|-----------------|
@@ -94,7 +96,9 @@ DFlash registers `QwenGdnTargetOps`, `Gemma4TargetOps`, and `MuseGlimmerTargetOp
 | poolside/Laguna-XS-2.1-NVFP4-mlx | poolside/Laguna-XS-2.1-DFlash-NVFP4 |
 | poolside/Laguna-S-2.1 | poolside/Laguna-S-2.1-DFlash |
 | poolside/Laguna-S-2.1-NVFP4-mlx | poolside/Laguna-S-2.1-DFlash-NVFP4 |
+| Vontra/MiMo-V2.6-Flash-RL-MLX-4bit-MTP | Bundled `dflash/` checkpoint |
 | meta-models/Muse-Glimmer-30B | meta-models/Muse-Glimmer-30B-assistant |
+| zai-org/GLM-5.3-Flash (and matched MLX quantizations, e.g. Jundot/GLM-5.3-Flash-oQ4e) | incoai/GLM-5.3-Flash-DFlash2 (set `dflash_draft_model` to its local path) |
 
 Other model families (Llama, Gemma3, etc.) are not supported — they require both a trained DFlash draft checkpoint and a compatible target adapter in dflash-mlx.
 
@@ -135,6 +139,28 @@ Note: the `-DFlash` suffix is specific to DFlash draft checkpoints. Gemma4 also 
 | `dflash_ssd_cache` | bool | Enable DFlash L2 snapshot spill |
 
 Configured via web admin UI → Model Settings → Experimental Features → DFlash.
+MiMo V2.6 repositories can bundle their trained drafter under `dflash/`. When
+that directory contains the drafter weights and `mask_embedding.pt`, enabling
+DFlash finds it automatically; an explicitly configured draft path still wins.
+
+GLM-5.3 (`model_type: glm5_next`) is served through mlx-vlm, so
+`DFlashEngine` loads it with the same vendored module, pre-quantization
+sanitize scope and eager materialization as `VLMBatchedEngine`, wires the
+`glm47` tool parser onto the DFlash tokenizer, and unions the checkpoint's
+`generation_config.json` EOS ids (`<|user|>`, `<|observation|>`) into the
+runtime stop list. Its hyper-connection residual streams are contracted
+(mean over the `hc_mult` axis, the model's own final contraction) before the
+five configured target-layer captures. Rejected verify tokens are rolled back
+exactly: recurrent KDA layers replay the accepted prefix through the vendored
+linear-attention forward from a state snapshot, and DSA layers trim their
+`CacheList(KVCache, PoolingCache)` through the MTP pooling undo log (which
+now covers verify blocks up to 16 tokens, so `dflash_block_size` must stay at
+or below 16). Cold prefill is chunked inside the adapter at the runtime
+`prefill_step_size`. The DFlash L1/L2 prefix cache, DDTree verification,
+verify-linear kernels and target KV quantization are disabled for this target
+until codecs for the composite DSA cache are parity-proven; image requests
+still take the evict-and-VLM-fallback path. The published drafter is CC
+BY-NC-ND 4.0 and is neither bundled nor downloaded automatically.
 
 ---
 
@@ -215,7 +241,7 @@ DFlash effectiveness degrades with long contexts:
 
 ### 3. Model support
 
-Qwen, Gemma4, and Laguna have compatible target adapters and published draft checkpoints. Each additional model family still requires:
+Qwen, Gemma4, Laguna, Muse Glimmer, MiMo V2, and GLM-5.3 have compatible target adapters and published draft checkpoints. Each additional model family still requires:
 - A trained DFlash draft checkpoint (block diffusion model matching target hidden dimensions)
 - Support in dflash-mlx's target model handling (hidden state extraction, cache rollback)
 
@@ -310,6 +336,7 @@ DFlash context fallback: 5120 >= 4096, evicting dflash models and switching to v
 - DFlashEngine: properties, stats, cache stats
 - EnginePool routing: disabled/enabled/draft model checks
 - Laguna: native-forward parity, hidden-state capture, full/rotating-cache rollback, gated draft forward, target binding, and fused-QKV checkpoint loading
+- GLM-5.3: compat gate, draft pairing, MHC-contracted capture, chunked prefill equivalence, KDA replay parity, DSA pooling rollback (up to 16-token blocks), mlx-vlm loader routing, and lifecycle cleanup (`tests/test_dflash_glm5.py`)
 
 ### Manual testing
 

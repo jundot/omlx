@@ -32,7 +32,7 @@ def test_dashboard_defaults_and_posts_audio_upload_limit():
 
     assert "max_audio_upload_size: '100MB'" in script
     assert "max_audio_upload_size:" in payload
-    assert "Maximum Audio Upload Size" in payload
+    assert "window.t('settings.advanced.max_audio_upload_size')" in payload
 
 
 def test_audio_upload_i18n_keys_exist_in_every_locale():
