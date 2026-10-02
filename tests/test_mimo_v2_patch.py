@@ -370,10 +370,14 @@ def test_lightning_mtp_heads_forward_and_adapter_contract():
     assert first_hidden.shape == (1, 2, 128)
     assert mtp_cache.layer_idx == 1
 
-    second_logits = model.mtp_forward(first_hidden[:, -1:], mx.array([[4]]), mtp_cache)
+    from omlx.patches.mlx_lm_mtp.batch_generator import _clone_mtp_head_cache
+
+    # Draft steps run on the generator's per-cycle clone.
+    draft_cache = _clone_mtp_head_cache(mtp_cache)
+    second_logits = model.mtp_forward(first_hidden[:, -1:], mx.array([[4]]), draft_cache)
     mx.eval(logits, first_logits, second_logits)
     assert second_logits.shape == (1, 1, 1000)
-    assert mtp_cache.layer_idx == 2
+    assert draft_cache.layer_idx == 2 and mtp_cache.layer_idx == 1
 
     changed_hidden = mx.concatenate([hidden[:, :1], hidden[:, 1:] + 5], axis=1)
     original_logits = model.mtp_forward(
@@ -705,17 +709,19 @@ def test_mtp_partial_rollback_after_rotation(accepted):
 
 
 def test_mtp_draft_clone_preserves_head_index_and_isolates_cache():
-    from omlx.patches.mlx_lm_mtp import set_mtp_active
+    from omlx.patches.mlx_lm_mtp import set_mtp_active, set_mtp_depth
     from omlx.patches.mlx_lm_mtp.batch_generator import _clone_mtp_head_cache
 
     module = _load_patch_module()
     set_mtp_active(True)
+    set_mtp_depth(3)
     try:
         model = module.Model(
             module.ModelArgs.from_dict(_minimal_config(num_nextn_predict_layers=3))
         )
     finally:
         set_mtp_active(False)
+        set_mtp_depth(1)
     cache = model.make_mtp_cache()
     hidden = mx.ones((1, 1, 128))
     ids = mx.array([[1]])
@@ -727,6 +733,179 @@ def test_mtp_draft_clone_preserves_head_index_and_isolates_cache():
     assert cache.layer_idx == 1
     assert clone[1].offset == 1
     assert cache[1].offset == 0
+
+
+def _mtp_model(depth=3, **overrides):
+    from omlx.patches.mlx_lm_mtp import set_mtp_active, set_mtp_depth
+
+    module = _load_patch_module()
+    config = _minimal_config(num_nextn_predict_layers=3, **overrides)
+    set_mtp_active(True)
+    set_mtp_depth(depth)
+    try:
+        return module.Model(module.ModelArgs.from_dict(config))
+    finally:
+        set_mtp_active(False)
+        set_mtp_depth(1)
+
+
+def _parallel_reference(model, hidden, tokens, drafts=()):
+    """Each head over a fresh cache: layer k pairs trunk row q with token
+    q+k+1 (``tokens[:, q]`` is token q+1; ``drafts`` continue the stream)."""
+    embed = model.model.embed_tokens
+    stream = mx.concatenate([tokens] + [mx.array([[int(d)]]) for d in drafts], axis=1)
+    n = int(hidden.shape[1])
+    outputs = []
+    for k, (layer, cache) in enumerate(zip(model.mtp.layers, model.make_mtp_cache())):
+        m = min(n, n + len(drafts) - k)
+        outputs.append(layer(hidden[:, :m], embed(stream[:, k : k + m]), cache))
+    return outputs
+
+
+def _fold_chunks(model, cache, hidden, tokens, chunks, *, begin):
+    outs, start = [], 0
+    for size in chunks:
+        if begin:
+            model.mtp_begin_cycle(cache, 3)
+        _, out = model.mtp_forward(
+            hidden[:, start : start + size],
+            tokens[:, start : start + size],
+            cache,
+            return_hidden=True,
+            logits_keep=1,
+        )
+        outs.append(out)
+        start += size
+    assert start == hidden.shape[1]
+    return mx.concatenate(outs, axis=1)
+
+
+def _draft_two(model, cache, last_out, d1, d2):
+    from omlx.patches.mlx_lm_mtp.batch_generator import _clone_mtp_head_cache
+
+    clone = _clone_mtp_head_cache(cache)
+    # The generator passes the previous head output; MiMo's heads ignore it.
+    _, out1 = model.mtp_forward(last_out[:, -1:], mx.array([[d1]]), clone, return_hidden=True)
+    _, out2 = model.mtp_forward(out1[:, -1:], mx.array([[d2]]), clone, return_hidden=True)
+    return clone, out1, out2
+
+
+def _close(a, b):
+    return mx.allclose(a, b, atol=1e-4, rtol=1e-4).item()
+
+
+@pytest.mark.parametrize(
+    "window,chunks", [(32, [3, 1, 4, 2, 2]), (8, [8, 1, 1, 5, 2, 3])]
+)
+def test_mtp_heads_fold_and_draft_from_the_trunk_hidden(window, chunks):
+    model = _mtp_model(sliding_window_size=window)
+    n, d1, d2 = sum(chunks), 7, 9
+    mx.random.seed(0)
+    hidden = mx.random.normal((1, n, 128))
+    tokens = mx.random.randint(0, 1000, (1, n))
+    ref = _parallel_reference(model, hidden, tokens, drafts=(d1, d2))
+
+    cache = model.make_mtp_cache()
+    out0 = _fold_chunks(model, cache, hidden, tokens, chunks, begin=True)
+    clone, out1, out2 = _draft_two(model, cache, out0, d1, d2)
+    mx.eval(out0, out1, out2, *ref)
+
+    assert _close(out0, ref[0])
+    assert out1.shape[1] == 1 and _close(out1, ref[1][:, -1:])
+    assert out2.shape[1] == 2 and _close(out2, ref[2][:, -2:])
+    # Committed history only in the persistent cache; drafts live on the clone.
+    assert [c.offset for c in cache] == [n, n - 1, n - 2]
+    assert [c.offset for c in clone] == [n, n, n]
+    assert cache.layer_idx == 1 and clone.layer_idx == 3
+    assert cache.draft_tokens == () and len(clone.draft_tokens) == 2
+
+
+def test_mtp_priming_folds_feed_every_head_without_a_cycle():
+    # Prompt priming folds the prompt tail and the activation seam without
+    # mtp_begin_cycle; every head's history must advance all the same.
+    model = _mtp_model()
+    n = 6
+    mx.random.seed(1)
+    hidden = mx.random.normal((1, n + 1, 128))
+    tokens = mx.random.randint(0, 1000, (1, n + 1))
+    ref = _parallel_reference(model, hidden, tokens, drafts=(11, 12))
+
+    cache = model.make_mtp_cache()
+    _fold_chunks(model, cache, hidden[:, :n], tokens[:, :n], [5, 1], begin=False)
+    assert cache.in_cycle is False
+    assert [c.offset for c in cache] == [n, n - 1, n - 2]
+    out0 = _fold_chunks(model, cache, hidden[:, n:], tokens[:, n:], [1], begin=True)
+    _, out1, out2 = _draft_two(model, cache, out0, 11, 12)
+    mx.eval(out0, out1, out2, *ref)
+
+    assert _close(out0, ref[0][:, -1:])
+    assert _close(out1, ref[1][:, -1:])
+    assert _close(out2, ref[2][:, -2:])
+
+
+def test_mtp_fold_skips_heads_past_the_loaded_depth():
+    from omlx.patches.mlx_lm_mtp.batch_generator import _clone_mtp_head_cache
+
+    model = _mtp_model(depth=1)
+    cache = model.make_mtp_cache()
+    model.mtp_begin_cycle(cache, 1)
+    model.mtp_forward(mx.ones((1, 4, 128)), mx.array([[1, 2, 3, 4]]), cache)
+    assert [c.offset for c in cache] == [4, 0, 0]
+    assert cache.trunk_rows is None
+    with pytest.raises(ValueError):
+        model.mtp_forward(
+            mx.ones((1, 1, 128)), mx.array([[5]]), _clone_mtp_head_cache(cache)
+        )
+
+
+def test_mtp_history_fold_after_an_abandoned_cycle():
+    # MTP can park mid-cycle and later resume: the generator then folds the
+    # tokens decoded while parked, and the activation seam, into the
+    # persistent cache without mtp_begin_cycle. The cache still carries the
+    # last cycle's state (in_cycle, layer_idx 1); those calls must fold every
+    # head, not run as draft steps (which paired the whole history with one
+    # trunk row and failed to concatenate).
+    model = _mtp_model()
+    n1, n2, d1, d2 = 4, 6, 7, 9
+    n = n1 + n2 + 2
+    mx.random.seed(3)
+    hidden = mx.random.normal((1, n, 128))
+    tokens = mx.random.randint(0, 1000, (1, n))
+    ref = _parallel_reference(model, hidden, tokens, drafts=(d1, d2))
+
+    cache = model.make_mtp_cache()
+    out = _fold_chunks(model, cache, hidden[:, :n1], tokens[:, :n1], [n1], begin=True)
+    _draft_two(model, cache, out, 5, 6)  # the abandoned cycle's drafts
+    assert cache.in_cycle and cache.layer_idx == 1
+
+    history = _fold_chunks(
+        model, cache, hidden[:, n1 : n1 + n2], tokens[:, n1 : n1 + n2], [n2], begin=False
+    )
+    seam = _fold_chunks(
+        model, cache, hidden[:, n1 + n2 : n - 1], tokens[:, n1 + n2 : n - 1], [1], begin=False
+    )
+    assert [c.offset for c in cache] == [n - 1, n - 2, n - 3]
+    out0 = _fold_chunks(model, cache, hidden[:, n - 1 :], tokens[:, n - 1 :], [1], begin=True)
+    _, out1, out2 = _draft_two(model, cache, out0, d1, d2)
+    mx.eval(history, seam, out0, out1, out2, *ref)
+
+    assert _close(history, ref[0][:, n1 : n1 + n2])
+    assert _close(seam, ref[0][:, n - 2 : n - 1])
+    assert _close(out0, ref[0][:, -1:])
+    assert _close(out1, ref[1][:, -1:])
+    assert _close(out2, ref[2][:, -2:])
+
+
+def test_mtp_predictor_module_runs_the_heads_in_parallel():
+    model = _mtp_model()
+    mx.random.seed(2)
+    hidden = mx.random.normal((1, 5, 128))
+    tokens = mx.random.randint(0, 1000, (1, 5))
+    outs = model.mtp(hidden, tokens, model.model.embed_tokens, model.make_mtp_cache())
+    ref = _parallel_reference(model, hidden, tokens)
+    mx.eval(*outs, *ref)
+    assert [o.shape[1] for o in outs] == [5, 4, 3]
+    assert all(_close(o, r) for o, r in zip(outs, ref))
 
 
 @pytest.mark.parametrize("layout", ["root", "nested"])
