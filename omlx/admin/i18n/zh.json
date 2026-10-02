@@ -159,6 +159,8 @@
   "status.integrations.copy_command_tooltip": "复制命令",
   "status.engines.section_label": "引擎版本",
   "status.engines.unknown_version": "未知",
+  "status.runtime.section_label": "MLX 运行时",
+  "status.runtime.not_installed": "未安装",
   "status.active_models.last_token_ago": "最后 Token {age}前",
   "status.integrations.claude_code": "Claude Code",
   "status.integrations.copilot_cli": "Copilot CLI",

@@ -7,6 +7,18 @@
         </div>
     </div>
     <div class="divide-y divide-neutral-100">
+        <!-- Installed MLX runtime stack. Read-only introspection; a package that
+             is not installed reports version null and shows "not installed". -->
+        <div class="px-6 py-2 bg-neutral-50">
+            <span class="text-[11px] font-semibold uppercase tracking-wider text-neutral-500" x-text="window.t('status.runtime.section_label')"></span>
+        </div>
+        <template x-for="[key, rt] in Object.entries(stats.runtime || {})" :key="'runtime-' + key">
+            <div class="flex items-center justify-between px-6 py-4">
+                <label class="text-sm text-neutral-700 font-medium" x-text="rt.name"></label>
+                <code class="px-3 py-1.5 bg-neutral-50 rounded-lg text-sm font-mono text-neutral-700"
+                      x-text="rt.version || window.t('status.runtime.not_installed')"></code>
+            </div>
+        </template>
         <template x-for="[key, engine] in Object.entries(stats.engines || {})" :key="key">
             <div class="flex items-center justify-between px-6 py-4">
                 <label class="text-sm text-neutral-700 font-medium" x-text="engine.name"></label>

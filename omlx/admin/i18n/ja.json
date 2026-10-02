@@ -159,6 +159,8 @@
   "status.integrations.copy_command_tooltip": "コマンドをコピー",
   "status.engines.section_label": "エンジンバージョン",
   "status.engines.unknown_version": "不明",
+  "status.runtime.section_label": "MLX ランタイム",
+  "status.runtime.not_installed": "未インストール",
   "status.active_models.last_token_ago": "last token {age} ago",
   "status.integrations.claude_code": "Claude Code",
   "status.integrations.copilot_cli": "Copilot CLI",
