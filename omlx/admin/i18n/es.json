@@ -55,6 +55,7 @@
   "navbar.logout": "Cerrar sesión",
   "navbar.update_available": "Actualización disponible: v{version}",
   "navbar.go_to_github": "Ir a GitHub",
+  "navbar.copy_version": "Copiar versión",
   "status.section_label": "Panel",
   "status.heading": "Estadísticas de Servicio",
   "status.layout.customize": "Customize dashboard",

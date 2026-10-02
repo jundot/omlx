@@ -55,6 +55,7 @@
   "navbar.logout": "退出登录",
   "navbar.update_available": "有可用更新：v{version}",
   "navbar.go_to_github": "前往 GitHub",
+  "navbar.copy_version": "复制版本号",
   "status.section_label": "仪表盘",
   "status.heading": "服务统计",
   "status.layout.customize": "Customize dashboard",

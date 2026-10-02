@@ -55,6 +55,7 @@
   "navbar.logout": "Выйти",
   "navbar.update_available": "Доступно обновление: v{version}",
   "navbar.go_to_github": "Перейти на GitHub",
+  "navbar.copy_version": "Копировать версию",
   "status.section_label": "Панель",
   "status.heading": "Статистика сервера",
   "status.layout.customize": "Customize dashboard",

@@ -55,6 +55,7 @@
   "navbar.logout": "Déconnexion",
   "navbar.update_available": "Mise à jour disponible : v{version}",
   "navbar.go_to_github": "Aller à GitHub",
+  "navbar.copy_version": "Copier la version",
   "status.section_label": "Tableau de bord",
   "status.heading": "Statistiques de service",
   "status.layout.customize": "Customize dashboard",

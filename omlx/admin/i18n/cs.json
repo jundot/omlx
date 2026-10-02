@@ -55,6 +55,7 @@
   "navbar.logout": "Odhlásit se",
   "navbar.update_available": "K dispozici je aktualizace: v{version}",
   "navbar.go_to_github": "Přejít na GitHub",
+  "navbar.copy_version": "Kopírovat verzi",
   "status.section_label": "Přehled",
   "status.heading": "Statistiky obsluhy",
   "status.layout.customize": "Přizpůsobit přehled",
