@@ -88,6 +88,21 @@ class Omlx < Formula
     pip_install = [libexec/"bin/pip", "install", *pip_flags, "--no-binary", no_binary]
 
     if build.with?("custom-kernel")
+      # `metal` is not part of the Command Line Tools, so on a CLT-only
+      # machine the kernel build dies deep inside CMake with
+      # `xcrun: error: unable to find utility "metal"`. Probe up front so the
+      # build fails immediately with a hint instead (issue #2112).
+      if metal_toolchain_path.nil?
+        odie <<~EOS
+          --with-custom-kernel requires the Metal compiler, but `xcrun -f metal` found none.
+          It ships with full Xcode, and on current Xcode versions is a separate component:
+
+            xcodebuild -downloadComponent MetalToolchain
+
+          Otherwise install omlx without the custom kernels: brew install omlx
+        EOS
+      end
+
       kernel_sources = CUSTOM_KERNELS.map do |kernel|
         buildpath/"omlx/custom_kernels/#{kernel}/csrc"
       end
@@ -232,6 +247,16 @@ class Omlx < Formula
 
     ohai "  verifying custom kernel imports..."
     verify_custom_kernels(python)
+  end
+
+  # Absolute path to the Metal compiler, or nil when it is not installed.
+  # `xcrun -f metal` exits non-zero when only the Command Line Tools are
+  # present, so the probe covers both "no metal" and "metal elsewhere".
+  def metal_toolchain_path
+    path = Utils.safe_popen_read("/usr/bin/xcrun", "-f", "metal").strip
+    path if !path.empty? && File.exist?(path)
+  rescue ErrorDuringExecution
+    nil
   end
 
   def verify_custom_kernels(python)

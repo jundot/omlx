@@ -20,6 +20,11 @@ macOS 27 betas broke `brew install omlx` in several ways (issue #2110):
   so a prebuilt wheel could clobber a source-built package, and pip's
   wheel cache could resurrect a dylib built before the strip guards.
 
+Issue #2112 left one gap in the custom-kernel path: the Metal compiler is
+not part of the Command Line Tools, so a CLT-only machine died deep inside
+the CMake kernel build with `unable to find utility "metal"` instead of
+getting an actionable message up front.
+
 The formula and workflow use Ruby and shell syntax, so these are text-level
 assertions that the guards stay present.
 """
@@ -135,3 +140,29 @@ class TestCustomKernelBuild:
     def test_kernel_verification_not_shadowed_by_buildpath(self, formula):
         """Import check must run outside buildpath's raw omlx/ source tree."""
         assert "Dir.chdir(libexec)" in formula
+
+
+class TestMetalToolchainGuard:
+    """Issue #2112: `metal` ships with Xcode, not the Command Line Tools."""
+
+    def test_guard_runs_before_any_kernel_build_work(self, formula):
+        """Probe for `metal` before the kernel build can start, not inside CMake."""
+        block_start = formula.index('if build.with?("custom-kernel")')
+        guard_at = formula.index("metal_toolchain_path", block_start)
+        kernel_env_at = formula.index('ENV["OMLX_WITH_CUSTOM_KERNEL"]', block_start)
+
+        assert block_start < guard_at < kernel_env_at
+        assert '"/usr/bin/xcrun", "-f", "metal"' in formula
+
+    def test_missing_toolchain_odie_names_the_fix(self, formula):
+        """The odie message must name the MetalToolchain download command."""
+        guard = formula[formula.index("if metal_toolchain_path.nil?") :]
+
+        assert "odie" in guard.split("\n    end")[0]
+        assert "xcodebuild -downloadComponent MetalToolchain" in guard.split("\n    end")[0]
+        assert "Xcode" in guard.split("\n    end")[0]
+
+    def test_no_xcode_build_dependency_added(self, formula):
+        """The guard replaces the heavyweight `depends_on "xcode"`, so it must
+        not creep back in: every tap user would be forced to install Xcode."""
+        assert "depends_on \"xcode\"" not in formula
