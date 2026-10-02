@@ -1276,3 +1276,34 @@ def test_rdma_fabric_caps_stays_false_when_disabled_or_no_devices():
     discovery._rdma_fabric_caps(caps, runner=failing)
     assert caps.thunderbolt is False
     assert caps.jaccl is False
+
+
+def test_address_health_requires_repeated_failures_and_recovers():
+    alive = [True]
+    service, clock = _service(
+        prober=lambda *_: {"node_id": "peer"} if alive[0] else None
+    )
+    service._add_candidate("192.0.2.1", 8000, node_id="peer", if_type="manual")
+    service._probe_candidate("192.0.2.1", 8000)
+    alive[0] = False
+    for _ in range(2):
+        service._probe_candidate("192.0.2.1", 8000)
+        assert service.address_health("peer")["192.0.2.1"]["state"] == "verified"
+    service._probe_candidate("192.0.2.1", 8000)
+    assert service.address_health("peer")["192.0.2.1"]["state"] == "stale"
+    assert service._candidates[("192.0.2.1", 8000)]["verified"] is False
+    alive[0] = True
+    service._probe_candidate("192.0.2.1", 8000)
+    assert service.address_health("peer")["192.0.2.1"] == {
+        "state": "verified",
+        "consecutive_failures": 0,
+    }
+    clock.advance(service.config.dead_after)
+    assert service.address_health("peer")["192.0.2.1"]["state"] == "stale"
+
+
+def test_address_health_does_not_inherit_other_node_identity():
+    service, _ = _service(prober=lambda *_: {"node_id": "other"})
+    service._add_candidate("192.0.2.1", 8000, node_id="peer", if_type="manual")
+    service._probe_candidate("192.0.2.1", 8000)
+    assert service.address_health("peer") == {}

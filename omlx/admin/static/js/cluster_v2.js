@@ -54,6 +54,7 @@ function clusterV2Wizard() {
         pairDeny: '/api/cluster/pair/deny',
         pairJoin: '/api/cluster/pair/join',
         pairJoinCancel: '/api/cluster/pair/join/cancel',
+        pairJoinCleanup: '/api/cluster/pair/join/cleanup',
         manualDevice: '/api/cluster/devices/manual',
         unpair: (nodeId) =>
             `/api/cluster/devices/${encodeURIComponent(nodeId)}`,
@@ -220,6 +221,7 @@ function clusterV2Wizard() {
         joinApprovedNotified: false,
         joinDeniedNotified: false,
         joinRevision: 0,
+        confirmForgetCleanup: false,
 
         // ---- add by IP (when multicast discovery is unavailable) -------------
         manualAddr: '',
@@ -289,6 +291,7 @@ function clusterV2Wizard() {
         stagingTimer: null,
         confirmUnpairFor: '',
         confirmDeactivateFor: '',
+        confirmForgetFor: '',
         confirmUnloadFor: '',
         confirmChangeModelFor: '',
         clusterLifecycleBusy: false,
@@ -503,6 +506,7 @@ function clusterV2Wizard() {
                 if (!snapshot || revision !== this.joinRevision) return;
                 const previous = this.join.state;
                 this.join = { ...this.join, ...snapshot, busy: false };
+                if (!snapshot.cleanup_pending) this.confirmForgetCleanup = false;
                 if (
                     snapshot.state === 'approved' &&
                     !this.joinApprovedNotified
@@ -1595,6 +1599,29 @@ function clusterV2Wizard() {
             }
         },
 
+        async forgetJoinCleanup() {
+            if (this.join.busy || !this.join.cleanup_pending) return;
+            if (!this.confirmForgetCleanup) {
+                this.confirmForgetCleanup = true;
+                return;
+            }
+            this.confirmForgetCleanup = false;
+            const revision = ++this.joinRevision;
+            this.join.busy = true;
+            try {
+                const snapshot = await this.apiFetch(CLUSTER_V2_API.pairJoinCleanup, {
+                    method: 'DELETE',
+                });
+                if (revision !== this.joinRevision) return;
+                this.join = { ...this.join, ...snapshot, busy: false };
+                this.notify('info', window.t('cluster.v2.join.cleanup_forgotten'));
+            } catch (error) {
+                if (revision !== this.joinRevision) return;
+                this.join.busy = false;
+                this.notify('error', error?.message || window.t('cluster.v2.join.forget_cleanup_error'));
+            }
+        },
+
         // =====================================================================
         // Add by IP — the deterministic path when multicast can't reach the
         // other Mac (Thunderbolt pairs, filtered routers, Local Network off).
@@ -1699,20 +1726,27 @@ function clusterV2Wizard() {
         },
 
         sshTargetFor(device) {
-            // Pairing enrollment records the SSH target; the devices payload
-            // surfaces it as ssh_target on paired rows. Fall back to the
-            // first verified probe address when no enrollment exists yet.
-            const user = device?.ssh_user;
+            const enrolled = String(device?.ssh_target || '');
+            const separator = enrolled.lastIndexOf('@');
+            const user = device?.ssh_user || (separator > 0 ? enrolled.slice(0, separator) : '');
             const withUser = (target) => user
                 ? `${user}@${String(target).replace(/^[^@]+@/, '')}`
                 : String(target);
-            if (device?.ssh_target) return withUser(device.ssh_target);
             const addrs = Array.isArray(device?.addrs) ? device.addrs : [];
             // A bare fe80:: link-local address has no scope id here, so SSH
             // to it has no route — prefer any routable address first.
             const usable = addrs.filter(
                 (addr) => addr && addr.ip && !String(addr.ip).startsWith('fe80::'),
             );
+            // Pairing pins every address. Select a verified address before
+            // falling back to the enrolled target, keeping the same login.
+            const verified = usable.find(
+                // The shared SSH policy forces AddressFamily=inet.
+                (addr) => !String(addr.ip).includes(':')
+                    && device?.address_health?.[addr.ip]?.state === 'verified',
+            );
+            if (verified) return withUser(verified.ip);
+            if (device?.ssh_target) return withUser(device.ssh_target);
             const first = usable[0] || addrs.find((addr) => addr && addr.ip);
             return withUser(first ? first.ip : this.deviceName(device));
         },
@@ -3520,11 +3554,36 @@ function clusterV2Wizard() {
             }
         },
 
-        async deactivateDeployment(deployment) {
+        async forgetCluster(device = null) {
+            if (this.clusterLifecycleBusy) return;
+            const nodeId = device?.node_id;
+            const confirmation = nodeId ? `node:${nodeId}` : 'all';
+            if (this.confirmForgetFor !== confirmation) {
+                this.confirmForgetFor = confirmation;
+                return;
+            }
+            this.confirmForgetFor = '';
+            this.clusterLifecycleBusy = true;
+            try {
+                await this.apiFetch('/admin/api/cluster/forget' +
+                    (nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : ''), {method: 'DELETE'});
+                this.notify('info', window.t('cluster.v2.toast.forgotten_local'));
+                await this.refreshDevices();
+                await this.refreshDeployments();
+                await this.refreshRuntime();
+            } catch (error) {
+                this.notify('error', error?.message || window.t('cluster.v2.err.unpair'));
+            } finally {
+                this.clusterLifecycleBusy = false;
+            }
+        },
+
+        async deactivateDeployment(deployment, localOnly = false) {
             const id = deployment?.deployment_id;
             if (!id || this.clusterLifecycleBusy) return;
-            if (this.confirmDeactivateFor !== id) {
-                this.confirmDeactivateFor = id;
+            const confirmation = localOnly ? `${id}:local` : id;
+            if (this.confirmDeactivateFor !== confirmation) {
+                this.confirmDeactivateFor = confirmation;
                 return;
             }
             this.confirmDeactivateFor = '';
@@ -3532,10 +3591,10 @@ function clusterV2Wizard() {
             this.confirmUnloadFor = '';
             this.clusterLifecycleBusy = true;
             try {
-                await this.apiFetch(CLUSTER_V2_API.deployment(id), {
+                await this.apiFetch(CLUSTER_V2_API.deployment(id) + (localOnly ? "?local_only=true" : ""), {
                     method: 'DELETE',
                 });
-                this.notify('info', window.t('cluster.v2.toast.deactivated'));
+                this.notify('info', window.t(localOnly ? 'cluster.v2.toast.forgotten_local' : 'cluster.v2.toast.deactivated'));
                 await this.refreshDeployments();
                 await this.refreshRuntime();
             } catch (error) {

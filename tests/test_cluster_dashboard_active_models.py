@@ -525,7 +525,7 @@ def test_status_template_renders_cluster_badge_and_rank_cache_row():
 
     assert status.count("clusterBadgeLabel(m.cluster)") == 2  # mobile + desktop
     assert "clusterBadgeLabel(cluster)" in javascript
-    assert "m.cluster.live && m.cluster.live.stale" in status
+    assert "m.cluster?.live?.stale" in status
     assert "m.cache_tier === 'rank-prompt-snapshot'" in status
     assert "m.rank_prompt_cache" in status
     for key in (

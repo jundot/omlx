@@ -2325,12 +2325,17 @@ async def cluster_complete_worker_join(
         last_seen_at=now,
     )
     try:
+        # Complete the enrollment first, pin the host key only afterwards:
+        # a failed complete() (node cap, expired session) must not leave a
+        # pinned key behind — the registry and known_hosts would disagree,
+        # and a retry with the same key would then be rejected as a
+        # "changed key" requiring manual cleanup.
+        enrolled = get_cluster_enrollment().complete(raw_session, node)
         await asyncio.to_thread(
             pin_enrolled_host_key,
             hostname=primary_address,
             public_key=request.ssh_host_public_key,
         )
-        enrolled = get_cluster_enrollment().complete(raw_session, node)
     except (EnrollmentError, OSError, RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return enrolled.to_dict()
@@ -3881,8 +3886,48 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
     }
 
 
+@router.delete("/forget")
+async def forget_cluster(node_id: str | None = None):
+    """Forget one peer, or leave the entire cluster, without remote contact.
+
+    A signed model placement cannot survive losing a rank. Remove affected
+    deployments after verified local teardown; retain all other peer trust.
+    Omitting node_id, or selecting this Mac, leaves the whole local cluster.
+    """
+    from .pairing_routes import _manager
+
+    manager = _manager()
+    peers = await asyncio.to_thread(manager.list_paired)
+    deployments = await asyncio.to_thread(get_cluster_registry().list)
+    forget_all = node_id is None or node_id == manager.node_id
+    affected = [
+        deployment
+        for deployment in deployments
+        if forget_all or any(host.node_id == node_id for host in deployment.hosts)
+    ]
+    targets = [
+        peer["node_id"] for peer in peers if forget_all or peer["node_id"] == node_id
+    ]
+    if not forget_all and not targets and not affected:
+        raise HTTPException(status_code=404, detail="cluster member not found")
+    # Do not revoke peer trust if local teardown fails or a request is active.
+    for deployment in affected:
+        await deactivate_cluster_deployment(deployment.deployment_id, local_only=True)
+    results = []
+    for target in targets:
+        results.append(await asyncio.to_thread(manager.unpair, target))
+    return {
+        "ok": True,
+        "local_only": True,
+        "stopped": False,
+        "forgotten_node_ids": targets,
+        "removed_deployment_ids": [item.deployment_id for item in affected],
+        "revocations": results,
+    }
+
+
 @router.delete("/deployments/{deployment_id}")
-async def deactivate_cluster_deployment(deployment_id: str):
+async def deactivate_cluster_deployment(deployment_id: str, local_only: bool = False):
     """Stop the resident cluster, then disable future distributed loads."""
 
     registry = get_cluster_registry()
@@ -3896,8 +3941,14 @@ async def deactivate_cluster_deployment(deployment_id: str):
         except ModelNotFoundError:
             model_id = None
         if model_id is not None:
-            await pool.prepare_cluster_reload(model_id)
-        await asyncio.to_thread(stop_deployment_processes, deployment)
+            await pool.prepare_cluster_reload(
+                model_id, **({"local_only": True} if local_only else {})
+            )
+        await asyncio.to_thread(
+            stop_deployment_processes,
+            deployment,
+            **({"local_only": True} if local_only else {}),
+        )
         removed = await asyncio.to_thread(registry.remove, deployment_id)
         unregister = getattr(pool, "unregister_cluster_model", None)
         if model_id is not None and callable(unregister):
@@ -3917,7 +3968,8 @@ async def deactivate_cluster_deployment(deployment_id: str):
     return {
         "ok": True,
         "deployment_id": deployment_id,
-        "stopped": True,
+        "stopped": not local_only,
+        "local_only": local_only,
     }
 
 

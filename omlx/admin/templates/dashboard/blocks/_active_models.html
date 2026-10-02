@@ -58,7 +58,7 @@
                         <div class="mt-1 flex flex-wrap items-center gap-1" x-show="m.cluster" x-cloak>
                             <span class="px-1.5 py-0.5 text-[10px] font-semibold rounded bg-violet-50 text-violet-600 border border-violet-200"
                                   x-text="clusterBadgeLabel(m.cluster)"></span>
-                            <span x-show="m.cluster.live && m.cluster.live.stale"
+                            <span x-show="m.cluster?.live?.stale"
                                   class="px-1.5 py-0.5 text-[10px] font-semibold rounded bg-amber-50 text-amber-600 border border-amber-200"
                                   x-text="window.t('cluster.badge.stale')"></span>
                         </div>
@@ -113,7 +113,7 @@
                             <span class="flex items-center gap-1">
                                 <span class="px-1.5 py-0.5 text-[10px] font-semibold rounded bg-violet-50 text-violet-600 border border-violet-200 whitespace-nowrap"
                                       x-text="clusterBadgeLabel(m.cluster)"></span>
-                                <span x-show="m.cluster.live && m.cluster.live.stale" x-cloak
+                                <span x-show="m.cluster?.live?.stale" x-cloak
                                       class="px-1.5 py-0.5 text-[10px] font-semibold rounded bg-amber-50 text-amber-600 border border-amber-200 whitespace-nowrap"
                                       x-text="window.t('cluster.badge.stale')"></span>
                             </span>

@@ -5076,3 +5076,29 @@ async def test_cancelled_unload_retains_marker_until_stop_finishes():
     with pytest.raises(asyncio.CancelledError):
         await task
     assert not pool._unloading_models
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("busy", [False, True])
+async def test_local_cluster_removal_preserves_busy_guard_and_scope(busy):
+    pool = _make_pool()
+    engine = MagicMock()
+    engine.runtime_failed_reason = "peer lost"
+    engine.has_active_requests.return_value = busy
+    pool._entries["test-model"] = EngineEntry(
+        model_id="test-model",
+        model_path="/fake/path",
+        model_type="llm",
+        engine_type="distributed_batched",
+        estimated_size=1000,
+        engine=engine,
+        in_use=int(busy),
+    )
+    pool._unload_engine = AsyncMock()
+    if busy:
+        with pytest.raises(ModelBusyError):
+            await pool.prepare_cluster_reload("test-model", local_only=True)
+        pool._unload_engine.assert_not_awaited()
+    else:
+        await pool.prepare_cluster_reload("test-model", local_only=True)
+        pool._unload_engine.assert_awaited_once_with("test-model", local_only=True)

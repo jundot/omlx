@@ -2338,3 +2338,152 @@ def test_peer_health_transition_records_one_incident(tmp_path, monkeypatch):
     fresh = "/admin/api/cluster/peer-health?hosts=studio.local&deployment_id=d2"
     assert client.get(fresh).json()["healthy"] is False
     assert len(store.list()) == 1
+
+
+@pytest.mark.parametrize("local_only", [False, True])
+def test_forget_cluster_with_unreachable_peer(monkeypatch, local_only):
+    from omlx.cluster.launch import DistributedTeardownError
+
+    deployment = SimpleNamespace(model="org/model", deployment_id="offline")
+    removed = []
+    prepared = []
+
+    class Pool:
+        def resolve_cluster_model_id(self, model):
+            return "model"
+
+        async def prepare_cluster_reload(self, model_id, **kwargs):
+            prepared.append(kwargs)
+
+        def unregister_cluster_model(self, model_id):
+            assert removed == ["offline"]
+
+    def stop(deployment, *, local_only=False):
+        if not local_only:
+            raise DistributedTeardownError("peer is unreachable")
+
+    monkeypatch.setattr(routes, "_engine_pool", lambda: Pool())
+    monkeypatch.setattr(
+        routes,
+        "get_cluster_registry",
+        lambda: SimpleNamespace(
+            get=lambda identifier: deployment,
+            remove=lambda identifier: removed.append(identifier) or True,
+        ),
+    )
+    monkeypatch.setattr(routes, "stop_deployment_processes", stop)
+    suffix = "?local_only=true" if local_only else ""
+    response = _client().delete("/admin/api/cluster/deployments/offline" + suffix)
+    assert response.status_code == (200 if local_only else 503)
+    assert removed == (["offline"] if local_only else [])
+    assert prepared == ([{"local_only": True}] if local_only else [{}])
+    if local_only:
+        assert response.json()["stopped"] is False
+        assert response.json()["local_only"] is True
+
+
+
+def test_forget_cluster_preserves_setup_when_local_stop_fails(monkeypatch):
+    from omlx.cluster.launch import DistributedTeardownError
+
+    deployment = SimpleNamespace(model="org/model", deployment_id="offline")
+    removed = []
+
+    class Pool:
+        def resolve_cluster_model_id(self, model):
+            return "model"
+
+        async def prepare_cluster_reload(self, model_id, **kwargs):
+            raise DistributedTeardownError("local worker survived")
+
+    monkeypatch.setattr(routes, "_engine_pool", lambda: Pool())
+    monkeypatch.setattr(
+        routes,
+        "get_cluster_registry",
+        lambda: SimpleNamespace(
+            get=lambda identifier: deployment,
+            remove=lambda identifier: removed.append(identifier),
+        ),
+    )
+    response = _client().delete(
+        "/admin/api/cluster/deployments/offline?local_only=true"
+    )
+    assert response.status_code == 503
+    assert removed == []
+
+
+@pytest.mark.parametrize("node_id", ["peer-a", None, "self"])
+def test_forget_member_preserves_other_pairings_or_leaves_cluster(monkeypatch, node_id):
+    from omlx.cluster import pairing_routes
+
+    peers = {"peer-a", "peer-b"}
+    placements = [
+        SimpleNamespace(
+            deployment_id="uses-a", hosts=[SimpleNamespace(node_id="peer-a")]
+        ),
+        SimpleNamespace(
+            deployment_id="uses-b", hosts=[SimpleNamespace(node_id="peer-b")]
+        ),
+    ]
+    stopped = []
+
+    async def stop(deployment_id, *, local_only):
+        assert local_only
+        stopped.append(deployment_id)
+
+    manager = SimpleNamespace(
+        node_id="self",
+        list_paired=lambda: [{"node_id": node} for node in sorted(peers)],
+        unpair=lambda node: peers.remove(node),
+    )
+    monkeypatch.setattr(pairing_routes, "_manager", lambda: manager)
+    monkeypatch.setattr(
+        routes, "get_cluster_registry", lambda: SimpleNamespace(list=lambda: placements)
+    )
+    monkeypatch.setattr(routes, "deactivate_cluster_deployment", stop)
+    app = FastAPI()
+    app.include_router(routes.router)
+    suffix = "" if node_id is None else f"?node_id={node_id}"
+    response = TestClient(app).delete("/admin/api/cluster/forget" + suffix)
+    assert response.status_code == 200
+    assert response.json()["stopped"] is False
+    if node_id == "peer-a":
+        assert peers == {"peer-b"}
+        assert stopped == ["uses-a"]
+    else:
+        assert peers == set()
+        assert stopped == ["uses-a", "uses-b"]
+
+
+@pytest.mark.parametrize("status", [409, 503])
+def test_forget_member_does_not_unpair_when_local_teardown_fails(monkeypatch, status):
+    from fastapi import HTTPException
+    from omlx.cluster import pairing_routes
+
+    removed = []
+    manager = SimpleNamespace(
+        node_id="self",
+        list_paired=lambda: [{"node_id": "offline"}],
+        unpair=removed.append,
+    )
+    deployment = SimpleNamespace(
+        deployment_id="model", hosts=[SimpleNamespace(node_id="offline")]
+    )
+
+    async def stop(*args, **kwargs):
+        raise HTTPException(status_code=status, detail="local teardown blocked")
+
+    monkeypatch.setattr(pairing_routes, "_manager", lambda: manager)
+    monkeypatch.setattr(
+        routes,
+        "get_cluster_registry",
+        lambda: SimpleNamespace(list=lambda: [deployment]),
+    )
+    monkeypatch.setattr(routes, "deactivate_cluster_deployment", stop)
+    app = FastAPI()
+    app.include_router(routes.router)
+    assert (
+        TestClient(app).delete("/admin/api/cluster/forget?node_id=offline").status_code
+        == status
+    )
+    assert not removed
