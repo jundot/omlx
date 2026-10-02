@@ -793,6 +793,70 @@ class TestReconstructCachePartialRestore:
         result = prefix_cache.reconstruct_cache(block_table)
 
         assert result is None
+        stats = prefix_cache.get_stats()
+        assert stats.placeholder_full_rejects == 1
+        assert prefix_cache.get_stats_dict()["placeholder_full_rejects"] == 1
+        stats.reset()
+        assert stats.placeholder_full_rejects == 0
+        prefix_cache.reset_stats()
+        assert prefix_cache.get_stats_dict()["placeholder_full_rejects"] == 0
+
+    def test_walk_back_truncates_to_latest_valid_rotating_block(
+        self, paged_cache, mock_ssd_cache
+    ):
+        model = MockModel(num_layers=2)
+        prefix_cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd_cache,
+        )
+
+        block1 = paged_cache.allocate_block()
+        block1.block_hash = b"block1_hash"
+        block1.token_count = 256
+        block2 = paged_cache.allocate_block()
+        block2.block_hash = b"block2_hash"
+        block2.token_count = 256
+
+        block_table = paged_cache.create_block_table("req-walkback")
+        block_table.block_ids = [block1.block_id, block2.block_id]
+        block_table.num_tokens = 512
+
+        kv_keys = mx.zeros((1, 8, 256, 64))
+        kv_values = mx.zeros((1, 8, 256, 64))
+        rot_keys = mx.ones((1, 8, 256, 64))
+        rot_values = mx.ones((1, 8, 256, 64))
+        placeholder = mx.zeros((1,))
+        metadata = {
+            'layer_cache_types': ['KVCache', 'RotatingKVCache'],
+            'layer_meta_states': [
+                (256,),
+                (4, 1024, 256, 256),
+            ],
+            'model_name': 'test-model',
+            'num_layers': 2,
+        }
+        mock_ssd_cache.load_block_with_metadata.side_effect = [
+            ([(kv_keys, kv_values), (rot_keys, rot_values)], metadata),
+            ([(kv_keys, kv_values), (placeholder, placeholder)], metadata),
+        ]
+
+        result = prefix_cache.reconstruct_cache(block_table)
+
+        assert result is not None
+        assert block_table.block_ids == [block1.block_id]
+        assert block_table.num_tokens == 256
+        assert result[0].offset == 256
+        assert result[1].offset == 256
+        assert mx.array_equal(result[1].state[0], rot_keys)
+        assert mx.array_equal(result[1].state[1], rot_values)
+        stats = prefix_cache.get_stats()
+        assert stats.retained_restore_walkbacks == 1
+        assert prefix_cache.get_stats_dict()["retained_restore_walkbacks"] == 1
+        stats.reset()
+        assert stats.retained_restore_walkbacks == 0
+        prefix_cache.reset_stats()
+        assert prefix_cache.get_stats_dict()["retained_restore_walkbacks"] == 0
 
     def test_full_restore_reconstructs_rotating_state(
         self, paged_cache, mock_ssd_cache
