@@ -1,0 +1,140 @@
+{
+  "name": "vscode-omlx",
+  "displayName": "oMLX",
+  "description": "Local LLM inference for Apple Silicon — inline completions, chat sidebar, model management",
+  "version": "0.1.0",
+  "publisher": "omlx",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "keywords": [
+    "llm",
+    "ai",
+    "copilot",
+    "mlx",
+    "apple silicon",
+    "local ai",
+    "chat",
+    "completions"
+  ],
+  "icon": "resources/icon.png",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "oMLX",
+      "properties": {
+        "omlx.serverUrl": {
+          "type": "string",
+          "default": "http://localhost:8000",
+          "description": "oMLX server URL"
+        },
+        "omlx.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key for oMLX authentication (leave empty if auth is disabled)"
+        },
+        "omlx.completions.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable inline code completions"
+        },
+        "omlx.completions.maxTokens": {
+          "type": "number",
+          "default": 80,
+          "description": "Max tokens for inline completions"
+        },
+        "omlx.completions.debounceMs": {
+          "type": "number",
+          "default": 300,
+          "description": "Debounce delay in milliseconds before triggering completions"
+        },
+        "omlx.completions.contextLines": {
+          "type": "number",
+          "default": 100,
+          "description": "Number of lines before the cursor to include as context"
+        },
+        "omlx.chat.defaultSystemPrompt": {
+          "type": "string",
+          "default": "You are a helpful programming assistant.",
+          "description": "Default system prompt for the chat sidebar"
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "omlx.selectModel",
+        "title": "oMLX: Select Model",
+        "icon": "$(list-selection)"
+      },
+      {
+        "command": "omlx.openSettings",
+        "title": "oMLX: Open Settings",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "omlx.openChat",
+        "title": "oMLX: Open Chat"
+      },
+      {
+        "command": "omlx.toggleCompletions",
+        "title": "oMLX: Toggle Inline Completions"
+      },
+      {
+        "command": "omlx.checkHealth",
+        "title": "oMLX: Check Server Health"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "omlx-sidebar",
+          "title": "oMLX",
+          "icon": "resources/omlx-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "omlx-sidebar": [
+        {
+          "type": "webview",
+          "id": "omlx.chatView",
+          "name": "Chat"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "omlx.selectModel",
+          "when": "view == omlx.chatView",
+          "group": "navigation"
+        },
+        {
+          "command": "omlx.openSettings",
+          "when": "view == omlx.chatView",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "package": "npm run build && vsce package",
+    "lint": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.22.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.3.0"
+  }
+}
