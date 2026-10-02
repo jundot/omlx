@@ -189,8 +189,9 @@ def open_system_tcp_proxy(
     executable = _system_python()
     if executable is None:
         raise RuntimeError("system Python control proxy is unavailable")
+    # -I: ignore the bundled app's PYTHONHOME, which system Python cannot use.
     process = subprocess.Popen(
-        [executable, "-u", "-c", _PROXY_PROGRAM, host, str(port), str(timeout)],
+        [executable, "-I", "-u", "-c", _PROXY_PROGRAM, host, str(port), str(timeout)],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

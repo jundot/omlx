@@ -10,9 +10,9 @@ This kernel runs the same pairs, one threadgroup per pair and output tile,
 but in expert order: each threadgroup finds the pair at its sorted position,
 and the grid covers all pairs of one output tile before the next. Pairs that
 share an expert then run back to back and read the expert tile from cache.
-Per pair, the arithmetic is MLX's ``qmv_fast`` (K a multiple of 512) or
-``qmv`` traversal, transcribed from MLX 0.32.2 ``quantized.h``, so each
-output equals the ``gather_qmm`` output bit for bit.
+Per pair, the arithmetic is MLX's ``qmv_fast`` or ``qmv`` traversal (chosen by
+``qmv_fast_layout``, MLX's rule), transcribed from MLX 0.32.2 ``quantized.h``,
+so each output equals the ``gather_qmm`` output bit for bit.
 """
 
 from __future__ import annotations
@@ -187,6 +187,16 @@ inline float qdot_n(
 }
 """
 
+
+def qmv_fast_layout(k: int, n: int, bits: int) -> bool:
+    """Whether MLX 0.32.2 runs ``qmv_fast`` (else ``qmv``) for a one-row affine
+    product with ``k`` inputs and ``n`` outputs: N a multiple of 8 and K of the
+    kernel's block, ``pack_factor * packs_per_thread * 32`` (quantized.cpp
+    ``qmv_fast_k_alignment``): 512 for 4/5-bit, 256 for 6/8-bit weights."""
+    pack_factor = 8 if bits in (3, 5) else (4 if bits == 6 else 32 // bits)
+    return n % 8 == 0 and k % (pack_factor * (1 if bits == 2 else 2) * 32) == 0
+
+
 # Each threadgroup takes the pair at sorted position ``y`` (pairs ordered by
 # expert, then by pair index) and output tile ``z``. The grid walks every
 # pair of one tile before the next tile, so pairs sharing an expert run back
@@ -304,7 +314,7 @@ def supported(linear, dtype) -> bool:
     n = int(weight.shape[-2])
     k = int(scales.shape[-1]) * group_size
     values_per_thread = (8 if bits == 5 else (4 if bits == 6 else 32 // bits)) * (
-        2 if k % 512 == 0 else 1
+        2 if qmv_fast_layout(k, n, bits) else 1
     )
     return (
         weight.ndim == 3
@@ -353,7 +363,8 @@ def gather_qmv(linear, x: mx.array, rhs: mx.array, pairs_per_row: int) -> mx.arr
     k = int(x.shape[-1])
     n = int(weight.shape[-2])
     pairs = int(rhs.shape[0])
-    kernel = _kernel(int(linear.bits), int(linear.group_size), k % 512 == 0)
+    fast = qmv_fast_layout(k, n, int(linear.bits))
+    kernel = _kernel(int(linear.bits), int(linear.group_size), fast)
     return kernel(
         inputs=[x, weight, scales, biases, rhs],
         template=[

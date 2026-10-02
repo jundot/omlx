@@ -28,7 +28,7 @@ import mlx.nn as nn
 from mlx_vlm.speculative.drafters import load_drafter
 
 from ..model_settings import MAX_LIGHTNING_MTP_DRAFT_TOKENS
-from ..patches import qwen35_packed_linear
+from ..patches import qwen35_packed_linear, qwen35_verify_qmm
 from ..patches.mlx_lm_mtp import batch_generator as bg
 from ..patches.qwen35_verify_qmm import set_verify_qmm_armed
 from ..utils.sampling import top_k_indices
@@ -75,6 +75,83 @@ class _Predraft:
     bases: list[int]
     unfed: list[int]
     proposals: list[tuple]
+
+
+# ``_grouped_dynamic_convolve`` for one of the two kernel sets in
+# ``dynamic`` (B, L, 2, KS, G), one thread per output element, with the bf16
+# rounding of each op in the composed version.
+_CONV_SOURCE = """
+    uint e = thread_position_in_grid.x;
+    uint c = e % H;
+    uint t = (e / H) % L;
+    uint bl = e / H;
+    uint g = c / GS;
+    T acc = T(0);
+    for (int o = 0; o < KS; ++o) {
+        T xv = int(t) >= o ? x[e - uint(o) * H] : T(0);
+        T k = static_cast<T>(
+            float(base[(SET * KS + o) * H + c]) + float(dyn[((bl * 2 + SET) * KS + o) * G + g]));
+        T prod = static_cast<T>(float(k) * float(xv));
+        acc = static_cast<T>(float(acc) + float(prod));
+    }
+    out[e] = acc;
+"""
+_CONV_KERNEL = None
+
+
+def _convolve(conv, hidden: mx.array, dynamic: mx.array, which: int) -> mx.array:
+    global _CONV_KERNEL
+    if _CONV_KERNEL is None:
+        _CONV_KERNEL = mx.fast.metal_kernel(
+            name="omlx_dflash2_conv",
+            input_names=["x", "dyn", "base"],
+            output_names=["out"],
+            source=_CONV_SOURCE,
+        )
+    batch, length, width = hidden.shape
+    (out,) = _CONV_KERNEL(
+        inputs=[hidden, dynamic, conv.base_kernel],
+        template=[
+            ("T", hidden.dtype),
+            ("H", width),
+            ("L", length),
+            ("GS", conv.group_size),
+            ("G", width // conv.group_size),
+            ("KS", conv.kernel_size),
+            ("SET", which),
+        ],
+        grid=(hidden.size, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[hidden.shape],
+        output_dtypes=[hidden.dtype],
+    )
+    return out
+
+
+def _conv_prepare(conv, hidden: mx.array) -> tuple[mx.array, mx.array]:
+    """``GroupedDynamicCausalConv.prepare``; returns both kernel sets."""
+    groups = hidden.shape[-1] // conv.group_size
+    dynamic = conv.kernel_projection(hidden).reshape(
+        *hidden.shape[:-1], 2, conv.kernel_size, groups
+    )
+    return _convolve(conv, hidden, dynamic, 0), dynamic
+
+
+def _conv_finish(conv, hidden: mx.array, dynamic: mx.array) -> mx.array:
+    return _convolve(conv, hidden, dynamic, 1)
+
+
+def _mlp(mlp, x: mx.array) -> mx.array:
+    """Gated MLP; eight-row verify shapes fuse gate, up and swiglu."""
+    gate = getattr(mlp, "gate_proj", None)
+    up = getattr(mlp, "up_proj", None)
+    if gate is not None and qwen35_verify_qmm.sg8_swiglu_eligible(gate, up, x):
+        batch, length, width = x.shape
+        hidden = qwen35_verify_qmm.vk_swiglu_sg8(
+            x.reshape(batch * length, width), gate, up
+        )
+        return mlp.down_proj(hidden.reshape(batch, length, -1))
+    return mlp(x)
 
 
 def _greedy_proposals(logits: mx.array) -> mx.array:
@@ -296,7 +373,7 @@ class DFlashDrafter:
             set_verify_qmm_armed(False)
         self._predraft.unfed = [unfed]
         tokens, accept_lps = proposals[0]
-        mx.async_eval(tokens, *accept_lps)
+        mx.async_eval(tokens, *_q_arrays(accept_lps))
         return True
 
     def adopt_predraft(self, state, count: int) -> None:
@@ -452,7 +529,10 @@ class DFlashDrafter:
         for index, (b, n, slots_b) in enumerate(zip(bases, lengths, write_slots)):
             pos[index, slots_b] = mx.arange(b, b + n, dtype=mx.int32)
         # Attend the newest ``slots`` committed positions; block keys always.
-        ring_valid = (pos >= (totals - slots)[:, None]) & (pos < totals[:, None])
+        # Unwritten slots hold position -1 until the ring fills.
+        ring_valid = (
+            (pos >= 0) & (pos >= (totals - slots)[:, None]) & (pos < totals[:, None])
+        )
         mask = mx.concatenate(
             [ring_valid, mx.ones((batch, block), dtype=mx.bool_)], axis=1
         )[:, None, None, :]
@@ -467,7 +547,7 @@ class DFlashDrafter:
             residual = h
             x = layer.input_layernorm(h)
             if attention_conv is not None:
-                x, kernel = attention_conv.prepare(x)
+                x, kernel = _conv_prepare(attention_conv, x)
 
             ctx_keys, ctx_values = attn._project_kv(h_ctx)
             ctx_keys = attn.k_norm(
@@ -513,16 +593,16 @@ class DFlashDrafter:
                 attended.transpose(0, 2, 1, 3).reshape(batch, block, -1)
             )
             if attention_conv is not None:
-                attended = attention_conv.finish(attended, kernel)
+                attended = _conv_finish(attention_conv, attended, kernel)
             h = residual + attended
 
             residual = h
             x = layer.post_attention_layernorm(h)
             if mlp_conv is not None:
-                x, kernel = mlp_conv.prepare(x)
-            x = layer.mlp(x)
+                x, kernel = _conv_prepare(mlp_conv, x)
+            x = _mlp(layer.mlp, x)
             if mlp_conv is not None:
-                x = mlp_conv.finish(x, kernel)
+                x = _conv_finish(mlp_conv, x, kernel)
             h = residual + x
 
         if commit:
@@ -538,7 +618,9 @@ class DFlashDrafter:
         logits = model._logits(draft_hidden)
         samplers = [sampler for *_, sampler in rows]
         selector = getattr(model, "candidate_selector", None)
-        if all(sampler is None for sampler in samplers):
+        if selector is not None and _fused_select_eligible(selector, draft_hidden):
+            proposals = _select_fused(selector, draft_hidden, logits, anchors, samplers)
+        elif all(sampler is None for sampler in samplers):
             if selector is not None:
                 tokens = selector.select(
                     draft_hidden, logits, anchors, _greedy_proposals
@@ -616,6 +698,193 @@ def _sample_candidates(scores: mx.array, sampler) -> tuple[mx.array, mx.array]:
     scaled = lp * (1.0 / temp)
     pick = mx.random.categorical(scaled)
     return pick, scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
+
+
+# One threadgroup per row walks the positions: simdgroup c scores candidate
+# c against the previous pick, then simdgroup 0 applies the row's filters
+# (as ``_sample_candidates``) and draws by inverse CDF. Temperature <= 0
+# takes the first argmax.
+_SELECT_SOURCE = """
+    constexpr int C = 16;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint b = threadgroup_position_in_grid.x;
+    threadgroup float scores[C];
+    threadgroup int pred_tg;
+    if (sg == 0 && lane == 0)
+        pred_tg = anchors[b];
+    float temp = params[b * 4 + 0];
+    float top_p = params[b * 4 + 1];
+    int top_k = int(params[b * 4 + 2]);
+    float min_p = params[b * 4 + 3];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int p = 0; p < P; ++p) {
+        int row = int(b) * P + p;
+        int pred = pred_tg;
+        int cid = cand[row * C + int(sg)];
+        auto pc = pcb + long(pred) * R;
+        auto sc = scb + long(cid) * R;
+        auto pj = proj + long(row) * R;
+        float acc = 0.0f;
+        for (int i = 0; i < R / 32; ++i) {
+            int d = int(lane) + i * 32;
+            acc += float(pc[d]) * float(pj[d]) * float(sc[d]);
+        }
+        acc = simd_sum(acc);
+        if (lane == 0)
+            scores[sg] = float(unary[row * C + int(sg)]) + acc;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+            bool live = int(lane) < C;
+            float s = live ? scores[lane] : -INFINITY;
+            float m = simd_max(s);
+            int pick;
+            float q = -INFINITY;
+            if (temp <= 0.0f) {
+                pick = simd_min((live && s == m) ? int(lane) : C);
+            } else {
+                float lp = s - m - log(simd_sum(live ? exp(s - m) : 0.0f));
+                if (!live)
+                    lp = -INFINITY;
+                if (top_k > 0 && top_k < C) {
+                    int greater = 0;
+                    for (int j = 0; j < C; ++j)
+                        greater += simd_shuffle(lp, ushort(j)) > lp ? 1 : 0;
+                    if (greater >= top_k)
+                        lp = -INFINITY;
+                }
+                if (top_p > 0.0f && top_p < 1.0f) {
+                    float prefix = 0.0f;
+                    for (int j = 0; j < C; ++j) {
+                        float o = simd_shuffle(lp, ushort(j));
+                        if (o > lp || (o == lp && j < int(lane)))
+                            prefix += exp(o);
+                    }
+                    if (!(prefix < top_p))
+                        lp = -INFINITY;
+                }
+                if (min_p > 0.0f) {
+                    float floor_ = simd_max(lp) + log(min_p);
+                    if (lp < floor_)
+                        lp = -INFINITY;
+                }
+                float scaled = lp / temp;
+                float sm = simd_max(scaled);
+                float e = scaled == -INFINITY ? 0.0f : exp(scaled - sm);
+                float total = simd_sum(e);
+                q = scaled == -INFINITY ? -INFINITY : scaled - sm - log(total);
+                float cdf = simd_prefix_inclusive_sum(e) / total;
+                float u = uniforms[row];
+                int first = simd_min((e > 0.0f && cdf > u) ? int(lane) : C);
+                int last = simd_max(e > 0.0f ? int(lane) : -1);
+                pick = first < C ? first : last;
+            }
+            if (live)
+                logq[row * C + int(lane)] = q;
+            if (lane == 0) {
+                int token = cand[row * C + pick];
+                tokens[row] = token;
+                pred_tg = token;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+"""
+_SELECT_KERNEL = None
+
+
+def _select_kernel():
+    global _SELECT_KERNEL
+    if _SELECT_KERNEL is None:
+        _SELECT_KERNEL = mx.fast.metal_kernel(
+            name="omlx_dflash2_select",
+            input_names=[
+                "cand",
+                "unary",
+                "proj",
+                "anchors",
+                "pcb",
+                "scb",
+                "params",
+                "uniforms",
+            ],
+            output_names=["tokens", "logq"],
+            source=_SELECT_SOURCE,
+        )
+    return _SELECT_KERNEL
+
+
+def _fused_select_eligible(selector, hidden) -> bool:
+    pcb = getattr(selector.predecessor_codebook, "weight", None)
+    scb = getattr(selector.successor_codebook, "weight", None)
+    return (
+        selector.top_k == 16
+        and isinstance(pcb, mx.array)
+        and isinstance(scb, mx.array)
+        and not hasattr(selector.predecessor_codebook, "scales")
+        and not hasattr(selector.successor_codebook, "scales")
+        and pcb.shape[-1] % 32 == 0
+        and hidden.shape[1] <= 32
+    )
+
+
+def _select_fused(selector, hidden, logits, anchors, samplers) -> list[tuple]:
+    """``_select_sampled`` in one launch with sparse q over the candidates."""
+    batch, length, vocab = logits.shape
+    candidates = top_k_indices(logits, selector.top_k).astype(mx.int32)
+    unary = mx.take_along_axis(logits, candidates, axis=-1)
+    projected = selector.hidden_projection(hidden)
+    params = mx.array(
+        [
+            (
+                [0.0, 0.0, 0.0, 0.0]
+                if sampler is None
+                else [
+                    float(getattr(sampler, "temp", 1.0) or 1.0),
+                    float(getattr(sampler, "top_p", 0.0) or 0.0),
+                    float(int(getattr(sampler, "top_k", 0) or 0)),
+                    float(getattr(sampler, "min_p", 0.0) or 0.0),
+                ]
+            )
+            for sampler in samplers
+        ],
+        dtype=mx.float32,
+    )
+    pcb = selector.predecessor_codebook.weight
+    tokens, logq = _select_kernel()(
+        inputs=[
+            candidates,
+            unary,
+            projected,
+            anchors.reshape(-1).astype(mx.int32),
+            pcb,
+            selector.successor_codebook.weight,
+            params,
+            mx.random.uniform(shape=(batch, length)),
+        ],
+        template=[("P", length), ("R", pcb.shape[-1])],
+        grid=(32 * selector.top_k * batch, 1, 1),
+        threadgroup=(32 * selector.top_k, 1, 1),
+        output_shapes=[(batch, length), (batch, length, selector.top_k)],
+        output_dtypes=[mx.int32, mx.float32],
+    )
+    return [
+        (
+            tokens[index : index + 1],
+            (
+                []
+                if sampler is None
+                else bg.SparseDraftQ(candidates[index], logq[index], vocab)
+            ),
+        )
+        for index, sampler in enumerate(samplers)
+    ]
+
+
+def _q_arrays(accept_lps) -> list:
+    if isinstance(accept_lps, bg.SparseDraftQ):
+        return accept_lps.arrays()
+    return list(accept_lps)
 
 
 def _select_sampled(selector, hidden, logits, anchors, samplers) -> list[tuple]:

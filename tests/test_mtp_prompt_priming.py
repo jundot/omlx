@@ -964,6 +964,28 @@ def test_retained_cache_survives_handoff_without_duplicate_pair():
     assert owned.uids == {}
 
 
+def test_parked_singleton_reenters_with_its_head_history():
+    """A park keeps the head cache; parked tokens fold in at the re-entry probe."""
+    host = RecordingHead()
+    head = [SimpleNamespace(pairs=[])]
+    # The park handoff fed token 10 (head input 100); the cache is now at 11.
+    prompt_priming.retain_parked_head_history(
+        host, 3, head, 10, mx.array([[[100]]]), [SimpleNamespace(offset=11)]
+    )
+    with prompt_priming.decode_scope(host, [3]):
+        for token in (11, 12):
+            prompt_priming.maybe_capture(
+                host,
+                mx.array([[token]]),
+                mx.array([[[token * 10]]]),
+                [SimpleNamespace(offset=token + 1)],
+            )
+    result = prompt_priming.take_primed(host, [], mx.array(13), uid=3, cache_offset=14)
+    assert result[0] is head
+    assert head[0].pairs == [(100, 11), (110, 12), (120, 13)]
+    assert result[1] == 13
+
+
 @pytest.mark.parametrize("failure", ["queued", "owned"])
 def test_retention_preflight_does_not_replace_another_row(failure):
     batch, owner = parked_batch()

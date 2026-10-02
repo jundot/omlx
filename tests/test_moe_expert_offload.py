@@ -33,6 +33,7 @@ if HAS_MLX:
         _io_pool,
         _shutdown_io_pool,
         apply_moe_expert_offload,
+        estimate_offload_admission_bytes,
         moe_offload_stats,
     )
 
@@ -847,6 +848,229 @@ class TestParallelFetch:
         assert live["peak"] <= 4 * 9  # batch x tensors per expert
         assert live["now"] == 0  # nothing left holding bytes
 
+    def _record_calls(self, patch, meo, cache, order):
+        """Log async_eval / eval / slot-write calls, with their arguments."""
+        async_eval, sync_eval, install = mx.async_eval, mx.eval, cache._install
+
+        def dispatch(*arrays):
+            order.append(("dispatch", arrays))
+            return async_eval(*arrays)
+
+        def evaluate(*arrays):
+            order.append(("eval", arrays))
+            return sync_eval(*arrays)
+
+        def write(e, payload=None):
+            order.append(("write", e))
+            return install(e, payload)
+
+        patch.setattr(meo.mx, "async_eval", dispatch)
+        patch.setattr(meo.mx, "eval", evaluate)
+        patch.setattr(cache, "_install", write)
+
+    def test_overlap_dispatches_gather_before_the_first_write(
+        self, tmp_path, monkeypatch
+    ):
+        """Fetch/compute overlap on slow reads: the resident routes' gather is
+        dispatched before any slot write and evaluated before the first one,
+        the layer's output is dispatched last, and the output is bit-identical
+        to the resident model either way. Keepalive pulses interleave while
+        the reads are pending; they do not change the order of the three."""
+        import time
+
+        import omlx.patches.moe_expert_offload as meo
+
+        glu = _make_glu(seed=12)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        x = mx.random.normal((1, 1, D))
+        warm = mx.array([[[0, 1]]], dtype=mx.int32)  # experts 0, 1 resident
+        idx = mx.array([[[0, 9]]], dtype=mx.int32)  # 0 hits, 9 misses
+        ref = glu(x, idx)
+        mx.eval(ref)
+        read = meo.CheckpointExpertStore.read
+
+        def slow_read(plan):
+            time.sleep(0.01)
+            return read(plan)
+
+        def run(overlap):
+            model, cache = self._wrap(tmp_path, glu, "4", monkeypatch)
+            w = model.layers[0].experts.switch_glu
+            w._overlap = overlap
+            w(x, warm)
+            order = []
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    meo.CheckpointExpertStore, "read", staticmethod(slow_read)
+                )
+                self._record_calls(patch, meo, cache, order)
+                out = w(x, idx)
+            mx.eval(out)
+            return out, order, (cache.hits, cache.misses)
+
+        on, on_order, on_counts = run(True)
+        off, off_order, off_counts = run(False)
+        assert bool(mx.array_equal(ref, on)) and bool(mx.array_equal(ref, off))
+        kinds = [kind for kind, _ in on_order]
+        assert kinds[0] == "dispatch"  # the resident gather, first
+        (y_hit,) = on_order[0][1]
+        before_write = on_order[: kinds.index("write")]
+        assert any(
+            a is y_hit for kind, args in before_write if kind == "eval" for a in args
+        )  # ... and evaluated before the first slot write
+        assert on_order[-1][0] == "dispatch" and on_order[-1][1][0] is on  # output
+        assert off_order == [("write", 9)]
+        assert on_counts == off_counts == (1, 3)
+
+    def test_overlap_keeps_the_serial_step_when_reads_are_fast(
+        self, tmp_path, monkeypatch
+    ):
+        """Reads that land within the grace (page cache, fast storage) leave
+        the step as it is with the overlap off: no gather before the write,
+        no keepalive, no early dispatch, and the same bytes."""
+        import omlx.patches.moe_expert_offload as meo
+
+        monkeypatch.setattr(meo, "_OVERLAP_GRACE_S", 5.0)  # every read is fast
+        glu = _make_glu(seed=15)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        x = mx.random.normal((1, 1, D))
+        warm = mx.array([[[0, 1]]], dtype=mx.int32)
+        idx = mx.array([[[0, 9]]], dtype=mx.int32)  # 0 hits, 9 misses
+        ref = glu(x, idx)
+        mx.eval(ref)
+
+        def run(overlap):
+            model, cache = self._wrap(tmp_path, glu, "4", monkeypatch)
+            w = model.layers[0].experts.switch_glu
+            w._overlap = overlap
+            w(x, warm)
+            order = []
+            with monkeypatch.context() as patch:
+                self._record_calls(patch, meo, cache, order)
+                out = w(x, idx)
+            mx.eval(out)
+            return out, order
+
+        on, on_order = run(True)
+        off, off_order = run(False)
+        assert bool(mx.array_equal(ref, on)) and bool(mx.array_equal(ref, off))
+        assert on_order == off_order == [("write", 9)]
+
+    def test_overlap_keeps_gpu_busy_while_reads_are_pending(
+        self, tmp_path, monkeypatch
+    ):
+        """While the overlap path waits on slow reads it keeps submitting GPU
+        work (the keepalive); the output stays bit-identical to the resident
+        model, and with the overlap off nothing is submitted."""
+        import time
+
+        import omlx.patches.moe_expert_offload as meo
+
+        glu = _make_glu(seed=14)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        x = mx.random.normal((1, 1, D))
+        warm = mx.array([[[0, 1]]], dtype=mx.int32)
+        idx = mx.array([[[0, 9]]], dtype=mx.int32)  # 0 hits, 9 misses
+        ref = glu(x, idx)
+        mx.eval(ref)
+        read = meo.CheckpointExpertStore.read
+
+        def slow_read(plan):
+            time.sleep(0.02)
+            return read(plan)
+
+        def run(overlap):
+            model, _ = self._wrap(tmp_path, glu, "4", monkeypatch)
+            w = model.layers[0].experts.switch_glu
+            w._overlap = overlap
+            w(x, warm)
+            submitted = []
+            async_eval = mx.async_eval
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    meo.CheckpointExpertStore, "read", staticmethod(slow_read)
+                )
+                patch.setattr(
+                    meo.mx,
+                    "async_eval",
+                    lambda *a: (submitted.append(1), async_eval(*a))[1],
+                )
+                out = w(x, idx)
+                mx.eval(out)
+            return out, len(submitted)
+
+        on, n_on = run(True)
+        off, n_off = run(False)
+        assert bool(mx.array_equal(ref, on)) and bool(mx.array_equal(ref, off))
+        assert n_on > 2 + 5  # the gather and the output, plus pulses during the reads
+        assert n_off == 0
+
+    def test_overlap_matches_serial_cache_state(self, tmp_path, monkeypatch):
+        """Overlap on and off are indistinguishable in everything but timing:
+        outputs, slot contents, LRU order and counters, over decode steps that
+        hit, miss and evict, whether the reads are slow (every step with a
+        miss overlaps) or fast (every step stays serial). With the serial
+        reader the overlap stays off."""
+        import time
+
+        import omlx.patches.moe_expert_offload as meo
+
+        glu = _make_glu(seed=13)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        mx.random.seed(17)
+        steps = [(mx.random.normal((2, 1, D)), _ri(2, 1, K)) for _ in range(16)]
+        refs = [glu(x, i) for x, i in steps]
+        mx.eval(*refs)
+        read = meo.CheckpointExpertStore.read
+
+        def slow_read(plan):
+            time.sleep(0.003)
+            return read(plan)
+
+        def run(overlap, workers, slow=False):
+            model, cache = self._wrap(tmp_path, glu, workers, monkeypatch)
+            w = model.layers[0].experts.switch_glu
+            w._overlap = overlap
+            dispatched = []
+            async_eval = mx.async_eval
+            outs = []
+            with monkeypatch.context() as patch:
+                if slow:
+                    patch.setattr(
+                        meo.CheckpointExpertStore, "read", staticmethod(slow_read)
+                    )
+                else:
+                    patch.setattr(meo, "_OVERLAP_GRACE_S", 5.0)
+                patch.setattr(
+                    meo.mx,
+                    "async_eval",
+                    lambda *a: (dispatched.append(1), async_eval(*a))[1],
+                )
+                for x, i in steps:  # one step evaluated before the next
+                    out = w(x, i)
+                    mx.eval(out)
+                    outs.append(out)
+            return cache, outs, len(dispatched)
+
+        serial, out_serial, n_serial = run(False, "8", slow=True)
+        overlap, out_overlap, n_overlap = run(True, "8", slow=True)
+        fast, out_fast, n_fast = run(True, "8")
+        _, out_one, n_one = run(True, "1", slow=True)
+        assert n_serial == n_fast == n_one == 0 and n_overlap > 0
+        assert overlap.misses > overlap.capacity  # evictions happened
+        for ref, *gots in zip(refs, out_serial, out_overlap, out_fast, out_one):
+            for got in gots:
+                assert bool(mx.array_equal(ref, got))
+        for other in (overlap, fast):
+            assert list(serial.slot_of.items()) == list(other.slot_of.items())
+            assert serial.free == other.free
+            assert (serial.hits, serial.misses) == (other.hits, other.misses)
+            assert bool(mx.array_equal(serial.map, other.map))
+            for proj in serial.projs:
+                for a, b in zip(serial.resident[proj], other.resident[proj]):
+                    if a is not None:
+                        assert bool(mx.array_equal(a, b))
+
 
 @pytest.mark.slow
 class TestRealGeometry:
@@ -892,6 +1116,36 @@ class TestRealGeometry:
         ref, got = glu(x, i), wrapped(x, i)
         mx.eval(ref, got)
         assert bool(mx.array_equal(ref, got))
+
+    def test_overlapped_decode_bit_exact(self, setup, monkeypatch):
+        """Slow reads split mixed decode steps into a resident and a missing
+        gather; at real dimensions every row still matches the resident
+        model's single gather."""
+        import time
+
+        import omlx.patches.moe_expert_offload as meo
+
+        read = meo.CheckpointExpertStore.read
+
+        def slow_read(plan):
+            time.sleep(0.002)
+            return read(plan)
+
+        monkeypatch.setattr(meo.CheckpointExpertStore, "read", staticmethod(slow_read))
+        _, wrapped, glu = self._fresh(setup, 0.25)
+        split = []
+        glu_routes = wrapped._glu_routes
+        monkeypatch.setattr(
+            wrapped, "_glu_routes", lambda *a: (split.append(1), glu_routes(*a))[1]
+        )
+        mx.random.seed(5)
+        for _ in range(6):  # 16 routes a step over 32 resident slots: hits and misses
+            x = mx.random.normal((2, 1, self.D))
+            i = _ri(2, 1, self.K, e=self.E)
+            ref, got = glu(x, i), wrapped(x, i)
+            mx.eval(ref, got)
+            assert bool(mx.array_equal(ref, got))
+        assert split  # the split path ran
 
 
 def test_capacity_uses_checkpoint_routing_top_k(tmp_path):
@@ -967,3 +1221,30 @@ def test_qwen38_flash_next_routing_and_eviction(tmp_path, length, batch):
         assert len(cache.slot_of) <= 64
     if length > 1:
         assert cache.misses > cache.capacity
+
+
+@pytest.mark.parametrize("mtp_resident", [False, True])
+def test_mtp_resident_keeps_native_head_unwrapped(tmp_path, mtp_resident):
+    """Qwen4-Exp Lightning MTP: the ``mtp.*`` head stays resident and priced."""
+    backbone, head = _make_glu(0), _make_glu(1)
+    model = _MiniMoE([backbone])
+    model.mtp = _MiniMoE([head])
+    _save_checkpoint(
+        tmp_path,
+        {
+            **_glu_tensors(backbone, "layers.0.experts.switch_glu"),
+            **_glu_tensors(head, "mtp.layers.0.experts.switch_glu"),
+        },
+    )
+    full = (tmp_path / "model.safetensors").stat().st_size
+    streamed = estimate_offload_admission_bytes(tmp_path, full, 0.25)
+    priced = estimate_offload_admission_bytes(
+        tmp_path, full, 0.25, mtp_resident=mtp_resident
+    )
+
+    wrapped = apply_moe_expert_offload(model, tmp_path, 0.25, mtp_resident=mtp_resident)
+
+    assert wrapped == (1 if mtp_resident else 2)
+    assert isinstance(model.layers[0].experts.switch_glu, OffloadSwitchGLU)
+    assert (model.mtp.layers[0].experts.switch_glu is head) is mtp_resident
+    assert (priced > streamed) is mtp_resident

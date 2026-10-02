@@ -568,6 +568,11 @@ class VLMModelAdapter(nn.Module):
         if hook is not None:
             hook(next_ids, current_ids)
 
+    def ple_gathers_ahead(self) -> bool:
+        """Whether the language model gathers PLE rows one prefill chunk ahead."""
+        probe = getattr(self._language_model, "ple_gathers_ahead", None)
+        return bool(probe()) if probe is not None else False
+
     def _omlx_prefill(self, input_ids, cache=None, **kwargs):
         """Forward the scheduler's cache-only contract to DeepSeek V4.1."""
         if self.model_type == "deepseek_v41":

@@ -102,6 +102,34 @@ def test_apply_top_p_masks_tail_tokens():
     assert np.isinf(out_np[0, 0]) and out_np[0, 0] < 0
 
 
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_apply_top_p_keeps_the_top_token_at_tiny_thresholds(dtype):
+    """A low-precision cumulative sum used to mask every token (mlx-lm #1912)."""
+    mx.random.seed(0)
+    logits = mx.random.normal((2, 4096)) * 3
+    logprobs = (logits - mx.logsumexp(logits, axis=-1, keepdims=True)).astype(dtype)
+    for top_p in (1e-8, 1e-4, 1e-3):
+        filtered = apply_top_p(logprobs, top_p)
+        assert ((filtered > -float("inf")).sum(axis=-1) > 0).all().item()
+        assert filtered.max(axis=-1).tolist() == logprobs.max(axis=-1).tolist()
+
+
+def test_apply_xtc_threshold_is_per_row():
+    """A batch row must not take its cutoff from another row's probabilities."""
+    logits = mx.log(mx.array([[0.5, 0.3, 0.2], [0.05, 0.15, 0.8]]))
+    out = apply_xtc(
+        logits, xtc_probability=1.0, xtc_threshold=0.1, xtc_special_tokens=[]
+    )
+    # Each row keeps only its own lowest above-threshold token and below.
+    assert (out > -float("inf")).tolist() == [[False, False, True], [True, True, False]]
+
+
+def test_apply_min_p_keeps_min_tokens():
+    logprobs = mx.log(mx.array([[0.9, 0.0, 0.0, 0.1]]))
+    out = apply_min_p(logprobs, 0.5, min_tokens_to_keep=2)
+    assert (out > -float("inf")).tolist() == [[True, False, False, True]]
+
+
 def test_apply_top_k_keeps_only_k_tokens():
     """apply_top_k should mask all but the top-k highest logits."""
     logits = mx.array([[1.0, 2.0, 3.0, 4.0, 5.0]])

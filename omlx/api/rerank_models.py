@@ -42,6 +42,12 @@ class RerankRequest(BaseModel):
     If not specified, returns all documents.
     """
 
+    max_length: int | None = Field(default=None, gt=0)
+    """
+    Maximum token length for each query-document pair. If not specified, the
+    model's own limit is used. Encoder rerankers cap it at the tokenizer limit.
+    """
+
     return_documents: bool = True
     """Whether to include document text in the response."""
 

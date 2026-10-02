@@ -599,6 +599,7 @@ class GlobalSettingsRequest(BaseModel):
     auto_start_on_launch: bool | None = None
     burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
     preserve_mid_system_cache: bool | None = None
+    gpu_keep_warm_interval: float | None = None
     qwen4_gdn_decode_wide_proj: bool | None = None
     distributed_inference_enabled: bool | None = None
     max_audio_upload_size: str | None = None
@@ -681,6 +682,7 @@ class GlobalSettingsRequest(BaseModel):
     integrations_openclaw_model: str | None = None
     integrations_hermes_model: str | None = None
     integrations_pi_model: str | None = None
+    integrations_dsh_model: str | None = None
     integrations_openclaw_tools_profile: (
         Literal["minimal", "coding", "messaging", "full"] | None
     ) = None
@@ -1780,6 +1782,13 @@ def get_system_memory_info() -> dict:
     except Exception:
         pass
 
+    try:
+        from ..process_memory_enforcer import preview_tier_ceilings
+
+        memory_guard_preview = preview_tier_ceilings()
+    except Exception:
+        memory_guard_preview = {}
+
     return {
         "total_bytes": total_bytes,
         "total_formatted": format_size(total_bytes),
@@ -1792,6 +1801,7 @@ def get_system_memory_info() -> dict:
         "free_memory_bytes": free_memory_bytes,
         "inactive_memory_bytes": inactive_memory_bytes,
         "active_memory_bytes": active_memory_bytes,
+        "memory_guard_preview": memory_guard_preview,
     }
 
 
@@ -3422,14 +3432,18 @@ async def update_model_settings(
     )
     auto_unloaded = False
     auto_reloaded = False
+    reload_deferred = False
     if requires_reload:
         was_pinned = entry.is_pinned
         try:
             logger.info(
                 f"Settings changed for loaded model {model_id}, auto-unloading."
             )
-            await engine_pool._unload_engine(model_id)
-            auto_unloaded = True
+            # Busy engines (requests, benchmark runs) unload after they drain.
+            auto_unloaded = await engine_pool.request_unload(
+                model_id, reason="settings changed", abort_active=False
+            )
+            reload_deferred = not auto_unloaded
         except Exception as e:
             logger.warning(f"Auto-unload failed for {model_id}: {e}")
         if auto_unloaded and was_pinned:
@@ -3449,6 +3463,7 @@ async def update_model_settings(
         "requires_reload": requires_reload,
         "auto_unloaded": auto_unloaded,
         "auto_reloaded": auto_reloaded,
+        "reload_deferred": reload_deferred,
     }
 
 
@@ -4027,6 +4042,7 @@ async def _apply_settings_snapshot(
             "requires_reload": False,
             "auto_unloaded": False,
             "auto_reloaded": False,
+            "reload_deferred": False,
         }
     if reset:
         # Metadata the PUT contract does not carry.
@@ -4564,6 +4580,11 @@ def _global_settings_response(global_settings):
                 "preserve_mid_system_cache",
                 True,
             ),
+            "gpu_keep_warm_interval": getattr(
+                global_settings.server,
+                "gpu_keep_warm_interval",
+                0.5,
+            ),
             "distributed_inference_enabled": getattr(
                 global_settings.server,
                 "distributed_inference_enabled",
@@ -4671,6 +4692,7 @@ def _global_settings_response(global_settings):
             "hermes_model": global_settings.integrations.hermes_model,
             "pi_model": global_settings.integrations.pi_model,
             "copilot_model": global_settings.integrations.copilot_model,
+            "dsh_model": global_settings.integrations.dsh_model,
             "openclaw_tools_profile": global_settings.integrations.openclaw_tools_profile,
             "markitdown_enabled": global_settings.integrations.markitdown_enabled,
             "markitdown_expose_model": global_settings.integrations.markitdown_expose_model,
@@ -4699,6 +4721,7 @@ def _global_settings_response(global_settings):
             "omlx_wired_limit_request_bytes": memory_info[
                 "omlx_wired_limit_request_bytes"
             ],
+            "memory_guard_preview": memory_info["memory_guard_preview"],
             "ssd_total_bytes": disk_info["total_bytes"],
             "ssd_total": disk_info["total_formatted"],
         },
@@ -4797,6 +4820,8 @@ async def update_global_settings(
     runtime_applied: list[str] = []
     pending_embedding_batch_size: int | None = None
     previous_embedding_batch_size: int | None = None
+    pending_max_concurrent_requests: int | None = None
+    previous_max_concurrent_requests: int | None = None
 
     # Apply server settings
     if request.host is not None:
@@ -4873,6 +4898,16 @@ async def update_global_settings(
             request.preserve_mid_system_cache
         )
         runtime_applied.append("preserve_mid_system_cache")
+    if request.gpu_keep_warm_interval is not None:
+        from ..server import _server_state
+
+        interval = max(0.0, float(request.gpu_keep_warm_interval))
+        global_settings.server.gpu_keep_warm_interval = interval
+        keep_warm_pool = _server_state.engine_pool
+        if keep_warm_pool is not None:
+            keep_warm_pool.configure_gpu_keep_warm(interval)
+            keep_warm_pool._ensure_gpu_keep_warm_task()
+        runtime_applied.append("gpu_keep_warm_interval")
     if request.distributed_inference_enabled is not None:
         # Route exposure and Bonjour publication are fixed at process startup,
         # so this intentionally takes effect after the normal settings restart.
@@ -4957,6 +4992,26 @@ async def update_global_settings(
         request.memory_guard_tier is not None
         or request.memory_guard_custom_ceiling_gb is not None
     ):
+        # Reject before touching live state: a custom tier without a ceiling
+        # would otherwise reach the enforcer before validate() runs below.
+        next_tier = (
+            str(request.memory_guard_tier or global_settings.memory.memory_guard_tier)
+            .strip()
+            .lower()
+        )
+        next_custom_gb = (
+            request.memory_guard_custom_ceiling_gb
+            if request.memory_guard_custom_ceiling_gb is not None
+            else global_settings.memory.memory_guard_custom_ceiling_gb
+        )
+        if next_tier == "custom" and float(next_custom_gb or 0) <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail=[
+                    "memory_guard_custom_ceiling_gb must be > 0 when "
+                    "memory_guard_tier is 'custom'"
+                ],
+            )
         if request.memory_guard_tier is not None:
             global_settings.memory.memory_guard_tier = request.memory_guard_tier
         if request.memory_guard_custom_ceiling_gb is not None:
@@ -4993,11 +5048,20 @@ async def update_global_settings(
             f"{'enabled' if request.memory_prefill_memory_guard else 'disabled'}"
         )
 
-    # Apply scheduler settings (restart required)
+    # Apply scheduler settings
     if request.max_concurrent_requests is not None:
-        global_settings.scheduler.max_concurrent_requests = (
+        if (
             request.max_concurrent_requests
-        )
+            != global_settings.scheduler.max_concurrent_requests
+        ):
+            # Applied to engines only after validate() and save() succeed.
+            previous_max_concurrent_requests = (
+                global_settings.scheduler.max_concurrent_requests
+            )
+            global_settings.scheduler.max_concurrent_requests = (
+                request.max_concurrent_requests
+            )
+            pending_max_concurrent_requests = request.max_concurrent_requests
 
     # Apply embedding batch size setting (Live for loaded embedding engines)
     if request.embedding_batch_size is not None:
@@ -5512,6 +5576,9 @@ async def update_global_settings(
     if "integrations_pi_model" in request.model_fields_set:
         global_settings.integrations.pi_model = request.integrations_pi_model
         integrations_changed = True
+    if "integrations_dsh_model" in request.model_fields_set:
+        global_settings.integrations.dsh_model = request.integrations_dsh_model
+        integrations_changed = True
     if "integrations_openclaw_tools_profile" in request.model_fields_set:
         global_settings.integrations.openclaw_tools_profile = (
             request.integrations_openclaw_tools_profile
@@ -5714,6 +5781,10 @@ async def update_global_settings(
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
             )
+        if previous_max_concurrent_requests is not None:
+            global_settings.scheduler.max_concurrent_requests = (
+                previous_max_concurrent_requests
+            )
         raise HTTPException(status_code=400, detail=errors)
 
     # Persist to file
@@ -5724,7 +5795,22 @@ async def update_global_settings(
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
             )
+        if previous_max_concurrent_requests is not None:
+            global_settings.scheduler.max_concurrent_requests = (
+                previous_max_concurrent_requests
+            )
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
+
+    if pending_max_concurrent_requests is not None:
+        from ..server import _server_state
+
+        pool = _server_state.engine_pool
+        if pool is not None:
+            await pool.apply_max_concurrent_requests(pending_max_concurrent_requests)
+        runtime_applied.append("max_concurrent_requests")
+        logger.info(
+            f"Max concurrent requests set to {pending_max_concurrent_requests} (live)"
+        )
 
     if pending_embedding_batch_size is not None:
         from ..server import _server_state
@@ -6745,8 +6831,11 @@ def _build_active_models_data() -> dict:
         idle_seconds: float | None = None
         ttl_remaining_seconds: float | None = None
 
-        if is_loaded and last_access is not None and last_access > 0:
-            idle_seconds = max(0.0, time.time() - last_access)
+        if is_loaded:
+            if active_requests or waiting_requests or getattr(entry, "in_use", 0) > 0:
+                idle_seconds = 0.0
+            elif last_access is not None and last_access > 0:
+                idle_seconds = max(0.0, time.time() - last_access)
 
         # Determine effective TTL: per-model ttl_seconds first, then global idle_timeout.
         effective_ttl: int | None = None
@@ -8166,8 +8255,11 @@ async def stream_accuracy_benchmark(
             while True:
                 async with run.cond:
                     while seen >= len(run.events) and not run.terminal:
+                        # Not wait_for: on 3.11 its child task can outlive a
+                        # client disconnect and leave run.cond unbalanced.
                         try:
-                            await asyncio.wait_for(run.cond.wait(), timeout=60.0)
+                            async with asyncio.timeout(60.0):
+                                await run.cond.wait()
                         except TimeoutError:
                             break
                     new = list(run.events[seen:])
@@ -8475,8 +8567,11 @@ async def stream_context_benchmark(
             while True:
                 async with run.cond:
                     while seen >= len(run.events) and not run.terminal:
+                        # Not wait_for: on 3.11 its child task can outlive a
+                        # client disconnect and leave run.cond unbalanced.
                         try:
-                            await asyncio.wait_for(run.cond.wait(), timeout=60.0)
+                            async with asyncio.timeout(60.0):
+                                await run.cond.wait()
                         except TimeoutError:
                             break
                     new = list(run.events[seen:])
@@ -8719,8 +8814,11 @@ async def stream_benchmark(
             while True:
                 async with run.cond:
                     while seen >= len(run.events) and not run.terminal:
+                        # Not wait_for: on 3.11 its child task can outlive a
+                        # client disconnect and leave run.cond unbalanced.
                         try:
-                            await asyncio.wait_for(run.cond.wait(), timeout=60.0)
+                            async with asyncio.timeout(60.0):
+                                await run.cond.wait()
                         except TimeoutError:
                             break
                     new = list(run.events[seen:])

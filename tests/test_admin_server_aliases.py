@@ -3,6 +3,8 @@
 ``server_aliases`` save/validate path in /admin/api/global-settings."""
 
 import asyncio
+import threading
+import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -12,6 +14,7 @@ from fastapi import HTTPException
 
 import omlx.admin.routes as admin_routes
 import omlx.server  # noqa: F401 — ensure server module is imported first (triggers set_admin_getters)
+import omlx.utils.network as network
 from omlx.admin.routes import GlobalSettingsRequest
 from omlx.settings import GlobalSettings
 from omlx.utils.network import (
@@ -350,6 +353,22 @@ class TestDetectServerAliases:
         """If no part of the comma-separated host is a loopback/wildcard, no loopback aliases."""
         aliases = detect_server_aliases(host="192.168.1.10, 10.0.0.1")
         assert "localhost" not in aliases
+
+    def test_slow_reverse_lookup_does_not_block(self, monkeypatch):
+        """A resolver that never answers costs the FQDN alias, not server startup."""
+        release = threading.Event()
+        monkeypatch.setattr(network, "_FQDN_TIMEOUT_S", 0.05)
+        monkeypatch.setattr(
+            network.socket, "getfqdn", lambda: release.wait(5) and "slow.example"
+        )
+        try:
+            start = time.monotonic()
+            aliases = detect_server_aliases(host="127.0.0.1")
+            assert time.monotonic() - start < 1.0
+            assert "localhost" in aliases
+            assert "slow.example" not in aliases
+        finally:
+            release.set()
 
 
 # =============================================================================
@@ -745,6 +764,7 @@ class TestGetGlobalSettingsGdnSplit:
             "active_memory_bytes": 2 * 1024**3,
             "iogpu_wired_limit_bytes": 0,
             "omlx_wired_limit_request_bytes": 0,
+            "memory_guard_preview": {},
         }
         disk_info = {"total_bytes": 100 * 1024**3, "total_formatted": "100GB"}
 
@@ -1054,6 +1074,61 @@ class TestUpdateGlobalSettingsEmbeddingBatchSize:
         assert exc_info.value.status_code == 500
         pool.apply_embedding_batch_size.assert_not_awaited()
         assert gs.scheduler.embedding_batch_size == 32
+
+
+class TestUpdateGlobalSettingsMaxConcurrentRequests:
+    """update_global_settings: saving and hot-applying max concurrent requests."""
+
+    def _setup(self, validate_errors=()):
+        gs = MagicMock()
+        gs.scheduler = SimpleNamespace(
+            max_concurrent_requests=1,
+            embedding_batch_size=32,
+            chunked_prefill=False,
+        )
+        gs.validate.return_value = list(validate_errors)
+        gs.save.return_value = None
+        return gs, SimpleNamespace(apply_max_concurrent_requests=AsyncMock())
+
+    def _save(self, gs, pool, value):
+        request = GlobalSettingsRequest(max_concurrent_requests=value)
+        with (
+            _patched_global_settings(gs),
+            patch.object(
+                omlx.server, "_server_state", SimpleNamespace(engine_pool=pool)
+            ),
+        ):
+            return asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+    def test_saves_and_hot_applies_max_concurrent_requests(self):
+        gs, pool = self._setup()
+
+        result = self._save(gs, pool, 4)
+
+        assert "max_concurrent_requests" in result["runtime_applied"]
+        assert gs.scheduler.max_concurrent_requests == 4
+        pool.apply_max_concurrent_requests.assert_awaited_once_with(4)
+
+    def test_unchanged_value_is_not_hot_applied(self):
+        gs, pool = self._setup()
+
+        result = self._save(gs, pool, 1)
+
+        assert "max_concurrent_requests" not in result["runtime_applied"]
+        pool.apply_max_concurrent_requests.assert_not_awaited()
+
+    def test_does_not_hot_apply_when_validation_fails(self):
+        gs, pool = self._setup(validate_errors=["invalid max_concurrent_requests"])
+
+        with pytest.raises(HTTPException) as exc_info:
+            self._save(gs, pool, 0)
+
+        assert exc_info.value.status_code == 400
+        assert gs.scheduler.max_concurrent_requests == 1
+        pool.apply_max_concurrent_requests.assert_not_awaited()
+        gs.save.assert_not_called()
 
 
 class TestUpdateGlobalSettingsGdnSidecarStateDtype:

@@ -210,6 +210,7 @@ class TestRunAccuracyBenchmark:
         mock_pool.get_loaded_model_ids = MagicMock(return_value=[])
         mock_pool.get_engine = AsyncMock(return_value=mock_engine)
         mock_pool._unload_engine = AsyncMock()
+        mock_pool.release_engine = AsyncMock()
 
         # Mock evaluator
         mock_result = MagicMock()
@@ -251,6 +252,7 @@ class TestRunAccuracyBenchmark:
         mock_pool.get_loaded_model_ids = MagicMock(return_value=[])
         mock_pool.get_engine = AsyncMock(return_value=MagicMock())
         mock_pool._unload_engine = AsyncMock()
+        mock_pool.release_engine = AsyncMock()
 
         mock_evaluator = MagicMock()
         mock_evaluator.load_dataset = AsyncMock(return_value=[])
@@ -272,6 +274,47 @@ class TestRunAccuracyBenchmark:
         assert len(run.results) == 0
 
 
+    @pytest.mark.asyncio
+    async def test_resident_target_is_reused_and_leased_for_the_run(self):
+        """Phase 1 keeps a resident target that the LM load reuses (#3959), and
+        the run holds a lease so a settings save cannot unload it (#3961)."""
+        run = create_run(
+            AccuracyBenchmarkRequest(model_id="target", benchmarks={"mmlu": 10})
+        )
+        order = []
+        mock_pool = MagicMock()
+        mock_pool._settings_manager = None
+        mock_pool.get_loaded_model_ids = MagicMock(return_value=["other", "target"])
+        mock_pool._force_lm_replaces_engine = MagicMock(return_value=False)
+        mock_pool.get_engine = AsyncMock(return_value=MagicMock())
+        mock_pool._unload_engine = AsyncMock(
+            side_effect=lambda mid: order.append(("unload", mid))
+        )
+        mock_pool.release_engine = AsyncMock(
+            side_effect=lambda mid: order.append(("release", mid))
+        )
+
+        mock_evaluator = MagicMock()
+        mock_evaluator.load_dataset = AsyncMock(return_value=[{"id": "1"}])
+        mock_evaluator.run = AsyncMock(return_value=_StubResult())
+        with patch.dict(
+            "omlx.eval.BENCHMARKS",
+            {"mmlu": MagicMock(return_value=mock_evaluator)},
+            clear=True,
+        ):
+            await run_accuracy_benchmark(run, mock_pool)
+
+        assert run.status == "completed"
+        mock_pool.get_engine.assert_awaited_once_with(
+            "target", force_lm=True, _lease=True
+        )
+        assert order == [
+            ("unload", "other"),
+            ("release", "target"),
+            ("unload", "target"),
+        ]
+
+
 class TestSamplingProfile:
     """sampling_profile gates whether per-model sampling reaches the evaluator.
 
@@ -287,6 +330,7 @@ class TestSamplingProfile:
         mock_pool.get_loaded_model_ids = MagicMock(return_value=[])
         mock_pool.get_engine = AsyncMock(return_value=mock_engine)
         mock_pool._unload_engine = AsyncMock()
+        mock_pool.release_engine = AsyncMock()
         mock_pool._settings_manager.get_settings = MagicMock(return_value=model_settings)
         return mock_pool
 
@@ -569,6 +613,117 @@ class TestExternalAccuracyRun:
         reset_accumulated_results()
 
 
+class TestLocalTruncation:
+    """Local runs count answers cut off by the token budget (#3772)."""
+
+    def teardown_method(self):
+        reset_accumulated_results()
+
+    @staticmethod
+    def _question(index, correct, finish_reason, completion_tokens):
+        return SimpleNamespace(
+            question_id=str(index),
+            correct=correct,
+            expected="A",
+            predicted="A" if correct else "",
+            question_text="question",
+            raw_response="answer",
+            category="test",
+            time_seconds=0.1,
+            status=None,
+            finish_reason=finish_reason,
+            reasoning_fields_present=[],
+            reasoning_fields_nonempty=[],
+            prompt_tokens=10,
+            completion_tokens=completion_tokens,
+            error_message="",
+        )
+
+    async def _run_local(self, questions):
+        correct = sum(q.correct for q in questions)
+        mock_result = MagicMock(
+            benchmark_name="mmlu",
+            accuracy=correct / len(questions),
+            total_questions=len(questions),
+            correct_count=correct,
+            time_seconds=0.4,
+            category_scores=None,
+            thinking_used=True,
+            question_results=questions,
+        )
+        mock_evaluator = MagicMock()
+        mock_evaluator.load_dataset = AsyncMock(return_value=[{"id": "1"}])
+        mock_evaluator.run = AsyncMock(return_value=mock_result)
+        pool = MagicMock()
+        pool.get_loaded_model_ids = MagicMock(return_value=[])
+        pool.get_engine = AsyncMock(return_value=AsyncMock())
+        pool._unload_engine = AsyncMock()
+        pool.release_engine = AsyncMock()
+        pool._settings_manager = None
+        run = create_run(
+            AccuracyBenchmarkRequest(model_id="test-model", benchmarks={"mmlu": 4})
+        )
+        with (
+            patch.dict(
+                "omlx.eval.BENCHMARKS",
+                {"mmlu": MagicMock(return_value=mock_evaluator)},
+                clear=True,
+            ),
+            patch(
+                "omlx.admin.accuracy_benchmark.upload_intelligence_result",
+                AsyncMock(return_value={"skipped": "min_questions"}),
+            ),
+        ):
+            await run_accuracy_benchmark(run, pool)
+        assert run.status == "completed"
+        return run.results[0]
+
+    @pytest.mark.asyncio
+    async def test_budget_limited_answers_are_counted(self):
+        result = await self._run_local([
+            self._question(0, True, "stop", 900),
+            self._question(1, True, "stop", 1200),
+            self._question(2, False, "stop", 700),
+            self._question(3, False, "length", 8192),
+            # Cut off after the answer was already stated: scored correct.
+            self._question(4, True, "length", 128),
+            # Engine errors, raised or reported: neither truncated nor finished.
+            self._question(5, False, None, 0),
+            self._question(6, False, "error", 12),
+        ])
+        assert result["truncated_count"] == 2
+        assert result["truncated_correct_count"] == 1
+        assert result["finished_count"] == 3
+        assert result["finished_accuracy"] == 0.6667
+        # External-run keys keep their external meaning only.
+        assert "valid_response_count" not in result
+        assert "valid_answer_accuracy" not in result
+        limited = result["question_results"][3]
+        assert limited["finish_reason"] == "length"
+        assert limited["completion_tokens"] == 8192
+        assert "status" not in limited
+
+    @pytest.mark.asyncio
+    async def test_clean_run_reports_zero_truncation(self):
+        result = await self._run_local([
+            self._question(0, True, "stop", 900),
+            self._question(1, False, "stop", 700),
+        ])
+        assert result["truncated_count"] == 0
+        assert result["truncated_correct_count"] == 0
+        assert result["finished_accuracy"] == result["accuracy"]
+
+    @pytest.mark.asyncio
+    async def test_all_truncated_has_no_finished_accuracy(self):
+        result = await self._run_local([
+            self._question(0, False, "length", 8192),
+            self._question(1, False, "length", 8192),
+        ])
+        assert result["truncated_count"] == 2
+        assert result["finished_count"] == 0
+        assert result["finished_accuracy"] is None
+
+
 class _StubResult:
     """Minimal stand-in for an eval BenchmarkResult."""
 
@@ -594,13 +749,20 @@ class _StubEnginePool:
     def get_loaded_model_ids(self):
         return list(self.loaded)
 
+    def _force_lm_replaces_engine(self, model_id):
+        return False
+
     async def _unload_engine(self, model_id):
         if model_id in self.loaded:
             self.loaded.remove(model_id)
 
-    async def get_engine(self, model_id, force_lm=False):
-        self.loaded.append(model_id)
+    async def get_engine(self, model_id, force_lm=False, _lease=False):
+        if model_id not in self.loaded:
+            self.loaded.append(model_id)
         return SimpleNamespace(model_id=model_id)
+
+    async def release_engine(self, model_id):
+        pass
 
 
 class TestQueueChainOwnership:
@@ -827,6 +989,7 @@ class TestCommunityUpload:
         pool.get_loaded_model_ids = MagicMock(return_value=[])
         pool.get_engine = AsyncMock(return_value=mock_engine)
         pool._unload_engine = AsyncMock()
+        pool.release_engine = AsyncMock()
         pool._settings_manager = None
         return pool
 

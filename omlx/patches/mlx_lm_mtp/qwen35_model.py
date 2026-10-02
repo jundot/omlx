@@ -252,7 +252,7 @@ def _patch_gated_delta_net(q35: Any) -> None:
     import mlx.core as mx
     import mlx.nn as nn
     from mlx.nn.layers.distributed import sum_gradients
-    from mlx_lm.models.gated_delta import gated_delta_update
+    from mlx_lm.models.gated_delta import gated_delta_update, normalize_qk
 
     def _process_chunk(
         self,
@@ -283,9 +283,7 @@ def _patch_gated_delta_net(q35: Any) -> None:
                 [self.head_k_dim, self.head_k_dim, self.head_v_dim],
             )
         ]
-        inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        q, k = normalize_qk(q, k, inv_scale=self.head_k_dim**-0.5, eps=1e-6)
 
         out, new_ssm_state = gated_delta_update(
             q,
@@ -695,6 +693,10 @@ def _patch_text_model(q35: Any) -> None:
         cls.__init__ = __init__
         cls._omlx_mtp_init_wrapped = True
     __call__._omlx_mtp_call_marker = True
+    # Logits are lm_head(mtp(...)); draft chains may score candidates themselves.
+    mtp_forward._omlx_lm_head_logits = True
+    # The head reads only its own cache, so it can draft before the backbone commit.
+    mtp_forward._omlx_head_cache_only = True
     cls.__call__ = __call__
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache

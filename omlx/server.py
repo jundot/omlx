@@ -665,6 +665,18 @@ async def lifespan(app: FastAPI):
     if mcp_config:
         await init_mcp(mcp_config)
 
+    # Resume persisted download queues after settings and model dirs are set.
+    if _server_state.hf_downloader is not None:
+        try:
+            await _server_state.hf_downloader.restore_tasks()
+        except Exception as exc:  # pragma: no cover - never block startup
+            logger.warning("HF download queue restore failed: %s", exc)
+    if _server_state.ms_downloader is not None:
+        try:
+            await _server_state.ms_downloader.restore_tasks()
+        except Exception as exc:  # pragma: no cover - never block startup
+            logger.warning("MS download queue restore failed: %s", exc)
+
     yield
 
     # Shutdown: Save all-time stats, stop TTL task, process memory enforcer, etc.
@@ -1986,6 +1998,38 @@ def _resolve_metric_durations(
     return prefill_duration, generation_duration
 
 
+def _usage_timing_fields(
+    prompt_tokens: int,
+    completion_tokens: int,
+    *,
+    ttft: float | None,
+    prefill_duration: float,
+    generation_duration: float,
+    cached_tokens: int = 0,
+) -> dict:
+    """Timing fields for a non-streaming Usage, computed like the final streaming chunk.
+
+    The prompt rate counts only the tokens prefilled in this request: cached
+    prefix tokens were restored, not computed, during prefill_duration.
+    """
+    computed = max(prompt_tokens - (cached_tokens or 0), 0)
+    return {
+        "time_to_first_token": round(ttft, 2) if ttft is not None else None,
+        "prompt_eval_duration": (
+            round(prefill_duration, 2) if prefill_duration > 0 else None
+        ),
+        "generation_duration": round(generation_duration, 2),
+        "prompt_tokens_per_second": (
+            round(computed / prefill_duration, 2) if prefill_duration > 0 else None
+        ),
+        "generation_tokens_per_second": (
+            round(completion_tokens / generation_duration, 2)
+            if generation_duration > 0
+            else None
+        ),
+    }
+
+
 def _get_ocr_defaults(model_id: str | None) -> dict | None:
     """Get OCR generation defaults for a model, or None if not an OCR model."""
     if model_id is None:
@@ -2244,6 +2288,9 @@ def init_server(
     _server_state.engine_pool = EnginePool(
         scheduler_config=scheduler_config,
     )
+    _server_state.engine_pool.configure_gpu_keep_warm(
+        global_settings.server.gpu_keep_warm_interval if global_settings else 0.5
+    )
     from .cluster.enrollment import configure_cluster_enrollment, get_cluster_enrollment
     from .cluster.incidents import configure_cluster_incidents
     from .cluster.pairing import configure_pairing_manager
@@ -2344,6 +2391,13 @@ def init_server(
     # Initialize HuggingFace downloader
     from .admin.hf_downloader import HFDownloader
     from .admin.routes import set_hf_downloader
+    from .settings import resolve_default_base_path
+
+    tasks_base = (
+        Path(global_settings.base_path)
+        if global_settings is not None
+        else resolve_default_base_path()
+    )
 
     async def _refresh_models_after_download():
         """Re-discover models when a HuggingFace download completes."""
@@ -2358,6 +2412,7 @@ def init_server(
     _server_state.hf_downloader = HFDownloader(
         model_dir=dir_list[0],  # Downloads go to primary directory
         on_complete=_refresh_models_after_download,
+        tasks_file=tasks_base / "hf_download_tasks.json",
     )
     set_hf_downloader(_server_state.hf_downloader)
     logger.info("HF Downloader initialized")
@@ -2372,6 +2427,7 @@ def init_server(
             _server_state.ms_downloader = MSDownloader(
                 model_dir=dir_list[0],
                 on_complete=_refresh_models_after_download,
+                tasks_file=tasks_base / "ms_download_tasks.json",
             )
             set_ms_downloader(_server_state.ms_downloader)
             logger.info("ModelScope Downloader initialized")
@@ -2435,7 +2491,36 @@ def _completion_keepalive_chunk(response_id: str) -> str:
 _KEEPALIVE_ANTHROPIC_PING = 'event: ping\ndata: {"type":"ping"}\n\n'
 
 
-def _resolve_keepalive(protocol: str) -> Optional[str]:
+@dataclass
+class _ResponsesStreamState:
+    """Share response identity and event ordering with prefill keepalives."""
+
+    sequence_number: int = 0
+    response: dict | None = None
+    prefilling: bool = True
+
+    def next_sequence(self) -> int:
+        self.sequence_number += 1
+        return self.sequence_number
+
+    def keepalive(self) -> str | None:
+        # response.created must come first. Once model output starts, do not
+        # send the initial empty-output snapshot over an active response.
+        if self.response is None or not self.prefilling:
+            return None
+        return format_sse_event(
+            "response.in_progress",
+            {
+                "type": "response.in_progress",
+                "response": self.response,
+                "sequence_number": self.next_sequence(),
+            },
+        )
+
+
+def _resolve_keepalive(
+    protocol: str, *, responses_state: _ResponsesStreamState | None = None
+) -> str | Callable[[], str | None] | None:
     """Pick a wire-level keepalive frame for the given API protocol.
 
     Returns None when the configured mode disables keepalive for this protocol.
@@ -2458,7 +2543,9 @@ def _resolve_keepalive(protocol: str) -> Optional[str]:
     if protocol == "anthropic":
         return _KEEPALIVE_ANTHROPIC_PING
     if protocol == "openai_responses":
-        return None
+        # Responses events need the real response id and a fresh sequence
+        # number, so a static frame cannot be reused here.
+        return responses_state.keepalive if responses_state is not None else None
     return None
 
 
@@ -2554,7 +2641,7 @@ async def _with_sse_keepalive(
     http_request: Optional["FastAPIRequest"] = None,
     interval: float = 10.0,
     disconnect_poll: float = 2.0,
-    keepalive_chunk: Optional[str] = _KEEPALIVE_COMMENT,
+    keepalive_chunk: str | Callable[[], str | None] | None = _KEEPALIVE_COMMENT,
 ) -> AsyncIterator[str]:
     """Wrap an SSE generator to send periodic keepalive frames.
 
@@ -2563,7 +2650,8 @@ async def _with_sse_keepalive(
     This wrapper periodically yields a keepalive frame to hold the
     connection open. The frame format depends on caller-supplied
     keepalive_chunk: a legacy SSE comment, a protocol-aware no-op event,
-    or None to disable emission entirely.
+    or None to disable emission entirely. A callable can build a fresh event
+    with per-stream state, returning None when no keepalive should be emitted.
 
     When http_request is provided, also polls for client disconnect
     between prefill steps. This detects cancellation during long prefills
@@ -2592,7 +2680,9 @@ async def _with_sse_keepalive(
     # Send initial keepalive immediately so clients with short read
     # timeouts (e.g. openclaw ~15s) don't disconnect during prefill.
     if keepalive_chunk is not None:
-        yield keepalive_chunk
+        chunk = keepalive_chunk() if callable(keepalive_chunk) else keepalive_chunk
+        if chunk is not None:
+            yield chunk
 
     try:
         while True:
@@ -2630,7 +2720,13 @@ async def _with_sse_keepalive(
                 if keepalive_elapsed >= interval:
                     keepalive_elapsed = 0.0
                     if keepalive_chunk is not None:
-                        yield keepalive_chunk
+                        chunk = (
+                            keepalive_chunk()
+                            if callable(keepalive_chunk)
+                            else keepalive_chunk
+                        )
+                        if chunk is not None:
+                            yield chunk
             if task.done():
                 try:
                     result = task.result()
@@ -3638,6 +3734,7 @@ async def create_rerank(
     Supports:
     - String documents or dict documents with 'text' field
     - Optional top_n to limit results
+    - Optional max_length to limit tokens per query-document pair
     - Optional return_documents to include document text in response
     """
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
@@ -3670,6 +3767,7 @@ async def create_rerank(
             query=request.query,
             documents=documents_raw,
             top_n=request.top_n,
+            max_length=request.max_length,
         )
 
     elapsed = time.perf_counter() - start_time
@@ -3882,11 +3980,12 @@ async def create_completion(
                 f"({tokens_per_sec:.1f} tok/s), prompt: {total_prompt_tokens}"
             )
 
-            prefill_duration = (
+            ttft = (
                 (first_token_at - start_time)
                 if first_token_at is not None
-                else 0.0
+                else None
             )
+            prefill_duration = ttft if ttft is not None else 0.0
             gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
             get_server_metrics().record_request_complete(
                 prompt_tokens=total_prompt_tokens,
@@ -3914,6 +4013,18 @@ async def create_completion(
                         else None
                     ),
                     total_time=round(elapsed, 2),
+                    **(
+                        _usage_timing_fields(
+                            total_prompt_tokens,
+                            total_completion_tokens,
+                            ttft=ttft,
+                            prefill_duration=prefill_duration,
+                            generation_duration=gen_duration,
+                            cached_tokens=total_cached_tokens,
+                        )
+                        if len(prompts) == 1
+                        else {}
+                    ),
                 ),
             ).model_dump_json(exclude_none=True)
 
@@ -4375,13 +4486,16 @@ async def create_chat_completion(
             ttft = (
                 (first_token_at - start_time)
                 if first_token_at is not None
-                else 0.0
+                else None
             )
-            gen_duration = elapsed - ttft if ttft > 0 else elapsed
+            metric_prefill = ttft if ttft is not None else 0.0
+            gen_duration = (
+                elapsed - metric_prefill if metric_prefill > 0 else elapsed
+            )
             metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
                 output,
                 is_diffusion=is_diffusion,
-                prefill_duration=ttft,
+                prefill_duration=metric_prefill,
                 generation_duration=gen_duration,
             )
 
@@ -4472,6 +4586,14 @@ async def create_chat_completion(
                         else None
                     ),
                     total_time=round(elapsed, 2),
+                    **_usage_timing_fields(
+                        output.prompt_tokens,
+                        output.completion_tokens,
+                        ttft=ttft,
+                        prefill_duration=metric_prefill_duration,
+                        generation_duration=metric_gen_duration,
+                        cached_tokens=output.cached_tokens,
+                    ),
                 ),
             ).model_dump_json(exclude_none=True)
 
@@ -4699,7 +4821,14 @@ def _compile_with_structural_tag(
             "compiling structural tag as-is",
             reasoning_parser,
         )
-    return compiler.compile_structural_tag(tag_dict)
+    from .api.grammar import mark_grammar_thinking_phase
+
+    return mark_grammar_thinking_phase(
+        compiler.compile_structural_tag(tag_dict), enabled=reasoning
+    )
+
+
+_JSON_SCHEMA_MAX_WHITESPACE_CNT = 32
 
 
 def _compile_bare_grammar(compiler, fmt: dict):
@@ -4711,7 +4840,15 @@ def _compile_bare_grammar(compiler, fmt: dict):
         if not schema:
             return compiler.compile_builtin_json_grammar()
         schema_str = _json.dumps(schema) if isinstance(schema, dict) else schema
-        return compiler.compile_json_schema(schema_str)
+        # An unlimited whitespace run can trap a grammar-constrained decoder
+        # after an early string termination: whitespace remains valid while
+        # every useful token is masked.  Keep the bound local to the compiler
+        # call so ordinary JSON and user-supplied EBNF/regex grammars retain
+        # their existing behavior.
+        return compiler.compile_json_schema(
+            schema_str,
+            max_whitespace_cnt=_JSON_SCHEMA_MAX_WHITESPACE_CNT,
+        )
     elif fmt["type"] == "grammar":
         return compiler.compile_grammar(fmt["grammar"])
     elif fmt["type"] == "regex":
@@ -5068,19 +5205,14 @@ async def stream_completion(
                         if model_load_duration > 1.0
                         else None
                     ),
-                    time_to_first_token=round(ttft, 2),
                     total_time=round(total_time, 2),
-                    prompt_eval_duration=round(metric_prefill_duration, 2),
-                    generation_duration=round(metric_gen_duration, 2),
-                    prompt_tokens_per_second=(
-                        round(pt / metric_prefill_duration, 2)
-                        if metric_prefill_duration > 0
-                        else None
-                    ),
-                    generation_tokens_per_second=(
-                        round(ct / metric_gen_duration, 2)
-                        if metric_gen_duration > 0
-                        else None
+                    **_usage_timing_fields(
+                        pt,
+                        ct,
+                        ttft=ttft,
+                        prefill_duration=metric_prefill_duration,
+                        generation_duration=metric_gen_duration,
+                        cached_tokens=last_output.cached_tokens,
                     ),
                 ).model_dump(exclude_none=True),
             }
@@ -5901,26 +6033,19 @@ async def stream_chat_completion(
                         if model_load_duration > 1.0
                         else None
                     ),
-                    time_to_first_token=(
-                        round(model_ttft, 2) if model_ttft is not None else None
-                    ),
                     time_to_first_visible_token=(
                         round(visible_ttft, 2)
                         if visible_ttft is not None
                         else None
                     ),
                     total_time=round(total_time, 2),
-                    prompt_eval_duration=round(metric_prefill_duration, 2),
-                    generation_duration=round(metric_gen_duration, 2),
-                    prompt_tokens_per_second=(
-                        round(pt / metric_prefill_duration, 2)
-                        if metric_prefill_duration > 0
-                        else None
-                    ),
-                    generation_tokens_per_second=(
-                        round(ct / metric_gen_duration, 2)
-                        if metric_gen_duration > 0
-                        else None
+                    **_usage_timing_fields(
+                        pt,
+                        ct,
+                        ttft=model_ttft,
+                        prefill_duration=metric_prefill_duration,
+                        generation_duration=metric_gen_duration,
+                        cached_tokens=last_output.cached_tokens,
                     ),
                 ),
             )
@@ -7221,6 +7346,7 @@ async def create_response(
             sse_headers = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
             if response_format_warning:
                 sse_headers["Warning"] = response_format_warning
+            stream_state = _ResponsesStreamState()
             return StreamingResponse(
                 _release_after_stream(
                     _with_request_disconnect_abort(
@@ -7236,10 +7362,13 @@ async def create_response(
                                 response_format=response_format,
                                 native_reasoning=native_reasoning,
                                 namespace_aliases=namespace_aliases,
+                                stream_state=stream_state,
                                 **chat_kwargs,
                             ),
                             http_request=http_request,
-                            keepalive_chunk=_resolve_keepalive("openai_responses"),
+                            keepalive_chunk=_resolve_keepalive(
+                                "openai_responses", responses_state=stream_state
+                            ),
                         ),
                         http_request,
                         engine,
@@ -7424,6 +7553,7 @@ async def stream_responses_api(
     response_format=None,
     native_reasoning: bool = False,
     namespace_aliases: Optional[dict] = None,
+    stream_state: _ResponsesStreamState | None = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream Responses API events (SSE with named event types)."""
@@ -7451,6 +7581,7 @@ async def stream_responses_api(
         except Exception as exc:
             logger.debug("Could not detect Responses stream thinking state: %s", exc)
     thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+    stream_state = stream_state or _ResponsesStreamState()
     seq = 0
 
     response_id = generate_id(IDPrefix.RESPONSE)
@@ -7479,9 +7610,10 @@ async def stream_responses_api(
         previous_response_id=request.previous_response_id,
     )
     initial_data = initial_response.model_dump(exclude_none=True)
+    stream_state.response = initial_data
 
     # 1. response.created
-    seq += 1
+    seq = stream_state.next_sequence()
     yield format_sse_event(
         "response.created",
         {
@@ -7492,7 +7624,7 @@ async def stream_responses_api(
     )
 
     # 2. response.in_progress
-    seq += 1
+    seq = stream_state.next_sequence()
     yield format_sse_event(
         "response.in_progress",
         {
@@ -7511,7 +7643,7 @@ async def stream_responses_api(
         reasoning_output_index = next_output_index
         next_output_index += 1
         events = []
-        seq += 1
+        seq = stream_state.next_sequence()
         events.append(
             format_sse_event(
                 "response.output_item.added",
@@ -7528,7 +7660,7 @@ async def stream_responses_api(
                 },
             )
         )
-        seq += 1
+        seq = stream_state.next_sequence()
         events.append(
             format_sse_event(
                 "response.reasoning_summary_part.added",
@@ -7551,7 +7683,7 @@ async def stream_responses_api(
         reasoning_closed = True
         reasoning_text = accumulated_reasoning
         events = []
-        seq += 1
+        seq = stream_state.next_sequence()
         events.append(
             format_sse_event(
                 "response.reasoning_summary_text.done",
@@ -7565,7 +7697,7 @@ async def stream_responses_api(
                 },
             )
         )
-        seq += 1
+        seq = stream_state.next_sequence()
         events.append(
             format_sse_event(
                 "response.reasoning_summary_part.done",
@@ -7579,7 +7711,7 @@ async def stream_responses_api(
                 },
             )
         )
-        seq += 1
+        seq = stream_state.next_sequence()
         events.append(
             format_sse_event(
                 "response.output_item.done",
@@ -7606,7 +7738,7 @@ async def stream_responses_api(
         msg_output_index = next_output_index
         next_output_index += 1
         events = []
-        seq += 1
+        seq = stream_state.next_sequence()
         events.append(
             format_sse_event(
                 "response.output_item.added",
@@ -7624,7 +7756,7 @@ async def stream_responses_api(
                 },
             )
         )
-        seq += 1
+        seq = stream_state.next_sequence()
         events.append(
             format_sse_event(
                 "response.content_part.added",
@@ -7647,7 +7779,7 @@ async def stream_responses_api(
         accumulated_reasoning += delta
         events = []
         events.extend(_open_reasoning())
-        seq += 1
+        seq = stream_state.next_sequence()
         events.append(
             format_sse_event(
                 "response.reasoning_summary_text.delta",
@@ -7694,6 +7826,7 @@ async def stream_responses_api(
     engine_stream = engine.stream_chat(messages=messages, **kwargs)
     try:
         async for output in engine_stream:
+            stream_state.prefilling = False
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
             last_output = output
@@ -7718,7 +7851,7 @@ async def stream_responses_api(
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
                     if content_delta:
-                        seq += 1
+                        seq = stream_state.next_sequence()
                         yield format_sse_event(
                             "response.output_text.delta",
                             {
@@ -7744,7 +7877,8 @@ async def stream_responses_api(
         else:
             logger.error(f"Error during Responses API streaming: {e}")
             failure_error = {"code": "server_error", "message": str(e)}
-        seq += 1
+        stream_state.prefilling = False
+        seq = stream_state.next_sequence()
         yield format_sse_event(
             "response.failed",
             {
@@ -7760,6 +7894,7 @@ async def stream_responses_api(
         return
 
     finally:
+        stream_state.prefilling = False
         await _aclose_async_iterator(engine_stream)
 
     # Flush remaining content from parsers
@@ -7785,7 +7920,7 @@ async def stream_responses_api(
             if tool_filter:
                 content_delta = tool_filter.feed(content_delta)
             if content_delta:
-                seq += 1
+                seq = stream_state.next_sequence()
                 yield format_sse_event(
                     "response.output_text.delta",
                     {
@@ -7805,7 +7940,7 @@ async def stream_responses_api(
                         yield ev
                 for ev in _open_message():
                     yield ev
-                seq += 1
+                seq = stream_state.next_sequence()
                 yield format_sse_event(
                     "response.output_text.delta",
                     {
@@ -7850,7 +7985,7 @@ async def stream_responses_api(
         if not stream_content and cleaned_text:
             for ev in _open_message():
                 yield ev
-            seq += 1
+            seq = stream_state.next_sequence()
             yield format_sse_event(
                 "response.output_text.delta",
                 {
@@ -7883,7 +8018,7 @@ async def stream_responses_api(
                     yield ev
             for ev in _open_message():
                 yield ev
-            seq += 1
+            seq = stream_state.next_sequence()
             yield format_sse_event(
                 "response.output_text.delta",
                 {
@@ -7927,7 +8062,7 @@ async def stream_responses_api(
         yield ev
 
     # response.output_text.done
-    seq += 1
+    seq = stream_state.next_sequence()
     yield format_sse_event(
         "response.output_text.done",
         {
@@ -7941,7 +8076,7 @@ async def stream_responses_api(
     )
 
     # response.content_part.done
-    seq += 1
+    seq = stream_state.next_sequence()
     yield format_sse_event(
         "response.content_part.done",
         {
@@ -7955,7 +8090,7 @@ async def stream_responses_api(
     )
 
     # response.output_item.done (message)
-    seq += 1
+    seq = stream_state.next_sequence()
     yield format_sse_event(
         "response.output_item.done",
         {
@@ -8027,7 +8162,7 @@ async def stream_responses_api(
                 fc_item["namespace"] = namespace
 
             # output_item.added
-            seq += 1
+            seq = stream_state.next_sequence()
             yield format_sse_event(
                 "response.output_item.added",
                 {
@@ -8039,7 +8174,7 @@ async def stream_responses_api(
             )
 
             # function_call_arguments.delta
-            seq += 1
+            seq = stream_state.next_sequence()
             yield format_sse_event(
                 "response.function_call_arguments.delta",
                 {
@@ -8052,7 +8187,7 @@ async def stream_responses_api(
             )
 
             # function_call_arguments.done
-            seq += 1
+            seq = stream_state.next_sequence()
             yield format_sse_event(
                 "response.function_call_arguments.done",
                 {
@@ -8075,7 +8210,7 @@ async def stream_responses_api(
             }
             if namespace:
                 completed_fc["namespace"] = namespace
-            seq += 1
+            seq = stream_state.next_sequence()
             yield format_sse_event(
                 "response.output_item.done",
                 {
@@ -8091,7 +8226,7 @@ async def stream_responses_api(
             next_output_index = output_index
 
     if tool_failure:
-        seq += 1
+        seq = stream_state.next_sequence()
         yield format_sse_event(
             "response.failed",
             {
@@ -8172,7 +8307,7 @@ async def stream_responses_api(
     if request.previous_response_id:
         final_response["previous_response_id"] = request.previous_response_id
 
-    seq += 1
+    seq = stream_state.next_sequence()
     yield format_sse_event(
         terminal_event,
         {

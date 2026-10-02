@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
@@ -178,12 +179,14 @@ def test_qwen4_small_hyper_connection_fusion_fails_closed(quantized):
     decode_compiled = module(decode_inputs)
     verify_compiled = module(inputs, target_verify=True)
     mx.eval(*prefill, *decode_eager, *decode_compiled, *verify_compiled)
+    # mx.compile fuses the elementwise tail into one kernel, and some GPUs
+    # (the CI VM) round it one ulp differently.
     for expected, actual in zip(fused, prefill):
-        assert mx.array_equal(expected, actual).item()
+        assert mx.allclose(expected, actual, rtol=1e-5, atol=1e-6).item()
     for expected, actual in zip(decode_eager, decode_compiled):
-        assert mx.array_equal(expected, actual).item()
+        assert mx.allclose(expected, actual, rtol=1e-5, atol=1e-6).item()
     for expected, actual in zip(verify_fused, verify_compiled):
-        assert mx.array_equal(expected, actual).item()
+        assert mx.allclose(expected, actual, rtol=1e-5, atol=1e-6).item()
 
     compiled_forward = module._compiled_forward
     module._compiled_forward = MagicMock(
@@ -264,9 +267,25 @@ def test_qwen4_resident_ple_fuses_packed_shards_exactly():
     indices = mx.array([[0, 9, 17, 31, 9]], dtype=mx.int32)
     expected = embedding(indices)
     mx.eval(expected)
+    scales_dtype = embedding.shards[0].scales.dtype
+    loads = []
 
-    assert embedding.fuse_quantized_shards() is True
-    assert embedding.fuse_quantized_shards() is False
+    def load_sources():
+        loads.append(1)
+        # Reloaded copies with another scales dtype must not replace the shards.
+        return [
+            SimpleNamespace(
+                weight=shard.weight,
+                scales=shard.scales.astype(mx.float16),
+                biases=shard.biases,
+            )
+            for shard in embedding.shards
+        ]
+
+    assert embedding.fuse_quantized_shards(load_sources) is True
+    assert embedding.fused.scales.dtype == scales_dtype
+    assert embedding.fuse_quantized_shards(load_sources) is False
+    assert len(loads) == 1
     assert embedding.shards == []
     # The fused arm performs one device gather and no longer consults the host
     # shard boundaries after load.
@@ -1050,6 +1069,56 @@ def test_qwen4_verify_matches_singleton_greedy_and_rolls_back_qsa():
     assert qsa_cache.offset == 4
     assert qsa_cache.index_keys.shape[1] == 4
     assert qsa_cache.index_position_ids.shape[-1] == 4
+
+
+def _cache_arrays(cache):
+    arrays = []
+    for entry in cache:
+        state = entry.state if hasattr(entry, "state") else entry
+        items = state if isinstance(state, (list, tuple)) else [state]
+        arrays.extend(item for item in items if isinstance(item, mx.array))
+    return arrays
+
+
+def test_qwen4_mtp_one_row_step_is_the_serial_decode_step():
+    """A Lightning MTP window of one row (activation, depth-0 cycle) has no draft
+    to roll back: it must be the serial decode step, cache and all, and leave
+    the cache ready for the next verify window."""
+    config = _tiny_config()
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
+
+    model = LanguageModel(config.text_config, config)
+    step_cache = model.make_cache()
+    serial_cache = model.make_cache()
+    prefix = mx.array([[2, 3, 4]], dtype=mx.int32)
+    model(prefix, cache=step_cache)
+    model(prefix, cache=serial_cache)
+
+    stepped = model(mx.array([[5]], dtype=mx.int32), cache=step_cache, return_hidden=True)
+    serial = model(mx.array([[5]], dtype=mx.int32), cache=serial_cache)
+    mx.eval(stepped.logits, stepped.hidden_states, serial.logits)
+
+    assert stepped.gdn_states is None
+    assert stepped.hidden_states[0].shape == (1, 1, 64)
+    assert mx.array_equal(stepped.logits, serial.logits).item()
+    stepped_arrays = _cache_arrays(step_cache)
+    serial_arrays = _cache_arrays(serial_cache)
+    assert len(stepped_arrays) == len(serial_arrays)
+    for got, want in zip(stepped_arrays, serial_arrays):
+        assert mx.array_equal(got, want).item()
+
+    # The next window verifies on top of the step and rolls back as usual.
+    verified = model(mx.array([[6, 7]], dtype=mx.int32), cache=step_cache, return_hidden=True)
+    assert verified.gdn_states.active
+    model.rollback_speculative_cache(
+        step_cache, verified.gdn_states, accepted=0, block_size=2
+    )
+    first = model(mx.array([[6]], dtype=mx.int32), cache=serial_cache)
+    assert mx.array_equal(
+        mx.argmax(verified.logits[:, :1], axis=-1), mx.argmax(first.logits, axis=-1)
+    ).item()
+    assert step_cache[1].offset == serial_cache[1].offset == 5
+
 
 
 def _assert_ple_state_matches(actual_cache, expected_cache):
@@ -1883,6 +1952,17 @@ def test_ngram_prefetch_computes_the_next_chunks_indices():
     assert mx.array_equal(seen["prefetch"], seen["call"]).item()
 
 
+
+def test_ple_gathers_ahead_only_with_a_prefetching_table():
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
+
+    config = _tiny_config()
+    model = LanguageModel(config.text_config, config)
+    assert model.ple_gathers_ahead() is False
+    ple = next(layer.ple for layer in model.model.layers if getattr(layer, "ple", None) is not None)
+    ple.ple_embedding.ngram_embedding.prefetch = lambda indices: None
+    assert model.ple_gathers_ahead() is True
+
 def test_prompt_lookahead_keeps_the_schedulers_mrope_hook(monkeypatch):
     """The scheduler wraps prompt() to set mRoPE deltas first; the lookahead loop must run under it, not over it."""
     import omlx.scheduler as scheduler  # installs the wrapper
@@ -2008,3 +2088,99 @@ def test_mtp_batched_positions_match_for_identical_rows():
         mx.eval(output)
         assert mx.allclose(output[0], output[1], atol=1e-6).item()
     assert cache[0].offset == 10
+
+
+@pytest.fixture
+def _depthwise_conv_state(monkeypatch):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp import language
+
+    monkeypatch.setitem(language._DEPTHWISE_CONV_STATE, "enabled", True)
+    monkeypatch.setitem(language._DEPTHWISE_CONV_STATE, "validated", False)
+    return language
+
+
+def _depthwise_conv(channels, taps=4, dilation=3, dtype=mx.bfloat16, bias=False):
+    conv = nn.Conv1d(
+        channels, channels, kernel_size=taps, dilation=dilation, groups=channels, bias=bias
+    )
+    conv.weight = (mx.random.normal(conv.weight.shape) * 0.3).astype(dtype)
+    if bias:
+        conv.bias = mx.random.normal((channels,)).astype(dtype)
+    return conv
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
+@pytest.mark.parametrize("dilation,taps", [(3, 4), (1, 4), (2, 3)])
+def test_ple_depthwise_conv_kernel_is_bit_equal_to_conv1d(_depthwise_conv_state, dtype, dilation, taps):
+    language = _depthwise_conv_state
+    mx.random.seed(dilation * 10 + taps)
+    conv = _depthwise_conv(320, taps=taps, dilation=dilation, dtype=dtype)
+    for batch, rows in ((1, 1), (1, 7), (2, 33), (1, 517)):
+        x = mx.random.normal((batch, rows + (taps - 1) * dilation, 320)).astype(dtype)
+        got = language._depthwise_conv1d(conv, x)
+        ref = conv(x)
+        mx.eval(got, ref)
+        assert got.shape == ref.shape and got.dtype == ref.dtype
+        view = {mx.float32: mx.uint32}.get(dtype, mx.uint16)
+        assert mx.array_equal(got.view(view), ref.view(view)).item()
+    assert language._DEPTHWISE_CONV_STATE["validated"]
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_ple_depthwise_conv_one_pipeline_serves_every_length(_depthwise_conv_state, monkeypatch):
+    language = _depthwise_conv_state
+    names = []
+    real = mx.fast.metal_kernel
+
+    def spy(*args, **kwargs):
+        names.append(kwargs.get("name"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(language.mx.fast, "metal_kernel", spy)
+    monkeypatch.setitem(language._DEPTHWISE_CONV_STATE, "kernel", None)
+    conv = _depthwise_conv(64)
+    for rows in (5, 9, 100):
+        mx.eval(language._depthwise_conv1d(conv, mx.ones((1, rows + 9, 64), mx.bfloat16)))
+    assert names == ["omlx_qwen4_depthwise_conv1d"]
+
+
+def test_ple_depthwise_conv_unsupported_layouts_use_conv1d(_depthwise_conv_state, monkeypatch):
+    language = _depthwise_conv_state
+    calls = []
+    monkeypatch.setattr(
+        language.mx.fast,
+        "metal_kernel",
+        lambda *a, **k: calls.append(k) or (_ for _ in ()).throw(AssertionError),
+    )
+    monkeypatch.setitem(language._DEPTHWISE_CONV_STATE, "kernel", None)
+    x = mx.ones((1, 12, 64), mx.bfloat16)
+    grouped = nn.Conv1d(64, 64, kernel_size=4, dilation=3, groups=32, bias=False)
+    grouped.weight = grouped.weight.astype(mx.bfloat16)
+    with_bias = _depthwise_conv(64, bias=True)
+    padded = _depthwise_conv(64)
+    padded.padding = 1
+    mixed_dtype = _depthwise_conv(64, dtype=mx.float32)
+    for conv in (grouped, with_bias, padded, mixed_dtype):
+        mx.eval(language._depthwise_conv1d(conv, x))
+    monkeypatch.setitem(language._DEPTHWISE_CONV_STATE, "enabled", False)
+    mx.eval(language._depthwise_conv1d(_depthwise_conv(64), x))
+    assert calls == []
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_ple_depthwise_conv_validation_mismatch_disables_kernel(_depthwise_conv_state, monkeypatch):
+    language = _depthwise_conv_state
+
+    class Wrong:
+        def __call__(self, inputs, **kwargs):
+            return [mx.zeros(kwargs["output_shapes"][0], kwargs["output_dtypes"][0])]
+
+    monkeypatch.setitem(language._DEPTHWISE_CONV_STATE, "kernel", Wrong())
+    conv = _depthwise_conv(64)
+    x = mx.random.normal((1, 20, 64)).astype(mx.bfloat16)
+    out = language._depthwise_conv1d(conv, x)
+    assert mx.array_equal(out, conv(x)).item()
+    assert language._DEPTHWISE_CONV_STATE["enabled"] is False
+    assert language._DEPTHWISE_CONV_STATE["validated"] is False

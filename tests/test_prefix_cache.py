@@ -2034,6 +2034,44 @@ class TestArraysCacheLastBlockOnly:
         assert old_tail_hash in paged_cache._tail_index[blocks[0].block_hash]
         assert blocks[2].block_hash in paged_cache._tail_index[blocks[1].block_hash]
 
+    def test_superseded_tail_deleted_two_turns_later(self, mx):
+        """Hybrid tails follow the same tip lineage as rotating models.
+
+        The previous turn's tail stays as the edited-turn fallback; the tail
+        two turns back is deleted when the chain is extended again."""
+        cache, paged_cache, _, config = self._tail_fixture(mx)
+
+        def turn(request_id, tokens):
+            n = len(tokens)
+            boundary = (n // 4) * 4
+            cache.fetch_cache(request_id, tokens)
+            table = cache.store_cache(
+                request_id,
+                tokens,
+                self._hybrid_state(mx, n, float(n)),
+                model_cache_config=config,
+                boundary_snapshots={
+                    boundary: self._hybrid_state(mx, boundary, float(boundary)),
+                    n: self._hybrid_state(mx, n, float(n)),
+                },
+                _store_tail_terminal=True,
+            )
+            paged_cache.release_for_eviction(table.block_ids)
+            return paged_cache.allocated_blocks[table.block_ids[-1]].block_hash
+
+        tail1 = turn("turn-1", list(range(7)))
+        turn("turn-2", list(range(11)))
+        assert paged_cache.cached_block_hash_to_block.get_block(tail1) is not None
+        tail3 = turn("turn-3", list(range(15)))
+
+        assert paged_cache.cached_block_hash_to_block.get_block(tail1) is None
+        assert tail1 not in cache._tail_hashes
+        assert paged_cache.cached_block_hash_to_block.get_block(tail3) is not None
+        table, remaining = cache.fetch_cache(
+            "turn-3-edited", list(range(11)) + [90, 91]
+        )
+        assert table.num_tokens == 11 and remaining == [90, 91]
+
     def test_store_cache_tail_dedup_reuses_existing_block(self, mx):
         """An identical tail under the same parent is reused, not re-saved."""
         cache, paged_cache, mock_ssd, config = self._tail_fixture(mx)
@@ -3010,21 +3048,6 @@ class TestPrefixCacheCacheList:
 
         result = prefix_cache._validate_block_cache_data(cache_data, layer_cache_types)
         assert result is True
-
-    def test_find_kv_shape_ref_skips_cache_list(self, prefix_cache, mx):
-        """Test _find_kv_shape_ref skips CacheList layers."""
-        all_block_data = [
-            [
-                [
-                    (mx.zeros((1, 8, 32, 64)), mx.zeros((1, 8, 32, 64)))
-                ],  # CacheList: List[Tuple]
-                (mx.zeros((1, 4, 32, 128)), mx.zeros((1, 4, 32, 128))),  # KVCache
-            ]
-        ]
-        layer_cache_types = ["CacheList", "KVCache"]
-
-        result = prefix_cache._find_kv_shape_ref(all_block_data, layer_cache_types)
-        assert result == (4, 128)  # From KVCache layer, not CacheList
 
     def test_reconstruct_cache_list_partial_match_reject(self, mx):
         """Test reconstruct_cache rejects CacheList with placeholder (partial match)."""

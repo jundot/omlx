@@ -39,18 +39,19 @@ import mlx.nn as nn
 
 logger = logging.getLogger(__name__)
 
+
+def env_enabled(name: str) -> bool:
+    """False when the switch ``name`` is set to 0, false, no or off."""
+    return os.environ.get(name, "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
 _HC_COUNT = 4
 _HIDDEN_SIZE = 2560
 _STREAM_WIDTH = _HC_COUNT * _HIDDEN_SIZE
 _LOW_RANK = 320
 _GROUP_SIZE = 64
 _SUPPORTED_BITS = (4, 5, 6, 8)
-_DISABLED = os.environ.get("OMLX_QWEN4_HC_HYBRID", "1").strip().lower() in {
-    "0",
-    "false",
-    "off",
-    "no",
-}
+_DISABLED = not env_enabled("OMLX_QWEN4_HC_HYBRID")
 _KERNEL = None
 _RUNTIME_FAILED = False
 _FAILURE_LOGGED = False

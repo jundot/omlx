@@ -515,6 +515,31 @@ class PackedLinear(nn.Module):
         )
         return y.reshape(*x.shape[:-1], self.output_dims).astype(dtype)
 
+    def quantized_rows(self, ids: mx.array):
+        """``QuantizedLinear`` weight, scales and biases of output rows ``ids``."""
+        groups = self.input_dims // 64
+        n = int(ids.shape[0])
+        ids = ids.astype(mx.uint32)
+        tile = (ids // TILE_N)[:, None]
+        col = (ids % TILE_N)[:, None]
+        # One 32-byte code block per (tile, group, column).
+        codes = (tile * groups + mx.arange(groups, dtype=mx.uint32)) * TILE_N + col
+        weight = mx.take(
+            self.packed_weight.view(mx.uint32).reshape(-1, 8), codes.reshape(-1), axis=0
+        )
+        # One 4-group block of scales or biases per (tile, group / 4, column).
+        quads = (
+            tile * (groups // 4) + mx.arange(groups // 4, dtype=mx.uint32)
+        ) * TILE_N
+        quads = (quads + col).reshape(-1)
+        scales = mx.take(self.packed_scales.reshape(-1, 4), quads, axis=0)
+        biases = mx.take(self.packed_biases.reshape(-1, 4), quads, axis=0)
+        return (
+            weight.reshape(n, groups * 8),
+            scales.reshape(n, groups),
+            biases.reshape(n, groups),
+        )
+
 
 def project(linears, x: mx.array):
     """Outputs of adjacent packed projections sharing one store, or None.

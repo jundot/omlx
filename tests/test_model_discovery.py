@@ -375,6 +375,15 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
+    def test_detect_text_only_deepseek_v41_as_vlm(self, tmp_path):
+        """oQ text-only V4.1 exports drop vision_config but stay on mlx-vlm."""
+        config = {
+            "model_type": "deepseek_v41",
+            "architectures": ["DeepseekV41ForConditionalGeneration"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
     def test_detect_unlimited_ocr_as_vlm(self, tmp_path):
         """baidu/Unlimited-OCR is served by mlx-vlm (dashed model_type)."""
         config = {

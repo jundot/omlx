@@ -591,6 +591,40 @@ class TestRunSingleTest:
         assert metrics["gen_tps"] is None
         assert metrics["tpot_ms"] is None
 
+    @pytest.mark.asyncio
+    async def test_early_stop_burst_has_no_decode_rate(self):
+        """Two queued MTP tokens then EOS must not report a burst rate as tg."""
+
+        class EarlyStopEngine:
+            async def stream_generate(self, **kwargs):
+                for count, at in ((1, 1.0), (2, 1.0004)):
+                    yield SimpleNamespace(
+                        completion_tokens=count,
+                        prompt_tokens=1024,
+                        cached_tokens=0,
+                        generated_at=at,
+                        generated_until=at,
+                    )
+                yield SimpleNamespace(
+                    completion_tokens=2,
+                    prompt_tokens=1024,
+                    cached_tokens=0,
+                    finished=True,
+                    finish_reason="stop",
+                )
+
+        with patch("omlx.admin.benchmark.time.perf_counter", side_effect=[0.0, 1.05]):
+            metrics = await _run_single_test(
+                EarlyStopEngine(),
+                prompt=[0] * 1024,
+                max_tokens=128,
+                pp_len=1024,
+            )
+
+        assert metrics["completion_tokens"] == 2
+        assert metrics["gen_tps"] is None
+        assert metrics["tpot_ms"] is None
+
 
 class TestRunBatchTest:
     @pytest.mark.asyncio

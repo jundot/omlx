@@ -3,10 +3,11 @@
 DFlash engine for block diffusion speculative decoding.
 
 This engine wraps dflash-mlx (>= 0.1.5) to provide faster decoding on Apple
-Silicon for Qwen, Gemma4, and Laguna model families. By default it serves all
-requests through dflash; setting ``model_settings.dflash_max_ctx`` opts into
-evicting the dflash models and delegating long-context requests to omlx's
-BatchedEngine/VLMBatchedEngine (paged cache, SSD cache, continuous batching).
+Silicon for Qwen, Gemma4, Laguna, Muse Glimmer, MiMo V2, and GLM-5.3 model
+families. By default it serves all requests through dflash; setting
+``model_settings.dflash_max_ctx`` opts into evicting the dflash models and
+delegating long-context requests to omlx's BatchedEngine/VLMBatchedEngine
+(paged cache, SSD cache, continuous batching).
 """
 
 import asyncio
@@ -35,6 +36,7 @@ from ..memory_monitor import (
     set_model_info_from_model,
 )
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
+from ..scheduler import _glm5_next_prefill_floor
 from ..utils.generation_config import load_generation_config_token_ids
 from ..utils.model_loading import maybe_apply_pre_load_patches
 from ..utils.proc_memory import get_phys_footprint
@@ -51,12 +53,51 @@ logger = logging.getLogger(__name__)
 _EXECUTOR_DRAIN_TIMEOUT = 10.0
 
 
+def _get_dflash_stop_token_ids(
+    tokenizer: Any,
+    generation_config_eos: set[int] | None = None,
+) -> list[int]:
+    """Resolve the stop IDs handed to the DFlash runtime.
+
+    dflash-mlx's ``get_stop_token_ids`` assumes ``tokenizer.eos_token_ids``
+    is iterable, but mlx-vlm's TokenizerWrapper (GLM-5.3) exposes only a
+    scalar ``eos_token_id`` and models such as GLM-5.3 publish their extra
+    turn terminators (``<|user|>``, ``<|observation|>``) only in
+    ``generation_config.json``. Normalize at the oMLX boundary instead of
+    mutating the tokenizer shared with chat-template and detokenizer code.
+    """
+    stop_ids: set[int] = set()
+
+    def add_ids(value: Any) -> None:
+        if value is None or isinstance(value, bool):
+            return
+        if isinstance(value, int):
+            stop_ids.add(int(value))
+            return
+        try:
+            values = iter(value)
+        except TypeError:
+            return
+        for token_id in values:
+            if isinstance(token_id, bool):
+                continue
+            try:
+                stop_ids.add(int(token_id))
+            except (TypeError, ValueError):
+                continue
+
+    add_ids(getattr(tokenizer, "eos_token_id", None))
+    add_ids(getattr(tokenizer, "eos_token_ids", None))
+    add_ids(generation_config_eos)
+    return sorted(stop_ids)
+
+
 def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     """Decide whether ``model_path`` can run on the current dflash backend.
 
-    DFlash 0.1.10+omlx.7 registers QwenGdnTargetOps, Gemma4TargetOps, and
-    MuseGlimmerTargetOps; oMLX adds Laguna and MiMo V2 target/draft adapters.
-    The top-level ``model_type`` is the canonical
+    DFlash 0.1.10+omlx.9 registers QwenGdnTargetOps, Gemma4TargetOps, and
+    MuseGlimmerTargetOps; oMLX adds Laguna, MiMo V2, and GLM-5.3 target/draft
+    adapters. The top-level ``model_type`` is the canonical
     discriminator: Gemma4 multimodal
     configs use ``gemma4`` at the top, while MTP-only variants (e.g. the
     Gemma4 ``-assistant`` checkpoint) declare ``gemma4_assistant`` even
@@ -77,6 +118,11 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     on ``config_model_type == "muse_glimmer_assistant"``, not on oMLX's
     historical "-assistant means MTP" name convention.
 
+    ``glm5_next`` (GLM-5.3-Flash, served through mlx-vlm; the nested
+    ``text_config.model_type`` is ``glm5_next_text``) is accepted through
+    oMLX's own target adapter (``omlx.patches.dflash_glm5``) paired with the
+    published ``incoai/GLM-5.3-Flash-DFlash2`` drafter.
+
     Returns:
         (is_compatible, reason). ``reason`` is empty when compatible.
     """
@@ -96,9 +142,10 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     is_laguna = model_type == "laguna"
     is_muse = model_type in ("muse_glimmer", "muse_glimmer_text")
     is_mimo = model_type in ("mimo_v2", "mimo_v2_flash")
-    if not (is_qwen or is_gemma4 or is_laguna or is_muse or is_mimo):
+    is_glm5 = model_type in ("glm5_next", "glm5_next_text")
+    if not (is_qwen or is_gemma4 or is_laguna or is_muse or is_mimo or is_glm5):
         return False, (
-            f"DFlash supports only Qwen, Gemma4, Laguna, MiMo V2, and "
+            f"DFlash supports only Qwen, Gemma4, Laguna, MiMo V2, GLM-5.3, and "
             f"Muse Glimmer "
             f"models (model_type='{cfg.get('model_type', '')}')"
         )
@@ -221,6 +268,18 @@ def check_draft_target_precision_pairing(
         "This may reduce acceptance and make speculative decoding slower. "
         "Use a target/draft pair recommended by the checkpoint's model card."
     )
+
+
+def _adapter_prefill_chunk(target_ops, runtime_step: int) -> int:
+    """Cold-prefill chunk for a target adapter that chunks prefill itself.
+
+    GLM-5.3 follows the batched scheduler's prefill floor, so DFlash prefill
+    runs the same chunks as the batched engine.
+    """
+    step = int(runtime_step or 0)
+    if getattr(target_ops, "backend_name", "") == "glm5_next":
+        step = max(step, _glm5_next_prefill_floor())
+    return step
 
 
 class _DFlashPrefillGuard:
@@ -428,6 +487,14 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             if model_settings
             else None
         )
+        # Extra stop tokens from the target's generation_config.json; unioned
+        # with the tokenizer's EOS set when the runtime stop list is built.
+        self._generation_config_eos: set[int] = set()
+        # DFlash bypasses mlx-lm's BatchGenerator, which normally owns the
+        # process Metal wired-limit raise/restore lifecycle. GLM-5.3 targets
+        # (loaded through mlx-vlm) take that ownership here.
+        self._old_wired_limit: int | None = None
+        self._wired_limit_owned = False
 
     @property
     def model_name(self) -> str:
@@ -440,6 +507,122 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
     @property
     def model_type(self) -> str | None:
         return self._model_type_str
+
+    @property
+    def supports_tool_calling(self) -> bool:
+        """Tool calling is prompt-driven plus output parsing on this lane."""
+        return bool(getattr(self._tokenizer_obj, "has_tool_calling", False))
+
+    def _is_glm5_target(self) -> bool:
+        from ..patches.dflash_glm5 import is_glm5_dflash_target
+
+        return is_glm5_dflash_target(self._model_name)
+
+    def _acquire_wired_limit(self) -> None:
+        """Mirror BatchGenerator's recommended working-set wired limit."""
+        if self._wired_limit_owned or not mx.metal.is_available():
+            return
+        recommended = int(
+            mx.device_info().get("max_recommended_working_set_size", 0) or 0
+        )
+        if recommended <= 0:
+            raise RuntimeError("MLX did not report a recommended working set size")
+        self._old_wired_limit = mx.set_wired_limit(recommended)
+        self._wired_limit_owned = True
+
+    def _restore_wired_limit(self) -> bool:
+        """Restore the pre-DFlash limit once, on the owning MLX thread."""
+        if not self._wired_limit_owned:
+            return False
+        previous = self._old_wired_limit
+        self._wired_limit_owned = False
+        self._old_wired_limit = None
+        try:
+            mx.synchronize()
+        finally:
+            if previous is not None:
+                mx.set_wired_limit(previous)
+        return True
+
+    def _load_with_wired_limit(self, loader):
+        """Run ``loader`` under the wired limit for targets that need it.
+
+        Only GLM-5.3 targets take ownership here (their mlx-vlm lane wires
+        the model for every generation); other targets keep the historical
+        DFlash behaviour. A load failure restores the limit before
+        re-raising so it never masks the original error.
+        """
+        if not self._is_glm5_target():
+            return loader()
+        try:
+            self._acquire_wired_limit()
+            return loader()
+        except BaseException:
+            try:
+                self._restore_wired_limit()
+            except Exception:
+                logger.warning(
+                    "DFlash wired-limit restore failed after load error",
+                    exc_info=True,
+                )
+            raise
+
+    async def _restore_wired_limit_async(self) -> bool:
+        if not self._wired_limit_owned:
+            return False
+        from ..engine_core import get_mlx_executor
+
+        loop = asyncio.get_running_loop()
+        return bool(
+            await loop.run_in_executor(get_mlx_executor(), self._restore_wired_limit)
+        )
+
+    def _install_glm_tool_parser(self) -> None:
+        """Enable GLM's native tool dialect on both DFlash tokenizer copies.
+
+        ``VLMBatchedEngine._inject_tool_calling`` infers ``glm47`` from the
+        chat template and sets the same attributes on mlx-vlm's
+        TokenizerWrapper; the DFlash lane loads GLM through the same wrapper,
+        so it mirrors that wiring here.
+        """
+        from ..patches.dflash_glm5 import is_glm5_model_type
+
+        if not is_glm5_model_type(self._model_type_str):
+            return
+        try:
+            from mlx_lm.tool_parsers.glm47 import (
+                parse_tool_call,
+                tool_call_end,
+                tool_call_start,
+            )
+        except ImportError as exc:
+            logger.warning("GLM tool parser unavailable on DFlash lane: %s", exc)
+            return
+        tokenizers = [
+            tokenizer
+            for tokenizer in (self._tokenizer_obj, self._executor_tokenizer)
+            if tokenizer is not None
+        ]
+        if not tokenizers:
+            return
+        try:
+            vocab = tokenizers[0].get_vocab()
+        except Exception:
+            vocab = None
+        if vocab is not None and (
+            tool_call_start not in vocab or tool_call_end not in vocab
+        ):
+            logger.warning(
+                "GLM tool parser markers missing from the tokenizer vocab; "
+                "tool calling stays disabled on the DFlash lane"
+            )
+            return
+        for tokenizer in tokenizers:
+            tokenizer.has_tool_calling = True
+            tokenizer.tool_call_start = tool_call_start
+            tokenizer.tool_call_end = tool_call_end
+            tokenizer.tool_parser = parse_tool_call
+        logger.info("DFlash tool calling enabled: parser=glm47")
 
     @staticmethod
     def _build_quant_spec(
@@ -532,6 +715,21 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
     async def start(self) -> None:
         if self._loaded:
             return
+        try:
+            await self._start_impl()
+        except BaseException:
+            try:
+                await asyncio.shield(self._restore_wired_limit_async())
+            except Exception:
+                logger.warning(
+                    "DFlash wired-limit restore failed after start error",
+                    exc_info=True,
+                )
+            raise
+
+    async def _start_impl(self) -> None:
+        if self._loaded:
+            return
 
         from ..engine_core import get_mlx_executor
 
@@ -557,11 +755,18 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
             # Register oMLX's target and drafter specializations before
             # load_target_bundle resolves either architecture.
+            from ..patches.dflash_glm5 import (
+                install_dflash_glm5_backend,
+                is_glm5_dflash_target,
+                load_glm5_target_bundle,
+                validate_glm5_dflash_pair,
+            )
             from ..patches.dflash_laguna import install_dflash_laguna_backend
             from ..patches.dflash_mimo_v2 import install_dflash_mimo_v2_backend
 
             install_dflash_laguna_backend()
             install_dflash_mimo_v2_backend()
+            install_dflash_glm5_backend()
 
             # Wrap dflash's hook installers so we can revert the class-level
             # __call__ patches when this engine stops. Without this, a later
@@ -572,13 +777,26 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
             install_dflash_lifecycle_wrap()
 
-            target_bundle = load_target_bundle(
-                self._model_name,
-                quantize_kv_cache=bool(
-                    getattr(runtime_context.runtime, "quantize_kv_cache", False)
-                ),
-                verify_config=getattr(runtime_context, "verify", None),
+            quantize_kv_cache = bool(
+                getattr(runtime_context.runtime, "quantize_kv_cache", False)
             )
+            if is_glm5_dflash_target(self._model_name):
+                # GLM-5.3 has no mlx-lm module: load it through mlx-vlm like
+                # VLMBatchedEngine does and wrap it in dflash's bundle type.
+                target_bundle = load_glm5_target_bundle(
+                    self._model_name,
+                    quantize_kv_cache=quantize_kv_cache,
+                    verify_config=getattr(runtime_context, "verify", None),
+                    trust_remote_code=bool(
+                        getattr(self._model_settings, "trust_remote_code", False)
+                    ),
+                )
+            else:
+                target_bundle = load_target_bundle(
+                    self._model_name,
+                    quantize_kv_cache=quantize_kv_cache,
+                    verify_config=getattr(runtime_context, "verify", None),
+                )
 
             # Keep DFlash targets on the same post-load MoE fast path as the
             # regular batched engine.  Laguna uses mlx-lm's SwitchGLU for its
@@ -593,11 +811,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 is not False
             ):
                 try:
-                    from ..patches.qwen35_moe_gate_up import (
-                        apply_qwen35_moe_gate_up_fusion,
+                    from ..patches.moe_gate_up_fusion import (
+                        apply_moe_gate_up_fusion,
                     )
 
-                    apply_qwen35_moe_gate_up_fusion(target_bundle.model)
+                    apply_moe_gate_up_fusion(target_bundle.model)
                 except Exception:
                     logger.debug(
                         "DFlash target MoE gate+up fusion not applied",
@@ -625,6 +843,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 draft_meta,
                 self._draft_model_path,
             )
+            # No-op for other targets; rejects a GLM target paired with a
+            # non-DFlash2 drafter or mismatched geometry before generation.
+            validate_glm5_dflash_pair(target_bundle.model, draft, draft_meta)
             bind_draft_to_target(
                 draft,
                 target_bundle.model,
@@ -633,15 +854,48 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             draft_backend = draft_backend_for(draft)
             return target_bundle, draft, draft_backend, draft_meta
 
-        result = await loop.run_in_executor(get_mlx_executor(), _load_models)
+        result = await loop.run_in_executor(
+            get_mlx_executor(), self._load_with_wired_limit, _load_models
+        )
         target_bundle, self._draft_model, self._draft_backend, draft_meta = result
         self._draft_window_size = self._resolve_draft_window_size(draft_meta)
+        capabilities_for = getattr(target_bundle.target_ops, "capabilities_for", None)
+        target_capabilities = (
+            capabilities_for(target_bundle.model)
+            if callable(capabilities_for)
+            else None
+        )
+        if (
+            self._in_memory_cache_enabled
+            and target_capabilities is not None
+            and not target_capabilities.supports_prefix_snapshot
+        ):
+            # Do not advertise or initialize an inert cache. GLM-5.3's DSA
+            # layers use CacheList(KVCache, PoolingCache), which the pinned
+            # dflash snapshot codec cannot serialize.
+            logger.warning(
+                "DFlash prefix snapshots are not supported by target backend %s; "
+                "disabling DFlash L1/L2 cache for this load",
+                getattr(target_bundle.target_ops, "backend_name", "unknown"),
+            )
+            self._in_memory_cache_enabled = False
+            self._ssd_cache_requested = False
         runtime_context = self._build_runtime_context()
         self._runtime_context = runtime_context
         self._target_model = target_bundle.model
         self._tokenizer_obj = target_bundle.tokenizer
         self._target_ops = target_bundle.target_ops
         target_meta = target_bundle.meta
+        if hasattr(self._target_ops, "prefill_chunk_size"):
+            # Adapters that chunk cold prefill themselves follow the runtime's
+            # prefill_step_size (GLM-5.3: the runtime only chunks
+            # snapshot-capable targets).
+            step = _adapter_prefill_chunk(
+                self._target_ops,
+                int(getattr(runtime_context.runtime, "prefill_step_size", 0) or 0),
+            )
+            if step > 0:
+                self._target_ops.prefill_chunk_size = step
 
         # Deep-copy tokenizer for executor-thread usage (dflash generation).
         # The original self._tokenizer_obj stays for event-loop operations
@@ -655,6 +909,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             self._model_type_str = config.get("model_type")
         elif hasattr(config, "model_type"):
             self._model_type_str = config.model_type
+        self._install_glm_tool_parser()
 
         self._pairing_warning = check_draft_target_precision_pairing(
             self._model_name,
@@ -674,6 +929,17 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 "DFlash loaded %d suppress token(s) from generation_config.json: %s",
                 len(self._suppress_token_ids),
                 self._suppress_token_ids,
+            )
+        self._generation_config_eos = set()
+        for key in ("eos_token_id", "eos_token_ids"):
+            configured_ids = load_generation_config_token_ids(suppress_ref, key)
+            if configured_ids:
+                self._generation_config_eos.update(configured_ids)
+        if self._generation_config_eos:
+            logger.info(
+                "DFlash loaded %d EOS token(s) from generation_config.json: %s",
+                len(self._generation_config_eos),
+                sorted(self._generation_config_eos),
             )
 
         # Detect protocol-specific output parser (gemma4 channel markers,
@@ -784,6 +1050,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         loop = asyncio.get_running_loop()
         pre_active = mx.get_active_memory()
 
+        # BatchGenerator would restore this in close(); DFlash owns the same
+        # lifecycle explicitly before its target allocations are released.
+        await self._restore_wired_limit_async()
+
         # Release dflash model and cache references
         await loop.run_in_executor(get_mlx_executor(), shutdown_runtime_cache_manager)
         self._dflash_prefix_cache = None
@@ -865,6 +1135,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         if self._fallback_engine is not None:
             await self._fallback_engine.stop()
             self._fallback_engine = None
+        await self._restore_wired_limit_async()
+        self._generation_config_eos = set()
         from ..engine_core import get_mlx_executor
 
         try:
@@ -1167,10 +1439,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         repetition_context_size: int = 20,
     ):
         """Build the dflash event iterator with prefix cache plumbed in."""
-        from dflash_mlx.runtime import get_stop_token_ids, stream_dflash_generate
+        from dflash_mlx.runtime import stream_dflash_generate
         from dflash_mlx.server.prefix_cache_flow import PrefixCacheFlow
 
-        stop_ids = get_stop_token_ids(self._executor_tokenizer)
+        stop_ids = _get_dflash_stop_token_ids(
+            self._executor_tokenizer, self._generation_config_eos
+        )
 
         # Build a minimal model_provider shim for the prefix cache flow.
         # ``model_key`` is consumed as a tuple where index 0 = target id and

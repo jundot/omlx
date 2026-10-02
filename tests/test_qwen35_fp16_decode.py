@@ -22,11 +22,19 @@ pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Me
 def restore_hooks(monkeypatch):
     cls = language.Qwen3_5GatedDeltaNet
     monkeypatch.setattr(cls, "__call__", cls.__call__)
+    monkeypatch.setattr(cls, "_normalize_qk", cls._normalize_qk)
     monkeypatch.setattr(cls, "_omlx_gdn_prework_patched", False, raising=False)
     verifier = Qwen3_5BatchInvariantForward
     monkeypatch.setattr(verifier, "_gated_delta", verifier._gated_delta)
+    monkeypatch.setattr(
+        verifier,
+        "_normalize_gated_delta_qk",
+        verifier.__dict__["_normalize_gated_delta_qk"],
+    )
     monkeypatch.setattr(prework, "_PATCHED", False)
     monkeypatch.setattr(prework, "_QWEN35_DECODE_ENGAGED_LOGGED", False)
+    # The fused prework kernel implements the patched q/k normalization.
+    prework.apply_qwen35_vlm_qk_norm_patch()
 
 
 def _module(dtype=mx.float16, hidden_size=2048, num_k_heads=16, num_v_heads=32):

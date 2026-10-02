@@ -958,13 +958,13 @@ def _install_spacy_model(export_dir: Path):
 
 
 # Packages to strip from the app bundle. These are transitive dependencies
-# pulled in by modelscope (datasets→pyarrow/pandas) and mlx-vlm (opencv)
-# but are NOT needed for inference at runtime. torch/sympy kept as safety
-# net in case any future dependency pulls them in transitively.
+# pulled in by modelscope (datasets→pyarrow/pandas) but are NOT needed for
+# inference at runtime. torch/sympy kept as safety net in case any future
+# dependency pulls them in transitively. OpenCV (from mlx-vlm) stays because
+# video input decodes frames with cv2.
 _STRIP_PACKAGES = [
     "torch",
     "sympy",           # torch dep (safety net)
-    "cv2",             # opencv-python, mlx-vlm only uses it for image loading (Pillow suffices)
     "pyarrow",         # datasets dep
     "pandas",          # datasets dep
     "datasets",        # modelscope dep, not used at inference
@@ -973,7 +973,7 @@ _STRIP_PACKAGES = [
 
 # Prefixes for dist-info directories to remove alongside the packages above.
 _STRIP_DIST_PREFIXES = [
-    "torch-", "sympy-", "opencv_python-", "pyarrow-", "pandas-", "datasets-",
+    "torch-", "sympy-", "pyarrow-", "pandas-", "datasets-",
 ]
 
 
@@ -1010,7 +1010,7 @@ def _strip_unused_packages(export_dir: Path):
     print(f"  ✓ Stripped {saved / 1024 / 1024:.0f} MB total")
 
     # venvstacks records native libraries in share/venv/dynlib as symlinks.
-    # Removing packages such as OpenCV and PyArrow leaves those links dangling,
+    # Removing packages such as PyArrow leaves those links dangling,
     # which makes codesign --verify reject the otherwise valid application
     # bundle. Prune only links whose targets disappeared during stripping.
     framework_dir = export_dir / "framework-mlx-base"

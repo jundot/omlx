@@ -349,7 +349,7 @@ def test_the_remote_interpreter_path_still_expands_on_the_peer(monkeypatch):
 
     staging.run_remote_python("studio", "print(1)", "/m", description="test")
 
-    assert captured["command"].startswith("~/omlx-distributed/.venv/bin/python -c ")
+    assert captured["command"].startswith("~/.omlx/bin/omlx-cluster-python -c ")
 
 
 def _plan_cli(model_root, *extra):

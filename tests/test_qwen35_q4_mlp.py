@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
+import sys
+
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
@@ -21,6 +24,19 @@ def _require_qmm_kernels(bits):
         if not fast.has_symbol(name):
             pytest.skip(f"{name} native kernel unavailable")
     return fast
+
+
+def _fresh_qwen35_module(monkeypatch):
+    """Execute a private copy of mlx-lm's qwen3_5 with the stock class bodies."""
+    import mlx_lm.models.qwen3_5 as qwen35
+
+    qualname = "mlx_lm.models._omlx_test_qwen35_stock"
+    spec = importlib.util.spec_from_file_location(qualname, qwen35.__file__)
+    module = importlib.util.module_from_spec(spec)
+    module.__package__ = "mlx_lm.models"
+    monkeypatch.setitem(sys.modules, qualname, module)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _quantized_bf16(linear, bits=4):
@@ -712,6 +728,23 @@ def test_qwen35_q4_lm_prefill_linear_patch_routes_attention_and_gdn(
             ).item()
             <= 1.0
         )
+
+        # The wrapper body must normalize q/k like the stock body, which
+        # decode and short chunks still run. Tiny k rows expose the eps.
+        gdn_fp32 = qwen35.GatedDeltaNet(args)
+        k_rows = mx.arange(gdn_fp32.in_proj_qkv.weight.shape[0])
+        k_scale = mx.where(
+            (k_rows >= gdn_fp32.key_dim) & (k_rows < 2 * gdn_fp32.key_dim), 1e-3, 1.0
+        )
+        gdn_fp32.in_proj_qkv.weight = gdn_fp32.in_proj_qkv.weight * k_scale[:, None]
+        x_fp32 = x.astype(mx.float32)
+        backend_calls.clear()
+        y_wrapped = gdn_fp32(x_fp32)
+        assert backend_calls == [(gdn_fp32, x.shape, False)]
+        # Earlier tests can leave a wrapper on the class; use a pristine copy.
+        stock = _fresh_qwen35_module(monkeypatch)
+        y_stock = stock.GatedDeltaNet.__call__(gdn_fp32, x_fp32)
+        assert mx.allclose(y_wrapped, y_stock, atol=1e-5).item()
 
         # The q8 standalone GPU tile is intentionally disabled below 16K,
         # but that threshold must not prevent the independent 2K ANE backend
