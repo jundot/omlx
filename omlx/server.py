@@ -87,6 +87,7 @@ from .api.anthropic_utils import (
     map_finish_reason_to_stop_reason,
     request_has_cache_control,
 )
+from .api.body_limit import RequestBodySizeLimitMiddleware
 from .api.embedding_models import (
     EmbeddingData,
     EmbeddingRequest,
@@ -1315,6 +1316,9 @@ class ClientDisconnectTrackingMiddleware:
 # passes through the same one-shot disconnect fan-out.
 app.add_middleware(ClientDisconnectTrackingMiddleware)
 app.add_middleware(DebugRequestLoggingMiddleware)
+# Outermost so oversized bodies are rejected before any buffering below
+# (the debug middleware caches the whole textual body at trace level).
+app.add_middleware(RequestBodySizeLimitMiddleware)
 
 
 # =============================================================================

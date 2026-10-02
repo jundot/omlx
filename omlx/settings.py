@@ -205,6 +205,12 @@ class ServerSettings:
     max_audio_upload_size: str = "100MB"
     # Maximum raw image payload size accepted ("50MB", "100MB").
     max_image_upload_size: str = "50MB"
+    # Transport-level cap on any single request body (JSON prompts,
+    # guided_grammar / json_schema, base64 media, multipart uploads). Must
+    # stay above max_audio_upload_size plus base64 expansion and any
+    # realistic multi-image payload; the per-endpoint limits below still
+    # apply on top of it.
+    max_request_body_size: str = "256MB"
     # Maximum side length in pixels for VLM input images (0 to disable downscaling).
     max_image_side_length: int = 2048
     # Seconds between trivial GPU kernels submitted while a model is loaded
@@ -226,6 +232,13 @@ class ServerSettings:
         size = parse_size(self.max_image_upload_size)
         if size <= 0:
             raise ValueError("max_image_upload_size must be positive")
+        return size
+
+    def max_request_body_bytes(self) -> int:
+        """Configured transport-level request body cap in bytes."""
+        size = parse_size(self.max_request_body_size)
+        if size <= 0:
+            raise ValueError("max_request_body_size must be positive")
         return size
 
     def to_dict(self) -> dict[str, Any]:
