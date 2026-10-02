@@ -91,6 +91,58 @@ def test_rdma_never_enabled_points_at_recovery_not_sudo():
     assert not any("sudo ifconfig" in c for c in status.commands)
 
 
+def test_tb4_with_no_devices_is_terminal_not_a_recovery_trip():
+    """#3037: on TB4, "enabled with no devices" is the hardware's final answer.
+
+    Recovery advice costs the user a reboot into a capability their hardware
+    will never have — RDMA over Thunderbolt needs TB5 on both ends.
+    """
+
+    status = _classify(
+        rdma_devices={"127.0.0.1": [], "Studio.local": []},
+        active_ports={"127.0.0.1": None, "Studio.local": None},
+        port_ips={"127.0.0.1": None, "Studio.local": None},
+        link_speed_gbps=40,
+        tb_version="TB4",
+        rdma_ctl_enabled=True,
+    )
+
+    assert status.state == "tb4_no_rdma"
+    assert status.ready is False
+    assert status.backend == "ring"
+    assert status.commands == (), "a terminal hardware state offers no commands"
+    assert "Thunderbolt 5" in status.detail
+    assert "already enabled" in status.detail
+    assert "Recovery" not in status.detail
+
+
+def test_tb4_guidance_does_not_claim_rdma_ctl_state_when_unread():
+    status = _classify(
+        rdma_devices={"127.0.0.1": [], "Studio.local": []},
+        active_ports={"127.0.0.1": None, "Studio.local": None},
+        port_ips={"127.0.0.1": None, "Studio.local": None},
+        link_speed_gbps=40,
+        tb_version="TB4",
+        rdma_ctl_enabled=None,
+    )
+
+    assert status.state == "tb4_no_rdma"
+    assert "already enabled" not in status.detail
+    assert status.commands == ()
+
+
+def test_thunderbolt_without_rdma_selects_the_tcp_ring():
+    """#3037 D1: jaccl-ring requires RDMA devices on every host (pinned MLX
+    check_rdma exits otherwise), so TB-without-RDMA must never select it."""
+
+    transports = (
+        TransportInfo(kind="thunderbolt", interface="Thunderbolt 1", peer_node_id="b", source_node_id="a"),
+    )
+    assert select_backend(transports) == "ring"
+    rdma = TransportInfo(kind="rdma", interface="rdma_en4", peer_node_id="b", source_node_id="a")
+    assert select_backend((rdma,)) == "jaccl"
+
+
 def test_thunderbolt_without_an_active_port_mentions_tb4():
     status = _classify(active_ports={"127.0.0.1": None, "Studio.local": None})
 
@@ -494,8 +546,7 @@ def test_rdma_detection_does_not_invent_a_three_mac_full_mesh(monkeypatch):
         ("a.local", "b.local"),
         ("b.local", "a.local"),
         ("b.local", "c.local"),
-        ("c.local", "b.local"),
-    }
+        ("c.local", "b.local"),    }
     assert ("a.local", "c.local") not in rdma_edges
 
 
@@ -817,3 +868,49 @@ def test_the_detected_link_speed_is_carried_into_the_explanation():
     assert link.link_speed_gbps == 120
     assert "120 Gb/s" in link.reason
     assert link.to_dict()["source"]["address"] == "10.0.1.1"
+
+
+def test_a_failed_link_speed_probe_degrades_the_pair_not_the_fabric(monkeypatch):
+    """#3037 D4: a link-speed SSH failure must not erase the connectivity
+    matrix that was already read — speed/Version degrade to None per pair."""
+
+    class FakeConfig:
+        class Host:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        @staticmethod
+        def extract_connectivity(hosts, verbose=False):
+            return hosts, {}
+
+        @staticmethod
+        def make_connectivity_matrix(hosts, reverse):
+            return [
+                [False, True],
+                [True, False],
+            ]
+
+    monkeypatch.setattr(
+        "omlx.cluster.transport._import_mlx_config",
+        lambda: FakeConfig,
+    )
+
+    def boom(host):
+        raise OSError("ssh to the link-speed probe failed")
+
+    monkeypatch.setattr(
+        "omlx.cluster.transport._extract_tb_link_speed",
+        boom,
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.transport._rdma_available",
+        lambda hosts, ssh_prefix="": False,
+    )
+
+    transports = detect_transports(["a.local", "b.local"])
+
+    thunderbolt = [item for item in transports if item.kind == "thunderbolt"]
+    assert len(thunderbolt) == 2, "the matrix was read; the fabric survives"
+    assert all(item.link_speed_gbps is None for item in thunderbolt)
+    assert all(item.tb_version is None for item in thunderbolt)
+    assert not any(item.kind == "ethernet" for item in transports)

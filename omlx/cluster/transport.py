@@ -233,6 +233,41 @@ def _rdma_available(hosts: list[str] | tuple[str, ...], *, ssh_prefix: str = "")
     )
 
 
+def _rdma_ctl_enabled(ssh_hostname: str) -> bool | None:
+    """The host's ``rdma_ctl status``, or None when it cannot be read.
+
+    "No RDMA devices" has two very different causes — the flag was never
+    enabled in Recovery (actionable) and Thunderbolt 4 hardware that can
+    never provide devices (terminal) — so the guidance needs the flag, not
+    just the device list (#3037).
+    """
+
+    if ssh_hostname in _LOCAL_HOSTS:
+        command = ["rdma_ctl", "status"]
+    else:
+        command = [
+            "ssh",
+            *cluster_ssh_options(connect_timeout=10),
+            ssh_hostname,
+            "rdma_ctl",
+            "status",
+        ]
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, check=False, timeout=15
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if getattr(result, "returncode", 1) != 0:
+        return None
+    output = (result.stdout or "").strip().lower()
+    if "enabled" in output:
+        return True
+    if "disabled" in output:
+        return False
+    return None
+
+
 def detect_transports(
     hosts: list[str] | tuple[str, ...],
     *,
@@ -287,7 +322,16 @@ def detect_transports(
                     if j < len(row) and row[j]:
                         # TB connection exists
                         physical_edges.add((i, j))
-                        link_speed = _extract_tb_link_speed(f"{ssh_prefix}{hosts[i]}")
+                        try:
+                            link_speed = _extract_tb_link_speed(
+                                f"{ssh_prefix}{hosts[i]}"
+                            )
+                        except Exception:
+                            # A missing link speed degrades this pair's
+                            # metadata only. The connectivity matrix was
+                            # already read — one SSH failure here must not
+                            # erase the fabric (#3037).
+                            link_speed = None
                         tb_version = _detect_tb_version(link_speed)
                         transports.append(
                             TransportInfo(
@@ -359,8 +403,9 @@ def detect_transports(
 def select_backend(transports: tuple[TransportInfo, ...]) -> str:
     """Select the optimal backend based on detected transports.
 
-    - RDMA-capable Thunderbolt mesh → jaccl
-    - Thunderbolt ring → jaccl-ring
+    - RDMA-capable Thunderbolt mesh/ring → jaccl
+    - Thunderbolt without RDMA devices → ring (jaccl-ring's hostfile requires
+      RDMA devices on every host — it is never selectable for TB4, #3037)
     - Ethernet only → ring
     """
 
@@ -370,7 +415,7 @@ def select_backend(transports: tuple[TransportInfo, ...]) -> str:
     if has_rdma:
         return "jaccl"
     if has_tb:
-        return "jaccl-ring"
+        return "ring"
     return "ring"
 
 
@@ -458,6 +503,7 @@ def classify_link(
     thunderbolt: bool,
     link_speed_gbps: int | None = None,
     tb_version: str | None = None,
+    rdma_ctl_enabled: bool | None = None,
 ) -> LinkStatus:
     """Decide the link state from per-host probe results.
 
@@ -492,6 +538,33 @@ def classify_link(
     hosts = list(rdma_devices)
     without_devices = [h for h in hosts if not rdma_devices.get(h)]
     if without_devices:
+        if tb_version == "TB4":
+            # Terminal hardware state, not a misconfiguration (#3037): RDMA
+            # over Thunderbolt needs Thunderbolt 5 on both ends, so on TB4
+            # "enabled with no devices" is the permanent answer and Recovery
+            # advice only costs the user a reboot for nothing.
+            ctl_note = (
+                " rdma_ctl is already enabled — there is nothing left to "
+                "configure; the hardware does not provide RDMA."
+                if rdma_ctl_enabled is True
+                else ""
+            )
+            return LinkStatus(
+                state="tb4_no_rdma",
+                title="Thunderbolt 4 connected — RDMA needs Thunderbolt 5",
+                detail=(
+                    f"Thunderbolt 4 is connected, but RDMA over Thunderbolt "
+                    f"requires Thunderbolt 5 on both Macs; "
+                    f"{', '.join(without_devices)} will never report RDMA "
+                    f"devices.{ctl_note} The cluster uses TCP over the "
+                    f"Thunderbolt link — it works, just slower."
+                ),
+                backend="ring",
+                ready=False,
+                link_label=label,
+                commands=(),
+                doc_url="https://developer.apple.com/documentation/technotes/tn3205-low-latency-communication-with-rdma-over-thunderbolt",
+            )
         return LinkStatus(
             state="rdma_not_enabled",
             title="RDMA is not enabled on every Mac",
@@ -917,6 +990,14 @@ def assess_link(
     ) or any(active_ports.values())
     speeds = [t.link_speed_gbps for t in transports if t.link_speed_gbps]
     versions = [t.tb_version for t in transports if t.tb_version]
+    ctl_states = {_rdma_ctl_enabled(host) for host in hosts}
+    rdma_ctl_enabled = (
+        True
+        if ctl_states == {True}
+        else False
+        if False in ctl_states
+        else None
+    )
     status = classify_link(
         rdma_devices=rdma_devices,
         active_ports=active_ports,
@@ -924,6 +1005,7 @@ def assess_link(
         thunderbolt=thunderbolt,
         link_speed_gbps=min(speeds) if speeds else None,
         tb_version=versions[0] if versions else None,
+        rdma_ctl_enabled=rdma_ctl_enabled,
     )
     # ``ibv_devinfo`` is not a reliable cable oracle after a JACCL process has
     # torn down: macOS can report PORT_DOWN while both live interfaces still
