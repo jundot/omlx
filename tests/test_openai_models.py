@@ -265,6 +265,74 @@ class TestFunctionCallArgumentsValidation:
             FunctionCall(name="f", arguments=123)
 
 
+class TestDoubleEncodedToolCallArguments:
+    """A client that JSON-encodes an already-encoded arguments string.
+
+    JetBrains IDEs send ``tool_call.arguments`` as a JSON string whose content
+    is itself the JSON object string, i.e. one encoding level deeper than the
+    spec asks for. A single ``json.loads`` then yields a ``str`` and every tool
+    call from that client is rejected with::
+
+        arguments must be a JSON object, got str.
+
+    which surfaces as HTTP 422 (#3093).
+    """
+
+    def test_accepts_double_encoded_object_and_unwraps_one_level(self):
+        inner = '{"location": "Tokyo"}'
+        fc = FunctionCall(name="f", arguments=json.dumps(inner))
+        assert json.loads(fc.arguments) == {"location": "Tokyo"}
+
+    def test_double_encoding_is_accepted_on_tool_call_too(self):
+        inner = '{"path": "src/main.py"}'
+        tc = ToolCall(
+            id="call_1",
+            type="function",
+            function=FunctionCall(name="read", arguments=json.dumps(inner)),
+        )
+        assert json.loads(tc.function.arguments) == {"path": "src/main.py"}
+
+    def test_single_encoded_object_is_unchanged(self):
+        fc = FunctionCall(name="f", arguments='{"location": "Tokyo"}')
+        assert fc.arguments == '{"location": "Tokyo"}'
+
+    def test_bare_string_still_rejected(self):
+        """Unwrapping must not turn ``"Tokyo"`` into an accepted object."""
+        with pytest.raises(ValidationError) as exc:
+            FunctionCall(name="f", arguments=json.dumps("Tokyo"))
+        assert "JSON object" in str(exc.value)
+
+    def test_double_encoded_array_still_rejected(self):
+        with pytest.raises(ValidationError) as exc:
+            FunctionCall(name="f", arguments=json.dumps("[1, 2, 3]"))
+        assert "JSON object" in str(exc.value)
+
+    def test_double_encoded_scalar_still_rejected(self):
+        with pytest.raises(ValidationError):
+            FunctionCall(name="f", arguments=json.dumps("42"))
+
+    def test_triple_encoding_still_rejected(self):
+        """Only one level is unwrapped; deeper nesting keeps the 422."""
+        with pytest.raises(ValidationError) as exc:
+            FunctionCall(name="f", arguments=json.dumps(json.dumps('{"a": 1}')))
+        assert "JSON object" in str(exc.value)
+
+    def test_double_encoded_empty_object(self):
+        fc = FunctionCall(name="f", arguments=json.dumps("{}"))
+        assert json.loads(fc.arguments) == {}
+
+    def test_double_encoded_unicode_survives(self):
+        inner = json.dumps({"city": "东京", "emoji": "🌏"}, ensure_ascii=False)
+        fc = FunctionCall(name="f", arguments=json.dumps(inner, ensure_ascii=False))
+        assert json.loads(fc.arguments) == {"city": "东京", "emoji": "🌏"}
+
+    def test_error_message_unchanged_for_single_level_mistakes(self):
+        """A plain array keeps the exact wording clients already match on."""
+        with pytest.raises(ValidationError) as exc:
+            FunctionCall(name="f", arguments="[1, 2, 3]")
+        assert "arguments must be a JSON object, got list" in str(exc.value)
+
+
 class TestMessageToolCallsArgumentsValidation:
     """Tests that Message.tool_calls validates nested arguments.
 

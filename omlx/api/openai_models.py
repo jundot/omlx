@@ -180,10 +180,27 @@ def _coerce_tool_call_arguments(v: Any) -> str:
             'JSON-encoded object string like \'{"location": "Tokyo"}\'. '
             f"Received: {snippet!r}"
         ) from e
+    if isinstance(parsed, str):
+        # Some clients (JetBrains AI Assistant, #3093) JSON-encode an already
+        # encoded arguments string, so the first decode yields a str instead
+        # of the object and every tool call from them is rejected with
+        # "arguments must be a JSON object, got str". Unwrap exactly one
+        # level — the inner string is the object string the templates expect
+        # back — and require an object there. Anything else falls through to
+        # the original rejection, so a bare string or a deeper nesting is
+        # still a 422.
+        try:
+            unwrapped = json.loads(parsed)
+        except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
+            unwrapped = None
+        if isinstance(unwrapped, dict):
+            return parsed
     if not isinstance(parsed, dict):
         raise ValueError(
             f"arguments must be a JSON object, got {type(parsed).__name__}. "
             "Tool-call arguments cannot be a list, number, or bare string. "
+            "If the client JSON-encoded the arguments string a second time, "
+            "send the object string itself. "
             'Example: \'{"location": "Tokyo"}\'.'
         )
     return v
