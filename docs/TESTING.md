@@ -192,3 +192,7 @@ FP16/BF16, varied RMS weights, three epsilon values, every gate encoding, and
 fallback when the installed MLX arithmetic is unsupported. The check supports
 both released and nightly MLX builds; it does not assume the exponential from
 the version number.
+
+# Native Qwen video input
+
+Run `python -m pytest -q tests/test_video.py tests/test_image_utils.py tests/test_vlm_engine.py -k "video or media"` to check video input for Qwen3.5-family checkpoints without weights. The cases cover data-URI extraction and the unchanged rejection for other models, the video processor attached after load (official pixel budget, checkpoint config, frame cap), the prompt-token count against mlx-vlm's real processor both under and over the pixel budget, rejection of undecodable or degenerate clips, the order of video and text in the formatted prompt, per-clip prefix-cache ranges, video feature caching, temporary-file cleanup when preprocessing fails, and the preflight budget. Changes to the video path also need a real-model check with Lightning MTP and the batched DFlash drafter, including a follow-up turn on the same clip that reuses the cached prefix.

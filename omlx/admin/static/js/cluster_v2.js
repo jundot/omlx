@@ -252,10 +252,9 @@ function clusterV2Wizard() {
         // Continuous batching itself is automatic for batchable models; this
         // profile controls its target width and prompt/decode admission limits.
         executionProfile: 'balanced',
-        // The volatile rank-local prompt LRU is always enabled. Persistent
-        // SSD boundary snapshots are explicit because their bounded detached
-        // payloads consume memory and disk even though writes run in back.
-        promptCacheSsd: false,
+        // Match the server default for new clusters. Existing deployments keep
+        // their explicit choice when hydrated, and the SSD quota stays bounded.
+        promptCacheSsd: true,
         promptCacheSsdMaxGiB: 20,
         targetContextTokens: 32768,
         // Per-model strategy advice from POST /admin/api/cluster/catalogue
@@ -3407,7 +3406,7 @@ function clusterV2Wizard() {
                 execution.profile || deployment?.execution?.profile || 'balanced',
             );
             this.promptCacheSsd = Boolean(
-                execution.prompt_cache_ssd ?? deployment?.prompt_cache_ssd,
+                execution.prompt_cache_ssd ?? deployment?.prompt_cache_ssd ?? true,
             );
             this.promptCacheSsdMaxGiB = Math.max(
                 1,
