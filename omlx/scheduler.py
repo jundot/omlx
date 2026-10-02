@@ -7554,7 +7554,7 @@ class Scheduler:
     def _extract_snapshot_cache_states(
         self, snapshot_cache: list[Any]
     ) -> tuple[list[dict[str, Any]], Any]:
-        """Extract snapshot states with sliceable CacheList members blanked.
+        """Extract snapshot states without independently stored sliceable KV.
 
         Boundary snapshots exist for non-sliceable state; for mixed
         CacheList layers eligible for per-member block storage the KV
@@ -7570,7 +7570,13 @@ class Scheduler:
         for layer in extracted or []:
             if not isinstance(layer, dict):
                 continue
-            if str(layer.get("class_name") or "") != "CacheList":
+            class_name = str(layer.get("class_name") or "")
+            if class_name in _KNOWN_SLICEABLE_CACHE_TYPES:
+                # Completion supplies a full cache. KV comes from paged
+                # blocks; serializing it here duplicates the entire prefix.
+                layer["state"] = ()
+                continue
+            if class_name != "CacheList":
                 continue
             state = layer.get("state")
             meta = layer.get("meta_state")
