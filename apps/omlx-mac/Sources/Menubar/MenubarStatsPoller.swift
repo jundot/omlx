@@ -142,14 +142,14 @@ final class MenubarStatsPoller {
 
                 var detailParts = [modelID]
                 if let tokensPerSecond = progress.speed, tokensPerSecond > 0 {
-                    detailParts.append("\(Int(tokensPerSecond.rounded())) tok/s")
+                    detailParts.append("\(Int(tokensPerSecond.rounded())) Tok/s")
                 }
                 if let etaSeconds = progress.eta, etaSeconds >= 0 {
                     detailParts.append("\(formatDuration(etaSeconds)) left")
                 }
 
                 return LiveActivity(
-                    menuBarTitle: "PP \(percentage)% · \(formatTokenCount(processedTokens))/\(formatTokenCount(totalTokens))",
+                    menuBarTitle: "PP \(percentage)% · \(CountFormat.compact(processedTokens))/\(CountFormat.compact(totalTokens))",
                     detail: detailParts.joined(separator: " · ")
                 )
             }
@@ -161,13 +161,13 @@ final class MenubarStatsPoller {
                 let tokensPerSecond = max(0, progress.tokensPerSecond ?? 0)
                 let generatedTokens = max(0, progress.generatedTokens ?? 0)
 
-                var detailParts = [modelID, "\(generatedTokens) tok"]
+                var detailParts = [modelID, "\(generatedTokens) Tok"]
                 if let elapsedSeconds = progress.elapsedSeconds {
                     detailParts.append(formatDuration(elapsedSeconds))
                 }
 
                 return LiveActivity(
-                    menuBarTitle: "GEN \(String(format: "%.1f", tokensPerSecond)) tok/s",
+                    menuBarTitle: "GEN \(String(format: "%.1f", tokensPerSecond)) Tok/s",
                     detail: detailParts.joined(separator: " · ")
                 )
             }
@@ -194,17 +194,6 @@ final class MenubarStatsPoller {
                     menuBarTitle: elapsed.map { "RUN \($0)" } ?? "RUN",
                     detail: detailParts.joined(separator: " · ")
                 )
-            }
-
-            private static func formatTokenCount(_ tokenCount: Int) -> String {
-                if tokenCount >= 1_000_000 {
-                    let millions = Double(tokenCount) / 1_000_000
-                    return String(format: millions >= 10 ? "%.0fM" : "%.1fM", millions)
-                }
-                if tokenCount >= 1_000 {
-                    return "\(Int((Double(tokenCount) / 1_000).rounded()))k"
-                }
-                return "\(tokenCount)"
             }
 
             private static func formatDuration(_ seconds: Double) -> String {

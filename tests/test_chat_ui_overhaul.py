@@ -174,6 +174,15 @@ def test_tailwind_contains_new_chat_ui_utilities():
     assert ".z-\\[200\\]{" in css
 
 
+def test_editing_a_message_brings_its_action_row_into_view():
+    # focus() only reveals the textarea; the Save/Cancel row below it can stay
+    # clipped at the transcript container's bottom edge (above the composer).
+    init = _section(_template(), 'class="inline-edit-textarea"', "</textarea>")
+
+    assert "$el.focus()" in init
+    assert "scrollIntoView({ block: 'nearest' })" in init
+
+
 def test_empty_thinking_content_is_not_rendered_or_replayed():
     html = _template()
     helper = _section(
@@ -208,3 +217,17 @@ def test_empty_thinking_content_is_not_rendered_or_replayed():
     assert "reasoning_content: this.hasVisibleThinking(stream.streamingThinking)" in stream
     assert 'x-if="hasVisibleThinking(msg._thinking)"' in html
     assert 'x-show="hasVisibleThinking(currentStream()?.streamingThinking)"' in html
+
+
+def test_top_capsule_shows_the_model_name_alone_and_centred():
+    # The profile shortcut sat beside the model name, so the pair centred itself
+    # and the model name leaned left; the drawer keeps the profile tab.
+    capsule = _section(
+        _template(),
+        '<div class="absolute top-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 max-w-[90%]">',
+        "<!-- Messages Container -->",
+    )
+
+    assert "openRightDrawer('profile')" not in capsule
+    assert "profile_default" not in capsule
+    assert "availableModels.find(m => m.id === currentModel)?.name" in capsule
