@@ -662,3 +662,68 @@ def test_production_install_order_covers_vlm_language(
         from omlx import memory_monitor as mm
 
         mm._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+
+
+# --- audit port: bounded-route discipline (jundot/omlx#2991 review) --------
+
+
+def test_array_tiled_causal_keeps_score_tiles_bounded(monkeypatch, _sdpa256_reset):
+    """Port of #2991's retained-pool audit onto the always-bounded route.
+
+    Within one bounded call every per-kv-tile score buffer must be
+    uniformly tile-clamped: differently shaped buffers cannot reuse each
+    other in Metal's pool, which is the retained-growth class of bug
+    reproduced on the conditional q-split route (24 GB guard, 12k prompt,
+    pool 6.6 -> 12.7 GB). Uniform (<= _Q_TILE, <= _KV_TILE) tiles keep the
+    pool reusable, and bounded evaluation per kv tile keeps the live graph
+    to one tile (the laziness hazard that piled sub-call graphs up)."""
+    from omlx.patches import sdpa256_attention as sdpa256
+
+    # Force the array-tiled implementation (skip the native fused kernel).
+    monkeypatch.setattr(sdpa256, "_NATIVE_FORCE_FUSED", False)
+    q, k, v = _qkv(3000, 3000)
+    mx.eval(q, k, v)
+
+    real_max = mx.max
+    score_shapes = []
+
+    def counting_max(a, axis=None, keepdims=False):
+        # Only the per-kv-tile reduction inside _array_tiled_sdpa256 calls
+        # mx.max on a 5-D score tile within these tests.
+        score_shapes.append(tuple(int(d) for d in a.shape))
+        return real_max(a, axis=axis, keepdims=keepdims)
+
+    monkeypatch.setattr(mx, "max", counting_max)
+
+    evals_before = []
+    real_eval = mx.eval
+
+    def counting_eval(*args, **kwargs):
+        evals_before.append(len(args))
+        real_eval(*args, **kwargs)
+
+    monkeypatch.setattr(mx, "eval", counting_eval)
+    baseline_evals = len(evals_before)
+
+    out = sdpa256._array_tiled_sdpa256(q, k, v, SCALE_256, "causal")
+    mx.eval(out)
+
+    q_tile = sdpa256._Q_TILE
+    kv_tile = sdpa256._KV_TILE
+    # Every kv-tile score shape is tile-clamped and uniformly sized among the
+    # tiles of one q-row (the last tile in the causal scan may be smaller,
+    # which the pool absorbs one buffer at a time).
+    for shape in score_shapes:
+        assert shape[-2] <= q_tile, shape
+        assert shape[-1] <= kv_tile, shape
+    assert score_shapes, "expected instrumented per-kv-tile reductions"
+
+    # mx.eval ran at least once per kv tile (laziness pile-up regression guard).
+    per_call_evals = len(evals_before) - baseline_evals
+    expected_kv_tiles = sum(
+        -(-min(qi, 3000) // kv_tile) for qi in range(q_tile, 3000 + 1, q_tile)
+    )
+    assert per_call_evals >= expected_kv_tiles, (
+        per_call_evals,
+        expected_kv_tiles,
+    )
