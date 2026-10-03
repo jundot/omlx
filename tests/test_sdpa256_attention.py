@@ -662,3 +662,47 @@ def test_production_install_order_covers_vlm_language(
         from omlx import memory_monitor as mm
 
         mm._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+
+
+# --- audit port: interleaving flap-free engagement log (jundot/omlx#3099) ---
+
+
+def test_tiled_route_note_dedup_is_per_reason_under_interleaving(
+    caplog, _sdpa256_reset
+):
+    """Port of #3099's per-identity audit onto the per-reason note.
+
+    The original flap risk came from interleaved calls (16 full-attention
+    layers, concurrent requests) deduping against ONE module-global last
+    decision: any per-call variation made the log chatter. The
+    always-bounded route logs per REASON instead, and reasons are static —
+    so no cache identity, layer slice, or call-site detail variation can
+    flap the engagement log. Pin the invariant: one record per reason for
+    the process lifetime, no matter what interleaves or calls it."""
+    from omlx.patches import sdpa256_attention as sdpa256
+
+    with caplog.at_level(logging.INFO, logger=sdpa256.logger.name):
+        interleaved = [
+            ("long-context", "detail cache-A layer-0"),
+            ("long-context", "detail cache-B layer-7"),
+            ("forced", "detail cache-A layer-1"),
+            ("long-context", "detail cache-D layer-15"),
+            ("forced", "detail cache-C layer-2"),
+        ]
+        for reason, detail in interleaved:
+            sdpa256._note_tiled_route(reason, detail)
+            # Engagement through the route gate itself must not add records:
+            # five more 'required' checks stand in for interleaved calls from
+            # five different cache identities.
+            sdpa256._tiled_route_required()
+
+        notes = [
+            r.getMessage()
+            for r in caplog.records
+            if "memory-bounded path:" in r.getMessage()
+        ]
+        # Exactly one record per reason: the first 'long-context' (detail
+        # "cache-A layer-0") and the first 'forced' (detail "cache-A layer-1").
+        assert len(notes) == 2, notes
+        assert "cache-A layer-0" not in notes[1] and "cache-A layer-0" in notes[0]
+        assert "cache-A layer-1" in notes[1]
