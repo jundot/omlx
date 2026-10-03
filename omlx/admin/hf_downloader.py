@@ -38,6 +38,8 @@ from huggingface_hub.utils import tqdm as _hf_tqdm
 # guarantees it exists. Re-verify the symbol when bumping the hub version.
 from huggingface_hub.utils._xet import abort_xet_session
 
+from omlx.utils.repo_id import validate_repo_id
+
 logger = logging.getLogger(__name__)
 
 # Timeout for HuggingFace API calls (seconds).
@@ -1200,11 +1202,8 @@ class HFDownloader(_QueuePersistenceMixin):
             ValueError: If repo_id format is invalid or download is already queued.
         """
         repo_id = repo_id.strip()
-        if "/" not in repo_id or len(repo_id.split("/")) != 2:
-            raise ValueError(
-                f"Invalid repository ID: '{repo_id}'. "
-                "Expected format: 'owner/model' (e.g., 'mlx-community/Llama-3-8B-4bit')"
-            )
+        if (error := validate_repo_id(repo_id)) is not None:
+            raise ValueError(error)
 
         # Check for duplicate active downloads
         for task in self._tasks.values():

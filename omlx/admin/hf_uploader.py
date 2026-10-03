@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from omlx.utils.repo_id import validate_repo_id
+
 logger = logging.getLogger(__name__)
 
 
@@ -341,11 +343,8 @@ class HFUploader:
             raise ValueError(f"Not a valid model directory (no config.json): {model_path}")
 
         repo_id = repo_id.strip()
-        if "/" not in repo_id or len(repo_id.split("/")) != 2:
-            raise ValueError(
-                f"Invalid repository ID: '{repo_id}'. "
-                "Expected format: 'owner/model' (e.g., 'user/Llama-3B-oQ4')"
-            )
+        if (error := validate_repo_id(repo_id)) is not None:
+            raise ValueError(error)
 
         # Check for duplicate active uploads
         for task in self._tasks.values():

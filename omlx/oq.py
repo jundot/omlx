@@ -6082,7 +6082,15 @@ def quantize_oq_streaming(
         )
     config["_oq_use_budget_plan"] = oq_level in _OQ_BPW_TARGETS
 
-    output.mkdir(parents=True, exist_ok=True)
+    # Atomic creation: the exists() check above raced with any concurrent
+    # writer; a losing job must abort here instead of interleaving shards
+    # into a directory created by the winner.
+    try:
+        output.mkdir(parents=True, exist_ok=False)
+    except FileExistsError as exc:
+        raise ValueError(
+            f"Output directory already exists: {output_path}"
+        ) from exc
 
     cb("loading", 5.0, "Reading model config")
 

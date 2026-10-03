@@ -4070,7 +4070,11 @@ class EnginePool:
         expired: list[str] = []
 
         async with self._lock:
-            for model_id, entry in self._entries.items():
+            # Snapshot before iterating: the loop awaits _unload_engine, and
+            # register/unregister_cluster_model mutate _entries synchronously
+            # without this lock — a live view would raise "dictionary changed
+            # size during iteration" and abort the whole TTL tick.
+            for model_id, entry in list(self._entries.items()):
                 if entry.engine is None or entry.is_loading or entry.is_pinned:
                     continue
 
