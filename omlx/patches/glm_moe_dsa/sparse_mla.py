@@ -2,12 +2,38 @@
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from typing import Optional
 
 import mlx.core as mx
 
 from .kernels import fast as glm_fast
+
+# The gathered (MLX-ops) sparse MLA prefill path runs on the tensor units and
+# is ~1.7x faster than the classic-simd custom kernel on NAX GPUs (M5), but it
+# rounds the scores (bf16 matmul output) and the probabilities (bf16 PV
+# operand) to bf16, which the custom kernel keeps in fp32: measured against
+# an exact fp32 reference its mean error is ~2.5 bf16 ulp vs 0.25 for the
+# kernel. It is therefore opt-in: OMLX_GLM_SPARSE_MLA_GATHERED=1.
+_GATHERED_ENV = os.environ.get("OMLX_GLM_SPARSE_MLA_GATHERED", "0").strip().lower()
+_GATHERED_ENABLED = _GATHERED_ENV in {"1", "true", "on"}
+_GATHERED_Q_BLOCK = 128
+
+
+@lru_cache(maxsize=1)
+def _gathered_available() -> bool:
+    """Whether the host has the tensor units the gathered path is built for."""
+    try:
+        from omlx.custom_kernels.nax import is_nax_available
+
+        return bool(is_nax_available())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _gathered_enabled() -> bool:
+    return _GATHERED_ENABLED and _gathered_available()
 
 
 @lru_cache(maxsize=None)
@@ -381,11 +407,87 @@ def fused_indexer_scores(
     return scores
 
 
+@mx.compile
+def _scaled_masked_scores(scores, valid, scale):
+    # fp32 scores (like the kernel's accumulators) with masked slots pushed to
+    # a finite floor so fully-masked rows stay finite.
+    return mx.where(valid, scores.astype(mx.float32) * scale, mx.array(-1e30))
+
+
+def sparse_mla_attention_gathered(
+    q_latent: mx.array,
+    q_pe: Optional[mx.array],
+    kv_latent: mx.array,
+    k_pe: Optional[mx.array],
+    topk_indices: mx.array,
+    scale: float,
+    *,
+    causal: bool = True,
+    q_block: int = _GATHERED_Q_BLOCK,
+) -> Optional[mx.array]:
+    """Sparse MLA prefill as gathered dense attention blocks (MLX ops only).
+
+    For each block of ``q_block`` queries the selected latent rows are
+    gathered once ([q_block, TOPK, D]) and every head of a query attends
+    over its own gathered rows with tensor-unit matmuls: scores in fp32
+    softmax, keys past the query position (causal) and negative indices
+    masked exactly like the custom kernel. ``q_pe``/``k_pe`` may be None
+    for models without rope dims (GLM-5.3), which skips the zero columns
+    the kernel would multiply. Returns None for shapes it does not handle
+    (batched inputs, prefix rows, per-row lengths).
+    """
+    if (
+        q_latent.ndim != 4
+        or kv_latent.ndim != 4
+        or topk_indices.ndim != 4
+        or q_latent.shape[0] != 1
+        or kv_latent.shape[:2] != (1, 1)
+        or topk_indices.shape[:2] != (1, 1)
+        or topk_indices.shape[2] != q_latent.shape[2]
+        or (q_pe is None) != (k_pe is None)
+    ):
+        return None
+    _, H, L, DL = q_latent.shape
+    K = kv_latent.shape[2]
+    topk = topk_indices.shape[-1]
+    if L <= 1 or K < L or kv_latent.shape[-1] != DL:
+        return None
+    q = q_latent[0].swapaxes(0, 1)  # [L, H, DL]
+    keys = kv_latent[0, 0]  # [K, DL]
+    if q_pe is not None:
+        if q_pe.shape[:3] != (1, H, L) or k_pe.shape[:3] != (1, 1, K):
+            return None
+        q = mx.concatenate([q, q_pe[0].swapaxes(0, 1).astype(q.dtype)], axis=-1)
+        keys = mx.concatenate([keys, k_pe[0, 0].astype(keys.dtype)], axis=-1)
+    idx_all = topk_indices[0, 0]
+    if idx_all.dtype != mx.int32:
+        idx_all = idx_all.astype(mx.int32)
+    q_off = K - L
+    scale_arr = mx.array(scale, dtype=mx.float32)
+    outs = []
+    for s in range(0, L, q_block):
+        e = min(L, s + q_block)
+        idx = idx_all[s:e]  # [qb, topk]
+        valid = (idx >= 0) & (idx < K)
+        if causal:
+            limit = mx.arange(q_off + s, q_off + e, dtype=mx.int32)[:, None]
+            valid = valid & (idx <= limit)
+        safe = mx.where(valid, idx, mx.array(0, dtype=mx.int32))
+        kg = keys[safe]  # [qb, topk, D]
+        scores = _scaled_masked_scores(
+            q[s:e] @ kg.swapaxes(-1, -2), valid[:, None, :], scale_arr
+        )
+        probs = mx.softmax(scores, axis=-1).astype(kg.dtype)
+        outs.append(probs @ kg[..., :DL])  # [qb, H, DL]
+    out = mx.concatenate(outs, axis=0) if len(outs) > 1 else outs[0]
+    return out.swapaxes(0, 1)[None]
+
+
 def sparse_mla_attention(
     q_latent: mx.array,
-    q_pe: mx.array,
+    q_pe: Optional[mx.array],
     kv_latent: mx.array,
-    k_pe: mx.array,
+    k_pe: Optional[mx.array],
     topk_indices: mx.array,
     scale: float,
     *,
@@ -396,6 +498,9 @@ def sparse_mla_attention(
     stream: Optional[mx.Stream] = None,
 ) -> Optional[mx.array]:
     """Sparse MLA prefill over per-query DSA top-k indices.
+
+    ``q_pe``/``k_pe`` may be None when the model has no rope dims; the
+    custom kernel then receives zero columns.
 
     This mirrors the FlashMLA sparse prefill contract used by vLLM/SGLang:
     attention scores are computed over [latent, rope] keys, values are the
@@ -409,6 +514,27 @@ def sparse_mla_attention(
       topk_indices: [B, 1, L, TOPK]
       topk_length: optional [B, L] or [B, 1, L] valid prefix length
     """
+
+    if (
+        _gathered_enabled()
+        and topk_length is None
+        and causal_prefix_rows == 0
+        and not topk_valid_prefix
+        and not causal_prefix_indices
+        and q_latent.dtype in (mx.float16, mx.bfloat16)
+        and kv_latent.dtype == q_latent.dtype
+    ):
+        out = sparse_mla_attention_gathered(
+            q_latent, q_pe, kv_latent, k_pe, topk_indices, scale
+        )
+        if out is not None:
+            return out
+
+    if q_pe is None or k_pe is None:
+        if q_pe is not None or k_pe is not None:
+            return None
+        q_pe = mx.zeros(q_latent.shape[:-1] + (64,), dtype=q_latent.dtype)
+        k_pe = mx.zeros(kv_latent.shape[:-1] + (64,), dtype=kv_latent.dtype)
 
     if (
         q_latent.ndim != 4
