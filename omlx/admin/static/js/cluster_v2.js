@@ -139,7 +139,7 @@ function clusterV2Wizard() {
         'cluster.v2.strategy.hint.auto':
             'oMLX picks the split that fits this model and your link',
         'cluster.v2.strategy.hint.tensor':
-            'Every Mac works on every token — needs a fast link',
+            'Every Mac works on every Token — needs a fast link',
         'cluster.v2.strategy.hint.pipeline':
             'Each Mac holds a different slice of the layers',
         'cluster.v2.strategy.tensor_needs_two':
@@ -729,7 +729,7 @@ function clusterV2Wizard() {
                     detail:
                         capability.reason ||
                         window.t('cluster.v2.batch.unavailable_reason'),
-                    tone: 'bg-amber-50 border-amber-200 text-amber-700',
+                    tone: 'chip--amber',
                     target,
                 };
             }
@@ -737,7 +737,7 @@ function clusterV2Wizard() {
                 return {
                     label: window.t('cluster.v2.batch.label_sequential'),
                     detail: window.t('cluster.v2.batch.sequential_detail'),
-                    tone: 'bg-neutral-50 border-neutral-200 text-neutral-600',
+                    tone: 'chip--neutral',
                     target,
                 };
             }
@@ -745,14 +745,14 @@ function clusterV2Wizard() {
                 return {
                     label: window.t('cluster.v2.batch.label_batched').replace('{n}', String(lastSize)),
                     detail: window.t('cluster.v2.batch.batched_detail').replace('{last}', String(lastSize)).replace('{target}', String(target)),
-                    tone: 'bg-green-50 border-green-200 text-green-700',
+                    tone: 'chip--green',
                     target,
                 };
             }
             return {
                 label: window.t('cluster.v2.batch.label_automatic'),
                 detail: window.t('cluster.v2.batch.automatic_detail').replace('{target}', String(target)),
-                tone: 'bg-green-50 border-green-200 text-green-700',
+                tone: 'chip--green',
                 target,
             };
         },
@@ -806,16 +806,16 @@ function clusterV2Wizard() {
 
         requestPhaseTone(request) {
             const phase = this.requestPhaseLabel(request);
-            if (phase === 'prefill') return 'bg-blue-50 border-blue-200 text-blue-700';
-            if (phase === 'decode') return 'bg-green-50 border-green-200 text-green-700';
-            if (phase === 'failed') return 'bg-red-50 border-red-200 text-red-700';
-            return 'bg-neutral-50 border-neutral-200 text-neutral-600';
+            if (phase === 'prefill') return 'chip--neutral';
+            if (phase === 'decode') return 'chip--green';
+            if (phase === 'failed') return 'chip--red';
+            return 'chip--neutral';
         },
 
         formatRequestRate(rate) {
             const value = Number(rate);
             if (!Number.isFinite(value) || value <= 0) return '—';
-            return `${value.toFixed(value >= 100 ? 0 : 1)} tok/s`;
+            return `${value.toFixed(value >= 100 ? 0 : 1)} Tok/s`;
         },
 
         requestPrefillRate(request) {
@@ -990,7 +990,7 @@ function clusterV2Wizard() {
                     label: window.t('cluster.v2.deploy.status_ready'),
                     detail:
                         window.t('cluster.v2.deploy.status_running_detail'),
-                    tone: 'bg-green-50 border-green-200 text-green-700',
+                    tone: 'chip--green',
                     pulse: true,
                 };
             }
@@ -1001,7 +1001,7 @@ function clusterV2Wizard() {
                     label: window.t('cluster.v2.deploy.status_loading'),
                     detail:
                         window.t('cluster.v2.deploy.status_starting_detail'),
-                    tone: 'bg-blue-50 border-blue-200 text-blue-700',
+                    tone: 'chip--neutral',
                     pulse: true,
                 };
             }
@@ -1011,7 +1011,7 @@ function clusterV2Wizard() {
                     eyebrow: window.t('cluster.v2.deploy.status_attention'),
                     label: window.t('cluster.v2.deploy.status_failed'),
                     detail: this.deploymentFailureReason(deployment),
-                    tone: 'bg-red-50 border-red-200 text-red-700',
+                    tone: 'chip--red',
                     pulse: false,
                 };
             }
@@ -1023,7 +1023,7 @@ function clusterV2Wizard() {
                     detail: this.runtimeError
                         ? window.t('cluster.v2.deploy.status_runtime_unavailable').replace('{message}', this.runtimeError)
                         : window.t('cluster.v2.deploy.status_checking_detail'),
-                    tone: 'bg-neutral-50 border-neutral-200 text-neutral-600',
+                    tone: 'chip--neutral',
                     pulse: true,
                 };
             }
@@ -1032,7 +1032,7 @@ function clusterV2Wizard() {
                 eyebrow: window.t('cluster.v2.deploy.status_configured'),
                 label: window.t('cluster.v2.deploy.status_not_loaded'),
                 detail: window.t('cluster.v2.deploy.status_not_loaded_detail'),
-                tone: 'bg-amber-50 border-amber-200 text-amber-700',
+                tone: 'chip--amber',
                 pulse: false,
             };
         },
@@ -1313,12 +1313,12 @@ function clusterV2Wizard() {
 
         deviceStateTone(device) {
             if (device?.state === 'dead') {
-                return 'bg-red-50 border-red-200 text-red-700';
+                return 'chip--red';
             }
             if (device?.state === 'suspect') {
-                return 'bg-amber-50 border-amber-200 text-amber-700';
+                return 'chip--amber';
             }
-            return 'bg-green-50 border-green-200 text-green-700';
+            return 'chip--green';
         },
 
         deviceStateLabel(device) {
@@ -2318,8 +2318,8 @@ function clusterV2Wizard() {
 
         contextReservationLabel(tokens) {
             const value = Math.max(1, Number(tokens) || 0);
-            if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2).replace(/\.00$/, '')}M tokens`;
-            return `${Math.round(value / 1024)}K tokens`;
+            if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2).replace(/\.00$/, '')}M Tokens`;
+            return `${Math.round(value / 1024)}K Tokens`;
         },
 
         setTargetContextTokens(value) {

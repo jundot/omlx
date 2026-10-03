@@ -1,21 +1,24 @@
-    <nav class="w-full py-5 px-6 md:px-12 border-b border-neutral-100 bg-white sticky top-0 z-50">
-        <div class="max-w-7xl mx-auto flex items-center relative">
+    <nav class="topbar-material w-full py-5 page-gutter sticky top-0 z-50">
+        <div class="page-wide flex items-center relative">
             <!-- Logo -->
             <div class="flex items-center gap-2">
                 <a href="/admin/dashboard" class="flex items-center gap-2">
                     <img x-show="activeTheme === 'light'" src="/admin/static/navbar-logo-light.svg" alt="oMLX" class="w-9 h-9">
                     <img x-show="activeTheme === 'dark'" src="/admin/static/navbar-logo-dark.svg" alt="oMLX" class="w-9 h-9" x-cloak>
                 </a>
+                {#- The brand pair sits one step up the type scale from the row
+                    labels around it: the page title (24pt) over the version
+                    caption (14pt). Both are token steps, not point sizes. -#}
                 <div class="flex flex-col gap-0">
-                    <a href="/admin/dashboard" class="font-bold tracking-tight text-xl leading-none">oMLX</a>
+                    <a href="/admin/dashboard" class="font-bold tracking-tight text-2xl leading-none">oMLX</a>
                     <a :href="updateAvailable && releaseUrl ? releaseUrl : 'https://github.com/jundot/omlx'" target="_blank"
-                       class="relative text-[10px] text-neutral-500 dark:text-neutral-400 leading-none hover:text-neutral-700 dark:hover:text-neutral-300"
+                       class="relative text-sm text-neutral-500 dark:text-neutral-400 leading-none hover:text-neutral-700 dark:hover:text-neutral-300"
                        @mouseenter="versionHover = true" @mouseleave="versionHover = false">
                         v{{ version }}
                         <span x-show="updateAvailable" x-cloak
                               class="inline-block w-1.5 h-1.5 bg-green-500 rounded-full ml-0.5 align-middle"></span>
                         <span x-show="versionHover" x-cloak
-                              class="absolute left-1/2 -translate-x-1/2 top-full mt-1 px-2 py-1 text-[10px] text-white bg-neutral-800 rounded whitespace-nowrap z-50"
+                              class="absolute left-1/2 -translate-x-1/2 top-full mt-1 px-2 py-1 text-[12px] text-white bg-neutral-800 rounded whitespace-nowrap z-50"
                               x-text="updateAvailable && latestVersion
                                   ? window.t('navbar.update_available').replace('{version}', latestVersion)
                                   : window.t('navbar.go_to_github')"></span>
@@ -31,7 +34,7 @@
             </button>
 
             <!-- Center Navigation -->
-            <div class="hidden lg:flex items-center gap-1 bg-neutral-100 rounded-full p-1 absolute left-1/2 -translate-x-1/2"
+            <div class="hidden lg:flex items-center gap-1 bg-neutral-100 rounded-lg p-1 absolute left-1/2 -translate-x-1/2"
                  role="tablist" aria-label="{{ t('navbar.tablist_label') }}"
                  @keydown="handleMainTabKeydown($event)">
                 <button
@@ -44,7 +47,7 @@
                     :class="mainTab === 'status'
                         ? 'bg-white text-neutral-900 shadow-sm'
                         : 'text-neutral-600 hover:text-neutral-900'"
-                    class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
+                    class="px-4 py-1.5 rounded-lg text-sm font-medium whitespace-nowrap transition-all duration-200 flex items-center gap-1.5"
                 >
                     <i data-lucide="bar-chart-3" class="w-4 h-4"></i>
                     {{ t('navbar.tab.status') }}
@@ -61,7 +64,7 @@
                     :class="mainTab === 'cluster'
                         ? 'bg-white text-neutral-900 shadow-sm'
                         : 'text-neutral-600 hover:text-neutral-900'"
-                    class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
+                    class="px-4 py-1.5 rounded-lg text-sm font-medium whitespace-nowrap transition-all duration-200 flex items-center gap-1.5"
                 >
                     <i data-lucide="network" class="w-4 h-4"></i>
                     {{ t('navbar.tab.cluster') }}
@@ -77,7 +80,7 @@
                         :class="mainTab === 'models'
                             ? 'bg-white text-neutral-900 shadow-sm'
                             : 'text-neutral-600 hover:text-neutral-900'"
-                        class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
+                        class="px-4 py-1.5 rounded-lg text-sm font-medium whitespace-nowrap transition-all duration-200 flex items-center gap-1.5"
                     >
                         <i data-lucide="hard-drive-download" class="w-4 h-4"></i>
                         {{ t('navbar.tab.models') }}
@@ -85,7 +88,7 @@
                     <!-- Download count badge -->
                     <span x-show="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length > 0"
                           x-text="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length"
-                          class="absolute -top-1 -right-1 w-4 h-4 bg-blue-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center pointer-events-none"
+                          class="absolute -top-1 -right-1 w-4 h-4 bg-accent text-accent-fg text-[12px] font-bold rounded-full flex items-center justify-center pointer-events-none"
                           x-cloak></span>
                     <!-- Dropdown menu -->
                     <div
@@ -96,12 +99,12 @@
                         x-transition:leave="transition ease-in duration-100"
                         x-transition:leave-start="opacity-100 translate-y-0"
                         x-transition:leave-end="opacity-0 translate-y-1"
-                        class="absolute left-1/2 -translate-x-1/2 mt-1.5 w-44 bg-white rounded-xl shadow-lg border border-neutral-200 py-1.5 z-[60]"
+                        class="absolute left-1/2 -translate-x-1/2 before:absolute before:left-0 before:right-0 before:content-[''] before:-top-1.5 before:h-1.5 mt-1.5 min-w-44 w-max bg-surface rounded-lg shadow-popover border border-line py-1.5 z-[60]"
                         x-cloak
                     >
                         <button
                             @click="setModelsTab('manager'); modelsDropdown = false;"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            class="w-full px-4 py-2 text-left text-sm font-medium whitespace-nowrap transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'models' && modelsTab === 'manager'
                                 ? 'text-neutral-900 bg-neutral-100'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
@@ -111,7 +114,7 @@
                         </button>
                         <button
                             @click="setModelsTab('downloader'); modelsDropdown = false;"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            class="w-full px-4 py-2 text-left text-sm font-medium whitespace-nowrap transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'models' && modelsTab === 'downloader'
                                 ? 'text-neutral-900 bg-neutral-100'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
@@ -121,7 +124,7 @@
                         </button>
                         <button
                             @click="setModelsTab('quantizer'); modelsDropdown = false;"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            class="w-full px-4 py-2 text-left text-sm font-medium whitespace-nowrap transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'models' && modelsTab === 'quantizer'
                                 ? 'text-neutral-900 bg-neutral-100'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
@@ -131,7 +134,7 @@
                         </button>
                         <button
                             @click="setModelsTab('uploader'); modelsDropdown = false;"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            class="w-full px-4 py-2 text-left text-sm font-medium whitespace-nowrap transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'models' && modelsTab === 'uploader'
                                 ? 'text-neutral-900 bg-neutral-100'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
@@ -152,7 +155,7 @@
                         :class="mainTab === 'settings'
                             ? 'bg-white text-neutral-900 shadow-sm'
                             : 'text-neutral-600 hover:text-neutral-900'"
-                        class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
+                        class="px-4 py-1.5 rounded-lg text-sm font-medium whitespace-nowrap transition-all duration-200 flex items-center gap-1.5"
                     >
                         <i data-lucide="settings" class="w-4 h-4"></i>
                         {{ t('navbar.tab.settings') }}
@@ -166,12 +169,12 @@
                         x-transition:leave="transition ease-in duration-100"
                         x-transition:leave-start="opacity-100 translate-y-0"
                         x-transition:leave-end="opacity-0 translate-y-1"
-                        class="absolute left-1/2 -translate-x-1/2 mt-1.5 w-52 bg-white rounded-xl shadow-lg border border-neutral-200 py-1.5 z-[60]"
+                        class="absolute left-1/2 -translate-x-1/2 before:absolute before:left-0 before:right-0 before:content-[''] before:-top-1.5 before:h-1.5 mt-1.5 min-w-44 w-max bg-surface rounded-lg shadow-popover border border-line py-1.5 z-[60]"
                         x-cloak
                     >
                         <button
                             @click="setSettingsTab('global'); settingsDropdown = false"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            class="w-full px-4 py-2 text-left text-sm font-medium whitespace-nowrap transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'settings' && activeTab === 'global'
                                 ? 'text-neutral-900 bg-neutral-100'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
@@ -181,7 +184,7 @@
                         </button>
                         <button
                             @click="setSettingsTab('models'); settingsDropdown = false"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            class="w-full px-4 py-2 text-left text-sm font-medium whitespace-nowrap transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'settings' && activeTab === 'models'
                                 ? 'text-neutral-900 bg-neutral-100'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
@@ -191,7 +194,7 @@
                         </button>
                         <button
                             @click="setSettingsTab('integrations'); settingsDropdown = false"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            class="w-full px-4 py-2 text-left text-sm font-medium whitespace-nowrap transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'settings' && activeTab === 'integrations'
                                 ? 'text-neutral-900 bg-neutral-100'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
@@ -211,7 +214,7 @@
                     :class="mainTab === 'logs'
                         ? 'bg-white text-neutral-900 shadow-sm'
                         : 'text-neutral-600 hover:text-neutral-900'"
-                    class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
+                    class="px-4 py-1.5 rounded-lg text-sm font-medium whitespace-nowrap transition-all duration-200 flex items-center gap-1.5"
                 >
                     <i data-lucide="scroll-text" class="w-4 h-4"></i>
                     {{ t('navbar.tab.logs') }}
@@ -227,7 +230,7 @@
                         :class="mainTab === 'bench'
                             ? 'bg-white text-neutral-900 shadow-sm'
                             : 'text-neutral-600 hover:text-neutral-900'"
-                        class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
+                        class="px-4 py-1.5 rounded-lg text-sm font-medium whitespace-nowrap transition-all duration-200 flex items-center gap-1.5"
                     >
                         <i data-lucide="gauge" class="w-4 h-4"></i>
                         {{ t('navbar.tab.bench') }}
@@ -240,12 +243,12 @@
                         x-transition:leave="transition ease-in duration-100"
                         x-transition:leave-start="opacity-100 translate-y-0"
                         x-transition:leave-end="opacity-0 translate-y-1"
-                        class="absolute left-1/2 -translate-x-1/2 mt-1.5 w-44 bg-white rounded-xl shadow-lg border border-neutral-200 py-1.5 z-[60]"
+                        class="absolute left-1/2 -translate-x-1/2 before:absolute before:left-0 before:right-0 before:content-[''] before:-top-1.5 before:h-1.5 mt-1.5 min-w-44 w-max bg-surface rounded-lg shadow-popover border border-line py-1.5 z-[60]"
                         x-cloak
                     >
                         <button
                             @click="setBenchTab('throughput'); benchDropdown = false;"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            class="w-full px-4 py-2 text-left text-sm font-medium whitespace-nowrap transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'bench' && benchTab === 'throughput'
                                 ? 'text-neutral-900 bg-neutral-100'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
@@ -255,7 +258,7 @@
                         </button>
                         <button
                             @click="setBenchTab('accuracy'); benchDropdown = false;"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            class="w-full px-4 py-2 text-left text-sm font-medium whitespace-nowrap transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'bench' && benchTab === 'accuracy'
                                 ? 'text-neutral-900 bg-neutral-100'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
@@ -265,7 +268,7 @@
                         </button>
                         <button
                             @click="setBenchTab('context'); benchDropdown = false;"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            class="w-full px-4 py-2 text-left text-sm font-medium whitespace-nowrap transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="mainTab === 'bench' && benchTab === 'context'
                                 ? 'text-neutral-900 bg-neutral-100'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
@@ -277,7 +280,7 @@
                 </div>
                 <a
                     href="/admin/chat"
-                    class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5 text-neutral-600 hover:text-neutral-900"
+                    class="px-4 py-1.5 rounded-lg text-sm font-medium whitespace-nowrap transition-all duration-200 flex items-center gap-1.5 text-neutral-600 hover:text-neutral-900"
                 >
                     <i data-lucide="message-circle" class="w-4 h-4"></i>
                     {{ t('navbar.tab.chat') }}
@@ -291,9 +294,9 @@
                         x-show="mainTab === 'status' && !dashEditing && dashEditAvailable"
                         x-cloak
                         @click="startDashboardEdit()"
-                        class="nav-tooltip p-2 rounded-full transition-all duration-200 cursor-pointer"
+                        class="nav-tooltip p-2 rounded-lg transition-all duration-200 cursor-pointer"
                         :class="activeTheme === 'dark'
-                            ? 'text-amber-400 hover:bg-neutral-700'
+                            ? 'text-amber-400 hover:bg-accent-hover'
                             : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
                         :data-tooltip="window.t('status.layout.customize')"
                         :aria-label="window.t('status.layout.customize')">
@@ -311,9 +314,9 @@
                             aria-haspopup="true"
                             aria-controls="dashboard-theme-menu"
                             :aria-expanded="themeDropdown ? 'true' : 'false'"
-                            class="p-2 rounded-full transition-all duration-200 cursor-pointer"
+                            class="p-2 rounded-lg transition-all duration-200 cursor-pointer"
                             :class="activeTheme === 'dark'
-                                ? 'text-amber-400 hover:bg-neutral-700'
+                                ? 'text-amber-400 hover:bg-accent-hover'
                                 : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
                             :title="theme === 'auto' ? window.t('navbar.theme.auto') : theme === 'light' ? window.t('navbar.theme.light_mode') : window.t('navbar.theme.dark_mode')">
                         <i data-lucide="sun-moon" class="w-4 h-4" x-show="theme === 'auto'"></i>
@@ -329,12 +332,12 @@
                         x-transition:leave="transition ease-in duration-100"
                         x-transition:leave-start="opacity-100 translate-y-0"
                         x-transition:leave-end="opacity-0 translate-y-1"
-                        class="absolute right-0 mt-1.5 w-64 bg-white rounded-xl shadow-lg border border-neutral-200 py-1.5 z-[60]"
+                        class="absolute right-0 before:absolute before:left-0 before:right-0 before:content-[''] before:-top-1.5 before:h-1.5 mt-1.5 w-64 bg-surface rounded-lg shadow-popover border border-line py-1.5 z-[60]"
                         x-cloak
                     >
                         <button
                             @click="setTheme('auto'); themeDropdown = false"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            class="w-full px-4 py-2 text-left text-sm font-medium whitespace-nowrap transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="theme === 'auto'
                                 ? 'text-neutral-900 bg-neutral-100'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
@@ -344,7 +347,7 @@
                         </button>
                         <button
                             @click="setTheme('light'); themeDropdown = false"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            class="w-full px-4 py-2 text-left text-sm font-medium whitespace-nowrap transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="theme === 'light'
                                 ? 'text-neutral-900 bg-neutral-100'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
@@ -354,7 +357,7 @@
                         </button>
                         <button
                             @click="setTheme('dark'); themeDropdown = false"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            class="w-full px-4 py-2 text-left text-sm font-medium whitespace-nowrap transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="theme === 'dark'
                                 ? 'text-neutral-900 bg-neutral-100'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
@@ -368,7 +371,7 @@
                             @click="setEnhancedReadability(!enhancedReadability)"
                             :aria-pressed="enhancedReadability ? 'true' : 'false'"
                             :title="window.t('chat.enhanced_readability_desc')"
-                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            class="w-full px-4 py-2 text-left text-sm font-medium whitespace-nowrap transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
                             :class="enhancedReadability
                                 ? 'text-neutral-900 bg-neutral-100'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
@@ -384,7 +387,7 @@
                 <button
                     @click="logout"
                     class="inline-flex items-center px-4 py-2 text-sm font-medium text-neutral-600
-                           hover:text-neutral-900 hover:bg-neutral-100 rounded-full transition-all duration-200"
+                           hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all duration-200"
                 >
                     <i data-lucide="log-out" class="w-4 h-4 mr-2"></i>
                     {{ t('navbar.logout') }}
@@ -423,7 +426,7 @@
                     {{ t('navbar.tab.models') }}
                     <span x-show="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length > 0"
                           x-text="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length"
-                          class="w-4 h-4 bg-blue-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center"
+                          class="w-4 h-4 bg-accent text-accent-fg text-[12px] font-bold rounded-full flex items-center justify-center"
                           x-cloak></span>
                 </button>
                 <button @click="setMainTab('settings'); mobileMenuOpen = false"
@@ -459,26 +462,26 @@
                 <div class="border-t border-neutral-100 pt-2 mt-2 flex items-center justify-between px-2">
                     <div class="flex items-center gap-1">
                         <button @click="setTheme('auto')"
-                                class="p-2 rounded-full transition-all duration-200"
+                                class="p-2 rounded-lg transition-all duration-200"
                                 :class="theme === 'auto' ? 'text-amber-400 bg-neutral-100' : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
                                 :title="window.t('navbar.theme.auto')">
                             <i data-lucide="sun-moon" class="w-4 h-4"></i>
                         </button>
                         <button @click="setTheme('light')"
-                                class="p-2 rounded-full transition-all duration-200"
+                                class="p-2 rounded-lg transition-all duration-200"
                                 :class="theme === 'light' ? 'text-amber-400 bg-neutral-100' : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
                                 :title="window.t('navbar.theme.light_mode')">
                             <i data-lucide="sun" class="w-4 h-4"></i>
                         </button>
                         <button @click="setTheme('dark')"
-                                class="p-2 rounded-full transition-all duration-200"
+                                class="p-2 rounded-lg transition-all duration-200"
                                 :class="theme === 'dark' ? 'text-amber-400 bg-neutral-100' : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
                                 :title="window.t('navbar.theme.dark_mode')">
                             <i data-lucide="moon" class="w-4 h-4"></i>
                         </button>
                     </div>
                     <button @click="logout"
-                            class="inline-flex items-center px-4 py-2 text-sm font-medium text-neutral-600 hover:text-neutral-900 rounded-full transition-all">
+                            class="inline-flex items-center px-4 py-2 text-sm font-medium text-neutral-600 hover:text-neutral-900 rounded-lg transition-all">
                         <i data-lucide="log-out" class="w-4 h-4 mr-2"></i>
                         {{ t('navbar.logout') }}
                     </button>

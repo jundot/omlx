@@ -1,0 +1,15 @@
+{#-
+  Global overlays. base.html includes this once, so every page the console
+  renders carries the toast stack and the ⌘K command palette without asking for
+  them. The commands the palette offers come from the page: static/js/ui.js
+  registers "go to chat" and the shortcut overview itself, and a page with more
+  to offer (the dashboard registers its tabs, blocks and settings sections)
+  adds them from its own script.
+
+  The shortcut overview is deliberately NOT here: chat already ships its own
+  list (showShortcutsHelp in chat.html) and two overviews bound to the same
+  `?` would open on top of each other, so each page owns the one it shows.
+-#}
+{% import "components/ui.html" as ui %}
+{{ ui.toast_host() }}
+{{ ui.command_palette() }}

@@ -1,12 +1,12 @@
 <!-- API Endpoints -->
-<div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+<div class="card overflow-hidden">
     <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
         <div class="flex items-center gap-3">
             <i data-lucide="link" class="w-4 h-4 text-neutral-500"></i>
             <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.api.section_label') }}</span>
         </div>
         <div x-show="serverAliases.length > 1" class="flex items-center gap-2">
-            <label for="server-alias-select" class="text-[11px] font-medium uppercase tracking-wider text-neutral-500">{{ t('status.api.host') }}</label>
+            <label for="server-alias-select" class="text-[12px] font-medium uppercase tracking-wider text-neutral-500">{{ t('status.api.host') }}</label>
             <select id="server-alias-select"
                     x-model="selectedAlias"
                     class="text-xs font-mono bg-white border border-neutral-300 rounded-md px-2 py-1 text-neutral-700 focus:outline-none focus:ring-2 focus:ring-neutral-400">

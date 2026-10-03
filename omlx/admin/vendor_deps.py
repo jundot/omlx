@@ -141,101 +141,18 @@ def download_katex_fonts() -> None:
 
 
 # =========================================================================
-# Inter font (SIL Open Font License)
+# Fonts
 # =========================================================================
-INTER_WEIGHTS = [300, 400, 500, 600, 700, 800]
-INTER_FONT_BASE = "https://cdn.jsdelivr.net/fontsource/fonts/inter@latest"
-
-
-def download_inter_fonts() -> None:
-    """Download Inter font files and create @font-face CSS."""
-    print("\n=== Inter Font ===")
-    inter_dir = STATIC / "fonts" / "inter"
-    inter_dir.mkdir(parents=True, exist_ok=True)
-
-    for weight in INTER_WEIGHTS:
-        url = f"{INTER_FONT_BASE}/latin-{weight}-normal.woff2"
-        _download(url, inter_dir / f"inter-latin-{weight}-normal.woff2")
-
-    # Generate @font-face CSS
-    css_path = inter_dir / "inter.css"
-    if css_path.exists():
-        print("  [skip] inter.css (already exists)")
-        return
-
-    print("  [generate] inter.css")
-    css_parts = []
-    for weight in INTER_WEIGHTS:
-        css_parts.append(f"""@font-face {{
-  font-family: 'Inter';
-  font-style: normal;
-  font-weight: {weight};
-  font-display: swap;
-  src: url('./inter-latin-{weight}-normal.woff2') format('woff2');
-  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
-    U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
-    U+2212, U+2215, U+FEFF, U+FFFD;
-}}""")
-    css_path.write_text("\n\n".join(css_parts) + "\n")
-
-
-# =========================================================================
-# CJK fonts (SIL Open Font License)
-# =========================================================================
-CJK_FONTS = {
-    # (font_family, fontsource_id, subset, dir_name, file_prefix)
-    "noto-sans-sc": ("Noto Sans SC", "noto-sans-sc", "chinese-simplified", "NotoSansSC"),
-    "noto-sans-tc": ("Noto Sans TC", "noto-sans-tc", "chinese-traditional", "NotoSansTC"),
-    "noto-sans-kr": ("Noto Sans KR", "noto-sans-kr", "korean", "NotoSansKR"),
-    "noto-sans-jp": ("Noto Sans JP", "noto-sans-jp", "japanese", "NotoSansJP"),
-}
-CJK_WEIGHTS = {400: "Regular", 500: "Medium", 700: "Bold"}
-CJK_FONT_BASE = "https://cdn.jsdelivr.net/fontsource/fonts"
-
-
-def download_cjk_fonts() -> None:
-    """Download CJK font files (Noto Sans SC/TC/KR/JP) and create @font-face CSS."""
-    print("\n=== CJK Fonts ===")
-    for dir_name, (family, fontsource_id, subset, prefix) in CJK_FONTS.items():
-        font_dir = STATIC / "fonts" / dir_name
-        font_dir.mkdir(parents=True, exist_ok=True)
-
-        for weight, weight_name in CJK_WEIGHTS.items():
-            filename = f"{prefix}-{weight_name}.woff2"
-            url = f"{CJK_FONT_BASE}/{fontsource_id}@latest/{subset}-{weight}-normal.woff2"
-            _download(url, font_dir / filename)
-
-        # Generate @font-face CSS
-        css_path = font_dir / f"{dir_name}.css"
-        if css_path.exists():
-            print(f"  [skip] {dir_name}.css (already exists)")
-            continue
-
-        print(f"  [generate] {dir_name}.css")
-        comment = {
-            "noto-sans-sc": "Simplified Chinese",
-            "noto-sans-tc": "Traditional Chinese",
-            "noto-sans-kr": "Korean",
-            "noto-sans-jp": "Japanese",
-        }[dir_name]
-        css_parts = [f"/* {family} - {comment} */"]
-        for weight, weight_name in CJK_WEIGHTS.items():
-            css_parts.append(f"""@font-face {{
-  font-family: '{family}';
-  font-style: normal;
-  font-weight: {weight};
-  font-display: swap;
-  src: url('{prefix}-{weight_name}.woff2') format('woff2');
-}}""")
-        css_path.write_text("\n".join(css_parts) + "\n")
+# None: the console uses the system font stack (see tokens.json typography
+# families), so no webfont is vendored. Apple platforms resolve Latin and CJK
+# from -apple-system; other clients fall back to the families listed in the
+# token stack.
 
 
 def main() -> None:
     print(f"Vendor directory: {STATIC}")
     download_js_css()
     download_katex_fonts()
-    download_inter_fonts()
-    download_cjk_fonts()
     print("\n=== Done! ===")
 
     # Summary

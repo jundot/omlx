@@ -30,11 +30,11 @@ struct Row<Trailing: View>: View {
             if let label {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(label)
-                        .font(.omlxText(13, weight: .medium))
+                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                         .foregroundStyle(theme.text)
                     if let sublabel, !sublabel.isEmpty {
                         Text(sublabel)
-                            .font(.omlxText(11.5))
+                            .font(.omlxText(DesignTokens.FontSize.aux))
                             .foregroundStyle(theme.textSecondary)
                             .lineLimit(2)
                             .fixedSize(horizontal: false, vertical: true)
@@ -174,10 +174,10 @@ struct LinkRow<Icon: View>: View {
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(label)
-                        .font(.omlxText(13, weight: .medium))
+                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                         .foregroundStyle(theme.text)
                     Text(sublabel)
-                        .font(.omlxText(11))
+                        .font(.omlxText(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textSecondary)
                         .lineLimit(2)
                 }

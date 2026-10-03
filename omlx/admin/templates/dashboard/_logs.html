@@ -2,116 +2,194 @@
                 <div class="animate-fade-in-up">
                     <!-- Header -->
                     <div class="mb-8">
-                        <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('logs.section_label') }}</h2>
                         <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('logs.heading') }}</h3>
                         <p class="text-sm text-neutral-500 mt-2">{{ t('logs.description') }}</p>
                     </div>
 
-                    <!-- Controls -->
-                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-4">
-                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
-                            <div class="flex items-center gap-3">
-                                <i data-lucide="terminal" class="w-4 h-4 text-neutral-500"></i>
-                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('logs.viewer_label') }}</span>
+                    {% set log_card_actions -%}
+                        {{ ui.badge(t('logs.live'), tone='green', dot=True, attrs='x-show="logAutoRefresh" x-cloak') }}
+                        {{ ui.button(t('logs.refresh_button'), variant='secondary', size='sm', icon='refresh-cw',
+                                     click='loadLogs()', disabled='logLoading') }}
+                    {%- endset %}
+                    {% call ui.card(title=t('logs.viewer_label'), header_actions=log_card_actions, attrs='log-card') %}
+                        <!-- Controls: the six that were here, on the shared components. -->
+                        <div class="log-toolbar">
+                            <div class="log-field">
+                                <label class="text-body text-neutral-600" for="log-lines">{{ t('logs.lines_label') }}</label>
+                                <input id="log-lines" type="number" x-model.number="logLines" min="10" max="10000" step="100"
+                                       class="w-24 px-3 py-2 text-body border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                             </div>
 
-                            <!-- Auto-refresh indicator -->
-                            <div x-show="logAutoRefresh" class="flex items-center gap-2 text-sm text-green-600">
-                                <span class="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
-                                {{ t('logs.auto_refresh') }}
-                            </div>
-                        </div>
-
-                        <div class="flex flex-wrap items-center gap-4 px-4 sm:px-6 py-4">
-                            <!-- Lines input -->
-                            <div class="flex items-center gap-2">
-                                <label class="text-sm text-neutral-600">{{ t('logs.lines_label') }}</label>
-                                <input type="number" x-model.number="logLines" min="10" max="10000" step="100"
-                                       class="w-24 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
-                            </div>
-
-                            <!-- Refresh interval input -->
-                            <div class="flex items-center gap-2">
-                                <label class="text-sm text-neutral-600">{{ t('logs.refresh_label') }}</label>
-                                <input type="number" x-model.number="logRefreshInterval" min="0" max="300" step="1"
+                            <div class="log-field">
+                                <label class="text-body text-neutral-600" for="log-interval">{{ t('logs.refresh_label') }}</label>
+                                <input id="log-interval" type="number" x-model.number="logRefreshInterval" min="0" max="300" step="1"
                                        @change="restartLogRefresh()"
-                                       class="w-20 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
-                                <span class="text-sm text-neutral-400">{{ t('logs.refresh_unit') }}</span>
+                                       class="w-20 px-3 py-2 text-body border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
+                                <span class="text-aux text-neutral-400">{{ t('logs.refresh_unit') }}</span>
                             </div>
 
-                            <!-- Log file selector -->
-                            <div class="flex items-center gap-2">
-                                <label class="text-sm text-neutral-600">{{ t('logs.file_label') }}</label>
-                                <select x-model="logFile" @change="loadLogs()"
-                                        class="px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white">
+                            <div class="log-field">
+                                <label class="text-body text-neutral-600" for="log-file">{{ t('logs.file_label') }}</label>
+                                <select id="log-file" x-model="logFile" @change="changeLogFile()"
+                                        class="px-3 py-2 text-body border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-transparent">
                                     <template x-for="f in logAvailableFiles" :key="f">
                                         <option :value="f" x-text="f"></option>
                                     </template>
                                 </select>
                             </div>
 
-                            <!-- Manual refresh button -->
-                            <button @click="loadLogs()"
-                                    :disabled="logLoading"
-                                    class="px-4 py-2 bg-neutral-900 text-white text-sm font-medium rounded-lg hover:bg-neutral-800 transition-all disabled:opacity-50">
-                                <span x-show="!logLoading">{{ t('logs.refresh_button') }}</span>
-                                <span x-show="logLoading">{{ t('logs.loading') }}</span>
-                            </button>
-
-                            <!-- Auto-scroll toggle -->
-                            <div class="flex items-center gap-2">
-                                <button type="button" @click="logAutoScroll = !logAutoScroll"
-                                        :class="logAutoScroll ? 'bg-black' : 'bg-neutral-200'"
-                                        class="relative w-9 h-5 rounded-full transition-colors duration-300 focus:outline-none">
-                                    <span :class="logAutoScroll ? 'translate-x-4' : 'translate-x-0'"
-                                          class="block w-4 h-4 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                            <div class="log-field">
+                                <button type="button" role="switch" :aria-checked="logAutoScroll ? 'true' : 'false'"
+                                        @click="logAutoScroll = !logAutoScroll"
+                                        class="switch" :class="logAutoScroll ? 'switch--on' : ''">
+                                    <span class="switch__knob"></span>
                                 </button>
-                                <label class="text-sm text-neutral-600">{{ t('logs.auto_scroll') }}</label>
+                                <span class="text-body text-neutral-600">{{ t('logs.auto_scroll') }}</span>
                             </div>
 
-                            <!-- Level filter -->
-                            <div class="flex items-center gap-2">
-                                <div class="flex items-center gap-1.5">
-                                    <span class="text-sm text-neutral-600">{{ t('logs.level_label') }}</span>
+                            <!-- Minimum level: one of six, so a segmented control -->
+                            <div class="log-field">
+                                <span class="text-body text-neutral-600">{{ t('logs.level_label') }}</span>
                                     <span class="text-neutral-400 cursor-help" :title="window.t('logs.level_tooltip')">
                                         <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5 inline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                                             <circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>
                                         </svg>
                                     </span>
+                                {{ ui.segmented([('TRACE', 'TRACE'),
+                                                 ('DEBUG', 'DEBUG'),
+                                                 ('INFO', 'INFO'),
+                                                 ('WARNING', 'WARNING'),
+                                                 ('ERROR', 'ERROR'),
+                                                 ('CRITICAL', 'CRITICAL')],
+                                                active='logMinLevel', setter="setLogMinLevel('{value}')",
+                                                aria_label=t('logs.level_label')) }}
+                    </div>
+                            </div>
+
+                        <!-- The selected record: full text and every occurrence of a
+                             collapsed run. -->
+                        <div class="log-detail" x-show="logSelectedRow" x-cloak>
+                            <div class="log-detail__head">
+                                <span class="font-semibold uppercase tracking-wider">{{ t('logs.detail.title') }}</span>
+                                <span class="log-time" x-text="logSelectedRow ? logSelectedRow.time : ''"></span>
+                                <span class="badge" :class="logSelectedRow ? logLevelTone(logSelectedRow.level) : ''"
+                                      x-text="logSelectedRow && logSelectedRow.level ? logSelectedRow.level : '—'"></span>
+                                <span class="log-module" x-text="logSelectedRow ? logSelectedRow.module : ''"></span>
+                                <span x-show="logSelectedRow && logSelectedRow.requestId && logSelectedRow.requestId !== '-'">
+                                    <span x-text="window.t('logs.detail.request_id')"></span>
+                                    <span class="font-mono" x-text="logSelectedRow ? logSelectedRow.requestId : ''"></span>
+                                </span>
+                                <span class="flex-grow"></span>
+                                {{ ui.button(t('logs.detail.close'), variant='ghost', size='sm', icon='x',
+                                             click='selectLogRow(null)') }}
+                            </div>
+                            <pre class="log-detail__body" x-text="logSelectedRow ? logSelectedRow.message : ''"></pre>
+                            <div class="log-occurrences" x-show="logSelectedRow && logSelectedRow.count > 1" x-cloak>
+                                <span x-text="window.t('logs.detail.occurrences').replace('{count}', window.formatCountExact(logSelectedRow ? logSelectedRow.count : 0))"></span>
+                                <!-- The list scrolls in its own box: a group can repeat
+                                     thousands of times and the panel must not push the
+                                     viewer off the page. -->
+                                <div class="log-occurrences__list">
+                                    <template x-for="(occurrence, i) in logOccurrences.shown" :key="occurrence.time + '#' + i">
+                                        <span class="log-occurrence">
+                                            <span x-text="occurrence.time"></span>
+                                            <span x-text="occurrence.requestId"></span>
+                                        </span>
+                                    </template>
                                 </div>
-                                <div class="flex gap-1">
-                                    <template x-for="lvl in ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']" :key="lvl">
-                                        <button type="button"
-                                                @click="logMinLevel = lvl"
-                                                :class="[levelButtonClass(lvl), logMinLevel === lvl ? 'ring-2 ring-offset-1 ring-neutral-500' : '']"
-                                                class="px-2 py-1 text-xs font-mono font-semibold rounded transition-all"
-                                                x-text="lvl">
-                                        </button>
+                                <!-- The rest of a long run stays counted, not mounted. -->
+                                <span class="log-occurrences__more" x-show="logOccurrences.hidden > 0" x-cloak
+                                      x-text="window.t('logs.detail.occurrences_more').replace('{count}', window.formatCountExact(logOccurrences.hidden))"></span>
+                        </div>
+                            </div>
+
+                        <!-- Three panes of one column grid: the header, the windowed
+                             list, and (inside the list) the rows themselves. -->
+                        <div x-show="logRows.length > 0" role="grid">
+                            <!-- A row is only a row inside a rowgroup inside a
+                                 grid: without the two ancestors every role
+                                 below breaks ARIA's required-parent rule and a
+                                 screen reader falls back to plain divs. -->
+                            <div role="rowgroup">
+                                <div class="log-head log-grid" role="row">
+                                    <span role="columnheader">{{ t('logs.col.time') }}</span>
+                                    <span role="columnheader">{{ t('logs.col.level') }}</span>
+                                    <span class="log-grid__module" role="columnheader">{{ t('logs.col.module') }}</span>
+                                    <span role="columnheader">{{ t('logs.col.message') }}</span>
+                                </div>
+                            </div>
+
+                            <div class="log-viewport h-[400px] sm:h-[600px]" role="rowgroup"
+                                 x-ref="logViewport" @scroll="onLogScroll($event)">
+                                <!-- An empty window explains itself: a filter that hides every
+                                     line and an empty file are different problems. -->
+                                <p class="log-empty" x-show="!logLoading && logRows.length === 0" x-cloak
+                                   x-text="logTotalLines > 0 ? window.t('logs.empty_filtered') : window.t('logs.empty_file')"></p>
+                                <div class="log-spacer" :style="'height: ' + (logRows.length * logRowHeight) + 'px'">
+                                    <template x-for="(row, i) in visibleLogRows" :key="row.key">
+                                        <div class="log-row log-grid" role="row" tabindex="0"
+                                             :class="logSelectedKey === row.key && 'log-row--selected'"
+                                             :style="'transform: translateY(' + ((logWindow.start + i) * logRowHeight) + 'px)'"
+                                             :aria-expanded="logSelectedKey === row.key ? 'true' : 'false'"
+                                             @click="selectLogRow(row)"
+                                             @keydown.enter.prevent="selectLogRow(row)">
+                                            <span class="log-time" role="cell" x-text="row.time || '—'"
+                                                  :title="row.continuation ? window.t('logs.fragment') : row.time"></span>
+                                            <span role="cell">
+                                                <span class="badge" :class="logLevelTone(row.level)"
+                                                      x-text="row.level ? row.level : '—'"></span>
+                                            </span>
+                                            <span class="log-module log-grid__module" role="cell"
+                                                  x-text="row.module" :title="row.module"></span>
+                                            <span class="log-message" role="cell">
+                                                <span class="log-message__text" x-text="row.message"
+                                                      :title="row.message"></span>
+                                                <span class="log-count" x-show="row.count > 1" x-cloak
+                                                      :title="window.t('logs.repeat_tooltip').replace('{count}', window.formatCountExact(row.count))"
+                                                      x-text="'×' + row.count"></span>
+                                                <span class="log-count log-count--muted" x-show="row.lines > 1" x-cloak
+                                                      :title="window.t('logs.multiline').replace('{count}', window.formatCountExact(row.lines))"
+                                                      x-text="'≡' + row.lines"></span>
+                                                <!-- Memory guard: the numbers it printed, and the two
+                                                     remedies it suggests. -->
+                                                <span class="log-chips" x-show="row.memory" x-cloak>
+                                                    <template x-for="chip in logMemoryChips(row)" :key="chip.key">
+                                                        <span class="log-chip" :title="chip.label">
+                                                            <span class="log-chip__label" x-text="chip.label"></span>
+                                                            <span class="log-chip__value" x-text="chip.value"></span>
+                                                        </span>
+                                                    </template>
+                                                    <template x-for="action in logMemoryActions" :key="action.anchor">
+                                                        <button type="button" class="log-action"
+                                                                @click.stop="openLogAction(action.anchor)"
+                                                                x-text="action.label"></button>
+                                                    </template>
+                                                </span>
+                                            </span>
+                                        </div>
                                     </template>
                                 </div>
                             </div>
                         </div>
-                    </div>
 
-                    <!-- Log Content -->
-                    <div class="bg-neutral-900 rounded-2xl overflow-hidden">
-                        <div class="flex items-center justify-between px-4 py-2 bg-neutral-800 border-b border-neutral-700">
-                            <span class="text-xs text-neutral-400" x-text="window.t('logs.showing_lines').replace('{lines}', logLines).replace('{total}', logTotalLines)"></span>
-                            <span class="text-xs text-neutral-500" x-text="logFile"></span>
+                        <!-- Empty: the level filter, or a file with nothing in it. -->
+                        <div x-show="logRows.length === 0" x-cloak>
+                            {{ ui.empty_state('terminal', t('logs.empty.title'), t('logs.empty.desc')) }}
                         </div>
-                        <textarea
-                            x-ref="logTextarea"
-                            :value="filteredLogContent()"
-                            readonly
-                            class="w-full h-[400px] sm:h-[600px] px-4 py-4 bg-neutral-900 text-green-400 font-mono text-xs leading-relaxed resize-none focus:outline-none"
-                            :placeholder="window.t('logs.placeholder')"
-                        ></textarea>
-                    </div>
 
-                    <!-- Stats -->
-                    <div class="mt-4 flex items-center justify-between text-sm text-neutral-500">
+                        <div class="log-foot">
+                            <span>
+                                <span x-text="window.t('logs.showing_lines').replace('{lines}', window.formatCountExact(logLines)).replace('{total}', window.formatCountExact(logTotalLines))"></span>
+                                <span x-show="logRows.length > 0">·</span>
+                                <span x-show="logRows.length > 0"
+                                      x-text="window.t('logs.row_count').replace('{rows}', window.formatCountExact(logRows.length))"></span>
+                            </span>
+                            <span class="flex items-center gap-3">
+                                <span x-show="logLoading">{{ t('logs.loading') }}</span>
                         <span x-show="logLastUpdated" x-text="window.t('logs.last_updated').replace('{time}', logLastUpdated)"></span>
-                        <span x-show="logError" class="text-red-500" x-text="logError"></span>
-                    </div>
+                                <!-- Log-read failures surface as a toast (dashboard.js watches logError). -->
+                            </span>
+                        </div>
+                    {% endcall %}
                 </div>
             </div>

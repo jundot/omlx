@@ -1,3 +1,4 @@
+            {% import "components/ui.html" as ui %}
             {% macro bench_th(label_key, tooltip_key, align='right') %}
             <th class="text-{{ align }} px-4 py-3 font-semibold text-neutral-600">
                 <div class="inline-flex items-center gap-1 {% if align == 'right' %}justify-end{% endif %}">
@@ -11,31 +12,12 @@
             {% endmacro %}
             <div x-show="mainTab === 'bench'" x-cloak role="tabpanel" id="panel-bench" aria-labelledby="tab-bench">
                 <!-- Sub-tab navigation -->
-                <div class="flex flex-wrap items-center gap-2 mb-10 animate-fade-in-up">
-                    <button
-                        @click="setBenchTab('throughput')"
-                        :class="benchTab === 'throughput'
-                            ? 'bg-neutral-900 text-white'
-                            : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
-                        class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200">
-                        {{ t('navbar.dropdown.performance') }}
-                    </button>
-                    <button
-                        @click="setBenchTab('accuracy')"
-                        :class="benchTab === 'accuracy'
-                            ? 'bg-neutral-900 text-white'
-                            : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
-                        class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200">
-                        {{ t('navbar.dropdown.accuracy') }}
-                    </button>
-                    <button
-                        @click="setBenchTab('context')"
-                        :class="benchTab === 'context'
-                            ? 'bg-neutral-900 text-white'
-                            : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
-                        class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200">
-                        {{ t('navbar.dropdown.context') }}
-                    </button>
+                <div class="page-tabs mb-6 animate-fade-in-up">
+                    {{ ui.segmented([('throughput', t('navbar.dropdown.performance')),
+                                     ('accuracy', t('navbar.dropdown.accuracy')),
+                                     ('context', t('navbar.dropdown.context'))],
+                                    'benchTab', "setBenchTab('{value}')",
+                                    aria_label=t('bench.sections.label')) }}
                 </div>
 
                 <!-- Throughput tab -->
@@ -45,7 +27,6 @@
                     <div class="mb-8">
                         <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
                             <div>
-                                <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('bench.section_label') }}</h2>
                                 <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('bench.heading') }}</h3>
                             </div>
                             <a x-show="benchDeviceInfo?.owner_hash"
@@ -67,7 +48,7 @@
                          keep their previous result on screen until they
                          explicitly choose to view the new run. -->
                     <div x-show="benchOtherActive" x-cloak
-                         class="bg-amber-50 border border-amber-200 rounded-2xl px-5 py-4 mb-6 flex items-center justify-between gap-4">
+                         class="notice notice--orange px-5 py-4 mb-6 flex items-center justify-between gap-4">
                         <div class="flex items-center gap-3">
                             <i data-lucide="info" class="w-5 h-5 text-amber-600 flex-shrink-0"></i>
                             <div class="text-sm text-amber-900">
@@ -88,7 +69,7 @@
                     </div>
 
                     <!-- Configuration Card -->
-                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                    <div class="card overflow-hidden mb-6">
                         <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                             <div class="flex items-center gap-3">
                                 <i data-lucide="settings-2" class="w-4 h-4 text-neutral-500"></i>
@@ -241,7 +222,7 @@
                             <!-- Run / Cancel Button -->
                             <div class="flex items-center gap-3 pt-2">
                                 <button x-show="!benchRunning"
-                                        @click="startBenchmark()"
+                                        @click="requestBenchConfirm('throughput')"
                                         :disabled="(benchExternalEnabled ? !externalConfigValid() : !benchModelId) || Object.values(benchPromptLengths).every(v => !v) || benchOtherActive !== null"
                                         :title="benchOtherActive ? window.t('bench.other_active.already_running') : ''"
                                         class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-medium rounded-lg hover:bg-neutral-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2">
@@ -253,14 +234,14 @@
                     </div>
 
                     <!-- Progress Section -->
-                    <div x-show="benchRunning && benchProgress" x-cloak class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                    <div x-show="benchRunning && benchProgress" x-cloak class="card overflow-hidden mb-6">
                         <div class="px-4 sm:px-6 py-4">
                             <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-3">
                                 <span class="text-sm font-medium text-neutral-700" x-text="benchProgress?.message || window.t('bench.progress.preparing')"></span>
                                 <div class="flex items-center gap-3">
                                     <span class="text-sm text-neutral-500" x-text="benchProgress?.current + ' / ' + benchProgress?.total"></span>
                                     <button @click="cancelBenchmark()"
-                                            class="px-3 py-1 bg-neutral-900 text-white text-xs font-medium rounded-lg hover:bg-neutral-800 transition-all flex items-center gap-1">
+                                            class="px-3 py-1 bg-accent text-accent-fg text-xs font-medium rounded-lg hover:bg-accent-hover transition-all flex items-center gap-1">
                                         <i data-lucide="square" class="w-3 h-3"></i>
                                         {{ t('bench.progress.cancel') }}
                                     </button>
@@ -274,7 +255,7 @@
                     </div>
 
                     <!-- Running indicator (no progress yet) -->
-                    <div x-show="benchRunning && !benchProgress" x-cloak class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                    <div x-show="benchRunning && !benchProgress" x-cloak class="card overflow-hidden mb-6">
                         <div class="px-6 py-4 flex items-center gap-3">
                             <div class="w-5 h-5 border-2 border-neutral-300 border-t-neutral-900 rounded-full animate-spin"></div>
                             <span class="text-sm text-neutral-600">{{ t('bench.progress.starting') }}</span>
@@ -282,7 +263,7 @@
                     </div>
 
                     <!-- Error -->
-                    <div x-show="benchError" x-cloak class="bg-red-50 border border-red-200 rounded-2xl px-6 py-4 mb-6">
+                    <div x-show="benchError" x-cloak class="notice notice--red px-6 py-4 mb-6">
                         <div class="flex items-center gap-2 text-red-700">
                             <i data-lucide="alert-circle" class="w-4 h-4"></i>
                             <span class="text-sm font-medium" x-text="benchError"></span>
@@ -290,7 +271,7 @@
                     </div>
 
                     <!-- Single Request Results -->
-                    <div x-show="benchSingleResults.length > 0" x-cloak class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                    <div x-show="benchSingleResults.length > 0" x-cloak class="card overflow-hidden mb-6">
                         <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                             <div class="flex items-center gap-3">
                                 <i data-lucide="zap" class="w-4 h-4 text-neutral-500"></i>
@@ -317,10 +298,10 @@
                                             <td class="px-4 py-3 font-medium text-neutral-900" x-text="benchSingleTestLabel(r)"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFmtNum(r.ttft_ms, 1)"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFmtNum(r.tpot_ms, 2)"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFmtNum(r.processing_tps, 1, ' tok/s')"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="benchFmtNum(r.gen_tps, 1, ' tok/s')"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFmtNum(r.processing_tps, 1, ' Tok/s')"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="benchFmtNum(r.gen_tps, 1, ' Tok/s')"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.e2e_latency_s.toFixed(3) + 's'"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.total_throughput.toFixed(1) + ' tok/s'"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.total_throughput.toFixed(1) + ' Tok/s'"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFormatMemory(r.peak_memory_bytes)"></td>
                                         </tr>
                                     </template>
@@ -330,7 +311,7 @@
                     </div>
 
                     <!-- Batch Results: Continuous Batching -->
-                    <div x-show="benchBatchResults.length > 0" x-cloak class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                    <div x-show="benchBatchResults.length > 0" x-cloak class="card overflow-hidden mb-6">
                         <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                             <div class="flex items-center gap-3">
                                 <i data-lucide="layers" class="w-4 h-4 text-neutral-500"></i>
@@ -355,20 +336,20 @@
                                     <!-- 1x baseline from single request -->
                                     <tr x-show="benchFindSingle(1024)" class="border-b border-neutral-100 bg-neutral-50/50">
                                         <td class="px-4 py-3 font-medium text-neutral-500">{{ t('bench.results.batch.baseline') }}</td>
-                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchFindSingle(1024)?.gen_tps?.toFixed(1) || '-') + ' tok/s'"></td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchFindSingle(1024)?.gen_tps?.toFixed(1) || '-') + ' Tok/s'"></td>
                                         <td class="px-4 py-3 text-right tabular-nums text-neutral-500">1.00x</td>
-                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchFindSingle(1024)?.processing_tps?.toFixed(1) || '-') + ' tok/s'"></td>
-                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchFindSingle(1024)?.processing_tps?.toFixed(1) || '-') + ' tok/s'"></td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchFindSingle(1024)?.processing_tps?.toFixed(1) || '-') + ' Tok/s'"></td>
+                                        <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchFindSingle(1024)?.processing_tps?.toFixed(1) || '-') + ' Tok/s'"></td>
                                         <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="benchFindSingle(1024)?.ttft_ms?.toFixed(1) || '-'"></td>
                                         <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="(benchFindSingle(1024)?.e2e_latency_s?.toFixed(3) || '-') + 's'"></td>
                                     </tr>
                                     <template x-for="r in benchBatchResults" :key="r.batch_size">
                                         <tr class="border-b border-neutral-100 hover:bg-neutral-50">
                                             <td class="px-4 py-3 font-medium text-neutral-900" x-text="r.batch_size + 'x'"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="benchFmtNum(r.tg_tps, 1, ' tok/s')"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="benchFmtNum(r.tg_tps, 1, ' Tok/s')"></td>
                                             <td class="px-4 py-3 text-right tabular-nums font-medium" :class="benchGetSpeedup(r) !== null && benchGetSpeedup(r) >= 1.5 ? 'text-green-600' : 'text-neutral-700'" x-text="benchGetSpeedup(r) !== null ? benchGetSpeedup(r).toFixed(2) + 'x' : 'N/A'"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFmtNum(r.pp_tps, 1, ' tok/s')"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="benchFmtNum(benchPpPerReq(r), 1, ' tok/s')"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFmtNum(r.pp_tps, 1, ' Tok/s')"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-500" x-text="benchFmtNum(benchPpPerReq(r), 1, ' Tok/s')"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFmtNum(r.avg_ttft_ms, 1)"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.e2e_latency_s.toFixed(3) + 's'"></td>
                                         </tr>
@@ -380,7 +361,7 @@
 
                     <!-- Benchmark Results (Text Export) -->
                     <div x-show="benchSingleResults.length > 0 || benchBatchResults.length > 0" x-cloak
-                         class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                         class="card overflow-hidden mb-6">
                         <button @click="benchShowText = !benchShowText"
                                 class="w-full flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200 hover:bg-neutral-150 transition-colors">
                             <div class="flex items-center gap-3">
@@ -392,7 +373,7 @@
                         <div x-show="benchShowText" x-cloak>
                             <div class="px-4 py-3 flex justify-end border-b border-neutral-200">
                                 <button @click="benchCopyText()"
-                                        class="px-4 py-1.5 bg-neutral-900 text-white text-xs font-medium rounded-lg hover:bg-neutral-800 transition-all flex items-center gap-1.5">
+                                        class="px-4 py-1.5 bg-accent text-accent-fg text-xs font-medium rounded-lg hover:bg-accent-hover transition-all flex items-center gap-1.5">
                                     <i data-lucide="copy" class="w-3.5 h-3.5"></i>
                                     <span x-text="benchCopied ? window.t('bench.results.text_export.copied') : window.t('bench.results.text_export.copy')"></span>
                                 </button>
@@ -410,7 +391,7 @@
 
                     <!-- Community Benchmark Upload Results -->
                     <div x-show="benchUploadResults.length > 0 || benchUploading" x-cloak
-                         class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                         class="card overflow-hidden mb-6">
                         <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                             <div class="flex items-center gap-3">
                                 <i data-lucide="upload-cloud" class="w-4 h-4 text-neutral-500"></i>
@@ -425,7 +406,7 @@
                             <div x-show="benchUploadFlags.length" x-cloak class="flex flex-wrap items-center gap-2 pb-2">
                                 <span class="text-xs text-neutral-500" x-text="t('bench.upload.flags_label')"></span>
                                 <template x-for="f in benchUploadFlags" :key="f.key">
-                                    <span class="px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 text-xs font-medium"
+                                    <span class="chip chip--emerald"
                                           x-text="f.label"></span>
                                 </template>
                             </div>
@@ -478,7 +459,7 @@
 
                     <!-- Community Benchmark Upload Skipped (external endpoint) -->
                     <div x-show="benchUploadSkipped" x-cloak
-                         class="bg-amber-50 rounded-2xl border border-amber-200 overflow-hidden mb-6">
+                         class="notice notice--orange overflow-hidden mb-6">
                         <div class="flex items-center gap-3 px-6 py-4 border-b border-amber-200">
                             <i data-lucide="flask-conical" class="w-4 h-4 text-amber-600"></i>
                             <span class="text-xs font-bold uppercase tracking-wider text-amber-600"
@@ -491,7 +472,7 @@
                     </div>
 
                     <!-- Metrics Reference -->
-                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                    <div class="card overflow-hidden">
                         <button @click="benchShowMetrics = !benchShowMetrics"
                                 class="w-full flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200 hover:bg-neutral-150 transition-colors">
                             <div class="flex items-center gap-3">
@@ -559,7 +540,37 @@
                      x-cloak
                      x-text="benchTip?.text"
                      class="bench-tip-fixed"></div>
+
                 </div>
+
+                <!-- Destructive-action alert: every benchmark loads its model for
+                     exclusive use, so the server unloads all resident models and
+                     interrupts in-flight requests. Same <dialog> pattern as the
+                     other console modals; focus starts on Cancel. -->
+                <dialog id="bench-confirm-dialog"
+                        class="dashboard-dialog fixed inset-0 z-[60] overflow-y-auto"
+                        role="alertdialog" aria-modal="true"
+                        aria-labelledby="bench-confirm-title" aria-describedby="bench-confirm-body"
+                        @keydown.tab="trapDialogFocus($event)"
+                        @cancel.prevent="cancelBenchConfirm()">
+                    <div class="fixed inset-0 bg-black/50" @click="cancelBenchConfirm()"></div>
+                    <div class="flex min-h-full items-center justify-center p-4">
+                        <div class="relative bg-surface rounded-lg shadow-popover w-full max-w-md p-6 text-center" @click.stop>
+                            <div class="alert-dialog__icon mx-auto mb-4">
+                                <i data-lucide="alert-triangle" class="w-7 h-7"></i>
+                            </div>
+                            <h4 id="bench-confirm-title" class="text-lg font-bold tracking-tight text-neutral-900"
+                                x-text="window.t('bench.confirm.title')"></h4>
+                            <p id="bench-confirm-body" class="text-sm text-neutral-600 mt-2" x-text="benchConfirmBody()"></p>
+                            <div class="flex justify-center gap-3 mt-6">
+                                {{ ui.button(t('bench.progress.cancel'), variant='secondary',
+                                             click='cancelBenchConfirm()', attrs='autofocus') }}
+                                {{ ui.button(t('bench.confirm.action'), variant='destructive',
+                                             click='confirmBenchRun()') }}
+                            </div>
+                        </div>
+                    </div>
+                </dialog>
 
                 <!-- Accuracy tab -->
                 {% include "dashboard/_bench_accuracy.html" %}
