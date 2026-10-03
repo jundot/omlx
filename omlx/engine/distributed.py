@@ -1880,6 +1880,7 @@ raise SystemExit(2)
                         rank: (host.node_id, host.ssh)
                         for rank, host in enumerate(self.deployment.hosts)
                     }
+                    refresh_started = time.monotonic()
                     try:
                         health = await asyncio.to_thread(
                             check_peers,
@@ -1900,6 +1901,15 @@ raise SystemExit(2)
                             healthy,
                             "" if healthy else describe_failure(health),
                         )
+                    # Phase 0.2: this blocks the request path on expiry (D1)
+                    # and 1.4 halved its SSH cost on the healthy path (C3) --
+                    # one line per refresh is enough to validate both against
+                    # real serving traffic without adding per-request noise.
+                    logger.info(
+                        "peer health refresh took %.1fms for %d peer(s)",
+                        (time.monotonic() - refresh_started) * 1000,
+                        len(hosts_by_rank),
+                    )
                     self._peer_health = cached
         if not cached[1]:
             raise DistributedInferenceError(f"cluster is not serving: {cached[2]}")
