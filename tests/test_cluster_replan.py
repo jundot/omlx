@@ -108,7 +108,7 @@ class _RecordingPool:
         self.entry = SimpleNamespace(engine=None)
         self.reloads = 0
 
-    def resolve_cluster_model_id(self, model_path):
+    def resolve_cluster_model_id(self, model_path, *, text_only=False):
         assert model_path == self.model_path
         return self.model_id
 

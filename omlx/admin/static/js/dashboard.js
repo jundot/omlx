@@ -265,6 +265,10 @@
             settingsApply: { open: false, mode: 'optimal', phase: 'input', recipeText: '', result: null, candidates: null, error: '' },
             importingMtplx: false,
             loadingGenDefaults: false,
+            // Auto-context assessment for the open settings modal:
+            // {max_context_tokens, declared_context_tokens} or null while
+            // unknown/unavailable (the template hides the button then).
+            modelSettingsAutoContext: null,
             reasoningParsers: [],
             aneTuning: {
                 tuningId: null,
@@ -2637,6 +2641,33 @@
                 }
             },
 
+            // Best-effort: fetch the largest context that fits on this Mac
+            // for the model. Fire-and-forget from openModelSettings — a slow
+            // or failed fetch (e.g. a model never downloaded) must never
+            // block the modal; the Auto button just stays hidden.
+            async fetchModelAutoContext(modelId) {
+                try {
+                    const resp = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/auto_context`);
+                    if (!resp.ok) return;
+                    const data = await resp.json();
+                    if (
+                        this.selectedModel
+                        && this.selectedModel.id === modelId
+                        && Number(data?.max_context_tokens) > 0
+                    ) {
+                        this.modelSettingsAutoContext = data;
+                    }
+                } catch (_) { /* advisory only */ }
+            },
+
+            // Clicking "Auto" is exactly typing the computed number in.
+            // No auto-vs-manual mode is persisted for local settings.
+            applyAutoContext() {
+                const tokens = Number(this.modelSettingsAutoContext?.max_context_tokens);
+                if (!Number.isFinite(tokens) || tokens <= 0) return;
+                this.modelSettings.max_context_window = tokens;
+            },
+
             async refreshOpenModelSettings() {
                 if (!this.showModelSettingsModal || !this.selectedModel) return;
                 const modelId = this.selectedModel.id;
@@ -2653,6 +2684,7 @@
                 const baseline = JSON.stringify(this.modelSettings);
                 const seq = ++this._applySeq;
                 this.profileError = '';
+                this.modelSettingsAutoContext = null;
                 this.showNewProfileForm = false;
                 this.showNewTemplateForm = false;
                 this.editingProfile = null;
@@ -2691,6 +2723,8 @@
                     || this.selectedModel?.id !== model.id
                     || JSON.stringify(this.modelSettings) !== baseline)) return;
                 this.selectedModel = model;
+                // Deliberately not awaited: advisory, must never delay the modal.
+                if (!isDiffusion) this.fetchModelAutoContext(model.id);
                 this.modelSettings = this.buildModelSettingsState(
                     model,
                     model.settings || {},

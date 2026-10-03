@@ -28,6 +28,8 @@ from .models import (
     ThunderboltPort,
     TransportState,
 )
+from .readiness import node_readiness
+from .transport import _UNROUTABLE_NETWORKS
 
 _RDMA_CTL = "/usr/bin/rdma_ctl"
 _IBV_DEVICES = "/usr/bin/ibv_devices"
@@ -381,6 +383,21 @@ def _warning_for(result: CommandResult, label: str) -> str | None:
     return f"{label} probe unavailable: {detail}"
 
 
+def _fabric_routable(address: str) -> bool:
+    """Whether an RDMA-interface address could carry a fabric, per host.
+
+    A 169.254 (self-assigned) or loopback address means macOS never finished
+    configuring the link, so it earns no ladder rung even though it renders
+    like a real address.
+    """
+
+    ip = ipaddress.ip_address(address)
+    return not any(
+        ip.version == network.version and ip in network
+        for network in _UNROUTABLE_NETWORKS
+    )
+
+
 def _advertised_python_executable() -> str:
     """The interpreter another Mac should run over SSH to reach this node.
 
@@ -508,7 +525,17 @@ def collect_cluster_status(
     if rdma_status == "disabled":
         transport_state = TransportState.DISABLED
     elif rdma_status == "enabled" and peer_connected:
+        # Climb the ladder on local evidence only: a routable (non-link-local)
+        # address on an RDMA interface earns ADDRESSED, and a route that uses
+        # the RDMA interface earns ROUTED on top of it. A 169.254 address stays
+        # at PEER_LINKED_CONFIG_PENDING — macOS never finished configuring the
+        # link, and the route it carries proves nothing. Node-local state tops
+        # out at ROUTED: REACHABLE requires two-ended proof (assess_link).
         transport_state = TransportState.PEER_LINKED_CONFIG_PENDING
+        if any(_fabric_routable(address) for _, address in rdma_addresses):
+            transport_state = TransportState.ADDRESSED
+            if route is not None and route.uses_rdma_interface:
+                transport_state = TransportState.ROUTED
     elif rdma_status == "enabled":
         transport_state = TransportState.ENABLED_NO_PEER
     else:
@@ -583,9 +610,24 @@ def collect_cluster_status(
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=UTC)
 
+    try:
+        # Advertise the port this node's own admin API answers on, so a
+        # coordinator's fast ceiling probe targets the real server instead
+        # of guessing conventional ports (C5).
+        from omlx.settings import get_settings
+
+        admin_port = int(get_settings().server.port)
+    except Exception:
+        # Settings are genuinely absent on a worker-only install; 0 tells the
+        # coordinator to keep its legacy port fallback rather than fail.
+        admin_port = 0
+    if admin_port <= 0:
+        admin_port = 0
+
     return ClusterStatus(
         collected_at=timestamp.isoformat(),
         hostname=socket.gethostname(),
+        admin_port=admin_port,
         platform=platform.platform(),
         chip_name=chip_name,
         physical_memory_bytes=physical_memory_bytes,
@@ -642,6 +684,7 @@ def format_cluster_status(status: ClusterStatus) -> str:
     """Render a compact human-readable node status."""
 
     gib = 1024**3
+    readiness = node_readiness(status.transport_state, status.rdma.addresses)
     lines = [
         "oMLX cluster node status",
         f"Node:        {status.hostname}",
@@ -659,6 +702,14 @@ def format_cluster_status(status: ClusterStatus) -> str:
             f"MLX-LM {status.runtime.mlx_lm_version}"
         ),
         f"Transport:   {status.transport_state.value}",
+        *(
+            (
+                f"  reason: {readiness.reason}",
+                f"  remedy: {readiness.remedy}",
+            )
+            if status.transport_state is not TransportState.COLLECTIVE_OK
+            else ()
+        ),
         (
             "RDMA:        "
             f"{status.rdma.control_status}"
