@@ -191,6 +191,36 @@
                                                 </template>
                                             </div>
                                         </div>
+                                        <!-- Exposed-profile child rows (§3 Theme B / Phase 2.3 of
+                                             docs/named-profile-model-list-feature.md) -- same
+                                             treatment as the settings-tab table, minus the
+                                             settings-summary chips this list doesn't show. -->
+                                        <template x-for="profile in (managerModelInfo(model.name)?.exposed_profiles || [])" :key="'row-' + profile.name">
+                                            <div class="flex items-center gap-3 pl-10 pr-4 sm:pr-6 py-2 border-t border-neutral-100">
+                                                <span class="text-neutral-300 flex-shrink-0" aria-hidden="true">↳</span>
+                                                <span class="px-1 py-0.5 text-[9px] font-bold rounded flex-shrink-0"
+                                                      :class="profile.has_engine_fields ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700'">API</span>
+                                                <div class="flex-1 min-w-0 flex items-center gap-2">
+                                                    <span class="text-sm font-medium text-neutral-800 truncate" x-text="profile.display_name || profile.name"></span>
+                                                    <span class="font-mono text-[10px] text-neutral-400 truncate" x-text="profile.model_id"></span>
+                                                </div>
+                                                <button @click="window.location.href = '/admin/chat?model=' + encodeURIComponent(profile.model_id)"
+                                                        :title="window.t('settings.models.table.profile_chat_tooltip')"
+                                                        class="p-1.5 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all flex-shrink-0">
+                                                    <i data-lucide="message-square" class="w-3.5 h-3.5"></i>
+                                                </button>
+                                                <button @click="editExposedProfileFromList(managerModelInfo(model.name), profile)"
+                                                        :title="window.t('settings.models.table.profile_edit_tooltip')"
+                                                        class="p-1.5 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all flex-shrink-0">
+                                                    <i data-lucide="pencil" class="w-3.5 h-3.5"></i>
+                                                </button>
+                                                <button @click="unexposeProfileFromList(managerModelInfo(model.name), profile)"
+                                                        :title="window.t('settings.models.table.profile_unexpose_tooltip')"
+                                                        class="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all flex-shrink-0">
+                                                    <i data-lucide="x" class="w-3.5 h-3.5"></i>
+                                                </button>
+                                            </div>
+                                        </template>
                                     </template>
                                 </div>
                             </div>
