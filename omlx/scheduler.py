@@ -82,6 +82,7 @@ from .speculative.vlm_mtp import (
     run_vlm_mtp_decode,
     vlm_mtp_positioned_sampling_available,
 )
+from .utils.dry import DryProcessor, find_breaker_token_ids
 from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
 from .utils.generation_config import load_generation_config_token_ids
 from .utils.hardware import format_bytes
@@ -2463,6 +2464,9 @@ class Scheduler:
         # Must be after _is_harmony_model / _generation_config_eos init
         # since _get_xtc_special_tokens() delegates to _get_stop_tokens().
         self._xtc_special_tokens: list[int] = self._get_xtc_special_tokens()
+        # DRY sequence-breaker token ids, keyed by the breaker strings. Built
+        # on first use: it decodes the whole vocabulary once.
+        self._dry_breaker_token_ids: dict[tuple[str, ...], list[int]] = {}
 
         # Drop transient aliases after ownership moves to scheduler fields;
         # close()/deep_reset() clear those fields during teardown.
@@ -6883,6 +6887,11 @@ class Scheduler:
             ),
         )
 
+        if sampling_params.dry is not None and sampling_params.dry.multiplier:
+            dry_processor = self._make_dry_processor(sampling_params.dry, request)
+            if dry_processor is not None:
+                logits_processors.append(dry_processor)
+
         suppress_processor = _make_suppress_logits_processor(
             self._model_suppress_tokens
         )
@@ -6954,6 +6963,41 @@ class Scheduler:
                 logger.warning("xgrammar not installed; skipping grammar constraint")
 
         return sampler, logits_processors
+
+    def _make_dry_processor(self, dry: Any, request: Any = None) -> Any:
+        """Build the per-request DRY processor, or None when DRY is off."""
+        if dry is None or not dry.multiplier:
+            return None
+        breakers = tuple(dry.sequence_breakers)
+        breaker_ids = self._dry_breaker_token_ids.get(breakers)
+        if breaker_ids is None:
+            try:
+                breaker_ids = find_breaker_token_ids(self.tokenizer, breakers)
+            except Exception as e:
+                logger.warning("DRY: could not resolve sequence breakers: %s", e)
+                breaker_ids = []
+            self._dry_breaker_token_ids[breakers] = breaker_ids
+        # Only a single-token close-think marker is a usable boundary; the
+        # pieces of a multi-token one occur in ordinary text.
+        think_end_ids = self._resolve_think_end_token_ids()
+        prompt_token_ids = getattr(request, "prompt_token_ids", None)
+        think_start_id = (
+            self._get_think_token_id("think_start_id") if dry.exclude_reasoning else None
+        )
+        return DryProcessor(
+            multiplier=dry.multiplier,
+            base=dry.base,
+            allowed_length=dry.allowed_length,
+            penalty_last_n=dry.penalty_last_n,
+            breaker_token_ids=breaker_ids,
+            prompt_length=len(prompt_token_ids) if prompt_token_ids else 0,
+            think_end_token_id=(
+                think_end_ids[0] if think_end_ids and len(think_end_ids) == 1 else None
+            ),
+            exclude_reasoning=dry.exclude_reasoning,
+            think_start_token_id=think_start_id,
+            starts_in_reasoning=bool(getattr(request, "needs_think_prefix", False)),
+        )
 
     def _get_model_vocab_size(self) -> int | None:
         """Return vocab_size from model config, or None if unavailable."""

@@ -199,6 +199,12 @@ class ModelSettings:
         min_p: Minimum probability threshold (None = use global default).
         repetition_penalty: Repetition penalty (None = use default 1.0, i.e. disabled).
         presence_penalty: Presence penalty (None = use global default).
+        dry_multiplier: DRY repetition penalty strength (None or 0 = disabled).
+        dry_base: DRY penalty growth per extra matched token (None = 1.75).
+        dry_allowed_length: Longest repeat DRY leaves unpenalised (None = 2).
+        dry_penalty_last_n: Generated tokens DRY searches (None = 4096, -1 = all).
+        dry_sequence_breakers: Strings that reset DRY matching (None = defaults).
+        dry_exclude_reasoning: Skip DRY inside the thinking block (None = False).
         force_sampling: Force sampling even with temperature=0.
         max_tool_result_tokens: Maximum tokens in tool result (None = use global default).
         chat_template_kwargs: Extra chat template keyword arguments.
@@ -317,6 +323,12 @@ class ModelSettings:
     repetition_penalty: Optional[float] = None
     min_p: Optional[float] = None
     presence_penalty: Optional[float] = None
+    dry_multiplier: Optional[float] = None
+    dry_base: Optional[float] = None
+    dry_allowed_length: Optional[int] = None
+    dry_penalty_last_n: Optional[int] = None
+    dry_sequence_breakers: Optional[list[str]] = None
+    dry_exclude_reasoning: Optional[bool] = None
     force_sampling: bool = False
     max_tool_result_tokens: Optional[int] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
