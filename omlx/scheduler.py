@@ -13270,8 +13270,9 @@ class Scheduler:
         # Reclaim before requeue so the retry starts from a lower baseline.
         self._reclaim_prefill_headroom()
 
-        # Clear any SpecPrefill RoPE patch tied to this request so the retry
-        # re-scores cleanly.
+        # Only drops the SpecPrefill id; the RoPE patch is not touched here.
+        # A request whose sparse prefill succeeded skips the chunked/external
+        # prefill, so it doesn't reach this path with the patch installed.
         if self._specprefill_active_request_id == request.request_id:
             self._specprefill_active_request_id = None
 
