@@ -147,6 +147,14 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
         for key, val in quant.items():
             if not isinstance(val, dict):
                 continue
+            for mtp_prefix in (
+                "model.language_model.mtp.",
+                "language_model.mtp.",
+                "model.mtp.",
+            ):
+                if key.startswith(mtp_prefix):
+                    extras["mtp." + key[len(mtp_prefix) :]] = val
+                    break
             if key.startswith(_CKPT_TEXT_PREFIX):
                 # model.language_model.X -> language_model.model.X
                 variant = _RUNTIME_TEXT_PREFIX + key[len(_CKPT_TEXT_PREFIX) :]
@@ -1423,6 +1431,7 @@ def maybe_load_custom_quantization(
     model_name: str,
     *,
     is_vlm: bool,
+    model_settings: Any | None = None,
 ) -> tuple[Any, Any] | None:
     """Load models that require a custom upstream quantization loader.
 
@@ -1444,6 +1453,33 @@ def maybe_load_custom_quantization(
             e,
         )
         return None
+
+    if (config.get("expert_quant") or {}).get("format") == "exl3":
+        if config.get("model_type") != "qwen4_exp" or not is_vlm:
+            raise ValueError(
+                "EXL3 packed experts currently require native Qwen4-Exp VLM loading"
+            )
+        import os
+
+        if os.environ.get("OMLX_EXL3_ENABLED", "0") != "1":
+            raise ValueError("EXL3 support is opt-in: set OMLX_EXL3_ENABLED=1")
+        from ..quantization.exl3 import validate_checkpoint_headers
+
+        from ..patches.mlx_lm_mtp import is_mtp_active
+        from ..patches.mlx_vlm_qwen4_exp_compat import configure_qwen4_exp_runtime
+
+        # The pre-load patch owns dispatch/depth configuration; do not revive
+        # process-wide state from a previous model when this request is plain.
+        mtp_enabled = bool(
+            model_settings is not None
+            and getattr(model_settings, "mtp_enabled", False)
+            and is_mtp_active()
+        )
+        validate_checkpoint_headers(model_name, config, include_mtp=mtp_enabled)
+        configure_qwen4_exp_runtime(model_name, mode="mmap", mtp_enabled=mtp_enabled)
+        import mlx_vlm.utils as vlm_utils
+
+        return vlm_utils.load(model_name, trust_remote_code=False, strict=True)
 
     quant_config = config.get("quantization_config")
     quant_method = quant_config.get("quant_method") if quant_config else None

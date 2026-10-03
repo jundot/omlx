@@ -501,6 +501,18 @@ class EnginePool:
         base = self._entry_resident_size(entry) if base_size is None else base_size
         if self._distributed_deployment_for_entry(entry) is not None:
             return base
+        # Packed EXL3 discovery reserves the optional head, but a plain
+        # native load drops it. Do not wait for those absent bytes at unload.
+        if entry.config_model_type == "qwen4_exp" and not getattr(
+            runtime_settings, "mtp_enabled", False
+        ):
+            from .model_discovery import estimate_model_size
+
+            try:
+                plain_size = estimate_model_size(Path(entry.model_path), include_mtp=False)
+            except (OSError, ValueError, TypeError):
+                plain_size = base  # Retain the conservative discovery estimate.
+            base = min(base, plain_size)
         qwen4_offload, _, qwen4_estimate = self._qwen4_ple_offload_status(
             entry, runtime_settings
         )

@@ -140,6 +140,9 @@ class Model(Qwen3_5Model):
         if get_mtp_runtime().enabled:
             self.mtp = Qwen4ExpMTPModule(config.text_config)
             self.language_model.bind_mtp_owner(self)
+        if config.expert_quant is not None:
+            from omlx.quantization.exl3 import install_packed_experts
+            install_packed_experts(self, config)
 
     def sanitize(self, weights):
         if get_ple_runtime_mode() == "mmap" and not getattr(
