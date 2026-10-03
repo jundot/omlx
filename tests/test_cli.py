@@ -1381,6 +1381,7 @@ class TestHasCliOverrides:
         [
             ("sse_keepalive_mode", "off"),
             ("max_audio_upload_size", "250MB"),
+            ("max_video_upload_size", "2GB"),
             ("max_concurrent_requests", 2),
             ("paged_ssd_cache_dir", "/tmp/cache"),
             ("paged_ssd_cache_max_size", "2GB"),

@@ -56,6 +56,7 @@ def _has_cli_overrides(args) -> bool:
         "sse_keepalive_mode",
         "max_audio_upload_size",
         "max_image_upload_size",
+        "max_video_upload_size",
         "max_image_side_length",
         "max_concurrent_requests",
         "embedding_batch_size",
@@ -1198,6 +1199,15 @@ Example directory structure:
         default=None,
         help="Maximum image payload size for VLM inputs (e.g. '50MB', '100MB'). "
         "Overrides the value in settings.json (built-in default: 50MB).",
+    )
+    serve_parser.add_argument(
+        "--max-video-upload-size",
+        type=str,
+        default=None,
+        help="Maximum size of one inline video for VLM inputs (e.g. '200MB', "
+        "'2GB'). Overrides the value in settings.json (built-in default: 200MB). "
+        "The base64 request body is held in memory, so this also bounds "
+        "per-request RAM",
     )
     serve_parser.add_argument(
         "--max-image-side-length",

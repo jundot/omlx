@@ -205,6 +205,8 @@ class ServerSettings:
     max_audio_upload_size: str = "100MB"
     # Maximum raw image payload size accepted ("50MB", "100MB").
     max_image_upload_size: str = "50MB"
+    # Maximum raw video payload size accepted per clip ("200MB", "2GB").
+    max_video_upload_size: str = "200MB"
     # Maximum side length in pixels for VLM input images (0 to disable downscaling).
     max_image_side_length: int = 2048
     # Seconds between trivial GPU kernels submitted while a model is loaded
@@ -226,6 +228,13 @@ class ServerSettings:
         size = parse_size(self.max_image_upload_size)
         if size <= 0:
             raise ValueError("max_image_upload_size must be positive")
+        return size
+
+    def max_video_upload_bytes(self) -> int:
+        """Configured video upload limit in bytes. Non-positive sizes raise ValueError."""
+        size = parse_size(self.max_video_upload_size)
+        if size <= 0:
+            raise ValueError("max_video_upload_size must be positive")
         return size
 
     def to_dict(self) -> dict[str, Any]:
@@ -253,6 +262,7 @@ class ServerSettings:
             ),
             max_audio_upload_size=data.get("max_audio_upload_size", "100MB"),
             max_image_upload_size=data.get("max_image_upload_size", "50MB"),
+            max_video_upload_size=data.get("max_video_upload_size", "200MB"),
             max_image_side_length=data.get("max_image_side_length", 2048),
             gpu_keep_warm_interval=float(data.get("gpu_keep_warm_interval", 0.5)),
         )
@@ -1195,6 +1205,8 @@ class GlobalSettings:
             os.getenv("OMLX_MAX_IMAGE_UPLOAD_SIZE") or os.getenv("OMLX_MAX_IMAGE_BYTES")
         ):
             self.server.max_image_upload_size = max_image_upload_size
+        if max_video_upload_size := os.getenv("OMLX_MAX_VIDEO_UPLOAD_SIZE"):
+            self.server.max_video_upload_size = max_video_upload_size
         if max_image_side_length := os.getenv("OMLX_MAX_IMAGE_SIDE_LENGTH"):
             try:
                 self.server.max_image_side_length = int(max_image_side_length)
@@ -1358,6 +1370,11 @@ class GlobalSettings:
             and args.max_image_upload_size is not None
         ):
             self.server.max_image_upload_size = args.max_image_upload_size
+        if (
+            hasattr(args, "max_video_upload_size")
+            and args.max_video_upload_size is not None
+        ):
+            self.server.max_video_upload_size = args.max_video_upload_size
         if (
             hasattr(args, "max_image_side_length")
             and args.max_image_side_length is not None
@@ -1688,6 +1705,13 @@ class GlobalSettings:
                 errors.append("max_image_upload_size must be positive")
         except (AttributeError, TypeError, ValueError) as e:
             errors.append(f"Invalid max_image_upload_size: {e}")
+
+        try:
+            video_upload_size = parse_size(self.server.max_video_upload_size)
+            if video_upload_size <= 0:
+                errors.append("max_video_upload_size must be positive")
+        except (AttributeError, TypeError, ValueError) as e:
+            errors.append(f"Invalid max_video_upload_size: {e}")
 
         if self.server.max_image_side_length < 0:
             errors.append("max_image_side_length must be non-negative")

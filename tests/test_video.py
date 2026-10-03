@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import tempfile
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,6 +10,7 @@ from PIL import Image
 
 from omlx.api.openai_models import ContentPart
 from omlx.exceptions import InvalidRequestError
+from omlx.utils import video as video_module
 from omlx.utils.image import extract_images_from_messages
 from omlx.utils.video import (
     NATIVE_VIDEO_MAX_FRAMES,
@@ -16,6 +18,7 @@ from omlx.utils.video import (
     _sample_indices,
     attach_native_video_processor,
     expand_video_parts,
+    get_max_video_bytes,
     native_video_token_count,
     probe_video,
     write_video_data_uri,
@@ -115,6 +118,78 @@ def test_write_video_data_uri_returns_file_and_payload_digest():
 def test_write_video_data_uri_rejects_remote_urls():
     with pytest.raises(InvalidRequestError, match="base64 data URIs"):
         write_video_data_uri("https://example.com/clip.mp4")
+
+
+@pytest.mark.parametrize("size", [1, 2, 3, 5, 6, 7, 47, 48, 100])
+def test_write_video_data_uri_decodes_across_chunks(monkeypatch, size):
+    # Eight base64 characters per chunk, so every size above crosses chunk
+    # boundaries and ends with each possible padding length.
+    monkeypatch.setattr(video_module, "_BASE64_CHUNK_CHARS", 8)
+    payload = bytes((i * 37) % 256 for i in range(size))
+    uri = " data:video/mp4;base64," + base64.b64encode(payload).decode() + "\n"
+
+    path, digest = write_video_data_uri(uri)
+    try:
+        assert path.read_bytes() == payload
+        assert digest == hashlib.sha256(payload).hexdigest()
+    finally:
+        path.unlink()
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        "AA==AAAA",  # padding before the end of the payload
+        "AAAAAAAAA!AA",  # invalid character in a later chunk
+        "AAAAAAAAA",  # truncated final group
+    ],
+)
+def test_write_video_data_uri_rejects_invalid_base64_and_removes_file(
+    monkeypatch, tmp_path, encoded
+):
+    monkeypatch.setattr(video_module, "_BASE64_CHUNK_CHARS", 4)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+
+    with pytest.raises(InvalidRequestError, match="invalid base64"):
+        write_video_data_uri("data:video/mp4;base64," + encoded)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_write_video_data_uri_rejects_empty_payload():
+    with pytest.raises(InvalidRequestError, match="empty"):
+        write_video_data_uri("data:video/mp4;base64,")
+
+
+@pytest.mark.parametrize("cli_override", [False, True])
+def test_video_size_limit_follows_settings(monkeypatch, tmp_path, cli_override):
+    from argparse import Namespace
+
+    from omlx import settings as settings_module
+
+    monkeypatch.setattr(settings_module, "_global_settings", None)
+    monkeypatch.setenv("OMLX_MAX_VIDEO_UPLOAD_SIZE", "1KB")
+    settings_module.init_settings(
+        base_path=tmp_path,
+        cli_args=Namespace(max_video_upload_size="2KB") if cli_override else None,
+    )
+    limit = (2 if cli_override else 1) * 1024
+    assert get_max_video_bytes() == limit
+
+    fits = b"\0" * (limit - limit % 3)
+    path, _ = write_video_data_uri(
+        "data:video/mp4;base64," + base64.b64encode(fits).decode()
+    )
+    path.unlink()
+    too_big = base64.b64encode(b"\0" * (limit + 3)).decode()
+    with pytest.raises(InvalidRequestError, match=f"exceeds {limit} bytes"):
+        write_video_data_uri("data:video/mp4;base64," + too_big)
+
+
+def test_video_size_limit_defaults_without_settings(monkeypatch):
+    from omlx import settings as settings_module
+
+    monkeypatch.setattr(settings_module, "_global_settings", None)
+    assert get_max_video_bytes() == 200 * 1024 * 1024
 
 
 class _FakeCapture:
