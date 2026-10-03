@@ -3032,6 +3032,14 @@ class BlockAwarePrefixCache(CacheManager):
             self.paged_cache.delete_block_table(request_id)
             logger.debug(f"Released cache for {request_id}")
 
+    def release_fetched_blocks(self, request_id: str) -> None:
+        """Release block refs taken by a fetch_cache that was never followed by a store.
+
+        release_cache only frees through _request_tables, which fetch_cache does not
+        write. A no-op when nothing was fetched.
+        """
+        self.paged_cache.delete_block_table(request_id)
+
     def clear_request_entry(self, request_id: str) -> None:
         """
         Clear request entry from tracking without freeing blocks.

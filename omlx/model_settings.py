@@ -23,8 +23,8 @@ from .model_profiles import (
     filter_universal_fields,
     normalize_turboquant_kv_bits,
     slugify_profile_api_name,
-    validate_profile_name,
     utcnow,
+    validate_profile_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -262,6 +262,12 @@ class ModelSettings:
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
         specprefill_threshold: Min tokens to trigger SpecPrefill.
+        canonical_state_recovery_enabled: Re-read ranges a sparse prefill served,
+            densely, while the scheduler is idle. Off by default. Also needs a
+            non-zero `scheduler.canonical_state_recovery_global_budget_pct`
+            (0 by default).
+        canonical_state_recovery_slice_tokens: Tokens per recovery slice; 0 means
+            the ordinary prefill step size. Publishing is still per cache block.
         dflash_enabled: Enable DFlash speculative decoding. Qwen3.5-family VLM
             targets draft inside the batched engine (Lightning MTP verify path
             with greedy or sampled acceptance, continuous batching); other
@@ -415,6 +421,10 @@ class ModelSettings:
     specprefill_keep_pct: Optional[float] = None  # Keep rate (0.1-0.5, default 0.2)
     specprefill_threshold: Optional[int] = None  # Min tokens to trigger (default 8192)
 
+    canonical_state_recovery_enabled: bool = False
+    # 0 = the ordinary prefill step size. Publishing is still per cache block.
+    canonical_state_recovery_slice_tokens: int = 0
+
     # DFlash (block diffusion speculative decoding)
     dflash_enabled: bool = False
     dflash_draft_model: Optional[str] = None  # Path/repo for DFlash draft checkpoint
@@ -548,6 +558,8 @@ class ModelSettings:
                     "vlm_mtp decode path does not apply"
                 )
         validate_moe_expert_offload(self.to_dict())
+        if self.canonical_state_recovery_slice_tokens < 0:
+            raise ValueError("canonical_state_recovery_slice_tokens must not be negative")
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.

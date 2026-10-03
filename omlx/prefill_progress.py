@@ -80,6 +80,21 @@ class PrefillProgressTracker:
                 )
                 self._progress[request_id] = entry
 
+    def any_active(
+        self, exclude_ids: tuple[str, ...] = (), exclude_prefix: str = ""
+    ) -> bool:
+        """True while any request other than the exclusions is in prefill.
+
+        ``exclude_prefix`` lets recovery skip its own entries. Recovery jobs are kept
+        apart by the budget claim, not by this tracker.
+        """
+        with self._lock:
+            return any(
+                rid not in exclude_ids
+                and not (exclude_prefix and rid.startswith(exclude_prefix))
+                for rid in self._progress
+            )
+
     def remove(self, request_id: str) -> None:
         """Explicitly remove a request (e.g. on abort or finish)."""
         with self._lock:
