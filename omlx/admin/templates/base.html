@@ -176,7 +176,6 @@
         [data-enhanced-readability] {
             --text-secondary: var(--text-primary) !important;
             --text-tertiary: var(--text-primary) !important;
-            --text-muted: var(--text-primary) !important;
             --text-danger: #d92d20 !important;
         }
         [data-theme="dark"][data-enhanced-readability] {
@@ -192,10 +191,8 @@
         [data-enhanced-readability][data-theme] .text-neutral-600,
         [data-enhanced-readability][data-theme] .text-neutral-700,
         [data-enhanced-readability][data-theme] .text-neutral-800,
-        [data-enhanced-readability][data-theme] .text-muted,
         [data-enhanced-readability][data-theme] .text-fg-tertiary,
-        [data-enhanced-readability][data-theme] .text-fg-secondary,
-        [data-enhanced-readability][data-theme] .text-fg-muted {
+        [data-enhanced-readability][data-theme] .text-fg-secondary {
             color: var(--text-primary) !important;
         }
         [data-enhanced-readability] ::placeholder { color: var(--text-primary) !important; opacity: 1 !important; }
@@ -203,23 +200,16 @@
            excluded (its font-size stays untouched, preserving 1.21em scaling).
            Tailwind arbitrary-value classes MUST use the escaped form
            (.text-\[10px\]) to match the compiled selector. */
-        [data-enhanced-readability] .text-\[9px\],
-        [data-enhanced-readability] .text-\[10px\],
-        [data-enhanced-readability] .text-\[11px\],
-        [data-enhanced-readability] .svg-allow-warning,
+        /* The size floor itself lives in the token layer (tokens.css), where
+           it applies to everyone; what is left here is the two icon buttons
+           whose size is relative (0.7em) and only the toggle lifts. */
         [data-enhanced-readability] .code-copy-btn,
-        [data-enhanced-readability] .svg-render-btn,
-        [data-enhanced-readability] .model-card-content pre code,
-        [data-enhanced-readability] *[style*="font-size: 10px"],
-        [data-enhanced-readability] *[style*="font-size: 11px"],
-        [data-enhanced-readability] *[style*="font-size:10px"],
-        [data-enhanced-readability] *[style*="font-size:11px"] {
+        [data-enhanced-readability] .svg-render-btn {
             font-size: 12px !important;
         }
         /* Inline gray vars (e.g. style="color: var(--text-tertiary)") -> primary */
         [data-enhanced-readability] [style*="--text-tertiary"],
-        [data-enhanced-readability] [style*="--text-secondary"],
-        [data-enhanced-readability] [style*="--text-muted"] {
+        [data-enhanced-readability] [style*="--text-secondary"]{
             color: var(--text-primary) !important;
         }
         /* Hardcoded gray hex inline colors -> primary (reds/greens excluded) */

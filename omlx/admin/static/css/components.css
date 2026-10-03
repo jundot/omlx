@@ -1,0 +1,1681 @@
+/*
+ * Shared component specs for the oMLX admin console.
+ *
+ * Every value here comes from a token in tokens.json (via the generated
+ * tokens.css); no literal colour, spacing or font size belongs in this file.
+ *
+ * The specs are written once and implemented per platform: this file is the
+ * web implementation, DesignTokens.swift + OMLXTheme is the app-side one.
+ */
+
+/* === Surfaces === */
+
+/* Recessed area inside a card: table headers, code blocks, empty states. */
+.surface-inset {
+    background-color: var(--bg-tertiary);
+    border-radius: var(--radius-md);
+}
+
+/* === Structure === */
+
+.section-stack > * + * {
+    margin-top: var(--space-5);
+}
+
+.row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+/* A resident model in a table: a token tint and the shared glow ring, never a
+   hard border — a border would read as a selection, which this is not. */
+.model-row--loaded {
+    /* Neutral tint, not a colour: the console's accent is grey, and the row
+       already carries the green Loaded badge that says what this means. */
+    background-color: color-mix(in srgb, var(--text-primary) 5%, transparent);
+    box-shadow: var(--shadow-glow);
+}
+
+/* === Button ===
+   Primary = the screen's single committed action, in the console's one tint
+   (the system blue the HIG fills tinted buttons with); secondary = neutral;
+   ghost = toolbar/row actions; destructive = system red. The neutral
+   `--btn-primary` fill is still the chosen-knob of a segmented control, where
+   colour would imply a state that is not there. */
+
+.btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-4);
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
+    font-weight: 500;
+    border-radius: var(--radius-md);
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.btn:disabled,
+.btn[aria-disabled="true"] {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.btn--primary {
+    background-color: var(--accent-fill);
+    color: var(--accent-fill-text);
+}
+
+.btn--primary:hover:not(:disabled) {
+    background-color: var(--accent-fill-hover);
+}
+
+.btn--secondary {
+    background-color: var(--bg-primary);
+    border-color: var(--border-normal);
+    color: var(--text-primary);
+}
+
+.btn--secondary:hover:not(:disabled) {
+    background-color: var(--bg-secondary);
+}
+
+.btn--ghost {
+    background-color: transparent;
+    color: var(--text-secondary);
+}
+
+.btn--ghost:hover:not(:disabled) {
+    background-color: var(--bg-tertiary);
+    color: var(--text-primary);
+}
+
+.btn--destructive {
+    background-color: var(--btn-danger);
+    color: var(--danger-fg);
+}
+
+.btn--destructive:hover:not(:disabled) {
+    filter: brightness(0.92);
+}
+
+.btn--sm {
+    padding: var(--space-1) var(--space-3);
+    font-size: var(--fs-aux);
+}
+
+.btn--icon {
+    padding: var(--space-2);
+}
+
+/* === Badge === */
+
+/* One box for every label in the console: the switch's width is the
+   two-character label's width, two labels of the same length are the same size
+   wherever they stand, and a row's chips and its switch share one centre line.
+   The height is fixed (only the length grows with the text), the box carries no
+   colour — a tone (`.badge--green`) or the element's own colour utilities paint
+   it — and every label wears it: `.badge` is the neutral one, `.chip` the one
+   that brings its own colour.
+
+   Two characters are 40 with or without the status dot: a label without one
+   keeps the dot's width as padding, so the dot costs no width. */
+.chip,
+.badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    vertical-align: middle;
+    gap: var(--space-1);
+    height: calc(var(--space-5) - var(--space-1));
+    padding: 0 var(--space-2);
+    font-size: var(--fs-aux);
+    line-height: 1.4;
+    font-weight: 600;
+    border-radius: var(--radius-sm);
+    white-space: nowrap;
+}
+
+/* The dot and its gap take the place of the padding they displace (4 + 4 = the
+   --space-2 of padding above), so the label keeps its width. */
+.badge:has(.badge__dot),
+.chip:has(.badge__dot) {
+    padding: 0 var(--space-1);
+}
+
+/* The neutral label: a badge that reports nothing in particular. */
+.badge {
+    background-color: var(--bg-tertiary);
+    color: var(--text-secondary);
+}
+
+.badge__dot {
+    width: var(--space-1);
+    height: var(--space-1);
+    border-radius: var(--radius-pill);
+    background-color: currentColor;
+}
+
+.badge--green {
+    color: var(--badge-green-fg);
+    background-color: color-mix(in srgb, var(--sys-green) 14%, transparent);
+}
+
+.badge--orange {
+    color: var(--badge-orange-fg);
+    background-color: color-mix(in srgb, var(--sys-orange) 14%, transparent);
+}
+
+.badge--red {
+    color: var(--badge-red-fg);
+    background-color: color-mix(in srgb, var(--sys-red) 14%, transparent);
+}
+
+.badge--blue {
+    color: var(--badge-blue-fg);
+    background-color: color-mix(in srgb, var(--sys-blue) 14%, transparent);
+}
+
+.badge--teal {
+    color: var(--badge-teal-fg);
+    background-color: color-mix(in srgb, var(--sys-teal) 14%, transparent);
+}
+
+.badge--purple {
+    color: var(--badge-purple-fg);
+    background-color: color-mix(in srgb, var(--sys-purple) 14%, transparent);
+}
+
+/* Category labels: a family's own fill and the step that reads on it. The same
+   colours used to be Tailwind literals in the markup, out of a theme's reach. */
+.chip--neutral {
+    background-color: var(--label-neutral);
+    color: var(--label-neutral-fg);
+}
+
+.chip--emerald {
+    background-color: var(--label-emerald);
+    color: var(--label-emerald-fg);
+}
+
+.chip--green {
+    background-color: var(--label-green);
+    color: var(--label-green-fg);
+}
+
+.chip--cyan {
+    background-color: var(--label-cyan);
+    color: var(--label-cyan-fg);
+}
+
+.chip--indigo {
+    background-color: var(--label-indigo);
+    color: var(--label-indigo-fg);
+}
+
+.chip--sky {
+    background-color: var(--label-sky);
+    color: var(--label-sky-fg);
+}
+
+.chip--purple {
+    background-color: var(--label-purple);
+    color: var(--label-purple-fg);
+}
+
+.chip--amber {
+    background-color: var(--label-amber);
+    color: var(--label-amber-fg);
+}
+
+.chip--orange {
+    background-color: var(--label-orange);
+    color: var(--label-orange-fg);
+}
+
+.chip--pink {
+    background-color: var(--label-pink);
+    color: var(--label-pink-fg);
+}
+
+.chip--rose {
+    background-color: var(--label-rose);
+    color: var(--label-rose-fg);
+}
+
+.chip--red {
+    background-color: var(--label-red);
+    color: var(--label-red-fg);
+}
+
+.chip--amberActive {
+    background-color: var(--label-amberActive);
+    color: var(--label-amberActive-fg);
+}
+
+
+/* A badge that states what the console is doing rather than a tone it reports:
+   the accent fill `.btn--primary` wears, in the same box as every other badge. */
+.badge--accent {
+    background-color: var(--accent-fill);
+    color: var(--accent-fill-text);
+}
+
+/* === Dual-value metric ===
+   The measured figure is the one that matters; the estimate, limit or budget it
+   is to be read against sits under it at the auxiliary size, never competing
+   with it for weight. */
+
+.metric-dual {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: var(--space-1);
+}
+
+.metric-dual__value {
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
+    font-weight: 600;
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+}
+
+.metric-dual__secondary {
+    font-size: var(--fs-aux);
+    line-height: var(--lh-aux);
+    color: var(--text-tertiary);
+    font-variant-numeric: tabular-nums;
+}
+
+/* === Card === */
+
+.card {
+    background-color: var(--bg-primary);
+    border: 1px solid var(--border-faint);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-card);
+    overflow: hidden;
+}
+
+.card__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding: var(--space-4) var(--space-5);
+    background-color: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-faint);
+}
+
+.card__title {
+    font-size: var(--fs-emphasis);
+    line-height: var(--lh-emphasis);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.card__subtitle {
+    margin-top: var(--space-1);
+    font-size: var(--fs-aux);
+    line-height: var(--lh-aux);
+    color: var(--text-tertiary);
+}
+
+.card__body {
+    padding: var(--space-5);
+}
+
+/* A card whose body is a list of rows that carry their own padding: the body
+   adds none, so a row's label starts where the header's title starts. Without
+   this the two insets stacked and every row sat one step (24pt) deeper than the
+   heading above it -- the MCP card in review 6. */
+.card__body:has(> .divide-y) {
+    padding: 0;
+}
+
+/* === Form row: label + description on the left, control on the right === */
+
+.form-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-5);
+    padding: var(--space-4) 0;
+}
+
+.form-row + .form-row {
+    border-top: 1px solid var(--border-faint);
+}
+
+.form-row__label {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    max-width: 60%;
+}
+
+.form-row__title {
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
+    font-weight: 500;
+    color: var(--text-primary);
+}
+
+.form-row__desc {
+    font-size: var(--fs-aux);
+    line-height: var(--lh-aux);
+    color: var(--text-tertiary);
+}
+
+.form-row__control {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-shrink: 0;
+}
+
+/* === Filter slider ===
+   A range filter reads its own value back: the live magnitude sits beside the
+   track, so "at least 7B" is legible without a second field to compare. */
+
+.filter-slider {
+    width: 100%;
+    accent-color: var(--sys-blue);
+    cursor: pointer;
+}
+
+.filter-slider__value {
+    min-width: var(--space-8);
+    font-size: var(--fs-aux);
+    line-height: var(--lh-aux);
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+/* === Sheet ===
+   A macOS sheet: a title bar, one fixed measure, a scrolling body and a footer
+   whose actions stay pinned while the body moves under them. */
+
+.sheet {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    max-width: var(--container-form);
+    max-height: calc(100vh - var(--space-8));
+    background-color: var(--bg-primary);
+    border: 1px solid var(--border-faint);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-popover);
+    overflow: hidden;
+}
+
+.sheet__titlebar {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-4);
+    padding: var(--space-5);
+    background-color: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-faint);
+}
+
+.sheet__body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: var(--space-5);
+}
+
+.sheet__footer {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--space-3);
+    padding: var(--space-4) var(--space-5);
+    background-color: var(--bg-secondary);
+    border-top: 1px solid var(--border-faint);
+}
+
+/* === Segmented control (macOS NSSegmentedControl) === */
+
+.segmented {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    padding: var(--space-1);
+    background-color: var(--bg-tertiary);
+    border-radius: var(--radius-md);
+}
+
+.segmented__item {
+    padding: var(--space-1) var(--space-3);
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
+    font-weight: 500;
+    color: var(--text-secondary);
+    background-color: transparent;
+    border: 0;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.segmented__item:hover {
+    color: var(--text-primary);
+}
+
+.segmented__item--active {
+    background-color: var(--bg-primary);
+    color: var(--text-primary);
+    box-shadow: var(--shadow-card);
+}
+
+/* === Switch (the console's one on/off control) ===
+   Off is a neutral track; on is the near-black this control always had (the fill
+   the primary button wears too, so a switch that is on and a button that acts
+   read as the same weight). The knob's position already carries the state, so the
+   colour is a second signal rather than the only one; the knob is a token colour
+   because the app draws its own.
+
+   One size, everywhere: 36x20 with a 16pt knob, which is the height of the
+   badge the row beside it already carries. The console used to draw two, 44x24
+   in the settings cards and 36x16 in the tables, the chat sheet and the upload
+   sheet, so the same control was a different control depending on where it
+   stood, and the small one stood shorter than its own row's badge. */
+
+/* The track is a rounded rectangle with a length and a height, not a capsule:
+   the corner is one control step. The knob is the same corner, one hairline
+   tighter (concentric). */
+.switch {
+    position: relative;
+    flex: none;
+    vertical-align: middle;
+    width: calc(var(--space-8) - var(--space-2));
+    height: calc(var(--space-5) - var(--space-1));
+    padding: 0;
+    background-color: var(--bg-tertiary);
+    border: 1px solid var(--border-normal);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: background-color var(--duration-normal) ease, border-color var(--duration-normal) ease;
+}
+
+.switch--on {
+    background-color: var(--switch-on);
+    border-color: var(--switch-on);
+}
+
+/* A switch that turns on something risky reads red, the same red the console
+   uses for destructive actions. Never the only signal: the label says what it does. */
+.switch--danger {
+    background-color: var(--sys-red);
+    border-color: var(--sys-red);
+}
+
+.switch:focus-visible {
+    outline: var(--focus-ring-width) solid var(--focus-ring-color);
+    outline-offset: var(--focus-ring-width);
+}
+
+.switch__knob {
+    position: absolute;
+    top: 1px;
+    left: 1px;
+    width: var(--space-4);
+    height: var(--space-4);
+    background-color: var(--switch-knob);
+    border-radius: calc(var(--radius-sm) - 1px);
+    box-shadow: var(--shadow-card);
+    transition: transform var(--duration-normal) ease;
+}
+
+/* The knob starts one hairline inside the left edge and lands one hairline
+   inside the right one: 40 - 2 borders - 16 knob - 2 insets = 20. */
+.switch--on .switch__knob {
+    transform: translateX(calc(var(--space-5) - var(--space-1)));
+}
+
+/* === Empty state === */
+
+.empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-10) var(--space-5);
+    text-align: center;
+}
+
+.empty-state__icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--space-10);
+    height: var(--space-10);
+    border-radius: var(--radius-pill);
+    background-color: var(--bg-tertiary);
+    color: var(--text-tertiary);
+}
+
+.empty-state__title {
+    font-size: var(--fs-emphasis);
+    line-height: var(--lh-emphasis);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.empty-state__action {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin-top: var(--space-2);
+}
+
+.empty-state__desc {
+    max-width: var(--container-form);
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
+    color: var(--text-tertiary);
+}
+
+/* === KPI card ===
+   Left-aligned: auxiliary label, 28pt figure, optional unit and a sparkline
+   that fills the bottom of the card. */
+
+.kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(var(--kpi-min-width), 1fr));
+    gap: var(--space-4);
+}
+
+.kpi {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    padding: var(--space-5);
+    background-color: var(--bg-primary);
+    border: 1px solid var(--border-faint);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-card);
+}
+
+.kpi__label {
+    font-size: var(--fs-aux);
+    line-height: var(--lh-aux);
+    font-weight: 600;
+    color: var(--text-tertiary);
+}
+
+.kpi__figure {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-1);
+}
+
+.kpi__value {
+    font-size: var(--fs-kpi);
+    line-height: var(--lh-kpi);
+    font-weight: 600;
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+}
+
+.kpi__unit {
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
+    color: var(--text-tertiary);
+}
+
+
+/* === Server status header card === */
+
+/* The oMLX mark beside the server's name: the same drawing the top bar uses,
+   at the size of the title it sits next to. No tile behind it and no rounded
+   square, so it reads as a logo rather than as the app's icon. */
+.status-header__mark {
+    width: var(--space-6);
+    height: var(--space-6);
+    flex: none;
+}
+
+.status-header__meta {
+    font-size: var(--fs-aux);
+    line-height: var(--lh-aux);
+    color: var(--text-tertiary);
+}
+
+/* === Memory watermark bar ===
+   One track scaled to the hard limit, the measured footprint inside it, the
+   estimate that sits behind it, and the two guard marks. */
+
+.watermark {
+    position: relative;
+    height: var(--space-3);
+    border-radius: var(--radius-sm);
+    background-color: var(--bg-tertiary);
+    overflow: hidden;
+}
+
+.watermark__bar {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    border-radius: var(--radius-sm);
+}
+
+.watermark__bar--estimated {
+    background-color: color-mix(in srgb, var(--text-primary) 14%, transparent);
+}
+
+/* The fill reads the same three thresholds the enforcer does, in the console's
+   own status colours: under the soft guard, at it, and at the hard ceiling. */
+.watermark__bar--actual.meter--ok {
+    background-color: var(--sys-green);
+}
+
+.watermark__bar--actual.meter--warn {
+    background-color: var(--sys-orange);
+}
+
+.watermark__bar--actual.meter--over {
+    background-color: var(--sys-red);
+}
+
+/* Two limits, two shapes: the guard is dashed, the ceiling is solid and carries
+   a caret above the track, so they are told apart by shape and not by colour
+   alone. Both are one control step wide (`--focus-ring-width`) and stand
+   on their semantic colour. */
+/* The two zones the track carries besides the fill: the band between the soft
+   guard and the hard limit is the guarded zone, and everything above the hard
+   limit is memory no model may be given. They sit behind the fill. */
+.watermark__bar--guard {
+    background-color: color-mix(in srgb, var(--text-primary) 32%, transparent);
+}
+
+.watermark__bar--unavailable {
+    background-color: var(--text-primary);
+}
+
+.watermark__marker {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    border-left-width: var(--focus-ring-width);
+    border-left-style: solid;
+}
+
+.watermark__marker--soft {
+    border-left-style: dashed;
+    border-left-color: var(--sys-orange);
+}
+
+.watermark__marker--hard {
+    border-left-color: var(--sys-red);
+}
+
+.watermark__marker--hard::after {
+    content: "";
+    position: absolute;
+    left: calc(var(--focus-ring-width) / -2 - var(--space-1) / 2);
+    top: calc(var(--space-1) * -1);
+    width: var(--space-1);
+    height: var(--space-1);
+    background-color: var(--sys-red);
+    transform: rotate(45deg);
+}
+
+/* The active-models pressure bar is the same meter, smaller: the same tones, on
+   its own track, with the soft guard marked the same way. */
+.pressure__bar.meter--ok {
+    background-color: var(--sys-green);
+}
+
+.pressure__bar.meter--warn {
+    background-color: var(--sys-orange);
+}
+
+.pressure__bar.meter--over {
+    background-color: var(--sys-red);
+}
+
+.watermark__legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-4);
+    margin-top: var(--space-2);
+    font-size: var(--fs-aux);
+    line-height: var(--lh-aux);
+    color: var(--text-tertiary);
+}
+
+.watermark__swatch {
+    display: inline-block;
+    width: var(--space-2);
+    height: var(--space-2);
+    border-radius: var(--radius-sm);
+    margin-right: var(--space-1);
+    vertical-align: -1px;
+}
+
+.watermark__swatch--actual {
+    background-color: var(--text-primary);
+}
+
+.watermark__swatch--estimated {
+    background-color: color-mix(in srgb, var(--text-primary) 14%, transparent);
+}
+
+.watermark__swatch--marker {
+    width: 0;
+    height: var(--space-2);
+    border-radius: 0;
+    border-left-width: var(--focus-ring-width);
+    border-left-style: solid;
+    background-color: transparent;
+}
+
+.watermark__swatch--soft {
+    border-left-style: dashed;
+    border-left-color: var(--sys-orange);
+}
+
+.watermark__swatch--hard {
+    border-left-color: var(--sys-red);
+}
+
+/* === Alert dialog ===
+   The macOS destructive-confirmation sheet: one symbol at the top, a centred
+   title, one paragraph and the two actions. The dialog chrome itself is
+   `dialog.dashboard-dialog` in base.html. */
+
+.alert-dialog__icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--space-10);
+    height: var(--space-10);
+    margin-left: auto;
+    margin-right: auto;
+    border-radius: var(--radius-pill);
+    color: var(--sys-red);
+    background-color: color-mix(in srgb, var(--sys-red) 12%, transparent);
+}
+
+/* === Drawer (slide-over from one edge) ===
+   Geometry (width, z-index, the slide) belongs to the page that owns the
+   drawer; only the shared parts live here. */
+
+.drawer-scrim {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    background-color: color-mix(in srgb, var(--text-primary) 40%, transparent);
+}
+
+.drawer-scrim--closed {
+    display: none;
+}
+
+.drawer {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    flex-direction: column;
+    max-width: 100%;
+    background-color: var(--bg-primary);
+    border-left: 1px solid var(--border-faint);
+    box-shadow: var(--shadow-popover);
+    transform: translateX(100%);
+    transition: transform 0.25s ease;
+}
+
+.drawer--open {
+    transform: translateX(0);
+}
+
+/* === Keyboard shortcut list (the help sheet) ===
+   One spec for both surfaces that show it: the dashboard's shared
+   `ui.shortcut_overview` macro and the chat page's own sheet use these
+   classes, so a key cap is defined once. */
+
+.shortcut-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
+}
+
+.shortcut-list__row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-4);
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
+    color: var(--text-primary);
+}
+
+.shortcut-list__keys {
+    display: flex;
+    flex-shrink: 0;
+    gap: var(--space-1);
+}
+
+.kbd {
+    display: inline-block;
+    min-inline-size: var(--space-5);
+    padding: 0 var(--space-1);
+    background-color: var(--bg-tertiary);
+    border: 1px solid var(--border-normal);
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+    font-size: var(--fs-aux);
+    line-height: var(--lh-aux);
+    text-align: center;
+}
+
+/* === Hourly trend strip ===
+   One bar per hour, summing every day in the selected range; it sits above the
+   day/hour heatmap so both read against the same 24 columns. */
+
+.heat-strip {
+    display: grid;
+    grid-template-columns: var(--heat-label-column) repeat(24, minmax(0, 1fr));
+    gap: var(--space-1);
+    align-items: end;
+    height: var(--space-8);
+}
+
+.heat-strip__bar {
+    display: block;
+    border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+    background-color: var(--sys-green);
+}
+
+/* === Log viewer ===
+   Four columns (time / level / module / message) over a windowed list: the
+   card body holds no padding, one grid keeps the header and the rows aligned,
+   and every row is exactly --log-row-height tall so the window can be computed
+   from the scroll offset instead of measured row by row. */
+
+.log-card .card__body {
+    padding: 0;
+}
+
+.log-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-4);
+    padding: var(--space-4) var(--space-5);
+    border-bottom: 1px solid var(--border-faint);
+}
+
+.log-field {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--fs-body);
+    color: var(--text-secondary);
+}
+
+.log-grid {
+    display: grid;
+    grid-template-columns:
+        var(--log-time-column)
+        var(--log-level-column)
+        var(--log-module-column)
+        minmax(0, 1fr);
+    align-items: center;
+    gap: var(--space-3);
+}
+
+.log-head {
+    padding: var(--space-2) var(--space-5);
+    background-color: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-faint);
+    font-size: var(--fs-aux);
+    font-weight: 600;
+    color: var(--text-tertiary);
+}
+
+.log-viewport {
+    position: relative;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+}
+
+/* Carries the full height of the list, so the scrollbar is honest even though
+   only a window of rows exists in the DOM. */
+.log-spacer {
+    position: relative;
+}
+
+.log-row {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: var(--log-row-height);
+    padding: 0 var(--space-5);
+    overflow: hidden;
+    border-bottom: 1px solid var(--border-faint);
+    font-size: var(--fs-body);
+    color: var(--text-primary);
+    cursor: pointer;
+}
+
+.log-row:hover {
+    background-color: var(--bg-secondary);
+}
+
+.log-row--selected {
+    background-color: var(--bg-tertiary);
+}
+
+.log-time,
+.log-module {
+    overflow: hidden;
+    font-family: var(--font-mono);
+    font-size: var(--fs-aux);
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+.log-time {
+    color: var(--text-tertiary);
+}
+
+.log-message {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-width: 0;
+}
+
+.log-message__text {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+/* The ×N counter of a collapsed run of identical warnings. */
+.log-count {
+    flex-shrink: 0;
+    padding: 0 var(--space-1);
+    font-size: var(--fs-aux);
+    line-height: var(--lh-aux);
+    font-weight: 600;
+    color: var(--sys-orange);
+    background-color: color-mix(in srgb, var(--sys-orange) 14%, transparent);
+    border-radius: var(--radius-sm);
+}
+
+/* How many lines one record covers (a traceback): a count, not a repeat. */
+.log-count--muted {
+    color: var(--text-tertiary);
+    background-color: var(--bg-tertiary);
+}
+
+/* Memory-guard numbers, taken from the line itself. */
+.log-chips {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    gap: var(--space-1);
+}
+
+.log-chip {
+    display: inline-flex;
+    align-items: baseline;
+    gap: var(--space-1);
+    padding: 0 var(--space-1);
+    font-size: var(--fs-aux);
+    line-height: var(--lh-aux);
+    color: var(--text-secondary);
+    background-color: var(--bg-tertiary);
+    border-radius: var(--radius-sm);
+    white-space: nowrap;
+}
+
+.log-chip__label {
+    color: var(--text-tertiary);
+}
+
+.log-chip__value {
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.log-action {
+    padding: 0 var(--space-1);
+    font-size: var(--fs-aux);
+    line-height: var(--lh-aux);
+    font-weight: 600;
+    color: var(--link-color);
+    background-color: transparent;
+    border: 0;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.log-action:hover {
+    text-decoration: underline;
+}
+
+/* The record open under the toolbar: full text, every occurrence. */
+.log-detail {
+    padding: var(--space-4) var(--space-5);
+    background-color: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-faint);
+}
+
+.log-detail__head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--fs-aux);
+    color: var(--text-tertiary);
+}
+
+.log-detail__body {
+    margin: var(--space-2) 0 0;
+    padding: var(--space-3);
+    max-height: 30vh;
+    overflow: auto;
+    font-family: var(--font-mono);
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
+    color: var(--text-primary);
+    background-color: var(--bg-primary);
+    border: 1px solid var(--border-faint);
+    border-radius: var(--radius-md);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.log-occurrences {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    margin-top: var(--space-2);
+    font-size: var(--fs-aux);
+    color: var(--text-secondary);
+}
+
+.log-occurrence {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    font-family: var(--font-mono);
+}
+/* The list of occurrences scrolls in a box of its own: a group can repeat
+   thousands of times, and the panel is a header over the viewer, not a page. */
+.log-occurrences__list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    max-height: var(--log-occurrences-height);
+    overflow-y: auto;
+}
+/* The occurrences past the window the panel lists. */
+.log-occurrences__more {
+    color: var(--text-tertiary);
+}
+
+.log-foot {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-5);
+    border-top: 1px solid var(--border-faint);
+    font-size: var(--fs-aux);
+    color: var(--text-tertiary);
+}
+.toast-stack {
+    position: fixed;
+    inset-block-start: var(--space-4);
+    inset-inline-end: var(--space-4);
+    z-index: 90;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    inline-size: min(calc(100% - var(--space-6)), var(--toast-max-width));
+    pointer-events: none;
+}
+
+.toast {
+    position: relative;
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    padding-inline-start: var(--space-5);
+    overflow: hidden;
+    pointer-events: auto;
+    background-color: var(--bg-primary);
+    border: 1px solid var(--border-faint);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-popover);
+    transition: opacity var(--duration-fast) ease, transform var(--duration-fast) ease;
+    animation: toast-in var(--duration-normal) ease-out;
+}
+
+.toast::before {
+    content: "";
+    position: absolute;
+    inset-block: 0;
+    inset-inline-start: 0;
+    inline-size: var(--space-1);
+    background-color: var(--toast-accent);
+}
+
+.toast--leaving {
+    opacity: 0;
+    transform: translateY(calc(var(--space-2) * -1));
+}
+
+.toast__body {
+    flex: 1;
+    min-inline-size: 0;
+}
+
+.toast__title {
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.toast__message {
+    margin-block-start: var(--space-1);
+    font-size: var(--fs-aux);
+    line-height: var(--lh-aux);
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+}
+
+.toast__close,
+.overlay-close {
+    flex-shrink: 0;
+    padding: var(--space-1);
+    background-color: transparent;
+    border: 0;
+    border-radius: var(--radius-sm);
+    color: var(--text-tertiary);
+    cursor: pointer;
+}
+
+.toast__close:hover,
+.overlay-close:hover {
+    color: var(--text-primary);
+    background-color: var(--bg-tertiary);
+}
+
+.toast--green {
+    --toast-accent: var(--sys-green);
+}
+
+.toast--orange {
+    --toast-accent: var(--sys-orange);
+}
+
+.toast--red {
+    --toast-accent: var(--sys-red);
+}
+
+.toast--blue {
+    --toast-accent: var(--sys-blue);
+}
+
+.toast--neutral {
+    --toast-accent: var(--border-normal);
+}
+
+@keyframes toast-in {
+    from {
+        opacity: 0;
+        transform: translateY(calc(var(--space-2) * -1));
+    }
+    to {
+        opacity: 1;
+        transform: none;
+    }
+}
+
+/* === Skeleton ===
+   First-paint placeholders. They shimmer, they hold the layout, and they never
+   invent a number: the real payload replaces them. */
+
+.skeleton {
+    position: relative;
+    display: block;
+    overflow: hidden;
+    background-color: var(--bg-tertiary);
+    border-radius: var(--radius-sm);
+}
+
+.skeleton::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-image: linear-gradient(
+        90deg,
+        transparent,
+        color-mix(in srgb, var(--text-primary) 8%, transparent),
+        transparent
+    );
+    transform: translateX(-100%);
+    animation: skeleton-sheen var(--duration-shimmer) linear infinite;
+}
+
+@keyframes skeleton-sheen {
+    to {
+        transform: translateX(100%);
+    }
+}
+
+.skeleton--line {
+    block-size: var(--space-2);
+}
+
+.skeleton--label {
+    block-size: var(--space-2);
+    inline-size: 40%;
+}
+
+.skeleton--figure {
+    block-size: var(--space-5);
+    inline-size: 60%;
+}
+
+.skeleton--spark {
+    block-size: var(--space-4);
+    inline-size: 100%;
+}
+
+.skeleton--cell {
+    block-size: var(--space-2);
+    inline-size: 15%;
+}
+
+.skeleton-stack {
+    display: flex;
+    flex-direction: column;
+}
+
+.skeleton-row,
+.skeleton-table__row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+    padding: var(--space-3) var(--space-4);
+}
+
+.skeleton-row + .skeleton-row,
+.skeleton-table__row + .skeleton-table__row {
+    border-top: 1px solid var(--border-faint);
+}
+
+.skeleton-row__cell {
+    flex: 1;
+}
+
+.skeleton-row__cell--short {
+    flex: 0 0 auto;
+}
+
+/* === Overlay dialogs (command palette, shortcut overview) ===
+   Native <dialog> in the top layer, so nothing on the page can sit above them
+   and the browser keeps focus inside them. Only the panel is patterned here;
+   everything else comes from the card spec. */
+
+.overlay-dialog {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    max-inline-size: none;
+    max-block-size: none;
+    background-color: transparent;
+    color: var(--text-primary);
+}
+
+.overlay-dialog[open] {
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    inline-size: 100%;
+    block-size: 100%;
+}
+
+.overlay-dialog::backdrop {
+    background-color: var(--scrim);
+}
+
+.overlay-panel {
+    inline-size: 100%;
+    max-inline-size: var(--palette-max-width);
+    margin-block-start: var(--space-8);
+    margin-inline: var(--space-4);
+    overflow: hidden;
+    background-color: var(--bg-primary);
+    border: 1px solid var(--border-faint);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-popover);
+}
+
+/* === Command palette === */
+
+.palette__search {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    border-bottom: 1px solid var(--border-faint);
+}
+
+.palette__input {
+    flex: 1;
+    min-inline-size: 0;
+    padding: var(--space-1) 0;
+    background-color: transparent;
+    border: 0;
+    color: var(--text-primary);
+    font-size: var(--fs-emphasis);
+    line-height: var(--lh-emphasis);
+}
+
+.palette__input:focus-visible {
+    outline-offset: 0;
+}
+
+.palette__list {
+    max-block-size: calc(var(--space-8) * 7);
+    padding: var(--space-2);
+    overflow-y: auto;
+}
+
+.palette__item {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    inline-size: 100%;
+    padding: var(--space-2) var(--space-3);
+    background-color: transparent;
+    border: 0;
+    border-radius: var(--radius-md);
+    color: var(--text-primary);
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
+    text-align: start;
+    cursor: pointer;
+}
+
+.palette__item--active {
+    background-color: var(--bg-tertiary);
+}
+
+.palette__item-label {
+    flex: 1;
+    min-inline-size: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.palette__item-hint {
+    flex-shrink: 0;
+    font-size: var(--fs-aux);
+    color: var(--text-tertiary);
+}
+
+/* A section the console just jumped to, marked long enough to be found. */
+.anchor-flash {
+    outline: 1px solid var(--text-primary);
+    outline-offset: var(--space-1);
+    border-radius: var(--radius-sm);
+}
+@media (max-width: 48em) {
+    .log-grid {
+        grid-template-columns:
+            var(--log-time-column)
+            var(--log-level-column)
+            minmax(0, 1fr);
+    }
+
+    .log-grid__module {
+        display: none;
+    }
+}
+
+/* === Settings anchor rail ===
+   The settings page is one long scroll; the rail lists its sections and keeps
+   the current one marked. It lives inside the same 760pt form measure as the
+   content (rail + content must fit), and below the stacking width the two
+   columns stack so the rail cannot squeeze the form into a sliver.
+
+   Stacking width: the query below cannot read a token (CSS forbids var() in a
+   media condition), so its value is the literal form of the generated
+   --settings-rail-stack-below: editing tokens.json means editing this query
+   too. */
+
+.settings-layout {
+    display: grid;
+    grid-template-columns: var(--settings-rail-width) minmax(0, 1fr);
+    gap: var(--space-5);
+    align-items: start;
+}
+@media (max-width: 900px) {
+    .settings-layout {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .settings-rail {
+        position: static;
+        max-height: none;
+        overflow-y: visible;
+    }
+
+    .settings-rail__list {
+        flex-direction: row;
+        overflow-x: auto;
+    }
+}
+
+.settings-rail {
+    position: sticky;
+    /* Clears the top bar and the sub-tab row under it. */
+    top: var(--sticky-offset);
+    max-height: calc(100vh - var(--sticky-offset) - var(--space-6));
+    overflow-y: auto;
+    padding: var(--space-4);
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border-faint);
+    border-radius: var(--radius-lg);
+}
+.palette__group {
+    padding: var(--space-2) var(--space-3) var(--space-1);
+    font-size: var(--fs-aux);
+    line-height: var(--lh-aux);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-tertiary);
+}
+
+/* The rail is the list and nothing else: it starts at the rail's own padding. */
+.settings-rail__list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+}
+.settings-rail__item {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2);
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
+    color: var(--text-secondary);
+    text-decoration: none;
+    border-left: 1px solid transparent;
+    border-radius: var(--radius-sm);
+}
+.settings-rail__item:hover {
+    color: var(--text-primary);
+    background-color: var(--bg-tertiary);
+}
+/* Sidebar selection: a grey one step deeper than the rail itself, not a colour.
+   The console keeps blue for things you can act on, and where you are is not an
+   action (tests/test_admin_contrast.py measures the label on this tint). */
+.settings-rail__item--active {
+    color: var(--text-primary);
+    font-weight: 600;
+    background-color: color-mix(in srgb, var(--text-primary) 10%, transparent);
+    border-left-color: color-mix(in srgb, var(--text-primary) 45%, transparent);
+    box-shadow: var(--shadow-card);
+}
+
+.settings-rail__item--active:hover {
+    color: var(--text-primary);
+    background-color: color-mix(in srgb, var(--text-primary) 14%, transparent);
+}
+.palette__empty {
+    padding: var(--space-5) var(--space-4);
+    font-size: var(--fs-body);
+    color: var(--text-tertiary);
+    text-align: center;
+}
+
+.palette__hint {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-4);
+    padding: var(--space-2) var(--space-4);
+    background-color: var(--bg-secondary);
+    border-top: 1px solid var(--border-faint);
+    font-size: var(--fs-aux);
+    color: var(--text-tertiary);
+}
+
+/* The element a palette "jump to this block" landed on. */
+.jump-hit {
+    box-shadow: var(--shadow-glow);
+}
+
+.overlay-note {
+    font-size: var(--fs-aux);
+    line-height: var(--lh-aux);
+    color: var(--text-tertiary);
+}
+
+/* A card that the rail can deep-link to and scroll smoothly into view. */
+.settings-section {
+    /* A section the rail scrolls to lands below the top bar and the switcher,
+       not under them. */
+    scroll-margin-top: var(--sticky-offset);
+}
+.settings-anchor {
+    color: var(--text-tertiary);
+}
+.settings-anchor:hover {
+    color: var(--text-primary);
+}
+.settings-anchor--done {
+    color: var(--sys-green);
+}
+
+/* === Reduced motion ===
+   base.html already collapses every animation for people who ask for less
+   motion; these rules remove the moving parts entirely instead of running them
+   once in a millisecond. */
+
+@media (prefers-reduced-motion: reduce) {
+    .skeleton::after {
+        animation: none;
+        opacity: 0;
+    }
+
+    .toast {
+        animation: none;
+        transition: none;
+    }
+
+    .toast--leaving {
+        opacity: 0;
+        transform: none;
+    }
+}
+
+/* Card header: the icon sits with its title, the badges and controls go right.
+   (Before this, callers passed the title through `header_actions`, which pushed
+   it to the far edge and left the icon alone on the left.) */
+/* A heading with a subtitle is two lines tall. The icon belongs to the title's
+   line, so it is centred on that line rather than on the block: centred on the
+   block it hangs between the title and the subtitle, belonging to neither. */
+.card__heading {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-2);
+    min-width: 0;
+}
+
+.card__heading-text {
+    min-width: 0;
+}
+
+.card__icon {
+    flex-shrink: 0;
+    color: var(--text-tertiary);
+    /* Half of the title's line box minus half the 1rem icon box. */
+    margin-top: calc((var(--lh-emphasis) * var(--fs-emphasis) - 1rem) / 2);
+}
+
+.card__actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-shrink: 0;
+}
+
+.log-empty {
+    padding: var(--space-8) var(--space-5);
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
+    color: var(--text-tertiary);
+    text-align: center;
+}
+
+/* The sub-tab switcher pins under the top bar, so scrolling moves only the
+   section cards on the right. */
+/* === Sub-tab row ===
+   The same row on Settings, Models and Bench: it pins under the top bar, so
+   scrolling moves only the content below it. The page scrolls the window, so
+   the offset is the top bar's own height -- which is also why <main> must not
+   carry `overflow: hidden` (see dashboard.html). */
+.page-tabs {
+    position: sticky;
+    top: var(--topbar-height);
+    z-index: 30;
+    background-color: var(--bg-primary);
+    padding-block: var(--space-2) var(--space-3);
+}

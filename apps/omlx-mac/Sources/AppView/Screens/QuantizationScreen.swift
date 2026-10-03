@@ -323,7 +323,7 @@ private struct EstimateStrip: View {
                 .font(.system(size: 10.5))
                 .foregroundStyle(theme.textTertiary)
             Text(text)
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textSecondary)
         }
     }
@@ -353,7 +353,7 @@ private struct AdvancedSection: View {
                     Text(String(localized: "quant.advanced.title",
                                 defaultValue: "Advanced settings",
                                 comment: "Collapsible header for the Quantization advanced-settings block"))
-                        .font(.omlxText(11, weight: .semibold))
+                        .font(.omlxText(DesignTokens.FontSize.aux, weight: .semibold))
                         .foregroundStyle(theme.textSecondary)
                         .textCase(.uppercase)
                         .kerning(0.6)
@@ -387,7 +387,7 @@ private struct AdvancedSection: View {
                                       comment: "Toggle row label: keep multi-token prediction heads"),
                         sublabel: selectedHasMTP
                             ? String(localized: "quant.advanced.preserve_mtp.sub.available",
-                                     defaultValue: "Keep multi-token prediction heads in the quantized output",
+                                     defaultValue: "Keep multi-Token prediction heads in the quantized output",
                                      comment: "Toggle row sublabel when MTP is available")
                             : String(localized: "quant.advanced.preserve_mtp.sub.unavailable",
                                      defaultValue: "Unavailable — source model has no MTP heads",
@@ -549,14 +549,14 @@ private struct QueueRow: View {
                     .font(.system(size: 12))
                     .foregroundStyle(theme.blueDot)
                 Text(task.outputName)
-                    .font(.omlxMono(12))
+                    .font(.omlxMono(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.text)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 StatusChip(status: task.statusEnum)
                 Spacer(minLength: 4)
                 Text(elapsedText)
-                    .font(.omlxMono(11))
+                    .font(.omlxMono(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textTertiary)
                 if task.statusEnum == .completed {
                     Button {
@@ -593,18 +593,18 @@ private struct QueueRow: View {
                 HStack(spacing: 8) {
                     if !task.phase.isEmpty {
                         Text(task.phase)
-                            .font(.omlxText(11))
+                            .font(.omlxText(DesignTokens.FontSize.aux))
                             .foregroundStyle(theme.textSecondary)
                     }
                     Spacer(minLength: 0)
                     Text(progressText)
-                        .font(.omlxMono(11))
+                        .font(.omlxMono(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textTertiary)
                 }
             }
             if !task.error.isEmpty {
                 Text(task.error)
-                    .font(.omlxMono(10.5))
+                    .font(.omlxMono(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.redDot)
                     .lineLimit(3)
             }
@@ -667,7 +667,7 @@ private struct StatusChip: View {
             }
         }()
         Text(cfg.1)
-            .font(.omlxText(10, weight: .semibold))
+            .font(.omlxText(DesignTokens.FontSize.aux, weight: .semibold))
             .foregroundStyle(cfg.0)
             .padding(.horizontal, 6)
             .padding(.vertical, 1)
@@ -733,7 +733,7 @@ private struct UploadRow: View {
                     .font(.system(size: 12))
                     .foregroundStyle(theme.blueDot)
                 Text(task.modelName)
-                    .font(.omlxMono(12))
+                    .font(.omlxMono(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.text)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -772,25 +772,25 @@ private struct UploadRow: View {
                 ProgressBar(progress: max(0, min(task.progress / 100, 1)), colors: [Color(rgb24: 0xFF2D55), Color(rgb24: 0xAF52DE)])
                 HStack(spacing: 8) {
                     Text(task.repoId)
-                        .font(.omlxMono(11))
+                        .font(.omlxMono(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textSecondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Spacer(minLength: 0)
                     Text("\(Int(task.progress.rounded()))%")
-                        .font(.omlxMono(11))
+                        .font(.omlxMono(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textTertiary)
                 }
             } else if !task.repoId.isEmpty {
                 Text(task.repoId)
-                    .font(.omlxMono(11))
+                    .font(.omlxMono(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textTertiary)
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
             if !task.error.isEmpty {
                 Text(task.error)
-                    .font(.omlxMono(10.5))
+                    .font(.omlxMono(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.redDot)
                     .lineLimit(3)
             }
@@ -829,7 +829,7 @@ private struct UploadStatusChip: View {
             }
         }()
         Text(cfg.1)
-            .font(.omlxText(10, weight: .semibold))
+            .font(.omlxText(DesignTokens.FontSize.aux, weight: .semibold))
             .foregroundStyle(cfg.0)
             .padding(.horizontal, 6)
             .padding(.vertical, 1)
@@ -871,10 +871,10 @@ private struct UploadModalView: View {
                 Text(String(localized: "quant.upload_modal.title",
                             defaultValue: "Upload to Hugging Face",
                             comment: "Title of the upload-to-HF sheet"))
-                    .font(.omlxText(15, weight: .semibold))
+                    .font(.omlxText(DesignTokens.FontSize.emphasis, weight: .semibold))
                     .foregroundStyle(theme.text)
                 Text(task.outputName)
-                    .font(.omlxMono(11.5))
+                    .font(.omlxMono(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textSecondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -894,7 +894,7 @@ private struct UploadModalView: View {
                         .font(.system(size: 11))
                         .padding(.top, 1)
                     Text(err)
-                        .font(.omlxText(11.5))
+                        .font(.omlxText(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.text)
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 0)
@@ -933,14 +933,14 @@ private struct UploadModalView: View {
                            comment: "Subtitle when a token has been validated. Placeholder is the HF username")
                 }
                     ?? String(localized: "quant.upload_modal.credentials.subtitle.needs_validate",
-                              defaultValue: "Validate a token to enable upload",
+                              defaultValue: "Validate a Token to enable upload",
                               comment: "Subtitle when no token has been validated yet")
             )
 
             ListGroup {
                 Row(
                     label: String(localized: "quant.upload_modal.token.label",
-                                  defaultValue: "HF token",
+                                  defaultValue: "HF Token",
                                   comment: "Row label for the HF token input"),
                     sublabel: String(localized: "quant.upload_modal.token.sub",
                                      defaultValue: "Stored in macOS Keychain. Needs write access to your account.",
@@ -1010,7 +1010,7 @@ private struct UploadModalView: View {
                         isLast: true
                     ) {
                         Text(vm.uploadNamespace.isEmpty ? "—" : "@\(vm.uploadNamespace)")
-                            .font(.omlxText(13, weight: .medium))
+                            .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                             .foregroundStyle(theme.textSecondary)
                     }
                 }
@@ -1036,7 +1036,7 @@ private struct UploadModalView: View {
                 ) {
                     HStack(spacing: 6) {
                         Text(vm.uploadNamespace.isEmpty ? "<namespace>/" : "\(vm.uploadNamespace)/")
-                            .font(.omlxMono(11.5))
+                            .font(.omlxMono(DesignTokens.FontSize.aux))
                             .foregroundStyle(theme.textSecondary)
                         TextInput(
                             text: $repoName,
@@ -1110,7 +1110,7 @@ private struct UploadModalView: View {
                         Text(String(localized: "quant.upload_modal.notice.off",
                                     defaultValue: "Off",
                                     comment: "Value text displayed when the re-download notice is unavailable"))
-                            .font(.omlxText(13, weight: .medium))
+                            .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                             .foregroundStyle(theme.textTertiary)
                     }
                 }
@@ -1228,12 +1228,12 @@ private struct AboutSection: View {
                         Text(String(localized: "quant.about.title",
                                     defaultValue: "About oQ Quantization",
                                     comment: "Title of the collapsible About oQ Quantization card"))
-                            .font(.omlxText(13, weight: .semibold))
+                            .font(.omlxText(DesignTokens.FontSize.body, weight: .semibold))
                             .foregroundStyle(theme.text)
                         Text(String(localized: "quant.about.subtitle",
                                     defaultValue: "Compare standard oQ with oQe imatrix and how enhanced quantization works.",
                                     comment: "Subtitle of the collapsible About oQ Quantization card"))
-                            .font(.omlxText(11.5))
+                            .font(.omlxText(DesignTokens.FontSize.aux))
                             .foregroundStyle(theme.textSecondary)
                     }
                     Spacer(minLength: 12)
@@ -1271,7 +1271,7 @@ private struct AboutSection: View {
                         defaultValue: "oQ: oMLX Universal Dynamic Quantization",
                         comment: "Large heading inside the expanded About oQ card")
                 )
-                .font(.omlxText(16, weight: .bold))
+                .font(.omlxText(DesignTokens.FontSize.emphasis, weight: .bold))
                 .foregroundStyle(theme.text)
                 HStack(alignment: .top, spacing: 14) {
                     Rectangle().fill(theme.rowSep).frame(width: 2)
@@ -1390,7 +1390,7 @@ private struct AboutSection: View {
                         defaultValue: "If a tensor has no matching imatrix entry, the default behavior is to fall back to standard oQ for that tensor. Enable strict coverage to fail instead.",
                         comment: "Footnote under the imatrix steps in the About oQ card")
                 )
-                .font(.omlxText(10.5))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textTertiary)
                 .fixedSize(horizontal: false, vertical: true)
             }
@@ -1420,7 +1420,7 @@ private struct AboutSection: View {
         VStack(alignment: .leading, spacing: 7) {
             heading(title)
             Text(body)
-                .font(.omlxText(11.5))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -1428,13 +1428,13 @@ private struct AboutSection: View {
 
     private func heading(_ value: String) -> some View {
         Text(value)
-            .font(.omlxText(13, weight: .semibold))
+            .font(.omlxText(DesignTokens.FontSize.body, weight: .semibold))
             .foregroundStyle(theme.text)
     }
 
     private func quote(_ value: String) -> some View {
         Text(value)
-            .font(.omlxText(11.5, weight: .semibold))
+            .font(.omlxText(DesignTokens.FontSize.aux, weight: .semibold))
             .italic()
             .foregroundStyle(theme.textSecondary)
             .fixedSize(horizontal: false, vertical: true)
@@ -1453,7 +1453,7 @@ private struct AboutSection: View {
     private func step(_ number: Int, title: String, body: String) -> some View {
         HStack(alignment: .top, spacing: 10) {
             Text("\(number)")
-                .font(.omlxText(10, weight: .semibold))
+                .font(.omlxText(DesignTokens.FontSize.aux, weight: .semibold))
                 .foregroundStyle(theme.textSecondary)
                 .frame(width: 20, height: 20)
                 .background(theme.rowSep)
@@ -1464,14 +1464,14 @@ private struct AboutSection: View {
 
     private func inlineText(title: String, body: String) -> some View {
         (Text(title).fontWeight(.semibold) + Text(" \(body)"))
-            .font(.omlxText(11.5))
+            .font(.omlxText(DesignTokens.FontSize.aux))
             .foregroundStyle(theme.textSecondary)
             .fixedSize(horizontal: false, vertical: true)
     }
 
     private func tableCell(_ value: String, header: Bool = false) -> some View {
         Text(value)
-            .font(.omlxText(10.5, weight: header ? .semibold : .regular))
+            .font(.omlxText(DesignTokens.FontSize.aux, weight: header ? .semibold : .regular))
             .foregroundStyle(header ? theme.text : theme.textSecondary)
             .fixedSize(horizontal: false, vertical: true)
     }
