@@ -7075,7 +7075,12 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
                     exc,
                 )
 
-    # Phase 2: remove any remaining files on disk (covers unloaded models)
+    # Phase 2: remove any remaining files on disk (covers unloaded models).
+    # Sweeps main-KV blocks, GDN sidecars, and the vision-feature cache —
+    # all three share this directory tree and none has a loaded manager to
+    # route through when no model is loaded. Without the sidecar sweep,
+    # "Clear SSD cache" silently left the majority of the cache's bytes
+    # behind (design doc §A4).
     global_settings = _get_global_settings()
     if global_settings is not None:
         cache_dir = global_settings.cache.get_ssd_cache_dir(
@@ -7083,17 +7088,44 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
         )
         if cache_dir.exists():
             try:
-                for root in (cache_dir, cache_dir / "deepseek_v41_ced_v1"):
+                resolved_cache_dir = cache_dir.resolve(strict=True)
+            except OSError:
+                resolved_cache_dir = None
+
+            def _safe_unlink(f: Path) -> bool:
+                # Never unlink through a symlinked component, and never
+                # unlink a path that resolves outside the cache root —
+                # mirrors the manager's own symlink-refusal discipline.
+                if resolved_cache_dir is None:
+                    return False
+                if f.is_symlink() or f.parent.is_symlink():
+                    return False
+                try:
+                    f.resolve(strict=True).relative_to(resolved_cache_dir)
+                except (OSError, ValueError):
+                    return False
+                try:
+                    f.unlink()
+                    return True
+                except OSError:
+                    return False
+
+            try:
+                # design doc §A4: main-KV blocks, the CED variant tree and the
+                # vision-feature cache all live under the shared SSD root;
+                # sweep each one that exists through the hardened unlink.
+                for root in (
+                    cache_dir,
+                    cache_dir / "deepseek_v41_ced_v1",
+                    cache_dir / "vision_features",
+                ):
                     for subdir in "0123456789abcdef":
                         subdir_path = root / subdir
-                        if not subdir_path.exists():
+                        if not subdir_path.exists() or subdir_path.is_symlink():
                             continue
                         for f in subdir_path.glob("*.safetensors"):
-                            try:
-                                f.unlink()
+                            if _safe_unlink(f):
                                 total_deleted += 1
-                            except OSError:
-                                pass
                 sidecar_count, _ = _scan_offline_gdn_sidecars(cache_dir, clear=True)
                 total_deleted += sidecar_count
             except Exception as exc:
