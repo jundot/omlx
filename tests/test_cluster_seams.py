@@ -89,6 +89,8 @@ def test_no_cluster_route_is_unreachable_from_the_dashboard():
         "/admin/api/cluster/backend-selection",
         "/admin/api/cluster/collective-smoke",
         "/admin/api/cluster/discover",
+        "/admin/api/cluster/doctor",
+        "/admin/api/cluster/doctor/{parameter}",
         "/admin/api/cluster/fabric",
         "/admin/api/cluster/guidance",
         "/admin/api/cluster/incidents",
@@ -104,6 +106,8 @@ def test_no_cluster_route_is_unreachable_from_the_dashboard():
         "/admin/api/cluster/ssh-key/exchange-token",
         "/admin/api/cluster/ssh-key/generate",
         "/admin/api/cluster/ssh-key/store-keychain",
+        "/admin/api/cluster/start-jobs",
+        "/admin/api/cluster/start-jobs/{parameter}",
         "/admin/api/cluster/status",
         "/admin/api/cluster/transports",
         "/admin/api/cluster/verify-pairing-token",
@@ -268,6 +272,18 @@ def test_no_unreachable_functions_in_the_cluster_package():
         # Peer import preflight, exposed ahead of the /autoconfigure handler
         # that will call it alongside preflight_issues.
         ("autoconfigure.py", "peer_import_issues"),
+        # Test-only reset hook for the in-memory start-job store singleton
+        # (B2); production code never needs to reset it mid-process.
+        ("start_job.py", "reset_start_job_store"),
+        # Readiness-ladder primitives (transport readiness ladder, #B3),
+        # exposed ahead of the Fabric Doctor UI panels (fabric-doctor
+        # C2-C5) that read the ladder state and gate on fabric verification.
+        ("readiness.py", "is_fabric_verified"),
+        ("readiness.py", "link_ladder_state"),
+        # VPN full-tunnel remedy copy (VPN detection, C4), exposed ahead of
+        # the Fabric Doctor UI panel that will surface it alongside the
+        # pre-warning banner already wired into _note_full_tunnel_vpns.
+        ("vpn.py", "exclusion_instruction"),
         # Test hooks that drop process-wide v2 singletons between cases; only
         # the test suite calls them (production swaps via configure_*).
         ("identity.py", "reset_configured_identity"),
