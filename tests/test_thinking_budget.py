@@ -237,6 +237,102 @@ class TestThinkingBudgetProcessor:
         assert not proc._done
         assert proc._in_thinking
 
+    # --- Thinking opened by the model, not the prompt (e.g. Gemma 4) ---
+
+    OPEN_SEQ = [60, 61]  # Dummy two-token open marker, like <|channel>thought
+
+    def _make_model_opened_processor(self, budget: int = 3):
+        return ThinkingBudgetProcessor(
+            think_end_token_ids=[self.THINK_END_ID],
+            budget=budget,
+            start_in_thinking=False,
+            think_start_token_ids=self.OPEN_SEQ,
+        )
+
+    def _feed(self, proc, token_ids):
+        """Feed tokens one decode step at a time, continuing earlier history."""
+        history = getattr(proc, "_test_history", None)
+        if history is None:
+            history = [10]
+            proc._test_history = history
+            proc(_make_tokens(*history), _make_logits())
+        logits = None
+        for token_id in token_ids:
+            history.append(token_id)
+            logits = proc(_make_tokens(*history), _make_logits())
+        return logits
+
+    def test_answer_without_thinking_is_never_forced(self):
+        """Answer tokens don't count when the model never opens thinking."""
+        proc = self._make_model_opened_processor(budget=3)
+
+        self._feed(proc, range(100, 120))
+
+        assert not proc._in_thinking
+        assert not proc._forcing
+        assert not proc._done
+
+    def test_budget_counts_after_multi_token_open_sequence(self):
+        """Counting starts once the model emits the full open sequence."""
+        proc = self._make_model_opened_processor(budget=3)
+
+        self._feed(proc, [100, 101, *self.OPEN_SEQ])
+        assert proc._in_thinking
+        assert not proc._forcing
+
+        # Same counting as for a prompt-opened block: the third thinking
+        # decode step is the one that forces the close.
+        self._feed(proc, [200])
+        assert not proc._forcing
+        logits = self._feed(proc, [201])
+        assert proc._forcing
+        assert mx.argmax(logits).item() == self.THINK_END_ID
+
+    def test_partial_open_sequence_does_not_start_thinking(self):
+        """Only the first token of the open sequence is not enough."""
+        proc = self._make_model_opened_processor(budget=3)
+
+        self._feed(proc, [self.OPEN_SEQ[0], 100, 101, 102, 103])
+
+        assert not proc._in_thinking
+        assert not proc._forcing
+
+    def test_snapshot_restores_partial_open_sequence(self):
+        """The open-sequence window is part of the rewind checkpoint."""
+        proc = self._make_model_opened_processor(budget=3)
+        self._feed(proc, [100, self.OPEN_SEQ[0]])
+        state = proc.snapshot_state()
+
+        proc._update_state(999)
+        proc.restore_state(state)
+        proc._update_state(self.OPEN_SEQ[1])
+
+        assert proc._in_thinking
+
+    def test_default_starts_in_thinking(self):
+        """Without start_in_thinking the prompt is assumed to open thinking."""
+        proc = self._make_processor(budget=3)
+        assert proc._in_thinking
+
+    def test_close_marker_does_not_seed_a_false_reopen(self):
+        """A close marker between a partial and a completing open token must
+        not reopen thinking."""
+        think_start = [100, 45518]
+        proc = ThinkingBudgetProcessor(
+            think_end_token_ids=[101],
+            budget=3,
+            start_in_thinking=False,
+            think_start_token_ids=think_start,
+        )
+
+        proc._update_state(5)
+        proc._update_state(think_start[0])  # partial open match: [5, 100]
+        proc._update_state(101)  # natural close-think token
+        proc._update_state(think_start[1])  # would complete [100, 45518]
+
+        assert not proc._in_thinking
+        assert proc._done
+
 
 # ---------------------------------------------------------------------------
 # ModelSettings serialization
@@ -282,6 +378,11 @@ class TestParserBackedThinkingBudgetWiring:
         )
         scheduler._get_output_parser_thinking_end_text = (
             Scheduler._get_output_parser_thinking_end_text.__get__(scheduler, Scheduler)
+        )
+        scheduler._get_output_parser_thinking_start_text = (
+            Scheduler._get_output_parser_thinking_start_text.__get__(
+                scheduler, Scheduler
+            )
         )
         scheduler._encode_thinking_marker = Scheduler._encode_thinking_marker.__get__(
             scheduler, Scheduler
@@ -408,6 +509,128 @@ class TestParserBackedThinkingBudgetWiring:
         ]
         assert len(budget_processors) == 1
         assert budget_processors[0]._think_end_ids == [101]
+
+    def _gemma4_budget_processor(self, needs_think_prefix):
+        factory = OutputParserFactory(
+            kind="gemma4",
+            create_session=MagicMock(),
+            thinking_start_text="<|channel>thought",
+            thinking_end_text="<channel|>",
+        )
+        scheduler = self._make_scheduler(
+            factory,
+            {"<channel|>": [101], "<|channel>thought": [100, 45518]},
+        )
+        request = self._make_request()
+        request.needs_think_prefix = needs_think_prefix
+
+        _, processors = scheduler._build_sampler_and_processors(
+            request.sampling_params, request
+        )
+        budget_processors = [
+            p for p in processors if isinstance(p, ThinkingBudgetProcessor)
+        ]
+        assert len(budget_processors) == 1
+        return budget_processors[0]
+
+    def test_gemma4_waits_for_the_model_to_open_thinking(self):
+        """Gemma 4 opens <|channel>thought itself; answer tokens don't count."""
+        processor = self._gemma4_budget_processor(needs_think_prefix=False)
+
+        assert not processor._in_thinking
+        assert processor._think_start_ids == [100, 45518]
+
+    def test_gemma4_starts_in_thinking_when_prompt_opened_it(self):
+        processor = self._gemma4_budget_processor(needs_think_prefix=True)
+
+        assert processor._in_thinking
+
+    def test_parser_without_start_marker_keeps_starting_in_thinking(self):
+        """No open marker to watch for (Harmony): keep the previous behavior."""
+        factory = OutputParserFactory(
+            kind="harmony",
+            create_session=MagicMock(),
+            thinking_end_text="<|end|>",
+        )
+        scheduler = self._make_scheduler(factory, {"<|end|>": [200]})
+        request = self._make_request()
+
+        _, processors = scheduler._build_sampler_and_processors(
+            request.sampling_params, request
+        )
+        budget_processors = [
+            p for p in processors if isinstance(p, ThinkingBudgetProcessor)
+        ]
+        assert len(budget_processors) == 1
+        assert budget_processors[0]._in_thinking
+
+    def test_k2_horizon_keeps_starting_in_thinking_without_prompt_marker(self):
+        """K2 Horizon may open any of three markers but exposes only the
+        first, so keep starting in thinking there rather than leave a
+        think_fast block unbudgeted."""
+        pairs = (
+            ("<ifm|think>", "</ifm|think>"),
+            ("<ifm|think_fast>", "</ifm|think_fast>"),
+            ("<ifm|think_faster>", "</ifm|think_faster>"),
+        )
+        factory = OutputParserFactory(
+            kind="k2_horizon",
+            create_session=MagicMock(),
+            thinking_start_text=pairs[0][0],
+            thinking_end_text=pairs[0][1],
+            thinking_marker_pairs=pairs,
+        )
+        scheduler = self._make_scheduler(
+            factory, {pairs[0][0]: [300, 301], pairs[0][1]: [302]}
+        )
+        request = self._make_request()
+        request.needs_think_prefix = False
+
+        _, processors = scheduler._build_sampler_and_processors(
+            request.sampling_params, request
+        )
+        budget_processors = [
+            p for p in processors if isinstance(p, ThinkingBudgetProcessor)
+        ]
+        assert len(budget_processors) == 1
+        assert budget_processors[0]._in_thinking
+
+    def test_detect_needs_think_prefix_false_for_gemma_disabled_thinking_tail(self):
+        """Gemma 4's disabled-thinking prompt tail does not count as opened.
+
+        The tail is ``<|channel>thought\\n<channel|>``; the stub tokenizer
+        raises on ``think_start_id`` like the real one (two-token marker).
+        """
+
+        class _GemmaTokenizerStub:
+            unk_token_id = -1
+
+            @property
+            def think_start_id(self):
+                raise ValueError("<|channel>thought is more than 1 token")
+
+            def convert_tokens_to_ids(self, text):
+                return self.unk_token_id
+
+            def encode(self, text, add_special_tokens=False):
+                return {
+                    "<|channel>thought": [100, 45518],
+                    "<channel|>": [101],
+                }[text]
+
+        factory = OutputParserFactory(
+            kind="gemma4",
+            create_session=MagicMock(),
+            thinking_start_text="<|channel>thought",
+            thinking_end_text="<channel|>",
+        )
+        scheduler = self._make_scheduler(factory, {})
+        scheduler.tokenizer = _GemmaTokenizerStub()
+        request = self._make_request()
+        # ... <|turn>model\n <|channel>thought \n <channel|>
+        request.prompt_token_ids = [5, 6, 100, 45518, 107, 101]
+
+        assert Scheduler._detect_needs_think_prefix(scheduler, request) is False
 
     def test_token_piece_to_bytes_handles_sentencepiece_byte_fallback(self):
         scheduler = self._make_scheduler(None, {})
