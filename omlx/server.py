@@ -2292,6 +2292,7 @@ def init_server(
         global_settings.server.gpu_keep_warm_interval if global_settings else 0.5
     )
     from .cluster.enrollment import configure_cluster_enrollment, get_cluster_enrollment
+    from .cluster.fabric_intent import configure_fabric_intent
     from .cluster.incidents import configure_cluster_incidents
     from .cluster.pairing import configure_pairing_manager
     from .cluster.rdma.store import configure_rdma_link_store
@@ -2306,6 +2307,7 @@ def init_server(
     configure_cluster_enrollment(base_path)
     configure_rdma_link_store(base_path)
     configure_cluster_incidents(base_path)
+    configure_fabric_intent(base_path)
     configure_strategy_benchmark_store(base_path)
     # Cluster v2: stable node identity + trusted device inventory. Best
     # effort — a failure here must never block local inference. Configured
