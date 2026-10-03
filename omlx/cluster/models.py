@@ -7,22 +7,35 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+# Stays "1.0" across the readiness-ladder additions: the TransportState rungs
+# past ``peer_linked_config_pending`` and the ``transport.readiness`` /
+# LinkStatus ``ladder``/``reason``/``remedy`` fields are additive — peers
+# serialize states to strings and coordinators render them as text, so an
+# older consumer degrades gracefully instead of failing to parse.
 CLUSTER_PROTOCOL_VERSION = "1.0"
 WORKER_PROTOCOL_VERSION = 1
 
 
 class TransportState(StrEnum):
-    """Observed transport readiness.
+    """Observed transport readiness, as a ladder.
 
     The states deliberately distinguish operating-system RDMA enablement from a
     physically connected peer and from a configured/benchmarked JACCL session.
-    This slice can report only through ``peer_linked_config_pending``.
+    Members are ordered as rungs between "cable in" and "collective proven"
+    (``readiness.LADDER_ORDER``); each carries reason/remedy copy from
+    ``readiness.ladder_copy``. Node-local evidence tops out at ``ROUTED`` —
+    ``REACHABLE`` and above require two-ended proof at the link level.
     """
 
     UNAVAILABLE = "unavailable"
     DISABLED = "disabled"
     ENABLED_NO_PEER = "enabled_no_peer"
     PEER_LINKED_CONFIG_PENDING = "peer_linked_config_pending"
+    ADDRESSED = "addressed"
+    ROUTED = "routed"
+    REACHABLE = "reachable"
+    FABRIC_VERIFIED = "fabric_verified"
+    COLLECTIVE_OK = "collective_ok"
 
 
 @dataclass(frozen=True)
@@ -145,6 +158,10 @@ class ClusterStatus:
         return any(port.peer_connected for port in self.thunderbolt_ports)
 
     def to_dict(self) -> dict[str, Any]:
+        # Local import: readiness derives its copy from TransportState, so a
+        # module-level import here would be circular.
+        from .readiness import node_readiness
+
         return {
             "protocol_version": self.protocol_version,
             "collected_at": self.collected_at,
@@ -166,6 +183,9 @@ class ClusterStatus:
             "runtime": self.runtime.to_dict(),
             "transport": {
                 "state": self.transport_state.value,
+                "readiness": node_readiness(
+                    self.transport_state, self.rdma.addresses
+                ).to_dict(),
                 "rdma": self.rdma.to_dict(),
                 "thunderbolt": {
                     "peer_connected": self.thunderbolt_peer_connected,
