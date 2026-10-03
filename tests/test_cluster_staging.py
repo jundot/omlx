@@ -621,7 +621,7 @@ def test_stage_route_runs_a_model_by_node_job_with_live_progress(
     monkeypatch.setattr(
         routes,
         "complete_model_layout",
-        lambda path: ModelLayout(
+        lambda path, *, text_only=False: ModelLayout(
             source=path,
             fixed_weight_bytes=1,
             layer_weight_bytes=(10, 10, 10, 10),
