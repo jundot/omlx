@@ -903,3 +903,69 @@ class TestClientBudgetMarkerStripping:
         messages = convert_anthropic_to_internal(request)
 
         assert "<total_tokens>7 tokens left</total_tokens>" in messages[-1]["content"]
+
+
+class TestAnthropicUnknownBlockConversion:
+    """Unknown content blocks validate, then drop out (issue #3754).
+
+    ``tool_addition`` (deferred/MCP tool loading) used to 422 the whole
+    request at the validation layer. Downstream converters already skip
+    unrecognized blocks, so accepting one must not change what the model sees.
+    """
+
+    @staticmethod
+    def _request():
+        return MessagesRequest(
+            model="minimax-m3-6bit",
+            max_tokens=64,
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[
+                        ContentBlockToolResult(
+                            tool_use_id="toolu_123",
+                            content="done",
+                        ),
+                        {
+                            "type": "tool_addition",
+                            "tool": {
+                                "type": "tool_reference",
+                                "name": "mcp__example__some_tool",
+                            },
+                            "cache_control": {"type": "ephemeral"},
+                        },
+                    ],
+                ),
+            ],
+        )
+
+    def test_tool_addition_block_dropped_downstream(self):
+        """Default (non-native) path: unknown block adds nothing to the prompt."""
+        from omlx.api.anthropic_utils import convert_anthropic_to_internal
+
+        messages = convert_anthropic_to_internal(self._request())
+
+        assert len(messages) == 1
+        content = messages[0]["content"]
+        assert "toolu_123" in content
+        assert "done" in content
+        assert "mcp__example__some_tool" not in content
+        assert "tool_addition" not in content
+
+    def test_tool_addition_block_dropped_with_native_tool_calling(self):
+        """Native tool-role path: no phantom tool message or tool_call."""
+        from omlx.api.anthropic_utils import convert_anthropic_to_internal
+
+        class _FakeTokenizer:
+            has_tool_calling = True
+
+        messages = convert_anthropic_to_internal(
+            self._request(), tokenizer=_FakeTokenizer()
+        )
+
+        # The real tool_result becomes exactly one role="tool" message; the
+        # unknown block must not add a second one with tool_call_id="".
+        tool_messages = [m for m in messages if m.get("role") == "tool"]
+        assert len(tool_messages) == 1
+        assert tool_messages[0]["tool_call_id"] == "toolu_123"
+        assert not any(m.get("tool_calls") for m in messages)
