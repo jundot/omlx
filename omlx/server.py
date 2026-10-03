@@ -3934,6 +3934,12 @@ async def create_completion(
             repetition_context_size = getattr(
                 request, "repetition_context_size", None
             )
+            if repetition_context_size is None:
+                _ms = get_model_settings_for_request(request.model)
+                if _ms is not None:
+                    repetition_context_size = getattr(
+                        _ms, "repetition_context_size", None
+                    )
             if repetition_context_size is not None:
                 gen_kwargs["repetition_context_size"] = repetition_context_size
 
@@ -4327,6 +4333,10 @@ async def create_chat_completion(
         repetition_context_size = getattr(
             request, "repetition_context_size", None
         )
+        if repetition_context_size is None and ms is not None:
+            repetition_context_size = getattr(
+                ms, "repetition_context_size", None
+            )
         if repetition_context_size is not None:
             chat_kwargs["repetition_context_size"] = repetition_context_size
 
@@ -5088,6 +5098,12 @@ async def stream_completion(
     repetition_context_size = getattr(
         request, "repetition_context_size", None
     )
+    if repetition_context_size is None:
+        _ms = get_model_settings_for_request(request.model)
+        if _ms is not None:
+            repetition_context_size = getattr(
+                _ms, "repetition_context_size", None
+            )
     if repetition_context_size is not None:
         gen_kwargs["repetition_context_size"] = repetition_context_size
     try:
@@ -6675,6 +6691,10 @@ async def create_anthropic_message(
         repetition_context_size = getattr(
             request, "repetition_context_size", None
         )
+        if repetition_context_size is None and ms is not None:
+            repetition_context_size = getattr(
+                ms, "repetition_context_size", None
+            )
         if repetition_context_size is not None:
             chat_kwargs["repetition_context_size"] = repetition_context_size
 
@@ -7269,6 +7289,10 @@ async def create_response(
         repetition_context_size = getattr(
             request, "repetition_context_size", None
         )
+        if repetition_context_size is None and ms is not None:
+            repetition_context_size = getattr(
+                ms, "repetition_context_size", None
+            )
         if repetition_context_size is not None:
             chat_kwargs["repetition_context_size"] = repetition_context_size
 
