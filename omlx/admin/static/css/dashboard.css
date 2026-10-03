@@ -1160,6 +1160,14 @@
         }
     }
 
+    /* Profile chips can contain long API names or settings values. */
+    @media (max-width: 639px) {
+        .model-list-details span {
+            min-width: 0;
+            overflow-wrap: anywhere;
+        }
+    }
+
     /* Keep usage columns readable inside narrow screens and dashboard blocks.
        The existing scroll container owns overflow, not the page. */
     .usage-model-table { min-width: 48rem; }
