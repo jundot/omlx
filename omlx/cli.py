@@ -505,9 +505,22 @@ def launch_command(args, extra_args: list[str] | None = None):
     connect_host = (
         first_bind if first_bind not in ("", "0.0.0.0", "::") else "127.0.0.1"
     )
+    base_url = f"http://{connect_host}:{port}"
+
+    # Claude Desktop resolves tier aliases server-side, so it needs no
+    # launch-time model — but it does need the desktop switch. The toggle
+    # lives in the dashboard; the CLI only points the user there.
+    if tool_name == "claude_desktop" and not bool(
+        getattr(getattr(settings, "claude_code", None), "desktop_enabled", False)
+    ):
+        print("Claude Desktop mode is not enabled in oMLX settings.")
+        print(
+            "Enable it in the oMLX dashboard (Integrations → Claude Desktop) "
+            "and re-run this command."
+        )
+        sys.exit(1)
 
     # Check if oMLX server is running
-    base_url = f"http://{connect_host}:{port}"
     try:
         resp = requests.get(f"{base_url}/health", timeout=3)
         resp.raise_for_status()
@@ -551,7 +564,9 @@ def launch_command(args, extra_args: list[str] | None = None):
         pass
 
     # Determine model. Explicit CLI tier flags bypass the picker; otherwise always
-    # prompt interactively so the user's selection is honoured.
+    # prompt interactively so the user's selection is honoured. Integrations
+    # that resolve models server-side (requires_model_selection=False) skip
+    # this block.
     model = args.model
     if not model and not integration.requires_model_selection:
         # The integration registers the server's whole model catalog, so
@@ -1352,8 +1367,8 @@ Example directory structure:
         "launch",
         help="Launch an external tool with oMLX integration",
         description=(
-            "Configure and launch external coding tools (Claude Code, Copilot, "
-            "Codex, Codex App, OpenCode, OpenClaw, Hermes Agent, Pi, DeepSeek "
+            "Configure and launch external coding tools (Claude Code, Claude Desktop, "
+            "Copilot, Codex, Codex App, OpenCode, OpenClaw, Hermes Agent, Pi, DeepSeek "
             "Harness) to use the running oMLX server."
         ),
     )
@@ -1361,7 +1376,7 @@ Example directory structure:
         "tool",
         type=str,
         help=(
-            "Tool to launch: claude, copilot, codex, codex_app, opencode, "
+            "Tool to launch: claude, claude_desktop, copilot, codex, codex_app, opencode, "
             "openclaw, hermes, pi, dsh, or 'list' to show available"
         ),
     )

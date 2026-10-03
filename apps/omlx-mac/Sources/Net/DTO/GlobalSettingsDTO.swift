@@ -171,6 +171,10 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let opusModel: String?
         let sonnetModel: String?
         let haikuModel: String?
+        /// Annotates the configured tier models with Anthropic family
+        /// metadata (anthropic_family_tier) for Claude Desktop. Optional so
+        /// older servers that omit the key still decode (nil = disabled).
+        let desktopEnabled: Bool?
     }
 
     struct IntegrationsSettings: Codable, Equatable, Sendable {
@@ -244,6 +248,9 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var claudeCodeOpusModel: String? = nil
     var claudeCodeSonnetModel: String? = nil
     var claudeCodeHaikuModel: String? = nil
+    /// This field (`claude_code_desktop_enabled` on the wire via
+    /// `convertToSnakeCase`): Claude Desktop tier-alias toggle.
+    var claudeCodeDesktopEnabled: Bool? = nil
 
     // Other integrations (PR 9)
     var integrationsCodexModel: String? = nil
