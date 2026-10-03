@@ -138,7 +138,7 @@ struct ServerScreen: View {
                                   defaultValue: "Record usage history",
                                   comment: "Row label for the switch that records local hourly usage history"),
                     sublabel: String(localized: "server.row.usage_history.sub",
-                                     defaultValue: "Stores hourly per-model token totals in usage.sqlite3. Turning this off keeps existing history.",
+                                     defaultValue: "Stores hourly per-model Token totals in usage.sqlite3. Turning this off keeps existing history.",
                                      comment: "Sublabel explaining the usage history switch"),
                     isLast: true
                 ) {
@@ -496,17 +496,17 @@ private struct ServerDefaultProfileEditor: View {
                                   defaultValue: "Context Window",
                                   comment: "Row label for the context window field in Default Profile"),
                     sublabel: String(localized: "server.profile.context_window.sub",
-                                     defaultValue: "Maximum prompt + completion tokens.",
+                                     defaultValue: "Maximum prompt + completion Tokens.",
                                      comment: "Sublabel for the context window field")) {
-                    TextInput(text: $vm.samplingContextText, mono: true, suffix: "tk", width: .controlCompact)
+                    TextInput(text: $vm.samplingContextText, mono: true, suffix: "Tok", width: .controlCompact)
                 }
                 Row(label: String(localized: "server.profile.max_tokens",
                                   defaultValue: "Max Tokens",
                                   comment: "Row label for the max tokens field"),
                     sublabel: String(localized: "server.profile.max_tokens.sub",
-                                     defaultValue: "Server-wide cap on generated tokens.",
+                                     defaultValue: "Server-wide cap on generated Tokens.",
                                      comment: "Sublabel for the max tokens field")) {
-                    TextInput(text: $vm.samplingMaxTokensText, mono: true, suffix: "tk", width: .controlCompact)
+                    TextInput(text: $vm.samplingMaxTokensText, mono: true, suffix: "Tok", width: .controlCompact)
                 }
                 Row(label: String(localized: "server.profile.temperature",
                                   defaultValue: "Temperature",
@@ -536,7 +536,7 @@ private struct ServerDefaultProfileEditor: View {
                                   defaultValue: "Repetition Penalty",
                                   comment: "Row label for the repetition penalty field"),
                     sublabel: String(localized: "server.profile.repetition_penalty.sub",
-                                     defaultValue: "Penalize repeated tokens.",
+                                     defaultValue: "Penalize repeated Tokens.",
                                      comment: "Sublabel for the repetition penalty field"),
                     isLast: !expanded
                 ) {
