@@ -70,6 +70,10 @@ def _custom_kernel_build_kwargs() -> dict:
                 "omlx.custom_kernels.qwen35_prefill._ext",
                 sourcedir="omlx/custom_kernels/qwen35_prefill/csrc",
             ),
+            extension.CMakeExtension(
+                "omlx.custom_kernels.qwen4_moe_stream._ext",
+                sourcedir="omlx/custom_kernels/qwen4_moe_stream/csrc",
+            ),
         ],
         "cmdclass": {"build_ext": extension.CMakeBuild},
     }
