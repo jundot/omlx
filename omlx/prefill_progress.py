@@ -99,40 +99,55 @@ class PrefillProgressTracker:
                 return True
             return (now - self._last_activity_ts) < within_s
 
+    def _snapshot_entry(self, rid: str, entry: Dict[str, Any]) -> Dict[str, Any]:
+        elapsed = time.monotonic() - entry["start_time"]
+        speed = entry.get("speed", 0.0)
+        remaining = entry["total"] - entry["processed"]
+        eta = remaining / speed if speed > 0 else None
+        result = {
+            "request_id": rid,
+            "processed": entry["processed"],
+            "total": entry["total"],
+            "speed": round(speed, 1),
+            "eta": round(eta, 1) if eta is not None else None,
+            "elapsed": round(elapsed, 1),
+            "phase": entry.get("phase", "prefill"),
+            "detail": entry.get("detail"),
+        }
+        for key in (
+            "scored_tokens",
+            "selected_tokens",
+            "keep_percent",
+            "prompt_tokens",
+            "system_tokens",
+            "conversation_tokens",
+            "cached_tokens",
+        ):
+            if key in entry:
+                result[key] = entry[key]
+        return result
+
+    def get(self, request_id: str) -> Optional[Dict[str, Any]]:
+        """Return the progress snapshot for a single request, or None.
+
+        O(1) direct lookup — for callers (e.g. the SSE stream) that already
+        know their own request_id and don't need to disambiguate among
+        multiple in-flight requests for the same model.
+        """
+        with self._lock:
+            entry = self._progress.get(request_id)
+            if entry is None:
+                return None
+            return self._snapshot_entry(request_id, entry)
+
     def get_model_progress(self, model_id: str) -> List[Dict[str, Any]]:
         """Return list of prefilling requests for a given model."""
         with self._lock:
-            results = []
-            for rid, entry in self._progress.items():
-                if entry["model_id"] != model_id:
-                    continue
-                elapsed = time.monotonic() - entry["start_time"]
-                speed = entry.get("speed", 0.0)
-                remaining = entry["total"] - entry["processed"]
-                eta = remaining / speed if speed > 0 else None
-                result = {
-                    "request_id": rid,
-                    "processed": entry["processed"],
-                    "total": entry["total"],
-                    "speed": round(speed, 1),
-                    "eta": round(eta, 1) if eta is not None else None,
-                    "elapsed": round(elapsed, 1),
-                    "phase": entry.get("phase", "prefill"),
-                    "detail": entry.get("detail"),
-                }
-                for key in (
-                    "scored_tokens",
-                    "selected_tokens",
-                    "keep_percent",
-                    "prompt_tokens",
-                    "system_tokens",
-                    "conversation_tokens",
-                    "cached_tokens",
-                ):
-                    if key in entry:
-                        result[key] = entry[key]
-                results.append(result)
-            return results
+            return [
+                self._snapshot_entry(rid, entry)
+                for rid, entry in self._progress.items()
+                if entry["model_id"] == model_id
+            ]
 
     def clear(self) -> None:
         """Remove all entries and forget the last activity timestamp."""
