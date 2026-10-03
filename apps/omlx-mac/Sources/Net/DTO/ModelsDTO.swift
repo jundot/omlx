@@ -60,6 +60,10 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     /// True when the model is structurally compatible with native MTP.
     let mtpCompatible: Bool?
     let mtpCompatibilityReason: String?
+    /// True when the checkpoint takes YaRN rope scaling derived from its
+    /// context-window override (Qwen4-Exp only). Drives the read-only YaRN
+    /// factor readout on the Context Window row; there is no YaRN setting.
+    var yarnRopeSupported: Bool? = nil
     /// Qwen4-Exp PLE mmap capability and server-side forced residency decision.
     let qwen4PleSsdOffloadSupported: Bool?
     let qwen4PleSsdOffloadForced: Bool?

@@ -130,3 +130,12 @@ tq_batch_memory.md
 .claude/
 issues.md
 clusterPlan.md
+
+# Load-gen / bench result artifacts (the tools themselves are tracked
+# in scripts/ and benchmarks/)
+scripts/needle_results.jsonl
+scripts/agentic_results.jsonl
+scripts/agentic_conversations/
+scripts/prefill_ab.jsonl
+benchmarks/mscale_sweep.jsonl
+benchmarks/parity/

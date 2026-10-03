@@ -12,6 +12,7 @@
 #include "exact_block_attention.h"
 #include "fused_moe.h"
 #include "qwen4_qsa_sparse_gqa.h"
+#include "qwen4_qsa_sparse_gqa_tq.h"
 #include "sparse_mla.h"
 
 namespace nb = nanobind;
@@ -82,6 +83,22 @@ NB_MODULE(_ext, m) {
       "q_offset"_a,
       "key_tile"_a = 128,
       "dimension_tile"_a = 32,
+      "stream"_a = nb::none());
+  m.def(
+      "qwen4_qsa_sparse_gqa_attention_tq",
+      &omlx::glm_kernels::qwen4_qsa_sparse_gqa_attention_tq,
+      "queries"_a,
+      "key_norms"_a,
+      "key_packed"_a,
+      "value_norms"_a,
+      "value_packed"_a,
+      "codebook_k"_a,
+      "codebook_v"_a,
+      "selected_blocks"_a,
+      "scale"_a,
+      "q_offset"_a,
+      "key_tile"_a = 64,
+      "dimension_tile"_a = 64,
       "stream"_a = nb::none());
   m.def(
       "dsa_topk_indices",

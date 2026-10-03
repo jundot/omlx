@@ -459,6 +459,14 @@ class ModelSettings:
     # Draft exactly this many tokens every cycle, with no adaptive controller.
     # Takes precedence over mtp_adaptive_max_depth; None = adaptive.
     mtp_fixed_depth: Optional[int] = None
+    # Token bound on the prompt history folded into the Lightning MTP head
+    # cache during prefill (prompt priming). Head-cache bytes scale with the
+    # folded span (~7KB/token on qwen4_exp) and so do the activation seam
+    # and the prefix-snapshot publish: unbounded priming on a 750k prompt
+    # pushed decode-start past the memory guard. 0 = unbounded (upstream
+    # default); a request whose unfolded span exceeds the bound runs
+    # unprimed. OMLX_MTP_PRIME_WINDOW overrides per-process.
+    mtp_prime_window: int = 0
 
     # VLM MTP speculative decoding via external MTP drafter (mlx-vlm f96138e+).
     # Supported drafter types: gemma4_assistant (for Gemma 4 VLMs), qwen3_5_mtp

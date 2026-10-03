@@ -1138,6 +1138,7 @@
   "modal.model_settings.turboquant_kv": "TurboQuant KV cache",
   "modal.model_settings.turboquant_kv_hint": "Komprimovat KV cache vektorovou kvantizací. Méně bitů = větší komprese, více bitů = lepší kvalita. Podporuje 2 až 8 bitů.",
   "modal.model_settings.turboquant_kv_bits_label": "Bitů na kanál",
+  "modal.model_settings.yarn_factor_label": "YaRN faktor",
   "modal.model_settings.k2_ane": "Zpracování promptů K2 na ANE",
   "modal.model_settings.k2_ane_hint": "Použít ANE pro zpracování promptů K2 včetně MoVA. Dekódování zůstává na GPU. ANE používá privátní rozhraní Apple. Výstupy se mohou lišit.",
   "modal.model_settings.k2_ane_shared": "SDÍLENÝ MLP na ANE",

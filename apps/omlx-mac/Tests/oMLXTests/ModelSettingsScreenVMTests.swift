@@ -361,6 +361,104 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(object?["qwen4_ple_ssd_offload"] as? Bool, true)
     }
 
+    func testContextWindowYaRNReadoutSnapsFactorToThePublishedRungs() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        func model(
+            id: String,
+            configModelType: String,
+            native: Int?,
+            yarnFlag: Bool?
+        ) throws -> ModelDTO {
+            let nativeJSON = native.map(String.init) ?? "null"
+            let flagJSON = yarnFlag.map { $0 ? "true" : "false" } ?? "null"
+            return try decoder.decode(
+                ModelDTO.self,
+                from: Data("""
+                {"id":"\(id)","loaded":false,"is_loading":false,"estimated_size":0,\
+                "config_model_type":"\(configModelType)","model_context_length":\(nativeJSON),\
+                "yarn_rope_supported":\(flagJSON)}
+                """.utf8)
+            )
+        }
+
+        let vm = ModelSettingsScreenVM()
+        vm.model = try model(id: "qwen4", configModelType: "qwen4_exp",
+                             native: 262144, yarnFlag: true)
+
+        // Unset / at / below native: nothing scales, the row says so.
+        XCTAssertEqual(vm.yarnScaling, .off(native: 262144))
+        XCTAssertTrue(vm.yarnScalingSummary.contains("off"))
+        vm.contextLength = "262144"
+        XCTAssertEqual(vm.yarnScaling, .off(native: 262144))
+        vm.contextLength = "131072"
+        XCTAssertEqual(vm.yarnScaling, .off(native: 262144))
+
+        // Above native: the readout names the rung the loader snaps to and the
+        // horizon that rung serves, plus the native window; the sublabel points
+        // at the auto-scaling behaviour. A 1.5x request serves the 2x rung.
+        vm.contextLength = "393216"
+        XCTAssertEqual(vm.yarnScaling, .scaled(factor: 2.0, scaled: 524288, native: 262144))
+        vm.contextLength = "524288"
+        XCTAssertEqual(vm.yarnScaling, .scaled(factor: 2.0, scaled: 524288, native: 262144))
+        XCTAssertEqual(vm.yarnScaling?.isScaled, true)
+        XCTAssertEqual(vm.yarnScaling?.isOverCeiling, false)
+        XCTAssertTrue(vm.yarnScalingSummary.contains(ModelSettingsScreenVM.factor(2.0)))
+        XCTAssertTrue(vm.yarnScalingSummary.contains(ModelSettingsScreenVM.grouped(524288)))
+        XCTAssertTrue(vm.yarnScalingSummary.contains(ModelSettingsScreenVM.grouped(262144)))
+        XCTAssertTrue(vm.contextWindowSublabel.contains("YaRN"))
+
+        // One token past the 2x rung commits to 4x; the published ceiling is
+        // still inside the recipe, and beyond it the readout holds at 4x while
+        // flagging the unvalidated horizon without blocking the field.
+        vm.contextLength = "524289"
+        XCTAssertEqual(vm.yarnScaling, .scaled(factor: 4.0, scaled: 1048576, native: 262144))
+        vm.contextLength = "1048576"
+        XCTAssertEqual(vm.yarnScaling, .scaled(factor: 4.0, scaled: 1048576, native: 262144))
+        XCTAssertEqual(vm.yarnScaling?.isOverCeiling, false)
+        vm.contextLength = "1310720"
+        XCTAssertEqual(vm.yarnScaling, .overCeiling(factor: 4.0, scaled: 1048576, native: 262144))
+        XCTAssertEqual(vm.yarnScaling?.isOverCeiling, true)
+        XCTAssertTrue(vm.yarnScalingSummary.contains(ModelSettingsScreenVM.factor(4.0)))
+
+        // Whitespace in the field must not change the derivation.
+        vm.contextLength = "  524288  "
+        XCTAssertEqual(vm.yarnScaling, .scaled(factor: 2.0, scaled: 524288, native: 262144))
+
+        // Server says no: the row stays silent even with an override typed
+        // in, and the sublabel reverts to the plain text.
+        vm.model = try model(id: "qwen36", configModelType: "qwen3_5",
+                             native: 262144, yarnFlag: false)
+        vm.contextLength = "524288"
+        XCTAssertNil(vm.yarnScaling)
+        XCTAssertFalse(vm.contextWindowSublabel.contains("YaRN"))
+        XCTAssertTrue(vm.yarnScalingSummary.isEmpty)
+
+        // Server predating the flag: the Qwen4-Exp config type carries it.
+        // Switching models re-hydrates the field from the server payload, so
+        // clear it explicitly the way `load()` does.
+        vm.model = try model(id: "legacy-qwen4", configModelType: "qwen4_exp",
+                             native: 262144, yarnFlag: nil)
+        vm.contextLength = ""
+        XCTAssertEqual(vm.yarnScaling, .off(native: 262144))
+        vm.contextLength = "1048576"
+        XCTAssertEqual(vm.yarnScaling, .scaled(factor: 4.0, scaled: 1048576, native: 262144))
+
+        // No reported native window: no factor can be derived, so no readout.
+        vm.model = try model(id: "clueless", configModelType: "qwen4_exp",
+                             native: nil, yarnFlag: nil)
+        vm.contextLength = "524288"
+        XCTAssertNil(vm.yarnScaling)
+        XCTAssertFalse(vm.contextWindowSublabel.contains("YaRN"))
+
+        // The context window stays the single knob on the wire.
+        vm.model = try model(id: "qwen4", configModelType: "qwen4_exp",
+                             native: 262144, yarnFlag: true)
+        vm.contextLength = "524288"
+        XCTAssertEqual(vm.currentSettingsDict()[ProfileSettingsKey.maxContextWindow]?.value as? Int,
+                     524288)
+    }
+
     func testQwenAneSettingsDecodeFromServerAndEncodeForPatch() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase

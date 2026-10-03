@@ -25,6 +25,7 @@
             "mtp_compatibility_reason": "Config declares MTP layers but the converted weights are missing mtp.* tensors. Re-convert from HF with a converter that preserves MTP weights.",
             "is_paroquant": false,
             "paroquant_reason": "",
+            "yarn_rope_supported": false,
             "settings": {
                 "max_context_window": 131072,
                 "max_tokens": 262144,
