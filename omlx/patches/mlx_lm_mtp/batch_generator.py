@@ -1341,11 +1341,28 @@ def _prepare_mtp_batch_state_for_next(gen_batch: Any) -> Optional[_MtpBatchState
     return batch_state
 
 
+# One ParkMemory per live model object (keyed by id: models are dict-like
+# modules; the weak reference keeps a reused id from inheriting verdicts).
+_BATCH_PARK_MEMORY: Dict[int, Tuple[Any, Any]] = {}
+
+
+def _batch_park_memory(model: Any):
+    from .batch_policy import ParkMemory
+
+    entry = _BATCH_PARK_MEMORY.get(id(model))
+    if entry is None or entry[0]() is not model:
+        entry = _BATCH_PARK_MEMORY[id(model)] = (weakref.ref(model), ParkMemory())
+    return entry[1]
+
+
 def _batch_policy_for_next(gen_batch: Any):
     from .batch_policy import BatchPolicy
 
     policy = getattr(gen_batch, "_omlx_mtp_batch_policy", None)
     if policy is None or policy.uids != tuple(gen_batch.uids):
+        memory = _batch_park_memory(gen_batch.model)
+        if policy is not None:
+            memory.retired(policy)
         chain, depth, _ = _resolve_mtp_chain_depth(gen_batch.model)
         policy = BatchPolicy(
             gen_batch.uids,
@@ -1353,6 +1370,7 @@ def _batch_policy_for_next(gen_batch: Any):
             fixed=_drafter_for(gen_batch.model) is not None
             or _mtp_depth_fixed(gen_batch.model),
         )
+        memory.seed(policy)
         gen_batch._omlx_mtp_batch_policy = policy
     return policy
 
@@ -3372,6 +3390,7 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
                     "Lightning MTP could not restore batch parking state"
                 )
             policy.park()
+            _batch_park_memory(gen_batch.model).parked(policy)
             logger.info(
                 "Lightning MTP batch parked: rows=%d standard_ms=%.3f cooldown=%d",
                 len(states),

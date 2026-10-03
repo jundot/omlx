@@ -2791,8 +2791,12 @@ def _quiet_prefill_tracker():
     from omlx.prefill_progress import get_prefill_tracker
 
     get_prefill_tracker().clear()
+    # Batch parking verdicts outlive a cohort (per model object); a model a
+    # fixture reuses must not start a test parked by an earlier one.
+    bg._BATCH_PARK_MEMORY.clear()
     yield
     get_prefill_tracker().clear()
+    bg._BATCH_PARK_MEMORY.clear()
 
 
 class TestLoopTaxHygiene:
@@ -4309,6 +4313,8 @@ def _join_as_batch_row_finishes(model, prompts, joined_prompt, max_tokens=40):
     that singleton with the pending prompt. A one-token prompt splits into
     generation at once, like the scheduler's externally prefilled inserts.
     """
+    # Shared MTP must activate: no parking verdict from an earlier run.
+    bg._BATCH_PARK_MEMORY.clear()
     gen = BatchGenerator(
         model,
         sampler=lambda lp: mx.argmax(lp, -1),
@@ -5597,3 +5603,35 @@ def test_spec_command_buffers_restore_caps_after_the_step(monkeypatch, raised):
         raise RuntimeError("step failed")
     assert inside == (bg._SPEC_BUFFER_CAPS if raised else (50, 50))
     assert caps[-1] == (50, 50)
+
+
+def test_batch_park_verdict_outlives_its_cohort():
+    """MTP parked at k rows keeps new cohorts of k or more rows parked (with
+    the doubled cooldown) until a cohort where MTP holds up clears it."""
+    from omlx.patches.mlx_lm_mtp.batch_policy import ParkMemory
+
+    memory = ParkMemory()
+    lost = BatchPolicy(range(4), 3)
+    lost.park()
+    memory.parked(lost)
+    wider, narrower = BatchPolicy(range(8), 3), BatchPolicy(range(2), 3)
+    memory.seed(wider)
+    memory.seed(narrower)
+    assert wider.remaining == 256 and wider.cooldown == 512
+    assert narrower.remaining == 0
+    fixed = BatchPolicy(range(8), 3, fixed=True)
+    memory.seed(fixed)
+    assert not fixed.needs_standard()
+
+    short = BatchPolicy(range(8), 3)
+    short.decisions = 31
+    memory.retired(short)
+    again = BatchPolicy(range(4), 3)
+    memory.seed(again)
+    assert again.remaining == 256
+    held = BatchPolicy(range(8), 3)
+    held.decisions = 32
+    memory.retired(held)
+    fresh = BatchPolicy(range(8), 3)
+    memory.seed(fresh)
+    assert fresh.remaining == 0

@@ -129,6 +129,10 @@ class _PrimeCtx:
     # Committed pairs collected during ordinary decoding. None means
     # ordinary prompt priming; a list resumes an already active head.
     deferred_pairs: Optional[List[Any]] = None
+    # The pairs are deferred only to batch the prompt priming's decode folds
+    # (``_defer_decode_history``): a broken timeline drops the history, as
+    # an eager fold would, instead of failing a resumed head's handoff.
+    decode_deferred: bool = False
     # Request/prefix-cache metadata used to publish and restore one exact
     # MTP boundary snapshot. The cache itself remains generic and
     # treats the snapshot as an opaque sidecar.
@@ -836,6 +840,8 @@ def maybe_capture(host, inputs, normed, cache):
                 if not valid:
                     continue
                 _restore_slot(host, record)
+                if prefill is None:
+                    _defer_decode_history(host)
                 _capture_single(
                     host,
                     inputs[row : row + 1, :valid],
@@ -920,6 +926,32 @@ def retain_parked_head_history(model, uid, mtp_cache, folded, pending_hidden, ca
     registry.uids[uid] = (ctx, None)
 
 
+# Deferred decode pairs fold once this many have collected, in one head
+# forward per row (bounds the held hidden rows: ~20 KB per token on Qwen4).
+_DEFERRED_FOLD_TOKENS = 256
+
+
+def _defer_decode_history(host):
+    """Collect a primed row's ordinary-decode pairs instead of folding them.
+
+    A batched ordinary decode step would otherwise run one MTP-head forward
+    per row per token (about 7% of an 8-row step on Qwen3.8-Flash-Next).
+    The pairs fold in chunks of ``_DEFERRED_FOLD_TOKENS`` and at activation,
+    through the same deferred-history path a parked batch uses; the head
+    history is the same sequence of committed pairs.
+    """
+    ctx = _find_ctx(host)
+    if (
+        isinstance(ctx, _PrimeCtx)
+        and ctx.deferred_pairs is None
+        and ctx.valid
+        and not ctx.window_exceeded
+        and ctx.folded > 0
+    ):
+        ctx.deferred_pairs = []
+        ctx.decode_deferred = True
+
+
 def _capture_deferred_history(host, inputs, hidden, cache):
     import mlx.core as mx
 
@@ -935,6 +967,9 @@ def _capture_deferred_history(host, inputs, hidden, cache):
         or after is None
         or ctx.expected_offset != after - count
     ):
+        if ctx.decode_deferred:
+            drop_ctx(host)
+            return True
         raise RuntimeError("Deferred head history lost its request timeline")
     if ctx.pending_hidden is None:
         paired_hidden, paired_tokens = hidden[:, :-1], inputs[:, 1:]
@@ -945,6 +980,8 @@ def _capture_deferred_history(host, inputs, hidden, cache):
         ctx.deferred_pairs.append((paired_hidden, paired_tokens))
     ctx.pending_hidden = hidden[:, -1:]
     ctx.expected_offset = after
+    if len(ctx.deferred_pairs) >= _DEFERRED_FOLD_TOKENS:
+        _flush_deferred_history(host, ctx)
     return True
 
 
@@ -1182,12 +1219,12 @@ def _take_primed(
         return None
     drop_ctx(model)
     if not (ctx.valid and ctx.folded > 0 and ctx.pending_hidden is not None):
-        if ctx.deferred_pairs is not None:
+        if ctx.deferred_pairs is not None and not ctx.decode_deferred:
             raise RuntimeError("Deferred head history activation seam is invalid")
         return None
     offset = _activation_offset(cache) if cache_offset is None else cache_offset
     if offset is None or ctx.expected_offset != offset - 1:
-        if ctx.deferred_pairs is not None:
+        if ctx.deferred_pairs is not None and not ctx.decode_deferred:
             raise RuntimeError("Deferred head history activation seam is invalid")
         logger.debug(
             "MTP priming discarded: seam offset mismatch (ctx=%s cache=%s)",
