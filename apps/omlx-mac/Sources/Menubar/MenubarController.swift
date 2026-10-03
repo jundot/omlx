@@ -1349,7 +1349,7 @@ final class MenubarController: NSObject {
 
     private func tps(_ value: Double?) -> String {
         guard let v = value else { return "—" }
-        return String(format: "%.1f tok/s", v)
+        return String(format: "%.1f Tok/s", v)
     }
 }
 
