@@ -8,7 +8,7 @@ import SwiftUI
 
 struct AppearanceScreen: View {
     @AppStorage(MenubarMetricPrefs.refreshIntervalKey)
-    private var refreshInterval = 1.0
+    private var refreshInterval = MenubarMetricPrefs.defaultRefreshInterval
     @AppStorage(MenubarMetricPrefs.showDockIconKey)
     private var showDockIcon = false
     @AppStorage(MenubarMetricPrefs.liveKey)

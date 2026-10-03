@@ -85,6 +85,10 @@ final class MenubarMetricTests: XCTestCase {
             MenubarMetricsStore.append(&series, Double(value))
         }
 
+        XCTAssertEqual(
+            MenubarMetricsStore.historyCapacity, 120,
+            "derived from the default cadence: 120 × 0.5 s = the promised minute"
+        )
         XCTAssertEqual(series.count, MenubarMetricsStore.historyCapacity)
         XCTAssertEqual(series.first, 5)
         XCTAssertEqual(series.last, Double(MenubarMetricsStore.historyCapacity + 4))
