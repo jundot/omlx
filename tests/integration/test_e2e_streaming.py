@@ -5354,3 +5354,90 @@ async def test_stream_thinking_length_channels(api, with_tools):
         )
     assert content == ""
     assert reasoning == "unfinished</thi"
+
+
+async def test_responses_opening_snapshot_echoes_the_whole_envelope():
+    """`response.created` must come from the envelope builder, not a subset copy.
+
+    A client latches `store`, `instructions`, `reasoning` and the sampling
+    values from the opening snapshot, so a hand-built second envelope makes one
+    request describe itself differently at the start and at the end.
+    """
+    from omlx.api.responses_models import ResponsesRequest
+    from omlx.server import stream_responses_api
+
+    engine = MockBaseEngine()
+    engine.set_stream_outputs(
+        [
+            MockGenerationOutput(
+                text="Hi",
+                new_text="Hi",
+                completion_tokens=1,
+                finished=True,
+                finish_reason="stop",
+            )
+        ]
+    )
+    request = ResponsesRequest(
+        model="test-model",
+        input="Hi",
+        stream=True,
+        instructions="be terse",
+        store=True,
+        parallel_tool_calls=False,
+        reasoning={"effort": "low"},
+        truncation="disabled",
+    )
+
+    events = [
+        event
+        async for event in stream_responses_api(
+            engine,
+            [{"role": "user", "content": "Hi"}],
+            request,
+            store_response=False,
+            max_tokens=256,
+            # What get_sampling_params resolves when the client omits them.
+            temperature=0.3,
+            top_p=0.9,
+        )
+    ]
+    payloads = [
+        json.loads(line[6:])
+        for event in events
+        for line in event.splitlines()
+        if line.startswith("data: {")
+    ]
+    created = next(
+        payload for payload in payloads if payload.get("type") == "response.created"
+    )
+    snapshot = created["response"]
+    assert snapshot["status"] == "in_progress"
+    assert snapshot["output"] == []
+    for field, expected in (
+        ("model", "test-model"),
+        ("instructions", "be terse"),
+        # The envelope echoes the effective flag (store_response=False below),
+        # not request.store.
+        ("store", False),
+        ("parallel_tool_calls", False),
+        ("reasoning", {"effort": "low"}),
+        ("truncation", "disabled"),
+        ("temperature", 0.3),
+        ("top_p", 0.9),
+    ):
+        assert snapshot.get(field) == expected, field
+
+    terminal = next(
+        payload for payload in payloads if payload.get("type") == "response.completed"
+    )["response"]
+    for field in (
+        "instructions",
+        "store",
+        "parallel_tool_calls",
+        "reasoning",
+        "truncation",
+        "temperature",
+        "top_p",
+    ):
+        assert terminal.get(field) == snapshot.get(field), field
