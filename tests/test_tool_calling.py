@@ -5716,3 +5716,100 @@ def test_native_union_parameter_keeps_correct_python_literal_values(
         tools,
     )
     assert json.loads(calls[0].function.arguments)["v"] == expected
+
+
+class TestStreamFilterLongOpenCandidateRegression:
+    """Regressions for hold windows interacting with long names and prose.
+
+    The fixed 128-char suffix window was sized for the literal markers;
+    open-tag candidates grow with the tool/namespace name, and bracket
+    holds grow with the prose after them.
+    """
+
+    def _feed_all(self, f, text, chunk=3):
+        out = [f.feed(text[i : i + chunk]) for i in range(0, len(text), chunk)]
+        out.append(f.finish())
+        return "".join(out)
+
+    def test_long_registered_tool_name_envelope_is_suppressed(self):
+        """A declared tool name past the old 128-char window still suppresses.
+
+        Previously the suffix window clamped at 128, chopping the open tag
+        mid-name; the complete tag could never reassemble and the whole
+        envelope leaked as content alongside the structured call.
+        """
+        name = "t" * 120
+        f = ToolCallStreamFilter(_make_tokenizer(), tools={name})
+        raw = (
+            f'before <function name="{name}">'
+            '<param name="a">1</param></function> after'
+        )
+        visible = self._feed_all(f, raw)
+        assert visible == "before  after"
+        assert "<function" not in visible
+
+    def test_unresolved_bracket_hold_recovers_prose_at_finish(self):
+        """'[Calling tool:' prose with no ']' must be recoverable, not lost.
+
+        The bracket hold is uncapped, and finish() used to drop the whole
+        tail silently — swallowing an unbounded amount of post-marker
+        prose. It now routes through the conditional-recovery contract
+        (caller re-emits only when final parsing confirms no structured
+        tool call).
+        """
+        f = ToolCallStreamFilter(_make_tokenizer())
+        prose_after = "maybe and then " + ("long prose " * 40)
+        visible = self._feed_all(f, f"Let me check the docs [Calling tool: {prose_after}")
+        assert visible == "Let me check the docs "
+        recovered = f.take_recovery_candidate()
+        assert recovered.startswith("[Calling tool: maybe and then")
+        assert "long prose" in recovered
+
+
+class TestQwenSplitRecoveryRegression:
+    """A missing outer close must not merge into the following call."""
+
+    def test_first_call_survives_missing_close_before_second_call(self):
+        from omlx.api.tool_calling import parse_qwen_tool_calls
+
+        tok = MagicMock(spec=[])
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "f",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"a": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        text = (
+            "<tool_call><function=f><parameter=a>one</parameter></function>"
+            "<tool_call><function=f><parameter=a>two</parameter></function>"
+            "</tool_call>"
+        )
+        prose, calls, errors = parse_qwen_tool_calls(text, tok, tools, "stop")
+        decoded = [(c.function.name, c.function.arguments) for c in (calls or [])]
+        # Both calls recover with clean arguments; previously the two
+        # envelopes merged and the native parser kept a single call whose
+        # argument value had swallowed the second call's markup.
+        assert decoded == [("f", '{"a": "one"}'), ("f", '{"a": "two"}')]
+        assert errors == ()
+
+    def test_truncated_declared_tool_call_stays_suppressed(self):
+        """A truncated invocation naming a declared tool keeps the contract.
+
+        '[Calling tool: get_weather({"city":"SF"}' (no closing bracket) is
+        a cut-off call, not prose: its markup — half-written JSON naming
+        the tool — must not surface, matching the
+        drops-unresolved-bracket-fragment e2e contract.
+        """
+        f = ToolCallStreamFilter(_make_tokenizer(), tools={"get_weather"})
+        text = 'Before [Calling tool: get_weather({"city":"SF"}'
+        out = [f.feed(ch) for ch in text]
+        out.append(f.finish())
+        assert "".join(out) == "Before "
+        assert f.take_recovery_candidate() == ""
+
