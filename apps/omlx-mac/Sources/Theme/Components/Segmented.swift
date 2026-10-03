@@ -4,7 +4,9 @@ import SwiftUI
 
 struct Segmented<Value: Hashable>: View {
     @Binding var selection: Value
-    let titleKey: LocalizedStringKey = ""
+    /// The control's own label. Hidden visually (the row it sits in carries the
+    /// visible label) and kept for assistive tech.
+    var titleKey: LocalizedStringKey = ""
     let options: [(value: Value, label: String)]
     /// Optional SF Symbol per option, matched by index. When present the
     /// segment renders `Label(label, systemImage:)` instead of plain text.
