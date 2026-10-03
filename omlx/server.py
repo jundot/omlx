@@ -92,10 +92,15 @@ from .api.embedding_models import (
     EmbeddingRequest,
     EmbeddingResponse,
     EmbeddingUsage,
+    TokenEmbeddingData,
+    TokenEmbeddingRequest,
+    TokenEmbeddingResponse,
+    TokenEmbeddingUsage,
 )
 from .api.embedding_utils import (
     encode_embedding_base64,
     find_non_finite_embeddings,
+    find_non_finite_token_embeddings,
     normalize_embedding_items,
     normalize_input,
     truncate_embedding,
@@ -3687,6 +3692,102 @@ async def create_embeddings(
         ).model_dump_json()
 
     return await _json_response_or_keepalive(http_request, _build_embeddings())
+
+
+@app.post("/v1/embeddings/tokens")
+async def create_token_embeddings(
+    request: TokenEmbeddingRequest,
+    http_request: FastAPIRequest,
+    _: bool = Depends(verify_api_key),
+):
+    """
+    Create per-token (late-interaction / MaxSim) embeddings for explicit token ids.
+
+    Unlike ``/v1/embeddings`` the caller supplies the token ids, so the returned
+    rows line up exactly with the text window the caller already embedded with
+    ``/v1/embeddings``. One vector per token id, padding never included; the
+    final hidden state (before pooling and L2 normalization) is returned, so a
+    caller that needs the ColBERT convention normalizes the rows itself.
+
+    Example request:
+    ```json
+    {
+        "model": "Qwen3-Embedding-0.6B-mlx-bf16",
+        "input_ids": [[104, 842, 151643]]
+    }
+    ```
+    """
+    oq_manager = getattr(_server_state, "oq_manager", None)
+    if oq_manager and oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
+
+    # Validate the model up front (resolves + loads + type-checks) so a bad
+    # model still 400/404s before we start the streaming response.
+    await get_embedding_engine(request.model)
+
+    sequences = [list(ids) for ids in request.input_ids]
+
+    async def _build_token_embeddings():
+        start_time = time.perf_counter()
+        try:
+            async with acquire_embedding_engine(request.model) as engine:
+                output = await engine.embed_token_ids(sequences)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except TypeError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        elapsed = time.perf_counter() - start_time
+        resolved_model = resolve_model_id(request.model) or request.model
+
+        non_finite = find_non_finite_token_embeddings(output.token_embeddings)
+        if non_finite:
+            logger.error(
+                f"Token embeddings: model={resolved_model} returned non-finite "
+                f"values for input item(s) {non_finite} of {len(sequences)}"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Model produced non-finite token embeddings for input "
+                    f"item(s) {non_finite}; refusing to return corrupt vectors."
+                ),
+            )
+
+        data = [
+            TokenEmbeddingData(
+                index=index,
+                embedding=vectors,
+                token_count=len(vectors),
+            )
+            for index, vectors in enumerate(output.token_embeddings)
+        ]
+
+        get_server_metrics().record_request_complete(
+            prompt_tokens=output.total_tokens,
+            completion_tokens=0,
+            cached_tokens=0,
+            prefill_duration=elapsed,
+            model_id=resolved_model,
+            request_duration=elapsed,
+        )
+
+        logger.info(
+            f"Token embeddings: model={resolved_model}, "
+            f"{len(sequences)} inputs, {output.dimensions} dims, "
+            f"{output.total_tokens} tokens in {elapsed:.3f}s"
+        )
+
+        return TokenEmbeddingResponse(
+            data=data,
+            model=request.model,
+            usage=TokenEmbeddingUsage(total_tokens=output.total_tokens),
+        ).model_dump_json()
+
+    return await _json_response_or_keepalive(http_request, _build_token_embeddings())
 
 
 # =============================================================================
