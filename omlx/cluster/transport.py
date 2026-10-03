@@ -1538,3 +1538,78 @@ def verify_link_reachability(
                 "but the peer did not answer on that address."
             )
     return True, link.reason
+
+
+def check_data_plane_reachability(
+    peer_ip: str,
+    *,
+    runner: LinkCommandRunner | None = None,
+    local_interfaces: HostInterfaces | None = None,
+) -> tuple[bool | None, str]:
+    """Can this Mac still reach ``peer_ip`` on the fabric interface it should
+    be using -- the data plane the collectives actually ride, as opposed to
+    the SSH/LAN control plane every other liveness check uses (§C1).
+
+    Deliberately local-only, unlike ``verify_link_reachability``: this is
+    always called from rank 0 (the only rank that runs the watchdog or
+    serves the preflight), re-checking a link that is already established
+    and in use -- not selecting a candidate among several ambiguous ones,
+    which is what that function's bidirectional SSH choreography and
+    peer-side interface check exist for. There is no "other side's
+    opinion" to gather here.
+
+    Returns ``(None, reason)`` when the check cannot be run at all (no
+    local interface shares a subnet with ``peer_ip`` -- a multi-hop
+    topology this cannot see past) rather than treating "inconclusive" as
+    "failed": a caller must not fail a deployment over a check that could
+    not run.
+
+    The local route lookup is not a redundant step before the ping: a
+    Thunderbolt interface can die while ``peer_ip`` keeps answering because
+    the route silently re-homed onto a second path (another cable, a
+    stale address, a LAN interface sharing the subnet). A ping alone reads
+    that as healthy; RDMA is pinned to a specific device, so this is
+    exactly the case where the fabric is actually down but a plain ping
+    would not notice.
+    """
+
+    run = runner or _run_link_command
+    interfaces = (
+        local_interfaces
+        if local_interfaces is not None
+        else probe_host_interfaces("127.0.0.1")
+    )
+    try:
+        target = ipaddress.IPv4Address(peer_ip)
+    except ValueError:
+        return None, f"{peer_ip!r} is not a valid IPv4 address"
+    local = next(
+        (
+            candidate
+            for candidate in interfaces.addresses
+            if target in candidate.network
+        ),
+        None,
+    )
+    if local is None:
+        return None, (
+            f"no local interface shares a subnet with {peer_ip} "
+            "(unreachable in one hop, or the address changed)"
+        )
+    route = run("127.0.0.1", ("/sbin/route", "-n", "get", peer_ip))
+    selected = _route_interface(route.stdout) if route.returncode == 0 else ""
+    # An empty ``selected`` means the platform has no ``route -n get`` (e.g.
+    # Linux) rather than a resolved mismatch -- the ping below is still a
+    # real reachability proof, just without the interface-re-homing check.
+    if selected and selected != local.interface:
+        return False, (
+            f"{peer_ip} is reachable, but the route now uses {selected} "
+            f"instead of {local.interface} -- the fabric path may have "
+            "silently re-homed onto a different link."
+        )
+    ping = run("127.0.0.1", ("/sbin/ping", "-n", "-c", "1", "-W", "1000", peer_ip))
+    if ping.returncode != 0:
+        return False, (
+            f"{local.interface} routes to {peer_ip}, but it did not answer."
+        )
+    return True, ""

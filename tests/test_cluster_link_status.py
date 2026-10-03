@@ -17,6 +17,7 @@ from omlx.cluster.transport import (
     LinkStatus,
     TransportInfo,
     assess_link,
+    check_data_plane_reachability,
     classify_link,
     configure_link,
     detect_transports,
@@ -795,6 +796,98 @@ def test_link_verification_rejects_a_route_on_the_wrong_interface():
     assert verified is False
     assert "uses en0" in reason
     assert "en4" in reason
+
+
+# --- §C1/2.3: local-only data-plane re-check of an already-established link.
+
+
+def test_data_plane_check_confirms_reachability_over_the_matching_interface():
+    def runner(_host, command):
+        if command[0] == "/sbin/route":
+            return subprocess.CompletedProcess(command, 0, "interface: en4\n", "")
+        return subprocess.CompletedProcess(command, 0, "one packet received\n", "")
+
+    ok, detail = check_data_plane_reachability(
+        "10.0.1.2", runner=runner, local_interfaces=_laptop()
+    )
+
+    assert ok is True
+    assert detail == ""
+
+
+def test_data_plane_check_flags_a_silently_re_homed_route():
+    """The failure ping alone would miss: the interface died, but peer_ip
+    still answers because the route moved to a different local path."""
+
+    def runner(_host, command):
+        if command[0] == "/sbin/route":
+            return subprocess.CompletedProcess(command, 0, "interface: en0\n", "")
+        return subprocess.CompletedProcess(command, 0, "one packet received\n", "")
+
+    ok, detail = check_data_plane_reachability(
+        "10.0.1.2", runner=runner, local_interfaces=_laptop()
+    )
+
+    assert ok is False
+    assert "re-homed" in detail
+    assert "en0" in detail
+    assert "en4" in detail
+
+
+def test_data_plane_check_flags_an_unanswered_ping():
+    def runner(_host, command):
+        if command[0] == "/sbin/route":
+            return subprocess.CompletedProcess(command, 0, "interface: en4\n", "")
+        return subprocess.CompletedProcess(command, 1, "", "")
+
+    ok, detail = check_data_plane_reachability(
+        "10.0.1.2", runner=runner, local_interfaces=_laptop()
+    )
+
+    assert ok is False
+    assert "did not answer" in detail
+
+
+def test_data_plane_check_is_inconclusive_with_no_local_subnet_match():
+    """A multi-hop peer this Mac cannot reach in one hop must not read as a
+    confirmed failure -- there is nothing to check yet, not evidence of a
+    broken fabric."""
+
+    def explode(_host, _command):
+        raise AssertionError("must not run a command with no subnet match")
+
+    ok, detail = check_data_plane_reachability(
+        "203.0.113.5", runner=explode, local_interfaces=_laptop()
+    )
+
+    assert ok is None
+    assert "no local interface" in detail
+
+
+def test_data_plane_check_rejects_a_malformed_address():
+    ok, detail = check_data_plane_reachability(
+        "not-an-ip", runner=lambda *a: None, local_interfaces=_laptop()
+    )
+
+    assert ok is None
+    assert "not a valid" in detail
+
+
+def test_data_plane_check_tolerates_platforms_without_route_n_get():
+    """Linux has no ``route -n get``; the ping alone must still be a real
+    reachability proof, just without the interface-re-homing check."""
+
+    def runner(_host, command):
+        if command[0] == "/sbin/route":
+            return subprocess.CompletedProcess(command, 1, "", "no such command")
+        return subprocess.CompletedProcess(command, 0, "one packet received\n", "")
+
+    ok, detail = check_data_plane_reachability(
+        "10.0.1.2", runner=runner, local_interfaces=_laptop()
+    )
+
+    assert ok is True
+    assert detail == ""
 
 
 def test_the_detected_link_speed_is_carried_into_the_explanation():
