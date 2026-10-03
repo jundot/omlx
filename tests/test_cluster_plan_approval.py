@@ -72,7 +72,7 @@ def test_soft_weight_target_is_clamped_to_current_safe_budget():
 # ---------------------------------------------------------------------------
 
 
-def _layout(path: str):
+def _layout(path: str, *, text_only: bool = False):
     from omlx.cluster.planner import ModelLayout
 
     return ModelLayout(
@@ -156,7 +156,7 @@ def cluster(tmp_path, monkeypatch):
         def __init__(self):
             self.entry = SimpleNamespace(engine=None)
 
-        def resolve_cluster_model_id(self, path):
+        def resolve_cluster_model_id(self, path, *, text_only=False):
             assert path == str(model_path)
             return "big"
 
