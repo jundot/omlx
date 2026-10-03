@@ -22,7 +22,7 @@ import os
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -290,6 +290,8 @@ class EngineEntry:
     model_context_length: int | None = (
         None  # Declared context length from config.json (None if unknown)
     )
+    reasoning_effort_options: list[str] = field(default_factory=list)
+    reasoning_effort_default: str | None = None
     source_type: str = "local"
     source_repo_id: str | None = None
     is_helper: bool = False  # Speculative-decoding drafter (dFlash/Assistant/MTP)
@@ -1336,6 +1338,12 @@ class EnginePool:
                     estimated_size=info.estimated_size,
                     text_only_size=getattr(info, "text_only_size", 0),
                     config_model_type=getattr(info, "config_model_type", ""),
+                    reasoning_effort_options=list(
+                        getattr(info, "reasoning_effort_options", [])
+                    ),
+                    reasoning_effort_default=getattr(
+                        info, "reasoning_effort_default", None
+                    ),
                     thinking_default=getattr(info, "thinking_default", None),
                     preserve_thinking_default=getattr(
                         info, "preserve_thinking_default", None
@@ -4003,6 +4011,8 @@ class EnginePool:
                     ),
                     "model_context_length": e.model_context_length,
                     "is_helper": e.is_helper,
+                    "reasoning_effort_options": list(e.reasoning_effort_options),
+                    "reasoning_effort_default": e.reasoning_effort_default,
                     "thinking_default": e.thinking_default,
                     "preserve_thinking_default": e.preserve_thinking_default,
                     "source_type": e.source_type,

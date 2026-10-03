@@ -19,7 +19,7 @@ Usage:
 Which launches:
     codex app
 
-Both CLI and App use the same config file:
+The App persists the provider and refreshed model catalog in:
     ~/.codex/config.toml
 """
 
@@ -86,10 +86,8 @@ class CodexAppIntegration(Integration):
         return resolve_codex_binary() is not None
 
     def get_command(self, ctx: IntegrationContext) -> str:
-        return (
-            f"{get_cli_command_prefix()} "
-            f"launch codex_app --model {ctx.model or 'select-a-model'}"
-        )
+        command = f"{get_cli_command_prefix()} launch codex_app"
+        return f"{command} --model {ctx.model}" if ctx.model else command
 
     def configure(self, ctx: IntegrationContext) -> None:
         write_codex_config(self.CONFIG_PATH, ctx)
