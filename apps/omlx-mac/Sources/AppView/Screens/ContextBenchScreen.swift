@@ -309,7 +309,7 @@ private struct ResultSection: View {
                         .foregroundStyle(theme.text)
                         .monospacedDigit()
                     Text(String(localized: "bench.context.result.tokens_label",
-                                defaultValue: "tokens applied to Context Window",
+                                defaultValue: "Tokens applied to Context Window",
                                 comment: "Unit caption next to the applied context window headline number"))
                         .font(.omlxText(12))
                         .foregroundStyle(theme.textSecondary)
@@ -390,7 +390,7 @@ private struct ResultSection: View {
 
     private var prefillTpsLabel: String {
         guard let tps = result.prefillTps, tps > 0 else { return "—" }
-        return "\(Int(tps.rounded()).formatted()) tok/s"
+        return "\(Int(tps.rounded()).formatted()) Tok/s"
     }
 
     private var durationLabel: String {

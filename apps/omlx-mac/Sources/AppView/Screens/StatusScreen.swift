@@ -335,13 +335,13 @@ private struct StatTilesRow: View {
                 label: String(localized: "status.tile.total",
                               defaultValue: "Total Prefill Tokens",
                               comment: "Stat tile label for total prefill tokens processed"),
-                value: stats.map { fmtNum($0.totalPromptTokens) } ?? "—"
+                value: stats.map { CountFormat.compact($0.totalPromptTokens) } ?? "—"
             )
             StatTile(
                 label: String(localized: "status.tile.cached",
                               defaultValue: "Cached Tokens",
                               comment: "Stat tile label for cached tokens"),
-                value: stats.map { fmtNum($0.totalCachedTokens) } ?? "—"
+                value: stats.map { CountFormat.compact($0.totalCachedTokens) } ?? "—"
             )
             StatTile(
                 label: String(localized: "status.tile.cache_efficiency",
@@ -412,13 +412,13 @@ private struct AverageSpeedTilesRow: View {
                 label: String(localized: "status.speed.prompt_processing.tile",
                               defaultValue: "Prompt Processing (excl. cached)",
                               comment: "Tile label for average prompt-processing speed excluding cached tokens"),
-                value: stats.map { String(format: "%.1f tok/s", $0.avgPrefillTps) } ?? "—"
+                value: stats.map { String(format: "%.1f Tok/s", $0.avgPrefillTps) } ?? "—"
             )
             StatTile(
                 label: String(localized: "status.speed.token_generation",
                               defaultValue: "Token Generation",
                               comment: "Label for average token-generation speed"),
-                value: stats.map { String(format: "%.1f tok/s", $0.avgGenerationTps) } ?? "—"
+                value: stats.map { String(format: "%.1f Tok/s", $0.avgGenerationTps) } ?? "—"
             )
         }
         .padding(.horizontal, 14)
@@ -770,14 +770,4 @@ private struct UpdatesSection: View {
                       defaultValue: "Last checked \(formatter.string(from: date))",
                       comment: "Last-checked text when the last check was before today; placeholder is the formatted date and time")
     }
-}
-
-// MARK: - Helpers
-
-private func fmtNum(_ n: Int) -> String {
-    let v = Double(n)
-    if v >= 1e9 { return String(format: "%.2fB", v / 1e9) }
-    if v >= 1e6 { return String(format: "%.2fM", v / 1e6) }
-    if v >= 1e3 { return String(format: "%.1fK", v / 1e3) }
-    return String(n)
 }
