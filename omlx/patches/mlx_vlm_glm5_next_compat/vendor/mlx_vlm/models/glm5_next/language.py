@@ -1605,6 +1605,12 @@ class Glm5NextMoEGate(nn.Module):
         self.weight = mx.zeros((config.n_routed_experts, config.hidden_size))
         self.e_score_correction_bias = mx.zeros((config.n_routed_experts,))
 
+    def to_quantized(self, group_size=64, bits=4, mode="affine"):
+        # Explicit checkpoint recipes can bypass the model quant_predicate.
+        # This router consumes only floating weights restored by sanitize;
+        # keep it dense when the loader applies those recipes.
+        return self
+
     def __call__(self, x):
         if (
             _DECODE_FUSION
@@ -1994,6 +2000,50 @@ class Glm5NextModel(nn.Module):
         return self.norm(h)
 
 
+def _dequantize_router_gates(weights, hidden_size):
+    """Restore affine router weights before strict loading into a plain gate."""
+    for scales_key in [k for k in weights if k.endswith(".mlp.gate.scales")]:
+        prefix = scales_key[: -len("scales")]
+        weight_key = prefix + "weight"
+        if weight_key not in weights:
+            continue
+        packed = weights[weight_key]
+        scales = weights[scales_key]
+        biases = weights.get(prefix + "biases")
+        if (
+            hidden_size <= 0
+            or packed.ndim != 2
+            or scales.ndim != 2
+            or packed.dtype != mx.uint32
+            or not mx.issubdtype(scales.dtype, mx.floating)
+            or scales.shape[0] != packed.shape[0]
+            or scales.shape[-1] == 0
+            or hidden_size % scales.shape[-1]
+            or (packed.shape[-1] * 32) % hidden_size
+            or (packed.shape[-1] * 32 // hidden_size) not in (2, 3, 4, 5, 6, 8)
+            or (hidden_size // scales.shape[-1]) not in (32, 64, 128)
+            or biases is None
+            or biases.shape != scales.shape
+        ):
+            raise ValueError(
+                f"{weight_key}: cannot infer quantization from shapes "
+                f"{tuple(packed.shape)} / {tuple(scales.shape)}"
+            )
+        # Unlike Linear, the MoE router has no quantized module to consume
+        # scales/biases. Stock bf16 gates are also promoted to fp32 below.
+        weights[weight_key] = mx.dequantize(
+            packed,
+            scales,
+            biases,
+            group_size=hidden_size // scales.shape[-1],
+            bits=packed.shape[-1] * 32 // hidden_size,
+            mode="affine",
+        ).astype(mx.float32)
+        weights.pop(scales_key)
+        weights.pop(prefix + "biases", None)
+    return weights
+
+
 class LanguageModel(nn.Module):
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()
@@ -2028,6 +2078,7 @@ class LanguageModel(nn.Module):
 
     def sanitize(self, weights):
         weights = {k: v for k, v in weights.items() if "mtp." not in k}
+        weights = _dequantize_router_gates(weights, self.args.hidden_size)
         weights = DSV32Model.sanitize(self, weights)
 
         remapped = {}
