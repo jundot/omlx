@@ -480,6 +480,39 @@ async def test_qwen_ane_prefill_rejects_other_model_families():
 
 
 @pytest.mark.asyncio
+async def test_qwen_ane_prefill_rejects_moe_variants():
+    """qwen3_5_moe matches the family prefix but the ANE path serves dense
+    MLPs only — enabling it on a MoE silently corrupts routed-expert output
+    (verified live), so the gate must refuse it explicitly."""
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5_moe"
+
+    with pytest.raises(admin_routes.HTTPException, match="MoE"):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
+        )
+
+
+@pytest.mark.asyncio
+async def test_qwen_ane_prefill_disable_allowed_on_moe():
+    """Turning ANE OFF must never be blocked — a MoE model that got the
+    setting enabled through an older server must be able to clear it."""
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5_moe"
+    settings = ModelSettings(qwen35_ane_prefill_enabled=True)
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=False),
+    )
+
+    assert settings.qwen35_ane_prefill_enabled is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("depth", [3, 4, 5, 6, 8])
 async def test_mtp_draft_tokens_is_persisted_not_dropped(depth):
     """#2823: mtp_adaptive_max_depth used to be silently discarded by PUT."""

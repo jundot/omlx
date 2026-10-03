@@ -2919,10 +2919,33 @@ async def update_model_settings(
             else bool(request.turboquant_skip_last)
         )
     # Shared load-time ANE controls. Model metadata selects limits and backend.
+    ane_backend = ane_prefill_backend(entry.config_model_type)
     if "qwen35_ane_prefill_enabled" in sent:
-        current_settings.qwen35_ane_prefill_enabled = bool(
-            request.qwen35_ane_prefill_enabled
-        )
+        enabled = bool(request.qwen35_ane_prefill_enabled)
+        config_type = str(getattr(entry, "config_model_type", "") or "")
+        config_type = config_type.lower().replace("-", "_")
+        if enabled and ane_backend is None:
+            raise HTTPException(
+                status_code=400,
+                detail="ANE prefill is unavailable for this model.",
+            )
+        # The qwen backend's family match lets MoE variants (qwen3_5_moe,
+        # ...) slip through, but the ANE patch offloads *dense* MLPs only —
+        # on a MoE model it silently corrupts output while running at
+        # plausible speed (verified live: pure "!!!" garbage on any prompt
+        # long enough to engage the fixed-shape ANE path, with the corrupted
+        # prefill then persisted into the SSD prefix cache). The k2 backend
+        # has no MoE variant, so this is scoped to qwen only.
+        if enabled and ane_backend == "qwen" and "moe" in config_type:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "ANE prefill supports only dense Qwen3.5/3.6/3.8 models; "
+                    "MoE variants are unsupported (the fixed-shape ANE path "
+                    "cannot serve routed experts and corrupts their output)."
+                ),
+            )
+        current_settings.qwen35_ane_prefill_enabled = enabled
     if "qwen35_ane_prefill_sequence_length" in sent:
         value = request.qwen35_ane_prefill_sequence_length
         if value is None:

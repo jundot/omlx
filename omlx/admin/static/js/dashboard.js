@@ -5,6 +5,7 @@
     const DSA_MODEL_TYPES = new Set([
         'deepseek_v32', 'glm_moe_dsa',
     ]);
+    const QWEN35_ANE_CONFIG_PREFIXES = ['qwen3_5', 'qwen3_6', 'qwen3_8'];
     const DIFFUSION_CONFIG_MODEL_TYPES = new Set([
         'diffusion_gemma',
     ]);
@@ -1697,6 +1698,18 @@
                     .toLowerCase()
                     .replace(/-/g, '_');
                 return DIFFUSION_CONFIG_MODEL_TYPES.has(modelType);
+            },
+
+            isQwen35AnePrefillModel(model) {
+                const modelType = String(model?.config_model_type || '')
+                    .toLowerCase()
+                    .replace(/-/g, '_');
+                // Dense only: MoE variants (qwen3_5_moe, ...) match the
+                // prefixes but the fixed-shape ANE path cannot serve routed
+                // experts and silently corrupts their output. Mirrors the
+                // backend gate in update_model_settings.
+                if (modelType.includes('moe')) return false;
+                return QWEN35_ANE_CONFIG_PREFIXES.some(prefix => modelType.startsWith(prefix));
             },
 
             isDiffusionUnsupportedProfileField(field) {
