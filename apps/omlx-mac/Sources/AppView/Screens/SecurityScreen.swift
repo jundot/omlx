@@ -23,7 +23,7 @@ struct SecurityScreen: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            APIKeySection(vm: vm, client: services.client)
+            APIKeySection(vm: vm, services: services)
             AuthenticationSection(vm: vm, client: services.client)
             SubKeysSection(vm: vm, client: services.client)
 
@@ -37,7 +37,7 @@ struct SecurityScreen: View {
 
 private struct APIKeySection: View {
     var vm: SecurityScreenVM
-    let client: OMLXClient
+    let services: AppServices
 
     var body: some View {
         SectionHeader(
@@ -50,14 +50,14 @@ private struct APIKeySection: View {
         )
 
         ListGroup {
-            APIKeyEditorRow(vm: vm, client: client)
+            APIKeyEditorRow(vm: vm, services: services)
         }
     }
 }
 
 private struct APIKeyEditorRow: View {
     var vm: SecurityScreenVM
-    let client: OMLXClient
+    let services: AppServices
 
     @State private var draft: String = ""
     @State private var showKey: Bool = false
@@ -178,7 +178,7 @@ private struct APIKeyEditorRow: View {
         saving = true
         defer { saving = false }
         let next = trimmed
-        let ok = await vm.applyApiKey(next, client: client)
+        let ok = await vm.applyApiKey(next, services: services)
         if ok {
             // Drop focus so the next `.task(id:)` mirror picks up the fresh
             // loaded value without fighting an in-progress edit.
