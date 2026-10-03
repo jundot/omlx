@@ -1506,8 +1506,24 @@ class TestSettingsSnapshotRoutes:
         assert body["applied"]["display_name"] is None
         assert body["applied"]["is_pinned"] is False
         assert body["skipped"] == []
-        assert body["settings"] == ModelSettings().to_dict()
-        assert mgr.get_settings("model-a").to_dict() == ModelSettings().to_dict()
+        defaults = ModelSettings().to_dict()
+        # settings_revision is monotonic metadata the reset bump maintains, not
+        # a user-visible default to clear.
+        defaults.pop("settings_revision", None)
+        defaults = ModelSettings().to_dict()
+        # settings_revision is monotonic metadata the reset's own write bump
+        # maintains — not a user-visible default to clear.
+        defaults.pop("settings_revision", None)
+        body_settings = {
+            k: v for k, v in body["settings"].items() if k != "settings_revision"
+        }
+        assert body_settings == defaults
+        saved_settings = {
+            k: v
+            for k, v in mgr.get_settings("model-a").to_dict().items()
+            if k != "settings_revision"
+        }
+        assert saved_settings == defaults
         assert state.default_model is None
         assert pool.get_entry("model-a").is_pinned is False
 

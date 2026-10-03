@@ -233,7 +233,7 @@ def test_admin_uses_adjusted_residency_for_offload_models(tmp_path, kind):
         ),
         patch.object(routes, "_get_global_settings", return_value=None),
         patch.object(routes, "_dflash_compat_for_model", return_value=(False, "")),
-        patch.object(routes, "_mtp_compat_for_model", return_value=(False, "")),
+        patch.object(routes, "_mtp_compat_for_model", return_value=(False, "", False)),
         patch.object(routes, "_paroquant_compat_for_model", return_value=(False, "")),
         patch("omlx.patches." + estimator, return_value=estimate),
         patch(

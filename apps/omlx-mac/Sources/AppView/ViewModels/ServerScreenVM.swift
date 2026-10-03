@@ -28,6 +28,10 @@ final class ServerScreenVM {
     private(set) var isLoading = false
     private(set) var isResetting = false
     var lastError: String?
+    /// Non-fatal notice for the offline endpoint-only Apply path (§G4) —
+    /// mirrors `WelcomeViewModel.apiKeyWarning`, the established pattern for
+    /// an informational message distinct from `lastError`.
+    var offlineApplyNotice: String?
     private(set) var isMovingBasePath: Bool = false
 
     // Server default profile (GlobalSettings.sampling). Backed by 6
@@ -242,6 +246,7 @@ final class ServerScreenVM {
         let t = { (s: String) in s.trimmingCharacters(in: .whitespaces) }
         var patch = GlobalSettingsPatch()
         var nextPort: Int? = nil
+        self.offlineApplyNotice = nil
         let nextHost = hasPendingDefaults && host != appliedBindAddress ? host : nil
         if hasPendingDefaults {
             patch.host = nextHost
@@ -387,7 +392,12 @@ final class ServerScreenVM {
                     self.effectivePort = nextPort
                     self.baselinePortText = String(nextPort)
                     self.lastError = nil
-                } catch {
+                    self.offlineApplyNotice = String(
+                        localized: "server.notice.offline_apply_saved",
+                        defaultValue: "Saved locally — takes effect the next time the server starts.",
+                        comment: "Server screen notice after an offline-only Apply of the listen port"
+                    )
+} catch {
                     self.lastError = error.omlxDescription
                 }
             }
@@ -581,6 +591,13 @@ final class ServerScreenVM {
         self.basePathText = config.basePath
         if !hasLoaded {
             self.modelDirTexts = config.effectiveModelDirs
+            // Without this, baselines stay at their hardcoded struct
+            // defaults (e.g. "8000") while the drafts above just got set
+            // from the real local config — if the server is offline on
+            // first load and the user's actual port isn't the default, the
+            // Apply button would show "pending changes" immediately with
+            // nothing touched (§G4).
+            snapshotApplyBaselines()
         }
     }
 
@@ -642,29 +659,25 @@ final class ServerScreenVM {
     /// hit Enter on the field OR just click Restart — both reach the same
     /// place.
     func restart(services: AppServices) {
+        // Validate the port text independently of whether it changed —
+        // previously `portChanged` defaulted to false when parsing failed
+        // (`parsedPort.map{...} ?? false`), which silently skipped BOTH
+        // validation guards below for malformed text instead of catching it.
         let trimmedPort = portText.trimmingCharacters(in: .whitespaces)
-        let parsedPort = Int(trimmedPort)
-        let portChanged = parsedPort.map { $0 != effectivePort } ?? false
+        guard let parsedPort = Int(trimmedPort), (1...65535).contains(parsedPort) else {
+            self.lastError = String(localized: "server.error.port_invalid",
+                                    defaultValue: "Port must be a number between 1 and 65535.",
+                                    comment: "Server screen error when port value is out of valid range")
+            return
+        }
+        let portChanged = parsedPort != effectivePort
         let hostChanged = host != appliedBindAddress
-
-        if portChanged, let p = parsedPort, !(1...65535).contains(p) {
-            self.lastError = String(localized: "server.error.port_invalid",
-                                    defaultValue: "Port must be a number between 1 and 65535.",
-                                    comment: "Server screen error when port value is out of valid range")
-            return
-        }
-        if parsedPort == nil {
-            self.lastError = String(localized: "server.error.port_invalid",
-                                    defaultValue: "Port must be a number between 1 and 65535.",
-                                    comment: "Server screen error when port value is out of valid range")
-            return
-        }
 
         Task {
             do {
                 if portChanged || hostChanged {
-                    if portChanged, let p = parsedPort {
-                        guard await commit(GlobalSettingsPatch(port: p)) else { return }
+                    if portChanged {
+                        guard await commit(GlobalSettingsPatch(port: parsedPort)) else { return }
                     }
                     if hostChanged {
                         guard await commit(GlobalSettingsPatch(host: host)) else { return }
@@ -673,7 +686,7 @@ final class ServerScreenVM {
                         host: hostChanged ? host : nil,
                         port: portChanged ? parsedPort : nil
                     )
-                    if let p = parsedPort, portChanged { self.effectivePort = p }
+                    if portChanged { self.effectivePort = parsedPort }
                     if hostChanged {
                         self.appliedBindAddress = host
                         self.effectiveHost = AppConfig.connectableHost(for: host)
