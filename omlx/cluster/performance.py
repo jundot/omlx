@@ -169,6 +169,9 @@ class ExecutionSettings:
     prompt_cache_ssd_max_bytes: int = 20 * 1024**3
     sampling_rank_only: bool = True
     async_overlap: bool = True
+    # Lightning MTP across the ranks (SPMD: every rank runs the same draft/verify
+    # cycle). Needs the lockstep sampler, so it excludes sampling_rank_only.
+    mtp: bool = False
     ring_connections_per_ip: int = 2
     tuning_reason: str = "balanced profile defaults"
 
@@ -203,6 +206,10 @@ class ExecutionSettings:
                 not isinstance(value, int) or isinstance(value, bool) or value <= 0
             ):
                 raise ValueError(f"{name} must be a positive integer when set")
+        if self.mtp and self.sampling_rank_only:
+            raise ValueError(
+                "mtp needs the lockstep sampler: disable sampling_rank_only"
+            )
         if not isinstance(self.tuning_reason, str) or not self.tuning_reason:
             raise ValueError("tuning_reason is required")
 
@@ -222,6 +229,7 @@ class ExecutionSettings:
             "prompt_cache_ssd_max_bytes": self.prompt_cache_ssd_max_bytes,
             "sampling_rank_only": self.sampling_rank_only,
             "async_overlap": self.async_overlap,
+            "mtp": self.mtp,
             "ring_connections_per_ip": self.ring_connections_per_ip,
             "tuning_reason": self.tuning_reason,
         }

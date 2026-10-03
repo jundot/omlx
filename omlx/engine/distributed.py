@@ -474,17 +474,18 @@ raise SystemExit(2)
         settings = self._model_settings
         if settings is None:
             return
-        incompatible = [
-            name
-            for name in (
-                "dflash_enabled",
-                "specprefill_enabled",
-                "mtp_enabled",
-                "vlm_mtp_enabled",
-                "turboquant_kv_enabled",
-            )
-            if bool(getattr(settings, name, False))
+        # Lightning MTP is carried by the deployment (``execution.mtp``): every
+        # rank then runs the same draft/verify cycle. The model setting alone is
+        # refused so a pipeline never silently drops (or half-enables) it.
+        names = [
+            "dflash_enabled",
+            "specprefill_enabled",
+            "vlm_mtp_enabled",
+            "turboquant_kv_enabled",
         ]
+        if not self.deployment.execution.mtp:
+            names.append("mtp_enabled")
+        incompatible = [name for name in names if bool(getattr(settings, name, False))]
         if incompatible:
             raise ValueError(
                 "distributed inference cannot be combined with "
