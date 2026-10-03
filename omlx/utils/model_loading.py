@@ -879,13 +879,33 @@ def maybe_apply_pre_load_patches(
                 backend = (
                     "embedded DSpark" if _has_dspark_heads(config) else "Lightning MTP"
                 )
-                logger.info(
-                    "Speculative backend selected for %s: %s "
-                    "(model_type=%s, active)",
-                    model_name,
-                    backend,
-                    model_type,
+                # Lightning MTP attaches an MTPModule keyed on the mtp.*
+                # tensors, so it is the only backend that can be probed for
+                # them here. DSpark is declared purely in config and has no
+                # separate weight namespace to scan, so a missing mtp.* is not
+                # evidence about it (#4000).
+                missing_mtp_weights = backend == "Lightning MTP" and (
+                    not _checkpoint_has_mtp_weights(model_name)
                 )
+                if missing_mtp_weights:
+                    logger.warning(
+                        "Speculative backend requested for %s: %s "
+                        "(model_type=%s) is INACTIVE — the config declares MTP "
+                        "heads but the checkpoint ships no MTP weights, so no "
+                        "draft head is attached and every MTP depth setting "
+                        "will decode identically.",
+                        model_name,
+                        backend,
+                        model_type,
+                    )
+                else:
+                    logger.info(
+                        "Speculative backend selected for %s: %s "
+                        "(model_type=%s, active)",
+                        model_name,
+                        backend,
+                        model_type,
+                    )
             else:
                 logger.debug(
                     "Native MTP patch applied for %s for sanitize correctness "

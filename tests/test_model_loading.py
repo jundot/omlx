@@ -2,6 +2,7 @@
 """Tests for omlx.utils.model_loading.maybe_load_custom_quantization."""
 
 import json
+import logging
 import sys
 import types
 from unittest.mock import MagicMock
@@ -662,6 +663,112 @@ class TestVlmMtpPreLoadDispatch:
         sanitize_mock.assert_not_called()
         runtime_mock.assert_not_called()
         assert calls == []
+
+
+class TestSpeculativeBackendLogTruthfulness:
+    """The "active" line must not be printed for a head that never attaches.
+
+    A checkpoint can declare MTP heads in config.json while shipping no
+    ``mtp.*`` tensors. Nothing attaches, every MTP depth setting decodes
+    identically, and users read the "active" log line as confirmation that
+    speculative decoding is running (#4000).
+    """
+
+    @staticmethod
+    def _stub_mlx_lm_mtp(monkeypatch):
+        """Only the mlx-lm side needs stubbing; these tests run for_vlm=False."""
+        monkeypatch.setattr(model_loading, "_patch_mlx_lm_load_config", lambda: None)
+        stub = MagicMock(apply_mlx_lm_mtp_patch=MagicMock(return_value=True))
+        monkeypatch.setitem(sys.modules, "omlx.patches.mlx_lm_mtp", stub)
+        return stub
+
+    @staticmethod
+    def _checkpoint(tmp_path, config_body: str, *, has_mtp: bool) -> str:
+        path = _write_config(tmp_path, config_body)
+        _write_mtp_index(tmp_path, has_mtp=has_mtp)
+        return path
+
+    def test_warns_when_config_declares_mtp_but_weights_missing(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        self._stub_mlx_lm_mtp(monkeypatch)
+        path = self._checkpoint(
+            tmp_path,
+            '{"model_type": "qwen3_5", "num_nextn_predict_layers": 1}',
+            has_mtp=False,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            maybe_apply_pre_load_patches(
+                path, model_settings=types.SimpleNamespace(mtp_enabled=True)
+            )
+
+        assert "is INACTIVE" in caplog.text
+        assert "ships no MTP weights" in caplog.text
+        assert "Speculative backend selected" not in caplog.text
+
+    def test_keeps_active_line_when_weights_present(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        self._stub_mlx_lm_mtp(monkeypatch)
+        path = self._checkpoint(
+            tmp_path,
+            '{"model_type": "qwen3_5", "num_nextn_predict_layers": 1}',
+            has_mtp=True,
+        )
+
+        with caplog.at_level(logging.INFO):
+            maybe_apply_pre_load_patches(
+                path, model_settings=types.SimpleNamespace(mtp_enabled=True)
+            )
+
+        assert "Speculative backend selected" in caplog.text
+        assert "is INACTIVE" not in caplog.text
+
+    def test_dspark_backend_is_not_probed_for_mtp_weights(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """DSpark is declared in config only and has no mtp.* namespace.
+
+        Probing it would turn a healthy DSpark checkpoint into a false
+        "INACTIVE" warning.
+        """
+        self._stub_mlx_lm_mtp(monkeypatch)
+        path = self._checkpoint(
+            tmp_path,
+            '{"model_type": "qwen3_5", "dspark_block_size": 4, '
+            '"dspark_target_layer_ids": [10]}',
+            has_mtp=False,
+        )
+        probe = MagicMock(side_effect=model_loading._checkpoint_has_mtp_weights)
+        monkeypatch.setattr(model_loading, "_checkpoint_has_mtp_weights", probe)
+
+        with caplog.at_level(logging.INFO):
+            maybe_apply_pre_load_patches(
+                path, model_settings=types.SimpleNamespace(mtp_enabled=True)
+            )
+
+        assert "embedded DSpark" in caplog.text
+        assert "is INACTIVE" not in caplog.text
+        # The mtp.* probe must short-circuit rather than report on DSpark.
+        probe.assert_not_called()
+
+    def test_no_probe_when_mtp_disabled(self, tmp_path, monkeypatch):
+        """MTP off keeps the debug line and must not scan the checkpoint."""
+        self._stub_mlx_lm_mtp(monkeypatch)
+        path = self._checkpoint(
+            tmp_path,
+            '{"model_type": "qwen3_5", "num_nextn_predict_layers": 1}',
+            has_mtp=False,
+        )
+        probe = MagicMock(side_effect=model_loading._checkpoint_has_mtp_weights)
+        monkeypatch.setattr(model_loading, "_checkpoint_has_mtp_weights", probe)
+
+        maybe_apply_pre_load_patches(
+            path, model_settings=types.SimpleNamespace(mtp_enabled=False)
+        )
+
+        probe.assert_not_called()
 
 
 class TestCheckpointHasMtpWeights:
