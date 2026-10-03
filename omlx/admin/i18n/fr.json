@@ -2031,5 +2031,7 @@
   "cluster.v2.join.cleanup_forgotten": "Ancien nettoyage oublié sur ce Mac. Le nettoyage distant n’a pas été confirmé.",
   "cluster.v2.join.forget_cleanup_error": "Impossible d’oublier ce nettoyage.",
   "cluster.v2.membership.waiting_request": "En attente du code et de la demande de couplage de ce Mac.",
-  "cluster.v2.membership.add_device": "Ajouter ce Mac"
+  "cluster.v2.membership.add_device": "Ajouter ce Mac",
+  "js.error.model_settings_conflict": "Settings for this model changed on the server since you opened this form.",
+  "js.confirm.model_settings_conflict_choice": "Click OK to load the latest settings (your unsaved edits will be lost), or Cancel to overwrite the server with your current changes."
 }

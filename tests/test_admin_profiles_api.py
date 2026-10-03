@@ -1506,8 +1506,19 @@ class TestSettingsSnapshotRoutes:
         assert body["applied"]["display_name"] is None
         assert body["applied"]["is_pinned"] is False
         assert body["skipped"] == []
-        assert body["settings"] == ModelSettings().to_dict()
-        assert mgr.get_settings("model-a").to_dict() == ModelSettings().to_dict()
+        # settings_revision is a persistence counter, not a setting: reset
+        # writes bump it (see docs/dashboard-model-config-sync.md), so the
+        # other fields must be defaults while the counter stays > 0.
+        defaults = {
+            k: v
+            for k, v in ModelSettings().to_dict().items()
+            if k != "settings_revision"
+        }
+        assert {k: v for k, v in body["settings"].items() if k != "settings_revision"} == defaults
+        assert body["settings"]["settings_revision"] > 0
+        stored = mgr.get_settings("model-a").to_dict()
+        assert {k: v for k, v in stored.items() if k != "settings_revision"} == defaults
+        assert stored["settings_revision"] > 0
         assert state.default_model is None
         assert pool.get_entry("model-a").is_pinned is False
 

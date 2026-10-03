@@ -116,6 +116,10 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "deepseek_v41_ced_prefill_enabled",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
+        # Per-model write counter, not a setting — a stored profile must
+        # never be able to rewind or forge a model's settings_revision on
+        # apply. See docs/dashboard-model-config-sync.md.
+        "settings_revision",
     }
 )
 
