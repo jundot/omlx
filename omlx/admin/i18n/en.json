@@ -159,6 +159,8 @@
   "status.integrations.copy_command_tooltip": "Copy command",
   "status.engines.section_label": "Engine Versions",
   "status.engines.unknown_version": "unknown",
+  "status.runtime.section_label": "MLX Runtime",
+  "status.runtime.not_installed": "not installed",
   "status.active_models.last_token_ago": "last token {age} ago",
   "status.integrations.claude_code": "Claude Code",
   "status.integrations.copilot_cli": "Copilot CLI",

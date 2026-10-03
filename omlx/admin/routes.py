@@ -61,6 +61,9 @@ from ..utils.hardware import (
     get_chip_name,
     get_gpu_core_count,
     get_io_platform_uuid,
+    get_mlx_lm_version,
+    get_mlx_version,
+    get_mlx_vlm_version,
     get_total_memory_gb,
     parse_chip_info,
 )
@@ -5991,6 +5994,42 @@ async def get_logs(
 # =============================================================================
 
 
+# hardware.py degrades to this literal when a package is not importable; the
+# dashboard renders it as "not installed" rather than as a version.
+_MLX_VERSION_UNKNOWN = "unknown"
+
+
+def _get_runtime_versions() -> dict:
+    """Get the installed MLX runtime versions for the dashboard.
+
+    Read-only introspection: the version strings come straight from the
+    already-imported ``mlx`` / ``mlx_lm`` / ``mlx_vlm`` modules. A server
+    running without the MLX stack must still render the dashboard, so every
+    getter is called defensively and an unusable value collapses to None
+    rather than propagating out of the status endpoint.
+    """
+    packages = {
+        "mlx": ("mlx", get_mlx_version),
+        "mlx_lm": ("mlx-lm", get_mlx_lm_version),
+        "mlx_vlm": ("mlx-vlm", get_mlx_vlm_version),
+    }
+
+    runtime: dict[str, dict] = {}
+    for key, (name, getter) in packages.items():
+        try:
+            raw = getter()
+        except Exception:  # noqa: BLE001 - a cosmetic card must never 500 stats
+            logger.debug("MLX runtime version lookup failed for %s", name, exc_info=True)
+            raw = None
+
+        text = "" if raw is None else str(raw).strip()
+        version = None if not text or text.lower() == _MLX_VERSION_UNKNOWN else text
+
+        runtime[key] = {"name": name, "version": version}
+
+    return runtime
+
+
 def _get_engine_info() -> dict:
     """Get commit SHA and GitHub URL for engine packages.
 
@@ -6584,6 +6623,7 @@ async def get_server_stats(
         "api_key": api_key or "",
         "cli_prefix": get_cli_prefix(),
         "engines": _get_engine_info(),
+        "runtime": _get_runtime_versions(),
         "active_models": active_models_data,
         "runtime_cache": runtime_cache_data,
     }

@@ -159,6 +159,8 @@
   "status.integrations.copy_command_tooltip": "Kopírovat příkaz",
   "status.engines.section_label": "Verze enginů",
   "status.engines.unknown_version": "neznámá",
+  "status.runtime.section_label": "Runtime MLX",
+  "status.runtime.not_installed": "nenainstalováno",
   "status.active_models.last_token_ago": "poslední token před {age}",
   "status.integrations.claude_code": "Claude Code",
   "status.integrations.copilot_cli": "Copilot CLI",
