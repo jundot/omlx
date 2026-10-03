@@ -36,6 +36,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
 from ..api.utils import _try_parse_json
+from ..model_discovery import is_splash_package
 from ..model_discovery import model_display_name as _model_display_name
 from ..model_profiles import (
     EXCLUDED_FROM_PROFILES,
@@ -55,6 +56,7 @@ from ..model_settings import (
     merge_chat_template_kwargs,
 )
 from ..patches.moe_offload_compat import moe_offload_compatibility
+from ..process_memory_enforcer import _format_gb
 from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
 from ..utils.hardware import (
     compute_owner_hash,
@@ -356,6 +358,8 @@ class ModelSettingsRequest(BaseModel):
     specprefill_keep_pct: float | None = None
     specprefill_threshold: int | None = None
     # DFlash (block diffusion speculative decoding)
+    splash_enabled: bool | None = None
+    splash_build: str | None = None
     dflash_enabled: bool | None = None
     dflash_draft_model: str | None = None
     dflash_draft_quant_enabled: bool | None = None
@@ -874,6 +878,30 @@ def _dflash_compat_for_model(model_info: dict) -> tuple[bool, str]:
     return is_dflash_compatible(model_path)
 
 
+def _splash_compat_for_model(
+    model_info: dict, build_id: str | None
+) -> tuple[bool, str]:
+    """Resolve Splash compatibility for an engine_pool model dict.
+
+    Splash packages always run on Splash; for them this reports whether an
+    installed build can serve them.
+    """
+    if model_info.get("engine_type") not in ("batched", "vlm", "splash"):
+        return False, ""
+    model_path = model_info.get("model_path") or ""
+    if not model_path:
+        return False, "model_path missing"
+    from ..engine.splash import is_splash_compatible
+
+    return is_splash_compatible(model_path, model_info.get("source_repo_id"), build_id)
+
+
+def _installed_splash_builds() -> list[dict]:
+    from ..engine.splash import find_splash_builds
+
+    return [{"id": b.id, "label": b.label} for b in find_splash_builds()]
+
+
 def _entry_is_diffusion_model(entry) -> bool:
     model_type = (getattr(entry, "config_model_type", None) or "").lower()
     return model_type.replace("-", "_") == "diffusion_gemma"
@@ -926,6 +954,8 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["moe_expert_offload_enabled"] = False
     settings["moe_expert_offload_resident_fraction"] = 0.25
     settings["specprefill_enabled"] = False
+    settings["splash_enabled"] = False
+    settings["splash_build"] = None
     settings["dflash_enabled"] = False
     settings["dflash_in_memory_cache"] = True
     settings["dflash_in_memory_cache_max_entries"] = 4
@@ -2368,6 +2398,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
     )
     dflash_ssd_cache_available = bool(ssd_cache_dir)
 
+    splash_builds = _installed_splash_builds()
+
     # Combine model info with settings
     models = []
     for model_info in models_status:
@@ -2377,6 +2409,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
         mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
+        splash_compat_ok, splash_compat_reason = _splash_compat_for_model(
+            model_info, getattr(settings, "splash_build", None)
+        )
         from ..patches.moe_offload_compat import moe_offload_compatibility
 
         moe_offload_supported, _ = moe_offload_compatibility(
@@ -2503,6 +2538,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "dflash_compatible": compat_ok,
             "dflash_compatibility_reason": compat_reason,
             "dflash_ssd_cache_available": dflash_ssd_cache_available,
+            "splash_compatible": splash_compat_ok,
+            "splash_compatibility_reason": splash_compat_reason,
+            "splash_builds": splash_builds,
             "mtp_compatible": mtp_compat_ok,
             "mtp_compatibility_reason": mtp_compat_reason,
             "moe_expert_offload_supported": moe_offload_supported,
@@ -2563,6 +2601,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "dflash_compatible": False,
                 "dflash_compatibility_reason": "",
                 "dflash_ssd_cache_available": False,
+                "splash_compatible": False,
+                "splash_compatibility_reason": "",
+                "splash_builds": [],
                 "mtp_compatible": False,
                 "mtp_compatibility_reason": "",
                 "is_paroquant": False,
@@ -2797,6 +2838,12 @@ async def update_model_settings(
                 status_code=400,
                 detail=f"Invalid model_type_override: {request.model_type_override}",
             )
+        if entry.engine_type == "splash" and override_value is not None:
+            # Splash packages have no MLX engine to switch to.
+            raise HTTPException(
+                status_code=400,
+                detail="Splash packages always run on the Splash engine",
+            )
         current_settings.model_type_override = override_value
         # Update engine pool entry type immediately
         type_to_engine = {
@@ -2808,7 +2855,9 @@ async def update_model_settings(
             "audio_tts": "audio_tts",
             "audio_sts": "audio_sts",
         }
-        if override_value:
+        if entry.engine_type == "splash":
+            pass  # auto-detection is what registered the package
+        elif override_value:
             entry.model_type = override_value
             entry.engine_type = type_to_engine.get(override_value, "batched")
         else:
@@ -3070,6 +3119,34 @@ async def update_model_settings(
         current_settings.specprefill_keep_pct = request.specprefill_keep_pct or None
     if "specprefill_threshold" in sent:
         current_settings.specprefill_threshold = request.specprefill_threshold or None
+    if "splash_build" in sent:
+        from ..engine.splash import CUSTOM_BUILD, KNOWN_BUILDS
+
+        build_id = request.splash_build or None
+        valid_builds = {build for build, _ in KNOWN_BUILDS} | {CUSTOM_BUILD}
+        if build_id is not None and build_id not in valid_builds:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid splash_build: {build_id}"
+            )
+        current_settings.splash_build = build_id
+    if "splash_enabled" in sent:
+        new_splash_enabled = bool(request.splash_enabled)
+        if new_splash_enabled:
+            from ..engine.splash import is_splash_compatible
+
+            if entry.engine_type not in ("batched", "vlm"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Splash serves language models only",
+                )
+            compat_ok, compat_reason = is_splash_compatible(
+                entry.model_path,
+                entry.source_repo_id,
+                current_settings.splash_build,
+            )
+            if not compat_ok:
+                raise HTTPException(status_code=400, detail=compat_reason)
+        current_settings.splash_enabled = new_splash_enabled
     # DFlash settings
     if "dflash_enabled" in sent:
         new_dflash_enabled = (
@@ -6467,6 +6544,11 @@ def _build_runtime_cache_observability(
             model_payload["cache_tier"] = "rank-prompt-snapshot"
             model_payload["rank_prompt_cache"] = rank_prompt_cache
 
+        splash_cache = runtime_stats.get("splash_cache")
+        if isinstance(splash_cache, dict):
+            model_payload["cache_tier"] = "splash"
+            model_payload["splash_cache"] = splash_cache
+
         payload["models"].append(model_payload)
         payload["total_num_files"] += model_payload["num_files"]
         payload["total_size_bytes"] += model_payload["total_size_bytes"]
@@ -6616,6 +6698,7 @@ def _build_active_models_data() -> dict:
                 "soft_formatted": "0.0GB",
                 "hard_formatted": "0.0GB",
                 "pressure_level": "ok",
+                "external_process_memory": 0,
             },
             "total_active_requests": 0,
             "total_waiting_requests": 0,
@@ -6763,6 +6846,18 @@ def _build_active_models_data() -> dict:
                     "max_tokens": getattr(req, "max_tokens", None) if req else None,
                 }
             )
+
+        # Engines that run requests outside an oMLX scheduler (Splash) report
+        # the same prefill/generate rows themselves.
+        get_live = getattr(entry.engine, "get_live_requests", None) if entry else None
+        if callable(get_live):
+            try:
+                live = get_live()
+                prefilling.extend(live["prefilling"])
+                generating.extend(live["generating"])
+                active_requests += len(live["prefilling"]) + len(live["generating"])
+            except Exception:  # noqa: BLE001
+                logger.debug("live request rows failed", exc_info=True)
 
         if cluster_metrics is not None:
             # Synthesize scheduler-shaped prefill/generate rows from rank
@@ -6923,7 +7018,7 @@ def _build_active_models_data() -> dict:
     else:
         memory_used = status.get("current_model_memory", 0)
         memory_max = status.get("final_ceiling", 0)
-    return {
+    data = {
         "models": models,
         "model_memory_used": memory_used,
         "model_memory_max": memory_max,
@@ -6968,6 +7063,19 @@ def _build_active_models_data() -> dict:
         "total_active_requests": total_active,
         "total_waiting_requests": total_waiting,
     }
+
+    # Splash and other out-of-process engines hold memory the enforcer's
+    # figures (oMLX's own footprint) leave out; show it in the bar.
+    external = int(status.get("external_process_memory", 0) or 0)
+    pressure = data["memory_pressure"]
+    pressure["external_process_memory"] = external
+    if external:
+        data["model_memory_used"] += external
+        data["model_memory_max"] += external
+        for level in ("current", "soft", "hard"):
+            pressure[f"{level}_bytes"] += external
+            pressure[f"{level}_formatted"] = _format_gb(pressure[f"{level}_bytes"])
+    return data
 
 
 @router.post("/api/stats/clear")
@@ -7707,6 +7815,11 @@ async def get_hf_model_info(
         raise HTTPException(status_code=502, detail=str(e))
 
 
+def _is_model_dir(path: Path) -> bool:
+    """A downloaded model folder: an MLX checkpoint or a Splash package."""
+    return (path / "config.json").exists() or is_splash_package(path)
+
+
 @router.get("/api/hf/models")
 async def list_hf_models(is_admin: bool = Depends(require_admin)):
     """List models in all model directories with disk size info."""
@@ -7752,14 +7865,14 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
             if not subdir.is_dir() or subdir.name.startswith("."):
                 continue
 
-            if (subdir / "config.json").exists():
+            if _is_model_dir(subdir):
                 # Level 1: direct model folder
                 _add_model(subdir, subdir.name)
             else:
                 # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
                 hf_resolved = _resolve_hf_cache_entry(subdir)
                 if hf_resolved is not None:
-                    if (hf_resolved.snapshot_path / "config.json").exists():
+                    if _is_model_dir(hf_resolved.snapshot_path):
                         _add_model(
                             hf_resolved.snapshot_path,
                             hf_resolved.model_id,
@@ -7771,7 +7884,7 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                 for child in sorted(subdir.iterdir()):
                     if not child.is_dir() or child.name.startswith("."):
                         continue
-                    if (child / "config.json").exists():
+                    if _is_model_dir(child):
                         _add_model(child, child.name)
 
     # Sort by the UI display name so organization prefixes group together.
@@ -7800,7 +7913,7 @@ async def delete_hf_model(
         if not model_dir.exists():
             continue
         candidate = model_dir / model_name
-        if candidate.is_dir() and (candidate / "config.json").exists():
+        if candidate.is_dir() and _is_model_dir(candidate):
             model_path = candidate
             parent_model_dir = model_dir
             break
@@ -7809,7 +7922,7 @@ async def delete_hf_model(
             if not subdir.is_dir() or subdir.name.startswith("."):
                 continue
             candidate = subdir / model_name
-            if candidate.is_dir() and (candidate / "config.json").exists():
+            if candidate.is_dir() and _is_model_dir(candidate):
                 model_path = candidate
                 parent_model_dir = model_dir
                 break

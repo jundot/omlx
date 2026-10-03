@@ -36,6 +36,7 @@ import mlx.core as mx
 from .engine import BaseEngine, BatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
+from .engine.splash import SplashEngine, resolve_splash_build
 from .engine.sts import STSEngine
 from .engine.stt import STTEngine
 from .engine.tts import TTSEngine
@@ -56,6 +57,7 @@ from .model_discovery import (
     discover_models,
     format_size,
     is_realtime_stt_model,
+    is_splash_package,
 )
 from .model_settings import (
     ane_prefill_backend,
@@ -1061,6 +1063,12 @@ class EnginePool:
         if mtp_active:
             add("mtp_adaptive_max_depth", data.get("mtp_adaptive_max_depth"))
             add("mtp_fixed_depth", data.get("mtp_fixed_depth"))
+        # A Splash server takes its context limit on the command line.
+        splash_active = bool(data.get("splash_enabled", False))
+        add("splash_enabled", splash_active)
+        if splash_active or (entry is not None and entry.engine_type == "splash"):
+            add("splash_build", data.get("splash_build"))
+            add("max_context_window", data.get("max_context_window"))
         if entry is not None:
             qwen4_offload, _, _ = self._qwen4_ple_offload_status(entry, settings)
             add("qwen4_ple_ssd_offload", qwen4_offload)
@@ -1392,7 +1400,8 @@ class EnginePool:
         """Apply model_type_override from persisted settings to discovered entries."""
         for model_id, entry in self._entries.items():
             settings = settings_manager.get_settings(model_id)
-            if settings.model_type_override:
+            # Splash packages have no MLX engine to override to.
+            if settings.model_type_override and entry.engine_type != "splash":
                 entry.model_type = settings.model_type_override
                 entry.engine_type = self._MODEL_TYPE_TO_ENGINE.get(
                     settings.model_type_override, "batched"
@@ -1623,6 +1632,9 @@ class EnginePool:
         model_path = Path(entry.model_path)
         if model_path.exists() and (model_path / "config.json").exists():
             return
+        # Splash packages carry manifest.json instead of config.json.
+        if entry.engine_type == "splash" and is_splash_package(model_path):
+            return
 
         if entry.engine is None:
             self._entries.pop(model_id, None)
@@ -1818,6 +1830,55 @@ class EnginePool:
     def _engine_has_usable_tokenizer(engine: object) -> bool:
         tokenizer = getattr(engine, "tokenizer", None)
         return tokenizer is not None and callable(getattr(tokenizer, "encode", None))
+
+    def _splash_engine_for(
+        self,
+        entry: EngineEntry,
+        model_settings: object | None,
+        effective_type: str,
+    ) -> SplashEngine | None:
+        """A Splash engine when Splash serves this model, else None.
+
+        Splash packages only run on Splash. An MLX checkpoint runs on it when
+        its settings enable Splash and an installed Splash build can serve
+        it; a load failure then surfaces Splash's own error instead of
+        silently falling back to MLX, since the user asked for Splash.
+        """
+        if entry.engine_type != "splash":
+            if not getattr(model_settings, "splash_enabled", False):
+                return None
+            if effective_type not in ("batched", "vlm"):
+                return None
+        build, reason = resolve_splash_build(
+            entry.model_path,
+            entry.source_repo_id,
+            getattr(model_settings, "splash_build", None),
+        )
+        if build is None:
+            raise ModelLoadingError(
+                entry.model_id, f"Splash cannot serve '{entry.model_id}': {reason}"
+            )
+        logger.info(
+            "Serving %s through %s (%s)", entry.model_id, build.label, build.path
+        )
+        cfg = self._scheduler_config
+        enabled = bool(getattr(cfg, "paged_ssd_cache_dir", None)) and not getattr(
+            cfg, "hot_cache_only", False
+        )
+        if enabled:
+            cache_disk_bytes = int(cfg.paged_ssd_cache_max_size)
+            cache_disk_dir = Path(cfg.paged_ssd_cache_dir) / "splash"
+        else:
+            cache_disk_bytes = 0
+            cache_disk_dir = None
+        return SplashEngine(
+            model_name=entry.model_path,
+            build=build,
+            source_repo_id=entry.source_repo_id,
+            max_context=getattr(model_settings, "max_context_window", None),
+            cache_disk_bytes=cache_disk_bytes,
+            cache_disk_dir=cache_disk_dir,
+        )
 
     def _validate_llm_engine_ready(self, model_id: str, engine: object | None) -> None:
         if engine is None:
@@ -2982,14 +3043,16 @@ class EnginePool:
 
         logger.info(f"Unloading model: {model_id} (immediate abort)")
         distributed = self._distributed_deployment_for_entry(entry) is not None
+        # A Splash server holds its memory in its own process.
+        external = distributed or isinstance(entry.engine, SplashEngine)
         resident_size = self._entry_resident_size(entry)
         settle_size = (
             entry.runtime_settle_size
             if entry.runtime_settle_size is not None
             else resident_size
         )
-        pre_unload_active = 0 if distributed else mx.get_active_memory()
-        pre_unload_footprint = 0 if distributed else get_phys_footprint()
+        pre_unload_active = 0 if external else mx.get_active_memory()
+        pre_unload_footprint = 0 if external else get_phys_footprint()
 
         try:
             await entry.engine.stop(
@@ -3040,19 +3103,21 @@ class EnginePool:
         entry.runtime_estimated_size = None
         entry.runtime_settle_size = None
 
-        if distributed:
-            # Cluster weights live in supervised rank processes, not this
-            # process's Metal allocator. Successful supervisor teardown is
-            # the memory barrier; polling mx.get_active_memory() here would
-            # wait against an unrelated gauge and then run emergency reclaim.
+        if external:
+            # Cluster weights live in supervised rank processes and Splash's
+            # in its server process, not this process's Metal allocator.
+            # Successful process teardown is the memory barrier; polling
+            # mx.get_active_memory() here would wait against an unrelated
+            # gauge and then run emergency reclaim.
             gc.collect()
             self._current_model_memory = max(
                 0,
                 self._current_model_memory - resident_size,
             )
+            kind = "distributed" if distributed else "Splash"
             logger.info(
-                f"Unloaded distributed model: {model_id}, "
-                f"released local shard process "
+                f"Unloaded {kind} model: {model_id}, "
+                f"released its process "
                 f"({format_size(resident_size)} planned)"
             )
             self._wake_process_memory_enforcer()
@@ -3358,9 +3423,9 @@ class EnginePool:
 
             # Check if DFlash is enabled -- takes priority over engine type
             # since DFlash has its own model loading pipeline
-            engine = None
+            engine = self._splash_engine_for(entry, model_settings, effective_type)
             deployment = deployment if effective_type == "batched" else None
-            if deployment is None and model_settings is not None:
+            if engine is None and deployment is None and model_settings is not None:
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
                 dflash_draft = getattr(model_settings, "dflash_draft_model", None)
                 if dflash_enabled and not dflash_draft:
@@ -3533,7 +3598,11 @@ class EnginePool:
             try:
                 await engine.start()
             except Exception as start_error:
-                if _is_dflash_engine:
+                if isinstance(engine, SplashEngine):
+                    # start() already stopped the Splash process; its error
+                    # carries the tail of the Splash log.
+                    raise
+                elif _is_dflash_engine:
                     # DFlash engine failed to start -- fall back to the
                     # model's natural engine type (VLM or Batched)
                     logger.warning(
@@ -3811,6 +3880,9 @@ class EnginePool:
 
             post_load_memory = max(mx.get_active_memory(), get_phys_footprint())
             observed_delta = max(0, post_load_memory - pre_load_memory)
+            if isinstance(engine, SplashEngine):
+                # The weights live in the Splash process, not this one.
+                observed_delta = 0
             entry.actual_size = observed_delta or resident_size
 
             # Registry consistency check: a lockless mutator (a
@@ -3976,8 +4048,21 @@ class EnginePool:
             Dictionary with pool status information
         """
         models = []
+        external_process_memory = 0
         for mid, e in sorted(self._entries.items()):
             deployment = self._distributed_deployment_for_entry(e)
+            actual_size = e.actual_size
+            # Out-of-process engines (Splash) report their live footprint.
+            if e.engine is not None:
+                proc_mem_fn = getattr(e.engine, "process_memory_bytes", None)
+                if callable(proc_mem_fn):
+                    try:
+                        live_mem = int(proc_mem_fn() or 0)
+                    except Exception:  # noqa: BLE001
+                        live_mem = 0
+                    external_process_memory += live_mem
+                    if live_mem > 0:
+                        actual_size = live_mem
             models.append(
                 {
                     "id": mid,
@@ -3993,7 +4078,7 @@ class EnginePool:
                         if deployment is not None
                         else None
                     ),
-                    "actual_size": e.actual_size,
+                    "actual_size": actual_size,
                     "pinned": e.is_pinned,
                     "engine_type": e.engine_type,
                     "model_type": e.model_type,
@@ -4013,6 +4098,7 @@ class EnginePool:
         return {
             "final_ceiling": self._current_ceiling(),
             "current_model_memory": self._current_model_memory,
+            "external_process_memory": external_process_memory,
             "model_count": len(self._entries),
             "loaded_count": sum(
                 1 for e in self._entries.values() if e.engine is not None

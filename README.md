@@ -219,6 +219,7 @@ Configure sampling parameters, chat template kwargs, TTL, model alias, model typ
 
 - **Model alias**: set a custom API-visible name. `/v1/models` returns the alias, and requests accept both the alias and directory name.
 - **Model type override**: manually set a model as LLM or VLM regardless of auto-detection.
+- **Splash engine**: serve Qwen3.8-27B and Qwen3.6-35B-A3B through [Splash](https://github.com/incoai/splash)'s Metal engine in a separate process, including prebuilt Splash packages, with the official build or the Splash M1 build for M1/M2 Macs. See [docs/Splash.md](docs/Splash.md).
 - **Profiles**: save named bundles of per-model settings and switch between them from the admin panel. A profile can optionally be exposed as its own model: `/v1/models` then also lists `<model>:<profile>` (e.g. `qwen3-8b:thinking`), which serves on the same engine as the base model with the profile's settings overlaid per request — no extra memory, no reload. When the base model has an alias, the exposed ID is advertised as `<alias>:<profile>`; the directory-name form keeps working, just like for the base model.
 
 <p align="center">
@@ -446,6 +447,7 @@ Contributions are welcome! See [Contributing Guide](docs/CONTRIBUTING.md) for de
 - [venvstacks](https://venvstacks.lmstudio.ai) - Portable Python environment layering for the macOS app bundle
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Embedding model support for Apple Silicon
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Block diffusion speculative decoding on Apple Silicon
+- [Splash](https://github.com/incoai/splash) - Metal inference engine with DFlash2 speculative decoding, available as an engine for supported models
 - [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP's verify-shape Metal kernels are powered by MTPLX by Youssof Altoukhi, which also inspired the depth-k pipeline
 - [mlx-serve](https://github.com/ddalcu/mlx-serve) - The fused GDN verify prework kernel is adapted from mlx-serve's port of the mlxfast-challenge qwen35_packed_gdn_prework kernel, and Qwen4's fused GDN decode and prefill kernels are adapted from mlx-serve's MIT-licensed `transformer.zig`; Qwen4 QSA's 128-bit K/V staging is adapted from mlx-serve's MIT-licensed `msv_attn_p256` kernel
 - [Splash](https://github.com/incoai/splash) - The verify-shape linear kernels use Splash's bf16 `0x4300 | q` weight operand with per-group input sums (from its Apache-2.0 `linear_q4_sgmatrix.metal`), and the tensor-op verify attention adapts the tile design of Splash's `paged_attention_tile.h`

@@ -1282,6 +1282,87 @@ async def _run_external_batch_test(
     }
 
 
+# Long enough that the prompt dwarfs the chat template it is wrapped in.
+_CHAT_CALIBRATION_TOKENS = 256
+
+
+class _ChatBenchmark:
+    """Benchmarks an engine that only serves chat (Splash) through its own API.
+
+    Splash takes no token-id prompts, so tests run through the external
+    endpoint helpers against the engine's loopback server, with prompts
+    sized by the model's tokenizer. Peak memory is the Splash process
+    group's.
+    """
+
+    def __init__(
+        self, engine: Any, context_profile: BenchmarkContextProfile | str
+    ) -> None:
+        self.engine = engine
+        self.context_profile = BenchmarkContextProfile(context_profile)
+        self.tokenizer = engine.tokenizer
+        self.client = ExternalAPIClient(
+            ExternalEndpointConfig(**engine.benchmark_endpoint())
+        )
+        # Chat template tokens around an empty user turn; prompts are trimmed
+        # by this much so the templated prompt lands on the requested length.
+        self.overhead = engine.count_chat_tokens([{"role": "user", "content": ""}])
+
+    @classmethod
+    def for_engine(
+        cls, engine: Any, context_profile: BenchmarkContextProfile | str
+    ) -> Optional["_ChatBenchmark"]:
+        if callable(getattr(engine, "benchmark_endpoint", None)):
+            return cls(engine, context_profile)
+        return None
+
+    def prompt(self, target_tokens: int) -> str:
+        spec = BENCHMARK_CONTEXT_PROFILES[self.context_profile]
+        corpus = _load_bench_corpus(self.context_profile)
+        target_chars = max(round(target_tokens * spec.chars_per_token * 2), 1)
+        repeats = (target_chars + len(corpus) - 1) // len(corpus)
+        text = f"BENCH-{uuid.uuid4().hex} " + (corpus * repeats)[:target_chars]
+        ids = self.tokenizer.encode(text, add_special_tokens=False)[
+            : max(1, target_tokens - self.overhead)
+        ]
+        return str(self.tokenizer.decode(ids))
+
+    async def warmup(self, target_tokens: int) -> None:
+        # The engine renders its own chat template, so calibrate the overhead
+        # from the prompt length it reports; later prompts then land on the
+        # requested length.
+        target_tokens = max(target_tokens, _CHAT_CALIBRATION_TOKENS)
+        stats = await self.client.stream_chat_completion(
+            messages=[{"role": "user", "content": self.prompt(target_tokens)}],
+            max_tokens=8,
+            temperature=0.0,
+        )
+        self.overhead += stats.prompt_tokens - target_tokens
+
+    async def single(self, pp_len: int, max_tokens: int) -> dict:
+        metrics = await _run_external_single_test(
+            client=self.client,
+            prompt=self.prompt(pp_len),
+            max_tokens=max_tokens,
+        )
+        metrics["peak_memory_bytes"] = self.engine.peak_memory_bytes()
+        return metrics
+
+    async def batch(self, batch_size: int, max_tokens: int) -> dict:
+        prompts = [self.prompt(1024) for _ in range(batch_size)]
+        metrics = await _run_external_batch_test(
+            client=self.client,
+            prompts=prompts,
+            max_tokens=max_tokens,
+            batch_size=batch_size,
+        )
+        metrics["peak_memory_bytes"] = self.engine.peak_memory_bytes()
+        return metrics
+
+    async def aclose(self) -> None:
+        await self.client.aclose()
+
+
 OMLX_AI_API_URL = "https://omlx.ai/api/benchmarks"
 OMLX_AI_BEST_URL = f"{OMLX_AI_API_URL}/best"
 
@@ -1703,6 +1784,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
     total_tests = len(request.prompt_lengths) + len(request.batch_sizes)
     current_test = 0
     overall_start = time.perf_counter()
+    chat: _ChatBenchmark | None = None
 
     # Throughput measurements must not be skewed by the memory-guard
     # throttle shrinking chunks; pin speed priority for the run.
@@ -1786,6 +1868,8 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         )
         logger.info(f"Benchmark: loaded {request.model_id}")
 
+        chat = _ChatBenchmark.for_engine(engine, request.context_profile)
+
         # Generate prompts for all needed lengths
         tokenizer = engine.tokenizer
         prompts: dict[int, list[int]] = {}
@@ -1820,29 +1904,37 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             },
         )
         warmup_started = time.perf_counter()
-        warmup_prompt_tokens = _warmup_prompt_tokens(request.warmup_mode)
-        warmup_prefill_tokens = warmup_prompt_tokens - 1
-        warmup_prompt = _generate_prompt(
-            tokenizer,
-            warmup_prompt_tokens,
-            request.context_profile,
-        )
-        warmup_max_tokens = (
-            request.generation_length
-            if getattr(engine, "is_diffusion_model", False)
-            else 8
-        )
-        async for _ in engine.stream_generate(
-            prompt=warmup_prompt, max_tokens=warmup_max_tokens, temperature=0.0
-        ):
-            pass
-        logger.info(
-            "Benchmark: warmup complete "
-            f"(mode={request.warmup_mode.value}, "
-            f"prompt_tokens={warmup_prompt_tokens}, "
-            f"prefill_tokens={warmup_prefill_tokens}, "
-            f"wall_ms={(time.perf_counter() - warmup_started) * 1000.0:.3f})"
-        )
+        if chat is not None:
+            await chat.warmup(_warmup_prompt_tokens(request.warmup_mode))
+            logger.info(
+                "Benchmark: warmup complete "
+                f"(mode={request.warmup_mode.value}, "
+                f"wall_ms={(time.perf_counter() - warmup_started) * 1000.0:.3f})"
+            )
+        else:
+            warmup_prompt_tokens = _warmup_prompt_tokens(request.warmup_mode)
+            warmup_prefill_tokens = warmup_prompt_tokens - 1
+            warmup_prompt = _generate_prompt(
+                tokenizer,
+                warmup_prompt_tokens,
+                request.context_profile,
+            )
+            warmup_max_tokens = (
+                request.generation_length
+                if getattr(engine, "is_diffusion_model", False)
+                else 8
+            )
+            async for _ in engine.stream_generate(
+                prompt=warmup_prompt, max_tokens=warmup_max_tokens, temperature=0.0
+            ):
+                pass
+            logger.info(
+                "Benchmark: warmup complete "
+                f"(mode={request.warmup_mode.value}, "
+                f"prompt_tokens={warmup_prompt_tokens}, "
+                f"prefill_tokens={warmup_prefill_tokens}, "
+                f"wall_ms={(time.perf_counter() - warmup_started) * 1000.0:.3f})"
+            )
 
         # Start host sampling after warmup: Metal shader and JIT compilation
         # would otherwise be folded into the CPU aggregates.
@@ -1968,12 +2060,16 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             # time.monotonic only — the test internals use perf_counter, and
             # the two clocks have different epochs.
             window_start = time.monotonic()
-            metrics = await _run_single_test(
-                engine=engine,
-                prompt=prompts[pp_len],
-                max_tokens=request.generation_length,
-                pp_len=pp_len,
-                ane_trace_config=ane_trace_config,
+            metrics = (
+                await chat.single(pp_len, request.generation_length)
+                if chat is not None
+                else await _run_single_test(
+                    engine=engine,
+                    prompt=prompts[pp_len],
+                    max_tokens=request.generation_length,
+                    pp_len=pp_len,
+                    ane_trace_config=ane_trace_config,
+                )
             )
             metrics["system_metrics"] = _sample_window(run, window_start)
             logger.info(
@@ -1988,7 +2084,8 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
 
             result = {
                 "test_type": "single",
-                "pp": pp_len,
+                "pp": metrics["prompt_tokens"] if chat is not None else pp_len,
+                **({"requested_pp": pp_len} if chat is not None else {}),
                 "tg": request.generation_length,
                 **metrics,
             }
@@ -2010,13 +2107,15 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
 
         # Skip batch tests for engines without scheduler core (e.g. VLM/Diffusion)
         batch_core = _get_batch_benchmark_core(engine)
-        if request.batch_sizes and batch_core is None:
+        if request.batch_sizes and batch_core is None and chat is None:
             logger.info(
                 "Batch test skipped: engine does not support concurrent batching"
             )
             current_test += len(request.batch_sizes)
 
-        for batch_size in request.batch_sizes if batch_core is not None else []:
+        for batch_size in (
+            request.batch_sizes if (batch_core is not None or chat is not None) else []
+        ):
             current_test += 1
             await _send_event(
                 run,
@@ -2030,18 +2129,23 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             )
 
             window_start = time.monotonic()
-            batch_metrics = await _run_batch_test(
-                engine=engine,
-                prompts=batch_prompts[:batch_size],
-                prompt_tokens=1024,
-                max_tokens=request.generation_length,
-                batch_size=batch_size,
+            batch_metrics = (
+                await chat.batch(batch_size, request.generation_length)
+                if chat is not None
+                else await _run_batch_test(
+                    engine=engine,
+                    prompts=batch_prompts[:batch_size],
+                    prompt_tokens=1024,
+                    max_tokens=request.generation_length,
+                    batch_size=batch_size,
+                )
             )
             batch_metrics["system_metrics"] = _sample_window(run, window_start)
 
             result = {
                 "test_type": "batch",
-                "pp": 1024,
+                "pp": batch_metrics["prompt_tokens"] if chat is not None else 1024,
+                **({"requested_pp": 1024} if chat is not None else {}),
                 "tg": request.generation_length,
                 **batch_metrics,
             }
@@ -2092,6 +2196,21 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 {
                     "type": "upload_skipped",
                     "reason": "ane_aligned_prompt",
+                    "features": run.feature_flags,
+                },
+            )
+            return
+
+        if chat is not None:
+            # Splash runs measure a different engine; keep them out of the
+            # oMLX community leaderboard.
+            run.upload_state["phase"] = "skipped"
+            run.upload_state["skipped_reason"] = "splash"
+            await _send_event(
+                run,
+                {
+                    "type": "upload_skipped",
+                    "reason": "splash",
                     "features": run.feature_flags,
                 },
             )
@@ -2149,6 +2268,11 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             pass
 
     finally:
+        if chat is not None:
+            try:
+                await chat.aclose()
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"Benchmark: client close failed: {e}")
         if run.sampler is not None:
             try:
                 run.sampler.stop()
