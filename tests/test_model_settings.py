@@ -725,12 +725,24 @@ class TestVlmMtpProcessorExclusivity:
         [
             ("repetition_penalty", 1.2),
             ("presence_penalty", 0.5),
-            ("guided_grammar_enabled", True),
         ],
     )
     def test_conflicting_setting_raises(self, field, value):
         with pytest.raises(ValueError, match="vlm_mtp_enabled cannot be combined"):
             ModelSettings(vlm_mtp_enabled=True, **{field: value})
+
+    def test_guided_grammar_no_longer_conflicts(self):
+        """The grammar processor rides the vlm_mtp verify walk through
+        MTPProcessingSampler (snapshot/restore plus self-advancing mode), so
+        a default grammar no longer forces the BatchGenerator fallback."""
+        settings = ModelSettings(vlm_mtp_enabled=True, guided_grammar_enabled=True)
+        assert settings.vlm_mtp_enabled is True
+        assert settings.guided_grammar_enabled is True
+        data, conflicts = resolve_vlm_mtp_conflicts(
+            {"vlm_mtp_enabled": True, "guided_grammar_enabled": True}
+        )
+        assert conflicts == []
+        assert data["vlm_mtp_enabled"] is True
 
     def test_thinking_budget_no_longer_conflicts(self):
         """Thinking budget is applied on the vlm_mtp path at verify time
@@ -752,10 +764,10 @@ class TestVlmMtpProcessorExclusivity:
 
     def test_resolve_helper_clears_vlm_mtp(self):
         data, conflicts = resolve_vlm_mtp_conflicts(
-            {"vlm_mtp_enabled": True, "guided_grammar_enabled": True}
+            {"vlm_mtp_enabled": True, "repetition_penalty": 1.2}
         )
         assert data["vlm_mtp_enabled"] is False
-        assert conflicts == ["guided_grammar_enabled"]
+        assert conflicts == ["repetition_penalty"]
 
     def test_resolve_helper_no_conflict_passthrough(self):
         original = {"vlm_mtp_enabled": True, "repetition_penalty": 1.0}
