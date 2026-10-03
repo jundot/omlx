@@ -54,6 +54,13 @@ _SLICEABLE_CACHE_TYPES = frozenset(
         "MiniMaxM3KVCache",
         "QSAKVCache",
         "QSAQuantizedKVCache",
+        # TurboQuant-quantized QSA singleton (Fix 2). Same handler contract as
+        # QSAQuantizedKVCache: dequantizes K/V to dense on store and slices
+        # the dense keys/values/index arrays along the token axis. The batch
+        # variant (BatchQSATurboQuantKVCache) is intentionally omitted,
+        # matching BatchQSAKVCache: decode-side boundary capture keeps its
+        # full state.
+        "QSATurboQuantKVCache",
     }
 )
 
