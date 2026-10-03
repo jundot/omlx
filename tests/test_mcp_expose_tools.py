@@ -82,11 +82,57 @@ class TestI18nKeys:
             missing = {key for key in REQUIRED_I18N_KEYS if not locale.get(key)}
             assert not missing, f"{locale_path.name}: missing {sorted(missing)}"
 
-    def test_locale_key_sets_identical(self):
+    def test_locale_keys_are_subset_of_english(self):
+        """Every locale key must exist in English; missing keys fall back to it.
+
+        Non-English locales are allowed to omit keys (the ``t()``/``window.t()``
+        loader always merges onto a full copy of English), but an orphaned key
+        with no English counterpart is a real bug, not a fallback case.
+        """
         base = set(json.loads((I18N_DIR / "en.json").read_text(encoding="utf-8")))
         for locale_path in sorted(I18N_DIR.glob("*.json")):
+            if locale_path.name == "en.json":
+                continue
             keys = set(json.loads(locale_path.read_text(encoding="utf-8")))
-            assert keys == base, locale_path.name
+            orphaned = keys - base
+            assert not orphaned, f"{locale_path.name}: keys not in en.json: {sorted(orphaned)}"
+
+    def test_locale_values_are_not_redundant_with_english(self):
+        """A locale entry byte-identical to English should be omitted, not stored.
+
+        Storing it is a no-op (the loader falls back to English for missing
+        keys anyway) but leaves untranslated padding on disk that looks
+        translated. Omit the key instead of pasting the English value.
+
+        A small set of keys is exempt: other locale tests assert these are
+        always explicitly present (not relying on the English-fallback
+        path), and their correct translation is legitimately identical to
+        English in at least one locale (e.g. a short technical term).
+        """
+        en = json.loads((I18N_DIR / "en.json").read_text(encoding="utf-8"))
+        required_even_if_redundant = {
+            "navbar.tab.cluster",
+            "settings.advanced.uploads",
+            "settings.advanced.max_audio_upload_size",
+            "settings.advanced.max_audio_upload_size_hint",
+            "settings.auth.skip_verification_warning",
+            "js.error.api_key_required_network",
+            "acc_bench.config.external_extra_body",
+            "acc_bench.config.external_extra_body_hint",
+            "js.error.external_extra_body_invalid_json",
+            "js.error.external_extra_body_object_required",
+            "js.error.external_extra_body_protected",
+        }
+        for locale_path in sorted(I18N_DIR.glob("*.json")):
+            if locale_path.name == "en.json":
+                continue
+            locale = json.loads(locale_path.read_text(encoding="utf-8"))
+            redundant = {
+                k
+                for k, v in locale.items()
+                if en.get(k) == v and k not in required_even_if_redundant
+            }
+            assert not redundant, f"{locale_path.name}: redundant with en.json: {sorted(redundant)}"
 
 
 class TestAdminApiExposeTools:

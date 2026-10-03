@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from omlx.admin.routes import _load_locale
+
 
 def _model_settings_template() -> str:
     root = Path(__file__).resolve().parents[1]
@@ -164,7 +166,7 @@ def test_model_settings_feature_i18n_keys_exist_in_every_locale():
     }
 
     for locale_path in sorted(i18n_dir.glob("*.json")):
-        translations = json.loads(locale_path.read_text())
+        translations = _load_locale(locale_path.stem)
         missing_keys = keys - translations.keys()
         assert not missing_keys, f"{locale_path.name} is missing {sorted(missing_keys)}"
 
@@ -382,20 +384,6 @@ def test_oq_a8_labels_use_i18n_keys():
     assert ">Qwen INT8 Activation Prefill<" not in html
 
 
-def test_oq_a8_i18n_keys_exist_in_every_locale():
-    root = Path(__file__).resolve().parents[1]
-    i18n_dir = root / "omlx/admin/i18n"
-    keys = {
-        "modal.model_settings.qwen_oq_a8",
-        "modal.model_settings.qwen_oq_a8_hint",
-        "modal.model_settings.qwen_oq_a8_min_tokens",
-    }
-    for path in sorted(i18n_dir.glob("*.json")):
-        catalog = json.loads(path.read_text())
-        missing = keys - set(catalog)
-        assert not missing, f"{path.name} is missing {sorted(missing)}"
-
-
 def test_profile_api_toggle_state_uses_i18n_keys():
     """Both expose-as-API toggles localise their ON/OFF state.
 
@@ -412,34 +400,6 @@ def test_profile_api_toggle_state_uses_i18n_keys():
     assert "'OFF'" not in html
 
     assert [line.strip() for line in html.splitlines()].count("API") == 2
-
-
-def test_profile_api_toggle_i18n_keys_exist_in_every_locale():
-    root = Path(__file__).resolve().parents[1]
-    i18n_dir = root / "omlx/admin/i18n"
-    english = {
-        "modal.model_settings.profiles.expose_as_model_on": "ON",
-        "modal.model_settings.profiles.expose_as_model_off": "OFF",
-    }
-    for path in sorted(i18n_dir.glob("*.json")):
-        catalog = json.loads(path.read_text())
-        missing = set(english) - set(catalog)
-        assert not missing, f"{path.name} is missing {sorted(missing)}"
-        if path.name == "zh.json":
-            # Simplified Chinese carries its own labels; every other locale
-            # keeps the English fallback until its own translation lands.
-            assert catalog["modal.model_settings.profiles.expose_as_model_on"] == "开"
-            assert catalog["modal.model_settings.profiles.expose_as_model_off"] == "关"
-            continue
-        if path.name == "cs.json":
-            # Czech carries its own labels (ZAP/VYP), same exemption as zh.
-            assert catalog["modal.model_settings.profiles.expose_as_model_on"] == "ZAP"
-            assert catalog["modal.model_settings.profiles.expose_as_model_off"] == "VYP"
-            continue
-        for key, value in english.items():
-            assert (
-                catalog[key] == value
-            ), f"{path.name} {key} is not the English fallback"
 
 
 def test_moe_expert_offload_toggle_blocks_speculative_decoding():
@@ -642,18 +602,18 @@ def test_dashboard_layout_template_contract():
     assert "ui_dashboard_layout" in dashboard_js
     assert "columnMax: lib.COLUMNS" in dashboard_js
 
-    locales = sorted((admin / "i18n").glob("*.json"))
-    assert locales
+    en = _load_locale("en")
     keys = [
         "status.layout.customize",
         "status.layout.width_full",
         "status.layout.save",
         *[f"status.layout.block.{block_id}" for block_id in DASHBOARD_BLOCK_IDS],
     ]
-    for locale in locales:
-        data = json.loads(locale.read_text(encoding="utf-8"))
-        for key in keys:
-            assert key in data, f"{locale.name} missing {key}"
+    # English carries the canonical strings; non-English locales omit keys whose
+    # value is byte-identical to English (redundancy policy) and fall back at
+    # load time.
+    for key in keys:
+        assert key in en, f"en.json missing {key}"
 
 
 def test_dashboard_layout_normalizer():

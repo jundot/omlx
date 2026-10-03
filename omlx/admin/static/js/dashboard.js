@@ -5,6 +5,7 @@
     const DSA_MODEL_TYPES = new Set([
         'deepseek_v32', 'glm_moe_dsa',
     ]);
+    const QWEN35_ANE_CONFIG_PREFIXES = ['qwen3_5', 'qwen3_6', 'qwen3_8'];
     const DIFFUSION_CONFIG_MODEL_TYPES = new Set([
         'diffusion_gemma',
     ]);
@@ -223,6 +224,11 @@
             // Model settings modal
             showModelSettingsModal: false,
             selectedModel: null,
+            // settings_revision the form was built from — sent back on save
+            // as expected_settings_revision so a write against stale state
+            // 409s instead of silently clobbering a newer one. See
+            // docs/dashboard-model-config-sync.md.
+            modelSettingsRevision: null,
             modelSettings: {
                 model_alias: '',
                 model_type_override: '',
@@ -1698,6 +1704,17 @@
                     .replace(/-/g, '_');
                 return DIFFUSION_CONFIG_MODEL_TYPES.has(modelType);
             },
+            isQwen35AnePrefillModel(model) {
+                const modelType = String(model?.config_model_type || '')
+                    .toLowerCase()
+                    .replace(/-/g, '_');
+                // Dense only: MoE variants (qwen3_5_moe, ...) match the
+                // prefixes but the fixed-shape ANE path cannot serve routed
+                // experts and silently corrupts their output. Mirrors the
+                // backend gate in update_model_settings.
+                if (modelType.includes('moe')) return false;
+                return QWEN35_ANE_CONFIG_PREFIXES.some(prefix => modelType.startsWith(prefix));
+            },
 
             isDiffusionUnsupportedProfileField(field) {
                 return DIFFUSION_UNSUPPORTED_PROFILE_FIELDS.has(field);
@@ -2161,6 +2178,11 @@
                         if (this.selectedModel) {
                             this.selectedModel.settings = { ...settings };
                         }
+                        // Applying a profile persists server-side and bumps
+                        // settings_revision — keep the form's tracked
+                        // revision in sync or the next Save would 409
+                        // against a change this same page just made.
+                        this.modelSettingsRevision = settings.settings_revision ?? null;
                         this.activeProfileName = activeName;
                         this.profilesDrift = false;
                         this._modelSettingsBaseline = JSON.stringify(this.modelSettings);
@@ -2629,6 +2651,13 @@
                     if (model && data.settings) {
                         model.settings = { ...data.settings };
                     }
+                    // This PUT persists and bumps settings_revision same as
+                    // any other save — keep the form's tracked revision in
+                    // sync or the next manual Save would 409 against a
+                    // change this same page just made.
+                    if (data.settings) {
+                        this.modelSettingsRevision = data.settings.settings_revision ?? null;
+                    }
                     this.aneTuning.applied = true;
                 } catch (error) {
                     this.aneTuning.error = error.message || String(error);
@@ -2690,7 +2719,28 @@
                 if (preservingEdits && (!this.showModelSettingsModal
                     || this.selectedModel?.id !== model.id
                     || JSON.stringify(this.modelSettings) !== baseline)) return;
+                // Fresh read of this model's settings — the `model` argument
+                // carries a snapshot from the last /admin/api/models list
+                // fetch, which can be arbitrarily stale (another tab, a raw
+                // API call, an ANE-tuner apply elsewhere). Fall back to that
+                // snapshot only if the fresh read fails. See
+                // docs/dashboard-model-config-sync.md.
+                try {
+                    const settingsResp = await fetch(
+                        `/admin/api/models/${encodeURIComponent(model.id)}/settings`
+                    );
+                    if (settingsResp.ok) {
+                        const freshData = await settingsResp.json();
+                        if (freshData.settings) model.settings = freshData.settings;
+                    } else if (settingsResp.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                } catch (_) { /* network error — use the cached snapshot */ }
+                if (seq !== this._applySeq) return;
                 this.selectedModel = model;
+                // Track the settings_revision the form is built from (§B1).
+                this.modelSettingsRevision = model.settings?.settings_revision ?? null;
                 this.modelSettings = this.buildModelSettingsState(
                     model,
                     model.settings || {},
@@ -2876,6 +2926,7 @@
                                 }
                             }
                             const payload = {
+                                expected_settings_revision: this.modelSettingsRevision,
                                 model_alias: this.modelSettings.model_alias?.trim() || null,
                                 model_type_override: this.modelSettings.model_type_override || null,
                                 max_context_window: this.modelSettings.max_context_window || null,
@@ -3108,6 +3159,8 @@
                         }
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
+                    } else if (response.status === 409) {
+                        await this.handleModelSettingsConflict(await response.json());
                     } else {
                         const data = await response.json();
                         alert(data.detail || window.t('js.error.save_model_settings_failed'));
@@ -3118,6 +3171,38 @@
                 } finally {
                     this.savingModelSettings = false;
                 }
+            },
+
+            // Someone else (another tab, a raw API call, an ANE-tuner apply)
+            // changed this model's settings since the form was opened, and
+            // save() was correctly rejected before touching anything (409,
+            // see the backend's expected_settings_revision check). Offer the
+            // two honest exits from docs/dashboard-model-config-sync.md — no
+            // silent merge, no silent overwrite.
+            async handleModelSettingsConflict(errorBody) {
+                const payload = errorBody && errorBody.detail;
+                const current = payload && payload.current_settings;
+                if (!current) {
+                    // Shape we didn't expect — fail safe rather than guess.
+                    alert(window.t('js.error.save_model_settings_failed'));
+                    return;
+                }
+                const wantsLoadLatest = confirm(
+                    (payload.message || window.t('js.error.model_settings_conflict')) +
+                    '\n\n' + window.t('js.confirm.model_settings_conflict_choice')
+                );
+                if (wantsLoadLatest) {
+                    if (this.selectedModel) this.selectedModel.settings = current;
+                    this.modelSettingsRevision = current.settings_revision ?? null;
+                    this.modelSettings = this.buildModelSettingsState(this.selectedModel, current);
+                    this.computeDrift();
+                    this._modelSettingsBaseline = JSON.stringify(this.modelSettings);
+                    return;
+                }
+                // Deliberate, informed overwrite — resend against the
+                // revision the 409 just told us is current, never blind.
+                this.modelSettingsRevision = current.settings_revision ?? null;
+                await this.saveModelSettings();
             },
 
             // Snapshot actions in the settings modal header. All three go

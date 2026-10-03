@@ -1506,8 +1506,14 @@ class TestSettingsSnapshotRoutes:
         assert body["applied"]["display_name"] is None
         assert body["applied"]["is_pinned"] is False
         assert body["skipped"] == []
-        assert body["settings"] == ModelSettings().to_dict()
-        assert mgr.get_settings("model-a").to_dict() == ModelSettings().to_dict()
+        expected = ModelSettings().to_dict()
+        # The reset path persists through the PUT contract, which bumps
+        # settings_revision (opt-in optimistic-concurrency support, PR #3154);
+        # everything else returns to defaults.
+        expected["settings_revision"] = body["settings"]["settings_revision"]
+        assert body["settings"] == expected
+        stored = mgr.get_settings("model-a").to_dict()
+        assert stored | {"settings_revision": expected["settings_revision"]} == expected | {"settings_revision": stored["settings_revision"]}
         assert state.default_model is None
         assert pool.get_entry("model-a").is_pinned is False
 

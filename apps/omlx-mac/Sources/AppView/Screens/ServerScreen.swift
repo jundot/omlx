@@ -205,7 +205,15 @@ struct ServerScreen: View {
                     .buttonStyle(.omlx(.primary))
                     .disabled(!vm.hasPendingServerChanges(services: services)
                               || vm.isMovingBasePath || vm.isResetting)
-            }
+                if let notice = vm.offlineApplyNotice, !notice.isEmpty {
+                    // Informational, not an error — the offline Apply path did
+                    // save successfully, just locally instead of live (§G4).
+                    Text(notice)
+                        .font(.omlxText(11))
+                        .foregroundStyle(.orange)
+                        .padding(.horizontal, 14)
+                        .padding(.top, 4)
+                }
         }
         .alert(String(localized: "settings.reset_defaults.title",
                       defaultValue: "Settings Reset"), isPresented: $vm.showResetNotice) {
@@ -229,9 +237,13 @@ struct ServerScreen: View {
         .onChange(of: services.config) { _, _ in
             vm.applyConfig(services.config)
         }
-        .onChange(of: services.serverState) { _, _ in
+        .onChange(of: services.serverState) { _, newState in
             // After a restart triggered by saving host/port, reload to pick
-            // up the new effective values.
+            // up the new effective values. Skip .stopping/.stopped (and any
+            // other non-running-like state) — reloading there just hits a
+            // connection-refused getGlobalSettings() and paints a spurious
+            // error every time the user stops their own server (§G3).
+            guard newState.isRunningLike else { return }
             Task { await vm.load(client: services.client) }
         }
     }
@@ -790,5 +802,4 @@ private struct ServerAdvancedSection: View {
         }
     }
 }
-
-
+}
