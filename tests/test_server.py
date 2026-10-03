@@ -1149,3 +1149,84 @@ def test_responses_reasoning_cache_policy(
         )
     assert response.status_code == 418, response.text
     assert engine.preflight_chat.call_args.kwargs["preserve_reasoning"] is expected
+
+
+@pytest.mark.parametrize(
+    "path, extra_payload",
+    [
+        (
+            "/v1/chat/completions",
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "response_format": {"type": "json_object"},
+            },
+        ),
+        (
+            "/v1/responses",
+            {
+                "input": "hi",
+                "text": {"format": {"type": "json_object"}},
+            },
+        ),
+    ],
+)
+def test_thinking_budget_auto_set_on_prompt_injection_fallback(
+    monkeypatch, path, extra_payload
+):
+    """A thinking model with no compiled grammar still gets a thinking_budget.
+
+    When grammar compilation is unavailable (``engine.grammar_compiler`` is
+    None) but ``response_format`` still asks for JSON, the server falls back
+    to prompt-injecting a JSON instruction instead of enforcing it at the
+    logit level. That fallback carries the identical reasoning-phase hazard
+    the compiled-grammar branch already guards against (#4084): the request
+    forces a JSON-only answer with no budget forcing the model out of the
+    thinking phase first, so a thinking model can run to its full token
+    budget instead of answering. Captured via the same preflight_chat-raises
+    technique as test_responses_reasoning_cache_policy: call_args.kwargs
+    is the same dict the compiled-grammar branch would have populated.
+    """
+    engine = MagicMock()
+    engine.model_type = "qwen3_5"
+    engine.is_diffusion_model = False
+    engine.supports_tool_calling = False
+    engine.grammar_compiler = None
+    engine.preflight_chat = AsyncMock(
+        side_effect=HTTPException(status_code=418, detail="Policy captured")
+    )
+    engine.start = AsyncMock()
+    engine.count_chat_tokens.return_value = 128
+    pool = MagicMock()
+    pool.preload_pinned_models = AsyncMock()
+    pool.check_ttl_expirations = AsyncMock()
+    pool.shutdown = AsyncMock()
+    pool.get_entry.return_value = SimpleNamespace(
+        config_model_type="qwen3_5",
+        preserve_thinking_default=None,
+        engine_model_type="qwen3_5",
+    )
+    monkeypatch.setattr(srv._server_state, "engine_pool", pool)
+    monkeypatch.setattr(srv, "get_engine_for_model", AsyncMock(return_value=engine))
+    monkeypatch.setattr(srv, "resolve_model_id", lambda name: name)
+    monkeypatch.setattr(srv, "validate_context_window", lambda *a, **k: None)
+    monkeypatch.setattr(
+        srv,
+        "get_model_settings_for_request",
+        lambda name: ModelSettings(reasoning_parser="qwen"),
+    )
+    monkeypatch.setitem(
+        srv.app.dependency_overrides, srv.verify_inference_api_key, lambda: True
+    )
+    with TestClient(srv.app, raise_server_exceptions=False) as client:
+        response = client.post(
+            path,
+            json={
+                "model": "test-model",
+                "stream": False,
+                **extra_payload,
+            },
+        )
+    assert response.status_code == 418, response.text
+    kwargs = engine.preflight_chat.call_args.kwargs
+    assert "compiled_grammar" not in kwargs
+    assert kwargs["thinking_budget"] == min(kwargs["max_tokens"] // 2, 4096)
