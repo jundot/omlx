@@ -46,6 +46,23 @@
 // like dashboard.js, so `clusterV2Wizard` is a global factory referenced from
 // x-data in _cluster_v2.html.
 
+// B6 asset-version handshake: standalone Alpine scope for the stale-bundle
+// bar in _cluster_v2.html. The dashboard.js fetch wrapper (X-Omlx-Asset-
+// Version mismatch) sets window.OMLX_ASSET_STALE and dispatches
+// 'omlx-asset-stale'; this bar reads the mirror flag once and heeds the
+// event thereafter. Once raised the flag is never cleared: the bar is
+// non-dismissable by design (B.3) — its only affordance is the reload.
+function clusterAssetStaleBar() {
+    return {
+        assetStale: Boolean(window.OMLX_ASSET_STALE || false),
+        listen() {
+            window.addEventListener('omlx-asset-stale', () => {
+                this.assetStale = true;
+            });
+        },
+    };
+}
+
 function clusterV2Wizard() {
     const CLUSTER_V2_API = {
         devices: '/api/cluster/devices',

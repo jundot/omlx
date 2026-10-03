@@ -8,6 +8,27 @@
      data-cluster-v2-wizard>
     <div class="animate-fade-in-up">
 
+        <!-- B6: stale cached bundle. Non-dismissable by design (B.3): there
+             is no close affordance because the only correct exit is the
+             reload the bar asks for — the page's JavaScript no longer
+             matches the server it is talking to. Self-contained scope: the
+             window flag covers a mismatch detected before this panel
+             initialized; the event covers ones flagged after. -->
+        <div x-data="clusterAssetStaleBar()"
+             x-init="listen()" x-show="assetStale" x-cloak data-asset-stale-bar
+             class="mb-6 flex items-center gap-3 rounded-xl border border-blue-300 bg-blue-50 px-4 py-3 text-sm text-blue-900">
+            <i data-lucide="refresh-cw" class="w-4 h-4 flex-shrink-0"></i>
+            <span class="font-semibold flex-shrink-0">Dashboard updated — reload</span>
+            <span class="text-xs text-blue-800 min-w-0">
+                This page is running an older copy of the dashboard than the
+                server now ships. Reload to pick up the update.
+            </span>
+            <button type="button" @click="window.location.reload()"
+                    class="ml-auto px-3 py-1.5 text-xs font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-700 flex-shrink-0">
+                Reload
+            </button>
+        </div>
+
         <!-- Header: outcome-first title. -->
         <div class="mb-6">
             <div>

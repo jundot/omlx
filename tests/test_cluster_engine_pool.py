@@ -175,6 +175,34 @@ def test_cluster_model_path_rejects_non_text_model(tmp_path):
         pool.resolve_cluster_model_id(str(model_path))
 
 
+def test_cluster_model_path_vlm_error_names_text_only_remedy(tmp_path):
+    model_path = tmp_path / "vision"
+    model_path.mkdir()
+    pool = EnginePool()
+    entry = _entry(str(model_path))
+    entry.model_type = "vlm"
+    entry.engine_type = "vlm"
+    pool._entries["vision"] = entry
+
+    with pytest.raises(ValueError, match="text-only option"):
+        pool.resolve_cluster_model_id(str(model_path))
+
+
+def test_cluster_model_path_accepts_vlm_when_text_only(tmp_path):
+    model_path = tmp_path / "vision"
+    model_path.mkdir()
+    pool = EnginePool()
+    entry = _entry(str(model_path))
+    entry.model_id = "public-vlm"
+    entry.model_type = "vlm"
+    entry.engine_type = "vlm"
+    pool._entries["public-vlm"] = entry
+
+    assert (
+        pool.resolve_cluster_model_id(str(model_path), text_only=True) == "public-vlm"
+    )
+
+
 def test_remote_only_cluster_model_gets_a_batched_pool_entry(tmp_path):
     model_path = tmp_path / "minimax"
     model_path.mkdir()

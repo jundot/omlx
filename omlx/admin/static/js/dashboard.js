@@ -1,3 +1,38 @@
+    // B6 asset-version handshake: every /admin/api/cluster/* response carries
+    // the X-Omlx-Asset-Version header for the dashboard.js the server ships
+    // right now. This page was built with window.OMLX_ASSET_VERSION (injected
+    // by dashboard.html). A mismatch means the browser cached a stale bundle
+    // across an app update (failure #8's cached-JS ghost) — flag it once,
+    // permanently, and let the reload bar in _cluster.html demand a reload.
+    // Wrapping the global fetch for cluster paths only means every current
+    // and future cluster call site participates without being touched.
+    (() => {
+        // A page environment without fetch at all (unit-test vm sandboxes)
+        // has nothing to wrap; the bar never fires there.
+        if (typeof window.fetch !== 'function') return;
+        const nativeFetch = window.fetch.bind(window);
+        window.fetch = async function (input, init) {
+            const response = await nativeFetch(input, init);
+            try {
+                const url = typeof input === 'string'
+                    ? input
+                    : String((input && input.url) || '');
+                if (url.startsWith('/admin/api/cluster/')
+                    || url.startsWith('/api/cluster/')) {
+                    const served = response.headers.get('X-Omlx-Asset-Version');
+                    const built = window.OMLX_ASSET_VERSION;
+                    if (served && built && served !== built) {
+                        window.OMLX_ASSET_STALE = true;
+                        window.dispatchEvent(new CustomEvent('omlx-asset-stale'));
+                    }
+                }
+            } catch (_) {
+                // Version bookkeeping must never break the API call itself.
+            }
+            return response;
+        };
+    })();
+
     // OCR model types that require temperature=0.0 (deterministic output)
     const OCR_CONFIG_MODEL_TYPES = new Set([
         'deepseekocr', 'deepseekocr_2', 'dots_ocr', 'glm_ocr',
@@ -265,6 +300,10 @@
             settingsApply: { open: false, mode: 'optimal', phase: 'input', recipeText: '', result: null, candidates: null, error: '' },
             importingMtplx: false,
             loadingGenDefaults: false,
+            // Auto-context assessment for the open settings modal:
+            // {max_context_tokens, declared_context_tokens} or null while
+            // unknown/unavailable (the template hides the button then).
+            modelSettingsAutoContext: null,
             reasoningParsers: [],
             aneTuning: {
                 tuningId: null,
@@ -679,6 +718,14 @@
             accCopied: false,
 
             async init() {
+                // B6: surface a stale cached bundle the fetch wrapper flags.
+                // The window-level flag covers a mismatch detected before
+                // this component initialized.
+                this.assetStale = Boolean(window.OMLX_ASSET_STALE);
+                window.addEventListener('omlx-asset-stale', () => {
+                    this.assetStale = true;
+                });
+
                 // Apply theme
                 this.applyTheme();
                 this.applyTabStateFromUrl();
@@ -2637,6 +2684,33 @@
                 }
             },
 
+            // Best-effort: fetch the largest context that fits on this Mac
+            // for the model. Fire-and-forget from openModelSettings — a slow
+            // or failed fetch (e.g. a model never downloaded) must never
+            // block the modal; the Auto button just stays hidden.
+            async fetchModelAutoContext(modelId) {
+                try {
+                    const resp = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/auto_context`);
+                    if (!resp.ok) return;
+                    const data = await resp.json();
+                    if (
+                        this.selectedModel
+                        && this.selectedModel.id === modelId
+                        && Number(data?.max_context_tokens) > 0
+                    ) {
+                        this.modelSettingsAutoContext = data;
+                    }
+                } catch (_) { /* advisory only */ }
+            },
+
+            // Clicking "Auto" is exactly typing the computed number in.
+            // No auto-vs-manual mode is persisted for local settings.
+            applyAutoContext() {
+                const tokens = Number(this.modelSettingsAutoContext?.max_context_tokens);
+                if (!Number.isFinite(tokens) || tokens <= 0) return;
+                this.modelSettings.max_context_window = tokens;
+            },
+
             async refreshOpenModelSettings() {
                 if (!this.showModelSettingsModal || !this.selectedModel) return;
                 const modelId = this.selectedModel.id;
@@ -2653,6 +2727,7 @@
                 const baseline = JSON.stringify(this.modelSettings);
                 const seq = ++this._applySeq;
                 this.profileError = '';
+                this.modelSettingsAutoContext = null;
                 this.showNewProfileForm = false;
                 this.showNewTemplateForm = false;
                 this.editingProfile = null;
@@ -2691,6 +2766,8 @@
                     || this.selectedModel?.id !== model.id
                     || JSON.stringify(this.modelSettings) !== baseline)) return;
                 this.selectedModel = model;
+                // Deliberately not awaited: advisory, must never delay the modal.
+                if (!isDiffusion) this.fetchModelAutoContext(model.id);
                 this.modelSettings = this.buildModelSettingsState(
                     model,
                     model.settings || {},

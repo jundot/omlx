@@ -199,3 +199,40 @@ def test_every_dashboard_locale_names_cluster_tab():
     for path in locale_dir.glob("*.json"):
         payload = json.loads(path.read_text(encoding="utf-8"))
         assert payload.get("navbar.tab.cluster"), path.name
+
+
+def test_cluster_dashboard_demands_reload_when_the_bundle_is_stale():
+    """B6: a stale cached dashboard names itself, and the bar cannot close."""
+
+    rendered = admin_routes.templates.get_template("dashboard.html").render()
+    template = TEMPLATE.read_text(encoding="utf-8")
+    bundle = (ROOT / "omlx/admin/static/js/dashboard.js").read_text("utf-8")
+
+    # The page carries the version it was built with, injected server-side
+    # from the same content hash that stamps every cluster API response.
+    assert "window.OMLX_ASSET_VERSION" in rendered
+    assert f'window.OMLX_ASSET_VERSION = "{admin_routes.asset_version()}"' in rendered
+    # The bundle URL busts on the same hash, so the demanded reload
+    # actually fetches the new JavaScript instead of the cached copy.
+    assert f"js/dashboard.js?v={admin_routes.asset_version()}" in rendered
+
+    # The reload bar exists, binds the flag, and is non-dismissable by
+    # design (B.3): its only affordance is the reload itself.
+    assert "data-asset-stale-bar" in template
+    assert 'x-show="assetStale"' in template
+    assert "Dashboard updated — reload" in template
+    bar = template.split("data-asset-stale-bar", 1)[1].split("</div>", 1)[0]
+    assert "window.location.reload()" in bar
+    assert "Dismiss" not in bar
+    assert "dismiss" not in bar
+
+    # One wrapper covers every cluster call site: the global fetch is
+    # intercepted for the cluster API paths, and the flag it sets is never
+    # cleared anywhere in the bundle.
+    assert "X-Omlx-Asset-Version" in bundle
+    assert "url.startsWith('/admin/api/cluster/')" in bundle
+    assert "omlx-asset-stale" in bundle
+    assert "window.OMLX_ASSET_STALE = true" in bundle
+    assert "this.assetStale = true" in bundle
+    # Nothing anywhere sets the flag back down once raised.
+    assert "assetStale = false" not in bundle.replace("assetStale: false", "")
