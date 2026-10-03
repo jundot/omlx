@@ -436,6 +436,75 @@ def _glm_indexer_q8_override(path: str, config: dict) -> dict | None:
     return dict(_GLM_INDEXER_Q8)
 
 
+# Qwen4-Exp (Qwen3.8-Flash-Next) quality-critical floor ---------------------
+#
+# Three groups of Qwen4-Exp tensors decide something discrete instead of
+# feeding a weighted sum, so their quantization error is not averaged out:
+#
+# * the sparse-attention indexer scores compressed KV blocks and keeps only the
+#   top ``indexer_budget / compress_ratio`` of them, so a flipped ranking drops
+#   the needed block from attention entirely;
+# * ``shared_expert_gate`` scales a whole shared expert with a single learned
+#   multiplier;
+# * the hyper-connection mixers write into the residual stream every later
+#   layer reads, so their error is re-injected rather than attenuated by depth.
+#
+# Together these are well under 1% of the checkpoint (attention is ~2% of this
+# fine-grained 512-expert MoE), so leaving them at the level's base bits saves
+# almost nothing while risking exactly the long-context and multi-step failure
+# modes this family is deployed for. Same reasoning as
+# ``_glm_indexer_q8_override`` above and the Inkling ``qkvr_proj`` floor: the
+# indexer and the MoE gate stay in full precision, and the attention, gated
+# residual, PLE key/value and MTP fusion projections get a fixed 8-bit affine
+# format. The MTP copies are included on purpose - keeping the backbone and the
+# preserved MTP head on one format is what the GLM indexer rule already does,
+# and draft acceptance depends on the same projections.
+_QWEN4_EXP_FULL_PRECISION_SUFFIXES = (
+    ".self_attn.indexer.index_qk_proj",
+    ".mlp.shared_expert_gate",
+)
+
+_QWEN4_EXP_Q8_SUFFIXES = (
+    ".self_attn.q_proj",
+    ".self_attn.k_proj",
+    ".self_attn.v_proj",
+    ".self_attn.o_proj",
+    ".ple.key_proj",
+    ".ple.value_proj",
+    ".attn_hyper_connection.block_inject_weight",
+    ".attn_hyper_connection.input_mix_weight_up",
+    ".attn_hyper_connection.input_mix_weight_down",
+    ".mlp_hyper_connection.block_inject_weight",
+    ".mlp_hyper_connection.input_mix_weight_up",
+    ".mlp_hyper_connection.input_mix_weight_down",
+    ".hyper_connection_mixer.input_mix_weight_up",
+    ".hyper_connection_mixer.input_mix_weight_down",
+    "mtp.fc_embedding",
+    "mtp.fc_hidden",
+)
+
+# Group size 64 matches the GLM indexer floor and the 8-bit tensors shipped in
+# existing Qwen4-Exp oQe checkpoints.
+_QWEN4_EXP_Q8 = {"bits": 8, "group_size": 64, "mode": "affine"}
+
+
+def _qwen4_exp_protected_floor(path: str, config: dict) -> dict | bool | None:
+    """Return the fixed format for Qwen4-Exp quality-critical tensors.
+
+    ``False`` keeps the tensor in full precision, a spec dict pins it to a
+    fixed 8-bit affine format, and ``None`` means this tensor is not covered
+    and the regular per-level policy applies.
+    """
+    if not _is_qwen4_exp_config(config):
+        return None
+    path = _normalize_quant_path(path)
+    if path.endswith(_QWEN4_EXP_FULL_PRECISION_SUFFIXES):
+        return False
+    if path.endswith(_QWEN4_EXP_Q8_SUFFIXES):
+        return dict(_QWEN4_EXP_Q8)
+    return None
+
+
 def _is_qwen4_exp_ngram_embedding_tensor(path: str, config: dict) -> bool:
     """Return whether *path* is one Qwen4-Exp PLE embedding shard.
 
@@ -499,6 +568,14 @@ def universal_quant_predicate(
     glm_indexer_override = _glm_indexer_q8_override(path, config)
     if glm_indexer_override is not None:
         return glm_indexer_override
+
+    # Qwen4-Exp keeps its indexer/gates in full precision and pins the
+    # attention, gated residual, PLE key/value and MTP fusion projections to a
+    # fixed 8-bit format at every oQ level. Evaluated before the boost map so a
+    # per-level budget plan cannot trade these tensors away.
+    qwen4_floor = _qwen4_exp_protected_floor(path, config)
+    if qwen4_floor is not None:
+        return qwen4_floor
 
     tc = config.get("text_config", {})
     num_layers = config.get("num_hidden_layers") or tc.get("num_hidden_layers", 32)
@@ -1061,10 +1138,18 @@ def _build_quant_plan(
     # GLM DSA indexers are a format invariant, not an optional sensitivity
     # boost. Seed them before pricing the plan and never let the bpw cap drop
     # them. On GLM-5.2 all 22 indexers together are only about 209 MiB at Q8.
+    #
+    # Qwen4-Exp's protected floor is seeded the same way, so its
+    # quality-critical small tensors are priced up front and cannot be trimmed
+    # back to base bits when a low level (oQ2/oQ3) runs out of budget. Tensors
+    # the floor keeps in full precision are skipped - they are never quantized.
     for path in named_shapes:
         if path in fixed_overrides:
             continue
         override = _glm_indexer_q8_override(path, config)
+        if override is None:
+            qwen4_override = _qwen4_exp_protected_floor(path, config)
+            override = qwen4_override if isinstance(qwen4_override, dict) else None
         if override is not None:
             boost_map[path] = override
 
