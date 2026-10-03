@@ -4190,44 +4190,80 @@
                 return Math.min(100, (rc.total_size_bytes / rc.disk_max_bytes) * 100);
             },
 
-            get activeModelsPressurePercent() {
-                const mp = this.stats.active_models?.memory_pressure;
-                if (!mp || !mp.hard_bytes) return 0;
-                return Math.min(100, (mp.current_bytes / mp.hard_bytes) * 100);
+            /* --- Memory watermark -------------------------------------------------
+               The meter reads the two thresholds the enforcer itself defines: fine
+               under the soft guard, the guard's colour at it, the ceiling's at the
+               hard limit (Apple's own memory-pressure gauge and Grafana's
+               thresholds use the same shape). The colours live in the stylesheet
+               (`--sys-green` / `--sys-orange` / `--sys-red`), so the watermark bar
+               and the marks cannot drift apart. */
+            memoryTone(percent) {
+                if (percent >= 90) return 'meter--over';
+                if (percent >= 70) return 'meter--warn';
+                return 'meter--ok';
             },
 
-            get activeModelsSoftPercent() {
-                const mp = this.stats.active_models?.memory_pressure;
-                if (!mp || !mp.hard_bytes || !mp.soft_bytes) return 0;
-                return Math.min(100, (mp.soft_bytes / mp.hard_bytes) * 100);
+            get watermarkTone() {
+                return this.memoryTone(this.memoryWatermark.actualOfLimit);
             },
 
-            get activeModelsPressureBarColor() {
-                const pct = this.activeModelsPressurePercent;
-                if (pct >= 90) return '#ef4444';
-                if (pct >= 80) return '#f97316';
-                if (pct >= 70) return '#f59e0b';
-                if (pct >= 60) return '#facc15';
-                return '#22c55e';
+            // One track, scaled to the memory the machine has: what is in use, the
+            // estimate behind it, the guarded zone between the soft guard and the
+            // hard limit, and the part above the hard limit no model may use.
+            // `actualOfLimit` is the only ratio the colour reads.
+            get memoryWatermark() {
+                const pressure = this.stats?.active_models?.memory_pressure;
+                const models = this.stats?.active_models?.models || [];
+                const hard = pressure?.hard_bytes || this.stats?.active_models?.model_memory_max || 0;
+                const actual = pressure?.enabled
+                    ? pressure.current_bytes
+                    : this.stats?.active_models?.model_memory_used || 0;
+                const soft = pressure?.soft_bytes || 0;
+                const estimated = models.reduce((total, model) => total + (model.estimated_size || 0), 0);
+                const machine = this.stats?.system?.total_memory_bytes || 0;
+                const scale = Math.max(machine, hard, 1);
+                const at = (bytes) => Math.min(100, (bytes / scale) * 100);
+                return {
+                    enabled: Boolean(pressure?.enabled) && hard > 0,
+                    hard,
+                    actual,
+                    soft,
+                    estimated,
+                    actualPercent: at(actual),
+                    estimatedPercent: at(estimated),
+                    softPercent: soft ? at(soft) : 0,
+                    hardPercent: at(hard),
+                    guardWidth: soft && hard > soft ? at(hard) - at(soft) : 0,
+                    unavailableWidth: Math.max(0, 100 - at(hard)),
+                    actualOfLimit: hard ? (actual / hard) * 100 : 0,
+                };
             },
 
-            get activeModelsPressureBarStyle() {
-                return `width: ${this.activeModelsPressurePercent}%; height: 100%; display: block; background-color: ${this.activeModelsPressureBarColor};`;
+            watermarkBarStyle(percent) {
+                return `width: ${percent}%;`;
             },
 
-            get activeModelsSoftMarkerStyle() {
-                return `left: ${this.activeModelsSoftPercent}%; width: 1px; background-color: rgba(64, 64, 64, 0.6);`;
+            watermarkBarStyleAt(startPercent, widthPercent) {
+                return `left: ${startPercent}%; width: ${widthPercent}%;`;
             },
 
-            activeModelsPressureLabel() {
-                const mp = this.stats.active_models?.memory_pressure;
-                if (!mp || !mp.enabled || !mp.hard_bytes) {
-                    return window.t('status.active_models.enforcer_disabled');
-                }
-                return window.t('status.active_models.pressure_label')
-                    .replace('{current}', this.formatSizeBytes(mp.current_bytes))
-                    .replace('{soft}', this.formatSizeBytes(mp.soft_bytes))
-                    .replace('{hard}', this.formatSizeBytes(mp.hard_bytes));
+            watermarkMarkerStyle(percent) {
+                return `left: ${percent}%;`;
+            },
+
+            // The two limit words the legend and the marker's tooltip name are
+            // the words the console has always used for the enforcer's limits:
+            // they are read out of the pressure label the old header bar
+            // carried, so the wording cannot drift from it and no new key is
+            // needed — the translations the sweep already made keep working.
+            get memoryGuardLabels() {
+                const tpl = window.t('status.active_models.pressure_label');
+                const soft = tpl.match(/\{soft\}\s*([^/]+)/);
+                const hard = tpl.match(/\{hard\}\s*([^/]+)/);
+                return {
+                    soft: soft ? soft[1].trim() : 'soft',
+                    hard: hard ? hard[1].trim() : 'hard',
+                };
             },
 
             modelSizeLabel(model) {

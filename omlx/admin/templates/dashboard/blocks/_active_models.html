@@ -1,44 +1,41 @@
 <!-- Active Models -->
 <div class="bg-white rounded-2xl border border-neutral-200">
-    <div class="lg:hidden flex flex-col gap-2 px-4 py-4 bg-neutral-100 border-b border-neutral-200 rounded-t-2xl">
-        <div class="flex items-center gap-3">
-            <i data-lucide="activity" class="w-4 h-4 text-neutral-500"></i>
-            <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.active_models.section_label') }}</span>
-        </div>
-        <div class="flex flex-col gap-1.5 w-full min-w-0">
-            <div class="w-full h-2.5 bg-neutral-200 rounded-full overflow-hidden relative shrink-0">
-                <div class="rounded-full transition-all duration-300"
-                     :style="activeModelsPressureBarStyle"></div>
-                <div x-show="stats.active_models.memory_pressure && stats.active_models.memory_pressure.enabled && activeModelsSoftPercent > 0"
-                     x-cloak
-                     class="absolute inset-y-0"
-                     :style="activeModelsSoftMarkerStyle">
-                </div>
-            </div>
-            <span class="text-xs font-medium text-neutral-500"
-                  x-text="activeModelsPressureLabel()"></span>
-        </div>
+    <div class="lg:hidden flex items-center gap-3 px-4 py-4 bg-neutral-100 border-b border-neutral-200 rounded-t-2xl">
+        <i data-lucide="activity" class="w-4 h-4 text-neutral-500"></i>
+        <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.active_models.section_label') }}</span>
     </div>
-    <div class="hidden lg:flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200 rounded-t-2xl">
-        <div class="flex items-center gap-3">
-            <i data-lucide="activity" class="w-4 h-4 text-neutral-500"></i>
-            <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.active_models.section_label') }}</span>
+    <div class="hidden lg:flex items-center gap-3 px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200 rounded-t-2xl">
+        <i data-lucide="activity" class="w-4 h-4 text-neutral-500"></i>
+        <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.active_models.section_label') }}</span>
+    </div>
+    <!-- Memory watermark: one track scaled to the machine's memory — the
+         measured footprint inside it, the resident estimate behind it, the
+         guarded band between the two limits, and the part above the hard
+         limit no model may be given. The enforcer's own numbers drive it,
+         so the bar and the guard cannot drift apart. -->
+    <div class="px-4 sm:px-6 py-4 border-b border-neutral-100"
+         x-show="memoryWatermark.enabled || memoryWatermark.actual > 0">
+        <div class="watermark">
+            <div class="watermark__bar watermark__bar--guard"
+                 :style="watermarkBarStyleAt(memoryWatermark.softPercent, memoryWatermark.guardWidth)"></div>
+            <div class="watermark__bar watermark__bar--unavailable"
+                 :style="watermarkBarStyleAt(memoryWatermark.hardPercent, memoryWatermark.unavailableWidth)"></div>
+            <div class="watermark__bar watermark__bar--estimated"
+                 :style="watermarkBarStyle(memoryWatermark.estimatedPercent)"></div>
+            <div class="watermark__bar watermark__bar--actual"
+                 :class="watermarkTone"
+                 :style="watermarkBarStyle(memoryWatermark.actualPercent)"></div>
+            <div class="watermark__marker watermark__marker--soft" x-show="memoryWatermark.softPercent > 0"
+                 :style="watermarkMarkerStyle(memoryWatermark.softPercent)"></div>
+            <div class="watermark__marker watermark__marker--hard" x-show="memoryWatermark.hard > 0"
+                 :style="watermarkMarkerStyle(memoryWatermark.hardPercent)"
+                 :title="memoryGuardLabels.hard"></div>
         </div>
-        <div class="flex items-center gap-3">
-            <!-- Memory progress bar -->
-            <div class="flex items-center gap-2">
-                <div class="w-36 h-2.5 bg-neutral-200 rounded-full overflow-hidden relative shrink-0">
-                    <div class="rounded-full transition-all duration-300"
-                         :style="activeModelsPressureBarStyle"></div>
-                    <div x-show="stats.active_models.memory_pressure && stats.active_models.memory_pressure.enabled && activeModelsSoftPercent > 0"
-                         x-cloak
-                         class="absolute inset-y-0"
-                         :style="activeModelsSoftMarkerStyle">
-                    </div>
-                </div>
-                <span class="text-xs font-medium text-neutral-500 whitespace-nowrap"
-                      x-text="activeModelsPressureLabel()"></span>
-            </div>
+        <div class="watermark__legend">
+            <span><span class="watermark__swatch watermark__swatch--actual"></span>Measured <span class="tabular-nums" x-text="formatSizeBytes(memoryWatermark.actual)"></span></span>
+            <span><span class="watermark__swatch watermark__swatch--estimated"></span>Estimated <span class="tabular-nums" x-text="formatSizeBytes(memoryWatermark.estimated)"></span></span>
+            <span x-show="memoryWatermark.softPercent > 0"><span class="watermark__swatch watermark__swatch--marker watermark__swatch--soft"></span><span x-text="memoryGuardLabels.soft"></span> <span class="tabular-nums" x-text="formatSizeBytes(memoryWatermark.soft)"></span></span>
+            <span><span class="watermark__swatch watermark__swatch--marker watermark__swatch--hard"></span><span x-text="memoryGuardLabels.hard"></span> <span class="tabular-nums" x-text="formatSizeBytes(memoryWatermark.hard)"></span></span>
         </div>
     </div>
     <div class="divide-y divide-neutral-100">
