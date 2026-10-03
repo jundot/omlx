@@ -268,6 +268,11 @@ def test_no_unreachable_functions_in_the_cluster_package():
         # Peer import preflight, exposed ahead of the /autoconfigure handler
         # that will call it alongside preflight_issues.
         ("autoconfigure.py", "peer_import_issues"),
+        # Readiness-ladder primitives (transport readiness ladder, #B3),
+        # exposed ahead of the Fabric Doctor UI panels (fabric-doctor
+        # C2-C5) that read the ladder state and gate on fabric verification.
+        ("readiness.py", "is_fabric_verified"),
+        ("readiness.py", "link_ladder_state"),
         # Test hooks that drop process-wide v2 singletons between cases; only
         # the test suite calls them (production swaps via configure_*).
         ("identity.py", "reset_configured_identity"),

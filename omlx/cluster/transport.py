@@ -424,7 +424,12 @@ _RDMA_STATES = (
 
 @dataclass(frozen=True)
 class LinkStatus:
-    """What the fabric can actually do right now, and how to fix it."""
+    """What the fabric can actually do right now, and how to fix it.
+
+    ``ladder`` is the ``TransportState`` rung this evidence supports (a plain
+    string to keep this module import-light); ``reason``/``remedy`` are the
+    copy the CLI and GUI render verbatim beside it.
+    """
 
     state: str
     title: str
@@ -435,6 +440,9 @@ class LinkStatus:
     commands: tuple[str, ...] = ()
     doc_url: str = ""
     setup_available: bool = False
+    ladder: str = ""
+    reason: str = ""
+    remedy: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -447,6 +455,9 @@ class LinkStatus:
             "commands": list(self.commands),
             "doc_url": self.doc_url,
             "setup_available": self.setup_available,
+            "ladder": self.ladder,
+            "reason": self.reason,
+            "remedy": self.remedy,
         }
 
 
@@ -487,6 +498,15 @@ def classify_link(
             backend="ring",
             ready=True,
             link_label=label or "Ethernet / Wi-Fi",
+            ladder="enabled_no_peer",
+            reason=(
+                "No Thunderbolt link was found between these Macs, so the "
+                "fast fabric does not exist yet."
+            ),
+            remedy=(
+                "Connect a Thunderbolt 5 cable between the Macs, then detect "
+                "the link again."
+            ),
         )
 
     hosts = list(rdma_devices)
@@ -512,6 +532,16 @@ def classify_link(
                 "rdma_ctl enable",
             ),
             doc_url="https://developer.apple.com/documentation/technotes/tn3205-low-latency-communication-with-rdma-over-thunderbolt",
+            ladder="disabled",
+            reason=(
+                f"RDMA is switched off in the operating system on "
+                f"{', '.join(without_devices)}."
+            ),
+            remedy=(
+                "On each listed Mac: enter macOS Recovery, run `rdma_ctl "
+                "enable` in Utilities → Terminal, restart, then detect the "
+                "link again."
+            ),
         )
 
     inactive = [h for h in hosts if not active_ports.get(h)]
@@ -529,6 +559,15 @@ def classify_link(
             backend="jaccl-ring",
             ready=False,
             link_label=label,
+            ladder="peer_linked_config_pending",
+            reason=(
+                f"RDMA is enabled but no Thunderbolt port reports an active "
+                f"RDMA link on {', '.join(inactive)}."
+            ),
+            remedy=(
+                "Reseat the cable, wake both Macs, and detect the link again "
+                "— RDMA needs Thunderbolt 5 on both ends."
+            ),
         )
 
     unrouted = [h for h in hosts if not port_ips.get(h)]
@@ -547,6 +586,15 @@ def classify_link(
             link_label=label,
             doc_url="https://github.com/ml-explore/mlx/discussions/3481",
             setup_available=True,
+            ladder="peer_linked_config_pending",
+            reason=(
+                "The active Thunderbolt ports have no IP address, so the RDMA "
+                "queue pairs cannot be established."
+            ),
+            remedy=(
+                "Press Start Cluster — oMLX will configure and verify the "
+                "link after administrator approval."
+            ),
         )
 
     return LinkStatus(
@@ -560,6 +608,17 @@ def classify_link(
         backend="jaccl",
         ready=True,
         link_label=label,
+        # Per-host evidence proves addressing and routing, not two-ended
+        # reachability — that rung belongs to assess_link's bound connect.
+        ladder="routed",
+        reason=(
+            "Every Mac has an active, routable RDMA port; reachability "
+            "between them has not been proven yet."
+        ),
+        remedy=(
+            "Press Start — activation verifies the link before launching — "
+            "or run Fabric Doctor to prove it now."
+        ),
     )
 
 
@@ -889,6 +948,9 @@ def assess_link(
             detail="Add a peer Mac to check the link between them.",
             backend="ring",
             ready=False,
+            ladder="unavailable",
+            reason="No peer Macs are configured, so there is no link to assess.",
+            remedy="Add a peer Mac to check the link between them.",
         )
 
     try:
@@ -911,6 +973,9 @@ def assess_link(
             ),
             backend="ring",
             ready=False,
+            ladder="unavailable",
+            reason="The peer's RDMA state could not be read over SSH.",
+            remedy="Fix the SSH connection and detect the link again.",
         )
     thunderbolt = any(
         getattr(t, "kind", "") in _FAST_KINDS for t in transports
@@ -963,6 +1028,17 @@ def assess_link(
                 backend="jaccl",
                 ready=True,
                 link_label=label or "Thunderbolt RDMA",
+                # The bound connect proved both ends, which is what earns the
+                # REACHABLE rung; bandwidth verification comes later.
+                ladder="reachable",
+                reason=(
+                    "Both Macs answered on their fabric addresses in both "
+                    "directions."
+                ),
+                remedy=(
+                    "Nothing to fix — press Start; the fabric bandwidth check "
+                    "runs during activation."
+                ),
             )
         if status.state == "rdma_ready" and shared is not None and shared.ok:
             return LinkStatus(
@@ -976,6 +1052,15 @@ def assess_link(
                 backend="ring",
                 ready=True,
                 link_label="Ethernet / Wi-Fi",
+                ladder="routed",
+                reason=(
+                    "The Thunderbolt RDMA addresses did not form the usable "
+                    "route; a TCP route was verified instead."
+                ),
+                remedy=(
+                    "Run Fabric Doctor to re-address the Thunderbolt link if "
+                    "you want the RDMA path; the TCP ring works meanwhile."
+                ),
             )
         if status.state == "rdma_ready" and (shared is None or not shared.ok):
             reason = (
@@ -994,6 +1079,17 @@ def assess_link(
                 backend="ring",
                 ready=False,
                 link_label=status.link_label or "Thunderbolt",
+                # Addressed and routed per-host, but the bound connect failed:
+                # the ladder honestly stops below REACHABLE.
+                ladder="routed",
+                reason=(
+                    "The Thunderbolt addresses are configured but did not "
+                    "answer a bound connect between the Macs."
+                ),
+                remedy=(
+                    "Run Fabric Doctor to check the static addresses and "
+                    "routes on both Macs."
+                ),
             )
         if status.ready and (shared is None or not shared.ok):
             reason = (
@@ -1012,6 +1108,12 @@ def assess_link(
                 backend="ring",
                 ready=False,
                 link_label=status.link_label,
+                ladder="unavailable",
+                reason="No route between the Macs could be verified.",
+                remedy=(
+                    "Run Fabric Doctor, or check the network addresses and "
+                    "routes on both Macs."
+                ),
             )
     return status
 
@@ -1479,18 +1581,38 @@ def _route_interface(output: str) -> str:
     return ""
 
 
+# A TCP connect *bound to the fabric source IP*. Proves the route AND that the
+# peer's SSH service answers over that exact path — the check that separates
+# "cable works" from "a VPN/firewall on that Mac swallows inbound TCP". ICMP and
+# route lookups can both pass while TCP is dropped (the incident's exact shape:
+# LAN ping/SSH fine, peer->coordinator on the fabric refused).
+_BOUND_CONNECT_SCRIPT = (
+    "import socket,sys\n"
+    "s=socket.create_connection((sys.argv[2],22),timeout=3,"
+    "source_address=(sys.argv[1],0))\n"
+    "s.close()"
+)
+
+
 def verify_link_reachability(
     link: SharedLink,
     *,
     runner: LinkCommandRunner | None = None,
 ) -> tuple[bool, str]:
-    """Prove both endpoints route and answer over the selected interfaces.
+    """Prove both endpoints route and answer TCP over the selected interfaces.
 
     Sharing a subnet is only a candidate. Macs can retain stale addresses on
     old Thunderbolt interfaces, and two unreachable interfaces can therefore
-    look like a perfect point-to-point link. The route must name the selected
-    interface in both directions and one bounded ICMP probe must succeed from
-    each endpoint before the address enters a hostfile.
+    look like a perfect point-to-point link. In each direction the route must
+    name the selected interface *and* a TCP connection bound to the fabric
+    source IP must succeed. TCP is the success criterion, not ping: a VPN or
+    firewall (org policy "all interfaces") can pass ICMP and route lookups while
+    refusing inbound TCP, which is exactly how the fabric silently failed.
+
+    Ping is kept only as a post-failure diagnostic, to tell "firewall drops TCP"
+    (route + ping fine, TCP refused) from "host down" (nothing answers). Worst
+    case on a fully dead link is ~3 bounded commands x 2 directions; acceptable
+    for an explicit, user-initiated check.
     """
 
     source, peer = link.source, link.peer
@@ -1500,25 +1622,12 @@ def verify_link_reachability(
     directions = ((source, peer), (peer, source))
     for local, remote in directions:
         route = run(local.host, ("/sbin/route", "-n", "get", remote.address))
-        selected = _route_interface(route.stdout) if route.returncode == 0 else ""
-        if selected != local.interface:
-            # Linux does not implement macOS's ``route -n get`` form. Binding
-            # a TCP connection to the candidate source address proves both the
-            # route and that the peer's SSH service answers on that exact path,
-            # without needing a platform-specific interface command.
-            script = (
-                "import socket,sys\n"
-                "s=socket.create_connection((sys.argv[2],22),timeout=3,"
-                "source_address=(sys.argv[1],0))\n"
-                "s.close()"
-            )
-            if route.returncode != 0:
-                bound = run(
-                    local.host,
-                    ("python3", "-c", script, local.address, remote.address),
-                )
-                if bound.returncode == 0:
-                    continue
+        route_available = route.returncode == 0
+        selected = _route_interface(route.stdout) if route_available else ""
+        # macOS names the egress interface; a mismatch means no route over our
+        # fabric interface. Linux lacks this ``route -n get`` form (returncode
+        # != 0) — there the bound connect below is the sole proof.
+        if route_available and selected != local.interface:
             detail = (
                 f"route uses {selected}"
                 if selected
@@ -1528,13 +1637,26 @@ def verify_link_reachability(
                 f"{local.host} cannot use {local.interface} to reach "
                 f"{remote.address}: {detail}."
             )
+        bound = run(
+            local.host,
+            ("python3", "-c", _BOUND_CONNECT_SCRIPT, local.address, remote.address),
+        )
+        if bound.returncode == 0:
+            continue
+        # TCP failed. Ping is only a diagnostic to name the likely cause.
         ping = run(
             local.host,
             ("/sbin/ping", "-n", "-c", "1", "-W", "1000", remote.address),
         )
-        if ping.returncode != 0:
+        if ping.returncode == 0:
             return False, (
-                f"{local.host} routes {remote.address} over {local.interface}, "
-                "but the peer did not answer on that address."
+                f"{remote.host} cannot accept connections on the Thunderbolt "
+                "link (a firewall or VPN on that Mac applies to all "
+                f"interfaces): {local.host} reached {remote.address} by ping "
+                "but the bound TCP connection was refused."
             )
+        return False, (
+            f"{local.host} routes {remote.address} over {local.interface}, "
+            f"but {remote.host} did not answer on that address (no TCP, no ping)."
+        )
     return True, link.reason
