@@ -823,11 +823,18 @@ def _marker_payloads(text: str, start_marker: str, end_marker: str) -> List[str]
 
 
 def _strip_marker_spans(text: str, start_marker: str, end_marker: str) -> str:
-    """Remove every complete marker-delimited span, keeping surrounding prose.
+    """Remove every marker-delimited span, keeping surrounding prose.
 
     Span-based rather than ``re.sub`` with a non-greedy pattern so that a call
     containing a literal close marker is removed whole instead of leaving its
     tail behind as visible content (#2507).
+
+    A trailing unterminated envelope is also removed: templates whose tool-call
+    instruction block shows only the opening marker (e.g. GLM-5.3-Flash emits
+    the raw start marker with no close in its template) make the model emit an
+    unclosed envelope at the very end of its output. Leaving that marker in
+    cleaned text re-seeds the envelope on the next turn, which suppresses the
+    replacement call and loops the turn (omlx issue: glm5_next tool-loop).
     """
     out: List[str] = []
     last = 0
@@ -836,7 +843,12 @@ def _strip_marker_spans(text: str, start_marker: str, end_marker: str) -> str:
     ):
         out.append(text[last:span_start])
         last = span_end
-    out.append(text[last:])
+    tail = text[last:]
+    trailing_open = tail.find(start_marker)
+    if trailing_open >= 0:
+        # Drop the unterminated tail envelope; keep the prose before it.
+        tail = tail[:trailing_open]
+    out.append(tail)
     return "".join(out)
 
 
@@ -2264,16 +2276,21 @@ def parse_qwen_tool_calls(
                 paired
                 and found
                 and finish_reason == "stop"
-                and _QWEN_OPEN_RE.search(text, function_start + len(_XML_FUNCTION_OPEN))
+                and _QWEN_OPEN_RE.search(
+                    text, function_start + len(_XML_FUNCTION_OPEN)
+                )
                 is None
             ):
-                # A literal close tag can hide the last function's missing outer close.
-                # Do not scan through a later call to recover it.
+                # A literal close tag can hide the last function's missing outer
+                # close. Do not scan through a later call to recover it.
                 relative_end = _NakedFunctionBoundary().feed(
                     text[function_start:], len(_XML_FUNCTION_OPEN)
                 )
                 if relative_end is not None:
                     candidate_end = function_start + relative_end
+                    # Whitespace after the envelope is normal template
+                    # separation, not "competing prose": accepting it keeps
+                    # single-marker templates (e.g. GLM-5.3-Flash) recoverable.
                     if not text[candidate_end:].strip():
                         function_end = candidate_end
                         found = None
@@ -2282,8 +2299,9 @@ def parse_qwen_tool_calls(
             envelope = text[start:end]
         else:
             end = function_end
+            remainder = text[end:].strip() if end is not None else ""
             if end is None or (
-                paired and (finish_reason != "stop" or text[end:].strip())
+                paired and (finish_reason != "stop" or remainder)
             ):
                 errors.append("incomplete")
                 pos = len(text)
