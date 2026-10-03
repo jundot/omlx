@@ -166,7 +166,7 @@ def test_proportional_plan_respects_weight_ceiling():
 
 
 def test_proportional_plan_validates_kv_fit():
-    model = _model(kv_bytes_per_token_per_layer=1)
+    model = _model(kv_bytes_per_token_by_layer=(1,) * 4)
     with pytest.raises(PlanningError, match="KV cache"):
         plan_proportional_pipeline(
             model,

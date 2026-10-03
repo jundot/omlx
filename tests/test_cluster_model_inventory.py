@@ -181,7 +181,7 @@ def test_catalogue_measures_a_peer_owned_model_on_the_peer(monkeypatch):
             fixed_weight_bytes=0,
             layer_weight_bytes=(1024,) * 8,
             supports_pipeline=True,
-            kv_bytes_per_token_per_layer=128,
+            kv_bytes_per_token_by_layer=(128,) * 8,
         )
 
     monkeypatch.setattr(routes, "remote_model_layout", fake_layout)
