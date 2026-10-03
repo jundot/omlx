@@ -37,6 +37,7 @@ from ..memory_monitor import (
 )
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..scheduler import _glm5_next_prefill_floor
+from ..utils.dry import warn_dry_unsupported
 from ..utils.generation_config import load_generation_config_token_ids
 from ..utils.model_loading import maybe_apply_pre_load_patches
 from ..utils.proc_memory import get_phys_footprint
@@ -1774,6 +1775,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         tools = kwargs.pop("tools", None)
         seed = kwargs.pop("seed", None)
         repetition_context_size = kwargs.pop("repetition_context_size", None)
+        if kwargs.pop("dry", None) is not None:
+            # The native DFlash lane samples inside dflash-mlx, which has no
+            # DRY hook; the fallback engine above does apply it.
+            warn_dry_unsupported("DFlash")
         if repetition_context_size is None:
             repetition_context_size = 20
 
@@ -2016,6 +2021,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         tools = kwargs.pop("tools", None)
         seed = kwargs.pop("seed", None)
         repetition_context_size = kwargs.pop("repetition_context_size", None)
+        if kwargs.pop("dry", None) is not None:
+            # The native DFlash lane samples inside dflash-mlx, which has no
+            # DRY hook; the fallback engine above does apply it.
+            warn_dry_unsupported("DFlash")
         if repetition_context_size is None:
             repetition_context_size = 20
 

@@ -347,6 +347,13 @@ class ChatCompletionRequest(BaseModel):
     xtc_threshold: float | None = None
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
+    # DRY repetition penalty (llama.cpp-compatible names; multiplier 0 = off)
+    dry_multiplier: float | None = Field(default=None, ge=0)
+    dry_base: float | None = Field(default=None, ge=0)
+    dry_allowed_length: int | None = None
+    dry_penalty_last_n: int | None = Field(default=None, ge=-1)
+    dry_sequence_breakers: list[str] | None = None
+    dry_exclude_reasoning: bool | None = None
     # Tool calling
     tools: Optional[List[ToolDefinition]] = None
     tool_choice: Optional[Union[str, dict]] = None  # "auto", "none", or specific tool
@@ -483,6 +490,13 @@ class CompletionRequest(BaseModel):
     xtc_threshold: float | None = None
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
+    # DRY repetition penalty (llama.cpp-compatible names; multiplier 0 = off)
+    dry_multiplier: float | None = Field(default=None, ge=0)
+    dry_base: float | None = Field(default=None, ge=0)
+    dry_allowed_length: int | None = None
+    dry_penalty_last_n: int | None = Field(default=None, ge=-1)
+    dry_sequence_breakers: list[str] | None = None
+    dry_exclude_reasoning: bool | None = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
     # Cap reasoning/thinking tokens (parity with /v1/chat/completions)

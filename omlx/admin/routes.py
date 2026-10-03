@@ -302,6 +302,12 @@ class ModelSettingsRequest(BaseModel):
     repetition_penalty: float | None = None
     min_p: float | None = None
     presence_penalty: float | None = None
+    dry_multiplier: float | None = Field(default=None, ge=0)
+    dry_base: float | None = Field(default=None, ge=0)
+    dry_allowed_length: int | None = None
+    dry_penalty_last_n: int | None = Field(default=None, ge=-1)
+    dry_sequence_breakers: list[str] | None = None
+    dry_exclude_reasoning: bool | None = None
     force_sampling: bool | None = None
     max_tool_result_tokens: int | None = None
     chat_template_kwargs: dict[str, Any] | None = None
@@ -2845,6 +2851,18 @@ async def update_model_settings(
         current_settings.min_p = request.min_p
     if "presence_penalty" in sent:
         current_settings.presence_penalty = request.presence_penalty
+    if "dry_multiplier" in sent:
+        current_settings.dry_multiplier = request.dry_multiplier
+    if "dry_base" in sent:
+        current_settings.dry_base = request.dry_base
+    if "dry_allowed_length" in sent:
+        current_settings.dry_allowed_length = request.dry_allowed_length
+    if "dry_penalty_last_n" in sent:
+        current_settings.dry_penalty_last_n = request.dry_penalty_last_n
+    if "dry_sequence_breakers" in sent:
+        current_settings.dry_sequence_breakers = request.dry_sequence_breakers
+    if "dry_exclude_reasoning" in sent:
+        current_settings.dry_exclude_reasoning = request.dry_exclude_reasoning
     if "force_sampling" in sent:
         current_settings.force_sampling = request.force_sampling
     if "max_tool_result_tokens" in sent:
