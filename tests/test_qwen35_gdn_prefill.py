@@ -165,7 +165,18 @@ def test_prefill_patch_passthrough_for_decode_mask_and_unsupported_shape(monkeyp
     )
 
 
-def test_prefill_patch_chunked_impl_opt_in(monkeypatch):
+def test_prefill_patch_chunked_impl_disabled_falls_back_to_default(
+    monkeypatch, caplog
+):
+    """E2: OMLX_GDN_IMPL=chunked routes to unbounded-tail-read/fp16-narrowed
+    kernels with no current callers and no performance upside (the module's
+    own docstring: slower than the default E2E) -- disabled rather than
+    fixed. Setting the env var must warn and fall back to the default
+    (pipelined) kernel, not silently ignore the request or route to the
+    buggy kernel.
+    See docs/qwen35-hardening-and-optimization.md E2."""
+    import logging
+
     import omlx.custom_kernels.qwen35_prefill as kernels
     import omlx.patches.qwen35_gdn_chunked as patch
 
@@ -173,21 +184,29 @@ def test_prefill_patch_chunked_impl_opt_in(monkeypatch):
     monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
     monkeypatch.setenv("OMLX_GDN_IMPL", "chunked")
 
-    calls = []
     monkeypatch.setattr(
         kernels,
         "gated_delta_chunked_metal",
-        lambda *args: calls.append("chunked") or ("chunked_y", "chunked_state"),
+        lambda *args: pytest.fail("chunked kernel must never be routed to"),
+    )
+    calls = []
+    monkeypatch.setattr(
+        kernels,
+        "gated_delta_pipelined",
+        lambda *args: calls.append("pipelined") or ("pipelined_y", "pipelined_state"),
     )
 
-    assert patch.apply_qwen35_gdn_prefill_patch() is True
+    with caplog.at_level(logging.WARNING):
+        assert patch.apply_qwen35_gdn_prefill_patch() is True
+    assert any("OMLX_GDN_IMPL=chunked is disabled" in r.getMessage() for r in caplog.records)
+
     q = _Tensor((1, 128, 16, 128))
     v = _Tensor((1, 128, 48, 128))
     assert gd.gated_delta_update(q, q, v, _Tensor((1, 128, 48)), None, None, None) == (
-        "chunked_y",
-        "chunked_state",
+        "pipelined_y",
+        "pipelined_state",
     )
-    assert calls == ["chunked"]
+    assert calls == ["pipelined"]
 
 
 def test_blocked_seq_default_block_size_depends_on_input_dtype(monkeypatch):
