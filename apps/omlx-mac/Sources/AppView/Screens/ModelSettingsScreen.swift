@@ -1513,6 +1513,7 @@ private struct EntryEditor: View {
             Popup(
                 selection: vm.bindProfile(binding.value),
                 width: Self.reasoningEffortValueWidth,
+                fillsWidth: true,
                 options: vm.reasoningEffortPresets.map {
                     ($0, $0)
                 }
