@@ -1,23 +1,22 @@
+{% import "components/ui.html" as ui %}
 <!-- Serving Stats Header -->
-<div class="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4 mb-8">
+<div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-8">
     <div>
-        <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('status.section_label') }}</h2>
         <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('status.heading') }}</h3>
     </div>
     <div class="flex flex-wrap items-center gap-2">
         <!-- Scope toggle -->
-        <div class="flex rounded-lg border border-neutral-200 overflow-hidden">
-            <button @click="statsScope = 'session'; showClearStatsConfirm = false; showClearAlltimeConfirm = false"
-                    :class="statsScope === 'session' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
-                    class="px-3 py-1.5 text-xs font-medium transition-all">
-                {{ t('status.scope_session') }}
-            </button>
-            <button @click="statsScope = 'alltime'; showClearStatsConfirm = false; showClearAlltimeConfirm = false"
-                    :class="statsScope === 'alltime' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
-                    class="px-3 py-1.5 text-xs font-medium transition-all border-l border-neutral-200">
-                {{ t('status.scope_alltime') }}
-            </button>
-        </div>
+        {#- The KPI cards read the scope out of `statsScope` themselves (the
+            payload for both scopes arrives in one poll), so the toggle only has
+            to set it — but it does have to set it, and it has to take the
+            other scope's pending confirmation with it: a "Clear stats?" row
+            left open on one scope used to reappear on its own when the user
+            came back to it. -#}
+        {{ ui.segmented([('session', t('status.scope_session')),
+                         ('alltime', t('status.scope_alltime'))],
+                        active='statsScope',
+                        setter="statsScope = '{value}'; showClearStatsConfirm = false; showClearAlltimeConfirm = false",
+                        aria_label=t('status.scope_label')) }}
         <!-- Clear button -->
         <div class="flex items-center gap-1.5">
             <button x-show="(statsScope === 'session' && !showClearStatsConfirm) || (statsScope === 'alltime' && !showClearAlltimeConfirm)"
@@ -31,7 +30,7 @@
                  x-cloak class="flex items-center gap-1.5">
                 <span class="text-xs text-red-600">{{ t('status.clear_confirm') }}</span>
                 <button @click="statsScope === 'session' ? clearStats() : clearAlltimeStats()"
-                        class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
+                        class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:brightness-95 rounded-lg transition-all">
                     {{ t('status.clear_yes') }}
                 </button>
                 <button @click="showClearStatsConfirm = false; showClearAlltimeConfirm = false"
@@ -51,35 +50,43 @@
     </div>
 </div>
 
-<!-- Three Stat Cards -->
-<div class="grid grid-cols-1 sm:grid-cols-3 gap-4 sm:gap-6 mb-8">
-    <!-- Total Prefill Tokens -->
-    <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
-        <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.total_tokens') }}</p>
-        <p class="font-bold tracking-tight text-neutral-900 transition-all"
-           :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_prompt_tokens)"
-           x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_prompt_tokens)"></p>
-    </div>
+<!-- First paint: four placeholder cards hold the row's shape until the first
+     /api/stats payload lands. No numbers of their own. -->
+<div x-show="!statsLoaded">{{ ui.skeleton_kpis(4) }}</div>
 
-    <!-- Cached Tokens Served -->
-    <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
-        <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.cached_tokens') }}</p>
-        <p class="font-bold tracking-tight text-neutral-900 transition-all"
-           :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_cached_tokens)"
-           x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_cached_tokens)"></p>
+<!-- KPI cards: auxiliary label, 28pt figure, and a sparkline drawn from the
+     console's own polling history (the API returns snapshots). The figures
+     animate from the previous poll's value; see omlxCountUp in js/ui.js. -->
+<div class="kpi-grid mb-8" x-show="statsLoaded" x-cloak>
+    <div class="kpi">
+        <span class="kpi__label">{{ t('status.kpi.requests') }}</span>
+        <span class="kpi__figure">
+            <span class="kpi__value" x-effect="window.omlxCountUp($el, kpiValue('total_requests'), {format: window.formatCount})"></span>
+        </span>
     </div>
-
-    <!-- Cache Efficiency -->
-    <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
-        <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.cache_efficiency') }}</p>
-        <p class="font-bold tracking-tight text-neutral-900 transition-all"
-           :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).cache_efficiency)"
-           x-text="(statsScope === 'alltime' ? alltimeStats : stats).cache_efficiency.toFixed(1) + '%'"></p>
+    <div class="kpi">
+        <span class="kpi__label">{{ t('status.stat.total_tokens') }}</span>
+        <span class="kpi__figure">
+            <span class="kpi__value" x-effect="window.omlxCountUp($el, kpiValue('total_prompt_tokens'), {format: window.formatCount})"></span>
+        </span>
+    </div>
+    <div class="kpi">
+        <span class="kpi__label">{{ t('status.stat.cached_tokens') }}</span>
+        <span class="kpi__figure">
+            <span class="kpi__value" x-effect="window.omlxCountUp($el, kpiValue('total_cached_tokens'), {format: window.formatCount})"></span>
+        </span>
+        </div>
+    <div class="kpi">
+        <span class="kpi__label">{{ t('status.stat.cache_efficiency') }}</span>
+        <span class="kpi__figure">
+            <span class="kpi__value" x-effect="window.omlxCountUp($el, kpiValue('cache_efficiency'), {decimals: 1})"></span>
+            <span class="kpi__unit">%</span>
+        </span>
     </div>
 </div>
 
 <!-- Speed Stats -->
-<div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+<div class="card overflow-hidden">
     <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
         <div class="flex items-center gap-3">
             <i data-lucide="gauge" class="w-4 h-4 text-neutral-500"></i>
@@ -88,12 +95,13 @@
     </div>
     <div class="grid grid-cols-1 sm:grid-cols-2 sm:divide-x divide-neutral-100">
         <div class="p-6">
-            <p class="text-xs text-neutral-500 mb-1">{{ t('status.speed.prompt_processing') }} <span class="text-neutral-400">{{ t('status.speed.prompt_processing_note') }}</span></p>
-            <p class="text-2xl font-bold text-neutral-900" x-text="(statsScope === 'alltime' ? alltimeStats : stats).avg_prefill_tps.toFixed(1) + ' tok/s'"></p>
+            <p class="kpi__label mb-1">{{ t('status.speed.prompt_processing') }}</p>
+            <p class="kpi__figure"><span class="kpi__value" x-effect="window.omlxCountUp($el, kpiValue('avg_prefill_tps'), {decimals: 1})"></span><span class="kpi__unit">Tok/s</span></p>
+            <p class="status-header__meta mt-1">{{ t('status.speed.prompt_processing_note') }}</p>
         </div>
         <div class="p-6">
-            <p class="text-xs text-neutral-500 mb-1">{{ t('status.speed.token_generation') }}</p>
-            <p class="text-2xl font-bold text-neutral-900" x-text="(statsScope === 'alltime' ? alltimeStats : stats).avg_generation_tps.toFixed(1) + ' tok/s'"></p>
+            <p class="kpi__label mb-1">{{ t('status.speed.token_generation') }}</p>
+            <p class="kpi__figure"><span class="kpi__value" x-effect="window.omlxCountUp($el, kpiValue('avg_generation_tps'), {decimals: 1})"></span><span class="kpi__unit">Tok/s</span></p>
         </div>
     </div>
 </div>

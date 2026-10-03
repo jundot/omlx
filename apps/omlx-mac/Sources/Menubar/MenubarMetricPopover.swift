@@ -34,7 +34,7 @@ struct MetricPopoverView: View {
 
             if let note = statusNote {
                 Text(note)
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textTertiary)
             }
 
@@ -46,9 +46,9 @@ struct MetricPopoverView: View {
                 comment: "Header above the throughput graphs in a menubar metric popover"
             ))
 
-            graphCaption("PP tk/s")
+            graphCaption("PP Tok/s")
             MetricSparkline(values: series.promptTps, color: theme.blueDot)
-            graphCaption("TG tk/s")
+            graphCaption("TG Tok/s")
             MetricSparkline(values: series.generationTps, color: theme.greenDot)
 
             Divider().padding(.vertical, 2)
@@ -113,7 +113,7 @@ struct MetricPopoverView: View {
 
     private func sectionHeader(_ title: String) -> some View {
         Text(title.uppercased())
-            .font(.omlxText(10, weight: .bold))
+            .font(.omlxText(DesignTokens.FontSize.aux, weight: .bold))
             .kerning(1)
             .foregroundStyle(theme.accent)
             .frame(maxWidth: .infinity, alignment: .center)
@@ -125,22 +125,22 @@ struct MetricPopoverView: View {
                 .fill(tint)
                 .frame(width: 6, height: 6)
             Text(label)
-                .font(.omlxText(12, weight: .medium))
+                .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                 .foregroundStyle(theme.textSecondary)
             Spacer()
             Text(value)
-                .font(.omlxMono(12, weight: .medium))
+                .font(.omlxMono(DesignTokens.FontSize.aux, weight: .medium))
                 .foregroundStyle(theme.text)
         }
     }
 
     private func graphCaption(_ text: String) -> some View {
         Text(text)
-            .font(.omlxMono(9))
+            .font(.omlxMono(DesignTokens.FontSize.aux))
             .foregroundStyle(theme.textTertiary)
     }
 
-    /// Popover readout: one decimal below 100 tk/s, whole numbers above,
+    /// Popover readout: one decimal below 100 Tok/s, whole numbers above,
     /// "–" for unknown.
     static func popoverTps(_ value: Double?) -> String {
         guard let value, value.isFinite else {
@@ -148,9 +148,9 @@ struct MetricPopoverView: View {
         }
         let clamped = max(0, value)
         if clamped < 100 {
-            return String(format: "%.1f tk/s", clamped)
+            return String(format: "%.1f Tok/s", clamped)
         }
-        return "\(Int(clamped.rounded())) tk/s"
+        return "\(Int(clamped.rounded())) Tok/s"
     }
 }
 

@@ -6,28 +6,30 @@
     <title>{% block title %}{{ t('app.title') }}{% endblock %}</title>
     <link rel="icon" type="image/svg+xml" href="/admin/static/favicon.svg">
 
-    <!-- Inter Font (self-hosted, Latin) -->
-    <link rel="stylesheet" href="/admin/static/fonts/inter/inter.css">
-
-    <!-- CJK Font (conditional, self-hosted) -->
-    {% if current_lang == 'zh' %}
-    <link rel="stylesheet" href="/admin/static/fonts/noto-sans-sc/noto-sans-sc.css">
-    {% elif current_lang == 'zh-TW' %}
-    <link rel="stylesheet" href="/admin/static/fonts/noto-sans-tc/noto-sans-tc.css">
-    {% elif current_lang == 'ko' %}
-    <link rel="stylesheet" href="/admin/static/fonts/noto-sans-kr/noto-sans-kr.css">
-    {% elif current_lang == 'ja' %}
-    <link rel="stylesheet" href="/admin/static/fonts/noto-sans-jp/noto-sans-jp.css">
-    {% endif %}
-
     <!-- Tailwind CSS (pre-compiled) -->
     <link rel="stylesheet" href="{{ static('css/tailwind.css') }}">
+
+    <!-- Design tokens (generated from omlx/admin/tokens.json; loaded after the
+         Tailwind utilities so the token type scale wins, and before the
+         per-page stylesheets so page rules still win over it) -->
+    <link rel="stylesheet" href="{{ static('css/tokens.css') }}">
+
+    <!-- Shared component specs (Button/Badge/Card/FormRow/Segmented/EmptyState) -->
+    <link rel="stylesheet" href="{{ static('css/components.css') }}">
 
     <!-- Alpine.js -->
     <script defer src="/admin/static/js/alpine.min.js"></script>
 
     <!-- Lucide Icons -->
     <script src="/admin/static/js/lucide.min.js"></script>
+
+    <!-- Number formatting (one implementation for every count in the console) -->
+    <script src="{{ static('js/format.js') }}"></script>
+
+    <!-- Toasts, the ⌘K palette and the animated number transition. Alpine-free
+         on purpose: these have to work on every page the console renders, not
+         only inside the dashboard's Alpine root. -->
+    <script src="{{ static('js/ui.js') }}"></script>
 
     <script>
         // Apply theme immediately to prevent flash of wrong theme
@@ -53,6 +55,10 @@
     </script>
 
     <script>
+        // The console's own language, not the browser's: number formatting and
+        // date formatting must follow this.
+        window.__omlxLang = "{{ current_lang }}";
+
         // i18n locale strings
         window._t = {{ locale_json | safe }};
         window.t = function(key) { return window._t[key] !== undefined ? window._t[key] : key; };
@@ -66,26 +72,8 @@
             display: inline-block;
         }
 
-        /* Global UI tokens */
-        :root {
-            --focus-ring-color: #171717;
-            {% if current_lang == 'ko' %}
-            --font-sans: 'Noto Sans KR', 'Inter', system-ui, sans-serif;
-            {% elif current_lang == 'zh' %}
-            --font-sans: 'PingFang SC', 'SF Pro Text', 'Noto Sans SC', 'Inter', system-ui, sans-serif;
-            {% elif current_lang == 'zh-TW' %}
-            --font-sans: 'PingFang TC', 'SF Pro Text', 'Noto Sans TC', 'Inter', system-ui, sans-serif;
-            {% elif current_lang == 'ja' %}
-            --font-sans: 'Noto Sans JP', 'Inter', system-ui, sans-serif;
-            {% else %}
-            --font-sans: 'Inter', system-ui, sans-serif;
-            {% endif %}
-        }
-
-        [data-theme="dark"] {
-            --focus-ring-color: #efefef;
-        }
-
+        /* Colour, type and layout tokens live in the generated tokens.css.
+           Nothing about the palette or the type scale belongs here. */
         body {
             font-family: var(--font-sans) !important;
             -webkit-font-smoothing: antialiased;
@@ -118,8 +106,8 @@
            contrast boost). Visible on :focus-visible only, so mouse users see
            no extra chrome while keyboard users always see where focus is. */
         :focus-visible {
-            outline: 2px solid var(--focus-ring-color) !important;
-            outline-offset: 2px;
+            outline: var(--focus-ring-width) solid var(--focus-ring-color) !important;
+            outline-offset: var(--focus-ring-width);
         }
 
         dialog.dashboard-dialog {
@@ -176,7 +164,6 @@
         [data-enhanced-readability] {
             --text-secondary: var(--text-primary) !important;
             --text-tertiary: var(--text-primary) !important;
-            --text-muted: var(--text-primary) !important;
             --text-danger: #d92d20 !important;
         }
         [data-theme="dark"][data-enhanced-readability] {
@@ -192,34 +179,25 @@
         [data-enhanced-readability][data-theme] .text-neutral-600,
         [data-enhanced-readability][data-theme] .text-neutral-700,
         [data-enhanced-readability][data-theme] .text-neutral-800,
-        [data-enhanced-readability][data-theme] .text-muted,
         [data-enhanced-readability][data-theme] .text-fg-tertiary,
-        [data-enhanced-readability][data-theme] .text-fg-secondary,
-        [data-enhanced-readability][data-theme] .text-fg-muted {
+        [data-enhanced-readability][data-theme] .text-fg-secondary {
             color: var(--text-primary) !important;
         }
         [data-enhanced-readability] ::placeholder { color: var(--text-primary) !important; opacity: 1 !important; }
         /* Font-size floor: lift all <12px text to 12px. KaTeX is intentionally
            excluded (its font-size stays untouched, preserving 1.21em scaling).
            Tailwind arbitrary-value classes MUST use the escaped form
-           (.text-\[10px\]) to match the compiled selector. */
-        [data-enhanced-readability] .text-\[9px\],
-        [data-enhanced-readability] .text-\[10px\],
-        [data-enhanced-readability] .text-\[11px\],
-        [data-enhanced-readability] .svg-allow-warning,
+           (.text-\[10px\]). The floor itself is the scale's now and is
+           generated into tokens.css, where it applies to everyone; what is
+           left here is the two icon buttons whose size is relative (0.7em)
+           and only this toggle lifts. */
         [data-enhanced-readability] .code-copy-btn,
-        [data-enhanced-readability] .svg-render-btn,
-        [data-enhanced-readability] .model-card-content pre code,
-        [data-enhanced-readability] *[style*="font-size: 10px"],
-        [data-enhanced-readability] *[style*="font-size: 11px"],
-        [data-enhanced-readability] *[style*="font-size:10px"],
-        [data-enhanced-readability] *[style*="font-size:11px"] {
+        [data-enhanced-readability] .svg-render-btn {
             font-size: 12px !important;
         }
         /* Inline gray vars (e.g. style="color: var(--text-tertiary)") -> primary */
         [data-enhanced-readability] [style*="--text-tertiary"],
-        [data-enhanced-readability] [style*="--text-secondary"],
-        [data-enhanced-readability] [style*="--text-muted"] {
+        [data-enhanced-readability] [style*="--text-secondary"]{
             color: var(--text-primary) !important;
         }
         /* Hardcoded gray hex inline colors -> primary (reds/greens excluded) */
@@ -242,6 +220,9 @@
 </head>
 <body class="font-sans bg-white text-neutral-900 antialiased selection:bg-neutral-900 selection:text-white">
     {% block content %}{% endblock %}
+
+    {#- Toast stack + command palette: one implementation for the console. -#}
+    {% include "components/overlays.html" %}
 
     <script>
         // Lucide icon processor — bypasses createIcons() which has Safari issues.

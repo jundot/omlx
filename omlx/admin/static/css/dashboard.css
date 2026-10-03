@@ -1,53 +1,28 @@
-    /* CSS Variables for theming (shared with chat.html) */
-    :root {
-        --bg-primary: #ffffff;
-        --bg-secondary: #f8fafc;
-        --bg-tertiary: #f1f5f9;
-        --text-primary: #0f172a;
-        --text-secondary: #475569;
-        --text-tertiary: #64748b;
-        --text-muted: #94a3b8;
-        --border-faint: #e2e8f0;
-        --border-normal: #cbd5e1;
-        --code-bg: #f3f4f6;
-        --link-color: #2563eb;
-    }
-
-    [data-theme="dark"] {
-        --bg-primary: #1d1d20;
-        --bg-secondary: #252529;
-        --bg-tertiary: #2d2d32;
-        --text-primary: #efefef;
-        --text-secondary: #a1a1aa;
-        --text-tertiary: #71717a;
-        --text-muted: #52525b;
-        --border-faint: #3f3f46;
-        --border-normal: #52525b;
-        --code-bg: #27272a;
-        --link-color: #60a5fa;
-    }
+    /* Theming tokens live in the generated static/css/tokens.css, which is
+       loaded before this file. Do not redeclare colours or font sizes here. */
 
     body {
         background-color: var(--bg-primary) !important;
         color: var(--text-primary) !important;
     }
 
-    /* === Page-level backgrounds === */
-    [data-theme="dark"] .bg-white { background-color: var(--bg-primary) !important; }
+    /* === Page-level backgrounds ===
+       The solid fills resolve at the resolver now: `bg-neutral-50/100/200`
+       map to the surface tokens and `.bg-white` is the companion rule in
+       components.css, so the dark appearance paints the same values these
+       overrides declared and the rules can go. What stays is the translucent
+       white: Tailwind renders `bg-white/80` from the literal `white` (a
+       var() colour cannot carry an opacity modifier), so its night value is
+       still this rule's to say. */
     [data-theme="dark"] .bg-white\/80 { background-color: rgba(29, 29, 32, 0.8) !important; }
-    [data-theme="dark"] .bg-neutral-50 { background-color: var(--bg-secondary) !important; }
-    [data-theme="dark"] .bg-neutral-50\/50 { background-color: rgba(37, 37, 41, 0.5) !important; }
-    [data-theme="dark"] .bg-neutral-100 { background-color: var(--bg-tertiary) !important; }
-    [data-theme="dark"] .bg-neutral-200 { background-color: var(--bg-tertiary) !important; }
 
-    /* === Text colors === */
-    [data-theme="dark"] .text-neutral-900 { color: var(--text-primary) !important; }
-    [data-theme="dark"] .text-neutral-800 { color: var(--text-primary) !important; }
-    [data-theme="dark"] .text-neutral-700 { color: var(--text-secondary) !important; }
-    [data-theme="dark"] .text-neutral-600 { color: var(--text-secondary) !important; }
-    [data-theme="dark"] .text-neutral-500 { color: var(--text-tertiary) !important; }
-    [data-theme="dark"] .text-neutral-400 { color: var(--text-muted) !important; }
-    [data-theme="dark"] .text-neutral-300 { color: var(--text-muted) !important; }
+    /* === Text colors ===
+       400-900 are the three text tokens at the resolver now (textColor in
+       tailwind.config.js), which is exactly what these overrides said — they
+       go. 300 stays: its light value is the faint decorative grey
+       (separators, dashes, disabled steps) that no token names, so the
+       utility keeps Tailwind's default and this rule keeps its dark step. */
+    [data-theme="dark"] .text-neutral-300 { color: var(--text-tertiary) !important; }
 
     /* Cluster status is operational data, not decorative helper copy. Keep
        its cache/fabric labels and request metrics readable in dark mode even
@@ -60,19 +35,18 @@
         color: #a1a1aa !important;
     }
 
-    /* === Borders === */
-    [data-theme="dark"] .border-neutral-100 { border-color: var(--border-faint) !important; }
-    [data-theme="dark"] .border-neutral-200 { border-color: var(--border-faint) !important; }
-    [data-theme="dark"] .border-neutral-300 { border-color: var(--border-normal) !important; }
-    [data-theme="dark"] .divide-neutral-100 > :not([hidden]) ~ :not([hidden]) { border-color: var(--border-faint) !important; }
-    [data-theme="dark"] .divide-neutral-200 > :not([hidden]) ~ :not([hidden]) { border-color: var(--border-faint) !important; }
+    /* === Borders ===
+       borderColor/divideColor in tailwind.config.js declare these values for
+       both appearances; the dark overrides said the same thing and go. */
 
-    /* === Hover states === */
-    [data-theme="dark"] .hover\:bg-neutral-100:hover { background-color: var(--bg-tertiary) !important; }
-    [data-theme="dark"] .hover\:bg-neutral-50:hover { background-color: var(--bg-secondary) !important; }
-    [data-theme="dark"] .hover\:text-neutral-900:hover { color: var(--text-primary) !important; }
+    /* === Hover states ===
+       The bg hovers and the 900/600 text hovers are the same keys the
+       resolver declares (their base values already matched this rule's
+       targets), so they go. The one that stays: `hover:text-neutral-700`
+       lights up to *primary* in the dark appearance while its base text is
+       *secondary* — one textColor key cannot say both, and this rule is the
+       only place the difference is written down. */
     [data-theme="dark"] .hover\:text-neutral-700:hover { color: var(--text-primary) !important; }
-    [data-theme="dark"] .hover\:text-neutral-600:hover { color: var(--text-secondary) !important; }
 
     /* === Gauge track (visible in both themes) === */
     .gauge-track { background-color: #e5e5e5; }
@@ -84,19 +58,20 @@
     /* === Settings dropdown === */
     [data-theme="dark"] .shadow-lg { box-shadow: 0 4px 12px 0 rgba(0, 0, 0, 0.5) !important; }
 
-    /* === Buttons: bg-neutral-900 text-white → invert in dark mode === */
+    /* === Buttons: bg-neutral-900 text-white → invert in dark mode ===
+       The fills are the resolver's now: `bg-neutral-900` is `--btn-primary`
+       and `hover:bg-neutral-800` is `--accent-fill-hover`, which paint
+       #e5e5e5 / #d4d4d8 in the dark appearance exactly as these rules
+       declared, so the fill declarations go with them. What no key can
+       express is the *label* flipping inside such a button, so the colour
+       half of each rule stays (the fill it used to carry is noted beside
+       it). */
     [data-theme="dark"] button.bg-neutral-900,
     [data-theme="dark"] a.bg-neutral-900 {
-        background-color: #e5e5e5 !important;
-        color: #18181b !important;
+        color: #18181b !important;  /* fill: var(--btn-primary), from the config */
     }
-    [data-theme="dark"] button.hover\:bg-neutral-800:hover,
-    [data-theme="dark"] a.hover\:bg-neutral-800:hover {
-        background-color: #d4d4d8 !important;
-    }
-    /* Status badge inversion */
+    /* Status badge inversion (fill: var(--btn-primary), from the config) */
     [data-theme="dark"] span.bg-neutral-900 {
-        background-color: #e5e5e5 !important;
         color: #18181b !important;
     }
     [data-theme="dark"] span.bg-neutral-900 span {
@@ -195,27 +170,24 @@
     [data-theme="dark"] .focus\:ring-black:focus { --tw-ring-color: var(--border-normal) !important; }
     [data-theme="dark"] .focus\:ring-2:focus { --tw-ring-color: var(--border-normal) !important; }
 
-    /* === Toggle switches (ON state: bg-black) === */
-    [data-theme="dark"] button.bg-black {
-        background-color: #a1a1aa !important;
-    }
+    /* === Toggle switches (ON state: bg-black) ===
+       `.bg-black` is the companion rule in components.css painting
+       `--switch-on`, whose dark value is this rule's #a1a1aa — the fill
+       rule goes; the knob stays white, because white is the one value the
+       config's single key cannot give both halves of this control. */
     [data-theme="dark"] button.bg-black span.bg-white {
         background-color: #ffffff !important;
     }
-    /* Toggle OFF state */
-    [data-theme="dark"] button.bg-neutral-200 {
-        background-color: var(--bg-tertiary) !important;
-    }
-    /* Default radio button (ON state) */
+    /* Toggle OFF state: `bg-neutral-200` is `--bg-tertiary` at the
+       resolver now, which is exactly what this rule said — the rule goes. */
+    /* Default radio button (ON state). The fill is the `.bg-black`
+       companion's already; `border-black` has no token mapping (its key
+       carries the alpha classes Tailwind would drop), so the border half
+       stays. `border-neutral-300` and `hover:border-neutral-400` are
+       `--border-normal` / `--text-tertiary` at the resolver now — the two
+       rules that said the same go. */
     [data-theme="dark"] button.bg-black.border-black {
-        background-color: #a1a1aa !important;
         border-color: #a1a1aa !important;
-    }
-    [data-theme="dark"] button.border-neutral-300 {
-        border-color: var(--border-normal) !important;
-    }
-    [data-theme="dark"] button.hover\:border-neutral-400:hover {
-        border-color: var(--text-muted) !important;
     }
 
     /* === Range slider === */
@@ -226,7 +198,17 @@
         background-color: #a1a1aa !important;
     }
 
-    /* === Badge colors (dark mode adjustments) === */
+    /* === Badge colors (dark mode adjustments) ===
+       KEPT ON PURPOSE. In the light appearance these utilities now resolve
+       through the config (`bg-*-50` -> `label.*`, borders -> a 30% system
+       tint, the label -> `badge.*-fg`), but the dark appearance must keep
+       painting what it paints today: a Tailwind-hue tint at 15/30% and the
+       lightened Tailwind foregrounds below. One key per shade cannot be two
+       hues, so these overrides stay until the token file grows a
+       per-appearance tint (they are the dark half of the mapping, not a
+       leftover). The rules for palettes the markup no longer compiles
+       (orange/purple/cyan/sky/indigo/violet/pink/rose/teal and blue's
+       -50/-200) had no reader and went with the sweep. */
     [data-theme="dark"] .bg-green-50 { background-color: rgba(34, 197, 94, 0.15) !important; }
     [data-theme="dark"] .border-green-200 { border-color: rgba(34, 197, 94, 0.3) !important; }
     [data-theme="dark"] .text-green-600 { color: #4ade80 !important; }
@@ -238,15 +220,7 @@
     [data-theme="dark"] .text-amber-700 { color: #fbbf24 !important; }
     [data-theme="dark"] .text-amber-800 { color: #fcd34d !important; }
     [data-theme="dark"] .text-amber-900 { color: #fcd34d !important; }
-    [data-theme="dark"] .bg-blue-50 { background-color: rgba(59, 130, 246, 0.15) !important; }
-    [data-theme="dark"] .border-blue-200 { border-color: rgba(59, 130, 246, 0.3) !important; }
     [data-theme="dark"] .text-blue-700 { color: #93c5fd !important; }
-    [data-theme="dark"] .bg-orange-50 { background-color: rgba(249, 115, 22, 0.15) !important; }
-    [data-theme="dark"] .border-orange-200 { border-color: rgba(249, 115, 22, 0.3) !important; }
-    [data-theme="dark"] .text-orange-700 { color: #fdba74 !important; }
-    [data-theme="dark"] .bg-purple-50 { background-color: rgba(168, 85, 247, 0.15) !important; }
-    [data-theme="dark"] .border-purple-200 { border-color: rgba(168, 85, 247, 0.3) !important; }
-    [data-theme="dark"] .text-purple-700 { color: #c4b5fd !important; }
     [data-theme="dark"] .bg-red-50 { background-color: rgba(239, 68, 68, 0.15) !important; }
     [data-theme="dark"] .border-red-200 { border-color: rgba(239, 68, 68, 0.3) !important; }
     [data-theme="dark"] .text-red-500 { color: #f87171 !important; }
@@ -257,34 +231,15 @@
     [data-theme="dark"] .border-emerald-200 { border-color: rgba(16, 185, 129, 0.3) !important; }
     [data-theme="dark"] .text-emerald-600 { color: #34d399 !important; }
     [data-theme="dark"] .text-emerald-700 { color: #6ee7b7 !important; }
-    [data-theme="dark"] .bg-cyan-50 { background-color: rgba(6, 182, 212, 0.15) !important; }
-    [data-theme="dark"] .border-cyan-200 { border-color: rgba(6, 182, 212, 0.3) !important; }
-    [data-theme="dark"] .text-cyan-700 { color: #67e8f9 !important; }
-    [data-theme="dark"] .bg-sky-50 { background-color: rgba(14, 165, 233, 0.15) !important; }
-    [data-theme="dark"] .border-sky-200 { border-color: rgba(14, 165, 233, 0.3) !important; }
-    [data-theme="dark"] .text-sky-600 { color: #38bdf8 !important; }
-    [data-theme="dark"] .text-sky-700 { color: #7dd3fc !important; }
-    [data-theme="dark"] .bg-indigo-50 { background-color: rgba(99, 102, 241, 0.15) !important; }
-    [data-theme="dark"] .border-indigo-200 { border-color: rgba(99, 102, 241, 0.3) !important; }
-    [data-theme="dark"] .text-indigo-700 { color: #a5b4fc !important; }
-    [data-theme="dark"] .bg-violet-50 { background-color: rgba(139, 92, 246, 0.15) !important; }
-    [data-theme="dark"] .border-violet-200 { border-color: rgba(139, 92, 246, 0.3) !important; }
-    [data-theme="dark"] .text-violet-600 { color: #a78bfa !important; }
-    [data-theme="dark"] .text-violet-700 { color: #c4b5fd !important; }
-    [data-theme="dark"] .bg-pink-50 { background-color: rgba(236, 72, 153, 0.15) !important; }
-    [data-theme="dark"] .border-pink-200 { border-color: rgba(236, 72, 153, 0.3) !important; }
-    [data-theme="dark"] .text-pink-700 { color: #f9a8d4 !important; }
-    [data-theme="dark"] .bg-rose-50 { background-color: rgba(244, 63, 94, 0.15) !important; }
-    [data-theme="dark"] .border-rose-200 { border-color: rgba(244, 63, 94, 0.3) !important; }
-    [data-theme="dark"] .text-rose-700 { color: #fda4af !important; }
-    [data-theme="dark"] .bg-teal-50 { background-color: rgba(20, 184, 166, 0.15) !important; }
-    [data-theme="dark"] .border-teal-200 { border-color: rgba(20, 184, 166, 0.3) !important; }
-    [data-theme="dark"] .text-teal-700 { color: #5eead4 !important; }
-    /* Small "API" tag inside the emerald profile pill. */
-    [data-theme="dark"] .bg-white\/70 { background-color: rgba(255, 255, 255, 0.12) !important; }
+    /* The "API" tag inside the emerald profile pill used a `.bg-white\/70`
+       override here; nothing compiles that class any more, so the rule went
+       with the sweep (its sibling `bg-white/80` above still has a reader). */
 
-    /* === Gradient background effect === */
-    [data-theme="dark"] .from-neutral-50 { --tw-gradient-from: var(--bg-secondary) !important; }
+    /* === Gradient background effect ===
+       The gradient stops are `gradientColorStops` at the resolver now, and
+       `--bg-secondary` is what this rule declared — the rule goes. The login
+       page's own gradient keeps its rule in login.html: that one declares a
+       different night value than `--bg-tertiary` gives it. */
 
     /* === Background grain texture in dark mode === */
     [data-theme="dark"] .bg-grain { opacity: 0.02; }
@@ -295,14 +250,16 @@
     /* === Selection text === */
     [data-theme="dark"] ::selection { background-color: #3f3f46; color: var(--text-primary); }
 
-    /* === Disabled states === */
-    [data-theme="dark"] .disabled\:opacity-50:disabled { opacity: 0.5; }
+    /* === Disabled states ===
+       `disabled:opacity-50` resolves to `--opacity-50` (0.5 in both
+       appearances), which is exactly what this rule said — the rule goes. */
 
-    /* === Hover bg for model rows === */
-    [data-theme="dark"] .hover\:bg-neutral-50:hover { background-color: var(--bg-secondary) !important; }
+    /* === Hover bg for model rows ===
+       `hover:bg-neutral-50` is `--bg-secondary` at the resolver now, which
+       is exactly what this rule said — the rule goes. */
 
-    /* === Copy button bg-white/80 === */
-    [data-theme="dark"] .bg-white\/80 { background-color: rgba(29, 29, 32, 0.8) !important; }
+    /* The copy-button `bg-white/80` restated the rule kept at the top of
+       this file (same selector, same value); one of them was enough. */
 
     /* === Model card markdown styles === */
     .model-card-content { font-size: 0.8125rem; line-height: 1.6; color: var(--text-secondary); }
@@ -314,7 +271,7 @@
     .model-card-content a:hover { text-decoration: underline; }
     .model-card-content code { font-size: 0.75rem; background: var(--code-bg); color: var(--text-primary); padding: 0.125rem 0.375rem; border-radius: 0.25rem; }
     .model-card-content pre { background: var(--bg-secondary); border: 1px solid var(--border-faint); border-radius: 0.75rem; padding: 0.75rem; overflow-x: auto; margin: 0.5rem 0; }
-    .model-card-content pre code { background: none; padding: 0; font-size: 0.6875rem; }
+    .model-card-content pre code { background: none; padding: 0; font-size: var(--fs-aux); }
     .model-card-content ul, .model-card-content ol { padding-left: 1.25rem; margin: 0.375rem 0; }
     .model-card-content li { margin: 0.125rem 0; }
     .model-card-content table { width: 100%; border-collapse: collapse; font-size: 0.75rem; margin: 0.5rem 0; }

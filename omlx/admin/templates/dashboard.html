@@ -8,17 +8,22 @@
 {% endblock %}
 
 {% block content %}
+{% import "components/ui.html" as ui %}
 <div class="min-h-screen bg-white flex flex-col" x-data="dashboard()" x-init="init()">
     <!-- Navigation Bar -->
     {% include "dashboard/_navbar.html" %}
 
     <!-- Main Content -->
-    <main class="flex-grow relative overflow-hidden">
-        <!-- Background Effects -->
-        <div class="absolute inset-0 bg-grain pointer-events-none z-0"></div>
+    <main class="flex-grow relative">
+        <!-- Background Effects. They clip themselves: an `overflow-hidden` on
+             <main> would make it the scroll container for the sticky sub-tab row
+             and the settings rail, and neither would stick. -->
+        <div class="absolute inset-0 overflow-hidden pointer-events-none" aria-hidden="true">
+            <div class="absolute inset-0 bg-grain z-0"></div>
         <div class="absolute top-0 left-1/2 -translate-x-1/2 w-[800px] h-[400px] bg-gradient-to-b from-neutral-50 to-transparent rounded-full blur-3xl -z-10 opacity-50"></div>
+        </div>
 
-        <div class="mx-auto px-4 sm:px-6 py-6 sm:py-10 relative z-10" :class="mainTab === 'status' ? dashboardWidthClass : 'max-w-7xl'">
+        <div class="page-frame page-wide relative z-10">
             <!-- Status Main Tab -->
             {% include "dashboard/_status.html" %}
 
@@ -46,15 +51,27 @@
     <!-- Model settings snapshot apply (optimal / recipe) -->
     {% include "dashboard/_modal_settings_apply.html" %}
 
+    <!-- Keyboard-shortcut overview. Chat ships its own list (chat.html), so
+         this one is the dashboard's and lists only what this page handles. -->
+    {% set shortcuts = [
+        (t('shortcuts.palette'), ['⌘K', '/']),
+        (t('shortcuts.overview'), ['?', '⌘/']),
+        (t('shortcuts.move'), ['↑', '↓']),
+        (t('shortcuts.run'), ['↵']),
+        (t('shortcuts.close'), [t('chat.shortcut_key_esc')]),
+        (t('shortcuts.tabs'), ['←', '→']),
+    ] %}
+    {{ ui.shortcut_overview(shortcuts) }}
+
     <!-- HF Mirror Settings Modal -->
-    <dialog x-effect="showHfMirrorModal ? $el.showModal() : $el.close()" x-cloak
+    <dialog id="hf-mirror-dialog"
          class="dashboard-dialog fixed inset-0 z-50 overflow-y-auto"
          role="dialog" aria-modal="true" aria-labelledby="hf-mirror-modal-title"
          @keydown.tab="trapDialogFocus($event)"
          @cancel.prevent="showHfMirrorModal = false">
         <div class="fixed inset-0 bg-black/50" @click="showHfMirrorModal = false"></div>
         <div class="flex min-h-full items-center justify-center p-4">
-            <div class="relative bg-white rounded-2xl shadow-2xl max-w-md w-[28rem] overflow-hidden"
+            <div class="relative bg-surface rounded-lg shadow-popover max-w-md w-[28rem] overflow-hidden"
                  @click.stop>
                 <div class="flex items-center justify-between px-6 py-4 border-b border-neutral-200">
                     <h3 id="hf-mirror-modal-title" class="text-base font-semibold text-neutral-900">{{ t('models.downloader.mirror_settings') }}</h3>
@@ -79,7 +96,7 @@
                     </button>
                     <button @click="saveHfMirrorEndpoint()"
                             :disabled="hfMirrorSaving"
-                            class="px-4 py-2 text-sm font-medium text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-50 transition-all">
+                            class="px-4 py-2 text-sm font-medium text-white bg-neutral-900 rounded-lg hover:bg-accent-hover disabled:opacity-50 transition-all">
                         <span x-show="!hfMirrorSaving">{{ t('models.downloader.mirror_save') }}</span>
                         <span x-show="hfMirrorSaving" class="flex items-center gap-2">
                             <svg class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
@@ -102,8 +119,11 @@
 <script src="{{ static('js/purify.min.js') }}"></script>
 <script src="{{ static('js/marked.umd.js') }}"></script>
 <script src="{{ static('js/usage.js') }}"></script>
+<script src="{{ static('js/settings_nav.js') }}"></script>
 <script src="{{ static('js/cluster_v2.js') }}"></script>
 <script src="{{ static('js/gridstack-all.js') }}"></script>
 <script src="{{ static('js/dashboard_layout.js') }}"></script>
+<!-- Log parsing/aggregation/windowing for the Logs tab (pure functions). -->
+<script src="{{ static('js/logs.js') }}"></script>
 <script src="{{ static('js/dashboard.js') }}"></script>
 {% endblock %}
