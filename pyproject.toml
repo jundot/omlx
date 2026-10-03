@@ -275,6 +275,7 @@ include = ["omlx*"]
 "omlx.custom_kernels.decode_fast" = ["*.metallib", "*.dylib", "*.so"]
 "omlx.custom_kernels.minimax_m3" = ["*.metallib", "*.dylib", "*.so"]
 "omlx.custom_kernels.qwen35_prefill" = ["*.metallib", "*.dylib", "*.so"]
+"omlx.custom_kernels.moe_staging" = ["csrc/*.cpp", "csrc/CMakeLists.txt"]
 
 [tool.uv]
 # mlx and mlx-lm are git-pinned; override transitive pins

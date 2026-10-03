@@ -85,6 +85,17 @@ A call's misses are read in parallel with `os.pread` on a shared thread pool. `e
 
 In decode, a slow read no longer leaves the GPU idle. The routing readback classifies the step's routes and the missing experts' reads are issued as before. If the first of them has not arrived 0.5 ms later, the step overlaps: the resident routes' `gather_qmm` is dispatched while the reads continue, a trivial kernel keeps the GPU busy until they finish, the missing routes are gathered once they are installed, and the layer's output is dispatched as soon as it is built. Each route is computed once, by the same kernel as the serial gather (`gather_qmm` is per-row), so the output is bit-identical. The resident gather is evaluated before the first slot write, because a write into an array a pending gather still references copies the whole array. The resident gather is only a fraction of a millisecond of GPU time, while a slow step waits a few milliseconds on its reads, and Apple GPUs lower their clock after a couple of milliseconds idle, which slows the next layer's work as well; keeping the GPU busy through the wait is what pays. Reads that arrive within 0.5 ms (page cache, fast internal storage) keep the serial order: an idle gap that short barely lowers the clock, and splitting the gather would cost more than it hides. Measured on `Qwen3.8-Flash-Next-oQ4e` (`qwen4_exp`, 48 layers wrapped), experts on a USB4 SSD, M4 Air 32 GB, greedy, output byte-identical with and without the overlap: 480 tokens after a 480-token warm-up at 18.8% residency, 3.56 tok/s serial and 5.03 with the overlap (two runs each, the drive's throttle stalls excluded); replaying two coding-agent sessions request by request (1.6k to 6k-token prompts with tool calls), 2.94 to 3.70 tok/s at 18.8% residency and 2.64 to 2.61 at 12.5%, where each decode step waits on about three misses and the reads set the pace. Time to first token is unchanged: prefill does not take this path.
 
+## Optional Flash Next read staging
+
+Build with `OMLX_WITH_MOE_STAGING=1 pip install -e .`, then set
+`OMLX_MOE_OFFLOAD_STAGING=1` before loading an offloaded Flash Next
+(`qwen4_exp`) model with MTP off. Staging is disabled by default; unset the
+runtime flag or set it to `0` and reload the model to disable it. This uses a
+bounded shared read pool (108.75 MiB for the measured layout), while retaining
+the original nine parallel tensor reads, install order, LRU and cache/stream
+semantics. Missing native helpers and pool exhaustion use original bytes.
+See [qualification and benchmark results](moe-offload-staging.md).
+
 ## Supported models
 
 The experimental toggle is available for `deepseek_v41`, `deepseek_v4`, `qwen4_exp`, `qwen3_5_moe` (Qwen3.5/3.6), `gemma4` MoE, `olmoe`, `glm_moe_dsa`, and `glm5_next` checkpoints whose expert tensor layout passes validation. Dense Gemma models and other model types do not show the toggle. The settings API and model loader use the same eligibility check.

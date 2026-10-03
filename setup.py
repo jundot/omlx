@@ -3,7 +3,6 @@ import sys
 
 from setuptools import setup
 
-
 CUSTOM_KERNEL_FLAG = "--with-custom-kernel"
 TRUTHY = {"1", "true", "yes", "on"}
 DEFAULT_CUSTOM_KERNEL_DEPLOYMENT_TARGET = "15.0"
@@ -17,7 +16,9 @@ def _with_custom_kernel() -> bool:
 
 
 def _custom_kernel_build_kwargs() -> dict:
-    if not _with_custom_kernel():
+    custom = _with_custom_kernel()
+    staging = os.environ.get("OMLX_WITH_MOE_STAGING", "").strip().lower() in TRUTHY
+    if not custom and not staging:
         return {}
 
     target = (
@@ -48,29 +49,41 @@ def _custom_kernel_build_kwargs() -> dict:
 
     from mlx import extension
 
+    modules = []
+    if custom:
+        modules.extend(
+            [
+                extension.CMakeExtension(
+                    "omlx.custom_kernels.bonsai._ext",
+                    sourcedir="omlx/custom_kernels/bonsai/csrc",
+                ),
+                extension.CMakeExtension(
+                    "omlx.custom_kernels.decode_fast._ext",
+                    sourcedir="omlx/custom_kernels/decode_fast/csrc",
+                ),
+                extension.CMakeExtension(
+                    "omlx.custom_kernels.glm_moe_dsa._ext",
+                    sourcedir="omlx/custom_kernels/glm_moe_dsa/csrc",
+                ),
+                extension.CMakeExtension(
+                    "omlx.custom_kernels.minimax_m3._ext",
+                    sourcedir="omlx/custom_kernels/minimax_m3/csrc",
+                ),
+                extension.CMakeExtension(
+                    "omlx.custom_kernels.qwen35_prefill._ext",
+                    sourcedir="omlx/custom_kernels/qwen35_prefill/csrc",
+                ),
+            ]
+        )
+    if staging:
+        modules.append(
+            extension.CMakeExtension(
+                "omlx.custom_kernels.moe_staging._ext",
+                sourcedir="omlx/custom_kernels/moe_staging/csrc",
+            )
+        )
     return {
-        "ext_modules": [
-            extension.CMakeExtension(
-                "omlx.custom_kernels.bonsai._ext",
-                sourcedir="omlx/custom_kernels/bonsai/csrc",
-            ),
-            extension.CMakeExtension(
-                "omlx.custom_kernels.decode_fast._ext",
-                sourcedir="omlx/custom_kernels/decode_fast/csrc",
-            ),
-            extension.CMakeExtension(
-                "omlx.custom_kernels.glm_moe_dsa._ext",
-                sourcedir="omlx/custom_kernels/glm_moe_dsa/csrc",
-            ),
-            extension.CMakeExtension(
-                "omlx.custom_kernels.minimax_m3._ext",
-                sourcedir="omlx/custom_kernels/minimax_m3/csrc",
-            ),
-            extension.CMakeExtension(
-                "omlx.custom_kernels.qwen35_prefill._ext",
-                sourcedir="omlx/custom_kernels/qwen35_prefill/csrc",
-            ),
-        ],
+        "ext_modules": modules,
         "cmdclass": {"build_ext": extension.CMakeBuild},
     }
 
