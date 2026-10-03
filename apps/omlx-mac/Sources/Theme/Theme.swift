@@ -67,6 +67,10 @@ struct OMLXTheme: Sendable {
     let amberDot: Color
     var redDot: Color
     let blueDot: Color
+    /// Quietest of the six: DEBUG's level mark.
+    let tealDot: Color
+    /// Worst of the six: CRITICAL's level mark.
+    let purpleDot: Color
 
     // Code + status backgrounds
     let codeBg: Color
@@ -131,6 +135,8 @@ extension OMLXTheme {
         amberDot: systemOrange,
         redDot: systemRed,
         blueDot: systemAccent,
+        tealDot: systemTeal,
+        purpleDot: systemPurple,
         codeBg: systemCodeBgLight,
         warningBg: systemOrange.opacity(0.16),
         warningText: systemOrange,
@@ -174,6 +180,8 @@ extension OMLXTheme {
         amberDot: systemOrange,
         redDot: systemRed,
         blueDot: systemAccent,
+        tealDot: systemTeal,
+        purpleDot: systemPurple,
         codeBg: systemCodeBgDark,
         warningBg: systemOrange.opacity(0.18),
         warningText: systemOrange,
@@ -260,6 +268,14 @@ extension OMLXTheme {
 
     private static var systemRed: Color {
         Color(nsColor: .systemRed)
+    }
+
+    private static var systemTeal: Color {
+        Color(nsColor: .systemTeal)
+    }
+
+    private static var systemPurple: Color {
+        Color(nsColor: .systemPurple)
     }
 }
 
