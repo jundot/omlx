@@ -1203,6 +1203,8 @@ def _make_row_batch(
 
 
 def _merge_row_caches(row_caches: List[List[Any]]) -> List[Any]:
+    import mlx.core as mx
+
     if not row_caches:
         return []
     merged = []
@@ -1213,7 +1215,11 @@ def _merge_row_caches(row_caches: List[List[Any]]) -> List[Any]:
             raise _MtpStepFallback(
                 f"cache {type(per_row[0]).__name__} cannot merge row caches"
             )
-        merged.append(merge(per_row))
+        layer = merge(per_row)
+        # Do not retain the padding/copy graphs for every target or head layer.
+        if not layer.empty():
+            mx.eval(layer.state)
+        merged.append(layer)
     return merged
 
 
@@ -1223,11 +1229,23 @@ def _replace_cache_rows(
 ) -> None:
     if not replacements:
         return
-    row_caches = [
-        replacements.get(idx) or gen_batch.extract_cache(idx)
-        for idx in range(len(gen_batch.uids))
-    ]
-    gen_batch.prompt_cache = _merge_row_caches(row_caches)
+    # Consume private replacement rows one layer at a time. Extracting all
+    # untouched rows first kept the old batch, row copies and joined batch
+    # alive together for the entire model.
+    for layer_idx, old in enumerate(gen_batch.prompt_cache):
+        rows = [
+            (
+                [replacements[idx][layer_idx]]
+                if idx in replacements
+                else [old.extract(idx)]
+            )
+            for idx in range(len(gen_batch.uids))
+        ]
+        layer = _merge_row_caches(rows)[0]
+        gen_batch.prompt_cache[layer_idx] = layer
+        for replacement in replacements.values():
+            replacement[layer_idx] = None
+        del old, rows
 
 
 def _initial_batch_forward(gen_batch):
@@ -1252,15 +1270,10 @@ def _initial_batch_forward(gen_batch):
         and getattr(host, "_omlx_mtp_batch_rollback", False)
         and gen_batch._next_tokens is not None
         and all(type(c) in cache_types for c in gen_batch.prompt_cache)
-        and all(
-            _is_greedy(
-                _make_row_batch(gen_batch, i, prompt_cache=gen_batch.prompt_cache)
-            )
-            and not _row_value(gen_batch.logits_processors, i)
-            for i in range(len(gen_batch.uids))
-        )
     ):
         return None
+    # Only the deterministic backbone is batched here. _post_init_mtp still
+    # applies each row's processors and sampler, in the original row order.
     # Validate the offset layout before advancing the shared target cache.
     offsets = _prompt_priming._row_offsets(gen_batch.prompt_cache, len(gen_batch.uids))
     if offsets is None:
