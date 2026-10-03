@@ -2031,5 +2031,12 @@
   "cluster.v2.join.cleanup_forgotten": "Old cleanup forgotten on this Mac. Remote cleanup was not confirmed.",
   "cluster.v2.join.forget_cleanup_error": "Could not forget this cleanup.",
   "cluster.v2.membership.waiting_request": "Waiting for this Mac to show its code and send a pairing request.",
-  "cluster.v2.membership.add_device": "Add this Mac"
+  "cluster.v2.membership.add_device": "Add this Mac",
+  "models.downloader.ms_checking": "Checking ModelScope availability…",
+  "modal.model_settings.discard_confirm": "Discard unsaved changes to this model's settings?",
+  "modal.model_settings.profile_merge_notice": "Saving will add these new fields to your active profile.",
+  "logs.auto_refresh_toggle_label": "Auto-refresh:",
+  "chat.confirm_delete_message": "This will delete this message and every message after it in this chat. Continue?",
+  "js.error.save_claude_code_settings_failed": "Failed to save Claude Code settings",
+  "js.error.save_integration_settings_failed": "Failed to save integration settings"
 }
