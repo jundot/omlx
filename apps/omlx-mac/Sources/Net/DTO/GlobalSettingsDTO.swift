@@ -197,6 +197,8 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     /// the existing usage.sqlite3 when it is turned off.
     struct UsageSettings: Codable, Equatable, Sendable {
         let usageHistory: Bool?
+        /// Opt-in per-client attribution (`usage_by_client`); absent on older servers.
+        let usageByClient: Bool?
     }
 
     /// Mirrors `omlx.settings.ModelScopeSettings`. Empty string means
@@ -264,6 +266,10 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     /// runtime; turning it off keeps the existing usage.sqlite3 so turning
     /// it back on resumes the same history.
     var usageHistory: Bool? = nil
+
+    /// Also attribute usage history to the API key name or peer IP of each
+    /// request. Applied at runtime; turning it off keeps recorded clients.
+    var usageByClient: Bool? = nil
 
     // Auth (PR 9)
     var skipApiKeyVerification: Bool? = nil

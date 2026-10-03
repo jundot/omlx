@@ -881,15 +881,24 @@ class UsageSettings:
     # Record hourly per-model serving aggregates to <base_path>/usage.sqlite3.
     # Turning this off stops recording; existing history is kept on disk.
     usage_history: bool = True
+    # Also attribute history to the API key name (or peer IP) of each request.
+    # Off by default: it stores client identifiers, not just model totals.
+    usage_by_client: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return {"usage_history": self.usage_history}
+        return {
+            "usage_history": self.usage_history,
+            "usage_by_client": self.usage_by_client,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> UsageSettings:
         """Create from dictionary."""
-        return cls(usage_history=data.get("usage_history", True))
+        return cls(
+            usage_history=data.get("usage_history", True),
+            usage_by_client=data.get("usage_by_client", False) is True,
+        )
 
 
 @dataclass
@@ -1310,6 +1319,13 @@ class GlobalSettings:
         # Usage history settings
         if usage_history := os.getenv("OMLX_USAGE_HISTORY"):
             self.usage.usage_history = usage_history.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        if usage_by_client := os.getenv("OMLX_USAGE_BY_CLIENT"):
+            self.usage.usage_by_client = usage_by_client.strip().lower() in {
                 "1",
                 "true",
                 "yes",

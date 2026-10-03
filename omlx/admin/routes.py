@@ -646,6 +646,7 @@ class GlobalSettingsRequest(BaseModel):
 
     # Usage history settings
     usage_history: bool | None = None
+    usage_by_client: bool | None = None
 
     # HuggingFace settings
     hf_endpoint: str | None = None
@@ -4647,6 +4648,7 @@ def _global_settings_response(global_settings):
         },
         "usage": {
             "usage_history": global_settings.usage.usage_history,
+            "usage_by_client": global_settings.usage.usage_by_client,
         },
         "huggingface": {
             "endpoint": global_settings.huggingface.endpoint,
@@ -5393,6 +5395,16 @@ async def update_global_settings(
             # Disabling flushes to SQLite; keep that off the event loop.
             await asyncio.to_thread(history.set_enabled, request.usage_history)
         runtime_applied.append("usage_history")
+
+    # Per-client attribution is also live; turning it off keeps recorded rows.
+    if request.usage_by_client is not None:
+        global_settings.usage.usage_by_client = request.usage_by_client
+        from ..server_metrics import get_server_metrics
+
+        history = get_server_metrics().usage_history
+        if history is not None:
+            history.set_by_client(request.usage_by_client)
+        runtime_applied.append("usage_by_client")
 
     # Apply HuggingFace settings (Live - immediately applied via env var)
     if request.hf_endpoint is not None:

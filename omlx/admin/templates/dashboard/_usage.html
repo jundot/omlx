@@ -62,6 +62,49 @@
                     </table>
                 </div>
             </div>
+            <div x-show="data.clients?.length" class="border border-neutral-200 rounded-xl overflow-hidden mb-5">
+                <div class="flex flex-wrap items-center justify-between gap-2 p-3 border-b border-neutral-200">
+                    <h4 class="text-sm font-semibold">{{ t('usage.clients') }}</h4>
+                    <div role="tablist" aria-label="{{ t('usage.clients') }}" class="flex rounded-lg border border-neutral-200 overflow-hidden">
+                        <template x-for="[view, label, index] in [['all', 'usage.clients_all', 0], ['key', 'usage.clients_by_key', 1], ['ip', 'usage.clients_by_ip', 2]]" :key="view">
+                            <button type="button" role="tab" @click="clientView = view"
+                                    :aria-selected="(clientView === view).toString()"
+                                    :class="[clientView === view ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50', index ? 'border-l border-neutral-200' : '']"
+                                    class="px-3 py-1.5 text-xs font-medium transition-all" x-text="window.t(label)"></button>
+                        </template>
+                    </div>
+                </div>
+                <div class="overflow-x-auto" tabindex="0" role="region" aria-label="{{ t('usage.clients') }}">
+                    <table class="usage-model-table w-full text-sm text-right">
+                        <thead class="bg-neutral-50 text-xs text-neutral-500">
+                            <tr>
+                                <th class="p-3 text-left" x-text="clientView === 'key' ? window.t('usage.client_key') : (clientView === 'ip' ? window.t('usage.client_ip_address') : window.t('usage.client'))"></th>
+                                <th class="p-3">{{ t('usage.requests') }}</th>
+                                <th class="p-3">{{ t('usage.prompt') }}</th>
+                                <th class="p-3">{{ t('usage.output') }}</th>
+                                <th class="p-3">{{ t('usage.cached') }}</th>
+                                <th class="p-3">{{ t('usage.total') }}</th>
+                                <th class="p-3">{{ t('usage.speed') }}</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <template x-for="row in clientRows()" :key="row.id">
+                                <tr class="border-t border-neutral-200">
+                                    <th scope="row" class="p-3 text-left font-medium">
+                                        <span x-text="row.label"></span>
+                                        <span class="text-xs text-neutral-500 font-normal" x-text="row.detail"></span>
+                                    </th>
+                                    <template x-for="key in ['requests', 'prompt_tokens', 'completion_tokens', 'cached_tokens', 'total_tokens']" :key="key">
+                                        <td class="p-3" x-text="number(row[key])" :title="row[key].toLocaleString()"></td>
+                                    </template>
+                                    <td class="p-3" x-text="speed(row.generation_tps)"></td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+                <p x-show="!data.by_client" class="text-xs text-neutral-500 p-3 border-t border-neutral-200">{{ t('usage.clients_paused') }}</p>
+            </div>
             <div class="border border-neutral-200 rounded-xl p-4">
                 <h4 class="text-sm font-semibold mb-2">{{ t('usage.heatmap') }}</h4>
                 <p class="text-xs text-neutral-500 mb-3">{{ t('usage.heatmap_note') }}</p>

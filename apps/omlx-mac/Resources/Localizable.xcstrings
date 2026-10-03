@@ -27297,6 +27297,246 @@
         }
       }
     },
+    "server.row.usage_by_client" : {
+      "comment" : "Row label for the switch that attributes usage history to API keys or client IPs",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Track usage per client"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Учитывать использование по клиентам"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "按客户端记录使用量"
+          }
+        }
+      }
+    },
+    "server.row.usage_by_client.sub" : {
+      "comment" : "Sublabel explaining the per-client usage history switch",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Also stores which API sub key made each request, or the client IP when no key was used. Off by default."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Также сохраняет, какой дополнительный API-ключ отправил каждый запрос, или IP клиента, если ключ не использовался. По умолчанию отключено."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "同时存储发出每个请求的附加 API 密钥，未使用密钥时则存储客户端 IP。默认关闭。"
+          }
+        }
+      }
+    },
+    "status.usage.clients.title" : {
+      "comment" : "Heading above the per-client usage breakdown",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Clients"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Клиенты"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "客户端"
+          }
+        }
+      }
+    },
+    "status.usage.clients.paused" : {
+      "comment" : "Shown above recorded client rows when per-client tracking is switched off",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Per-client tracking is off. Showing previously recorded clients."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Учёт по клиентам отключён. Показаны ранее записанные клиенты."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "按客户端记录已关闭。显示先前记录的客户端。"
+          }
+        }
+      }
+    },
+    "status.usage.client.main_key" : {
+      "comment" : "Client label for requests authenticated with the main API key",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Main API key"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Основной API-ключ"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "主 API 密钥"
+          }
+        }
+      }
+    },
+    "status.usage.client.sub_key" : {
+      "comment" : "Client kind shown for requests attributed to a named API sub key",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sub key"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Доп. ключ"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "附加密钥"
+          }
+        }
+      }
+    },
+    "status.usage.clients.all" : {
+      "comment" : "Clients tab showing each API key and IP address pair",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "All"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Все"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "全部"
+          }
+        }
+      }
+    },
+    "status.usage.clients.by_key" : {
+      "comment" : "Clients tab grouping usage by API key",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "By key"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "По ключу"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "按密钥"
+          }
+        }
+      }
+    },
+    "status.usage.clients.by_ip" : {
+      "comment" : "Clients tab grouping usage by client IP address",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "By IP"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "По IP"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "按 IP"
+          }
+        }
+      }
+    },
+    "status.usage.client.no_key" : {
+      "comment" : "Client label for requests that were not authenticated with an API key",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No key"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Без ключа"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无密钥"
+          }
+        }
+      }
+    },
     "status.usage.heading" : {
       "comment" : "Section header for the local usage history panel",
       "extractionState" : "manual",

@@ -12,6 +12,8 @@ struct UsageHistoryView: View {
     @State private var disabled = false
 
     @State private var peak: Double = 1
+    /// Clients breakdown: each key+IP pair, per key, or per IP.
+    @State private var clientView = "all"
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -99,6 +101,9 @@ struct UsageHistoryView: View {
                         }
                     }
                 }
+                if let clients = data.clients, !clients.isEmpty {
+                    clientsSection(data, tracking: data.byClient ?? false)
+                }
                 heatmap(data.heatmap)
             } else if error == nil {
                 ProgressView().padding(.horizontal, 18)
@@ -171,6 +176,90 @@ struct UsageHistoryView: View {
         .frame(maxWidth: .infinity, alignment: .leading).padding(12)
         .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 10))
         .help(value.formatted())
+    }
+
+    private func clientsSection(_ data: UsageHistoryDTO, tracking: Bool) -> some View {
+        let rows: [UsageHistoryDTO.UsageClientDTO] = switch clientView {
+        case "key": data.clientsByKey ?? []
+        case "ip": data.clientsByIp ?? []
+        default: data.clients ?? []
+        }
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(String(localized: "status.usage.clients.title",
+                            defaultValue: "Clients",
+                            comment: "Heading above the per-client usage breakdown"))
+                    .font(.omlxText(13))
+                Spacer()
+                Segmented(selection: $clientView, options: [
+                    ("all", String(localized: "status.usage.clients.all",
+                                   defaultValue: "All",
+                                   comment: "Clients tab showing each API key and IP address pair")),
+                    ("key", String(localized: "status.usage.clients.by_key",
+                                   defaultValue: "By key",
+                                   comment: "Clients tab grouping usage by API key")),
+                    ("ip", String(localized: "status.usage.clients.by_ip",
+                                  defaultValue: "By IP",
+                                  comment: "Clients tab grouping usage by client IP address")),
+                ])
+                .frame(width: 220)
+            }
+            .padding(.horizontal, 18)
+            if !tracking {
+                Text(String(localized: "status.usage.clients.paused",
+                            defaultValue: "Per-client tracking is off. Showing previously recorded clients.",
+                            comment: "Shown above recorded client rows when per-client tracking is switched off"))
+                    .font(.omlxText(11)).foregroundStyle(.secondary)
+                    .padding(.horizontal, 18)
+            }
+            ListGroup {
+                ForEach(rows) { row in
+                    Row(label: clientLabel(row), sublabel: clientDetail(row)) {
+                        VStack(alignment: .trailing, spacing: 3) {
+                            Text(String(localized: "status.usage.row.tokens",
+                                        defaultValue: "\(compact(row.totalTokens)) tokens",
+                                        comment: "Per-model total token count; placeholder is a compact number"))
+                            Text(String(localized: "status.usage.row.requests_speed",
+                                        defaultValue: "\(row.requests) requests · \(speed(row.generationTps)) tok/s",
+                                        comment: "Per-model request count and output speed; placeholders are a count and a formatted tokens-per-second value"))
+                                .foregroundStyle(.secondary)
+                        }.font(.omlxMono(11))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Key name (or the main key / no key), the IP in the per-IP view, or
+    /// "key · IP" for each pair in the All view.
+    private func clientLabel(_ row: UsageHistoryDTO.UsageClientDTO) -> String {
+        guard let kind = row.keyKind else { return row.clientIp ?? "" }
+        let key: String
+        switch kind {
+        case "main_key":
+            key = String(localized: "status.usage.client.main_key",
+                         defaultValue: "Main API key",
+                         comment: "Client label for requests authenticated with the main API key")
+        case "none":
+            key = String(localized: "status.usage.client.no_key",
+                         defaultValue: "No key",
+                         comment: "Client label for requests that were not authenticated with an API key")
+        default:
+            key = row.keyId ?? ""
+        }
+        guard let ip = row.clientIp else { return key }
+        return "\(key) · \(ip)"
+    }
+
+    private func clientDetail(_ row: UsageHistoryDTO.UsageClientDTO) -> String {
+        let counts = String(localized: "status.usage.row.detail",
+                            defaultValue: "Prompt \(compact(row.promptTokens)) · output \(compact(row.completionTokens)) · cached \(compact(row.cachedTokens))",
+                            comment: "Per-model breakdown sublabel; placeholders are compact prompt, output, and cached token counts")
+        guard row.keyKind == "sub_key" else { return counts }
+        let kind = String(localized: "status.usage.client.sub_key",
+                          defaultValue: "Sub key",
+                          comment: "Client kind shown for requests attributed to a named API sub key")
+        return "\(kind) · \(counts)"
     }
 
     private func heatmap(_ days: [UsageHistoryDTO.UsageDayDTO]) -> some View {
