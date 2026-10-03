@@ -69,7 +69,7 @@
                             <button type="button" x-show="profileScope === 'preset'"
                                     @click="refreshPresets()"
                                     :disabled="refreshingPresets"
-                                    @mouseenter="showTip($event.currentTarget, 'Fetch latest presets from omlx.ai')"
+                                    @mouseenter="showTip($event.currentTarget, window.t('modal.model_settings.refresh_presets_tooltip'))"
                                     @mouseleave="hideTip()"
                                     class="p-1 rounded-full text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 transition-all disabled:opacity-50">
                                 <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
@@ -457,6 +457,9 @@
                                             const effective = modelSettings.enable_thinking != null ? modelSettings.enable_thinking : (modelSettings.thinking_default || false);
                                             modelSettings.enable_thinking = !effective;
                                         "
+                                            role="switch"
+                                            :aria-checked="(modelSettings.enable_thinking != null ? modelSettings.enable_thinking : (modelSettings.thinking_default || false)) ? 'true' : 'false'"
+                                            aria-label="{{ t('modal.model_settings.enable_thinking') }}"
                                             :class="(selectedModel?.thinking_forced || (modelSettings.enable_thinking != null ? modelSettings.enable_thinking : (modelSettings.thinking_default || false))) ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="(selectedModel?.thinking_forced || (modelSettings.enable_thinking != null ? modelSettings.enable_thinking : (modelSettings.thinking_default || false))) ? 'translate-x-5' : 'translate-x-0'"
@@ -548,6 +551,9 @@
                                         <p class="text-xs text-neutral-500 mt-0.5" x-text="window.t('modal.model_settings.thinking_budget_hint')"></p>
                                     </div>
                                     <button type="button" @click="modelSettings.enableThinkingBudget = !modelSettings.enableThinkingBudget; if (!modelSettings.enableThinkingBudget) modelSettings.thinking_budget_tokens = null;"
+                                            role="switch"
+                                            :aria-checked="modelSettings.enableThinkingBudget ? 'true' : 'false'"
+                                            aria-label="{{ t('modal.model_settings.thinking_budget') }}"
                                             :class="modelSettings.enableThinkingBudget ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="modelSettings.enableThinkingBudget ? 'translate-x-5' : 'translate-x-0'"
@@ -572,6 +578,9 @@
                                     </div>
                                     <button type="button" @click="if (!modelSettings.vlm_mtp_enabled) { modelSettings.guided_grammar_enabled = !modelSettings.guided_grammar_enabled; if (!modelSettings.guided_grammar_enabled) modelSettings.guided_grammar = ''; }"
                                             :disabled="modelSettings.vlm_mtp_enabled"
+                                            role="switch"
+                                            :aria-checked="modelSettings.guided_grammar_enabled ? 'true' : 'false'"
+                                            aria-label="{{ t('modal.model_settings.guided_grammar') }}"
                                             :class="[
                                                 modelSettings.guided_grammar_enabled ? 'bg-black' : 'bg-neutral-200',
                                                 modelSettings.vlm_mtp_enabled ? 'opacity-40 cursor-not-allowed' : ''
@@ -598,6 +607,9 @@
                                         <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.limit_tool_result_hint') }}</p>
                                     </div>
                                     <button type="button" @click="modelSettings.enableToolResultLimit = !modelSettings.enableToolResultLimit; if (!modelSettings.enableToolResultLimit) modelSettings.max_tool_result_tokens = null;"
+                                            role="switch"
+                                            :aria-checked="modelSettings.enableToolResultLimit ? 'true' : 'false'"
+                                            aria-label="{{ t('modal.model_settings.limit_tool_result') }}"
                                             :class="modelSettings.enableToolResultLimit ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="modelSettings.enableToolResultLimit ? 'translate-x-5' : 'translate-x-0'"
@@ -619,6 +631,9 @@
                                         <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.force_sampling_hint') }}</p>
                                     </div>
                                     <button type="button" @click="modelSettings.force_sampling = !modelSettings.force_sampling"
+                                            role="switch"
+                                            :aria-checked="modelSettings.force_sampling ? 'true' : 'false'"
+                                            aria-label="{{ t('modal.model_settings.force_sampling') }}"
                                             :class="modelSettings.force_sampling ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="modelSettings.force_sampling ? 'translate-x-5' : 'translate-x-0'"
@@ -635,6 +650,9 @@
                                         <p class="text-xs text-red-600 mt-0.5">{{ t('modal.model_settings.trust_remote_code_hint') }}</p>
                                     </div>
                                     <button type="button" @click="modelSettings.trust_remote_code = !modelSettings.trust_remote_code"
+                                            role="switch"
+                                            :aria-checked="modelSettings.trust_remote_code ? 'true' : 'false'"
+                                            aria-label="{{ t('modal.model_settings.trust_remote_code') }}"
                                             :class="modelSettings.trust_remote_code ? 'bg-red-600' : 'bg-neutral-200'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500">
                                         <span :class="modelSettings.trust_remote_code ? 'translate-x-5' : 'translate-x-0'"
@@ -789,6 +807,9 @@
                                                                 : (modelSettings.vlm_mtp_enabled
                                                                     ? '{{ t('modal.model_settings.vlm_mtp_conflict')|replace('\\', '\\\\')|replace("'", "\\'") }}'
                                                                     : ''))"
+                                                role="switch"
+                                                :aria-checked="modelSettings.mtp_enabled ? 'true' : 'false'"
+                                                aria-label="{{ t('modal.model_settings.lightning_mtp') }}"
                                                 :class="[
                                                     modelSettings.mtp_enabled ? 'bg-black' : 'bg-neutral-200',
                                                     ((modelSettings.moe_expert_offload_enabled && !modelSettings.moe_offload_allows_mtp) || (!modelSettings.mtp_compatible && !modelSettings.mtp_enabled) || modelSettings.dflash_enabled || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
@@ -1076,6 +1097,9 @@
                                             </div>
                                             <button type="button"
                                                     @click="modelSettings.qwen35_ane_prefill_enabled = !modelSettings.qwen35_ane_prefill_enabled"
+                                                    role="switch"
+                                                    :aria-checked="modelSettings.qwen35_ane_prefill_enabled ? 'true' : 'false'"
+                                                    aria-label="{{ t('modal.model_settings.qwen_ane') }}"
                                                     :class="modelSettings.qwen35_ane_prefill_enabled ? 'bg-black' : 'bg-neutral-200'"
                                                     class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                 <span :class="modelSettings.qwen35_ane_prefill_enabled ? 'translate-x-5' : 'translate-x-0'"
@@ -1121,6 +1145,9 @@
                                                 </div>
                                                 <button type="button"
                                                         @click="modelSettings.qwen35_ane_prefill_dual_ane = !modelSettings.qwen35_ane_prefill_dual_ane"
+                                                        role="switch"
+                                                        :aria-checked="modelSettings.qwen35_ane_prefill_dual_ane ? 'true' : 'false'"
+                                                        aria-label="{{ t('modal.model_settings.qwen_ane_dual') }}"
                                                         :class="modelSettings.qwen35_ane_prefill_dual_ane ? 'bg-black' : 'bg-neutral-200'"
                                                         class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                     <span :class="modelSettings.qwen35_ane_prefill_dual_ane ? 'translate-x-5' : 'translate-x-0'"
@@ -1136,6 +1163,9 @@
                                                     </div>
                                                     <button type="button"
                                                             @click="modelSettings.qwen35_ane_prefill_cpu_enabled = !modelSettings.qwen35_ane_prefill_cpu_enabled"
+                                                            role="switch"
+                                                            :aria-checked="modelSettings.qwen35_ane_prefill_cpu_enabled ? 'true' : 'false'"
+                                                            aria-label="{{ t('modal.model_settings.qwen_ane_cpu') }}"
                                                             :class="modelSettings.qwen35_ane_prefill_cpu_enabled ? 'bg-black' : 'bg-neutral-200'"
                                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                         <span :class="modelSettings.qwen35_ane_prefill_cpu_enabled ? 'translate-x-5' : 'translate-x-0'"
@@ -1179,6 +1209,9 @@
                                                     </div>
                                                     <button type="button"
                                                             @click="modelSettings.qwen35_ane_prefill_cpu_shared_resource = !modelSettings.qwen35_ane_prefill_cpu_shared_resource"
+                                                            role="switch"
+                                                            :aria-checked="modelSettings.qwen35_ane_prefill_cpu_shared_resource ? 'true' : 'false'"
+                                                            aria-label="{{ t('modal.model_settings.qwen_ane_cpu_scheduler') }}"
                                                             :class="modelSettings.qwen35_ane_prefill_cpu_shared_resource ? 'bg-black' : 'bg-neutral-200'"
                                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                         <span :class="modelSettings.qwen35_ane_prefill_cpu_shared_resource ? 'translate-x-5' : 'translate-x-0'"
@@ -1194,6 +1227,9 @@
                                                 </div>
                                                 <button type="button"
                                                         @click="modelSettings.qwen35_ane_prefill_gdn = !modelSettings.qwen35_ane_prefill_gdn"
+                                                        role="switch"
+                                                        :aria-checked="modelSettings.qwen35_ane_prefill_gdn ? 'true' : 'false'"
+                                                        aria-label="{{ t('modal.model_settings.qwen_ane_gdn') }}"
                                                         :class="modelSettings.qwen35_ane_prefill_gdn ? 'bg-black' : 'bg-neutral-200'"
                                                         class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                     <span :class="modelSettings.qwen35_ane_prefill_gdn ? 'translate-x-5' : 'translate-x-0'"
@@ -1372,6 +1408,9 @@
                                                 @click="if (!modelSettings.is_paroquant && !modelSettings.vlm_mtp_enabled) modelSettings.turboquant_kv_enabled = !modelSettings.turboquant_kv_enabled"
                                                 :disabled="modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled"
                                                 :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : (modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.vlm_mtp_conflict')|replace('\\', '\\\\')|replace("'", "\\'") }}' : '')"
+                                                role="switch"
+                                                :aria-checked="modelSettings.turboquant_kv_enabled ? 'true' : 'false'"
+                                                aria-label="{{ t('modal.model_settings.turboquant_kv') }}"
                                                 :class="[
                                                     modelSettings.turboquant_kv_enabled ? 'bg-black' : 'bg-neutral-200',
                                                     (modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
@@ -1448,6 +1487,9 @@
                                                     @click="if (!modelSettings.is_paroquant) { modelSettings.enableIndexCache = !modelSettings.enableIndexCache; if (!modelSettings.enableIndexCache) modelSettings.index_cache_freq = null; }"
                                                     :disabled="modelSettings.is_paroquant"
                                                     :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : ''"
+                                                    role="switch"
+                                                    :aria-checked="modelSettings.enableIndexCache ? 'true' : 'false'"
+                                                    aria-label="{{ t('modal.model_settings.index_cache') }}"
                                                     :class="[
                                                         modelSettings.enableIndexCache ? 'bg-black' : 'bg-neutral-200',
                                                         modelSettings.is_paroquant ? 'opacity-40 cursor-not-allowed' : ''
@@ -1476,6 +1518,9 @@
                                                 @click="if (!modelSettings.is_paroquant && !modelSettings.vlm_mtp_enabled) modelSettings.specprefill_enabled = !modelSettings.specprefill_enabled"
                                                 :disabled="modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled"
                                                 :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : (modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.vlm_mtp_conflict')|replace('\\', '\\\\')|replace("'", "\\'") }}' : '')"
+                                                role="switch"
+                                                :aria-checked="modelSettings.specprefill_enabled ? 'true' : 'false'"
+                                                aria-label="{{ t('modal.model_settings.specprefill') }}"
                                                 :class="[
                                                     modelSettings.specprefill_enabled ? 'bg-black' : 'bg-neutral-200',
                                                     (modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''

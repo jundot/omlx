@@ -128,6 +128,9 @@ private struct ActiveModelsSection: View {
                             .help(String(localized: "models.active.unload.help",
                                          defaultValue: "Unload model",
                                          comment: "Tooltip on the eject button that unloads an active model"))
+                            .accessibilityLabel(String(localized: "models.active.unload.help",
+                                         defaultValue: "Unload model",
+                                         comment: "Tooltip on the eject button that unloads an active model"))
                         }
                     }
                 }
@@ -222,6 +225,13 @@ private struct LibrarySection: View {
                                 : String(localized: "models.library.favorite_off.help",
                                          defaultValue: "Add to favorites",
                                          comment: "Tooltip on the outlined star that adds a model to favorites"))
+                            .accessibilityLabel((m.isFavorite ?? false)
+                                ? String(localized: "models.library.favorite_on.help",
+                                         defaultValue: "Favorite — click to remove",
+                                         comment: "Tooltip on the filled star that removes a model from favorites")
+                                : String(localized: "models.library.favorite_off.help",
+                                         defaultValue: "Add to favorites",
+                                         comment: "Tooltip on the outlined star that adds a model to favorites"))
                             Squircle(systemSymbol: iconName(for: m),
                                      size: 26,
                                      gradient: gradient(for: m))
@@ -276,6 +286,9 @@ private struct LibrarySection: View {
                                 .help(String(localized: "models.library.settings.help",
                                              defaultValue: "Settings",
                                              comment: "Tooltip on the chevron that opens a model's settings screen"))
+                                .accessibilityLabel(String(localized: "models.library.settings.help",
+                                             defaultValue: "Settings",
+                                             comment: "Tooltip on the chevron that opens a model's settings screen"))
                                 Button {
                                     onRequestRemove(m.id)
                                 } label: {
@@ -291,6 +304,9 @@ private struct LibrarySection: View {
                                 .buttonStyle(.omlx(.plain, size: .small))
                                 .disabled(deletingID != nil)
                                 .help(String(localized: "models.library.remove.help",
+                                             defaultValue: "Remove from disk",
+                                             comment: "Tooltip on the trash button that deletes a model from local storage"))
+                                .accessibilityLabel(String(localized: "models.library.remove.help",
                                              defaultValue: "Remove from disk",
                                              comment: "Tooltip on the trash button that deletes a model from local storage"))
                             }

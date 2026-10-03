@@ -631,14 +631,17 @@ final class MenubarController: NSObject {
                                                  comment: "Disabled placeholder in the Serving Stats submenu when the server isn't running")))
             return
         }
+        let hasAPIKey = !(config.apiKey ?? "").isEmpty
+        let noAPIKeyMessage = String(localized: "menubar.stats.no_api_key",
+                                     defaultValue: "Set an API key in the Security screen to enable stats",
+                                     comment: "Disabled placeholder shown wherever stats are unavailable because no API key is configured")
+
         let session = statsPoller?.sessionStats
         let liveActivity = statsPoller?.liveStats?.liveActivity
         let alltime = statsPoller?.alltimeStats
         if session == nil && alltime == nil {
-            statsSubmenu.addItem(disabled(statsPoller == nil
-                                          ? String(localized: "menubar.stats.no_api_key",
-                                                   defaultValue: "Set OMLX_API_KEY to enable stats",
-                                                   comment: "Disabled placeholder in the Serving Stats submenu when no API key is configured")
+            statsSubmenu.addItem(disabled(!hasAPIKey
+                                          ? noAPIKeyMessage
                                           : String(localized: "menubar.stats.loading",
                                                    defaultValue: "Loading stats…",
                                                    comment: "Disabled placeholder shown while stats are loading")))
@@ -685,22 +688,29 @@ final class MenubarController: NSObject {
         statsSubmenu.addItem(disabled(String(localized: "menubar.stats.alltime_section",
                                              defaultValue: "All-Time",
                                              comment: "Section header inside the Serving Stats submenu for all-time metrics")))
-        appendStat(String(localized: "menubar.stats.total_tokens",
-                          defaultValue: "Total Tokens Processed",
-                          comment: "Stats row label for total tokens processed"),
-                   compact(alltime?.totalPromptTokens))
-        appendStat(String(localized: "menubar.stats.cached_tokens",
-                          defaultValue: "Cached Tokens",
-                          comment: "Stats row label for cached tokens count"),
-                   compact(alltime?.totalCachedTokens))
-        appendStat(String(localized: "menubar.stats.cache_efficiency",
-                          defaultValue: "Cache Efficiency",
-                          comment: "Stats row label for the cache efficiency percentage"),
-                   percent(alltime?.cacheEfficiency))
-        appendStat(String(localized: "menubar.stats.total_requests",
-                          defaultValue: "Total Requests",
-                          comment: "Stats row label for total request count"),
-                   compact(alltime?.totalRequests))
+        if !hasAPIKey {
+            // All-time stats need an authenticated admin endpoint; the public
+            // status endpoint that feeds Session above has no such gate. Say
+            // why these rows are empty instead of showing "—" forever.
+            statsSubmenu.addItem(disabled(noAPIKeyMessage))
+        } else {
+            appendStat(String(localized: "menubar.stats.total_tokens",
+                              defaultValue: "Total Tokens Processed",
+                              comment: "Stats row label for total tokens processed"),
+                       compact(alltime?.totalPromptTokens))
+            appendStat(String(localized: "menubar.stats.cached_tokens",
+                              defaultValue: "Cached Tokens",
+                              comment: "Stats row label for cached tokens count"),
+                       compact(alltime?.totalCachedTokens))
+            appendStat(String(localized: "menubar.stats.cache_efficiency",
+                              defaultValue: "Cache Efficiency",
+                              comment: "Stats row label for the cache efficiency percentage"),
+                       percent(alltime?.cacheEfficiency))
+            appendStat(String(localized: "menubar.stats.total_requests",
+                              defaultValue: "Total Requests",
+                              comment: "Stats row label for total request count"),
+                       compact(alltime?.totalRequests))
+        }
     }
 
     // MARK: - Pollers

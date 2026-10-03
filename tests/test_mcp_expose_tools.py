@@ -82,11 +82,139 @@ class TestI18nKeys:
             missing = {key for key in REQUIRED_I18N_KEYS if not locale.get(key)}
             assert not missing, f"{locale_path.name}: missing {sorted(missing)}"
 
-    def test_locale_key_sets_identical(self):
+    def test_locale_keys_are_subset_of_english(self):
+        """Every locale key must exist in English; missing keys fall back to it.
+
+        Non-English locales are allowed to omit keys (the ``t()``/``window.t()``
+        loader always merges onto a full copy of English), but an orphaned key
+        with no English counterpart is a real bug, not a fallback case.
+        """
         base = set(json.loads((I18N_DIR / "en.json").read_text(encoding="utf-8")))
         for locale_path in sorted(I18N_DIR.glob("*.json")):
+            if locale_path.name == "en.json":
+                continue
             keys = set(json.loads(locale_path.read_text(encoding="utf-8")))
-            assert keys == base, locale_path.name
+            orphaned = keys - base
+            assert not orphaned, f"{locale_path.name}: keys not in en.json: {sorted(orphaned)}"
+
+    def test_locale_values_are_not_redundant_with_english(self):
+        """A locale entry byte-identical to English should be omitted, not stored.
+
+        Storing it is a no-op (the loader falls back to English for missing
+        keys anyway) but leaves untranslated padding on disk that looks
+        translated. Omit the key instead of pasting the English value.
+        """
+        en = json.loads((I18N_DIR / "en.json").read_text(encoding="utf-8"))
+        # Keys that the per-locale presence tests in this suite still require
+        # raw (status-layout block ids, ON/OFF toggles, qwen/acc-bench option
+        # catalogs, extra-body labels…). Translators have not rendered them
+        # yet; the required-presence tests win until they do (the loader
+        # falls back to English for anything missing). "Cluster" and the
+        # Claude Code product name stay Latin in every locale by design.
+        allowed_untranslated = frozenset(
+            [
+                "acc_bench.config.external_extra_body",
+                "acc_bench.config.external_extra_body_hint",
+                "acc_bench.results.connection_errors",
+                "acc_bench.results.empty_content",
+                "acc_bench.results.finished_accuracy",
+                "acc_bench.results.finished_within_limit",
+                "acc_bench.results.hit_token_limit",
+                "acc_bench.results.http_errors",
+                "acc_bench.results.invalid_responses",
+                "acc_bench.results.local_truncation_warning",
+                "acc_bench.results.parse_errors",
+                "acc_bench.results.reliability_warning",
+                "acc_bench.results.text_export.local_truncation_line",
+                "acc_bench.results.timeout",
+                "acc_bench.results.total_accuracy",
+                "acc_bench.results.truncated",
+                "acc_bench.results.valid_answer_accuracy",
+                "acc_bench.results.valid_response_rate",
+                "acc_bench.results.valid_responses",
+                "js.error.external_extra_body_invalid_json",
+                "js.error.external_extra_body_object_required",
+                "js.error.external_extra_body_protected",
+                "modal.model_settings.dflash",
+                "modal.model_settings.profiles.expose_as_model_off",
+                "modal.model_settings.profiles.expose_as_model_on",
+                "modal.model_settings.qwen_ane",
+                "modal.model_settings.qwen_ane_dual",
+                "modal.model_settings.qwen_ane_dual_hint",
+                "modal.model_settings.qwen_ane_gdn",
+                "modal.model_settings.qwen_ane_gdn_fraction",
+                "modal.model_settings.qwen_ane_gdn_hint",
+                "modal.model_settings.qwen_ane_gdn_layers",
+                "modal.model_settings.qwen_ane_hint",
+                "modal.model_settings.qwen_ane_mlp_fraction",
+                "modal.model_settings.qwen_ane_mlp_layers",
+                "modal.model_settings.qwen_ane_prompt_block",
+                "modal.model_settings.qwen_ane_tail_padding",
+                "modal.model_settings.qwen_ane_tune",
+                "modal.model_settings.qwen_ane_tune_again",
+                "modal.model_settings.qwen_ane_tune_allow_ane_gdn",
+                "modal.model_settings.qwen_ane_tune_allow_cpu",
+                "modal.model_settings.qwen_ane_tune_allow_cpu_down",
+                "modal.model_settings.qwen_ane_tune_allow_cpu_gate",
+                "modal.model_settings.qwen_ane_tune_allow_cpu_gdn",
+                "modal.model_settings.qwen_ane_tune_allow_cpu_scheduler",
+                "modal.model_settings.qwen_ane_tune_applied",
+                "modal.model_settings.qwen_ane_tune_apply",
+                "modal.model_settings.qwen_ane_tune_applying",
+                "modal.model_settings.qwen_ane_tune_cancel",
+                "modal.model_settings.qwen_ane_tune_hint",
+                "modal.model_settings.qwen_ane_tune_overrides",
+                "modal.model_settings.qwen_ane_tune_preparing",
+                "modal.model_settings.qwen_ane_tune_start",
+                "modal.model_settings.qwen_ane_tune_test",
+                "modal.model_settings.qwen_ane_tune_throughput",
+                "modal.model_settings.qwen_oq_a8",
+                "modal.model_settings.qwen_oq_a8_hint",
+                "modal.model_settings.qwen_oq_a8_min_tokens",
+                "modal.model_settings.reasoning_parser",
+                "modal.model_settings.reasoning_parser_none",
+                "modal.model_settings.vlm_mtp_draft_model",
+                "modal.model_settings.vlm_mtp_draft_model_placeholder",
+                "navbar.tab.cluster",
+                "settings.advanced.hot_cache_write_through",
+                "settings.advanced.max_audio_upload_size",
+                "settings.advanced.max_audio_upload_size_hint",
+                "settings.advanced.uploads",
+                "settings.language.en",
+                "settings.language.es",
+                "settings.language.fr",
+                "settings.language.ja",
+                "settings.language.ko",
+                "settings.language.pt-BR",
+                "settings.language.ru",
+                "settings.language.zh",
+                "settings.language.zh-TW",
+                "settings.mcp.config_path",
+                "settings.mcp.expose_tools",
+                "settings.mcp.expose_tools_hint",
+                "status.layout.block.api_endpoints",
+                "status.layout.block.applications",
+                "status.layout.block.claude_code",
+                "status.layout.block.cache_observability",
+                "status.layout.block.engine_versions",
+                "status.layout.block.serving_stats",
+                "status.layout.block.active_models",
+                "status.layout.block.usage_history",
+                "status.layout.customize",
+                "status.layout.save",
+                "status.layout.width_full",
+            ]
+        )
+        for locale_path in sorted(I18N_DIR.glob("*.json")):
+            if locale_path.name == "en.json":
+                continue
+            locale = json.loads(locale_path.read_text(encoding="utf-8"))
+            redundant = {
+                k
+                for k, v in locale.items()
+                if en.get(k) == v and k not in allowed_untranslated
+            }
+            assert not redundant, f"{locale_path.name}: redundant with en.json: {sorted(redundant)}"
 
 
 class TestAdminApiExposeTools:

@@ -52,6 +52,13 @@ struct StatusScreen: View {
                           : String(localized: "status.clear.session.help",
                                    defaultValue: "Clear session stats",
                                    comment: "Tooltip on the clear button when session scope is selected"))
+                    .accessibilityLabel(vm.scope == "alltime"
+                          ? String(localized: "status.clear.alltime.help",
+                                   defaultValue: "Clear all-time stats",
+                                   comment: "Tooltip on the clear button when all-time scope is selected")
+                          : String(localized: "status.clear.session.help",
+                                   defaultValue: "Clear session stats",
+                                   comment: "Tooltip on the clear button when session scope is selected"))
                     .disabled(vm.stats == nil)
                 }
             }
