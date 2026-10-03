@@ -1,5 +1,6 @@
-import json
 from pathlib import Path
+
+from omlx.admin.routes import _load_locale
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -47,7 +48,7 @@ def test_gdn_cache_policy_i18n_keys_exist_in_every_locale():
     i18n_dir = ROOT / "omlx/admin/i18n"
 
     for locale_path in sorted(i18n_dir.glob("*.json")):
-        translations = json.loads(locale_path.read_text())
+        translations = _load_locale(locale_path.stem)
         missing_keys = GDN_I18N_KEYS - translations.keys()
         assert not missing_keys, f"{locale_path.name} is missing {sorted(missing_keys)}"
 

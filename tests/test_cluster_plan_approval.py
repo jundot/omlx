@@ -20,6 +20,8 @@ capped at 40 and marked as one they were working on.
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,6 +32,10 @@ from fastapi.testclient import TestClient
 from omlx.cluster import routes
 
 GiB = 1024**3
+
+_REPO = Path(__file__).resolve().parents[1]
+_DASHBOARD_JS = _REPO / "omlx" / "admin" / "static" / "js" / "dashboard.js"
+
 # The two Macs from the incident. Rank 0 is the local coordinator, which on the
 # dashboard is always the Mac the browser is on — the laptop.
 _MBP_CAPACITY = int(107.5 * GiB)
@@ -563,3 +569,15 @@ def test_the_catalogue_answers_with_the_same_budgets_as_the_planner(cluster):
     # capacity is untouched by a reserve; the reserve shows up as the model
     # verdict, which must agree with the plan the same nodes produce.
     assert payload["cluster_capacity_bytes"] == _MBP_CAPACITY + _STUDIO_CAPACITY
+
+def test_the_dashboard_javascript_parses():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required to parse dashboard.js")
+    result = subprocess.run(
+        [node, "--check", str(_DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
