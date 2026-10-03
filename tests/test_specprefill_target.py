@@ -135,6 +135,7 @@ def _run(
     exact_prefix_cache: _TieredExactPrefixCache | None = None,
     static_prefix_tokens: list[int] | None = None,
     promote_static_prefix_to_hot_cache: bool = True,
+    prepare_prompt_cache: target_workflow.PreparePromptCache | None = None,
 ) -> tuple[Any, _Logger, dict[str, Any]]:
     all_tokens = _all_tokens(
         system_token_count,
@@ -244,6 +245,7 @@ def _run(
             exact_prefix_cache=exact_prefix_cache,
             static_prefix_tokens=static_prefix_tokens,
             promote_static_prefix_to_hot_cache=promote_static_prefix_to_hot_cache,
+            prepare_prompt_cache=prepare_prompt_cache,
         )
     trace.update(
         {
@@ -340,6 +342,62 @@ def test_target_prefill_extends_an_existing_partial_prefix_cache():
 
     assert all(cache is restored_prefix_cache for _, cache in trace["model"].calls)
     assert trace["sparse_calls"][0]["cache"] is restored_prefix_cache
+
+
+def test_target_prefill_prepares_cold_cache_before_any_forward():
+    prepared = []
+
+    affine_layer = _CacheLayer()
+
+    def prepare(cache):
+        prepared.append(cache)
+        cache[:] = [affine_layer]
+
+    result, _, trace = _run(
+        system_token_count=5,
+        conversation_token_count=8,
+        selected_indices=[0, 2, 6],
+        prepare_prompt_cache=prepare,
+    )
+
+    assert prepared == [trace["prompt_cache"]]
+    assert result.prompt_cache == [affine_layer]
+    assert all(cache is result.prompt_cache for _, cache in trace["model"].calls)
+    assert trace["sparse_calls"][0]["cache"] is result.prompt_cache
+
+
+def test_target_prefill_prepares_restored_static_prefix_before_sparse_forward():
+    exact_prefix_cache = _TieredExactPrefixCache()
+    static_prefix_tokens = list(range(5))
+    _run(
+        system_token_count=5,
+        conversation_token_count=8,
+        selected_indices=[0, 2, 6],
+        exact_prefix_cache=exact_prefix_cache,
+        static_prefix_tokens=static_prefix_tokens,
+        extract_cache_states=_extract_cache_states,
+    )
+    prepared = []
+
+    def prepare(cache):
+        prepared.append(cache)
+        cache[:] = ["affine-restored"]
+
+    result, _, trace = _run(
+        system_token_count=5,
+        conversation_token_count=8,
+        selected_indices=[0, 2, 6],
+        conversation_start=2_000,
+        exact_prefix_cache=exact_prefix_cache,
+        static_prefix_tokens=static_prefix_tokens,
+        extract_cache_states=_extract_cache_states,
+        prepare_prompt_cache=prepare,
+    )
+
+    assert prepared == [result.prompt_cache]
+    assert result.prompt_cache == ["affine-restored"]
+    assert trace["model"].calls == []
+    assert trace["sparse_calls"][0]["cache"] is result.prompt_cache
 
 
 def test_github_2177_restores_static_prefix_from_tiered_cache():

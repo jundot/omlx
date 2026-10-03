@@ -68,6 +68,7 @@ struct ModelSettingsSnapshot: Equatable {
     var chatTemplateEntries: [ChatTemplateKwargEntry]
 
     var turboquantKvEnabled: Bool
+    var turboquantKvScheme: String
     var turboquantKvBits: String
     var qwen35AnePrefillEnabled: Bool
     var qwen35AnePrefillSequenceLength: String
@@ -141,6 +142,7 @@ enum ProfileSettingsKey {
     static let modelTypeOverride = "model_type_override"
     static let trustRemoteCode = "trust_remote_code"
     static let turboquantKvEnabled = "turboquant_kv_enabled"
+    static let turboquantKvScheme = "turboquant_kv_scheme"
     static let turboquantKvBits = "turboquant_kv_bits"
     static let qwen35AnePrefillSharedFraction = "qwen35_ane_prefill_shared_fraction"
     static let qwen35OqA8Enabled = "qwen35_oq_a8_enabled"
