@@ -147,6 +147,12 @@
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
                 claude_code: { mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
+                // Snapshot of the last successfully saved Claude Code /
+                // Integration settings — a failed save reverts to these instead
+                // of leaving the form showing values the server declined (§C2).
+                // Populated on every successful load/save.
+                _lastSavedClaudeCode: null,
+                _lastSavedIntegrations: null,
                 integrations: {
                     copilot_model: null,
                     codex_model: null,
@@ -172,6 +178,7 @@
                 },
                 ui: { language: 'en', dashboard_layout: null },
                 idle_timeout: { idle_timeout_seconds: null },
+                cluster: { auto_evict_competing_local_models: false },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
             },
 
@@ -219,10 +226,16 @@
             saveSuccess: false,
             saveMessage: '',
             saveError: '',
+            // Transient toast queue for actions with no dedicated status
+            // surface (SSH pairing flow, save failures in peripheral panels).
+            // Rendered by the container in dashboard.html.
+            notifications: [],
 
             // Model settings modal
             showModelSettingsModal: false,
             selectedModel: null,
+            _modelSettingsSeq: 0,
+            modelSettingsLoadingId: null,  // model.id/name mid-open, for a per-row spinner
             modelSettings: {
                 model_alias: '',
                 model_type_override: '',
@@ -389,8 +402,16 @@
             // Log viewer state
             logContent: '',
             logLines: 500,
-            logRefreshInterval: 5,  // seconds, 0 = disabled
-            logAutoRefresh: false,
+            // Persisted separately (§B13): previously the only way to pause
+            // was setting the interval to 0, which destroyed whatever
+            // cadence the user preferred and required re-typing it to
+            // resume. Neither value survived a reload before this either.
+            logRefreshInterval: (() => {
+                const n = parseInt(localStorage.getItem('logRefreshInterval'), 10);
+                return Number.isFinite(n) && n >= 0 && n <= 300 ? n : 5;
+            })(),
+            logAutoRefreshEnabled: localStorage.getItem('logAutoRefreshEnabled') !== 'false',
+            logAutoRefresh: false,  // derived: true only while the timer is actually armed
             logAutoScroll: true,
             logLoading: false,
             logError: '',
@@ -475,6 +496,7 @@
             downloaderSource: 'hf',
             msAvailable: false,
             msInitialized: false,
+            msChecking: false,
             msRepoId: '',
             msToken: '',
             msDownloading: false,
@@ -1021,6 +1043,7 @@
                             claude_code: { ...this.globalSettings.claude_code, ...data.claude_code },
                             integrations: { ...this.globalSettings.integrations, ...data.integrations },
                             idle_timeout: { ...this.globalSettings.idle_timeout, ...data.idle_timeout },
+                            cluster: { ...this.globalSettings.cluster, ...data.cluster },
                             system: { ...this.globalSettings.system, ...data.system },
                         };
                         this.globalSettings.ui = { language: 'en', dashboard_layout: null, ...(data.ui || {}) };
@@ -1029,6 +1052,15 @@
                             ? layoutLib.normalizeLayout(this.globalSettings.ui.dashboard_layout)
                             : null;
                         if (dashGrid && !this.dashEditing) this.applyDashboardLayout(this.dashLayout);
+                        // Snapshots for saveClaudeCodeSettings/saveIntegrationSettings
+                        // to revert to on a failed save (§C2). Deliberately NOT a
+                        // full loadGlobalSettings() re-fetch on failure — this tab's
+                        // fields auto-save on change from many different call sites,
+                        // and a full reload here would also clobber any unsaved edit
+                        // in progress elsewhere on the Settings tab (see the same
+                        // reasoning in saveIdleTimeout, below).
+                        this._lastSavedClaudeCode = { ...this.globalSettings.claude_code };
+                        this._lastSavedIntegrations = { ...this.globalSettings.integrations };
                         if (
                             !this.globalSettings.server.distributed_inference_active
                             && this.mainTab === 'cluster'
@@ -1048,7 +1080,17 @@
                             this.globalSettings.memory.memory_guard_tier = 'balanced';
                         }
 
-                        // Calculate cache percent from stored value (based on total capacity)
+                        // Calculate cache percent from stored value (based on total
+                        // capacity) — only to position the slider's initial display.
+                        // Do NOT call updateCacheFromSlider() here: it round-trips
+                        // the server's string through percent -> GB (whole-percent
+                        // rounding, tens of GB on a large disk) and clobbers 'auto'
+                        // with a concrete size, persisted the next time the user
+                        // saves ANY unrelated setting. globalSettings.cache was
+                        // already correctly populated straight from the server
+                        // above; only rewrite ssd_cache_max_size when the user
+                        // actually moves the slider (@input="updateCacheFromSlider()"
+                        // in _settings.html) or edits the GB input.
                         this.cachePercent = this.parseCacheToPercent(
                             this.globalSettings.cache.ssd_cache_max_size,
                             this.globalSettings.system.ssd_total_bytes
@@ -1296,9 +1338,13 @@
                         await this.loadGlobalSettings();
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
+                    } else {
+                        const data = await response.json().catch(() => ({}));
+                        this.showNotification(data.detail || 'Failed to delete sub key', 'error');
                     }
                 } catch (err) {
                     console.error('Failed to delete sub key:', err);
+                    this.showNotification('Failed to delete sub key', 'error');
                 }
             },
 
@@ -1517,14 +1563,36 @@
                 if (!this.activeProfileName) { this.profilesDrift = false; return; }
                 const active = this.profiles.find(p => p.name === this.activeProfileName);
                 if (!active) { this.profilesDrift = false; return; }
-                const form = this.formValuesForProfile();
-                for (const [k, v] of Object.entries(active.settings || {})) {
-                    if (JSON.stringify(form[k]) !== JSON.stringify(v)) {
-                        this.profilesDrift = true;
-                        return;
-                    }
+                this.profilesDrift = this._profileDrift(active.settings || {}, this.formValuesForProfile());
+            },
+            // Symmetric key comparison (union of form + profile keys), unlike
+            // the backend's own narrower check below — a field the user just
+            // set that the saved profile doesn't have yet (e.g. enabling
+            // guided_grammar_enabled for the first time) previously wasn't
+            // detected as drift at all (§B10).
+            _profileDrift(activeSettings, form) {
+                const keys = new Set([...Object.keys(form), ...Object.keys(activeSettings)]);
+                for (const k of keys) {
+                    // Backend treats a profile value of None as "unconstrained"
+                    // (routes.py:2769-2773) — match that here so this doesn't
+                    // flag drift the backend won't actually act on.
+                    if (activeSettings[k] === null) continue;
+                    if (JSON.stringify(form[k]) !== JSON.stringify(activeSettings[k])) return true;
                 }
-                this.profilesDrift = false;
+                return false;
+            },
+            // Mirrors the backend's PUT-time divergence check exactly
+            // (routes.py:2753-2794, profile-keys-only): true only when an
+            // EXISTING profile field's value actually changed. When this is
+            // false but _profileDrift is true, the difference is form-only
+            // keys, and the backend's real behavior for those is NOT to
+            // unlink the profile — it silently merges them into it.
+            _profileDiverged(activeSettings, form) {
+                for (const [k, v] of Object.entries(activeSettings)) {
+                    if (v === null) continue;
+                    if (JSON.stringify(form[k]) !== JSON.stringify(v)) return true;
+                }
+                return false;
             },
             matchedPreset(settings) {
                 // Return the preset whose universal-field settings match the current model
@@ -1598,11 +1666,12 @@
                     console.error('Failed to load profiles:', e);
                 }
             },
-            async loadTemplates() {
+            async loadTemplates(isCurrent = () => true) {
                 try {
                     const r = await fetch('/admin/api/profile-templates');
                     if (r.ok) {
                         const data = await r.json();
+                        if (!isCurrent()) return;
                         this.templates = data.templates || [];
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
@@ -1690,6 +1759,19 @@
             },
             hideTip() {
                 this.tip.visible = false;
+            },
+
+            // Transient toast for actions with no dedicated status surface
+            // (e.g. the SSH pairing flow's generate/exchange/keychain-store
+            // calls). Auto-dismisses; also removable via dismissNotification.
+            showNotification(message, level = 'info') {
+                const id = 'n-' + Date.now().toString(36) + '-' +
+                           Math.random().toString(36).slice(2, 6);
+                this.notifications.push({ id, message, level });
+                setTimeout(() => this.dismissNotification(id), 5000);
+            },
+            dismissNotification(id) {
+                this.notifications = this.notifications.filter(n => n.id !== id);
             },
 
             isDiffusionModel(model) {
@@ -1954,6 +2036,7 @@
                         ? String(s.mtp_adaptive_max_depth) : '3',
                     mtp_compatible: model?.mtp_compatible === true,
                     mtp_compatibility_reason: model?.mtp_compatibility_reason || '',
+                    mtplx_sidecar_available: model?.mtplx_sidecar_available === true,
                     is_paroquant: model?.is_paroquant === true,
                     paroquant_reason: model?.paroquant_reason || '',
                     qwen35_ane_prefill_shared_fraction: s.qwen35_ane_prefill_shared_fraction ?? 1,
@@ -2649,6 +2732,7 @@
                 const model = this.models.find(m => m.id === modelId);
                 if (model) await this.openModelSettings(model, true);
             },
+
             async openModelSettings(model, preservingEdits = false) {
                 const baseline = JSON.stringify(this.modelSettings);
                 const seq = ++this._applySeq;
@@ -2840,6 +2924,22 @@
                     return;
                 }
 
+                // Surface the backend's silent-merge behavior (§B10): if the
+                // only reason this save "drifts" from the active profile is
+                // form-only keys the profile doesn't have yet, the backend
+                // won't unlink the profile — it'll rewrite it to absorb
+                // those fields. The generic drift dot doesn't say that.
+                if (this.activeProfileName) {
+                    const active = this.profiles.find(p => p.name === this.activeProfileName);
+                    if (active) {
+                        const form = this.formValuesForProfile();
+                        const activeSettings = active.settings || {};
+                        if (this._profileDrift(activeSettings, form) && !this._profileDiverged(activeSettings, form)) {
+                            this.showNotification(window.t('modal.model_settings.profile_merge_notice'), 'warning');
+                        }
+                    }
+                }
+
                 this.savingModelSettings = true;
                 try {
                     const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/settings`, {
@@ -2878,8 +2978,8 @@
                             const payload = {
                                 model_alias: this.modelSettings.model_alias?.trim() || null,
                                 model_type_override: this.modelSettings.model_type_override || null,
-                                max_context_window: this.modelSettings.max_context_window || null,
-                                max_tokens: this.modelSettings.max_tokens || null,
+                                max_context_window: Number.isFinite(this.modelSettings.max_context_window) ? this.modelSettings.max_context_window : null,
+                                max_tokens: Number.isFinite(this.modelSettings.max_tokens) ? this.modelSettings.max_tokens : null,
                                 temperature: Number.isFinite(this.modelSettings.temperature) ? this.modelSettings.temperature : null,
                                 top_p: Number.isFinite(this.modelSettings.top_p) ? this.modelSettings.top_p : null,
                                 top_k: Number.isFinite(this.modelSettings.top_k) ? this.modelSettings.top_k : null,
@@ -2888,7 +2988,7 @@
                                 presence_penalty: Number.isFinite(this.modelSettings.presence_penalty) ? this.modelSettings.presence_penalty : null,
                                 force_sampling: this.modelSettings.force_sampling,
                                 reasoning_parser: this.modelSettings.reasoning_parser || null,
-                                ttl_seconds: this.modelSettings.ttl_seconds || null,
+                                ttl_seconds: Number.isFinite(this.modelSettings.ttl_seconds) ? this.modelSettings.ttl_seconds : null,
                                 index_cache_freq: this.modelSettings.enableIndexCache
                                     ? (this.modelSettings.index_cache_freq || 4)
                                     : 0,
@@ -3578,11 +3678,24 @@
                             claude_code_haiku_model: this.globalSettings.claude_code.haiku_model,
                         }),
                     });
-                    if (!response.ok) {
-                        console.error('Failed to save Claude Code settings');
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
                     }
+                    if (!response.ok) {
+                        const data = await response.json().catch(() => ({}));
+                        this.globalSettings.claude_code = { ...this._lastSavedClaudeCode };
+                        this.showNotification(
+                            data.detail || window.t('js.error.save_claude_code_settings_failed'),
+                            'error'
+                        );
+                        return;
+                    }
+                    this._lastSavedClaudeCode = { ...this.globalSettings.claude_code };
                 } catch (err) {
                     console.error('Failed to save Claude Code settings:', err);
+                    this.globalSettings.claude_code = { ...this._lastSavedClaudeCode };
+                    this.showNotification(window.t('js.error.save_claude_code_settings_failed'), 'error');
                 }
             },
 
@@ -3883,11 +3996,24 @@
                             web_search_content_max_chars: this.globalSettings.integrations.web_search_content_max_chars,
                         }),
                     });
-                    if (!response.ok) {
-                        console.error('Failed to save integration settings');
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
                     }
+                    if (!response.ok) {
+                        const data = await response.json().catch(() => ({}));
+                        this.globalSettings.integrations = { ...this._lastSavedIntegrations };
+                        this.showNotification(
+                            data.detail || window.t('js.error.save_integration_settings_failed'),
+                            'error'
+                        );
+                        return;
+                    }
+                    this._lastSavedIntegrations = { ...this.globalSettings.integrations };
                 } catch (err) {
                     console.error('Failed to save integration settings:', err);
+                    this.globalSettings.integrations = { ...this._lastSavedIntegrations };
+                    this.showNotification(window.t('js.error.save_integration_settings_failed'), 'error');
                 }
             },
 
@@ -3961,6 +4087,11 @@
             },
 
             async loadStats(includeAlltime = true) {
+                // A model switch or the periodic refresh timer can overlap
+                // two calls; without this a slower older request could land
+                // after a newer one and repaint stats for the wrong model
+                // (§B11).
+                const seq = ++this._statsReqSeq;
                 try {
                     const params = new URLSearchParams();
                     if (this.selectedStatsModel) {
@@ -3968,8 +4099,10 @@
                     }
                     const url = '/admin/api/stats' + (params.toString() ? '?' + params : '');
                     const response = await fetch(url);
+                    if (seq !== this._statsReqSeq) return;
                     if (response.ok) {
                         const data = await response.json();
+                        if (seq !== this._statsReqSeq) return;
                         this.stats = { ...this.stats, ...data };
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
@@ -3986,8 +4119,10 @@
                     }
                     const alltimeUrl = '/admin/api/stats?' + alltimeParams;
                     const alltimeResponse = await fetch(alltimeUrl);
+                    if (seq !== this._statsReqSeq) return;
                     if (alltimeResponse.ok) {
                         const alltimeData = await alltimeResponse.json();
+                        if (seq !== this._statsReqSeq) return;
                         this.alltimeStats = { ...this.alltimeStats, ...alltimeData };
                     }
                 } catch (err) {
@@ -3997,47 +4132,69 @@
 
             async clearStats() {
                 try {
-                    await fetch('/admin/api/stats/clear', { method: 'POST' });
+                    const resp = await fetch('/admin/api/stats/clear', { method: 'POST' });
                     this.showClearStatsConfirm = false;
+                    if (!resp.ok) {
+                        const data = await resp.json().catch(() => ({}));
+                        this.showNotification(data.detail || 'Failed to clear stats', 'error');
+                        return;
+                    }
                     await this.loadStats();
                 } catch (err) {
                     console.error('Failed to clear stats:', err);
                     this.showClearStatsConfirm = false;
+                    this.showNotification('Failed to clear stats', 'error');
                 }
             },
 
             async clearAlltimeStats() {
                 try {
-                    await fetch('/admin/api/stats/clear-alltime', { method: 'POST' });
+                    const resp = await fetch('/admin/api/stats/clear-alltime', { method: 'POST' });
                     this.showClearAlltimeConfirm = false;
+                    if (!resp.ok) {
+                        const data = await resp.json().catch(() => ({}));
+                        this.showNotification(data.detail || 'Failed to clear all-time stats', 'error');
+                        return;
+                    }
                     await this.loadStats();
                 } catch (err) {
                     console.error('Failed to clear all-time stats:', err);
                     this.showClearAlltimeConfirm = false;
+                    this.showNotification('Failed to clear all-time stats', 'error');
                 }
             },
 
             async clearSsdCache() {
                 try {
                     const resp = await fetch('/admin/api/ssd-cache/clear', { method: 'POST' });
-                    if (!resp.ok) console.error('SSD cache clear failed:', resp.status);
                     this.showClearSsdCacheConfirm = false;
+                    if (!resp.ok) {
+                        const data = await resp.json().catch(() => ({}));
+                        this.showNotification(data.detail || 'Failed to clear SSD cache', 'error');
+                        return;
+                    }
                     await this.loadStats();
                 } catch (err) {
                     console.error('Failed to clear SSD cache:', err);
                     this.showClearSsdCacheConfirm = false;
+                    this.showNotification('Failed to clear SSD cache', 'error');
                 }
             },
 
             async clearHotCache() {
                 try {
                     const resp = await fetch('/admin/api/hot-cache/clear', { method: 'POST' });
-                    if (!resp.ok) console.error('Hot cache clear failed:', resp.status);
                     this.showClearHotCacheConfirm = false;
+                    if (!resp.ok) {
+                        const data = await resp.json().catch(() => ({}));
+                        this.showNotification(data.detail || 'Failed to clear hot cache', 'error');
+                        return;
+                    }
                     await this.loadStats();
                 } catch (err) {
                     console.error('Failed to clear hot cache:', err);
                     this.showClearHotCacheConfirm = false;
+                    this.showNotification('Failed to clear hot cache', 'error');
                 }
             },
 
@@ -4463,6 +4620,7 @@
                 if (this.benchEventSource) {
                     this.benchEventSource.close();
                 }
+                this._stopBenchPolling();
 
                 const es = new EventSource(`/admin/api/bench/${benchId}/stream`);
                 this.benchEventSource = es;
@@ -4536,6 +4694,14 @@
                             es.close();
                             this.benchEventSource = null;
                             this.loadModels();
+                        } else if (data.type === 'cancelled') {
+                            // User-initiated cancel, not a failure — no benchError.
+                            // The backend still unloads the model (§C1), so refresh.
+                            this.benchRunning = false;
+                            this.benchProgress = null;
+                            es.close();
+                            this.benchEventSource = null;
+                            this.loadModels();
                         } else if (data.type === 'error') {
                             this.benchError = data.message;
                             this.benchRunning = false;
@@ -4551,14 +4717,68 @@
                 };
 
                 es.onerror = () => {
+                    es.close();
+                    this.benchEventSource = null;
+                    // SSE disconnected — fall back to polling rather than
+                    // immediately declaring the run dead (§C1): a dropped
+                    // connection is common (tab backgrounded, brief network
+                    // blip) and the run is very likely still going server-side.
                     if (this.benchRunning) {
+                        this._startBenchPolling();
+                    }
+                };
+            },
+
+            async _pollBenchOnce(benchId) {
+                try {
+                    const resp = await fetch(`/admin/api/bench/${benchId}/results`);
+                    if (resp.status === 404) {
+                        // Run no longer exists server-side (restart) — terminal.
+                        this._stopBenchPolling();
                         this.benchError = window.t('js.error.benchmark_connection_lost');
                         this.benchRunning = false;
                         this.benchProgress = null;
+                        return;
                     }
-                    es.close();
-                    this.benchEventSource = null;
-                };
+                    if (!resp.ok) return;
+                    const data = await resp.json();
+                    const terminal = data.status === 'completed'
+                        || data.status === 'cancelled'
+                        || data.status === 'error';
+                    if (terminal) {
+                        this._stopBenchPolling();
+                        this.benchRunning = false;
+                        this.benchProgress = null;
+                        if (data.status === 'error' && data.error) {
+                            this.benchError = data.error;
+                        }
+                        this.loadModels();
+                        return;
+                    }
+                    // Still running — try to reconnect the live stream; replay-
+                    // on-subscribe restores progress/results, and our result
+                    // arrays dedupe so a replay can't double-add rows.
+                    if (!this.benchEventSource) {
+                        this._stopBenchPolling();
+                        this.connectBenchSSE(benchId);
+                    }
+                } catch (err) {
+                    // Transient — next tick retries.
+                }
+            },
+
+            _startBenchPolling() {
+                this._stopBenchPolling();
+                const benchId = this.benchBenchId;
+                if (!benchId) return;
+                this._benchPollTimer = setInterval(() => this._pollBenchOnce(benchId), 3000);
+            },
+
+            _stopBenchPolling() {
+                if (this._benchPollTimer) {
+                    clearInterval(this._benchPollTimer);
+                    this._benchPollTimer = null;
+                }
             },
 
             async cancelBenchmark() {
@@ -4568,7 +4788,7 @@
                 } catch (err) {
                     console.error('Failed to cancel benchmark:', err);
                 }
-                // SSE handler will update state when error/done event arrives
+                // SSE handler will update state when cancelled/error/done event arrives
             },
 
             // Context benchmark functions
@@ -4617,6 +4837,7 @@
                 if (this.ctxBenchEventSource) {
                     this.ctxBenchEventSource.close();
                 }
+                this._stopCtxBenchPolling();
 
                 const es = new EventSource(`/admin/api/bench/context/${benchId}/stream`);
                 this.ctxBenchEventSource = es;
@@ -4640,6 +4861,13 @@
                             this.ctxBenchEventSource = null;
                             // The applied setting changed the model row.
                             this.loadModels();
+                        } else if (data.type === 'cancelled') {
+                            // User-initiated cancel, not a failure — no ctxBenchError.
+                            this.ctxBenchRunning = false;
+                            this.ctxBenchProgress = null;
+                            es.close();
+                            this.ctxBenchEventSource = null;
+                            this.loadModels();
                         } else if (data.type === 'error') {
                             this.ctxBenchError = data.message;
                             this.ctxBenchRunning = false;
@@ -4654,14 +4882,63 @@
                 };
 
                 es.onerror = () => {
+                    es.close();
+                    this.ctxBenchEventSource = null;
+                    // SSE disconnected — fall back to polling rather than
+                    // immediately declaring the run dead (§C1).
                     if (this.ctxBenchRunning) {
+                        this._startCtxBenchPolling();
+                    }
+                };
+            },
+
+            async _pollCtxBenchOnce(benchId) {
+                try {
+                    const resp = await fetch(`/admin/api/bench/context/${benchId}/results`);
+                    if (resp.status === 404) {
+                        this._stopCtxBenchPolling();
                         this.ctxBenchError = window.t('js.error.benchmark_connection_lost');
                         this.ctxBenchRunning = false;
                         this.ctxBenchProgress = null;
+                        return;
                     }
-                    es.close();
-                    this.ctxBenchEventSource = null;
-                };
+                    if (!resp.ok) return;
+                    const data = await resp.json();
+                    const terminal = data.status === 'completed'
+                        || data.status === 'cancelled'
+                        || data.status === 'error';
+                    if (terminal) {
+                        this._stopCtxBenchPolling();
+                        this.ctxBenchRunning = false;
+                        this.ctxBenchProgress = null;
+                        if (data.status === 'error' && data.error) {
+                            this.ctxBenchError = data.error;
+                        }
+                        if (data.result) this.ctxBenchResult = data.result;
+                        this.loadModels();
+                        return;
+                    }
+                    if (!this.ctxBenchEventSource) {
+                        this._stopCtxBenchPolling();
+                        this.connectContextBenchSSE(benchId);
+                    }
+                } catch (err) {
+                    // Transient — next tick retries.
+                }
+            },
+
+            _startCtxBenchPolling() {
+                this._stopCtxBenchPolling();
+                const benchId = this.ctxBenchBenchId;
+                if (!benchId) return;
+                this._ctxBenchPollTimer = setInterval(() => this._pollCtxBenchOnce(benchId), 3000);
+            },
+
+            _stopCtxBenchPolling() {
+                if (this._ctxBenchPollTimer) {
+                    clearInterval(this._ctxBenchPollTimer);
+                    this._ctxBenchPollTimer = null;
+                }
             },
 
             async cancelContextBenchmark() {
@@ -4671,7 +4948,7 @@
                 } catch (err) {
                     console.error('Failed to cancel context benchmark:', err);
                 }
-                // SSE handler will update state when the error event arrives
+                // SSE handler will update state when the cancelled/error event arrives
             },
 
             async loadCtxBenchState() {
@@ -4730,6 +5007,49 @@
 
             // Narrow-patch save of the global Prefill Priority setting from
             // the bench tab (mirrors the Settings row; applied live server-side).
+            async saveIdleTimeout(value) {
+                // Narrow patch instead of saveGlobalSettings() — the dropdown's
+                // @change previously posted the ENTIRE settings form, so
+                // changing idle timeout silently committed (or, on a
+                // validation failure, silently discarded via the reload in
+                // loadGlobalSettings) every other unsaved edit on the page.
+                const seconds = value === '' ? null : Number(value);
+                const prev = this.globalSettings.idle_timeout.idle_timeout_seconds;
+                if (prev === seconds) return;
+                this.globalSettings.idle_timeout.idle_timeout_seconds = seconds;
+                try {
+                    const resp = await fetch('/admin/api/global-settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ idle_timeout_seconds: seconds }),
+                    });
+                    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                } catch (err) {
+                    console.error('Failed to save idle timeout:', err);
+                    this.globalSettings.idle_timeout.idle_timeout_seconds = prev;
+                    this.idleTimeoutValue = prev == null ? '' : String(prev);
+                    this.showNotification(window.t('js.error.save_settings_failed'), 'error');
+                }
+            },
+
+            async saveClusterAutoEvict(value) {
+                const prev = this.globalSettings.cluster.auto_evict_competing_local_models;
+                if (prev === value) return;
+                this.globalSettings.cluster.auto_evict_competing_local_models = value;
+                try {
+                    const resp = await fetch('/admin/api/global-settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ cluster_auto_evict_competing_local_models: value }),
+                    });
+                    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                } catch (err) {
+                    console.error('Failed to save cluster auto-evict setting:', err);
+                    this.globalSettings.cluster.auto_evict_competing_local_models = prev;
+                    this.showNotification('Failed to save setting', 'error');
+                }
+            },
+
             async saveCtxBenchPriority(value) {
                 if (this.ctxBenchRunning) return;
                 const prev = this.globalSettings.scheduler.prefill_priority;
@@ -4868,8 +5188,8 @@
                             pad(this.benchFmtNum(r.tpot_ms, 2), 10),
                             pad(this.benchFmtNum(r.processing_tps, 1, ' tok/s'), 12),
                             pad(this.benchFmtNum(r.gen_tps, 1, ' tok/s'), 12),
-                            pad(r.e2e_latency_s.toFixed(3), 10),
-                            pad(r.total_throughput.toFixed(1) + ' tok/s', 12),
+                            pad(this.benchFmtNum(r.e2e_latency_s, 3), 10),
+                            pad(this.benchFmtNum(r.total_throughput, 1, ' tok/s'), 12),
                             pad(this.benchFormatMemory(r.peak_memory_bytes), 10),
                         ];
                         lines.push(row.join('  '));
@@ -4894,7 +5214,7 @@
                             pad(this.benchFmtNum(baseline.processing_tps, 1, ' tok/s'), 12),
                             pad(this.benchFmtNum(baseline.processing_tps, 1, ' tok/s'), 12),
                             pad(this.benchFmtNum(baseline.ttft_ms, 1), 10),
-                            pad(baseline.e2e_latency_s.toFixed(3), 10),
+                            pad(this.benchFmtNum(baseline.e2e_latency_s, 3), 10),
                         ];
                         lines.push(row.join('  '));
                     }
@@ -4907,7 +5227,7 @@
                             pad(this.benchFmtNum(r.pp_tps, 1, ' tok/s'), 12),
                             pad(this.benchFmtNum(this.benchPpPerReq(r), 1, ' tok/s'), 12),
                             pad(this.benchFmtNum(r.avg_ttft_ms, 1), 10),
-                            pad(r.e2e_latency_s.toFixed(3), 10),
+                            pad(this.benchFmtNum(r.e2e_latency_s, 3), 10),
                         ];
                         lines.push(row.join('  '));
                     }
@@ -5215,15 +5535,27 @@
                                 this.accCurrentModel = data.model_id || this.accCurrentModel;
                                 break;
                             case 'result':
-                                // Dedupe on replay: accuracy results are unique by
-                                // (model_id, benchmark).
+                                // (model_id, benchmark) is NOT unique across runs —
+                                // re-running the same model+benchmark (the normal
+                                // "changed a setting, run again" flow) is keyed
+                                // identically to an SSE replay of the prior run's
+                                // own result event. Replace-in-place instead of
+                                // dropping: idempotent on a true replay (same
+                                // data back in) and correct on a fresh re-run
+                                // (the new result actually shows), and it keeps
+                                // the follow-up 'upload' event's (model_id,
+                                // benchmark) findIndex pointed at the current
+                                // card instead of a stale one.
                                 {
-                                    const exists = this.accAllResults.some(
+                                    const idx = this.accAllResults.findIndex(
                                         r => r.model_id === data.data.model_id
                                           && r.benchmark === data.data.benchmark
                                     );
-                                    if (!exists) {
-                                        data.data._showCategories = false;
+                                    data.data._showCategories = false;
+                                    if (idx >= 0) {
+                                        this.accAllResults.splice(idx, 1, data.data);
+                                        this.accAllResults = [...this.accAllResults];
+                                    } else {
                                         this.accAllResults.push(data.data);
                                     }
                                 }
@@ -5245,10 +5577,13 @@
                                 }
                                 break;
                             case 'done':
+                                this.accRunning = false;
                                 this.accProgress = null;
                                 es.close();
                                 this.accEventSource = null;
-                                // Check for next in queue
+                                // Check for next in queue — _pollForNextRun's
+                                // own loadAccQueueStatus() flips accRunning
+                                // back to true within ~1s if one starts.
                                 this._pollForNextRun();
                                 break;
                             case 'error':
@@ -5663,6 +5998,11 @@
             },
 
             async loadLogs() {
+                // Switching log files (or the auto-refresh timer firing
+                // mid-switch) can overlap two calls; without a sequence
+                // guard a slower, older request can land after a newer one
+                // and paint the wrong file's content (§B11).
+                const seq = ++this._logsReqSeq;
                 this.logLoading = true;
                 this.logError = '';
 
@@ -5675,9 +6015,11 @@
                     }
 
                     const response = await fetch(`/admin/api/logs?${params}`);
+                    if (seq !== this._logsReqSeq) return;
 
                     if (response.ok) {
                         const data = await response.json();
+                        if (seq !== this._logsReqSeq) return;
                         this.logContent = data.logs;
                         this.logTotalLines = data.total_lines;
                         this.logAvailableFiles = data.available_files || ['server.log'];
@@ -5696,20 +6038,21 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
+                        if (seq !== this._logsReqSeq) return;
                         this.logError = data.detail || window.t('js.error.load_logs_failed');
                     }
                 } catch (err) {
                     console.error('Failed to load logs:', err);
-                    this.logError = window.t('js.error.load_logs_failed');
+                    if (seq === this._logsReqSeq) this.logError = window.t('js.error.load_logs_failed');
                 } finally {
-                    this.logLoading = false;
+                    if (seq === this._logsReqSeq) this.logLoading = false;
                 }
             },
 
             startLogRefresh() {
                 this.stopLogRefresh();  // Clear existing timer
 
-                if (this.logRefreshInterval > 0) {
+                if (this.logAutoRefreshEnabled && this.logRefreshInterval > 0) {
                     this.logAutoRefresh = true;
                     this._logRefreshTimer = setInterval(() => {
                         this.loadLogs();
@@ -5723,6 +6066,17 @@
                     this._logRefreshTimer = null;
                 }
                 this.logAutoRefresh = false;
+            },
+
+            saveLogRefreshInterval() {
+                localStorage.setItem('logRefreshInterval', String(this.logRefreshInterval));
+                this.restartLogRefresh();
+            },
+
+            toggleLogAutoRefresh() {
+                this.logAutoRefreshEnabled = !this.logAutoRefreshEnabled;
+                localStorage.setItem('logAutoRefreshEnabled', String(this.logAutoRefreshEnabled));
+                this.restartLogRefresh();
             },
 
             restartLogRefresh() {
@@ -6565,6 +6919,11 @@
                 return `${pct}% · ${label}`;
             },
 
+            taskStatusLabel(status) {
+                const key = 'models.task_status.' + status;
+                return window._t[key] !== undefined ? window._t[key] : status;
+            },
+
             formatOQElapsed(task) {
                 if (!task.started_at) return '';
                 const now = task.completed_at || (Date.now() / 1000);
@@ -6960,9 +7319,13 @@
                     most_params:  { col: 'params',    dir: 'desc' },
                     least_params: { col: 'params',    dir: 'asc'  },
                     downloads:    { col: 'downloads', dir: 'desc' },
-                    trending:     { col: 'downloads', dir: 'desc' },
-                    created:      { col: 'downloads', dir: 'desc' },
-                    updated:      { col: 'downloads', dir: 'desc' },
+                    // trending/created/updated are already sorted server-side
+                    // (that's the whole point of picking them) — 'rank'
+                    // preserves the backend's order instead of re-sorting by
+                    // downloads and discarding it (§B7).
+                    trending:     { col: 'rank',      dir: 'asc'  },
+                    created:      { col: 'rank',      dir: 'asc'  },
+                    updated:      { col: 'rank',      dir: 'asc'  },
                 };
                 const m = map[this.hfSearchSort];
                 if (m) {
@@ -7036,7 +7399,11 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.hfTokenInvalid = !!data.hf_token_invalid;
-                        this.hfSearchResults = data.models || [];
+                        // Attach original rank so a trending/created/updated
+                        // sort (server-ordered) survives the client-side
+                        // re-sort in sortModels() — same pattern as
+                        // loadRecommendedModels' trending/popular lists.
+                        this.hfSearchResults = (data.models || []).map((m, i) => ({ ...m, rank: i + 1 }));
                         this.hfSearchLoaded = true;
                         // Save to search history
                         this.addSearchHistory(this.hfSearchQuery.trim());
@@ -7159,19 +7526,34 @@
             // =================================================================
 
             async initMsDownloader() {
-                if (this.msInitialized) return;
-                this.msInitialized = true;
+                // msChecking (not just msInitialized) guards re-entrancy: without
+                // it, two quick clicks on the ModelScope tab before the first
+                // fetch resolves would fire two concurrent status checks.
+                if (this.msInitialized || this.msChecking) return;
+                this.msChecking = true;
                 try {
                     const response = await fetch('/admin/api/ms/status');
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
                     if (response.ok) {
                         const data = await response.json();
+                        // A definitive server answer (available either way) is a
+                        // stable environmental fact — latch it so we don't
+                        // re-check on every tab click. A failed request below is
+                        // NOT latched: it may be a transient blip, and the amber
+                        // "unavailable" banner shouldn't be permanent on a guess.
                         this.msAvailable = data.available === true;
+                        this.msInitialized = true;
                     } else {
                         this.msAvailable = false;
                     }
                 } catch (err) {
                     this.msAvailable = false;
                     console.error('Failed to check MS status:', err);
+                } finally {
+                    this.msChecking = false;
                 }
                 if (this.msAvailable) {
                     await this.loadMSTasks();

@@ -196,6 +196,20 @@ def test_cluster_v2_javascript_parses():
 
 def test_every_dashboard_locale_names_cluster_tab():
     locale_dir = ROOT / "omlx/admin/i18n"
+    required = {
+        "navbar.tab.cluster",
+        "settings.advanced.distributed_inference",
+        "settings.advanced.distributed_inference_enabled",
+        "settings.advanced.distributed_inference_hint",
+        "cluster.pairing.shared_secret",
+        "cluster.pairing.shared_secret_hint",
+        "cluster.pairing.shared_secret_placeholder",
+        "cluster.pairing.generate",
+        "cluster.pairing.copy",
+    }
+
     for path in locale_dir.glob("*.json"):
         payload = json.loads(path.read_text(encoding="utf-8"))
         assert payload.get("navbar.tab.cluster"), path.name
+        missing = {key for key in required if not payload.get(key)}
+        assert not missing, f"{path.name}: missing {sorted(missing)}"

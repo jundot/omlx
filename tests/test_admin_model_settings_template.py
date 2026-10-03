@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from omlx.admin.routes import _load_locale
+
 
 def _model_settings_template() -> str:
     root = Path(__file__).resolve().parents[1]
@@ -58,6 +60,18 @@ def test_vlm_mtp_still_conflicts_with_turboquant():
     )
 
     assert "modelSettings.turboquant_kv_enabled" in vlm_mtp
+
+
+def test_apply_profile_surfaces_server_validation_error():
+    script = _dashboard_script()
+    method = script.split("async applyProfileToForm(profile, fromTemplate = false) {", 1)[1].split(
+        "async applyTemplateToForm(template) {", 1
+    )[0]
+
+    assert "this.profileError = '';" in method
+    assert "const data = await r.json().catch(() => ({}));" in method
+    assert "this.profileError = data.detail || window.t('js.error.apply_profile_failed');" in method
+    assert "this.profileError = String(e);" in method
 
 
 def test_reasoning_effort_has_presets_and_custom_input():
@@ -164,7 +178,7 @@ def test_model_settings_feature_i18n_keys_exist_in_every_locale():
     }
 
     for locale_path in sorted(i18n_dir.glob("*.json")):
-        translations = json.loads(locale_path.read_text())
+        translations = _load_locale(locale_path.stem)
         missing_keys = keys - translations.keys()
         assert not missing_keys, f"{locale_path.name} is missing {sorted(missing_keys)}"
 

@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from omlx.admin.routes import _load_locale
+
 ROOT = Path(__file__).resolve().parents[1]
 I18N_DIR = ROOT / "omlx" / "admin" / "i18n"
 
@@ -41,7 +43,7 @@ def test_external_accuracy_diagnostic_i18n_keys_exist_in_every_locale():
         "acc_bench.results.reliability_warning",
     }
     for locale_path in I18N_DIR.glob("*.json"):
-        translations = json.loads(locale_path.read_text())
+        translations = _load_locale(locale_path.stem)
         missing = keys - translations.keys()
         assert not missing, f"{locale_path.name} is missing {sorted(missing)}"
 
