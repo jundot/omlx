@@ -2031,5 +2031,6 @@
   "cluster.v2.join.cleanup_forgotten": "Old cleanup forgotten on this Mac. Remote cleanup was not confirmed.",
   "cluster.v2.join.forget_cleanup_error": "Could not forget this cleanup.",
   "cluster.v2.membership.waiting_request": "Waiting for this Mac to show its code and send a pairing request.",
-  "cluster.v2.membership.add_device": "Add this Mac"
+  "cluster.v2.membership.add_device": "Add this Mac",
+  "chat.confirm_delete_message": "This will delete this message and every message after it in this chat. Continue?"
 }
