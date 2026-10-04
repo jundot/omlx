@@ -436,43 +436,45 @@ def _glm_indexer_q8_override(path: str, config: dict) -> dict | None:
     return dict(_GLM_INDEXER_Q8)
 
 
-# Small-but-critical role floor (model agnostic) ----------------------------
+# Small-but-critical role floor ----------------------------------------------
 #
-# Some roles decide something discrete instead of feeding a weighted sum, so
-# their quantization error is not averaged out - it flips a selection:
+# A sparse-attention scorer/indexer keeps only the top-k of the compressed KV
+# blocks it scores, so a flipped ranking drops a needed block from attention
+# entirely - the same argument that settled the GLM DSA rule above on Q8,
+# applied per role instead of per family. The draft head's fusion projections,
+# its copies of the backbone roles and the PLE key/value lookups decide
+# discrete reads (accept length, exact-match retrieval) the same way.
 #
-# * a sparse-attention scorer/indexer keeps only the top-k of the compressed KV
-#   blocks it scores, so a flipped ranking drops the needed block from attention
-#   entirely;
-# * gated residual / hyper-connection mixers write into the residual stream that
-#   every later layer reads, so their error is re-injected rather than
-#   attenuated by depth;
-# * attention projections decide which positions a token reads at all.
-#
-# On a fine-grained MoE these roles are a rounding error of the checkpoint, so
-# holding them at full precision or Q8 costs almost nothing while protecting the
-# long-context and multi-step failure modes. That is the same argument as
-# ``_glm_indexer_q8_override`` above and the Inkling ``qkvr_proj`` floor; this
-# generalizes it from one family to any checkpoint whose roles are small.
-#
-# Split in two halves:
-#   * ``_role_floor`` is unconditional, for roles that are tiny by construction
-#     (scorers, PLE key/value, MTP fusion projections and the MTP copies of the
-#     backbone roles);
-#   * ``_role_floor_gated_overrides`` applies the attention and gated-residual
-#     roles behind a size gate, because in a dense model attention is a large
-#     share of the checkpoint and pinning it would cost real bytes instead of
-#     rounding error.
+# The floor is the *last consumer of the plan's byte budget*, not a carve-out
+# outside it (see ``_apply_role_floor`` in ``_build_quant_plan``):
+#   * it runs after the format invariants (GLM indexer seeds), the mandatory
+#     consensus boosts (``lm_head`` / embeddings), the fractional-level expert
+#     floor, the per-family protection floor, the sensitivity-ranked boosts
+#     and the toward-target fallback have all spent what they spent - so it
+#     buys a role only bits that no earlier stage bought, and it cannot
+#     displace a single allocation the base plan would have made;
+#   * every bump is priced and cap-checked: a tensor is raised toward Q8 only
+#     while the plan's effective bpw stays at or under ``hard_cap_bpw``, one
+#     tensor's extra bytes stay under ``_ROLE_FLOOR_MAX_TENSOR_COST_SHARE`` of
+#     the plan and a role's total stays under
+#     ``_ROLE_FLOOR_MAX_COST_SHARE``. A role over either budget, or over the
+#     cap, keeps exactly what the base plan gave it - nothing is repinned and
+#     no other tensor moves;
+#   * raise-only, and scoped to checkpoints that have routed experts. Dense
+#     transformers are left to a separate change: on a dense model attention
+#     is a large share of the checkpoint and pinning it would cost real bytes
+#     instead of a rounding error.
+#   * roles are claimed in priority order (``_ROLE_FLOOR_PRIORITY``): when
+#     the leftover band cannot pay for everything, the discrete-decision
+#     roles get it before the weighted-sum ones.
 #
 # A family whose loader fuses one of these into a fixed format needs its own
 # invariant ahead of this floor - see ``_glm_indexer_q8_override`` and the
 # Inkling ``qkvr_proj`` Q8 floor.
 
-# Hard top-k selectors: kept in full precision. They are a rounding error of
-# every checkpoint, and a wrong ranking drops information instead of adding a
-# little noise. Matched per dot-segment, so an unrelated ``*_indexer_thing``
-# name is not swept in by a substring match. Add a family's spelling here as it
-# is verified.
+# Hard top-k selectors: floored to Q8 by the plan pass. Matched per
+# dot-segment, so an unrelated ``*_indexer_thing`` name is not swept in by a
+# substring match. Add a family's spelling here as it is verified.
 _HARD_SELECTOR_SEGMENTS = ("indexer",)
 
 # Attention projections, covering every spelling seen in the open MoE
@@ -536,22 +538,25 @@ _MLA_LEAVES = frozenset(("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_pro
 # prefixes.
 _RESIDUAL_MIXER_MARKERS = ("hyper_connection", "hc_attn", "hc_ffn", "attn_hc", "ffn_hc")
 
-# The MTP head's fusion projections stay in full precision: aggressively
-# quantizing them collapses draft acceptance (see ``_is_mtp_protected_tensor``).
+# The MTP head's fusion projections join the floor below: on these spellings
+# the per-level policy ships them at the level's base bits, and the floor
+# raises them toward Q8 like any other role - it does not single them out for
+# full precision (``mtp.fc.weight`` on Qwen3.5/3.6 stays protected by
+# ``_is_mtp_protected_tensor`` itself; this is only the split-up Qwen4-Exp
+# pair).
 _MTP_FUSION_SUFFIXES = ("mtp.fc_embedding", "mtp.fc_hidden")
 
 # Group size 64 matches the GLM indexer floor and the 8-bit tensors shipped in
 # existing oQe checkpoints.
 _ROLE_Q8 = {"bits": 8, "group_size": 64, "mode": "affine"}
 
-# Cost budget for the gated half, as a share of the checkpoint's bytes at the
-# selected level. Unlike a parameter-share threshold this is level aware: the
-# same tensors cost proportionally more at oQ2 and almost nothing at oQ8, and a
-# role that would blow the budget keeps the per-level policy instead - nothing
-# is repinned and no other tensor moves, so an over-budget role behaves exactly
-# as it does on the base branch. That is what keeps a dense model (attention
-# near a third of the weights, i.e. several times the budget) from being
-# repriced, while fine-grained and coarse MoE roles fit.
+# Cost budgets, as shares of the plan's own byte total at the selected level
+# (not parameter shares: the same tensors cost proportionally more at oQ2 and
+# almost nothing at oQ8). A role whose total extra bytes exceed the role
+# budget keeps exactly what the plan had assigned it before the floor -
+# nothing is repinned and no other tensor moves - and the whole pass never
+# spends past ``hard_cap_bpw``, so an over-budget checkpoint behaves as it
+# does on the base branch.
 _ROLE_FLOOR_MAX_COST_SHARE = 0.035
 # No single tensor may cost more than this share on its own, so one large member
 # cannot hide behind the role budget or drag the whole role over it.
@@ -596,118 +601,168 @@ def _gated_role(path: str) -> str | None:
     return None
 
 
-def _role_floor(path: str, config: dict) -> dict | bool | None:
-    """Unconditional part of the small-but-critical role floor.
+def _role_floor_role(path: str) -> str | None:
+    """Return the floor role for *path*, or ``None`` for anything else.
 
-    ``False`` keeps the tensor in full precision, a spec dict pins it to a fixed
-    8-bit affine format, and ``None`` means the path is not one of these roles
-    and the regular per-level policy applies.
+    ``selector`` (hard top-k scorer), ``mtp_fusion`` (the split Qwen4-Exp
+    fusion pair), ``ple_kv`` (exact-match PLE reads), ``mtp_attention`` /
+    ``mtp_mixer`` (the draft head's copies of the backbone roles) and
+    ``attention`` / ``mixer`` are the floored roles. Every one of them is
+    raised only toward Q8 and only inside the plan's budget - see
+    ``_role_floor_candidates``.
     """
-    # The sensitivity proxy stays uniform: it is a measuring instrument, not an
-    # artifact, and its precision must not depend on the policy it measures.
-    if config.get("_oq_proxy"):
-        return None
     path = _normalize_quant_path(path)
     if _is_hard_selector(path):
-        return False
+        return "selector"
     if path.endswith(_MTP_FUSION_SUFFIXES):
-        return False
-    # The MTP head carries its own copies of the backbone roles. Keeping the
-    # backbone and the preserved MTP head on one format is what the GLM indexer
-    # rule already does, and draft acceptance depends on those projections.
-    if _is_mtp_path(path) and _gated_role(path) is not None:
-        return dict(_ROLE_Q8)
+        return "mtp_fusion"
     if path.endswith((".ple.key_proj", ".ple.value_proj")):
-        return dict(_ROLE_Q8)
-    return None
-
-
-def _baseline_spec(path: str, config: dict, oq_level: int) -> tuple | None:
-    """Bits the per-level policy would use for *path*.
-
-    Returns ``(bits, group_size, mode)``, or ``None`` when the policy keeps the
-    tensor in full precision. Computed with the budget plan disabled so the
-    floor is measured against the policy, not against itself.
-    """
-    base_bits = _base_bits_for_level(oq_level)
-    result = universal_quant_predicate(path, None, config, oq_level)
-    if result is False:
+        return "ple_kv"
+    role = _gated_role(path)
+    if role is None:
         return None
-    if isinstance(result, dict):
-        bits = int(result.get("bits", base_bits))
-        return (
-            bits,
-            int(result.get("group_size", _OQ_DEFAULT_GROUP_SIZE)),
-            result.get("mode", _mode_for_bits(bits)),
-        )
-    return base_bits, _OQ_DEFAULT_GROUP_SIZE, _mode_for_bits(base_bits)
+    return f"mtp_{role}" if _is_mtp_path(path) else role
 
 
-def _role_floor_gated_overrides(
+# Roles are applied in this order: the discrete-decision roles are priced
+# first, so when the level cap makes the budget contended the bytes go to
+# them before the weighted-sum roles.
+_ROLE_FLOOR_PRIORITY = (
+    "selector",
+    "mtp_fusion",
+    "mtp_attention",
+    "mtp_mixer",
+    "ple_kv",
+    "attention",
+    "mixer",
+)
+
+
+def _role_floor_candidates(
     named_shapes: dict[str, tuple],
     config: dict,
     oq_level: int,
-    pricing_overrides: dict[str, dict] | None = None,
-) -> dict[str, dict]:
-    """Cost-gated half: attention and gated-residual roles pinned to Q8.
+    boost_map: dict[str, dict],
+    fixed_overrides: dict[str, dict],
+    plan_bytes: float,
+) -> dict[str, list[tuple[str, int]]]:
+    """Per-role lists of ``(path, extra_bytes)`` to raise toward Q8.
 
-    Every candidate is priced against what the per-level policy would choose,
-    and is pinned only while its own extra bytes fit
-    ``_ROLE_FLOOR_MAX_TENSOR_COST_SHARE`` and its role's total fits
-    ``_ROLE_FLOOR_MAX_COST_SHARE`` of the checkpoint. That makes "small in size"
-    measurable per tensor and level aware, instead of a single parameter-share
-    cliff on the whole role.
+    Each candidate is priced against the bits the plan has already assigned
+    at the point the floor runs - the format invariants, the mandatory
+    consensus boosts and the protection floors have been applied, the
+    sensitivity-ranked and toward-target discretionary boosts have not. A
+    role is only listed while its total extra bytes fit
+    ``_ROLE_FLOOR_MAX_COST_SHARE`` of ``plan_bytes`` and no single tensor in
+    it exceeds ``_ROLE_FLOOR_MAX_TENSOR_COST_SHARE``; the caller additionally
+    applies a role only while the plan stays at or under ``hard_cap_bpw``.
+    An over-budget or over-cap role is dropped whole, so its tensors keep
+    exactly what the plan had already given them.
 
-    ``pricing_overrides`` carries the layouts fixed by a model invariant
-    (``_structural_quant_overrides``), which the plan prices the same way. A
-    table the writer emits at the level's bits must not be counted at 16 bits
-    here: on Qwen4-Exp that alone would inflate the budget by more than half and
-    admit roles that do not actually fit.
+    Never lowered, never raised past Q8: tensors already at 8 or more bits,
+    full-precision tensors, routed experts, fixed-layout pass-throughs and
+    paths outside the verified role spellings are not listed.
     """
-    pricing_overrides = pricing_overrides or {}
+    if plan_bytes <= 0:
+        return {}
     base_bits = _base_bits_for_level(oq_level)
-    baseline_config = {**config, "_oq_use_budget_plan": False, "_oq_boost_map": {}}
-    total_bytes = 0
+    policy_config = {**config, "_oq_use_budget_plan": False, "_oq_boost_map": {}}
+    tensor_budget = plan_bytes * _ROLE_FLOOR_MAX_TENSOR_COST_SHARE
+    role_budget = plan_bytes * _ROLE_FLOOR_MAX_COST_SHARE
     candidates: dict[str, list[tuple[str, int]]] = {}
     for path, shape in named_shapes.items():
-        fixed = pricing_overrides.get(path)
-        if fixed:
-            baseline = (
-                int(fixed.get("bits", base_bits)),
-                int(fixed.get("group_size", _OQ_DEFAULT_GROUP_SIZE)),
-                fixed.get("mode", _mode_for_bits(int(fixed.get("bits", base_bits)))),
+        if path in fixed_overrides or _is_routed_expert(path):
+            continue
+        role = _role_floor_role(path)
+        if role is None:
+            continue
+        boosted = boost_map.get(path)
+        if boosted is not None:
+            cur_bits = int(boosted.get("bits", base_bits))
+            cur_spec = (
+                cur_bits,
+                int(boosted.get("group_size", _OQ_DEFAULT_GROUP_SIZE)),
+                boosted.get("mode", _mode_for_bits(cur_bits)),
             )
         else:
-            baseline = _baseline_spec(path, baseline_config, oq_level)
-        if baseline is None:
-            n = 1
-            for dim in shape:
-                n *= dim
-            total_bytes += n * 2  # full precision is priced at 16 bits
-            continue
-        total_bytes += _tensor_quantized_bytes(shape, *baseline)
-        if fixed or _is_mtp_path(path):
-            continue  # already pinned by an invariant, or kept in full precision
-        role = _gated_role(path)
-        if role is None:
+            pred = universal_quant_predicate(path, None, policy_config, oq_level)
+            if pred is False:
+                continue  # kept in full precision - already above the floor
+            if isinstance(pred, dict):
+                cur_bits = int(pred.get("bits", base_bits))
+                cur_spec = (
+                    cur_bits,
+                    int(pred.get("group_size", _OQ_DEFAULT_GROUP_SIZE)),
+                    pred.get("mode", _mode_for_bits(cur_bits)),
+                )
+            else:
+                cur_spec = (
+                    base_bits,
+                    _OQ_DEFAULT_GROUP_SIZE,
+                    _mode_for_bits(base_bits),
+                )
+        if cur_spec[0] >= _ROLE_Q8["bits"]:
             continue
         delta = _tensor_quantized_bytes(
             shape, _ROLE_Q8["bits"], _ROLE_Q8["group_size"], _ROLE_Q8["mode"]
-        ) - _tensor_quantized_bytes(shape, *baseline)
-        if delta > 0:
-            candidates.setdefault(role, []).append((path, delta))
-    if total_bytes <= 0:
-        return {}
-    tensor_budget = total_bytes * _ROLE_FLOOR_MAX_TENSOR_COST_SHARE
-    role_budget = total_bytes * _ROLE_FLOOR_MAX_COST_SHARE
-    overrides: dict[str, dict] = {}
-    for entries in candidates.values():
-        if sum(delta for _, delta in entries) > role_budget:
+        ) - _tensor_quantized_bytes(shape, *cur_spec)
+        if delta <= 0 or delta > tensor_budget:
             continue
-        for path, delta in entries:
-            if delta <= tensor_budget:
-                overrides[path] = dict(_ROLE_Q8)
-    return overrides
+        candidates.setdefault(role, []).append((path, delta))
+    return {
+        role: entries
+        for role, entries in candidates.items()
+        if sum(delta for _, delta in entries) <= role_budget
+    }
+
+
+def _apply_role_floor(
+    named_shapes: dict[str, tuple],
+    config: dict,
+    oq_level: int,
+    boost_map: dict[str, dict],
+    fixed_overrides: dict[str, dict],
+    total_bits_f: float,
+    total_params: int,
+    current_bpw: float,
+    hard_cap_bpw: float,
+) -> tuple[float, float, int]:
+    """Apply the role floor as the last consumer of the plan; return totals.
+
+    Walks the budget-passing roles in ``_ROLE_FLOOR_PRIORITY`` order and
+    applies a role whole only while the plan's bpw stays at or under
+    ``hard_cap_bpw`` after paying for it; an over-cap role is dropped and its
+    tensors keep exactly what the earlier stages assigned them. Mutates
+    ``boost_map`` only by adding or raising entries to Q8 - it never lowers a
+    tensor and never touches one already at 8 or more. It runs after every
+    other stage of the plan, so it only buys bits that no earlier stage
+    bought.
+    """
+    if total_params <= 0:
+        return total_bits_f, current_bpw, 0
+    candidates = _role_floor_candidates(
+        named_shapes,
+        config,
+        oq_level,
+        boost_map,
+        fixed_overrides,
+        total_bits_f / 8.0,
+    )
+    bumped = 0
+    for role in _ROLE_FLOOR_PRIORITY:
+        entries = candidates.get(role)
+        if not entries:
+            continue
+        role_delta_bits = 8.0 * sum(delta for _, delta in entries)
+        next_bpw = (total_bits_f + role_delta_bits) / total_params
+        if next_bpw > hard_cap_bpw:
+            continue
+        for path, _delta in entries:
+            boost_map[path] = dict(_ROLE_Q8)
+        bumped += len(entries)
+        total_bits_f += role_delta_bits
+        current_bpw = next_bpw
+    return total_bits_f, current_bpw, bumped
 
 
 def _is_qwen4_exp_ngram_embedding_tensor(path: str, config: dict) -> bool:
@@ -773,14 +828,6 @@ def universal_quant_predicate(
     glm_indexer_override = _glm_indexer_q8_override(path, config)
     if glm_indexer_override is not None:
         return glm_indexer_override
-
-    # The small-but-critical role floor keeps hard top-k selectors in full
-    # precision and pins the PLE key/value, MTP fusion and MTP role copies to a
-    # fixed 8-bit format at every oQ level. Evaluated before the boost map so a
-    # per-level budget plan cannot trade these away.
-    role_floor = _role_floor(path, config)
-    if role_floor is not None:
-        return role_floor
 
     tc = config.get("text_config", {})
     num_layers = config.get("num_hidden_layers") or tc.get("num_hidden_layers", 32)
@@ -1343,18 +1390,13 @@ def _build_quant_plan(
     # GLM DSA indexers are a format invariant, not an optional sensitivity
     # boost. Seed them before pricing the plan and never let the bpw cap drop
     # them. On GLM-5.2 all 22 indexers together are only about 209 MiB at Q8.
-    #
-    # The small-but-critical role floor is seeded the same way, so its tensors
-    # are priced up front and cannot be trimmed back to base bits when a low
-    # level (oQ2/oQ3) runs out of budget. Roles the floor keeps in full
-    # precision are skipped here - they are never quantized.
+    # The small-but-critical role floor is a later stage of this same budget
+    # (see ``_apply_role_floor``), not a seed: it claims bytes after the
+    # stages above have secured theirs, so it can never displace them.
     for path in named_shapes:
         if path in fixed_overrides:
             continue
         override = _glm_indexer_q8_override(path, config)
-        if override is None:
-            role_override = _role_floor(path, config)
-            override = role_override if isinstance(role_override, dict) else None
         if override is not None:
             boost_map[path] = override
 
@@ -1370,18 +1412,6 @@ def _build_quant_plan(
         total_params += n
         if _is_routed_expert(path):
             expert_params += n
-
-    # Cost-gated half of the role floor: attention projections (including
-    # linear attention) and gated residual mixers are pinned only while their
-    # extra bytes stay inside the budget. Seeded before pricing for the same
-    # reason as above, so the per-level allocator cannot trim them back.
-    gated = _role_floor_gated_overrides(named_shapes, config, oq_level, fixed_overrides)
-    for path, override in gated.items():
-        if path in fixed_overrides or path in boost_map:
-            continue
-        if _is_routed_expert(path):
-            continue
-        boost_map[path] = override
 
     current_bpw = _estimate_effective_bpw(
         named_shapes,
@@ -1622,6 +1652,30 @@ def _build_quant_plan(
             target_bpw,
             hard_cap_bpw,
         )
+
+    # Small-but-critical role floor: the last consumer of the level cap. Every
+    # invariant, mandatory, protection and discretionary stage above has spent
+    # what it spent; the floor only adds bits that no earlier stage bought, so
+    # it cannot displace a single allocation the base plan would have made and
+    # cannot push the plan past ``hard_cap_bpw``. Checkpoints without routed
+    # experts are out of scope: on a dense model these roles are not a
+    # rounding error, and the plan must match the base branch exactly.
+    if expert_params > 0:
+        total_bits_f, current_bpw, floor_bumps = _apply_role_floor(
+            named_shapes,
+            config,
+            oq_level,
+            boost_map,
+            fixed_overrides,
+            total_bits_f,
+            total_params,
+            current_bpw,
+            hard_cap_bpw,
+        )
+        if floor_bumps:
+            logger.info(
+                f"oQ{oq_level:g}: role floor raised {floor_bumps} tensors to Q8"
+            )
 
     if boost_map:
         from collections import Counter
@@ -4813,12 +4867,6 @@ def _is_mtp_protected_tensor(name: str) -> bool:
         return False
     # Qwen3.5/3.6 fusion projection
     if name.endswith("mtp.fc.weight") or ".mtp.fc.weight" in name:
-        return True
-    # Qwen4-Exp splits the same fusion into an embedding and a hidden half.
-    if any(
-        name.endswith(f"{suffix}.weight") or name.endswith(suffix)
-        for suffix in ("mtp.fc_embedding", "mtp.fc_hidden")
-    ):
         return True
     # DeepSeek-V4 / GLM-5.2 MTP block fusion projections. Embedded DSpark
     # combines target-layer taps through main_proj instead of e_proj/h_proj.
@@ -10359,10 +10407,9 @@ def _build_streaming_proxy_for_sensitivity(
     config["_oq_use_budget_plan"] = False
     config["_oq_boost_map"] = {}
     # The proxy is a deliberately uniform 4-bit stand-in used only to measure
-    # sensitivity, so the small-but-critical role floor does not apply to it.
-    # Its precision choices must not depend on the policy of the artifact that
-    # the measurement is going to inform.
-    config["_oq_proxy"] = True
+    # sensitivity. The role floor lives entirely in the budget plan stage that
+    # this disables (``_oq_use_budget_plan``), so its precision choices cannot
+    # depend on the policy of the artifact the measurement informs.
 
     output.mkdir(parents=True, exist_ok=False)
 

@@ -299,17 +299,13 @@ class TestUniversalQuantPredicate:
 
     @pytest.mark.parametrize("model_type", ["deepseek_v32", "deepseek_v4"])
     def test_glm_dsa_indexer_q8_rule_does_not_touch_deepseek(self, model_type, module):
-        # GLM's mandatory Q8 stays scoped to GLM. DeepSeek's DSA indexer is the
-        # same hard top-k role, so it now takes the generic role floor (full
-        # precision) instead of the per-level default.
         result = universal_quant_predicate(
             "model.layers.0.self_attn.indexer.wq_b",
             module,
             {"model_type": model_type},
             3.5,
         )
-        assert result is False
-        assert result != {"bits": 8, "group_size": 64, "mode": "affine"}
+        assert result is True
 
     def test_dense_o_proj_5bit(self, dense_config, module):
         result = universal_quant_predicate(
