@@ -178,9 +178,26 @@ def _inputs(rows, step, batch=1):
     return mx.broadcast_to(row, shape)
 
 
+@pytest.fixture(params=[True, False], ids=["topk_fold", "topk_launch"])
+def topk_fold(request, monkeypatch):
+    """Routing folded into the gate+up launch, or OMLX_QWEN35_MOE_TOPK_FOLD=0
+    (the separate routing launch); cached plans are rebuilt either way."""
+
+    def drop_plans():
+        for block in _BLOCKS.values():
+            block.__dict__.pop("_omlx_routed_decode_plan", None)
+
+    monkeypatch.setattr(routed, "_TOPK_FOLD", request.param)
+    drop_plans()
+    yield request.param
+    drop_plans()
+
+
 @pytest.mark.parametrize("seed", [0, 1])
-def test_window_rows_equal_one_token_decode(seed, engaged):
+def test_window_rows_equal_one_token_decode(seed, topk_fold, engaged):
     block = _block(seed)
+    plan = routed.routed_decode_plan(block, mx.zeros((1, 1, HIDDEN), mx.bfloat16))
+    assert (plan.topk_kernel is not None) == topk_fold
     for rows in range(1, routed.WINDOW_MAX_ROWS + 1):
         for step in range(3):
             _check(block, _inputs(rows, step), engaged)
@@ -236,7 +253,7 @@ def test_kernel_failure_falls_back_to_the_composed_verifier(monkeypatch, engaged
     def broken(*args):
         raise RuntimeError("no pipeline")
 
-    monkeypatch.setattr(routed, "routed_window", broken)
+    monkeypatch.setattr(routed, "_window_down", broken)
     out = _verify(block, x, window=True)
     assert engaged[-1] is False and routed._WINDOW_DISABLED
     assert _same_bits(out, old)
@@ -328,15 +345,19 @@ def test_fp32_window_router_equals_one_row_router():
     weight = mx.concatenate([weight[:480], weight[:32]])
     x = mx.random.normal((rows, HIDDEN))
     launch = router.router_gemv(weight.astype(mx.bfloat16))
-    mx.eval(launch(x[:1].astype(mx.bfloat16)), launch(x.astype(mx.bfloat16)))
-    logits = router._GEMV_WINDOW_KERNEL(
-        inputs=[x, weight],
-        template=[("T", f32), ("K", HIDDEN), ("N", EXPERTS), ("M", rows), ("NSG", 4)],
-        grid=(32, EXPERTS, 1),
-        threadgroup=(32, 4, 1),
-        output_shapes=[(rows, EXPERTS)],
-        output_dtypes=[f32],
-    )[0]
+    mx.eval(launch(x.astype(mx.bfloat16)))
+
+    def gemv(x, rows):
+        return router._GEMV_KERNEL(
+            inputs=[x, weight],
+            template=[("T", f32), ("K", HIDDEN), ("N", EXPERTS), ("M", rows), ("NSG", 4)],
+            grid=(32, EXPERTS * rows, 1),
+            threadgroup=(32, 4, 1),
+            output_shapes=[(rows, EXPERTS)],
+            output_dtypes=[f32],
+        )[0]
+
+    logits = gemv(x, rows)
     probe = (mx.random.normal((rows, EXPERTS)) * 3).astype(mx.bfloat16)
     mx.eval(router.softmax_topk_row(probe[:1], 10), router.softmax_topk_rows(probe, 10))
     inds, scores = router._SOFTMAX_TOPK_ROWS_KERNEL(
@@ -348,14 +369,7 @@ def test_fp32_window_router_equals_one_row_router():
         output_dtypes=[mx.uint32, f32],
     )
     for r in range(rows):
-        logits_r = router._GEMV_KERNEL(
-            inputs=[x[r], weight],
-            template=[("T", f32), ("K", HIDDEN), ("R", 1), ("NSG", 4)],
-            grid=(32, EXPERTS, 1),
-            threadgroup=(32, 4, 1),
-            output_shapes=[(EXPERTS,)],
-            output_dtypes=[f32],
-        )[0]
+        logits_r = gemv(x[r], 1)[0]
         inds_r, scores_r = router._SOFTMAX_TOPK_KERNEL(
             inputs=[logits_r],
             template=[("T", f32), ("NE", EXPERTS), ("K", 10)],
