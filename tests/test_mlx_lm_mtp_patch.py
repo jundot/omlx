@@ -5728,3 +5728,59 @@ def test_shared_activation_with_adaptive_policy_matches_greedy_target(monkeypatc
         assert actual == expected
     finally:
         mlx_lm_mtp.set_mtp_active(previous)
+
+
+@pytest.mark.parametrize("failure", [None, "invalid", "fallback"])
+@pytest.mark.parametrize("late_join", [False, True])
+def test_private_activation_consumes_rows_and_reconciles_partial_failure(
+    monkeypatch, failure, late_join
+):
+    active = mlx_lm_mtp.is_mtp_active()
+    mlx_lm_mtp.set_mtp_active(True)
+    monkeypatch.setattr(bg, "_initial_batch_forward", lambda batch: None)
+    monkeypatch.setattr(bg, "_batch_policy_for_next", lambda batch: None)
+    monkeypatch.setattr(bg, "_DepthController", lambda *args, **kwargs: None)
+    original_prepare = bg._prepare_mtp_batch_state_for_next
+    original_init = bg._post_init_mtp
+    private_rows = []
+    checking = False
+    injected = False
+
+    def prepare(batch):
+        nonlocal checking
+        checking = True
+        try:
+            return original_prepare(batch)
+        finally:
+            checking = False
+
+    def initialize(row, *args, **kwargs):
+        nonlocal injected
+        if checking:
+            if private_rows:
+                assert all(layer is None for layer in private_rows[-1])
+            if failure and private_rows and not injected:
+                injected = True
+                if failure == "fallback":
+                    raise bg._MtpStepFallback("injected partial activation failure")
+                return
+        result = original_init(row, *args, **kwargs)
+        if checking:
+            private_rows.append(row.prompt_cache)
+        return result
+
+    monkeypatch.setattr(bg, "_prepare_mtp_batch_state_for_next", prepare)
+    monkeypatch.setattr(bg, "_post_init_mtp", initialize)
+    try:
+        mx.random.seed(173)
+        model = _model("qwen_vlm")
+        prompts = [[3, 4, 5], [3, 6, 7, 8], [4, 5, 6], [7, 8, 9, 10]]
+        actual, _ = generate(model, prompts, [16] * 4, late_join=late_join)
+        assert private_rows
+        assert all(layer is None for layer in private_rows[-1])
+        assert injected == bool(failure)
+        model._language_model._omlx_mtp_decode_enabled = False
+        expected, _ = generate(model, prompts, [16] * 4, late_join=late_join)
+        assert actual == expected
+    finally:
+        mlx_lm_mtp.set_mtp_active(active)

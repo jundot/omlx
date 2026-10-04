@@ -1306,11 +1306,13 @@ def _prepare_mtp_batch_state_for_next(gen_batch: Any) -> Optional[_MtpBatchState
     if _mtp_batch_state_valid_for_batch(gen_batch, batch_state):
         return batch_state
 
-    replacements: Dict[int, List[Any]] = {}
-    token_context_updates: Dict[int, Any] = {}
     states = dict(batch_state.states) if batch_state is not None else {}
 
     shared = _initial_batch_forward(gen_batch) if not states else None
+    # Publish committed private rows so the normal fallback can reconcile a
+    # partially initialized batch if a later row cannot enter MTP.
+    if shared is None:
+        gen_batch._omlx_mtp_batch_state = _MtpBatchState(states=states)
     for idx, uid in enumerate(gen_batch.uids):
         if uid in states:
             continue
@@ -1336,16 +1338,23 @@ def _prepare_mtp_batch_state_for_next(gen_batch: Any) -> Optional[_MtpBatchState
             )
         state = getattr(row, "_omlx_mtp_state", None)
         if not _mtp_state_valid_for_batch(row, state):
+            if shared is None and not _reconcile_mtp_batch_to_standard(gen_batch):
+                raise RuntimeError("MTP could not reconcile partial initialization")
             _drop_mtp_batch_state(gen_batch, "batch-post-init-invalid")
             return None
-        states[uid] = state
         if shared is None:
-            replacements[idx] = row.prompt_cache
-        token_context_updates[idx] = row._token_context[0]
+            # Keep one private full-window row, rather than all new rows plus
+            # the original batch. The singleton forward and sampling order
+            # stay unchanged; only ownership moves earlier.
+            _replace_cache_rows(gen_batch, {idx: row.prompt_cache})
+        states[uid] = state
+        gen_batch._token_context[idx] = row._token_context[0]
+        if shared is None:
+            from omlx.utils.metal_sync import _sync_and_clear_cache
 
-    _replace_cache_rows(gen_batch, replacements)
-    for idx, token_context in token_context_updates.items():
-        gen_batch._token_context[idx] = token_context
+            # Activation can span several enforcer polls inside one next().
+            # Return pooled row/merge buffers before copying the next row.
+            _sync_and_clear_cache()
 
     batch_state = _MtpBatchState(states=states)
     gen_batch._omlx_mtp_batch_state = batch_state
