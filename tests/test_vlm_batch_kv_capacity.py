@@ -206,3 +206,42 @@ def test_cold_and_restored_backends_can_share_a_batch(backend):
     for c in (a, b):
         c.update_and_fetch(x, x / 4)
     equal(a, b)
+
+
+@pytest.mark.parametrize("operation", ["extract", "filter"])
+def test_reduced_row_does_not_retain_the_original_batch_bank(backend, operation):
+    import gc
+
+    _, patched = backend
+    gc.collect()
+    baseline = mx.get_active_memory()
+    length = 65536
+    batch = make(patched, [length] * 6)
+    mx.eval(batch.keys, batch.values)
+    original_bytes = batch.keys.nbytes + batch.values.nbytes
+    if operation == "extract":
+        row = batch.extract(2)
+        del batch
+    else:
+        batch.filter([2])
+        row = batch
+    gc.collect()
+    # The retained one-row state must not keep a lazy dependency on all six
+    # source rows. Check before any assertion could materialize that graph.
+    assert mx.get_active_memory() - baseline < original_bytes // 2
+    expected = (mx.arange(2 * length * 8).reshape(1, 2, length, 8) % 29 + 2).astype(
+        mx.bfloat16
+    )
+    assert mx.array_equal(row.keys[..., :length, :], expected).item()
+    assert mx.array_equal(row.values[..., :length, :], expected / 4).item()
+
+
+def test_extracted_row_preserves_special_float_bits(backend):
+    _, patched = backend
+    bits = mx.array([0x80000000, 1, 0x7FC12345, 0x7F800000, 0xFF800000], mx.uint32)
+    bits = bits.reshape(1, 1, 5, 1)
+    source = patched.KVCache()
+    source.update_and_fetch(bits.view(mx.float32), bits.view(mx.float32))
+    row = patched.BatchKVCache.merge([source, source]).extract(1)
+    assert mx.array_equal(row.keys[..., :5, :].view(mx.uint32), bits).item()
+    assert mx.array_equal(row.values[..., :5, :].view(mx.uint32), bits).item()

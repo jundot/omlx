@@ -200,6 +200,10 @@ class _CapacityMethods:
         if min_left_pad > 0:
             self._idx -= min_left_pad
             self.left_padding -= min_left_pad
+        if self._keys is not None:
+            # GenerationBatch filters one layer at a time. Finish this copy
+            # here so later layers do not retain every pre-filter bank.
+            mx.eval(self._keys, self._values)
 
     def _compact_rows(self, kept, start: int) -> None:
         """Keep rows ``kept`` and drop the first ``start`` columns.
@@ -388,6 +392,14 @@ class _CapacityMethods:
             idx : idx + 1, :, padding : self._idx, :
         ]
         cache.offset = length
+        # A terminal response must own its row before the surviving batch is
+        # filtered. A lazy row copy otherwise pins the whole old batch bank.
+        if isinstance(self, LMBatchKVCache):
+            # An exact-width assignment can become a contiguous source view.
+            # Copy bytes without changing signed zero, subnormals or NaNs.
+            cache.keys = (cache.keys.view(mx.uint8) | 0).view(cache.keys.dtype)
+            cache.values = (cache.values.view(mx.uint8) | 0).view(cache.values.dtype)
+        mx.eval(cache.keys, cache.values)
         return cache
 
 
