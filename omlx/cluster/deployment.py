@@ -364,6 +364,13 @@ class ClusterDeployment:
     path_map: dict[str, str] = field(default_factory=dict)
     # RDMA stage edges for one launch only; never stored or compared.
     stage_links: tuple[StageLink, ...] = field(default=(), compare=False)
+    # Explicit user opt-in to serve a VLM-shaped checkpoint as a text-only
+    # distributed model: the pinned mlx-lm rank loader drops the vision tower
+    # during sanitize, so only the language model runs across ranks. The flag
+    # is persisted so peers and later server restarts keep honoring the
+    # opt-in; an un-flagged VLM deployment stays refused (silent vision drop
+    # is treated as a bug, #1261/#1426).
+    text_only: bool = False
 
     def __post_init__(self) -> None:
         if _NODE_ID.fullmatch(self.deployment_id) is None:
@@ -506,6 +513,7 @@ class ClusterDeployment:
             "tensor_parallel_size": self.tensor_parallel_size,
             "target_context_tokens": self.target_context_tokens,
             "path_map": dict(sorted(self.path_map.items())),
+            "text_only": self.text_only,
         }
 
     @classmethod
@@ -553,11 +561,16 @@ class ClusterDeployment:
             # Schema 1 payloads predate per-node paths; they decode to the
             # empty map, which is the shared-path behavior they ran with.
             path_map=validate_model_path_map(payload.get("path_map")),
+            text_only=bool(payload.get("text_only", False)),
         )
 
     def encode_worker_plan(self) -> str:
         """Encode the small trusted plan as a bounded command-line argument."""
 
+        # ``text_only`` deliberately stays out of the worker contract: ranks
+        # load through the pinned mlx-lm, whose sanitize drops vision weights
+        # for these checkpoints natively, so the worker needs no flag and the
+        # contract decoded by ``decode_worker_contract`` stays unchanged.
         raw = json.dumps(
             {
                 "schema_version": DEPLOYMENT_SCHEMA_VERSION,
