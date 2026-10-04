@@ -27,6 +27,10 @@ from types import SimpleNamespace
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from omlx.prefill_progress import get_prefill_tracker
+from ..batch_completion_cache import (
+    apply_batch_completion_cache_patch,
+    defer_terminal_cache_extraction,
+)
 
 from . import cache_rollback as _rollback_mod
 from . import prompt_priming as _prompt_priming
@@ -107,6 +111,7 @@ def apply() -> bool:
         logger.debug("mlx_lm.generate GenerationBatch/BatchGenerator not importable")
         return False
 
+    apply_batch_completion_cache_patch()
     if not hasattr(GenerationBatch, "_omlx_mtp_patched"):
         original_init = GenerationBatch.__init__
         original_next = GenerationBatch.next
@@ -3421,6 +3426,7 @@ def _mtp_batch_next(gen_batch: Any, batch_state: _MtpBatchState) -> Any:
     return _run_verify_cycle_batched(gen_batch, batch_state)
 
 
+@defer_terminal_cache_extraction
 def _emit_ragged_responses(
     gen_batch: Any, batch_state: _MtpBatchState, per_row: dict[Any, list]
 ) -> list[Any]:

@@ -62,6 +62,7 @@ from .exceptions import (
     describe_ceiling_binding,
     is_cache_corruption_error,
 )
+from .patches.batch_completion_cache import apply_batch_completion_cache_patch
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import _drafter_for as _block_drafter_for
 from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
@@ -900,6 +901,7 @@ _original_merge_caches = _mlx_lm_generate_module._merge_caches
 _original_ppb_split = PromptProcessingBatch.split
 
 apply_batch_kv_capacity_patch()
+apply_batch_completion_cache_patch()
 
 _REGULAR_SINGLETON_CACHE_TYPES = (
     _MLXKVCache,
