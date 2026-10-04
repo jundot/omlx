@@ -552,12 +552,14 @@ _ROLE_Q8 = {"bits": 8, "group_size": 64, "mode": "affine"}
 
 # Cost budgets, as shares of the plan's own byte total at the selected level
 # (not parameter shares: the same tensors cost proportionally more at oQ2 and
-# almost nothing at oQ8). A role whose total extra bytes exceed the role
-# budget keeps exactly what the plan had assigned it before the floor -
-# nothing is repinned and no other tensor moves - and the whole pass never
-# spends past ``hard_cap_bpw``, so an over-budget checkpoint behaves as it
-# does on the base branch.
-_ROLE_FLOOR_MAX_COST_SHARE = 0.035
+# almost nothing at oQ8). The level cap is the real limit - the floor only
+# buys bytes the plan left unspent under it - so this is the sanity ceiling
+# that keeps "small but critical" honest: the verified spellings cost 1.5-4%
+# of plan bytes at the levels where the floor fires, and a role over the
+# ceiling keeps exactly what the plan had assigned it before the floor -
+# nothing is repinned and no other tensor moves, so an over-budget
+# checkpoint behaves as it does on the base branch.
+_ROLE_FLOOR_MAX_COST_SHARE = 0.05
 # No single tensor may cost more than this share on its own, so one large member
 # cannot hide behind the role budget or drag the whole role over it.
 _ROLE_FLOOR_MAX_TENSOR_COST_SHARE = 0.005
