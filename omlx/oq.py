@@ -523,9 +523,9 @@ _ROLE_Q8 = {"bits": 8, "group_size": 64, "mode": "affine"}
 # role that would blow the budget keeps the per-level policy instead - nothing
 # is repinned and no other tensor moves, so an over-budget role behaves exactly
 # as it does on the base branch. That is what keeps a dense model (attention
-# near a third of the weights) from being repriced, while a fine-grained or
-# coarse MoE passes.
-_ROLE_FLOOR_MAX_COST_SHARE = 0.03
+# near a third of the weights, i.e. several times the budget) from being
+# repriced, while fine-grained and coarse MoE roles fit.
+_ROLE_FLOOR_MAX_COST_SHARE = 0.035
 # No single tensor may cost more than this share on its own, so one large member
 # cannot hide behind the role budget or drag the whole role over it.
 _ROLE_FLOOR_MAX_TENSOR_COST_SHARE = 0.005
@@ -620,6 +620,7 @@ def _role_floor_gated_overrides(
     named_shapes: dict[str, tuple],
     config: dict,
     oq_level: int,
+    pricing_overrides: dict[str, dict] | None = None,
 ) -> dict[str, dict]:
     """Cost-gated half: attention and gated-residual roles pinned to Q8.
 
@@ -629,12 +630,28 @@ def _role_floor_gated_overrides(
     ``_ROLE_FLOOR_MAX_COST_SHARE`` of the checkpoint. That makes "small in size"
     measurable per tensor and level aware, instead of a single parameter-share
     cliff on the whole role.
+
+    ``pricing_overrides`` carries the layouts fixed by a model invariant
+    (``_structural_quant_overrides``), which the plan prices the same way. A
+    table the writer emits at the level's bits must not be counted at 16 bits
+    here: on Qwen4-Exp that alone would inflate the budget by more than half and
+    admit roles that do not actually fit.
     """
+    pricing_overrides = pricing_overrides or {}
+    base_bits = _base_bits_for_level(oq_level)
     baseline_config = {**config, "_oq_use_budget_plan": False, "_oq_boost_map": {}}
     total_bytes = 0
     candidates: dict[str, list[tuple[str, int]]] = {}
     for path, shape in named_shapes.items():
-        baseline = _baseline_spec(path, baseline_config, oq_level)
+        fixed = pricing_overrides.get(path)
+        if fixed:
+            baseline = (
+                int(fixed.get("bits", base_bits)),
+                int(fixed.get("group_size", _OQ_DEFAULT_GROUP_SIZE)),
+                fixed.get("mode", _mode_for_bits(int(fixed.get("bits", base_bits)))),
+            )
+        else:
+            baseline = _baseline_spec(path, baseline_config, oq_level)
         if baseline is None:
             n = 1
             for dim in shape:
@@ -642,8 +659,8 @@ def _role_floor_gated_overrides(
             total_bytes += n * 2  # full precision is priced at 16 bits
             continue
         total_bytes += _tensor_quantized_bytes(shape, *baseline)
-        if _is_mtp_path(path):
-            continue  # handled unconditionally by _role_floor
+        if fixed or _is_mtp_path(path):
+            continue  # already pinned by an invariant, or kept in full precision
         role = _gated_role(path)
         if role is None:
             continue
@@ -1331,7 +1348,7 @@ def _build_quant_plan(
     # linear attention) and gated residual mixers are pinned only while their
     # extra bytes stay inside the budget. Seeded before pricing for the same
     # reason as above, so the per-level allocator cannot trim them back.
-    gated = _role_floor_gated_overrides(named_shapes, config, oq_level)
+    gated = _role_floor_gated_overrides(named_shapes, config, oq_level, fixed_overrides)
     for path, override in gated.items():
         if path in fixed_overrides or path in boost_map:
             continue

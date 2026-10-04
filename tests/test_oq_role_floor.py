@@ -285,8 +285,8 @@ class TestRoleFloorCostGate:
         assert overrides["model.layers.0.self_attn.q_a_proj"] == Q8_SPEC
         assert overrides["model.layers.0.self_attn.kv_b_proj"] == Q8_SPEC
 
-    def test_role_budget_is_three_percent(self):
-        assert oq._ROLE_FLOOR_MAX_COST_SHARE == 0.03
+    def test_role_budget(self):
+        assert oq._ROLE_FLOOR_MAX_COST_SHARE == 0.035
 
     def test_role_budget_boundary(self, monkeypatch):
         # Inside the budget the role is pinned; outside it drops as a whole.
@@ -296,7 +296,7 @@ class TestRoleFloorCostGate:
 
     def test_coarse_moe_fits_the_budget(self):
         # A coarse MoE (few large experts) costs more than a fine-grained one
-        # but still fits, which is what raising the budget to 3% buys.
+        # but still fits, which is what raising the budget buys.
         shapes = {
             "model.layers.0.self_attn.q_proj": (4096, 4096),
             "model.layers.0.self_attn.k_proj": (1024, 4096),
@@ -309,6 +309,35 @@ class TestRoleFloorCostGate:
         }
         overrides = _role_floor_gated_overrides(shapes, {}, 4)
         assert overrides["model.layers.0.self_attn.q_proj"] == Q8_SPEC
+
+    def test_structural_pricing_keeps_the_budget_honest(self):
+        # The Qwen4-Exp PLE rows are 160 elements wide, so pricing them at the
+        # default group size 64 makes them look unquantizable and counts them at
+        # 16 bits. That inflates the budget enough to admit a role that does not
+        # actually fit, which is why the invariant layout is priced in.
+        tables = {
+            f"language_model.model.ple.ple_embedding.ngram_embedding.shards.{i}": (
+                2500012,
+                160,
+            )
+            for i in range(4)
+        }
+        shapes = {
+            **tables,
+            **{f"model.layers.{i}.self_attn.q_proj": (4096, 4096) for i in range(13)},
+            **{
+                f"model.layers.{i}.mlp.experts.gate_proj": (8, 14336, 4096)
+                for i in range(4)
+            },
+        }
+        invariant = {
+            path: {"bits": 4, "group_size": 32, "mode": "affine"} for path in tables
+        }
+        # Priced at group 32 the attention role really is over budget.
+        assert _role_floor_gated_overrides(shapes, {}, 4, invariant) == {}
+        # Priced at group 64 the table is counted at 16 bits and the role slips
+        # through on a budget that does not exist.
+        assert _role_floor_gated_overrides(shapes, {}, 4) != {}
 
     def test_per_tensor_budget_boundary(self, monkeypatch):
         # A single expensive member cannot hide behind the role budget.
