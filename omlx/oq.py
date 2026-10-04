@@ -468,54 +468,103 @@ def _glm_indexer_q8_override(path: str, config: dict) -> dict | None:
 # invariant ahead of this floor - see ``_glm_indexer_q8_override`` and the
 # Inkling ``qkvr_proj`` Q8 floor.
 
-# Hard top-k selectors. Kept in full precision: they are a rounding error of
-# every checkpoint, and a wrong bit-width there is unrecoverable rather than a
-# small accuracy dip. Add a family's spelling here as it is verified.
-_HARD_SELECTOR_MARKERS = ("indexer",)
+# Hard top-k selectors: kept in full precision. They are a rounding error of
+# every checkpoint, and a wrong ranking drops information instead of adding a
+# little noise. Matched per dot-segment, so an unrelated ``*_indexer_thing``
+# name is not swept in by a substring match. Add a family's spelling here as it
+# is verified.
+_HARD_SELECTOR_SEGMENTS = ("indexer",)
 
-# Attention projections. Deliberately excludes linear-attention / DeltaNet
-# (``linear_attn.in_proj_*``) and MLA low-rank pairs (``q_a_proj`` ...), which
-# the per-level policy already prices and which are not a small share.
-_ATTENTION_PARENT_PARTS = frozenset(("self_attn", "attention", "attn"))
-_ATTENTION_PROJECTION_LEAVES = frozenset(
-    ("q_proj", "k_proj", "v_proj", "o_proj", "qkv_proj", "wq", "wk", "wv", "wo", "qkv")
+# Attention projections, including linear attention / DeltaNet recurrences
+# (``linear_attn.in_proj_*``, ``linear_attn.out_proj``) and MLA low-rank pairs
+# (``q_a_proj`` ...). Whether these are small enough to pin is decided per
+# checkpoint by the cost gate below - on a dense model they are not.
+_ATTENTION_PARENT_PARTS = frozenset(
+    ("self_attn", "attention", "attn", "linear_attn", "delta_net")
 )
+_ATTENTION_PROJECTION_LEAVES = frozenset(
+    (
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "qkv_proj",
+        "qkv",
+        "wq",
+        "wk",
+        "wv",
+        "wo",
+        "in_proj_qkv",
+        "in_proj_z",
+        "in_proj_a",
+        "in_proj_b",
+        "in_proj",
+        "out_proj",
+    )
+)
+_MLA_LEAVES = frozenset(("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"))
 
 # Gated residual / hyper-connection mixers. Add a family's spelling here as it
 # is verified (e.g. GLM-5.2's ``hc_*`` helpers once their weight names are
 # confirmed) rather than guessing at short prefixes.
 _RESIDUAL_MIXER_MARKERS = ("hyper_connection",)
 
-# MTP fusion projections: the draft head's embedding/hidden fusion is small and
-# precision-sensitive (see ``_is_mtp_protected_tensor``).
+# The MTP head's fusion projections stay in full precision: aggressively
+# quantizing them collapses draft acceptance (see ``_is_mtp_protected_tensor``).
 _MTP_FUSION_SUFFIXES = ("mtp.fc_embedding", "mtp.fc_hidden")
 
 # Group size 64 matches the GLM indexer floor and the 8-bit tensors shipped in
 # existing oQe checkpoints.
 _ROLE_Q8 = {"bits": 8, "group_size": 64, "mode": "affine"}
 
-# Above this share of the checkpoint a role stops being "small in size" and the
-# per-level allocator keeps deciding for it. A fine-grained MoE puts attention
-# around 1%; a dense model puts it around a third.
-_ROLE_FLOOR_MAX_SHARE = 0.02
+# Cost budget for the gated half, as a share of the checkpoint's bytes at the
+# selected level. Unlike a parameter-share threshold this is level aware: the
+# same tensors cost proportionally more at oQ2 and almost nothing at oQ8, and a
+# role that would blow the budget keeps the per-level policy instead. That is
+# what keeps a dense model (attention near a third of the weights) from being
+# repriced, while a fine-grained MoE passes comfortably.
+_ROLE_FLOOR_MAX_COST_SHARE = 0.02
+# No single tensor may cost more than this share on its own, so one large member
+# cannot hide behind the role budget or drag the whole role over it.
+_ROLE_FLOOR_MAX_TENSOR_COST_SHARE = 0.005
+
+
+def _is_mtp_path(path: str) -> bool:
+    """Return whether *path* belongs to the MTP / draft head.
+
+    One spelling for every caller: the share accounting, the guard and the
+    seeded override have to agree on what counts as MTP.
+    """
+    return path.startswith("mtp.") or ".mtp." in path
 
 
 def _is_hard_selector(path: str) -> bool:
     """Return whether *path* is a sparse-attention scorer/indexer."""
-    return any(marker in path for marker in _HARD_SELECTOR_MARKERS)
-
-
-def _is_attention_projection(path: str) -> bool:
-    """Return whether *path* is a full-attention q/k/v/o-style projection."""
-    parts = path.split(".")
-    if len(parts) < 2 or parts[-1] not in _ATTENTION_PROJECTION_LEAVES:
-        return False
-    return any(part in _ATTENTION_PARENT_PARTS for part in parts[:-1])
+    return any(
+        segment == marker or segment.startswith(f"{marker}_")
+        for segment in path.split(".")
+        for marker in _HARD_SELECTOR_SEGMENTS
+    )
 
 
 def _is_residual_mixer(path: str) -> bool:
     """Return whether *path* is a gated residual / hyper-connection mixer."""
     return any(marker in path for marker in _RESIDUAL_MIXER_MARKERS)
+
+
+def _gated_role(path: str) -> str | None:
+    """Return the cost-gated role for *path*: ``attention``, ``mixer`` or None."""
+    if _is_residual_mixer(path):
+        return "mixer"
+    parts = path.split(".")
+    leaf = parts[-1]
+    if leaf in _MLA_LEAVES:
+        return "attention"
+    if leaf in _ATTENTION_PROJECTION_LEAVES and any(
+        part in _ATTENTION_PARENT_PARTS for part in parts[:-1]
+    ):
+        return "attention"
+    return None
 
 
 def _role_floor(path: str, config: dict) -> dict | bool | None:
@@ -525,60 +574,93 @@ def _role_floor(path: str, config: dict) -> dict | bool | None:
     8-bit affine format, and ``None`` means the path is not one of these roles
     and the regular per-level policy applies.
     """
+    # The sensitivity proxy stays uniform: it is a measuring instrument, not an
+    # artifact, and its precision must not depend on the policy it measures.
+    if config.get("_oq_proxy"):
+        return None
     path = _normalize_quant_path(path)
     if _is_hard_selector(path):
         return False
     if path.endswith(_MTP_FUSION_SUFFIXES):
-        return dict(_ROLE_Q8)
-    # The MTP head carries its own copies of the backbone roles. Keeping both on
-    # one format is what the GLM indexer rule already does, and draft acceptance
-    # depends on the same projections.
-    if "mtp" in path and (_is_attention_projection(path) or _is_residual_mixer(path)):
+        return False
+    # The MTP head carries its own copies of the backbone roles. Keeping the
+    # backbone and the preserved MTP head on one format is what the GLM indexer
+    # rule already does, and draft acceptance depends on those projections.
+    if _is_mtp_path(path) and _gated_role(path) is not None:
         return dict(_ROLE_Q8)
     if path.endswith((".ple.key_proj", ".ple.value_proj")):
         return dict(_ROLE_Q8)
     return None
 
 
+def _baseline_spec(path: str, config: dict, oq_level: int) -> tuple | None:
+    """Bits the per-level policy would use for *path*.
+
+    Returns ``(bits, group_size, mode)``, or ``None`` when the policy keeps the
+    tensor in full precision. Computed with the budget plan disabled so the
+    floor is measured against the policy, not against itself.
+    """
+    base_bits = _base_bits_for_level(oq_level)
+    result = universal_quant_predicate(path, None, config, oq_level)
+    if result is False:
+        return None
+    if isinstance(result, dict):
+        bits = int(result.get("bits", base_bits))
+        return (
+            bits,
+            int(result.get("group_size", _OQ_DEFAULT_GROUP_SIZE)),
+            result.get("mode", _mode_for_bits(bits)),
+        )
+    return base_bits, _OQ_DEFAULT_GROUP_SIZE, _mode_for_bits(base_bits)
+
+
 def _role_floor_gated_overrides(
     named_shapes: dict[str, tuple],
+    config: dict,
+    oq_level: int,
 ) -> dict[str, dict]:
-    """Size-gated part: attention and gated-residual roles pinned to Q8.
+    """Cost-gated half: attention and gated-residual roles pinned to Q8.
 
-    Applied only while the role stays a small share of the checkpoint, which is
-    what makes the bytes negligible. Above ``_ROLE_FLOOR_MAX_SHARE`` the role is
-    a real part of the model (dense attention, say) and the per-level allocator
-    keeps pricing it.
+    Every candidate is priced against what the per-level policy would choose,
+    and is pinned only while its own extra bytes fit
+    ``_ROLE_FLOOR_MAX_TENSOR_COST_SHARE`` and its role's total fits
+    ``_ROLE_FLOOR_MAX_COST_SHARE`` of the checkpoint. That makes "small in size"
+    measurable per tensor and level aware, instead of a single parameter-share
+    cliff on the whole role.
     """
-    totals = {"attention": 0, "mixer": 0}
-    total = 0
+    baseline_config = {**config, "_oq_use_budget_plan": False, "_oq_boost_map": {}}
+    total_bytes = 0
+    candidates: dict[str, list[tuple[str, int]]] = {}
     for path, shape in named_shapes.items():
-        n = 1
-        for dim in shape:
-            n *= dim
-        total += n
-        if path.startswith("mtp.") or ".mtp." in path:
-            continue  # handled unconditionally by _role_floor
-        if _is_residual_mixer(path):
-            totals["mixer"] += n
-        elif _is_attention_projection(path):
-            totals["attention"] += n
-    if total <= 0:
-        return {}
-    overrides: dict[str, dict] = {}
-    for path in named_shapes:
-        if path.startswith("mtp.") or ".mtp." in path:
+        baseline = _baseline_spec(path, baseline_config, oq_level)
+        if baseline is None:
+            n = 1
+            for dim in shape:
+                n *= dim
+            total_bytes += n * 2  # full precision is priced at 16 bits
             continue
-        role = (
-            "mixer"
-            if _is_residual_mixer(path)
-            else "attention" if _is_attention_projection(path) else None
-        )
+        total_bytes += _tensor_quantized_bytes(shape, *baseline)
+        if _is_mtp_path(path):
+            continue  # handled unconditionally by _role_floor
+        role = _gated_role(path)
         if role is None:
             continue
-        share = totals[role] / total
-        if totals[role] and share <= _ROLE_FLOOR_MAX_SHARE:
-            overrides[path] = dict(_ROLE_Q8)
+        delta = _tensor_quantized_bytes(
+            shape, _ROLE_Q8["bits"], _ROLE_Q8["group_size"], _ROLE_Q8["mode"]
+        ) - _tensor_quantized_bytes(shape, *baseline)
+        if delta > 0:
+            candidates.setdefault(role, []).append((path, delta))
+    if total_bytes <= 0:
+        return {}
+    tensor_budget = total_bytes * _ROLE_FLOOR_MAX_TENSOR_COST_SHARE
+    role_budget = total_bytes * _ROLE_FLOOR_MAX_COST_SHARE
+    overrides: dict[str, dict] = {}
+    for entries in candidates.values():
+        if sum(delta for _, delta in entries) > role_budget:
+            continue
+        for path, delta in entries:
+            if delta <= tensor_budget:
+                overrides[path] = dict(_ROLE_Q8)
     return overrides
 
 
@@ -1243,10 +1325,12 @@ def _build_quant_plan(
         if _is_routed_expert(path):
             expert_params += n
 
-    # Size-gated half of the role floor: attention projections and gated
-    # residual mixers are only pinned while they stay a small share of the
-    # checkpoint. Seeded before pricing for the same reason as above.
-    for path, override in _role_floor_gated_overrides(named_shapes).items():
+    # Cost-gated half of the role floor: attention projections (including
+    # linear attention) and gated residual mixers are pinned only while their
+    # extra bytes stay inside the budget. Seeded before pricing for the same
+    # reason as above, so the per-level allocator cannot trim them back.
+    gated = _role_floor_gated_overrides(named_shapes, config, oq_level)
+    for path, override in gated.items():
         if path in fixed_overrides or path in boost_map:
             continue
         if _is_routed_expert(path):
@@ -4683,6 +4767,12 @@ def _is_mtp_protected_tensor(name: str) -> bool:
         return False
     # Qwen3.5/3.6 fusion projection
     if name.endswith("mtp.fc.weight") or ".mtp.fc.weight" in name:
+        return True
+    # Qwen4-Exp splits the same fusion into an embedding and a hidden half.
+    if any(
+        name.endswith(f"{suffix}.weight") or name.endswith(suffix)
+        for suffix in ("mtp.fc_embedding", "mtp.fc_hidden")
+    ):
         return True
     # DeepSeek-V4 / GLM-5.2 MTP block fusion projections. Embedded DSpark
     # combines target-layer taps through main_proj instead of e_proj/h_proj.
@@ -10222,6 +10312,11 @@ def _build_streaming_proxy_for_sensitivity(
     config["_oq_non_quantizable"] = _build_non_quantizable_set(config)
     config["_oq_use_budget_plan"] = False
     config["_oq_boost_map"] = {}
+    # The proxy is a deliberately uniform 4-bit stand-in used only to measure
+    # sensitivity, so the small-but-critical role floor does not apply to it.
+    # Its precision choices must not depend on the policy of the artifact that
+    # the measurement is going to inform.
+    config["_oq_proxy"] = True
 
     output.mkdir(parents=True, exist_ok=False)
 
