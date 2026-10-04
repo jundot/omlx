@@ -156,7 +156,7 @@ class _ReadyClusterPool:
         self.entry = SimpleNamespace(engine=None)
         self.reloads = 0
 
-    def resolve_cluster_model_id(self, model_path):
+    def resolve_cluster_model_id(self, model_path, *, text_only=False):
         assert model_path == self.model_path
         if self.remote_only and not self.cluster_registered:
             from omlx.exceptions import ModelNotFoundError
@@ -164,7 +164,7 @@ class _ReadyClusterPool:
             raise ModelNotFoundError(model_path, [])
         return self.model_id
 
-    def register_cluster_model(self, model_path, *, estimated_size):
+    def register_cluster_model(self, model_path, *, estimated_size, text_only=False):
         assert model_path == self.model_path
         assert estimated_size > 0
         self.cluster_registered = True
@@ -666,7 +666,7 @@ def test_cluster_plan_route_uses_downloaded_model_headers(monkeypatch):
     monkeypatch.setattr(
         routes,
         "inspect_safetensors_layout",
-        lambda path: ModelLayout(
+        lambda path, *, text_only=False: ModelLayout(
             source=path,
             fixed_weight_bytes=1 * 1024**3,
             layer_weight_bytes=(2 * 1024**3,) * 4,
@@ -698,7 +698,7 @@ def test_cluster_plan_context_changes_kv_memory_and_signed_placement(monkeypatch
     monkeypatch.setattr(
         routes,
         "inspect_safetensors_layout",
-        lambda path: ModelLayout(
+        lambda path, *, text_only=False: ModelLayout(
             source=str(path),
             fixed_weight_bytes=gib,
             layer_weight_bytes=(gib,) * 8,
@@ -761,7 +761,7 @@ def test_cluster_plan_route_refuses_hybrid_tp_the_worker_cannot_run(monkeypatch)
     monkeypatch.setattr(
         routes,
         "inspect_safetensors_layout",
-        lambda path: ModelLayout(
+        lambda path, *, text_only=False: ModelLayout(
             source=path,
             fixed_weight_bytes=1 * gib,
             layer_weight_bytes=(2 * gib,) * 80,
@@ -814,7 +814,7 @@ def test_cluster_deployment_recomputes_plan_and_preflights(tmp_path, monkeypatch
     monkeypatch.setattr(
         routes,
         "inspect_safetensors_layout",
-        lambda path: ModelLayout(
+        lambda path, *, text_only=False: ModelLayout(
             source=path,
             fixed_weight_bytes=1,
             layer_weight_bytes=(10, 10, 10, 10),
@@ -945,7 +945,7 @@ def test_cluster_deployment_keeps_memory_plan_when_benchmark_is_unavailable(
     monkeypatch.setattr(
         routes,
         "inspect_safetensors_layout",
-        lambda path: ModelLayout(
+        lambda path, *, text_only=False: ModelLayout(
             source=path,
             fixed_weight_bytes=1,
             layer_weight_bytes=(10, 10, 10, 10),
@@ -1017,7 +1017,7 @@ def test_cluster_activation_rolls_back_when_canary_fails(
     monkeypatch.setattr(
         routes,
         "inspect_safetensors_layout",
-        lambda path: ModelLayout(
+        lambda path, *, text_only=False: ModelLayout(
             source=path,
             fixed_weight_bytes=1,
             layer_weight_bytes=(10, 10, 10, 10),
@@ -1071,7 +1071,7 @@ def test_cluster_deployment_rejects_unsafe_ssh_target(tmp_path, monkeypatch):
     monkeypatch.setattr(
         routes,
         "inspect_safetensors_layout",
-        lambda path: ModelLayout(
+        lambda path, *, text_only=False: ModelLayout(
             source=path,
             fixed_weight_bytes=0,
             layer_weight_bytes=(1, 1),
@@ -1989,7 +1989,7 @@ def test_a_peer_that_cannot_import_blocks_activation_with_its_fix(
     monkeypatch.setattr(
         routes,
         "inspect_safetensors_layout",
-        lambda path: ModelLayout(
+        lambda path, *, text_only=False: ModelLayout(
             source=str(path),
             fixed_weight_bytes=1024**3,
             layer_weight_bytes=(1024**3,) * 8,
@@ -2358,12 +2358,14 @@ def test_peer_health_transition_records_one_incident(tmp_path, monkeypatch):
 def test_forget_cluster_with_unreachable_peer(monkeypatch, local_only):
     from omlx.cluster.launch import DistributedTeardownError
 
-    deployment = SimpleNamespace(model="org/model", deployment_id="offline")
+    deployment = SimpleNamespace(
+        model="org/model", deployment_id="offline", text_only=False
+    )
     removed = []
     prepared = []
 
     class Pool:
-        def resolve_cluster_model_id(self, model):
+        def resolve_cluster_model_id(self, model, *, text_only=False):
             return "model"
 
         async def prepare_cluster_reload(self, model_id, **kwargs):
@@ -2400,11 +2402,13 @@ def test_forget_cluster_with_unreachable_peer(monkeypatch, local_only):
 def test_forget_cluster_preserves_setup_when_local_stop_fails(monkeypatch):
     from omlx.cluster.launch import DistributedTeardownError
 
-    deployment = SimpleNamespace(model="org/model", deployment_id="offline")
+    deployment = SimpleNamespace(
+        model="org/model", deployment_id="offline", text_only=False
+    )
     removed = []
 
     class Pool:
-        def resolve_cluster_model_id(self, model):
+        def resolve_cluster_model_id(self, model, *, text_only=False):
             return "model"
 
         async def prepare_cluster_reload(self, model_id, **kwargs):
