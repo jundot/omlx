@@ -170,6 +170,79 @@ class TestSensitivityProxyStaysUniform:
             assert result != Q8_SPEC
 
 
+class TestRoleFloorCoverage:
+    """Verified family spellings for the gated roles."""
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            # Qwen4-Exp / Qwen3.8-Flash-Next
+            "model.layers.3.attn_hyper_connection.block_inject_weight",
+            "model.layers.3.mlp_hyper_connection.block_inject_weight_down",
+            # GLM-5-Next / DeepSeek-V4, checkpoint and sanitized spellings
+            "model.layers.3.hc_attn_fn",
+            "model.layers.3.hc_ffn.base",
+            "model.layers.3.attn_hc.scale",
+            "model.layers.3.ffn_hc.fn",
+        ],
+    )
+    def test_gated_residual_mixers_across_families(self, path):
+        assert oq._gated_role(path) == "mixer"
+        # Gated: the cost gate decides, so the unconditional half must not claim it.
+        assert _role_floor(path, {}) is None
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "model.layers.3.self_attn.q_proj",
+            "model.layers.3.self_attn.q_a_proj",
+            "model.layers.3.linear_attn.in_proj_qkv",
+            # Jamba / Bamba spell the state-space block ``mamba``
+            "model.layers.3.mamba.in_proj",
+            "model.layers.3.mamba.x_proj",
+            "model.layers.3.mamba.dt_proj",
+            "model.layers.3.mamba.out_proj",
+            # Nemotron-H spells it ``mixer``, including its attention blocks
+            "backbone.layers.3.mixer.in_proj",
+            "backbone.layers.3.mixer.x_proj",
+            "backbone.layers.3.mixer.dt_proj",
+            "backbone.layers.3.mixer.out_proj",
+            "backbone.layers.3.mixer.q_proj",
+        ],
+    )
+    def test_sequence_mixing_projections(self, path):
+        assert oq._gated_role(path) == "attention"
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            # Nemotron-H names its MLP under ``mixer.`` too: not a mixing path.
+            "backbone.layers.3.mixer.up_proj",
+            "backbone.layers.3.mixer.down_proj",
+            "backbone.layers.3.mixer.conv1d",
+            "model.layers.3.mamba.A_log",
+            "model.layers.3.mamba.D",
+            "model.layers.3.mamba.norm",
+        ],
+    )
+    def test_non_mixing_tensors_are_not_claimed(self, path):
+        assert oq._gated_role(path) is None
+
+    def test_hybrid_moe_pins_the_new_roles(self):
+        shapes = {
+            **{f"model.layers.{i}.mamba.in_proj": (4096, 8192) for i in range(6)},
+            "model.layers.0.hc_attn_fn": (4096, 4096),
+            **{
+                f"model.layers.{i}.mlp.experts.gate_proj": (8, 14336, 4096)
+                for i in range(16)
+            },
+        }
+        overrides = _role_floor_gated_overrides(shapes, {}, 4)
+        assert overrides["model.layers.0.mamba.in_proj"] == Q8_SPEC
+        assert overrides["model.layers.0.hc_attn_fn"] == Q8_SPEC
+        assert not any("experts" in path for path in overrides)
+
+
 class TestMtpPathConsistency:
     """Every caller must agree on what counts as MTP."""
 

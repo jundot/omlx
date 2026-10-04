@@ -475,12 +475,29 @@ def _glm_indexer_q8_override(path: str, config: dict) -> dict | None:
 # is verified.
 _HARD_SELECTOR_SEGMENTS = ("indexer",)
 
-# Attention projections, including linear attention / DeltaNet recurrences
-# (``linear_attn.in_proj_*``, ``linear_attn.out_proj``) and MLA low-rank pairs
-# (``q_a_proj`` ...). Whether these are small enough to pin is decided per
-# checkpoint by the cost gate below - on a dense model they are not.
+# Attention projections, covering every spelling seen in the open MoE
+# checkpoints this is tested against:
+#   * softmax attention (``self_attn.q_proj`` ... , ``qkv_proj``, ``wq`` ...),
+#     including MLA low-rank pairs (``q_a_proj`` ...) and a fused Q/K/V/R;
+#   * linear attention / DeltaNet recurrences (``linear_attn.in_proj_*``);
+#   * state-space layers, whose parent is ``mamba`` in Jamba/Bamba and ``mixer``
+#     in Nemotron-H (``mamba.in_proj``, ``mixer.x_proj``, ``dt_proj`` ...).
+# Nemotron-H names its attention, MLP and state-space blocks all under
+# ``mixer.``, so the leaf name is what separates them: ``mixer.up_proj`` and
+# ``mixer.down_proj`` are the MLP and are deliberately not matched here.
+# Whether these are small enough to pin is decided per checkpoint by the cost
+# gate below - on a dense model they are not.
 _ATTENTION_PARENT_PARTS = frozenset(
-    ("self_attn", "attention", "attn", "linear_attn", "delta_net")
+    (
+        "self_attn",
+        "attention",
+        "attn",
+        "linear_attn",
+        "delta_net",
+        "mamba",
+        "mixer",
+        "ssm",
+    )
 )
 _ATTENTION_PROJECTION_LEAVES = frozenset(
     (
@@ -500,14 +517,24 @@ _ATTENTION_PROJECTION_LEAVES = frozenset(
         "in_proj_b",
         "in_proj",
         "out_proj",
+        "x_proj",
+        "dt_proj",
     )
 )
 _MLA_LEAVES = frozenset(("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"))
 
-# Gated residual / hyper-connection mixers. Add a family's spelling here as it
-# is verified (e.g. GLM-5.2's ``hc_*`` helpers once their weight names are
-# confirmed) rather than guessing at short prefixes.
-_RESIDUAL_MIXER_MARKERS = ("hyper_connection",)
+# Gated residual / hyper-connection mixers, matched on the verified spellings:
+#   * Qwen4-Exp / Qwen3.8-Flash-Next: ``attn_hyper_connection`` /
+#     ``mlp_hyper_connection``;
+#   * GLM-5-Next and DeepSeek-V4: ``hc_attn_fn|base|scale`` in the checkpoint,
+#     which the V4 sanitizer rewrites to ``attn_hc.fn|base|scale`` (see
+#     omlx/patches/deepseek_v41/dspark.py and
+#     omlx/patches/deepseek_v4/deepseek_v4_model.py). Both spellings are kept
+#     because the sanitizer leaves the original in place when the rewritten name
+#     already exists.
+# Add a family's spelling here once it is verified rather than guessing at short
+# prefixes.
+_RESIDUAL_MIXER_MARKERS = ("hyper_connection", "hc_attn", "hc_ffn", "attn_hc", "ffn_hc")
 
 # The MTP head's fusion projections stay in full precision: aggressively
 # quantizing them collapses draft acceptance (see ``_is_mtp_protected_tensor``).
