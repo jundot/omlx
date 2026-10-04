@@ -73,6 +73,16 @@ _QWEN4_DECODE_QMV = os.environ.get("OMLX_QWEN4_GDN_DECODE_QMV", "1") != "0"
 # launch for every row's prework, recurrence (with the per-step rollback
 # states) and norm-gate, and the out-projection (=0 keeps the per-op path).
 _QWEN4_VERIFY_FUSED = os.environ.get("OMLX_QWEN4_GDN_VERIFY_FUSED", "1") != "0"
+# Its 2..8-row projections on the fully unrolled row-exact tile with the
+# per-row-count tiles below (=0 keeps the rolled tiles of the first geometry).
+_QWEN4_VERIFY_TILES = os.environ.get("OMLX_QWEN4_GDN_VERIFY_TILES", "1") != "0"
+# Its rollback records skip the per-step recurrent states (S-1 x 3 MB per
+# layer, written on every verify and read only on a partial accept): a commit
+# keeping m of S rows reruns the fused step on the first m rows (=0 writes
+# them per verify).
+_QWEN4_VERIFY_DEFERRED_STATES = (
+    os.environ.get("OMLX_QWEN4_GDN_VERIFY_DEFERRED_STATES", "1") != "0"
+)
 _QWEN4_VERIFY_STEP_KERNELS: dict = {}
 _QWEN4_VERIFY_ENGAGED_LOGGED = False
 _VERIFY_REJECT_DIAG = 0
@@ -1019,7 +1029,6 @@ def _qwen4_prefill(module, inputs, cache):
     )
     if hasattr(cache, "advance"):
         cache.advance(length)
-        q35._qwen3_5_advance_left_padding_info(cache, length)
         q35._qwen3_5_advance_lengths_info(cache, length)
     flat = norm_gate(
         inputs=[
@@ -1164,9 +1173,9 @@ def _qwen4_verify_step_kernel(states: bool):
 
 
 @functools.cache
-def _qwen4_verify_step_launch(steps, dtype, state_dtype, c_dim, hk, hv, dk, dv):
+def _qwen4_verify_step_launch(steps, dtype, state_dtype, c_dim, hk, hv, dk, dv, history=True):
     """Launch parameters of ``qwen4_verify_step_fused`` for one block shape."""
-    history = steps > 1
+    history = history and steps > 1
     rows = dv // 8
     return _qwen4_verify_step_kernel(history), {
         "template": [
@@ -1191,27 +1200,29 @@ def _qwen4_verify_step_launch(steps, dtype, state_dtype, c_dim, hk, hv, dk, dv):
 
 def qwen4_verify_step_fused(
     proj, conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w, eps, hk, hv, dk, dv,
+    history=True,
 ):
     """``S = proj.shape[1]`` decode steps from (conv_state, state) in one launch
     (B = 1, dk = dv = 128, a 4-tap convolution: conv_state [1, 3, C]).
 
     Row t of ``proj`` is the stacked in-projection [qkv | z | b | a] of step t.
     Returns (next conv state, rollback window [1, 3 + S, C] = [conv_state; qkv
-    rows], the states after steps 0..S-2 [1, S-1, hv, dv, dk] or None at S = 1,
-    the state after step S-1, gated output [1, S, hv*dv]); step t's values are
-    bit-identical to the (t+1)-th of S chained ``qwen4_decode_step_fused`` calls.
+    rows], the states after steps 0..S-2 [1, S-1, hv, dv, dk] or None at S = 1
+    or without ``history``, the state after step S-1, gated output [1, S,
+    hv*dv]); step t's values are bit-identical to the (t+1)-th of S chained
+    ``qwen4_decode_step_fused`` calls.
     """
     steps = proj.shape[1]
     kernel, launch = _qwen4_verify_step_launch(
-        steps, proj.dtype, state.dtype, conv_state.shape[-1], hk, hv, dk, dv
+        steps, proj.dtype, state.dtype, conv_state.shape[-1], hk, hv, dk, dv, history
     )
     outputs = kernel(
         inputs=[proj, conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w, eps],
         **launch,
     )
-    if steps > 1:
-        conv_out, window, state_out, history, out = outputs
-        return conv_out, window, history, state_out, out
+    if len(outputs) == 5:
+        conv_out, window, state_out, states, out = outputs
+        return conv_out, window, states, state_out, out
     conv_out, window, state_out, out = outputs
     return conv_out, window, None, state_out, out
 
@@ -1513,6 +1524,23 @@ def _qwen4_verify_out_geometry(rows):
     return (_QWEN4_OUT_QMV_RPS, 1) if rows == 1 else (4, 1)
 
 
+# The same (columns per simdgroup, rows per threadgroup) pairs for the
+# unrolled tile, per block size: the fastest over a chain of 36 layers on M5
+# Ultra (oQ5e: 6-bit in-, 5-bit out-projection), each inside the unrolled
+# tile's register envelope at every bit width the kernel serves (at most 16
+# values per lane). Other block sizes keep the pairs above.
+_QWEN4_VERIFY_IN_TILES = {2: (1, 2), 3: (2, 3), 4: (4, 2), 5: (2, 5), 6: (4, 3), 7: (8, 1), 8: (4, 2)}
+_QWEN4_VERIFY_OUT_TILES = {2: (4, 1), 3: (4, 3), 4: (2, 4), 5: (2, 5), 6: (4, 3), 7: (4, 1), 8: (2, 4)}
+
+
+def _qwen4_verify_in_tile(rows):
+    return _QWEN4_VERIFY_IN_TILES.get(rows) or _qwen4_verify_in_geometry(rows)
+
+
+def _qwen4_verify_out_tile(rows):
+    return _QWEN4_VERIFY_OUT_TILES.get(rows) or _qwen4_verify_out_geometry(rows)
+
+
 def _build_qwen4_verify_plan(module):
     """Resolved operands of the fused speculative verify, or None when ineligible.
 
@@ -1538,13 +1566,16 @@ def _build_qwen4_verify_plan(module):
     if fused is None:
         return None
     weights, scales, biases, _, group_size, bits, mode = fused
+    tiles = _QWEN4_VERIFY_TILES
     in_rows = rows_qmv(
         weights, scales, biases, bits, group_size, mode, mx.bfloat16,
-        _qwen4_verify_in_geometry,
+        _qwen4_verify_in_tile if tiles else _qwen4_verify_in_geometry,
+        unrolled=tiles,
     )
     out_rows = rows_qmv(
         out.weight, out.scales, out.biases, out.bits, out.group_size, out.mode,
-        mx.bfloat16, _qwen4_verify_out_geometry,
+        mx.bfloat16, _qwen4_verify_out_tile if tiles else _qwen4_verify_out_geometry,
+        unrolled=tiles,
     )
     if in_rows is None or out_rows is None:
         return None
@@ -1595,8 +1626,9 @@ def _qwen4_verify_state_eligible(inputs, cache) -> bool:
 
 def _qwen4_verify(plan, inputs, cache):
     """Fused verify rows on a cached plan: bit-identical outputs, next states
-    and rollback records (the conv window and the per-step recurrent states)
-    to the per-op verify path below."""
+    and committed rollback states (the conv window, and the per-step
+    recurrent states or their deferred recomputation) to the per-op verify
+    path below."""
     (
         in_rows,
         out_rows,
@@ -1611,15 +1643,46 @@ def _qwen4_verify(plan, inputs, cache):
         dk,
         dv,
     ) = plan
+    proj = in_rows(inputs)
+    steps = proj.shape[1]
+    conv_start, start = cache[0], cache[1]
+    deferred = (
+        _QWEN4_VERIFY_DEFERRED_STATES
+        and steps > 1
+        and qwen35_gdn_verify_fused.deferred_states_ready(cache, 1, steps)
+    )
     conv_state, window, states, state, gated = qwen4_verify_step_fused(
-        in_rows(inputs), cache[0], conv_w, q_scale, A_log, dt_bias, cache[1], norm_w,
-        eps, hk, hv, dk, dv,
+        proj, conv_start, conv_w, q_scale, A_log, dt_bias, start, norm_w,
+        eps, hk, hv, dk, dv, not deferred,
     )
     cache.record_speculative_window(0, window, 3)
     cache[0] = conv_state
-    cache.record_speculative_states(1, states, state)
+    if deferred:
+        qwen35_gdn_verify_fused.record_deferred_states(
+            cache, 1, start, state, steps,
+            functools.partial(
+                _qwen4_state_after, proj, conv_start, conv_w, q_scale, A_log, dt_bias,
+                start, norm_w, eps, hk, hv, dk, dv,
+            ),
+        )
+    else:
+        cache.record_speculative_states(1, states, state)
     cache[1] = state
     return out_rows(gated)
+
+
+def _qwen4_state_after(
+    proj, conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w, eps, hk, hv, dk, dv,
+    keep,
+):
+    """The recurrent state after the first ``keep`` rows of a verify block:
+    the fused step on those rows, whose last state is the block's state
+    after row ``keep - 1`` bit for bit (row t's arithmetic does not depend
+    on the block length)."""
+    return qwen4_verify_step_fused(
+        proj[:, :keep], conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w,
+        eps, hk, hv, dk, dv, False,
+    )[3]
 
 
 def _qwen4_decode_dynamic_eligible(
@@ -1806,7 +1869,6 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         cache[0], cache[1] = conv_state, state
         if hasattr(cache, "advance"):
             cache.advance(1)
-            q35._qwen3_5_advance_left_padding_info(cache, 1)
             q35._qwen3_5_advance_lengths_info(cache, 1)
         global _QWEN4_DECODE_ENGAGED_LOGGED
         if not _QWEN4_DECODE_ENGAGED_LOGGED:
@@ -1869,7 +1931,6 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             result = self.out_proj(out.reshape(1, 1, -1))
             cache[0], cache[1] = conv_state, state
             cache.advance(1)
-            q35._qwen3_5_advance_left_padding_info(cache, 1)
             q35._qwen3_5_advance_lengths_info(cache, 1)
             global _QWEN35_DECODE_ENGAGED_LOGGED
             if not _QWEN35_DECODE_ENGAGED_LOGGED:
@@ -1909,7 +1970,6 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         cache[0], cache[1] = conv_state, state
         if hasattr(cache, "advance"):
             cache.advance(1)
-            q35._qwen3_5_advance_left_padding_info(cache, 1)
             q35._qwen3_5_advance_lengths_info(cache, 1)
         global _QWEN4_DECODE_ENGAGED_LOGGED
         if not _QWEN4_DECODE_ENGAGED_LOGGED:
@@ -1956,7 +2016,6 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                 result = _qwen4_verify(plan, inputs, cache)
                 if hasattr(cache, "advance"):
                     cache.advance(length)
-                    q35._qwen3_5_advance_left_padding_info(cache, length)
                     q35._qwen3_5_advance_lengths_info(cache, length)
                 global _QWEN4_VERIFY_ENGAGED_LOGGED
                 if not _QWEN4_VERIFY_ENGAGED_LOGGED:
@@ -2071,7 +2130,6 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             )
         if hasattr(cache, "advance"):
             cache.advance(length)
-            q35._qwen3_5_advance_left_padding_info(cache, length)
             q35._qwen3_5_advance_lengths_info(cache, length)
         if not fused:
             out = layer.norm(

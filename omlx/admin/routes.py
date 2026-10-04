@@ -6831,8 +6831,11 @@ def _build_active_models_data() -> dict:
         idle_seconds: float | None = None
         ttl_remaining_seconds: float | None = None
 
-        if is_loaded and last_access is not None and last_access > 0:
-            idle_seconds = max(0.0, time.time() - last_access)
+        if is_loaded:
+            if active_requests or waiting_requests or getattr(entry, "in_use", 0) > 0:
+                idle_seconds = 0.0
+            elif last_access is not None and last_access > 0:
+                idle_seconds = max(0.0, time.time() - last_access)
 
         # Determine effective TTL: per-model ttl_seconds first, then global idle_timeout.
         effective_ttl: int | None = None

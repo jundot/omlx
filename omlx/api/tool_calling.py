@@ -26,7 +26,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import regex
-from jsonschema import SchemaError, ValidationError, validate
+from jsonschema import Draft202012Validator, SchemaError, ValidationError, validate
+from jsonschema.exceptions import UndefinedTypeCheck
 
 from .openai_models import FunctionCall, ResponseFormat, ToolCall
 
@@ -43,16 +44,19 @@ def _template_safe_description(value: Any) -> str:
 
 
 def _copy_schema_with_template_defaults(value: Any, *, is_schema: bool) -> Any:
-    """Copy JSON Schema data while filling missing schema descriptions."""
+    """Copy JSON Schema with stable object order and template descriptions."""
     if isinstance(value, dict):
         copied = {}
-        for key, child in value.items():
+        # Equivalent client JSON key orders must render the same token prefix.
+        # Keep array order intact: only object member order is canonicalized.
+        for key in sorted(value):
+            child = value[key]
             if key == "properties" and isinstance(child, dict):
                 copied[key] = {
                     name: _copy_schema_with_template_defaults(
-                        prop_schema, is_schema=True
+                        child[name], is_schema=True
                     )
-                    for name, prop_schema in child.items()
+                    for name in sorted(child)
                 }
             elif key in {
                 "items",
@@ -296,6 +300,21 @@ def _repair_json_value(val: str) -> Optional[Any]:
         return None
 
 
+def _matches_union_type(value: Any, types: list) -> bool | None:
+    """Check declared alternatives, preserving malformed schemas' legacy behavior."""
+    if not types:
+        return None
+    # Native Qwen parsers can return tuples; tool-call serialization emits arrays.
+    if isinstance(value, tuple):
+        value = list(value)
+    try:
+        return any(
+            Draft202012Validator.TYPE_CHECKER.is_type(value, ptype) for ptype in types
+        )
+    except (UndefinedTypeCheck, TypeError):
+        return None
+
+
 def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
     """Convert an XML-extracted parameter value per its declared schema type.
 
@@ -307,11 +326,16 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
     spec = props.get(key)
     raw_type = spec.get("type") if isinstance(spec, dict) else None
     if not isinstance(raw_type, str):
-        # Undeclared param, union type list, or anyOf: legacy behavior.
         try:
-            return json.loads(val)
+            decoded = json.loads(val)
         except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
             return val
+        if isinstance(raw_type, list):
+            # Plain 123 remains a string for ["string", "null"].
+            matches = _matches_union_type(decoded, raw_type)
+            return val if matches is False else decoded
+        # Undeclared params and oneOf/anyOf retain best-effort JSON parsing.
+        return decoded
     if val.strip().lower() == "null":
         return None
     ptype = raw_type.strip().lower()
@@ -609,6 +633,17 @@ def _xml_element_value_end(text: str, start: int, close_tag: str, next_open: str
 # while accepting hyphens and dots in parameter names.
 _XML_PARAMETER_OPEN_RE = re.compile(r"<parameter=([\w.-]+)>")
 
+# Models sometimes drop the ``>`` of an empty parameter's open tag and emit
+# ``<parameter=name=`` or ``<parameter=name`` right before the close tag.
+_PARAMETER_OPEN_LOST_GT_RE = re.compile(
+    r"<parameter=([\w.-]+)=?(?=\s*(?:</parameter>|</function>|$))"
+)
+
+
+def repair_parameter_open_tags(text: str) -> str:
+    """Restore ``<parameter=name>`` for empty parameters that lost their ``>``."""
+    return _PARAMETER_OPEN_LOST_GT_RE.sub(r"<parameter=\1>", text)
+
 
 def _iter_xml_parameters(params_text: str) -> Iterator[Tuple[str, str]]:
     """Yield ``(key, value)`` for each ``<parameter=k>v</parameter>`` element.
@@ -850,7 +885,9 @@ def _parse_xml_tool_calls(
         func_close = content.rfind(_XML_FUNCTION_CLOSE)
         if func_open and func_close >= func_open.end():
             func_name = func_open.group(1)
-            params_text = content[func_open.end() : func_close]
+            params_text = repair_parameter_open_tags(
+                content[func_open.end() : func_close]
+            )
             props = _tool_param_properties(func_name, tools)
             arguments = {}
             for key, val in _iter_xml_parameters(params_text):
@@ -1979,6 +2016,7 @@ def _parse_tool_calls_impl(
                 matches = [p for p in parts[1:] if p.strip()]
 
             for match in matches:
+                match = repair_parameter_open_tags(match)
                 try:
                     parsed = tool_parser(match.strip(), tools)
                     # MiniMax M2 parser returns a list when a single
@@ -1999,11 +2037,18 @@ def _parse_tool_calls_impl(
                             # Use XML values to avoid decoding parsed strings twice.
                             for key, val in _iter_xml_parameters(match):
                                 spec = props.get(key)
-                                if (
-                                    isinstance(spec, dict)
-                                    and "type" not in spec
-                                    and isinstance(arguments.get(key), str)
-                                ):
+                                if not isinstance(spec, dict):
+                                    continue
+                                value = arguments.get(key)
+                                union_mismatch = (
+                                    isinstance(spec.get("type"), list)
+                                    and _matches_union_type(value, spec["type"])
+                                    is False
+                                )
+                                untyped_string = "type" not in spec and isinstance(
+                                    value, str
+                                )
+                                if union_mismatch or untyped_string:
                                     arguments[key] = _coerce_param_value(
                                         val, key, props, name
                                     )

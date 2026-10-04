@@ -257,6 +257,7 @@ def test_glm_loader_paths_match_offload_admission(tmp_path, layout):
     import mlx.nn as nn
     from mlx.utils import tree_flatten
     from mlx_lm.utils import load_model
+    from test_glm_moe_dsa_patch import _glm_generate_patch_installed
 
     from omlx.patches.glm_moe_dsa import apply_glm_moe_dsa_patch
     from omlx.patches.moe_expert_offload import (
@@ -264,7 +265,8 @@ def test_glm_loader_paths_match_offload_admission(tmp_path, layout):
         estimate_offload_admission_bytes,
     )
 
-    apply_glm_moe_dsa_patch()
+    with _glm_generate_patch_installed():
+        apply_glm_moe_dsa_patch()
     from mlx_lm.models import glm_moe_dsa
 
     config = dict(

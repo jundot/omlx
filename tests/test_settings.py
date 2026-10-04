@@ -3015,15 +3015,19 @@ class TestClaudeCodeRouteIntegration:
 class TestCORSMiddleware:
     """Test that CORS middleware is correctly applied to the server."""
 
-    def test_cors_preflight(self):
+    def test_cors_preflight(self, monkeypatch):
         """Test that CORS preflight requests get proper response headers."""
         from fastapi.testclient import TestClient
 
-        from omlx.server import app, init_server
+        from omlx.server import _server_state, app, init_server
 
         # Reset middleware stack so add_middleware works even if app was
         # already started by another test in the same process.
         app.middleware_stack = None
+        # init_server points the Responses store into tmpdir; restore it afterwards.
+        monkeypatch.setattr(
+            _server_state, "responses_store", _server_state.responses_store
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = GlobalSettings(base_path=Path(tmpdir))

@@ -32,6 +32,7 @@ from omlx.cache.stats import PrefixCacheStats
 from omlx.models.vlm import VLMModelAdapter
 from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
 from omlx.patches.mlx_lm_mtp import batch_generator as bg
+from omlx.patches.specprefill import _OffsetAdjustedRoPE
 from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
 from omlx.scheduler import (
     Scheduler,
@@ -1486,8 +1487,6 @@ class TestSchedulerAbortRequest:
         path itself must clear the wrapper and the active id, otherwise the
         specprefill guard defers all other requests forever.
         """
-        from omlx.patches.specprefill import _OffsetAdjustedRoPE
-
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
 
         original_rope = MagicMock()
@@ -1509,6 +1508,62 @@ class TestSchedulerAbortRequest:
 
         assert scheduler._specprefill_active_request_id is None
         assert layer.self_attn.rope is original_rope
+
+    def _start_specprefill_decode(self, scheduler, mock_model):
+        """Put one request in decode with its offset RoPE installed."""
+        original_rope = MagicMock()
+        layer = MagicMock()
+        layer.self_attn.rope = _OffsetAdjustedRoPE(original_rope, adjustment=50)
+        mock_model.layers = [layer]
+        request = Request(
+            request_id="sp",
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+            prompt_token_ids=[1],
+            num_prompt_tokens=1,
+            status=RequestStatus.RUNNING,
+        )
+        scheduler.running["sp"] = request
+        scheduler.requests["sp"] = request
+        scheduler._specprefill_active_request_id = "sp"
+        return request, layer, original_rope
+
+    def test_fail_all_requests_releases_active_specprefill(
+        self, mock_model, mock_tokenizer
+    ):
+        """An engine-loop failure must not leave later requests deferred."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        _, layer, original_rope = self._start_specprefill_decode(scheduler, mock_model)
+
+        assert scheduler.fail_all_requests() == ["sp"]
+
+        assert scheduler._specprefill_active_request_id is None
+        assert layer.self_attn.rope is original_rope
+
+    def test_cache_corruption_retry_readmits_active_specprefill(
+        self, mock_model, mock_tokenizer
+    ):
+        """The re-queued request must not be deferred by its own SpecPrefill id."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request, layer, original_rope = self._start_specprefill_decode(
+            scheduler, mock_model
+        )
+        batch_generator = MagicMock()
+        batch_generator.next_generated.side_effect = TypeError(
+            "'NoneType' object is not subscriptable"
+        )
+        batch_generator.insert.return_value = [42]
+        scheduler.batch_generator = batch_generator
+
+        scheduler.step()
+
+        assert layer.self_attn.rope is original_rope
+        assert list(scheduler.waiting) == [request]
+        # Recovery drops the batch generator; reinstall the stub for re-admission.
+        scheduler.batch_generator = batch_generator
+        scheduler._ensure_batch_generator = MagicMock()
+        scheduled, _ = scheduler._schedule_waiting()
+        assert scheduled == [request]
 
     def test_abort_nonexistent_request(self, mock_model, mock_tokenizer):
         """Test aborting a non-existent request is silently ignored."""
@@ -5073,6 +5128,51 @@ class TestSpecPrefillCaches:
         finally:
             scheduler.shutdown()
 
+    def test_rejected_cache_hit_falls_back_to_dense_full_prefill(
+        self, mock_model, mock_tokenizer
+    ):
+        """Indices scored against a rejected prefix hit must not drive prefill.
+
+        SpecPrefill scores only the suffix after the restored hit, so once
+        _validate_cache rejects that hit the full prompt is prefilled densely.
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="specprefill-rejected-hit",
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=4),
+            prompt_token_ids=[1, 2, 3, 4],
+            num_prompt_tokens=4,
+            cached_tokens=2,
+            remaining_tokens=[3, 4],
+            prompt_cache=[object()],
+            specprefill_indices=mx.array([0]),
+        )
+        scheduler.waiting.append(request)
+        scheduler.requests[request.request_id] = request
+        scheduler._prefix_cache_prepared.add(request.request_id)
+
+        batch_generator = MagicMock()
+        batch_generator.insert.return_value = [42]
+        scheduler.batch_generator = batch_generator
+        scheduler._ensure_batch_generator = MagicMock()
+        scheduler._validate_cache = MagicMock(return_value=False)
+        scheduler._do_external_prefill = MagicMock(return_value=([object()], [4]))
+
+        try:
+            with patch(
+                "omlx.specprefill.target.run_specprefill_target_prefill"
+            ) as sparse_prefill:
+                scheduled, _ = scheduler._schedule_waiting()
+
+            assert scheduled == [request]
+            sparse_prefill.assert_not_called()
+            prefill_args = scheduler._do_external_prefill.call_args.args
+            assert prefill_args[1] == [1, 2, 3, 4]
+            assert prefill_args[2] is None
+        finally:
+            scheduler.shutdown()
+
     def test_cache_counters_work_before_a_draft_model_is_configured(
         self, mock_model, mock_tokenizer
     ):
@@ -5324,6 +5424,7 @@ class TestCacheCorruptionRecovery:
         req.think_prefix_sent = True
         req.prompt_cache = MagicMock()
         req.cached_tokens = 10
+        req.specprefill_indices = mx.array([0, 2])
 
         scheduler._reschedule_running_requests()
 
@@ -5340,6 +5441,7 @@ class TestCacheCorruptionRecovery:
         assert req._extracted_cache is None
         assert req._model_cache_config is None
         assert req.think_prefix_sent is False
+        assert req.specprefill_indices is None
 
     def test_reschedule_corruption_increments_counter(self, mock_model, mock_tokenizer):
         """Corruption reschedule increments per-request retry counter."""
@@ -5682,6 +5784,42 @@ class TestCacheCorruptionRecovery:
         # uid mapping preserved for the async drain.
         assert scheduler.request_id_to_uid["req-async-cleanup"] == 999
         assert scheduler.uid_to_request_id[999] == "req-async-cleanup"
+
+    def test_drain_after_fail_all_leaves_reused_uid_alone(
+        self, mock_model, mock_tokenizer
+    ):
+        """A deferred remove must not touch a uid the next generator reused."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        finished = Request(
+            request_id="req-finished",
+            prompt="finished",
+            sampling_params=SamplingParams(),
+        )
+        future = concurrent.futures.Future()
+        scheduler.requests[finished.request_id] = finished
+        scheduler._inflight_store_futures[finished.request_id] = future
+        scheduler.request_id_to_uid[finished.request_id] = 0
+        scheduler.uid_to_request_id[0] = finished.request_id
+        scheduler._pending_async_removes.append((0, finished.request_id, future))
+        scheduler.batch_generator = MagicMock()
+
+        scheduler.fail_all_requests()
+
+        # mlx-lm BatchGenerator uids restart at 0 on a new instance.
+        new_batch_generator = MagicMock()
+        scheduler.batch_generator = new_batch_generator
+        scheduler.request_id_to_uid["req-new"] = 0
+        scheduler.uid_to_request_id[0] = "req-new"
+        future.set_result(None)
+
+        with patch("omlx.scheduler._safe_sync_stream"):
+            assert scheduler._drain_pending_async_removes() is True
+
+        new_batch_generator.remove.assert_not_called()
+        assert scheduler.uid_to_request_id[0] == "req-new"
+        assert scheduler.request_id_to_uid["req-new"] == 0
+        assert finished.request_id not in scheduler.request_id_to_uid
+        assert finished.request_id not in scheduler.requests
 
 
 class TestGenerationOverflowRecovery:

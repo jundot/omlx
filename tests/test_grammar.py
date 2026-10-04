@@ -18,12 +18,23 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+from omlx.api.grammar import GrammarConstraintProcessor
 from omlx.api.openai_models import StructuredOutputOptions
+from omlx.api.thinking import ThinkingBudgetProcessor
+from omlx.patches.k2_horizon.tool_grammar import compile_tool_grammar
+from omlx.request import Request, SamplingParams
+from omlx.scheduler import Scheduler
+from omlx.server import (
+    _compile_bare_grammar,
+    _compile_with_structural_tag,
+    _patch_output_format,
+)
 
 try:
-    import xgrammar  # noqa: F401
+    import xgrammar as xgr
     HAS_XGRAMMAR = True
 except ImportError:
+    xgr = None
     HAS_XGRAMMAR = False
 
 requires_xgrammar = pytest.mark.skipif(
@@ -996,6 +1007,136 @@ class TestSchedulerGrammarPath:
         from omlx.api.grammar import GrammarConstraintProcessor
         grammar_procs = [p for p in processors if isinstance(p, GrammarConstraintProcessor)]
         assert len(grammar_procs) == 0
+
+
+# =========================================================================
+# Thinking budget with grammar constraints
+# =========================================================================
+
+_BUDGET_VOCAB = [bytes([i]) for i in range(256)] + [
+    b"</think>",
+    b"<think>",
+    b"</s>",
+    b"<|im_end|>",
+    b"<ifm|tool_calls>",
+    b"</ifm|tool_calls>",
+    b"<ifm|tool_call>",
+    b"</ifm|tool_call>",
+    b"<ifm|arg_key>",
+]
+_THINK_END, _THINK_START, _BUDGET_STOP = 256, 257, 258
+
+
+def _budget_processors(compiled):
+    scheduler = MagicMock(spec=Scheduler)
+    scheduler._xtc_special_tokens = set()
+    scheduler._model_suppress_tokens = set()
+    scheduler._get_model_vocab_size.return_value = len(_BUDGET_VOCAB)
+    scheduler._get_think_token_id.return_value = _THINK_START
+    scheduler._resolve_think_end_token_ids.return_value = [_THINK_END]
+    scheduler._resolve_think_close_pattern.return_value = (None, None)
+    scheduler._resolve_output_parser_thinking_trailing_ids.return_value = None
+    scheduler._get_output_parser_thinking_end_text.return_value = "</think>"
+    scheduler._thinking_budget_token_to_piece.side_effect = (
+        lambda token: _BUDGET_VOCAB[token]
+    )
+    params = SamplingParams(temperature=0, thinking_budget=1, compiled_grammar=compiled)
+    request = Request(request_id="grammar-budget", prompt="test", sampling_params=params)
+    request.needs_think_prefix = True
+    request.think_end_token_id = _THINK_END
+    return Scheduler._build_sampler_and_processors(scheduler, params, request)[1]
+
+
+def _has_budget(processors):
+    return any(isinstance(p, ThinkingBudgetProcessor) for p in processors)
+
+
+def _sample_through(processors, expected, preferred=lambda token: token):
+    grammar = next(p for p in processors if isinstance(p, GrammarConstraintProcessor))
+    history = []
+    for token in expected:
+        logits = mx.full((len(_BUDGET_VOCAB),), -10.0)
+        logits[preferred(token)] = 10.0
+        for processor in processors:
+            logits = processor(mx.array(history, dtype=mx.int32), logits)
+        assert bool(mx.any(mx.isfinite(logits)).item())
+        sampled = int(mx.argmax(logits).item())
+        assert sampled == token
+        grammar.accept_token(sampled)
+        history.append(sampled)
+    assert grammar.is_terminated
+
+
+@requires_xgrammar
+class TestGrammarThinkingBudget:
+    """Thinking budgets must not inject tokens into whole-output grammars."""
+
+    @pytest.fixture(scope="class")
+    def compiler(self):
+        return xgr.GrammarCompiler(
+            xgr.TokenizerInfo(
+                _BUDGET_VOCAB, xgr.VocabType.RAW, stop_token_ids=[_BUDGET_STOP]
+            )
+        )
+
+    @pytest.mark.parametrize(
+        "fmt, expected",
+        [
+            ({"type": "grammar", "grammar": 'root ::= "abc"'}, "abc"),
+            ({"type": "regex", "pattern": "abc"}, "abc"),
+            (
+                {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "type": "object",
+                        "properties": {"answer": {"const": "yes"}},
+                        "required": ["answer"],
+                        "additionalProperties": False,
+                    },
+                },
+                '{"answer":"yes"}',
+            ),
+        ],
+    )
+    def test_bare_grammar_skips_budget(self, compiler, fmt, expected):
+        processors = _budget_processors(_compile_bare_grammar(compiler, fmt))
+        assert not _has_budget(processors)
+        _sample_through(processors, [*expected.encode(), _BUDGET_STOP])
+
+    @pytest.mark.parametrize("reasoning", [False, True])
+    def test_structural_grammar_accepts_budget_close(self, compiler, reasoning):
+        compiled = _compile_with_structural_tag(
+            compiler,
+            {"type": "regex", "pattern": "abc"},
+            "qwen_3_5",
+            {"enable_thinking": reasoning},
+        )
+        expected = [_THINK_END, ord("\n"), ord("\n")] if reasoning else []
+        # The model prefers to keep reasoning; the budget must force the close.
+        _sample_through(
+            _budget_processors(compiled),
+            [*expected, *b"abc", _BUDGET_STOP],
+            preferred=lambda token: ord("x") if token == _THINK_END else token,
+        )
+
+    def test_unconstrained_output_keeps_budget(self):
+        assert _has_budget(_budget_processors(None))
+
+    def test_k2_tool_grammar_keeps_budget(self, compiler):
+        compiled = compile_tool_grammar(compiler, [{"function": {"name": "read_file"}}])
+        assert _has_budget(_budget_processors(compiled))
+
+    def test_reasoning_marker_does_not_leak_through_compiler_cache(self, compiler):
+        fmt = {"type": "regex", "pattern": "abc"}
+        for reasoning in (True, False, True):
+            compiled = _compile_with_structural_tag(
+                compiler, fmt, "qwen_3_5", {"enable_thinking": reasoning}
+            )
+            assert _has_budget(_budget_processors(compiled)) == reasoning
+        tag = xgr.get_builtin_structural_tag("qwen_3_5", reasoning=True).model_dump()
+        assert _patch_output_format(tag, fmt)
+        raw = compiler.compile_structural_tag(tag)
+        assert not _has_budget(_budget_processors(raw))
 
 
 # =========================================================================
