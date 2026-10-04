@@ -520,10 +520,12 @@ _ROLE_Q8 = {"bits": 8, "group_size": 64, "mode": "affine"}
 # Cost budget for the gated half, as a share of the checkpoint's bytes at the
 # selected level. Unlike a parameter-share threshold this is level aware: the
 # same tensors cost proportionally more at oQ2 and almost nothing at oQ8, and a
-# role that would blow the budget keeps the per-level policy instead. That is
-# what keeps a dense model (attention near a third of the weights) from being
-# repriced, while a fine-grained MoE passes comfortably.
-_ROLE_FLOOR_MAX_COST_SHARE = 0.02
+# role that would blow the budget keeps the per-level policy instead - nothing
+# is repinned and no other tensor moves, so an over-budget role behaves exactly
+# as it does on the base branch. That is what keeps a dense model (attention
+# near a third of the weights) from being repriced, while a fine-grained or
+# coarse MoE passes.
+_ROLE_FLOOR_MAX_COST_SHARE = 0.03
 # No single tensor may cost more than this share on its own, so one large member
 # cannot hide behind the role budget or drag the whole role over it.
 _ROLE_FLOOR_MAX_TENSOR_COST_SHARE = 0.005

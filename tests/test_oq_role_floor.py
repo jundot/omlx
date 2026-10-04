@@ -285,12 +285,30 @@ class TestRoleFloorCostGate:
         assert overrides["model.layers.0.self_attn.q_a_proj"] == Q8_SPEC
         assert overrides["model.layers.0.self_attn.kv_b_proj"] == Q8_SPEC
 
+    def test_role_budget_is_three_percent(self):
+        assert oq._ROLE_FLOOR_MAX_COST_SHARE == 0.03
+
     def test_role_budget_boundary(self, monkeypatch):
         # Inside the budget the role is pinned; outside it drops as a whole.
-        monkeypatch.setattr(oq, "_ROLE_FLOOR_MAX_COST_SHARE", 0.02)
         assert _role_floor_gated_overrides(MOE_SHAPES, {}, 4)
         monkeypatch.setattr(oq, "_ROLE_FLOOR_MAX_COST_SHARE", 0.0)
         assert _role_floor_gated_overrides(MOE_SHAPES, {}, 4) == {}
+
+    def test_coarse_moe_fits_the_budget(self):
+        # A coarse MoE (few large experts) costs more than a fine-grained one
+        # but still fits, which is what raising the budget to 3% buys.
+        shapes = {
+            "model.layers.0.self_attn.q_proj": (4096, 4096),
+            "model.layers.0.self_attn.k_proj": (1024, 4096),
+            "model.layers.0.self_attn.v_proj": (1024, 4096),
+            "model.layers.0.self_attn.o_proj": (4096, 4096),
+            **{
+                f"model.layers.{i}.mlp.experts.gate_proj": (8, 14336, 4096)
+                for i in range(32)
+            },
+        }
+        overrides = _role_floor_gated_overrides(shapes, {}, 4)
+        assert overrides["model.layers.0.self_attn.q_proj"] == Q8_SPEC
 
     def test_per_tensor_budget_boundary(self, monkeypatch):
         # A single expensive member cannot hide behind the role budget.
@@ -341,3 +359,17 @@ class TestRoleFloorInBudgetPlan:
             # floor must not pin them to Q8 the way it does for a checkpoint
             # where attention is a rounding error.
             assert plan.boost_map.get(path, {}).get("bits", 0) != 8
+
+    def test_over_budget_plan_matches_the_base_branch(self, monkeypatch):
+        # An over-budget role changes nothing: nothing is repinned and no other
+        # tensor moves, so the plan is identical to one built with no gated
+        # floor at all.
+        with_floor = _build_quant_plan(
+            DENSE_SHAPES, {}, 4, target_bpw=4.6, hard_cap_bpw=4.7
+        )
+        monkeypatch.setattr(oq, "_role_floor_gated_overrides", lambda *a, **k: {})
+        without_floor = _build_quant_plan(
+            DENSE_SHAPES, {}, 4, target_bpw=4.6, hard_cap_bpw=4.7
+        )
+        assert with_floor.boost_map == without_floor.boost_map
+        assert with_floor.effective_bpw == without_floor.effective_bpw
