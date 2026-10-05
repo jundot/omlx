@@ -16,8 +16,10 @@ def _fresh_nax_state(monkeypatch):
     monkeypatch.setattr(fast, "_nax_available_cache", None)
     monkeypatch.setattr(fast, "_stock_nax_cache", None)
     monkeypatch.setattr(fast, "_qmm_nax_cache", None)
+    monkeypatch.setattr(fast, "_qmm_nax_variant_resolved", None)
     monkeypatch.delenv("OMLX_NAX", raising=False)
     monkeypatch.delenv("OMLX_QWEN35_QMM_NAX", raising=False)
+    monkeypatch.delenv("OMLX_QWEN35_QMM_NAX_VARIANT", raising=False)
     yield
 
 
@@ -101,9 +103,21 @@ def test_qmm_nax_kwargs_on_nax_machine(monkeypatch):
     )
     monkeypatch.setattr(fast, "_ext", fake_ext)
     monkeypatch.setattr(fast, "_EXT_HAS_NAX", True)
+    monkeypatch.setattr(fast, "_autotune_qmm_nax_variant", lambda: 2)
     kwargs = fast._qmm_nax_kwargs()
-    assert kwargs["use_nax"] is True
-    assert kwargs["nax_variant"] == fast.QMM_NAX_VARIANT
+    assert kwargs == {"use_nax": True, "nax_variant": 2}
+
+
+def test_qmm_nax_variant_autotunes_once(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        fast, "_autotune_qmm_nax_variant", lambda: calls.append(None) or 3
+    )
+
+    assert fast._resolve_qmm_nax_variant() == 3
+    assert fast._resolve_qmm_nax_variant() == 3
+    assert calls == [None]
+    assert fast.QMM_NAX_VARIANT == 3
 
 
 def test_qmm_nax_env_kill_switch(monkeypatch):
@@ -175,7 +189,7 @@ def test_every_bundled_nax_qmm_tile_matches_stock(
     ref = mx.quantized_matmul(
         x, wq, scales, biases, transpose=True, group_size=group_size, bits=bits
     )
-    monkeypatch.setattr(fast, "QMM_NAX_VARIANT", variant)
+    monkeypatch.setenv("OMLX_QWEN35_QMM_NAX_VARIANT", str(variant))
     native = getattr(fast, f"qwen35_q{bits}_affine_qmm_t")
     out = native(x, wq, scales, biases, 8, group_size)
     ref32 = ref.astype(mx.float32)
