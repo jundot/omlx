@@ -295,7 +295,7 @@ class TestCaptureFold:
 
     @pytest.mark.parametrize("boundary, length", [(8, 13), (5, 7), (11, 13)])
     def test_warm_prefix_restores_exact_head_history_without_trunk_reforward(
-        self, strict_model, boundary, length
+        self, strict_model, boundary, length, monkeypatch
     ):
         """A backbone hit at C restores MTP(C-1)+hidden(C-1), then folds
         only the uncached suffix and activation seam.  The resulting head
@@ -340,6 +340,14 @@ class TestCaptureFold:
         warm_cache = _make_cache(model)
         with prompt_priming.suppress_capture():
             model(tokens[:boundary][None, :], cache=warm_cache)
+        materialized = []
+        async_eval = mx.async_eval
+
+        def capture_eval(arrays):
+            materialized.extend(arrays)
+            return async_eval(arrays)
+
+        monkeypatch.setattr(mx, "async_eval", capture_eval)
         assert prompt_priming.prepare_prefix_context(
             model,
             request_id="warm",
@@ -349,6 +357,8 @@ class TestCaptureFold:
         )
         warm_ctx = prompt_priming._find_ctx(model)
         assert warm_ctx is not None
+        for array in prompt_priming._snapshot_arrays(warm_ctx):
+            assert any(array is evaluated for evaluated in materialized)
         assert warm_ctx.folded == boundary - 1
         assert warm_ctx.expected_offset == boundary
         assert mx.array_equal(warm_ctx.pending_hidden, boundary_pending).item()

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exercise completed hybrid requests through durable prefix reuse."""
 
+import json
+import struct
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -123,6 +125,19 @@ def test_completed_hybrid_boundary_reuses_final_response(
             assert remaining == extended
         else:
             assert table is not None and table.num_tokens == total_tokens
+            if split:
+                sidecars = list(
+                    (tmp_path / "cache" / "_gdn_sidecars").rglob("*.safetensors")
+                )
+                assert len(sidecars) == 1
+                with sidecars[0].open("rb") as checkpoint:
+                    header_size = struct.unpack("<Q", checkpoint.read(8))[0]
+                    header = json.loads(checkpoint.read(header_size))
+                # KV comes from the paged blocks; completion checkpoints
+                # must retain only recurrent state, like prefill checkpoints.
+                assert "layer_0_state_0" in header
+                assert "layer_0_state_1" in header
+                assert not any(key.startswith("layer_1_") for key in header)
             restored = prefix.reconstruct_cache(table)
             assert restored is not None
             assert remaining == [9, 10]

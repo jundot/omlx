@@ -4686,6 +4686,64 @@ def test_initialization_uses_one_forward_without_cache_extraction(
         mlx_lm_mtp.set_mtp_active(active)
 
 
+@pytest.mark.parametrize("backend", ["lm", "vlm"])
+def test_replace_cache_rows_preserves_state_and_releases_each_layer(
+    backend, monkeypatch
+):
+    import weakref
+
+    from mlx_lm.models import cache as lm_cache
+    from mlx_vlm.models import cache as vlm_cache
+
+    caches = lm_cache if backend == "lm" else vlm_cache
+    layers = []
+    for layer in range(3):
+        rows = []
+        for idx, length in enumerate([11, 9, 7]):
+            row = caches.KVCache()
+            x = mx.full((1, 2, length, 4), layer * 10 + idx, mx.float32)
+            row.update_and_fetch(x, x + 1)
+            rows.append(row)
+        layers.append(caches.BatchKVCache.merge(rows))
+    batch = SimpleNamespace(uids=[0, 1, 2], prompt_cache=layers)
+    replacements = {1: [layer.extract(1) for layer in layers]}
+    for layer in replacements[1]:
+        x = mx.full((1, 2, 3, 4), 42, mx.float32)
+        layer.update_and_fetch(x, x + 1)
+    del layer
+    expected = bg._merge_row_caches(
+        [
+            replacements.get(idx) or [layer.extract(idx) for layer in layers]
+            for idx in range(3)
+        ]
+    )
+    old = [weakref.ref(layer) for layer in layers]
+    merge = bg._merge_row_caches
+    calls = 0
+
+    def checked_merge(rows):
+        nonlocal calls
+        if calls:
+            assert old[calls - 1]() is None
+            assert replacements[1][calls - 1] is None
+        calls += 1
+        return merge(rows)
+
+    monkeypatch.setattr(bg, "_merge_row_caches", checked_merge)
+    bg._replace_cache_rows(batch, replacements)
+    assert calls == 3
+    assert all(ref() is None for ref in old)
+    assert replacements[1] == [None] * 3
+    for actual, reference in zip(batch.prompt_cache, expected):
+        for (_, value), (_, target) in zip(
+            tree_flatten(actual.state), tree_flatten(reference.state)
+        ):
+            if isinstance(value, mx.array):
+                assert mx.array_equal(value, target)
+            else:
+                assert value == target
+
+
 def calibrated(batch=4, depth=2):
     policy = BatchPolicy(range(batch), depth)
     for cost in [100, 50, 10, 10, 10]:
@@ -5707,3 +5765,134 @@ def test_spec_command_buffers_restore_caps_after_the_step(monkeypatch, raised):
         raise RuntimeError("step failed")
     assert inside == (bg._SPEC_BUFFER_CAPS if raised else (50, 50))
     assert caps[-1] == (50, 50)
+
+
+def test_activation_replay_compares_logits_hidden_and_logical_cache(
+    tmp_path, monkeypatch
+):
+    """Exercise the same diagnostic used with the real quantized checkpoint."""
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "activation_audit",
+        Path(__file__).parents[1] / "scripts" / "compare_mtp_activation.py",
+    )
+    audit = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(audit)
+    previous = mlx_lm_mtp.is_mtp_active()
+    mlx_lm_mtp.set_mtp_active(True)
+    try:
+        mx.random.seed(173)
+        model = _model("qwen_vlm")
+        prompts = [[3, 4, 5 + i] + [6] * i for i in range(4)]
+        before, after = tmp_path / "before", tmp_path / "after"
+        with monkeypatch.context() as patch:
+            patch.setattr(bg, "_initial_batch_forward", lambda batch: None)
+            audit.replay(model, prompts, [7, 8, 9], before)
+        audit.replay(model, prompts, [7, 8, 9], after)
+        report = audit.compare(before, after)
+        assert report["before_shared"] == [False] * 3
+        # This candidate keeps stock private activation for sampled rows.
+        assert report["after_shared"] == [False] * 3
+        assert report["exact"]
+        assert report["finite"] and report["top1_equal"]
+        assert max(t["max_abs"] for t in report["tensors"]) < 1e-4
+        assert audit.compare(after, after)["exact"]
+        # Ensure a cache-only corruption fails even with identical output logits.
+        path = after / "step-2-row-3.safetensors"
+        arrays = mx.load(str(path))
+        name = next(k for k in arrays if k.startswith("layer."))
+        arrays[name] = arrays[name] + 1
+        mx.eval(arrays)
+        mx.save_safetensors(str(path), arrays)
+        changed = audit.compare(before, after)
+        assert not changed["exact"]
+        assert any(
+            t["tensor"] == name and t["max_abs"] > 0.9 for t in changed["tensors"]
+        )
+    finally:
+        mlx_lm_mtp.set_mtp_active(previous)
+
+
+def test_shared_activation_with_adaptive_policy_matches_greedy_target(monkeypatch):
+    previous = mlx_lm_mtp.is_mtp_active()
+    mlx_lm_mtp.set_mtp_active(True)
+    try:
+        mx.random.seed(173)
+        model = _model("qwen_vlm")
+        prompts = [[3, 4, 5 + i] + [6] * i for i in range(4)]
+        shared = []
+        initial = bg._initial_batch_forward
+
+        def record_shared(batch):
+            result = initial(batch)
+            if result is not None:
+                shared.append(tuple(batch.uids))
+            return result
+
+        monkeypatch.setattr(bg, "_initial_batch_forward", record_shared)
+        # Keep the real batch policy and depth controller, including late joins.
+        actual, _ = generate(model, prompts, [24] * 4, late_join=True)
+        assert shared, "Exercise shared activation rather than target-only fallback"
+        model._language_model._omlx_mtp_decode_enabled = False
+        expected, _ = generate(model, prompts, [24] * 4, late_join=True)
+        assert actual == expected
+    finally:
+        mlx_lm_mtp.set_mtp_active(previous)
+
+
+@pytest.mark.parametrize("failure", [None, "invalid", "fallback"])
+@pytest.mark.parametrize("late_join", [False, True])
+def test_private_activation_consumes_rows_and_reconciles_partial_failure(
+    monkeypatch, failure, late_join
+):
+    active = mlx_lm_mtp.is_mtp_active()
+    mlx_lm_mtp.set_mtp_active(True)
+    monkeypatch.setattr(bg, "_initial_batch_forward", lambda batch: None)
+    monkeypatch.setattr(bg, "_batch_policy_for_next", lambda batch: None)
+    monkeypatch.setattr(bg, "_DepthController", lambda *args, **kwargs: None)
+    original_prepare = bg._prepare_mtp_batch_state_for_next
+    original_init = bg._post_init_mtp
+    private_rows = []
+    checking = False
+    injected = False
+
+    def prepare(batch):
+        nonlocal checking
+        checking = True
+        try:
+            return original_prepare(batch)
+        finally:
+            checking = False
+
+    def initialize(row, *args, **kwargs):
+        nonlocal injected
+        if checking:
+            if private_rows:
+                assert all(layer is None for layer in private_rows[-1])
+            if failure and private_rows and not injected:
+                injected = True
+                if failure == "fallback":
+                    raise bg._MtpStepFallback("injected partial activation failure")
+                return
+        result = original_init(row, *args, **kwargs)
+        if checking:
+            private_rows.append(row.prompt_cache)
+        return result
+
+    monkeypatch.setattr(bg, "_prepare_mtp_batch_state_for_next", prepare)
+    monkeypatch.setattr(bg, "_post_init_mtp", initialize)
+    try:
+        mx.random.seed(173)
+        model = _model("qwen_vlm")
+        prompts = [[3, 4, 5], [3, 6, 7, 8], [4, 5, 6], [7, 8, 9, 10]]
+        actual, _ = generate(model, prompts, [16] * 4, late_join=late_join)
+        assert private_rows
+        assert all(layer is None for layer in private_rows[-1])
+        assert injected == bool(failure)
+        model._language_model._omlx_mtp_decode_enabled = False
+        expected, _ = generate(model, prompts, [16] * 4, late_join=late_join)
+        assert actual == expected
+    finally:
+        mlx_lm_mtp.set_mtp_active(active)

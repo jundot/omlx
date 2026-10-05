@@ -27,6 +27,10 @@ from types import SimpleNamespace
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from omlx.prefill_progress import get_prefill_tracker
+from ..batch_completion_cache import (
+    apply_batch_completion_cache_patch,
+    defer_terminal_cache_extraction,
+)
 
 from . import cache_rollback as _rollback_mod
 from . import context_copy as _context_copy
@@ -108,6 +112,7 @@ def apply() -> bool:
         logger.debug("mlx_lm.generate GenerationBatch/BatchGenerator not importable")
         return False
 
+    apply_batch_completion_cache_patch()
     if not hasattr(GenerationBatch, "_omlx_mtp_patched"):
         original_init = GenerationBatch.__init__
         original_next = GenerationBatch.next
@@ -1217,6 +1222,8 @@ def _make_row_batch(
 
 
 def _merge_row_caches(row_caches: List[List[Any]]) -> List[Any]:
+    import mlx.core as mx
+
     if not row_caches:
         return []
     merged = []
@@ -1227,7 +1234,11 @@ def _merge_row_caches(row_caches: List[List[Any]]) -> List[Any]:
             raise _MtpStepFallback(
                 f"cache {type(per_row[0]).__name__} cannot merge row caches"
             )
-        merged.append(merge(per_row))
+        layer = merge(per_row)
+        # Do not retain the padding/copy graphs for every target or head layer.
+        if not layer.empty():
+            mx.eval(layer.state)
+        merged.append(layer)
     return merged
 
 
@@ -1237,11 +1248,23 @@ def _replace_cache_rows(
 ) -> None:
     if not replacements:
         return
-    row_caches = [
-        replacements.get(idx) or gen_batch.extract_cache(idx)
-        for idx in range(len(gen_batch.uids))
-    ]
-    gen_batch.prompt_cache = _merge_row_caches(row_caches)
+    # Consume private replacement rows one layer at a time. Extracting all
+    # untouched rows first kept the old batch, row copies and joined batch
+    # alive together for the entire model.
+    for layer_idx, old in enumerate(gen_batch.prompt_cache):
+        rows = [
+            (
+                [replacements[idx][layer_idx]]
+                if idx in replacements
+                else [old.extract(idx)]
+            )
+            for idx in range(len(gen_batch.uids))
+        ]
+        layer = _merge_row_caches(rows)[0]
+        gen_batch.prompt_cache[layer_idx] = layer
+        for replacement in replacements.values():
+            replacement[layer_idx] = None
+        del old, rows
 
 
 def _initial_batch_forward(gen_batch):
@@ -1302,11 +1325,13 @@ def _prepare_mtp_batch_state_for_next(gen_batch: Any) -> Optional[_MtpBatchState
     if _mtp_batch_state_valid_for_batch(gen_batch, batch_state):
         return batch_state
 
-    replacements: Dict[int, List[Any]] = {}
-    token_context_updates: Dict[int, Any] = {}
     states = dict(batch_state.states) if batch_state is not None else {}
 
     shared = _initial_batch_forward(gen_batch) if not states else None
+    # Publish committed private rows so the normal fallback can reconcile a
+    # partially initialized batch if a later row cannot enter MTP.
+    if shared is None:
+        gen_batch._omlx_mtp_batch_state = _MtpBatchState(states=states)
     for idx, uid in enumerate(gen_batch.uids):
         if uid in states:
             continue
@@ -1332,16 +1357,23 @@ def _prepare_mtp_batch_state_for_next(gen_batch: Any) -> Optional[_MtpBatchState
             )
         state = getattr(row, "_omlx_mtp_state", None)
         if not _mtp_state_valid_for_batch(row, state):
+            if shared is None and not _reconcile_mtp_batch_to_standard(gen_batch):
+                raise RuntimeError("MTP could not reconcile partial initialization")
             _drop_mtp_batch_state(gen_batch, "batch-post-init-invalid")
             return None
-        states[uid] = state
         if shared is None:
-            replacements[idx] = row.prompt_cache
-        token_context_updates[idx] = row._token_context[0]
+            # Keep one private full-window row, rather than all new rows plus
+            # the original batch. The singleton forward and sampling order
+            # stay unchanged; only ownership moves earlier.
+            _replace_cache_rows(gen_batch, {idx: row.prompt_cache})
+        states[uid] = state
+        gen_batch._token_context[idx] = row._token_context[0]
+        if shared is None:
+            from omlx.utils.metal_sync import _sync_and_clear_cache
 
-    _replace_cache_rows(gen_batch, replacements)
-    for idx, token_context in token_context_updates.items():
-        gen_batch._token_context[idx] = token_context
+            # Activation can span several enforcer polls inside one next().
+            # Return pooled row/merge buffers before copying the next row.
+            _sync_and_clear_cache()
 
     batch_state = _MtpBatchState(states=states)
     gen_batch._omlx_mtp_batch_state = batch_state
@@ -3413,6 +3445,7 @@ def _mtp_batch_next(gen_batch: Any, batch_state: _MtpBatchState) -> Any:
     return _run_verify_cycle_batched(gen_batch, batch_state)
 
 
+@defer_terminal_cache_extraction
 def _emit_ragged_responses(
     gen_batch: Any, batch_state: _MtpBatchState, per_row: dict[Any, list]
 ) -> list[Any]:
