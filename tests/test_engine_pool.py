@@ -2752,6 +2752,72 @@ class TestEnginePoolPrefillEviction:
         pool._unload_engine.assert_not_awaited()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("held", [True, False])
+    async def test_prefill_eviction_releases_hot_cache_before_idle_model(self, held):
+        """Hot cache gives way before idle models, only for a request the
+        scheduler holds, whose prefix blocks are protected (#4213)."""
+        gb = 1024**3
+        hot = [10 * gb]
+        phys = [50 * gb]
+
+        async def release(reserved_bytes):
+            hot[0] -= 6 * gb
+            phys[0] -= 6 * gb
+            return 6 * gb
+
+        class _Budget:
+            @property
+            def total_bytes(self):
+                return hot[0]
+
+        scheduler = MagicMock()
+        scheduler.requests = {"req-1": object()} if held else {}
+        scheduler._hot_cache_limit_factor = MagicMock(return_value=0.9)
+        pool = _make_pool(ceiling=0)
+        pool._entries = {
+            "idle-a": self._entry("idle-a", 20 * gb),
+            "target": self._entry("target", 25 * gb, scheduler=scheduler),
+        }
+        pool._current_model_memory = 30 * gb
+        pool._scheduler_config.hot_cache_budget = _Budget()
+        release_mock = AsyncMock(side_effect=release)
+        pool._process_memory_enforcer = SimpleNamespace(
+            release_hot_cache_for_prefill=release_mock
+        )
+        unloaded = []
+
+        async def fake_unload(model_id):
+            unloaded.append(model_id)
+            pool._entries[model_id].engine = None
+            phys[0] -= 20 * gb
+
+        pool._unload_engine = fake_unload
+        req = PrefillEvictionRequest(
+            request_id="req-1",
+            model_id="target",
+            current_bytes=40 * gb,
+            target_cap_bytes=45 * gb,
+            predicted_transient_bytes=10 * gb,
+            requested_tokens=2048,
+            reason="prefill_preflight",
+        )
+
+        with (
+            patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+            patch("omlx.engine_pool.get_phys_footprint", side_effect=lambda: phys[0]),
+        ):
+            admitted = await pool._evict_idle_lru_for_prefill("target", req)
+
+        assert admitted is True
+        if held:
+            # Usage is 50 - 10 hot = 40GB, 5GB short of the 45GB target.
+            release_mock.assert_awaited_once_with(int(5 * gb / 0.9) + 1)
+            assert unloaded == []
+        else:
+            release_mock.assert_not_awaited()
+            assert unloaded == ["idle-a"]
+
+    @pytest.mark.asyncio
     async def test_prefill_reclaims_pooled_buffers_when_no_idle_victim(self):
         """No idle model, but pooled Metal buffers are reclaimable -> reclaim
         on the requesting engine's own MLX thread, then admit (the

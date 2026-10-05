@@ -32,6 +32,7 @@ from omlx.memory_monitor import (
 from omlx.prefill_transient_tracker import PrefillTransientTracker
 from omlx.request import Request, SamplingParams
 from omlx.scheduler import (
+    PrefillEvictionRequest,
     Scheduler,
     SchedulerConfig,
     _PrefillEvictionNeeded,
@@ -1841,6 +1842,53 @@ def test_prefill_loop_records_pool_release_before_next_chunk(chunked, monkeypatc
     assert len(charges) == 3
     assert charges[0] == 0
     assert all(charge > 0 for charge in charges[1:])
+
+
+def test_resumed_prefill_pausing_before_progress_skips_readmission():
+    """A resumed run can pause for eviction again before its first chunk.
+    It already passed admission, so its next resume must not be re-admitted
+    against the remaining prompt (#4213)."""
+    model = Model(
+        ModelArgs(
+            model_type="llama",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+        )
+    )
+    ns = Scheduler(
+        model,
+        SimpleNamespace(eos_token_id=2, encode=lambda s: [1]),
+        SchedulerConfig(prefill_step_size=64, paged_cache_block_size=0),
+    )
+    eviction = PrefillEvictionRequest(
+        request_id="resumed",
+        model_id="m",
+        current_bytes=0,
+        target_cap_bytes=1,
+        predicted_transient_bytes=1,
+        requested_tokens=64,
+        reason="adaptive_prefill_throttle",
+    )
+
+    def pause(*args, **kwargs):
+        raise _PrefillEvictionNeeded(eviction)
+
+    ns._guard_prefill_chunk = pause
+    prompt = [10] * 129
+    req = Request(request_id="resumed", prompt=prompt, sampling_params=SamplingParams())
+    req.prompt_token_ids = prompt
+    req.num_prompt_tokens = len(prompt)
+    req.prompt_cache = make_prompt_cache(model)
+
+    with pytest.raises(_PrefillEvictionNeeded):
+        ns._do_external_prefill(req, prompt, req.prompt_cache)
+
+    assert req._prefill_resumed is True
 
 
 @pytest.mark.parametrize("route", [False, True])

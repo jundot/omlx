@@ -106,6 +106,33 @@ class TestPreflightOrRaise:
         # Must not raise
         scheduler.preflight_or_raise(num_prompt_tokens=1024)
 
+    def test_counts_releasable_hot_cache(self, monkeypatch):
+        """The request has no block table yet, so route preflight counts the
+        hot cache the scheduler releases after admission (#4213)."""
+        gb = 1024**3
+        scheduler = _make_scheduler()
+        scheduler._prefill_memory_guard = True
+        scheduler._memory_abort_limit_bytes = 10**18
+
+        import omlx.scheduler as scheduler_mod
+
+        monkeypatch.setattr(scheduler_mod.mx, "get_active_memory", lambda: 0)
+        monkeypatch.setattr(scheduler_mod, "get_phys_footprint", lambda: 0)
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=65536, cached_tokens=0, current=0
+        )
+        scheduler._memory_hard_limit_bytes = est.estimated - gb
+        scheduler._memory_hot_cache_reserved_bytes = 4 * gb
+        hot = [2 * gb]
+        monkeypatch.setattr(scheduler, "_hot_cache_cpu_bytes", lambda: hot[0])
+
+        scheduler.preflight_or_raise(num_prompt_tokens=65536, request_id="r")
+        assert scheduler.preflight_eviction_request(num_prompt_tokens=65536) is None
+
+        hot[0] = gb // 2
+        with pytest.raises(PrefillMemoryExceededError):
+            scheduler.preflight_or_raise(num_prompt_tokens=65536, request_id="r")
+
     def test_skips_when_guard_disabled(self):
         scheduler = _make_scheduler()
         scheduler._prefill_memory_guard = False
@@ -1029,6 +1056,26 @@ class TestRejectionMessageNamesBindingCeiling:
         assert "metal_cap ceiling" in rej.message
         assert "effective ceiling" not in rej.message
         assert "caps Metal at 16.00 GB" in rej.message
+
+    def test_message_breaks_down_prefill_limit(self, monkeypatch):
+        """Usage excludes the hot cache while the ceilings include it, so the
+        message must subtract it before calling memory reclaimable (#4213)."""
+        sched = _make_scheduler()
+        self._arm_ceilings(
+            sched,
+            static=64 * 1024**3,
+            dynamic=32 * 1024**3,
+            metal_cap=48 * 1024**3,
+            hot_cache_reserved=8 * 1024**3,
+        )
+        sched._prefill_headroom_safety = 0.92
+        rej = self._force_rejection(sched, monkeypatch)
+        assert "but the prefill limit is 22.08 GB" in rej.message
+        assert (
+            "(dynamic ceiling 32.00 GB - hot cache 8.00 GB - safety margin 1.92 GB)"
+            in rej.message
+        )
+        assert "only 24.00 GB is reclaimable right now" in rej.message
 
     def test_static_binding_falls_back_to_generic_advice(self, monkeypatch):
         sched = _make_scheduler()

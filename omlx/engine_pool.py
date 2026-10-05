@@ -2614,6 +2614,8 @@ class EnginePool:
         evicted_count = 0
         reclaim_attempted = False
         ane_release_attempted = False
+        hot_cache_attempted = False
+        hot_cache_released = False
         reason = str(getattr(eviction_request, "reason", "") or "")
         async with self._lock:
             attempt = self._prefill_headroom_recurring.get(request_id, 0) + 1
@@ -2630,12 +2632,14 @@ class EnginePool:
                     action = "reclaim_pool"
                 elif evicted_any:
                     action = "evict_model"
+                elif hot_cache_released:
+                    action = "release_hot_cache"
                 else:
                     action = "already_fit"
                 logger.info(
                     "[prefill-eviction] request=%s retry=%d reason=%s "
                     "action=%s outcome=%s recurring=%s mx_active=%.2fGB "
-                    "phys_footprint=%.2fGB model_memory=%.2fGB "
+                    "phys_footprint=%.2fGB hot_cache=%.2fGB model_memory=%.2fGB "
                     "predicted=%.2fGB target=%.2fGB evicted=%d",
                     request_id,
                     attempt,
@@ -2645,6 +2649,7 @@ class EnginePool:
                     recurring,
                     active / 1024**3,
                     footprint / 1024**3,
+                    hot_cache / 1024**3,
                     self._current_model_memory / 1024**3,
                     predicted / 1024**3,
                     target / 1024**3,
@@ -2653,12 +2658,31 @@ class EnginePool:
 
             while True:
                 active = mx.get_active_memory()
-                footprint = _settled_phys_footprint()
+                # Targets subtract the hot-cache reservation, so usage
+                # excludes the hot cache, as in Scheduler._current_usage_bytes.
+                hot_cache = self._hot_cache_bytes()
+                footprint = max(0, _settled_phys_footprint() - hot_cache)
                 current = max(active, footprint, self._current_model_memory)
                 if current + predicted <= target:
                     # Use the same sample for admission and its decision log.
                     _log_decision("headroom_available")
-                    return evicted_any or reclaim_attempted or ane_release_attempted
+                    return (
+                        evicted_any
+                        or reclaim_attempted
+                        or ane_release_attempted
+                        or hot_cache_released
+                    )
+
+                if not hot_cache_attempted:
+                    # Cached prefix blocks give way before any model does.
+                    hot_cache_attempted = True
+                    gain = await self._release_hot_cache_for_prefill(
+                        exclude_model_id, request_id, current + predicted - target
+                    )
+                    if gain > 0:
+                        hot_cache_released = True
+                        target += gain
+                        continue
 
                 victim = self._find_lru_prefill_eviction_victim(
                     exclude_model_id=exclude_model_id
@@ -2735,6 +2759,49 @@ class EnginePool:
                 await self._unload_engine(victim)
                 evicted_any = True
                 evicted_count += 1
+
+    def _hot_cache_bytes(self) -> int:
+        budget = getattr(self._scheduler_config, "hot_cache_budget", None)
+        if budget is None:
+            return 0
+        return max(0, int(getattr(budget, "total_bytes", 0) or 0))
+
+    async def _release_hot_cache_for_prefill(
+        self, model_id: str, request_id: str, shortfall: int
+    ) -> int:
+        """Release hot cache for a prefill; return how far its target rose.
+
+        Skips requests the scheduler does not hold yet: their prefix blocks
+        are not protected (see ``Scheduler._releasable_hot_cache_credit``).
+        """
+        release = getattr(
+            self._process_memory_enforcer, "release_hot_cache_for_prefill", None
+        )
+        entry = self._entries.get(model_id)
+        engine = entry.engine if entry is not None else None
+        scheduler = (
+            self._resolve_scheduler_from_engine(engine) if engine is not None else None
+        )
+        limit_factor = getattr(scheduler, "_hot_cache_limit_factor", None)
+        if (
+            not callable(release)
+            or not callable(limit_factor)
+            or request_id not in getattr(scheduler, "requests", {})
+        ):
+            return 0
+        factor = limit_factor()
+        if factor <= 0 or shortfall <= 0:
+            return 0
+        released = await release(int(shortfall / factor) + 1)
+        if released <= 0:
+            return 0
+        logger.info(
+            "Released %s of hot cache for prefill request %s on '%s'",
+            format_size(released),
+            request_id,
+            model_id,
+        )
+        return int(released * factor)
 
     @staticmethod
     def _resolve_engine_core_from_engine(engine: object) -> object | None:

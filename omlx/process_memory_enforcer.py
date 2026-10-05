@@ -42,7 +42,11 @@ from .engine.base import BaseNonStreamingEngine
 from .utils import psutil_compat
 from .utils.image import clear_image_decode_cache
 from .utils.metal_sync import unreleased_graphics_bytes
-from .utils.proc_memory import get_graphics_footprint, get_phys_footprint
+from .utils.proc_memory import (
+    get_graphics_footprint,
+    get_phys_footprint,
+    release_free_malloc_memory,
+)
 
 if TYPE_CHECKING:
     from .engine_pool import EnginePool
@@ -1126,11 +1130,37 @@ class ProcessMemoryEnforcer:
 
     def _shrink_hot_cache_for_pressure(self, current: int, target: int) -> int:
         """Try to shrink hot cache enough to move process usage toward target."""
+        if current <= target:
+            return 0
+        return self._shrink_hot_cache_by(current - target)
+
+    async def release_hot_cache_for_prefill(self, reserved_bytes: int) -> int:
+        """Shrink the hot cache until its reservation drops by ``reserved_bytes``.
+
+        Blocks of admitted or queued requests stay. Returns the actual drop.
+        """
+        before = self._hot_cache_reserved_bytes()
+        if before <= 0 or reserved_bytes <= 0:
+            return 0
+        # The reservation is used + slack, capped at max_bytes.
+        target_used = max(
+            0, before - reserved_bytes - _HOT_CACHE_RESERVATION_SLACK_BYTES
+        )
+        excess = self._hot_cache_used_bytes() - target_used
+        if excess > 0:
+            await asyncio.to_thread(self._shrink_hot_cache_by, excess)
+        released = max(0, before - self._hot_cache_reserved_bytes())
+        if released > 0:
+            self._propagate_memory_limit()
+        return released
+
+    def _shrink_hot_cache_by(self, bytes_to_free: int) -> int:
+        """Free up to ``bytes_to_free`` of unprotected hot-cache blocks by LRU."""
         hot_used = self._hot_cache_used_bytes()
-        if hot_used <= 0 or current <= target:
+        if hot_used <= 0 or bytes_to_free <= 0:
             return 0
 
-        target_hot_bytes = max(0, hot_used - (current - target))
+        target_hot_bytes = max(0, hot_used - bytes_to_free)
         protected_hashes = self._active_hot_cache_block_hashes()
         budget = self._hot_cache_budget()
         if budget is not None:
@@ -1140,6 +1170,8 @@ class ProcessMemoryEnforcer:
                     shrink(target_hot_bytes, protected_hashes=protected_hashes) or 0
                 )
                 if freed > 0:
+                    # Otherwise the freed bytes stay in phys_footprint.
+                    release_free_malloc_memory()
                     logger.warning(
                         "Shrank shared hot cache under memory pressure: "
                         "freed=%s target_hot=%s protected=%d",
@@ -1150,7 +1182,7 @@ class ProcessMemoryEnforcer:
                 return freed
 
         freed_total = 0
-        remaining_to_free = current - target
+        remaining_to_free = bytes_to_free
         seen_managers: set[int] = set()
         for entry in self._engine_pool._entries.values():
             if remaining_to_free <= 0:
@@ -1176,6 +1208,7 @@ class ProcessMemoryEnforcer:
             remaining_to_free = max(0, remaining_to_free - freed)
 
         if freed_total > 0:
+            release_free_malloc_memory()
             logger.warning(
                 "Shrank hot cache under memory pressure: freed=%s protected=%d",
                 _format_gb(freed_total),

@@ -152,6 +152,7 @@ _libproc: ctypes.CDLL | None = None
 _proc_pid_rusage = None
 _task_info = None
 _mach_task_self: ctypes.c_uint | None = None
+_malloc_zone_pressure_relief = None
 
 if sys.platform == "darwin":
     try:
@@ -178,10 +179,13 @@ if sys.platform == "darwin":
         ]
         _task_info.restype = ctypes.c_int
         _mach_task_self = ctypes.c_uint.in_dll(_libc, "mach_task_self_")
-    except (OSError, ValueError) as e:
+        _malloc_zone_pressure_relief = _libc.malloc_zone_pressure_relief
+        _malloc_zone_pressure_relief.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    except (OSError, ValueError, AttributeError) as e:
         logger.debug(f"task_info unavailable, graphics footprint will return 0: {e}")
         _task_info = None
         _mach_task_self = None
+        _malloc_zone_pressure_relief = None
 
 
 def get_phys_footprint(pid: int | None = None) -> int:
@@ -256,3 +260,13 @@ def get_graphics_footprint() -> int:
     if rc != 0 or count.value < _TASK_VM_INFO_GRAPHICS_COUNT:
         return 0
     return max(0, int(info.ledger_tag_graphics_footprint))
+
+
+def release_free_malloc_memory() -> None:
+    """Return freed malloc pages to the OS.
+
+    macOS malloc keeps freed blocks in phys_footprint, nearly all of them when
+    they sit between live blocks.
+    """
+    if _malloc_zone_pressure_relief is not None:
+        _malloc_zone_pressure_relief(None, 0)
