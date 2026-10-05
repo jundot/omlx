@@ -161,12 +161,8 @@ def test_qwen4_prefill_profile_gathered_core_caps_score_matrix():
         prefill_memory_profile=profile,
     )
     query, kv_len = 4096, 233_472
-    dense = monitor.estimate_chunk_transient_bytes(
-        query, kv_len, gathered_core=False
-    )
-    gathered = monitor.estimate_chunk_transient_bytes(
-        query, kv_len, gathered_core=True
-    )
+    dense = monitor.estimate_chunk_transient_bytes(query, kv_len, gathered_core=False)
+    gathered = monitor.estimate_chunk_transient_bytes(query, kv_len, gathered_core=True)
     assert gathered * 8 < dense
     # 147GB resident + this gathered gulp stays under the 214GB safety cap.
     assert gathered < 12 * 1024**3
@@ -422,6 +418,61 @@ class TestSetModelInfoTurboQuantDtype:
         kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
         assert kwargs["dtype_size"] == 2
 
+    @pytest.mark.parametrize("dim", [63, 256])
+    @pytest.mark.parametrize("skip_last", [False, True])
+    @pytest.mark.parametrize(
+        "scheme,bits,cache_class",
+        [
+            ("affine4", 4, "Affine4KVCache"),
+            ("affine8", 8, "Affine8KVCache"),
+        ],
+    )
+    def test_affine_prefill_prices_packed_words_and_fp32_scales(
+        self, dim, skip_last, scheme, bits, cache_class
+    ):
+        from mlx_lm.models.cache import ArraysCache, KVCache
+        from omlx import affine4
+
+        config = SimpleNamespace(
+            num_hidden_layers=64,
+            num_key_value_heads=4,
+            num_attention_heads=24,
+            head_dim=dim,
+        )
+        sched = self._make_sched_with_config(config)
+        sched.model.make_cache.return_value = [
+            KVCache() if (i + 1) % 4 == 0 else ArraysCache(size=2) for i in range(64)
+        ]
+        sched._turboquant_kv_bits = float(bits)
+        sched._turboquant_kv_scheme = scheme
+        sched._turboquant_skip_last = skip_last
+        sched.memory_monitor = MemoryMonitor(None, eviction_enabled=False)
+        sched._set_model_info_for_monitor()
+        native = KVCache()
+        native.update_and_fetch(
+            mx.ones((1, 4, 256, dim), mx.bfloat16),
+            mx.ones((1, 4, 256, dim), mx.bfloat16),
+        )
+        packed = getattr(affine4, cache_class).from_cache(native)
+        expected = (
+            (15 * packed.nbytes + native.nbytes) if skip_last else 16 * packed.nbytes
+        )
+        assert sched.memory_monitor.estimate_prompt_kv_bytes(256) == expected
+        assert sched.memory_monitor.estimate_block_memory(256) == expected
+        # Even a tiny query needs one layer's full unpacked history.
+        workspace = sched.memory_monitor.estimate_chunk_transient_bytes(32, 200000)
+        assert workspace >= 2 * 4 * 200000 * dim * 4
+        assert workspace < 2 * 4 * 200000 * dim * 4 + 128 * 1024**2
+
+    def test_turboquant_cold_prefill_prices_native_residency(self):
+        sched = self._make_sched_with_config(_PlainLMConfig())
+        sched._turboquant_kv_bits = 4.0
+        sched.memory_monitor = MemoryMonitor(None, eviction_enabled=False)
+        sched._set_model_info_for_monitor()
+        native = 200000 * 40 * 8 * 128 * 2 * 2
+        assert sched.memory_monitor.estimate_prompt_kv_bytes(200000) == native
+        assert sched.memory_monitor.estimate_block_memory(200000) < native / 3
+
     def test_turboquant_4bit_without_skip_last_uses_quantized_dtype(self):
         sched = self._make_sched_with_config(_PlainLMConfig())
         sched._turboquant_kv_bits = 4.0
@@ -432,8 +483,8 @@ class TestSetModelInfoTurboQuantDtype:
         kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
         expected = 4.0 / 8.0 + 2.0 / 128
         assert abs(kwargs["dtype_size"] - expected) < 1e-9
-        # Prefill holds fp16 KV until conversion, then both copies.
-        assert abs(kwargs["prefill_dtype_size"] - (2.0 + expected)) < 1e-9
+        # Cold prefill holds fp16 KV until conversion.
+        assert kwargs["prefill_dtype_size"] == 2.0
 
     def test_turboquant_prefill_kv_is_priced_at_full_width(self):
         monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
@@ -443,12 +494,10 @@ class TestSetModelInfoTurboQuantDtype:
             num_kv_heads=8,
             head_dim=128,
             dtype_size=quantized,
-            prefill_dtype_size=2.0 + quantized,
+            prefill_dtype_size=2.0,
         )
         per_token_fp16 = 40 * 8 * 128 * 2 * 2
-        assert monitor.estimate_prompt_kv_bytes(1000) == pytest.approx(
-            1000 * per_token_fp16 * (2.0 + quantized) / 2.0
-        )
+        assert monitor.estimate_prompt_kv_bytes(1000) == per_token_fp16 * 1000
 
     def test_turboquant_4bit_default_skip_last_keeps_one_full_dtype_layer(self):
         sched = self._make_sched_with_config(_PlainLMConfig())
