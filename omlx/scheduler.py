@@ -65,6 +65,7 @@ from .exceptions import (
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import _drafter_for as _block_drafter_for
 from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
+from .patches.sdpa256_attention import get_route_snapshot as sdpa256_route_snapshot
 from .prefill_boundaries import (
     clamp_prefill_chunk_to_boundary,
     should_emit_prefill_boundary,
@@ -1774,6 +1775,7 @@ class _BoundarySnapshotProvider:
         valid_tcs: list[int],
         in_memory_snapshots: dict[int, Any],
         paged_ssd_manager: Any | None = None,
+        diagnostics: Any | None = None,
         tail_terminal_token_count: int | None = None,
     ) -> None:
         self._store = store
@@ -1781,6 +1783,7 @@ class _BoundarySnapshotProvider:
         self._valid_tcs = set(valid_tcs)
         self._in_memory = in_memory_snapshots
         self._paged_ssd_manager = paged_ssd_manager
+        self._diagnostics = diagnostics
         # Set when the stored sequence ends on a tail snapshot, not a boundary.
         self.tail_terminal_token_count = tail_terminal_token_count
 
@@ -1822,10 +1825,43 @@ class _BoundarySnapshotProvider:
         block_size: int,
     ) -> bool:
         """Promote one request-local boundary snapshot to durable sidecar storage."""
+
+        def _record(reason: str | None, success: bool) -> None:
+            diagnostics = self._diagnostics
+            if diagnostics is None:
+                return
+            try:
+                diagnostics.record(
+                    "gdn_commit_success" if success else "gdn_commit_failure",
+                    reason=reason,
+                    request_id=self._request_id,
+                    token_count=token_count,
+                    block_size=block_size,
+                )
+            except Exception:
+                logger.debug("gdn commit diagnostics record failed", exc_info=True)
+
+        diagnostics = self._diagnostics
+        if diagnostics is not None:
+            try:
+                diagnostics.record(
+                    "gdn_commit_attempt",
+                    request_id=self._request_id,
+                    token_count=token_count,
+                    block_size=block_size,
+                )
+            except Exception:
+                logger.debug("gdn commit diagnostics record failed", exc_info=True)
         if self._store is None or self._paged_ssd_manager is None:
+            # Snapshot lived in memory only — no SSD staging was ever
+            # captured for this request, so there is nothing to promote.
+            _record("in_memory_only", False)
             return False
         staged_path = self._store.take_staged_file(self._request_id, token_count)
         if staged_path is None:
+            # Capture claimed a boundary but the staged sidecar file is
+            # gone — the store never wrote it or it was cleaned up.
+            _record("staged_missing", False)
             return False
         try:
             signature_builder = getattr(
@@ -1850,10 +1886,14 @@ class _BoundarySnapshotProvider:
             if committed is None:
                 with suppress(OSError):
                     staged_path.unlink()
-            return committed is not None
+                _record("promotion_failed", False)
+                return False
+            _record(None, True)
+            return True
         except Exception:
             with suppress(OSError):
                 staged_path.unlink()
+            _record("promotion_failed", False)
             return False
 
     @classmethod
@@ -4019,7 +4059,9 @@ class Scheduler:
                 request.benchmark_prefill_chunks.append(int(n_to_process))
                 request.benchmark_requested_steps.append(int(prefill_step_size))
 
-            _pre_active, _, _pre_cpu = Scheduler._chunk_memory_sample()
+            _pre_active, _, _pre_cpu, _trace_phys_pre = (
+                Scheduler._chunk_memory_sample()
+            )
             # External prefill bypasses BatchGenerator, so it must establish
             # the per-engine stream context itself. Native lazy primitives
             # otherwise bind to the worker's unrelated default stream and can
@@ -4088,7 +4130,9 @@ class Scheduler:
                     if extra_kwargs:
                         extra_kwargs = _advance_vlm_extra(extra_kwargs, n_to_process)
             _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
-            _, _post_total, _post_cpu = Scheduler._chunk_memory_sample()
+            _, _post_total, _post_cpu, _trace_phys_post = (
+                Scheduler._chunk_memory_sample()
+            )
             # Charge the chunk everything it grew above live arrays, including
             # the pool it filled, so the next chunk after a clear is priced.
             _throttle_pre = _pre_active + _pre_cpu
@@ -4264,7 +4308,7 @@ class Scheduler:
                     "processed=%d->%d kv_before=%d requested_step=%d "
                     "boundary_enabled=%s cache_block_size=%d ane_tile=%d "
                     "ane_full_tiles=%d ane_tail_tokens=%d model_cache_ms=%.3f "
-                    "total_ms=%.3f overhead_ms=%.3f",
+                    "total_ms=%.3f overhead_ms=%.3f %s",
                     request.request_id,
                     n_to_process,
                     _trace_processed_before,
@@ -4279,6 +4323,13 @@ class Scheduler:
                     _trace_model_ms,
                     _trace_total_ms,
                     max(0.0, _trace_total_ms - _trace_model_ms),
+                    self._benchmark_trace_memory_fields(
+                        n_tokens=n_to_process,
+                        kv_len=base_size + _trace_processed_before,
+                        phys_pre=_trace_phys_pre,
+                        phys_post=_trace_phys_post,
+                        phys_post_clear=get_phys_footprint(),
+                    ),
                 )
 
         # Emit final boundary snapshot if prompt lands exactly on boundary,
@@ -5434,6 +5485,64 @@ class Scheduler:
             return False
         return current >= self._memory_limit_bytes
 
+    def _benchmark_trace_memory_fields(
+        self,
+        *,
+        n_tokens: int,
+        kv_len: int,
+        phys_pre: int,
+        phys_post: int,
+        phys_post_clear: int,
+    ) -> str:
+        """Content-free memory context for one benchmark-trace chunk line.
+
+        Only called for benchmark_trace requests; normal inference logs
+        never reach this path.
+        """
+        tracker = self._prefill_transient_tracker
+        try:
+            predicted = int(self._predicted_chunk_transient(n_tokens, kv_len))
+        except Exception:
+            predicted = 0
+        guard_cap = 0
+        guard_headroom = 0
+        try:
+            _, guard_cap, _ = self._prefill_abort_description()
+            if guard_cap > 0:
+                guard_headroom = guard_cap - self._current_usage_bytes()
+        except Exception:
+            pass
+        try:
+            mx_active = mx.get_active_memory()
+            mx_peak = mx.get_peak_memory()
+        except Exception:
+            mx_active = 0
+            mx_peak = 0
+        sdpa_stock = sdpa_bounded = sdpa_first_kv = 0
+        try:
+            snapshot = sdpa256_route_snapshot()
+            sdpa_stock = int(snapshot.get("stock_calls", 0))
+            sdpa_bounded = int(snapshot.get("bounded_calls", 0))
+            sdpa_first_kv = int(snapshot.get("first_bounded_kv_len", 0))
+        except Exception:
+            pass
+        return (
+            f"phys_pre={phys_pre / 1024**3:.3f}GB "
+            f"phys_post={phys_post / 1024**3:.3f}GB "
+            f"phys_post_clear={phys_post_clear / 1024**3:.3f}GB "
+            f"mx_active={mx_active / 1024**3:.3f}GB "
+            f"mx_peak={mx_peak / 1024**3:.3f}GB "
+            f"predicted_transient={predicted / 1024**3:.3f}GB "
+            f"measured_delta={(phys_post - phys_pre) / 1024**2:.1f}MB "
+            f"reclaim_recent="
+            f"{(tracker.recent_reclaim_bytes if tracker else 0) / 1024**2:.1f}MB "
+            f"guard_cap={guard_cap / 1024**3:.3f}GB "
+            f"guard_headroom={guard_headroom / 1024**3:.3f}GB "
+            f"priority={'speed' if self._prefill_speed_priority else 'context'} "
+            f"sdpa_stock={sdpa_stock} sdpa_bounded={sdpa_bounded} "
+            f"sdpa_first_switch_kv={sdpa_first_kv}"
+        )
+
     def _clear_cache(self) -> None:
         """Clear the Metal pool and account for flat-overhead buffers that may return."""
         tracker = getattr(self, "_prefill_transient_tracker", None)
@@ -5490,17 +5599,18 @@ class Scheduler:
             set_chunk_memory_limit(id(self), None)
 
     @staticmethod
-    def _chunk_memory_sample() -> tuple[int, int, int]:
-        """Return (MLX active, MLX active + pool, CPU footprint) bytes.
+    def _chunk_memory_sample() -> tuple[int, int, int, int]:
+        """Return MLX active, MLX total, CPU, and physical footprint bytes.
 
         MLX counters change as soon as buffers are allocated or pooled. The
         kernel footprint keeps charging a cleared pool for a while, so only
-        its CPU part (phys minus graphics) is read.
+        its CPU part (physical minus graphics) feeds transient accounting.
         """
         active = max(0, int(mx.get_active_memory()))
         pooled = max(0, int(mx.get_cache_memory()))
-        cpu = max(0, int(get_phys_footprint()) - int(get_graphics_footprint()))
-        return active, active + pooled, cpu
+        physical = max(0, int(get_phys_footprint()))
+        cpu = max(0, physical - int(get_graphics_footprint()))
+        return active, active + pooled, cpu, physical
 
     def _record_chunk_transient(
         self,
@@ -6127,7 +6237,7 @@ class Scheduler:
             state.request.benchmark_prefill_chunks.append(int(n))
             state.request.benchmark_requested_steps.append(int(prefill_step_size))
 
-        _pre_active, _, _pre_cpu = Scheduler._chunk_memory_sample()
+        _pre_active, _, _pre_cpu, _trace_phys_pre = Scheduler._chunk_memory_sample()
         # Chunked prefill also bypasses BatchGenerator and must establish the
         # same per-engine stream context as the regular external prefill path.
         # The chunk views stay inside it for the same reason (single-stream
@@ -6167,7 +6277,9 @@ class Scheduler:
                 self._dflash_seed_prefill(state.request, prefill_out, capture_from)
             mx.eval([c.state for c in state.cache])
         _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
-        _, _post_total, _post_cpu = Scheduler._chunk_memory_sample()
+        _, _post_total, _post_cpu, _trace_phys_post = (
+            Scheduler._chunk_memory_sample()
+        )
         _throttle_pre = _pre_active + _pre_cpu
         _throttle_post = _post_total + max(_pre_cpu, _post_cpu)
         actual_gathered_core = gathered_core
@@ -6309,7 +6421,7 @@ class Scheduler:
                 "processed=%d->%d kv_before=%d requested_step=%d "
                 "boundary_enabled=%s cache_block_size=%d ane_tile=%d "
                 "ane_full_tiles=%d ane_tail_tokens=%d model_cache_ms=%.3f "
-                "total_ms=%.3f overhead_ms=%.3f",
+                "total_ms=%.3f overhead_ms=%.3f %s",
                 state.request.request_id,
                 n,
                 _trace_processed_before,
@@ -6324,6 +6436,13 @@ class Scheduler:
                 _trace_model_ms,
                 chunk_dt * 1000.0,
                 max(0.0, chunk_dt * 1000.0 - _trace_model_ms),
+                self._benchmark_trace_memory_fields(
+                    n_tokens=n,
+                    kv_len=state.base_size + _trace_processed_before,
+                    phys_pre=_trace_phys_pre,
+                    phys_post=_trace_phys_post,
+                    phys_post_clear=get_phys_footprint(),
+                ),
             )
         # Full-size chunks only: boundary/tail slivers under-measure, and
         # the running max must reflect sustained capability.
@@ -8114,6 +8233,7 @@ class Scheduler:
             valid_tcs=provider_tcs,
             in_memory_snapshots=extracted_in_memory,
             paged_ssd_manager=self.paged_ssd_cache_manager,
+            diagnostics=self._boundary_snapshot_diagnostics,
             tail_terminal_token_count=latest_tc if tail_terminal else None,
         )
 
