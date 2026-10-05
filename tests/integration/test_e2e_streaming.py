@@ -2341,7 +2341,8 @@ class TestStreamingHelperFunctions:
             return result
 
         monkeypatch.setattr(ChatCompletionChunk, "model_dump_json", tracked_dump)
-        ticks = iter([100.0, 102.5, 110.0])
+        # Finished inference accounting precedes final response serialization.
+        ticks = iter([100.0, 102.5, 109.0, 110.0])
 
         def perf_counter():
             value = next(ticks)
@@ -5694,6 +5695,33 @@ async def test_tool_length_retains_complete_calls_and_usage_without_partial_argu
         assert events[-1]["response"]["usage"]["output_tokens"] == 32768
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+@pytest.mark.parametrize("finish", ["stop", "length"])
+async def test_invalid_complete_tool_remains_failure_with_exactly_once_accounting(
+    monkeypatch, api, finish
+):
+    from types import SimpleNamespace
+    import omlx.server as server
+    metrics = []
+    monkeypatch.setattr(server, "get_server_metrics", lambda: SimpleNamespace(
+        record_request_complete=lambda **kw: metrics.append(kw)))
+    events = await _recovery_stream('<tool_call>not a function</tool_call>', api,
+                                    finish_reason=finish, completion_tokens=123,
+                                    include_usage=True)
+    assert not _recovery_calls(events, api)
+    assert len(metrics) == 1 and metrics[0]["completion_tokens"] == 123
+    terminal = events[-1]
+    if api == "responses":
+        assert terminal["type"] == "response.failed"
+        assert terminal["response"]["error"]["code"] == "invalid_tool_call"
+        assert terminal["response"]["usage"]["output_tokens"] == 123
+    else:
+        error = next(e for e in events if "error" in e)
+        assert error["error"]["code"] == "invalid_tool_call"
+        assert error["usage"]["output_tokens" if api == "anthropic" else "completion_tokens"] == 123
+
+
 @pytest.mark.parametrize("api", ["chat/completions", "messages", "responses"])
 @pytest.mark.parametrize("prefix", ["", _RECOVERY_CALL])
 @pytest.mark.parametrize("response_format", [False, True])
@@ -5739,3 +5767,65 @@ def test_nonstream_tool_length_suppresses_partial_and_retains_usage(monkeypatch,
         assert data["status"] == "incomplete"
         assert len([c for c in data["output"] if c["type"] == "function_call"]) == bool(prefix)
         assert data["usage"]["output_tokens"] == 32768
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+async def test_terminal_length_accounting_survives_consumer_close(monkeypatch, api):
+    from types import SimpleNamespace
+    import omlx.server as server
+    metrics = []
+    monkeypatch.setattr(server, "get_server_metrics", lambda: SimpleNamespace(
+        record_request_complete=lambda **kw: metrics.append(kw)))
+    # Chat emits an early tool before the separate terminal output. Sibling
+    # adapters deliver these calls only after observing finished inference.
+    closed = []
+    events = await _recovery_stream(_RECOVERY_CALL + '<tool_call><function=write>',
+                                    api, finish_reason="length", completion_tokens=123,
+                                    closed=closed, cancel=(api == "chat"))
+    if api == "chat":
+        assert metrics == []
+    else:
+        assert len(metrics) == 1 and metrics[0]["completion_tokens"] == 123
+    assert closed == [True]
+
+
+def test_failed_tool_usage_obeys_native_cache_partition():
+    from types import SimpleNamespace
+    from omlx.server import _tool_generation_usage
+    output = SimpleNamespace(prompt_tokens=10, completion_tokens=123, cached_tokens=3)
+    assert _tool_generation_usage(output, "anthropic", True) == {
+        "input_tokens":0, "output_tokens":123,
+        "cache_creation_input_tokens":7, "cache_read_input_tokens":3}
+    assert _tool_generation_usage(output, "anthropic", False) == {
+        "input_tokens":10, "output_tokens":123}
+    assert _tool_generation_usage(output, "responses")["input_tokens_details"] == {"cached_tokens":3}
+
+
+@pytest.mark.asyncio
+async def test_finished_output_tool_delta_cancellation_accounts_once(monkeypatch):
+    from types import SimpleNamespace
+    from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+    from omlx.api.openai_models import ChatCompletionRequest
+    import omlx.server as server
+    metrics = []
+    monkeypatch.setattr(server, "get_server_metrics", lambda: SimpleNamespace(
+        record_request_complete=lambda **kw: metrics.append(kw)))
+    engine = MockBaseEngine()
+    engine._supports_early_tool_call_streaming = True
+    engine.tokenizer.has_tool_calling = True
+    engine.tokenizer.tool_call_start = "<tool_call>"
+    engine.tokenizer.tool_call_end = "</tool_call>"
+    engine.tokenizer.tool_parser = parse_tool_call
+    raw = _RECOVERY_CALL + '<tool_call><function=write>'
+    engine.set_stream_outputs([MockGenerationOutput(text=raw, new_text=raw,
+                              finished=True, finish_reason="length", completion_tokens=123)])
+    messages = [{"role":"user", "content":"Write"}]
+    request = ChatCompletionRequest(model="test", messages=messages, stream=True)
+    stream = server.stream_chat_completion(engine, messages, request, tools=_RECOVERY_TOOLS)
+    async for event in stream:
+        if '"tool_calls"' in event:
+            await stream.aclose()
+            break
+    assert len(metrics) == 1
+    assert metrics[0]["completion_tokens"] == 123

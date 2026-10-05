@@ -995,6 +995,8 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
         )
     else:
         content = {"detail": exc.detail}
+    if getattr(exc, "usage", None) is not None:
+        content["usage"] = exc.usage
     return JSONResponse(
         status_code=exc.status_code, content=content, headers=exc.headers
     )
@@ -2693,6 +2695,8 @@ def _completion_keepalive_chunk(response_id: str) -> str:
         '"model":"keepalive",'
         '"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null}]}\n\n'
     )
+
+
 _KEEPALIVE_ANTHROPIC_PING = 'event: ping\ndata: {"type":"ping"}\n\n'
 
 
@@ -3143,11 +3147,12 @@ async def _with_json_keepalive(
             logger.warning(
                 "JSON keepalive request failed (%d): %s", e.status_code, e.detail
             )
-            yield json.dumps(
-                _openai_error_body(
-                    e.detail, e.status_code, code=getattr(e, "code", None)
-                )
+            error_data = _openai_error_body(
+                e.detail, e.status_code, code=getattr(e, "code", None)
             )
+            if getattr(e, "usage", None) is not None:
+                error_data["usage"] = e.usage
+            yield json.dumps(error_data)
             return
         if result is not None:
             yield result
@@ -5061,9 +5066,7 @@ async def create_chat_completion(
 
         # Widen the repetition-penalty look-back window when the client
         # asks for it (mlx-lm default window is 20 tokens).
-        repetition_context_size = getattr(
-            request, "repetition_context_size", None
-        )
+        repetition_context_size = getattr(request, "repetition_context_size", None)
         if repetition_context_size is not None:
             chat_kwargs["repetition_context_size"] = repetition_context_size
         chat_kwargs.update(_no_repeat_ngram_kwargs(request))
@@ -5207,15 +5210,9 @@ async def create_chat_completion(
                 f"request_max_tokens={request.max_tokens}"
             )
             first_token_at = getattr(output, "first_token_at", None)
-            ttft = (
-                (first_token_at - start_time)
-                if first_token_at is not None
-                else None
-            )
+            ttft = (first_token_at - start_time) if first_token_at is not None else None
             metric_prefill = ttft if ttft is not None else 0.0
-            gen_duration = (
-                elapsed - metric_prefill if metric_prefill > 0 else elapsed
-            )
+            gen_duration = elapsed - metric_prefill if metric_prefill > 0 else elapsed
             metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
                 output,
                 is_diffusion=is_diffusion,
@@ -5276,7 +5273,7 @@ async def create_chat_completion(
                     cleaned_text = recovered
                     tool_truncated = False
                 elif failure := _tool_call_failure(extraction, output.finish_reason):
-                    raise _ToolCallGenerationError(failure["error"])
+                    raise _ToolCallGenerationError(failure["error"], output)
                 cleaned_thinking = extraction.cleaned_thinking
 
             # Process response_format if specified
@@ -6181,9 +6178,10 @@ def _chat_prompt_opens_thinking(
 class _ToolCallGenerationError(HTTPException):
     """Keep generation failure codes through JSON keepalive responses."""
 
-    def __init__(self, error: dict):
+    def __init__(self, error: dict, output=None, api="chat", cache_control=False):
         super().__init__(status_code=500, detail=error["message"])
         self.code = error["code"]
+        self.usage = _tool_generation_usage(output, api, cache_control)
 
 
 def _is_length_tool_truncation(extraction, finish_reason):
@@ -6271,6 +6269,68 @@ def _nonstream_recovery_text(
     if probe.recovery_candidate_is_payload() or not probe.take_recovery_candidate():
         return None
     return raw_text
+
+
+def _tool_generation_usage(output, api="chat", cache_control=False) -> dict | None:
+    """Expose known generation counts even when terminal tool parsing fails."""
+    if output is None:
+        return None
+    if api == "anthropic":
+        usage = {
+            "input_tokens": output.prompt_tokens,
+            "output_tokens": output.completion_tokens,
+        }
+        if cache_control:
+            read = max(0, min(output.cached_tokens, output.prompt_tokens))
+            usage.update(
+                input_tokens=0,
+                cache_read_input_tokens=read,
+                cache_creation_input_tokens=output.prompt_tokens - read,
+            )
+        return usage
+    if api == "responses":
+        return {
+            "input_tokens": output.prompt_tokens,
+            "output_tokens": output.completion_tokens,
+            "total_tokens": output.prompt_tokens + output.completion_tokens,
+            "input_tokens_details": {"cached_tokens": output.cached_tokens},
+        }
+    return Usage(
+        prompt_tokens=output.prompt_tokens,
+        completion_tokens=output.completion_tokens,
+        total_tokens=output.prompt_tokens + output.completion_tokens,
+        prompt_tokens_details=PromptTokensDetails(cached_tokens=output.cached_tokens),
+    ).model_dump(exclude_none=True)
+
+
+def _record_terminal_generation(output, engine, model, start_time, first_token_time):
+    """Account finished inference once before terminal events or parser errors."""
+    if output is None:
+        return None
+    end = time.perf_counter()
+    duration = max(0.0, end - start_time)
+    ttft = max(0.0, (first_token_time or end) - start_time)
+    gen_duration = (
+        duration
+        if getattr(engine, "is_diffusion_model", False)
+        else max(0.0, end - (first_token_time or start_time))
+    )
+    prefill, generation = _resolve_metric_durations(
+        output,
+        is_diffusion=getattr(engine, "is_diffusion_model", False),
+        prefill_duration=ttft,
+        generation_duration=gen_duration,
+    )
+    get_server_metrics().record_request_complete(
+        prompt_tokens=output.prompt_tokens,
+        completion_tokens=output.completion_tokens,
+        cached_tokens=output.cached_tokens,
+        prefill_duration=prefill,
+        generation_duration=generation,
+        model_id=model,
+        request_duration=duration,
+    )
+    return end
 
 
 def _registered_tool_names(tools: object) -> set[str]:
@@ -6598,9 +6658,8 @@ async def stream_chat_completion(
                         completed_keys = [
                             _tool_call_semantic_key(tc) for tc in completed_calls
                         ]
-                        if (
-                            not completed_calls
-                            or any(key is None for key in completed_keys)
+                        if not completed_calls or any(
+                            key is None for key in completed_keys
                         ):
                             stream_tool_sequence_safe = False
                             continue
@@ -6647,6 +6706,16 @@ async def stream_chat_completion(
 
     finally:
         await _aclose_async_iterator(engine_stream)
+        # Count finished inference even if a client closes on a tool delta in
+        # that same output. Later terminal blocks emit usage without recounting.
+        if last_output and last_output.finished:
+            _record_terminal_generation(
+                last_output,
+                engine,
+                resolved_model or request.model,
+                start_time,
+                first_token_time,
+            )
 
     # Flush remaining buffered content from thinking/tool-call parsers
     if stream_content:
@@ -6920,6 +6989,7 @@ async def stream_chat_completion(
             yield event
 
     if tool_failure:
+        tool_failure["usage"] = _tool_generation_usage(last_output)
         yield f"data: {json.dumps(tool_failure)}\n\n"
         yield "data: [DONE]\n\n"
         return
@@ -6967,28 +7037,13 @@ async def stream_chat_completion(
             gen_duration = max(
                 0.0,
                 end_time
-                - (
-                    first_token_time
-                    if first_token_time is not None
-                    else start_time
-                ),
+                - (first_token_time if first_token_time is not None else start_time),
             )
         metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
             last_output,
             is_diffusion=is_diffusion,
-            prefill_duration=(
-                model_ttft if model_ttft is not None else total_duration
-            ),
+            prefill_duration=(model_ttft if model_ttft is not None else total_duration),
             generation_duration=gen_duration,
-        )
-        get_server_metrics().record_request_complete(
-            prompt_tokens=last_output.prompt_tokens,
-            completion_tokens=last_output.completion_tokens,
-            cached_tokens=last_output.cached_tokens,
-            prefill_duration=metric_prefill_duration,
-            generation_duration=metric_gen_duration,
-            model_id=resolved_model or request.model,
-            request_duration=total_duration,
         )
         speed_duration = total_duration if is_diffusion else gen_duration
         tokens_per_sec = (
@@ -7046,9 +7101,7 @@ async def stream_chat_completion(
                         else None
                     ),
                     time_to_first_visible_token=(
-                        round(visible_ttft, 2)
-                        if visible_ttft is not None
-                        else None
+                        round(visible_ttft, 2) if visible_ttft is not None else None
                     ),
                     total_time=round(total_time, 2),
                     **_usage_timing_fields(
@@ -7273,6 +7326,16 @@ async def stream_anthropic_messages(
 
     finally:
         await _aclose_async_iterator(engine_stream)
+        # Count finished inference even if a client closes on a tool delta in
+        # that same output. Later terminal blocks emit usage without recounting.
+        if last_output and last_output.finished:
+            _record_terminal_generation(
+                last_output,
+                engine,
+                resolved_model or request.model,
+                start_time,
+                first_token_time,
+            )
 
     # Flush remaining buffered content from thinking parser
     thinking_delta, content_delta = thinking_parser.finish(
@@ -7332,9 +7395,7 @@ async def stream_anthropic_messages(
         # held newlines here, and pure whitespace must not open a
         # phantom text block.
         if remaining and not (
-            not text_block_started
-            and kwargs.get("tools")
-            and not remaining.strip()
+            not text_block_started and kwargs.get("tools") and not remaining.strip()
         ):
             if not text_block_started:
                 if thinking_block_started:
@@ -7467,6 +7528,9 @@ async def stream_anthropic_messages(
             yield create_content_block_stop_event(index=i)
 
     if tool_failure:
+        failure_usage = _tool_generation_usage(
+            last_output, "anthropic", uses_cache_control
+        )
         error = tool_failure["error"]
         yield format_sse_event(
             "error",
@@ -7477,6 +7541,7 @@ async def stream_anthropic_messages(
                     "message": error["message"],
                     "code": error["code"],
                 },
+                "usage": failure_usage,
             },
         )
         yield create_message_stop_event()
@@ -7508,15 +7573,6 @@ async def stream_anthropic_messages(
         else:
             gen_duration = end_time - (first_token_time or start_time)
         serving_model = resolved_model or request.model
-        get_server_metrics().record_request_complete(
-            prompt_tokens=last_output.prompt_tokens,
-            completion_tokens=last_output.completion_tokens,
-            cached_tokens=last_output.cached_tokens,
-            prefill_duration=ttft,
-            generation_duration=gen_duration,
-            model_id=serving_model,
-            request_duration=total_duration,
-        )
         tokens_per_sec = (
             last_output.completion_tokens / total_duration if total_duration > 0 else 0
         )
@@ -7707,9 +7763,7 @@ async def create_anthropic_message(
 
         # Widen the repetition-penalty look-back window when the client
         # asks for it (mlx-lm default window is 20 tokens).
-        repetition_context_size = getattr(
-            request, "repetition_context_size", None
-        )
+        repetition_context_size = getattr(request, "repetition_context_size", None)
         if repetition_context_size is not None:
             chat_kwargs["repetition_context_size"] = repetition_context_size
 
@@ -7885,11 +7939,11 @@ async def create_anthropic_message(
 
             first_token_at = getattr(output, "first_token_at", None)
             prefill_duration = (
-                (first_token_at - start_time)
-                if first_token_at is not None
-                else 0.0
+                (first_token_at - start_time) if first_token_at is not None else 0.0
             )
-            gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
+            gen_duration = (
+                elapsed - prefill_duration if prefill_duration > 0 else elapsed
+            )
             get_server_metrics().record_request_complete(
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
@@ -7943,7 +7997,12 @@ async def create_anthropic_message(
                     cleaned_text = recovered
                     tool_truncated = False
                 elif failure := _tool_call_failure(extraction, output.finish_reason):
-                    raise _ToolCallGenerationError(failure["error"])
+                    raise _ToolCallGenerationError(
+                        failure["error"],
+                        output,
+                        "anthropic",
+                        request_has_cache_control(request),
+                    )
                 cleaned_thinking = extraction.cleaned_thinking
 
             # Reverse Gemma 4 parameter renaming
@@ -8461,11 +8520,7 @@ async def create_response(
             and not getattr(engine, "supports_tool_calling", False)
         )
         effective_tools = None if tools_disabled else openai_tools
-        if (
-            _server_state.mcp_manager
-            and not tools_disabled
-            and mcp_tools_exposed()
-        ):
+        if _server_state.mcp_manager and not tools_disabled and mcp_tools_exposed():
             effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
 
         # Convert tools for chat template
@@ -8549,9 +8604,7 @@ async def create_response(
 
         # Widen the repetition-penalty look-back window when the client
         # asks for it (mlx-lm default window is 20 tokens).
-        repetition_context_size = getattr(
-            request, "repetition_context_size", None
-        )
+        repetition_context_size = getattr(request, "repetition_context_size", None)
         if repetition_context_size is not None:
             chat_kwargs["repetition_context_size"] = repetition_context_size
 
@@ -8670,11 +8723,11 @@ async def create_response(
 
             first_token_at = getattr(output, "first_token_at", None)
             prefill_duration = (
-                (first_token_at - start_time)
-                if first_token_at is not None
-                else 0.0
+                (first_token_at - start_time) if first_token_at is not None else 0.0
             )
-            gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
+            gen_duration = (
+                elapsed - prefill_duration if prefill_duration > 0 else elapsed
+            )
             get_server_metrics().record_request_complete(
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
@@ -8728,7 +8781,9 @@ async def create_response(
                     cleaned_text = recovered
                     tool_truncated = False
                 elif failure := _tool_call_failure(extraction, output.finish_reason):
-                    raise _ToolCallGenerationError(failure["error"])
+                    raise _ToolCallGenerationError(
+                        failure["error"], output, "responses"
+                    )
                 cleaned_thinking = extraction.cleaned_thinking
 
             # Reverse Gemma 4 parameter renaming
@@ -8809,7 +8864,9 @@ async def create_response(
                 top_p=top_p,
                 max_output_tokens=request.max_output_tokens,
                 previous_response_id=request.previous_response_id,
-                incomplete_details={"reason": "max_output_tokens"} if truncated else None,
+                incomplete_details=(
+                    {"reason": "max_output_tokens"} if truncated else None
+                ),
             )
 
             # Store response
@@ -9192,6 +9249,16 @@ async def stream_responses_api(
     finally:
         stream_state.prefilling = False
         await _aclose_async_iterator(engine_stream)
+        # Count finished inference even if a client closes on a tool delta in
+        # that same output. Later terminal blocks emit usage without recounting.
+        if last_output and last_output.finished:
+            _record_terminal_generation(
+                last_output,
+                engine,
+                resolved_model or request.model,
+                start_time,
+                first_token_time,
+            )
 
     # Flush remaining content from parsers
     if stream_content:
@@ -9545,6 +9612,7 @@ async def stream_responses_api(
             next_output_index = output_index
 
     if tool_failure:
+        failure_usage = _tool_generation_usage(last_output, "responses")
         seq = stream_state.next_sequence()
         yield format_sse_event(
             "response.failed",
@@ -9555,6 +9623,7 @@ async def stream_responses_api(
                     "status": "failed",
                     "output": output_items,
                     "error": tool_failure["error"],
+                    "usage": failure_usage,
                 },
                 "sequence_number": seq,
             },
@@ -9572,15 +9641,6 @@ async def stream_responses_api(
         else:
             gen_duration = end_time - (first_token_time or start_time)
         serving_model = resolved_model or request.model
-        get_server_metrics().record_request_complete(
-            prompt_tokens=last_output.prompt_tokens,
-            completion_tokens=last_output.completion_tokens,
-            cached_tokens=last_output.cached_tokens,
-            prefill_duration=ttft,
-            generation_duration=gen_duration,
-            model_id=serving_model,
-            request_duration=total_duration,
-        )
         tokens_per_sec = (
             last_output.completion_tokens / total_duration if total_duration > 0 else 0
         )
