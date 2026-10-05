@@ -37,7 +37,7 @@ import re
 import struct
 import threading
 import time
-from collections import namedtuple
+from collections import Counter, namedtuple
 from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
@@ -112,6 +112,7 @@ class CheckpointExpertStore:
     """
 
     def __init__(self, model_path: str | Path):
+        self._staging = None
         self._specs: dict[str, tuple[Path, str, tuple[int, ...], int]] = {}
         self._fds: dict[Path, int] = {}
         model_path = Path(model_path)
@@ -362,6 +363,7 @@ class ExpertCache:
         self.capacity = min(capacity, self.n_experts)
         self.projs = _PROJS
         self.disk = disk
+        self._staging = None
         self.resident: dict[str, list] = {}
         for name in self.projs:
             lin = getattr(glu, name)
@@ -417,13 +419,15 @@ class ExpertCache:
 
     def _write(self, slot: int, payload: list) -> None:
         """Copy one expert's fetched bytes into ``slot``."""
+        convert = self._staging.to_mx if self._staging else CheckpointExpertStore.to_mx
         for name, field, plan, raw in payload:
-            self.resident[name][field][slot] = CheckpointExpertStore.to_mx(plan, raw)
+            self.resident[name][field][slot] = convert(plan, raw)
 
     def _install(self, e: int, payload: list | None = None) -> int:
         if payload is None:
+            read = self._staging.read if self._staging else CheckpointExpertStore.read
             payload = [
-                (n, f, pl, CheckpointExpertStore.read(pl))
+                (n, f, pl, read(pl))
                 for n, f, pl in self._plans(e)
             ]
         slot = self._reserve()
@@ -473,6 +477,9 @@ class ExpertCache:
         :meth:`OffloadSwitchGLU._forward_overlap`). Returns whether that
         happened.
         """
+        staging = self.disk._store._staging
+        self._staging = staging.for_owner() if staging is not None else None
+        read = self._staging.read if self._staging else CheckpointExpertStore.read
         pool = _io_pool()
         queue = [e for e in needed if e not in self.slot_of] if pool is not None else []
         window = _io_batch()
@@ -493,7 +500,7 @@ class ExpertCache:
                             name,
                             field,
                             plan,
-                            pool.submit(CheckpointExpertStore.read, plan),
+                            pool.submit(read, plan),
                         )
                     )
 
@@ -990,6 +997,13 @@ def apply_moe_expert_offload(
         model, model_dir, resident_fraction, mtp_resident=mtp_resident
     )
     total_bytes = resident_bytes = 0
+    staging_sizes = {}
+    staging_requested = (
+        kind == "qwen4_exp"
+        and not mtp_resident
+        and resident_fraction < 1
+        and os.environ.get("OMLX_MOE_OFFLOAD_STAGING", "0") == "1"
+    )
     for parent, key, glu, path in list(_iter_switch_glus(model)):
         if mtp_resident and _is_mtp_path(path):
             # Lightning MTP drafts from this head every step; streaming its
@@ -1018,6 +1032,11 @@ def apply_moe_expert_offload(
         total_bytes += layer_bytes
         resident_bytes += layer_bytes * capacity // n_experts
         new = OffloadSwitchGLU(glu, capacity, view)
+        if staging_requested:
+            for size, count in Counter(
+                p.nbytes for _, _, p in new.cache._plans(0)
+            ).items():
+                staging_sizes[size] = max(staging_sizes.get(size, 0), count)
         if isinstance(parent, nn.Module):
             setattr(parent, key, new)  # registers via Module.__setattr__
         else:
@@ -1027,6 +1046,20 @@ def apply_moe_expert_offload(
         # to total RAM, so drain per layer to bound the load transient
         # (same reasoning as the gate/up fusion patch, #2304).
         _sync_and_clear_cache()
+
+    if staging_sizes:
+        from ..custom_kernels.moe_staging import EXPERTS, MAX_BYTES, Staging
+
+        sizes = [
+            size
+            for size, count in sorted(staging_sizes.items())
+            for _ in range(count * EXPERTS)
+        ]
+        # MLX allocations round up to pages, so bound actual reserved memory.
+        if sum((size + 16383) // 16384 * 16384 for size in sizes) <= MAX_BYTES:
+            store._staging = Staging(sizes, store.read, store.to_mx)
+        else:
+            logger.warning("moe offload staging layout exceeds 128 MiB; using bytes")
 
     if total_bytes:
         logger.info(
