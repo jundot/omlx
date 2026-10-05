@@ -215,12 +215,24 @@ def _apply_minimax_m3_thinking_mode(
         return
     enable_thinking = template_kwargs.pop("enable_thinking", None)
     if "thinking_mode" in template_kwargs:
+        if enable_thinking is not None:
+            logger.debug(
+                "MiniMax M3 request carries both enable_thinking=%r and "
+                "thinking_mode=%r; the model-native thinking_mode wins",
+                enable_thinking,
+                template_kwargs["thinking_mode"],
+            )
         return
 
     if enable_thinking is True:
         template_kwargs["thinking_mode"] = "enabled"
     elif enable_thinking is False:
         template_kwargs["thinking_mode"] = "disabled"
+    elif enable_thinking == "adaptive":
+        # The template has three states; the boolean key only carries two, so
+        # a string on it would otherwise be dropped and the request would fall
+        # back to the template default (#4242).
+        template_kwargs["thinking_mode"] = "adaptive"
 
 
 def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id: Any):

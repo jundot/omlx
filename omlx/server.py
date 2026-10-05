@@ -6568,6 +6568,8 @@ async def create_anthropic_message(
         )
         forced_keys = forced_ct_keys(ms)
 
+        _entry = get_engine_pool().get_entry(resolved_model)
+
         # Pass Anthropic thinking config to chat template (except forced keys)
         if hasattr(request, "thinking") and request.thinking:
             if "enable_thinking" not in forced_keys:
@@ -6578,15 +6580,22 @@ async def create_anthropic_message(
                     # indistinguishable from "enabled".  Templates whose
                     # ``thinking_mode`` is three-state get the state itself;
                     # every other template keeps the portable boolean (#4242).
-                    if thinking_type == "adaptive" and uses_thinking_mode_kwarg(
-                        resolved_model,
-                        engine_model_type=getattr(engine, "model_type", None),
+                    # A client-supplied or operator-pinned ``thinking_mode``
+                    # wins, so only fill the key when nobody set it.
+                    if (
+                        thinking_type == "adaptive"
+                        and "thinking_mode" not in forced_keys
+                        and uses_thinking_mode_kwarg(
+                            resolved_model,
+                            config_model_type=getattr(
+                                _entry, "config_model_type", None
+                            ),
+                            engine_model_type=getattr(engine, "model_type", None),
+                        )
                     ):
-                        merged_ct_kwargs["thinking_mode"] = "adaptive"
+                        merged_ct_kwargs.setdefault("thinking_mode", "adaptive")
                 elif thinking_type == "disabled":
                     merged_ct_kwargs["enable_thinking"] = False
-
-        _entry = get_engine_pool().get_entry(resolved_model)
 
         logger.debug(
             f"Tool result truncation config: max_tokens={max_tool_result_tokens}, "

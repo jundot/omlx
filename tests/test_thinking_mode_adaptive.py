@@ -34,12 +34,22 @@ from omlx.model_settings import ModelSettings
 # ---------------------------------------------------------------------------
 
 
-def _capture_anthropic_ct_kwargs(monkeypatch, model_type, body_extra, settings=None):
+def _capture_anthropic_ct_kwargs(
+    monkeypatch,
+    model_type,
+    body_extra,
+    settings=None,
+    *,
+    pool_config_model_type=None,
+):
     """POST /v1/messages and return the chat_template_kwargs the engine saw.
 
     ``preflight_chat`` raises so the request stops at the generation boundary;
     everything upstream (kwarg merge, thinking mapping, budget injection,
     grammar derivation) has already run by then.
+
+    ``pool_config_model_type`` decouples the pool entry's ``config_model_type``
+    from ``engine.model_type``; it defaults to ``model_type``.
     """
     engine = MagicMock()
     engine.model_type = model_type
@@ -56,7 +66,9 @@ def _capture_anthropic_ct_kwargs(monkeypatch, model_type, body_extra, settings=N
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
     pool.get_entry.return_value = SimpleNamespace(
-        config_model_type=model_type,
+        config_model_type=(
+            model_type if pool_config_model_type is None else pool_config_model_type
+        ),
         preserve_thinking_default=None,
     )
 
@@ -225,6 +237,51 @@ class TestAnthropicThinkingType:
         )
         assert ct_kwargs == {"thinking_mode": "adaptive", "enable_thinking": True}
 
+    def test_client_supplied_thinking_mode_wins_over_adaptive(self, monkeypatch):
+        """A client's ``thinking_mode`` must not be clobbered by the injection.
+
+        This is the case that regressed against main: assigning the key
+        unconditionally overwrote the client's value.
+        """
+        ct_kwargs = _capture_anthropic_ct_kwargs(
+            monkeypatch,
+            "minimax_m3",
+            {
+                "thinking": {"type": "adaptive"},
+                "chat_template_kwargs": {"thinking_mode": "disabled"},
+            },
+        )
+        assert ct_kwargs == {"thinking_mode": "disabled", "enable_thinking": True}
+
+    def test_forced_thinking_mode_setting_wins_over_adaptive(self, monkeypatch):
+        """``forced_ct_kwargs=["thinking_mode"]`` pins the operator's value."""
+        ct_kwargs = _capture_anthropic_ct_kwargs(
+            monkeypatch,
+            "minimax_m3",
+            {"thinking": {"type": "adaptive"}},
+            settings=ModelSettings(
+                chat_template_kwargs={"thinking_mode": "disabled"},
+                forced_ct_kwargs=["thinking_mode"],
+            ),
+        )
+        assert ct_kwargs == {"thinking_mode": "disabled", "enable_thinking": True}
+
+    def test_pool_config_model_type_enables_injection_when_engine_type_is_none(
+        self, monkeypatch
+    ):
+        """The pool entry's ``config_model_type`` alone must enable injection.
+
+        ``engine.model_type`` can be ``None`` and the served name need not look
+        like MiniMax; the pool's configured type still identifies the template.
+        """
+        ct_kwargs = _capture_anthropic_ct_kwargs(
+            monkeypatch,
+            None,
+            {"thinking": {"type": "adaptive"}},
+            pool_config_model_type="minimax_m3",
+        )
+        assert ct_kwargs == {"thinking_mode": "adaptive", "enable_thinking": True}
+
 
 # ---------------------------------------------------------------------------
 # 2. The MiniMax-M3 translator: boolean -> thinking_mode
@@ -261,7 +318,7 @@ class TestMinimaxThinkingKwargsTable:
         ],
         ids=["true", "false", "absent", "both-adaptive", "both-disabled"],
     )
-    def _table(self, kwargs, expected):
+    def test_table(self, kwargs, expected):
         assert self._translate(kwargs) == expected
 
     def test_translator_emits_adaptive_when_the_boolean_carries_it(self):
@@ -275,6 +332,81 @@ class TestMinimaxThinkingKwargsTable:
         assert self._translate({"enable_thinking": "adaptive"}) == {
             "thinking_mode": "adaptive"
         }
+
+
+class TestVlmMinimaxThinkingMode:
+    """``VLMBatchedEngine`` calls its own translator, not the patch-module one.
+
+    Both functions must map every input identically; the VL translator used to
+    drop a string ``enable_thinking`` on the floor.
+    """
+
+    @staticmethod
+    def _translate(model_type, kwargs):
+        from omlx.engine.vlm import _apply_minimax_m3_thinking_mode
+
+        out = dict(kwargs)
+        _apply_minimax_m3_thinking_mode(model_type, out)
+        return out
+
+    @pytest.mark.parametrize(
+        "kwargs, expected",
+        [
+            ({"enable_thinking": True}, {"thinking_mode": "enabled"}),
+            ({"enable_thinking": False}, {"thinking_mode": "disabled"}),
+            # No boolean, nothing to derive.
+            ({}, {}),
+            ({"enable_thinking": "adaptive"}, {"thinking_mode": "adaptive"}),
+            # The model-native keyword wins and enable_thinking is dropped.
+            (
+                {"enable_thinking": True, "thinking_mode": "adaptive"},
+                {"thinking_mode": "adaptive"},
+            ),
+            (
+                {"enable_thinking": False, "thinking_mode": "disabled"},
+                {"thinking_mode": "disabled"},
+            ),
+        ],
+        ids=[
+            "true",
+            "false",
+            "absent",
+            "adaptive",
+            "both-adaptive",
+            "both-disabled",
+        ],
+    )
+    def test_vl_translator_table(self, kwargs, expected):
+        assert self._translate("minimax_m3_vl", kwargs) == expected
+
+    def test_vl_translator_emits_adaptive(self):
+        assert self._translate("minimax_m3_vl", {"enable_thinking": "adaptive"}) == {
+            "thinking_mode": "adaptive"
+        }
+
+    def test_non_minimax_type_is_a_noop(self):
+        kwargs = {"enable_thinking": "adaptive"}
+        assert self._translate("qwen3_5", kwargs) == kwargs
+
+    def test_both_translators_agree_on_every_input(self):
+        from omlx.patches.mlx_vlm_minimax_m3_compat import (
+            _apply_minimax_thinking_kwargs,
+        )
+
+        cases = [
+            {},
+            {"enable_thinking": True},
+            {"enable_thinking": False},
+            {"enable_thinking": None},
+            {"enable_thinking": "adaptive"},
+            {"thinking_mode": "adaptive"},
+            {"enable_thinking": True, "thinking_mode": "disabled"},
+            {"enable_thinking": "adaptive", "thinking_mode": "enabled"},
+        ]
+        for kwargs in cases:
+            patch_out = dict(kwargs)
+            _apply_minimax_thinking_kwargs(patch_out)
+            assert self._translate("minimax_m3_vl", kwargs) == patch_out, kwargs
 
 
 # ---------------------------------------------------------------------------
