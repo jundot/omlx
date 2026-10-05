@@ -1635,6 +1635,13 @@ def test_payload_without_any_close_marker_is_still_withheld():
         ('<tool_call>[{"name":"f"', True),
         ("<tool_call><function=write><parameter=x>", True),
         ('<|tool_call_start|>{"name":"f"', True),
+        # The opener is the call syntax itself, so nothing was quoted: this is
+        # a bare attribute-function call cut mid-argument (#4241 review).
+        ("<function=write><parameter=content>cut", True),
+        # A marker with nothing behind it is a call cut at its own marker;
+        # recovering it would leak the control token into the answer.
+        ("<tool_call>", True),
+        ("<tool_call>   ", True),
     ],
 )
 def test_recovery_candidate_classifies_payload_versus_prose(withheld, is_payload):
@@ -1661,6 +1668,20 @@ def test_closed_envelope_leaves_no_recovery_payload_flag():
 
     assert f.take_recovery_candidate() == ""
     assert f.take_recovery_is_payload() is False
+
+
+def test_gemma_style_payload_opener_is_classified_as_payload():
+    """A native ``call:name{...}`` payload is a call, not prose (#4241)."""
+
+    f = ToolCallStreamFilter(
+        _make_tokenizer_with_end("<|tool_call>", "<|tool_call|>")
+    )
+
+    f.feed('<|tool_call>call:get_weather{city:"Seat')
+    f.finish()
+
+    assert f.take_recovery_is_payload() is True
+    assert f.take_recovery_candidate() == '<|tool_call>call:get_weather{city:"Seat'
 
 
 def test_close_marker_fallback_rescans_the_recovered_tail():

@@ -2605,12 +2605,12 @@ class ToolCallStreamFilter:
         return candidate
 
     def take_recovery_is_payload(self) -> bool:
-        """Whether the drained candidate opens a structured tool payload.
+        """Whether the withheld tail opens a structured tool payload.
 
-        True means the withheld tail is a truncated tool call, not prose: a
-        caller must keep treating it as a failed call rather than surfacing
-        markup as answer text.  Drained together with
-        ``take_recovery_candidate``; both default to False.
+        True means the tail is a truncated tool call, not prose: a caller must
+        keep treating it as a failed call rather than surfacing markup as
+        answer text.  Drained independently of ``take_recovery_candidate``
+        (each read clears only its own state); both default to False.
         """
 
         flag = self._recovery_is_payload
@@ -3246,8 +3246,8 @@ class ToolCallStreamFilter:
 
         return "".join(out)
 
-    def _withheld_payload_body(self, withheld: str) -> str:
-        """Return ``withheld`` with its opening envelope marker removed.
+    def _withheld_opener(self, withheld: str) -> str:
+        """Return the opening envelope marker ``withheld`` starts with.
 
         Longest matching marker wins so an overlapping tokenizer-supplied
         marker cannot shadow a more specific built-in pair.
@@ -3261,7 +3261,33 @@ class ToolCallStreamFilter:
                 and len(start_marker) > len(opener)
             ):
                 opener = start_marker
-        return withheld[len(opener) :]
+        return opener
+
+    def _withheld_is_payload(self, withheld: str) -> bool:
+        """Whether the tail withheld at EOF is a truncated call, not prose.
+
+        The terminal parser reports ``incomplete`` for a control marker the
+        model merely quoted in prose exactly as it does for a call the stream
+        cut short (#4241), so the shape of the tail decides.  Three forms are
+        payloads by construction:
+
+        * the opener *is* the call syntax (``<function=``), so nothing was
+          quoted -- a bare attribute-function call was cut mid-argument;
+        * nothing follows the opener, which is a call cut at its own marker,
+          never a sentence; recovering it would leak the control marker;
+        * the tail opens the way a payload grammar does: ``<``, ``{``, ``[``,
+          or Gemma's ``call:name{...}``.
+        """
+
+        opener = self._withheld_opener(withheld)
+        if opener == _XML_FUNCTION_OPEN:
+            return True
+        body = withheld[len(opener) :].lstrip()
+        if not body:
+            return True
+        if body[0] in "<{[":
+            return True
+        return body.startswith("call:")
 
     def _unwind_withheld_at_eof(
         self, candidate: str, marker: str, start_marker: str
@@ -3310,11 +3336,10 @@ class ToolCallStreamFilter:
                     self._recovery_candidate = withheld
                     # A model that quotes a literal control marker in prose
                     # opens the same envelope as a real call and ends the turn
-                    # the same way, so the withheld text is only recoverable
-                    # when what follows the marker is not a payload opener
-                    # (#4241).
-                    body = self._withheld_payload_body(withheld).lstrip()
-                    self._recovery_is_payload = bool(body) and body[0] in "<{["
+                    # the same way, so only a prose-shaped tail is recoverable;
+                    # a payload-shaped one (including a bare
+                    # ``<function=...`` call) stays a failed call (#4241).
+                    self._recovery_is_payload = self._withheld_is_payload(withheld)
                     logger.warning(
                         "Unclosed tool-call envelope at end of stream; "
                         "withheld %d characters are available for content "

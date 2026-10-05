@@ -4986,6 +4986,54 @@ async def test_truncated_sibling_of_a_delivered_call_keeps_the_error(api):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # The opener is the call syntax itself, so nothing was quoted: this is
+        # a bare attribute-function call cut mid-argument.
+        "<function=write><parameter=content>cut",
+        # A marker with nothing behind it is a call cut at its own marker.
+        "<tool_call>",
+    ],
+)
+async def test_call_syntax_envelope_is_never_recovered_as_content(api, raw):
+    """Counter-example: these tails are payloads, not prose (#4241 review)."""
+    events = await _recovery_stream(raw, api)
+
+    assert _recovery_error_codes(events, api) == ["incomplete_tool_call"]
+    assert not _recovery_calls(events, api)
+    assert _recovery_text(events, api) == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+async def test_recovered_prose_reaches_the_authoritative_final_text(api):
+    """The recovered tail must reach the final object, not only the deltas."""
+    events = await _recovery_stream(_RECOVERY_PROSE, api)
+
+    streamed = _recovery_text(events, api)
+    assert "This sentence must survive. END" in streamed
+
+    if api == "responses":
+        tail = "This sentence must survive. END"
+        done = [
+            e.get("text")
+            for e in events
+            if e.get("type") == "response.output_text.done"
+        ]
+        assert [t for t in done if t.endswith(tail)], done
+        completed = [
+            item["content"][0]["text"]
+            for e in events
+            if e.get("type") == "response.completed"
+            for item in e["response"].get("output", [])
+            if item.get("type") == "message"
+        ]
+        assert [t for t in completed if t.endswith(tail)], completed
+
+
+@pytest.mark.asyncio
 async def test_withheld_prose_never_reports_a_tool_call_finish():
     """Recovering prose must not look like a tool turn to the client."""
     events = await _recovery_stream(_RECOVERY_PROSE, "chat")

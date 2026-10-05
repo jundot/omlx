@@ -8048,10 +8048,12 @@ async def stream_responses_api(
     withheld_is_payload = (
         tool_filter.take_recovery_is_payload() if tool_filter else False
     )
+    recovered_content_visible = ""
     if _withholding_is_recoverable(tool_calls, tool_failure, withheld_is_payload):
         for ev in _emit_reasoning_delta(recovered_thinking):
             yield ev
         if recovered_content:
+            recovered_content_visible = recovered_content
             if reasoning_opened and not reasoning_closed:
                 for ev in _close_reasoning():
                     yield ev
@@ -8086,7 +8088,15 @@ async def stream_responses_api(
                 except (json.JSONDecodeError, AttributeError):
                     pass
 
-    final_text = cleaned_text.strip() if cleaned_text else ""
+    # The recovered tail was streamed as a delta, so the authoritative final
+    # text has to carry it too: clients that read ``response.completed`` (or
+    # chain with ``previous_response_id``) never see the deltas (#4241).  Some
+    # extractions already fold an unclosed envelope into ``cleaned_text``, so
+    # only a tail that is genuinely missing is appended.
+    full_text = cleaned_text or ""
+    if recovered_content_visible and recovered_content_visible not in full_text:
+        full_text = f"{full_text}{recovered_content_visible}"
+    final_text = full_text.strip() if full_text.strip() else ""
 
     # Process response_format if specified
     if response_format and not tool_calls:
