@@ -69,7 +69,7 @@
                             <button type="button" x-show="profileScope === 'preset'"
                                     @click="refreshPresets()"
                                     :disabled="refreshingPresets"
-                                    @mouseenter="showTip($event.currentTarget, 'Fetch latest presets from omlx.ai')"
+                                    @mouseenter="showTip($event.currentTarget, window.t('modal.model_settings.refresh_presets_tooltip'))"
                                     @mouseleave="hideTip()"
                                     class="p-1 rounded-full text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 transition-all disabled:opacity-50">
                                 <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
@@ -770,7 +770,7 @@
                                                class="text-xs text-amber-600 mt-1"
                                                x-text="modelSettings.mtp_compatibility_reason"></p>
                                             <button type="button"
-                                                    x-show="!modelSettings.mtp_compatible && modelSettings.mtp_compatibility_reason.includes('MTPLX side-car')"
+                                                    x-show="!modelSettings.mtp_compatible && modelSettings.mtplx_sidecar_available"
                                                     @click="importMtplxSidecar()"
                                                     :disabled="importingMtplx"
                                                     :class="importingMtplx ? 'opacity-40 cursor-not-allowed' : ''"
