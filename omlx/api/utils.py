@@ -52,6 +52,31 @@ def uses_native_reasoning_content(
     return "minimax" in lowered and "m3" in lowered
 
 
+# Model families whose chat templates take a three-state ``thinking_mode``
+# ("enabled" / "disabled" / "adaptive") instead of the two-state
+# ``enable_thinking`` boolean.  Only these templates can honour the "adaptive"
+# state of the Anthropic ``thinking.type`` field; every other template reads
+# the boolean, and some (DeepSeek V4.x) own an unrelated ``thinking_mode``
+# whose value space is ("chat", "thinking").
+_THINKING_MODE_MODEL_TYPES = {"minimax_m3", "minimax_m3_vl"}
+
+
+def uses_thinking_mode_kwarg(
+    model_name: str | None = None,
+    *,
+    config_model_type: str | None = None,
+    engine_model_type: str | None = None,
+) -> bool:
+    """Return whether the model's chat template takes ``thinking_mode``."""
+    if config_model_type in _THINKING_MODE_MODEL_TYPES:
+        return True
+    if engine_model_type in _THINKING_MODE_MODEL_TYPES:
+        return True
+
+    lowered = (model_name or "").lower()
+    return "minimax" in lowered and "m3" in lowered
+
+
 def cache_reasoning_output(
     settings: Any,
     *,

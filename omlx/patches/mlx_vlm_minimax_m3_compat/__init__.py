@@ -452,11 +452,23 @@ def _config_model_type(config: Any) -> str | None:
 def _apply_minimax_thinking_kwargs(kwargs: dict[str, Any]) -> None:
     enable_thinking = kwargs.pop("enable_thinking", None)
     if "thinking_mode" in kwargs:
+        if enable_thinking is not None:
+            logger.debug(
+                "MiniMax M3 request carries both enable_thinking=%r and "
+                "thinking_mode=%r; the model-native thinking_mode wins",
+                enable_thinking,
+                kwargs["thinking_mode"],
+            )
         return
     if enable_thinking is True:
         kwargs["thinking_mode"] = "enabled"
     elif enable_thinking is False:
         kwargs["thinking_mode"] = "disabled"
+    elif enable_thinking == "adaptive":
+        # The template has three states; the boolean key only carries two, so
+        # a string on it would otherwise be dropped and the request would fall
+        # back to the template default (#4242).
+        kwargs["thinking_mode"] = "adaptive"
 
 
 def _build_minimax_messages(prompt: Any, num_images: int = 0) -> list[dict[str, Any]]:
