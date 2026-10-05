@@ -306,6 +306,13 @@ def _draft_path_is_unusable(value: str) -> bool:
     return not (path / "config.json").is_file()
 
 
+# Dormant DFlash draft paths already reported in this process. Every save
+# re-sends the full payload and profile create/update runs the same validator,
+# so without this the same broken value would log a warning on every write
+# (#4217).
+_WARNED_DORMANT_DFLASH_DRAFTS: set[str] = set()
+
+
 class ModelSettingsRequest(BaseModel):
     """Request model for updating per-model settings."""
 
@@ -468,11 +475,22 @@ class ModelSettingsRequest(BaseModel):
         deliberately parks the stale path in settings.json so it comes back
         when Custom is picked again, so it is validated when it is live and
         kept verbatim when it is not.
+
+        This validator only sees the request payload, so it cannot tell whether
+        DFlash is already on in the *stored* settings -- the route re-checks the
+        effective post-save state, which also covers single-field patches that
+        omit ``dflash_enabled``.
         """
+        if not value:
+            return None
         # dflash_enabled is declared above this field, so pydantic has already
         # validated it (unsent -> None) by the time we run.
         if not info.data.get("dflash_enabled"):
-            if value and _draft_path_is_unusable(value):
+            if (
+                _draft_path_is_unusable(value)
+                and value not in _WARNED_DORMANT_DFLASH_DRAFTS
+            ):
+                _WARNED_DORMANT_DFLASH_DRAFTS.add(value)
                 logger.warning(
                     "DFlash draft model %r is missing or incomplete but DFlash "
                     "is off; keeping the stored value for when it is "
@@ -3227,6 +3245,23 @@ async def update_model_settings(
         )
     if "dflash_verify_mode" in sent:
         current_settings.dflash_verify_mode = request.dflash_verify_mode
+    # The field validator only sees the payload, so it cannot know that DFlash
+    # is already enabled in the stored settings. Check the effective post-save
+    # state here -- after both DFlash blocks have been applied and before
+    # anything is validated, persisted or pushed to the engine -- so a
+    # single-field patch (the macOS app sends ``dflash_draft_model`` alone) or
+    # a flag-only enable can never leave DFlash on with a draft path that
+    # cannot load (#4217). A rejected save persists nothing.
+    draft_model_after = current_settings.dflash_draft_model
+    if (
+        current_settings.dflash_enabled
+        and draft_model_after
+        and _draft_path_is_unusable(draft_model_after)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Draft model has no config.json: {draft_model_after}",
+        )
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:

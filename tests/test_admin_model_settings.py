@@ -615,7 +615,11 @@ def test_runtime_signature_gates_mtp_depth_on_lightning_mtp():
 
 
 def _draft_path_client(tmp_path, monkeypatch):
-    """Wire the admin router behind a TestClient with a real settings manager."""
+    """Wire the admin router behind a TestClient with a real settings manager.
+
+    Returns ``(client, settings, manager)``; ``settings`` is the stored state
+    the fake manager snapshots and ``manager`` records the persistence calls.
+    """
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -639,14 +643,12 @@ def _draft_path_client(tmp_path, monkeypatch):
     # compatibility probe that otherwise 400s before the draft path is read.
     from omlx.engine import dflash as dflash_engine
 
-    monkeypatch.setattr(
-        dflash_engine, "is_dflash_compatible", lambda _p: (True, "")
-    )
+    monkeypatch.setattr(dflash_engine, "is_dflash_compatible", lambda _p: (True, ""))
 
     app = FastAPI()
     app.include_router(admin_routes.router)
     app.dependency_overrides[admin_routes.require_admin] = _fake_require_admin
-    return TestClient(app), settings, tmp_path
+    return TestClient(app), settings, manager
 
 
 def _draft_dir(tmp_path) -> str:
@@ -739,7 +741,7 @@ def test_null_dflash_enabled_leaves_stale_draft_path_untouched(tmp_path, monkeyp
 def test_dflash_enabled_absent_from_payload_does_not_validate_draft(
     tmp_path, monkeypatch
 ):
-    """#4217: the stored DFlash flag is unknown here, so do not hard-fail."""
+    """#4217: with DFlash stored off, an unsent flag must not hard-fail."""
     client, settings, _ = _draft_path_client(tmp_path, monkeypatch)
     draft = _draft_dir(tmp_path)
     _delete_draft(draft)
@@ -824,20 +826,153 @@ def test_specprefill_draft_path_validation_is_unchanged():
             )
 
 
-def test_dflash_draft_field_unsent_is_never_validated(tmp_path, monkeypatch):
-    """#4217: an unsent draft field keeps its stored value, no path check."""
-    client, settings, _ = _draft_path_client(tmp_path, monkeypatch)
+def test_dflash_draft_field_unsent_rejects_the_effective_on_state(
+    tmp_path, monkeypatch
+):
+    """#4217: the payload validator is skipped for an unsent draft field, but
+    the route still rejects an effective DFlash-on + unusable-path state.
+
+    The stored value is never rewritten, so without the route check the broken
+    configuration would be silently re-persisted on every unrelated save.
+    """
+    client, settings, manager = _draft_path_client(tmp_path, monkeypatch)
     draft = _draft_dir(tmp_path)
     settings.dflash_draft_model = draft
     settings.dflash_enabled = True
     _delete_draft(draft)
 
+    response = client.put("/admin/api/models/ling/settings", json={"temperature": 0.3})
+    assert response.status_code == 422, response.text
+    assert "no config.json" in response.text
+    assert settings.temperature != 0.3
+    manager.set_settings.assert_not_called()
+
+
+def test_single_field_draft_path_patch_with_stored_dflash_on_is_rejected(
+    tmp_path, monkeypatch
+):
+    """macOS single-field patch shape: no ``dflash_enabled`` in the payload.
+
+    ``ModelSettingsScreenVM`` sends only ``dflash_draft_model`` for the draft
+    picker and ``ModelsDTO`` uses ``encodeIfPresent``, so the request validator
+    takes its OFF branch. The route, which knows the stored flag, must reject
+    the save and persist nothing.
+    """
+    client, settings, manager = _draft_path_client(tmp_path, monkeypatch)
+    stored_draft = _draft_dir(tmp_path)
+    # A path the user deleted from disk: absolute, no config.json.
+    stale = str(tmp_path / "deleted-draft")
+    settings.dflash_enabled = True
+    settings.dflash_draft_model = stored_draft
+
     response = client.put(
-        "/admin/api/models/ling/settings", json={"temperature": 0.3}
+        "/admin/api/models/ling/settings", json={"dflash_draft_model": stale}
+    )
+    assert response.status_code == 422, response.text
+    assert "no config.json" in response.text
+    assert stale in response.text
+
+    # Rejected before persistence: the stored path and flag are untouched.
+    manager.set_settings.assert_not_called()
+    assert settings.dflash_draft_model == stored_draft
+    assert settings.dflash_enabled is True
+
+
+def test_flag_only_enable_with_a_stale_stored_draft_path_is_rejected(
+    tmp_path, monkeypatch
+):
+    """The macOS app enables DFlash with the flag alone.
+
+    The PR body claimed the path is rejected "when DFlash is next actually
+    enabled"; that never happened because the draft-path validator only runs
+    when the payload carries the draft field.
+    """
+    client, settings, manager = _draft_path_client(tmp_path, monkeypatch)
+    draft = _draft_dir(tmp_path)
+    settings.dflash_enabled = False
+    settings.dflash_draft_model = draft
+    _delete_draft(draft)
+
+    response = client.put(
+        "/admin/api/models/ling/settings", json={"dflash_enabled": True}
+    )
+    assert response.status_code == 422, response.text
+    assert "no config.json" in response.text
+    assert draft in response.text
+
+    manager.set_settings.assert_not_called()
+    assert settings.dflash_enabled is False
+
+
+def test_single_field_draft_path_patch_with_stored_dflash_off_is_accepted(
+    tmp_path, monkeypatch
+):
+    """#4217 regression guard: a disabled DFlash parks the stale path."""
+    client, settings, manager = _draft_path_client(tmp_path, monkeypatch)
+    draft = _draft_dir(tmp_path)
+    settings.dflash_enabled = False
+    _delete_draft(draft)
+
+    response = client.put(
+        "/admin/api/models/ling/settings", json={"dflash_draft_model": draft}
     )
     assert response.status_code == 200, response.text
-    assert settings.temperature == 0.3
+    manager.set_settings.assert_called_once()
     assert settings.dflash_draft_model == draft
+
+
+def test_profile_normalization_keeps_a_stale_draft_path_when_dflash_is_off(
+    tmp_path, monkeypatch
+):
+    """Profile create/update behaviour for a dormant broken path (#4217).
+
+    ``_normalize_profile_settings`` runs the request validator, which warns but
+    never rewrites the value; the route's effective-state check does not run on
+    profile writes, so a profile may legitimately store a dormant bad path.
+    """
+    monkeypatch.setattr(admin_routes, "_WARNED_DORMANT_DFLASH_DRAFTS", set())
+    stale = str(tmp_path / "deleted-draft")
+
+    normalized = admin_routes._normalize_profile_settings(
+        {"dflash_enabled": False, "dflash_draft_model": stale}
+    )
+
+    assert normalized == {"dflash_enabled": False, "dflash_draft_model": stale}
+
+
+def test_empty_dflash_draft_path_normalises_to_none_while_disabled():
+    """#4217: the off branch keeps the sibling validators' "" -> None rule."""
+    request = admin_routes.ModelSettingsRequest(
+        dflash_draft_model="", dflash_enabled=False
+    )
+    assert request.model_dump()["dflash_draft_model"] is None
+
+
+def test_dormant_draft_warning_fires_once_per_distinct_value(
+    tmp_path, monkeypatch, caplog
+):
+    """#4217: the full-payload console save must not warn on every write."""
+    import logging
+
+    monkeypatch.setattr(admin_routes, "_WARNED_DORMANT_DFLASH_DRAFTS", set())
+    client, settings, _ = _draft_path_client(tmp_path, monkeypatch)
+    draft = _draft_dir(tmp_path)
+    _delete_draft(draft)
+    payload = {"dflash_enabled": False, "dflash_draft_model": draft}
+
+    with caplog.at_level(logging.WARNING, logger="omlx.admin.routes"):
+        for _ in range(3):
+            assert (
+                client.put("/admin/api/models/ling/settings", json=payload).status_code
+                == 200
+            )
+
+    warnings = [
+        record
+        for record in caplog.records
+        if "missing or incomplete" in record.getMessage()
+    ]
+    assert len(warnings) == 1
 
 
 def test_dflash_draft_warning_only_fires_for_a_broken_path(
@@ -877,8 +1012,10 @@ def test_dflash_enabled_is_declared_before_the_draft_model_field():
     """#4217: the sibling-aware validator relies on pydantic field order.
 
     ``info.data`` only holds fields validated so far, so moving
-    ``dflash_enabled`` below ``dflash_draft_model`` would silently turn the
-    dormant-DFlash path back into a hard 422. Fail loudly instead.
+    ``dflash_enabled`` below ``dflash_draft_model`` would leave ``info.data``
+    empty and the validator would take the OFF branch, silently ACCEPTING a
+    stale path with no config.json instead of rejecting it. Fail loudly
+    instead.
     """
     names = list(admin_routes.ModelSettingsRequest.model_fields)
     assert names.index("dflash_enabled") < names.index("dflash_draft_model")
