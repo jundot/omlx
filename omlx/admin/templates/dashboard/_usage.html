@@ -29,7 +29,7 @@
                 <template x-for="[key, label] in [['requests', 'requests'], ['total_tokens', 'total'], ['prompt_tokens', 'prompt'], ['completion_tokens', 'output'], ['cached_tokens', 'cached']]" :key="key">
                     <div class="bg-neutral-50 rounded-xl border border-neutral-200 p-4">
                         <div class="text-xs text-neutral-500" x-text="window.t('usage.' + label)"></div>
-                        <div class="text-2xl font-semibold mt-2" x-text="number(data.totals[key])" :title="data.totals[key].toLocaleString()"></div>
+                        <div class="text-2xl font-semibold mt-2" x-text="number(data.totals[key])" :title="exact(data.totals[key])"></div>
                     </div>
                 </template>
             </div>
@@ -53,7 +53,7 @@
                                 <tr class="border-t border-neutral-200">
                                     <th scope="row" class="p-3 text-left font-medium" x-text="row.model_id"></th>
                                     <template x-for="key in ['requests', 'prompt_tokens', 'completion_tokens', 'cached_tokens', 'total_tokens']" :key="key">
-                                        <td class="p-3" x-text="number(row[key])" :title="row[key].toLocaleString()"></td>
+                                        <td class="p-3" x-text="number(row[key])" :title="exact(row[key])"></td>
                                     </template>
                                     <td class="p-3" x-text="speed(row.generation_tps)"></td>
                                 </tr>
@@ -74,7 +74,7 @@
                             <div style="display:grid;grid-template-columns:90px repeat(24,minmax(0,1fr));gap:3px" class="mb-1 items-center">
                                 <span class="text-xs text-neutral-500" x-text="day.date"></span>
                                 <template x-for="(tokens, hour) in day.tokens" :key="hour">
-                                    <span role="img" :aria-label="day.date + ' ' + hour + ':00 · ' + tokens.toLocaleString() + ' tokens'" :title="day.date + ' ' + hour + ':00 · ' + tokens.toLocaleString() + ' tokens'" :style="{backgroundColor: shade(tokens), height: '14px', borderRadius: '2px'}"></span>
+                                    <span role="img" :aria-label="day.date + ' ' + hour + ':00 · ' + exact(tokens) + ' tokens'" :title="day.date + ' ' + hour + ':00 · ' + exact(tokens) + ' tokens'" :style="{backgroundColor: shade(tokens), height: '14px', borderRadius: '2px'}"></span>
                                 </template>
                             </div>
                         </template>

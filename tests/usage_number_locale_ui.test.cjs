@@ -14,15 +14,26 @@ const source = fs.readFileSync(process.env.OMLX_USAGE_JS || 'omlx/admin/static/j
 
 const TOKENS = 33320000;
 
-// Load usage.js and return just the number() formatter bound to a UI language.
-function numberIn(uiLang, extra = {}) {
+// The locales omlx/admin/i18n ships; each must resolve to itself, never to the
+// runtime locale.
+const SHIPPED = ['en', 'zh', 'zh-TW', 'ja', 'ko', 'fr', 'cs', 'ru', 'es', 'pt-BR'];
+
+// CLDR uses U+00A0 (and sometimes U+202F) as the fr/cs/ru group separator; fold
+// them to a plain space so the assertion survives CLDR revisions.
+const fold = text => text.replace(/[\u00A0\u202F]/g, ' ');
+
+// Load usage.js and return the Alpine component bound to a UI language. An
+// undefined uiLang models a missing documentElement entirely.
+function componentIn(uiLang, extra = {}) {
     const document = {hidden: false};
     if (uiLang !== undefined) document.documentElement = {lang: uiLang};
     const context = vm.createContext({fetch: () => {}, AbortController, URLSearchParams, Intl,
         window: {t: key => key}, document, setInterval, clearInterval, ...extra});
     vm.runInContext(source, context);
-    return context.usageHistory().number;
+    return context.usageHistory();
 }
+
+function numberIn(uiLang) { return componentIn(uiLang).number; }
 
 test('UI language, not runtime locale, selects the compact unit', () => {
     // 'en' must give SI units even when the runtime locale is CJK; 'zh-TW' must
@@ -31,7 +42,17 @@ test('UI language, not runtime locale, selects the compact unit', () => {
     assert.equal(numberIn('zh-TW')(TOKENS), '3332萬');
     assert.equal(numberIn('ja')(TOKENS), '3332万');
     assert.equal(numberIn('ko')(TOKENS), '3332만');
-    assert.equal(numberIn('fr')(TOKENS), '33,3 M');
+    assert.equal(fold(numberIn('fr')(TOKENS)), '33,3 M');
+});
+
+test('every shipped UI language resolves to itself', () => {
+    for (const code of SHIPPED) {
+        assert.equal(componentIn(code).locale(), code);
+    }
+    // A compact counter for each shipped code renders without throwing.
+    for (const code of SHIPPED) {
+        assert.equal(typeof componentIn(code).number(TOKENS), 'string');
+    }
 });
 
 test('an English UI on a zh-TW machine shows 33.3M, not 3332萬', () => {
@@ -54,15 +75,72 @@ test('an English UI on a zh-TW machine shows 33.3M, not 3332萬', () => {
     assert.equal(out.rendered, '33.3M');
 });
 
+test('unusable ui.language tags never fall back to the runtime locale', () => {
+    // ui.language is an unvalidated string (omlx/admin/routes.py:704). Two kinds
+    // of bad tag reach <html lang>: structurally invalid ones Intl throws on
+    // ('en_US', 'None', '') and structurally valid but unresolvable ones it
+    // silently maps to the runtime locale ('bogus'). On this zh-TW child both
+    // must render English, and an unshipped-but-valid tag ('de') must render its
+    // own locale — anything but the runtime CJK units.
+    const harness = `
+        const fs = require('node:fs'), vm = require('node:vm');
+        const source = fs.readFileSync(${JSON.stringify(process.env.OMLX_USAGE_JS || 'omlx/admin/static/js/usage.js')}, 'utf8');
+        const cases = [['bogus', 'bogus'], ['empty', ''], ['missing', null], ['unshipped', 'de'], ['malformed', 'None']];
+        const out = {runtime: Intl.NumberFormat().resolvedOptions().locale, cases: {}};
+        for (const [name, lang] of cases) {
+            const document = {hidden: false};
+            if (lang !== null) document.documentElement = {lang};
+            const ctx = vm.createContext({fetch: () => {}, AbortController, URLSearchParams, Intl,
+                window: {t: k => k}, document, setInterval, clearInterval});
+            vm.runInContext(source, ctx);
+            const view = ctx.usageHistory();
+            out.cases[name] = {locale: view.locale(), rendered: view.number(${TOKENS})};
+        }
+        console.log(JSON.stringify(out));`;
+    const out = JSON.parse(execFileSync(process.execPath, ['-e', harness],
+        {env: {...process.env, LANG: 'zh_TW.UTF-8', LC_ALL: 'zh_TW.UTF-8'}, encoding: 'utf8'}));
+    assert.match(out.runtime, /^zh/i, `expected a CJK runtime locale, got ${out.runtime}`);
+    for (const name of ['bogus', 'empty', 'missing', 'malformed']) {
+        assert.equal(out.cases[name].locale, 'en', `${name}: expected the English fallback`);
+        assert.equal(out.cases[name].rendered, '33.3M', `${name}: leaked the runtime locale`);
+    }
+    // 'de' is a valid tag omlx does not ship: ICU resolves it (or, on a minimal
+    // ICU build, it falls back to English) — never to the zh-TW runtime units.
+    assert.doesNotMatch(out.cases.unshipped.rendered, /[萬万만]/,
+        `unshipped tag leaked the runtime locale: ${out.cases.unshipped.rendered}`);
+});
+
+test('number() and exact() pass the resolved locale, never undefined', () => {
+    // A recording Intl makes the locale argument observable on any host, so the
+    // tooltip/aria-label formatting is pinned to the same locale as the counter
+    // without depending on the machine's ICU data.
+    const seen = [];
+    const spy = {
+        NumberFormat: function (locale, options) {
+            seen.push(locale);
+            return new Intl.NumberFormat(locale, options);
+        },
+    };
+    spy.NumberFormat.supportedLocalesOf = Intl.NumberFormat.supportedLocalesOf.bind(Intl.NumberFormat);
+    const view = componentIn('en', {Intl: spy});
+    assert.equal(view.number(TOKENS), '33.3M');
+    assert.equal(view.locale(), 'en');
+    assert.equal(view.number(1500), '1.5K');
+    assert.equal(view.exact(1500), '1,500');
+    assert.equal(view.exact(TOKENS), '33,320,000');
+    for (const locale of seen) assert.notEqual(locale, undefined);
+    assert.deepEqual([...new Set(seen)], ['en']);
+});
+
 test('a ui.language Intl cannot parse does not break the panel', () => {
     // ui.language is an unvalidated string (omlx/admin/routes.py:704), so a
     // hand-edited settings.json can reach <html lang>. Intl throws RangeError
-    // on such tags; the counters must still render.
-    assert.doesNotThrow(() => numberIn('en_US')(TOKENS));
-    assert.doesNotThrow(() => numberIn('!!')(TOKENS));
-    assert.doesNotThrow(() => numberIn('')(TOKENS));
-    assert.doesNotThrow(() => numberIn(undefined)(TOKENS));   // no documentElement at all
-    assert.doesNotThrow(() => numberIn('   ')(TOKENS));
+    // on such tags; the counters must still render, in English.
+    for (const uiLang of ['en_US', '!!', '', '   ', undefined]) {
+        assert.doesNotThrow(() => numberIn(uiLang)(TOKENS));
+        assert.equal(numberIn(uiLang)(TOKENS), '33.3M');
+        assert.equal(componentIn(uiLang).locale(), 'en');
+    }
 });
 
 test('counter rendering is unchanged for zero, missing and fractional input', () => {
@@ -71,11 +149,20 @@ test('counter rendering is unchanged for zero, missing and fractional input', ()
         assert.equal(number(0), '0');
         assert.equal(number(null), '0');
         assert.equal(number(undefined), '0');
-        assert.equal(number(0.42), number(0.42));
-        assert.equal(number(1500), number(1500));
     }
-    assert.equal(numberIn('en')(0), '0');
-    assert.equal(numberIn('zh-TW')(0), '0');
+    // Values derived from the ECMA-402 compact spec, not from number() itself:
+    // en rounds 0.42 to one decimal and reaches the K unit at 1500, while zh-TW
+    // keeps 1500 unscaled because it has no 千 unit.
+    assert.equal(numberIn('en')(0.42), '0.4');
     assert.equal(numberIn('en')(999), '999');
     assert.equal(numberIn('en')(1500), '1.5K');
+    assert.equal(numberIn('zh-TW')(1500), '1500');
+});
+
+test('the Usage template formats tooltips and aria-labels with exact()', () => {
+    // The counters, their :title tooltips and the heatmap aria-label must share
+    // one locale; a bare toLocaleString() follows the runtime locale instead.
+    const template = fs.readFileSync('omlx/admin/templates/dashboard/_usage.html', 'utf8');
+    assert.doesNotMatch(template, /toLocaleString/);
+    assert.equal((template.match(/exact\(/g) || []).length, 4);
 });
