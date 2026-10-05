@@ -898,6 +898,12 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
         "min_p",
         "repetition_penalty",
         "presence_penalty",
+        "dry_multiplier",
+        "dry_base",
+        "dry_allowed_length",
+        "dry_penalty_last_n",
+        "dry_sequence_breakers",
+        "dry_exclude_reasoning",
         "enable_thinking",
         "preserve_thinking",
         "thinking_budget_tokens",
@@ -972,6 +978,12 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.min_p = None
     settings.repetition_penalty = None
     settings.presence_penalty = None
+    settings.dry_multiplier = None
+    settings.dry_base = None
+    settings.dry_allowed_length = None
+    settings.dry_penalty_last_n = None
+    settings.dry_sequence_breakers = None
+    settings.dry_exclude_reasoning = None
     settings.force_sampling = False
     settings.enable_thinking = None
     settings.preserve_thinking = None

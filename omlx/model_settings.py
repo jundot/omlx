@@ -201,7 +201,7 @@ class ModelSettings:
         presence_penalty: Presence penalty (None = use global default).
         dry_multiplier: DRY repetition penalty strength (None or 0 = disabled).
         dry_base: DRY penalty growth per extra matched token (None = 1.75).
-        dry_allowed_length: Longest repeat DRY leaves unpenalised (None = 2).
+        dry_allowed_length: Longest repeat DRY leaves unpenalized (None = 2).
         dry_penalty_last_n: Generated tokens DRY searches (None = 4096, -1 = all).
         dry_sequence_breakers: Strings that reset DRY matching (None = defaults).
         dry_exclude_reasoning: Skip DRY inside the thinking block (None = False).

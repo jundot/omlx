@@ -93,6 +93,12 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let minP: Double?
     let presencePenalty: Double?
     let repetitionPenalty: Double?
+    let dryMultiplier: Double?
+    let dryBase: Double?
+    let dryAllowedLength: Int?
+    let dryPenaltyLastN: Int?
+    let drySequenceBreakers: [String]?
+    let dryExcludeReasoning: Bool?
     let forceSampling: Bool?
     let maxToolResultTokens: Int?
     let enableThinking: Bool?

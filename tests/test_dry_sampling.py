@@ -64,7 +64,7 @@ class TestDryMatching:
                 assert got[token] == pytest.approx(value, rel=1e-4)
 
     def test_worked_example(self):
-        # the cat sat on the mat . the cat sat on  ->  penalise "the"
+        # the cat sat on the mat . the cat sat on  ->  penalize "the"
         the, cat, sat, on, mat, dot = 1, 2, 3, 4, 5, 6
         history = [the, cat, sat, on, the, mat, dot, the, cat, sat, on]
         processor = DryProcessor(0.8, breaker_token_ids=[dot])
@@ -101,13 +101,13 @@ class TestDryMatching:
 
 
 class TestDryScope:
-    def test_prompt_only_repeat_is_not_penalised(self):
+    def test_prompt_only_repeat_is_not_penalized(self):
         prompt = [1, 2, 3, 4, 5, 6]
         generated = [1, 2, 3]
         processor = DryProcessor(0.8, prompt_length=len(prompt))
         assert _penalties(processor, mx.array(prompt + generated)) == {}
 
-    def test_loop_in_generated_output_is_penalised(self):
+    def test_loop_in_generated_output_is_penalized(self):
         prompt = [1, 2, 3, 4, 5, 6]
         generated = [20, 21, 22, 23, 20, 21, 22]
         processor = DryProcessor(0.8, prompt_length=len(prompt))
@@ -122,13 +122,13 @@ class TestDryScope:
         history = reasoning + [think_end] + [20, 21, 22]
         assert _penalties(processor, mx.array(history)) == {}
 
-    def test_loop_inside_reasoning_is_penalised(self):
+    def test_loop_inside_reasoning_is_penalized(self):
         processor = DryProcessor(0.8, think_end_token_id=50)
         assert _penalties(processor, mx.array([20, 21, 22, 23, 20, 21, 22])) == {
             23: pytest.approx(0.8 * 1.75)
         }
 
-    def test_loop_after_reasoning_is_penalised(self):
+    def test_loop_after_reasoning_is_penalized(self):
         processor = DryProcessor(0.8, think_end_token_id=50)
         history = [20, 21, 22, 23, 50, 30, 31, 32, 33, 30, 31, 32]
         assert _penalties(processor, mx.array(history)) == {
@@ -179,7 +179,7 @@ class TestDryExcludeReasoning:
         processor = self._processor(starts_in_reasoning=True, prompt_length=len(prompt))
         assert _penalties(processor, mx.array(prompt + self.LOOP)) == {}
 
-    def test_non_thinking_response_is_still_penalised(self):
+    def test_non_thinking_response_is_still_penalized(self):
         processor = self._processor()
         assert _penalties(processor, mx.array(self.LOOP)) == {
             23: pytest.approx(0.8 * 1.75)

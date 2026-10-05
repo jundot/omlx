@@ -72,6 +72,33 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(settings["turboquant_kv_enabled"]?.value as? Bool, true)
     }
 
+    func testDrySettingsInWorkingProfile() {
+        let vm = ModelSettingsScreenVM()
+        XCTAssertNil(vm.currentSettingsDict()[ProfileSettingsKey.dryMultiplier])
+        XCTAssertNil(vm.currentSettingsDict()[ProfileSettingsKey.dryExcludeReasoning])
+
+        vm.dryMultiplier = "0.8"
+        vm.dryBase = "1.75"
+        vm.dryAllowedLength = "3"
+        vm.dryPenaltyLastN = "-1"
+        vm.dryExcludeReasoning = true
+        vm.drySequenceBreakers = ["\n", "/"]
+
+        let settings = vm.currentSettingsDict()
+        XCTAssertEqual(settings[ProfileSettingsKey.dryMultiplier]?.value as? Double, 0.8)
+        XCTAssertEqual(settings[ProfileSettingsKey.dryBase]?.value as? Double, 1.75)
+        XCTAssertEqual(settings[ProfileSettingsKey.dryAllowedLength]?.value as? Int, 3)
+        XCTAssertEqual(settings[ProfileSettingsKey.dryPenaltyLastN]?.value as? Int, -1)
+        XCTAssertEqual(settings[ProfileSettingsKey.dryExcludeReasoning]?.value as? Bool, true)
+        // Breakers have no editor; the stored list must survive a profile
+        // save, and must encode (AnyCodable only encodes [AnyCodable]).
+        XCTAssertEqual(
+            settings[ProfileSettingsKey.drySequenceBreakers],
+            AnyCodable([AnyCodable("\n"), AnyCodable("/")])
+        )
+        XCTAssertNoThrow(try JSONEncoder().encode(settings))
+    }
+
     func testLightningMtpAdaptiveMaxDepthInWorkingProfile() {
         let vm = ModelSettingsScreenVM()
         vm.mtpEnabled = true

@@ -247,6 +247,14 @@ final class ModelSettingsScreenVM {
     var minP: String = ""
     var repetitionPenalty: String = ""
     var presencePenalty: String = ""
+    var dryMultiplier: String = ""
+    var dryBase: String = ""
+    var dryAllowedLength: String = ""
+    var dryPenaltyLastN: String = ""
+    var dryExcludeReasoning: Bool = false
+    /// No editor: carried through so saving a profile from the app keeps
+    /// breakers that were set through the API.
+    var drySequenceBreakers: [String]? = nil
     var ttlSeconds: String = ""
 
     // Advanced
@@ -583,6 +591,12 @@ final class ModelSettingsScreenVM {
                 self.minP = s?.minP.map { String($0) } ?? ""
                 self.repetitionPenalty = s?.repetitionPenalty.map { String($0) } ?? ""
                 self.presencePenalty = s?.presencePenalty.map { String($0) } ?? ""
+                self.dryMultiplier = s?.dryMultiplier.map { String($0) } ?? ""
+                self.dryBase = s?.dryBase.map { String($0) } ?? ""
+                self.dryAllowedLength = s?.dryAllowedLength.map(String.init) ?? ""
+                self.dryPenaltyLastN = s?.dryPenaltyLastN.map(String.init) ?? ""
+                self.dryExcludeReasoning = s?.dryExcludeReasoning ?? false
+                self.drySequenceBreakers = s?.drySequenceBreakers
                 self.ttlSeconds = s?.ttlSeconds.map(String.init) ?? ""
                 self.enableThinking = s?.enableThinking ?? true
                 self.qwen4PleSsdOffloadForced =
@@ -1238,6 +1252,17 @@ final class ModelSettingsScreenVM {
             putDouble(ProfileSettingsKey.minP, minP)
             putDouble(ProfileSettingsKey.repetitionPenalty, repetitionPenalty)
             putDouble(ProfileSettingsKey.presencePenalty, presencePenalty)
+            putDouble(ProfileSettingsKey.dryMultiplier, dryMultiplier)
+            putDouble(ProfileSettingsKey.dryBase, dryBase)
+            putInt(ProfileSettingsKey.dryAllowedLength, dryAllowedLength)
+            putInt(ProfileSettingsKey.dryPenaltyLastN, dryPenaltyLastN)
+            if dryExcludeReasoning {
+                putBool(ProfileSettingsKey.dryExcludeReasoning, true)
+            }
+            if let breakers = drySequenceBreakers {
+                out[ProfileSettingsKey.drySequenceBreakers] =
+                    AnyCodable(breakers.map { AnyCodable($0) })
+            }
         }
 
         // Universal — thinking / tool / reasoning
