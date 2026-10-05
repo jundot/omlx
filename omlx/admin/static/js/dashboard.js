@@ -754,12 +754,15 @@
                         this.resumeVisibleRefreshers();
                     }
                 });
-                // A bfcache restore fires `pageshow` *and* `visibilitychange`,
-                // so this has to be safe to call twice. resumeVisibleRefreshers
-                // coalesces same-tick calls, and every start*Refresh() calls
-                // its own stop*Refresh() first.
-                window.addEventListener('pageshow', (e) => {
-                    if (!document.hidden && !e.persisted) {
+                // A bfcache restore fires `pageshow` (with `persisted`) *and*
+                // usually `visibilitychange` in the same tick, so this has to be
+                // safe to call twice. resumeVisibleRefreshers coalesces same-tick
+                // calls and every start*Refresh() calls its own stop*Refresh()
+                // first. The persisted restore is deliberately *not* excluded:
+                // it is the case visibilitychange is not guaranteed to cover,
+                // and it is exactly what leaves a restored dashboard frozen.
+                window.addEventListener('pageshow', () => {
+                    if (!document.hidden) {
                         this.resumeVisibleRefreshers();
                     }
                 });

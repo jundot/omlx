@@ -137,6 +137,32 @@ test('a live benchmark stream is left alone', async () => {
     assert.deepEqual(app._calls.sse, []);
 });
 
+test('a bfcache restore (pageshow with persisted) resumes the visible tab', async () => {
+    // The shipped pageshow listener, lifted out of dashboard.js and run against
+    // a stub component. A restore that visibilitychange does not cover is the
+    // case this listener exists for, so it must not gate on event.persisted.
+    const at = source.indexOf("addEventListener('pageshow'");
+    assert.notEqual(at, -1, 'pageshow listener not found in dashboard.js');
+    const listener = source.slice(at, source.indexOf('});', at) + 3);
+    assert.ok(!/persisted/.test(listener),
+        `the pageshow handler must not skip bfcache restores: ${listener}`);
+
+    const arrow = listener.slice(listener.indexOf('('), listener.lastIndexOf(')') + 1);
+    const app = component({mainTab: 'logs'});
+    const previousDocument = globalThis.document;
+    globalThis.document = {hidden: false};
+    try {
+        const handler = new Function('app', `return (${arrow.replace(/this\./g, 'app.')})`)(app);
+        handler({persisted: true});
+    } finally {
+        globalThis.document = previousDocument;
+    }
+    app._flushTicks();
+    await new Promise(r => setImmediate(r));
+    assert.ok(app._calls.started.includes('startLogRefresh'),
+        'a persisted restore must resume the visible tab');
+});
+
 test('resume is idempotent: pageshow + visibilitychange in the same tick coalesce', async () => {
     const app = component({mainTab: 'logs'});
     // A bfcache restore fires pageshow *and* visibilitychange in one tick.
