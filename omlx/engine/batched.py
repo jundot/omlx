@@ -18,6 +18,7 @@ from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..model_settings import (
     ane_prefill_backend,
     ane_prefill_fraction,
+    apply_concurrency_override,
     validate_ane_prefill,
 )
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
@@ -692,6 +693,9 @@ class BatchedEngine(BaseEngine):
             if self._scheduler_config
             else SchedulerConfig()
         )
+        # Per-model concurrency override, clamped to the global cap in the
+        # copied config.
+        apply_concurrency_override(scheduler_config, self._model_settings)
         signature = getattr(self._model, "_omlx_k2_ane_signature", None)
         if signature:
             scheduler_config.model_name = (

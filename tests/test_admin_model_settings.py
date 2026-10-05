@@ -607,3 +607,68 @@ def test_runtime_signature_gates_mtp_depth_on_lightning_mtp():
     assert pool._engine_runtime_signature(
         "m", depth_3_off
     ) == pool._engine_runtime_signature("m", depth_8_off)
+
+
+@pytest.mark.asyncio
+async def test_max_concurrent_requests_is_persisted_and_cleared():
+    pool, _ = _failed_pool()
+    settings = ModelSettings()
+
+    result = await _update_settings(
+        pool, settings, admin_routes.ModelSettingsRequest(max_concurrent_requests=5)
+    )
+    assert settings.max_concurrent_requests == 5
+    # The PUT response echoes the persisted settings for the dashboard.
+    assert result["settings"]["max_concurrent_requests"] == 5
+
+    result = await _update_settings(
+        pool, settings, admin_routes.ModelSettingsRequest(max_concurrent_requests=None)
+    )
+    assert settings.max_concurrent_requests is None
+    # to_dict() filters None: cleared means the key is absent (the
+    # dashboard falls back with `?? null`).
+    assert result["settings"].get("max_concurrent_requests") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [0, -3])
+async def test_max_concurrent_requests_rejects_non_positive(value):
+    pool, _ = _failed_pool()
+    settings = ModelSettings()
+
+    with pytest.raises(admin_routes.HTTPException) as exc_info:
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(max_concurrent_requests=value),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert settings.max_concurrent_requests is None
+
+
+@pytest.mark.asyncio
+async def test_max_concurrent_requests_live_applied_when_engine_loaded():
+    pool, entry = _failed_pool()
+    entry.engine = MagicMock()
+    pool.apply_model_max_concurrent_requests = AsyncMock()
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool, settings, admin_routes.ModelSettingsRequest(max_concurrent_requests=2)
+    )
+
+    pool.apply_model_max_concurrent_requests.assert_awaited_once_with("ling")
+
+
+@pytest.mark.asyncio
+async def test_max_concurrent_requests_not_live_applied_when_engine_absent():
+    pool, _ = _failed_pool()
+    pool.apply_model_max_concurrent_requests = AsyncMock()
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool, settings, admin_routes.ModelSettingsRequest(max_concurrent_requests=2)
+    )
+
+    pool.apply_model_max_concurrent_requests.assert_not_awaited()

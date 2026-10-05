@@ -48,7 +48,11 @@ from ..api.utils import (
 )
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
-from ..model_settings import ane_prefill_backend, ane_prefill_fraction
+from ..model_settings import (
+    ane_prefill_backend,
+    ane_prefill_fraction,
+    apply_concurrency_override,
+)
 from ..models.vlm import VLMModelAdapter
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
@@ -2523,6 +2527,9 @@ class VLMBatchedEngine(BaseEngine):
             if self._scheduler_config
             else SchedulerConfig()
         )
+        # Per-model concurrency override, clamped to the global cap in the
+        # copied config.
+        apply_concurrency_override(scheduler_config, self._model_settings)
         if (
             self._adapter.model_type == "deepseek_v41"
             and self._adapter.config.ced_prefill

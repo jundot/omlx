@@ -2382,3 +2382,76 @@ async def test_shutdown_persists_snapshot_on_generation_thread(
     assert engine._target_model is None
     if method != "stop":
         fallback.start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fallback_type", ["batched", "vlm"])
+async def test_evict_fallback_uses_live_updated_concurrency_cap(
+    monkeypatch, fallback_type
+):
+    """A live pool cap update must reach the fallback built at eviction.
+
+    The pool refreshes the DFlash engine-owned ``_model_settings`` copy when
+    the per-model cap changes; the lazily constructed Batched/VLM fallback
+    receives that copy and re-clamps its scheduler via
+    ``apply_concurrency_override`` in ``start()``. A stale copy here would
+    silently re-impose the old cap on eviction.
+    """
+    cache_manager = pytest.importorskip("dflash_mlx.cache.manager")
+    from omlx import engine_core
+    from omlx.engine import batched, dflash, vlm
+    from omlx.engine_pool import EngineEntry, EnginePool
+    from omlx.scheduler import SchedulerConfig
+
+    settings = ModelSettings(max_concurrent_requests=1)
+    engine = dflash.DFlashEngine(
+        "target",
+        "draft",
+        model_settings=settings,
+        fallback_engine_type=fallback_type,
+        scheduler_config=SchedulerConfig(max_num_seqs=8, completion_batch_size=8),
+    )
+
+    pool = EnginePool()
+    pool._settings_manager = SimpleNamespace(
+        get_settings=lambda mid: ModelSettings.from_dict(
+            {"max_concurrent_requests": 4}
+        )
+    )
+    pool._entries["target"] = EngineEntry(
+        model_id="target",
+        model_path="/tmp/target",
+        model_type="llm",
+        engine_type="batched",
+        estimated_size=1024,
+        engine=engine,
+    )
+
+    # Live update: the cap moves 1 -> 4 while the dflash engine is primary.
+    await pool.apply_model_max_concurrent_requests("target")
+    assert engine._model_settings.max_concurrent_requests == 4
+
+    captured: dict = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(start=AsyncMock())
+
+    monkeypatch.setattr(batched, "BatchedEngine", _capture)
+    monkeypatch.setattr(vlm, "VLMBatchedEngine", _capture)
+    monkeypatch.setattr(cache_manager, "shutdown_runtime_cache_manager", lambda: None)
+    memory = iter((2, 1))
+    monkeypatch.setattr(dflash.mx, "get_active_memory", lambda: next(memory))
+    monkeypatch.setattr(dflash.mx, "synchronize", lambda: None)
+    monkeypatch.setattr(dflash.mx, "clear_cache", lambda: None)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(engine_core, "get_mlx_executor", lambda: executor)
+        await engine._evict_dflash_and_start_fallback()
+
+    assert captured, "fallback engine was not constructed"
+    # The fallback is built from the refreshed settings copy, so its
+    # start()-time clamp lands on the current cap, not the stale one.
+    assert captured["model_settings"] is settings
+    assert captured["model_settings"].max_concurrent_requests == 4
+    assert captured["scheduler_config"].max_num_seqs == 4

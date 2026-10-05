@@ -307,6 +307,9 @@ class ModelSettingsRequest(BaseModel):
     chat_template_kwargs: dict[str, Any] | None = None
     forced_ct_kwargs: list[str] | None = None
     ttl_seconds: int | None = None
+    # Max concurrent requests for this model, clamped to the global cap
+    # (null = inherit global).
+    max_concurrent_requests: int | None = None
     index_cache_freq: int | None = None
     enable_thinking: bool | None = None
     # Keep  thinking blocks in historical turns (None = auto, True when the
@@ -2899,6 +2902,16 @@ async def update_model_settings(
         current_settings.forced_ct_kwargs = request.forced_ct_kwargs
     if "ttl_seconds" in sent:
         current_settings.ttl_seconds = request.ttl_seconds
+    if "max_concurrent_requests" in sent:
+        if (
+            request.max_concurrent_requests is not None
+            and request.max_concurrent_requests <= 0
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="max_concurrent_requests must be > 0 (or null).",
+            )
+        current_settings.max_concurrent_requests = request.max_concurrent_requests
     if "index_cache_freq" in sent:
         # 0 means disable (reset to None)
         current_settings.index_cache_freq = (
@@ -3387,6 +3400,11 @@ async def update_model_settings(
 
     # Persist settings
     settings_manager.set_settings(model_id, current_settings)
+
+    # Concurrency caps apply live: no reload needed (lowering only stops
+    # new admissions; decoding rows finish normally).
+    if "max_concurrent_requests" in sent and entry.engine is not None:
+        await engine_pool.apply_model_max_concurrent_requests(model_id)
 
     # A failed load is cached to prevent clients from retrying the same broken
     # configuration on every request. Clear that cache only when the effective

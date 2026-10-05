@@ -324,6 +324,9 @@ class ModelSettings:
         None  # Keys that cannot be overridden by API requests
     )
     ttl_seconds: Optional[int] = None  # Auto-unload after idle seconds (None = no TTL)
+    # Max concurrent requests for this model, clamped to the global
+    # scheduler.max_concurrent_requests cap (None = inherit the global cap).
+    max_concurrent_requests: Optional[int] = None
     model_type_override: Optional[str] = (
         None  # "llm", "vlm", "embedding", "reranker", or None (auto-detect)
     )
@@ -1786,6 +1789,47 @@ def forced_ct_keys(settings: "ModelSettings | None") -> set[str]:
     if settings is None:
         return set()
     return set(settings.forced_ct_kwargs or [])
+
+
+def coerce_max_concurrent_requests(raw: Any) -> "int | None":
+    """Coerce a stored concurrency override to an int cap.
+
+    ``ModelSettings.from_dict`` performs no coercion, so a hand-edited
+    settings file can hold non-numeric junk. Such a value is treated as
+    unset (inherit the global cap) with a warning instead of raising at
+    engine load or mid fan-out. Numeric values pass through; flooring at
+    1 is the callers' responsibility.
+    """
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring non-numeric max_concurrent_requests %r; "
+            "inheriting the global cap.",
+            raw,
+        )
+        return None
+
+
+def apply_concurrency_override(
+    config: Any, settings: "ModelSettings | None"
+) -> None:
+    """Clamp a per-engine SchedulerConfig copy to the model's cap.
+
+    ``config`` is a copy that still carries the current global
+    ``max_concurrent_requests`` value in ``max_num_seqs``; the per-model
+    override may only narrow it, never widen it.
+    """
+    value = coerce_max_concurrent_requests(
+        getattr(settings, "max_concurrent_requests", None)
+    )
+    if value is None:
+        return
+    capped = max(1, min(value, int(getattr(config, "max_num_seqs", 1) or 1)))
+    config.max_num_seqs = capped
+    config.completion_batch_size = capped
 
 
 def merge_chat_template_request_kwargs(

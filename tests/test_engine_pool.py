@@ -29,6 +29,7 @@ from omlx.exceptions import (
 from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
     Qwen4ExpResidencyEstimate,
 )
+from omlx.model_settings import ModelSettings
 from omlx.scheduler import PrefillEvictionRequest, SchedulerConfig
 
 
@@ -2122,6 +2123,396 @@ class TestEnginePoolAsync:
         finish_step.set()
         executor.shutdown(wait=True)
         assert scheduler.batch_generator.completion_batch_size == 4
+
+    @pytest.mark.asyncio
+    async def test_apply_max_concurrent_requests_clamps_per_model_override(self):
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        pool = _make_pool(
+            scheduler_config=SchedulerConfig(max_num_seqs=8, completion_batch_size=8)
+        )
+        plain, plain_scheduler = self._engine_with_scheduler(executor)
+        capped, capped_scheduler = self._engine_with_scheduler(executor)
+        self._add_entry(pool, "plain", plain)
+        self._add_entry(pool, "capped", capped)
+        pool._entries["capped"].max_concurrent_requests_override = 1
+
+        await pool.apply_max_concurrent_requests(4)
+        executor.shutdown(wait=True)
+
+        assert (plain_scheduler.config.max_num_seqs,
+                plain_scheduler.config.completion_batch_size) == (4, 4)
+        assert (capped_scheduler.config.max_num_seqs,
+                capped_scheduler.config.completion_batch_size) == (1, 1)
+        assert plain_scheduler.batch_generator.completion_batch_size == 4
+        assert capped_scheduler.batch_generator.completion_batch_size == 1
+        # The shared pool config keeps the global value for future loads.
+        assert pool._scheduler_config.max_num_seqs == 4
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("raw_override", [0, -3])
+    async def test_apply_max_concurrent_requests_sanitizes_invalid_raw_override(
+        self, raw_override
+    ):
+        """A corrupted stored override (0/negative) must floor to 1, never
+        widen to global nor pass a negative cap to the scheduler."""
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        pool = _make_pool(
+            scheduler_config=SchedulerConfig(max_num_seqs=8, completion_batch_size=8)
+        )
+        engine, scheduler = self._engine_with_scheduler(executor)
+        scheduler.config.max_num_seqs = 1
+        scheduler.config.completion_batch_size = 1
+        self._add_entry(pool, "capped", engine)
+        pool._entries["capped"].max_concurrent_requests_override = raw_override
+
+        await pool.apply_max_concurrent_requests(4)
+        executor.shutdown(wait=True)
+
+        assert (scheduler.config.max_num_seqs,
+                scheduler.config.completion_batch_size) == (1, 1)
+
+    @pytest.mark.asyncio
+    async def test_apply_max_concurrent_requests_shared_config_keeps_global(self):
+        """The primary engine's _scheduler_config IS the shared pool config:
+        a per-model clamped value must never be written to it."""
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        pool = _make_pool(
+            scheduler_config=SchedulerConfig(max_num_seqs=8, completion_batch_size=8)
+        )
+        engine, scheduler = self._engine_with_scheduler(executor)
+        # Real engines hold the shared pool config reference.
+        engine._scheduler_config = pool._scheduler_config
+        scheduler.config.max_num_seqs = 1
+        scheduler.config.completion_batch_size = 1
+        self._add_entry(pool, "capped", engine)
+        pool._entries["capped"].max_concurrent_requests_override = 1
+
+        await pool.apply_max_concurrent_requests(4)
+        executor.shutdown(wait=True)
+
+        assert (pool._scheduler_config.max_num_seqs,
+                pool._scheduler_config.completion_batch_size) == (4, 4)
+        assert (scheduler.config.max_num_seqs,
+                scheduler.config.completion_batch_size) == (1, 1)
+
+    @staticmethod
+    def _pool_with_settings(pool, overrides: dict):
+        pool._settings_manager = SimpleNamespace(
+            get_settings=lambda mid: ModelSettings.from_dict(
+                {"max_concurrent_requests": overrides.get(mid)}
+            )
+        )
+        return pool
+
+    @pytest.mark.asyncio
+    async def test_apply_model_max_concurrent_requests_lowers_one_engine_only(self):
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        pool = _make_pool(
+            scheduler_config=SchedulerConfig(max_num_seqs=8, completion_batch_size=8)
+        )
+        a, a_scheduler = self._engine_with_scheduler(executor)
+        b, b_scheduler = self._engine_with_scheduler(executor)
+        # Loaded engines carry the global cap until changed.
+        for config in (a_scheduler.config, b_scheduler.config):
+            config.max_num_seqs = 8
+            config.completion_batch_size = 8
+        self._add_entry(pool, "a", a)
+        self._add_entry(pool, "b", b)
+        self._pool_with_settings(pool, {"a": 2})
+
+        await pool.apply_model_max_concurrent_requests("a")
+        executor.shutdown(wait=True)
+
+        assert (a_scheduler.config.max_num_seqs,
+                a_scheduler.config.completion_batch_size) == (2, 2)
+        assert a_scheduler.batch_generator.completion_batch_size == 2
+        assert (b_scheduler.config.max_num_seqs,
+                b_scheduler.config.completion_batch_size) == (8, 8)
+        assert pool._scheduler_config.max_num_seqs == 8
+        assert pool._entries["a"].max_concurrent_requests_override == 2
+
+    @pytest.mark.asyncio
+    async def test_apply_model_max_concurrent_requests_clamps_above_global(self):
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        pool = _make_pool(
+            scheduler_config=SchedulerConfig(max_num_seqs=8, completion_batch_size=8)
+        )
+        a, a_scheduler = self._engine_with_scheduler(executor)
+        self._add_entry(pool, "a", a)
+        self._pool_with_settings(pool, {"a": 16})
+
+        await pool.apply_model_max_concurrent_requests("a")
+        executor.shutdown(wait=True)
+
+        assert (a_scheduler.config.max_num_seqs,
+                a_scheduler.config.completion_batch_size) == (8, 8)
+
+    @pytest.mark.asyncio
+    async def test_apply_model_max_concurrent_requests_clear_reverts_to_global(self):
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        pool = _make_pool(
+            scheduler_config=SchedulerConfig(max_num_seqs=8, completion_batch_size=8)
+        )
+        a, a_scheduler = self._engine_with_scheduler(executor)
+        self._add_entry(pool, "a", a)
+        pool._entries["a"].max_concurrent_requests_override = 1
+        a_scheduler.config.max_num_seqs = 1
+        a_scheduler.config.completion_batch_size = 1
+        self._pool_with_settings(pool, {})
+
+        await pool.apply_model_max_concurrent_requests("a")
+        executor.shutdown(wait=True)
+
+        assert (a_scheduler.config.max_num_seqs,
+                a_scheduler.config.completion_batch_size) == (8, 8)
+        assert a_scheduler.batch_generator.completion_batch_size == 8
+        assert pool._entries["a"].max_concurrent_requests_override is None
+
+    @pytest.mark.asyncio
+    async def test_apply_max_concurrent_requests_non_numeric_override_inherits_global(
+        self,
+    ):
+        """Hand-edited junk stored as the override must not raise mid
+        fan-out (partial application + 500): treat it as unset."""
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        pool = _make_pool(
+            scheduler_config=SchedulerConfig(max_num_seqs=8, completion_batch_size=8)
+        )
+        engine, scheduler = self._engine_with_scheduler(executor)
+        scheduler.config.max_num_seqs = 8
+        scheduler.config.completion_batch_size = 8
+        self._add_entry(pool, "capped", engine)
+        pool._entries["capped"].max_concurrent_requests_override = "five"
+
+        await pool.apply_max_concurrent_requests(4)
+        executor.shutdown(wait=True)
+
+        assert (scheduler.config.max_num_seqs,
+                scheduler.config.completion_batch_size) == (4, 4)
+
+    @pytest.mark.asyncio
+    async def test_apply_model_max_concurrent_requests_non_numeric_reverts_to_global(
+        self,
+    ):
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        pool = _make_pool(
+            scheduler_config=SchedulerConfig(max_num_seqs=8, completion_batch_size=8)
+        )
+        a, a_scheduler = self._engine_with_scheduler(executor)
+        self._add_entry(pool, "a", a)
+        pool._entries["a"].max_concurrent_requests_override = 1
+        a_scheduler.config.max_num_seqs = 1
+        a_scheduler.config.completion_batch_size = 1
+        self._pool_with_settings(pool, {"a": "five"})
+
+        await pool.apply_model_max_concurrent_requests("a")
+        executor.shutdown(wait=True)
+
+        assert pool._entries["a"].max_concurrent_requests_override is None
+        assert (a_scheduler.config.max_num_seqs,
+                a_scheduler.config.completion_batch_size) == (8, 8)
+
+    @pytest.mark.asyncio
+    async def test_apply_model_max_concurrent_requests_missing_engine_stores_override(self):
+        pool = _make_pool(
+            scheduler_config=SchedulerConfig(max_num_seqs=8, completion_batch_size=8)
+        )
+        self._add_entry(pool, "a", None)
+        self._pool_with_settings(pool, {"a": 2})
+
+        await pool.apply_model_max_concurrent_requests("a")
+
+        assert pool._entries["a"].max_concurrent_requests_override == 2
+
+    @pytest.mark.asyncio
+    async def test_apply_model_max_concurrent_requests_missing_entry_is_noop(self):
+        pool = _make_pool(
+            scheduler_config=SchedulerConfig(max_num_seqs=8, completion_batch_size=8)
+        )
+        self._pool_with_settings(pool, {"ghost": 2})
+
+        await pool.apply_model_max_concurrent_requests("ghost")
+
+    @pytest.mark.asyncio
+    async def test_apply_model_max_concurrent_requests_rejects_invalid_override(self):
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        pool = _make_pool(
+            scheduler_config=SchedulerConfig(max_num_seqs=8, completion_batch_size=8)
+        )
+        a, _ = self._engine_with_scheduler(executor)
+        self._add_entry(pool, "a", a)
+        self._pool_with_settings(pool, {"a": 0})
+
+        with pytest.raises(ValueError):
+            await pool.apply_model_max_concurrent_requests("a")
+        executor.shutdown(wait=True)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "mid_load_value,expected_cap,expected_override",
+        [
+            (1, 1, 1),
+            ("junk", 8, None),
+            ("manager-gone", 1, 1),
+            ("reader-gone", 1, 1),
+            (None, 8, None),
+        ],
+        ids=["save", "junk", "manager_gone", "reader_gone", "clear"],
+    )
+    async def test_get_engine_reconciles_cap_saved_during_load(
+        self, pool_with_mock_engines, mid_load_value, expected_cap, expected_override
+    ):
+        """A cap change landing mid-load must reach the new engine.
+
+        The settings route skips live apply while ``entry.engine`` is None
+        (the pool lock is held through the whole load), so without
+        post-attach reconciliation the engine keeps the cap its settings
+        snapshot had at load start and the change is silently lost with
+        ``requires_reload: false``. Junk persisted mid-load coerces to unset
+        (inherit global); an unavailable settings reader preserves the cap
+        captured at load start. An explicit None still clears the override.
+        """
+        pool = pool_with_mock_engines
+        pool._scheduler_config.max_num_seqs = 8
+        pool._scheduler_config.completion_batch_size = 8
+        persisted = ModelSettings(
+            max_concurrent_requests=None if mid_load_value == 1 else 1
+        )
+        pool._settings_manager = SimpleNamespace(
+            get_settings=lambda mid: persisted
+        )
+        load_settings = ModelSettings.from_dict(persisted.to_dict())
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        fake, scheduler = self._engine_with_scheduler(executor)
+        # The engine is built at the global cap the load snapshot saw.
+        scheduler.config.max_num_seqs = 8
+        scheduler.config.completion_batch_size = 8
+        scheduler.batch_generator.completion_batch_size = 8
+
+        def _change_settings_mid_load():
+            from omlx.model_settings import apply_concurrency_override
+
+            apply_concurrency_override(scheduler.config, load_settings)
+            scheduler.batch_generator.completion_batch_size = (
+                scheduler.config.completion_batch_size
+            )
+            # Simulate an admin settings save landing during the load.
+            if mid_load_value == "manager-gone":
+                pool._settings_manager = None
+            elif mid_load_value == "reader-gone":
+                pool._settings_manager = SimpleNamespace()
+            else:
+                persisted.max_concurrent_requests = mid_load_value
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock(side_effect=_change_settings_mid_load)
+        mock_engine.stop = AsyncMock()
+        # Real batched primaries hold the shared pool config by reference
+        # and expose the core engine internals the fan-out walks.
+        mock_engine._scheduler_config = pool._scheduler_config
+        mock_engine._engine = fake._engine
+        # MagicMock auto-creates truthy attributes; pin the guards and hosts
+        # the fan-out checks so it does not bail out or walk phantom state.
+        mock_engine._prefill_memory_guard_managed_externally = False
+        mock_engine._fallback_engine = None
+        mock_engine._model_settings = None
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            engine = await pool.get_engine("model-a")
+
+        executor.shutdown(wait=True)
+        assert engine is mock_engine
+        assert (
+            pool._entries["model-a"].max_concurrent_requests_override
+            == expected_override
+        )
+        assert (scheduler.config.max_num_seqs,
+                scheduler.config.completion_batch_size) == (
+            expected_cap, expected_cap
+        )
+        assert scheduler.batch_generator.completion_batch_size == expected_cap
+        # The shared pool config keeps the global value for future loads.
+        assert pool._scheduler_config.max_num_seqs == 8
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("override,expected_cap", [(1, 1), (16, 8)])
+    async def test_get_engine_preserves_runtime_concurrency_without_settings_manager(
+        self, pool_with_mock_engines, override, expected_cap
+    ):
+        from omlx.model_settings import apply_concurrency_override
+
+        pool = pool_with_mock_engines
+        pool._settings_manager = None
+        pool._scheduler_config.max_num_seqs = 8
+        pool._scheduler_config.completion_batch_size = 8
+        settings = ModelSettings(max_concurrent_requests=override)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            engine, scheduler = self._engine_with_scheduler(executor)
+            engine._scheduler_config = pool._scheduler_config
+            engine._model_settings = settings
+            scheduler.config.max_num_seqs = 8
+            scheduler.config.completion_batch_size = 8
+
+            async def start():
+                apply_concurrency_override(scheduler.config, settings)
+                scheduler.batch_generator.completion_batch_size = (
+                    scheduler.config.completion_batch_size
+                )
+
+            engine.start = AsyncMock(side_effect=start)
+            with patch("omlx.engine_pool.BatchedEngine", return_value=engine):
+                loaded = await pool.get_engine("model-a", runtime_settings=settings)
+
+        assert loaded is engine
+        assert pool._entries["model-a"].max_concurrent_requests_override == override
+        assert settings.max_concurrent_requests == override
+        assert scheduler.config.max_num_seqs == expected_cap
+        assert scheduler.config.completion_batch_size == expected_cap
+        assert scheduler.batch_generator.completion_batch_size == expected_cap
+        assert pool._scheduler_config.max_num_seqs == 8
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "new_cap,expected_cap",
+        [(4, 4), (None, 8)],
+        ids=["raise", "clear"],
+    )
+    async def test_apply_model_max_concurrent_requests_refreshes_dflash_settings_for_lazy_fallback(
+        self, new_cap, expected_cap
+    ):
+        """A live update must refresh the DFlash engine-owned settings copy.
+
+        The lazy Batched/VLM fallback is built from ``_model_settings`` on
+        eviction and re-clamps its scheduler via
+        ``apply_concurrency_override``; a stale cap there would silently
+        re-apply the old limit.
+        """
+        from omlx.model_settings import apply_concurrency_override
+
+        pool = _make_pool(
+            scheduler_config=SchedulerConfig(max_num_seqs=8, completion_batch_size=8)
+        )
+        dflash_settings = ModelSettings(max_concurrent_requests=1)
+        dflash = SimpleNamespace(
+            _scheduler_config=SchedulerConfig(max_num_seqs=1, completion_batch_size=1),
+            _model_settings=dflash_settings,
+            _fallback_engine=None,
+        )
+        self._add_entry(pool, "dflash", dflash)
+        pool._entries["dflash"].max_concurrent_requests_override = 1
+        self._pool_with_settings(pool, {"dflash": new_cap})
+
+        await pool.apply_model_max_concurrent_requests("dflash")
+
+        assert dflash_settings.max_concurrent_requests == (
+            None if new_cap is None else new_cap
+        )
+        # A fallback built from the refreshed copy clamps to the current cap.
+        fallback_config = SchedulerConfig(max_num_seqs=8, completion_batch_size=8)
+        apply_concurrency_override(fallback_config, dflash_settings)
+        assert (fallback_config.max_num_seqs,
+                fallback_config.completion_batch_size) == (expected_cap, expected_cap)
 
     @pytest.mark.asyncio
     async def test_get_engine_returns_cached(self, pool_with_mock_engines):
