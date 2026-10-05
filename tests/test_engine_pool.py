@@ -1079,6 +1079,30 @@ class TestVLMFallback:
         assert "785 parameters not in model" in (entry.vision_downgrade_reason or "")
 
     @pytest.mark.asyncio
+    async def test_a_vision_load_retires_the_downgrade_note(self, small_mock_model_dir):
+        """Once the model loads as a VLM again, image input is accepted again."""
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        entry = pool.get_entry("model-a")
+        entry.model_type = "vlm"
+        entry.engine_type = "vlm"
+        entry.vision_downgrade_reason = "Received 785 parameters not in model: mtp."
+
+        class _VisionEngine(MagicMock):
+            # A real class, so the pool's isinstance check sees a vision engine.
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+                self.start = AsyncMock()
+                self.stop = AsyncMock()
+
+        with patch("omlx.engine_pool.VLMBatchedEngine", _VisionEngine):
+            await pool._load_engine("model-a")
+
+        assert isinstance(entry.engine, _VisionEngine)
+        assert entry.vision_downgrade_reason is None
+
+    @pytest.mark.asyncio
     async def test_non_vlm_failure_still_raises(self, small_mock_model_dir):
         """Test that non-VLM engine failures propagate normally."""
         pool = _make_pool(ceiling=10 * 1024**3)

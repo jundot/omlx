@@ -1041,6 +1041,35 @@ class TestCompletionEndpoint:
 class TestChatCompletionEndpoint:
     """Tests for the /v1/chat/completions endpoint."""
 
+    def test_chat_completion_refuses_an_image_on_a_downgraded_vlm(
+        self, client, mock_engine_pool
+    ):
+        """A VLM served text-only answers 400 instead of dropping the image (#3688)."""
+        mock_engine_pool._entries["test-model"] = SimpleNamespace(
+            vision_downgrade_reason="Received 785 parameters not in model: mtp."
+        )
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "what is this?"},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64,iVBOR"},
+                            },
+                        ],
+                    }
+                ],
+            },
+        )
+
+        assert response.status_code == 400
+        assert "785 parameters not in model" in response.text
+
     def test_chat_completion_uses_llm_lease(self, client, mock_engine_pool):
         """Chat completion keeps a pool lease until the response body finishes."""
         response = client.post(
@@ -1391,6 +1420,40 @@ class TestChatCompletionEndpoint:
 
 class TestAnthropicMessagesEndpoint:
     """Tests for the /v1/messages endpoint (Anthropic format)."""
+
+    def test_messages_refuses_an_image_on_a_downgraded_vlm(
+        self, client, mock_engine_pool
+    ):
+        """The Anthropic route applies the same refusal as chat completions (#3688)."""
+        mock_engine_pool._entries["test-model"] = SimpleNamespace(
+            vision_downgrade_reason="Received 785 parameters not in model: mtp."
+        )
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "test-model",
+                "max_tokens": 64,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "iVBOR",
+                                },
+                            },
+                            {"type": "text", "text": "what is this?"},
+                        ],
+                    }
+                ],
+            },
+        )
+
+        assert response.status_code == 400
+        assert "cannot accept images" in response.text
 
     def test_anthropic_messages_uses_llm_lease(self, client, mock_engine_pool):
         response = client.post(
