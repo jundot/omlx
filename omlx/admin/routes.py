@@ -31,7 +31,14 @@ import requests
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
@@ -287,6 +294,18 @@ class CacheProbeRequest(BaseModel):
     thinking_budget: int | None = None
 
 
+def _draft_path_is_unusable(value: str) -> bool:
+    """True when ``value`` names a local draft directory with no config.json.
+
+    Matches local references without resolving or downloading HF repo IDs, so
+    ``NewHorizonGroup/Qwen3-...-oQ4`` is never treated as a filesystem path.
+    """
+    path = Path(value).expanduser()
+    if not (path.is_absolute() or value.startswith(("./", "../")) or path.exists()):
+        return False
+    return not (path / "config.json").is_file()
+
+
 class ModelSettingsRequest(BaseModel):
     """Request model for updating per-model settings."""
 
@@ -427,20 +446,41 @@ class ModelSettingsRequest(BaseModel):
             raise ValueError(f"Unknown reasoning_parser: {value}")
         return value
 
-    @field_validator(
-        "specprefill_draft_model", "dflash_draft_model", "vlm_mtp_draft_model"
-    )
+    @field_validator("specprefill_draft_model", "vlm_mtp_draft_model")
     @classmethod
     def validate_draft_path(cls, value: str | None) -> str | None:
         if not value:
             return None
-        path = Path(value).expanduser()
-        # Match local references without resolving or downloading HF repo IDs.
-        if (
-            path.is_absolute() or value.startswith(("./", "../")) or path.exists()
-        ) and not (path / "config.json").is_file():
+        if _draft_path_is_unusable(value):
             raise ValueError(f"Draft model has no config.json: {value}")
         return value
+
+    @field_validator("dflash_draft_model")
+    @classmethod
+    def validate_dflash_draft_path(
+        cls, value: str | None, info: ValidationInfo
+    ) -> str | None:
+        """Only check the draft path while DFlash is actually turned on (#4217).
+
+        Every settings save re-sends the whole payload, so a draft model that
+        was deleted from disk used to 422 *every* write, including ones with
+        nothing to do with DFlash. Switching the DFlash profile to Balanced
+        deliberately parks the stale path in settings.json so it comes back
+        when Custom is picked again, so it is validated when it is live and
+        kept verbatim when it is not.
+        """
+        # dflash_enabled is declared above this field, so pydantic has already
+        # validated it (unsent -> None) by the time we run.
+        if not info.data.get("dflash_enabled"):
+            if value and _draft_path_is_unusable(value):
+                logger.warning(
+                    "DFlash draft model %r is missing or incomplete but DFlash "
+                    "is off; keeping the stored value for when it is "
+                    "re-enabled.",
+                    value,
+                )
+            return value
+        return cls.validate_draft_path(value)
 
 
 def _normalize_profile_settings(
