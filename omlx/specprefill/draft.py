@@ -50,6 +50,8 @@ _SLICEABLE_CACHE_TYPES = frozenset(
         "QuantizedKVCache",
         "TurboQuantKVCache",
         "BatchTurboQuantKVCache",
+        "TurboQuantQSAKVCache",
+        "BatchTurboQuantQSAKVCache",
         "ChunkedKVCache",
         "MiniMaxM3KVCache",
         "QSAKVCache",

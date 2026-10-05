@@ -51,6 +51,7 @@ def _make_fixture(monkeypatch, drafter_returns_uid):
         _route_to_vlm_mtp=fake_route,
         _finalize_chunked_prefill_cache_for_insert=lambda req, cache: None,
         _stream=mx.default_stream(mx.default_device()),
+        _log_mem_trace=lambda *a, **k: None,
         batch_generator=SimpleNamespace(insert=fake_bg_insert),
         model=SimpleNamespace(),  # no register_rope_delta attr -> skipped
         request_id_to_uid={},

@@ -1073,6 +1073,23 @@ class EnginePool:
                 getattr(settings, "deepseek_v41_ced_prefill_enabled", False),
             )
 
+        # Qwen4-Exp YaRN: the frequency table is built from the published rung
+        # the context override snaps to, so crossing a rung must reload the
+        # engine while two windows inside one rung (600k and 1M both serve the
+        # 4.0 table) must not. Gate-only overrides on other model types stay
+        # out of the signature.
+        if entry is not None and entry.config_model_type == "qwen4_exp":
+            from .patches.mlx_vlm_qwen4_exp_compat.yarn_rope import (
+                yarn_context_for_target,
+            )
+
+            window = data.get("max_context_window")
+            native = entry.model_context_length or 0
+            add(
+                "qwen4_yarn_target",
+                yarn_context_for_target(window, native) if native else None,
+            )
+
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)
         if turboquant_active:

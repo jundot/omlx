@@ -72,6 +72,11 @@ class CacheTypeRegistry:
         # checks the class name first and routes to TQ-specific handling)
         "TurboQuantKVCache": CacheType.KVCACHE,
         "BatchTurboQuantKVCache": CacheType.KVCACHE,
+        # TurboQuant QSA hybrid (qwen4_exp): prefix_cache checks the class
+        # name first and routes to hybrid-specific store/restore branches;
+        # mapped to KVCACHE so supports_block_slicing = True.
+        "TurboQuantQSAKVCache": CacheType.KVCACHE,
+        "BatchTurboQuantQSAKVCache": CacheType.KVCACHE,
         # DeepSeek V4 compressed-attention pool. Handlers live in
         # patches/deepseek_v4/cache_handlers.py and register on patch apply.
         "PoolingCache": CacheType.POOLING_CACHE,
