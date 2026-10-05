@@ -457,7 +457,7 @@ def exact_verify_qmv_pair(module_a, module_b, inputs: mx.array):
 
 def multi_eligible(module, inputs: mx.array) -> bool:
     """Return whether a grouped MultiLinear has the exact shared-row path."""
-    if inputs.ndim < 3 or module.weight.ndim != 3:
+    if inputs.ndim < 3 or module.weight.ndim != 3 or not hasattr(module, "scales"):
         return False
     groups = int(module.scales.shape[0])
     input_dims = int(inputs.shape[-1])

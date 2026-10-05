@@ -15,7 +15,9 @@ from omlx.cluster.system_socket_proxy import (
 )
 
 
-def test_system_proxy_bridges_a_loopback_stream():
+def test_system_proxy_bridges_a_loopback_stream(monkeypatch, tmp_path):
+    # oMLX.app exports PYTHONHOME for its bundled interpreter.
+    monkeypatch.setenv("PYTHONHOME", str(tmp_path))
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", 0))
@@ -32,7 +34,8 @@ def test_system_proxy_bridges_a_loopback_stream():
             stream.close()
             listener.close()
 
-    thread = threading.Thread(target=server)
+    # Daemon: a helper that fails to start must fail the test, not hang it.
+    thread = threading.Thread(target=server, daemon=True)
     thread.start()
     proxy = open_system_tcp_proxy("127.0.0.1", port, timeout=3)
     try:

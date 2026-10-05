@@ -2,10 +2,13 @@
 # ruff: noqa: N803, N806
 """Route Qwen3.5/3.6 Gated DeltaNet prefill to an optimized Metal kernel.
 
-Default route: ``gated_delta_blocked_seq`` — the exact sequential recurrence
-restructured for Apple GPUs (threadgroup-staged k/q/v blocks, register-resident
-state, Dv/32 split). ~2x faster than mlx_lm's stock sequential kernel at 16k
-(14.9ms vs 29.7ms per layer call) with fp32-exact state (rel-err ~5e-8).
+Default route: ``gated_delta_pipelined`` — the exact sequential recurrence
+with 8 lanes per value row, 16-row threadgroups and a software-pipelined,
+unrolled 12-token block (Qwen3.8 16/48 heads, T=8191: 3.0 ms vs 4.9 ms per
+layer call for ``gated_delta_blocked_seq`` on M5 Ultra). Layouts it does not
+cover run ``gated_delta_blocked_seq``: threadgroup-staged k/q/v blocks,
+register-resident state, Dv/32 split, fp32-exact state (rel-err ~5e-8). Both
+kernels assume 128-wide heads, so the route only engages for Dk = Dv = 128.
 
 Optional route (``OMLX_GDN_IMPL=chunked``): the FLA chunked WY-representation
 kernels — accuracy-validated but slower than the stock kernel E2E; kept for
@@ -17,7 +20,7 @@ masked/vectorized paths keep the original kernel.
 
 Toggles:
   OMLX_GDN_KERNEL=0    disable the patch entirely
-  OMLX_GDN_IMPL=...    blocked_seq (default) | chunked
+  OMLX_GDN_IMPL=...    pipelined (default) | blocked_seq | chunked
   OMLX_GDN_BLOCK_T=N   blocked_seq time block: 16 | 32 | 48
                          (default 16 for float32, 32 otherwise)
   OMLX_GDN_MIN_T=N     minimum prefill length to engage (default 64)
@@ -60,16 +63,51 @@ def apply_qwen35_gdn_prefill_patch() -> bool:
     from omlx.custom_kernels.qwen35_prefill import (
         gated_delta_blocked_seq,
         gated_delta_chunked_metal,
+        gated_delta_pipelined,
     )
 
-    impl = os.environ.get("OMLX_GDN_IMPL", "blocked_seq")
-    fast_prefill = (
-        gated_delta_chunked_metal if impl == "chunked" else gated_delta_blocked_seq
-    )
+    kernels = {
+        "pipelined": gated_delta_pipelined,
+        "chunked": gated_delta_chunked_metal,
+        "blocked_seq": gated_delta_blocked_seq,
+    }
+    impl = os.environ.get("OMLX_GDN_IMPL", "pipelined")
+    if impl not in kernels:
+        logger.warning("Unknown OMLX_GDN_IMPL=%r; using pipelined", impl)
+        impl = "pipelined"
+    fast_prefill = kernels[impl]
 
     def gated_delta_update_metal(
-        q, k, v, a, b, A_log, dt_bias, state=None, mask=None, use_kernel=True
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state=None,
+        mask=None,
+        use_kernel=True,
+        state_steps=None,
+        cache=None,
+        cache_index=1,
     ):
+        if cache is not None or state_steps is not None:
+            return original(
+                q,
+                k,
+                v,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                state,
+                mask,
+                use_kernel=use_kernel,
+                state_steps=state_steps,
+                cache=cache,
+                cache_index=cache_index,
+            )
         # Debug-only: skip the GDN op entirely to measure its E2E share.
         # Output is garbage; never enable outside profiling.
         if stub and q.shape[1] > 1:
@@ -81,8 +119,14 @@ def apply_qwen35_gdn_prefill_patch() -> bool:
             use_kernel
             and mask is None
             and q.shape[1] >= min_t
-            and q.shape[-1] % 16 == 0
-            and v.shape[-1] % 32 == 0
+            # Both the chunked kernel (A) and the default blocked_seq
+            # kernel (S) hard-assume Dk=128/Dv=128 internally; this gate
+            # used to admit any multiple of 16/32, which would silently
+            # misbehave rather than error on other head dims that satisfy
+            # the modulus but not the hard-coded 128 assumption.
+            # See docs/qwen35-hardening-and-optimization.md E2.
+            and q.shape[-1] == 128
+            and v.shape[-1] == 128
             and a.ndim == 3  # scalar per-head gating
         ):
             if fused_g_beta and hasattr(gd, "_compute_g_beta_prefill"):

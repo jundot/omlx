@@ -55,7 +55,7 @@ final class ModelSettingsScreenVM {
         case dflashVerifyMode, dflashDraftWindowSize, dflashDraftSinkSize, dflashBlockSize
         case dflashInMemoryCache, dflashInMemoryCacheGib, dflashInMemoryCacheMaxEntries
         case dflashSsdCache, dflashSsdCacheGib
-        case mtpEnabled
+        case mtpEnabled, mtpAdaptiveMaxDepth
         case vlmMtpEnabled, vlmMtpDraftModel, vlmMtpDraftBlockSize
     }
 
@@ -176,6 +176,17 @@ final class ModelSettingsScreenVM {
             ("64", "64"),
             ("128", "128"),
         ]
+    }
+
+    static var mtpDepthOptions: [(String, String)] {
+        let adaptive = String(localized: "settings.acceleration.mtp.depth.adaptive",
+                              defaultValue: "3 tokens (Default)",
+                              comment: "Default Lightning MTP adaptive maximum draft depth")
+        return [("3", adaptive)] + (4...6).map { depth in
+            ("\(depth)", String(localized: "settings.acceleration.mtp.depth.option",
+                                defaultValue: "\(depth) tokens",
+                                comment: "Lightning MTP depth option; placeholder is the maximum draft token count"))
+        }
     }
 
     static var dflashVerifyModeOptions: [(String, String)] {
@@ -306,6 +317,13 @@ final class ModelSettingsScreenVM {
     var aneTuningAllowCPUGDN: Bool = true
     var aneTuningAllowCPUSharedResource: Bool = true
 
+    // Header snapshot actions: reset / optimal (omlx.ai) / custom recipe.
+    var isApplyingSettings: Bool = false
+    var pendingReset: Bool = false
+    var applyOutcome: SettingsApplyOutcome?
+    /// Error shown inside the snapshot sheet so the user can retry.
+    var applyError: String?
+
     // Experimental: IndexCache (DSA-only)
     var indexCacheEnabled: Bool = false
     var indexCacheFreq: String = "4"
@@ -336,6 +354,8 @@ final class ModelSettingsScreenVM {
 
     // Experimental: native MTP
     var mtpEnabled: Bool = false
+    /// Empty = adaptive depth.
+    var mtpAdaptiveMaxDepth: String = "3"
 
     // Experimental: VLM MTP (assistant-drafter speculative decoding for VLMs).
     // Block size is held as a string for the editor; empty = mlx-vlm default.
@@ -470,7 +490,7 @@ final class ModelSettingsScreenVM {
             return true
         case .dflashSsdCache, .dflashSsdCacheGib:
             return true
-        case .mtpEnabled, .vlmMtpEnabled, .vlmMtpDraftModel:
+        case .mtpEnabled, .mtpAdaptiveMaxDepth, .vlmMtpEnabled, .vlmMtpDraftModel:
             return true
         case .vlmMtpDraftBlockSize:
             return true
@@ -636,6 +656,7 @@ final class ModelSettingsScreenVM {
                 self.dflashSsdCacheGib = DflashByteSize.bytesToGib(s?.dflashSsdCacheMaxBytes)
                     .map(String.init) ?? "20"
                 self.mtpEnabled = s?.mtpEnabled ?? false
+                self.mtpAdaptiveMaxDepth = s?.mtpAdaptiveMaxDepth.flatMap { (3...6).contains($0) ? String($0) : nil } ?? "3"
                 self.vlmMtpEnabled = s?.vlmMtpEnabled ?? false
                 self.vlmMtpDraftModel = s?.vlmMtpDraftModel ?? ""
                 self.vlmMtpDraftBlockSize = s?.vlmMtpDraftBlockSize.map(String.init) ?? ""
@@ -867,7 +888,10 @@ final class ModelSettingsScreenVM {
         case .dflashSsdCache:          patch.dflashSsdCache = dflashSsdCache
         case .dflashSsdCacheGib:
             patch.dflashSsdCacheMaxBytes = DflashByteSize.gibToBytes(Int(dflashSsdCacheGib))
-        case .mtpEnabled:              patch.mtpEnabled = mtpEnabled
+        case .mtpEnabled, .mtpAdaptiveMaxDepth:
+            patch.mtpEnabled = mtpEnabled
+            patch.mtpAdaptiveMaxDepth = Int(mtpAdaptiveMaxDepth) ?? 3
+            patch.mtpFixedDepth = .some(nil)
         case .vlmMtpEnabled:           patch.vlmMtpEnabled = vlmMtpEnabled
         case .vlmMtpDraftModel:        patch.vlmMtpDraftModel = vlmMtpDraftModel.isEmpty ? nil : vlmMtpDraftModel
         case .vlmMtpDraftBlockSize:    patch.vlmMtpDraftBlockSize = Int(vlmMtpDraftBlockSize)
@@ -1319,6 +1343,9 @@ final class ModelSettingsScreenVM {
                 }
             }
             putBool(ProfileSettingsKey.mtpEnabled, mtpEnabled)
+            if mtpEnabled {
+                putInt(ProfileSettingsKey.mtpAdaptiveMaxDepth, mtpAdaptiveMaxDepth)
+            }
             putBool(ProfileSettingsKey.vlmMtpEnabled, vlmMtpEnabled)
             if vlmMtpEnabled {
                 putString(ProfileSettingsKey.vlmMtpDraftModel, vlmMtpDraftModel)
@@ -1427,6 +1454,91 @@ final class ModelSettingsScreenVM {
         } catch {
             self.lastError = error.omlxDescription
         }
+    }
+
+
+    // MARK: - Snapshot actions
+
+    func resetDefaults(client: OMLXClient) async {
+        guard !isApplyingSettings else { return }
+        isApplyingSettings = true
+        defer { isApplyingSettings = false }
+        do {
+            _ = try await client.resetModelSettings(id: modelID)
+            await load(modelID: modelID, client: client)
+        } catch {
+            lastError = error.omlxDescription
+        }
+    }
+
+    func loadOptimalCandidates(client: OMLXClient) async {
+        guard !isApplyingSettings else { return }
+        isApplyingSettings = true
+        applyError = nil
+        applyOutcome = .optimalCandidates(nil)
+        defer { isApplyingSettings = false }
+        do {
+            let candidates = try await client.listOptimalCandidates(id: modelID)
+            applyOutcome = .optimalCandidates(candidates)
+        } catch {
+            applyError = error.omlxDescription
+        }
+    }
+
+    func applyOptimalCandidate(_ benchmarkId: String, client: OMLXClient) async {
+        guard !isApplyingSettings else { return }
+        isApplyingSettings = true
+        applyError = nil
+        defer { isApplyingSettings = false }
+        do {
+            let result = try await client.applyOptimalCandidate(id: modelID, benchmarkId: benchmarkId)
+            await load(modelID: modelID, client: client)
+            applyOutcome = .optimal(result)
+        } catch {
+            applyError = error.omlxDescription
+        }
+    }
+
+    func applyRecipe(_ recipe: String, client: OMLXClient) async {
+        let text = recipe.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !isApplyingSettings else { return }
+        isApplyingSettings = true
+        applyError = nil
+        defer { isApplyingSettings = false }
+        do {
+            let result = try await client.applyRecipe(id: modelID, recipe: text)
+            await load(modelID: modelID, client: client)
+            applyOutcome = .recipe(result)
+        } catch {
+            applyError = error.omlxDescription
+        }
+    }
+
+    /// One line per skipped feature for the result sheet.
+    nonisolated static func summarizeSkipped(_ skipped: [SkippedFeatureDTO]?) -> [String] {
+        (skipped ?? []).map { "\($0.feature): \($0.reason)" }
+    }
+
+    /// Pretty JSON of the applied values, keys sorted so the sheet is stable.
+    nonisolated static func appliedJSON(_ applied: [String: AnyCodable]?) -> String {
+        guard let applied, !applied.isEmpty else { return "{}" }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(applied),
+              let text = String(data: data, encoding: .utf8) else { return "{}" }
+        return text
+    }
+
+    /// "PP 1309.1 tok/s · TG 59.6 tok/s · 128 GB · 4bit · oMLX 0.7.0" for a candidate row.
+    nonisolated static func candidateStats(pp: Double?, tg: Double?, memoryGb: Int? = nil,
+                                           quantization: String?, omlxVersion: String?) -> String {
+        var parts: [String] = []
+        if let pp { parts.append(String(format: "PP %.1f tok/s", pp)) }
+        if let tg { parts.append(String(format: "TG %.1f tok/s", tg)) }
+        if let memoryGb { parts.append("\(memoryGb) GB") }
+        if let quantization, !quantization.isEmpty { parts.append(quantization) }
+        if let omlxVersion, !omlxVersion.isEmpty { parts.append("oMLX \(omlxVersion)") }
+        return parts.joined(separator: " · ")
     }
 
     /// Save the current working settings as a new profile (model scope)
@@ -1790,4 +1902,13 @@ enum QwenAneSettingsValidator {
         }
         return .success(value)
     }
+}
+
+/// Sheet state for the header snapshot actions on ModelSettingsScreen.
+/// `optimalCandidates(nil)` is the loading state while omlx.ai is queried.
+enum SettingsApplyOutcome {
+    case recipeInput
+    case optimalCandidates(OptimalCandidatesDTO?)
+    case optimal(SettingsApplyResultDTO)
+    case recipe(SettingsApplyResultDTO)
 }

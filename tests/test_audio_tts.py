@@ -186,6 +186,64 @@ class TestTTSKokoroLangInference:
         assert captured["had_lang_code"] is False
 
 
+class TestTTSPresetVoiceRouting:
+    """Qwen3-TTS Base has no preset speakers and raises on any ``voice``."""
+
+    @staticmethod
+    def _engine(captured: list, speakers: list):
+        from types import SimpleNamespace
+
+        import numpy as np
+
+        from omlx.engine.tts import TTSEngine
+
+        class FakeQwenTTS:
+            sample_rate = 24000
+            supported_speakers = speakers
+
+            def generate(
+                self,
+                *,
+                text,
+                verbose=False,
+                voice=None,
+                instruct=None,
+                stream=False,
+                streaming_interval=2.0,
+                **kw,
+            ):
+                if voice is not None and voice not in self.supported_speakers:
+                    raise ValueError(f"Voice '{voice}' is not supported")
+                captured.append(voice)
+                return [SimpleNamespace(audio=np.zeros(100, dtype=np.float32))]
+
+        engine = TTSEngine("qwen3-tts")
+        engine._model = FakeQwenTTS()
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_base_model_ignores_openai_voice(self):
+        captured: list = []
+        engine = self._engine(captured, speakers=[])
+
+        await engine.synthesize("hello", voice="alloy")
+        async for _ in engine.stream_synthesize_pcm("hello", voice="alloy"):
+            pass
+
+        assert captured == [None, None]
+
+    @pytest.mark.asyncio
+    async def test_custom_voice_model_keeps_voice(self):
+        captured: list = []
+        engine = self._engine(captured, speakers=["ryan"])
+
+        await engine.synthesize("hello", voice="ryan")
+        async for _ in engine.stream_synthesize_pcm("hello", voice="ryan"):
+            pass
+
+        assert captured == ["ryan", "ryan"]
+
+
 class TestTTSEndpointBasic:
     """Core TTS endpoint behaviour."""
 

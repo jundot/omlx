@@ -19,7 +19,13 @@ def test_new_profile_api_toggle():
 
     assert "modal.model_settings.profiles.expose_as_model" in form
     assert "newProfile.expose_as_model = !newProfile.expose_as_model" in form
-    assert "newProfile.expose_as_model ? 'ON' : 'OFF'" in form
+    # The state labels are localised now, so assert the keys the toggle
+    # renders rather than the English copy it used to hardcode.
+    assert (
+        "newProfile.expose_as_model ? "
+        "t('modal.model_settings.profiles.expose_as_model_on') : "
+        "t('modal.model_settings.profiles.expose_as_model_off')"
+    ) in form
 
 
 def test_new_profile_resets_api_exposure():

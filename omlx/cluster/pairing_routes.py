@@ -120,6 +120,19 @@ async def cluster_pair_join_cancel():
         raise _pairing_http_error(exc) from exc
 
 
+@pair_admin_router.delete("/pair/join/cleanup")
+async def cluster_forget_join_cleanup():
+    """Abandon only pending local cleanup, without unpairing any device."""
+    try:
+        return await asyncio.to_thread(_manager().ui_session.forget_cleanup)
+    except PairingError as exc:
+        raise _pairing_http_error(exc) from exc
+    except OSError as exc:
+        raise HTTPException(
+            status_code=503, detail="Could not save the local cleanup change."
+        ) from exc
+
+
 def _pairing_http_error(exc: PairingError) -> HTTPException:
     if isinstance(exc, PairingLockoutError):
         return HTTPException(status_code=423, detail=str(exc))

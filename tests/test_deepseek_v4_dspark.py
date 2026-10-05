@@ -839,7 +839,12 @@ def test_vectorized_verify_ring_snapshots_match_m1_updates(dsv4, batch_cache):
     assert len(actual_rows) == len(expected_rows)
     for actual, expected in zip(actual_rows, expected_rows):
         assert mx.array_equal(actual, expected).item()
-    assert actual_cache.meta_state == expected_cache.meta_state
+    from omlx.cache.type_registry import CacheTypeRegistry
+
+    handler = CacheTypeRegistry.get_handler_for_object(actual_cache)
+    assert handler.serialize_meta_state(actual_cache) == handler.serialize_meta_state(
+        expected_cache
+    )
     assert mx.array_equal(actual_cache.keys, expected_cache.keys).item()
     assert mx.array_equal(actual_cache.values, expected_cache.values).item()
     if batch_cache:
@@ -903,7 +908,12 @@ def test_vectorized_verify_ring_rollback_matches_accepted_prefix(dsv4, batch_cac
     assert actual.trim(2) == 2
     mx.eval(expected.keys, expected.values, actual.keys, actual.values)
 
-    assert actual.meta_state == expected.meta_state
+    from omlx.cache.type_registry import CacheTypeRegistry
+
+    handler = CacheTypeRegistry.get_handler_for_object(actual)
+    assert handler.serialize_meta_state(actual) == handler.serialize_meta_state(
+        expected
+    )
     assert mx.array_equal(actual.keys, expected.keys).item()
     assert mx.array_equal(actual.values, expected.values).item()
     if batch_cache:

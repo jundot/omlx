@@ -14,11 +14,15 @@ struct AppView: View {
     @State private var selection: AppSection? = .status
     @State private var presentedUpdate: AvailableUpdate?
 
+    @AppStorage(EnhancedReadability.enabledKey) private var enhancedReadability = false
+
     @Environment(\.colorScheme) private var scheme
     @Environment(AppServices.self) private var services
 
     var body: some View {
-        let theme = scheme == .dark ? OMLXTheme.dark : OMLXTheme.light
+        let theme = OMLXTheme.resolved(
+            for: scheme, enhancedReadability: enhancedReadability
+        )
         let section = selectedSection
 
         // The sidebar is the only way to switch screens, so it must never

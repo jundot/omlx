@@ -20,7 +20,7 @@ def test_minimax_m3_compat_installs_vendor_modules():
     import mlx_vlm.models.minimax_m3_vl  # noqa: F401
     import mlx_vlm.models.minimax_m3_vl.language as language
     import mlx_vlm.models.minimax_m3_vl.msa as msa
-    import mlx_vlm.tool_parsers.minimax_m3 as parser
+    import mlx_vlm.tools.parsers.minimax_m3 as parser
 
     assert hasattr(language, "MiniMaxM3KVCache")
     assert hasattr(msa, "build_grouped_msa_topk")
@@ -143,6 +143,9 @@ def test_stopping_criteria_accepts_none_eos_ids():
 
     criteria = StoppingCriteria(None)
     assert criteria.eos_token_ids == []
+    tokenizer = SimpleNamespace(eos_token_id=7)
+    criteria = StoppingCriteria(None, tokenizer, additional_eos_token_ids=[9])
+    assert criteria.eos_token_ids == [9]
 
 
 def test_minimax_quantization_compat_restores_mxfp8_and_skip_module(tmp_path):
@@ -283,6 +286,35 @@ def test_minimax_unpacked_mixed_bit_moe_forward():
     mx.eval(output)
     assert output.shape == (1, 1, 64)
     assert bool(mx.all(mx.isfinite(output)).item())
+
+
+def test_minimax_m3_kv_cache_state_and_to_batch_accept_both_kv_classes():
+    mx = pytest.importorskip("mlx.core")
+    from omlx.patches.mlx_vlm_minimax_m3_compat import (
+        apply_mlx_vlm_minimax_m3_compat_patch,
+    )
+
+    apply_mlx_vlm_minimax_m3_compat_patch()
+
+    from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
+
+    keys = mx.random.normal((1, 2, 5, 4))
+    values = mx.random.normal((1, 2, 5, 4))
+    fresh = MiniMaxM3KVCache()
+    fresh.update_and_fetch(keys, values)
+    # extract() wraps the mlx_lm KVCache instead of the mlx_vlm one.
+    extracted = fresh.to_batch([0]).extract(0)
+    assert type(extracted.kv_cache) is not type(fresh.kv_cache)
+
+    for cache in (fresh, extracted):
+        (state_keys, state_values), _ = cache.state
+        assert mx.array_equal(state_keys, keys)
+        assert mx.array_equal(state_values, values)
+
+        batch_keys, batch_values = cache.to_batch([2]).kv_cache.keys_and_values()
+        assert batch_keys.shape[2] == 7
+        assert mx.array_equal(batch_keys[..., 2:, :], keys)
+        assert mx.array_equal(batch_values[..., 2:, :], values)
 
 
 def test_omlx_loader_respects_minimax_shared_expert_layout_override():

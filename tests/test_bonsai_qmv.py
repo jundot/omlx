@@ -824,3 +824,55 @@ class TestT5FormatDetection:
         object.__setattr__(layer, "weight", mx.zeros((16, 3), dtype=mx.uint8))
         second = _is_t5_format(layer)
         assert first == second
+
+
+def test_vlm_one_bit_modules_keep_bonsai_paths(monkeypatch):
+    from mlx_vlm.quantization.one_bit import OneBitEmbedding, OneBitLinear
+
+    from omlx.models.vlm import restore_bonsai_quantized_modules
+    from omlx.patches import bonsai_qmv
+
+    model = nn.Module()
+    model.linear = OneBitLinear(128, 32, bias=False)
+    model.embedding = OneBitEmbedding(32, 128)
+    for module in (model.linear, model.embedding):
+        module.weight = mx.full((32, 4), 0x55555555, dtype=mx.uint32)
+        module.scales = mx.ones((32, 2), dtype=mx.float16)
+        module.biases = mx.full((32, 2), -0.5, dtype=mx.float16)
+    weights = model.linear.weight, model.embedding.weight
+    calls = []
+
+    def native(x, weight, scales, biases):
+        calls.append(tuple(x.shape))
+        return x @ bonsai_fast._dequant_1bit(weight, scales, biases, x.dtype).T
+
+    monkeypatch.setattr(bonsai_qmv, "has_native", lambda: True)
+    monkeypatch.setattr(bonsai_qmv, "bonsai_q1_affine_qmv_sym", native)
+    assert restore_bonsai_quantized_modules(model) == 2
+    assert type(model.linear) is nn.QuantizedLinear
+    assert type(model.embedding) is nn.QuantizedEmbedding
+    assert model.linear.weight is weights[0]
+    assert model.embedding.weight is weights[1]
+    assert not model.linear.trainable_parameters()
+    assert not model.embedding.trainable_parameters()
+    assert restore_bonsai_quantized_modules(model) == 0
+    for batch in (1, 2):
+        x = mx.ones((batch, 128), dtype=mx.float16)
+        actual = model.linear(x)
+        expected = (
+            x
+            @ bonsai_fast._dequant_1bit(
+                weights[0], model.linear.scales, model.linear.biases, x.dtype
+            ).T
+        )
+        mx.eval(actual, expected)
+        np.testing.assert_array_equal(np.array(actual), np.array(expected))
+    assert calls == [(1, 128), (2, 128)]
+    ids = mx.array([0, 7])
+    expected = bonsai_fast._dequant_1bit(
+        model.embedding.weight,
+        model.embedding.scales,
+        model.embedding.biases,
+        mx.float16,
+    )[ids]
+    np.testing.assert_array_equal(np.array(model.embedding(ids)), np.array(expected))

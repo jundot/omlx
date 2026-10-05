@@ -335,7 +335,9 @@ class Indexer(nn.Module):
                 scores = mx.where(mask, scores, -float("inf"))
             return select_topk(scores)
         weights_lh = weights_lh * self.weight_scale
-        fuse_causal_mask = mask is not None
+        # A causal-only kernel cannot represent per-row left padding. Apply
+        # the full batch mask before top-k so padding cannot displace real keys.
+        fuse_causal_mask = mask is not None and not hasattr(cache, "left_padding")
         causal_valid_prefix_topk = fuse_causal_mask
 
         scores = None
@@ -712,7 +714,8 @@ class DeepseekV32MoE(nn.Module):
             scores=scores if use_weighted_sum else None,
             weighted_sum=use_weighted_sum,
         )
-        if not use_weighted_sum:
+        # Unsummed routes: no weighted sum asked for, or the kernel declined.
+        if y.ndim == x.ndim + 1:
             y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
         if self.config.n_shared_experts is not None:
             y = y + self.shared_experts(x)

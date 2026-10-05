@@ -69,6 +69,7 @@ class VisionFeatureSSDEntry:
     created_at: float
     last_access: float
     num_tensors: int = 1  # 1 for single image, N for multi-image list
+    grid: Optional[List[int]] = None  # Per-image patch grid [t, h, w].
 
 
 class VisionFeatureSSDCache:
@@ -78,6 +79,7 @@ class VisionFeatureSSDCache:
         cache_dir: SSD storage directory. None for memory-only mode.
         max_size_bytes: Maximum SSD cache size in bytes (default 10GB).
         max_memory_entries: Maximum in-memory LRU entries (default 20).
+        max_memory_bytes: Maximum in-memory LRU size in bytes (default 1GB).
     """
 
     def __init__(
@@ -85,13 +87,19 @@ class VisionFeatureSSDCache:
         cache_dir: Optional[Path] = None,
         max_size_bytes: int = 10 * 1024**3,
         max_memory_entries: int = 20,
+        max_memory_bytes: int = 1024**3,
     ):
         self._cache_dir = cache_dir
         self._max_size_bytes = max_size_bytes
         self._max_memory_entries = max_memory_entries
+        self._max_memory_bytes = max_memory_bytes
 
         # In-memory LRU cache: composite_key -> mx.array (or list[mx.array])
         self._memory_cache: OrderedDict[str, Any] = OrderedDict()
+        self._memory_bytes = 0
+        self._memory_entry_bytes: Dict[str, int] = {}
+        # Lets a cache hit rebuild placeholder tokens without the processor.
+        self._memory_grid: Dict[str, List[int]] = {}
         self._memory_lock = threading.Lock()
 
         # SSD index: composite_key -> VisionFeatureSSDEntry
@@ -151,8 +159,13 @@ class VisionFeatureSSDCache:
             features = self._load_from_ssd(key)
             if features is not None:
                 # Promote to memory cache
+                with self._ssd_lock:
+                    entry = self._ssd_index.get(key)
+                    grid = entry.grid if entry is not None else None
                 with self._memory_lock:
                     self._memory_put(key, features)
+                    if grid is not None:
+                        self._memory_grid[key] = grid
                 self._stats["hits"] += 1
                 self._stats["ssd_loads"] += 1
                 return features
@@ -165,6 +178,7 @@ class VisionFeatureSSDCache:
         image_hash: str,
         model_name: str,
         features: Any,
+        grid: Optional[List[int]] = None,
     ) -> None:
         """Store vision features in the cache.
 
@@ -174,23 +188,42 @@ class VisionFeatureSSDCache:
             image_hash: SHA256 hash from compute_image_hash().
             model_name: Model path for cache isolation.
             features: Evaluated mx.array (or list of mx.array for multi-image).
+            grid: Optional per-image patch grid ``[t, h, w]``.
         """
         key = _composite_key(model_name, image_hash)
 
         # Store in memory LRU
         with self._memory_lock:
             self._memory_put(key, features)
+            if grid is not None:
+                self._memory_grid[key] = list(grid)
 
         # Enqueue SSD write
         if self._cache_dir is not None:
-            self._enqueue_ssd_write(key, image_hash, model_name, features)
+            self._enqueue_ssd_write(key, image_hash, model_name, features, grid)
 
         self._stats["saves"] += 1
+
+    def get_grid(self, image_hash: str, model_name: str) -> Optional[List[int]]:
+        """Return the cached patch grid ``[t, h, w]``, or None if not stored."""
+        key = _composite_key(model_name, image_hash)
+        with self._memory_lock:
+            grid = self._memory_grid.get(key)
+        if grid is not None:
+            return grid
+        if self._cache_dir is not None:
+            with self._ssd_lock:
+                entry = self._ssd_index.get(key)
+                return entry.grid if entry is not None else None
+        return None
 
     def close(self) -> None:
         """Shut down the background writer and flush pending writes."""
         with self._memory_lock:
             self._memory_cache.clear()
+            self._memory_grid.clear()
+            self._memory_entry_bytes.clear()
+            self._memory_bytes = 0
         self._writer_shutdown.set()
         # Send sentinel to unblock the writer
         try:
@@ -211,20 +244,37 @@ class VisionFeatureSSDCache:
     # ── Memory LRU helpers ──────────────────────────────────────────
 
     def _memory_put(self, key: str, features: Any) -> None:
-        """Insert into memory LRU, evicting oldest if over limit.
+        """Insert into memory LRU, evicting oldest if over limits.
 
         Caller must hold _memory_lock.
         """
+        nbytes = self._features_bytes(features)
         if key in self._memory_cache:
             self._memory_cache.move_to_end(key)
             self._memory_cache[key] = features
+            self._memory_bytes += nbytes - self._memory_entry_bytes.get(key, 0)
+            self._memory_entry_bytes[key] = nbytes
             return
 
-        # Evict oldest if over limit
-        while len(self._memory_cache) >= self._max_memory_entries:
-            self._memory_cache.popitem(last=False)
-
         self._memory_cache[key] = features
+        self._memory_entry_bytes[key] = nbytes
+        self._memory_bytes += nbytes
+
+        # Evict oldest if over either limit
+        while self._memory_cache and (
+            self._memory_bytes > self._max_memory_bytes
+            or len(self._memory_cache) > self._max_memory_entries
+        ):
+            evicted_key, _ = self._memory_cache.popitem(last=False)
+            self._memory_bytes -= self._memory_entry_bytes.pop(evicted_key, 0)
+            self._memory_grid.pop(evicted_key, None)
+
+    @staticmethod
+    def _features_bytes(features: Any) -> int:
+        """Accounted bytes of a cached feature tensor (or tensor list)."""
+        if isinstance(features, (list, tuple)):
+            return sum(int(f.nbytes) for f in features)
+        return int(features.nbytes)
 
     # ── SSD persistence ─────────────────────────────────────────────
 
@@ -240,6 +290,7 @@ class VisionFeatureSSDCache:
         image_hash: str,
         model_name: str,
         features: Any,
+        grid: Optional[List[int]] = None,
     ) -> None:
         """Extract tensor bytes and enqueue background SSD write."""
         with self._pending_lock:
@@ -247,7 +298,8 @@ class VisionFeatureSSDCache:
                 return  # Already pending
             self._pending_write_keys.add(key)
 
-        # Check if already on SSD
+        # Check if already on SSD. Entries without grid metadata are not
+        # rewritten: a failed rewrite would unlink the valid old file.
         with self._ssd_lock:
             if key in self._ssd_index:
                 self._ssd_index[key].last_access = time.time()
@@ -274,6 +326,8 @@ class VisionFeatureSSDCache:
                 "num_tensors": str(num_tensors),
                 "created_at": str(time.time()),
             }
+            if grid is not None:
+                metadata["grid_thw"] = json.dumps(list(grid))
 
             file_path = self._file_path_for_key(key)
 
@@ -290,6 +344,7 @@ class VisionFeatureSSDCache:
                 created_at=now,
                 last_access=now,
                 num_tensors=num_tensors,
+                grid=list(grid) if grid is not None else None,
             )
             with self._ssd_lock:
                 self._ssd_index[key] = entry
@@ -328,8 +383,12 @@ class VisionFeatureSSDCache:
             try:
                 if oldest.file_path.exists():
                     oldest.file_path.unlink()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(
+                    "Failed to remove evicted vision cache file %s: %s",
+                    oldest.file_path,
+                    e,
+                )
 
     def _load_from_ssd(self, key: str) -> Optional[Any]:
         """Load cached features from SSD.
@@ -391,8 +450,12 @@ class VisionFeatureSSDCache:
             try:
                 if file_path.exists():
                     file_path.unlink()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(
+                    "Failed to remove unusable vision cache file %s: %s",
+                    file_path,
+                    e,
+                )
             return None
 
     def _scan_existing_files(self) -> None:
@@ -424,6 +487,20 @@ class VisionFeatureSSDCache:
                     key = _composite_key(model_name, image_hash)
                     file_stat = file_path.stat()
 
+                    grid = None
+                    grid_raw = metadata.get("grid_thw")
+                    if grid_raw:
+                        try:
+                            parsed = json.loads(grid_raw)
+                            if (
+                                isinstance(parsed, list)
+                                and len(parsed) == 3
+                                and all(isinstance(v, int) for v in parsed)
+                            ):
+                                grid = parsed
+                        except (ValueError, TypeError):
+                            grid = None
+
                     entry = VisionFeatureSSDEntry(
                         image_hash=image_hash,
                         model_name=model_name,
@@ -432,6 +509,7 @@ class VisionFeatureSSDCache:
                         created_at=file_stat.st_ctime,
                         last_access=file_stat.st_mtime,
                         num_tensors=num_tensors,
+                        grid=grid,
                     )
                     self._ssd_index[key] = entry
                     self._ssd_total_size += file_stat.st_size
@@ -502,8 +580,10 @@ class VisionFeatureSSDCache:
                     try:
                         if p is not None and p.exists():
                             p.unlink()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to clean up vision cache file %s: %s", p, e
+                        )
             finally:
                 with self._pending_lock:
                     self._pending_write_keys.discard(key)

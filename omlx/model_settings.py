@@ -21,6 +21,7 @@ from .model_profiles import (
     UNIVERSAL_FIELDS_SET,
     filter_profile_fields,
     filter_universal_fields,
+    normalize_turboquant_kv_bits,
     slugify_profile_api_name,
     validate_profile_name,
     utcnow,
@@ -35,8 +36,14 @@ SETTINGS_VERSION = 1
 # Keep API validation and runtime normalization on the same contract.
 MAX_LIGHTNING_MTP_DRAFT_TOKENS = 8
 
+# These families keep the MTP head resident while backbone experts stream.
+# qwen4_exp (Qwen3.8-Flash-Next) drafts from its embedded native head, whose
+# experts the generic SwitchGLU adapter leaves resident (see
+# apply_moe_expert_offload's mtp_resident).
+MOE_OFFLOAD_MTP_MODEL_TYPES = ("deepseek_v41", "glm5_next", "qwen4_exp")
 
-def validate_moe_expert_offload(settings: dict) -> None:
+
+def validate_moe_expert_offload(settings: dict, model_type: str | None = None) -> None:
     fraction = settings.get("moe_expert_offload_resident_fraction", 0.25)
     if (
         isinstance(fraction, bool)
@@ -44,14 +51,22 @@ def validate_moe_expert_offload(settings: dict) -> None:
         or not 0 < fraction <= 1
     ):
         raise ValueError("moe_expert_offload_resident_fraction must be in (0, 1]")
-    if settings.get("moe_expert_offload_enabled") and any(
-        settings.get(key)
-        for key in ("mtp_enabled", "vlm_mtp_enabled", "dflash_enabled")
-    ):
+    if not settings.get("moe_expert_offload_enabled"):
+        return
+    # VLM MTP and DFlash have no offload-aware draft path at all.
+    if any(settings.get(key) for key in ("vlm_mtp_enabled", "dflash_enabled")):
         raise ValueError(
             "MoE expert offload cannot be combined with Lightning MTP, "
             "VLM MTP, or DFlash; disable speculative decoding first."
         )
+    # Settings can load before the checkpoint family is known.
+    if settings.get("mtp_enabled") and model_type is not None:
+        family = model_type.replace("-", "_").lower()
+        if family not in MOE_OFFLOAD_MTP_MODEL_TYPES:
+            raise ValueError(
+                "MoE expert offload cannot be combined with Lightning MTP, "
+                "VLM MTP, or DFlash; disable speculative decoding first."
+            )
 
 
 def ane_prefill_backend(model_type: str | None) -> str | None:
@@ -247,7 +262,11 @@ class ModelSettings:
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
         specprefill_threshold: Min tokens to trigger SpecPrefill.
-        dflash_enabled: Enable DFlash speculative decoding.
+        dflash_enabled: Enable DFlash speculative decoding. Qwen3.5-family VLM
+            targets draft inside the batched engine (Lightning MTP verify path
+            with greedy or sampled acceptance, continuous batching); other
+            targets use the single-stream DFlash engine, which alone honours
+            the max_ctx, cache, window, sink and verify_mode settings below.
         dflash_draft_model: Path/repo for DFlash draft checkpoint.
         dflash_draft_quant_enabled: Enable draft model quantization.
         dflash_draft_quant_weight_bits: Quantization weight bits (2, 4, 8).
@@ -426,16 +445,20 @@ class ModelSettings:
     dflash_block_size: Optional[int] = None
     dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
 
-    # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
-    # uses MTP draft+verify for singleton decode and aligned multi-row decode batches.
-    # Compatible model_types: qwen3_5*, qwen3_6*, deepseek_v4*. Mutually exclusive
-    # with dflash.
+    # Lightning MTP uses the embedded head for single and concurrent requests.
+    # Equal-depth rows share target verification when supported by the backbone;
+    # each request keeps its own acceptance, draft history and cache frontier.
+    # Mutually exclusive with DFlash.
     mtp_enabled: bool = False
     # Maximum chained MTP draft tokens per verify cycle (speculative depth).
-    # None = model-specific default (3 for DeepSeek-V4 and Qwen3.5/3.6).
-    # An adaptive controller picks 1..max per sequence from rolling
-    # acceptance/latency estimates; set to 1 for a fixed depth-1 cycle.
-    mtp_num_draft_tokens: Optional[int] = None
+    # Qwen 27B enforces a minimum adaptive ceiling of 4.
+    # None = model-specific default (4 for dense Qwen3.5-family on M5, else 3
+    # for DeepSeek-V4 and Qwen3.5/3.6). An adaptive controller picks 1..max
+    # per sequence from rolling acceptance/latency estimates.
+    mtp_adaptive_max_depth: Optional[int] = None
+    # Draft exactly this many tokens every cycle, with no adaptive controller.
+    # Takes precedence over mtp_adaptive_max_depth; None = adaptive.
+    mtp_fixed_depth: Optional[int] = None
 
     # VLM MTP speculative decoding via external MTP drafter (mlx-vlm f96138e+).
     # Supported drafter types: gemma4_assistant (for Gemma 4 VLMs), qwen3_5_mtp
@@ -469,6 +492,8 @@ class ModelSettings:
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
 
     def __post_init__(self) -> None:
+        # Profiles retain raw JSON types; engine signatures use repr().
+        self.turboquant_kv_bits = normalize_turboquant_kv_bits(self.turboquant_kv_bits)
         if self.qwen35_oq_a8_enabled and self.qwen35_oq_a8_min_tokens < 1:
             raise ValueError("qwen35_oq_a8_min_tokens must be at least 1")
         # Both accelerate the same Qwen3.5 prefill projections by wrapping
@@ -533,6 +558,8 @@ class ModelSettings:
         result = {}
         for f in fields(self):
             value = getattr(self, f.name)
+            if f.name == "turboquant_kv_bits":
+                value = normalize_turboquant_kv_bits(value)
             if value is not None:
                 result[f.name] = value
         return result
@@ -959,6 +986,11 @@ class ModelSettingsManager:
                 used_api_names: set[str] = set()
                 for name, profile in profiles.items():
                     settings = profile.get("settings")
+                    # Normalize in memory only; the next save writes floats.
+                    if settings and "turboquant_kv_bits" in settings:
+                        settings["turboquant_kv_bits"] = normalize_turboquant_kv_bits(
+                            settings["turboquant_kv_bits"]
+                        )
                     if settings and "ttl_seconds" in settings:
                         del settings["ttl_seconds"]
                         changed = True
@@ -1483,7 +1515,12 @@ class ModelSettingsManager:
         merged = {
             k: v for k, v in current.to_dict().items() if k not in UNIVERSAL_FIELDS_SET
         }
-        merged.update(filter_profile_fields(profile_settings))
+        overlay = filter_profile_fields(profile_settings)
+        merged.update(overlay)
+        # A profile that sets the Lightning MTP toggle also owns the depth
+        # choice; no fixed depth there selects adaptive depth.
+        if "mtp_enabled" in overlay and "mtp_fixed_depth" not in overlay:
+            merged["mtp_fixed_depth"] = None
         merged["active_profile_name"] = name
         if settings_sanitizer is not None:
             settings_sanitizer(merged)

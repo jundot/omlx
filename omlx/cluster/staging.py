@@ -27,14 +27,15 @@ from pathlib import Path
 from typing import Any
 
 from .ssh_policy import cluster_ssh_options
+from .worker_shim import CLUSTER_PYTHON_SHIM
 
 _LAYER = re.compile(r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)(?:\.|$)")
 _MAX_HEADER_BYTES = 64 * 1024 * 1024
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
-# Where a peer's oMLX checkout keeps its interpreter. Unquoted on the remote
-# command line so the peer's shell expands ``~`` to its own home.
-DEFAULT_REMOTE_PYTHON = "~/omlx-distributed/.venv/bin/python"
+# Every running oMLX installation publishes this interpreter shim. Keep the
+# peer-home form so the remote shell expands it for the authenticated user.
+DEFAULT_REMOTE_PYTHON = CLUSTER_PYTHON_SHIM
 
 
 def is_local_host(host: str) -> bool:
@@ -752,12 +753,13 @@ def scp_push(
         result = subprocess.run(
             [
                 "scp",
+                "-s",
                 "-q",
                 *cluster_ssh_options(connect_timeout=10),
                 "-c",
                 cipher,
                 str(source),
-                f"{destination_host}:{shlex.quote(temporary_path)}",
+                f"{destination_host}:{temporary_path}",
             ],
             capture_output=True,
             text=True,
@@ -823,7 +825,13 @@ def scp_copy(
         )
         return
 
-    remote_source = shlex.quote(f"{source_dir.rstrip('/')}/{filename}")
+    # SFTP receives paths as arguments, not shell commands. Shell quotes here
+    # become literal filename characters, breaking directories with spaces.
+    remote_source = f"{source_dir.rstrip('/')}/{filename}"
+    # SFTP scp still expands remote source globs; quote their metacharacters.
+    remote_source = "".join(
+        "\\" + char if char in "\\*?[]" else char for char in remote_source
+    )
     if destination_local:
         destination = Path(destination_dir).expanduser()
         destination.mkdir(parents=True, exist_ok=True)
@@ -832,6 +840,7 @@ def scp_copy(
             result = subprocess.run(
                 [
                     "scp",
+                    "-s",
                     "-q",
                     *cluster_ssh_options(connect_timeout=10),
                     "-c",
@@ -877,13 +886,14 @@ def scp_copy(
             result = subprocess.run(
                 [
                     "scp",
+                    "-s",
                     "-3",
                     "-q",
                     *cluster_ssh_options(connect_timeout=10),
                     "-c",
                     cipher,
                     f"{source_host}:{remote_source}",
-                    f"{destination_host}:{shlex.quote(temporary_path)}",
+                    f"{destination_host}:{temporary_path}",
                 ],
                 capture_output=True,
                 text=True,

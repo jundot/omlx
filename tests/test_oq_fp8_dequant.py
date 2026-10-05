@@ -155,3 +155,38 @@ def test_minimax_m3_k_proj_magnitude():
     max_abs = mx.abs(weight).max().item()
     assert mean_abs < 1.0, f"mean|w|={mean_abs}"
     assert max_abs < 2.0, f"max|w|={max_abs}"
+
+
+def test_mimo_mxfp4_index_preserves_packed_experts_through_stack(tmp_path):
+    from omlx.oq import _discover_sanitize_plan, _DiscoveredPlan
+
+    mx.random.seed(5)
+    packed, scales = mx.quantize(
+        mx.random.normal((2, 64, 128)), group_size=32, bits=4, mode="mxfp4"
+    )
+    tensors = {}
+    for i in range(2):
+        key = f"experts.{i}.weight"
+        tensors[key] = packed[i].view(mx.uint8)
+        tensors[key + "_scale"] = scales[i]
+    path = tmp_path / "model.safetensors"
+    mx.save_safetensors(str(path), tensors)
+    config = {"model_type": "mimo_v2", "quantization_config": {"store_dtype": "mxfp4"}}
+    index = _LazyTensorIndex([path], config=config)
+    assert index.logical_metadata()["experts.0.weight"][0] == (64, 128)
+    assert "experts.0.weight_scale" not in index
+
+    def sanitize(weights):
+        return {
+            "switch_mlp.weight": mx.stack(
+                [weights[f"experts.{i}.weight"] for i in range(2)]
+            )
+        }
+
+    plan = _DiscoveredPlan(_discover_sanitize_plan(sanitize, index), index)
+    assert plan.source_quant_info("switch_mlp.weight")["mode"] == "mxfp4"
+    actual_weight, actual_scales = plan.pop_packed("switch_mlp.weight")
+    assert mx.array_equal(actual_weight, packed).item()
+    assert mx.array_equal(actual_scales, scales).item()
+    other = _LazyTensorIndex([path])
+    assert other.source_quant_info("experts.0.weight") is None

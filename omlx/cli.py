@@ -82,6 +82,82 @@ def _has_cli_overrides(args) -> bool:
     return bool(getattr(args, "no_cache", False))
 
 
+def _migrate_saved_network_auth(settings, args) -> None:
+    import json
+    import os
+    import tempfile
+    from pathlib import Path
+
+    from .utils.network import is_valid_bind_host, network_auth_error
+
+    if getattr(args, "host", None) is not None or os.environ.get("OMLX_HOST"):
+        return
+    path = settings.base_path / "settings.json"
+    if not path.exists():
+        return
+    host = settings.server.host
+    if not isinstance(host, str) or not all(
+        is_valid_bind_host(part.strip()) for part in host.split(",")
+    ):
+        return
+    if not network_auth_error(
+        host, settings.auth.api_key, settings.auth.skip_api_key_verification
+    ):
+        return
+
+    settings.server.host = "127.0.0.1"
+    if settings.validate():
+        settings.server.host = host
+        return
+
+    message = (
+        f"The saved server address ({host}) was changed to 127.0.0.1 because "
+        "API key authentication is required for access from other devices. "
+        "The server is now limited to this Mac. Your other settings and models "
+        "have been preserved. To allow access from other devices, set an API "
+        "key and enable authentication in Settings, then change the server address."
+    )
+    notice_path = os.environ.get("OMLX_STARTUP_NOTICE_PATH")
+    if not notice_path:
+        warning = message.replace("was changed", "will be changed").replace(
+            "is now limited", "will be limited"
+        )
+        print(f"Warning: {warning}", flush=True)
+        try:
+            input("Press Enter to continue, or Ctrl+C to cancel. ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nStartup canceled. Settings have not been changed.", flush=True)
+            raise SystemExit(1) from None
+
+    # Preserve unknown settings and avoid persisting environment overrides.
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.setdefault("server", {})["host"] = settings.server.host
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, delete=False
+        ) as output:
+            temporary = Path(output.name)
+            json.dump(data, output, indent=2)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+    if notice_path:
+        print(f"Warning: {message}", flush=True)
+
+        notice = Path(notice_path)
+        temporary = notice.with_suffix(".tmp")
+        try:
+            temporary.write_text(message, encoding="utf-8")
+            os.replace(temporary, notice)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
 def serve_command(args):
     """Start the OpenAI-compatible multi-model server."""
     import logging
@@ -185,6 +261,11 @@ def serve_command(args):
 
     # Validate before persisting CLI overrides, so invalid flags never poison
     # settings.json.
+    try:
+        _migrate_saved_network_auth(settings, args)
+    except (OSError, ValueError) as error:
+        print(f"Configuration error: {error}")
+        sys.exit(1)
     errors = settings.validate()
     if errors:
         for error in errors:
@@ -292,15 +373,21 @@ def serve_command(args):
         scheduler_config.paged_ssd_cache_dir = paged_ssd_cache_dir
         # Determine cache max size: CLI arg > settings (with auto resolution)
         if paged_ssd_cache_dir:
-            if args.paged_ssd_cache_max_size:
+            if (
+                args.paged_ssd_cache_max_size
+                and args.paged_ssd_cache_max_size.lower() != "auto"
+            ):
                 # CLI argument specified explicitly
                 cache_max_size_bytes = parse_size(args.paged_ssd_cache_max_size)
             else:
-                # Use settings value (handles "auto" -> 10% of SSD capacity)
+                # Resolve the initial automatic budget from disk space and existing cache.
                 cache_max_size_bytes = settings.cache.get_ssd_cache_max_size_bytes(
                     settings.base_path
                 )
             scheduler_config.paged_ssd_cache_max_size = cache_max_size_bytes
+            scheduler_config.paged_ssd_cache_auto_size = (
+                args.paged_ssd_cache_max_size or settings.cache.ssd_cache_max_size
+            ).lower() == "auto"
         else:
             scheduler_config.paged_ssd_cache_max_size = 0
             cache_max_size_bytes = 0
@@ -330,6 +417,8 @@ def serve_command(args):
             print("Mode: Multi-model serving (continuous batching + paged SSD cache)")
             # Format cache size for display
             cache_max_size_display = f"{cache_max_size_bytes / (1024**3):.1f}GB"
+            if scheduler_config.paged_ssd_cache_auto_size:
+                cache_max_size_display = f"auto, current limit {cache_max_size_display}"
             print(
                 f"paged SSD cache: {paged_ssd_cache_dir} (max: {cache_max_size_display})"
             )
@@ -464,9 +553,17 @@ def launch_command(args, extra_args: list[str] | None = None):
     # Determine model. Explicit CLI tier flags bypass the picker; otherwise always
     # prompt interactively so the user's selection is honoured.
     model = args.model
+    if not model and not integration.requires_model_selection:
+        # The integration registers the server's whole model catalog, so
+        # there is nothing to pick here; the optional per-tool default (or
+        # --model) only seeds the tool's own default model.
+        model = (
+            _optional_str(getattr(settings.integrations, f"{tool_name}_model", None))
+            or ""
+        )
     if not model and (cli_opus_model or cli_sonnet_model or cli_haiku_model):
         model = cli_sonnet_model or cli_opus_model or cli_haiku_model or ""
-    elif not model:
+    elif not model and integration.requires_model_selection:
         # Fetch available models from server
         try:
             resp = requests.get(f"{base_url}/v1/models", headers=headers, timeout=5)
@@ -565,13 +662,17 @@ def launch_command(args, extra_args: list[str] | None = None):
         max_tokens=model_info.get("max_tokens"),
         model_type=model_info.get("model_type"),
         reasoning=model_info.get("enable_thinking"),
+        models_status_map=models_status_map,
         tools_profile=getattr(args, "tools_profile", "coding"),
         extra_args=tuple(extra_args or ()),
         cross_session=getattr(args, "cross_session", False),
     )
 
     # Launch
-    print(f"Launching {integration.display_name} with model {model}...")
+    if model:
+        print(f"Launching {integration.display_name} with model {model}...")
+    else:
+        print(f"Launching {integration.display_name}...")
     integration.launch(ctx)
 
 
@@ -1127,7 +1228,7 @@ Example directory structure:
         type=str,
         choices=["off", "safe", "balanced", "aggressive"],
         default=None,
-        help="Memory guard tier, or 'off' to disable the guard. safe reserves more system memory; aggressive allows more oMLX memory use. Passing a tier also turns the guard on. (default: balanced)",
+        help="Memory guard tier, or 'off' to disable the guard. The tier sets how much memory stays free for other apps: safe keeps about 20%% of RAM (6-16 GB), balanced about 8%% (3-8 GB), aggressive 2%% (1.5-4 GB) and may compress other apps' memory. Passing a tier also turns the guard on. (default: balanced)",
     )
     serve_parser.add_argument(
         "--memory-guard-gb",
@@ -1252,8 +1353,8 @@ Example directory structure:
         help="Launch an external tool with oMLX integration",
         description=(
             "Configure and launch external coding tools (Claude Code, Copilot, "
-            "Codex, Codex App, OpenCode, OpenClaw, Hermes Agent, Pi) to use "
-            "the running oMLX server."
+            "Codex, Codex App, OpenCode, OpenClaw, Hermes Agent, Pi, DeepSeek "
+            "Harness) to use the running oMLX server."
         ),
     )
     launch_parser.add_argument(
@@ -1261,7 +1362,7 @@ Example directory structure:
         type=str,
         help=(
             "Tool to launch: claude, copilot, codex, codex_app, opencode, "
-            "openclaw, hermes, pi, or 'list' to show available"
+            "openclaw, hermes, pi, dsh, or 'list' to show available"
         ),
     )
     launch_parser.add_argument(

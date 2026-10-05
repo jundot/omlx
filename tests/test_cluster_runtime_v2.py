@@ -361,12 +361,15 @@ def test_ring_teardown_verifies_killpg_and_raises_on_survivors(monkeypatch):
     assert supervisor.process is not None
 
 
-def test_ring_teardown_sweeps_leftover_ranks_by_marker_pid(monkeypatch):
+def test_ring_teardown_sweeps_leftover_ranks_by_marker_pid(
+    tmp_path, monkeypatch, mock_cluster_ssh
+):
     deployment = _three_node_ring_deployment()
     supervisor = launch.DistributedJobSupervisor(
         deployment,
         preflight=False,
         stop_timeout=0.1,
+        state_dir=str(tmp_path),
     )
     supervisor.process = _Launcher()
     _teardown_mocks(monkeypatch, [True])

@@ -824,3 +824,25 @@ async def test_v41_source_metadata_and_converted_filter(tmp_path, layer_key):
         "original": False,
         "converted": True,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "settings, message",
+    [
+        ({"oq_level": 8, "enhanced": True}, "Choose oQ3/oQ3e or oQ4/oQ4e"),
+        ({"oq_level": 4, "dtype": "float16"}, "requires dtype='bfloat16'"),
+        ({"oq_level": 3, "group_size": 32}, "group_size=64"),
+    ],
+)
+async def test_v41_rejects_unsupported_settings_before_queueing(
+    tmp_path, settings, message
+):
+    source = tmp_path / "DeepSeek-V4.1"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "deepseek_v41"}))
+    manager = OQManager(model_dirs=[str(tmp_path)])
+    with pytest.raises(ValueError, match=message):
+        await manager.start_quantization(str(source), **settings)
+    assert not manager._active_tasks
+    assert list(tmp_path.iterdir()) == [source]

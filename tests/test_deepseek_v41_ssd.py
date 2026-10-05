@@ -61,7 +61,7 @@ def test_delta_growth_is_linear_and_terminal_partial_preserves_state():
     markers = [_marker(0, 3), _marker(3, 6), _marker(6, 7)]
     restored = restore_chain(markers, [META] * 3, 7)
     assert restored.size() == 7
-    assert restored.state[2].shape[1] == 3
+    assert restored.cache[2].shape[1] == 3
 
 
 @pytest.mark.parametrize("indices", [(1,), (0, 2), (1, 0), (0, 0)])
@@ -74,7 +74,7 @@ def test_missing_or_reordered_blocks_are_rejected(indices):
 def test_legacy_anchor_and_invalid_metadata():
     old = ("__nstate__", "DeepseekV41Cache", _state(3))
     restored = restore_chain([old, _marker(3, 6)], [("deepseek_v41", "2"), META], 6)
-    assert restored.state[2].shape[1] == 3
+    assert restored.cache[2].shape[1] == 3
     with pytest.raises(ValueError):
         compact_state(_state(3), ("deepseek_v41", "4"), 0, 3)
     with pytest.raises(ValueError):
@@ -202,8 +202,8 @@ def test_real_ssd_reopen_full_and_partial_prefix(
             restored = prefix.reconstruct_cache(partial)
             assert restored is not None
             for cache in restored:
-                assert cache.state[2].dtype == mx.uint8
-                assert cache.state[3].dtype == mx.uint8
+                assert cache.cache[2].dtype == mx.uint8
+                assert cache.cache[3].dtype == mx.uint8
             actual = model(mx.array([[20, 21]]), cache=restored)
             if decoder_replay:
                 # Replay approximates each chunk boundary. Compare restoration
@@ -251,5 +251,5 @@ def test_cache_size_single_row_and_unaligned_batch():
     cache.cache[0] = mx.array([4096, 17, 8192], mx.int32)
     assert cache.size() == 8192
     assert cache.extract(1).size() == 17
-    restored = DeepseekV41Cache.from_state(cache.state, cache.meta_state)
+    restored = DeepseekV41Cache.from_state(cache.cache, cache.meta_state)
     assert restored.size() == 8192

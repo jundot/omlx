@@ -54,6 +54,23 @@ def create_grammar_compiler(tokenizer, model, *, cache_limit_bytes=-1):
     return xgr.GrammarCompiler(tokenizer_info, cache_limit_bytes=cache_limit_bytes)
 
 
+def mark_grammar_thinking_phase(compiled_grammar, *, enabled: bool):
+    """Record whether oMLX compiled a separate reasoning phase.
+
+    Metadata travels with the Python CompiledGrammar wrapper through every
+    engine path. Bare or externally compiled grammars are conservative by
+    default: their accepted tokens need not include a forced thinking close.
+    """
+    from .._torch_stub import install as _install_torch_stub
+
+    _install_torch_stub()
+    import xgrammar as xgr
+
+    if isinstance(compiled_grammar, xgr.CompiledGrammar):
+        compiled_grammar._omlx_has_thinking_phase = enabled
+    return compiled_grammar
+
+
 class GrammarConstraintProcessor:
     """Logits processor that enforces grammar constraints via xgrammar bitmask.
 

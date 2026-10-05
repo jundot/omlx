@@ -12,6 +12,7 @@ def _global_settings(tmp_path):
     return SimpleNamespace(
         base_path=tmp_path,
         cache=SimpleNamespace(
+            ssd_cache_max_size="auto",
             get_ssd_cache_dir=lambda base_path: cache_dir,
             get_ssd_cache_max_size_bytes=lambda base_path: 0,
         ),

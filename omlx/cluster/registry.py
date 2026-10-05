@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import threading
 from contextlib import suppress
@@ -12,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from .deployment import ClusterDeployment
+
+SSH_USER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,63}")
 
 # Version 2 persists per-node model paths (``path_map`` on each deployment).
 # Version 1 files are migrated in memory on load and rewritten atomically.
@@ -285,6 +288,13 @@ class DeviceRegistry:
             if isinstance(last_addrs, list)
             else [],
         }
+        ssh_user = item.get("ssh_user")
+        if ssh_user is not None:
+            if not isinstance(ssh_user, str) or not SSH_USER_PATTERN.fullmatch(
+                ssh_user
+            ):
+                raise ValueError("cluster device SSH user is invalid")
+            device["ssh_user"] = ssh_user
         http_port = item.get("http_port")
         if http_port is not None:
             if (
@@ -479,9 +489,12 @@ class DeviceRegistry:
         addrs: list[str] | None = None,
         http_port: int | None = None,
         paired_at: float | None = None,
+        ssh_user: str | None = None,
     ) -> dict[str, Any]:
         """Promote a device to trusted/paired and persist it."""
 
+        if ssh_user is not None and not SSH_USER_PATTERN.fullmatch(ssh_user):
+            raise ValueError("cluster device SSH user is invalid")
         with self._lock:
             existing = self._paired.get(node_id) or self._discovered.get(node_id, {})
             if http_port is not None and (
@@ -503,6 +516,8 @@ class DeviceRegistry:
                 if addrs is not None
                 else list(existing.get("last_addrs") or []),
             }
+            if ssh_user or existing.get("ssh_user"):
+                device["ssh_user"] = ssh_user or existing["ssh_user"]
             effective_port = http_port or existing.get("http_port")
             if effective_port:
                 device["http_port"] = int(effective_port)
@@ -515,6 +530,29 @@ class DeviceRegistry:
                 self._paired = previous
                 raise
             self.load_error = None
+            return dict(device)
+
+    def set_ssh_user(self, node_id: str, ssh_user: str | None) -> dict[str, Any]:
+        """Persist an administrator's SSH login override for an already paired node."""
+        if ssh_user is not None and (
+            not isinstance(ssh_user, str) or not SSH_USER_PATTERN.fullmatch(ssh_user)
+        ):
+            raise ValueError("cluster device SSH user is invalid")
+        with self._lock:
+            if node_id not in self._paired:
+                raise KeyError(node_id)
+            previous = self._paired[node_id]
+            device = dict(previous)
+            if ssh_user is None:
+                device.pop("ssh_user", None)
+            else:
+                device["ssh_user"] = ssh_user
+            self._paired[node_id] = device
+            try:
+                self._save()
+            except Exception:
+                self._paired[node_id] = previous
+                raise
             return dict(device)
 
     def unpair(self, node_id: str) -> bool:
