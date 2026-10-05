@@ -158,8 +158,39 @@ def _migrate_saved_network_auth(settings, args) -> None:
             temporary.unlink(missing_ok=True)
 
 
+def _bind_secondary_socket(host: str, port: int):
+    """Bind one socket for a secondary bind address.
+
+    Mirrors the plain-TCP branch of ``uvicorn.Config.bind_socket`` -- which is
+    the only branch ``serve_command`` can reach, since it never configures
+    ``uds``, ``fd`` or ``ssl``: choose the family from the address, set
+    ``SO_REUSEADDR``, bind, and mark the descriptor inheritable. Uvicorn's
+    ``Server.run(sockets=[...])`` hands each socket straight to
+    ``loop.create_server(sock=...)``, which wants a bound (not yet listening)
+    socket, exactly what this returns.
+
+    The bind is done here rather than through ``Config.bind_socket`` because
+    that method swallows the ``OSError`` and exits with code 3, which loses the
+    errno. Callers need it to tell "this address is not on any local interface"
+    apart from a port clash or a permission problem.
+    """
+    import socket
+
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    sock = socket.socket(family=family)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+    except BaseException:
+        sock.close()
+        raise
+    sock.set_inheritable(True)
+    return sock
+
+
 def serve_command(args):
     """Start the OpenAI-compatible multi-model server."""
+    import errno
     import logging
     import os
     import uvicorn
@@ -319,15 +350,43 @@ def serve_command(args):
     # Bind a socket per host so an occupied port fails fast before model preload.
     # uvicorn.Server.run(sockets=[...]) accepts a list and listens on all of them.
     serve_sockets = [uvicorn_config.bind_socket()]
+    bound_hosts = [bind_hosts[0]]
     for h in bind_hosts[1:]:
-        extra_cfg = uvicorn.Config(
-            "omlx.server:app",
-            host=h,
-            port=settings.server.port,
-            log_level=uvicorn_level,
-            access_log=show_access_log,
-        )
-        serve_sockets.append(extra_cfg.bind_socket())
+        try:
+            serve_sockets.append(_bind_secondary_socket(h, settings.server.port))
+        except OSError as exc:
+            # EADDRNOTAVAIL means this address is on no local interface right
+            # now -- a VPN/Tailscale link that is down, e.g. when the machine
+            # woke before the tunnel came back. The primary is already bound,
+            # so the alternative is refusing to serve on the address that does
+            # work. Everything else (EADDRINUSE, EACCES, a gaierror from a
+            # mistyped address -- itself an OSError subclass) is a real
+            # configuration fault and stays fatal.
+            if exc.errno != errno.EADDRNOTAVAIL:
+                # socket.bind does not name the address it failed on, and this
+                # path no longer goes through uvicorn's error logger, so say
+                # which address was at fault before letting the error through.
+                print(
+                    f"Configuration error: cannot bind {h}:{settings.server.port}: "
+                    f"{exc.strerror} [Errno {exc.errno}]",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise
+            # Warn rather than drop silently: a skipped bind that the user
+            # cannot see leaves them expecting oMLX on the VPN address and
+            # getting connection refused, which is the confusion that produced
+            # this bug. print(), not the logger, because file logging is a
+            # separate destination the user may never open.
+            print(
+                f"Warning: Skipping bind address {h}: {exc.strerror} "
+                f"[Errno {exc.errno}]. The server is still reachable on "
+                f"{', '.join(bound_hosts)}. Re-run omlx serve once "
+                f"{h} is assigned to an interface.",
+                flush=True,
+            )
+            continue
+        bound_hosts.append(h)
 
     try:
         # Import server and config after the port is known to be available.
@@ -451,7 +510,7 @@ def serve_command(args):
             global_settings=settings,
         )
 
-        for h in bind_hosts:
+        for h in bound_hosts:
             print(f"Starting server at http://{h}:{settings.server.port}")
         try:
             uvicorn.Server(uvicorn_config).run(sockets=serve_sockets)

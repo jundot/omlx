@@ -7,7 +7,9 @@ Note: Configuration validation tests are in test_config.py.
 """
 
 import argparse
+import errno
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -1289,6 +1291,387 @@ class TestServeCommandFunctions:
         assert captured["socket_count"] == 1
         assert captured["socket_name"][0] == host
         assert captured["socket_name"][1] > 0
+
+    def _serve_with_hosts(self, tmp_path, monkeypatch, hosts, bind_errno=None):
+        """Drive serve_command over a comma-separated multi-host config.
+
+        The secondary addresses used here (100.64.0.x) are genuinely
+        unassigned on this machine -- the CGNAT range a Tailscale/VPN
+        interface holds while it is up -- so EADDRNOTAVAIL comes out of the
+        real socket path instead of being mocked in.
+
+        ``bind_errno`` optionally forces every *non-primary* bind to raise
+        that errno, so the tolerate/re-raise split can be exercised for codes
+        that cannot be produced on demand. The primary bind is left real.
+
+        Returns {"ran": bool, "socket_names": list, "error": BaseException|None}.
+        """
+        from omlx.cli import serve_command
+
+        port = 0
+        settings = self._make_settings(tmp_path, host=hosts, port=port)
+        args = self._make_serve_args(tmp_path, host=hosts, port=port)
+
+        fake_server = ModuleType("omlx.server")
+
+        async def app(scope, receive, send):
+            return None
+
+        fake_server.app = app
+        fake_server.init_server = MagicMock()
+        monkeypatch.setitem(sys.modules, "omlx.server", fake_server)
+
+        fake_mlx = ModuleType("mlx")
+        fake_mlx_core = ModuleType("mlx.core")
+        fake_mlx_core.device_info = lambda: {"memory_size": 0}
+        fake_mlx_core.set_cache_limit = MagicMock()
+        fake_mlx.core = fake_mlx_core
+        monkeypatch.setitem(sys.modules, "mlx", fake_mlx)
+        monkeypatch.setitem(sys.modules, "mlx.core", fake_mlx_core)
+
+        monkeypatch.setattr("omlx.settings.init_settings", lambda **kwargs: settings)
+        monkeypatch.setattr(
+            "omlx.logging_config.configure_file_logging",
+            lambda **kwargs: None,
+        )
+        monkeypatch.setattr("faulthandler.enable", lambda *a, **k: None)
+
+        if bind_errno is not None:
+            # Inject at socket.bind: uvicorn's Config.bind_socket swallows the
+            # errno and exits 3, so the seam has to sit below it.
+            real_bind = socket.socket.bind
+            calls = {"n": 0}
+
+            def failing_bind(self, address):
+                calls["n"] += 1
+                if calls["n"] == 1:  # primary stays real
+                    return real_bind(self, address)
+                raise OSError(bind_errno, os.strerror(bind_errno))
+
+            monkeypatch.setattr("socket.socket.bind", failing_bind, raising=False)
+
+        captured = {"ran": False, "socket_names": None, "error": None}
+
+        def fake_run(self, sockets=None):
+            self.config.load()
+            captured["ran"] = True
+            captured["socket_names"] = [s.getsockname() for s in sockets]
+
+        monkeypatch.setattr("uvicorn.Server.run", fake_run)
+
+        try:
+            serve_command(args)
+        except BaseException as error:  # noqa: BLE001 - recorded, then asserted
+            captured["error"] = error
+        return captured
+
+    # --- issue #2736: a secondary bind on a downed interface is tolerated ---
+
+    def test_serve_continues_when_secondary_bind_address_is_unassigned(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The reported bug: a downed VPN/Tailscale address must not kill startup."""
+        captured = self._serve_with_hosts(tmp_path, monkeypatch, "127.0.0.1,100.64.0.5")
+
+        out = capsys.readouterr().out
+        assert captured["error"] is None
+        assert captured["ran"] is True
+        # Only the surviving primary reaches uvicorn.Server.run(sockets=[...]).
+        assert len(captured["socket_names"]) == 1
+        assert captured["socket_names"][0][0] == "127.0.0.1"
+        # The skipped host is named on the user's terminal, not only in the log.
+        assert "100.64.0.5" in out
+        assert "Warning" in out
+        # ...and is not advertised as an address the server actually serves.
+        assert "Starting server at http://100.64.0.5" not in out
+        assert "Starting server at http://127.0.0.1" in out
+
+    def test_serve_secondary_bind_failure_does_not_stop_later_secondaries(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """One dead secondary must not discard the secondaries after it."""
+        captured = self._serve_with_hosts(
+            tmp_path, monkeypatch, "127.0.0.1,100.64.0.5,127.0.0.1"
+        )
+
+        out = capsys.readouterr().out
+        assert captured["error"] is None
+        assert captured["ran"] is True
+        # Primary plus the surviving third host; both real bound sockets.
+        assert len(captured["socket_names"]) == 2
+        assert all(name[0] == "127.0.0.1" for name in captured["socket_names"])
+        assert "100.64.0.5" in out
+
+    def test_serve_starts_on_primary_when_every_secondary_is_unassigned(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Every secondary down still leaves a serving primary."""
+        captured = self._serve_with_hosts(
+            tmp_path, monkeypatch, "127.0.0.1,100.64.0.5,100.64.0.6"
+        )
+
+        out = capsys.readouterr().out
+        assert captured["error"] is None
+        assert captured["ran"] is True
+        assert len(captured["socket_names"]) == 1
+        assert captured["socket_names"][0][0] == "127.0.0.1"
+        # Each dead address is reported separately.
+        assert "100.64.0.5" in out
+        assert "100.64.0.6" in out
+
+    # --- the primary bind stays fatal, for every errno ---
+
+    def test_serve_primary_unassigned_address_is_still_fatal(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Fail-fast on the primary survives the new secondary tolerance."""
+        captured = self._serve_with_hosts(tmp_path, monkeypatch, "100.64.0.5,127.0.0.1")
+
+        out = capsys.readouterr().out
+        # The original path: uvicorn exits 3 and never reaches Server.run.
+        assert isinstance(captured["error"], SystemExit)
+        assert captured["error"].code == 3
+        assert captured["ran"] is False
+        assert "Starting server at" not in out
+
+    def test_serve_primary_port_conflict_is_still_fatal(self, tmp_path, monkeypatch):
+        """An occupied primary port still fails before model preload."""
+        listener = self._reserve_port(host="127.0.0.1")
+        host, port = listener.getsockname()
+        try:
+            settings = self._make_settings(
+                tmp_path, host=f"{host},127.0.0.1", port=port
+            )
+            args = self._make_serve_args(tmp_path, host=f"{host},127.0.0.1", port=port)
+            fake_server = ModuleType("omlx.server")
+            fake_server.app = lambda *a, **k: None
+            fake_server.init_server = MagicMock()
+            monkeypatch.setitem(sys.modules, "omlx.server", fake_server)
+            monkeypatch.setattr(
+                "omlx.settings.init_settings", lambda **kwargs: settings
+            )
+            monkeypatch.setattr(
+                "omlx.logging_config.configure_file_logging",
+                lambda **kwargs: None,
+            )
+            monkeypatch.setattr("faulthandler.enable", lambda *a, **k: None)
+
+            from omlx.cli import serve_command
+
+            ran = {"value": False}
+            monkeypatch.setattr(
+                "uvicorn.Server.run", lambda self, sockets=None: ran.update(value=True)
+            )
+            with pytest.raises(SystemExit) as exc:
+                serve_command(args)
+            assert exc.value.code == 3
+            assert ran["value"] is False
+            # Fail-fast means the server module is never even imported.
+            assert isinstance(fake_server.init_server, MagicMock)
+            assert fake_server.init_server.call_count == 0
+        finally:
+            listener.close()
+
+    # --- errno split: only EADDRNOTAVAIL means "interface down" ---
+
+    @pytest.mark.parametrize(
+        "errno_code",
+        [
+            pytest.param(errno.EADDRINUSE, id="EADDRINUSE"),
+            pytest.param(errno.EACCES, id="EACCES"),
+            pytest.param(errno.EAFNOSUPPORT, id="EAFNOSUPPORT"),
+            pytest.param(errno.EADDRNOTAVAIL, id="EADDRNOTAVAIL-tolerated"),
+        ],
+    )
+    def test_serve_secondary_errno_split(
+        self, tmp_path, monkeypatch, capsys, errno_code
+    ):
+        """Only EADDRNOTAVAIL is skipped; every other errno stays fatal.
+
+        Swallowing EACCES would leave the user with a server quietly listening
+        on one address and no idea why the other is missing.
+        """
+        result = self._serve_with_hosts(
+            tmp_path,
+            monkeypatch,
+            "127.0.0.1,127.0.0.1",
+            bind_errno=errno_code,
+        )
+        terminal = capsys.readouterr()
+        out, err = terminal.out, terminal.err
+
+        if errno_code == errno.EADDRNOTAVAIL:
+            assert result["error"] is None
+            assert result["ran"] is True
+            assert len(result["socket_names"]) == 1
+            assert "Warning" in out
+        else:
+            assert isinstance(result["error"], OSError)
+            assert result["error"].errno == errno_code
+            assert result["ran"] is False
+            assert "Starting server at" not in out
+            # socket.bind does not name the address that failed, and this path
+            # no longer logs through uvicorn, so the message must.
+            assert "cannot bind 127.0.0.1:" in err
+
+    def test_serve_malformed_secondary_address_is_still_fatal(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A typo'd address is a config error, not a downed interface.
+
+        socket.gaierror subclasses OSError, so a blanket `except OSError`
+        around the secondary bind would swallow exactly this.
+        """
+        captured = self._serve_with_hosts(
+            tmp_path, monkeypatch, "127.0.0.1,999.999.999.999"
+        )
+
+        out = capsys.readouterr().out
+        assert isinstance(captured["error"], socket.gaierror)
+        assert captured["error"].errno != errno.EADDRNOTAVAIL
+        assert captured["ran"] is False
+        assert "Starting server at" not in out
+
+    def test_serve_real_secondary_port_clash_stays_fatal(self, tmp_path, monkeypatch):
+        """A genuine EADDRINUSE on a secondary, from the real socket path.
+
+        Both configs target the same host/port, so the primary takes it and the
+        secondary's own bind loses with the OS's errno 48 -- no mocking.
+        """
+        from omlx.cli import serve_command
+
+        probe = self._reserve_port(host="127.0.0.1")
+        _, port = probe.getsockname()
+        probe.close()
+
+        fake_server = ModuleType("omlx.server")
+        fake_server.app = lambda *a, **k: None
+        fake_server.init_server = MagicMock()
+        monkeypatch.setitem(sys.modules, "omlx.server", fake_server)
+        monkeypatch.setattr(
+            "omlx.logging_config.configure_file_logging",
+            lambda **kwargs: None,
+        )
+        monkeypatch.setattr("faulthandler.enable", lambda *a, **k: None)
+
+        settings = self._make_settings(tmp_path, host="127.0.0.1,127.0.0.1", port=port)
+        args = self._make_serve_args(tmp_path, host="127.0.0.1,127.0.0.1", port=port)
+        monkeypatch.setattr("omlx.settings.init_settings", lambda **kwargs: settings)
+
+        ran = {"value": False}
+        monkeypatch.setattr(
+            "uvicorn.Server.run", lambda self, sockets=None: ran.update(value=True)
+        )
+        with pytest.raises(OSError) as exc:
+            serve_command(args)
+
+        assert exc.value.errno == errno.EADDRINUSE
+        assert ran["value"] is False
+
+    def test_serve_still_binds_a_second_interface_that_is_up(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Tolerating a downed address must not break a working one.
+
+        This is the other endpoint of the same transition: with the interface
+        assigned, the secondary binds, is handed to uvicorn, and is advertised
+        -- with no warning.
+        """
+        second = _second_local_address()
+        if second is None:
+            pytest.skip("host has no second non-loopback address")
+
+        captured = self._serve_with_hosts(tmp_path, monkeypatch, f"127.0.0.1,{second}")
+        out = capsys.readouterr().out
+
+        assert captured["error"] is None
+        assert captured["ran"] is True
+        assert [name[0] for name in captured["socket_names"]] == [
+            "127.0.0.1",
+            second,
+        ]
+        assert "Warning: Skipping" not in out
+        assert f"Starting server at http://{second}" in out
+
+    def test_ipv6_secondary_addresses_use_the_ipv6_family(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Tailscale also hands out IPv6; the family must follow the address.
+
+        fd7a:115c:a1e0::/48 is the Tailscale CGNAT range, so ::1 stands in for
+        an up interface and fd7a:115c:a1e0::5 for a down one.
+        """
+        up = self._serve_with_hosts(tmp_path, monkeypatch, "127.0.0.1,::1")
+        assert up["error"] is None
+        assert up["ran"] is True
+        assert [name[0] for name in up["socket_names"]] == ["127.0.0.1", "::1"]
+        assert "Warning: Skipping" not in capsys.readouterr().out
+
+        down = self._serve_with_hosts(
+            tmp_path, monkeypatch, "127.0.0.1,fd7a:115c:a1e0::5"
+        )
+        out = capsys.readouterr().out
+        assert down["error"] is None
+        assert down["ran"] is True
+        assert len(down["socket_names"]) == 1
+        assert "fd7a:115c:a1e0::5" in out
+        assert "Warning" in out
+
+    def test_skipped_secondary_does_not_leak_a_socket(self, tmp_path, monkeypatch):
+        """A failed secondary bind must close the socket it opened."""
+        before = len(os.listdir("/dev/fd"))
+        for _ in range(5):
+            captured = self._serve_with_hosts(
+                tmp_path, monkeypatch, "127.0.0.1,100.64.0.5,100.64.0.6"
+            )
+            assert captured["error"] is None
+        after = len(os.listdir("/dev/fd"))
+        assert after - before <= 2, f"descriptors grew {before} -> {after}"
+
+    def test_primary_still_binds_through_uvicorn(self, tmp_path, monkeypatch):
+        """The fail-fast primary keeps using Config.bind_socket.
+
+        That method is what turns an occupied primary port into exit code 3
+        before any model preload, and the secondary path must not replace it.
+        """
+        import uvicorn
+
+        seen = []
+        real_bind_socket = uvicorn.Config.bind_socket
+
+        def tracking_bind_socket(self):
+            seen.append(self.host)
+            return real_bind_socket(self)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("uvicorn.Config.bind_socket", tracking_bind_socket)
+            captured = self._serve_with_hosts(
+                tmp_path, monkeypatch, "127.0.0.1,100.64.0.5"
+            )
+
+        assert seen == ["127.0.0.1"]
+        assert captured["ran"] is True
+        assert len(captured["socket_names"]) == 1
+
+
+def _second_local_address():
+    """Return a non-loopback address assigned to this host, if there is one."""
+    try:
+        candidates = socket.gethostbyname_ex(socket.gethostname())[2]
+    except OSError:
+        return None
+    for candidate in candidates:
+        if candidate.startswith("127."):
+            continue
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind((candidate, 0))
+        except OSError:
+            continue
+        finally:
+            probe.close()
+        return candidate
+    return None
 
 
 class TestHasCliOverrides:
