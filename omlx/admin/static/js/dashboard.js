@@ -750,11 +750,83 @@
                 document.addEventListener('visibilitychange', () => {
                     if (document.hidden) {
                         this.stopStatsRefresh();
-                    } else if (this.mainTab === 'status') {
-                        this.loadStats();
-                        this.startStatsRefresh();
+                    } else {
+                        this.resumeVisibleRefreshers();
                     }
                 });
+                // A bfcache restore fires `pageshow` *and* `visibilitychange`,
+                // so this has to be safe to call twice. resumeVisibleRefreshers
+                // coalesces same-tick calls, and every start*Refresh() calls
+                // its own stop*Refresh() first.
+                window.addEventListener('pageshow', (e) => {
+                    if (!document.hidden && !e.persisted) {
+                        this.resumeVisibleRefreshers();
+                    }
+                });
+            },
+
+            /**
+             * Restart whatever the visible tab needs.
+             *
+             * Only the stats timer used to be resumed here, so after a
+             * background/foreground cycle on mobile the log poll, the
+             * HF/MS/OQ task refreshers and the benchmark EventSource stayed
+             * dead — the streams close themselves in `onerror`, and a closed
+             * EventSource never reconnects on its own.
+             *
+             * The per-tab conditions mirror handleMainTabChange so a resume
+             * cannot start a poller for a tab the user never opened.
+             */
+            resumeVisibleRefreshers() {
+                if (this._resumeScheduled) return;
+                this._resumeScheduled = true;
+                const run = () => {
+                    this._resumeScheduled = false;
+                    this._resumeVisibleRefreshers();
+                };
+                if (typeof this.$nextTick === 'function') {
+                    this.$nextTick(run);
+                } else {
+                    run();
+                }
+            },
+
+            async _resumeVisibleRefreshers() {
+                if (this.mainTab === 'status') {
+                    await this.loadStats();
+                    this.startStatsRefresh();
+                } else {
+                    this.stopStatsRefresh();
+                }
+                if (this.mainTab === 'logs') {
+                    await this.loadLogs();
+                    this.startLogRefresh();
+                } else {
+                    this.stopLogRefresh();
+                }
+                if (this.mainTab === 'models') {
+                    const hasActive = this.hfTasks.some(t =>
+                        t.status === 'pending' || t.status === 'downloading');
+                    if (hasActive) this.startHFRefresh(); else this.stopHFRefresh();
+                    const hasMsActive = this.msTasks.some(t =>
+                        t.status === 'pending' || t.status === 'downloading');
+                    if (hasMsActive) this.startMSRefresh(); else this.stopMSRefresh();
+                    const hasOqActive = this.oqTasks.some(t =>
+                        ['pending', 'loading', 'quantizing', 'saving'].includes(t.status));
+                    if (hasOqActive) this.startOQRefresh(); else this.stopOQRefresh();
+                } else {
+                    this.stopHFRefresh();
+                    this.stopMSRefresh();
+                    this.stopOQRefresh();
+                }
+                // A benchmark stream closed by its own onerror has to be
+                // re-created; EventSource cannot be reopened once closed.
+                if (this.mainTab === 'bench'
+                    && this.benchRunning
+                    && !this.benchEventSource
+                    && this.benchBenchId) {
+                    this.connectBenchSSE(this.benchBenchId);
+                }
             },
 
             async handleMainTabChange(value) {
