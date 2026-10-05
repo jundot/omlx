@@ -254,6 +254,11 @@ class ThinkingParser:
         self._close_seen: bool = False
         self._thinking_accumulated: List[str] = []
         self._content_emitted: bool = False
+        # A think tag after the block closed may be literal answer text, such
+        # as a JSON string. Hold what follows until the block closes again;
+        # at a normal stop it is content, as in extract_thinking().
+        self._reopen_tag: str | None = None
+        self._reopened: list[str] = []
 
     def feed(self, text: str) -> Tuple[str, str]:
         """Feed a text chunk, return (thinking_delta, content_delta).
@@ -282,25 +287,23 @@ class ThinkingParser:
 
                 # Try to match <think>
                 if remaining.startswith(_OPEN_TAG):
-                    self._in_thinking = True
+                    self._open_thinking(_OPEN_TAG)
                     i += _OPEN_LEN
                     continue
 
                 if remaining.startswith(_HY3_OPEN_TAG):
-                    self._in_thinking = True
+                    self._open_thinking(_HY3_OPEN_TAG)
                     i += len(_HY3_OPEN_TAG)
                     continue
 
                 # Try to match </think>
                 if remaining.startswith(_CLOSE_TAG):
-                    self._in_thinking = False
-                    self._close_seen = True
+                    self._close_thinking(thinking_out)
                     i += _CLOSE_LEN
                     continue
 
                 if remaining.startswith(_HY3_CLOSE_TAG):
-                    self._in_thinking = False
-                    self._close_seen = True
+                    self._close_thinking(thinking_out)
                     i += len(_HY3_CLOSE_TAG)
                     continue
 
@@ -312,13 +315,13 @@ class ThinkingParser:
 
                 # Not a tag, emit the '<' as regular content
                 if self._in_thinking:
-                    thinking_out.append('<')
+                    self._thinking_sink(thinking_out).append('<')
                 else:
                     content_out.append('<')
                 i += 1
             else:
                 if self._in_thinking:
-                    thinking_out.append(text[i])
+                    self._thinking_sink(thinking_out).append(text[i])
                 else:
                     content_out.append(text[i])
                 i += 1
@@ -331,12 +334,31 @@ class ThinkingParser:
             self._content_emitted = True
         return (thinking_delta, content_delta)
 
+    def _open_thinking(self, tag: str) -> None:
+        if self._reopen_tag is not None:
+            self._reopened.append(tag)
+        elif self._close_seen and not self._in_thinking:
+            self._reopen_tag = tag
+        self._in_thinking = True
+
+    def _close_thinking(self, thinking_out: list[str]) -> None:
+        if self._reopen_tag is not None:
+            thinking_out.extend(self._reopened)
+            self._reopen_tag = None
+            self._reopened = []
+        self._in_thinking = False
+        self._close_seen = True
+
+    def _thinking_sink(self, thinking_out: list[str]) -> list[str]:
+        return thinking_out if self._reopen_tag is None else self._reopened
+
     def finish(self, *, truncated: bool = False) -> Tuple[str, str]:
         """Flush any remaining buffered content.
 
         Should be called when the stream is complete to emit any
         buffered characters that were waiting for potential tag completion.
         Unless truncated, recover an unclosed thinking block as content when no answer was emitted.
+        Unless truncated, a block reopened after ``</think>`` and never closed is content.
 
         Returns:
             Tuple of (thinking_text, content_text) from remaining buffer
@@ -344,6 +366,18 @@ class ThinkingParser:
         """
         partial = self._buffer
         self._buffer = ""
+
+        if self._reopen_tag is not None:
+            held = "".join(self._reopened) + partial
+            reopen_tag = self._reopen_tag
+            self._reopen_tag = None
+            self._reopened = []
+            if truncated:
+                self._thinking_accumulated.append(held)
+                return (held, "")
+            self._in_thinking = False
+            self._content_emitted = True
+            return ("", reopen_tag + held)
 
         # Recovery: prompt opened a thinking block (or model echoed
         # ``<think>`` itself), the close tag never arrived, and nothing

@@ -5354,3 +5354,91 @@ async def test_stream_thinking_length_channels(api, with_tools):
         )
     assert content == ""
     assert reasoning == "unfinished</thi"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("split", [False, True])
+@pytest.mark.parametrize("with_tools", [False, True])
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+async def test_stream_literal_think_tag_after_close_stays_content(
+    api, with_tools, split
+):
+    from omlx.api.anthropic_models import MessagesRequest as AnthropicMessagesRequest
+    from omlx.api.openai_models import ChatCompletionRequest
+    from omlx.api.responses_models import ResponsesRequest
+    from omlx.server import (
+        stream_anthropic_messages,
+        stream_chat_completion,
+        stream_responses_api,
+    )
+
+    answer = '{"tag": "<think>", "n": 1}'
+    pieces = ["<think>", "r", "</think>", '{"tag": "', "<think>", '", "n": 1}']
+    chunks = pieces if split else ["".join(pieces)]
+    engine = MockBaseEngine()
+    text = ""
+    outputs = []
+    for index, chunk in enumerate(chunks):
+        text += chunk
+        last = index == len(chunks) - 1
+        outputs.append(
+            MockGenerationOutput(
+                text=text,
+                new_text=chunk,
+                finish_reason="stop" if last else None,
+                completion_tokens=index + 1,
+                finished=last,
+            )
+        )
+    engine.set_stream_outputs(outputs)
+    messages = [{"role": "user", "content": "Reply with the JSON"}]
+    kwargs = {}
+    if with_tools:
+        kwargs["tools"] = [
+            {
+                "type": "function",
+                "function": {"name": "lookup", "parameters": {"type": "object"}},
+            }
+        ]
+    if api == "chat":
+        request = ChatCompletionRequest(model="test-model", messages=messages)
+        stream = stream_chat_completion(engine, messages, request, **kwargs)
+    elif api == "anthropic":
+        request = AnthropicMessagesRequest(
+            model="test-model", messages=messages, max_tokens=64
+        )
+        stream = stream_anthropic_messages(engine, messages, request, **kwargs)
+    else:
+        request = ResponsesRequest(model="test-model", input="Reply with the JSON")
+        stream = stream_responses_api(
+            engine, messages, request, store_response=False, **kwargs
+        )
+    events = parse_sse_events("".join([frame async for frame in stream]))
+    assert not any("error" in event for event in events)
+    if api == "chat":
+        deltas = [c["delta"] for e in events for c in e.get("choices", [])]
+        content = "".join(d.get("content") or "" for d in deltas)
+        reasoning = "".join(d.get("reasoning_content") or "" for d in deltas)
+    elif api == "anthropic":
+        deltas = [e.get("delta", {}) for e in events]
+        content = "".join(d.get("text") or "" for d in deltas)
+        reasoning = "".join(d.get("thinking") or "" for d in deltas)
+    else:
+        content = "".join(
+            e["delta"] for e in events if e["type"] == "response.output_text.delta"
+        )
+        reasoning = "".join(
+            e["delta"]
+            for e in events
+            if e["type"] == "response.reasoning_summary_text.delta"
+        )
+        final = next(e["response"] for e in events if e["type"] == "response.completed")
+        assert [
+            b["text"]
+            for item in final["output"]
+            if item["type"] == "message"
+            for b in item["content"]
+            if b["type"] == "output_text"
+        ] == [answer]
+    assert content == answer
+    assert reasoning == "r"
