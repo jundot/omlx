@@ -2326,21 +2326,25 @@ class PagedSSDCacheManager(CacheManager):
     def _scan_existing_files(self) -> None:
         """Scan cache directory for existing files and build the compatible index.
 
-        Only blocks compatible with the currently loaded model/layout are
-        indexed. Incompatible blocks are left on disk so a shared SSD cache
-        directory can safely serve multiple loaded models without one model's
-        startup scan deleting another model's cache.
+        Only blocks compatible with the currently loaded model/layout enter the
+        compatible index; incompatible blocks go to a separate index. The scan
+        itself does not unlink them, but they share the same tracked budget, so
+        a startup convergence that finds the directory over its effective
+        budget can evict incompatible blocks too (oldest-mtime-first). A shared
+        SSD cache directory therefore cannot rely on another model's blocks
+        being left alone across a convergence.
 
         A directory that is already over the effective budget is then converged
         immediately, before any request is served. Note that convergence
         *deletes* persisted blocks oldest-mtime-first rather than declining to
         add new ones, and the ceiling is
-        ``min(max_size_bytes, 99% of disk headroom)``. With
+        ``min(max_size_bytes, 99% of free space plus the tracked cache)``. With
         ``ssd_cache_max_size: auto`` (``auto_size=True``) there is no
         user-configured ceiling at all: the bound comes from disk headroom
         alone (50% of free space plus the tracked cache), so it can be crossed
-        by simply accumulating cache. A warning naming the block count, the
-        byte total and both limits is logged before anything is unlinked.
+        by simply accumulating cache. A warning naming the cache directory, the
+        block count, the estimated reclaim, and both limits is logged before
+        anything is unlinked.
         """
         logger.info(f"Scanning SSD cache directory: {self._cache_dir}")
 
@@ -2407,15 +2411,25 @@ class PagedSSDCacheManager(CacheManager):
                 # #3253: this path unlinks persisted blocks, so announce what is
                 # about to go first. A plain restart reaches it before serving
                 # anything, which makes this log the only chance the user gets
-                # to see it happen.
+                # to see it happen. The reclaim is what has to go to reach the
+                # effective budget, not the total tracked size; in auto_size
+                # mode ``_max_size`` is only the config-time snapshot, so it is
+                # named as such rather than implying a user-set ceiling. The
+                # cache dir is included because the main manager and a
+                # SpecPrefill draft manager can scan the same directory.
+                excess = max(0, tracked_size - effective_max)
                 logger.warning(
                     "SSD cache startup eviction: tracked cache is over its "
-                    "effective budget; about to unlink up to %d blocks (%s) to "
-                    "reach configured=%s, effective=%s (auto_size=%s)",
+                    "effective budget; about to unlink up to %d blocks to free "
+                    "about %s from %s (tracked=%s, effective=%s, %s=%s, "
+                    "auto_size=%s)",
                     self._tracked_ssd_count(),
+                    format_bytes(excess),
+                    self._cache_dir,
                     format_bytes(tracked_size),
-                    format_bytes(self._max_size),
                     format_bytes(effective_max),
+                    "auto snapshot" if self._auto_size else "configured",
+                    format_bytes(self._max_size),
                     self._auto_size,
                 )
                 self._enforce_size_limit_for_new_block(0, unbounded=True)

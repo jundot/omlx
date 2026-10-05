@@ -1334,9 +1334,9 @@ class TestPagedSSDCacheManagerWithMLX:
         Convergence runs before any request is served and unlinks in st_mtime
         order. Nothing announced that, so a plain restart could drop cache data
         with no log line naming what was about to go. Assert the warning names
-        the block count, the byte total and both limits -- and that it lands
-        *before* the first unlink rather than after, so it is a pre-announcement
-        and not a post-mortem.
+        the cache directory, the block count, the reclaim estimate and both
+        limits -- and that it lands *before* the first unlink rather than after,
+        so it is a pre-announcement and not a post-mortem.
         """
         mx = mock_mlx
         cache_dir = tmp_path / "ssd_cache"
@@ -1399,17 +1399,133 @@ class TestPagedSSDCacheManagerWithMLX:
         assert pre_eviction, f"no pre-eviction warning emitted; events={events}"
 
         message = pre_eviction[-1]
-        # Block count, byte total, and both limits are all named.
+        # Stable prefix, quoted by the PR description.
+        assert message.startswith("SSD cache startup eviction")
+        # Cache dir, block count, reclaim estimate, and both limits are named.
+        assert str(cache_dir) in message
         assert f"{observed['count']} blocks" in message
-        assert format_bytes(observed["tracked"]) in message
-        assert format_bytes(observed["effective"]) in message
-        assert format_bytes(manager._max_size) in message
-        assert "configured=" in message and "effective=" in message
+        excess = max(0, observed["tracked"] - observed["effective"])
+        assert excess > 0
+        assert f"to free about {format_bytes(excess)}" in message
+        assert f"tracked={format_bytes(observed['tracked'])}" in message
+        assert f"effective={format_bytes(observed['effective'])}" in message
+        assert f"configured={format_bytes(manager._max_size)}" in message
+        assert "auto_size=False" in message
+        # The reclaim is the overage, not the whole tracked cache: naming the
+        # total as the amount about to be freed would overstate it.
+        assert f"to free about {format_bytes(observed['tracked'])}" not in message
+        assert "auto snapshot" not in message
 
         # Pre-announcement: the warning must precede the first unlink.
         first_unlink = next(i for i, (kind, _) in enumerate(events) if kind == "UNLINK")
         warned_at = events.index(("WARNING", message))
         assert warned_at < first_unlink, f"warning came after eviction began: {events}"
+
+    def test_startup_eviction_stays_silent_under_limit(
+        self, tmp_path: Path, mock_mlx, caplog
+    ):
+        """#4303 review: the warning is conditional, not unconditional.
+
+        An empty cache directory and a cache that fits inside its effective
+        budget must both stay quiet. Without this case an unconditional warning
+        would still satisfy ``test_startup_eviction_warns_before_unlinking``.
+        """
+        mx = mock_mlx
+
+        def _eviction_warnings() -> list[str]:
+            return [
+                record.getMessage()
+                for record in caplog.records
+                if record.name == "omlx.cache.paged_ssd_cache"
+                and "startup eviction" in record.getMessage()
+            ]
+
+        # Empty cache: nothing tracked, so nothing to converge.
+        with caplog.at_level(logging.INFO, logger="omlx.cache.paged_ssd_cache"):
+            empty = PagedSSDCacheManager(
+                cache_dir=tmp_path / "empty", max_size_bytes=1024**3
+            )
+        assert _eviction_warnings() == []
+        empty.close()
+
+        # Under-limit cache: a block exists but fits inside the budget.
+        cache_dir = tmp_path / "under"
+        block = self._write_versioned_fixture_block(
+            cache_dir, mx, b"\xb0" + b"\x00" * 31, num_layers=4, model_name="m"
+        )
+        block_size = block.stat().st_size
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="omlx.cache.paged_ssd_cache"):
+            under = PagedSSDCacheManager(
+                cache_dir=cache_dir, max_size_bytes=block_size * 4
+            )
+        assert _eviction_warnings() == []
+        under.close()
+
+    def test_startup_eviction_labels_auto_size_snapshot(self, tmp_path: Path, mock_mlx):
+        """#4303 review: in auto_size mode ``_max_size`` is only a snapshot.
+
+        It is the config-time value, not a user-configured ceiling, so the
+        warning must label it as the auto snapshot instead of "configured".
+        Force the over-budget branch by reporting a full disk: in auto mode the
+        effective ceiling is half of free-plus-tracked, i.e. half the tracked
+        cache, which is below the tracked size.
+        """
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+
+        blocks = [
+            self._write_versioned_fixture_block(
+                cache_dir,
+                mx,
+                bytes([0xC0 + i]) + b"\x00" * 31,
+                num_layers=4,
+                model_name="m",
+            )
+            for i in range(3)
+        ]
+        snapshot = max(1, sum(p.stat().st_size for p in blocks) // 4)
+
+        events: list[tuple[str, str]] = []
+
+        class _Recorder(logging.Handler):
+            def emit(self, record):
+                events.append((record.levelname, record.getMessage()))
+
+        class _FullDisk:
+            total = 0
+            used = 0
+            free = 0
+
+        recorder = _Recorder()
+        cache_logger = logging.getLogger("omlx.cache.paged_ssd_cache")
+        cache_logger.addHandler(recorder)
+        try:
+            with patch.object(shutil, "disk_usage", return_value=_FullDisk()):
+                manager = PagedSSDCacheManager(
+                    cache_dir=cache_dir,
+                    max_size_bytes=snapshot,
+                    auto_size=True,
+                )
+        finally:
+            cache_logger.removeHandler(recorder)
+
+        pre_eviction = [
+            msg
+            for level, msg in events
+            if level == "WARNING" and "startup eviction" in msg
+        ]
+        assert pre_eviction, f"no pre-eviction warning emitted; events={events}"
+
+        message = pre_eviction[-1]
+        assert message.startswith("SSD cache startup eviction")
+        assert str(cache_dir) in message
+        assert f"auto snapshot={format_bytes(snapshot)}" in message
+        assert "auto_size=True" in message
+        # The config-time snapshot is not presented as a user-set ceiling.
+        assert f"configured={format_bytes(snapshot)}" not in message
+        assert f"configured={format_bytes(manager._max_size)}" not in message
 
     def test_model_switch_enforces_shared_ssd_limit_on_new_save(
         self, tmp_path: Path, mock_mlx
