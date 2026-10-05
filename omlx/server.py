@@ -60,6 +60,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
 
 from omlx._version import __version__
 
@@ -177,6 +178,7 @@ from .api.utils import (
     detect_and_strip_partial,
     extract_multimodal_content,
     extract_text_content,
+    find_lone_surrogate,
     has_nonleading_system_message,
     merge_reasoning_effort_chat_template_kwargs,
     prepare_system_messages_for_template,
@@ -1524,6 +1526,17 @@ def _suggest_endpoint_for_engine(engine: object) -> str:
     if isinstance(engine, RerankerEngine):
         return "Use /v1/rerank for reranker models."
     return "Use the model's dedicated endpoint (see /v1/models)."
+
+
+def _reject_lone_surrogates(request: BaseModel) -> None:
+    """Answer 400, not 500, for text the tokenizer cannot encode."""
+    field = find_lone_surrogate(request.model_dump(exclude_none=True))
+    if field:
+        raise InvalidRequestError(
+            f"Invalid string in '{field}': unpaired UTF-16 surrogate "
+            "(text was likely truncated through an emoji)",
+            field=field,
+        )
 
 
 @dataclass
@@ -3821,6 +3834,7 @@ async def create_completion(
     _: bool = Depends(verify_inference_api_key),
 ):
     """Create a text completion."""
+    _reject_lone_surrogates(request)
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
@@ -4061,6 +4075,7 @@ async def create_chat_completion(
     }
     ```
     """
+    _reject_lone_surrogates(request)
     # Log incoming request summary at debug, message content at trace
     logger.debug(
         f"Chat completion request received: model={request.model}, "
@@ -6528,6 +6543,7 @@ async def create_anthropic_message(
 
     Streaming is supported with `stream: true`.
     """
+    _reject_lone_surrogates(request)
     logger.debug(
         f"Anthropic Messages request: model={request.model}, "
         f"messages={len(request.messages)}, stream={request.stream}, "
@@ -6926,6 +6942,7 @@ async def count_anthropic_tokens(
 
     This is compatible with Anthropic's token counting API.
     """
+    _reject_lone_surrogates(request)
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
@@ -7046,6 +7063,7 @@ async def create_response(
     _: bool = Depends(verify_inference_api_key),
 ):
     """Create a response (OpenAI Responses API)."""
+    _reject_lone_surrogates(request)
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
