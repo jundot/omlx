@@ -2673,11 +2673,22 @@ class EnginePool:
                         or hot_cache_released
                     )
 
+                if not recurring and not reclaim_attempted and mx.get_cache_memory():
+                    # Pooled buffers cost nothing to return, so they go first.
+                    reclaim_attempted = True
+                    await self._reclaim_pooled_buffers_for_prefill(
+                        exclude_model_id, request_id
+                    )
+                    continue
+
                 if not hot_cache_attempted:
                     # Cached prefix blocks give way before any model does.
                     hot_cache_attempted = True
                     gain = await self._release_hot_cache_for_prefill(
-                        exclude_model_id, request_id, current + predicted - target
+                        exclude_model_id,
+                        request_id,
+                        current + predicted - target,
+                        reason,
                     )
                     if gain > 0:
                         hot_cache_released = True
@@ -2767,7 +2778,7 @@ class EnginePool:
         return max(0, int(getattr(budget, "total_bytes", 0) or 0))
 
     async def _release_hot_cache_for_prefill(
-        self, model_id: str, request_id: str, shortfall: int
+        self, model_id: str, request_id: str, shortfall: int, reason: str
     ) -> int:
         """Release hot cache for a prefill; return how far its target rose.
 
@@ -2788,6 +2799,12 @@ class EnginePool:
             or not callable(limit_factor)
             or request_id not in getattr(scheduler, "requests", {})
         ):
+            return 0
+        if (
+            reason == "adaptive_prefill_throttle"
+            and getattr(scheduler, "_prefill_speed_priority", False) is not True
+        ):
+            # The throttle shrinks the chunk instead, so keep the cache.
             return 0
         factor = limit_factor()
         if factor <= 0 or shortfall <= 0:

@@ -122,14 +122,15 @@ class TestPreflightOrRaise:
             num_prompt_tokens=65536, cached_tokens=0, current=0
         )
         scheduler._memory_hard_limit_bytes = est.estimated - gb
-        scheduler._memory_hot_cache_reserved_bytes = 4 * gb
-        hot = [2 * gb]
+        scheduler._memory_hot_cache_reserved_bytes = est.kv_exact + 4 * gb
+        # Up to the prompt's own KV may be its protected prefix, not credit.
+        hot = [est.kv_exact + 2 * gb]
         monkeypatch.setattr(scheduler, "_hot_cache_cpu_bytes", lambda: hot[0])
 
         scheduler.preflight_or_raise(num_prompt_tokens=65536, request_id="r")
         assert scheduler.preflight_eviction_request(num_prompt_tokens=65536) is None
 
-        hot[0] = gb // 2
+        hot[0] = est.kv_exact + gb // 2
         with pytest.raises(PrefillMemoryExceededError):
             scheduler.preflight_or_raise(num_prompt_tokens=65536, request_id="r")
 
@@ -1076,6 +1077,7 @@ class TestRejectionMessageNamesBindingCeiling:
             in rej.message
         )
         assert "only 24.00 GB is reclaimable right now" in rej.message
+        assert "lower hot_cache_max_size" in rej.message
 
     def test_static_binding_falls_back_to_generic_advice(self, monkeypatch):
         sched = _make_scheduler()

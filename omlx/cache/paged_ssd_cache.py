@@ -1551,6 +1551,15 @@ class SharedHotCacheBudget:
                     )
         return cleared
 
+    def releasable_bytes(self, protected_hashes: set[bytes]) -> int:
+        """Bytes ``shrink_to`` can free while keeping ``protected_hashes``."""
+        with self._lock:
+            return sum(
+                entry.size_bytes
+                for entry in self._entries.values()
+                if entry.block_hash not in protected_hashes
+            )
+
     def shrink_to(
         self,
         target_bytes: int,
@@ -3182,6 +3191,17 @@ class PagedSSDCacheManager(CacheManager):
                         if p is not None and isinstance(p, Path) and p.exists():
                             p.unlink()
                 return False
+
+    def wait_for_pending_writes(self, timeout: float) -> bool:
+        """Wait until queued SSD writes finish. Returns False on timeout."""
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._pending_write_hashes_lock:
+                if not self._pending_write_hashes:
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
 
     def _clear_pending_write(
         self, block_hash: bytes, *, remove_hot_cache: bool = False

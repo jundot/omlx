@@ -128,6 +128,8 @@ _PREFILL_ABORT_MARGIN: dict[str, float] = {
 _EMERGENCY_OVER_CEILING_MARGIN_BYTES = 2 * 1024**3
 _EMERGENCY_OVER_CEILING_POLLS = 2
 _HOT_CACHE_RESERVATION_SLACK_BYTES = 512 * 1024**2
+# Longest a prefill waits for released dirty hot-cache blocks to reach SSD.
+_HOT_CACHE_WRITE_WAIT_S = 5.0
 
 
 def _format_gb(b: int) -> str:
@@ -1132,12 +1134,16 @@ class ProcessMemoryEnforcer:
         """Try to shrink hot cache enough to move process usage toward target."""
         if current <= target:
             return 0
-        return self._shrink_hot_cache_by(current - target)
+        freed = self._shrink_hot_cache_by(current - target)
+        if freed > 0:
+            release_free_malloc_memory()
+        return freed
 
     async def release_hot_cache_for_prefill(self, reserved_bytes: int) -> int:
         """Shrink the hot cache until its reservation drops by ``reserved_bytes``.
 
-        Blocks of admitted or queued requests stay. Returns the actual drop.
+        Blocks of admitted or queued requests stay. Nothing is released when
+        the other blocks cannot cover the drop. Returns the actual drop.
         """
         before = self._hot_cache_reserved_bytes()
         if before <= 0 or reserved_bytes <= 0:
@@ -1147,21 +1153,46 @@ class ProcessMemoryEnforcer:
             0, before - reserved_bytes - _HOT_CACHE_RESERVATION_SLACK_BYTES
         )
         excess = self._hot_cache_used_bytes() - target_used
-        if excess > 0:
-            await asyncio.to_thread(self._shrink_hot_cache_by, excess)
+        if excess <= 0:
+            return 0
+        protected = self._active_hot_cache_block_hashes()
+        releasable = getattr(self._hot_cache_budget(), "releasable_bytes", None)
+        if callable(releasable) and releasable(protected) < excess:
+            return 0
+        await asyncio.to_thread(self._release_hot_cache_blocks, excess, protected)
         released = max(0, before - self._hot_cache_reserved_bytes())
         if released > 0:
             self._propagate_memory_limit()
         return released
 
-    def _shrink_hot_cache_by(self, bytes_to_free: int) -> int:
+    def _release_hot_cache_blocks(
+        self, bytes_to_free: int, protected_hashes: set[bytes]
+    ) -> None:
+        if self._shrink_hot_cache_by(bytes_to_free, protected_hashes) <= 0:
+            return
+        # Dirty blocks stay in RAM until the SSD writer has written them.
+        deadline = time.monotonic() + _HOT_CACHE_WRITE_WAIT_S
+        seen_managers: set[int] = set()
+        for entry in self._engine_pool._entries.values():
+            scheduler = self._resolve_scheduler(entry)
+            manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+            wait = getattr(manager, "wait_for_pending_writes", None)
+            if callable(wait) and id(manager) not in seen_managers:
+                seen_managers.add(id(manager))
+                wait(max(0.0, deadline - time.monotonic()))
+        release_free_malloc_memory()
+
+    def _shrink_hot_cache_by(
+        self, bytes_to_free: int, protected_hashes: set[bytes] | None = None
+    ) -> int:
         """Free up to ``bytes_to_free`` of unprotected hot-cache blocks by LRU."""
         hot_used = self._hot_cache_used_bytes()
         if hot_used <= 0 or bytes_to_free <= 0:
             return 0
 
         target_hot_bytes = max(0, hot_used - bytes_to_free)
-        protected_hashes = self._active_hot_cache_block_hashes()
+        if protected_hashes is None:
+            protected_hashes = self._active_hot_cache_block_hashes()
         budget = self._hot_cache_budget()
         if budget is not None:
             shrink = getattr(budget, "shrink_to", None)
@@ -1170,8 +1201,6 @@ class ProcessMemoryEnforcer:
                     shrink(target_hot_bytes, protected_hashes=protected_hashes) or 0
                 )
                 if freed > 0:
-                    # Otherwise the freed bytes stay in phys_footprint.
-                    release_free_malloc_memory()
                     logger.warning(
                         "Shrank shared hot cache under memory pressure: "
                         "freed=%s target_hot=%s protected=%d",
@@ -1208,7 +1237,6 @@ class ProcessMemoryEnforcer:
             remaining_to_free = max(0, remaining_to_free - freed)
 
         if freed_total > 0:
-            release_free_malloc_memory()
             logger.warning(
                 "Shrank hot cache under memory pressure: freed=%s protected=%d",
                 _format_gb(freed_total),

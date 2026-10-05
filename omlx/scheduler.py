@@ -4494,17 +4494,25 @@ class Scheduler:
             ratios.append(watermark / hard_limit)
         return max(0.0, min(1.0, *ratios))
 
-    def _releasable_hot_cache_credit(self) -> int:
+    def _releasable_hot_cache_credit(self, own_prefix_bytes: int) -> int:
         """Limit the hot cache gives back once a request is admitted.
 
         Route preflight cannot protect the request's prefix blocks yet, so it
-        counts this instead of releasing hot cache.
+        counts this instead of releasing hot cache. ``own_prefix_bytes``
+        bounds the request's own cached prefix, which stays protected.
         """
         reserved = self._memory_hot_cache_reserved_bytes
         if reserved <= 0:
             return 0
-        held = min(self._hot_cache_cpu_bytes(), reserved)
-        return int(held * self._hot_cache_limit_factor())
+        releasable = getattr(
+            getattr(self.config, "hot_cache_budget", None), "releasable_bytes", None
+        )
+        if callable(releasable):
+            held = releasable(self.get_active_hot_cache_block_hashes())
+        else:
+            held = self._hot_cache_cpu_bytes()
+        held = min(held - own_prefix_bytes, reserved)
+        return int(max(0, held) * self._hot_cache_limit_factor())
 
     def _prefill_abort_description(self) -> tuple[int, int, float]:
         """Return (base cap, safety cap, margin) for diagnostics."""
@@ -11120,7 +11128,11 @@ class Scheduler:
             tier=self._memory_guard_tier,
             current=current,
             fmt=format_bytes,
-            tail="reduce context length",
+            tail=(
+                ["lower hot_cache_max_size", "reduce context length"]
+                if hot_cache > 0
+                else "reduce context length"
+            ),
             hot_cache=hot_cache,
         )
         scheduler_ceiling = self._memory_hard_limit_bytes
@@ -11181,7 +11193,7 @@ class Scheduler:
 
             request_id = f"preflight-{_uuid.uuid4().hex[:8]}"
 
-        hot_cache_credit = self._releasable_hot_cache_credit()
+        hot_cache_credit = self._releasable_hot_cache_credit(est.kv_exact)
         admission_limit = self._admission_limit_bytes()
         if est.estimated - hot_cache_credit > admission_limit:
             message = self._format_rejection_message(
@@ -11265,7 +11277,7 @@ class Scheduler:
             return None
 
         # Evict models only for what the hot cache cannot give back.
-        hot_cache_credit = self._releasable_hot_cache_credit()
+        hot_cache_credit = self._releasable_hot_cache_credit(est.kv_exact)
         admission_limit = self._admission_limit_bytes()
         if est.estimated - hot_cache_credit > admission_limit:
             return PrefillEvictionRequest(

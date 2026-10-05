@@ -1813,8 +1813,8 @@ class TestMemoryLimitPropagation:
     async def test_release_hot_cache_for_prefill_raises_scheduler_limit(
         self, mock_engine_pool
     ):
-        """Unprotected blocks go in LRU order until the reservation has dropped
-        by the requested bytes, and the higher limit reaches the scheduler
+        """Unprotected blocks go in LRU order once they can cover the drop,
+        after their SSD writes, and the higher limit reaches the scheduler
         before the prefill retries (#4213)."""
         gb = 1024**3
         budget = SharedHotCacheBudget(6 * gb)
@@ -1838,6 +1838,9 @@ class TestMemoryLimitPropagation:
         scheduler = MagicMock(spec=[])
         scheduler.batch_generator = None
         scheduler.get_active_hot_cache_block_hashes = lambda: {b"held"}
+        scheduler.paged_ssd_cache_manager = SimpleNamespace(
+            wait_for_pending_writes=MagicMock(return_value=True)
+        )
         engine = MagicMock(spec=[])
         engine.scheduler = scheduler
         mock_engine_pool._entries = {"model-a": _make_entry("model-a", engine=engine)}
@@ -1845,11 +1848,15 @@ class TestMemoryLimitPropagation:
         assert scheduler._memory_hard_limit_bytes == int(25.5 * gb)
 
         with patch.object(pme, "release_free_malloc_memory") as relief:
+            # 3GB of unprotected blocks cannot cover a 3.5GB drop.
+            assert await enforcer.release_hot_cache_for_prefill(int(3.5 * gb)) == 0
+            assert removed == []
             released = await enforcer.release_hot_cache_for_prefill(int(1.5 * gb))
 
         assert removed == [b"old", b"mid"]
         assert released == 2 * gb
         assert scheduler._memory_hard_limit_bytes == int(27.5 * gb)
+        scheduler.paged_ssd_cache_manager.wait_for_pending_writes.assert_called_once()
         # Freed blocks must leave phys_footprint, not wait in malloc's cache.
         relief.assert_called_once()
 

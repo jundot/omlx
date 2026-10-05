@@ -149,6 +149,7 @@ _TASK_VM_INFO_GRAPHICS_COUNT = (
 ) // 4
 
 _libproc: ctypes.CDLL | None = None
+_libc: ctypes.CDLL | None = None
 _proc_pid_rusage = None
 _task_info = None
 _mach_task_self: ctypes.c_uint | None = None
@@ -179,13 +180,17 @@ if sys.platform == "darwin":
         ]
         _task_info.restype = ctypes.c_int
         _mach_task_self = ctypes.c_uint.in_dll(_libc, "mach_task_self_")
-        _malloc_zone_pressure_relief = _libc.malloc_zone_pressure_relief
-        _malloc_zone_pressure_relief.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-    except (OSError, ValueError, AttributeError) as e:
+    except (OSError, ValueError) as e:
         logger.debug(f"task_info unavailable, graphics footprint will return 0: {e}")
         _task_info = None
         _mach_task_self = None
-        _malloc_zone_pressure_relief = None
+    if _libc is not None:
+        try:
+            _malloc_zone_pressure_relief = _libc.malloc_zone_pressure_relief
+            _malloc_zone_pressure_relief.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        except AttributeError as e:
+            logger.debug(f"malloc_zone_pressure_relief unavailable: {e}")
+            _malloc_zone_pressure_relief = None
 
 
 def get_phys_footprint(pid: int | None = None) -> int:
