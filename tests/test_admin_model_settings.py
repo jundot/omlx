@@ -826,14 +826,13 @@ def test_specprefill_draft_path_validation_is_unchanged():
             )
 
 
-def test_dflash_draft_field_unsent_rejects_the_effective_on_state(
-    tmp_path, monkeypatch
-):
-    """#4217: the payload validator is skipped for an unsent draft field, but
-    the route still rejects an effective DFlash-on + unusable-path state.
+def test_dflash_draft_field_unsent_is_not_validated(tmp_path, monkeypatch):
+    """#4217: a save that touches no DFlash field must never be bricked.
 
-    The stored value is never rewritten, so without the route check the broken
-    configuration would be silently re-persisted on every unrelated save.
+    The payload validator is skipped for an unsent draft field, and the route
+    check only applies to saves that touch DFlash. DFlash being on with a path
+    that has since been deleted is the reporter's state; an unrelated save has
+    to keep working so the user can recover, which is what #4217 asks for.
     """
     client, settings, manager = _draft_path_client(tmp_path, monkeypatch)
     draft = _draft_dir(tmp_path)
@@ -842,10 +841,10 @@ def test_dflash_draft_field_unsent_rejects_the_effective_on_state(
     _delete_draft(draft)
 
     response = client.put("/admin/api/models/ling/settings", json={"temperature": 0.3})
-    assert response.status_code == 422, response.text
-    assert "no config.json" in response.text
-    assert settings.temperature != 0.3
-    manager.set_settings.assert_not_called()
+    assert response.status_code == 200, response.text
+    assert settings.temperature == 0.3
+    assert settings.dflash_draft_model == draft
+    manager.set_settings.assert_called_once()
 
 
 def test_single_field_draft_path_patch_with_stored_dflash_on_is_rejected(

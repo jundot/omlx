@@ -3246,15 +3246,20 @@ async def update_model_settings(
     if "dflash_verify_mode" in sent:
         current_settings.dflash_verify_mode = request.dflash_verify_mode
     # The field validator only sees the payload, so it cannot know that DFlash
-    # is already enabled in the stored settings. Check the effective post-save
-    # state here -- after both DFlash blocks have been applied and before
-    # anything is validated, persisted or pushed to the engine -- so a
-    # single-field patch (the macOS app sends ``dflash_draft_model`` alone) or
-    # a flag-only enable can never leave DFlash on with a draft path that
-    # cannot load (#4217). A rejected save persists nothing.
+    # is already enabled in the stored settings. When this save actually
+    # touches DFlash, re-check the effective post-save state here -- after both
+    # DFlash blocks have been applied and before anything is validated,
+    # persisted or pushed to the engine -- so a single-field patch (the macOS
+    # app sends ``dflash_draft_model`` alone) or a flag-only enable can never
+    # leave DFlash on with a draft path that cannot load (#4217). A save that
+    # touches neither DFlash field is unrelated and keeps working, which is
+    # what #4217 asks for: a rejected save persists nothing, and a rejected
+    # unrelated save would brick the model's settings.
+    dflash_touched = "dflash_enabled" in sent or "dflash_draft_model" in sent
     draft_model_after = current_settings.dflash_draft_model
     if (
-        current_settings.dflash_enabled
+        dflash_touched
+        and current_settings.dflash_enabled
         and draft_model_after
         and _draft_path_is_unusable(draft_model_after)
     ):
