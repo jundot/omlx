@@ -283,7 +283,7 @@ The admin API for settings, models, downloads, quantization, and benchmarks take
 
 ### DRY Repetition Penalty
 
-DRY ("Don't Repeat Yourself") penalises the token that would extend a sequence the model has already produced, growing exponentially with the length of the repeat: `dry_multiplier * dry_base ^ (match_length - dry_allowed_length)`. Unlike `repetition_penalty` and `presence_penalty` it never penalises a token for merely having appeared, so it targets verbatim loops without discouraging common words. It is off by default.
+DRY ("Don't Repeat Yourself") penalizes the token that would extend a sequence the model has already produced, growing exponentially with the length of the repeat: `dry_multiplier * dry_base ^ (match_length - dry_allowed_length)`. Unlike `repetition_penalty` and `presence_penalty` it never penalizes a token for merely having appeared, so it targets verbatim loops without discouraging common words. It is off by default.
 
 Set it per request on `/v1/chat/completions` and `/v1/completions`, or as a per-model default in model settings, using llama.cpp's parameter names:
 
@@ -291,12 +291,12 @@ Set it per request on `/v1/chat/completions` and `/v1/completions`, or as a per-
 |-----------|---------|-------------|
 | `dry_multiplier` | `0` (off) | Penalty strength; 0.8 is a common starting point |
 | `dry_base` | `1.75` | Growth per token past the allowed length |
-| `dry_allowed_length` | `2` | Longest repeat left unpenalised |
+| `dry_allowed_length` | `2` | Longest repeat left unpenalized |
 | `dry_penalty_last_n` | `4096` | How many generated tokens to search (`-1` = all) |
 | `dry_sequence_breakers` | `["\n", ":", "\"", "*", "/"]` | Strings that end a match (`["none"]` = no breakers) |
 | `dry_exclude_reasoning` | `false` | Apply no penalty inside the thinking block |
 
-Two differences from llama.cpp keep legitimate copying free: only tokens generated in the current response are searched (quoting the prompt, such as a file path or an edit's old text, is never penalised), and for thinking models matching restarts after the close-think token, so an answer can reuse its reasoning's draft. `/` is a default breaker so repeated file paths in parallel tool calls are not altered. DRY applies on the standard, MTP and DFlash decode paths; distributed inference logs a warning and generates without it.
+Two differences from llama.cpp keep legitimate copying free: only tokens generated in the current response are searched (quoting the prompt, such as a file path or an edit's old text, is never penalized), and for thinking models matching restarts after the close-think token, so an answer can reuse its reasoning's draft. `/` is a default breaker so repeated file paths in parallel tool calls are not altered. DRY applies on the standard, MTP and DFlash decode paths; distributed inference logs a warning and generates without it.
 
 ### Tool Calling & Structured Output
 

@@ -2973,6 +2973,7 @@
                 min_p: null,
                 repetition_penalty: null,
                 presence_penalty: null,
+                dry_multiplier: null,
                 enable_thinking: null,
                 reasoning_effort: null,
                 thinking_budget_enabled: false,
@@ -2988,6 +2989,7 @@
                     min_p: null,
                     repetition_penalty: null,
                     presence_penalty: null,
+                    dry_multiplier: null,
                     enable_thinking: null,
                     reasoning_effort: null,
                     thinking_budget_enabled: false,
@@ -3600,7 +3602,7 @@
                 }
                 const scalarKeys = [
                     'temperature', 'max_tokens', 'top_p', 'top_k', 'min_p',
-                    'repetition_penalty', 'presence_penalty',
+                    'repetition_penalty', 'presence_penalty', 'dry_multiplier',
                 ];
                 for (const key of scalarKeys) {
                     if (generation[key] != null) s[key] = generation[key];
@@ -3759,7 +3761,7 @@
                 const s = this.modelSettings;
                 const scalarKeys = [
                     'temperature', 'max_tokens', 'top_p', 'top_k', 'min_p',
-                    'repetition_penalty', 'presence_penalty'
+                    'repetition_penalty', 'presence_penalty', 'dry_multiplier'
                 ];
                 const source = this.samplingSource();
                 for (const key of scalarKeys) {
@@ -5309,6 +5311,7 @@
                 min_p: s.min_p ?? null,
                 repetition_penalty: s.repetition_penalty ?? null,
                 presence_penalty: s.presence_penalty ?? null,
+                dry_multiplier: s.dry_multiplier ?? null,
                 enable_thinking: s.enable_thinking ?? null,
                 thinking_budget_enabled: !!(s.thinking_budget_enabled || (s.thinking_budget_tokens != null && s.thinking_budget_tokens > 0)),
                 thinking_budget_tokens: (s.thinking_budget_enabled || (s.thinking_budget_tokens != null && s.thinking_budget_tokens > 0))
@@ -5443,6 +5446,7 @@
             { key: 'min_p', label: window.t('modal.model_settings.min_p'), step: 0.01, min: 0, max: 1 },
             { key: 'repetition_penalty', label: window.t('modal.model_settings.repetition_penalty_short'), step: 0.05, min: 0 },
             { key: 'presence_penalty', label: window.t('modal.model_settings.presence_penalty'), step: 0.05, min: -2, max: 2 },
+            { key: 'dry_multiplier', label: window.t('modal.model_settings.dry_multiplier'), step: 0.1, min: 0 },
         ];
     },
 
@@ -7132,6 +7136,7 @@
                             ['min_p', 'min_p'],
                             ['repetition_penalty', 'rep_pen'],
                             ['presence_penalty', 'pres_pen'],
+                            ['dry_multiplier', 'dry'],
                         ];
                         for (const [key, label] of scalarLabels) {
                             if (gen[key] != null) parts.push(`${label}=${gen[key]}`);

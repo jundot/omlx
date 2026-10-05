@@ -17,6 +17,12 @@
         'min_p',
         'repetition_penalty',
         'presence_penalty',
+        'dry_multiplier',
+        'dry_base',
+        'dry_allowed_length',
+        'dry_penalty_last_n',
+        'dry_sequence_breakers',
+        'dry_exclude_reasoning',
         'force_sampling',
         'enable_thinking',
         'preserve_thinking',
@@ -276,6 +282,14 @@
                 repetition_penalty: null,
                 min_p: null,
                 presence_penalty: null,
+                dry_multiplier: null,
+                dry_base: null,
+                dry_allowed_length: null,
+                dry_penalty_last_n: null,
+                // No form control: carried through so a UI save keeps a
+                // value set through the API.
+                dry_sequence_breakers: null,
+                dry_exclude_reasoning: false,
                 force_sampling: false,
                 enableToolResultLimit: false,
                 max_tool_result_tokens: null,
@@ -1741,6 +1755,10 @@
                         if (g) out.guided_grammar = g;
                         continue;
                     }
+                    if (k === 'dry_exclude_reasoning') {
+                        if (ms.dry_exclude_reasoning) out.dry_exclude_reasoning = true;
+                        continue;
+                    }
                     // Standard field: omit unset values entirely — the server
                     // treats absent universal keys as "reset to default" when
                     // the profile is applied (snapshot semantics).
@@ -2140,6 +2158,12 @@
                     repetition_penalty: s.repetition_penalty ?? null,
                     min_p: s.min_p ?? null,
                     presence_penalty: s.presence_penalty ?? null,
+                    dry_multiplier: s.dry_multiplier ?? null,
+                    dry_base: s.dry_base ?? null,
+                    dry_allowed_length: s.dry_allowed_length ?? null,
+                    dry_penalty_last_n: s.dry_penalty_last_n ?? null,
+                    dry_sequence_breakers: s.dry_sequence_breakers ?? null,
+                    dry_exclude_reasoning: s.dry_exclude_reasoning || false,
                     force_sampling: s.force_sampling || false,
                     enable_thinking: s.enable_thinking ?? null,
                     thinking_default: model?.thinking_default ?? null,
@@ -2327,6 +2351,12 @@
                 ms.min_p = null;
                 ms.repetition_penalty = null;
                 ms.presence_penalty = null;
+                ms.dry_multiplier = null;
+                ms.dry_base = null;
+                ms.dry_allowed_length = null;
+                ms.dry_penalty_last_n = null;
+                ms.dry_sequence_breakers = null;
+                ms.dry_exclude_reasoning = false;
                 ms.force_sampling = false;
                 ms.max_context_window = null;
                 ms.max_tokens = null;
@@ -2370,6 +2400,8 @@
                         ms.guided_grammar_enabled = !!s[k];
                     } else if (k === 'guided_grammar') {
                         ms.guided_grammar = s[k] || '';
+                    } else if (k === 'dry_exclude_reasoning') {
+                        ms.dry_exclude_reasoning = !!s[k];
                     } else if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') {
                         ms.ctKwargEntries = this.buildCtKwargEntries(
                             s.chat_template_kwargs,
@@ -3223,6 +3255,12 @@
                     repetition_penalty: Number.isFinite(ms.repetition_penalty) ? ms.repetition_penalty : null,
                     min_p: Number.isFinite(ms.min_p) ? ms.min_p : null,
                     presence_penalty: Number.isFinite(ms.presence_penalty) ? ms.presence_penalty : null,
+                    dry_multiplier: Number.isFinite(ms.dry_multiplier) ? ms.dry_multiplier : null,
+                    dry_base: Number.isFinite(ms.dry_base) ? ms.dry_base : null,
+                    dry_allowed_length: Number.isFinite(ms.dry_allowed_length) ? ms.dry_allowed_length : null,
+                    dry_penalty_last_n: Number.isFinite(ms.dry_penalty_last_n) ? ms.dry_penalty_last_n : null,
+                    dry_sequence_breakers: ms.dry_sequence_breakers ?? null,
+                    dry_exclude_reasoning: ms.dry_exclude_reasoning ? true : null,
                     force_sampling: ms.force_sampling,
                     reasoning_parser: ms.reasoning_parser || null,
                     ttl_seconds: ms.ttl_seconds || null,
@@ -3353,6 +3391,12 @@
                         repetition_penalty: null,
                         min_p: null,
                         presence_penalty: null,
+                        dry_multiplier: null,
+                        dry_base: null,
+                        dry_allowed_length: null,
+                        dry_penalty_last_n: null,
+                        dry_sequence_breakers: null,
+                        dry_exclude_reasoning: null,
                         force_sampling: false,
                         reasoning_parser: null,
                         index_cache_freq: 0,
@@ -3660,6 +3704,11 @@
                         this.modelSettings.max_tokens = null;
                         this.modelSettings.min_p = null;
                         this.modelSettings.presence_penalty = null;
+                        this.modelSettings.dry_multiplier = null;
+                        this.modelSettings.dry_base = null;
+                        this.modelSettings.dry_allowed_length = null;
+                        this.modelSettings.dry_penalty_last_n = null;
+                        this.modelSettings.dry_exclude_reasoning = false;
                         this.modelSettings.force_sampling = false;
                         this.modelSettings.reasoning_parser = null;
                         this.modelSettings.guided_grammar_enabled = false;

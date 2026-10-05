@@ -58,7 +58,7 @@ class DryParams:
     -1 means everything generated so far. ``exclude_reasoning`` turns the
     penalty off inside the model's thinking block. The default breakers are
     llama.cpp's plus "/": without it, parallel tool calls on files under one
-    directory get their shared path prefix penalised into misspellings.
+    directory get their shared path prefix penalized into misspellings.
     """
 
     multiplier: float

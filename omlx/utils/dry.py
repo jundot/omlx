@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """DRY ("Don't Repeat Yourself") repetition penalty as a logits processor.
 
-DRY penalises the token that would *extend* a sequence the model has already
+DRY penalizes the token that would *extend* a sequence the model has already
 produced, in proportion to how long the repeated sequence already is::
 
     penalty = multiplier * base ** (match_length - allowed_length)
 
-Unlike repetition/presence penalties it never penalises a token for merely
+Unlike repetition/presence penalties it never penalizes a token for merely
 having appeared, only for continuing a verbatim run. The algorithm follows
 text-generation-webui #5677 and llama.cpp's ``dry`` sampler, with two
 deliberate differences:
@@ -230,7 +230,7 @@ class DryProcessor:
             ),
             0.0,
         )
-        # The penalised token is the one that followed each earlier match;
+        # The penalized token is the one that followed each earlier match;
         # several matches naming the same token keep the longest.
         followers = mx.clip(recent[1:], 0, vocab_size - 1)
         per_token = (
