@@ -14,6 +14,7 @@ import struct
 import wave
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import mlx.core as mx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -1074,6 +1075,20 @@ class TestTTSVoiceRouting:
 class TestTTSVoiceClonePassthrough:
     """Verify ref_audio and ref_text are forwarded to model.generate()."""
 
+    @staticmethod
+    def _write_ref_wav(path, seconds=1.0, sample_rate=24000):
+        """Write a real mono WAV so the engine's ref_audio loader succeeds."""
+        import numpy as np
+
+        from omlx.engine.audio_utils import audio_to_wav_bytes
+
+        n = int(seconds * sample_rate)
+        tone = (
+            0.4 * np.sin(np.linspace(0, seconds, n, endpoint=False) * 440.0 * 2 * np.pi)
+        ).astype(np.float32)
+        path.write_bytes(audio_to_wav_bytes(tone, sample_rate))
+        return str(path)
+
     @pytest.fixture
     def _run_synthesize_clone(self):
         """Helper: run TTSEngine.synthesize with ref_audio/ref_text and return generate() kwargs."""
@@ -1081,7 +1096,7 @@ class TestTTSVoiceClonePassthrough:
 
         from omlx.engine.tts import TTSEngine
 
-        def _run(ref_audio_path=None, ref_text=None):
+        def _run(ref_audio_path=None, ref_text=None, preserve_ref_audio_path=False):
             engine = TTSEngine("test-model")
 
             import inspect
@@ -1115,6 +1130,11 @@ class TestTTSVoiceClonePassthrough:
 
             fake_model = FakeModel()
             fake_model.generate = generate_mock
+            fake_model.sample_rate = 24000
+            if preserve_ref_audio_path:
+                # Models such as ZonoS2/DramaBox own reference preprocessing and
+                # want the path itself, not a decoded array.
+                fake_model.preserve_ref_audio_path = True
 
             engine._model = fake_model
 
@@ -1133,11 +1153,17 @@ class TestTTSVoiceClonePassthrough:
 
         return _run
 
-    def test_ref_audio_passed_to_generate(self, _run_synthesize_clone):
-        """ref_audio path is forwarded to model.generate()."""
-        call = _run_synthesize_clone(ref_audio_path="/tmp/ref.wav", ref_text="hello")
+    def test_ref_audio_loaded_into_array(self, _run_synthesize_clone, tmp_path):
+        """ref_audio is decoded into an mx.array before model.generate() (#1495)."""
+        ref_file = self._write_ref_wav(tmp_path / "ref.wav")
+        call = _run_synthesize_clone(ref_audio_path=ref_file, ref_text="hello")
         kwargs = call.kwargs if call else {}
-        assert kwargs.get("ref_audio") == "/tmp/ref.wav"
+        ref_audio = kwargs.get("ref_audio")
+        # A raw path string would raise "'str' object has no attribute 'ndim'"
+        # inside models such as Fish that index the reference audio.
+        assert isinstance(ref_audio, mx.array)
+        assert ref_audio.ndim == 1
+        assert ref_audio.shape[0] == 24000
         assert kwargs.get("ref_text") == "hello"
 
     def test_ref_audio_none_not_passed(self, _run_synthesize_clone):
@@ -1147,12 +1173,44 @@ class TestTTSVoiceClonePassthrough:
         assert "ref_audio" not in kwargs
         assert "ref_text" not in kwargs
 
-    def test_ref_audio_without_ref_text(self, _run_synthesize_clone):
-        """ref_audio without ref_text passes ref_audio and ref_text=None."""
-        call = _run_synthesize_clone(ref_audio_path="/tmp/ref.wav", ref_text=None)
+    def test_ref_audio_without_ref_text(self, _run_synthesize_clone, tmp_path):
+        """ref_audio without ref_text passes a loaded array and ref_text=None."""
+        ref_file = self._write_ref_wav(tmp_path / "ref.wav")
+        call = _run_synthesize_clone(ref_audio_path=ref_file, ref_text=None)
         kwargs = call.kwargs if call else {}
-        assert kwargs.get("ref_audio") == "/tmp/ref.wav"
+        assert isinstance(kwargs.get("ref_audio"), mx.array)
         assert kwargs.get("ref_text") is None
+
+    def test_ref_audio_resampled_to_model_sample_rate(
+        self, _run_synthesize_clone, tmp_path
+    ):
+        """A 16 kHz reference is resampled up to the model's 24 kHz rate."""
+        ref_file = self._write_ref_wav(tmp_path / "ref16.wav", sample_rate=16000)
+        call = _run_synthesize_clone(ref_audio_path=ref_file, ref_text="hello")
+        kwargs = call.kwargs if call else {}
+        ref_audio = kwargs.get("ref_audio")
+        assert isinstance(ref_audio, mx.array)
+        assert ref_audio.shape[0] == 24000
+
+    def test_ref_audio_path_kept_when_model_preserves_paths(
+        self, _run_synthesize_clone, tmp_path
+    ):
+        """Models with preserve_ref_audio_path still receive the path string."""
+        ref_file = self._write_ref_wav(tmp_path / "ref.wav")
+        call = _run_synthesize_clone(
+            ref_audio_path=ref_file,
+            ref_text="hello",
+            preserve_ref_audio_path=True,
+        )
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("ref_audio") == ref_file
+
+    def test_unreadable_ref_audio_falls_back_to_path(self, _run_synthesize_clone):
+        """A reference that cannot be decoded is forwarded unchanged, not fatal."""
+        missing = "/tmp/definitely-missing-ref-1495.wav"
+        call = _run_synthesize_clone(ref_audio_path=missing, ref_text="hello")
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("ref_audio") == missing
 
 
 # ---------------------------------------------------------------------------

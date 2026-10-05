@@ -11,6 +11,7 @@ when mlx-audio is not installed.
 import asyncio
 import gc
 import logging
+import os
 import re
 from collections.abc import AsyncIterator
 from typing import Any, Dict, Optional
@@ -55,6 +56,52 @@ def _accepts_preset_voice(model: Any) -> bool:
     """
     speakers = getattr(model, "supported_speakers", None)
     return not (isinstance(speakers, list) and not speakers)
+
+
+def _resolve_ref_audio(model: Any, ref_audio: Any) -> Any:
+    """Return ``ref_audio`` in the shape ``model.generate()`` expects.
+
+    mlx-audio's ``tts.generate.generate_audio()`` loads the reference clip into
+    an ``mx.array`` before calling ``model.generate()``; only models that own
+    their reference preprocessing opt out via ``preserve_ref_audio_path`` and
+    receive the path untouched. oMLX writes the uploaded clip to a temp file and
+    used to forward that path directly, but models such as Fish index the value
+    (``fish_speech.py``: ``if audio.ndim == 1``) and failed with
+    ``'str' object has no attribute 'ndim'``.
+
+    The load is guarded: if the clip cannot be decoded the original value is
+    forwarded unchanged, so an unreadable reference degrades to the pre-existing
+    behaviour instead of introducing a new failure mode. Sample rate, mono
+    downmixing and resampling all come from ``mlx_audio.utils.load_audio``.
+    """
+    if ref_audio is None:
+        return None
+    # Models that own reference preprocessing (ZonoS2, DramaBox, Spark-style
+    # checkpoints) want the path string, matching generate_audio().
+    if getattr(model, "preserve_ref_audio_path", False) is True:
+        return ref_audio
+    if not isinstance(ref_audio, (str, os.PathLike)):
+        return ref_audio
+    try:
+        from mlx_audio.utils import load_audio
+
+        # load_audio() only accepts str/mx.array; fspath() mirrors generate_audio().
+        ref_path = os.fspath(ref_audio)
+        load_kwargs: Dict[str, Any] = {}
+        sample_rate = getattr(model, "sample_rate", None)
+        if sample_rate is not None:
+            load_kwargs["sample_rate"] = int(sample_rate)
+        # Spark normalises loudness itself, as generate_audio() does.
+        if getattr(model, "model_type", None) == "spark":
+            load_kwargs["volume_normalize"] = True
+        return load_audio(ref_path, **load_kwargs)
+    except Exception:
+        logger.warning(
+            "TTS: could not load ref_audio %r, forwarding it unchanged",
+            ref_audio,
+            exc_info=True,
+        )
+        return ref_audio
 
 
 class TTSEngine(BaseNonStreamingEngine):
@@ -250,7 +297,7 @@ class TTSEngine(BaseNonStreamingEngine):
             if speed != 1.0:
                 gen_kwargs["speed"] = speed
             if ref_audio is not None and "ref_audio" in gen_params:
-                gen_kwargs["ref_audio"] = ref_audio
+                gen_kwargs["ref_audio"] = _resolve_ref_audio(model, ref_audio)
                 gen_kwargs["ref_text"] = ref_text
             # Generation params (only add non-None values)
             if temperature is not None:
@@ -376,7 +423,7 @@ class TTSEngine(BaseNonStreamingEngine):
             if speed != 1.0:
                 gen_kwargs["speed"] = speed
             if ref_audio is not None and "ref_audio" in gen_params:
-                gen_kwargs["ref_audio"] = ref_audio
+                gen_kwargs["ref_audio"] = _resolve_ref_audio(model, ref_audio)
                 gen_kwargs["ref_text"] = ref_text
             if temperature is not None:
                 gen_kwargs["temperature"] = temperature
