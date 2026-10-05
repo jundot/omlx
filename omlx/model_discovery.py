@@ -26,7 +26,7 @@ from typing import Literal
 logger = logging.getLogger(__name__)
 
 ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
-EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
+EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "splash"]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -1123,6 +1123,25 @@ def _is_model_dir(path: Path) -> bool:
     return (path / "config.json").exists() and not _is_adapter_dir(path)
 
 
+def is_splash_package(path: Path) -> bool:
+    """Check if a directory is a prebuilt Splash package.
+
+    Splash packages carry packed weights for Splash's own Metal engine and a
+    ``manifest.json`` naming a ``splash-packed`` format instead of a
+    config.json; only the Splash engine (omlx/engine/splash.py) serves them.
+    """
+    manifest = path / "manifest.json"
+    if not manifest.is_file():
+        return False
+    try:
+        data = json.loads(manifest.read_text())
+    except (OSError, ValueError):
+        return False
+    fmt = data.get("format") if isinstance(data, dict) else None
+    name = fmt.get("name") if isinstance(fmt, dict) else None
+    return isinstance(name, str) and name.startswith("splash-packed")
+
+
 _SHARD_FILE_RE = re.compile(r"-(\d+)-of-(\d+)\.safetensors$")
 
 
@@ -1681,6 +1700,49 @@ def _register_model(
         logger.error(f"Failed to discover model {model_id}: {e}")
 
 
+def _register_splash_package(
+    models: dict[str, DiscoveredModel],
+    package_dir: Path,
+    model_id: str,
+    *,
+    source_type: str = "local",
+    source_repo_id: str | None = None,
+) -> None:
+    """Register a Splash package, served by the Splash engine."""
+    if model_id in models:
+        logger.warning(
+            f"Duplicate model_id '{model_id}' found in {package_dir}, "
+            f"keeping version from {models[model_id].model_path}"
+        )
+        return
+    tokenizer_dir = package_dir / "tokenizer"
+    try:
+        config = json.loads((tokenizer_dir / "config.json").read_text())
+    except (OSError, ValueError):
+        config = {}
+    config_model_type = config.get("model_type") if isinstance(config, dict) else ""
+    try:
+        size = sum(f.stat().st_size for f in package_dir.rglob("*") if f.is_file())
+    except OSError as e:
+        logger.error(f"Failed to size Splash package {model_id}: {e}")
+        return
+    models[model_id] = DiscoveredModel(
+        model_id=model_id,
+        model_path=str(package_dir),
+        model_type="llm",
+        engine_type="splash",
+        estimated_size=size,
+        config_model_type=str(config_model_type or ""),
+        thinking_default=detect_thinking_default(tokenizer_dir),
+        source_type=source_type,
+        source_repo_id=source_repo_id,
+    )
+    logger.info(
+        f"Discovered model: {model_id} "
+        f"(type: llm, engine: splash, size: {size / (1024**3):.2f}GB)"
+    )
+
+
 def model_display_name(
     model_id: str,
     model_path: str | Path | None,
@@ -1777,11 +1839,21 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
         elif _is_model_dir(subdir):
             # Level 1: direct model folder
             _register_model(models, subdir, subdir.name)
+        elif is_splash_package(subdir):
+            _register_splash_package(models, subdir, subdir.name)
         else:
             # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
             hf_resolved = _resolve_hf_cache_entry(subdir)
             if hf_resolved is not None:
-                if _is_hf_cache_mlx_compatible(
+                if is_splash_package(hf_resolved.snapshot_path):
+                    _register_splash_package(
+                        models,
+                        hf_resolved.snapshot_path,
+                        hf_resolved.model_id,
+                        source_type="hf_cache",
+                        source_repo_id=hf_resolved.source_repo_id,
+                    )
+                elif _is_hf_cache_mlx_compatible(
                     hf_resolved.snapshot_path,
                     hf_resolved.source_repo_id,
                 ):
@@ -1810,6 +1882,9 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
                 elif _is_model_dir(child):
                     has_children = True
                     _register_model(models, child, child.name)
+                elif is_splash_package(child):
+                    has_children = True
+                    _register_splash_package(models, child, child.name)
 
             if not has_children:
                 logger.debug(

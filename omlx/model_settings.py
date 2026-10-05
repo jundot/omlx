@@ -415,6 +415,11 @@ class ModelSettings:
     specprefill_keep_pct: Optional[float] = None  # Keep rate (0.1-0.5, default 0.2)
     specprefill_threshold: Optional[int] = None  # Min tokens to trigger (default 8192)
 
+    # Splash: serve the model through a Splash server process
+    # (omlx/engine/splash.py) instead of an in-process MLX engine.
+    splash_enabled: bool = False
+    splash_build: Optional[str] = None  # "splash", "splash-m1", "custom"; None = auto
+
     # DFlash (block diffusion speculative decoding)
     dflash_enabled: bool = False
     dflash_draft_model: Optional[str] = None  # Path/repo for DFlash draft checkpoint

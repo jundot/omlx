@@ -486,7 +486,7 @@
                         </div>
                         <div class="px-6 py-4 space-y-2">
                             <p class="text-sm text-amber-600"
-                               x-text="t('bench.upload_skipped.reason_external')"></p>
+                               x-text="benchUploadSkipped?.reason === 'splash' ? t('bench.upload_skipped.reason_splash') : t('bench.upload_skipped.reason_external')"></p>
                         </div>
                     </div>
 

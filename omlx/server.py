@@ -4196,14 +4196,23 @@ async def create_chat_completion(
             structured_outputs=structured_outputs,
             guided_grammar=guided_grammar,
         )
-        if structured_outputs is not None or response_format:
+        native_response_format = _native_response_format(
+            engine, response_format, structured_outputs
+        )
+        if native_response_format is None and (
+            structured_outputs is not None or response_format
+        ):
             await engine.start()
-        compiled_grammar = _compile_grammar_for_request(
-            engine,
-            structured_outputs=structured_outputs,
-            response_format=response_format,
-            chat_template_kwargs=merged_ct_kwargs or None,
-            reasoning_parser=reasoning_parser,
+        compiled_grammar = (
+            None
+            if native_response_format is not None
+            else _compile_grammar_for_request(
+                engine,
+                structured_outputs=structured_outputs,
+                response_format=response_format,
+                chat_template_kwargs=merged_ct_kwargs or None,
+                reasoning_parser=reasoning_parser,
+            )
         )
         # Fall back to prompt injection when grammar is not compiled. The degrade
         # is also surfaced to the caller as a Warning response header (#1241).
@@ -4211,8 +4220,10 @@ async def create_chat_completion(
         # (json_object / json_schema) can be "unenforced"; a plain text format
         # never asked for enforcement, so it must not warn (#1241 review).
         response_format_warning = None
-        if compiled_grammar is None and _response_format_requests_grammar(
-            response_format
+        if (
+            native_response_format is None
+            and compiled_grammar is None
+            and _response_format_requests_grammar(response_format)
         ):
             response_format_warning = _response_format_warning_header(response_format)
             json_instruction = build_json_system_prompt(response_format)
@@ -4375,6 +4386,8 @@ async def create_chat_completion(
                     "Auto-set thinking_budget=%d for grammar-constrained request",
                     default_budget,
                 )
+        if native_response_format is not None:
+            chat_kwargs["response_format"] = native_response_format
 
         # Add tools if provided (includes MCP tools)
         if tools_for_template:
@@ -4898,6 +4911,28 @@ def _response_format_requests_grammar(response_format) -> bool:
     if response_format is None:
         return False
     return _build_format_element(response_format=response_format) is not None
+
+
+def _native_response_format(
+    engine, response_format, structured_outputs=None
+) -> dict | None:
+    """Return ``response_format`` as an OpenAI wire dict for engines that enforce it.
+
+    Engines with ``supports_native_response_format`` (Splash) validate
+    structured output in their own process, so oMLX forwards the format
+    instead of compiling a grammar or injecting a JSON instruction.
+    Returns None for every other engine, when there is no format, or when
+    ``structured_outputs`` asks for oMLX's own grammar path.
+    """
+    if response_format is None or structured_outputs is not None:
+        return None
+    if not getattr(engine, "supports_native_response_format", False):
+        return None
+    if hasattr(response_format, "model_dump"):
+        return response_format.model_dump(by_alias=True, exclude_none=True)
+    if isinstance(response_format, dict):
+        return dict(response_format)
+    return None
 
 
 def _compile_grammar_for_request(
@@ -7137,6 +7172,7 @@ async def create_response(
         response_format = None
         compiled_grammar = None
         response_format_warning = None
+        native_response_format = None
         if request.text and request.text.format:
             fmt = request.text.format
             if fmt.type == "json_object":
@@ -7157,15 +7193,19 @@ async def create_response(
                     engine,
                     response_format=response_format,
                 )
-                await engine.start()
-                rf = ResponseFormat(**response_format)
-                compiled_grammar = _compile_grammar_for_request(
-                    engine,
-                    response_format=rf,
-                    chat_template_kwargs=merged_ct_kwargs or None,
-                    reasoning_parser=reasoning_parser,
+                native_response_format = _native_response_format(
+                    engine, response_format
                 )
-                if compiled_grammar is None:
+                if native_response_format is None:
+                    await engine.start()
+                    rf = ResponseFormat(**response_format)
+                    compiled_grammar = _compile_grammar_for_request(
+                        engine,
+                        response_format=rf,
+                        chat_template_kwargs=merged_ct_kwargs or None,
+                        reasoning_parser=reasoning_parser,
+                    )
+                if native_response_format is None and compiled_grammar is None:
                     # Non-strict formats still degrade to prompt injection, so
                     # surface it to the caller with the same Warning response
                     # header /v1/chat/completions uses; the log line alone only
@@ -7379,6 +7419,11 @@ async def create_response(
                 media_type="text/event-stream",
                 headers=sse_headers,
             )
+
+        # Engines that enforce response_format themselves get it with the
+        # request; the stream path adds it in stream_responses_api.
+        if native_response_format is not None:
+            chat_kwargs["response_format"] = native_response_format
 
         # Non-streaming with keepalive during prefill
         async def _build_responses_api():
@@ -7823,6 +7868,9 @@ async def stream_responses_api(
         else:
             stream_content = False
 
+    native_response_format = _native_response_format(engine, response_format)
+    if native_response_format is not None:
+        kwargs = {**kwargs, "response_format": native_response_format}
     engine_stream = engine.stream_chat(messages=messages, **kwargs)
     try:
         async for output in engine_stream:
