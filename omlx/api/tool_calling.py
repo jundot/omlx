@@ -2572,6 +2572,7 @@ class ToolCallStreamFilter:
         self._pending_envelope_parts: List[str] = []
         self._pending_start_marker: Optional[str] = None
         self._recovery_candidate = ""
+        self._recovery_is_payload = False
         self._completed_envelopes: List[str] = []
         self._completed_envelope_bytes = 0
         self._completed_envelope_overflowed = False
@@ -2602,6 +2603,19 @@ class ToolCallStreamFilter:
         candidate = self._recovery_candidate
         self._recovery_candidate = ""
         return candidate
+
+    def take_recovery_is_payload(self) -> bool:
+        """Whether the drained candidate opens a structured tool payload.
+
+        True means the withheld tail is a truncated tool call, not prose: a
+        caller must keep treating it as a failed call rather than surfacing
+        markup as answer text.  Drained together with
+        ``take_recovery_candidate``; both default to False.
+        """
+
+        flag = self._recovery_is_payload
+        self._recovery_is_payload = False
+        return flag
 
     def take_completed_envelopes(self) -> List[str]:
         """Return complete suppressed envelopes ready for exact parsing.
@@ -3232,6 +3246,23 @@ class ToolCallStreamFilter:
 
         return "".join(out)
 
+    def _withheld_payload_body(self, withheld: str) -> str:
+        """Return ``withheld`` with its opening envelope marker removed.
+
+        Longest matching marker wins so an overlapping tokenizer-supplied
+        marker cannot shadow a more specific built-in pair.
+        """
+
+        opener = ""
+        for start_marker, _close in self._marker_pairs:
+            if (
+                start_marker
+                and withheld.startswith(start_marker)
+                and len(start_marker) > len(opener)
+            ):
+                opener = start_marker
+        return withheld[len(opener) :]
+
     def _unwind_withheld_at_eof(
         self, candidate: str, marker: str, start_marker: str
     ) -> str:
@@ -3277,6 +3308,13 @@ class ToolCallStreamFilter:
                 withheld = candidate[env_start:]
                 if withheld:
                     self._recovery_candidate = withheld
+                    # A model that quotes a literal control marker in prose
+                    # opens the same envelope as a real call and ends the turn
+                    # the same way, so the withheld text is only recoverable
+                    # when what follows the marker is not a payload opener
+                    # (#4241).
+                    body = self._withheld_payload_body(withheld).lstrip()
+                    self._recovery_is_payload = bool(body) and body[0] in "<{["
                     logger.warning(
                         "Unclosed tool-call envelope at end of stream; "
                         "withheld %d characters are available for content "

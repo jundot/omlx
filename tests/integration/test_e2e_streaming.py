@@ -4901,6 +4901,146 @@ async def test_qwen_closed_envelope_with_unclosed_parameter_never_emits_call():
     assert events[-1]["error"]["code"] == "invalid_tool_call"
 
 
+# --- #4241: withheld prose is content, a truncated payload is still a failure.
+
+# Prose that quotes the control marker literally. The marker opens an envelope
+# the filter then withholds to EOF, but nothing here is a tool call payload.
+_RECOVERY_PROSE = (
+    "The tag <tool_call> is how qwen calls a tool. "
+    "This sentence must survive. END"
+)
+
+
+def _recovery_text(events, api):
+    if api == "chat":
+        return "".join(
+            c.get("delta", {}).get("content") or ""
+            for e in events
+            for c in e.get("choices", [])
+        )
+    if api == "anthropic":
+        return "".join(
+            e.get("delta", {}).get("text") or ""
+            for e in events
+            if e.get("type") == "content_block_delta"
+        )
+    return "".join(
+        e.get("delta") or ""
+        for e in events
+        if e.get("type") == "response.output_text.delta"
+    )
+
+
+def _recovery_error_codes(events, api):
+    codes = [e["error"]["code"] for e in events if "error" in e]
+    if api == "responses":
+        codes += [
+            e["response"]["error"]["code"]
+            for e in events
+            if e.get("type") == "response.failed"
+        ]
+    return codes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+@pytest.mark.parametrize("chunk_size", [1, 7, 4096])
+async def test_withheld_prose_after_literal_marker_is_delivered(api, chunk_size):
+    """A marker quoted in prose must not discard the text behind it."""
+    events = await _recovery_stream(_RECOVERY_PROSE, api, chunk_size=chunk_size)
+
+    assert _recovery_error_codes(events, api) == []
+    assert _recovery_text(events, api) == _RECOVERY_PROSE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # XML payload opener, the shape a real qwen call has.
+        "<tool_call><function=write><parameter=content>cut",
+        # JSON object and array payload openers are equally structured.
+        '<tool_call>{"name":"write","arguments":{"content":"cut',
+        '<tool_call>[{"name":"write","arguments":{"content":"cut',
+    ],
+)
+async def test_truncated_tool_payload_is_never_recovered_as_content(api, raw):
+    """Counter-example: a withheld payload keeps the 500 and stays hidden."""
+    events = await _recovery_stream(raw, api)
+
+    assert _recovery_error_codes(events, api) == ["incomplete_tool_call"]
+    assert not _recovery_calls(events, api)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+async def test_truncated_sibling_of_a_delivered_call_keeps_the_error(api):
+    """Counter-example: a valid prefix is delivered once, the tail still fails."""
+    raw = _RECOVERY_CALL + "<tool_call><function=write><parameter=content>cut"
+    events = await _recovery_stream(raw, api)
+
+    assert _recovery_error_codes(events, api) == ["incomplete_tool_call"]
+    assert len(_recovery_calls(events, api)) == 1
+    assert "cut" not in _recovery_text(events, api)
+
+
+@pytest.mark.asyncio
+async def test_withheld_prose_never_reports_a_tool_call_finish():
+    """Recovering prose must not look like a tool turn to the client."""
+    events = await _recovery_stream(_RECOVERY_PROSE, "chat")
+
+    assert not _recovery_calls(events, "chat")
+    assert [
+        c.get("finish_reason")
+        for e in events
+        for c in e.get("choices", [])
+        if c.get("finish_reason")
+    ] == ["stop"]
+
+
+@pytest.mark.asyncio
+async def test_delivered_call_is_not_recovered_and_not_reexecuted():
+    """Counter-example: a call already delivered keeps the 500, emitted once.
+
+    Recovery is refused whenever anything structured is in flight, so the
+    client is never told to run a delivered call a second time.
+    """
+    raw = _RECOVERY_CALL + " then <tool_call> prose that must not be recovered. END"
+    events = await _recovery_stream(raw, "chat")
+
+    assert [e["error"]["code"] for e in events if "error" in e] == [
+        "incomplete_tool_call"
+    ]
+    assert _recovery_text(events, "chat") == " then "
+    assert len(_recovery_calls(events, "chat")) == 1
+
+
+@pytest.mark.asyncio
+async def test_partially_streamed_call_never_emits_call_or_recovery():
+    """Counter-example: a call cut mid-arguments yields neither side."""
+    events = await _recovery_stream(
+        "<tool_call><function=write><parameter=content>half a sen",
+        "chat",
+    )
+
+    assert not _recovery_calls(events, "chat")
+    assert [e["error"]["code"] for e in events if "error" in e] == [
+        "incomplete_tool_call"
+    ]
+    assert _recovery_text(events, "chat") == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+async def test_withheld_prose_is_delivered_exactly_once(api):
+    """Counter-example: repeated recovery must not duplicate answer text."""
+    events = await _recovery_stream(_RECOVERY_PROSE + " " + _RECOVERY_PROSE, api)
+
+    assert _recovery_text(events, api).count("END") == 2
+    assert _recovery_error_codes(events, api) == []
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
 @pytest.mark.parametrize("raw", [_RECOVERY_CALL, "<tool_call><function=write>"])

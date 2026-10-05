@@ -1622,6 +1622,47 @@ def test_payload_without_any_close_marker_is_still_withheld():
     assert f.take_recovery_candidate() == '<tool_call>{"name":"f" After'
 
 
+@pytest.mark.parametrize(
+    "withheld,is_payload",
+    [
+        # Prose that quotes the marker: recoverable as content (#4241).
+        ("<tool_call> is how qwen calls a tool. END", False),
+        ("<tool_call> to call anything. END", False),
+        ("<tool_call> then write to save. END", False),
+        ("<|tool_call_start|> is the Hermes form. END", False),
+        # Structured payload openers: a truncated call, never content.
+        ('<tool_call>{"name":"f"', True),
+        ('<tool_call>[{"name":"f"', True),
+        ("<tool_call><function=write><parameter=x>", True),
+        ('<|tool_call_start|>{"name":"f"', True),
+    ],
+)
+def test_recovery_candidate_classifies_payload_versus_prose(withheld, is_payload):
+    """Only payload-shaped tails are a failed call; prose is recoverable."""
+
+    f = ToolCallStreamFilter(_make_tokenizer())
+
+    f.feed(withheld)
+    f.finish()
+
+    assert f.take_recovery_is_payload() is is_payload
+    # The flag drains with the text so a second read cannot re-apply it.
+    assert f.take_recovery_candidate() == withheld
+    assert f.take_recovery_is_payload() is False
+
+
+def test_closed_envelope_leaves_no_recovery_payload_flag():
+    """A correctly closed call must not arm the payload flag."""
+
+    f = ToolCallStreamFilter(_make_tokenizer())
+
+    f.feed('<tool_call>{"name":"f"}</tool_call>')
+    f.finish()
+
+    assert f.take_recovery_candidate() == ""
+    assert f.take_recovery_is_payload() is False
+
+
 def test_close_marker_fallback_rescans_the_recovered_tail():
     """Prose recovered after a close marker is re-filtered, not emitted raw."""
     f = ToolCallStreamFilter(_make_tokenizer())

@@ -5309,6 +5309,28 @@ def _tool_call_failure(extraction: ToolCallExtraction) -> dict | None:
     return _openai_error_body(message, 500, code=code)
 
 
+def _withholding_is_recoverable(
+    tool_calls: object,
+    tool_failure: object,
+    withheld_is_payload: bool,
+    streamed_tool_calls: list | None = None,
+) -> bool:
+    """Whether an unterminated envelope's withheld text may become content.
+
+    The terminal parser reports "incomplete" for a control marker the model
+    merely quoted in prose exactly as it does for a truncated call, so the
+    failure flag alone can never open this path (#4241).  Recovery is allowed
+    only when nothing structured is in flight for this response: no parsed
+    call, no call already streamed to the client, and no payload-shaped tail.
+    Otherwise a failed call would be laundered into answer text, and clearing
+    the failure could let a delivered call run again on retry.
+    """
+
+    if tool_calls or streamed_tool_calls:
+        return False
+    return not (tool_failure and withheld_is_payload)
+
+
 def _registered_tool_names(tools: object) -> set[str]:
     """Return nonempty function names explicitly registered by the request."""
 
@@ -5815,7 +5837,12 @@ async def stream_chat_completion(
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
-    if not tool_calls and not tool_failure:
+    withheld_is_payload = (
+        tool_filter.take_recovery_is_payload() if tool_filter else False
+    )
+    if _withholding_is_recoverable(
+        tool_calls, tool_failure, withheld_is_payload, streamed_tool_calls
+    ):
         if recovered_thinking:
             chunk = ChatCompletionChunk(
                 id=response_id,
@@ -5846,6 +5873,9 @@ async def stream_chat_completion(
             event = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
             mark_visible_delta()
             yield event
+        if recovered_thinking or recovered_content:
+            # Prose that merely quoted a marker is not a failed tool call.
+            tool_failure = None
 
     # A qwen3_coder raw-envelope stream has no engine-side structured parser,
     # so preserve each already-emitted validated occurrence even if malformed
@@ -6361,7 +6391,10 @@ async def stream_anthropic_messages(
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
-    if not tool_calls and not tool_failure:
+    withheld_is_payload = (
+        tool_filter.take_recovery_is_payload() if tool_filter else False
+    )
+    if _withholding_is_recoverable(tool_calls, tool_failure, withheld_is_payload):
         if recovered_thinking:
             if text_block_started:
                 yield create_content_block_stop_event(index=block_index)
@@ -6386,6 +6419,9 @@ async def stream_anthropic_messages(
                 )
                 text_block_started = True
             yield create_text_delta_event(index=block_index, text=recovered_content)
+        if recovered_thinking or recovered_content:
+            # Prose that merely quoted a marker is not a failed tool call.
+            tool_failure = None
 
     # 4. Close open blocks
     if thinking_block_started and not text_block_started:
@@ -8009,7 +8045,10 @@ async def stream_responses_api(
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
-    if not tool_calls and not tool_failure:
+    withheld_is_payload = (
+        tool_filter.take_recovery_is_payload() if tool_filter else False
+    )
+    if _withholding_is_recoverable(tool_calls, tool_failure, withheld_is_payload):
         for ev in _emit_reasoning_delta(recovered_thinking):
             yield ev
         if recovered_content:
@@ -8030,6 +8069,10 @@ async def stream_responses_api(
                     "sequence_number": seq,
                 },
             )
+
+        if recovered_thinking or recovered_content:
+            # Prose that merely quoted a marker is not a failed tool call.
+            tool_failure = None
 
     # Reverse Gemma 4 parameter renaming
     if tool_calls and "gemma" in (resolved_model or request.model or "").lower():
