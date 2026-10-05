@@ -71,6 +71,7 @@ class _RusageInfoV4(ctypes.Structure):
 
 
 _RUSAGE_INFO_V4 = 4
+_PROC_PGRP_ONLY = 2
 
 
 # task_vm_info from /usr/include/mach/task_info.h (rev7). Metal buffers are
@@ -152,6 +153,7 @@ _libproc: ctypes.CDLL | None = None
 _proc_pid_rusage = None
 _task_info = None
 _mach_task_self: ctypes.c_uint | None = None
+_proc_listpids = None
 
 if sys.platform == "darwin":
     try:
@@ -163,10 +165,20 @@ if sys.platform == "darwin":
             ctypes.c_void_p,
         ]
         _proc_pid_rusage.restype = ctypes.c_int
+
+        _proc_listpids = _libproc.proc_listpids
+        _proc_listpids.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        _proc_listpids.restype = ctypes.c_int
     except OSError as e:
         logger.warning(f"libproc unavailable, phys_footprint will return 0: {e}")
         _libproc = None
         _proc_pid_rusage = None
+        _proc_listpids = None
     try:
         _libc = ctypes.CDLL("/usr/lib/libc.dylib")
         _task_info = _libc.task_info
@@ -256,3 +268,28 @@ def get_graphics_footprint() -> int:
     if rc != 0 or count.value < _TASK_VM_INFO_GRAPHICS_COUNT:
         return 0
     return max(0, int(info.ledger_tag_graphics_footprint))
+
+
+def list_process_group_pids(pgid: int) -> list[int]:
+    """Return all process IDs belonging to the process group ``pgid``.
+
+    Args:
+        pgid: Process group ID to query.
+
+    Returns:
+        List of process IDs. Returns an empty list on non-Darwin platforms,
+        if libproc is unavailable, or if the call fails.
+    """
+    if _proc_listpids is None or pgid <= 0:
+        return []
+    # A NULL buffer queries the required buffer size in bytes.
+    size = _proc_listpids(_PROC_PGRP_ONLY, pgid, None, 0)
+    if size <= 0:
+        return []
+    num_pids = size // ctypes.sizeof(ctypes.c_int)
+    buf = (ctypes.c_int * num_pids)()
+    ret = _proc_listpids(_PROC_PGRP_ONLY, pgid, buf, size)
+    if ret <= 0:
+        return []
+    count = ret // ctypes.sizeof(ctypes.c_int)
+    return [buf[i] for i in range(count) if buf[i] > 0]

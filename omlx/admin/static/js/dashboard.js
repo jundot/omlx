@@ -54,6 +54,8 @@
         'specprefill_draft_model',
         'specprefill_keep_pct',
         'specprefill_threshold',
+        'splash_enabled',
+        'splash_build',
         'dflash_enabled',
         'dflash_draft_model',
         'dflash_draft_quant_enabled',
@@ -1926,6 +1928,8 @@
                     specprefill_draft_model: s.specprefill_draft_model || '',
                     specprefill_keep_pct: s.specprefill_keep_pct ? String(s.specprefill_keep_pct) : '0.2',
                     specprefill_threshold: s.specprefill_threshold || null,
+                    splash_enabled: s.splash_enabled || false,
+                    splash_build: s.splash_build || '',
                     dflash_enabled: s.dflash_enabled || false,
                     dflash_draft_model: s.dflash_draft_model || '',
                     dflash_draft_quant_enabled: s.dflash_draft_quant_enabled || false,
@@ -1946,6 +1950,10 @@
                     dflash_draft_sink_size: s.dflash_draft_sink_size ?? 0,
                     dflash_block_size: s.dflash_block_size ?? null,
                     dflash_verify_mode: s.dflash_verify_mode || 'adaptive',
+                    is_splash_package: model?.engine_type === 'splash',
+                    splash_builds: model?.splash_builds || [],
+                    splash_compatible: model?.splash_compatible === true,
+                    splash_compatibility_reason: model?.splash_compatibility_reason || '',
                     dflash_compatible: model?.dflash_compatible !== false,
                     dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
                     dflash_ssd_cache_available: !!model?.dflash_ssd_cache_available,
@@ -2960,6 +2968,8 @@
                                 specprefill_threshold: this.modelSettings.specprefill_enabled
                                     ? (this.modelSettings.specprefill_threshold || null)
                                     : null,
+                                splash_enabled: !!this.modelSettings.splash_enabled,
+                                splash_build: this.modelSettings.splash_build || null,
                                 dflash_enabled: this.modelSettings.dflash_enabled,
                                 dflash_draft_model: this.modelSettings.dflash_draft_model || null,
                                 dflash_draft_quant_enabled: this.modelSettings.dflash_enabled && !!this.modelSettings.dflash_draft_quant_enabled,
@@ -3062,6 +3072,8 @@
                                     specprefill_draft_model: null,
                                     specprefill_keep_pct: null,
                                     specprefill_threshold: null,
+                                    splash_enabled: false,
+                                    splash_build: null,
                                     dflash_enabled: false,
                                     dflash_draft_model: null,
                                     dflash_draft_quant_enabled: false,
@@ -3328,6 +3340,8 @@
                         this.modelSettings.specprefill_draft_model = null;
                         this.modelSettings.specprefill_keep_pct = 0.2;
                         this.modelSettings.specprefill_threshold = null;
+                        this.modelSettings.splash_enabled = false;
+                        this.modelSettings.splash_build = '';
                         this.modelSettings.dflash_enabled = false;
                         this.modelSettings.dflash_draft_model = null;
                         this.modelSettings.dflash_draft_quant_enabled = false;
