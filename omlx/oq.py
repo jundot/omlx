@@ -481,14 +481,17 @@ _HARD_SELECTOR_SEGMENTS = ("indexer",)
 # checkpoints this is tested against:
 #   * softmax attention (``self_attn.q_proj`` ... , ``qkv_proj``, ``wq`` ...),
 #     including MLA low-rank pairs (``q_a_proj`` ...) and a fused Q/K/V/R;
+#   * GLM-5.3-Flash's gated attention halves of the same block
+#     (``f_a_proj``/``f_b_proj``, ``g_a_proj``/``g_b_proj``, ``b_proj``), so a
+#     floored block is uniform instead of pinning q/k/v/o past a starving gate;
 #   * linear attention / DeltaNet recurrences (``linear_attn.in_proj_*``);
 #   * state-space layers, whose parent is ``mamba`` in Jamba/Bamba and ``mixer``
 #     in Nemotron-H (``mamba.in_proj``, ``mixer.x_proj``, ``dt_proj`` ...).
 # Nemotron-H names its attention, MLP and state-space blocks all under
 # ``mixer.``, so the leaf name is what separates them: ``mixer.up_proj`` and
 # ``mixer.down_proj`` are the MLP and are deliberately not matched here.
-# Whether these are small enough to pin is decided per checkpoint by the cost
-# gate below - on a dense model they are not.
+# Whether the role is small enough to floor is decided per checkpoint by the
+# role budget and the level cap in ``_apply_role_floor``.
 _ATTENTION_PARENT_PARTS = frozenset(
     (
         "self_attn",
@@ -521,6 +524,11 @@ _ATTENTION_PROJECTION_LEAVES = frozenset(
         "out_proj",
         "x_proj",
         "dt_proj",
+        "b_proj",
+        "f_a_proj",
+        "f_b_proj",
+        "g_a_proj",
+        "g_b_proj",
     )
 )
 _MLA_LEAVES = frozenset(("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"))

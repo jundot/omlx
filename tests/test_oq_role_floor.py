@@ -64,6 +64,12 @@ CLASSIFIED_ROLES = [
     ("model.layers.3.mamba.dt_proj", "attention"),
     ("backbone.layers.3.mixer.in_proj", "attention"),
     ("backbone.layers.3.mixer.x_proj", "attention"),
+    # GLM-5.3-Flash gated attention halves of the floored block
+    ("language_model.model.layers.12.self_attn.f_a_proj", "attention"),
+    ("language_model.model.layers.12.self_attn.f_b_proj", "attention"),
+    ("language_model.model.layers.12.self_attn.g_a_proj", "attention"),
+    ("language_model.model.layers.12.self_attn.g_b_proj", "attention"),
+    ("language_model.model.layers.12.self_attn.b_proj", "attention"),
     # gated residual / hyper-connection mixers across families
     ("model.layers.3.attn_hyper_connection.block_inject_weight", "mixer"),
     ("model.layers.3.mlp_hyper_connection.input_mix_weight_down", "mixer"),
