@@ -1014,6 +1014,7 @@ class TestRuntimeCacheObservability:
         mock_settings = MagicMock()
         mock_settings.base_path = Path("/tmp/omlx-base")
         mock_settings.cache.get_ssd_cache_dir.return_value = cache_dir
+        mock_settings.cache.ssd_cache_max_size = "auto"
         mock_settings.cache.get_ssd_cache_max_size_bytes.return_value = 0
 
         shared_ssd_stats = {
@@ -1088,6 +1089,7 @@ class TestRuntimeCacheObservability:
         with patch.object(admin_routes, "_get_engine_pool", return_value=engine_pool):
             payload = admin_routes._build_runtime_cache_observability(mock_settings)
 
+        mock_settings.cache.get_ssd_cache_max_size_bytes.assert_not_called()
         assert payload["total_num_files"] == 10
         assert payload["total_size_bytes"] == 12288
         assert payload["effective_block_sizes"] == [1024, 2048]
@@ -1353,3 +1355,66 @@ class TestGlobalSettingsValidation:
         )
         assert req.sampling_max_context_window_policy is None
         assert "sampling_max_context_window_policy" in req.model_fields_set
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_kv", [False, True])
+async def test_offline_ssd_sidecar_usage_and_clear(tmp_path, monkeypatch, include_kv):
+    cache_dir = tmp_path / "cache"
+    sidecar = cache_dir / "_gdn_sidecars" / ("a" * 64) / "abcd.safetensors"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_bytes(b"sidecar")
+    if include_kv:
+        block = cache_dir / "b" / "abcd.safetensors"
+        block.parent.mkdir()
+        block.write_bytes(b"kv")
+    settings = SimpleNamespace(
+        base_path=tmp_path,
+        cache=SimpleNamespace(
+            ssd_cache_max_size="1GB",
+            get_ssd_cache_dir=lambda _: cache_dir,
+            get_ssd_cache_max_size_bytes=lambda _: 10**9,
+        ),
+    )
+    monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+    monkeypatch.setattr(
+        admin_routes,
+        "_get_engine_pool",
+        lambda: SimpleNamespace(get_status=lambda: {"models": []}, _entries={}),
+    )
+    monkeypatch.setattr(
+        admin_routes, "_clear_cold_remote_cluster_cache_roots", lambda _: (0, 0)
+    )
+    before = admin_routes._build_runtime_cache_observability(settings)
+    assert before["total_num_files"] == 1 + include_kv
+    assert before["total_size_bytes"] == 7 + 2 * include_kv
+    result = await admin_routes.clear_ssd_cache(is_admin=True)
+    assert result["total_deleted"] == 1 + include_kv
+    assert not list(cache_dir.rglob("*.safetensors"))
+    after = admin_routes._build_runtime_cache_observability(settings)
+    assert after["total_num_files"] == 0
+    assert after["total_size_bytes"] == 0
+
+
+@pytest.mark.parametrize("link_level", ["root", "signature", "file"])
+def test_offline_gdn_scan_preserves_symlink_targets(tmp_path, link_level):
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "state.safetensors"
+    target.write_bytes(b"keep")
+    root = cache_dir / "_gdn_sidecars"
+    if link_level == "root":
+        root.symlink_to(outside, target_is_directory=True)
+    else:
+        root.mkdir()
+        signature = root / ("a" * 64)
+        if link_level == "signature":
+            signature.symlink_to(outside, target_is_directory=True)
+        else:
+            signature.mkdir()
+            (signature / "state.safetensors").symlink_to(target)
+    assert admin_routes._scan_offline_gdn_sidecars(cache_dir) == (0, 0)
+    assert admin_routes._scan_offline_gdn_sidecars(cache_dir, clear=True) == (0, 0)
+    assert target.read_bytes() == b"keep"

@@ -72,6 +72,17 @@ def _verify_abi(ext, import_error):
 _ext, _IMPORT_ERROR = _verify_abi(_ext, _IMPORT_ERROR)
 
 
+def set_command_buffer_caps(ops: int, mb: int) -> tuple[int, int] | None:
+    """Set MLX's per-command-buffer caps and return the previous pair.
+
+    Returns None when the native extension is unavailable; MLX keeps its caps.
+    """
+    setter = getattr(_ext, "set_command_buffer_caps", None)
+    if setter is None:
+        return None
+    return tuple(setter(int(ops), int(mb)))
+
+
 NATIVE_SYMBOLS = (
     "qwen35_fa256_attention",
     "qwen35_q2_affine_qmm_t",
@@ -80,6 +91,7 @@ NATIVE_SYMBOLS = (
     "qwen35_q6_affine_qmm_t",
     "qwen35_q8_affine_qmm_t",
     "qwen35_moe_weighted_sum",
+    "qwen35_gather_qmm_rhs_t",
     "qwen35_ane_q4_affine_qmm_t",
     "qwen35_ane_affine_qmm_t",
     "qwen35_ane_q4_swiglu_t",
@@ -973,8 +985,13 @@ def _qmm_use_nax() -> bool:
     return _qmm_nax_cache
 
 
-def _qmm_nax_kwargs() -> dict[str, object]:
-    if not _EXT_HAS_NAX:
+def _qmm_nax_kwargs(bits: int) -> dict[str, object]:
+    # The NAX metal kernel only defines bits 4/5/6/8 (qwen35_qmm_nax.metal).
+    # Routing a q2 call through NAX anyway hits a kernel-lookup failure that
+    # latches `nax_qmm_runtime_ok=false` process-wide, permanently demoting
+    # every q4/q5/q6/q8 layer to the classic kernel for the rest of the
+    # process. Never request NAX for bits==2.
+    if bits == 2 or not _EXT_HAS_NAX:
         return {}
     return {"use_nax": _qmm_use_nax(), "nax_variant": QMM_NAX_VARIANT}
 
@@ -1070,7 +1087,7 @@ def qwen35_q2_affine_qmm_t(
             scales,
             biases,
             variant,
-            **_qmm_nax_kwargs(),
+            **_qmm_nax_kwargs(2),
             **_qmm_group_size_kwargs(group_size),
             **_native_stream_kwargs(stream),
         )
@@ -1094,7 +1111,7 @@ def qwen35_q4_affine_qmm_t(
             scales,
             biases,
             variant,
-            **_qmm_nax_kwargs(),
+            **_qmm_nax_kwargs(4),
             **_qmm_group_size_kwargs(group_size),
             **_native_stream_kwargs(stream),
         )
@@ -1118,7 +1135,7 @@ def qwen35_q5_affine_qmm_t(
             scales,
             biases,
             variant,
-            **_qmm_nax_kwargs(),
+            **_qmm_nax_kwargs(5),
             **_qmm_group_size_kwargs(group_size),
             **_native_stream_kwargs(stream),
         )
@@ -1142,7 +1159,7 @@ def qwen35_q6_affine_qmm_t(
             scales,
             biases,
             variant,
-            **_qmm_nax_kwargs(),
+            **_qmm_nax_kwargs(6),
             **_qmm_group_size_kwargs(group_size),
             **_native_stream_kwargs(stream),
         )
@@ -1166,7 +1183,7 @@ def qwen35_q8_affine_qmm_t(
             scales,
             biases,
             variant,
-            **_qmm_nax_kwargs(),
+            **_qmm_nax_kwargs(8),
             **_qmm_group_size_kwargs(group_size),
             **_native_stream_kwargs(stream),
         )
@@ -1195,6 +1212,47 @@ def qwen35_moe_weighted_sum(
             stream=stream or mx.gpu,
         )
     raise RuntimeError("qwen35_moe_weighted_sum native kernel is unavailable")
+
+
+def gather_qmm_rhs_available() -> bool:
+    """True when the NAX sorted-expert gather kernel loaded on this machine."""
+    ready = getattr(_ext, "qwen35_gather_qmm_rhs_nax_ready", None)
+    if ready is None:
+        return False
+    try:
+        return bool(ready())
+    except Exception:
+        return False
+
+
+def qwen35_gather_qmm_rhs_t(
+    x: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    indices: mx.array,
+    bits: int,
+    group_size: int,
+    *,
+    stream=None,
+) -> mx.array:
+    """Sorted-expert ``gather_qmm(x, w, rhs_indices=indices, transpose=True)``.
+
+    One dispatch for any row count; raises ValueError for layouts the kernel
+    does not cover (the caller keeps its own fallback).
+    """
+    if _ext is None or not hasattr(_ext, "qwen35_gather_qmm_rhs_t"):
+        raise RuntimeError("qwen35_gather_qmm_rhs_t native kernel is unavailable")
+    return _ext.qwen35_gather_qmm_rhs_t(
+        x,
+        weight,
+        scales,
+        biases,
+        indices,
+        bits,
+        group_size,
+        **_native_stream_kwargs(stream),
+    )
 
 
 # --- oQ mixed-bit QxA8 (Q4/Q5, GS64, affine) on the M5 tensor units ---------
@@ -1249,6 +1307,7 @@ def qwen35_oq_a8_qmm_t(
     act_mode: int = 0,
     variant: int = 800,
     *,
+    packed: bool = False,
     stream=None,
 ) -> mx.array:
     if _ext is None or not hasattr(_ext, "qwen35_oq_a8_qmm_t"):
@@ -1263,6 +1322,7 @@ def qwen35_oq_a8_qmm_t(
         bits,
         act_mode,
         variant,
+        packed=packed,
         **_native_stream_kwargs(stream),
     )
 

@@ -284,6 +284,13 @@ _clean_custom_kernel_build_artifacts() {
                 -prune \
                 -exec rm -rf {} +
         done
+
+        # mlx's CMakeBuild --inplace copies each build-lib package dir into the
+        # source tree, so stale build_py copies of *.py there overwrite sources.
+        for dir in "$REPO_ROOT"/build/lib*/omlx/custom_kernels; do
+            [ -d "$dir" ] || continue
+            rm -rf "$dir"
+        done
     fi
 }
 

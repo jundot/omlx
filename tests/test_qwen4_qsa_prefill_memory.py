@@ -28,6 +28,8 @@ def test_qsa_cache_is_not_retained_in_boundary_snapshots(cache_cls):
 
     captured = []
     scheduler = SimpleNamespace(
+        config=SimpleNamespace(paged_cache_block_size=16),
+        _boundary_snapshot_block_size=lambda request, token_count: 16,
         _on_prefill_boundary_snapshot=(
             lambda request_id, snapshot_cache, token_count: captured.append(
                 snapshot_cache
@@ -52,11 +54,8 @@ def test_qsa_cache_is_not_retained_in_boundary_snapshots(cache_cls):
 
 
 def test_bool_mask_uses_tiled_sdpa_and_matches_dense(monkeypatch):
-    import threading
-
     from omlx.patches import sdpa256_attention as sdpa256
 
-    monkeypatch.setattr(sdpa256, "_HEADROOM_PROVIDER_LOCAL", threading.local())
     monkeypatch.setattr(sdpa256, "_FORCE_TILED", None)
     monkeypatch.setattr(sdpa256, "_SDPA256_MIN_KV_LEN", 64)
     monkeypatch.setattr(sdpa256, "_Q_TILE", 16)
@@ -205,7 +204,6 @@ def test_qwen4_mask_dense_seam_reaches_array_tiled_sdpa256(monkeypatch):
     min_kv_len_snap = sdpa256._SDPA256_MIN_KV_LEN
     routes_snap = memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.get(256)
     monkeypatch.setattr(sdpa256, "_PATCHED", False, raising=False)
-    monkeypatch.setattr(sdpa256, "_HEADROOM_PROVIDER", None, raising=False)
     monkeypatch.setattr(sdpa256, "_FORCE_TILED", None, raising=False)
     assert sdpa256.apply_sdpa256_attention_patch(min_kv_len=32) is True
 

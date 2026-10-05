@@ -2,13 +2,19 @@
 """Tests for the ModelScope model downloader."""
 
 import asyncio
+import json
+import logging
+import threading
 import time
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from omlx.admin.hf_downloader import DownloadStatus, DownloadTask
+from omlx.admin.hf_downloader import (
+    DownloadStatus,
+    DownloadTask,
+    _DownloadActivity,
+)
 from omlx.admin.ms_downloader import (
     MSDownloader,
     _ENRICH_CACHE,
@@ -22,6 +28,15 @@ from omlx.admin.ms_downloader import (
     _get_ms_endpoint,
     _parse_ms_model_entry,
 )
+
+
+async def _wait_for(predicate, timeout: float = 5.0) -> None:
+    """Wait for a background download action to become observable."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("Timed out waiting for download state")
+        await asyncio.sleep(0.01)
 
 
 # =============================================================================
@@ -231,7 +246,7 @@ class TestMSDownloader:
             mock_get_api.return_value = mock_api
 
             await downloader.start_download("qwen/Qwen2.5-7B-Instruct-MLX")
-            await asyncio.sleep(0.5)
+            await _wait_for(lambda: mock_download.called)
 
             assert mock_download.called
             call_kwargs = mock_download.call_args[1]
@@ -245,27 +260,41 @@ class TestMSDownloader:
 
     @pytest.mark.asyncio
     async def test_cancel_download(self, downloader):
-        with patch(
-            "omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True
-        ), patch(
-            "omlx.admin.ms_downloader._get_ms_api"
-        ) as mock_get_api, patch(
-            "omlx.admin.ms_downloader.ms_snapshot_download",
-            side_effect=lambda **kwargs: time.sleep(10),
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def download(**kwargs):
+            started.set()
+            try:
+                if not release.wait(timeout=5.0):
+                    raise TimeoutError("Download was not released")
+            finally:
+                finished.set()
+
+        with (
+            patch("omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True),
+            patch("omlx.admin.ms_downloader._get_ms_api") as mock_get_api,
+            patch(
+                "omlx.admin.ms_downloader.ms_snapshot_download",
+                side_effect=download,
+            ),
         ):
             mock_api = MagicMock()
             mock_api.get_model_files.return_value = []
             mock_get_api.return_value = mock_api
 
-            task = await downloader.start_download("owner/model")
-            # Allow task to start
-            await asyncio.sleep(0.1)
-
-            result = await downloader.cancel_download(task.task_id)
-            assert result is True
-            assert task.status == DownloadStatus.CANCELLED
-
-            await downloader.shutdown()
+            try:
+                task = await downloader.start_download("owner/model")
+                await _wait_for(started.is_set)
+                result = await downloader.cancel_download(task.task_id)
+                assert result is True
+                assert task.status == DownloadStatus.CANCELLED
+            finally:
+                release.set()
+                await downloader.shutdown()
+                if started.is_set():
+                    await _wait_for(finished.is_set)
 
     @pytest.mark.asyncio
     async def test_cancel_nonexistent_task(self, downloader):
@@ -409,16 +438,66 @@ class TestMSDownloader:
     def test_get_dir_size_nonexistent(self, tmp_path):
         assert MSDownloader._get_dir_size(tmp_path / "nonexistent") == 0
 
-    def test_get_latest_mtime_empty(self, tmp_path):
-        assert MSDownloader._get_latest_mtime(tmp_path) == 0.0
+    def test_get_download_activity_reports_all_signals_in_one_walk(
+        self, tmp_path
+    ):
+        (tmp_path / "a.bin").write_bytes(b"x" * 300)
+        activity = MSDownloader._get_download_activity(tmp_path)
+        assert activity.logical_size == 300
+        assert activity.latest_mtime_ns > 0
+        # The per-file map feeds the speed meter's continuity tracking.
+        assert activity.files[str(tmp_path / "a.bin")] >= 300
 
-    def test_get_latest_mtime_with_files(self, tmp_path):
-        (tmp_path / "a.bin").write_bytes(b"x")
-        mtime = MSDownloader._get_latest_mtime(tmp_path)
-        assert mtime > 0
+    def test_get_download_activity_nonexistent(self, tmp_path):
+        empty = MSDownloader._get_download_activity(tmp_path / "nope")
+        assert (empty.logical_size, empty.latest_mtime_ns, empty.files) == (
+            0,
+            0,
+            {},
+        )
 
-    def test_get_latest_mtime_nonexistent(self, tmp_path):
-        assert MSDownloader._get_latest_mtime(tmp_path / "nonexistent") == 0.0
+    @pytest.mark.asyncio
+    async def test_poll_reports_speed_then_zeroes_it(self, downloader, monkeypatch):
+        """ModelScope tasks publish a live rate while transferring only."""
+        import omlx.admin.ms_downloader as ms_module
+
+        monkeypatch.setattr(ms_module, "_PROGRESS_POLL_INTERVAL", 0.01)
+        target = downloader.model_dir / "owner" / "model"
+        target.mkdir(parents=True, exist_ok=True)
+        task = DownloadTask(
+            task_id="t-speed",
+            repo_id="owner/model",
+            status=DownloadStatus.DOWNLOADING,
+        )
+        downloader._tasks[task.task_id] = task
+
+        state = {"allocated": 0}
+
+        def growing_scan(_path):
+            state["allocated"] += 150_000
+            return _DownloadActivity(
+                file_count=1,
+                logical_size=state["allocated"],
+                allocated_size=state["allocated"],
+                latest_mtime_ns=int(time.time() * 1e9),
+                files={"payload": state["allocated"]},
+            )
+
+        with patch.object(
+            downloader,
+            "_get_download_activity",
+            side_effect=growing_scan,
+        ):
+            poll = asyncio.create_task(
+                downloader._poll_progress(task.task_id, target)
+            )
+            await asyncio.sleep(0.05)
+            observed_speed = task.speed_bps
+            task.status = DownloadStatus.COMPLETED
+            await poll
+
+        assert observed_speed > 0, "a live download must report a rate"
+        assert task.speed_bps == 0.0
 
 
 # =============================================================================

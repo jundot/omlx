@@ -391,6 +391,15 @@ def add_host_key(
 ) -> bool:
     """Add a host key to known_hosts."""
 
+    # Both fields go verbatim into a known_hosts line; block injected entries.
+    hostname = validate_ssh_target(hostname)
+    if "@" in hostname:
+        hostname = hostname.rsplit("@", 1)[1]
+    key_parts = host_key.strip().split()
+    if len(key_parts) < 2 or key_parts[0] not in {"ssh-ed25519", "ssh-rsa"}:
+        raise ValueError("invalid SSH host public key")
+    host_key = " ".join(key_parts[:2])
+
     if known_hosts_path is None:
         known_hosts_path = get_known_hosts_path()
 

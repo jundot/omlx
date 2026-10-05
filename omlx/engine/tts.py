@@ -19,7 +19,6 @@ import mlx.core as mx
 import numpy as np
 
 from ..engine_core import get_mlx_executor
-from ..patches.mlx_audio_sampling import ensure_uncompiled_tts_samplers
 from .audio_utils import DEFAULT_SAMPLE_RATE as _DEFAULT_SAMPLE_RATE
 from .audio_utils import audio_to_wav_bytes as _audio_to_wav_bytes
 from .base import BaseNonStreamingEngine
@@ -46,6 +45,16 @@ def _infer_kokoro_lang_code(voice: Optional[str]) -> Optional[str]:
         return None
     match = _KOKORO_VOICE_RE.match(voice.lower())
     return match.group(1) if match else None
+
+
+def _accepts_preset_voice(model: Any) -> bool:
+    """Return False for models with an empty preset speaker table.
+
+    Qwen3-TTS Base checkpoints have no preset speakers and reject any
+    ``voice``. OpenAI clients always send one, so it is not forwarded.
+    """
+    speakers = getattr(model, "supported_speakers", None)
+    return not (isinstance(speakers, list) and not speakers)
 
 
 class TTSEngine(BaseNonStreamingEngine):
@@ -107,10 +116,6 @@ class TTSEngine(BaseNonStreamingEngine):
             return
 
         logger.info(f"Starting TTS engine: {self._model_name}")
-
-        # Must run before mlx-audio imports so backend modules bind the
-        # compile-free samplers instead of mlx-lm's compiled ones (#2312).
-        ensure_uncompiled_tts_samplers()
 
         try:
             from mlx_audio.tts.utils import load_model as _load_model
@@ -229,7 +234,8 @@ class TTSEngine(BaseNonStreamingEngine):
                 # a speaker name. Models with only 'instruct' (non-Qwen TTS)
                 # get it as a voice description fallback.
                 if "voice" in gen_params:
-                    gen_kwargs["voice"] = voice
+                    if _accepts_preset_voice(model):
+                        gen_kwargs["voice"] = voice
                 elif "instruct" in gen_params:
                     gen_kwargs["instruct"] = voice
             if instructions is not None and "instruct" in gen_params:
@@ -354,7 +360,8 @@ class TTSEngine(BaseNonStreamingEngine):
                 gen_kwargs["streaming_interval"] = streaming_interval
             if voice is not None:
                 if "voice" in gen_params:
-                    gen_kwargs["voice"] = voice
+                    if _accepts_preset_voice(model):
+                        gen_kwargs["voice"] = voice
                 elif "instruct" in gen_params:
                     gen_kwargs["instruct"] = voice
             if instructions is not None and "instruct" in gen_params:

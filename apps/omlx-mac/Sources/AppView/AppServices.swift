@@ -180,7 +180,8 @@ final class AppServices: NSObject {
         basePath: String? = nil,
         modelDir: String? = nil,
         modelDirs: [String]? = nil,
-        port: Int? = nil
+        port: Int? = nil,
+        host: String? = nil
     ) async throws {
         let normalizedBase = basePath.map(Self.normalize)
         let trimmedDir = modelDir?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -224,17 +225,18 @@ final class AppServices: NSObject {
 
         // The child is stopped. Preserve the bundled port even if a storage
         // save above rewrote the old endpoint from AppConfig.
-        if let port {
+        if port != nil || host != nil {
             var updated = config
-            updated.port = port
-            try AppConfig.saveServerEndpoint(basePath: updated.basePath, port: port)
+            if let port { updated.port = port }
+            if let host { updated.bindAddress = host }
+            try AppConfig.saveServerEndpoint(basePath: updated.basePath, host: host, port: port)
             self.config = updated
-            client.configure(host: updated.host, port: port, apiKey: updated.apiKey)
+            client.configure(host: updated.host, port: updated.port, apiKey: updated.apiKey)
         }
 
         if let server {
             let baseURL = URL(fileURLWithPath: config.basePath, isDirectory: true)
-            try server.reconfigure(port: port, basePath: baseURL)
+            try server.reconfigure(bindAddress: host, port: port, basePath: baseURL)
             _ = try server.start()
         }
     }

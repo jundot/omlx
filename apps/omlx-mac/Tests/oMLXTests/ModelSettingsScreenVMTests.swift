@@ -5,6 +5,43 @@ import SwiftUI
 @MainActor
 final class ModelSettingsScreenVMTests: XCTestCase {
 
+    func testSnapshotResultHelpersFormatSkippedStatsAndAppliedJSON() {
+        let skipped = [
+            SkippedFeatureDTO(feature: "dflash", reason: "draft model 'x' is not installed"),
+            SkippedFeatureDTO(feature: "oq_a8", reason: "cannot be combined with qwen35_ane_prefill_enabled"),
+        ]
+        XCTAssertEqual(
+            ModelSettingsScreenVM.summarizeSkipped(skipped),
+            ["dflash: draft model 'x' is not installed",
+             "oq_a8: cannot be combined with qwen35_ane_prefill_enabled"]
+        )
+        XCTAssertEqual(ModelSettingsScreenVM.summarizeSkipped(nil), [])
+
+        XCTAssertEqual(
+            ModelSettingsScreenVM.candidateStats(pp: 1309.1, tg: 59.6, memoryGb: 128, quantization: "4bit", omlxVersion: "0.7.0"),
+            "PP 1309.1 tok/s · TG 59.6 tok/s · 128 GB · 4bit · oMLX 0.7.0"
+        )
+        XCTAssertEqual(
+            ModelSettingsScreenVM.candidateStats(pp: 12.0, tg: nil, quantization: nil, omlxVersion: ""),
+            "PP 12.0 tok/s"
+        )
+
+        let json = ModelSettingsScreenVM.appliedJSON([
+            "turboquant_kv_enabled": AnyCodable(true),
+            "temperature": AnyCodable(0.6),
+        ])
+        XCTAssertEqual(
+            json,
+            """
+            {
+              "temperature" : 0.6,
+              "turboquant_kv_enabled" : true
+            }
+            """
+        )
+        XCTAssertEqual(ModelSettingsScreenVM.appliedJSON(nil), "{}")
+    }
+
     func testModelTypeOptionsMatchServerValues() {
         let values = ModelSettingsScreenVM.modelTypeOptions.map(\.0)
 
@@ -33,6 +70,23 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         let settings = vm.currentSettingsDict()
         XCTAssertEqual(settings["mtp_enabled"]?.value as? Bool, true)
         XCTAssertEqual(settings["turboquant_kv_enabled"]?.value as? Bool, true)
+    }
+
+    func testLightningMtpAdaptiveMaxDepthInWorkingProfile() {
+        let vm = ModelSettingsScreenVM()
+        vm.mtpEnabled = true
+        XCTAssertEqual(vm.currentSettingsDict()[ProfileSettingsKey.mtpAdaptiveMaxDepth]?.value as? Int, 3)
+        XCTAssertEqual(ModelSettingsScreenVM.mtpDepthOptions.map(\.0), ["3", "4", "5", "6"])
+
+        for depth in 3...6 {
+            vm.mtpAdaptiveMaxDepth = String(depth)
+            let settings = vm.currentSettingsDict()
+            XCTAssertEqual(settings[ProfileSettingsKey.mtpAdaptiveMaxDepth]?.value as? Int, depth)
+            XCTAssertNil(settings["mtp_fixed_depth"])
+        }
+
+        vm.mtpEnabled = false
+        XCTAssertNil(vm.currentSettingsDict()[ProfileSettingsKey.mtpAdaptiveMaxDepth])
     }
 
     func testVlmMtpDraftModelOptionsIncludeQwenMtpConfigType() {

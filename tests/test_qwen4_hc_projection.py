@@ -12,7 +12,7 @@ import pytest
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 
 
-def _production_module(bits: int):
+def _production_module(bits: int, group_size: int = 64):
     from mlx_vlm.models.qwen4_exp.language import (
         Qwen4ExpGatedResidual,
         Qwen4ExpRMSNorm,
@@ -33,7 +33,7 @@ def _production_module(bits: int):
         10240,
         320,
         bias=False,
-        group_size=64,
+        group_size=group_size,
         bits=bits,
         mode="affine",
     )
@@ -41,7 +41,7 @@ def _production_module(bits: int):
         10240,
         4,
         bias=False,
-        group_size=64,
+        group_size=group_size,
         bits=bits,
         mode="affine",
     )
@@ -49,7 +49,7 @@ def _production_module(bits: int):
         320,
         10240,
         bias=False,
-        group_size=64,
+        group_size=group_size,
         bits=bits,
         mode="affine",
     )
@@ -63,9 +63,12 @@ def _production_module(bits: int):
     return module
 
 
+@pytest.mark.parametrize("group_size", [32, 64])
 @pytest.mark.parametrize("bits", [4, 5, 6, 8])
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-def test_qwen4_exact_hybrid_raw_and_full_outputs_are_bit_exact(bits, monkeypatch):
+def test_qwen4_exact_hybrid_raw_and_full_outputs_are_bit_exact(
+    bits, group_size, monkeypatch
+):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp import hc_fused
     from mlx_vlm.models.qwen4_exp.hc_projection import hybrid_projection
@@ -76,15 +79,15 @@ def test_qwen4_exact_hybrid_raw_and_full_outputs_are_bit_exact(bits, monkeypatch
 
     # Keep this bit-exact test on the hybrid path, below fused dispatch.
     monkeypatch.setattr(hc_fused, "_DISABLED", True)
-    mx.random.seed(20260900 + bits)
-    module = _production_module(bits)
+    mx.random.seed(20260900 + bits + group_size)
+    module = _production_module(bits, group_size)
     down = module.input_mix_weight_down
     injection = module.block_inject_weight
     down_id = id(down)
     injection_id = id(injection)
 
     for seed in range(4):
-        mx.random.seed(20261000 + 100 * bits + seed)
+        mx.random.seed(20261000 + 100 * bits + 10 * group_size + seed)
         stream = mx.random.normal((1, 1, 10240)).astype(mx.bfloat16)
         normed = module.hc_norm(stream)
         expected_down = down(normed)
@@ -182,6 +185,20 @@ def test_qwen4_exact_hybrid_preparation_fails_closed_for_other_geometry():
         missing.block_inject_weight,
     )
     assert fuse_hyper_connection_projections(missing) == 0
+
+    other_group = _production_module(4)
+    for name, rows in (("input_mix_weight_down", 320), ("block_inject_weight", 4)):
+        projection = nn.QuantizedLinear(
+            10240, rows, bias=False, group_size=128, bits=4, mode="affine"
+        )
+        projection.scales = projection.scales.astype(mx.bfloat16)
+        projection.biases = projection.biases.astype(mx.bfloat16)
+        setattr(other_group, name, projection)
+    assert not compatible_projections(
+        other_group.input_mix_weight_down,
+        other_group.block_inject_weight,
+    )
+    assert fuse_hyper_connection_projections(other_group) == 0
 
     none_metadata = _production_module(5)
     none_metadata.block_inject_weight.biases = None

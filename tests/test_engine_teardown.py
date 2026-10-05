@@ -184,8 +184,9 @@ with _EngineTeardown("subprocess", 0.2) as guard:
         guard.set_phase("primary_ssd", time.monotonic)
     time.sleep(10)
 """
+    # Cold engine imports can exceed five seconds before the watchdog starts.
     result = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, timeout=5
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=30
     )
     assert result.returncode == 70
     if progressing:
@@ -304,7 +305,7 @@ async def test_cancelled_wrapper_finishes_close_and_clears_references(wrapper_cl
         entered.set()
         assert release.wait(3)
 
-    wrapper = wrapper_class.__new__(wrapper_class)
+    wrapper = wrapper_class(model_name="test")
     wrapper._engine = SimpleNamespace(
         stop=AsyncMock(), engine=SimpleNamespace(close=close)
     )

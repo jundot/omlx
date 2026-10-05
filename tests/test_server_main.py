@@ -20,7 +20,8 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -256,3 +257,67 @@ def test_module_entry_api_key_setup_end_to_end(tmp_path):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=15)
+
+
+@pytest.fixture
+def wired_downloaders(monkeypatch, tmp_path):
+    """Boot the real init_server() wiring with both downloaders present."""
+    from omlx import server
+    from omlx.settings import reset_settings
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("OMLX_BASE_PATH", str(tmp_path / "omlx-base"))
+    reset_settings()
+    server.app.middleware_stack = None
+
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    argv = ["omlx.server", "--model-dir", str(model_dir)]
+    with (
+        patch.object(sys, "argv", argv),
+        patch("mlx.core.set_cache_limit"),
+        # The MS downloader is optional and its SDK is not installed here;
+        # the wiring under test only needs the constructor to run.
+        patch("omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True),
+        patch("uvicorn.run"),
+    ):
+        server.main()
+
+    from omlx.admin.routes import set_admin_getters
+
+    set_admin_getters(
+        server.get_server_state,
+        server.get_engine_pool,
+        lambda: server._server_state.settings_manager,
+        lambda: server._server_state.global_settings,
+    )
+
+    yield server
+    reset_settings()
+
+
+def test_download_queues_are_wired_for_restart_resume(wired_downloaders):
+    """Pin the wiring that makes restart-resume reachable end to end.
+
+    init_server() chooses the two queue file names and the lifespan awaits
+    restore_tasks() on each downloader. Either half missing silently turns a
+    restart into an empty queue, and nothing else in the suite covers the
+    lifespan's startup half.
+    """
+    from fastapi.testclient import TestClient
+
+    server = wired_downloaders
+    base = Path(server._server_state.global_settings.base_path)
+    hf = server._server_state.hf_downloader
+    ms = server._server_state.ms_downloader
+    assert hf is not None and ms is not None
+    assert hf._tasks_file == base / "hf_download_tasks.json"
+    assert ms._tasks_file == base / "ms_download_tasks.json"
+
+    hf.restore_tasks = AsyncMock()
+    ms.restore_tasks = AsyncMock()
+    with TestClient(server.app):
+        pass
+
+    hf.restore_tasks.assert_awaited_once()
+    ms.restore_tasks.assert_awaited_once()

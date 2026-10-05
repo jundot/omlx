@@ -8,6 +8,7 @@ for better throughput when serving multiple concurrent requests.
 
 import asyncio
 import copy
+import functools
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
@@ -41,6 +42,19 @@ try:
 except ImportError:
     HAS_HARMONY_ADAPTER = False
     preprocess_harmony_messages = None  # type: ignore
+
+
+def _mtp_sidecar_load_kwargs(model_name: str) -> dict[str, Any]:
+    """Loader kwargs for a MiMo MTP sidecar next to the checkpoint.
+
+    MLX conversions of MiMo V2 drop the next-token-prediction layers; the
+    upstream ``model_mtp.safetensors`` under ``<model>/mtp/`` restores
+    Lightning MTP decoding (same rule as ``load_text_model``).
+    """
+    from ..utils.model_loading import mimo_mtp_sidecar_config
+
+    sidecar_config = mimo_mtp_sidecar_config(model_name)
+    return {"model_config": sidecar_config} if sidecar_config else {}
 
 
 class BatchedEngine(BaseEngine):
@@ -310,6 +324,7 @@ class BatchedEngine(BaseEngine):
                 self._model_name,
                 tokenizer_config=tokenizer_config,
                 trust_remote_code=self._trust_remote_code,
+                **_mtp_sidecar_load_kwargs(self._model_name),
                 # With expert offload the load stays lazy so the wrap below
                 # can drop non-resident expert tensors BEFORE anything
                 # materializes them; materialize_lazy_state then evaluates
@@ -353,9 +368,17 @@ class BatchedEngine(BaseEngine):
                     0.25,
                 )
             )
+            # Lightning MTP: the draft head's experts stay resident while the
+            # backbone streams, matching the VLM engine and what admission
+            # prices (run_in_executor takes no kwargs, so bind with partial).
             moe_offload_wrapped = await loop.run_in_executor(
                 get_mlx_executor(),
-                apply_moe_expert_offload,
+                functools.partial(
+                    apply_moe_expert_offload,
+                    mtp_resident=bool(
+                        getattr(self._model_settings, "mtp_enabled", False)
+                    ),
+                ),
                 self._model,
                 self._model_name,
                 fraction,
@@ -394,13 +417,11 @@ class BatchedEngine(BaseEngine):
             is not False
         ):
             try:
-                from ..patches.qwen35_moe_gate_up import (
-                    apply_qwen35_moe_gate_up_fusion,
-                )
+                from ..patches.moe_gate_up_fusion import apply_moe_gate_up_fusion
 
                 await loop.run_in_executor(
                     get_mlx_executor(),
-                    apply_qwen35_moe_gate_up_fusion,
+                    apply_moe_gate_up_fusion,
                     self._model,
                 )
             except Exception:
@@ -430,17 +451,8 @@ class BatchedEngine(BaseEngine):
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
 
-        # head_dim=256 long-context prefill: route to an O(L) tiled SDPA kernel
-        # so models like Qwen3.6-27B stop OOMing / getting prefill-guard-rejected
-        # below their context window. The route is memory-aware: it defers to
-        # the faster unfused fallback whenever the scheduler-provided guard
-        # headroom fits its O(L^2) transient (#2204). Installed after
-        # TurboQuant so it is the outer wrapper and only grabs non-quantized
-        # 256 prefill; all other cases (incl. TurboQuant caches, other head
-        # dims, decode, short prefill) fall through to the prior SDPA
-        # unchanged. Passthrough-safe to install unconditionally — the route
-        # is strictly gated. Disable via
-        # model_settings.sdpa256_prefill_enabled = False.
+        # Install after TurboQuant so only non-quantized, long SDPA256 prefills
+        # take the bounded route used by the prefill memory estimator.
         if getattr(self._model_settings, "sdpa256_prefill_enabled", True) is not False:
             try:
                 from ..patches.sdpa256_attention import (
@@ -478,11 +490,9 @@ class BatchedEngine(BaseEngine):
                 from ..patches.qwen35_q4_mlp import (
                     apply_qwen35_q4_lm_prefill_linear_patch,
                     apply_qwen35_q4_mlp_patch,
-                    apply_qwen35_q4_prefill_linear_patch,
                 )
 
                 apply_qwen35_q4_mlp_patch()
-                apply_qwen35_q4_prefill_linear_patch()
                 apply_qwen35_q4_lm_prefill_linear_patch()
             except Exception:
                 logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
@@ -796,6 +806,29 @@ class BatchedEngine(BaseEngine):
                     cancelled = await _close_engine_core(self._engine.engine)
                 except Exception as e:
                     logger.warning(f"Error closing engine: {e}")
+
+        # ANE procedure banks retain native mapped weights and IOSurfaces on
+        # the model modules. Release them after the engine has stopped, but
+        # before dropping the wrapper's model reference, so unload does not
+        # depend on a later GC pass to reclaim the ANE allocation.
+        if self._model is not None:
+            try:
+                from ..patches.qwen35_ane_prefill import release_qwen35_ane_prefill
+
+                released, programs = release_qwen35_ane_prefill(self._model)
+                if released:
+                    logger.info(
+                        "Released %d ANE prefill module state(s) (%d program(s)) "
+                        "on engine stop",
+                        released,
+                        programs,
+                    )
+            except Exception:
+                # ANE is optional; a release failure must not prevent the
+                # normal wrapper teardown from clearing all other references.
+                logger.warning(
+                    "ANE prefill state release failed during stop", exc_info=True
+                )
         _clear_teardown_references(
             self,
             none_attrs=(
@@ -817,6 +850,7 @@ class BatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
         is_partial: bool | None = None,
+        add_generation_prompt: bool | None = None,
     ) -> str:
         """Apply chat template to messages.
 
@@ -830,6 +864,8 @@ class BatchedEngine(BaseEngine):
                 key is cleaned from message dicts but no detection is performed.
                 ``None`` (default) — auto-detect from messages for backward
                 compatibility with direct engine callers.
+            add_generation_prompt: Overrides the partial-derived default, used
+                to render the same messages without the generation prompt.
         """
         if hasattr(self._tokenizer, "apply_chat_template"):
             if is_partial is None:
@@ -841,7 +877,11 @@ class BatchedEngine(BaseEngine):
                     msg.pop("partial", None)
             template_kwargs = {
                 "tokenize": False,
-                "add_generation_prompt": not is_partial,
+                "add_generation_prompt": (
+                    not is_partial
+                    if add_generation_prompt is None
+                    else add_generation_prompt
+                ),
             }
             if is_partial:
                 template_kwargs["continue_final_message"] = True
@@ -916,12 +956,12 @@ class BatchedEngine(BaseEngine):
 
     @staticmethod
     def _pop_specprefill_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
-        """Pop SpecPrefill per-request overrides out of ``kwargs``.
+        """Pop per-request prompt overrides out of ``kwargs``.
 
         The engine's ``add_request`` accepts these as dedicated arguments, so
         they must be forwarded explicitly rather than left in ``**kwargs``.
         Shared by ``generate`` and ``stream_generate`` so both request paths
-        honour SpecPrefill overrides identically.
+        honour SpecPrefill overrides and the generation prompt marker alike.
         """
         specprefill_kwargs: dict[str, Any] = {}
         for key in (
@@ -929,6 +969,8 @@ class BatchedEngine(BaseEngine):
             "specprefill_keep_pct",
             "specprefill_threshold",
             "specprefill_system_end",
+            "generation_prompt_text",
+            "generation_prompt_persists",
         ):
             if kwargs.get(key) is not None:
                 specprefill_kwargs[key] = kwargs.pop(key)
@@ -1249,6 +1291,10 @@ class BatchedEngine(BaseEngine):
         self._inject_specprefill_system_end(
             messages, prompt, template_tools, ct_kwargs, kwargs
         )
+        generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
+        if generation_prompt:
+            kwargs["generation_prompt_text"] = generation_prompt
+            kwargs["generation_prompt_persists"] = persists
 
         return await self.generate(
             prompt=prompt,
@@ -1407,6 +1453,10 @@ class BatchedEngine(BaseEngine):
         self._inject_specprefill_system_end(
             messages, prompt, template_tools, ct_kwargs, kwargs
         )
+        generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
+        if generation_prompt:
+            kwargs["generation_prompt_text"] = generation_prompt
+            kwargs["generation_prompt_persists"] = persists
 
         async for output in self.stream_generate(
             prompt=prompt,

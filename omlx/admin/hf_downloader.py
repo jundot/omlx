@@ -2,7 +2,9 @@
 """HuggingFace model downloader for oMLX admin panel.
 
 Downloads models with huggingface_hub's snapshot_download, filesystem-based
-progress polling, and an isolated HTTP retry for xet transport failures.
+progress polling fed by disk allocation and xet wire bytes, and an isolated
+HTTP retry for xet transport failures. The task queue persists beside
+settings.json so a restart resumes interrupted downloads.
 """
 
 import asyncio
@@ -14,8 +16,10 @@ import os
 import shutil
 import signal
 import sys
+import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,16 +44,70 @@ logger = logging.getLogger(__name__)
 # Prevents server from hanging when HF is unreachable.
 _HF_API_TIMEOUT = 10
 
-# Seconds with no download progress before considering the download stalled.
+# Seconds with no disk or wire activity before considering the download
+# stalled.
 _STALL_TIMEOUT = 300
 
 # A separate first-activity deadline catches xet token/CAS hangs that never
-# create a payload file. Once any write is observed, the more tolerant stall
-# timeout above applies so slow but active connections are left alone.
+# move the wire counter or create a payload file. Once any payload activity
+# is observed, the more tolerant stall timeout above applies so slow but
+# active connections are left alone.
 _STARTUP_STALL_TIMEOUT = 120
 
-_PROGRESS_POLL_INTERVAL = 2
+_PROGRESS_POLL_INTERVAL = 0.5
 _SUBPROCESS_TERMINATE_TIMEOUT = 5
+
+# Seconds of byte-count history the reported speed averages over.
+_SPEED_WINDOW = 1.0
+
+
+class _SlidingRate:
+    """Mean bytes/second over a sliding window of cumulative byte samples."""
+
+    def __init__(self, window: float = _SPEED_WINDOW) -> None:
+        self.window = window
+        self._samples: deque[tuple[float, float]] = deque()
+
+    def _record(self, total: float, now: float) -> float:
+        self._samples.append((now, float(total)))
+        # Keep one sample older than the window as the anchor.
+        while len(self._samples) > 2 and self._samples[1][0] < now - self.window:
+            self._samples.popleft()
+        if len(self._samples) < 2:
+            return 0.0
+        start_t, start_b = self._samples[0]
+        end_t, end_b = self._samples[-1]
+        span = end_t - start_t
+        if span <= 0:
+            return 0.0
+        return (end_b - start_b) / span
+
+
+class _SpeedMeter(_SlidingRate):
+    """Bytes/second from per-file allocated-block growth between walks.
+
+    Only growth of a path seen in the previous walk counts, so files that
+    appear at full size (resume, partial walk) do not read as a spike.
+    """
+
+    def __init__(self, window: float = _SPEED_WINDOW) -> None:
+        super().__init__(window)
+        self._prev: dict[str, int] = {}
+
+    def add(self, files: dict, now: float | None = None) -> float:
+        """Record a per-file sample and return the mean rate over the window."""
+        now = time.monotonic() if now is None else now
+        growth = 0
+        prev = self._prev
+        for path, allocated in files.items():
+            before = prev.get(path)
+            if before is not None and allocated > before:
+                growth += allocated - before
+        # Replace, not merge: vanished paths drop their baseline.
+        self._prev = dict(files)
+        total = (self._samples[-1][1] if self._samples else 0.0) + growth
+        return self._record(total, now)
+
 
 _NON_XET_WORKER_MODULE = "omlx._hf_download_worker"
 
@@ -163,6 +221,8 @@ class _DownloadActivity:
     logical_size: int = 0
     allocated_size: int = 0
     latest_mtime_ns: int = 0
+    # Per-file allocated bytes for _SpeedMeter.
+    files: dict = field(default_factory=dict)
 
 
 def _is_xet_transport_error(error: BaseException) -> bool:
@@ -187,7 +247,44 @@ def _is_xet_transport_error(error: BaseException) -> bool:
     return any(marker in detail for marker in _XET_ERROR_MARKERS)
 
 
-def _make_cancellable_tqdm(should_cancel: Callable[[], bool]) -> type:
+class _WireCounter:
+    """Cumulative network bytes from xet's transfer progress bar.
+
+    During xet's fetch phase bytes arrive on the wire long before they are
+    written to disk, so the disk meter alone reads 0 B/s.
+    """
+
+    __slots__ = ("_value", "_lock")
+
+    def __init__(self) -> None:
+        self._value = 0
+        self._lock = threading.Lock()
+
+    def add(self, n: int) -> None:
+        if n <= 0:
+            return
+        with self._lock:
+            self._value += int(n)
+
+    @property
+    def value(self) -> int:
+        with self._lock:
+            return self._value
+
+
+class _WireSpeedMeter(_SlidingRate):
+    """Sliding-window bytes/second over a cumulative wire-byte counter."""
+
+    def add(self, total: int, now: float | None = None) -> float:
+        """Record a cumulative sample and return the mean rate over the window."""
+        now = time.monotonic() if now is None else now
+        return self._record(max(0.0, float(total)), now)
+
+
+def _make_cancellable_tqdm(
+    should_cancel: Callable[[], bool],
+    on_wire_bytes: Callable[[int], None] | None = None,
+) -> type:
     """Build a tqdm subclass that aborts the download when cancelled.
 
     huggingface_hub's http_get calls ``progress.update(len(chunk))`` once per
@@ -201,10 +298,28 @@ def _make_cancellable_tqdm(should_cancel: Callable[[], bool]) -> type:
     callback exception until the whole transfer finishes (issue #1322), so
     cancellation there is driven by ``abort_xet_session()`` instead; this
     class is kept as the raise-on-next-chunk backstop for http_get.
+
+    When ``on_wire_bytes`` is given, increments of snapshot_download's xet
+    transfer bar are passed to it. That bar is the only one whose format
+    has no ``{total_fmt}``, so disk and file-count bars are not counted.
     """
 
     class _CancellableTqdm(_hf_tqdm):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            fmt = kwargs.get("bar_format")
+            self._wire_bar = (
+                on_wire_bytes is not None
+                and isinstance(fmt, str)
+                and "total_fmt" not in fmt
+            )
+
         def update(self, n=1):
+            if self._wire_bar and n:
+                try:
+                    on_wire_bytes(int(n))
+                except Exception:  # noqa: BLE001 - metering must not break a transfer
+                    logger.debug("wire-byte hook failed", exc_info=True)
             if should_cancel():
                 raise _DownloadCancelled()
             return super().update(n)
@@ -281,7 +396,11 @@ class DownloadTask:
     progress: float = 0.0
     total_size: int = 0
     downloaded_size: int = 0
+    # Bytes/second over the last _SPEED_WINDOW; 0.0 when not transferring.
+    speed_bps: float = 0.0
     error: str = ""
+    # Request-supplied HF/MS token for restart resume. Never in to_dict().
+    token: str = ""
     created_at: float = field(default_factory=time.time)
     started_at: float = 0.0
     completed_at: float = 0.0
@@ -296,12 +415,31 @@ class DownloadTask:
             "progress": round(self.progress, 1),
             "total_size": self.total_size,
             "downloaded_size": self.downloaded_size,
+            "speed_bps": round(self.speed_bps, 1),
             "error": self.error,
             "created_at": self.created_at,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "retry_count": self.retry_count,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "DownloadTask":
+        """Rebuild a persisted task row."""
+        return cls(
+            task_id=data["task_id"],
+            repo_id=data["repo_id"],
+            status=DownloadStatus(data["status"]),
+            progress=float(data.get("progress", 0.0)),
+            total_size=int(data.get("total_size", 0)),
+            downloaded_size=int(data.get("downloaded_size", 0)),
+            error=data.get("error", ""),
+            token=data.get("token", ""),
+            created_at=float(data.get("created_at", time.time())),
+            started_at=float(data.get("started_at", 0.0)),
+            completed_at=float(data.get("completed_at", 0.0)),
+            retry_count=int(data.get("retry_count", 0)),
+        )
 
 
 _DTYPE_BYTES = {
@@ -563,7 +701,140 @@ _SORT_MAP = {
 }
 
 
-class HFDownloader:
+def _write_tasks_file(path: Path, tasks) -> None:
+    """Atomically write task rows to an owner-only (0600) file."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = []
+        for task in sorted(tasks, key=lambda t: t.created_at):
+            row = task.to_dict()
+            # Only a row that can still resume keeps its token on disk.
+            row["token"] = (
+                task.token
+                if task.status
+                in (DownloadStatus.PENDING, DownloadStatus.DOWNLOADING)
+                else ""
+            )
+            payload.append(row)
+        tmp_path = path.with_name(path.name + ".tmp")
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # O_CREAT's mode does not apply to an existing temp file.
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload))
+        tmp_path.replace(path)
+    except OSError as exc:
+        logger.warning(
+            "Could not persist download tasks to %s: %s", path, exc
+        )
+
+
+def _read_tasks_file(path: Path | None) -> list[dict]:
+    """Read persisted task rows; a missing or corrupt file yields []."""
+    if path is None or not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "Could not read persisted download tasks from %s: %s", path, exc
+        )
+        return []
+    return data if isinstance(data, list) else []
+
+
+class _QueuePersistenceMixin:
+    """Restart-surviving task queue shared by the HF and MS downloaders."""
+
+    @staticmethod
+    def _get_download_activity(path: Path) -> _DownloadActivity:
+        """Return size, allocation, and mtime signals including Hub temp files."""
+        if not path.exists():
+            return _DownloadActivity()
+        file_count = 0
+        logical_size = 0
+        allocated_size = 0
+        latest_mtime_ns = 0
+        files: dict[str, int] = {}
+        try:
+            for file_path in path.rglob("*"):
+                if not file_path.is_file():
+                    continue
+                try:
+                    stat = file_path.stat()
+                except OSError:
+                    continue
+                file_count += 1
+                logical_size += stat.st_size
+                blocks = getattr(stat, "st_blocks", 0) * 512
+                allocated_size += blocks
+                files[str(file_path)] = blocks
+                latest_mtime_ns = max(latest_mtime_ns, stat.st_mtime_ns)
+        except OSError:
+            pass
+        return _DownloadActivity(
+            file_count=file_count,
+            logical_size=logical_size,
+            allocated_size=allocated_size,
+            latest_mtime_ns=latest_mtime_ns,
+            files=files,
+        )
+
+    def _init_queue(self, tasks_file: str | Path | None) -> None:
+        # None disables persistence.
+        self._tasks_file = Path(tasks_file) if tasks_file else None
+        self._shutting_down = False
+        self._restoring = False
+
+    def _persist(self) -> None:
+        # Skipped during restore (the file is still being read) and shutdown
+        # (interrupted rows must stay resumable on disk).
+        if self._tasks_file is None or self._restoring or self._shutting_down:
+            return
+        _write_tasks_file(self._tasks_file, self._tasks.values())
+
+    async def restore_tasks(self) -> None:
+        """Resume interrupted rows and restore failed/cancelled rows.
+
+        Completed rows are dropped. A row that cannot be read or started is
+        logged and skipped.
+        """
+        entries = _read_tasks_file(self._tasks_file)
+        if not entries:
+            return
+        self._restoring = True
+        try:
+            for entry in entries:
+                try:
+                    status = DownloadStatus(entry["status"])
+                    if status in (
+                        DownloadStatus.PENDING,
+                        DownloadStatus.DOWNLOADING,
+                    ):
+                        task = await self.start_download(
+                            entry["repo_id"], entry.get("token", "")
+                        )
+                        task.created_at = float(
+                            entry.get("created_at", task.created_at)
+                        )
+                        task.retry_count = int(entry.get("retry_count", 0))
+                        logger.info(
+                            "Resumed interrupted download: %s", task.repo_id
+                        )
+                    elif status in (
+                        DownloadStatus.FAILED,
+                        DownloadStatus.CANCELLED,
+                    ):
+                        task = DownloadTask.from_dict(entry)
+                        self._tasks.setdefault(task.task_id, task)
+                except Exception as exc:
+                    logger.warning("Skipping persisted download row: %s", exc)
+        finally:
+            self._restoring = False
+        self._persist()
+
+
+class HFDownloader(_QueuePersistenceMixin):
     """Manages HuggingFace model downloads with progress tracking.
 
     Uses huggingface_hub.snapshot_download() for actual downloads and polls
@@ -892,6 +1163,7 @@ class HFDownloader:
         self,
         model_dir: str,
         on_complete: Optional[Callable] = None,
+        tasks_file: str | Path | None = None,
     ):
         self._model_dir = Path(model_dir)
         self._tasks: dict[str, DownloadTask] = {}
@@ -899,6 +1171,7 @@ class HFDownloader:
         self._progress_tasks: dict[str, asyncio.Task] = {}
         self._on_complete = on_complete
         self._cancelled: set[str] = set()
+        self._init_queue(tasks_file)
         self._stalled: dict[str, _DownloadStalledError] = {}
         self._fallback_processes: dict[str, asyncio.subprocess.Process] = {}
         self._download_sem = asyncio.Semaphore(1)
@@ -945,12 +1218,14 @@ class HFDownloader:
 
         task_id = str(uuid.uuid4())
         task = DownloadTask(task_id=task_id, repo_id=repo_id)
+        task.token = hf_token or ""
         self._tasks[task_id] = task
 
         # Start download in background
         self._active_tasks[task_id] = asyncio.create_task(
             self._run_download(task_id, hf_token)
         )
+        self._persist()
 
         logger.info(f"Download queued: {repo_id} (task_id={task_id})")
         return task
@@ -976,6 +1251,7 @@ class HFDownloader:
         # Mark as cancelled
         self._cancelled.add(task_id)
         task.status = DownloadStatus.CANCELLED
+        self._persist()
 
         # A task in DOWNLOADING owns the download semaphore, so the in-flight
         # xet transfer is necessarily this one; aborting the (global) session
@@ -1016,6 +1292,7 @@ class HFDownloader:
 
         del self._tasks[task_id]
         self._cancelled.discard(task_id)
+        self._persist()
         return True
 
     async def retry_download(
@@ -1052,9 +1329,11 @@ class HFDownloader:
         del self._tasks[task_id]
         self._cancelled.discard(task_id)
 
-        # Start fresh download (snapshot_download resumes from existing files)
-        new_task = await self.start_download(repo_id, hf_token)
+        # Start fresh download (snapshot_download resumes from existing files).
+        # An empty retry token keeps the stored one.
+        new_task = await self.start_download(repo_id, hf_token or old_task.token)
         new_task.retry_count = old_retry_count + 1
+        self._persist()
         return new_task
 
     def get_tasks(self) -> list[dict]:
@@ -1066,6 +1345,9 @@ class HFDownloader:
 
     async def shutdown(self) -> None:
         """Cancel all active downloads and clean up."""
+        # Keep persisted rows as pending/downloading so the next boot
+        # resumes them.
+        self._shutting_down = True
         # Cancel all progress polling tasks
         for task_id, progress_task in list(self._progress_tasks.items()):
             if not progress_task.done():
@@ -1192,8 +1474,9 @@ class HFDownloader:
                         f"Dry run failed for {task.repo_id}: {e}. {detail}"
                     )
 
+                wire_counter = _WireCounter()
                 self._progress_tasks[task_id] = asyncio.create_task(
-                    self._poll_progress(task_id, target_dir)
+                    self._poll_progress(task_id, target_dir, wire_counter)
                 )
 
                 xet_error: Exception | None = None
@@ -1205,7 +1488,8 @@ class HFDownloader:
                         snapshot_download,
                         **dl_kwargs,
                         tqdm_class=_make_cancellable_tqdm(
-                            lambda: task_id in self._cancelled
+                            lambda: task_id in self._cancelled,
+                            on_wire_bytes=wire_counter.add,
                         ),
                     )
                 except Exception as error:
@@ -1231,8 +1515,10 @@ class HFDownloader:
                     progress_task = self._progress_tasks.pop(task_id, None)
                     if progress_task and not progress_task.done():
                         progress_task.cancel()
+                    # The HTTP worker refetches the payload, so xet's wire
+                    # bytes do not carry over.
                     self._progress_tasks[task_id] = asyncio.create_task(
-                        self._poll_progress(task_id, target_dir)
+                        self._poll_progress(task_id, target_dir, _WireCounter())
                     )
                     try:
                         await self._run_http_fallback(task_id, dl_kwargs)
@@ -1253,6 +1539,7 @@ class HFDownloader:
                 # Success
                 task.status = DownloadStatus.COMPLETED
                 task.progress = 100.0
+                task.speed_bps = 0.0
                 if size_estimated or not task.total_size:
                     # The estimate was only a progress denominator; report
                     # the measured on-disk size once the download is done.
@@ -1319,6 +1606,8 @@ class HFDownloader:
 
             # Remove from active tasks
             self._active_tasks.pop(task_id, None)
+
+            self._persist()
 
     async def _run_http_fallback(
         self,
@@ -1388,7 +1677,9 @@ class HFDownloader:
                 return
             await process.wait()
 
-    async def _poll_progress(self, task_id: str, target_dir: Path) -> None:
+    async def _poll_progress(
+        self, task_id: str, target_dir: Path, wire: _WireCounter | None = None
+    ) -> None:
         """Poll the target directory to estimate download progress.
 
         Uses both directory size and file modification times to detect
@@ -1396,7 +1687,12 @@ class HFDownloader:
         in, so size alone may not change for extended periods. File mtimes
         are updated on each write syscall and serve as a more reliable
         liveness signal.
+
+        The wire counter covers xet's fetch phase, where bytes arrive on the
+        network long before they reach disk: it feeds progress, speed, and
+        stall liveness.
         """
+        wire = wire or _WireCounter()
         task = self._tasks.get(task_id)
         if task is None:
             return
@@ -1404,6 +1700,14 @@ class HFDownloader:
         last_activity = self._get_download_activity(target_dir)
         last_activity_at = time.monotonic()
         observed_activity = False
+        # Prime both meters before the first sleep.
+        speed_meter = _SpeedMeter()
+        speed_meter.add(last_activity.files, now=last_activity_at)
+        wire_meter = _WireSpeedMeter()
+        wire_meter.add(wire.value, now=last_activity_at)
+        last_wire = wire.value
+        # A resume fetches only missing bytes, so wire bytes add to this.
+        base_logical = last_activity.logical_size
 
         try:
             while task.status == DownloadStatus.DOWNLOADING:
@@ -1413,14 +1717,27 @@ class HFDownloader:
                     break
 
                 activity = self._get_download_activity(target_dir)
-                task.downloaded_size = activity.logical_size
+                wire_now = wire.value
 
+                # Add wire bytes the disk has not caught up with yet.
+                disk_growth = max(0, activity.logical_size - base_logical)
+                reported = activity.logical_size + max(0, wire_now - disk_growth)
                 if task.total_size > 0:
+                    reported = min(reported, task.total_size)
                     # Cap at 99% until snapshot_download confirms completion
                     task.progress = min(
-                        (activity.logical_size / task.total_size) * 100,
+                        (reported / task.total_size) * 100,
                         99.0,
                     )
+                task.downloaded_size = reported
+
+                disk_bps = speed_meter.add(activity.files)
+                wire_bps = wire_meter.add(wire_now)
+                # Both meters see the same payload, so never sum them.
+                task.speed_bps = max(disk_bps, wire_bps)
+
+                wire_moved = wire_now > last_wire
+                last_wire = wire_now
 
                 if activity != last_activity:
                     # A zero-byte temp file or metadata touch is not payload
@@ -1429,6 +1746,12 @@ class HFDownloader:
                     if activity.allocated_size > last_activity.allocated_size:
                         observed_activity = True
                     last_activity = activity
+                    last_activity_at = time.monotonic()
+                    continue
+
+                if wire_moved:
+                    # Wire bytes mean the token/CAS handshake is done.
+                    observed_activity = True
                     last_activity_at = time.monotonic()
                     continue
 
@@ -1460,55 +1783,8 @@ class HFDownloader:
                     break
         except asyncio.CancelledError:
             pass
-
-    @staticmethod
-    def _get_download_activity(path: Path) -> _DownloadActivity:
-        """Return size, allocation, and mtime signals including Hub temp files."""
-        if not path.exists():
-            return _DownloadActivity()
-        file_count = 0
-        logical_size = 0
-        allocated_size = 0
-        latest_mtime_ns = 0
-        try:
-            for file_path in path.rglob("*"):
-                if not file_path.is_file():
-                    continue
-                try:
-                    stat = file_path.stat()
-                except OSError:
-                    continue
-                file_count += 1
-                logical_size += stat.st_size
-                allocated_size += getattr(stat, "st_blocks", 0) * 512
-                latest_mtime_ns = max(latest_mtime_ns, stat.st_mtime_ns)
-        except OSError:
-            pass
-        return _DownloadActivity(
-            file_count=file_count,
-            logical_size=logical_size,
-            allocated_size=allocated_size,
-            latest_mtime_ns=latest_mtime_ns,
-        )
-
-    @staticmethod
-    def _get_latest_mtime(path: Path) -> float:
-        """Return the most recent modification time of any file in a directory."""
-        if not path.exists():
-            return 0.0
-        latest = 0.0
-        try:
-            for f in path.rglob("*"):
-                if f.is_file():
-                    try:
-                        mt = f.stat().st_mtime
-                        if mt > latest:
-                            latest = mt
-                    except OSError:
-                        pass
-        except OSError:
-            pass
-        return latest
+        finally:
+            task.speed_bps = 0.0
 
     @staticmethod
     def _get_dir_size(path: Path) -> int:

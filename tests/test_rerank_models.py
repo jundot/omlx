@@ -32,8 +32,15 @@ class TestRerankRequest:
     def test_defaults(self):
         req = RerankRequest(model="m", query="q", documents=["d"])
         assert req.top_n is None
+        assert req.max_length is None  # Model default
         assert req.return_documents is True  # Cohere-compat default
         assert req.max_chunks_per_doc is None
+
+    def test_max_length_must_be_positive(self):
+        req = RerankRequest(model="m", query="q", documents=["d"], max_length=8192)
+        assert req.max_length == 8192
+        with pytest.raises(ValidationError):
+            RerankRequest(model="m", query="q", documents=["d"], max_length=0)
 
     def test_dict_query_for_multimodal(self):
         image = (

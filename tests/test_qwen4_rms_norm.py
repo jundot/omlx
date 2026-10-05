@@ -195,11 +195,26 @@ def test_rejects_a_dim_not_divisible_by_group_size():
         language.Qwen4ExpRMSNorm(10240, group_size=3000)
 
 
-def test_weight_stays_a_parameter_and_nothing_else_is_registered():
+@pytest.mark.parametrize("cache_scale", [False, True])
+def test_weight_stays_a_parameter_and_nothing_else_is_registered(cache_scale):
     """A cached scale filed into the module dict would break checkpoint I/O."""
-    module = language.Qwen4ExpRMSNorm(10240, group_size=2560, eps=1e-6)
+    module = language.Qwen4ExpRMSNorm(
+        10240, group_size=2560, eps=1e-6, cache_scale=cache_scale
+    )
     mx.eval(module(mx.zeros((1, 4, 10240), mx.bfloat16)))
     assert list(module.parameters()) == ["weight"]
+
+
+def test_cached_scale_is_bit_identical_and_follows_a_reloaded_weight():
+    x = mx.random.normal((1, 1, 24, 256), key=mx.random.key(5)).astype(mx.bfloat16)
+    cached = language.Qwen4ExpRMSNorm(256, eps=1e-6, cache_scale=True)
+    plain = language.Qwen4ExpRMSNorm(256, eps=1e-6)
+    for seed in (1, 2):
+        weight = (0.1 * mx.random.normal((256,), key=mx.random.key(seed))).astype(mx.bfloat16)
+        cached.load_weights([("weight", weight)])
+        plain.load_weights([("weight", weight)])
+        for _ in range(2):
+            assert mx.array_equal(cached(x).view(mx.uint16), plain(x).view(mx.uint16)).item()
 
 
 def test_deviation_rate_across_the_whole_geometry_is_a_few_ppm():

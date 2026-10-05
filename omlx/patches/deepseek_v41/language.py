@@ -848,9 +848,10 @@ class LanguageModel(DSparkMixin, nn.Module):
 
             self.mtp = make_stages(config)
         self._hasher = None
-        from ..mlx_lm_mtp import get_mtp_depth, is_mtp_active
+        from ..mlx_lm_mtp import get_mtp_depth, is_mtp_active, is_mtp_depth_fixed
 
         self.configure_mtp(config.preserve_mtp and is_mtp_active(), get_mtp_depth())
+        self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
 
     def make_dspark_cache(self):
         from .dspark import make_cache
@@ -960,6 +961,18 @@ class LanguageModel(DSparkMixin, nn.Module):
             )
             ced_mid = c.n_layers // 2
             prefetch = getattr(self, "_engram_prefetch", None)
+            # The CPU enqueues a whole prefill chunk in ~1s while the GPU runs
+            # ~15x longer; with the layer loop fully lazy every intermediate
+            # (fp32 hyper-connection streams across hc_mult, gathered sparse
+            # attention loads, MoE routes) stays pinned until the final logits
+            # eval and the Metal pool hoards every freed size class as
+            # IOAccelerator footprint (measured +14.5GB per 2048-token chunk).
+            # Eval the running stream at each layer boundary during prefill so
+            # intermediates retire as the GPU progresses, and clear the pool at
+            # the same points (per-layer widths vary across the ratio switch,
+            # CED tail and 2047/2048 chunk widths, so size classes never
+            # reuse). Decode/verify widths stay lazy for latency.
+            prefill_backpressure = end - begin >= 256
             with prefetch.forward() if prefetch is not None else nullcontext():
                 if prefetch is not None and c.engram_layer_ids:
                     first = self.layers[c.engram_layer_ids[0]].engram.embed
@@ -992,6 +1005,9 @@ class LanguageModel(DSparkMixin, nn.Module):
                     )
                     if prefetch is not None and "engram" in layer:
                         mx.async_eval(h, pre)
+                    if prefill_backpressure:
+                        mx.eval(h, pre)
+                        mx.clear_cache()
                     rc[i][0] = mx.array([start + end - begin], mx.int32)
                     if history is not None and i == 0:
                         rc[i][6] = mx.array(history, mx.int64)
