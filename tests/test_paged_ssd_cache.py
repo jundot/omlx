@@ -32,6 +32,7 @@ from omlx.cache.paged_ssd_cache import (
     _restore_tensor_from_bytes,
     _signature_turboquant_bits,
     _write_safetensors_no_mx,
+    format_bytes,
     numerics_revision_for_model,
     parse_size,
 )
@@ -1326,6 +1327,89 @@ class TestPagedSSDCacheManagerWithMLX:
         ]
         assert scan_lines, "scan completion log not emitted"
         assert "skipped_incompatible=3 blocks" in scan_lines[-1]
+
+    def test_startup_eviction_warns_before_unlinking(self, tmp_path: Path, mock_mlx):
+        """#3253: the startup scan deletes persisted blocks, so it must say so.
+
+        Convergence runs before any request is served and unlinks in st_mtime
+        order. Nothing announced that, so a plain restart could drop cache data
+        with no log line naming what was about to go. Assert the warning names
+        the block count, the byte total and both limits -- and that it lands
+        *before* the first unlink rather than after, so it is a pre-announcement
+        and not a post-mortem.
+        """
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+
+        blocks = [
+            self._write_versioned_fixture_block(
+                cache_dir,
+                mx,
+                bytes([0xA0 + i]) + b"\x00" * 31,
+                num_layers=4,
+                model_name="m",
+            )
+            for i in range(3)
+        ]
+        max_size = sum(p.stat().st_size for p in blocks) // 2
+
+        events: list[tuple[str, str]] = []
+
+        class _Recorder(logging.Handler):
+            def emit(self, record):
+                events.append((record.levelname, record.getMessage()))
+
+        recorder = _Recorder()
+        cache_logger = logging.getLogger("omlx.cache.paged_ssd_cache")
+        cache_logger.addHandler(recorder)
+        original_unlink = PagedSSDCacheManager._unlink_evicted
+        original_enforce = PagedSSDCacheManager._enforce_size_limit_for_new_block
+        # Snapshot the limits at the moment convergence starts: afterwards the
+        # tracked size is post-eviction and would not match the warning.
+        observed: dict[str, int] = {}
+
+        def _record_unlink(self, metadata, source_index=None):
+            events.append(("UNLINK", str(getattr(metadata, "file_path", "?"))))
+            return original_unlink(self, metadata, source_index)
+
+        def _record_enforce(self, *args, **kwargs):
+            observed["tracked"] = self._tracked_ssd_size()
+            observed["effective"] = self._get_effective_max_size()
+            observed["count"] = self._tracked_ssd_count()
+            return original_enforce(self, *args, **kwargs)
+
+        try:
+            with (
+                patch.object(PagedSSDCacheManager, "_unlink_evicted", _record_unlink),
+                patch.object(
+                    PagedSSDCacheManager,
+                    "_enforce_size_limit_for_new_block",
+                    _record_enforce,
+                ),
+            ):
+                manager = PagedSSDCacheManager(
+                    cache_dir=cache_dir,
+                    max_size_bytes=max_size,
+                )
+        finally:
+            cache_logger.removeHandler(recorder)
+
+        warnings = [msg for level, msg in events if level == "WARNING"]
+        pre_eviction = [msg for msg in warnings if "startup eviction" in msg]
+        assert pre_eviction, f"no pre-eviction warning emitted; events={events}"
+
+        message = pre_eviction[-1]
+        # Block count, byte total, and both limits are all named.
+        assert f"{observed['count']} blocks" in message
+        assert format_bytes(observed["tracked"]) in message
+        assert format_bytes(observed["effective"]) in message
+        assert format_bytes(manager._max_size) in message
+        assert "configured=" in message and "effective=" in message
+
+        # Pre-announcement: the warning must precede the first unlink.
+        first_unlink = next(i for i, (kind, _) in enumerate(events) if kind == "UNLINK")
+        warned_at = events.index(("WARNING", message))
+        assert warned_at < first_unlink, f"warning came after eviction began: {events}"
 
     def test_model_switch_enforces_shared_ssd_limit_on_new_save(
         self, tmp_path: Path, mock_mlx

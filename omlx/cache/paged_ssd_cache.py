@@ -2330,6 +2330,17 @@ class PagedSSDCacheManager(CacheManager):
         indexed. Incompatible blocks are left on disk so a shared SSD cache
         directory can safely serve multiple loaded models without one model's
         startup scan deleting another model's cache.
+
+        A directory that is already over the effective budget is then converged
+        immediately, before any request is served. Note that convergence
+        *deletes* persisted blocks oldest-mtime-first rather than declining to
+        add new ones, and the ceiling is
+        ``min(max_size_bytes, 99% of disk headroom)``. With
+        ``ssd_cache_max_size: auto`` (``auto_size=True``) there is no
+        user-configured ceiling at all: the bound comes from disk headroom
+        alone (50% of free space plus the tracked cache), so it can be crossed
+        by simply accumulating cache. A warning naming the block count, the
+        byte total and both limits is logged before anything is unlinked.
         """
         logger.info(f"Scanning SSD cache directory: {self._cache_dir}")
 
@@ -2388,14 +2399,32 @@ class PagedSSDCacheManager(CacheManager):
         # Startup can find a cache directory that already exceeds the shared
         # SSD budget. Converge immediately before serving requests.
         tracked_size = self._tracked_ssd_size()
-        if tracked_size > 0 and tracked_size > self._get_effective_max_size():
-            self._enforce_size_limit_for_new_block(0, unbounded=True)
-            logger.info(
-                "SSD cache startup cleanup: freed=%s, remaining=%s, limit=%s",
-                format_bytes(tracked_size - self._tracked_ssd_size()),
-                format_bytes(self._tracked_ssd_size()),
-                format_bytes(self._get_effective_max_size()),
-            )
+        if tracked_size > 0:
+            # Resolved only when the cache is non-empty, so an empty cache
+            # directory still touches neither disk_usage nor its warn path.
+            effective_max = self._get_effective_max_size()
+            if tracked_size > effective_max:
+                # #3253: this path unlinks persisted blocks, so announce what is
+                # about to go first. A plain restart reaches it before serving
+                # anything, which makes this log the only chance the user gets
+                # to see it happen.
+                logger.warning(
+                    "SSD cache startup eviction: tracked cache is over its "
+                    "effective budget; about to unlink up to %d blocks (%s) to "
+                    "reach configured=%s, effective=%s (auto_size=%s)",
+                    self._tracked_ssd_count(),
+                    format_bytes(tracked_size),
+                    format_bytes(self._max_size),
+                    format_bytes(effective_max),
+                    self._auto_size,
+                )
+                self._enforce_size_limit_for_new_block(0, unbounded=True)
+                logger.info(
+                    "SSD cache startup cleanup: freed=%s, remaining=%s, limit=%s",
+                    format_bytes(tracked_size - self._tracked_ssd_size()),
+                    format_bytes(self._tracked_ssd_size()),
+                    format_bytes(self._get_effective_max_size()),
+                )
 
     def _scan_existing_gdn_sidecars(self) -> tuple[int, int, int]:
         """Index existing sidecars using only path and stat metadata.
