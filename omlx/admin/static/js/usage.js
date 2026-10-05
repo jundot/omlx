@@ -50,7 +50,22 @@ function usageHistory() {
         shade(tokens) {
             return tokens ? `rgba(22, 163, 74, ${0.2 + 0.8 * Math.sqrt(tokens / this.peak)})` : 'rgba(128, 128, 128, 0.12)';
         },
-        number(value) { return new Intl.NumberFormat(undefined, {notation: 'compact', maximumFractionDigits: 1}).format(value || 0); },
+        number(value) {
+            // Compact units follow the oMLX UI language, exposed as <html lang>
+            // from ui.language by base.html. An undefined locale would fall back
+            // to the runtime locale, so an English UI rendered 3332萬 on a
+            // zh-TW machine — labels and units from two different languages.
+            const uiLang = (document.documentElement?.lang || '').trim();
+            try {
+                return new Intl.NumberFormat(uiLang || undefined, {notation: 'compact', maximumFractionDigits: 1})
+                    .format(value || 0);
+            } catch (error) {
+                // ui.language is an unvalidated string, so a hand-edited
+                // settings.json can supply a tag Intl rejects (RangeError).
+                return new Intl.NumberFormat(undefined, {notation: 'compact', maximumFractionDigits: 1})
+                    .format(value || 0);
+            }
+        },
         speed(value) { return value == null ? '—' : value.toFixed(1); },
     };
 }
