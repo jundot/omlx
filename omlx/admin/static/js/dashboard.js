@@ -1895,6 +1895,7 @@
                     max_tool_result_tokens: s.max_tool_result_tokens || null,
                     reasoning_parser: s.reasoning_parser || '',
                     ttl_seconds: s.ttl_seconds ?? null,
+                    max_concurrent_requests: s.max_concurrent_requests ?? null,
                     enableIndexCache: !!(s.index_cache_freq),
                     index_cache_freq: s.index_cache_freq || null,
                     turboquant_kv_enabled: s.turboquant_kv_enabled || false,
@@ -2003,7 +2004,10 @@
             _resetPresetApplicableFields() {
                 // Reset all fields a preset can touch so switching presets does not leave
                 // stale values. Intentionally does NOT touch model_alias / model_type_override
-                // / is_pinned / is_default / turboquant_* / dflash_* / specprefill_* / index_cache_*.
+                // / is_pinned / is_default / turboquant_* / dflash_* / specprefill_* / index_cache_*
+                // / max_concurrent_requests. Presets can never carry the concurrency cap
+                // (excluded from profiles), so nulling it here would silently wipe a
+                // governance cap from the save payload on any preset selection.
                 const ms = this.modelSettings;
                 ms.temperature = null;
                 ms.top_p = null;
@@ -2889,6 +2893,10 @@
                                 force_sampling: this.modelSettings.force_sampling,
                                 reasoning_parser: this.modelSettings.reasoning_parser || null,
                                 ttl_seconds: this.modelSettings.ttl_seconds || null,
+                                // Floor to an integer; below 1 or empty inherits the global cap.
+                                max_concurrent_requests: Number.isFinite(this.modelSettings.max_concurrent_requests) && this.modelSettings.max_concurrent_requests >= 1
+                                    ? Math.floor(this.modelSettings.max_concurrent_requests)
+                                    : null,
                                 index_cache_freq: this.modelSettings.enableIndexCache
                                     ? (this.modelSettings.index_cache_freq || 4)
                                     : 0,
@@ -3299,6 +3307,7 @@
                         this.modelSettings.guided_grammar_enabled = false;
                         this.modelSettings.guided_grammar = '';
                         this.modelSettings.ttl_seconds = null;
+                        this.modelSettings.max_concurrent_requests = null;
                         this.modelSettings.enableIndexCache = false;
                         this.modelSettings.index_cache_freq = 0;
                         this.modelSettings.enable_thinking = false;

@@ -60,6 +60,7 @@ from .model_discovery import (
 from .model_settings import (
     ane_prefill_backend,
     ane_prefill_fraction,
+    coerce_max_concurrent_requests,
     validate_ane_prefill,
 )
 from .scheduler import SchedulerConfig
@@ -293,6 +294,9 @@ class EngineEntry:
     source_type: str = "local"
     source_repo_id: str | None = None
     is_helper: bool = False  # Speculative-decoding drafter (dFlash/Assistant/MTP)
+    # Raw per-model max-concurrent-requests override (unclamped; the live
+    # effective cap is min(global, override)). None = inherit the global cap.
+    max_concurrent_requests_override: int | None = None
     engine: (
         BaseEngine
         | EmbeddingEngine
@@ -1265,30 +1269,122 @@ class EnginePool:
         async with self._lock:
             _set_concurrency_limits(self._scheduler_config, value)
             for entry in list(self._entries.values()):
-                engine = entry.engine if entry is not None else None
-                # Cluster ranks build their schedulers from the deployment.
-                if engine is None or getattr(
-                    engine, "_prefill_memory_guard_managed_externally", False
-                ):
-                    continue
-                # DFlash keeps its own config copy for the lazy fallback engine.
-                for host in (engine, getattr(engine, "_fallback_engine", None)):
-                    if host is None:
-                        continue
-                    config = getattr(host, "_scheduler_config", None)
-                    if config is not None:
-                        _set_concurrency_limits(config, value)
-                    core = getattr(getattr(host, "_engine", None), "engine", None)
-                    scheduler = getattr(core, "scheduler", None)
-                    if scheduler is None:
-                        continue
-                    _set_concurrency_limits(scheduler.config, value)
-                    executor = getattr(core, "_mlx_executor", None)
-                    if executor is None:
-                        continue
-                    # A shut-down executor means the engine is stopping.
-                    with suppress(RuntimeError):
-                        executor.submit(_set_decode_cap, scheduler, value)
+                self._apply_limits_to_entry(entry, value)
+
+    def _apply_limits_to_entry(self, entry: EngineEntry, value: int) -> None:
+        """Apply a global concurrency value to one entry, honoring its
+        per-model override (effective = min(global, override)).
+
+        A primary Batched/VLM engine holds the shared pool config by
+        reference: it keeps the global value so future loads of other
+        models still see it. Private copies — the DFlash snapshot and the
+        lazy fallback engine's config — and the live scheduler take the
+        clamped effective value.
+        """
+        engine = entry.engine if entry is not None else None
+        # Cluster ranks build their schedulers from the deployment.
+        if engine is None or getattr(
+            engine, "_prefill_memory_guard_managed_externally", False
+        ):
+            return
+        # Backstop coercion: the entry override may be raw from a corrupted
+        # settings file; junk means unset, numeric floors at 1 (a 0/negative
+        # cap must neither widen to global nor reach the scheduler).
+        override = coerce_max_concurrent_requests(
+            getattr(entry, "max_concurrent_requests_override", None)
+        )
+        effective = min(value, max(1, override)) if override is not None else value
+        # DFlash keeps its own config copy for the lazy fallback engine.
+        for host in (engine, getattr(engine, "_fallback_engine", None)):
+            if host is None:
+                continue
+            config = getattr(host, "_scheduler_config", None)
+            if config is not None:
+                _set_concurrency_limits(
+                    config,
+                    value if config is self._scheduler_config else effective,
+                )
+            # Keep the engine-owned settings copy in sync with the current
+            # override: a DFlash primary builds its lazy Batched/VLM fallback
+            # from this copy later, and a stale cap there would re-clamp the
+            # fallback scheduler to the old value on eviction.
+            host_settings = getattr(host, "_model_settings", None)
+            if host_settings is not None and getattr(
+                host_settings, "max_concurrent_requests", None
+            ) != override:
+                host_settings.max_concurrent_requests = override
+            core = getattr(getattr(host, "_engine", None), "engine", None)
+            scheduler = getattr(core, "scheduler", None)
+            if scheduler is None:
+                continue
+            _set_concurrency_limits(scheduler.config, effective)
+            executor = getattr(core, "_mlx_executor", None)
+            if executor is None:
+                continue
+            # A shut-down executor means the engine is stopping.
+            with suppress(RuntimeError):
+                executor.submit(_set_decode_cap, scheduler, effective)
+
+    async def apply_model_max_concurrent_requests(self, model_id: str) -> None:
+        """Re-resolve one model's concurrency override and apply it live.
+
+        The effective cap is ``min(global, override)``; clearing the
+        override reverts the engine to the global cap. Not-loaded models
+        only store the override — the engine applies it at next load.
+        """
+        async with self._lock:
+            override = self._persisted_concurrency_override(model_id)
+            if override is not None and override <= 0:
+                raise ValueError("max concurrent requests must be > 0")
+            entry = self._entries.get(model_id)
+            if entry is None:
+                return
+            entry.max_concurrent_requests_override = override
+            if entry.engine is None:
+                return
+            self._apply_limits_to_entry(
+                entry, int(self._scheduler_config.max_num_seqs)
+            )
+
+    def _persisted_concurrency_override(self, model_id: str) -> int | None:
+        """Read the persisted per-model concurrency cap (None = unset)."""
+        if self._settings_manager is None:
+            return None
+        get_settings = getattr(self._settings_manager, "get_settings", None)
+        if get_settings is None:
+            return None
+        return coerce_max_concurrent_requests(
+            getattr(get_settings(model_id), "max_concurrent_requests", None)
+        )
+
+    def _reconcile_concurrency_override(self, entry: EngineEntry) -> None:
+        """Re-check persisted settings against the entry override after load.
+
+        The settings route skips live apply while ``entry.engine`` is None,
+        so a cap saved during a load would otherwise never reach the engine
+        that was just built from settings captured at load start. Called
+        under the pool lock (``get_engine`` holds it through ``_load_engine``;
+        the direct pinned-auto-reload caller runs while idle), so re-reading
+        persisted state here is safe. Junk values coerce to unset (inherit
+        global) or floor at 1 in ``_apply_limits_to_entry`` rather than
+        raising: this is a load-time backstop, not a user-facing validation
+        path. If persisted settings cannot be read, preserve the captured
+        override rather than treating the missing reader as an explicit clear.
+        """
+        if not callable(getattr(self._settings_manager, "get_settings", None)):
+            return
+        override = self._persisted_concurrency_override(entry.model_id)
+        if override == entry.max_concurrent_requests_override:
+            return
+        logger.info(
+            f"Reconciling concurrency override for {entry.model_id}: "
+            f"{entry.max_concurrent_requests_override} -> {override} "
+            "(settings changed while the model was loading)"
+        )
+        entry.max_concurrent_requests_override = override
+        self._apply_limits_to_entry(
+            entry, int(self._scheduler_config.max_num_seqs)
+        )
 
     def discover_models(
         self, model_dirs: str | list[str], pinned_models: list[str] | None = None
@@ -3315,6 +3411,9 @@ class EnginePool:
             model_settings = self._effective_deepseek_v41_model_settings(
                 entry, model_settings
             )
+            entry.max_concurrent_requests_override = coerce_max_concurrent_requests(
+                getattr(model_settings, "max_concurrent_requests", None)
+            )
             if getattr(model_settings, "qwen35_ane_prefill_enabled", False):
                 validate_ane_prefill(model_settings.to_dict(), entry.config_model_type)
 
@@ -3677,6 +3776,18 @@ class EnginePool:
 
             self._validate_llm_engine_ready(model_id, engine)
             entry.engine = engine
+            # A settings save may have landed while this load was in flight
+            # (the route defers live apply while the engine is absent). The
+            # engine was built from settings captured at load start, so
+            # re-check persisted settings and clamp the fresh engine now.
+            # Fail-soft: a healthy engine must not be failed by a settings
+            # read here; the un-applied cap stays persisted for next load.
+            try:
+                self._reconcile_concurrency_override(entry)
+            except Exception as exc:
+                logger.warning(
+                    f"Concurrency override reconciliation failed for {model_id}: {exc}"
+                )
             entry.last_access = time.time()
             self._current_model_memory += resident_size
             load_completed = True

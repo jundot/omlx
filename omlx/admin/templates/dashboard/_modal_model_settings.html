@@ -413,6 +413,19 @@
                                 </div>
                             </template>
 
+                            <!-- Per-model concurrency cap (llm/vlm) -->
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4"
+                                 x-show="!selectedModel?.model_type || selectedModel.model_type === 'llm' || selectedModel.model_type === 'vlm'">
+                                <div>
+                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.max_concurrent_requests') }}</label>
+                                    <input type="number" x-model.number="modelSettings.max_concurrent_requests"
+                                           placeholder="{{ t('modal.model_settings.placeholder_default') }}"
+                                           min="1" step="1"
+                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                                <p class="text-xs text-neutral-400 self-end pb-2.5">{{ t('modal.model_settings.max_concurrent_requests_hint') }}</p>
+                            </div>
+
                             <!-- TTL (all model types) -->
                             <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                                 <div>

@@ -109,6 +109,8 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "model_type_override",
         "active_profile_name",
         "ttl_seconds",
+        # Per-model governance cap; never propagate across models.
+        "max_concurrent_requests",
         # Hardware-specific residency choice; never propagate across models.
         "qwen4_ple_ssd_offload",
         "deepseek_v41_engram_ssd_offload",

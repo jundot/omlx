@@ -582,6 +582,26 @@ test('Template matching ignores nested dictionary ordering', () => {
     copy.settings.chat_template_kwargs.custom = 2;
     assert.equal(state.matchingProfileTemplate(copy), null);
 });
+
+test('Applying a preset preserves the concurrency cap through the save payload', async () => {
+    // Presets can never carry max_concurrent_requests (excluded from
+    // profiles), so applying one must not wipe the governance cap from
+    // the form or the PUT body.
+    let putBody;
+    const state = setup(async (url, options) => {
+        putBody = JSON.parse(options.body);
+        return {ok: true, json: async () => ({})};
+    });
+    state.loadModels = async () => {};
+    state.modelSettings.max_concurrent_requests = 1;
+    state.modelSettings.temperature = 0.5;
+    state.applyPresetToForm({name:'creative', settings:{temperature:0.7}});
+    assert.equal(state.modelSettings.temperature, 0.7);
+    assert.equal(state.modelSettings.max_concurrent_requests, 1);
+    await state.saveModelSettings();
+    assert.equal(putBody.temperature, 0.7);
+    assert.equal(putBody.max_concurrent_requests, 1);
+});
 """
     result = subprocess.run(
         [node, "-e", script],

@@ -4,6 +4,7 @@
 import json
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +12,7 @@ from omlx.model_settings import (
     SETTINGS_VERSION,
     ModelSettings,
     ModelSettingsManager,
+    apply_concurrency_override,
     resolve_qwen35_prefill_conflicts,
     resolve_vlm_mtp_conflicts,
 )
@@ -50,6 +52,55 @@ class TestModelSettings:
         assert d["is_favorite"] is True
         restored = ModelSettings.from_dict(d)
         assert restored.is_favorite is True
+
+    def test_max_concurrent_requests_roundtrip(self):
+        """max_concurrent_requests survives to_dict -> from_dict."""
+        original = ModelSettings(max_concurrent_requests=5)
+        d = original.to_dict()
+        assert d["max_concurrent_requests"] == 5
+        restored = ModelSettings.from_dict(d)
+        assert restored.max_concurrent_requests == 5
+
+    def test_max_concurrent_requests_default_none(self):
+        """Unset max_concurrent_requests means 'inherit the global cap'."""
+        assert ModelSettings().max_concurrent_requests is None
+        assert ModelSettings.from_dict({}).max_concurrent_requests is None
+
+    def test_apply_concurrency_override_below_global_clamps_to_override(self):
+        cfg = SimpleNamespace(max_num_seqs=8, completion_batch_size=8)
+        apply_concurrency_override(cfg, ModelSettings(max_concurrent_requests=3))
+        assert cfg.max_num_seqs == 3
+        assert cfg.completion_batch_size == 3
+
+    def test_apply_concurrency_override_above_global_clamps_to_global(self):
+        cfg = SimpleNamespace(max_num_seqs=8, completion_batch_size=8)
+        apply_concurrency_override(cfg, ModelSettings(max_concurrent_requests=16))
+        assert cfg.max_num_seqs == 8
+        assert cfg.completion_batch_size == 8
+
+    def test_apply_concurrency_override_none_is_noop(self):
+        cfg = SimpleNamespace(max_num_seqs=8, completion_batch_size=8)
+        apply_concurrency_override(cfg, ModelSettings())
+        apply_concurrency_override(cfg, None)
+        assert cfg.max_num_seqs == 8
+        assert cfg.completion_batch_size == 8
+
+    def test_apply_concurrency_override_non_numeric_inherits_global(self):
+        """Hand-edited junk in a persisted override must not break the
+        engine load: treat it as unset (inherit the global cap)."""
+        cfg = SimpleNamespace(max_num_seqs=8, completion_batch_size=8)
+        # from_dict does no coercion, so a corrupted store holds raw junk.
+        corrupted = ModelSettings.from_dict({"max_concurrent_requests": "five"})
+        apply_concurrency_override(cfg, corrupted)
+        assert cfg.max_num_seqs == 8
+        assert cfg.completion_batch_size == 8
+
+    def test_apply_concurrency_override_numeric_string_clamps(self):
+        cfg = SimpleNamespace(max_num_seqs=8, completion_batch_size=8)
+        corrupted = ModelSettings.from_dict({"max_concurrent_requests": "5"})
+        apply_concurrency_override(cfg, corrupted)
+        assert cfg.max_num_seqs == 5
+        assert cfg.completion_batch_size == 5
 
     def test_moe_expert_offload_defaults(self):
         """Expert offload is opt-in, at 25% residency."""
