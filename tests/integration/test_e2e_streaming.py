@@ -4677,7 +4677,8 @@ _RECOVERY_CALL = (
 
 
 async def _recovery_stream(
-    raw, api="chat", chunk_size=7, finish_reason="stop", closed=None, cancel=False
+    raw, api="chat", chunk_size=7, finish_reason="stop", closed=None, cancel=False,
+    completion_tokens=0, include_usage=False
 ):
     from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
 
@@ -4703,7 +4704,8 @@ async def _recovery_stream(
             )
             for i in range(0, len(raw), chunk_size)
         ]
-        + [MockGenerationOutput(text=raw, finished=True, finish_reason=finish_reason)]
+        + [MockGenerationOutput(text=raw, finished=True, finish_reason=finish_reason,
+                                completion_tokens=completion_tokens, cached_tokens=3)]
     )
     if closed is not None:
         original_stream = engine.stream_chat
@@ -4718,7 +4720,8 @@ async def _recovery_stream(
         engine.stream_chat = tracked_stream
     messages = [{"role": "user", "content": "Write hello"}]
     if api == "chat":
-        request = ChatCompletionRequest(model="test", messages=messages, stream=True)
+        request = ChatCompletionRequest(model="test", messages=messages, stream=True,
+                                        stream_options={"include_usage": include_usage})
         stream = stream_chat_completion(
             engine, messages, request, tools=_RECOVERY_TOOLS
         )
@@ -4884,12 +4887,13 @@ async def test_qwen_unrecoverable_sibling_is_not_success(api, valid_prefix, bad,
 
 
 @pytest.mark.asyncio
-async def test_qwen_length_does_not_repair_missing_envelope_close():
+async def test_qwen_length_discards_partial_call_without_server_error():
     events = await _recovery_stream(
         _RECOVERY_CALL.removesuffix("</tool_call>"), finish_reason="length"
     )
     assert not _recovery_calls(events, "chat")
-    assert events[-1]["error"]["code"] == "incomplete_tool_call"
+    assert not any("error" in event for event in events)
+    assert [c["finish_reason"] for e in events for c in e.get("choices", []) if c.get("finish_reason")] == ["length"]
 
 
 @pytest.mark.asyncio
@@ -5652,3 +5656,86 @@ async def test_responses_stream_reports_resolved_sampling():
     for name in ("response.created", "response.completed"):
         response = next(e["response"] for e in events if e["type"] == name)
         assert (response["temperature"], response["top_p"]) == (0.2, 0.5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+@pytest.mark.parametrize("chunk_size", [1, 7])
+@pytest.mark.parametrize("prefix", ["", _RECOVERY_CALL, _RECOVERY_CALL * 2])
+async def test_tool_length_retains_complete_calls_and_usage_without_partial_arguments(
+    monkeypatch, api, chunk_size, prefix
+):
+    from types import SimpleNamespace
+    import omlx.server as server
+    metrics = []
+    monkeypatch.setattr(server, "get_server_metrics", lambda: SimpleNamespace(
+        record_request_complete=lambda **kw: metrics.append(kw)))
+    partial = '<tool_call><function=write><parameter=content>PRIVATE_PARTIAL_BODY'
+    events = await _recovery_stream(prefix + partial, api, chunk_size,
+                                    finish_reason="length", completion_tokens=32768,
+                                    include_usage=True)
+    assert len(_recovery_calls(events, api)) == len(prefix) // len(_RECOVERY_CALL)
+    assert "PRIVATE_PARTIAL_BODY" not in json.dumps(events)
+    assert not any("error" in event for event in events)
+    assert len(metrics) == 1
+    assert metrics[0]["completion_tokens"] == 32768
+    assert metrics[0]["prompt_tokens"] == 10
+    assert metrics[0]["cached_tokens"] == 3
+    if api == "chat":
+        assert [c["finish_reason"] for e in events for c in e.get("choices", []) if c.get("finish_reason")] == ["length"]
+        assert events[-1]["usage"]["completion_tokens"] == 32768
+    elif api == "anthropic":
+        end = next(e for e in events if e.get("type") == "message_delta")
+        assert end["delta"]["stop_reason"] == "max_tokens"
+        assert end["usage"]["output_tokens"] == 32768
+    else:
+        assert events[-1]["type"] == "response.incomplete"
+        assert events[-1]["response"]["incomplete_details"] == {"reason": "max_output_tokens"}
+        assert events[-1]["response"]["usage"]["output_tokens"] == 32768
+
+
+@pytest.mark.parametrize("api", ["chat/completions", "messages", "responses"])
+@pytest.mark.parametrize("prefix", ["", _RECOVERY_CALL])
+@pytest.mark.parametrize("response_format", [False, True])
+def test_nonstream_tool_length_suppresses_partial_and_retains_usage(monkeypatch, api, prefix, response_format):
+    from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+    from omlx.server import _server_state
+    partial = '<tool_call><function=write><parameter=content>PRIVATE_PARTIAL_BODY'
+    client = _responses_tool_call_client(monkeypatch, prefix + partial)
+    engine = _server_state.engine_pool._engine
+    engine.tokenizer.has_tool_calling = True
+    engine.tokenizer.tool_call_start = "<tool_call>"
+    engine.tokenizer.tool_call_end = "</tool_call>"
+    engine.tokenizer.tool_parser = parse_tool_call
+    output = engine.generate.return_value
+    output.finish_reason = "length"
+    output.completion_tokens = 32768
+    body = {"model": "test-model", "stream": False, "max_tokens": 32768}
+    if api == "responses":
+        body.pop("max_tokens")
+        body.update(input="Write", max_output_tokens=32768, store=False,
+                    tools=[{"type":"function", **_RECOVERY_TOOLS[0]["function"]}])
+    else:
+        body["messages"] = [{"role":"user", "content":"Write"}]
+        body["tools"] = ([{"name":"write", "input_schema":_RECOVERY_TOOLS[0]["function"]["parameters"]}]
+                         if api == "messages" else _RECOVERY_TOOLS)
+    if response_format and api == "chat/completions":
+        body["response_format"] = {"type": "json_object"}
+    elif response_format and api == "responses":
+        body["text"] = {"format": {"type": "json_object"}}
+    response = client.post('/v1/' + api, json=body)
+    assert response.status_code == 200, response.text
+    assert "PRIVATE_PARTIAL_BODY" not in response.text
+    data = response.json()
+    if api == "chat/completions":
+        assert data["choices"][0]["finish_reason"] == "length"
+        assert len(data["choices"][0]["message"].get("tool_calls") or []) == bool(prefix)
+        assert data["usage"]["completion_tokens"] == 32768
+    elif api == "messages":
+        assert data["stop_reason"] == "max_tokens"
+        assert len([c for c in data["content"] if c["type"] == "tool_use"]) == bool(prefix)
+        assert data["usage"]["output_tokens"] == 32768
+    else:
+        assert data["status"] == "incomplete"
+        assert len([c for c in data["output"] if c["type"] == "function_call"]) == bool(prefix)
+        assert data["usage"]["output_tokens"] == 32768

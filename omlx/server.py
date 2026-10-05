@@ -5248,6 +5248,7 @@ async def create_chat_completion(
             )
 
             # Protocol parsers can return structured tool_calls directly.
+            tool_truncated = False
             if output.tool_calls:
                 tool_calls = _convert_parser_tool_calls(output.tool_calls)
                 cleaned_text = regular_content
@@ -5261,6 +5262,9 @@ async def create_chat_completion(
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
+                tool_truncated = _is_length_tool_truncation(
+                    extraction, output.finish_reason
+                )
                 recovered = _nonstream_recovery_text(
                     extraction,
                     regular_content,
@@ -5270,12 +5274,13 @@ async def create_chat_completion(
                 )
                 if recovered is not None:
                     cleaned_text = recovered
-                elif failure := _tool_call_failure(extraction):
+                    tool_truncated = False
+                elif failure := _tool_call_failure(extraction, output.finish_reason):
                     raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
             # Process response_format if specified
-            if response_format and not tool_calls:
+            if response_format and not tool_calls and not tool_truncated:
                 cleaned_text, _, is_valid, error = parse_json_output(
                     cleaned_text or regular_content, response_format
                 )
@@ -5293,7 +5298,11 @@ async def create_chat_completion(
                         except (json.JSONDecodeError, AttributeError):
                             pass
 
-            finish_reason = "tool_calls" if tool_calls else output.finish_reason
+            finish_reason = (
+                "length"
+                if output.finish_reason == "length"
+                else "tool_calls" if tool_calls else output.finish_reason
+            )
             reasoning_token_count = (
                 len(engine.tokenizer.encode(cleaned_thinking))
                 if cleaned_thinking
@@ -6177,9 +6186,27 @@ class _ToolCallGenerationError(HTTPException):
         self.code = error["code"]
 
 
-def _tool_call_failure(extraction: ToolCallExtraction) -> dict | None:
+def _is_length_tool_truncation(extraction, finish_reason):
+    return (
+        finish_reason == "length"
+        and bool(extraction.parse_errors)
+        and all(error == "incomplete" for error in extraction.parse_errors)
+    )
+
+
+def _tool_call_failure(
+    extraction: ToolCallExtraction, finish_reason: str | None = None
+) -> dict | None:
     failed = extraction.parse_errors
     if not failed:
+        return None
+    # A length stop is an expected budget boundary, not invalid completed syntax.
+    # The parser has already excluded the unfinished envelope and retained only
+    # complete siblings. Never repair partial arguments or replay earlier calls.
+    if _is_length_tool_truncation(extraction, finish_reason):
+        logger.warning(
+            "Output limit discarded %d incomplete tool envelope(s)", len(failed)
+        )
         return None
     code = "incomplete_tool_call" if "incomplete" in failed else "invalid_tool_call"
     message = (
@@ -6705,6 +6732,7 @@ async def stream_chat_completion(
     tool_calls = None
     tool_failure = None
     parse_errors: tuple = ()
+    tool_truncated = False
     cleaned_text = accumulated_text
     terminal_tool_calls_authoritative = bool(last_output and last_output.tool_calls)
     if last_output and last_output.tool_calls:
@@ -6728,10 +6756,15 @@ async def stream_chat_completion(
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
         parse_errors = extraction.parse_errors
-        tool_failure = _tool_call_failure(extraction)
+        tool_failure = _tool_call_failure(
+            extraction, last_output.finish_reason if last_output else None
+        )
+        tool_truncated = _is_length_tool_truncation(
+            extraction, last_output.finish_reason if last_output else None
+        )
         cleaned_thinking = extraction.cleaned_thinking
         # Process response_format if specified
-        if request.response_format and not tool_calls:
+        if request.response_format and not tool_calls and not tool_truncated:
             cleaned_text, _, is_valid, error = parse_json_output(
                 cleaned_text, request.response_format
             )
@@ -6780,7 +6813,8 @@ async def stream_chat_completion(
     if recovered_thinking or recovered_content:
         # The marker was quoted in prose, so this is not a failed tool call.
         tool_failure = None
-    if not tool_calls and not tool_failure:
+        tool_truncated = False
+    if not tool_calls and not tool_failure and not tool_truncated:
         if recovered_thinking:
             accumulated_reasoning += recovered_thinking
             chunk = ChatCompletionChunk(
@@ -6892,9 +6926,13 @@ async def stream_chat_completion(
 
     # Final chunk with finish_reason
     finish_reason = (
-        "tool_calls"
-        if tool_calls
-        else (last_output.finish_reason if last_output else "stop")
+        "length"
+        if last_output and last_output.finish_reason == "length"
+        else (
+            "tool_calls"
+            if tool_calls
+            else (last_output.finish_reason if last_output else "stop")
+        )
     )
     final_chunk = ChatCompletionChunk(
         id=response_id,
@@ -7316,6 +7354,7 @@ async def stream_anthropic_messages(
     tool_calls = None
     tool_failure = None
     parse_errors: tuple = ()
+    tool_truncated = False
     if last_output and last_output.tool_calls:
         # Protocol parser already extracted structured tool calls.
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
@@ -7335,7 +7374,12 @@ async def stream_anthropic_messages(
         )
         tool_calls = extraction.tool_calls
         parse_errors = extraction.parse_errors
-        tool_failure = _tool_call_failure(extraction)
+        tool_failure = _tool_call_failure(
+            extraction, last_output.finish_reason if last_output else None
+        )
+        tool_truncated = _is_length_tool_truncation(
+            extraction, last_output.finish_reason if last_output else None
+        )
 
     recovered_thinking, recovered_content = _take_recoverable_withheld_text(
         tool_filter, thinking_filter, tool_calls, parse_errors
@@ -7343,7 +7387,8 @@ async def stream_anthropic_messages(
     if recovered_thinking or recovered_content:
         # The marker was quoted in prose, so this is not a failed tool call.
         tool_failure = None
-    if not tool_calls and not tool_failure:
+        tool_truncated = False
+    if not tool_calls and not tool_failure and not tool_truncated:
         if recovered_thinking:
             if text_block_started:
                 yield create_content_block_stop_event(index=block_index)
@@ -7870,6 +7915,7 @@ async def create_anthropic_message(
             )
 
             # Protocol parsers can return structured tool_calls directly.
+            tool_truncated = False
             if output.tool_calls:
                 tool_calls = _convert_parser_tool_calls(output.tool_calls)
                 cleaned_text = regular_content
@@ -7883,6 +7929,9 @@ async def create_anthropic_message(
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
+                tool_truncated = _is_length_tool_truncation(
+                    extraction, output.finish_reason
+                )
                 recovered = _nonstream_recovery_text(
                     extraction,
                     regular_content,
@@ -7892,7 +7941,8 @@ async def create_anthropic_message(
                 )
                 if recovered is not None:
                     cleaned_text = recovered
-                elif failure := _tool_call_failure(extraction):
+                    tool_truncated = False
+                elif failure := _tool_call_failure(extraction, output.finish_reason):
                     raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
@@ -8647,6 +8697,7 @@ async def create_response(
             )
 
             # Parse tool calls
+            tool_truncated = False
             if output.tool_calls:
                 tool_calls = _convert_parser_tool_calls(output.tool_calls)
                 cleaned_text = regular_content
@@ -8663,6 +8714,9 @@ async def create_response(
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
+                tool_truncated = _is_length_tool_truncation(
+                    extraction, output.finish_reason
+                )
                 recovered = _nonstream_recovery_text(
                     extraction,
                     regular_content,
@@ -8672,7 +8726,8 @@ async def create_response(
                 )
                 if recovered is not None:
                     cleaned_text = recovered
-                elif failure := _tool_call_failure(extraction):
+                    tool_truncated = False
+                elif failure := _tool_call_failure(extraction, output.finish_reason):
                     raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
@@ -8689,7 +8744,7 @@ async def create_response(
                             pass
 
             # Process response_format if specified
-            if response_format and not tool_calls:
+            if response_format and not tool_calls and not tool_truncated:
                 cleaned_text, _, is_valid, error = parse_json_output(
                     cleaned_text or regular_content, response_format
                 )
@@ -9201,6 +9256,7 @@ async def stream_responses_api(
     tool_calls = None
     tool_failure = None
     parse_errors: tuple = ()
+    tool_truncated = False
     cleaned_text = accumulated_text
     if last_output and last_output.tool_calls:
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
@@ -9220,7 +9276,12 @@ async def stream_responses_api(
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
         parse_errors = extraction.parse_errors
-        tool_failure = _tool_call_failure(extraction)
+        tool_failure = _tool_call_failure(
+            extraction, last_output.finish_reason if last_output else None
+        )
+        tool_truncated = _is_length_tool_truncation(
+            extraction, last_output.finish_reason if last_output else None
+        )
         if not stream_content:
             cleaned_thinking = (extraction.cleaned_thinking or "").strip()
             for ev in _emit_reasoning_delta(cleaned_thinking):
@@ -9258,11 +9319,12 @@ async def stream_responses_api(
     if recovered_thinking or recovered_content:
         # The marker was quoted in prose, so this is not a failed tool call.
         tool_failure = None
+        tool_truncated = False
     if recovered_content:
         # The parser strips the prose before the marker, so rebuild the final
         # text from the raw answer to match the streamed deltas.
         cleaned_text = clean_special_tokens(regular_content)
-    if not tool_calls and not tool_failure:
+    if not tool_calls and not tool_failure and not tool_truncated:
         for ev in _emit_reasoning_delta(recovered_thinking):
             yield ev
         if recovered_content:
