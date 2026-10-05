@@ -408,6 +408,10 @@ class ThinkingBudgetProcessor:
         think_end_token_ids: Token ID(s) for the close-think tag.
         budget: Maximum number of thinking tokens before forcing close.
         think_start_token_id: Token ID for the open-think tag (re-entry detection).
+        start_in_thinking: The prompt already opened the thinking block. When
+            False, counting starts only once the model opens it itself.
+        think_start_token_ids: Multi-token open-think sequence (e.g. Gemma 4's
+            ``<|channel>thought``), used instead of ``think_start_token_id``.
     """
 
     def __init__(
@@ -418,6 +422,8 @@ class ThinkingBudgetProcessor:
         leading_token_ids: Optional[List[int]] = None,
         trailing_token_ids: Optional[List[int]] = None,
         token_to_piece: Optional[Callable[[int], str | bytes | None]] = None,
+        start_in_thinking: bool = True,
+        think_start_token_ids: Optional[List[int]] = None,
     ):
         self._think_end_ids = think_end_token_ids
         # Full force sequence: \n + </think> + \n\n (matches training pattern)
@@ -427,12 +433,17 @@ class ThinkingBudgetProcessor:
             + (trailing_token_ids or [])
         )
         self._budget = budget
-        self._think_start_id = think_start_token_id
+        if think_start_token_ids:
+            self._think_start_ids = list(think_start_token_ids)
+        elif think_start_token_id is not None:
+            self._think_start_ids = [think_start_token_id]
+        else:
+            self._think_start_ids = []
         self._token_to_piece = token_to_piece
 
         # State
         self._thinking_tokens: int = 0
-        self._in_thinking: bool = True  # Starts True (prompt ends with <think>)
+        self._in_thinking: bool = start_in_thinking
         self._forcing: bool = False
         self._waiting_utf8: bool = False
         self._force_idx: int = 0
@@ -440,6 +451,7 @@ class ThinkingBudgetProcessor:
         self._first_call: bool = True
         # Sliding window for multi-token end detection
         self._recent_tokens: List[int] = []
+        self._recent_start_tokens: List[int] = []
         self._last_token_utf8_complete: bool = True
         self._pending_utf8: bytes = b""
 
@@ -483,13 +495,18 @@ class ThinkingBudgetProcessor:
     def _update_state(self, token_id: int) -> None:
         """Update thinking state based on the last generated token."""
         self._last_token_utf8_complete = self._is_utf8_complete(token_id)
+        # Slide the open-sequence window for every accepted token, so it
+        # never holds stale tokens from a branch that returned early below
+        # (that would let unrelated tokens complete a false open sequence).
+        self._push_start_window(token_id)
 
         if self._done:
-            if self._think_start_id and token_id == self._think_start_id:
+            if self._opens_thinking():
                 self._in_thinking = True
                 self._done = False
                 self._thinking_tokens = 0
                 self._recent_tokens = []
+                self._recent_start_tokens = []
             return
 
         if self._forcing:
@@ -505,6 +522,9 @@ class ThinkingBudgetProcessor:
             if token_id == self._think_end_ids[0]:
                 self._in_thinking = False
                 self._done = True
+                # The close marker itself must not seed a false re-entry
+                # match on the tokens that follow it.
+                self._recent_start_tokens = []
                 return
         else:
             self._recent_tokens.append(token_id)
@@ -513,6 +533,7 @@ class ThinkingBudgetProcessor:
             if self._recent_tokens == self._think_end_ids:
                 self._in_thinking = False
                 self._done = True
+                self._recent_start_tokens = []
                 return
 
         if self._waiting_utf8:
@@ -523,12 +544,28 @@ class ThinkingBudgetProcessor:
                 self._recent_tokens = []
             return
 
-        # Detect re-entry into thinking (rare but possible)
-        if not self._in_thinking and self._think_start_id and token_id == self._think_start_id:
+        # Detect the model opening thinking (or re-entry, rare but possible).
+        # A reopened block gets a fresh budget, matching <think>-style models.
+        if not self._in_thinking and self._opens_thinking():
             self._in_thinking = True
             self._done = False
             self._thinking_tokens = 0
             self._recent_tokens = []
+            self._recent_start_tokens = []
+
+    def _push_start_window(self, token_id: int) -> None:
+        """Slide the open-sequence detection window by one token."""
+        if not self._think_start_ids:
+            return
+        self._recent_start_tokens.append(token_id)
+        if len(self._recent_start_tokens) > len(self._think_start_ids):
+            self._recent_start_tokens.pop(0)
+
+    def _opens_thinking(self) -> bool:
+        """Whether the current window matches the open-think sequence."""
+        if not self._think_start_ids:
+            return False
+        return self._recent_start_tokens == self._think_start_ids
 
     def _is_utf8_complete(self, token_id: int) -> bool:
         """Best-effort UTF-8 boundary check for accepted token bytes."""
@@ -582,6 +619,7 @@ class ThinkingBudgetProcessor:
         "_done",
         "_first_call",
         "_recent_tokens",
+        "_recent_start_tokens",
         "_last_token_utf8_complete",
         "_pending_utf8",
         "_accepted_up_to",
