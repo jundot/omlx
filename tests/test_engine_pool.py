@@ -26,6 +26,7 @@ from omlx.exceptions import (
     ModelTooLargeError,
     ModelUnavailableError,
 )
+from omlx.model_settings import ModelSettings
 from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
     Qwen4ExpResidencyEstimate,
 )
@@ -46,30 +47,6 @@ def _make_pool(ceiling: int | None = None, **kwargs) -> EnginePool:
     else:
         pool._get_final_ceiling = lambda c=int(ceiling): c
     return pool
-
-
-@pytest.fixture
-def mock_model_dir(tmp_path):
-    """Create a mock model directory with multiple models."""
-    # Create model-a (1GB)
-    model_a = tmp_path / "model-a"
-    model_a.mkdir()
-    (model_a / "config.json").write_text(json.dumps({"model_type": "llama"}))
-    (model_a / "model.safetensors").write_bytes(b"0" * (1024 * 1024 * 1024))  # 1GB
-
-    # Create model-b (2GB)
-    model_b = tmp_path / "model-b"
-    model_b.mkdir()
-    (model_b / "config.json").write_text(json.dumps({"model_type": "qwen"}))
-    (model_b / "model.safetensors").write_bytes(b"0" * (2 * 1024 * 1024 * 1024))  # 2GB
-
-    # Create model-c (500MB MLLM)
-    model_c = tmp_path / "model-c"
-    model_c.mkdir()
-    (model_c / "config.json").write_text(json.dumps({"vision_config": {}}))
-    (model_c / "model.safetensors").write_bytes(b"0" * (512 * 1024 * 1024))  # 500MB
-
-    return tmp_path
 
 
 @pytest.fixture
@@ -1657,6 +1634,26 @@ class TestEnginePoolAsync:
         )
 
     @pytest.mark.asyncio
+    async def test_dflash_bare_draft_name_resolves_to_local_path(
+        self, pool_with_mock_engines
+    ):
+        pool = pool_with_mock_engines
+        engine = MagicMock()
+        engine.start = AsyncMock()
+
+        with patch("omlx.engine.dflash.DFlashEngine", return_value=engine) as load:
+            await pool.get_engine(
+                "model-a",
+                runtime_settings=ModelSettings(
+                    dflash_enabled=True, dflash_draft_model="model-b"
+                ),
+            )
+
+        assert load.call_args.kwargs["draft_model_path"] == (
+            pool.get_entry("model-b").model_path
+        )
+
+    @pytest.mark.asyncio
     async def test_runtime_settings_reload_rejected_while_leased(
         self, pool_with_mock_engines
     ):
@@ -2750,6 +2747,93 @@ class TestEnginePoolPrefillEviction:
 
         assert evicted is False
         pool._unload_engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("case", "reason", "phys_gb", "pool_gb", "releases", "unloaded_expected"),
+        [
+            ("held", "prefill_preflight", 50, 0, True, []),
+            ("route", "prefill_preflight", 50, 0, False, ["idle-a"]),
+            ("throttle", "adaptive_prefill_throttle", 50, 0, False, ["idle-a"]),
+            ("pool", "prefill_preflight", 48, 8, False, []),
+        ],
+    )
+    async def test_prefill_eviction_hot_cache_rung(
+        self, case, reason, phys_gb, pool_gb, releases, unloaded_expected
+    ):
+        """Hot cache gives way before idle models, but only after the free
+        pool and only when the request would otherwise be rejected and its
+        prefix blocks are protected (#4213)."""
+        gb = 1024**3
+        hot = [10 * gb]
+        phys = [phys_gb * gb]
+        pool = [pool_gb * gb]
+
+        async def release(reserved_bytes):
+            hot[0] -= 6 * gb
+            phys[0] -= 6 * gb
+            return 6 * gb
+
+        def reclaim():
+            phys[0] -= pool[0]
+            pool[0] = 0
+
+        class _Budget:
+            @property
+            def total_bytes(self):
+                return hot[0]
+
+        scheduler = self._reclaim_scheduler(reclaim)
+        scheduler.requests = {} if case == "route" else {"req-1": object()}
+        scheduler._hot_cache_limit_factor = MagicMock(return_value=0.9)
+        scheduler._prefill_speed_priority = False
+        release_mock = AsyncMock(side_effect=release)
+        unloaded = []
+
+        async def fake_unload(model_id):
+            unloaded.append(model_id)
+            pool_obj._entries[model_id].engine = None
+            phys[0] -= 20 * gb
+
+        req = PrefillEvictionRequest(
+            request_id="req-1",
+            model_id="target",
+            current_bytes=40 * gb,
+            target_cap_bytes=45 * gb,
+            predicted_transient_bytes=10 * gb,
+            requested_tokens=2048,
+            reason=reason,
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            pool_obj = _make_pool(ceiling=0)
+            pool_obj._entries = {
+                "idle-a": self._entry("idle-a", 20 * gb),
+                "target": self._entry(
+                    "target", 25 * gb, scheduler=scheduler, executor=executor
+                ),
+            }
+            pool_obj._current_model_memory = 30 * gb
+            pool_obj._scheduler_config.hot_cache_budget = _Budget()
+            pool_obj._process_memory_enforcer = SimpleNamespace(
+                release_hot_cache_for_prefill=release_mock
+            )
+            pool_obj._unload_engine = fake_unload
+            with (
+                patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+                patch(
+                    "omlx.engine_pool.mx.get_cache_memory", side_effect=lambda: pool[0]
+                ),
+                patch("omlx.engine_pool.get_phys_footprint", side_effect=lambda: phys[0]),
+            ):
+                admitted = await pool_obj._evict_idle_lru_for_prefill("target", req)
+
+        assert admitted is True
+        if releases:
+            # Usage is 50 - 10 hot = 40GB, 5GB short of the 45GB target.
+            release_mock.assert_awaited_once_with(int(5 * gb / 0.9) + 1)
+        else:
+            release_mock.assert_not_awaited()
+        assert unloaded == unloaded_expected
 
     @pytest.mark.asyncio
     async def test_prefill_reclaims_pooled_buffers_when_no_idle_victim(self):

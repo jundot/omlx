@@ -1149,3 +1149,56 @@ def test_responses_reasoning_cache_policy(
         )
     assert response.status_code == 418, response.text
     assert engine.preflight_chat.call_args.kwargs["preserve_reasoning"] is expected
+
+
+@pytest.mark.parametrize(
+    "model_type, thinking_type, expected",
+    [
+        (
+            "minimax_m3",
+            "adaptive",
+            {"enable_thinking": True, "thinking_mode": "adaptive"},
+        ),
+        ("minimax_m3", "enabled", {"enable_thinking": True}),
+        ("qwen3_5", "adaptive", {"enable_thinking": True}),
+    ],
+)
+def test_anthropic_adaptive_thinking_reaches_minimax_m3_template(
+    monkeypatch, model_type, thinking_type, expected
+):
+    engine = MagicMock()
+    engine.model_type = model_type
+    engine.is_diffusion_model = False
+    engine.tokenizer = None
+    engine.preflight_chat = AsyncMock(
+        side_effect=HTTPException(status_code=418, detail="Kwargs captured")
+    )
+    engine.start = AsyncMock()
+    engine.count_chat_tokens.return_value = 128
+    pool = MagicMock()
+    pool.preload_pinned_models = AsyncMock()
+    pool.check_ttl_expirations = AsyncMock()
+    pool.shutdown = AsyncMock()
+    pool.get_entry.return_value = SimpleNamespace(
+        config_model_type=model_type, preserve_thinking_default=None
+    )
+    monkeypatch.setattr(srv._server_state, "engine_pool", pool)
+    monkeypatch.setattr(srv, "get_engine_for_model", AsyncMock(return_value=engine))
+    monkeypatch.setattr(srv, "resolve_model_id", lambda name: name)
+    monkeypatch.setattr(srv, "validate_context_window", lambda *a, **k: None)
+    monkeypatch.setattr(srv, "get_model_settings_for_request", lambda name: None)
+    monkeypatch.setitem(
+        srv.app.dependency_overrides, srv.verify_inference_api_key, lambda: True
+    )
+    with TestClient(srv.app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "test-model",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "thinking": {"type": thinking_type},
+            },
+        )
+    assert response.status_code == 418, response.text
+    assert engine.preflight_chat.call_args.kwargs["chat_template_kwargs"] == expected

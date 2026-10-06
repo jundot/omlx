@@ -31,7 +31,14 @@ import requests
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
@@ -287,6 +294,14 @@ class CacheProbeRequest(BaseModel):
     thinking_budget: int | None = None
 
 
+def _draft_path_is_unusable(value: str) -> bool:
+    path = Path(value).expanduser()
+    # Match local references without resolving or downloading HF repo IDs.
+    return (
+        path.is_absolute() or value.startswith(("./", "../")) or path.exists()
+    ) and not (path / "config.json").is_file()
+
+
 class ModelSettingsRequest(BaseModel):
     """Request model for updating per-model settings."""
 
@@ -431,14 +446,11 @@ class ModelSettingsRequest(BaseModel):
         "specprefill_draft_model", "dflash_draft_model", "vlm_mtp_draft_model"
     )
     @classmethod
-    def validate_draft_path(cls, value: str | None) -> str | None:
+    def validate_draft_path(cls, value: str | None, info: ValidationInfo) -> str | None:
         if not value:
             return None
-        path = Path(value).expanduser()
-        # Match local references without resolving or downloading HF repo IDs.
-        if (
-            path.is_absolute() or value.startswith(("./", "../")) or path.exists()
-        ) and not (path / "config.json").is_file():
+        # A DFlash draft may stay parked while DFlash is off; the route checks it.
+        if info.field_name != "dflash_draft_model" and _draft_path_is_unusable(value):
             raise ValueError(f"Draft model has no config.json: {value}")
         return value
 
@@ -1580,6 +1592,15 @@ _ms_downloader = None
 _oq_manager = None
 _hf_uploader = None
 
+# One save at a time: _save_data writes through a pid-named temp file.
+_settings_save_lock = asyncio.Lock()
+
+
+async def _save_global_settings_async(global_settings) -> None:
+    """Persist global settings off the event loop, serialized."""
+    async with _settings_save_lock:
+        await asyncio.to_thread(global_settings.save)
+
 
 def set_admin_getters(
     state_getter,
@@ -2017,7 +2038,7 @@ async def setup_api_key(
 
     # Persist to file
     try:
-        global_settings.save()
+        await _save_global_settings_async(global_settings)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
 
@@ -2139,7 +2160,7 @@ async def create_sub_key(
     global_settings.auth.sub_keys.append(entry)
 
     try:
-        global_settings.save()
+        await _save_global_settings_async(global_settings)
     except Exception as e:
         # Rollback
         global_settings.auth.sub_keys.pop()
@@ -2173,7 +2194,7 @@ async def delete_sub_key(
         if sk.key and compare_keys(request.key, sk.key):
             removed = global_settings.auth.sub_keys.pop(i)
             try:
-                global_settings.save()
+                await _save_global_settings_async(global_settings)
             except Exception as e:
                 global_settings.auth.sub_keys.insert(i, removed)
                 raise HTTPException(
@@ -3178,6 +3199,16 @@ async def update_model_settings(
         )
     if "dflash_verify_mode" in sent:
         current_settings.dflash_verify_mode = request.dflash_verify_mode
+    draft_model = current_settings.dflash_draft_model
+    if (
+        ("dflash_enabled" in sent or "dflash_draft_model" in sent)
+        and current_settings.dflash_enabled
+        and draft_model
+        and _draft_path_is_unusable(draft_model)
+    ):
+        raise HTTPException(
+            status_code=422, detail=f"Draft model has no config.json: {draft_model}"
+        )
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:
@@ -5789,7 +5820,7 @@ async def update_global_settings(
 
     # Persist to file
     try:
-        global_settings.save()
+        await _save_global_settings_async(global_settings)
     except Exception as e:
         if previous_embedding_batch_size is not None:
             global_settings.scheduler.embedding_batch_size = (
@@ -5957,7 +5988,7 @@ async def get_logs(
     log_dir = global_settings.logging.get_log_dir(global_settings.base_path)
 
     # Get available log files
-    available_files = _get_available_log_files(log_dir)
+    available_files = await asyncio.to_thread(_get_available_log_files, log_dir)
 
     # Determine which file to read
     if file:
@@ -5973,7 +6004,7 @@ async def get_logs(
 
     # Read log content
     if log_file.exists():
-        content, total_lines = _tail_file(log_file, lines)
+        content, total_lines = await asyncio.to_thread(_tail_file, log_file, lines)
     else:
         content = ""
         total_lines = 0
@@ -6003,6 +6034,7 @@ def _get_engine_info() -> dict:
 
     engines = {}
     packages = {
+        "mlx": "https://github.com/ml-explore/mlx",
         "mlx-lm": "https://github.com/ml-explore/mlx-lm",
         "mlx-vlm": "https://github.com/Blaizzy/mlx-vlm",
         "mlx-embeddings": "https://github.com/Blaizzy/mlx-embeddings",

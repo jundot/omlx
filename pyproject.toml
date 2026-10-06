@@ -31,7 +31,6 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -224,7 +223,7 @@ dev = [
     # in the dev environment so the test actually runs.
     #
     # Held at 0.2.3: xgrammar 0.2.4/0.2.5 cap transformers at <5,
-    # which conflicts with our transformers>=5.12.1 pin and makes
+    # which conflicts with our transformers>=5.14 pin and makes
     # pip/uv dev installs unresolvable (#2289). Bump again once
     # upstream lifts the cap.
     "xgrammar==0.2.3",
@@ -275,6 +274,7 @@ include = ["omlx*"]
 "omlx.custom_kernels.decode_fast" = ["*.metallib", "*.dylib", "*.so"]
 "omlx.custom_kernels.minimax_m3" = ["*.metallib", "*.dylib", "*.so"]
 "omlx.custom_kernels.qwen35_prefill" = ["*.metallib", "*.dylib", "*.so"]
+"omlx.custom_kernels.bonsai" = ["*.metallib", "*.dylib", "*.so"]
 
 [tool.uv]
 # mlx and mlx-lm are git-pinned; override transitive pins
@@ -286,7 +286,7 @@ override-dependencies = [
 
 [tool.black]
 line-length = 88
-target-version = ["py310", "py311", "py312", "py313"]
+target-version = ["py311", "py312", "py313"]
 
 [tool.ruff]
 line-length = 88
@@ -297,7 +297,7 @@ ignore = ["E501", "B905"]
 extend-exclude = ["omlx/patches/*/vendor"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true

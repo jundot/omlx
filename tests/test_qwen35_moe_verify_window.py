@@ -205,6 +205,20 @@ def test_window_rows_equal_one_token_decode(seed, topk_fold, engaged):
     _check(block, _inputs(3, 1, batch=2), engaged)
 
 
+@pytest.mark.parametrize("rows", [2, 5, 8])
+def test_batched_decode_rows_equal_one_token_decode(rows, engaged):
+    """Several requests' one-token decode ([B, 1, hidden], not a verify
+    window) runs the window launches: every row equals its own fused
+    one-token call bit for bit."""
+    block = _block(0)
+    x = _inputs(rows, 0).reshape(rows, 1, HIDDEN)
+    count = len(engaged)
+    got = block(x)
+    ref = _serial(block, x)
+    assert engaged[count:] == [True]
+    assert _same_bits(got, ref.reshape(got.shape))
+
+
 def test_four_bit_window_rows_equal_one_token_decode(engaged):
     block = _block(2, bits=4)
     for rows in (2, 3, 4, 8):
@@ -263,12 +277,15 @@ def _quantized(shape, group_size, bits):
     return mx.quantize(mx.random.normal(shape) * 0.05, group_size, bits)
 
 
+@pytest.mark.parametrize("window_rps,token_rps", [(4, 4), (4, 2)])
 @pytest.mark.parametrize("bits", [4, 5])
-def test_fp32_window_kernels_equal_one_token_kernels(bits):
+def test_fp32_window_kernels_equal_one_token_kernels(bits, window_rps, token_rps):
     """BF16 outputs hide one-ulp FP32 differences: run the window launches
     and the one-token launches in FP32 (the one-token ones equal MLX's FP32
     mat-vecs, see test_qwen35_moe_routed_decode) and compare row by row. The
-    rows share experts at different slots and read the last experts."""
+    rows share experts at different slots and read the last experts. The
+    down launches group rows per simdgroup as served (``_down_rows``): a
+    verify window must equal one-token decode under either grouping."""
     f32, top_k, experts, rows = mx.float32, routed.TOP_K, 64, 4
     mx.random.seed(60 + bits)
     fmt = routed._Format
@@ -304,12 +321,12 @@ def test_fp32_window_kernels_equal_one_token_kernels(bits):
         output_dtypes=[f32],
     )[0]
     down_template = [
-        ("T", f32), ("K", INTER), ("N", HIDDEN), ("RPS", 4), ("KS", INTER), ("NPART", top_k + 1),
+        ("T", f32), ("K", INTER), ("N", HIDDEN), ("KS", INTER), ("NPART", top_k + 1),
     ]
     y = routed._down_window_kernel(routed_d, shared_d)(
         inputs=[h, *experts_down, *shared_down, ids, scores],
-        template=down_template + [("M", rows)],
-        grid=(32, (top_k + 1) * HIDDEN // 4 * rows, 1),
+        template=down_template + [("RPS", window_rps), ("M", rows)],
+        grid=(32, (top_k + 1) * HIDDEN // window_rps * rows, 1),
         threadgroup=(32, top_k + 1, 1),
         output_shapes=[(rows, HIDDEN)],
         output_dtypes=[f32],
@@ -325,8 +342,8 @@ def test_fp32_window_kernels_equal_one_token_kernels(bits):
         )[0]
         y_r = routed._down_kernel(routed_d, shared_d)(
             inputs=[h_r, *experts_down, *shared_down, ids[r], scores[r]],
-            template=down_template,
-            grid=(32, (top_k + 1) * HIDDEN // 4, 1),
+            template=down_template + [("RPS", token_rps)],
+            grid=(32, (top_k + 1) * HIDDEN // token_rps, 1),
             threadgroup=(32, top_k + 1, 1),
             output_shapes=[(HIDDEN,)],
             output_dtypes=[f32],

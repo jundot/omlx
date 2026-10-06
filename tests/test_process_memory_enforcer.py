@@ -14,6 +14,7 @@ from PIL import Image
 import omlx.process_memory_enforcer as pme
 import omlx.utils.image as images
 import omlx.utils.psutil_compat as psutil_compat
+from omlx.cache.paged_ssd_cache import SharedHotCacheBudget
 from omlx.decode_activity import get_decode_activity
 from omlx.engine.embedding import EmbeddingEngine
 from omlx.engine.tts import TTSEngine
@@ -1807,6 +1808,57 @@ class TestMemoryLimitPropagation:
 
         assert scheduler._memory_hard_limit_bytes == 1
         assert scheduler._memory_abort_limit_bytes == 1
+
+    @pytest.mark.asyncio
+    async def test_release_hot_cache_for_prefill_raises_scheduler_limit(
+        self, mock_engine_pool
+    ):
+        """Unprotected blocks go in LRU order once they can cover the drop,
+        after their SSD writes, and the higher limit reaches the scheduler
+        before the prefill retries (#4213)."""
+        gb = 1024**3
+        budget = SharedHotCacheBudget(6 * gb)
+        removed = []
+
+        class _Owner:
+            def _hot_cache_remove(self, block_hash, update_budget=True):
+                removed.append(block_hash)
+                return {}
+
+            def _handle_hot_cache_eviction(self, block_hash, entry):
+                pass
+
+        owner = _Owner()
+        for block_hash in (b"old", b"held", b"mid", b"new"):
+            budget.put(owner, block_hash, gb)
+        mock_engine_pool._scheduler_config = SimpleNamespace(hot_cache_budget=budget)
+        enforcer = _make_enforcer(mock_engine_pool, ceiling=30 * gb)
+        enforcer._get_abort_limit_bytes = lambda: 30 * gb
+
+        scheduler = MagicMock(spec=[])
+        scheduler.batch_generator = None
+        scheduler.get_active_hot_cache_block_hashes = lambda: {b"held"}
+        scheduler.paged_ssd_cache_manager = SimpleNamespace(
+            wait_for_pending_writes=MagicMock(return_value=True)
+        )
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        mock_engine_pool._entries = {"model-a": _make_entry("model-a", engine=engine)}
+        enforcer._propagate_memory_limit()
+        assert scheduler._memory_hard_limit_bytes == int(25.5 * gb)
+
+        with patch.object(pme, "release_free_malloc_memory") as relief:
+            # 3GB of unprotected blocks cannot cover a 3.5GB drop.
+            assert await enforcer.release_hot_cache_for_prefill(int(3.5 * gb)) == 0
+            assert removed == []
+            released = await enforcer.release_hot_cache_for_prefill(int(1.5 * gb))
+
+        assert removed == [b"old", b"mid"]
+        assert released == 2 * gb
+        assert scheduler._memory_hard_limit_bytes == int(27.5 * gb)
+        scheduler.paged_ssd_cache_manager.wait_for_pending_writes.assert_called_once()
+        # Freed blocks must leave phys_footprint, not wait in malloc's cache.
+        relief.assert_called_once()
 
     def test_propagate_with_guard_disabled(self, enforcer):
         """When the guard is disabled the field reflects it; hard limit is

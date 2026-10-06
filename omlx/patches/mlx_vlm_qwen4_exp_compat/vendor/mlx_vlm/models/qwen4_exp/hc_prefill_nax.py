@@ -66,6 +66,8 @@ _BM = 64
 _BN = 64
 # Hidden columns per stream in one up-projection tile (4 streams x 16 = 64).
 UP_COLS = 16
+# Each K step loads one quantization group's scale and bias.
+GROUP_SIZE = 64
 
 _NAX_HEADER = r"""
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>

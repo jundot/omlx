@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import numpy as np
 import pytest
 
+from omlx.exceptions import InvalidRequestError
 from omlx.patches.gemma4_audio import apply_gemma4_audio_patch
 from omlx.patches.mlx_vlm_glm5_next_compat import (
     apply_mlx_vlm_glm5_next_compat_patch,
@@ -1557,6 +1558,32 @@ class TestPrepareVisionInputs:
         # For gemma4, audio=audio kwarg should be present
         call_kwargs = mock_prepare.call_args[1]
         assert call_kwargs.get("audio") == audio
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_text_only_template_reports_missing_image_tokens(
+        self, mock_vlm_act, mock_prepare
+    ):
+        from PIL import Image
+
+        engine = self._setup_engine_for_vision()
+        engine._processor.image_token = "<|image_pad|>"
+        mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+        messages = [{"role": "user", "content": "Describe"}]
+        images = [Image.new("RGB", (4, 4), "red")]
+
+        with pytest.raises(InvalidRequestError, match="text-only chat template"):
+            engine._prepare_vision_inputs(messages, images)
+        mock_prepare.assert_not_called()
+
+        engine._processor.apply_chat_template.return_value = "<|image_pad|>Describe"
+        engine._prepare_vision_inputs(messages, images)
+        mock_prepare.assert_called_once()
 
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     @patch("mlx_vlm.utils.prepare_inputs")

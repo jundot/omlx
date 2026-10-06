@@ -3303,7 +3303,16 @@ def test_decode_hc_pre_declines_uncovered_inputs():
 # ---------------------------------------------------------------------------
 
 
-def _moe(experts=16, hidden=1024, inter=512, top_k=8, shared_bits=8, seed=0):
+def _moe(
+    experts=16,
+    hidden=1024,
+    inter=512,
+    top_k=8,
+    shared_bits=8,
+    seed=0,
+    routed_bits=4,
+    down_bits=None,
+):
     language = _language()
     mx.random.seed(seed)
     cfg = SimpleNamespace(
@@ -3321,9 +3330,9 @@ def _moe(experts=16, hidden=1024, inter=512, top_k=8, shared_bits=8, seed=0):
     )
     moe = language.Glm5NextMoE(cfg)
     sw = moe.switch_mlp
-    sw.gate_proj = _switch_linear(experts, inter, hidden, 4)
-    sw.up_proj = _switch_linear(experts, inter, hidden, 4)
-    sw.down_proj = _switch_linear(experts, hidden, inter, 4)
+    sw.gate_proj = _switch_linear(experts, inter, hidden, routed_bits)
+    sw.up_proj = _switch_linear(experts, inter, hidden, routed_bits)
+    sw.down_proj = _switch_linear(experts, hidden, inter, down_bits or routed_bits)
     if shared_bits:
         sh = moe.shared_experts
         sh.gate_proj = _quantized_linear(inter, hidden, shared_bits)
@@ -3337,11 +3346,19 @@ def _moe(experts=16, hidden=1024, inter=512, top_k=8, shared_bits=8, seed=0):
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize(("routed_bits", "down_bits"), [(4, 4), (3, 4)])
 @pytest.mark.parametrize("shared_bits", [8, 4, 0])
 @pytest.mark.parametrize("length", [1, 2, 4, 7])
-def test_decode_experts_are_bitwise_reference(length, shared_bits, monkeypatch):
+def test_decode_experts_are_bitwise_reference(
+    length, shared_bits, routed_bits, down_bits, monkeypatch
+):
     language = _language()
-    moe = _moe(shared_bits=shared_bits, seed=length)
+    moe = _moe(
+        shared_bits=shared_bits,
+        seed=length,
+        routed_bits=routed_bits,
+        down_bits=down_bits,
+    )
     for trial in range(2):
         x = (mx.random.normal((1, length, 1024)) * (0.5 + trial)).astype(mx.bfloat16)
         indices, scores = moe.gate(x)
@@ -3359,6 +3376,48 @@ def test_decode_experts_are_bitwise_reference(length, shared_bits, monkeypatch):
         assert _mismatches(fused, reference) == 0
         assert _mismatches(fused, compiled) == 0
         assert _mismatches(moe(x), reference) == 0
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("length", [1, 2, 3, 4])
+def test_decode_experts_all_3bit_cover_unsorted_routes(length, monkeypatch):
+    """All-3-bit experts: below the sort threshold (32 routes) the fused
+    kernels replay the unsorted gather; from there SwitchGLU sorts the routes
+    for its native block kernels and the fused path steps aside."""
+    language = _language()
+    moe = _moe(shared_bits=8, seed=21 + length, routed_bits=3, down_bits=3)
+    x = (mx.random.normal((1, length, 1024)) * 0.5).astype(mx.bfloat16)
+    indices, scores = moe.gate(x)
+    fused = moe._decode_experts(x, indices, scores)
+    if indices.size >= 32:
+        assert fused is None
+        return
+    assert fused is not None
+    monkeypatch.setattr(language, "_DECODE_FUSION", False)
+    reference = moe(x)
+    monkeypatch.setattr(language, "_DECODE_FUSION", True)
+    assert _mismatches(fused, reference) == 0
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("length", [1, 3])
+def test_decode_experts_with_3bit_shared_expert_are_bitwise_reference(
+    length, monkeypatch
+):
+    """3-bit shared expert: one token runs it in the fused kernels; for
+    several rows its qmv_wide products keep the reference calls."""
+    language = _language()
+    moe = _moe(shared_bits=3, seed=11 + length, routed_bits=3, down_bits=4)
+    x = (mx.random.normal((1, length, 1024)) * 0.5).astype(mx.bfloat16)
+    indices, scores = moe.gate(x)
+    wide_before = _stats()["moe_shared_wide"]
+    fused = moe._decode_experts(x, indices, scores)
+    assert fused is not None
+    assert _stats()["moe_shared_wide"] == wide_before
+    monkeypatch.setattr(language, "_DECODE_FUSION", False)
+    reference = moe(x)
+    monkeypatch.setattr(language, "_DECODE_FUSION", True)
+    assert _mismatches(fused, reference) == 0
 
 
 class _OffloadedExperts(nn.Module):
@@ -3408,13 +3467,22 @@ def test_multi_linear_declines_armed_verify_routes():
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("routed_bits", [4, 3])
 @pytest.mark.parametrize("seed", [0, 1, 2])
-def test_one_token_moe_selects_routes_inside_gate_up(seed, monkeypatch):
+def test_one_token_moe_selects_routes_inside_gate_up(seed, routed_bits, monkeypatch):
     """One token: the gate/up kernel replays the router's top-k selection
     (router logits -> gate/up -> down), bitwise like the reference MoE,
     including exact score ties."""
     language = _language()
-    moe = _moe(experts=288, hidden=4096, inter=2048, shared_bits=8, seed=seed)
+    moe = _moe(
+        experts=288,
+        hidden=4096,
+        inter=2048,
+        shared_bits=8,
+        seed=seed,
+        routed_bits=routed_bits,
+        down_bits=4,
+    )
     if seed == 2:
         weight = moe.gate.weight
         bias = moe.gate.e_score_correction_bias
@@ -3434,7 +3502,7 @@ def test_one_token_moe_selects_routes_inside_gate_up(seed, monkeypatch):
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
-@pytest.mark.parametrize("bits", [8, 4])
+@pytest.mark.parametrize("bits", [8, 4, 3])
 def test_one_token_dense_mlp_gate_up_is_bitwise_reference(bits, monkeypatch):
     """GLM-5.3's dense MLP layers: gate/up + clamped SwiGLU in one dispatch
     for one token, bitwise like the eager and the compiled reference."""
@@ -4233,6 +4301,23 @@ def test_multi_qmv_is_bitwise_separate_projections(tokens, bits):
         for layer, out in zip(group, fused):
             reference = language.linear_forward(layer, x).reshape(tokens, -1)
             assert _mismatches(out, reference) == 0, (count, layer.weight.shape)
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+def test_multi_qmv_covers_one_token_3bit_projections():
+    """3-bit weights replay qmv_fast for one token; multi-row products keep
+    the reference call (qmv_wide is replayed for 4/5/6/8 bits)."""
+    language = _language()
+    mx.random.seed(31)
+    k = 1024
+    layers = [_quantized_linear(n, k, 3) for n in (512, 136, 128, 32)]
+    x = (mx.random.normal((1, 1, k)) * 0.7).astype(mx.bfloat16)
+    fused = dk.multi_qmv(x.reshape(1, k), layers)
+    assert fused is not None
+    for layer, out in zip(layers, fused):
+        reference = language.linear_forward(layer, x).reshape(1, -1)
+        assert _mismatches(out, reference) == 0, layer.weight.shape
+    assert dk.multi_qmv(mx.zeros((2, k), mx.bfloat16), layers) is None
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")

@@ -6,9 +6,9 @@ Default route: ``gated_delta_pipelined`` — the exact sequential recurrence
 with 8 lanes per value row, 16-row threadgroups and a software-pipelined,
 unrolled 12-token block (Qwen3.8 16/48 heads, T=8191: 3.0 ms vs 4.9 ms per
 layer call for ``gated_delta_blocked_seq`` on M5 Ultra). Layouts it does not
-cover (key dim != 128, value dim not a multiple of 16) run
-``gated_delta_blocked_seq``: threadgroup-staged k/q/v blocks, register-resident
-state, Dv/32 split, fp32-exact state (rel-err ~5e-8).
+cover run ``gated_delta_blocked_seq``: threadgroup-staged k/q/v blocks,
+register-resident state, Dv/32 split, fp32-exact state (rel-err ~5e-8). Both
+kernels assume 128-wide heads, so the route only engages for Dk = Dv = 128.
 
 Optional route (``OMLX_GDN_IMPL=chunked``): the FLA chunked WY-representation
 kernels — accuracy-validated but slower than the stock kernel E2E; kept for
@@ -119,8 +119,14 @@ def apply_qwen35_gdn_prefill_patch() -> bool:
             use_kernel
             and mask is None
             and q.shape[1] >= min_t
-            and q.shape[-1] % 16 == 0
-            and v.shape[-1] % 32 == 0
+            # Both the chunked kernel (A) and the default blocked_seq
+            # kernel (S) hard-assume Dk=128/Dv=128 internally; this gate
+            # used to admit any multiple of 16/32, which would silently
+            # misbehave rather than error on other head dims that satisfy
+            # the modulus but not the hard-coded 128 assumption.
+            # See docs/qwen35-hardening-and-optimization.md E2.
+            and q.shape[-1] == 128
+            and v.shape[-1] == 128
             and a.ndim == 3  # scalar per-head gating
         ):
             if fused_g_beta and hasattr(gd, "_compute_g_beta_prefill"):
