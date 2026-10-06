@@ -151,10 +151,9 @@ class QwenArgumentStream:
                 self.started = False
                 self.leading = True
                 cfg = self.config.get(self.param, {})
-                if isinstance(self.config.get(self.param), dict) and "type" not in cfg:
-                    # The final wrapper uses structural XML boundaries and
-                    # coercion here. A literal parameter close is ambiguous
-                    # until the complete envelope is available.
+                if self.param not in self.config or "type" not in cfg:
+                    # Undeclared/untyped values can change type through final
+                    # fallback coercion. Leave the remaining suffix to it.
                     self.enabled = False
                     break
                 self.string = (
@@ -171,6 +170,19 @@ class QwenArgumentStream:
                 # Preserve a possible closing marker and one final newline.
                 end = self.buf.find("</parameter>")
                 closed = end >= 0
+                if closed:
+                    after = self.buf[end + 12:]
+                    following = after.lstrip()
+                    boundaries = ("<parameter=", "</function>")
+                    if not any(following.startswith(marker) for marker in boundaries):
+                        if (len(after) <= self.MAX_HEADER_CHARS and
+                                any(marker.startswith(following) for marker in boundaries)):
+                            break
+                        # A literal close belongs to a different value in the
+                        # recovery parser. Leave the JSON string open until
+                        # final parsing settles that interpretation.
+                        self.enabled = False
+                        break
                 n = end if closed else max(0, len(self.buf) - 13)
                 if not n and not closed:
                     break
@@ -186,9 +198,18 @@ class QwenArgumentStream:
                     self.raw.append(part)
                     if closed:
                         try:
+                            raw_value = "".join(self.raw)
                             value = _convert_param_value(
-                                "".join(self.raw), self.param, self.config
+                                raw_value, self.param, self.config
                             )
+                            from .tool_calling import _coerce_param_value
+                            fallback = _coerce_param_value(
+                                raw_value.strip(), self.param, self.config,
+                                self.current["name"],
+                            )
+                            if json.dumps(value, ensure_ascii=False) != json.dumps(fallback, ensure_ascii=False):
+                                self.enabled = False
+                                break
                         except (ValueError, SyntaxError, TypeError):
                             self.enabled = False
                             break

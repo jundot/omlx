@@ -610,3 +610,29 @@ async def test_large_valid_envelope_falls_back_after_incremental_buffer_limit():
     assert not actual["errors"]
     assert signature(actual) == signature(native)
     assert any(p < len(raw) // 2 for p in actual["positions"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [1, 13, 4096])
+@pytest.mark.parametrize("recover", [False, True])
+@pytest.mark.parametrize("parameters", [
+    {"undeclared": "42"},
+    {"flag": " true "},
+    {"content": "a</parameter>b"},
+    {"content": "plain", "flag": " true ", "number": "invalid"},
+    {"content": '"quoted"', "number": "invalid"},
+])
+async def test_each_emitted_value_is_settled_for_native_and_fallback(size, recover, parameters):
+    raw = envelope(parameters)
+    if recover:
+        raw = raw.removesuffix("</tool_call>")
+    native = await run(raw, size, False)
+    actual = await run(raw, size, True)
+    if native["errors"]:
+        assert actual["errors"] == native["errors"]
+        for call in actual["calls"]:
+            with pytest.raises(json.JSONDecodeError):
+                json.loads(call["arguments"])
+    else:
+        assert not actual["errors"]
+        assert signature(actual) == signature(native)
