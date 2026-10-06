@@ -26,8 +26,9 @@ and argument validation failures produce an SSE error. Cancellation closes the
 producer. No closing syntax is invented, and no mutation is automatically retried.
 A complete function missing only its outer envelope close retains the existing
 final-parser recovery rule; its validated suffix uses the original call ID.
-An envelope is bounded to 2 Mi characters and an unfinished header to 4,096
-characters.
+Early envelope delivery is bounded to 2 Mi characters. Beyond the limit,
+final parsing validates any emitted prefix and delivers the remaining suffix.
+Unfinished headers retain at most 4,096 characters.
 Numeric and structured values stay buffered until their parameter closes;
 string contents stream after resolving Qwen's special `null` handling.
 
@@ -51,3 +52,7 @@ The incremental parser retains a SHA-256 digest and character count of emitted
 arguments, checked once against final parsing. Non-string values remain buffered
 until their parameter closes. The existing server transcript and envelope filter
 still retain raw output for final parsing; total request memory is not constant.
+
+Strings with ambiguous leading quotes/whitespace or trailing whitespace defer
+those bytes to final parsing so missing-outer-close recovery keeps its existing
+semantics. Boolean schemas and untyped properties also use final parsing.

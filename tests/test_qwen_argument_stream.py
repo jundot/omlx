@@ -399,13 +399,15 @@ def test_unfinished_header_has_bounded_buffer():
     assert not stream.enabled and not stream.buf
 
 
-def test_partial_envelope_size_limit_fails_closed():
+def test_partial_envelope_size_limit_defers_final_validation():
     from omlx.api.qwen_argument_stream import QwenArgumentStream
 
     stream = QwenArgumentStream(TOOLS)
     assert stream.feed("<tool_call><function=write><parameter=content>value")
-    with pytest.raises(ValueError, match="character limit"):
-        stream.feed("x" * stream.MAX_ENVELOPE_CHARS)
+    before = stream.current["digest"].digest(), stream.current["length"]
+    assert stream.feed("x" * stream.MAX_ENVELOPE_CHARS) == []
+    assert not stream.enabled and not stream.buf
+    assert before == (stream.current["digest"].digest(), stream.current["length"])
 
 
 @pytest.mark.asyncio
@@ -487,9 +489,21 @@ async def test_untyped_properties_match_final_qwen_wrapper(size, schema, value):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("size", [1, 13, 1024])
-@pytest.mark.parametrize("value", ['  spaced  ', '"quoted"', 'null ', 'tail  ', 'body\n\n', 'body' + ' ' * 200 + 'tail'])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "  spaced  ",
+        '"quoted"',
+        "null ",
+        "tail  ",
+        "body\n\n",
+        "body" + " " * 200 + "tail",
+    ],
+)
 @pytest.mark.parametrize("recover", [False, True])
-async def test_string_prefix_matches_both_normal_and_recovered_calls(size, value, recover):
+async def test_string_prefix_matches_both_normal_and_recovered_calls(
+    size, value, recover
+):
     raw = envelope({"content": value})
     if recover:
         raw = raw.removesuffix("</tool_call>")
@@ -507,9 +521,13 @@ async def test_string_prefix_matches_both_normal_and_recovered_calls(size, value
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("size", [1, 13, 1024])
-@pytest.mark.parametrize("header", [" content", "content ", "\tcontent", "content ignored"])
+@pytest.mark.parametrize(
+    "header", [" content", "content ", "\tcontent", "content ignored"]
+)
 async def test_parameter_header_matches_native_name_and_value_boundary(size, header):
-    raw = envelope({"content": "text"}).replace("<parameter=content>", "<parameter=" + header + ">")
+    raw = envelope({"content": "text"}).replace(
+        "<parameter=content>", "<parameter=" + header + ">"
+    )
     native = await run(raw, size, False)
     actual = await run(raw, size, True)
     assert not actual["errors"]
@@ -519,12 +537,76 @@ async def test_parameter_header_matches_native_name_and_value_boundary(size, hea
 @pytest.mark.asyncio
 @pytest.mark.parametrize("size", [1, 13, 4096])
 @pytest.mark.parametrize("schema", [True, False, {}, {"description": "untyped"}])
-async def test_fallback_schema_and_literal_parameter_marker_keep_final_semantics(size, schema):
-    tools = [{"type": "function", "function": {"name": "write", "parameters": {
-        "type": "object", "properties": {"content": schema, "path": {"type": "string"}},
-    }}}]
+async def test_fallback_schema_and_literal_parameter_marker_keep_final_semantics(
+    size, schema
+):
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "write",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"content": schema, "path": {"type": "string"}},
+                },
+            },
+        }
+    ]
     raw = envelope({"content": "a</parameter>b", "path": "file"})
     native = await run(raw, size, False, tools=tools)
     actual = await run(raw, size, True, tools=tools)
     assert not actual["errors"]
     assert signature(actual) == signature(native)
+
+
+@pytest.mark.asyncio
+async def test_completed_queue_overflow_preserves_partial_id_and_later_calls():
+    from omlx.api.tool_calling import ToolCallStreamFilter
+
+    raw = "".join(
+        envelope({"content": str(i)})
+        for i in range(ToolCallStreamFilter._COMPLETED_ENVELOPE_MAX_COUNT + 2)
+    )
+
+    # Split the first call, then deliver enough siblings to overflow one FIFO.
+    class Coalesced(Engine):
+        async def stream_chat(self, **kwargs):
+            for text in (raw[:70], raw[70:]):
+                yield SimpleNamespace(
+                    new_text=text,
+                    tool_calls=None,
+                    finished=False,
+                    finish_reason="stop",
+                    prompt_tokens=10,
+                    completion_tokens=25,
+                    cached_tokens=0,
+                )
+
+    engine = Coalesced(raw, 70)
+    request = ChatCompletionRequest(model="test", messages=[], stream=True)
+    calls = {}
+    async for event in stream_chat_completion(engine, [], request, tools=TOOLS):
+        if not event.startswith("data: {"):
+            continue
+        payload = json.loads(event[6:])
+        assert "error" not in payload
+        for choice in payload.get("choices", []):
+            for tc in choice.get("delta", {}).get("tool_calls", []):
+                call = calls.setdefault(tc["index"], {"id": "", "arguments": ""})
+                call["id"] += tc.get("id", "")
+                call["arguments"] += tc["function"].get("arguments", "")
+    assert list(calls) == list(range(18))
+    assert len({call["id"] for call in calls.values()}) == 18
+    assert [
+        json.loads(call["arguments"])["content"] for call in calls.values()
+    ] == list(map(str, range(18)))
+
+
+@pytest.mark.asyncio
+async def test_large_valid_envelope_falls_back_after_incremental_buffer_limit():
+    raw = envelope({"content": "x" * (2 * 1024 * 1024)})
+    native = await run(raw, 4096, False)
+    actual = await run(raw, 4096, True)
+    assert not actual["errors"]
+    assert signature(actual) == signature(native)
+    assert any(p < len(raw) // 2 for p in actual["positions"])

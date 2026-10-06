@@ -5599,9 +5599,11 @@ async def stream_chat_completion(
                             # retained duplicate state.
                             tool_filter.take_completed_envelopes()
                             if tool_filter.completed_envelope_overflowed:
-                                if argument_stream is not None and argument_stream.calls:
-                                    raise ValueError("Partial tool envelope exceeded the early-stream limit")
-                                argument_stream = None
+                                if argument_stream is not None:
+                                    # Retain the emitted prefix for final native
+                                    # validation; queue bounds only stop early
+                                    # delivery, not an otherwise valid call.
+                                    argument_stream.enabled = False
                                 logger.warning(
                                     "Early qwen tool streaming disabled for this "
                                     "Chat turn: completed-envelope queue exceeded "
@@ -5913,7 +5915,8 @@ async def stream_chat_completion(
     # full body. Length-stopped or malformed calls retain their open JSON.
     if argument_stream is not None and argument_stream.calls:
         if not tool_failure and not tool_truncated:
-            pending_calls = (tool_calls or [])[len(streamed_tool_calls):]
+            pending_calls = (tool_calls or [])[len(streamed_tool_calls):
+                                              len(streamed_tool_calls) + len(argument_stream.calls)]
             try:
                 remaining = argument_stream.finish(pending_calls)
             except ValueError:

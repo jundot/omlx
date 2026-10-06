@@ -66,8 +66,8 @@ class QwenArgumentStream:
         if self.received > self.MAX_ENVELOPE_CHARS:
             self.enabled = False
             self.buf = ""
-            if self.calls:
-                raise ValueError("Partial tool envelope exceeded its character limit")
+            self.raw = []
+            self.trailing_whitespace = []
             return []
         self.buf += text
         out = []
@@ -91,10 +91,6 @@ class QwenArgumentStream:
                     if len(self.buf) > self.MAX_HEADER_CHARS:
                         self.enabled = False
                         self.buf = ""
-                        if self.calls:
-                            raise ValueError(
-                                "Partial tool header exceeded its character limit"
-                            )
                     break
                 name = self.buf[10:i]
                 if not any(
@@ -139,12 +135,8 @@ class QwenArgumentStream:
                     if len(self.buf) > self.MAX_HEADER_CHARS:
                         self.enabled = False
                         self.buf = ""
-                        if self.calls:
-                            raise ValueError(
-                                "Partial tool header exceeded its character limit"
-                            )
                     break
-                header = self.buf[11:i + 1]
+                header = self.buf[11 : i + 1]
                 match = _name_regex.match(header)
                 if match is None:
                     self.enabled = False
@@ -152,7 +144,7 @@ class QwenArgumentStream:
                 self.param = match.group(1)
                 self.duplicate_parameter = self.param in self.seen_parameters
                 self.seen_parameters.add(self.param)
-                self.buf = header[match.end():] + self.buf[i + 1 :]
+                self.buf = header[match.end() :] + self.buf[i + 1 :]
                 self.state = "value"
                 self.raw = []
                 self.trailing_whitespace = []
@@ -237,7 +229,9 @@ class QwenArgumentStream:
                     settled = part.rstrip()
                     if settled:
                         value = "".join(self.trailing_whitespace) + settled
-                        self.trailing_whitespace = [part[len(settled):]] if len(settled) < len(part) else []
+                        self.trailing_whitespace = (
+                            [part[len(settled) :]] if len(settled) < len(part) else []
+                        )
                     else:
                         value = ""
                         if part:
@@ -246,10 +240,13 @@ class QwenArgumentStream:
                         # Preserve an open JSON string. Final parsing decides
                         # whether the trailing whitespace belongs to the value.
                         self.enabled = False
-                    out.append(self.emit(
-                        prefix + json.dumps(value, ensure_ascii=False)[1:-1]
-                        + ('"' if closed and self.enabled else "")
-                    ))
+                    out.append(
+                        self.emit(
+                            prefix
+                            + json.dumps(value, ensure_ascii=False)[1:-1]
+                            + ('"' if closed and self.enabled else "")
+                        )
+                    )
                     if not self.enabled:
                         break
                 if closed:
