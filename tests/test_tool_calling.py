@@ -1684,6 +1684,64 @@ def test_gemma_style_payload_opener_is_classified_as_payload():
     assert f.take_recovery_candidate() == '<|tool_call>call:get_weather{city:"Seat'
 
 
+def test_recovery_tail_without_a_second_marker_is_recoverable():
+    """Prose that quotes the marker once has no later opener (#4300)."""
+
+    f = ToolCallStreamFilter(_make_tokenizer())
+
+    f.feed("<tool_call> is how qwen calls a tool. END")
+    f.finish()
+
+    assert f.recovery_tail_has_later_opener() is False
+    assert f.take_recovery_candidate() == "<tool_call> is how qwen calls a tool. END"
+
+
+def test_recovery_tail_with_a_second_marker_is_refused():
+    """A later opener inside the withheld tail must be visible (#4300)."""
+
+    f = ToolCallStreamFilter(_make_tokenizer())
+
+    f.feed(
+        "<tool_call> is how qwen calls a tool. Now calling: "
+        '<tool_call>{"name":"write"'
+    )
+    f.finish()
+
+    assert f.recovery_tail_has_later_opener() is True
+    # The guard must not drain the candidate other readers still need.
+    assert f.take_recovery_candidate().startswith(
+        "<tool_call> is how qwen calls a tool. Now calling:"
+    )
+
+
+def test_recovery_tail_guard_sees_a_later_naked_function_opener():
+    """``<function=`` is an opener too, with no ``<tool_call>`` around it."""
+
+    f = ToolCallStreamFilter(_make_tokenizer())
+
+    f.feed("The tag <tool_call> is how qwen calls a tool. Now calling: <function=write>")
+    f.finish()
+
+    assert f.recovery_tail_has_later_opener() is True
+
+
+def test_recovery_tail_guard_is_false_without_a_withheld_tail():
+    """A closed envelope leaves no candidate, so there is nothing to judge."""
+
+    f = ToolCallStreamFilter(_make_tokenizer())
+
+    assert f.recovery_tail_has_later_opener() is False
+
+    f.feed(
+        "<tool_call><function=write><parameter=x>done</parameter>"
+        "</function></tool_call>"
+    )
+    f.finish()
+
+    assert f.take_recovery_candidate() == ""
+    assert f.recovery_tail_has_later_opener() is False
+
+
 def test_close_marker_fallback_rescans_the_recovered_tail():
     """Prose recovered after a close marker is re-filtered, not emitted raw."""
     f = ToolCallStreamFilter(_make_tokenizer())

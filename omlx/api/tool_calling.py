@@ -2617,6 +2617,28 @@ class ToolCallStreamFilter:
         self._recovery_is_payload = False
         return flag
 
+    def recovery_tail_has_later_opener(self) -> bool:
+        """Whether the withheld tail holds a second opening marker.
+
+        Envelopes do not nest: everything from the first opening marker to EOF is
+        withheld as one tail, so a further opener inside it is model text the
+        filter never saw as an envelope.  A caller that judges the tail by the
+        text right after its first marker would call the whole tail prose even
+        when a genuine (truncated) call follows the quoted marker, so this guard
+        lets it refuse the tail instead (#4300 review).
+
+        Must be read before ``take_recovery_candidate`` drains the text.
+        """
+
+        tail = self._recovery_candidate
+        if not tail:
+            return False
+        opener = self._withheld_opener(tail)
+        rest = tail[len(opener) :]
+        return any(
+            marker and marker in rest for marker, _close in self._marker_pairs
+        )
+
     def take_completed_envelopes(self) -> List[str]:
         """Return complete suppressed envelopes ready for exact parsing.
 

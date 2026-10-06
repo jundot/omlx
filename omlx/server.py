@@ -4532,7 +4532,17 @@ async def create_chat_completion(
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
-                if failure := _tool_call_failure(extraction):
+                recovered = _nonstream_recovery_text(
+                    extraction,
+                    regular_content,
+                    engine.tokenizer,
+                    tools_for_template,
+                )
+                if recovered is not None:
+                    # The marker was quoted in prose, not a failed call: deliver
+                    # the model's answer instead of the 500 (#4241, #4300).
+                    cleaned_text = recovered
+                elif failure := _tool_call_failure(extraction):
                     raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
@@ -5314,6 +5324,7 @@ def _withholding_is_recoverable(
     tool_failure: object,
     withheld_is_payload: bool,
     streamed_tool_calls: list | None = None,
+    parse_errors: tuple = (),
 ) -> bool:
     """Whether an unterminated envelope's withheld text may become content.
 
@@ -5324,11 +5335,63 @@ def _withholding_is_recoverable(
     call, no call already streamed to the client, and no payload-shaped tail.
     Otherwise a failed call would be laundered into answer text, and clearing
     the failure could let a delivered call run again on retry.
+
+    ``parse_errors`` adds the other half of the #4300 review: only a failure the
+    unclosed envelope itself explains may be cleared.  An envelope that
+    *closed* but failed to parse reports "malformed", so recovering an unrelated
+    quoted marker further down the output would silently drop a tool call the
+    model really attempted.  ``withheld_is_payload`` now covers both channels,
+    so a payload-shaped tail in either one keeps the failure whenever there is
+    one to keep.
     """
 
     if tool_calls or streamed_tool_calls:
         return False
+    if any(error != "incomplete" for error in parse_errors):
+        return False
     return not (tool_failure and withheld_is_payload)
+
+
+def _nonstream_recovery_text(
+    extraction: ToolCallExtraction,
+    raw_text: str,
+    tokenizer: object,
+    tools: object,
+) -> str | None:
+    """The answer text a non-streaming request should return instead of 500.
+
+    Non-streaming never builds a ``ToolCallStreamFilter``, so a control marker
+    the model quoted in prose reaches the terminal parser as "incomplete"
+    exactly as a call the generator cut short does (#4241).  The streaming
+    gate's shape rules are reused over the whole output, and the text is only
+    recovered when every one of them agrees:
+
+    * nothing was parsed as a call;
+    * every parser verdict is "incomplete" (a "malformed" sibling stays fatal);
+    * the withheld tail is prose-shaped;
+    * no later opening marker follows in that tail (#4300 review).  Without
+      this guard ``... Now calling: <tool_call>{"name": ...cut`` would be
+      returned as answer text instead of failing as a truncated call.
+
+    Returns the raw answer text (markup included, exactly as generated) when
+    recovery applies, else ``None`` so the caller keeps the hard error.
+    """
+
+    if extraction.tool_calls:
+        return None
+    failed = extraction.parse_errors
+    if not failed or any(error != "incomplete" for error in failed):
+        return None
+    probe = ToolCallStreamFilter(tokenizer, tools=tools)
+    probe.feed(raw_text)
+    probe.finish()
+    if probe.take_recovery_is_payload():
+        return None
+    if probe.recovery_tail_has_later_opener():
+        return None
+    if not probe.take_recovery_candidate():
+        return None
+    return raw_text
 
 
 def _registered_tool_names(tools: object) -> set[str]:
@@ -5763,6 +5826,7 @@ async def stream_chat_completion(
     # Parse tool calls from accumulated text
     tool_calls = None
     tool_failure = None
+    parse_errors: tuple = ()
     cleaned_text = accumulated_text
     terminal_tool_calls_authoritative = bool(last_output and last_output.tool_calls)
     if last_output and last_output.tool_calls:
@@ -5785,6 +5849,7 @@ async def stream_chat_completion(
         )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
+        parse_errors = extraction.parse_errors
         tool_failure = _tool_call_failure(extraction)
         cleaned_thinking = extraction.cleaned_thinking
         # Process response_format if specified
@@ -5837,11 +5902,15 @@ async def stream_chat_completion(
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
-    withheld_is_payload = (
-        tool_filter.take_recovery_is_payload() if tool_filter else False
+    # Both channels hold an independent filter, and the terminal parser only
+    # reads the content channel, so a payload-shaped tail in the thinking
+    # channel has no parser failure backing it.  Consult both flags (#4300).
+    withheld_is_payload = bool(
+        (tool_filter.take_recovery_is_payload() if tool_filter else False)
+        or (thinking_filter.take_recovery_is_payload() if thinking_filter else False)
     )
     if _withholding_is_recoverable(
-        tool_calls, tool_failure, withheld_is_payload, streamed_tool_calls
+        tool_calls, tool_failure, withheld_is_payload, streamed_tool_calls, parse_errors
     ):
         if recovered_thinking:
             chunk = ChatCompletionChunk(
@@ -6367,6 +6436,7 @@ async def stream_anthropic_messages(
     # For other models, parse from accumulated text
     tool_calls = None
     tool_failure = None
+    parse_errors: tuple = ()
     if last_output and last_output.tool_calls:
         # Protocol parser already extracted structured tool calls.
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
@@ -6385,16 +6455,23 @@ async def stream_anthropic_messages(
             finish_reason=last_output.finish_reason if last_output else "stop",
         )
         tool_calls = extraction.tool_calls
+        parse_errors = extraction.parse_errors
         tool_failure = _tool_call_failure(extraction)
 
     recovered_thinking = (
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
-    withheld_is_payload = (
-        tool_filter.take_recovery_is_payload() if tool_filter else False
+    # Both channels hold an independent filter, and the terminal parser only
+    # reads the content channel, so a payload-shaped tail in the thinking
+    # channel has no parser failure backing it.  Consult both flags (#4300).
+    withheld_is_payload = bool(
+        (tool_filter.take_recovery_is_payload() if tool_filter else False)
+        or (thinking_filter.take_recovery_is_payload() if thinking_filter else False)
     )
-    if _withholding_is_recoverable(tool_calls, tool_failure, withheld_is_payload):
+    if _withholding_is_recoverable(
+        tool_calls, tool_failure, withheld_is_payload, parse_errors=parse_errors
+    ):
         if recovered_thinking:
             if text_block_started:
                 yield create_content_block_stop_event(index=block_index)
@@ -6911,7 +6988,17 @@ async def create_anthropic_message(
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
-                if failure := _tool_call_failure(extraction):
+                recovered = _nonstream_recovery_text(
+                    extraction,
+                    regular_content,
+                    engine.tokenizer,
+                    internal_tools,
+                )
+                if recovered is not None:
+                    # The marker was quoted in prose, not a failed call: deliver
+                    # the model's answer instead of the 500 (#4241, #4300).
+                    cleaned_text = recovered
+                elif failure := _tool_call_failure(extraction):
                     raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
@@ -7470,7 +7557,17 @@ async def create_response(
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
-                if failure := _tool_call_failure(extraction):
+                recovered = _nonstream_recovery_text(
+                    extraction,
+                    regular_content,
+                    engine.tokenizer,
+                    tools_for_template,
+                )
+                if recovered is not None:
+                    # The marker was quoted in prose, not a failed call: deliver
+                    # the model's answer instead of the 500 (#4241, #4300).
+                    cleaned_text = recovered
+                elif failure := _tool_call_failure(extraction):
                     raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
@@ -7992,6 +8089,7 @@ async def stream_responses_api(
     # Parse tool calls from accumulated text
     tool_calls = None
     tool_failure = None
+    parse_errors: tuple = ()
     cleaned_text = accumulated_text
     if last_output and last_output.tool_calls:
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
@@ -8010,6 +8108,7 @@ async def stream_responses_api(
         )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
+        parse_errors = extraction.parse_errors
         tool_failure = _tool_call_failure(extraction)
         if not stream_content:
             cleaned_thinking = (extraction.cleaned_thinking or "").strip()
@@ -8045,11 +8144,17 @@ async def stream_responses_api(
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
-    withheld_is_payload = (
-        tool_filter.take_recovery_is_payload() if tool_filter else False
+    # Both channels hold an independent filter, and the terminal parser only
+    # reads the content channel, so a payload-shaped tail in the thinking
+    # channel has no parser failure backing it.  Consult both flags (#4300).
+    withheld_is_payload = bool(
+        (tool_filter.take_recovery_is_payload() if tool_filter else False)
+        or (thinking_filter.take_recovery_is_payload() if thinking_filter else False)
     )
     recovered_content_visible = ""
-    if _withholding_is_recoverable(tool_calls, tool_failure, withheld_is_payload):
+    if _withholding_is_recoverable(
+        tool_calls, tool_failure, withheld_is_payload, parse_errors=parse_errors
+    ):
         for ev in _emit_reasoning_delta(recovered_thinking):
             yield ev
         if recovered_content:
