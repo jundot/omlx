@@ -1876,6 +1876,24 @@ class TestRerankEndpoint:
         calls = mock_engine_pool._reranker_engine.calls
         assert [call["kwargs"]["max_length"] for call in calls] == [None, 8192]
 
+    def test_rerank_forwards_instruction(self, client, mock_engine_pool):
+        """Custom instruction must reach the reranker engine."""
+        mock_engine_pool._models.append(
+            {"id": "test-rerank-model", "loaded": True, "pinned": False, "size": 500000}
+        )
+        base = {"model": "test-rerank-model", "query": "q", "documents": ["d"]}
+
+        for payload, expected in (
+            ({}, None),
+            ({"instruction": "Find Python functions"}, "Find Python functions"),
+        ):
+            mock_engine_pool._reranker_engine.calls.clear()
+            resp = client.post("/v1/rerank", json={**base, **payload})
+            assert resp.status_code == 200
+            calls = mock_engine_pool._reranker_engine.calls
+            assert len(calls) == 1
+            assert calls[0]["kwargs"]["instruction"] == expected
+
     def test_rerank_response_format(self, client, mock_engine_pool):
         """Test rerank response format."""
         mock_engine_pool._models.append(

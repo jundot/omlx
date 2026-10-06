@@ -285,6 +285,97 @@ class TestCausalLMReranker:
             args, _ = mock_method.call_args
             assert args[2] == 512
 
+    def test_rerank_dispatches_instruction_to_causal_lm(self, tmp_path):
+        """Test that rerank() forwards instruction to _rerank_causal_lm."""
+        model_dir = self._make_model_dir(tmp_path)
+        model = MLXRerankerModel(str(model_dir))
+        model._is_causal_lm = True
+        model._loaded = True
+
+        mock_result = RerankOutput(scores=[0.9], indices=[0], total_tokens=10)
+        with patch.object(
+            model, "_rerank_causal_lm", return_value=mock_result
+        ) as mock_method:
+            model.rerank("query", ["doc"], instruction="Find code snippets")
+            mock_method.assert_called_once_with(
+                "query", ["doc"], 8192, instruction="Find code snippets"
+            )
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_rerank_causal_lm_custom_instruction(self, tmp_path):
+        """Test that _rerank_causal_lm inserts custom instruction into prompt text."""
+        model_dir = self._make_model_dir(tmp_path)
+        model = MLXRerankerModel(str(model_dir))
+        model._is_causal_lm = True
+        model._loaded = True
+        model._token_true_id = 9693
+        model._token_false_id = 2152
+        model._prefix_tokens = [1, 2]
+        model._suffix_tokens = [3, 4]
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.return_value = {"input_ids": [[10, 11]]}
+        model.processor = mock_tokenizer
+        model.model = MagicMock(return_value=mx.zeros((1, 5, 10000)))
+
+        custom_instruction = "Given a code query, retrieve matching functions"
+        model._rerank_causal_lm(
+            "test query", ["test doc"], instruction=custom_instruction
+        )
+
+        mock_tokenizer.assert_called_once()
+        pairs_text = mock_tokenizer.call_args[0][0]
+        assert len(pairs_text) == 1
+        assert f"<Instruct>: {custom_instruction}" in pairs_text[0]
+        assert "<Query>: test query" in pairs_text[0]
+        assert "<Document>: test doc" in pairs_text[0]
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_rerank_causal_lm_default_instruction_when_none_or_blank(self, tmp_path):
+        """Test that _rerank_causal_lm falls back to default when instruction is None or whitespace."""
+        model_dir = self._make_model_dir(tmp_path)
+        model = MLXRerankerModel(str(model_dir))
+        model._is_causal_lm = True
+        model._loaded = True
+        model._token_true_id = 9693
+        model._token_false_id = 2152
+        model._prefix_tokens = [1, 2]
+        model._suffix_tokens = [3, 4]
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.return_value = {"input_ids": [[10, 11]]}
+        model.processor = mock_tokenizer
+        model.model = MagicMock(return_value=mx.zeros((1, 5, 10000)))
+
+        for blank_instruction in (None, "", "   "):
+            mock_tokenizer.reset_mock()
+            model._rerank_causal_lm(
+                "test query", ["test doc"], instruction=blank_instruction
+            )
+            pairs_text = mock_tokenizer.call_args[0][0]
+            assert (
+                f"<Instruct>: {model._CAUSAL_LM_DEFAULT_INSTRUCTION}" in pairs_text[0]
+            )
+
+    def test_rerank_request_instruction_support(self):
+        """RerankRequest supports optional instruction field."""
+        from omlx.api.rerank_models import RerankRequest
+
+        req1 = RerankRequest(
+            model="m",
+            query="q",
+            documents=["d"],
+            instruction="custom task",
+        )
+        assert req1.instruction == "custom task"
+
+        req2 = RerankRequest(
+            model="m",
+            query="q",
+            documents=["d"],
+        )
+        assert req2.instruction is None
+
 
 class TestCausalLMPromptAffixes:
     """Tests for prefix/suffix extraction across chat template shapes."""

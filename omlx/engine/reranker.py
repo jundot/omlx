@@ -104,6 +104,7 @@ class RerankerEngine(BaseNonStreamingEngine):
         documents: "list[str] | list[dict]",
         top_n: int | None = None,
         max_length: int | None = None,
+        instruction: str | None = None,
     ) -> RerankOutput:
         """
         Rerank documents by relevance to the query.
@@ -117,7 +118,8 @@ class RerankerEngine(BaseNonStreamingEngine):
             max_length: Maximum token length for each query-document pair.
                 If None, uses model-appropriate default (the tokenizer limit
                 for encoders, 8192 for CausalLM).
-
+            instruction: Optional task instruction for instruction-conditioned
+                rerankers (e.g., Qwen3-Reranker).
         Returns:
             RerankOutput with scores, sorted indices, and token count
         """
@@ -131,6 +133,7 @@ class RerankerEngine(BaseNonStreamingEngine):
                 query=query,
                 documents=documents,
                 max_length=max_length,
+                instruction=instruction,
             )
 
         activity_id = self._begin_activity(

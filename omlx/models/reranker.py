@@ -283,17 +283,23 @@ class MLXRerankerModel:
         query: "str | dict[str, Any]",
         documents: "list[str] | list[dict[str, Any]]",
         max_length: int,
+        instruction: str | None = None,
     ) -> RerankOutput:
         """Rerank using mlx-embeddings' multimodal model.process() API."""
         query_item = self._build_vl_item(query)
         doc_items = [self._build_vl_item(d) for d in documents]
 
+        instruction = (
+            instruction.strip()
+            if instruction and instruction.strip()
+            else self._CAUSAL_LM_DEFAULT_INSTRUCTION
+        )
+
         inputs = {
-            "instruction": self._CAUSAL_LM_DEFAULT_INSTRUCTION,
+            "instruction": instruction,
             "query": query_item,
             "documents": doc_items,
         }
-
         scores = self.model.process(inputs, processor=self.processor)
         mx.eval(scores)
         scores_list = [float(s) for s in scores.tolist()]
@@ -965,6 +971,7 @@ class MLXRerankerModel:
         query: "str | dict",
         documents: "list[str] | list[dict]",
         max_length: int | None = None,
+        instruction: str | None = None,
     ) -> RerankOutput:
         """
         Rerank documents by relevance to the query.
@@ -978,7 +985,8 @@ class MLXRerankerModel:
                 If None, uses model-appropriate default (the tokenizer limit
                 for encoders, 8192 for CausalLM). Encoder values are capped
                 at the tokenizer limit.
-
+            instruction: Optional task instruction for instruction-conditioned
+                rerankers (e.g., Qwen3-Reranker).
         Returns:
             RerankOutput with scores, sorted indices, and token count
         """
@@ -994,8 +1002,11 @@ class MLXRerankerModel:
                 if max_length is not None
                 else self._DEFAULT_MAX_LENGTH_CAUSAL_LM
             )
+            if instruction is not None:
+                return self._rerank_vl(
+                    query, documents, effective_max_length, instruction=instruction
+                )
             return self._rerank_vl(query, documents, effective_max_length)
-
         # Text-only paths: coerce dict inputs down to text so existing
         # _rerank_* methods keep their str-only contract.
         query_str = _coerce_item_to_text(query)
@@ -1014,6 +1025,10 @@ class MLXRerankerModel:
                 if max_length is not None
                 else self._DEFAULT_MAX_LENGTH_CAUSAL_LM
             )
+            if instruction is not None:
+                return self._rerank_causal_lm(
+                    query_str, docs_str, effective_max_length, instruction=instruction
+                )
             return self._rerank_causal_lm(query_str, docs_str, effective_max_length)
         else:
             # Absolute position tables read out of range without an error, so
@@ -1031,6 +1046,7 @@ class MLXRerankerModel:
         query: str,
         documents: list[str],
         max_length: int = 8192,
+        instruction: str | None = None,
     ) -> RerankOutput:
         """
         Rerank using CausalLM yes/no logit scoring (e.g., Qwen3-Reranker).
@@ -1056,16 +1072,22 @@ class MLXRerankerModel:
         # Compute max tokens available for the instruction content
         max_content_tokens = max_length - len(prefix_tokens) - len(suffix_tokens)
 
+        # Normalize instruction (fallback to default if None or blank)
+        instruction = (
+            instruction.strip()
+            if instruction and instruction.strip()
+            else self._CAUSAL_LM_DEFAULT_INSTRUCTION
+        )
+
         # Format and tokenize each query-document pair
         pairs_text = []
         for doc in documents:
             content = (
-                f"<Instruct>: {self._CAUSAL_LM_DEFAULT_INSTRUCTION}\n"
+                f"<Instruct>: {instruction}\n"
                 f"<Query>: {query}\n"
                 f"<Document>: {doc}"
             )
             pairs_text.append(content)
-
         # Tokenize content parts (without prefix/suffix)
         content_encodings = tokenizer(
             pairs_text,
