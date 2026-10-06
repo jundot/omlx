@@ -117,9 +117,15 @@ def _normalize_ones_centered_rmsnorm_weights(model, weights):
             value.dtype, mx.floating
         ):
             continue
-        # Keep the residual in FP32. Subtracting in BF16 can lose information
-        # for direct gamma values below 0.5, which occur in the trained MTP head.
-        weights[key] = value.astype(mx.float32) - 1.0
+        # Subtract in FP32: in BF16 it can lose information for direct gamma
+        # values below 0.5, which occur in the trained MTP head. Keep the
+        # checkpoint dtype when it holds the residual exactly (gammas in
+        # [0.5, 2] always do), so 1 + weight is unchanged and BF16-only kernels
+        # such as the fused hyper-connection norm still apply.
+        residual = value.astype(mx.float32) - 1.0
+        narrow = residual.astype(value.dtype)
+        exact = mx.array_equal(narrow.astype(mx.float32), residual).item()
+        weights[key] = narrow if exact else residual
         normalized += 1
 
     logger.info(
@@ -186,7 +192,7 @@ class Model(Qwen3_5Model):
 
         num_experts = int(getattr(self.config.text_config, "num_experts", 0) or 0)
 
-        def stack_experts(prefix):
+        def stack_experts(prefix, expert_count):
             if f"{prefix}.switch_mlp.gate_proj.weight" in weights:
                 return
 
@@ -228,14 +234,17 @@ class Model(Qwen3_5Model):
                             weights.pop(
                                 f"{prefix}.experts.{expert}.{projection}.{suffix}"
                             )
-                            for expert in range(num_experts)
+                            for expert in range(expert_count)
                         ]
                     )
 
         for layer_idx in range(self.config.text_config.num_hidden_layers):
-            stack_experts(f"model.language_model.layers.{layer_idx}.mlp")
+            stack_experts(f"model.language_model.layers.{layer_idx}.mlp", num_experts)
 
         if mtp_enabled:
+            mtp_num_experts = getattr(self.config.text_config, "mtp_num_experts", None)
+            if mtp_num_experts is None:
+                mtp_num_experts = num_experts
             mtp_layer_indices = sorted(
                 {
                     int(key.split(".")[2])
@@ -246,7 +255,7 @@ class Model(Qwen3_5Model):
                 }
             )
             for layer_idx in mtp_layer_indices:
-                stack_experts(f"mtp.layers.{layer_idx}.mlp")
+                stack_experts(f"mtp.layers.{layer_idx}.mlp", mtp_num_experts)
 
         sanitized = {}
         for key, value in weights.items():

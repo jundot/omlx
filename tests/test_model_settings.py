@@ -51,6 +51,31 @@ class TestModelSettings:
         restored = ModelSettings.from_dict(d)
         assert restored.is_favorite is True
 
+    def test_moe_expert_offload_defaults(self):
+        """Expert offload is opt-in, at 25% residency."""
+        settings = ModelSettings()
+        assert settings.moe_expert_offload_enabled is False
+        assert settings.moe_expert_offload_resident_fraction == 0.25
+
+    def test_moe_expert_offload_roundtrip(self):
+        """Both offload fields survive to_dict -> from_dict."""
+        original = ModelSettings(
+            moe_expert_offload_enabled=True,
+            moe_expert_offload_resident_fraction=0.5,
+        )
+        d = original.to_dict()
+        assert d["moe_expert_offload_enabled"] is True
+        restored = ModelSettings.from_dict(d)
+        assert restored.moe_expert_offload_enabled is True
+        assert restored.moe_expert_offload_resident_fraction == 0.5
+
+    def test_moe_expert_offload_fraction_out_of_range_rejected(self):
+        """Residency outside (0, 1] fails at construction, not at load."""
+        with pytest.raises(ValueError, match="resident_fraction"):
+            ModelSettings(moe_expert_offload_resident_fraction=0.0)
+        with pytest.raises(ValueError, match="resident_fraction"):
+            ModelSettings(moe_expert_offload_resident_fraction=1.5)
+
     def test_guided_grammar_defaults(self):
         """Test guided grammar defaults to disabled."""
         settings = ModelSettings()
@@ -642,6 +667,21 @@ class TestModelSettingsManager:
         )
 
         assert merged == {"enable_thinking": True, "custom_flag": "request"}
+
+    @pytest.mark.parametrize("budget", [None, 0, 1])
+    @pytest.mark.parametrize("enabled", [None, True, False])
+    def test_budget_respects_explicit_thinking_mode(self, budget, enabled):
+        from omlx.model_settings import merge_chat_template_kwargs
+
+        kwargs = {} if enabled is None else {"enable_thinking": enabled}
+        expected = {"enable_thinking": True} if not kwargs and budget == 1 else kwargs
+        assert merge_chat_template_kwargs(None, kwargs, thinking_budget=budget) == expected
+
+    def test_zero_thinking_budget_does_not_enable_thinking(self):
+        """Zero means no thinking budget activation at template-render time."""
+        from omlx.model_settings import merge_chat_template_kwargs
+
+        assert merge_chat_template_kwargs(None, thinking_budget=0) == {}
 
     def test_thread_safety(self):
         """Test thread-safe access."""

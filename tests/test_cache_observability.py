@@ -3,7 +3,6 @@
 """Tests for cache observability module."""
 
 import threading
-import time
 from unittest.mock import patch
 
 import pytest
@@ -91,14 +90,23 @@ class TestCacheRateTrackerRates:
         def mock_monotonic():
             return fake_time[0]
 
-        with patch("omlx.cache.observability.time.monotonic", side_effect=mock_monotonic):
+        with patch(
+            "omlx.cache.observability.time.monotonic",
+            side_effect=mock_monotonic,
+        ):
             tracker.maybe_snapshot(old_counters)
 
         fake_time[0] = 1000.0 + elapsed
-        with patch("omlx.cache.observability.time.monotonic", side_effect=mock_monotonic):
+        with patch(
+            "omlx.cache.observability.time.monotonic",
+            side_effect=mock_monotonic,
+        ):
             tracker.maybe_snapshot(new_counters)
 
-        with patch("omlx.cache.observability.time.monotonic", return_value=fake_time[0]):
+        with patch(
+            "omlx.cache.observability.time.monotonic",
+            return_value=fake_time[0],
+        ):
             return tracker.get_rates(windows=(60, 300, 900))
 
     def test_steady_state_prefix_hit_rate(self):
@@ -198,12 +206,15 @@ class TestCacheRateTrackerThreadSafety:
         tracker = CacheRateTracker(min_interval=0.0)
         errors = []
         stop = threading.Event()
+        writer_started = threading.Event()
+        reader_started = threading.Event()
 
         def writer():
             i = 0
             while not stop.is_set():
                 try:
                     tracker.maybe_snapshot(_make_counters(prefix_hits=i))
+                    writer_started.set()
                     i += 1
                 except Exception as e:
                     errors.append(e)
@@ -212,17 +223,22 @@ class TestCacheRateTrackerThreadSafety:
             while not stop.is_set():
                 try:
                     tracker.get_rates()
+                    reader_started.set()
                 except Exception as e:
                     errors.append(e)
 
         threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
         for t in threads:
             t.start()
-        time.sleep(0.2)
-        stop.set()
-        for t in threads:
-            t.join(timeout=2.0)
+        try:
+            assert writer_started.wait(timeout=5.0)
+            assert reader_started.wait(timeout=5.0)
+        finally:
+            stop.set()
+            for t in threads:
+                t.join(timeout=2.0)
 
+        assert all(not t.is_alive() for t in threads)
         assert errors == [], f"Thread errors: {errors}"
 
 

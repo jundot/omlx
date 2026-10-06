@@ -43,7 +43,7 @@ def test_regeneration_overrides_survive_stream_context():
     assert "context._generationOverride" in stream
 
 
-def test_one_off_regeneration_does_not_replace_session_model():
+def test_regeneration_model_override_reaches_the_request():
     html = _template()
     stream = _section(
         html,
@@ -208,3 +208,13 @@ def test_empty_thinking_content_is_not_rendered_or_replayed():
     assert "reasoning_content: this.hasVisibleThinking(stream.streamingThinking)" in stream
     assert 'x-if="hasVisibleThinking(msg._thinking)"' in html
     assert 'x-show="hasVisibleThinking(currentStream()?.streamingThinking)"' in html
+
+
+def test_regenerate_with_model_switches_the_chat_model():
+    regenerate = _section(
+        _template(),
+        "async regenerateMessage(index, opts = {})",
+        "_copyFallback(text)",
+    )
+
+    assert "if (opts.model) await this.selectModel(opts.model);" in regenerate

@@ -2,6 +2,7 @@
 """Tests for omlx.server module - sampling parameter resolution and exception handlers."""
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -475,7 +476,17 @@ class TestExceptionHandlers:
     @pytest.fixture
     def client(self):
         """Create a test client for the FastAPI app."""
-        return TestClient(app, raise_server_exceptions=False)
+        from omlx.server import _server_state
+
+        original_key = _server_state.api_key
+        original_settings = _server_state.global_settings
+        _server_state.api_key = None
+        _server_state.global_settings = None
+        try:
+            yield TestClient(app, raise_server_exceptions=False)
+        finally:
+            _server_state.api_key = original_key
+            _server_state.global_settings = original_settings
 
     def test_http_exception_logged(self, client, caplog):
         """Test that HTTPException responses are logged."""
@@ -519,6 +530,40 @@ class TestExceptionHandlers:
         assert response.status_code == 404
         data = response.json()
         assert "detail" in data
+
+    @pytest.mark.parametrize(
+        ("path", "body", "param"),
+        [
+            (
+                "/v1/chat/completions",
+                {"messages": [{"role": "user", "content": "hi \ud83d"}]},
+                "messages[0].content",
+            ),
+            ("/v1/completions", {"prompt": "hi \ud83d"}, "prompt"),
+            (
+                "/v1/messages",
+                {
+                    "max_tokens": 8,
+                    "messages": [{"role": "user", "content": "hi \ud83d"}],
+                },
+                "messages[0].content",
+            ),
+            (
+                "/v1/messages/count_tokens",
+                {"messages": [{"role": "user", "content": "hi \ud83d"}]},
+                "messages[0].content",
+            ),
+            ("/v1/responses", {"input": "hi \ud83d"}, "input"),
+        ],
+    )
+    def test_lone_surrogate_returns_400(self, client, path, body, param):
+        response = client.post(
+            path,
+            content=json.dumps({"model": "m", **body}),
+            headers={"content-type": "application/json"},
+        )
+        assert response.status_code == 400
+        assert response.json()["error"]["param"] == param
 
     def test_non_api_validation_error_with_value_error_ctx_returns_422(self):
         """A ValueError-raising validator on a non-/v1/ route must 422, not 500.
@@ -1124,7 +1169,9 @@ def test_responses_reasoning_cache_policy(
         "get_model_settings_for_request",
         lambda name: ModelSettings(cache_reasoning_output=forced),
     )
-    monkeypatch.setitem(srv.app.dependency_overrides, srv.verify_api_key, lambda: True)
+    monkeypatch.setitem(
+        srv.app.dependency_overrides, srv.verify_inference_api_key, lambda: True
+    )
     with TestClient(srv.app, raise_server_exceptions=False) as client:
         response = client.post(
             "/v1/responses",
@@ -1137,3 +1184,56 @@ def test_responses_reasoning_cache_policy(
         )
     assert response.status_code == 418, response.text
     assert engine.preflight_chat.call_args.kwargs["preserve_reasoning"] is expected
+
+
+@pytest.mark.parametrize(
+    "model_type, thinking_type, expected",
+    [
+        (
+            "minimax_m3",
+            "adaptive",
+            {"enable_thinking": True, "thinking_mode": "adaptive"},
+        ),
+        ("minimax_m3", "enabled", {"enable_thinking": True}),
+        ("qwen3_5", "adaptive", {"enable_thinking": True}),
+    ],
+)
+def test_anthropic_adaptive_thinking_reaches_minimax_m3_template(
+    monkeypatch, model_type, thinking_type, expected
+):
+    engine = MagicMock()
+    engine.model_type = model_type
+    engine.is_diffusion_model = False
+    engine.tokenizer = None
+    engine.preflight_chat = AsyncMock(
+        side_effect=HTTPException(status_code=418, detail="Kwargs captured")
+    )
+    engine.start = AsyncMock()
+    engine.count_chat_tokens.return_value = 128
+    pool = MagicMock()
+    pool.preload_pinned_models = AsyncMock()
+    pool.check_ttl_expirations = AsyncMock()
+    pool.shutdown = AsyncMock()
+    pool.get_entry.return_value = SimpleNamespace(
+        config_model_type=model_type, preserve_thinking_default=None
+    )
+    monkeypatch.setattr(srv._server_state, "engine_pool", pool)
+    monkeypatch.setattr(srv, "get_engine_for_model", AsyncMock(return_value=engine))
+    monkeypatch.setattr(srv, "resolve_model_id", lambda name: name)
+    monkeypatch.setattr(srv, "validate_context_window", lambda *a, **k: None)
+    monkeypatch.setattr(srv, "get_model_settings_for_request", lambda name: None)
+    monkeypatch.setitem(
+        srv.app.dependency_overrides, srv.verify_inference_api_key, lambda: True
+    )
+    with TestClient(srv.app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "test-model",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "thinking": {"type": thinking_type},
+            },
+        )
+    assert response.status_code == 418, response.text
+    assert engine.preflight_chat.call_args.kwargs["chat_template_kwargs"] == expected

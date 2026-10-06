@@ -10,7 +10,6 @@ machine. Mitigations: subprocess with timeout, memory limits via resource
 module, temp file cleanup. Users are warned in the UI before running.
 """
 
-import asyncio
 import json
 import logging
 import os
@@ -20,9 +19,8 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional
 
-from .base import BaseBenchmark, BenchmarkResult, QuestionResult
+from .base import BaseBenchmark
 from .datasets import deterministic_sample, load_jsonl
 
 logger = logging.getLogger(__name__)
@@ -124,6 +122,10 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
 
     name = "livecodebench"
     quick_size = 100
+    auto_detect_thinking = False
+    blocking_scoring = True
+    expected_label = "(test cases)"
+    predicted_max_chars = 200
 
     async def load_dataset(self, sample_size: int = 0) -> list[dict]:
         """Load LiveCodeBench from bundled data."""
@@ -210,80 +212,3 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
                 return False
 
         return True
-
-    async def run(
-        self,
-        engine: Any,
-        items: list[dict],
-        on_progress: Optional[Callable[[int, int], Any]] = None,
-        batch_size: int = 1,
-        sampling_kwargs: Optional[dict] = None,
-        enable_thinking: bool = False,
-    ) -> BenchmarkResult:
-        """Override run: generation is batched, code execution is sequential."""
-        results: list[QuestionResult] = []
-        correct = 0
-        start_time = time.time()
-        completed = 0
-
-        for batch_start in range(0, len(items), batch_size):
-            batch_end = min(batch_start + batch_size, len(items))
-            batch = items[batch_start:batch_end]
-            batch_time = time.time()
-
-            # Batch the generation phase
-            gen_tasks = [
-                self._eval_single(engine, item, batch_start + j, sampling_kwargs, enable_thinking)
-                for j, item in enumerate(batch)
-            ]
-            gen_results = await asyncio.gather(*gen_tasks)
-            gen_elapsed = time.time() - batch_time
-
-            # Code execution is sequential (subprocess safety)
-            for (
-                idx,
-                item,
-                response_text,
-                prompt_text,
-                _raw,
-                diagnostics,
-            ) in sorted(gen_results, key=lambda x: x[0]):
-                code, is_correct, question_status = self._classify_response(
-                    response_text, item, diagnostics
-                )
-                result_diagnostics = self._diagnostic_result_fields(diagnostics)
-                result_diagnostics["status"] = question_status
-
-                if is_correct:
-                    correct += 1
-
-                results.append(
-                    QuestionResult(
-                        question_id=str(item.get("id", idx)),
-                        correct=is_correct,
-                        expected="(test cases)",
-                        predicted=code[:200] + "..." if len(code) > 200 else code,
-                        time_seconds=gen_elapsed / len(batch),
-                        question_text=prompt_text,
-                        raw_response=response_text,
-                        category=self.get_category(item),
-                        **result_diagnostics,
-                    )
-                )
-
-            completed += len(batch)
-            if on_progress:
-                await on_progress(completed, len(items))
-
-        total_time = time.time() - start_time
-        total = len(items)
-
-        return BenchmarkResult(
-            benchmark_name=self.name,
-            accuracy=correct / total if total > 0 else 0.0,
-            total_questions=total,
-            correct_count=correct,
-            time_seconds=total_time,
-            question_results=results,
-            thinking_used=enable_thinking,
-        )

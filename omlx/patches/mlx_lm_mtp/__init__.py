@@ -20,10 +20,10 @@ Activation gate: caller (utils/model_loading.py) checks
 heads + a supported ``model_type`` before invoking ``apply_mlx_lm_mtp_patch``.
 The patches are idempotent.
 
-Concurrency model: the BatchGenerator patch uses the singleton MTP path for
-one active sequence, and a row-wise MTP controller for multi-sequence batches
-only when every row is at the same target cache position. Late-join or otherwise
-unaligned batches fall through to standard continuous batching.
+Concurrency model: each UID owns its MTP head history. Compatible rows share
+backbone verification while acceptance and cache commits remain per-request.
+Backbones with a singleton capture contract run independent verify forwards
+inside the continuous batch.
 """
 
 from __future__ import annotations
@@ -68,15 +68,23 @@ def is_mtp_active() -> bool:
 # engages on models whose patch marks ``_omlx_mtp_chain`` (Qwen3.5/3.6);
 # DeepSeek-V4 stays on the depth-1 legacy cycle.
 _MTP_DEPTH = 1
+# True when every cycle drafts exactly _MTP_DEPTH tokens (no adaptive
+# controller); copied onto the instance as ``_omlx_mtp_depth_fixed``.
+_MTP_DEPTH_FIXED = False
 
 
-def set_mtp_depth(depth: int) -> None:
-    global _MTP_DEPTH
+def set_mtp_depth(depth: int, fixed: bool = False) -> None:
+    global _MTP_DEPTH, _MTP_DEPTH_FIXED
     _MTP_DEPTH = max(1, min(MAX_LIGHTNING_MTP_DRAFT_TOKENS, int(depth)))
+    _MTP_DEPTH_FIXED = bool(fixed)
 
 
 def get_mtp_depth() -> int:
     return _MTP_DEPTH
+
+
+def is_mtp_depth_fixed() -> bool:
+    return _MTP_DEPTH_FIXED
 
 
 def apply_mlx_lm_mtp_patch() -> bool:

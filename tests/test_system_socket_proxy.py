@@ -8,13 +8,16 @@ import threading
 
 import pytest
 
+from omlx.cluster import system_socket_proxy as proxy_module
 from omlx.cluster.system_socket_proxy import (
     open_system_tcp_proxy,
     should_proxy_control_socket,
 )
 
 
-def test_system_proxy_bridges_a_loopback_stream():
+def test_system_proxy_bridges_a_loopback_stream(monkeypatch, tmp_path):
+    # oMLX.app exports PYTHONHOME for its bundled interpreter.
+    monkeypatch.setenv("PYTHONHOME", str(tmp_path))
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", 0))
@@ -31,7 +34,8 @@ def test_system_proxy_bridges_a_loopback_stream():
             stream.close()
             listener.close()
 
-    thread = threading.Thread(target=server)
+    # Daemon: a helper that fails to start must fail the test, not hang it.
+    thread = threading.Thread(target=server, daemon=True)
     thread.start()
     proxy = open_system_tcp_proxy("127.0.0.1", port, timeout=3)
     try:
@@ -85,3 +89,21 @@ def test_system_proxy_reaches_ipv6_loopback():
         proxy.close()
     thread.join(3)
     assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("override", [None, "/custom/python", "/missing/python"])
+def test_proxy_python_preserves_system_default_and_explicit_override(
+    monkeypatch, override
+):
+    if override is None:
+        monkeypatch.delenv("OMLX_CLUSTER_CONTROL_PROXY_PYTHON", raising=False)
+    else:
+        monkeypatch.setenv("OMLX_CLUSTER_CONTROL_PROXY_PYTHON", override)
+    monkeypatch.setattr(
+        proxy_module.Path, "is_file", lambda path: str(path) != "/missing/python"
+    )
+    monkeypatch.setattr(proxy_module.os, "access", lambda path, mode: True)
+    expected = "/usr/bin/python3" if override is None else override
+    if override == "/missing/python":
+        expected = None
+    assert proxy_module._system_python() == expected

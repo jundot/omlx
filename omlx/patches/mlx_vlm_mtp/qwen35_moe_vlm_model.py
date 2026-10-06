@@ -120,29 +120,6 @@ def apply() -> bool:
             "mtp.norm.weight",
         )
 
-        # MTP-head norm conventions: raw-HF sources (unsanitized conv1d
-        # present) shift every head norm uniformly with the backbone — see
-        # the raw-HF branch below. Pre-converted checkpoints can ship MIXED
-        # head conventions (JANG MXFP4 Qwen3.6 bundles keep ``mtp.norm`` in
-        # MLX's +1 convention while the per-layer head norms remain raw-HF),
-        # so that branch decides PER-KEY from each weight's own magnitude
-        # (raw-HF center ~0, MLX-shifted ~1). Mirrors
-        # mlx_lm_mtp/qwen35_model.py. The magnitude is unreadable during oQ
-        # streaming plan discovery (the weight is a no-data ``_TrackedTensor``
-        # and ``mx.mean(...).item()`` raises), so emit a conditional replay
-        # transform there.
-        def _is_oq_tracked_tensor(_w):
-            return _w.__class__.__name__ == "_TrackedTensor" and hasattr(_w, "_clone")
-
-        def _mark_mtp_norm_conditional_add(_w):
-            return _w._clone(transform="add_if_mean_lt_0_5")
-
-        def _mtp_norm_is_raw_hf(_w, _fallback):
-            try:
-                return float(mx.mean(_w.astype(mx.float32)).item()) < 0.5
-            except Exception:
-                return _fallback
-
         sanitized_weights = {}
         for key, value in weights.items():
             if "model" in key:
@@ -165,26 +142,15 @@ def apply() -> bool:
                 # monkey-patch in omlx.oq when called with _TrackedTensor;
                 # the instance method on the tracker doesn't exist.
                 value = mx.moveaxis(value, 2, 1)
-            if value.ndim == 1 and any(key.endswith(sfx) for sfx in norm_keys):
-                # ``key`` is already remapped to ``language_model.mtp.*`` for
-                # MTP weights here, so test the ``mtp.`` substring.
-                if "mtp." in key:
-                    if should_shift_norm_weights:
-                        # Raw-HF source: every Qwen3-Next RMSNorm gamma is
-                        # zero-centered — shift head norms uniformly like the
-                        # backbone's. Per-key mean heuristics misclassify
-                        # q_norm/k_norm (raw ~0.75), post_attention_layernorm
-                        # (raw ~0.87 on 35B-A3B), and mtp.norm (raw ~1.3-1.9),
-                        # costing tens of points of draft acceptance.
-                        value = value + 1.0
-                    # Pre-converted checkpoints: per-key decision (JANG
-                    # mixed-convention bundles).
-                    elif _is_oq_tracked_tensor(value):
-                        value = _mark_mtp_norm_conditional_add(value)
-                    elif _mtp_norm_is_raw_hf(value, should_shift_norm_weights):
-                        value = value + 1.0
-                elif should_shift_norm_weights:
-                    value = value + 1.0
+            # Head norms follow the backbone: raw-HF shifts every gamma by
+            # +1, MLX-format is loaded as stored. Legacy mixed heads are
+            # repaired in ``norm_repair`` at load_weights time (see #3742).
+            if (
+                should_shift_norm_weights
+                and value.ndim == 1
+                and any(key.endswith(sfx) for sfx in norm_keys)
+            ):
+                value = value + 1.0
 
             sanitized_weights[key] = value
 

@@ -1,4 +1,7 @@
 import os
+import subprocess
+import sys
+import zlib
 
 # MLX 0.32.2 runs fp32 GPU matmuls at TF32 precision on M5-class tensor units;
 # the fp32 parity tests assert 2e-5, which TF32 cannot hold. Test session only.
@@ -31,7 +34,46 @@ _install_torch_stub()
 from omlx.patches.m5_gather_qmm import apply_m5_gather_qmm_workaround
 apply_m5_gather_qmm_workaround()
 
+from omlx.custom_kernels.nax import is_nax_available
 from omlx.request import Request, SamplingParams
+
+
+@pytest.fixture
+def glm5_fused_decode():
+    """GLM-5.3's fused decode/verify kernels, which run (and replay the
+    reference bit for bit) only on NAX GPUs."""
+    if not is_nax_available():
+        pytest.skip("the fused GLM-5.3 decode kernels run on M5 (NAX) GPUs")
+    from omlx.patches.mlx_vlm_glm5_next_compat import (
+        apply_mlx_vlm_glm5_next_compat_patch,
+    )
+
+    apply_mlx_vlm_glm5_next_compat_patch()
+    from mlx_vlm.models.glm5_next import language
+
+    assert language._DECODE_FUSION
+    return language
+
+
+@pytest.fixture(autouse=True)
+def cluster_home(tmp_path, monkeypatch):
+    from omlx.cluster import ssh_keys, worker_shim
+
+    home = tmp_path / "cluster-home"
+    publish = worker_shim.ensure_cluster_python_shim
+
+    def publish_shim(**kwargs):
+        if kwargs.get("home") is None:
+            kwargs["home"] = home
+        return publish(**kwargs)
+
+    monkeypatch.setattr(worker_shim, "ensure_cluster_python_shim", publish_shim)
+    # SSH paths are resolved at import time, before test fixtures run.
+    ssh_dir = home / ".ssh"
+    monkeypatch.setattr(ssh_keys, "_SSH_DIR", ssh_dir)
+    monkeypatch.setattr(ssh_keys, "_SSH_KEY_PATH", ssh_dir / "omlx_cluster")
+    monkeypatch.setattr(ssh_keys, "_SSH_PUBKEY_PATH", ssh_dir / "omlx_cluster.pub")
+    return home
 
 
 class MockTokenizer:
@@ -51,8 +93,8 @@ class MockTokenizer:
             tokens.append(self.bos_token_id)
         # Simulate tokenization by splitting on spaces
         for i, word in enumerate(text.split()):
-            # Use hash to get a consistent token id for each word
-            token_id = (hash(word) % (self.vocab_size - 10)) + 10
+            # crc32, unlike hash(), is stable across processes.
+            token_id = (zlib.crc32(word.encode()) % (self.vocab_size - 10)) + 10
             tokens.append(token_id)
         return tokens
 
@@ -137,6 +179,19 @@ def mock_tokenizer() -> MockTokenizer:
 
 
 @pytest.fixture
+def mock_cluster_ssh(monkeypatch):
+    from omlx.cluster import launch
+
+    runner = MagicMock(
+        return_value=subprocess.CompletedProcess(
+            [], 0, stdout='{"action": "no-marker"}', stderr=""
+        )
+    )
+    monkeypatch.setattr(launch, "_run_cluster_ssh", runner)
+    return runner
+
+
+@pytest.fixture
 def mock_model() -> MockModel:
     """Provide a mock model for tests."""
     return MockModel()
@@ -217,3 +272,29 @@ def _reset_decode_activity_registry():
     get_decode_activity().clear()
     yield
     get_decode_activity().clear()
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_metal_release_accounting(monkeypatch):
+    """Keep the graphics footprint and its release-lag history test-local.
+
+    Tests feed synthetic phys_footprint values. The test process's real
+    graphics ledger and earlier tests' samples would otherwise split or
+    discount them unpredictably. Tests of the split patch these explicitly.
+    """
+    for name in (
+        "omlx.scheduler",
+        "omlx.process_memory_enforcer",
+        "omlx.utils.metal_sync",
+    ):
+        module = sys.modules.get(name)
+        if module is not None and hasattr(module, "get_graphics_footprint"):
+            monkeypatch.setattr(module, "get_graphics_footprint", lambda: 0)
+    metal_sync = sys.modules.get("omlx.utils.metal_sync")
+    if metal_sync is not None:
+        metal_sync._residuals.clear()
+        metal_sync._last_unreleased = (0.0, 0)
+    yield
+    if metal_sync is not None:
+        metal_sync._residuals.clear()
+        metal_sync._last_unreleased = (0.0, 0)

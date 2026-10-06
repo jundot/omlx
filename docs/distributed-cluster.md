@@ -125,9 +125,11 @@ with HMAC-SHA256; an unkeyed or altered token is rejected.
 ### CUDA Worker Enrollment
 
 The CUDA card is the normal Linux path; the older two-dashboard key exchange is
-only for peer Macs. The coordinator must listen on a LAN-reachable address. If
-the dashboard URL uses localhost, set **Settings > Server host** to `0.0.0.0`,
-restart oMLX, and enter the Studio's private IPv4 address in the card.
+only for peer Macs. The coordinator must listen on a LAN-reachable address.
+Configure the main API key first, or save it together with **Settings > Server
+host** set to `0.0.0.0`. Then restart oMLX and enter the Studio's private IPv4
+address in the card. oMLX refuses a non-loopback bind until an API key is
+configured.
 
 Select **Generate join command**, copy it, and paste it into one CUDA worker. The
 command expires after thirty minutes and can be claimed only once. It may ask for
@@ -342,3 +344,9 @@ the two target Macs:
 7. the target large model's per-rank resident memory, TTFT, prefill throughput,
    single-stream decode, concurrent aggregate decode, cache hit rate, pipeline
    utilization, and long-context KV growth.
+
+### Different SSH usernames in the Cluster v2 wizard
+
+Pairing installs each Mac's key in the account that runs oMLX, and each Mac sends that account name with its pairing request or approval. The other Mac stores it and uses it for peer checks, model discovery and new plans, so Macs with different usernames need no extra setup.
+
+A peer on an older oMLX version does not send its account name, and devices paired before this version have none stored. If the SSH check fails for such a device, enter the remote account's short login name in the **SSH username** field shown under the failed check and select **Save SSH username**, then re-run the checks. Clearing the field and saving removes the stored account, including one received during pairing, and falls back to your OpenSSH configuration. Existing signed deployments keep their original SSH targets; recreate their plan to use a changed username.

@@ -65,6 +65,8 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "qwen35_ane_prefill_cpu_shared_resource",
     "qwen35_oq_a8_enabled",
     "qwen35_oq_a8_min_tokens",
+    "moe_expert_offload_enabled",
+    "moe_expert_offload_resident_fraction",
     "dflash_enabled",
     "dflash_draft_model",
     "dflash_draft_quant_enabled",
@@ -82,7 +84,8 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "dflash_block_size",
     "dflash_verify_mode",
     "mtp_enabled",
-    "mtp_num_draft_tokens",
+    "mtp_adaptive_max_depth",
+    "mtp_fixed_depth",
     "vlm_mtp_enabled",
     "vlm_mtp_draft_model",
     "vlm_mtp_draft_block_size",
@@ -108,6 +111,9 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "ttl_seconds",
         # Hardware-specific residency choice; never propagate across models.
         "qwen4_ple_ssd_offload",
+        "deepseek_v41_engram_ssd_offload",
+        # Architecture-level prefill strategy; explicit per model.
+        "deepseek_v41_ced_prefill_enabled",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
     }
@@ -137,9 +143,24 @@ def filter_universal_fields(data: dict[str, Any]) -> dict[str, Any]:
     return _filter_and_sanitize(data, UNIVERSAL_FIELDS_SET)
 
 
+def normalize_turboquant_kv_bits(value: Any) -> Any:
+    """Return float bits; keep invalid legacy values so other settings still load."""
+    if isinstance(value, bool):
+        return value
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return value
+
+
 def filter_profile_fields(data: dict[str, Any]) -> dict[str, Any]:
     """Return a new dict of UNIVERSAL + MODEL_SPECIFIC keys with real values."""
-    return _filter_and_sanitize(data, PROFILE_FIELDS_SET)
+    filtered = _filter_and_sanitize(data, PROFILE_FIELDS_SET)
+    if "turboquant_kv_bits" in filtered:
+        filtered["turboquant_kv_bits"] = normalize_turboquant_kv_bits(
+            filtered["turboquant_kv_bits"]
+        )
+    return filtered
 
 
 @dataclass

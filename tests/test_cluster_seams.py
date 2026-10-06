@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import re
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -275,13 +276,16 @@ def test_no_unreachable_functions_in_the_cluster_package():
         ("pairing_routes.py", "set_pairing_manager_getter"),
     }
 
-    sources = {path: path.read_text() for path in (_REPO / "omlx").rglob("*.py")}
+    name_counts = Counter(
+        name
+        for path in (_REPO / "omlx").rglob("*.py")
+        for name in re.findall(r"\w+", path.read_text())
+    )
 
     uncalled = []
-    for path in sorted(_CLUSTER.glob("*.py")):
+    for path in sorted(_CLUSTER.rglob("*.py")):
         for name in _public_functions(path):
-            pattern = re.compile(rf"\b{re.escape(name)}\b")
-            hits = sum(len(pattern.findall(text)) for text in sources.values())
+            hits = name_counts[name]
             if hits <= 1 and (path.name, name) not in allowed_uncalled:
                 uncalled.append(f"{path.name}:{name}")
 
@@ -295,7 +299,7 @@ def test_every_literal_ssh_and_scp_command_uses_the_shared_policy():
     """One raw subprocess is enough to bring an interactive prompt back."""
 
     offenders = []
-    for path in sorted(_CLUSTER.glob("*.py")):
+    for path in sorted(_CLUSTER.rglob("*.py")):
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if not isinstance(node, ast.List) or not node.elts:
@@ -333,8 +337,8 @@ def test_discovery_does_not_import_the_transport_prober():
             )
 
 
-def test_every_get_route_answers_without_a_server_error():
-    """Smoke every read-only route through the real app.
+def test_every_get_route_answers_without_a_server_error(cluster_home):
+    """Smoke every GET route through the real app.
 
     Not about the payloads — about the wiring. A route that raises on import,
     a missing dependency, or a handler signature FastAPI cannot satisfy shows up
@@ -367,6 +371,11 @@ def test_every_get_route_answers_without_a_server_error():
             assert response.status_code != 500, (
                 f"GET {route.path} returned {response.status_code}: {response.text[:200]}"
             )
+            if route.path == "/admin/api/cluster/ssh-key":
+                key_path = cluster_home / ".ssh/omlx_cluster"
+                assert response.json()["private_key_path"] == str(key_path)
+                assert key_path.is_file()
+                assert key_path.with_suffix(".pub").is_file()
             checked += 1
     assert checked >= 5, "expected to smoke several GET routes"
 

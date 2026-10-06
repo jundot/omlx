@@ -6,14 +6,44 @@ This module provides shared tokenizer configuration and fixes that are used
 across multiple modules in the codebase.
 """
 
+import copy
 import json
 import logging
+import weakref
 from collections.abc import Callable
 from functools import lru_cache, partial
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Prototype streaming detokenizers per tokenizer object, keyed by how they
+# were built. mlx-lm's SPM/BPE detokenizers convert the entire vocabulary in
+# __init__ (~90 ms for a 250k-token vocab), which is a per-request cost when
+# the tokenizer has no reusable detokenizer of its own (mlx-vlm and raw HF
+# tokenizers). Requests copy the prototype instead, the way mlx-lm's
+# TokenizerWrapper.detokenizer does: the copy shares only the vocabulary
+# tables, which are never mutated, and reset() gives it fresh streaming state.
+_DETOKENIZER_PROTOTYPES: "weakref.WeakKeyDictionary[Any, dict[str, Any]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _fresh_detokenizer(tokenizer: Any, key: str, build: Callable[[], Any]) -> Any:
+    """Return a fresh streaming detokenizer, building its prototype once."""
+    try:
+        prototypes = _DETOKENIZER_PROTOTYPES.setdefault(tokenizer, {})
+    except TypeError:
+        # Not weak-referenceable or not hashable: build per request as before.
+        prototypes = None
+    prototype = prototypes.get(key) if prototypes is not None else None
+    if prototype is None:
+        prototype = build()
+        if prototypes is not None:
+            prototypes[key] = prototype
+    detokenizer = copy.copy(prototype)
+    detokenizer.reset()
+    return detokenizer
 
 
 def unwrap_tokenizer(tokenizer):
@@ -44,11 +74,24 @@ def unwrap_tokenizer(tokenizer):
     return tokenizer
 
 
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
 def resolve_vocab_size(model: Any) -> int | None:
     """Extract vocab_size from a model's config/args, handling nested configs.
 
-    Tries ``model.config.vocab_size``, then ``model.args.vocab_size``,
-    then ``text_config.vocab_size`` for VLM composite models (e.g. Qwen3.5).
+    For a composite (VLM) config the nested ``text_config.vocab_size`` wins
+    over the top-level ``vocab_size``: the language model's embedding and
+    ``lm_head`` are sized from the text config, while the top-level field
+    is often a dataclass placeholder that the checkpoint's ``config.json``
+    never sets (mlx-vlm's Qwen3-VL ``ModelConfig`` defaults it to 32000
+    against a 151936-token text vocabulary). Sizing the grammar bitmask
+    from that placeholder misaligns the mask with the logits, and every
+    sampled token is rejected until ``max_tokens`` (#3550). Falls back to
+    ``model.config.vocab_size`` / ``model.args.vocab_size`` for plain LLMs.
 
     Args:
         model: An MLX model object (LLM, VLM, or any object with config/args).
@@ -62,15 +105,17 @@ def resolve_vocab_size(model: Any) -> int | None:
         config = getattr(model, attr, None)
         if config is None:
             continue
-        vs = getattr(config, "vocab_size", None)
-        if isinstance(vs, int):
-            return vs
         text_cfg = getattr(config, "text_config", None)
         if isinstance(text_cfg, dict):
-            vs = text_cfg.get("vocab_size")
+            nested = _positive_int(text_cfg.get("vocab_size"))
         elif text_cfg is not None:
-            vs = getattr(text_cfg, "vocab_size", None)
-        if isinstance(vs, int):
+            nested = _positive_int(getattr(text_cfg, "vocab_size", None))
+        else:
+            nested = None
+        if nested is not None:
+            return nested
+        vs = _positive_int(getattr(config, "vocab_size", None))
+        if vs is not None:
             return vs
     return None
 
@@ -364,7 +409,9 @@ def _create_decoder_aware_detokenizer(
         return None
 
     try:
-        return factory(tokenizer)
+        return _fresh_detokenizer(
+            tokenizer, f"decoder:{tokenizer_file}", lambda: factory(tokenizer)
+        )
     except Exception as exc:
         logger.debug(
             "Failed to create decoder-aware detokenizer from %s: %s",
@@ -442,7 +489,9 @@ def create_streaming_detokenizer(
         try:
             from mlx_lm.tokenizer_utils import BPEStreamingDetokenizer
 
-            return BPEStreamingDetokenizer(tokenizer)
+            return _fresh_detokenizer(
+                tokenizer, "ocr-bpe", lambda: BPEStreamingDetokenizer(tokenizer)
+            )
         except Exception as exc:
             raise RuntimeError(
                 "Failed to create a byte-level Unlimited-OCR detokenizer."
@@ -503,33 +552,6 @@ def create_streaming_detokenizer(
         return None
 
 
-def _is_lfm2_text_lm(model_name: str) -> bool:
-    """Return True for local LFM2 text causal LM checkpoints."""
-    config_path = Path(model_name) / "config.json"
-    config = _read_json_file(config_path)
-    if config is None:
-        return False
-
-    model_type = str(config.get("model_type") or "").lower().replace("-", "_")
-    architectures = [
-        str(arch) for arch in config.get("architectures", []) if isinstance(arch, str)
-    ]
-    architectures_lower = [arch.lower() for arch in architectures]
-
-    if model_type in {"lfm_audio", "lfm2_audio"}:
-        return False
-    if any(key in config for key in ("audio_config", "tts_config", "stt_config")):
-        return False
-    if any("audio" in arch for arch in architectures_lower):
-        return False
-    if not any("forcausallm" in arch for arch in architectures_lower):
-        return False
-
-    return model_type.startswith("lfm2") or any(
-        arch.lower().startswith("lfm2") for arch in architectures
-    )
-
-
 def _is_laguna_model(model_name: str) -> bool:
     """Return True only for a local checkpoint declaring ``model_type: laguna``."""
     config = _read_json_file(Path(model_name) / "config.json")
@@ -583,10 +605,6 @@ def get_tokenizer_config(
     if is_qwen3_model(model_name):
         config["eos_token"] = "<|im_end|>"
         logger.debug("Qwen3 detected: setting eos_token to <|im_end|>")
-
-    if _is_lfm2_text_lm(model_name):
-        config.setdefault("tool_parser_type", "pythonic")
-        logger.debug("LFM2 text LM detected: setting tool_parser_type to pythonic")
 
     if _is_laguna_model(model_name):
         # Laguna's Mistral-derived tokenizer ships the legacy regex that

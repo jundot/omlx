@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question
+    url: https://github.com/jundot/omlx/discussions/categories/q-a
+    about: Ask setup and usage questions in Discussions.
+  - name: Feature request
+    url: https://github.com/jundot/omlx/discussions/categories/ideas
+    about: Suggest new features or model support in Discussions.
+  - name: Security vulnerability
+    url: https://github.com/jundot/omlx/security/advisories/new
+    about: Report vulnerabilities privately. See SECURITY.md.

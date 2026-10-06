@@ -5,6 +5,8 @@
 
 #include "dsa_indexer.h"
 #include "deepseek_v4_sparse_attention.h"
+#include "deepseek_v41_packed_attention.h"
+#include "deepseek_v41_grouped_expert.h"
 #include "dspark_gemm.h"
 #include "dspark_qmv.h"
 #include "exact_block_attention.h"
@@ -17,6 +19,9 @@ using namespace nb::literals;
 
 NB_MODULE(_ext, m) {
   m.doc() = "Native GLM kernels for oMLX";
+  m.def("deepseek_v41_grouped_expert",
+        &omlx::glm_kernels::deepseek_v41_grouped_expert,
+        "gate"_a, "up"_a, "activation"_a, "down"_a);
 
   // ABI canary: when the extension is built with a nanobind whose ABI tag
   // differs from the one the mlx wheel was built with, the NB_DOMAIN is
@@ -154,6 +159,19 @@ NB_MODULE(_ext, m) {
   m.def(
       "deepseek_v4_sparse_attention",
       &omlx::glm_kernels::deepseek_v4_sparse_attention,
+      "q"_a,
+      "local_kv"_a,
+      "pooled"_a,
+      "topk_indices"_a,
+      "sinks"_a,
+      "scale"_a,
+      "q_offset"_a,
+      "compress_ratio"_a,
+      "local_window"_a,
+      "stream"_a = nb::none());
+  m.def(
+      "deepseek_v41_packed_attention",
+      &omlx::glm_kernels::deepseek_v41_packed_attention,
       "q"_a,
       "local_kv"_a,
       "pooled"_a,

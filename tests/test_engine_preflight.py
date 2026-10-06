@@ -14,13 +14,20 @@ the exception into HTTP 400. We exercise the contract by:
 """
 
 import concurrent.futures
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from omlx.engine.base import _run_scheduler_preflight_with_cleanup_retry
+from omlx.engine.batched import BatchedEngine
+from omlx.engine.vlm import VLMBatchedEngine
 from omlx.exceptions import PrefillMemoryExceededError
 from omlx.scheduler import Scheduler
+
+_GB = 1024**3
 
 _TINY_PNG_DATA_URI = (
     "data:image/png;base64,"
@@ -63,7 +70,11 @@ def _make_scheduler():
         prefill_step_size=2048,
         paged_cache_block_size=0,
     )
-    return Scheduler(model=model, tokenizer=tokenizer, config=config)
+    scheduler = Scheduler(model=model, tokenizer=tokenizer, config=config)
+    # Admission also plans against hard limit * headroom safety; tests that
+    # pin other terms keep that line at the hard limit.
+    scheduler._prefill_headroom_safety = 1.0
+    return scheduler
 
 
 class TestPreflightOrRaise:
@@ -94,6 +105,34 @@ class TestPreflightOrRaise:
 
         # Must not raise
         scheduler.preflight_or_raise(num_prompt_tokens=1024)
+
+    def test_counts_releasable_hot_cache(self, monkeypatch):
+        """The request has no block table yet, so route preflight counts the
+        hot cache the scheduler releases after admission (#4213)."""
+        gb = 1024**3
+        scheduler = _make_scheduler()
+        scheduler._prefill_memory_guard = True
+        scheduler._memory_abort_limit_bytes = 10**18
+
+        import omlx.scheduler as scheduler_mod
+
+        monkeypatch.setattr(scheduler_mod.mx, "get_active_memory", lambda: 0)
+        monkeypatch.setattr(scheduler_mod, "get_phys_footprint", lambda: 0)
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=65536, cached_tokens=0, current=0
+        )
+        scheduler._memory_hard_limit_bytes = est.estimated - gb
+        scheduler._memory_hot_cache_reserved_bytes = est.kv_exact + 4 * gb
+        # Up to the prompt's own KV may be its protected prefix, not credit.
+        hot = [est.kv_exact + 2 * gb]
+        monkeypatch.setattr(scheduler, "_hot_cache_cpu_bytes", lambda: hot[0])
+
+        scheduler.preflight_or_raise(num_prompt_tokens=65536, request_id="r")
+        assert scheduler.preflight_eviction_request(num_prompt_tokens=65536) is None
+
+        hot[0] = est.kv_exact + gb // 2
+        with pytest.raises(PrefillMemoryExceededError):
+            scheduler.preflight_or_raise(num_prompt_tokens=65536, request_id="r")
 
     def test_skips_when_guard_disabled(self):
         scheduler = _make_scheduler()
@@ -132,6 +171,7 @@ def _build_engine_with_stub_scheduler(engine_cls, scheduler):
     """
     engine = engine_cls.__new__(engine_cls)
     engine._loaded = True
+    engine._model_name = "test-model"
     engine._enable_thinking = None
     engine._prefill_eviction_callback = None
 
@@ -249,6 +289,130 @@ def test_scheduler_route_preflight_cleanup_signal():
     assert scheduler.has_pending_route_preflight_cleanup() is False
 
 
+def test_scheduler_reports_stale_route_preflight_usage(monkeypatch):
+    scheduler = _make_scheduler()
+    assert scheduler.route_preflight_usage_is_stale() is True
+
+    import omlx.scheduler as scheduler_mod
+
+    monkeypatch.setattr(scheduler_mod.mx, "get_active_memory", lambda: 0)
+    monkeypatch.setattr(scheduler_mod, "get_phys_footprint", lambda: 0)
+    scheduler.refresh_route_preflight_usage()
+
+    assert scheduler.route_preflight_usage_is_stale() is False
+    assert scheduler._last_mlx_active_memory_at <= time.monotonic()
+
+
+@pytest.mark.asyncio
+async def test_stale_idle_preflight_refreshes_before_eviction():
+    scheduler = MagicMock()
+    stale_rejection = SimpleNamespace(request_id="req-stale", stale_usage=True)
+    scheduler.preflight_eviction_request.side_effect = [stale_rejection, None]
+    scheduler.has_pending_route_preflight_cleanup.return_value = False
+    evict = AsyncMock()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        await _run_scheduler_preflight_with_cleanup_retry(
+            scheduler,
+            num_prompt_tokens=60_000,
+            request_id="req-stale",
+            eviction_callback=evict,
+            executor=executor,
+        )
+    finally:
+        executor.shutdown(wait=True)
+
+    assert scheduler.preflight_eviction_request.call_count == 2
+    scheduler.refresh_route_preflight_usage.assert_called_once_with()
+    scheduler.preflight_or_raise.assert_called_once_with(
+        num_prompt_tokens=60_000,
+        request_id="req-stale",
+    )
+    evict.assert_not_awaited()
+
+
+def _post_eviction_scheduler(monkeypatch):
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 100 * _GB
+    scheduler._memory_abort_limit_bytes = 10**18
+    scheduler._last_mlx_active_memory_bytes = 110 * _GB
+    scheduler._last_mlx_active_memory_at = time.monotonic()
+    # Isolate post-callback refresh from the existing idle-age refresh path.
+    monkeypatch.setattr(scheduler, "route_preflight_usage_is_stale", lambda: False)
+    monkeypatch.setattr("omlx.scheduler.mx.get_cache_memory", lambda: 0)
+    monkeypatch.setattr("omlx.scheduler.unreleased_graphics_bytes", lambda *a, **k: 0)
+    monkeypatch.setattr(scheduler, "_hot_cache_cpu_bytes", lambda: 0)
+    return scheduler
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine_cls", [BatchedEngine, VLMBatchedEngine])
+@pytest.mark.parametrize("callback_result", [True, False])
+@pytest.mark.parametrize("remaining_gb", [80, 110])
+async def test_post_callback_refresh_preserves_admission_guard(
+    monkeypatch, engine_cls, callback_result, remaining_gb
+):
+    """Route admission must re-sample memory after the pool's eviction callback."""
+    scheduler = _post_eviction_scheduler(monkeypatch)
+    resident = {"bytes": 110 * _GB}
+    sample_threads = []
+    event_loop_thread = threading.get_ident()
+
+    def active_memory():
+        sample_threads.append(threading.get_ident())
+        return resident["bytes"]
+
+    monkeypatch.setattr("omlx.scheduler.mx.get_active_memory", active_memory)
+    monkeypatch.setattr("omlx.scheduler.get_phys_footprint", lambda: resident["bytes"])
+    requests = []
+
+    async def evict(request):
+        requests.append(request)
+        # False can mean the pool already sees enough headroom; its sample
+        # can disagree with the requesting scheduler's cached MLX reading.
+        resident["bytes"] = remaining_gb * _GB
+        return callback_result
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        engine = engine_cls("test-model", prefill_eviction_callback=evict)
+        engine._engine = SimpleNamespace(engine=SimpleNamespace(_mlx_executor=executor))
+        if remaining_gb == 110:
+            with pytest.raises(PrefillMemoryExceededError) as exc:
+                await engine._preflight_or_raise_with_eviction(
+                    scheduler, num_prompt_tokens=2048, request_id="after-eviction"
+                )
+            assert exc.value.estimated_bytes > 110 * _GB
+        else:
+            await engine._preflight_or_raise_with_eviction(
+                scheduler, num_prompt_tokens=2048, request_id="after-eviction"
+            )
+
+    assert len(requests) == 1
+    assert requests[0].current_bytes == 110 * _GB
+    assert scheduler._last_mlx_active_memory_bytes == remaining_gb * _GB
+    assert len(sample_threads) == 1
+    assert sample_threads[0] != event_loop_thread
+
+
+@pytest.mark.asyncio
+async def test_fitting_preflight_does_not_queue_executor_work(monkeypatch):
+    scheduler = _post_eviction_scheduler(monkeypatch)
+    scheduler._last_mlx_active_memory_bytes = 80 * _GB
+    monkeypatch.setattr("omlx.scheduler.get_phys_footprint", lambda: 80 * _GB)
+    refresh = MagicMock()
+    monkeypatch.setattr(scheduler, "refresh_route_preflight_usage", refresh)
+    evict = AsyncMock()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        engine = BatchedEngine("test-model", prefill_eviction_callback=evict)
+        engine._engine = SimpleNamespace(engine=SimpleNamespace(_mlx_executor=executor))
+        await engine._preflight_or_raise_with_eviction(
+            scheduler, num_prompt_tokens=2048, request_id="already-fits"
+        )
+    evict.assert_not_awaited()
+    refresh.assert_not_called()
+
+
 def test_async_remove_schedules_clear_after_extracted_cache_release(monkeypatch):
     scheduler = _make_scheduler()
     future = concurrent.futures.Future()
@@ -339,7 +503,7 @@ async def test_preflight_completion_raises_for_oversize_prompt(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_vlm_preflight_chat_adds_image_token_budget(monkeypatch):
-    """Each image-bearing content part must add
+    """Each decoded image must add
     ``_IMAGE_TOKEN_UPPER_BOUND_FALLBACK`` to the prompt size the scheduler sees,
     so image-heavy borderline requests can't slip past."""
     from omlx.engine.vlm import _IMAGE_TOKEN_UPPER_BOUND_FALLBACK, VLMBatchedEngine
@@ -365,7 +529,10 @@ async def test_vlm_preflight_chat_adds_image_token_budget(monkeypatch):
                     "type": "image_url",
                     "image_url": {"url": _TINY_PNG_DATA_URI},
                 },
-                {"type": "image", "source": {}},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": _TINY_PNG_DATA_URI},
+                },
                 {"type": "text", "text": "world"},
             ],
         }
@@ -885,6 +1052,27 @@ class TestRejectionMessageNamesBindingCeiling:
         assert "metal_cap ceiling" in rej.message
         assert "effective ceiling" not in rej.message
         assert "caps Metal at 16.00 GB" in rej.message
+
+    def test_message_breaks_down_prefill_limit(self, monkeypatch):
+        """Usage excludes the hot cache while the ceilings include it, so the
+        message must subtract it before calling memory reclaimable (#4213)."""
+        sched = _make_scheduler()
+        self._arm_ceilings(
+            sched,
+            static=64 * 1024**3,
+            dynamic=32 * 1024**3,
+            metal_cap=48 * 1024**3,
+            hot_cache_reserved=8 * 1024**3,
+        )
+        sched._prefill_headroom_safety = 0.92
+        rej = self._force_rejection(sched, monkeypatch)
+        assert "but the prefill limit is 22.08 GB" in rej.message
+        assert (
+            "(dynamic ceiling 32.00 GB - hot cache 8.00 GB - safety margin 1.92 GB)"
+            in rej.message
+        )
+        assert "only 24.00 GB is reclaimable right now" in rej.message
+        assert "lower hot_cache_max_size" in rej.message
 
     def test_static_binding_falls_back_to_generic_advice(self, monkeypatch):
         sched = _make_scheduler()

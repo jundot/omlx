@@ -17,7 +17,7 @@ from .base import (
     scaled_dot_product_attention,
 )
 from .cache import ArraysCache, KVCache
-from .gated_delta import gated_delta_kernel, gated_delta_ops
+from .gated_delta import gated_delta_kernel, gated_delta_ops, normalize_qk
 from .mla import MultiLinear
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -389,9 +389,7 @@ def recurrent_kda(
         # mlx-lm's fused kernel uses [value_dim, key_dim].
         state = h.swapaxes(-1, -2).astype(mx.float32)
 
-    inv_scale = head_dim**-0.5
-    q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-    k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+    q, k = normalize_qk(q, k, inv_scale=head_dim**-0.5, eps=1e-6)
 
     gate_input = g.astype(mx.float32) + dt_bias.reshape(
         1, 1, heads, head_dim
@@ -463,7 +461,7 @@ class LinearAttention(nn.Module):
         # legacy layout in place before external prefill reuses it.
         state = None
         if cache is not None:
-            slots = list(cache.state)
+            slots = list(cache.cache)
             if len(slots) == 1:
                 legacy_state = slots[0]
                 if legacy_state is None:
@@ -475,7 +473,7 @@ class LinearAttention(nn.Module):
                         "Invalid bailing_hybrid recurrent cache: expected a "
                         "four-tensor legacy state"
                     )
-                cache.state = slots
+                cache.cache = slots
             if len(slots) != 4:
                 raise ValueError(
                     "Invalid bailing_hybrid recurrent cache: expected 4 slots, "

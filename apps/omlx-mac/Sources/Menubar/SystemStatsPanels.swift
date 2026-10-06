@@ -156,7 +156,7 @@ struct MemoryStatsPanel: View {
                 comment: "Title of the Memory panel in the System Stats submenu"
             ))
             HStack {
-                Text("\(SystemMetricsPoller.formatBytesAsGB(memory.usedBytes)) / \(StatsFormat.wholeGB(memory.totalBytes)) GB")
+                Text("\(SystemMetricsPoller.formatBytesAsGiB(memory.usedBytes)) / \(StatsFormat.wholeGiB(memory.totalBytes)) GB")
                     .font(.omlxMono(12, weight: .semibold))
                     .foregroundStyle(theme.text)
                 Spacer()
@@ -207,7 +207,7 @@ struct MemoryStatsPanel: View {
                 .font(.omlxText(11.5))
                 .foregroundStyle(theme.textSecondary)
             Spacer()
-            Text(SystemStatsSampler.formatBytes(bytes))
+            Text(SystemMetricsPoller.formatBytesAsGiB(bytes) + " GB")
                 .font(.omlxMono(11.5))
                 .foregroundStyle(theme.text)
         }
@@ -388,9 +388,9 @@ enum StatsFormat {
         return "\(Int((min(1, max(0, fraction)) * 100).rounded()))%"
     }
 
-    /// 512_000_000_000 → "512" (whole decimal GB for machine totals)
-    static func wholeGB(_ bytes: UInt64) -> String {
-        "\(Int((Double(bytes) / 1_000_000_000).rounded()))"
+    /// 51_539_607_552 → "48" (whole binary GiB for physical memory totals)
+    static func wholeGiB(_ bytes: UInt64) -> String {
+        "\(Int((Double(bytes) / 1_073_741_824).rounded()))"
     }
 
     /// History window caption: 60 samples at 1 s → "60s"; at 0.5 s → "30s".

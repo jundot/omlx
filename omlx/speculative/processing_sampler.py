@@ -61,6 +61,10 @@ import mlx.core as mx
 logger = logging.getLogger(__name__)
 
 
+class MTPProcessorContractError(RuntimeError):
+    """Positioned MTP sampling cannot safely enforce request processors."""
+
+
 def supports_vlm_mtp_processing(processor: Any) -> bool:
     """True when a logits processor can be applied on the vlm_mtp path."""
     return callable(getattr(processor, "snapshot_state", None)) and callable(
@@ -145,13 +149,16 @@ class MTPProcessingSampler:
         after every slot so a later call can rewind to any re-sampled
         position.
         """
-        if self._degraded or not self._processors:
+        if self._degraded:
+            raise MTPProcessorContractError(
+                "positioned sampling previously violated its processor contract"
+            )
+        if not self._processors:
             return self._base(logprobs)
         if not positions:
-            # Positioned contract violated — never sample unprocessed
-            # silently (#2399); degrade loudly.
+            # Positioned contract violated — abort rather than sampling an
+            # unprocessed token that could bypass a privacy/safety processor.
             self._degrade("sample_target called without positions")
-            return self._base(logprobs)
 
         if logprobs.ndim == 1:
             logprobs = logprobs[None, :]
@@ -161,13 +168,11 @@ class MTPProcessingSampler:
                 f"row/position mismatch (rows={n_slots}, "
                 f"positions={len(positions)})"
             )
-            return self._base(logprobs)
 
         base_pos = int(positions[0])
         snapshot = self._snapshots.get(base_pos)
         if snapshot is None:
             self._degrade(f"no checkpoint for base position {base_pos}")
-            return self._base(logprobs)
 
         # Rewind: restore state at base_pos and drop the re-sampled suffix.
         self._restore(snapshot)
@@ -181,10 +186,6 @@ class MTPProcessingSampler:
             pos = int(positions[i])
             if pos != base_pos + i:
                 self._degrade(f"non-contiguous positions ({positions!r})")
-                # Finish this call unprocessed for the remaining slots.
-                rest = self._base(logprobs[i:])
-                rest_list = [int(t) for t in mx.reshape(rest, (-1,)).tolist()]
-                return mx.array(sampled + rest_list, dtype=mx.int32)
             processed = logprobs[i][None, :]
             for proc in self._processors:
                 processed = proc(self._history, processed)
@@ -206,10 +207,10 @@ class MTPProcessingSampler:
 
     def _degrade(self, reason: str) -> None:
         self._degraded = True
-        logger.warning(
-            "MTPProcessingSampler degraded to plain sampling (%s) — "
-            "per-request logits processors are NOT enforced for the rest "
-            "of this request. This indicates an mlx-vlm contract change; "
-            "please report it.",
+        logger.error(
+            "MTPProcessingSampler aborted (%s): continuing would bypass "
+            "per-request logits processors. This indicates an mlx-vlm "
+            "contract change; please report it.",
             reason,
         )
+        raise MTPProcessorContractError(reason)

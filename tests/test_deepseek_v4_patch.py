@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the DeepSeek V4 monkey-patch (PR 1192 port)."""
 
-import importlib
 import inspect
 import json
 import os
@@ -162,6 +161,32 @@ class TestUtilsPatch:
             is True
         )
 
+    @pytest.mark.parametrize("location", ["quantization", "quantization_config", "text_quantization", "text_quantization_config"])
+    @pytest.mark.parametrize("bits", [2, 3, 3.5])
+    def test_nested_sub4_override_disables_native_attention(self, location, bits):
+        from omlx.patches.deepseek_v4.utils_patch import (
+            _native_ratio128_attention_enabled,
+        )
+
+        quantization = {"bits": 4, "overrides": [{"layers.0.mlp": {"bits": bits}}]}
+        config = {"model_type": "deepseek_v4"}
+        if location.startswith("text_"):
+            config["text_config"] = {location[5:]: quantization}
+        else:
+            config[location] = quantization
+        assert _native_ratio128_attention_enabled(config) is False
+
+    @pytest.mark.parametrize("bits", [4, 8, True, False, None, "3"])
+    def test_nested_non_sub4_values_keep_existing_dispatch(self, bits):
+        from omlx.patches.deepseek_v4.utils_patch import (
+            _native_ratio128_attention_enabled,
+        )
+
+        config = {"model_type": "deepseek_v4", "quantization": {"layers": {"bits": bits}}}
+        assert _native_ratio128_attention_enabled(config) is True
+        config = {"model_type": "qwen3", "quantization": {"bits": 2}}
+        assert _native_ratio128_attention_enabled(config) is True
+
     @pytest.mark.parametrize(
         ("bits", "expected_enabled"),
         ((4, True), (2, False)),
@@ -201,18 +226,52 @@ class TestUtilsPatch:
         assert model.args.use_native_ratio128_attention is expected_enabled
         assert loaded_config["use_native_ratio128_attention"] is expected_enabled
 
+    @pytest.mark.parametrize(
+        ("model_type", "delegated"),
+        (("llama", True), ("deepseek_v4", False)),
+    )
+    def test_only_deepseek_v4_uses_replacement_body(
+        self, tmp_path, monkeypatch, model_type, delegated
+    ):
+        import mlx.nn as nn
+        import mlx_lm.utils as utils_mod
 
-class TestGeneratePatch:
-    """mlx_lm.generate._make_cache replaced."""
+        from omlx.patches.deepseek_v4 import utils_patch
 
-    def test_make_cache_replaced(self, applied_patch):
-        gen_mod = importlib.import_module("mlx_lm.generate")
+        calls = []
 
-        assert hasattr(gen_mod, "_make_cache")
-        # Source must include PoolingCache → BatchPoolingCache branch.
-        # We can't easily compare functions, so just verify the new
-        # behavior: passing a model with a PoolingCache in make_cache
-        # produces a BatchPoolingCache.
+        def original(model_path, **kwargs):
+            calls.append(model_path)
+            return "original", {}
+
+        monkeypatch.setattr(utils_mod, "load_model", original)
+        patched = utils_patch._build_patched_load_model()
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+
+        class CapturingModel(nn.Module):
+            def __init__(self, args):
+                super().__init__()
+
+        result = patched(
+            tmp_path,
+            strict=False,
+            lazy=True,
+            get_model_classes=lambda config: (
+                CapturingModel,
+                SimpleNamespace(from_dict=lambda c: None),
+            ),
+        )
+
+        assert (calls == [tmp_path]) is delegated
+        assert (result[0] == "original") is delegated
+
+
+class TestBatchCacheConversion:
+    """Model-owned caches retain batch conversion with upstream cache creation."""
+
+    def test_pooling_cache_conversion(self, applied_patch):
+        from omlx.scheduler import _patched_merge_caches
+
         from mlx_lm.models.cache import BatchPoolingCache, PoolingCache
 
         class FakeModel:
@@ -222,7 +281,7 @@ class TestGeneratePatch:
             def make_cache(self):
                 return [PoolingCache(ratio=4)]
 
-        result = gen_mod._make_cache(FakeModel(), [0], None)
+        result = _patched_merge_caches([FakeModel().make_cache()])
         assert len(result) == 1
         assert isinstance(result[0], BatchPoolingCache)
 
@@ -238,8 +297,7 @@ class TestGeneratePatch:
             patch_setup = (
                 "apply_deepseek_v4_patch()\n            import omlx.scheduler"
             )
-        script = textwrap.dedent(
-            f"""
+        script = textwrap.dedent(f"""
             import importlib
 
             from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
@@ -260,11 +318,10 @@ class TestGeneratePatch:
                     return [CacheList(PoolingCache(4), QSAKVCache())]
 
             generate = importlib.import_module("mlx_lm.generate")
-            caches = generate._make_cache(Model(), [0], None)
+            caches = generate._merge_caches([Model().make_cache()])
             assert isinstance(caches[0].caches[0], BatchPoolingCache)
             assert isinstance(caches[0].caches[1], BatchQSAKVCache)
-            """
-        )
+            """)
         env = dict(os.environ)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         result = subprocess.run(
@@ -2035,16 +2092,19 @@ class TestPoolingCacheTrimRollback:
         )
 
     def test_untrimmable_when_no_undo_after_prompt(self, applied_patch):
-        """Prompt-sized updates (L > 8) don't stash an undo log; a trim at
-        a pool boundary right after one must report not-trimmable instead
-        of corrupting state. (Updates up to L == 8 keep an undo so depth-k
-        MTP verify windows can roll back.)"""
+        """Prompt-sized updates (L > POOLING_UNDO_MAX_TOKENS) don't stash an
+        undo log; a trim at a pool boundary right after one must report
+        not-trimmable instead of corrupting state. (Updates up to the bound
+        keep an undo so depth-k MTP / DFlash verify windows can roll back.)"""
         from mlx_lm.models.cache import PoolingCache
 
+        from omlx.patches.deepseek_v4.cache_extras import POOLING_UNDO_MAX_TOKENS
+
         cache = PoolingCache(4)
+        width = POOLING_UNDO_MAX_TOKENS + 4  # one window past the bound
         self._push(
             cache,
-            self._tok([float(v) for v in range(1, 13)]),  # L = 12 > 8
+            self._tok([float(v) for v in range(1, width + 1)]),
             0,
         )
         assert cache.remainder == 0
@@ -2449,13 +2509,13 @@ def test_switch_sorting_preserves_other_formats(
     hidden = (mx.random.normal((1, tokens, 128)) * 0.1).astype(mx.float16)
     indices = mx.random.randint(0, 8, (1, tokens, 8)).astype(mx.uint32)
     calls = []
-    original_sort = sl._gather_sort
+    original_sort = sl.sort_routes
 
     def tracked_sort(x, indices):
         calls.append(indices.size)
         return original_sort(x, indices)
 
-    monkeypatch.setattr(sl, "_gather_sort", tracked_sort)
+    monkeypatch.setattr(sl, "sort_routes", tracked_sort)
     actual = model(hidden, indices)
     mx.eval(actual)
     should_sort = tokens == 8 or sort_at_32

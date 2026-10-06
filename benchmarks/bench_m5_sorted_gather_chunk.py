@@ -6,10 +6,11 @@ Qwen4-Exp, 512 experts / top-10 / hidden 2560 / inter 640, 4-bit gs64 with
 the fused gate+up layout) and times the sorted SwitchGLU path for several
 prefill chunk widths under three dispatch modes:
 
-- ``sorted``      raw ``sorted_indices=True`` (NAX rhs kernel; corrupt past
-                  32768 rows on mlx <= 0.32.2, timed for reference only)
-- ``unsorted``    what the pre-segmenting M5 reroute did past the row cap
-- ``segmented``   the oMLX reroute with <=32768-row sorted slices
+- ``sorted``      raw ``sorted_indices=True`` (mlx's NAX rhs kernel, one call
+                  for any row count since mlx 0.32.3)
+- ``unsorted``    what the M5 reroute does for ``K % 64 != 0``
+- ``nax``         the oMLX NAX route (``m5_gather_qmm_nax``: segmented tile
+                  scheduling, one call for any row count)
 
 Prints ms per layer call and derived tokens/s so the chunk-width policy can
 be judged on numbers. Run from a checkout with the reroute installed::
@@ -28,17 +29,21 @@ from mlx_lm.models.switch_layers import _gather_sort, _scatter_unsort
 import omlx.patches.m5_gather_qmm as reroute
 
 
-def _build(experts, hidden, inter, bits, group_size, key):
+def _build(experts, hidden, inter, bits, group_size, mode, key):
     k1, k2 = mx.random.split(key)
     gate_up = mx.random.normal((experts, 2 * inter, hidden), key=k1) * 0.02
     down = mx.random.normal((experts, hidden, inter), key=k2) * 0.02
-    gu = mx.quantize(gate_up.astype(mx.bfloat16), group_size=group_size, bits=bits)
-    dn = mx.quantize(down.astype(mx.bfloat16), group_size=group_size, bits=bits)
+    gu = mx.quantize(
+        gate_up.astype(mx.bfloat16), group_size=group_size, bits=bits, mode=mode
+    )
+    dn = mx.quantize(
+        down.astype(mx.bfloat16), group_size=group_size, bits=bits, mode=mode
+    )
     mx.eval(*gu, *dn)
     return gu, dn
 
 
-def _layer(x, inds, gu, dn, bits, group_size, sorted_flag, gather_qmm):
+def _layer(x, inds, gu, dn, bits, group_size, mode, sorted_flag, gather_qmm):
     x5 = mx.expand_dims(x, (-2, -3))
     xs, idx, inv = _gather_sort(x5, inds)
     h = gather_qmm(
@@ -48,6 +53,7 @@ def _layer(x, inds, gu, dn, bits, group_size, sorted_flag, gather_qmm):
         transpose=True,
         group_size=group_size,
         bits=bits,
+        mode=mode,
         sorted_indices=sorted_flag,
     )
     g, u = mx.split(h, 2, axis=-1)
@@ -59,6 +65,7 @@ def _layer(x, inds, gu, dn, bits, group_size, sorted_flag, gather_qmm):
         transpose=True,
         group_size=group_size,
         bits=bits,
+        mode=mode,
         sorted_indices=sorted_flag,
     )
     return _scatter_unsort(y, inv, inds.shape).squeeze(-2)
@@ -72,9 +79,10 @@ def main():
     ap.add_argument("--inter", type=int, default=640)
     ap.add_argument("--bits", type=int, default=4)
     ap.add_argument("--group-size", type=int, default=64)
+    ap.add_argument("--qmode", default="affine", choices=["affine", "mxfp4"])
     ap.add_argument("--chunks", type=int, nargs="+", default=[2048, 4096, 8192])
     ap.add_argument("--iters", type=int, default=5)
-    ap.add_argument("--modes", nargs="+", default=["sorted", "unsorted", "segmented"])
+    ap.add_argument("--modes", nargs="+", default=["sorted", "unsorted", "nax"])
     args = ap.parse_args()
 
     reroute.apply_m5_gather_qmm_workaround()
@@ -89,11 +97,12 @@ def main():
         args.inter,
         args.bits,
         args.group_size,
+        args.qmode,
         mx.random.key(0),
     )
     print(
         f"geometry: E={args.experts} topk={args.topk} hidden={args.hidden} "
-        f"inter={args.inter} q{args.bits}/gs{args.group_size}"
+        f"inter={args.inter} {args.qmode} q{args.bits}/gs{args.group_size}"
     )
     print(f"{'chunk':>6} {'rows':>7} {'mode':>10} {'ms/layer':>9} {'tok/s':>10}")
     for chunk in args.chunks:
@@ -107,14 +116,22 @@ def main():
                 sorted_flag, gather = True, raw
             elif mode == "unsorted":
                 sorted_flag, gather = False, raw
-            elif mode == "segmented":
+            elif mode == "nax":
                 sorted_flag, gather = True, reroute._gather_qmm_rerouted
             else:
                 raise SystemExit(f"unknown mode {mode}")
 
             def fn(x=x, inds=inds, sorted_flag=sorted_flag, gather=gather):
                 return _layer(
-                    x, inds, gu, dn, args.bits, args.group_size, sorted_flag, gather
+                    x,
+                    inds,
+                    gu,
+                    dn,
+                    args.bits,
+                    args.group_size,
+                    args.qmode,
+                    sorted_flag,
+                    gather,
                 )
 
             for _ in range(2):

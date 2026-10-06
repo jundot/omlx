@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for load-failure invalidation in admin model settings."""
 
+import asyncio
 import copy
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 
 import omlx.server  # noqa: F401 - ensure server module is imported first
 from omlx.admin import routes as admin_routes
@@ -159,11 +161,19 @@ async def test_qwen_ane_prefill_settings_are_persisted():
     assert result["requires_reload"] is False
 
 
+def _idle_engine() -> MagicMock:
+    engine = MagicMock()
+    engine.has_active_requests.return_value = False
+    engine.scheduler = None
+    engine._engine = None
+    return engine
+
+
 @pytest.mark.asyncio
 async def test_qwen_ane_prefill_change_unloads_a_loaded_engine():
     pool, entry = _failed_pool()
     entry.config_model_type = "qwen3_5"
-    entry.engine = MagicMock()
+    entry.engine = _idle_engine()
     entry.load_failed = False
     pool._unload_engine = AsyncMock()
 
@@ -175,7 +185,39 @@ async def test_qwen_ane_prefill_change_unloads_a_loaded_engine():
 
     assert result["requires_reload"] is True
     assert result["auto_unloaded"] is True
+    assert result["reload_deferred"] is False
     pool._unload_engine.assert_awaited_once_with("ling")
+
+
+@pytest.mark.asyncio
+async def test_reload_setting_on_busy_engine_defers_unload():
+    """A save during a benchmark run must not abort it (#3961)."""
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5"
+    entry.engine = _idle_engine()
+    entry.engine.abort_all_requests = AsyncMock()
+    entry.load_failed = False
+    entry.in_use = 1
+    pool._unload_engine = AsyncMock()
+
+    result = await _update_settings(
+        pool,
+        ModelSettings(),
+        admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
+    )
+
+    assert result["requires_reload"] is True
+    assert result["auto_unloaded"] is False
+    assert result["reload_deferred"] is True
+    assert entry.pending_unload_reason == "settings changed"
+    assert entry.abort_requested is False
+    entry.engine.abort_all_requests.assert_not_awaited()
+    pool._unload_engine.assert_not_awaited()
+
+    pending = pool._pending_unload_tasks["ling"]
+    await pool.release_engine("ling")
+    pool._unload_engine.assert_awaited_once_with("ling")
+    await asyncio.wait_for(pending, timeout=1)
 
 
 @pytest.mark.asyncio
@@ -296,6 +338,35 @@ async def test_qwen4_ple_ssd_offload_is_ignored_for_other_models():
 
 
 @pytest.mark.asyncio
+async def test_deepseek_v41_engram_ssd_offload_is_persisted_for_v41_only():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "deepseek_v41"
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(deepseek_v41_engram_ssd_offload=True),
+    )
+
+    assert settings.deepseek_v41_engram_ssd_offload is True
+
+
+@pytest.mark.asyncio
+async def test_deepseek_v41_engram_ssd_offload_is_ignored_for_other_models():
+    pool, _ = _failed_pool()
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(deepseek_v41_engram_ssd_offload=True),
+    )
+
+    assert settings.deepseek_v41_engram_ssd_offload is False
+
+
+@pytest.mark.asyncio
 async def test_qwen4_mtp_setting_accepts_embedded_head(tmp_path):
     _write_qwen4_mtp_checkpoint(tmp_path, embedded_mtp=True)
     pool, entry = _failed_pool()
@@ -410,19 +481,24 @@ async def test_qwen_ane_prefill_rejects_other_model_families():
 
 
 @pytest.mark.asyncio
-async def test_mtp_draft_tokens_is_persisted_not_dropped():
-    """#2823: mtp_num_draft_tokens used to be silently discarded by PUT."""
+@pytest.mark.parametrize("depth", [3, 4, 5, 6, 8])
+async def test_mtp_draft_tokens_is_persisted_not_dropped(depth):
+    """#2823: mtp_adaptive_max_depth used to be silently discarded by PUT."""
     pool, _ = _failed_pool()
-    settings = ModelSettings(mtp_num_draft_tokens=None)
+    settings = ModelSettings(mtp_adaptive_max_depth=None, mtp_fixed_depth=2)
 
     result = await _update_settings(
         pool,
         settings,
-        admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=8),
+        admin_routes.ModelSettingsRequest(
+            mtp_adaptive_max_depth=depth, mtp_fixed_depth=None
+        ),
     )
 
-    assert settings.mtp_num_draft_tokens == 8
-    assert result["settings"]["mtp_num_draft_tokens"] == 8
+    assert settings.mtp_adaptive_max_depth == depth
+    assert result["settings"]["mtp_adaptive_max_depth"] == depth
+
+    assert settings.mtp_fixed_depth is None
 
 
 @pytest.mark.asyncio
@@ -450,15 +526,33 @@ async def test_preserve_thinking_and_turboquant_skip_last_are_persisted():
 
 
 @pytest.mark.asyncio
+async def test_mtp_fixed_depth_is_persisted_and_cleared():
+    pool, _ = _failed_pool()
+    settings = ModelSettings()
+
+    result = await _update_settings(
+        pool, settings, admin_routes.ModelSettingsRequest(mtp_fixed_depth=4)
+    )
+    assert settings.mtp_fixed_depth == 4
+    assert result["settings"]["mtp_fixed_depth"] == 4
+
+    await _update_settings(
+        pool, settings, admin_routes.ModelSettingsRequest(mtp_fixed_depth=None)
+    )
+    assert settings.mtp_fixed_depth is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["mtp_adaptive_max_depth", "mtp_fixed_depth"])
 @pytest.mark.parametrize("value", [0, 9])
-async def test_mtp_draft_tokens_rejects_out_of_range_values(value):
+async def test_mtp_depth_rejects_out_of_range_values(field, value):
     pool, _ = _failed_pool()
 
     with pytest.raises(admin_routes.HTTPException, match="must be between 1 and 8"):
         await _update_settings(
             pool,
             ModelSettings(),
-            admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=value),
+            admin_routes.ModelSettingsRequest(**{field: value}),
         )
 
 
@@ -468,7 +562,7 @@ def test_unknown_settings_fields_are_rejected_loudly():
 
     with pytest.raises(pydantic.ValidationError, match="bogus_field"):
         # Simulate a client sending a field that has no admin-PUT support.
-        admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=8, bogus_field=1)
+        admin_routes.ModelSettingsRequest(mtp_adaptive_max_depth=8, bogus_field=1)
 
 
 @pytest.mark.asyncio
@@ -489,22 +583,22 @@ async def test_turboquant_skip_last_null_preserves_default_true():
 
 
 def test_runtime_signature_gates_mtp_depth_on_lightning_mtp():
-    """mtp_num_draft_tokens must be part of the engine runtime signature only
+    """mtp_adaptive_max_depth must be part of the engine runtime signature only
     while Lightning MTP (mtp_enabled) is active (review feedback), so a depth
     change reloads a loaded engine, but a stale value never forces one."""
     from omlx.engine_pool import EnginePool
 
     pool = EnginePool()
 
-    depth_3_on = ModelSettings(mtp_enabled=True, mtp_num_draft_tokens=3)
-    depth_8_on = ModelSettings(mtp_enabled=True, mtp_num_draft_tokens=8)
-    depth_3_off = ModelSettings(mtp_enabled=False, mtp_num_draft_tokens=3)
-    depth_8_off = ModelSettings(mtp_enabled=False, mtp_num_draft_tokens=8)
+    depth_3_on = ModelSettings(mtp_enabled=True, mtp_adaptive_max_depth=3)
+    depth_8_on = ModelSettings(mtp_enabled=True, mtp_adaptive_max_depth=8)
+    depth_3_off = ModelSettings(mtp_enabled=False, mtp_adaptive_max_depth=3)
+    depth_8_off = ModelSettings(mtp_enabled=False, mtp_adaptive_max_depth=8)
 
     on_keys = {k for k, _ in pool._engine_runtime_signature("m", depth_3_on)}
-    assert "mtp_num_draft_tokens" in on_keys
+    assert "mtp_adaptive_max_depth" in on_keys
     off_keys = {k for k, _ in pool._engine_runtime_signature("m", depth_3_off)}
-    assert "mtp_num_draft_tokens" not in off_keys
+    assert "mtp_adaptive_max_depth" not in off_keys
 
     # Active MTP: different depths produce different signatures (reload).
     assert pool._engine_runtime_signature(
@@ -514,3 +608,51 @@ def test_runtime_signature_gates_mtp_depth_on_lightning_mtp():
     assert pool._engine_runtime_signature(
         "m", depth_3_off
     ) == pool._engine_runtime_signature("m", depth_8_off)
+
+
+@pytest.mark.asyncio
+async def test_parked_dflash_draft_path_does_not_block_saves(tmp_path):
+    pool, _ = _failed_pool()
+    deleted = str(tmp_path / "deleted-draft")
+    settings = ModelSettings(dflash_enabled=True, dflash_draft_model=deleted)
+
+    await _update_settings(
+        pool, settings, admin_routes.ModelSettingsRequest(temperature=0.3)
+    )
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(
+            dflash_enabled=False, dflash_draft_model=deleted
+        ),
+    )
+
+    assert settings.dflash_enabled is False
+    assert settings.dflash_draft_model == deleted
+
+
+@pytest.mark.asyncio
+async def test_enabling_dflash_over_a_deleted_draft_path_is_rejected(tmp_path):
+    pool, _ = _failed_pool()
+    deleted = str(tmp_path / "deleted-draft")
+    manager = MagicMock()
+    manager.get_settings.side_effect = lambda _: ModelSettings(
+        dflash_draft_model=deleted
+    )
+
+    with (
+        patch("omlx.admin.routes._get_engine_pool", return_value=pool),
+        patch("omlx.admin.routes._get_settings_manager", return_value=manager),
+        patch("omlx.admin.routes._get_server_state", return_value=MagicMock()),
+        patch("omlx.engine.dflash.is_dflash_compatible", return_value=(True, "")),
+    ):
+        for payload in (
+            {"dflash_enabled": True},
+            {"dflash_enabled": True, "dflash_draft_model": deleted},
+        ):
+            request = admin_routes.ModelSettingsRequest(**payload)
+            with pytest.raises(HTTPException) as exc:
+                await admin_routes.update_model_settings("ling", request, is_admin=True)
+            assert exc.value.status_code == 422
+
+    manager.set_settings.assert_not_called()

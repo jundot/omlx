@@ -16,6 +16,11 @@ final class NetworkScreenVM {
     private(set) var loadedCaBundle: String = ""
 
     private(set) var isSaving: Bool = false
+    @ObservationIgnored
+    private var restoreBeforeReset: (() -> Void)?
+    var showResetNotice = false
+    private(set) var isLoading = false
+    private(set) var isResetting = false
     var lastError: String?
 
     /// Trimmed draft != loaded for at least one field. Whitespace-only edits
@@ -27,7 +32,51 @@ final class NetworkScreenVM {
         || trim(caBundle)   != loadedCaBundle
     }
 
+    func resetDefaults(client: OMLXClient) async {
+        guard !isLoading, !isResetting, !showResetNotice else { return }
+        isResetting = true
+        defer { isResetting = false }
+        let previous = (
+            httpProxy: httpProxy,
+            httpsProxy: httpsProxy,
+            noProxy: noProxy,
+            lastError: lastError
+        )
+        do {
+            let settings = try await client.getGlobalSettingsDefaults()
+            restoreBeforeReset = { [weak self] in
+                guard let self else { return }
+                self.httpProxy = previous.httpProxy
+                self.httpsProxy = previous.httpsProxy
+                self.noProxy = previous.noProxy
+                self.lastError = previous.lastError
+            }
+            if let net = settings.network {
+                self.httpProxy = net.httpProxy
+                self.httpsProxy = net.httpsProxy
+                self.noProxy = net.noProxy
+            }
+
+            self.lastError = nil
+            self.showResetNotice = true
+        } catch {
+            self.lastError = error.omlxDescription
+        }
+    }
+
+    func cancelReset() {
+        restoreBeforeReset?()
+        confirmReset()
+    }
+
+    func confirmReset() {
+        restoreBeforeReset = nil
+        showResetNotice = false
+    }
+
     func load(client: OMLXClient) async {
+        isLoading = true
+        defer { isLoading = false }
         do {
             let settings = try await client.getGlobalSettings()
             if let net = settings.network {

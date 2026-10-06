@@ -147,6 +147,174 @@ final class ServerProcessIntegrationTests: XCTestCase {
                        "Port \(port) still bound after stop — orphaned child?")
     }
 
+    func testEnvironmentPortOverridesSavedPort() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let oldPort = Self.findFreePort()
+        let nextPort = Self.findFreePort()
+        try AppConfig.saveServerEndpoint(basePath: base.path, port: oldPort)
+        let previous = ProcessInfo.processInfo.environment["OMLX_PORT"]
+        setenv("OMLX_PORT", String(nextPort), 1)
+        defer {
+            if let previous { setenv("OMLX_PORT", previous, 1) }
+            else { unsetenv("OMLX_PORT") }
+        }
+        let proc = ServerProcess(runtime: try PythonRuntime.resolve(), port: oldPort, basePath: base)
+        addTeardownBlock { @MainActor in await proc.stop(timeout: 2) }
+        try proc.start()
+        try await waitForPort(nextPort)
+        XCTAssertEqual(proc.port, nextPort)
+        await proc.stop(timeout: 2)
+        XCTAssertFalse(Self.isPortInUse(port: nextPort))
+    }
+
+    func testSavedPortSurvivesRestartAndUpdatesClient() async throws {
+        let runtime = try PythonRuntime.resolve()
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let oldPort = Self.findFreePort()
+        let proc = ServerProcess(runtime: runtime, port: oldPort, basePath: base)
+        let config = AppConfig(bindAddress: "127.0.0.1", port: oldPort, apiKey: "test1234",
+                               basePath: base.path, modelDir: base.appendingPathComponent("models").path,
+                               hfEndpoint: "")
+        try config.save()
+        let services = AppServices(config: config, server: proc)
+        addTeardownBlock { @MainActor in await proc.stop(timeout: 2) }
+        try proc.start()
+        try await waitForPort(oldPort)
+        let newPort = Self.findFreePort()
+        XCTAssertNotEqual(newPort, oldPort)
+        var saved = config
+        saved.port = newPort
+        if ProcessInfo.processInfo.environment["OMLX_DEV_SERVER_SCRIPT"] == nil {
+            _ = try await services.client.updateGlobalSettings(GlobalSettingsPatch(port: newPort))
+        } else {
+            try saved.save()
+        }
+        try await services.restartServer()
+        try await waitForPort(newPort)
+        XCTAssertFalse(Self.isPortInUse(port: oldPort))
+        XCTAssertEqual(proc.port, newPort)
+        XCTAssertEqual(services.client.port, newPort)
+        XCTAssertEqual(services.config.port, newPort)
+        XCTAssertEqual(try AppConfig.readSettingsForTests(basePath: base.path).port, newPort)
+        let thirdPort = Self.findFreePort()
+        saved.port = thirdPort
+        if ProcessInfo.processInfo.environment["OMLX_DEV_SERVER_SCRIPT"] == nil {
+            _ = try await services.client.updateGlobalSettings(GlobalSettingsPatch(port: thirdPort))
+        } else {
+            try saved.save()
+        }
+        // The admin restart route sends the same delayed SIGTERM.
+        kill(try XCTUnwrap(proc.pid), SIGTERM)
+        try await waitForPort(thirdPort)
+        XCTAssertFalse(Self.isPortInUse(port: newPort))
+        XCTAssertEqual(services.client.port, thirdPort)
+        await proc.stop(timeout: 2)
+        try proc.start()
+        try await waitForPort(thirdPort)
+        if ProcessInfo.processInfo.environment["OMLX_DEV_SERVER_SCRIPT"] == nil {
+            let vm = ServerScreenVM()
+            vm.applyConfig(services.config)
+            await vm.load(client: services.client)
+            XCTAssertNil(vm.lastError)
+            let fourthPort = Self.findFreePort()
+            vm.portText = String(fourthPort)
+            vm.applyServerSettings(services: services)
+            try await waitForPort(fourthPort)
+            XCTAssertNil(vm.lastError)
+            XCTAssertEqual(services.client.port, fourthPort)
+            XCTAssertEqual(try AppConfig.readSettingsForTests(basePath: base.path).port, fourthPort)
+            XCTAssertFalse(Self.isPortInUse(port: thirdPort))
+            let fifthPort = Self.findFreePort()
+            _ = try await services.client.updateGlobalSettings(GlobalSettingsPatch(port: fifthPort))
+            try await services.applyStorageChanges(
+                modelDirs: [base.appendingPathComponent("other-models").path], port: fifthPort
+            )
+            try await waitForPort(fifthPort)
+            XCTAssertFalse(Self.isPortInUse(port: fourthPort))
+            XCTAssertEqual(services.client.port, fifthPort)
+            XCTAssertEqual(try AppConfig.readSettingsForTests(basePath: base.path).port, fifthPort)
+            await proc.stop(timeout: 2)
+            XCTAssertFalse(Self.isPortInUse(port: fifthPort))
+        } else {
+            await proc.stop(timeout: 2)
+            XCTAssertFalse(Self.isPortInUse(port: thirdPort))
+        }
+    }
+
+    func testOfflinePortApplyDoesNotNeedHTTPOrStartServer() async throws {
+        try await checkOfflinePortApply(occupied: false)
+    }
+
+    func testPortConflictCanBeFixedWithOfflineApply() async throws {
+        try await checkOfflinePortApply(occupied: true)
+    }
+
+    private func checkOfflinePortApply(occupied: Bool) async throws {
+        let runtime = try PythonRuntime.resolve()
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let oldPort = Self.findFreePort()
+        let proc = ServerProcess(runtime: runtime, port: oldPort, basePath: base)
+        let config = AppConfig(bindAddress: "127.0.0.1", port: oldPort, apiKey: "test1234",
+                               basePath: base.path, modelDir: base.appendingPathComponent("models").path,
+                               hfEndpoint: "")
+        try config.save()
+        let services = AppServices(config: config, server: proc)
+        var occupyingProcess: ServerProcess?
+        if occupied {
+            let other = ServerProcess(runtime: runtime, port: oldPort, basePath: base)
+            occupyingProcess = other
+            addTeardownBlock { @MainActor in await other.stop(timeout: 2) }
+            try other.start()
+            try await waitForPort(oldPort)
+            guard case .portConflict = try proc.start() else {
+                return XCTFail("Expected an occupied-port startup failure")
+            }
+        }
+        let vm = ServerScreenVM()
+        vm.applyConfig(config)
+        await vm.load(client: services.client)
+        for invalid in ["0", "-1", "65536", "invalid"] {
+            vm.portText = invalid
+            vm.applyServerSettings(services: services)
+            XCTAssertNotNil(vm.lastError)
+            XCTAssertEqual(try AppConfig.readSettingsForTests(basePath: base.path).port, oldPort)
+        }
+        let newPort = Self.findFreePort()
+        vm.portText = String(newPort)
+        vm.applyServerSettings(services: services)
+        let deadline = Date().addingTimeInterval(3)
+        while services.config.port != newPort && Date() < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertNil(vm.lastError)
+        XCTAssertEqual(proc.port, newPort)
+        XCTAssertEqual(services.client.port, newPort)
+        XCTAssertEqual(try AppConfig.readSettingsForTests(basePath: base.path).port, newPort)
+        XCTAssertNil(proc.pid)
+        XCTAssertFalse(vm.hasPendingServerChanges(services: services))
+        await occupyingProcess?.stop(timeout: 2)
+        addTeardownBlock { @MainActor in await proc.stop(timeout: 2) }
+        try services.startServer()
+        try await waitForPort(newPort)
+        await proc.stop(timeout: 2)
+        XCTAssertFalse(Self.isPortInUse(port: newPort))
+    }
+
+    private func waitForPort(_ port: Int) async throws {
+        let deadline = Date().addingTimeInterval(15)
+        while Date() < deadline {
+            if Self.isPortInUse(port: port) { return }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTFail("Child did not bind port \(port)")
+    }
+
     // MARK: - Helpers
 
     /// Bind to port 0, let the OS pick a free port, close the socket, and
@@ -198,5 +366,26 @@ final class ServerProcessIntegrationTests: XCTestCase {
             }
         }
         return result == 0
+    }
+}
+
+@MainActor
+final class StartupNoticeTests: XCTestCase {
+    func testNoticeUpdatesEndpointAndIsConsumedOnce() throws {
+        let runtime = PythonRuntime(
+            executable: URL(fileURLWithPath: "/usr/bin/python3"),
+            homebrewPaths: [], pythonPath: [], pythonHome: nil, isBundled: false
+        )
+        let server = ServerProcess(runtime: runtime, bindAddress: "192.168.1.10", port: 18150)
+        let services = AppServices(server: server)
+        let url = server.prepareStartupNotice()
+        defer { try? FileManager.default.removeItem(at: url) }
+        XCTAssertNil(server.consumeStartupNotice())
+        try "Server access is now limited to this Mac".write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertEqual(server.consumeStartupNotice(), "Server access is now limited to this Mac")
+        XCTAssertEqual(server.bindAddress, "127.0.0.1")
+        XCTAssertEqual(services.config.bindAddress, "127.0.0.1")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertNil(server.consumeStartupNotice())
     }
 }

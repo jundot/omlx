@@ -6,6 +6,7 @@ module.exports = {
   ],
   safelist: [
     "sm:grid-cols-2",  // dynamic :class in _modal_model_settings.html
+    "max-w-[90rem]", "max-w-[100rem]", "max-w-none",  // dashboardWidthClass in dashboard_layout.js
     "bg-emerald-500", "text-white", "border-emerald-500",
     "bg-emerald-50", "text-emerald-700", "border-emerald-200", "hover:bg-emerald-100",
   ],
