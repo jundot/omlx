@@ -514,3 +514,17 @@ async def test_parameter_header_matches_native_name_and_value_boundary(size, hea
     actual = await run(raw, size, True)
     assert not actual["errors"]
     assert signature(actual) == signature(native)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [1, 13, 4096])
+@pytest.mark.parametrize("schema", [True, False, {}, {"description": "untyped"}])
+async def test_fallback_schema_and_literal_parameter_marker_keep_final_semantics(size, schema):
+    tools = [{"type": "function", "function": {"name": "write", "parameters": {
+        "type": "object", "properties": {"content": schema, "path": {"type": "string"}},
+    }}}]
+    raw = envelope({"content": "a</parameter>b", "path": "file"})
+    native = await run(raw, size, False, tools=tools)
+    actual = await run(raw, size, True, tools=tools)
+    assert not actual["errors"]
+    assert signature(actual) == signature(native)

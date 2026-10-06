@@ -103,6 +103,13 @@ class QwenArgumentStream:
                     self.enabled = False
                     break
                 self.config = _get_arguments_config(name, self.tools)
+                if not isinstance(self.config, dict) or any(
+                    not isinstance(spec, dict) for spec in self.config.values()
+                ):
+                    # Boolean JSON schemas route through the final fallback;
+                    # native conversion can fail even on a later parameter.
+                    self.enabled = False
+                    break
                 self.seen_parameters = set()
                 self.duplicate_parameter = False
                 self.current = {
@@ -152,13 +159,13 @@ class QwenArgumentStream:
                 self.started = False
                 self.leading = True
                 cfg = self.config.get(self.param, {})
-                # oMLX's final Qwen wrapper re-coerces explicitly declared
-                # properties without a type. Their JSON/quoted-string meaning
-                # cannot be settled until the parameter closes.
-                self.untyped = (
-                    isinstance(self.config.get(self.param), dict) and "type" not in cfg
-                )
-                self.string = not self.untyped and (
+                if isinstance(self.config.get(self.param), dict) and "type" not in cfg:
+                    # The final wrapper uses structural XML boundaries and
+                    # coercion here. A literal parameter close is ambiguous
+                    # until the complete envelope is available.
+                    self.enabled = False
+                    break
+                self.string = (
                     not cfg
                     or str(cfg.get("type", "string")).strip().lower() in _string_types
                 )
@@ -190,15 +197,6 @@ class QwenArgumentStream:
                             value = _convert_param_value(
                                 "".join(self.raw), self.param, self.config
                             )
-                            if self.untyped and isinstance(value, str):
-                                from .tool_calling import _coerce_param_value
-
-                                value = _coerce_param_value(
-                                    "".join(self.raw).strip(),
-                                    self.param,
-                                    self.config,
-                                    self.current["name"],
-                                )
                         except (ValueError, SyntaxError, TypeError):
                             self.enabled = False
                             break
