@@ -27,7 +27,14 @@ from omlx.patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import register_pl
 from omlx.patches import row_exact_qmv
 from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
 
-from .cache import BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
+from .cache import (
+    BatchKVCache,
+    KVCache,
+    QuantizedKVCache,
+    _ladder_capacity,
+    _roll_logical_prefix,
+    dynamic_roll,
+)
 from mlx_vlm.models.cache import ArraysCache
 from mlx_vlm.speculative.cache_state import start_speculative_cache
 from mlx_vlm.speculative.ops.linear import _target_verify_linear, _target_verify_linears
@@ -248,6 +255,25 @@ def _append_indexer_positions(
     return mx.concatenate([cached, position_ids], axis=-1)
 
 
+def _write_block_parts(parts, axis: int, capacity: int) -> mx.array:
+    """Write ``parts`` in order along ``axis`` into a zeroed ``capacity`` buffer.
+
+    Equals ``concatenate(parts, axis)`` in ``[0, total)``; each slice update
+    donates the buffer, so only the buffer itself is allocated.
+    """
+    shape = list(parts[0].shape)
+    shape[axis] = capacity
+    buffer = mx.zeros(shape, dtype=parts[0].dtype)
+    index = [slice(None)] * len(shape)
+    start = 0
+    for part in parts:
+        stop = start + int(part.shape[axis])
+        index[axis] = slice(start, stop)
+        buffer[tuple(index)] = part
+        start = stop
+    return buffer
+
+
 class _QSAIndexerCache:
     """Capacity-backed raw and completed-block state shared by QSA caches.
 
@@ -268,9 +294,15 @@ class _QSAIndexerCache:
         self._invalidate_pooled_indexer()
 
     def reserve_index_capacity(self, tokens: int) -> None:
-        """Reserve a stepped prefill horizon; later growth uses plain steps."""
+        """Reserve a stepped prefill horizon; later growth uses plain steps.
+
+        The horizon also sizes a fixed-step KV buffer (``_reserved_tokens``).
+        """
 
         self._index_reserved_tokens = max(0, int(tokens))
+
+    def _reserved_tokens(self) -> int:
+        return getattr(self, "_index_reserved_tokens", 0)
 
     @property
     def index_keys(self):
@@ -537,8 +569,46 @@ class QSAKVCache(_QSAIndexerCache, KVCache):
     def state(self, value):
         self.keys, self.values, index_keys, index_position_ids = value
         self.offset = 0 if self.keys is None else self.keys.shape[2]
-        self._geometric_capacity_managed = False
         self._restore_indexer_state(index_keys, index_position_ids)
+
+    @classmethod
+    def from_block_parts(
+        cls, keys, values, index_keys, index_position_ids, reserve_tokens
+    ):
+        """Restore a stored prefix from its blocks into reserved buffers.
+
+        Same logical cache as ``state = (concatenated blocks...)`` followed by
+        ``reserve_index_capacity(reserve_tokens)``. Each block is written
+        straight into a buffer that already spans the reserved horizon, the
+        width the first prefill append would have grown the concatenated
+        prefix to, so neither the concatenated prefix nor that regrowth copy
+        is ever materialized. Columns past the prefix are zero, as after a
+        grow. Parts must share dtype and non-sequence shape.
+        """
+        cache = cls()
+        cache.reserve_index_capacity(reserve_tokens)
+        length = sum(int(part.shape[2]) for part in keys)
+
+        def capacity(step):
+            # Exact width when the prompt adds nothing, like the old concat.
+            if reserve_tokens <= length:
+                return length
+            return ((reserve_tokens + step - 1) // step) * step
+
+        kv_capacity = capacity(cls.step)
+        cache.keys = _write_block_parts(keys, 2, kv_capacity)
+        cache.values = _write_block_parts(values, 2, kv_capacity)
+        cache.offset = length
+        index_capacity = capacity(cache.index_step)
+        cache._index_keys = _write_block_parts(index_keys, 1, index_capacity)
+        cache._index_position_ids = _write_block_parts(
+            index_position_ids, index_position_ids[0].ndim - 1, index_capacity
+        )
+        cache._index_offset = length
+        # Same flag as a state restore: the buffers are caller-sized.
+        cache._index_capacity_managed = False
+        cache._invalidate_pooled_indexer()
+        return cache
 
     def trim(self, n):
         n = min(self.offset, n)
@@ -556,7 +626,6 @@ class QSAKVCache(_QSAIndexerCache, KVCache):
                 self.values[idx : idx + 1, :, : self.offset, :]
             )
             cache.offset = self.offset
-            cache._geometric_capacity_managed = False
         if self.index_keys is not None:
             index_keys = mx.contiguous(self.index_keys[idx : idx + 1])
             if self.index_position_ids.ndim == 3:
@@ -648,11 +717,63 @@ class BatchQSAKVCache:
     _omlx_mtp_batch_rollback_cache = True
     _omlx_mtp_verify_attention_cache = True
 
+    # Decode appends write into a capacity-backed buffer instead of
+    # concatenating the whole raw-key bank every step. Each concatenate left
+    # the previous exact-width bank in MLX's pool, where it can never satisfy
+    # a (larger) later request, so the pool grew with every page crossed.
+    # Capacity grows on the _ladder_capacity ladder with this minimum grain.
+    index_step = 1024
+
     def __init__(self, left_padding):
         self.kv_cache = BatchKVCache(left_padding)
         self.index_keys = None
         self.index_position_ids = None
         self.index_offset = 0
+
+    # ``index_keys`` / ``index_position_ids`` keep their exact-width public
+    # meaning. Arrays assigned from outside (merge/extend/filter/state/tests)
+    # are returned unchanged, exactly like the former plain attributes; only a
+    # backing buffer this class grew itself is sliced to ``index_offset``.
+    @property
+    def index_keys(self):
+        keys = self._index_keys
+        if keys is None or not self._index_capacity_managed:
+            return keys
+        return keys[:, : self.index_offset]
+
+    @index_keys.setter
+    def index_keys(self, value):
+        self._release_index_capacity()
+        self._index_keys = value
+
+    @property
+    def index_position_ids(self):
+        positions = self._index_position_ids
+        if positions is None or not self._index_capacity_managed:
+            return positions
+        return positions[..., : self.index_offset]
+
+    @index_position_ids.setter
+    def index_position_ids(self, value):
+        self._release_index_capacity()
+        self._index_position_ids = value
+
+    def _release_index_capacity(self):
+        """Collapse a managed buffer to its logical prefix before a plain set.
+
+        Callers assign keys and positions one at a time (filter, extend,
+        state); the not-yet-assigned partner must already be exact-width.
+        """
+        if not getattr(self, "_index_capacity_managed", False):
+            self._index_capacity_managed = False
+            return
+        self._index_capacity_managed = False
+        if self._index_keys is not None:
+            self._index_keys = self._index_keys[:, : self.index_offset]
+        if self._index_position_ids is not None:
+            self._index_position_ids = self._index_position_ids[
+                ..., : self.index_offset
+            ]
 
     @property
     def keys(self):
@@ -681,15 +802,72 @@ class BatchQSAKVCache:
         return self.kv_cache.update_and_fetch(keys, values)
 
     def update_indexer(self, keys: mx.array, position_ids: mx.array):
-        if self.index_keys is None:
+        cached_keys = self.index_keys
+        cached_positions = self.index_position_ids
+        if cached_keys is None:
             self.index_keys = keys
             self.index_position_ids = position_ids
-        else:
-            self.index_keys = mx.concatenate([self.index_keys, keys], axis=1)
-            self.index_position_ids = _append_indexer_positions(
-                self.index_position_ids, position_ids
+            self.index_offset = self.index_keys.shape[1]
+            return self.index_keys, self.index_position_ids
+
+        # Same rank promotion as _append_indexer_positions (it also raises on
+        # incompatible ranks), applied before the in-place write.
+        if cached_positions.ndim == 3 and position_ids.ndim == 2:
+            position_ids = mx.broadcast_to(
+                position_ids[None],
+                (cached_positions.shape[0], *position_ids.shape),
             )
-        self.index_offset = self.index_keys.shape[1]
+        elif cached_positions.ndim == 2 and position_ids.ndim == 3:
+            cached_positions = mx.broadcast_to(
+                cached_positions[None],
+                (position_ids.shape[0], *cached_positions.shape),
+            )
+        elif cached_positions.ndim != position_ids.ndim:
+            raise ValueError(
+                "QSA position IDs must be 2-D text positions or 3-D MRoPE "
+                f"positions, got cached={cached_positions.shape} and "
+                f"current={position_ids.shape}."
+            )
+        if (
+            cached_keys.dtype != keys.dtype
+            or cached_positions.dtype != position_ids.dtype
+        ):
+            # concatenate would promote; keep its exact semantics.
+            self.index_keys = mx.concatenate([cached_keys, keys], axis=1)
+            self.index_position_ids = mx.concatenate(
+                [cached_positions, position_ids], axis=-1
+            )
+            self.index_offset = self.index_keys.shape[1]
+            return self.index_keys, self.index_position_ids
+
+        start = int(cached_keys.shape[1])
+        end = start + int(keys.shape[1])
+        if (
+            not self._index_capacity_managed
+            or cached_positions.shape[:-1] != self._index_position_ids.shape[:-1]
+            or end > int(self._index_keys.shape[1])
+        ):
+            # Same bounded-ratio ladder as the batch KV bank (spare capacity
+            # at most max(2 * index_step, end / 8)): a 130K bank regrows
+            # every 8K-16K tokens instead of every 1024.
+            capacity = _ladder_capacity(end, self.index_step)
+            new_keys = mx.zeros(
+                (cached_keys.shape[0], capacity, cached_keys.shape[-1]),
+                dtype=cached_keys.dtype,
+            )
+            new_positions = mx.zeros(
+                (*cached_positions.shape[:-1], capacity),
+                dtype=cached_positions.dtype,
+            )
+            if start:
+                new_keys[:, :start] = cached_keys
+                new_positions[..., :start] = cached_positions
+            self._index_keys = new_keys
+            self._index_position_ids = new_positions
+            self._index_capacity_managed = True
+        self._index_keys[:, start:end] = keys
+        self._index_position_ids[..., start:end] = position_ids
+        self.index_offset = end
         return self.index_keys, self.index_position_ids
 
     def prepare(self, **kwargs):
@@ -699,6 +877,23 @@ class BatchQSAKVCache:
         right_padding = getattr(self.kv_cache, "_right_padding", None)
         self.kv_cache.finalize()
         if right_padding is None or self.index_keys is None:
+            return
+        if self._index_capacity_managed:
+            # Roll only the logical prefix (identical indices to the exact-width
+            # roll) but keep the stepped width, so the result recycles the
+            # previous same-size buffer instead of allocating a new width.
+            length = self.index_offset
+            self._index_keys = _roll_logical_prefix(
+                self._index_keys, right_padding, length, axis=1
+            )
+            if self._index_position_ids.ndim == 3:
+                self._index_position_ids = _roll_logical_prefix(
+                    self._index_position_ids, right_padding[None], length, axis=2
+                )
+            else:
+                self._index_position_ids = _roll_logical_prefix(
+                    self._index_position_ids, right_padding, length, axis=1
+                )
             return
         self.index_keys = dynamic_roll(self.index_keys, right_padding, axis=1)
         if self.index_position_ids.ndim == 3:
@@ -717,6 +912,32 @@ class BatchQSAKVCache:
         min_left = int(self.left_padding[batch_indices].min().item())
         self.kv_cache.filter(batch_indices)
         if self.index_keys is None:
+            return
+        kept = (
+            batch_indices.tolist()
+            if isinstance(batch_indices, mx.array)
+            else list(batch_indices)
+        )
+        keys, positions = self.index_keys, self.index_position_ids
+        length = int(keys.shape[1]) - min_left
+        if kept and length == self.index_offset - min_left:
+            # One copy straight onto the ladder the next append would regrow
+            # to, like ``extend``; gather-then-slice left a strided view that
+            # the first append copied again.
+            capacity = _ladder_capacity(length + 1, self.index_step)
+            new_keys = mx.zeros((len(kept), capacity, keys.shape[-1]), keys.dtype)
+            shape = list(positions.shape)
+            shape[-2], shape[-1] = len(kept), capacity
+            new_positions = mx.zeros(shape, dtype=positions.dtype)
+            for row, old in enumerate(kept):
+                new_keys[row : row + 1, :length] = keys[old : old + 1, min_left:]
+                new_positions[..., row : row + 1, :length] = positions[
+                    ..., old : old + 1, min_left:
+                ]
+            self._index_keys = new_keys
+            self._index_position_ids = new_positions
+            self._index_capacity_managed = True
+            self.index_offset = length
             return
         self.index_keys = self.index_keys[batch_indices]
         if self.index_position_ids.ndim == 3:
@@ -828,15 +1049,42 @@ class BatchQSAKVCache:
         target = max(self.index_offset, other.index_offset)
         left = self._pad_index(self, target, sample_keys, sample_positions)
         right = self._pad_index(other, target, sample_keys, sample_positions)
-        index_keys = mx.concatenate([left[0], right[0]], axis=0)
+        self.kv_cache.extend(other.kv_cache)
         position_axis = 1 if sample_positions.ndim == 3 else 0
-        index_position_ids = mx.concatenate(
+        if (
+            left[0].dtype == right[0].dtype
+            and left[1].dtype == right[1].dtype
+            and left[1].ndim == right[1].ndim
+        ):
+            # Join straight onto the capacity ladder the next append would
+            # regrow to, instead of an exact-width bank it copies again.
+            rows = int(left[0].shape[0])
+            capacity = _ladder_capacity(target + 1, self.index_step)
+            keys = mx.zeros(
+                (rows + int(right[0].shape[0]), capacity, left[0].shape[-1]),
+                dtype=left[0].dtype,
+            )
+            shape = list(left[1].shape)
+            shape[position_axis] += int(right[1].shape[position_axis])
+            shape[-1] = capacity
+            positions = mx.zeros(shape, dtype=left[1].dtype)
+            keys[:rows, :target] = left[0]
+            keys[rows:, :target] = right[0]
+            if position_axis:
+                positions[:, :rows, :target] = left[1]
+                positions[:, rows:, :target] = right[1]
+            else:
+                positions[:rows, :target] = left[1]
+                positions[rows:, :target] = right[1]
+            self._index_keys = keys
+            self._index_position_ids = positions
+            self._index_capacity_managed = True
+            self.index_offset = target
+            return
+        self.index_keys = mx.concatenate([left[0], right[0]], axis=0)
+        self.index_position_ids = mx.concatenate(
             [left[1], right[1]], axis=position_axis
         )
-
-        self.kv_cache.extend(other.kv_cache)
-        self.index_keys = index_keys
-        self.index_position_ids = index_position_ids
         self.index_offset = target
 
     def extract(self, idx):
@@ -954,6 +1202,10 @@ class BatchQSAKVCache:
     def trim(self, n):
         trimmed = self.kv_cache.trim(n)
         self.index_offset = max(0, self.index_offset - trimmed)
+        if self._index_capacity_managed:
+            # The managed buffer is addressed by index_offset; the stale draft
+            # columns past it are overwritten by the next update_indexer.
+            return trimmed
         # Slice the physical arrays like the singleton trim does:
         # update_indexer concatenates onto them and re-derives index_offset
         # from shape[1], so stale draft columns would otherwise fossilize
@@ -990,8 +1242,8 @@ class BatchQSAKVCache:
     @property
     def nbytes(self):
         extra = 0
-        if self.index_keys is not None:
-            extra = self.index_keys.nbytes + self.index_position_ids.nbytes
+        if self._index_keys is not None:
+            extra = self._index_keys.nbytes + self._index_position_ids.nbytes
         return self.kv_cache.nbytes + extra
 
 
@@ -1018,7 +1270,6 @@ class QSAQuantizedKVCache(_QSAIndexerCache, QuantizedKVCache):
     def state(self, value):
         self.keys, self.values, index_keys, index_position_ids = value
         self.offset = 0 if self.keys is None else self.keys[0].shape[2]
-        self._geometric_capacity_managed = False
         self._restore_indexer_state(index_keys, index_position_ids)
 
     def trim(self, n):
@@ -1039,7 +1290,6 @@ class QSAQuantizedKVCache(_QSAIndexerCache, QuantizedKVCache):
                 for x in self.values
             )
             cache.offset = self.offset
-            cache._geometric_capacity_managed = False
         if self.index_keys is not None:
             index_keys = mx.contiguous(self.index_keys[idx : idx + 1])
             if self.index_position_ids.ndim == 3:

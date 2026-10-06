@@ -742,7 +742,9 @@ def test_scheduler_exact_split_hit_reprefills_only_last_block():
     assert request.cached_tokens == 8
     assert request.remaining_tokens == [8, 9, 10, 11]
     scheduler.paged_cache_manager.free_block.assert_called_once_with(3)
-    scheduler.block_aware_cache.reconstruct_cache.assert_called_once_with(table)
+    scheduler.block_aware_cache.reconstruct_cache.assert_called_once_with(
+        table, reserve_tokens=12
+    )
 
 
 def test_split_restore_retries_legacy_candidate_at_the_same_endpoint(tmp_path):
