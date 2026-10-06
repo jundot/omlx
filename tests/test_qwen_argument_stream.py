@@ -72,11 +72,13 @@ class Engine:
                 tool_calls=None,
                 finished=False,
                 finish_reason="stop",
-                prompt_tokens=10, completion_tokens=25, cached_tokens=0,
+                prompt_tokens=10,
+                completion_tokens=25,
+                cached_tokens=0,
             )
 
 
-async def run(raw, size, incremental, capable=True):
+async def run(raw, size, incremental, capable=True, tools=TOOLS):
     engine = Engine(raw, size, capable and incremental)
     request = ChatCompletionRequest(
         model="model-alias",
@@ -90,7 +92,7 @@ async def run(raw, size, incremental, capable=True):
     content = []
     reasoning = []
     ordered = []
-    async for event in stream_chat_completion(engine, [], request, tools=TOOLS):
+    async for event in stream_chat_completion(engine, [], request, tools=tools):
         if event == "data: [DONE]\n\n":
             continue
         data = json.loads(event[6:])
@@ -230,9 +232,7 @@ async def test_changed_final_parameter_cannot_validate_previously_emitted_value(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("size", [1, 7, 13, 64, 1024])
 async def test_parameter_tracking_resets_for_the_next_call(size):
-    raw = envelope([("content", ""), ("content", "")]) + envelope(
-        {"content": "next"}
-    )
+    raw = envelope([("content", ""), ("content", "")]) + envelope({"content": "next"})
     native = await run(raw, size, False)
     actual = await run(raw, size, True)
     assert not actual["errors"]
@@ -370,3 +370,36 @@ def test_emitted_string_body_is_not_retained():
     assert stream.current["length"] > 1024 * 1023
     assert retained < 65536
     assert peak < 131072
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [1, 13, 1024])
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {},
+        {"description": "any value"},
+        {"anyOf": [{"type": "string"}, {"type": "number"}]},
+    ],
+)
+@pytest.mark.parametrize(
+    "value", ['"quoted"', "42", " null ", '{"x": 1}', "  plain  ", "🚀\ntext"]
+)
+async def test_untyped_properties_match_final_qwen_wrapper(size, schema, value):
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "write",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"content": schema},
+                },
+            },
+        }
+    ]
+    raw = envelope({"content": value})
+    native = await run(raw, size, False, tools=tools)
+    actual = await run(raw, size, True, tools=tools)
+    assert not actual["errors"]
+    assert signature(actual) == signature(native)

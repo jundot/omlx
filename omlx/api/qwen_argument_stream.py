@@ -145,7 +145,13 @@ class QwenArgumentStream:
                 self.started = False
                 self.leading = True
                 cfg = self.config.get(self.param, {})
-                self.string = (
+                # oMLX's final Qwen wrapper re-coerces explicitly declared
+                # properties without a type. Their JSON/quoted-string meaning
+                # cannot be settled until the parameter closes.
+                self.untyped = (
+                    isinstance(self.config.get(self.param), dict) and "type" not in cfg
+                )
+                self.string = not self.untyped and (
                     not cfg
                     or str(cfg.get("type", "string")).strip().lower() in _string_types
                 )
@@ -177,6 +183,15 @@ class QwenArgumentStream:
                             value = _convert_param_value(
                                 "".join(self.raw), self.param, self.config
                             )
+                            if self.untyped and isinstance(value, str):
+                                from .tool_calling import _coerce_param_value
+
+                                value = _coerce_param_value(
+                                    "".join(self.raw).strip(),
+                                    self.param,
+                                    self.config,
+                                    self.current["name"],
+                                )
                         except (ValueError, SyntaxError, TypeError):
                             self.enabled = False
                             break
@@ -240,8 +255,11 @@ class QwenArgumentStream:
             # Compare once at envelope completion. Retain only the digest and
             # character count while streaming, not a second argument body.
             digest = hashlib.sha256(full[:length].encode("utf-8", "surrogatepass"))
-            if (tc.function.name != call["name"] or len(full) < length
-                    or digest.digest() != call["digest"].digest()):
+            if (
+                tc.function.name != call["name"]
+                or len(full) < length
+                or digest.digest() != call["digest"].digest()
+            ):
                 raise ValueError(
                     "Incremental arguments differ from native final parsing"
                 )
