@@ -2031,7 +2031,34 @@ class EnginePool:
             return None
         return entry.pending_unload_reason or "request abort"
 
-    def _acquire_loaded_engine(self, model_id, force_lm, lease, runtime_settings):
+    @staticmethod
+    def _runtime_failed_engine(engine: object) -> bool:
+        """True for a distributed engine whose ranks died (it can never serve again)."""
+        reason = getattr(engine, "runtime_failed_reason", None)
+        return isinstance(reason, str) and bool(reason.strip())
+
+    async def _reloadable_failed_engine(self, model_id: str) -> bool:
+        """True when the resident engine is dead AND its deployment can be rebuilt.
+
+        Rebuilding means tearing the old ranks down, and that teardown is
+        verified on every Mac. When a peer is off or off the network (the usual
+        way a rank dies with ``peer_lost``) it cannot succeed, so the engine is
+        left in place and requests keep getting the fast 503 from its health
+        gate instead of each one running a doomed teardown. Called outside the
+        pool lock: the reachability probe is bounded but is network I/O.
+        """
+        entry = self._entries.get(model_id)
+        engine = entry.engine if entry is not None else None
+        if engine is None or not self._runtime_failed_engine(engine):
+            return False
+        reachable = getattr(engine, "peers_reachable", None)
+        if reachable is None:
+            return True
+        return bool(await reachable())
+
+    def _acquire_loaded_engine(
+        self, model_id, force_lm, lease, runtime_settings, reload_failed=False
+    ):
         """Lease a ready engine without waiting for another model's disk drain.
 
         This path has no await: the unload marker and lease update are atomic
@@ -2045,6 +2072,7 @@ class EnginePool:
             or entry.pending_unload_reason
             or model_id in self._unloading_models
             or (force_lm and isinstance(entry.engine, VLMBatchedEngine))
+            or (reload_failed and self._runtime_failed_engine(entry.engine))
         ):
             return None
         expected = self._engine_runtime_signature(model_id, runtime_settings)
@@ -2110,8 +2138,9 @@ class EnginePool:
         if force_lm and entry is not None and not self._has_mlx_lm_path(entry):
             # The VLM engine is the only text engine for these families.
             force_lm = False
+        reload_failed = await self._reloadable_failed_engine(model_id)
         ready = self._acquire_loaded_engine(
-            model_id, force_lm, _lease, runtime_settings
+            model_id, force_lm, _lease, runtime_settings, reload_failed
         )
         if ready is not None:
             return ready
@@ -2136,6 +2165,20 @@ class EnginePool:
                 if candidate > 0:
                     ngram_admission_ceiling = candidate
             unloaded_for_admission = False
+
+            if (
+                reload_failed
+                and entry.engine is not None
+                and self._runtime_failed_engine(entry.engine)
+            ):
+                logger.warning(
+                    "Distributed runtime for %s is no longer serviceable (%s); "
+                    "unloading it so this request reloads the deployment",
+                    model_id,
+                    getattr(entry.engine, "runtime_failed_reason", ""),
+                )
+                await self._unload_engine(model_id)
+                unloaded_for_admission = True
 
             # Already loaded - just update access time
             if entry.engine is not None:
@@ -2614,6 +2657,8 @@ class EnginePool:
         evicted_count = 0
         reclaim_attempted = False
         ane_release_attempted = False
+        hot_cache_attempted = False
+        hot_cache_released = False
         reason = str(getattr(eviction_request, "reason", "") or "")
         async with self._lock:
             attempt = self._prefill_headroom_recurring.get(request_id, 0) + 1
@@ -2630,12 +2675,14 @@ class EnginePool:
                     action = "reclaim_pool"
                 elif evicted_any:
                     action = "evict_model"
+                elif hot_cache_released:
+                    action = "release_hot_cache"
                 else:
                     action = "already_fit"
                 logger.info(
                     "[prefill-eviction] request=%s retry=%d reason=%s "
                     "action=%s outcome=%s recurring=%s mx_active=%.2fGB "
-                    "phys_footprint=%.2fGB model_memory=%.2fGB "
+                    "phys_footprint=%.2fGB hot_cache=%.2fGB model_memory=%.2fGB "
                     "predicted=%.2fGB target=%.2fGB evicted=%d",
                     request_id,
                     attempt,
@@ -2645,6 +2692,7 @@ class EnginePool:
                     recurring,
                     active / 1024**3,
                     footprint / 1024**3,
+                    hot_cache / 1024**3,
                     self._current_model_memory / 1024**3,
                     predicted / 1024**3,
                     target / 1024**3,
@@ -2653,12 +2701,42 @@ class EnginePool:
 
             while True:
                 active = mx.get_active_memory()
-                footprint = _settled_phys_footprint()
+                # Targets subtract the hot-cache reservation, so usage
+                # excludes the hot cache, as in Scheduler._current_usage_bytes.
+                hot_cache = self._hot_cache_bytes()
+                footprint = max(0, _settled_phys_footprint() - hot_cache)
                 current = max(active, footprint, self._current_model_memory)
                 if current + predicted <= target:
                     # Use the same sample for admission and its decision log.
                     _log_decision("headroom_available")
-                    return evicted_any or reclaim_attempted or ane_release_attempted
+                    return (
+                        evicted_any
+                        or reclaim_attempted
+                        or ane_release_attempted
+                        or hot_cache_released
+                    )
+
+                if not recurring and not reclaim_attempted and mx.get_cache_memory():
+                    # Pooled buffers cost nothing to return, so they go first.
+                    reclaim_attempted = True
+                    await self._reclaim_pooled_buffers_for_prefill(
+                        exclude_model_id, request_id
+                    )
+                    continue
+
+                if not hot_cache_attempted:
+                    # Cached prefix blocks give way before any model does.
+                    hot_cache_attempted = True
+                    gain = await self._release_hot_cache_for_prefill(
+                        exclude_model_id,
+                        request_id,
+                        current + predicted - target,
+                        reason,
+                    )
+                    if gain > 0:
+                        hot_cache_released = True
+                        target += gain
+                        continue
 
                 victim = self._find_lru_prefill_eviction_victim(
                     exclude_model_id=exclude_model_id
@@ -2735,6 +2813,55 @@ class EnginePool:
                 await self._unload_engine(victim)
                 evicted_any = True
                 evicted_count += 1
+
+    def _hot_cache_bytes(self) -> int:
+        budget = getattr(self._scheduler_config, "hot_cache_budget", None)
+        if budget is None:
+            return 0
+        return max(0, int(getattr(budget, "total_bytes", 0) or 0))
+
+    async def _release_hot_cache_for_prefill(
+        self, model_id: str, request_id: str, shortfall: int, reason: str
+    ) -> int:
+        """Release hot cache for a prefill; return how far its target rose.
+
+        Skips requests the scheduler does not hold yet: their prefix blocks
+        are not protected (see ``Scheduler._releasable_hot_cache_credit``).
+        """
+        release = getattr(
+            self._process_memory_enforcer, "release_hot_cache_for_prefill", None
+        )
+        entry = self._entries.get(model_id)
+        engine = entry.engine if entry is not None else None
+        scheduler = (
+            self._resolve_scheduler_from_engine(engine) if engine is not None else None
+        )
+        limit_factor = getattr(scheduler, "_hot_cache_limit_factor", None)
+        if (
+            not callable(release)
+            or not callable(limit_factor)
+            or request_id not in getattr(scheduler, "requests", {})
+        ):
+            return 0
+        if (
+            reason == "adaptive_prefill_throttle"
+            and getattr(scheduler, "_prefill_speed_priority", False) is not True
+        ):
+            # The throttle shrinks the chunk instead, so keep the cache.
+            return 0
+        factor = limit_factor()
+        if factor <= 0 or shortfall <= 0:
+            return 0
+        released = await release(int(shortfall / factor) + 1)
+        if released <= 0:
+            return 0
+        logger.info(
+            "Released %s of hot cache for prefill request %s on '%s'",
+            format_size(released),
+            request_id,
+            model_id,
+        )
+        return int(released * factor)
 
     @staticmethod
     def _resolve_engine_core_from_engine(engine: object) -> object | None:
@@ -3400,9 +3527,13 @@ class EnginePool:
                     try:
                         from .engine.dflash import DFlashEngine
 
+                        draft_entry = self._entries.get(dflash_draft)
+                        draft_path = (
+                            draft_entry.model_path if draft_entry else dflash_draft
+                        )
                         engine = DFlashEngine(
                             model_name=entry.model_path,
-                            draft_model_path=dflash_draft,
+                            draft_model_path=draft_path,
                             draft_quant_enabled=getattr(
                                 model_settings, "dflash_draft_quant_enabled", False
                             ),
@@ -3423,7 +3554,7 @@ class EnginePool:
                             ),
                         )
                         logger.info(
-                            f"DFlash enabled for {model_id}, draft={dflash_draft}"
+                            f"DFlash enabled for {model_id}, draft={draft_path}"
                         )
                     except ImportError:
                         logger.warning(

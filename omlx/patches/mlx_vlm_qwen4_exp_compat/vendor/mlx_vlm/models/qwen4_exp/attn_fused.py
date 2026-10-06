@@ -480,6 +480,12 @@ def _gpu_class() -> str:
         return ""
 
 
+def rows_available() -> bool:
+    """Whether the fused decode/verify attention rows can run on this GPU at
+    all (layers still check their own shapes): off after a kernel failure."""
+    return not _DISABLED and _gpu_class() == "d"
+
+
 def row_plan(first_keys: int, last_keys: int) -> int | None:
     """MLX 0.32.2's vector SDPA plan shared by rows seeing ``first_keys`` to
     ``last_keys`` keys (12 query heads per KV head, one row per call, 'd'

@@ -214,10 +214,10 @@ def test_fp32_kernels_match_mlx_mat_vecs(bits):
                     scores,
                 ],
                 template=[
-                    ("T", f32), ("K", inter), ("N", hidden), ("RPS", 4), ("KS", inter),
-                    ("NPART", top_k + 1),
+                    ("T", f32), ("K", inter), ("N", hidden), ("RPS", routed._down_rows(1)),
+                    ("KS", inter), ("NPART", top_k + 1),
                 ],
-                grid=(32, (top_k + 1) * hidden // 4, 1),
+                grid=(32, (top_k + 1) * hidden // routed._down_rows(1), 1),
                 threadgroup=(32, top_k + 1, 1),
                 output_shapes=[(hidden,)],
                 output_dtypes=[f32],

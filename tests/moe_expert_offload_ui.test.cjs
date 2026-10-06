@@ -33,12 +33,13 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx/admin/static/js/dashboard.
         assert.equal(vm.runInNewContext(condition, {selectedModel:{moe_expert_offload_supported:supported}}), supported === true);
     }
     for (const key of ['mtp_enabled', 'vlm_mtp_enabled', 'dflash_enabled']) {
-        const scope = {modelSettings: {[enabled]:false, [key]:true}};
+        // The disabled bindings also read selectedModel.
+        const scope = {modelSettings: {[enabled]:false, [key]:true}, selectedModel: null};
         assert.equal(vm.runInNewContext(offload.match(/:disabled="([^"]+)"/)[1], scope), true);
         const lines = html.split('\n');
         const i = lines.findIndex(line => line.includes('@click=') && line.includes(`modelSettings.${key} = !modelSettings.${key}`));
         const disabled = lines[i+1].match(/:disabled="([^"]+)"/)[1];
-        assert.equal(vm.runInNewContext(disabled, {modelSettings:{[enabled]:true}}), true);
+        assert.equal(vm.runInNewContext(disabled, {modelSettings:{[enabled]:true}, selectedModel: null}), true);
     }
     const percent = 'moe_expert_offload_resident_percent';
     for (const [stored, displayed] of [[0.125, 12.5], [0.333, 33.3], [0.02, 2], [1, 100]]) {

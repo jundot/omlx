@@ -405,7 +405,7 @@ FastAPI Server (OpenAI / Anthropic API)
 git clone https://github.com/jundot/omlx.git
 cd omlx
 pip install -e ".[dev]"
-pytest -m "not slow"
+pytest
 ```
 
 ### macOS App

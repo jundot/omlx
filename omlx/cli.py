@@ -15,8 +15,10 @@ Usage:
 """
 
 import argparse
+import errno
 import faulthandler
 import math
+import socket
 import sys
 
 from ._version import __version__
@@ -156,6 +158,16 @@ def _migrate_saved_network_auth(settings, args) -> None:
             os.replace(temporary, notice)
         finally:
             temporary.unlink(missing_ok=True)
+
+
+def _is_local_address(host: str) -> bool:
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    with socket.socket(family) as probe:
+        try:
+            probe.bind((host, 0))
+        except OSError as exc:
+            return exc.errno != errno.EADDRNOTAVAIL
+    return True
 
 
 def serve_command(args):
@@ -301,6 +313,11 @@ def serve_command(args):
     # normal startup runs ASGI lifespan before binding host/port, which means
     # pinned models can be preloaded before a port conflict is detected.
     bind_hosts = [h.strip() for h in settings.server.host.split(",") if h.strip()]
+    # A secondary address such as a VPN IP can be missing until its link is up.
+    for h in bind_hosts[1:]:
+        if not _is_local_address(h):
+            print(f"Warning: skipping {h}, it is not assigned to any local interface")
+            bind_hosts.remove(h)
     for h in bind_hosts:
         print(f"Binding server at http://{h}:{settings.server.port}")
     # uvicorn does not support "trace" — map to "debug" for its internal logging

@@ -93,6 +93,20 @@ def test_estimator_produces_nonzero_peak_after_init():
     assert peak > 0
 
 
+def test_paused_request_hot_cache_blocks_stay_protected():
+    """A request paused for prefill eviction waits in the queue with its block
+    table. Releasing its prefix blocks would re-prefill it next turn (#4213)."""
+    scheduler = _make_scheduler()
+    scheduler.paged_cache_manager = SimpleNamespace(
+        blocks={7: SimpleNamespace(block_hash=b"prefix")}
+    )
+    req = _make_request(1024)
+    req.block_table = SimpleNamespace(block_ids=[7])
+    scheduler.waiting.append(req)
+
+    assert scheduler.get_active_hot_cache_block_hashes() == {b"prefix"}
+
+
 def test_preflight_positive_control_passes_normal_request():
     """Positive-control: a normal prompt under a generous limit must NOT
     be rejected. Defends against an accidental sign-flip on the

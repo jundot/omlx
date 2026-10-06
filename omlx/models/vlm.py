@@ -36,11 +36,30 @@ logger = logging.getLogger(__name__)
 _STEP_TEXT_POSITIONS_DISABLED = os.environ.get(
     "OMLX_QWEN4_STEP_TEXT_POSITIONS", "1"
 ).strip().lower() in {"0", "false", "no", "off"}
-# Cached tokens below which decode/verify rows keep rank-three positions (dense
-# path); the M5 Max crossover for the gathered arms is ~12k serial, higher for MTP.
-_STEP_TEXT_POSITIONS_MIN_CONTEXT = int(
-    os.environ.get("OMLX_QWEN4_STEP_TEXT_POSITIONS_MIN_CONTEXT", "32768")
+# Cached tokens below which decode/verify rows keep rank-three positions (the
+# masked QSA path); OMLX_QWEN4_STEP_TEXT_POSITIONS_MIN_CONTEXT overrides. Unset,
+# it is _GATHERED_STEP_MIN_CONTEXT, the M5 Max crossover for the gathered arms
+# (~12k serial, higher for MTP) -- unless Qwen4's fused attention rows run on
+# this GPU: the masked path is then faster at every context (M5 Ultra, 16K-128K)
+# and bit-identical to the unfused MLX ops, so steps never switch.
+_STEP_TEXT_POSITIONS_MIN_CONTEXT: Optional[int] = (
+    int(os.environ["OMLX_QWEN4_STEP_TEXT_POSITIONS_MIN_CONTEXT"])
+    if "OMLX_QWEN4_STEP_TEXT_POSITIONS_MIN_CONTEXT" in os.environ
+    else None
 )
+_GATHERED_STEP_MIN_CONTEXT = 32768
+
+
+def _step_text_positions_min_context() -> float:
+    """Cached tokens from which a text-proven Qwen4 step takes rank-two
+    positions (the gathered QSA arms); infinite while fused attention rows run."""
+    if _STEP_TEXT_POSITIONS_MIN_CONTEXT is not None:
+        return _STEP_TEXT_POSITIONS_MIN_CONTEXT
+    try:
+        from mlx_vlm.models.qwen4_exp import attn_fused
+    except ImportError:
+        return _GATHERED_STEP_MIN_CONTEXT
+    return float("inf") if attn_fused.rows_available() else _GATHERED_STEP_MIN_CONTEXT
 
 
 class PrefillReadyRotatingKVCache(RotatingKVCache):
@@ -649,8 +668,9 @@ class VLMModelAdapter(nn.Module):
                 # scalar offset is the batch-one case the proof is bound to.
                 qwen4_text_prefill_positions = prefill_text_positions or (
                     step_text_positions
+                    and self.model_type == "qwen4_exp"
                     and isinstance(offsets, (int, float))
-                    and offsets >= _STEP_TEXT_POSITIONS_MIN_CONTEXT
+                    and offsets >= _step_text_positions_min_context()
                 )
                 base_offsets = None
                 if isinstance(offsets, mx.array):

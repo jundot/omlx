@@ -1,3 +1,13 @@
+/* Numbers follow the UI language. Intl maps unknown tags to the OS locale, so fall back to 'en'. */
+function usageLocale() {
+    try {
+        const lang = document.documentElement.lang;
+        return Intl.NumberFormat.supportedLocalesOf(lang).length ? lang : 'en';
+    } catch (error) {
+        return 'en';
+    }
+}
+
 /* Local serving history; independent of the high-frequency live stats poll. */
 function usageHistory() {
     return {
@@ -50,7 +60,7 @@ function usageHistory() {
         shade(tokens) {
             return tokens ? `rgba(22, 163, 74, ${0.2 + 0.8 * Math.sqrt(tokens / this.peak)})` : 'rgba(128, 128, 128, 0.12)';
         },
-        number(value) { return new Intl.NumberFormat(undefined, {notation: 'compact', maximumFractionDigits: 1}).format(value || 0); },
+        number(value) { return new Intl.NumberFormat(usageLocale(), {notation: 'compact', maximumFractionDigits: 1}).format(value || 0); },
         speed(value) { return value == null ? '—' : value.toFixed(1); },
     };
 }

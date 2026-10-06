@@ -4008,7 +4008,9 @@ class Scheduler:
                         request.prompt_cache = prompt_cache
                     request.cached_tokens += processed_tokens
                     request.remaining_tokens = tokens[processed_tokens:]
-                    request._prefill_resumed = True
+                # Admission already passed. A resumed run can pause again
+                # before its first chunk and must not be re-admitted.
+                request._prefill_resumed = True
                 raise
 
             # Keep token and embedding slices aligned at the final prefill chunk.
@@ -4477,6 +4479,41 @@ class Scheduler:
             limits.append(int(hard_limit * headroom))
         return min(limits) if limits else 0
 
+    def _hot_cache_limit_factor(self) -> float:
+        """Least a prefill limit rises per byte the hot-cache reservation drops.
+
+        Each limit is (ceiling - reservation) times one of these ratios.
+        """
+        headroom = getattr(self, "_prefill_headroom_safety", None)
+        if headroom is None:
+            headroom = Scheduler._PREFILL_HEADROOM_SAFETY
+        ratios = [headroom, self._prefill_abort_margin]
+        hard_limit = self._memory_hard_limit_bytes
+        watermark = self._memory_hard_watermark_bytes
+        if hard_limit > 0 and watermark > 0:
+            ratios.append(watermark / hard_limit)
+        return max(0.0, min(1.0, *ratios))
+
+    def _releasable_hot_cache_credit(self, own_prefix_bytes: int) -> int:
+        """Limit the hot cache gives back once a request is admitted.
+
+        Route preflight cannot protect the request's prefix blocks yet, so it
+        counts this instead of releasing hot cache. ``own_prefix_bytes``
+        bounds the request's own cached prefix, which stays protected.
+        """
+        reserved = self._memory_hot_cache_reserved_bytes
+        if reserved <= 0:
+            return 0
+        releasable = getattr(
+            getattr(self.config, "hot_cache_budget", None), "releasable_bytes", None
+        )
+        if callable(releasable):
+            held = releasable(self.get_active_hot_cache_block_hashes())
+        else:
+            held = self._hot_cache_cpu_bytes()
+        held = min(held - own_prefix_bytes, reserved)
+        return int(max(0, held) * self._hot_cache_limit_factor())
+
     def _prefill_abort_description(self) -> tuple[int, int, float]:
         """Return (base cap, safety cap, margin) for diagnostics."""
         base_cap = self._memory_abort_limit_bytes or self._memory_hard_limit_bytes
@@ -4653,6 +4690,7 @@ class Scheduler:
                 current=current,
                 fmt=format_bytes,
                 tail="reduce context length",
+                hot_cache=getattr(self, "_memory_hot_cache_reserved_bytes", 0),
             )
             message = (
                 "Prefill context too large for available memory "
@@ -4922,6 +4960,7 @@ class Scheduler:
                 current=current,
                 fmt=format_bytes,
                 tail="reduce context length",
+                hot_cache=getattr(self, "_memory_hot_cache_reserved_bytes", 0),
             )
             logger.info(
                 "Prefill throttled for %s: chunk %d -> %d "
@@ -5149,13 +5188,16 @@ class Scheduler:
         return max(active, phys, 0)
 
     def get_active_hot_cache_block_hashes(self) -> set[bytes]:
-        """Return hot-cache block hashes owned by active in-flight requests."""
+        """Return hot-cache block hashes owned by admitted or queued requests."""
         manager = getattr(self, "paged_cache_manager", None)
         if manager is None:
             return set()
 
         hashes: set[bytes] = set()
-        active_requests = list(self.running.values()) + list(self.prefilling)
+        # A request paused for prefill eviction waits with its block table.
+        active_requests = (
+            list(self.running.values()) + list(self.prefilling) + list(self.waiting)
+        )
         for request in active_requests:
             block_table = getattr(request, "block_table", None)
             if block_table is None:
@@ -11072,11 +11114,12 @@ class Scheduler:
 
         The ladder itself lives in ``exceptions.describe_ceiling_binding``
         so engine-pool load refusals and DFlash's guard name the same
-        binding ceiling and the same knob. ``hard_limit`` here has the
-        hot-cache reservation already subtracted while the components are
-        raw; that offset shifts every component equally, so it does not
-        affect which one is binding.
+        binding ceiling and the same knob. ``hard_limit`` is the admission
+        line: the binding ceiling minus the hot-cache reservation and the
+        safety margin. The message names each part, because ``current``
+        excludes the hot cache while the components include it.
         """
+        hot_cache = getattr(self, "_memory_hot_cache_reserved_bytes", 0)
         binding_str, advice = describe_ceiling_binding(
             static=self._memory_static_ceiling_bytes,
             dynamic=self._memory_dynamic_ceiling_bytes,
@@ -11085,14 +11128,27 @@ class Scheduler:
             tier=self._memory_guard_tier,
             current=current,
             fmt=format_bytes,
-            tail="reduce context length",
+            tail=(
+                ["lower hot_cache_max_size", "reduce context length"]
+                if hot_cache > 0
+                else "reduce context length"
+            ),
+            hot_cache=hot_cache,
         )
+        scheduler_ceiling = self._memory_hard_limit_bytes
+        parts = [f"{binding_str} ceiling {format_bytes(scheduler_ceiling + hot_cache)}"]
+        if hot_cache > 0:
+            parts.append(f"hot cache {format_bytes(hot_cache)}")
+        if scheduler_ceiling > hard_limit:
+            parts.append(
+                f"safety margin {format_bytes(scheduler_ceiling - hard_limit)}"
+            )
 
         return (
             f"Prefill would require ~{format_bytes(estimated)} peak "
             f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
-            f"but {binding_str} ceiling is {format_bytes(hard_limit)}. "
-            f"{advice}."
+            f"but the prefill limit is {format_bytes(hard_limit)} "
+            f"({' - '.join(parts)}). {advice}."
         )
 
     def preflight_or_raise(
@@ -11137,8 +11193,9 @@ class Scheduler:
 
             request_id = f"preflight-{_uuid.uuid4().hex[:8]}"
 
+        hot_cache_credit = self._releasable_hot_cache_credit(est.kv_exact)
         admission_limit = self._admission_limit_bytes()
-        if est.estimated > admission_limit:
+        if est.estimated - hot_cache_credit > admission_limit:
             message = self._format_rejection_message(
                 estimated=est.estimated,
                 current=current,
@@ -11163,6 +11220,7 @@ class Scheduler:
         safety_rejection = self._preflight_safety_rejection(
             est=est,
             current_usage_bytes=current,
+            hot_cache_credit=hot_cache_credit,
         )
         if safety_rejection is None:
             return
@@ -11218,13 +11276,15 @@ class Scheduler:
         if est is None:
             return None
 
+        # Evict models only for what the hot cache cannot give back.
+        hot_cache_credit = self._releasable_hot_cache_credit(est.kv_exact)
         admission_limit = self._admission_limit_bytes()
-        if est.estimated > admission_limit:
+        if est.estimated - hot_cache_credit > admission_limit:
             return PrefillEvictionRequest(
                 request_id=request_id,
                 model_id=getattr(self.config, "model_name", ""),
                 current_bytes=int(current),
-                target_cap_bytes=int(admission_limit),
+                target_cap_bytes=int(admission_limit + hot_cache_credit),
                 predicted_transient_bytes=int(est.kv_exact + est.transient),
                 requested_tokens=est.floor_chunk,
                 reason="prefill_preflight",
@@ -11234,6 +11294,7 @@ class Scheduler:
         safety_rejection = self._preflight_safety_rejection(
             est=est,
             current_usage_bytes=current,
+            hot_cache_credit=hot_cache_credit,
         )
         if safety_rejection is None:
             return None
@@ -11242,7 +11303,7 @@ class Scheduler:
             request_id=request_id,
             model_id=getattr(self.config, "model_name", ""),
             current_bytes=int(current),
-            target_cap_bytes=int(safety_rejection.limit_bytes),
+            target_cap_bytes=int(safety_rejection.limit_bytes + hot_cache_credit),
             predicted_transient_bytes=max(
                 0, int(safety_rejection.estimated_bytes) - int(current)
             ),
@@ -11256,6 +11317,7 @@ class Scheduler:
         *,
         est: _AdmissionEstimate,
         current_usage_bytes: int,
+        hot_cache_credit: int = 0,
     ) -> _PreflightRejection | None:
         """Predict whether even the safety floor chunk cannot fit.
 
@@ -11272,7 +11334,7 @@ class Scheduler:
         kv_growth = est.kv_exact
         min_transient = est.transient
         estimated = int(current_usage_bytes) + kv_growth + min_transient
-        if estimated <= cap:
+        if estimated - hot_cache_credit <= cap:
             return None
 
         binding_str, advice = describe_ceiling_binding(
@@ -11292,6 +11354,7 @@ class Scheduler:
             current=current_usage_bytes,
             fmt=format_bytes,
             tail="reduce context length",
+            hot_cache=getattr(self, "_memory_hot_cache_reserved_bytes", 0),
         )
         message = (
             "Prefill context too large for available memory "

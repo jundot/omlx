@@ -185,6 +185,7 @@ from .api.utils import (
 )
 from .engine import BaseEngine, VLMBatchedEngine
 from .engine.distributed import DistributedInferenceError
+from .engine.vlm import MINIMAX_M3_MODEL_TYPES
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine_pool import EnginePool
@@ -6557,6 +6558,7 @@ async def create_anthropic_message(
             request.chat_template_kwargs,
         )
         forced_keys = forced_ct_keys(ms)
+        _entry = get_engine_pool().get_entry(resolved_model)
 
         # Pass Anthropic thinking config to chat template (except forced keys)
         if hasattr(request, "thinking") and request.thinking:
@@ -6566,8 +6568,14 @@ async def create_anthropic_message(
                     merged_ct_kwargs["enable_thinking"] = True
                 elif thinking_type == "disabled":
                     merged_ct_kwargs["enable_thinking"] = False
-
-        _entry = get_engine_pool().get_entry(resolved_model)
+                # MiniMax M3 templates have a separate adaptive thinking_mode.
+                if (
+                    thinking_type == "adaptive"
+                    and "thinking_mode" not in forced_keys
+                    and getattr(_entry, "config_model_type", None)
+                    in MINIMAX_M3_MODEL_TYPES
+                ):
+                    merged_ct_kwargs.setdefault("thinking_mode", "adaptive")
 
         logger.debug(
             f"Tool result truncation config: max_tokens={max_tool_result_tokens}, "
@@ -7604,8 +7612,8 @@ async def stream_responses_api(
         output=[],
         tools=request.tools or [],
         tool_choice=request.tool_choice or "auto",
-        temperature=request.temperature,
-        top_p=request.top_p,
+        temperature=kwargs.get("temperature"),
+        top_p=kwargs.get("top_p"),
         max_output_tokens=request.max_output_tokens,
         previous_response_id=request.previous_response_id,
     )
@@ -8298,8 +8306,8 @@ async def stream_responses_api(
             if request.tools
             else []
         ),
-        "temperature": request.temperature,
-        "top_p": request.top_p,
+        "temperature": kwargs.get("temperature"),
+        "top_p": kwargs.get("top_p"),
         "max_output_tokens": request.max_output_tokens,
     }
     if truncated:

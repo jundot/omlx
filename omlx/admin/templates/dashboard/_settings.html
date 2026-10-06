@@ -189,7 +189,7 @@
                                             <div class="flex items-center justify-between p-3 bg-neutral-50 rounded-xl border border-neutral-100">
                                                 <div class="flex-1 min-w-0">
                                                     <div class="flex items-center gap-2">
-                                                        <span class="text-sm font-medium text-neutral-700" x-text="sk.name || '{{ t('settings.auth.sub_keys_unnamed') }}'"></span>
+                                                        <span class="text-sm font-medium text-neutral-700" x-text="sk.name || window.t('settings.auth.sub_keys_unnamed')"></span>
                                                     </div>
                                                     <div class="flex items-center gap-2 mt-1">
                                                         <code class="text-xs text-neutral-400 font-mono" x-text="showSubKeys[sk.key] ? sk.key : sk.key.substring(0, 4) + '••••••••'"></code>
@@ -337,7 +337,7 @@
                                             <div class="flex items-center gap-2">
                                                 <input type="text" x-model="globalSettings.model.model_dirs[index]"
                                                        class="flex-1 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs"
-                                                       :placeholder="index === 0 ? '{{ t('settings.model.placeholder_primary') }}' : '{{ t('settings.model.placeholder_additional') }}'">
+                                                       :placeholder="index === 0 ? window.t('settings.model.placeholder_primary') : window.t('settings.model.placeholder_additional')">
                                                 <button @click="if (globalSettings.model.model_dirs.length > 1) globalSettings.model.model_dirs.splice(index, 1)"
                                                         class="flex-shrink-0 p-1.5 rounded-lg transition-colors"
                                                         :class="globalSettings.model.model_dirs.length > 1 ? 'text-neutral-400 hover:text-red-500 hover:bg-red-50' : 'text-neutral-200 cursor-not-allowed'">
@@ -1129,10 +1129,10 @@
                                 <i x-show="restartServer.status !== 'restarting' && restartServer.status !== 'waiting'"
                                    data-lucide="rotate-cw" class="w-4 h-4 shrink-0"></i>
                                 <span x-text="restartServer.status === 'restarting'
-                                               ? '{{ t('settings.server.restart_button_restarting') }}'
+                                               ? window.t('settings.server.restart_button_restarting')
                                                : (restartServer.status === 'waiting'
-                                                   ? '{{ t('settings.server.restart_button_waiting') }}'
-                                                   : '{{ t('settings.server.restart_button') }}')"></span>
+                                                   ? window.t('settings.server.restart_button_waiting')
+                                                   : window.t('settings.server.restart_button'))"></span>
                             </button>
                             <button
                                 @click="saveGlobalSettings"

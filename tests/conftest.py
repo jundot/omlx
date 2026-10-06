@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import zlib
 
 # MLX 0.32.2 runs fp32 GPU matmuls at TF32 precision on M5-class tensor units;
 # the fp32 parity tests assert 2e-5, which TF32 cannot hold. Test session only.
@@ -92,8 +93,8 @@ class MockTokenizer:
             tokens.append(self.bos_token_id)
         # Simulate tokenization by splitting on spaces
         for i, word in enumerate(text.split()):
-            # Use hash to get a consistent token id for each word
-            token_id = (hash(word) % (self.vocab_size - 10)) + 10
+            # crc32, unlike hash(), is stable across processes.
+            token_id = (zlib.crc32(word.encode()) % (self.vocab_size - 10)) + 10
             tokens.append(token_id)
         return tokens
 

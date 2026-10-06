@@ -66,7 +66,20 @@ constexpr int glm_bytes_per_pack() {
 template <typename T, int values_per_thread, int bits>
 inline float glm_load_vector(const device T* x, thread float* x_thread) {
   float sum = 0;
-  if (bits == 4) {
+  if (bits == 3) {
+    for (int i = 0; i < values_per_thread; i += 8) {
+      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
+          x[i + 6] + x[i + 7];
+      x_thread[i] = x[i];
+      x_thread[i + 1] = x[i + 1] / 8.0f;
+      x_thread[i + 2] = x[i + 2] / 64.0f;
+      x_thread[i + 3] = x[i + 3] / 2.0f;
+      x_thread[i + 4] = x[i + 4] / 16.0f;
+      x_thread[i + 5] = x[i + 5] / 128.0f;
+      x_thread[i + 6] = x[i + 6] / 4.0f;
+      x_thread[i + 7] = x[i + 7] / 32.0f;
+    }
+  } else if (bits == 4) {
     for (int i = 0; i < values_per_thread; i += 4) {
       sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
       x_thread[i] = x[i];
@@ -113,7 +126,25 @@ inline float glm_qdot(
     float bias,
     float sum) {
   float accum = 0;
-  if (bits == 4) {
+  if (bits == 3) {
+    for (int i = 0; i < (values_per_thread / 8); i++) {
+      x_thread += 8 * i;
+      w += 3 * i;
+
+      accum += (w[0] & 0x07) * x_thread[0];
+      accum += (w[0] & 0x38) * x_thread[1];
+      accum += (w[0] & 0xc0) * x_thread[2];
+      accum += (w[1] & 0x01) * (x_thread[2] * 256.0f);
+
+      accum += (w[1] & 0x0e) * x_thread[3];
+      accum += (w[1] & 0x70) * x_thread[4];
+      accum += (w[1] & 0x80) * x_thread[5];
+      accum += (w[2] & 0x03) * (x_thread[5] * 256.0f);
+
+      accum += (w[2] & 0x1c) * x_thread[6];
+      accum += (w[2] & 0xe0) * x_thread[7];
+    }
+  } else if (bits == 4) {
     const device uint16_t* ws = (const device uint16_t*)w;
     for (int i = 0; i < (values_per_thread / 4); i++) {
       accum +=
@@ -749,11 +780,12 @@ def _down_kernel(
     )
 
 
+# MLX uses the same qmv_fast alignment rule for 3-bit and 4/5/6/8-bit weights.
 def _qmv_fast_ok(bits: int, group_size: int, n: int, k: int) -> bool:
     """Shapes on which MLX routes a one-token product to qmv_fast."""
-    if bits not in (4, 5, 6, 8) or group_size not in (32, 64, 128):
+    if bits not in (3, 4, 5, 6, 8) or group_size not in (32, 64, 128):
         return False
-    pack_factor = 8 if bits == 5 else (4 if bits == 6 else 32 // bits)
+    pack_factor = 8 if bits in (3, 5) else (4 if bits == 6 else 32 // bits)
     values_per_thread = pack_factor * 2
     if group_size % values_per_thread:
         return False

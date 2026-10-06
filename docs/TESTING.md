@@ -14,7 +14,7 @@ Run `python -m pytest -q tests/test_vlm_vision_fallback.py` to check strict load
 
 # Test timing
 
-CI runs all default tests on Python 3.11, 3.12, and 3.13, reports the 50 slowest phases, and uploads `test-results.xml` as `test-results-py<version>`. Use `python -m pytest --durations=50 --junitxml=test-results.xml` to collect the same timing data locally. Compare runner queue time separately from test execution.
+CI runs all default tests on Python 3.11 for PRs and pushes to `main`. A daily scheduled run, which can also be started manually, covers Python 3.11, 3.12, and 3.13. Each run reports the 50 slowest phases and uploads `test-results.xml` as `test-results-py<version>`. Use `python -m pytest --durations=50 --junitxml=test-results.xml` to collect the same timing data locally. Compare runner queue time separately from test execution.
 
 The automatic Qwen FP16/BF16 decode route has numerical, cache-state and
 fallback tests in `tests/test_qwen35_fp16_decode.py`. Run it with

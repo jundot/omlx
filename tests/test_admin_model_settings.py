@@ -7,6 +7,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 
 import omlx.server  # noqa: F401 - ensure server module is imported first
 from omlx.admin import routes as admin_routes
@@ -607,3 +608,51 @@ def test_runtime_signature_gates_mtp_depth_on_lightning_mtp():
     assert pool._engine_runtime_signature(
         "m", depth_3_off
     ) == pool._engine_runtime_signature("m", depth_8_off)
+
+
+@pytest.mark.asyncio
+async def test_parked_dflash_draft_path_does_not_block_saves(tmp_path):
+    pool, _ = _failed_pool()
+    deleted = str(tmp_path / "deleted-draft")
+    settings = ModelSettings(dflash_enabled=True, dflash_draft_model=deleted)
+
+    await _update_settings(
+        pool, settings, admin_routes.ModelSettingsRequest(temperature=0.3)
+    )
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(
+            dflash_enabled=False, dflash_draft_model=deleted
+        ),
+    )
+
+    assert settings.dflash_enabled is False
+    assert settings.dflash_draft_model == deleted
+
+
+@pytest.mark.asyncio
+async def test_enabling_dflash_over_a_deleted_draft_path_is_rejected(tmp_path):
+    pool, _ = _failed_pool()
+    deleted = str(tmp_path / "deleted-draft")
+    manager = MagicMock()
+    manager.get_settings.side_effect = lambda _: ModelSettings(
+        dflash_draft_model=deleted
+    )
+
+    with (
+        patch("omlx.admin.routes._get_engine_pool", return_value=pool),
+        patch("omlx.admin.routes._get_settings_manager", return_value=manager),
+        patch("omlx.admin.routes._get_server_state", return_value=MagicMock()),
+        patch("omlx.engine.dflash.is_dflash_compatible", return_value=(True, "")),
+    ):
+        for payload in (
+            {"dflash_enabled": True},
+            {"dflash_enabled": True, "dflash_draft_model": deleted},
+        ):
+            request = admin_routes.ModelSettingsRequest(**payload)
+            with pytest.raises(HTTPException) as exc:
+                await admin_routes.update_model_settings("ling", request, is_admin=True)
+            assert exc.value.status_code == 422
+
+    manager.set_settings.assert_not_called()

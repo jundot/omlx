@@ -4184,13 +4184,32 @@ class VLMBatchedEngine(BaseEngine):
                 fast_cached_features = fast.pop("cached_image_features", None)
                 inputs = fast
         if inputs is None:
+            prompts = [prompt] if isinstance(prompt, str) else prompt
+            # A text-only chat template renders images as prose, and the
+            # processor then fails with a misleading image-count error.
+            image_token = getattr(self._processor, "image_token", None)
+            texts = [item for item in prompts if isinstance(item, str)]
+            if (
+                num_images
+                and isinstance(image_token, str)
+                and image_token
+                and texts
+                and not any(image_token in text for text in texts)
+            ):
+                raise InvalidRequestError(
+                    "The chat template did not emit image tokens for the "
+                    "attached images. This checkpoint likely ships a text-only "
+                    "chat template; use the vision template from the upstream "
+                    "model repository.",
+                    field="messages",
+                )
             # Tokenize text and preprocess images and audio
             inputs = prepare_inputs(
                 self._processor,
                 images=images if images else None,
                 audio=audio if audio else None,
                 videos=videos if videos else None,
-                prompts=[prompt] if isinstance(prompt, str) else prompt,
+                prompts=prompts,
             )
 
         input_ids = inputs["input_ids"]

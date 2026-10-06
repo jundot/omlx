@@ -851,6 +851,42 @@ class TestPerRequestMRoPEDecode:
         adapter(mx.zeros((1, 4), dtype=mx.int32), cache=[cache_layer])
         assert vlm.language_model.call_args.kwargs["position_ids"].shape == (1, 4)
 
+    def test_qwen4_step_threshold_default_follows_fused_attention_rows(self, monkeypatch):
+        """Unset, the threshold keeps the masked path at every context while the fused
+        attention rows run (faster there, and bit-identical to the MLX ops), and is
+        the gathered crossover otherwise; an explicit value still wins."""
+        import mlx.core as mx
+
+        import omlx.models.vlm as vlm_module
+        from omlx.models.vlm import VLMModelAdapter
+        from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
+
+        compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+        from mlx_vlm.models.qwen4_exp import attn_fused
+
+        monkeypatch.setattr(vlm_module, "_STEP_TEXT_POSITIONS_MIN_CONTEXT", None)
+        vlm = self._make_qwen4_mrope_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+        adapter.mark_text_positions(7)
+        cache_layer = MagicMock()
+
+        def step_shape(offset):
+            cache_layer.offset = offset
+            adapter.set_step_rope_deltas(mx.array([0.0]), uids=[7])
+            adapter(mx.zeros((1, 4), dtype=mx.int32), cache=[cache_layer])
+            return vlm.language_model.call_args.kwargs["position_ids"].shape
+
+        monkeypatch.setattr(attn_fused, "rows_available", lambda: True)
+        assert step_shape(130_000) == (3, 1, 4)
+
+        monkeypatch.setattr(attn_fused, "rows_available", lambda: False)
+        assert step_shape(32_767) == (3, 1, 4)
+        assert step_shape(32_768) == (1, 4)
+
+        monkeypatch.setattr(attn_fused, "rows_available", lambda: True)
+        monkeypatch.setattr(vlm_module, "_STEP_TEXT_POSITIONS_MIN_CONTEXT", 65536)
+        assert step_shape(82_000) == (1, 4)
+
     def test_qwen4_unregister_clears_text_positions_proof(self):
         import mlx.core as mx
 
