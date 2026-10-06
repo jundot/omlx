@@ -3629,8 +3629,10 @@ def format_tool_call_for_message(tool_call: ToolCall) -> dict:
     }
 
 
-# ======================================================================# Structured Output (JSON Schema) Utilities
-# ======================================================================
+# =============================================================================
+# Structured Output (JSON Schema) Utilities
+# =============================================================================
+
 
 def validate_json_schema(
     data: Any, schema: Dict[str, Any]
