@@ -7756,19 +7756,30 @@ async def stream_responses_api(
     has_tools = bool(kwargs.get("tools"))
     # Some templates open the thinking block in the prompt itself, so the
     # generated text starts with reasoning body and only later emits </think>.
-    start_in_thinking = native_reasoning
-    if not start_in_thinking:
-        try:
-            tokenizer = getattr(engine, "tokenizer", None)
-            if tokenizer is not None:
-                prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
-                    engine, messages, kwargs
-                )
-                start_in_thinking, _ = prompt_opens_thinking(
-                    tokenizer, prompt, prompt_token_ids=prompt_token_ids
-                )
-        except Exception as exc:
-            logger.debug("Could not detect Responses stream thinking state: %s", exc)
+    # Decide from the rendered prompt (same as the Chat Completions stream).
+    # ``native_reasoning`` only says the template supports preserve_thinking
+    # (e.g. Gemma 4); it does not mean the prompt left a thought block open.
+    # Gemma 4 with enable_thinking=false renders an empty, already-closed
+    # ``<|channel>thought\n<channel|>`` so the answer must start as content.
+    start_in_thinking = False
+    detected = False
+    try:
+        tokenizer = getattr(engine, "tokenizer", None)
+        if tokenizer is not None:
+            prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
+                engine, messages, kwargs
+            )
+            start_in_thinking, _ = prompt_opens_thinking(
+                tokenizer, prompt, prompt_token_ids=prompt_token_ids
+            )
+            detected = True
+    except Exception as exc:
+        logger.debug("Could not detect Responses stream thinking state: %s", exc)
+    if not detected:
+        ct_kwargs = kwargs.get("chat_template_kwargs") or {}
+        start_in_thinking = (
+            native_reasoning and ct_kwargs.get("enable_thinking") is not False
+        )
     thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
     stream_state = stream_state or _ResponsesStreamState()
     seq = 0
