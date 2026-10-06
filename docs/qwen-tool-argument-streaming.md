@@ -41,6 +41,12 @@ https://github.com/jundot/omlx/pull/3646. The port retains the existing naked-fu
 filter and terminal-generation accounting, then adapts activation and finalization
 for the custom GA stack.
 
+Triple-quoted Python docstring prefixes stream as literal string contents.
+Split opening quotes wait until the prefix is settled: three quotes cannot
+become a JSON-encoded string in the recovery parser. Single/double-quote
+prefixes and meaningful leading whitespace keep their existing deferral.
+Native parsing, recovery values and completion validation are unchanged.
+
 The incremental parser retains a SHA-256 digest and character count of emitted
 arguments, checked once against final parsing. Non-string values remain buffered
 until their parameter closes. The existing server transcript and envelope filter

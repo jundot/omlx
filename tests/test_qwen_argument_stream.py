@@ -87,6 +87,7 @@ async def run(raw, size, incremental, capable=True, tools=TOOLS):
     )
     calls = {}
     positions = []
+    argument_lengths = []
     errors = []
     finish = None
     content = []
@@ -114,11 +115,13 @@ async def run(raw, size, incremental, capable=True, tools=TOOLS):
                     call[key] += tc["function"].get(key, "")
                 if tc["function"].get("arguments"):
                     positions.append(engine.position)
+                    argument_lengths.append(len(tc["function"]["arguments"]))
                 if tc["function"].get("name"):
                     ordered.append(("tool", tc["function"]["name"]))
     return dict(
         calls=list(calls.values()),
         positions=positions,
+        argument_lengths=argument_lengths,
         errors=errors,
         finish=finish,
         content="".join(content),
@@ -136,6 +139,83 @@ def signature(result):
         content=result["content"],
         reasoning=result["reasoning"],
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [1, 2, 3, 7, 128, 4096])
+@pytest.mark.parametrize("content_first", [False, True])
+@pytest.mark.parametrize("recover", [False, True])
+async def test_docstring_body_streams_before_close(size, content_first, recover):
+    value = '"""Module docstring: café 🚀 with \\"quotes\\"."""\n' + "x" * 65536
+    params = [("content", value), ("path", "probe.py")]
+    if not content_first:
+        params.reverse()
+    raw = envelope(params)
+    if recover:
+        raw = raw.removesuffix("</tool_call>")
+    native = await run(raw, size, False)
+    actual = await run(raw, size, True)
+    assert not actual["errors"]
+    assert signature(actual) == signature(native)
+    # Require body bytes, not just a name/opening brace, during generation.
+    halfway = raw.index(value) + len(value) // 2
+    early = sum(
+        n
+        for p, n in zip(actual["positions"], actual["argument_lengths"])
+        if p < halfway
+    )
+    assert early > 16000
+    assert json.loads(actual["calls"][0]["arguments"])["content"] == value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [1, 2, 13, 4096])
+@pytest.mark.parametrize("recover", [False, True])
+@pytest.mark.parametrize(
+    "value",
+    [
+        '"',
+        '""',
+        '"""',
+        '""""',
+        '"quoted"',
+        '"escaped\\"quote"',
+        '"\\u263a"',
+        '"""doc"""\n',
+        "'''doc'''\n",
+        '\n"""doc"""',
+        '  """doc"""',
+        '\t"""doc"""',
+        '\r\n"""doc"""',
+        '\u00a0"""doc"""',
+        '"""doc"""  ',
+        '"""doc"""\n\n',
+    ],
+)
+async def test_quote_and_whitespace_prefixes_keep_native_recovery_semantics(
+    size, recover, value
+):
+    raw = envelope({"content": value, "path": "probe.py"})
+    if recover:
+        raw = raw.removesuffix("</tool_call>")
+    native = await run(raw, size, False)
+    actual = await run(raw, size, True)
+    assert not actual["errors"]
+    assert signature(actual) == signature(native)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [1, 13, 4096])
+async def test_docstring_calls_keep_distinct_ids_and_append_only_arguments(size):
+    value = '"""doc"""\n' + "x" * 4096
+    raw = envelope({"content": value, "path": "one.py"}) + envelope(
+        {"path": "two.py", "content": value}
+    )
+    native = await run(raw, size, False)
+    actual = await run(raw, size, True)
+    assert not actual["errors"]
+    assert signature(actual) == signature(native)
+    assert len({call["id"] for call in actual["calls"]}) == 2
 
 
 VALUES = [
@@ -401,6 +481,26 @@ async def test_untyped_properties_match_final_qwen_wrapper(size, schema, value):
     raw = envelope({"content": value})
     native = await run(raw, size, False, tools=tools)
     actual = await run(raw, size, True, tools=tools)
+    assert not actual["errors"]
+    assert signature(actual) == signature(native)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [1, 13, 1024])
+@pytest.mark.parametrize("value", ['  spaced  ', '"quoted"', 'null ', 'tail  ', 'body\n\n', 'body' + ' ' * 200 + 'tail'])
+@pytest.mark.parametrize("recover", [False, True])
+async def test_string_prefix_matches_both_normal_and_recovered_calls(size, value, recover):
+    raw = envelope({"content": value})
+    if recover:
+        raw = raw.removesuffix("</tool_call>")
+    native = await run(raw, size, False)
+    actual = await run(raw, size, True)
+    if native["errors"]:
+        assert actual["errors"] == native["errors"]
+        for call in actual["calls"]:
+            with pytest.raises(json.JSONDecodeError):
+                json.loads(call["arguments"])
+        return
     assert not actual["errors"]
     assert signature(actual) == signature(native)
 

@@ -148,6 +148,7 @@ class QwenArgumentStream:
                 self.buf = header[match.end():] + self.buf[i + 1 :]
                 self.state = "value"
                 self.raw = []
+                self.trailing_whitespace = []
                 self.started = False
                 self.leading = True
                 cfg = self.config.get(self.param, {})
@@ -207,32 +208,52 @@ class QwenArgumentStream:
                             )
                         )
                 else:
+                    prefix = ""
                     if not self.started:
                         self.raw.append(part)
                         pending = "".join(self.raw)
-                        # Native Qwen treats even string-schema NULL as null.
+                        # Resolve split null/quote prefixes before deciding.
                         if not closed and len(pending) <= 4:
                             continue
+                        # Recovery trims whitespace and decodes JSON strings.
+                        # Three quotes cannot start one JSON string: the first
+                        # two already close an empty string. Preserve such
+                        # literal source prefixes, including Python docstrings.
+                        if pending and (
+                            pending[0].isspace()
+                            or (pending[0] == '"' and not pending.startswith('"""'))
+                        ):
+                            self.enabled = False
+                            break
+                        if pending.lower().startswith("null") and pending[4:].isspace():
+                            self.enabled = False
+                            break
+                        self.raw = []
                         if closed and pending.lower() == "null":
                             out.append(self.emit(self.prefix + "null"))
-                        else:
-                            out.append(
-                                self.emit(
-                                    self.prefix
-                                    + '"'
-                                    + json.dumps(pending, ensure_ascii=False)[1:-1]
-                                    + ('"' if closed else "")
-                                )
-                            )
-                            self.started = True
-                        self.raw = []
+                            self.state = "parameter"
+                            continue
+                        prefix = self.prefix + '"'
+                        part = pending
+                        self.started = True
+                    settled = part.rstrip()
+                    if settled:
+                        value = "".join(self.trailing_whitespace) + settled
+                        self.trailing_whitespace = [part[len(settled):]] if len(settled) < len(part) else []
                     else:
-                        out.append(
-                            self.emit(
-                                json.dumps(part, ensure_ascii=False)[1:-1]
-                                + ('"' if closed else "")
-                            )
-                        )
+                        value = ""
+                        if part:
+                            self.trailing_whitespace.append(part)
+                    if closed and self.trailing_whitespace:
+                        # Preserve an open JSON string. Final parsing decides
+                        # whether the trailing whitespace belongs to the value.
+                        self.enabled = False
+                    out.append(self.emit(
+                        prefix + json.dumps(value, ensure_ascii=False)[1:-1]
+                        + ('"' if closed and self.enabled else "")
+                    ))
+                    if not self.enabled:
+                        break
                 if closed:
                     self.state = "parameter"
                 elif not self.buf:
