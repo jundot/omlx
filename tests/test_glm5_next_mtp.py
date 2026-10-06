@@ -1450,6 +1450,7 @@ def test_fused_verify_cycles_are_bitwise_reference_with_nax_tf32():
     code = (
         "import sys; sys.path[:0] = [%r, %r]\n"
         "import test_glm5_next_mtp as t\n"
+        "t.dk.moe_router = t._kernel_parity_router(t.dk.moe_router)\n"
         "from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk\n"
         "used = []\n"
         "for seed, ctx in ((5, 300), (11, 2101)):\n"
@@ -1695,3 +1696,23 @@ def test_batched_rollback_rejects_a_fused_capture():
     capture = language.KdaStepCapture(None, mx.zeros((2, 4, 8)), None, None)
     with pytest.raises(ValueError):
         rollback_rows(language, [cache], [capture], [0, 1], 4)
+
+
+def _kernel_parity_router(one_row):
+    """Pin block-reference routes when comparing downstream fusion kernels.
+
+    The default router is covered by test_glm53_verify_router.py. These
+    tests compare the remaining kernels with identical expert decisions.
+    """
+
+    def routed(x, *args, **kwargs):
+        if 2 <= x.shape[0] <= 8:
+            return dk.moe_router_rows(x, *args, **kwargs)
+        return one_row(x, *args, **kwargs)
+
+    return routed
+
+
+@pytest.fixture(autouse=True)
+def _verify_router_block_replay(monkeypatch):
+    monkeypatch.setattr(dk, "moe_router", _kernel_parity_router(dk.moe_router))

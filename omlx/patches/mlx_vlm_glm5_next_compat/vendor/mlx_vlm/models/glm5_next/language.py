@@ -1566,8 +1566,7 @@ class Glm5NextMoEGate(nn.Module):
             and self.n_group == 1
         ):
             # One token: the reference logits come from the one-row fp32
-            # gemv, which the fused router reproduces (multi-row calls use
-            # a different matmul and keep the reference path).
+            # gemv, which the fused router reproduces.
             routed = _decode_kernels.moe_router(
                 x.reshape(1, -1),
                 self.weight,
@@ -1586,9 +1585,10 @@ class Glm5NextMoEGate(nn.Module):
             and 2 <= x.shape[1] <= _DECODE_BLOCK
             and self.n_group == 1
         ):
-            # Verify block: the reference logits come from MLX's NAX split-K
-            # GEMM, which moe_router_rows reproduces op for op.
-            routed = _decode_kernels.moe_router_rows(
+            # Verify rows use the one-token fp32 GEMV arithmetic, so each
+            # row gets the routing its decode step computes. The stock
+            # block GEMM uses TF32 on NAX and can give different routes.
+            routed = _decode_kernels.moe_router(
                 x.reshape(x.shape[1], -1),
                 self.weight,
                 self.e_score_correction_bias,

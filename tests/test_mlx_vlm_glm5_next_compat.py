@@ -3175,7 +3175,8 @@ def _run_with_tf32(snippet: str) -> str:
         "import sys; sys.path[:0] = [%r, %r]\n"
         "from omlx.patches import mlx_vlm_glm5_next_compat as compat\n"
         "compat.apply_mlx_vlm_glm5_next_compat_patch()\n"
-        "import test_mlx_vlm_glm5_next_compat as t\n" % (str(here), str(here.parent))
+        "import test_mlx_vlm_glm5_next_compat as t\n"
+        "t.dk.moe_router = t._kernel_parity_router(t.dk.moe_router)\n" % (str(here), str(here.parent))
     ) + snippet
     env = dict(os.environ, MLX_ENABLE_TF32="1")
     done = subprocess.run(
@@ -4225,22 +4226,31 @@ def test_router_declines_other_gemv_configurations():
 
 
 def _check_router_rows(experts=288, hidden=4096):
-    """Verify-block routers (2..8 rows), bitwise; returns engaged calls."""
+    """The block-GEMM replay kernel, independently of default gate dispatch."""
     language = _language()
     gate = _router(experts, hidden, seed=7)
     engaged = 0
     for trial, rows in enumerate([2, 3, 4, 5, 8, 4]):
         x = (mx.random.normal((1, rows, hidden)) * (0.3 + trial)).astype(mx.bfloat16)
         before = _stats()["router_rows"]
-        indices, scores = gate(x)
+        routed = dk.moe_router_rows(
+            x.reshape(rows, hidden),
+            gate.weight,
+            gate.e_score_correction_bias,
+            gate.top_k,
+            gate.routed_scaling_factor,
+            gate.norm_topk_prob,
+        )
         engaged += _stats()["router_rows"] - before
         language._DECODE_FUSION = False
         try:
             ref_indices, ref_scores = gate(x)
         finally:
             language._DECODE_FUSION = True
-        assert mx.array_equal(indices, ref_indices).item(), rows
-        assert _mismatches(scores, ref_scores) == 0, rows
+        if routed is not None:
+            indices, scores = (a.reshape(1, rows, -1) for a in routed)
+            assert mx.array_equal(indices, ref_indices).item(), rows
+            assert _mismatches(scores, ref_scores) == 0, rows
     return engaged
 
 
@@ -4468,9 +4478,17 @@ def test_router_rows_first_use_check_inside_compile_uses_reference():
         "    language = t._language()\n"
         "    gate = t._router(64, 512, seed=6)\n"
         "    x = mx.random.normal((1, 4, 512)).astype(mx.bfloat16)\n"
-        "    traced = mx.compile(lambda v: gate(v))(x)\n"
+        "    def call(v):\n"
+        "        out = dk.moe_router_rows(v.reshape(4, 512), gate.weight,\n"
+        "            gate.e_score_correction_bias, 8, 2.5, True)\n"
+        "        if out is None:\n"
+        "            return language.group_expert_select(\n"
+        "                v.astype(mx.float32) @ gate.weight.astype(mx.float32).T,\n"
+        "                gate.e_score_correction_bias, 8, 1, 1, 2.5, True)\n"
+        "        return tuple(a.reshape(1, 4, -1) for a in out)\n"
+        "    traced = mx.compile(call)(x)\n"
         "    assert dk._ROUTER_ROWS_CHECKED == {}  # no check inside compile\n"
-        "    eager = gate(x)\n"
+        "    eager = call(x)\n"
         "    assert list(dk._ROUTER_ROWS_CHECKED.values()) == [True]\n"
         "    mx.eval(traced)\n"
         "    language._DECODE_FUSION = False\n"
@@ -4691,3 +4709,23 @@ def test_compiled_ffn_block_releases_the_layer_weights():
     leak = _leaked_bytes(lambda layer: mx.compile(layer._ffn_block))
     # A pinned weight would leave 8 MB+; only tiny trace constants may remain.
     assert leak < (64 << 10), f"{leak} bytes still active after the layer was dropped"
+
+
+def _kernel_parity_router(one_row):
+    """Pin block-reference routes when comparing downstream fusion kernels.
+
+    The default router is covered by test_glm53_verify_router.py. These
+    tests compare the remaining kernels with identical expert decisions.
+    """
+
+    def routed(x, *args, **kwargs):
+        if 2 <= x.shape[0] <= 8:
+            return dk.moe_router_rows(x, *args, **kwargs)
+        return one_row(x, *args, **kwargs)
+
+    return routed
+
+
+@pytest.fixture(autouse=True)
+def _verify_router_block_replay(monkeypatch):
+    monkeypatch.setattr(dk, "moe_router", _kernel_parity_router(dk.moe_router))
