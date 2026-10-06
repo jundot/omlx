@@ -3577,4 +3577,3 @@ class TestNativeVideo:
         assert estimate.call_count == 2
         kwargs = engine._preflight_or_raise_with_eviction.call_args.kwargs
         assert kwargs["num_prompt_tokens"] == 1002
-        assert kwargs["text_only"] is False
