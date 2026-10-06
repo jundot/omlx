@@ -5914,9 +5914,22 @@ async def stream_chat_completion(
     # the existing final parser. Finish its existing index, never resend the
     # full body. Length-stopped or malformed calls retain their open JSON.
     if argument_stream is not None and argument_stream.calls:
-        if not tool_failure and not tool_truncated:
-            pending_calls = (tool_calls or [])[len(streamed_tool_calls):
-                                              len(streamed_tool_calls) + len(argument_stream.calls)]
+        offset = len(streamed_tool_calls)
+        pending_end = offset + len(argument_stream.calls)
+        prefix_calls = tool_calls
+        prefix_errors = ()
+        if tool_failure or tool_truncated:
+            # Queue overflow may leave a complete call awaiting validation.
+            # Parse its own source prefix: a later bad sibling must neither
+            # suppress its close nor cause the whole body to be sent again.
+            _, prefix_calls, prefix_errors = parse_qwen_tool_calls(
+                regular_content, engine.tokenizer, kwargs.get("tools"),
+                last_output.finish_reason if last_output else "stop",
+                max_envelopes=pending_end,
+            )
+        pending_calls = (prefix_calls or [])[offset:pending_end]
+        pending_validated = False
+        if not prefix_errors:
             try:
                 remaining = argument_stream.finish(pending_calls)
             except ValueError:
@@ -5927,7 +5940,7 @@ async def stream_chat_completion(
                     "code": "invalid_tool_call",
                 }}
             else:
-                offset = len(streamed_tool_calls)
+                pending_validated = True
                 for tc, partial in zip(pending_calls, argument_stream.calls):
                     tc.id = partial["id"]
                     streamed_tool_calls.append(tc)
@@ -5942,7 +5955,7 @@ async def stream_chat_completion(
                     )
                     mark_visible_delta()
                     yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
-        if tool_failure or tool_truncated:
+        if not pending_validated:
             # Reserve abandoned indices so later complete siblings cannot
             # overwrite a partial call already visible to the client.
             partial_tool_call_count = len(argument_stream.calls)

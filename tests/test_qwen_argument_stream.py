@@ -615,14 +615,19 @@ async def test_large_valid_envelope_falls_back_after_incremental_buffer_limit():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("size", [1, 13, 4096])
 @pytest.mark.parametrize("recover", [False, True])
-@pytest.mark.parametrize("parameters", [
-    {"undeclared": "42"},
-    {"flag": " true "},
-    {"content": "a</parameter>b"},
-    {"content": "plain", "flag": " true ", "number": "invalid"},
-    {"content": '"quoted"', "number": "invalid"},
-])
-async def test_each_emitted_value_is_settled_for_native_and_fallback(size, recover, parameters):
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        {"undeclared": "42"},
+        {"flag": " true "},
+        {"content": "a</parameter>b"},
+        {"content": "plain", "flag": " true ", "number": "invalid"},
+        {"content": '"quoted"', "number": "invalid"},
+    ],
+)
+async def test_each_emitted_value_is_settled_for_native_and_fallback(
+    size, recover, parameters
+):
     raw = envelope(parameters)
     if recover:
         raw = raw.removesuffix("</tool_call>")
@@ -642,8 +647,54 @@ async def test_each_emitted_value_is_settled_for_native_and_fallback(size, recov
 @pytest.mark.parametrize("size", [1, 13, 4096])
 @pytest.mark.parametrize("header", [" content", "\tcontent", "content!"])
 async def test_native_only_parameter_names_defer_until_recovery_is_known(size, header):
-    raw = envelope({"content": "text"}).replace("<parameter=content>", "<parameter=" + header + ">").removesuffix("</tool_call>")
+    raw = (
+        envelope({"content": "text"})
+        .replace("<parameter=content>", "<parameter=" + header + ">")
+        .removesuffix("</tool_call>")
+    )
     native = await run(raw, size, False)
     actual = await run(raw, size, True)
     assert not actual["errors"]
     assert signature(actual) == signature(native)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason,bad",
+    [
+        ("length", "<tool_call><function=write><parameter=content>partial"),
+        ("stop", "<tool_call>malformed</tool_call>"),
+    ],
+)
+async def test_overflow_complete_prefix_is_not_resent_when_a_later_call_fails(
+    reason, bad
+):
+    from tests.integration.test_e2e_streaming import (
+        _recovery_stream,
+        _chat_argument_calls,
+    )
+
+    value = "x" * (2 * 1024 * 1024)
+    events = await _recovery_stream(
+        envelope({"content": value}) + bad, chunk_size=4096, finish_reason=reason
+    )
+    calls = _chat_argument_calls(events)
+    assert len(calls) == 1
+    assert json.loads(calls[0]["arguments"]) == {"content": value}
+    starts = [
+        tc
+        for event in events
+        for choice in event.get("choices", [])
+        for tc in choice.get("delta", {}).get("tool_calls", [])
+        if "id" in tc
+    ]
+    assert len(starts) == 1 and starts[0]["index"] == 0
+    if reason == "length":
+        assert not any(e.get("error") for e in events)
+        assert any(
+            c.get("finish_reason") == "length"
+            for e in events
+            for c in e.get("choices", [])
+        )
+    else:
+        assert events[-1]["error"]["code"] == "invalid_tool_call"

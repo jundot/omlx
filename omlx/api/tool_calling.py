@@ -2189,16 +2189,23 @@ def _extract_tool_names(tools: List) -> set:
 
 
 def parse_qwen_tool_calls(
-    text: str, tokenizer: Any, tools: list, finish_reason: str
+    text: str, tokenizer: Any, tools: list, finish_reason: str,
+    *, max_envelopes: int | None = None,
 ) -> tuple[str, list[ToolCall] | None, tuple[str, ...]]:
     """Recover only complete functions missing their outer close at normal EOF.
 
     Report failed envelopes while preserving successfully parsed siblings.
-    Never close a parameter value or infer missing argument bytes.
+    Never close a parameter value or infer missing argument bytes. A bounded
+    prefix lets streaming validate a completed call independently of a later
+    malformed or truncated sibling; ordinary callers parse the entire text.
     """
     calls, prose, errors = [], [], []
     pos = 0
+    envelopes = 0
     while match := _QWEN_OPEN_RE.search(text, pos):
+        if max_envelopes is not None and envelopes >= max_envelopes:
+            break
+        envelopes += 1
         start = match.start()
         prose.append(text[pos:start])
         paired = match.group() == "<tool_call>"

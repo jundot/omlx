@@ -136,9 +136,10 @@ class QwenArgumentStream:
                         self.buf = ""
                     break
                 from .tool_calling import _XML_PARAMETER_OPEN_RE
+
                 # Native-only header spellings may disappear entirely during
                 # EOF recovery. Stream only their common exact grammar.
-                match = _XML_PARAMETER_OPEN_RE.fullmatch(self.buf[:i + 1])
+                match = _XML_PARAMETER_OPEN_RE.fullmatch(self.buf[: i + 1])
                 if match is None:
                     self.enabled = False
                     break
@@ -172,12 +173,13 @@ class QwenArgumentStream:
                 end = self.buf.find("</parameter>")
                 closed = end >= 0
                 if closed:
-                    after = self.buf[end + 12:]
+                    after = self.buf[end + 12 :]
                     following = after.lstrip()
                     boundaries = ("<parameter=", "</function>")
                     if not any(following.startswith(marker) for marker in boundaries):
-                        if (len(after) <= self.MAX_HEADER_CHARS and
-                                any(marker.startswith(following) for marker in boundaries)):
+                        if len(after) <= self.MAX_HEADER_CHARS and any(
+                            marker.startswith(following) for marker in boundaries
+                        ):
                             break
                         # A literal close belongs to a different value in the
                         # recovery parser. Leave the JSON string open until
@@ -204,11 +206,16 @@ class QwenArgumentStream:
                                 raw_value, self.param, self.config
                             )
                             from .tool_calling import _coerce_param_value
+
                             fallback = _coerce_param_value(
-                                raw_value.strip(), self.param, self.config,
+                                raw_value.strip(),
+                                self.param,
+                                self.config,
                                 self.current["name"],
                             )
-                            if json.dumps(value, ensure_ascii=False) != json.dumps(fallback, ensure_ascii=False):
+                            if json.dumps(value, ensure_ascii=False) != json.dumps(
+                                fallback, ensure_ascii=False
+                            ):
                                 self.enabled = False
                                 break
                         except (ValueError, SyntaxError, TypeError):
