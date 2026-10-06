@@ -1,10 +1,8 @@
 # Incremental Qwen tool arguments
 
-Chat Completions clients can request partial JSON argument deltas with
-`"stream_options": {"incremental_tool_arguments": true}`.
-The default remains false, which keeps existing completed-envelope delivery.
-The option requires an engine explicitly advertising raw early tool streaming
-and the native mlx-lm `qwen3_coder` parser.
+Chat Completions streams Qwen XML argument fragments through the existing raw
+Qwen engine capability gate. Stock clients need no extra request option.
+Other engines and non-streaming responses retain their existing handling.
 
 For a long `write` call, the first argument bytes can now arrive while the model
 is still generating that call's content.
@@ -22,8 +20,12 @@ Repeated XML parameters emit only one JSON key and succeed when native parsing
 confirms the value already sent. If a later occurrence changes that value, the
 stream ends with an error because earlier argument bytes cannot be withdrawn.
 
-Malformed, oversized or interrupted partial calls produce an SSE error and no
-successful completion; the client should discard the incomplete call.
+Length stops retain `finish_reason: length` and terminal usage when available.
+Incomplete arguments remain open and must not execute. Malformed complete calls
+and argument validation failures produce an SSE error. Cancellation closes the
+producer. No closing syntax is invented, and no mutation is automatically retried.
+A complete function missing only its outer envelope close retains the existing
+final-parser recovery rule; its validated suffix uses the original call ID.
 An envelope is bounded to 2 Mi characters and an unfinished header to 4,096
 characters.
 Numeric and structured values stay buffered until their parameter closes;
@@ -33,3 +35,8 @@ This changes delivery timing without changing model inference or sampling.
 Tests compare complete arguments, content and reasoning against the existing
 server on synthetic fixtures and check that long arguments arrive before the
 outer envelope closes.
+
+Ported from ashhart's commits 3a1979a and 09400ec in
+https://github.com/jundot/omlx/pull/3646. The port retains the existing naked-function
+filter and terminal-generation accounting, then adapts activation and finalization
+for the custom GA stack.

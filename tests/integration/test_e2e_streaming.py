@@ -1838,10 +1838,11 @@ class TestStreamingHelperFunctions:
             if choice.get("finish_reason"):
                 finish_index = event_index
 
+        calls = _chat_argument_calls(payloads)
         assert len(calls) == 1
         assert call_seen_before_engine_finish
-        assert calls[0]["function"]["name"] == "get_weather"
-        assert json.loads(calls[0]["function"]["arguments"]) == {
+        assert calls[0]["name"] == "get_weather"
+        assert json.loads(calls[0]["arguments"]) == {
             "city": "Seattle"
         }
         assert call_event_indexes[0] < finish_index
@@ -1915,7 +1916,7 @@ class TestStreamingHelperFunctions:
             delta = choices[0].get("delta") or {}
             if delta.get("content"):
                 ordered.append(("content", delta["content"]))
-            if delta.get("tool_calls"):
+            if delta.get("tool_calls") and delta["tool_calls"][0]["function"].get("name"):
                 ordered.append(
                     ("tool", delta["tool_calls"][0]["function"]["name"])
                 )
@@ -2287,7 +2288,7 @@ class TestStreamingHelperFunctions:
                 seen_before_finish |= not engine.last_stream_output_finished
 
         assert seen_before_finish
-        assert [call["function"]["name"] for call in calls] == [
+        assert [call["function"]["name"] for call in calls if call["function"].get("name")] == [
             "hallucinated",
             "get_weather",
         ]
@@ -4749,14 +4750,29 @@ async def _recovery_stream(
     return events
 
 
+def _chat_argument_calls(events):
+    """Accumulate standard argument deltas without repairing incomplete JSON."""
+    calls = {}
+    for event in events:
+        for choice in event.get("choices", []):
+            for tc in choice.get("delta", {}).get("tool_calls", []):
+                call = calls.setdefault(tc["index"], {"id": "", "name": "", "arguments": ""})
+                call["id"] += tc.get("id", "")
+                for field in ("name", "arguments"):
+                    call[field] += tc["function"].get(field, "")
+    return list(calls.values())
+
+
 def _recovery_calls(events, api):
     if api == "chat":
-        return [
-            {"id": tc["id"], **tc["function"]}
-            for e in events
-            for c in e.get("choices", [])
-            for tc in c.get("delta", {}).get("tool_calls", [])
-        ]
+        complete = []
+        for call in _chat_argument_calls(events):
+            try:
+                json.loads(call["arguments"])
+            except json.JSONDecodeError:
+                continue
+            complete.append(call)
+        return complete
     if api == "anthropic":
         calls = {}
         for event in events:
@@ -4820,7 +4836,7 @@ async def test_qwen_recovery_delivers_calls_once(api, chunk_size, shape):
             for c in e.get("choices", [])
             for tc in c.get("delta", {}).get("tool_calls", [])
         ]
-        assert indexes == list(range(len(calls)))
+        assert list(dict.fromkeys(indexes)) == list(range(len(calls)))
         assert [
             c["finish_reason"]
             for e in events
@@ -5378,7 +5394,12 @@ async def test_tool_length_retains_complete_calls_and_usage_without_partial_argu
                                     finish_reason="length", completion_tokens=32768,
                                     include_usage=True)
     assert len(_recovery_calls(events, api)) == len(prefix) // len(_RECOVERY_CALL)
-    assert "PRIVATE_PARTIAL_BODY" not in json.dumps(events)
+    if api == "chat":
+        partial_call = _chat_argument_calls(events)[-1]
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(partial_call["arguments"])
+    else:
+        assert "PRIVATE_PARTIAL_BODY" not in json.dumps(events)
     assert not any("error" in event for event in events)
     assert len(metrics) == 1
     assert metrics[0]["completion_tokens"] == 32768

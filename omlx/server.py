@@ -5497,6 +5497,7 @@ async def stream_chat_completion(
     tool_filter = None
     thinking_filter = None
     streamed_tool_calls = []
+    partial_tool_call_count = 0
     stream_tool_sequence_safe = True
     stream_completed_qwen_tools = False
     qwen_tool_envelope_streaming_capable = False
@@ -5509,8 +5510,7 @@ async def stream_chat_completion(
             registered_tool_names and _chat_can_stream_qwen_tool_envelopes(engine)
         )
         stream_completed_qwen_tools = qwen_tool_envelope_streaming_capable
-        if (qwen_tool_envelope_streaming_capable and request.stream_options
-                and request.stream_options.incremental_tool_arguments):
+        if qwen_tool_envelope_streaming_capable:
             from .api.qwen_argument_stream import QwenArgumentStream
             argument_stream = QwenArgumentStream(kwargs.get("tools"))
         _content_filter = ToolCallStreamFilter(
@@ -5662,7 +5662,7 @@ async def stream_chat_completion(
                         if segment.kind != "envelope":
                             stream_tool_sequence_safe = False
                             continue
-                        _, completed_calls, _ = parse_qwen_tool_calls(
+                        _, completed_calls, completed_errors = parse_qwen_tool_calls(
                             segment.text,
                             engine.tokenizer,
                             kwargs.get("tools"),
@@ -5672,12 +5672,11 @@ async def stream_chat_completion(
                         completed_keys = [
                             _tool_call_semantic_key(tc) for tc in completed_calls
                         ]
-                        if not completed_calls or any(
+                        if completed_errors or not completed_calls or any(
                             key is None for key in completed_keys
                         ):
-                            if argument_stream is not None and argument_stream.calls:
-                                raise ValueError("Partial tool arguments did not form a valid registered call")
-                            argument_stream = None
+                            # Let terminal extraction retain its malformed/length
+                            # distinction and usage. Any partial JSON stays open.
                             stream_tool_sequence_safe = False
                             continue
                         if not stream_tool_sequence_safe:
@@ -5738,6 +5737,8 @@ async def stream_chat_completion(
                             yield event
     except Exception as e:
         error_data = _streaming_error_payload(e, "chat streaming")
+        if last_output and last_output.finished:
+            error_data["usage"] = _tool_generation_usage(last_output)
         yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
         return
@@ -5753,14 +5754,6 @@ async def stream_chat_completion(
                 start_time,
                 first_token_time,
             )
-
-    if argument_stream is not None and argument_stream.calls:
-        yield "data: " + json.dumps({"error": {
-            "message": "Incomplete tool arguments; retry the request",
-            "type": "tool_stream_validation_error",
-        }}) + "\n\n"
-        yield "data: [DONE]\n\n"
-        return
 
     # Flush remaining buffered content from thinking/tool-call parsers
     if stream_content:
@@ -5915,6 +5908,42 @@ async def stream_chat_completion(
                 mark_visible_delta()
                 yield event
 
+    # A complete function missing only its outer close may be recovered by
+    # the existing final parser. Finish its existing index, never resend the
+    # full body. Length-stopped or malformed calls retain their open JSON.
+    if argument_stream is not None and argument_stream.calls:
+        if not tool_failure and not tool_truncated:
+            pending_calls = (tool_calls or [])[len(streamed_tool_calls):]
+            try:
+                remaining = argument_stream.finish(pending_calls)
+            except ValueError:
+                tool_calls = list(streamed_tool_calls)
+                tool_failure = {"error": {
+                    "message": "Incremental arguments differ from final parsing",
+                    "type": "tool_stream_validation_error",
+                    "code": "invalid_tool_call",
+                }}
+            else:
+                offset = len(streamed_tool_calls)
+                for tc, partial in zip(pending_calls, argument_stream.calls):
+                    tc.id = partial["id"]
+                    streamed_tool_calls.append(tc)
+                for delta in remaining or []:
+                    delta["index"] += offset
+                    chunk = ChatCompletionChunk(
+                        id=response_id, model=request.model,
+                        choices=[ChatCompletionChunkChoice(
+                            delta=ChatCompletionChunkDelta(tool_calls=[delta]),
+                            finish_reason=None,
+                        )],
+                    )
+                    mark_visible_delta()
+                    yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+        if tool_failure or tool_truncated:
+            # Reserve abandoned indices so later complete siblings cannot
+            # overwrite a partial call already visible to the client.
+            partial_tool_call_count = len(argument_stream.calls)
+
     # Surface an unterminated paired envelope only when final parsing could not
     # recover a structured tool call. The candidate begins at the opening marker,
     # so prose already streamed before it is never duplicated.
@@ -6009,7 +6038,7 @@ async def stream_chat_completion(
                         delta=ChatCompletionChunkDelta(
                             tool_calls=[
                                 {
-                                    "index": i,
+                                    "index": i + partial_tool_call_count,
                                     "id": tc.id,
                                     "type": "function",
                                     "function": {

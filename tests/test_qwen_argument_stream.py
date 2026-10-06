@@ -72,16 +72,16 @@ class Engine:
                 tool_calls=None,
                 finished=False,
                 finish_reason="stop",
+                prompt_tokens=10, completion_tokens=25, cached_tokens=0,
             )
 
 
 async def run(raw, size, incremental, capable=True):
-    engine = Engine(raw, size, capable)
+    engine = Engine(raw, size, capable and incremental)
     request = ChatCompletionRequest(
         model="model-alias",
         messages=[{"role": "user", "content": "fixture"}],
         stream=True,
-        stream_options={"incremental_tool_arguments": incremental},
     )
     calls = {}
     positions = []
@@ -253,7 +253,7 @@ async def test_arguments_arrive_before_envelope_closes():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("capable,incremental", [(False, True), (True, False)])
-async def test_explicit_opt_in_and_engine_capability_are_both_required(
+async def test_engines_without_raw_qwen_capability_keep_buffered_arguments(
     capable, incremental
 ):
     raw = envelope({"content": "abcdefghij" * 1000})
@@ -345,7 +345,6 @@ async def test_cancellation_closes_the_producer():
         model="model-alias",
         messages=[],
         stream=True,
-        stream_options={"incremental_tool_arguments": True},
     )
     output = stream_chat_completion(engine, [], request, tools=TOOLS)
     async for event in output:
