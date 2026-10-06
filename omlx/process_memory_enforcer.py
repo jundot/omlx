@@ -1686,7 +1686,11 @@ class ProcessMemoryEnforcer:
             if dropped_images:
                 current = self._current_usage_bytes()
         prev_level = self._pressure_level
-        emergency = self._is_emergency_pressure(current, ceiling)
+        # Admission may follow a dynamic ceiling, but emergency aborts must
+        # use the stable physical cap, as the prefill guard already does.
+        abort_limit = self._get_abort_limit_bytes()
+        emergency_limit = abort_limit if abort_limit > 0 else ceiling
+        emergency = self._is_emergency_pressure(current, emergency_limit)
 
         if current < soft:
             new_level = "ok"
@@ -1757,7 +1761,7 @@ class ProcessMemoryEnforcer:
                 self._request_scheduler_cache_reclaim(freed_hot)
             if freed_hot > 0:
                 current = self._current_usage_bytes()
-                emergency = self._is_emergency_pressure(current, ceiling)
+                emergency = self._is_emergency_pressure(current, emergency_limit)
                 if current < soft:
                     recovered_level = "ok"
                 elif current < hard:
@@ -1895,7 +1899,7 @@ class ProcessMemoryEnforcer:
                                 emergency_current = self._current_usage_bytes()
                             else:
                                 emergency_current = 0
-                            if emergency and emergency_current >= ceiling:
+                            if emergency and emergency_current >= emergency_limit:
                                 aborted = await (
                                     self._abort_loaded_requests_for_memory_emergency()
                                 )

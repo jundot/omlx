@@ -16,16 +16,18 @@ Note: BatchGenerator is mocked; step() coverage is limited to targeted paths.
 """
 
 import concurrent.futures
+import gc
 import json
 import sys
 import threading
+import weakref
 from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import mlx.core as mx
 import pytest
-from mlx_lm.models.cache import CacheList, KVCache
+from mlx_lm.models.cache import BatchKVCache, CacheList, KVCache
 
 import omlx.scheduler as scheduler_module
 from omlx.cache.stats import PrefixCacheStats
@@ -2595,6 +2597,7 @@ class TestSchedulerSuppressTokens:
         request.prompt_token_ids = [1]
         request.rope_deltas = 123.0
         cache = [SimpleNamespace(state=mx.array([0]))]
+        request.prompt_cache = cache
 
         def sampler(logits):
             return mx.argmax(logits, axis=-1)
@@ -2623,6 +2626,8 @@ class TestSchedulerSuppressTokens:
             )
 
         assert uid is not None
+        assert request.prompt_cache is None
+        assert scheduler._vlm_mtp_active[uid].prompt_cache is cache
         assert mock_model.calls
         assert captured["target_language_model"] is mock_model
         assert float(mock_model.batch_rope_deltas.item()) == 123.0
@@ -5036,6 +5041,12 @@ class TestSpecPrefillCaches:
             prompt_cache=restored_cache,
             tokens_to_process=[4],
         )
+
+        def insert(*args, **kwargs):
+            assert request.prompt_cache is restored_cache
+            return [42]
+
+        batch_generator.insert.side_effect = insert
         try:
             with patch(
                 "omlx.specprefill.target.run_specprefill_target_prefill",
@@ -5045,8 +5056,7 @@ class TestSpecPrefillCaches:
 
             assert rejected == []
             assert scheduled == [request]
-            assert request.prompt_cache is restored_cache
-            assert request.prompt_cache is not old_cache
+            assert request.prompt_cache is None
             assert batch_generator.insert.call_args.kwargs["caches"] == [
                 restored_cache
             ]
@@ -6280,6 +6290,75 @@ class TestBatchGeneratorAllTokens:
 
         call_kwargs = scheduler.batch_generator.insert.call_args.kwargs
         assert call_kwargs["all_tokens"] == [[11, 12, 13]]
+
+    @pytest.mark.parametrize("chunked", [False, True])
+    @pytest.mark.parametrize("outcome", ["success", "empty", "raises"])
+    def test_restored_cache_ownership_transfers_only_after_insert(
+        self, mock_model, mock_tokenizer, chunked, outcome
+    ):
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        request = Request(
+            "restored-owner", [11, 12, 13, 14], SamplingParams(max_tokens=4)
+        )
+        row = KVCache()
+        values = mx.ones((1, 2, 3, 8), mx.bfloat16)
+        row.update_and_fetch(values, values)
+        original = [row]
+        ref = weakref.ref(row)
+        self._queue_request(
+            scheduler,
+            request,
+            prompt_tokens=[11, 12, 13, 14],
+            remaining_tokens=[14],
+            cached_tokens=3,
+            prompt_cache=original,
+        )
+        state = SimpleNamespace(
+            cache=original,
+            last_token=[14],
+            sampler=MagicMock(),
+            sm=MagicMock(),
+            per_row_lps=[],
+        )
+        receiver = []
+
+        def insert(*args, **kwargs):
+            if outcome == "raises":
+                raise RuntimeError("insert failed")
+            if outcome == "empty":
+                return []
+            receiver.extend(kwargs["caches"][0])
+            return [42]
+
+        scheduler.batch_generator.insert.side_effect = insert
+
+        def handoff():
+            if chunked:
+                scheduler._insert_prefilled_request(request, state, [])
+            else:
+                scheduler._schedule_waiting()
+
+        if outcome == "raises":
+            with pytest.raises(RuntimeError, match="insert failed"):
+                handoff()
+        else:
+            handoff()
+        if outcome != "success":
+            assert request.prompt_cache is original
+            return
+
+        assert request.prompt_cache is None
+        assert receiver[0] is row
+        batch = BatchKVCache.merge(receiver)
+        assert mx.array_equal(batch.state[0][..., :3, :], values).item()
+        # After batching copies the row, the request must not keep the old bank.
+        receiver.clear()
+        state.cache = None
+        scheduler.batch_generator.reset_mock()
+        scheduler._validate_cache.reset_mock()
+        del row, original
+        gc.collect()
+        assert ref() is None
 
     def test_external_prefill_insert_seeds_prompt_prefix(
         self, mock_model, mock_tokenizer

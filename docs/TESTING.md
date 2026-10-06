@@ -84,6 +84,10 @@ Run `python -m pytest -q tests/test_prefill_transient_tracker.py tests/test_pref
 
 Run `python -m pytest -q tests/test_scheduler.py tests/test_scheduler_boundary_completion.py tests/test_prefix_cache_gdn_split.py` to check cache-freshness admission and completed boundary recovery. The completion tests use a small initialized Qwen3.5 hybrid model and the real BatchGenerator, then compare restored-prefix logits with a fresh forward pass. They cover embedded snapshots, GDN sidecars, exact SpecPrefill static-prefix sidecars, off-boundary completion, and unknown or inconsistent cache positions.
 
+# Batch KV capacity tests
+
+Run `python -m pytest -q tests/test_vlm_batch_kv_capacity.py` after changing `omlx/patches/vlm_batch_kv_capacity.py` or bumping the mlx-lm or mlx-vlm pin. The tests load the installed, unpatched cache module next to the patched one and compare cache state and attention output bit for bit through random appends, trims, rollbacks, merges, joins, filters and restores. They cover the mlx-vlm class, the mlx-lm class that prefix restore builds, and a batch that mixes both.
+
 # Cluster join recovery tests
 
 Run `python -m pytest -q tests/test_cluster_pairing_session.py tests/test_cluster_pairing.py tests/test_cluster_ui_integration.py tests/ui/test_cluster_v2_wizard.py` to check joining, cancellation, and approval. Session tests recreate a manager with the same base path to verify that the original code and cancellation proof survive a restart. They also cover offline cancellation, switching peers while cleanup is pending, rejected requests versus lost responses, and storage failures. Wizard tests check that delayed responses cannot restore a cancelled join and that pending cleanup leaves new pairing controls available.

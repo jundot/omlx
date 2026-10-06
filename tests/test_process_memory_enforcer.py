@@ -55,6 +55,7 @@ def _make_enforcer(
     )
     enforcer._soft_threshold = soft_threshold
     enforcer._get_hard_limit_bytes = lambda: int(ceiling)
+    enforcer._get_abort_limit_bytes = lambda: int(ceiling)
     if breakdown is None:
         breakdown = {
             "static": int(ceiling),
@@ -3079,6 +3080,39 @@ class TestPressureReclaimGrace:
         enforcer._engine_pool._entries = {"big-model": entry}
         enforcer._engine_pool._find_lru_victim.return_value = None
         return engine
+
+    @pytest.mark.asyncio
+    async def test_dynamic_dip_reclaims_below_stable_abort_cap(self, enforcer):
+        engine = self._busy_setup(enforcer)
+        enforcer._get_abort_limit_bytes = lambda: 12 * 1024**3
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch.object(
+                enforcer, "_current_usage_bytes", return_value=int(11.5 * 1024**3)
+            ) as usage,
+        ):
+            mock_mx.get_cache_memory.return_value = 3 * 1024**3
+            await enforcer._check_and_enforce()
+            engine.scheduler.request_pressure_reclaim.assert_called_once()
+            engine.abort_all_requests.assert_not_awaited()
+            usage.return_value = 9 * 1024**3
+            await enforcer._check_and_enforce()
+        assert enforcer._pressure_level == "ok"
+        assert enforcer._pressure_reclaim_grace_polls == 0
+
+    @pytest.mark.asyncio
+    async def test_stable_physical_cap_still_aborts(self, enforcer):
+        engine = self._busy_setup(enforcer)
+        enforcer._get_abort_limit_bytes = lambda: 12 * 1024**3
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch.object(
+                enforcer, "_current_usage_bytes", return_value=int(14.5 * 1024**3)
+            ),
+        ):
+            mock_mx.get_cache_memory.return_value = 3 * 1024**3
+            await enforcer._check_and_enforce()
+        engine.abort_all_requests.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_reclaim_defers_hot_cache_shrink_and_abort(self, enforcer):
