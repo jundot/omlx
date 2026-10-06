@@ -84,7 +84,8 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "dflash_block_size",
     "dflash_verify_mode",
     "mtp_enabled",
-    "mtp_num_draft_tokens",
+    "mtp_adaptive_max_depth",
+    "mtp_fixed_depth",
     "vlm_mtp_enabled",
     "vlm_mtp_draft_model",
     "vlm_mtp_draft_block_size",
@@ -142,9 +143,24 @@ def filter_universal_fields(data: dict[str, Any]) -> dict[str, Any]:
     return _filter_and_sanitize(data, UNIVERSAL_FIELDS_SET)
 
 
+def normalize_turboquant_kv_bits(value: Any) -> Any:
+    """Return float bits; keep invalid legacy values so other settings still load."""
+    if isinstance(value, bool):
+        return value
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return value
+
+
 def filter_profile_fields(data: dict[str, Any]) -> dict[str, Any]:
     """Return a new dict of UNIVERSAL + MODEL_SPECIFIC keys with real values."""
-    return _filter_and_sanitize(data, PROFILE_FIELDS_SET)
+    filtered = _filter_and_sanitize(data, PROFILE_FIELDS_SET)
+    if "turboquant_kv_bits" in filtered:
+        filtered["turboquant_kv_bits"] = normalize_turboquant_kv_bits(
+            filtered["turboquant_kv_bits"]
+        )
+    return filtered
 
 
 @dataclass

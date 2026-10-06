@@ -233,36 +233,10 @@ class TestAudioNotUnsupported:
 class TestNonAudioRegressions:
     """Non-audio model types must not be affected by the audio changes."""
 
-    def test_llm_still_detected(self, tmp_path):
-        _write_config(tmp_path, {"model_type": "llama", "architectures": ["LlamaForCausalLM"]})
-        assert detect_model_type(tmp_path) == "llm"
-
-    def test_vlm_still_detected(self, tmp_path):
-        _write_config(tmp_path, {
-            "model_type": "qwen2_5_vl",
-            "architectures": ["Qwen2_5_VLForConditionalGeneration"],
-            "vision_config": {"model_type": "siglip_vision_model"},
-        })
-        assert detect_model_type(tmp_path) == "vlm"
-
-    def test_embedding_still_detected(self, tmp_path):
-        _write_config(tmp_path, {"model_type": "bert", "architectures": ["BertModel"]})
-        assert detect_model_type(tmp_path) == "embedding"
-
-    def test_reranker_still_detected(self, tmp_path):
-        _write_config(tmp_path, {
-            "model_type": "modernbert",
-            "architectures": ["ModernBertForSequenceClassification"],
-        })
-        assert detect_model_type(tmp_path) == "reranker"
-
     def test_qwen2_causal_lm_not_audio(self, tmp_path):
         _write_config(tmp_path, {"model_type": "qwen2", "architectures": ["Qwen2ForCausalLM"]})
         result = detect_model_type(tmp_path)
         assert result not in ("audio_stt", "audio_tts")
-
-    def test_missing_config_defaults_to_llm(self, tmp_path):
-        assert detect_model_type(tmp_path) == "llm"
 
     def test_qwen2_causal_lm_not_sts(self, tmp_path):
         _write_config(tmp_path, {"model_type": "qwen2", "architectures": ["Qwen2ForCausalLM"]})

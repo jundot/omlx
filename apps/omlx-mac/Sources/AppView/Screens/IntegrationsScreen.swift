@@ -94,7 +94,8 @@ private struct ClaudeCodeSection: View {
                                   comment: "Row label for the Haiku model picker"),
                     sublabel: String(localized: "integrations.claude.haiku.sub",
                                      defaultValue: "Used for background tasks and tool calls",
-                                     comment: "Sublabel for the Haiku tier picker")
+                                     comment: "Sublabel for the Haiku tier picker"),
+                    isLast: true
                 ) {
                     Popup(
                         selection: vm.bind($vm.haikuModel, save: {
@@ -104,48 +105,6 @@ private struct ClaudeCodeSection: View {
                         options: vm.modelOptions
                     )
                 }
-            }
-            Row(
-                label: String(localized: "integrations.claude.context_scaling",
-                              defaultValue: "Context scaling",
-                              comment: "Row label for the Claude Code context scaling toggle"),
-                sublabel: String(localized: "integrations.claude.context_scaling.sub",
-                                 defaultValue: "Stretch context windows for long agentic sessions",
-                                 comment: "Sublabel for the context scaling toggle"),
-                isLast: !vm.contextScaling
-            ) {
-                RowSwitch(isOn: vm.bind($vm.contextScaling, save: {
-                    Task { await vm.save(.contextScaling, client: client) }
-                }))
-            }
-            if vm.contextScaling {
-                Row(
-                    label: String(localized: "integrations.claude.target_context",
-                                  defaultValue: "Target context size",
-                                  comment: "Row label for the Claude Code target context size field"),
-                    sublabel: String(localized: "integrations.claude.target_context.sub",
-                                     defaultValue: "Per-request context window Claude Code will scale toward",
-                                     comment: "Sublabel for the target context size field"),
-                    isLast: true
-                ) {
-                    TextInput(
-                        text: $vm.targetContextSizeText,
-                        mono: true,
-                        suffix: "tk",
-                        width: .controlCompact
-                    )
-                }
-            }
-        }
-        if vm.contextScaling {
-            FooterBar {
-                Button(String(localized: "integrations.target_context.apply",
-                              defaultValue: "Apply",
-                              comment: "Apply button for the Claude Code target context size field")) {
-                    Task { await vm.save(.targetContextSize, client: client) }
-                }
-                .buttonStyle(.omlx(.primary))
-                .disabled(!vm.hasPendingContextSizeChange)
             }
         }
     }
@@ -330,7 +289,17 @@ private struct OtherIntegrationsSection: View {
                     Task { await vm.save(.copilotModel, client: client) }
                 }),
                 modelOptions: vm.modelOptions,
-                command: vm.copilotCommand,
+                command: vm.copilotCommand
+            )
+            IntegrationRow(
+                name: String(localized: "integrations.tool.dsh",
+                             defaultValue: "DeepSeek Harness",
+                             comment: "Display name for the DeepSeek Harness (dsh) integration"),
+                modelBinding: vm.bind($vm.dshModel, save: {
+                    Task { await vm.save(.dshModel, client: client) }
+                }),
+                modelOptions: vm.modelOptions,
+                command: vm.dshCommand,
                 isLast: true
             )
         }

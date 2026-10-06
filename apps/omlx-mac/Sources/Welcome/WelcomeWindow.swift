@@ -423,10 +423,8 @@ final class WelcomeViewModel: ObservableObject {
 
 struct WelcomeView: View {
     @ObservedObject var vm: WelcomeViewModel
-    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        let theme = scheme == .dark ? OMLXTheme.dark : OMLXTheme.light
         ZStack {
             WelcomeBackdrop()
                 .ignoresSafeArea()
@@ -446,7 +444,7 @@ struct WelcomeView: View {
                 WelcomeFooter(vm: vm)
             }
         }
-        .environment(\.omlxTheme, theme)
+        .omlxThemed()
         .frame(width: 680, height: 620)
     }
 }
@@ -845,7 +843,9 @@ private struct WelcomeIcon: View {
             .frame(width: size, height: size)
             .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
             .shadow(color: Color.black.opacity(0.10), radius: 12, y: 6)
-            .accessibilityLabel("oMLX")
+            .accessibilityLabel(String(localized: "common.app_name",
+                                       defaultValue: "oMLX",
+                                       comment: "Product name used as the app logo accessibility label"))
     }
 }
 

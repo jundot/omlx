@@ -44,6 +44,15 @@ def create_test_image(width: int = 224, height: int = 224) -> Image.Image:
     return img
 
 
+def wait_for_file(path: Path, timeout: float = 5.0) -> None:
+    """Wait for the cache writer to create an expected SSD entry."""
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"Cache file was not created: {path}")
+        time.sleep(0.01)
+
+
 def test_model(model_path: str, ssd_dir: Optional[str] = None) -> bool:
     """Run all vision cache tests for a single model."""
     from mlx_vlm.utils import load as vlm_load, prepare_inputs
@@ -204,7 +213,8 @@ def test_model(model_path: str, ssd_dir: Optional[str] = None) -> bool:
     print(f"  memory hit: OK")
 
     # SSD roundtrip
-    time.sleep(1.0)  # wait for background writer
+    entry = cache._ssd_index[f"{model_path}:{image_hash}"]
+    wait_for_file(entry.file_path)
     with cache._memory_lock:
         cache._memory_cache.clear()
     result = cache.get(image_hash, model_path)

@@ -6,6 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_lm.models.activations import swiglu
+from omlx.patches.m5_gather_qmm import fused_gate_up_activation
 from .kernels import fast as glm_fast
 
 
@@ -20,14 +21,21 @@ def _inverse_permutation(order, inverse_scatter=False):
     return mx.argsort(order)
 
 
-def _gather_sort(x, indices, inverse_scatter=False):
+def _sort_rows(x, indices, inverse_scatter=False):
+    """``_gather_sort`` without the gather: the token rows, the sorted row ->
+    token row map, the sorted indices and the inverse order."""
     *_, M = indices.shape
     indices = indices.flatten()
     order = mx.argsort(indices)
     inv_order = _inverse_permutation(order, inverse_scatter)
     lhs_indices = order // M
     x = x.flatten(0, -3)
-    return x[lhs_indices], indices[order], inv_order
+    return x, lhs_indices, indices[order], inv_order
+
+
+def _gather_sort(x, indices, inverse_scatter=False):
+    x, lhs_indices, indices, inv_order = _sort_rows(x, indices, inverse_scatter)
+    return x[lhs_indices], indices, inv_order
 
 
 def _scatter_unsort(x, inv_order, shape=None):
@@ -209,17 +217,32 @@ class SwitchGLU(nn.Module):
         do_sort = indices.size >= 64
         idx = indices
         inv_order = None
+        token_rows = None
         if do_sort:
-            x, idx, inv_order = _gather_sort(
+            # The replicated rows x_tok[row_map] stay lazy: never computed
+            # when the gate/up kernel reads the token rows in place.
+            x_tok, row_map, idx, inv_order = _sort_rows(
                 x, indices, inverse_scatter=self.inverse_scatter
             )
+            x = x_tok[row_map]
+            token_rows = (x_tok, row_map)
         if self.training:
             idx = mx.stop_gradient(idx)
         if hasattr(self, "gate_up_proj"):
-            x_gate_up = self.gate_up_proj(x, idx, sorted_indices=do_sort)
-            x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+            x_act = None
+            if do_sort and not self.training:
+                # Sorted prefill on M5: the activation in the [gate; up]
+                # matmul's epilogue, token rows read in place (bit-identical;
+                # None keeps this path).
+                x_act = fused_gate_up_activation(
+                    self.gate_up_proj, x, idx, self.activation, token_rows=token_rows
+                )
+            if x_act is None:
+                x_gate_up = self.gate_up_proj(x, idx, sorted_indices=do_sort)
+                x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+                x_act = self.activation(x_up, x_gate)
             x = self.down_proj(
-                self.activation(x_up, x_gate),
+                x_act,
                 idx,
                 sorted_indices=do_sort,
             )
@@ -238,7 +261,12 @@ class SwitchGLU(nn.Module):
             and do_sort
             and hasattr(glm_fast, "glm_moe_weighted_sum")
         ):
-            return glm_fast.glm_moe_weighted_sum(x, inv_order, scores)
+            try:
+                return glm_fast.glm_moe_weighted_sum(x, inv_order, scores)
+            except ValueError:
+                # Shape outside the kernel's contract (e.g. top-k other than
+                # 6/8): combine the unsorted per-expert rows instead.
+                pass
 
         if do_sort:
             x = _scatter_unsort(x, inv_order, indices.shape)

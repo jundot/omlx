@@ -18,9 +18,11 @@ from fastapi.testclient import TestClient
 
 from omlx.api.responses_utils import ResponseStore
 from omlx.engine.base import BaseEngine
+from omlx.engine.decision import DecisionEngine
 from omlx.engine.embedding import EmbeddingEngine
 from omlx.engine.reranker import RerankerEngine
 from omlx.mcp.types import MCPToolResult
+from omlx.models.decision import DecisionContextLengthError, DecisionRequestError
 
 
 @dataclass
@@ -96,6 +98,7 @@ class MockRerankerEngineImpl(RerankerEngine):
         # Don't call super().__init__ to avoid loading real model
         self._model_name = model_name
         self._model = None  # Set as None but present
+        self.calls: List[Dict[str, Any]] = []
 
     @property
     def model_name(self) -> str:
@@ -110,6 +113,7 @@ class MockRerankerEngineImpl(RerankerEngine):
     async def rerank(
         self, query: str, documents: List[str], top_n: Optional[int] = None, **kwargs
     ) -> MockRerankOutput:
+        self.calls.append({"documents": list(documents), "kwargs": dict(kwargs)})
         n_docs = len(documents)
         scores = [0.9 - i * 0.2 for i in range(n_docs)]
         indices = list(range(n_docs))
@@ -240,6 +244,35 @@ class RecordingResponsesEngine(MockBaseEngine):
         return MockGenerationOutput(text="Chat response.")
 
 
+class MockDecisionEngineImpl(DecisionEngine):
+    """Decision engine that records requests instead of running a model."""
+
+    def __init__(self, model_name: str = "test-clef-model"):
+        # Don't call super().__init__ to avoid loading real model
+        self._model_name = model_name
+        self.encode_error: Exception | None = None
+        self.encoded: List[Dict[str, Any]] = []
+
+    async def start(self) -> None:
+        pass
+
+    async def stop(self) -> None:
+        pass
+
+    async def encode(self, request: dict, truncate: bool = True):
+        if self.encode_error is not None:
+            raise self.encode_error
+        self.encoded.append({"request": request, "truncate": truncate})
+        return SimpleNamespace(questions=request["questions"])
+
+    async def systemone(self, plan) -> dict:
+        answers = {
+            question_id: {"type": "noul", "noul": 0.75}
+            for question_id in plan.questions
+        }
+        return {"answers": answers, "input_tokens": 42}
+
+
 class MockEnginePool:
     """Mock engine pool for testing."""
 
@@ -248,10 +281,12 @@ class MockEnginePool:
         llm_engine: Optional[MockBaseEngine] = None,
         embedding_engine: Optional[MockEmbeddingEngineImpl] = None,
         reranker_engine: Optional[MockRerankerEngineImpl] = None,
+        decision_engine: Optional[MockDecisionEngineImpl] = None,
     ):
         self._llm_engine = llm_engine or MockBaseEngine()
         self._embedding_engine = embedding_engine
         self._reranker_engine = reranker_engine
+        self._decision_engine = decision_engine
         self._models = [
             {"id": "test-model", "loaded": True, "pinned": False, "size": 1000000}
         ]
@@ -317,6 +352,10 @@ class MockEnginePool:
             if self._reranker_engine:
                 return self._reranker_engine
             raise ValueError(f"No reranker engine for {model_id}")
+        elif "clef" in model_id.lower():
+            if self._decision_engine:
+                return self._decision_engine
+            raise ValueError(f"No decision engine for {model_id}")
         return self._llm_engine
 
     async def release_engine(self, model_id: str) -> None:
@@ -347,12 +386,21 @@ def mock_reranker_engine():
 
 
 @pytest.fixture
-def mock_engine_pool(mock_llm_engine, mock_embedding_engine, mock_reranker_engine):
+def mock_decision_engine():
+    """Create a mock decision engine."""
+    return MockDecisionEngineImpl()
+
+
+@pytest.fixture
+def mock_engine_pool(
+    mock_llm_engine, mock_embedding_engine, mock_reranker_engine, mock_decision_engine
+):
     """Create a mock engine pool."""
     return MockEnginePool(
         llm_engine=mock_llm_engine,
         embedding_engine=mock_embedding_engine,
         reranker_engine=mock_reranker_engine,
+        decision_engine=mock_decision_engine,
     )
 
 
@@ -1812,6 +1860,22 @@ class TestRerankEndpoint:
         data = response.json()
         assert len(data["results"]) == 2
 
+    def test_rerank_forwards_max_length(self, client, mock_engine_pool):
+        """Request max_length must reach the engine; omitted means model default."""
+        mock_engine_pool._models.append(
+            {"id": "test-rerank-model", "loaded": True, "pinned": False, "size": 500000}
+        )
+        body = {"model": "test-rerank-model", "query": "q", "documents": ["d"]}
+
+        statuses = [
+            client.post("/v1/rerank", json={**body, **extra}).status_code
+            for extra in ({}, {"max_length": 8192}, {"max_length": 0})
+        ]
+        assert statuses == [200, 200, 422]
+
+        calls = mock_engine_pool._reranker_engine.calls
+        assert [call["kwargs"]["max_length"] for call in calls] == [None, 8192]
+
     def test_rerank_response_format(self, client, mock_engine_pool):
         """Test rerank response format."""
         mock_engine_pool._models.append(
@@ -1842,6 +1906,72 @@ class TestRerankEndpoint:
         assert "index" in result
         assert "relevance_score" in result
         assert "document" in result
+
+
+class TestSystemOneEndpoint:
+    """Tests for the /v1/systemone endpoint."""
+
+    _BODY = {
+        "model": "test-clef-model",
+        "state": {"message": "Checkout is down"},
+        "questions": {
+            "urgent": {"type": "noul", "instructions": "Is this urgent?"},
+            "team": {"type": "choice", "criteria": {"billing": None, "tech": None}},
+        },
+    }
+
+    def test_systemone_response_shape(self, client, mock_decision_engine):
+        response = client.post("/v1/systemone", json={**self._BODY, "truncate": False})
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "model": "test-clef-model",
+            "answers": {
+                "urgent": {"type": "noul", "noul": 0.75},
+                "team": {"type": "noul", "noul": 0.75},
+            },
+            "usage": {"input_tokens": 42, "output_tokens": 0},
+        }
+        (call,) = mock_decision_engine.encoded
+        assert call["truncate"] is False
+        assert call["request"]["questions"]["team"]["criteria"] == {
+            "billing": None,
+            "tech": None,
+        }
+
+    @pytest.mark.parametrize(
+        "error,status",
+        [
+            (DecisionContextLengthError("too long"), 413),
+            (DecisionRequestError("bad criteria"), 400),
+        ],
+    )
+    def test_systemone_request_errors_keep_status(
+        self, client, mock_decision_engine, error, status
+    ):
+        mock_decision_engine.encode_error = error
+        response = client.post("/v1/systemone", json=self._BODY)
+        assert response.status_code == status
+        assert str(error) in response.text
+
+    def test_systemone_rejects_non_decision_model(self, client):
+        response = client.post(
+            "/v1/systemone", json={**self._BODY, "model": "test-model"}
+        )
+        assert response.status_code == 400
+        assert "not a decision model" in response.text
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"state": None},
+            {"questions": {}},
+            {"questions": {"q": {"type": "rank"}}},
+        ],
+    )
+    def test_systemone_schema_validation(self, client, change):
+        response = client.post("/v1/systemone", json={**self._BODY, **change})
+        assert response.status_code == 422
 
 
 class TestTokenCountEndpoint:
@@ -2463,3 +2593,47 @@ class TestJsonOutputParsing:
         data = response.json()
         output_text = data["output"][0]["content"][0]["text"]
         assert "Hello" in output_text
+
+
+@pytest.mark.parametrize("api", ["chat/completions", "messages", "responses"])
+def test_nonstream_thinking_length_channels(client, mock_llm_engine, api):
+    mock_llm_engine.chat = AsyncMock(
+        return_value=MockGenerationOutput(
+            text="<think>unfinished", finish_reason="length"
+        )
+    )
+    body = {"model": "test-model", "max_tokens": 64}
+    if api == "responses":
+        body["input"] = "Reply OK"
+    else:
+        body["messages"] = [{"role": "user", "content": "Reply OK"}]
+    response = client.post(f"/v1/{api}", json=body)
+    assert response.status_code == 200, response.text
+    data = response.json()
+    if api == "chat/completions":
+        message = data["choices"][0]["message"]
+        content = message.get("content") or ""
+        reasoning = message.get("reasoning_content") or ""
+        assert data["choices"][0]["finish_reason"] == "length"
+    elif api == "messages":
+        content = "".join(b["text"] for b in data["content"] if b["type"] == "text")
+        reasoning = "".join(
+            b["thinking"] for b in data["content"] if b["type"] == "thinking"
+        )
+        assert data["stop_reason"] == "max_tokens"
+    else:
+        content = "".join(
+            b["text"]
+            for item in data["output"]
+            if item["type"] == "message"
+            for b in item["content"]
+            if b["type"] == "output_text"
+        )
+        reasoning = "".join(
+            b["text"]
+            for item in data["output"]
+            if item["type"] == "reasoning"
+            for b in item["summary"]
+        )
+    assert content == ""
+    assert reasoning == "unfinished"

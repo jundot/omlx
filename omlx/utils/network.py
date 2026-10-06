@@ -12,6 +12,7 @@ import ipaddress
 import logging
 import re
 import socket
+import threading
 from collections.abc import Iterable
 
 logger = logging.getLogger(__name__)
@@ -201,6 +202,29 @@ def _local_ipv4_addresses() -> list[str]:
     return addresses
 
 
+# getfqdn() is a reverse DNS lookup; with a broken resolver it blocks for 35 s
+# or more, and server startup calls detect_server_aliases().
+_FQDN_TIMEOUT_S = 2.0
+
+
+def _fqdn() -> str | None:
+    """``socket.getfqdn()``, or None when it does not answer in time."""
+    result: list[str] = []
+
+    def lookup() -> None:
+        try:
+            result.append(socket.getfqdn())
+        except OSError as exc:
+            logger.debug("getfqdn failed: %s", exc)
+
+    worker = threading.Thread(target=lookup, name="omlx-getfqdn", daemon=True)
+    worker.start()
+    worker.join(_FQDN_TIMEOUT_S)
+    if worker.is_alive():
+        logger.debug("getfqdn timed out after %.1fs", _FQDN_TIMEOUT_S)
+    return result[0] if result else None
+
+
 def _dedupe_preserve_order(items: Iterable[str]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
@@ -243,14 +267,11 @@ def detect_server_aliases(host: str = "127.0.0.1") -> list[str]:
     except OSError as exc:
         logger.debug("gethostname failed: %s", exc)
 
-    try:
-        fqdn = socket.getfqdn()
-        # Skip reverse-DNS PTR records (e.g. "...ip6.arpa", "...in-addr.arpa")
-        # which are not user-friendly and not routable as URLs.
-        if fqdn and not fqdn.endswith((".ip6.arpa", ".in-addr.arpa")):
-            candidates.append(fqdn)
-    except OSError as exc:
-        logger.debug("getfqdn failed: %s", exc)
+    fqdn = _fqdn()
+    # Skip reverse-DNS PTR records (e.g. "...ip6.arpa", "...in-addr.arpa")
+    # which are not user-friendly and not routable as URLs.
+    if fqdn and not fqdn.endswith((".ip6.arpa", ".in-addr.arpa")):
+        candidates.append(fqdn)
 
     candidates.extend(_local_ipv4_addresses())
 

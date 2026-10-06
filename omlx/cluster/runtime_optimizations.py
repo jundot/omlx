@@ -96,6 +96,27 @@ def _supports_rank_zero_logits(model: Any) -> tuple[bool, int, str]:
     )
 
 
+def _agree_across_ranks(group: Any, local: dict[str, bool]) -> dict[str, bool]:
+    """Keep a capability only if every rank supports it.
+
+    Each rank validates the optimized paths against its own pipeline stage and
+    runtime, but those paths change which collectives a rank issues. Ranks that
+    resolve them differently wait on different collectives and deadlock without
+    an error (#3521), so every rank votes and the minimum wins.
+    """
+
+    import mlx.core as mx
+
+    names = sorted(local)
+    votes = mx.array([1 if local[name] else 0 for name in names], dtype=mx.int32)
+    totals = mx.distributed.all_sum(votes, group=group)
+    mx.eval(totals)
+    world_size = int(group.size())
+    return {
+        name: int(total) == world_size for name, total in zip(names, totals.tolist())
+    }
+
+
 def _supports_pipeline_prompt(prompt_batch: Any) -> tuple[bool, str]:
     """Validate the exact MLX-LM prompt loop this module replaces.
 
@@ -227,12 +248,34 @@ def install_runtime_optimizations(
         if prompt_batch_cls
         else (False, "MLX-LM has no prompt-processing batch")
     )
-    sampling_active = execution.sampling_rank_only and sampling_supported
     (
         rank_zero_logits_supported,
         output_vocab_size,
         rank_zero_logits_reason,
     ) = _supports_rank_zero_logits(model)
+    if execution.sampling_rank_only and pipeline_parallel and world_size > 1:
+        agreed = _agree_across_ranks(
+            group,
+            {
+                "prompt": prompt_supported,
+                "rank_zero_logits": rank_zero_logits_supported,
+                "sampling": sampling_supported,
+            },
+        )
+        if sampling_supported and not agreed["sampling"]:
+            sampling_supported = False
+            sampling_reason = (
+                "another rank cannot use the validated rank-zero sampling path"
+            )
+        if rank_zero_logits_supported and not agreed["rank_zero_logits"]:
+            rank_zero_logits_supported = False
+            rank_zero_logits_reason = (
+                "another rank's model adapter has no rank-zero logits contract"
+            )
+        if prompt_supported and not agreed["prompt"]:
+            prompt_supported = False
+            prompt_reason = "another rank cannot use the validated pipeline prompt loop"
+    sampling_active = execution.sampling_rank_only and sampling_supported
     rank_zero_logits_active = sampling_active and rank_zero_logits_supported
     prefill_active = (
         execution.async_overlap

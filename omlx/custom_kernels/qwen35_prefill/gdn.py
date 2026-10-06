@@ -2,9 +2,11 @@
 # ruff: noqa: N806, UP006, UP035, UP045
 """Optimized Metal Gated DeltaNet prefill kernels for Qwen3.5/3.6.
 
-The default production path is ``gated_delta_blocked_seq``: the exact
-sequential recurrence used by mlx-lm, restructured for Apple GPUs with
-threadgroup-staged q/k/v blocks and register-resident state.
+The default production path is ``gated_delta_pipelined``: the exact
+sequential recurrence used by mlx-lm with 8 lanes per value row, 16-row
+threadgroups and a software-pipelined, unrolled 12-token block. Layouts it
+does not cover fall back to ``gated_delta_blocked_seq`` (the same recurrence
+with threadgroup-staged q/k/v blocks and register-resident state).
 
 The module also keeps the FLA (flash-linear-attention) chunked
 WY-representation experiment as two Metal kernels (mx.fast.metal_kernel JIT;
@@ -594,6 +596,346 @@ def gated_delta_blocked_seq(
         grid=(256 * (Dv // 32), Hv, B),
         threadgroup=(256, 1, 1),
         output_shapes=[(B, T, Hv, Dv), state.shape],
+        output_dtypes=[in_dtype, mx.float32],
+    )
+    return y, state_out
+
+
+# ---------------------------------------------------------------------------
+# Kernel P: software-pipelined blocked-sequential Gated DeltaNet prefill.
+#
+# Same per-step math as mlx_lm's gated_delta_kernel and Kernel S; only the
+# fp32 summation order of the two 128-wide dots differs:
+#     S = S * g_t;  p = S.k_t;  delta = (v_t - p) * beta_t;
+#     S = S + k_t * delta;  y_t = S.q_t
+# The recurrence is issue- and latency-bound (the per-step dependency chain
+# runs through two cross-lane reductions), so the layout trades a little
+# reduction work for parallelism and hides the rest by scheduling:
+#   - 8 lanes own a value row, 16 fp32 state channels each, held in
+#     registers as four float4 granules at columns seg, seg+8, seg+16, seg+24
+#     (bank-conflict-free threadgroup reads). A 128-thread threadgroup covers
+#     16 rows, so 8 x Hv threadgroups spread evenly over the GPU cores.
+#   - q/k (input dtype), v, g and beta are staged in threadgroup memory per
+#     12-token block; the next block is prefetched into registers while the
+#     current one runs.
+#   - The 12 steps of a block are unrolled and software pipelined: step
+#     t+1's k/g/beta/v are read during step t, and the q.S partials of four
+#     steps are reduced together (a reduce-scatter that leaves each step's y
+#     on its own lane pair, with the same pairwise tree as a per-step
+#     reduction) after the next step's decay and k.S FMAs, so the in-order
+#     issue does not stall on those shuffles.
+#   - Dots accumulate in float2 (one horizontal add each) and the k.S dot is
+#     all-reduced over the 8 lanes with xor shuffles; y is buffered per
+#     block and written with 8-byte stores.
+# ---------------------------------------------------------------------------
+
+_PIPE_TB = 12  # tokens staged per block
+_PIPE_DB = 16  # value rows per threadgroup
+_PIPE_THREADS = _PIPE_DB * 8  # 8 lanes per row
+
+
+def _pipe_load_vec(arr: str, dst: str, t: str) -> str:
+    return "".join(
+        f"{dst}[{i}] = float4(*(const threadgroup vec<InT, 4>*)"
+        f"(&{arr}[{t}][4 * (seg + 8 * {i})]));\n"
+        for i in range(4)
+    )
+
+
+def _pipe_reduce_q(t: str) -> str:
+    # q.S partials of step t (carried in pq_prev) -> y_s[t][row] on lane 0.
+    return (
+        "{\n"
+        "float yq = pq_prev;\n"
+        "yq += simd_shuffle_down(yq, 4);\n"
+        "yq += simd_shuffle_down(yq, 2);\n"
+        "yq += simd_shuffle_down(yq, 1);\n"
+        f"if (seg == 0) y_s[{t}][rg] = static_cast<InT>(yq);\n"
+        "}\n"
+    )
+
+
+def _pipe_reduce_q4(s0: int) -> str:
+    # q.S partials of steps s0..s0+3 (pq4[0..3]) -> y_s: a reduce-scatter
+    # over the 8 lanes that leaves step s0 + 2*b2 + b1 on lanes (b2, b1, *).
+    # Each sum uses the pairwise tree of _pipe_reduce_q (lane ^4, ^2, ^1),
+    # so the result is bit-identical to reducing every step on its own.
+    return (
+        "{\n"
+        "const bool qb2 = (seg & 4) != 0, qb1 = (seg & 2) != 0;\n"
+        "float qa = qb2 ? pq4[2] : pq4[0];\n"
+        "float qb = qb2 ? pq4[3] : pq4[1];\n"
+        "qa += simd_shuffle_xor(qb2 ? pq4[0] : pq4[2], 4);\n"
+        "qb += simd_shuffle_xor(qb2 ? pq4[1] : pq4[3], 4);\n"
+        "float qx = qb1 ? qb : qa;\n"
+        "qx += simd_shuffle_xor(qb1 ? qa : qb, 2);\n"
+        "qx += simd_shuffle_xor(qx, 1);\n"
+        f"if ((seg & 1) == 0) y_s[{s0} + (qb2 ? 2 : 0) + (qb1 ? 1 : 0)][rg] ="
+        " static_cast<InT>(qx);\n"
+        "}\n"
+    )
+
+
+def _pipe_step(t, load_next, reduce_prev) -> str:
+    """One recurrence step at block-local index ``t``.
+
+    Full blocks pass ``t`` as an int: step t+1's operands are read when
+    ``load_next``, the q.S partial goes to pq4[t % 4], and the four steps
+    before t are reduced here when t is a multiple of 4. The tail block
+    passes C expressions (``t``, ``load_next``) and ``reduce_prev=None``:
+    per-step q.S reduction of step t-1 when t > 0, partial in pq_prev.
+    """
+    nxt = (
+        _pipe_load_vec("k_s", "k_next", f"({t}) + 1")
+        + f"g_next = g_s[({t}) + 1]; b_next = b_s[({t}) + 1]; "
+        f"v_next = v_s[({t}) + 1][rg];\n"
+    )
+    code = "{\n"
+    code += "float4 kc[4];\nfor (int i = 0; i < 4; ++i) kc[i] = k_next[i];\n"
+    code += "const float gc = g_next, bc = b_next, vc = v_next;\n"
+    if load_next is True:
+        code += nxt
+    elif load_next is not False:
+        code += f"if ({load_next}) {{\n{nxt}}}\n"
+    # decay, then the k.S partial dot
+    code += (
+        "float2 a2 = 0.0f;\n"
+        "for (int i = 0; i < 4; ++i) {\n"
+        "    st[i] = st[i] * gc;\n"
+        "    a2 = fma(st[i].xy, kc[i].xy, a2);\n"
+        "    a2 = fma(st[i].zw, kc[i].zw, a2);\n"
+        "}\n"
+    )
+    if reduce_prev is None:
+        code += f"if (({t}) > 0) " + _pipe_reduce_q(f"({t}) - 1")
+    elif reduce_prev:
+        code += _pipe_reduce_q4(t - 4)
+    code += (
+        "float p = a2.x + a2.y;\n"
+        "p += simd_shuffle_xor(p, 4);\n"
+        "p += simd_shuffle_xor(p, 2);\n"
+        "p += simd_shuffle_xor(p, 1);\n"
+        "float4 qc[4];\n"
+        + _pipe_load_vec("q_s", "qc", t)
+        + "const float delta = (vc - p) * bc;\n"
+        "float2 o2 = 0.0f;\n"
+        "for (int i = 0; i < 4; ++i) {\n"
+        "    st[i] = fma(kc[i], float4(delta), st[i]);\n"
+        "    o2 = fma(st[i].xy, qc[i].xy, o2);\n"
+        "    o2 = fma(st[i].zw, qc[i].zw, o2);\n"
+        "}\n"
+    )
+    if reduce_prev is None:
+        code += "pq_prev = o2.x + o2.y;\n"
+    else:
+        code += f"pq4[{t % 4}] = o2.x + o2.y;\n"
+    return code + "}\n"
+
+
+def _pipelined_source(tb: int = _PIPE_TB) -> str:
+    assert tb % 4 == 0
+    full_block = "".join(
+        f"// step {t}\n" + _pipe_step(t, t + 1 < tb, t > 0 and t % 4 == 0)
+        for t in range(tb)
+    ) + _pipe_reduce_q4(tb - 4)
+    tail_block = (
+        "for (int t = 0; t < tt; ++t) "
+        + _pipe_step("t", "t + 1 < tt", None)
+        + _pipe_reduce_q("tt - 1")
+    )
+    first_operands = (
+        _pipe_load_vec("k_s", "k_next", "0")
+        + "g_next = g_s[0]; b_next = b_s[0]; v_next = v_s[0][rg];\n"
+    )
+    return f"""
+    constexpr int TB = {tb};
+    constexpr int DB = {_PIPE_DB};
+    constexpr int NT = {_PIPE_THREADS};
+    const int tid = thread_position_in_threadgroup.x;
+    const int hv = threadgroup_position_in_grid.y;
+    const int b = threadgroup_position_in_grid.z;
+    const int hk = hv / (Hv / Hk);
+    const int dv0 = threadgroup_position_in_grid.x * DB;
+    const int rg = tid / 8;   // value row within the threadgroup
+    const int seg = tid % 8;  // lane within the row
+
+    threadgroup InT k_s[TB][Dk];
+    threadgroup InT q_s[TB][Dk];
+    threadgroup float v_s[TB][DB];
+    threadgroup float g_s[TB];
+    threadgroup float b_s[TB];
+    threadgroup InT y_s[TB][DB];
+
+    const size_t krow = (size_t)Hk * Dk;
+    const size_t vrow = (size_t)Hv * Dv;
+    const device InT* k_base = k + ((size_t)b * T * Hk + hk) * Dk;
+    const device InT* q_base = q + ((size_t)b * T * Hk + hk) * Dk;
+    const device InT* v_base = v + ((size_t)b * T * Hv + hv) * Dv + dv0;
+    device InT* y_base = y + ((size_t)b * T * Hv + hv) * Dv + dv0;
+
+    // fp32 state row fragment: channels 4*(seg + 8*i) .. +3, i = 0..3
+    float4 st[4];
+    {{
+        const device float4* S_in = (const device float4*)(
+            state_in + (((size_t)b * Hv + hv) * Dv + dv0 + rg) * Dk);
+        for (int i = 0; i < 4; ++i) st[i] = S_in[seg + 8 * i];
+    }}
+
+    // register prefetch of one block (k/q rows, v slice, g, beta)
+    constexpr int KQ4 = TB * Dk / 4;
+    constexpr int NKQ = (KQ4 + NT - 1) / NT;
+    constexpr int V4 = TB * DB / 4;
+    constexpr int NV = (V4 + NT - 1) / NT;
+    vec<InT, 4> pk[NKQ];
+    vec<InT, 4> pq[NKQ];
+    vec<InT, 4> pv[NV];
+    float pg = 0.0f, pb = 0.0f;
+#define GDN_PIPE_FETCH(T0N) {{ \\
+        const int ttn = min(TB, T - (T0N)); \\
+        for (int j = 0; j < NKQ; ++j) {{ \\
+            const int p = tid + j * NT; \\
+            if (p < ttn * (Dk / 4)) {{ \\
+                const int r = p / (Dk / 4), c4 = p % (Dk / 4); \\
+                const size_t off = (size_t)((T0N) + r) * krow + 4 * c4; \\
+                pk[j] = *(const device vec<InT, 4>*)(k_base + off); \\
+                pq[j] = *(const device vec<InT, 4>*)(q_base + off); \\
+            }} \\
+        }} \\
+        for (int j = 0; j < NV; ++j) {{ \\
+            const int p = tid + j * NT; \\
+            if (p < ttn * (DB / 4)) {{ \\
+                const int r = p / (DB / 4), c4 = p % (DB / 4); \\
+                pv[j] = *(const device vec<InT, 4>*)( \\
+                    v_base + (size_t)((T0N) + r) * vrow + 4 * c4); \\
+            }} \\
+        }} \\
+        if (tid < ttn) {{ \\
+            pg = g[((size_t)b * T + (T0N) + tid) * Hv + hv]; \\
+            pb = beta[((size_t)b * T + (T0N) + tid) * Hv + hv]; \\
+        }} \\
+    }}
+    GDN_PIPE_FETCH(0)
+
+    float4 k_next[4];
+    float g_next = 0.0f, b_next = 0.0f, v_next = 0.0f;
+    float pq_prev = 0.0f;
+    float pq4[4] = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    for (int t0 = 0; t0 < T; t0 += TB) {{
+        const int tt = min(TB, T - t0);
+        for (int j = 0; j < NKQ; ++j) {{
+            const int p = tid + j * NT;
+            if (p < tt * (Dk / 4)) {{
+                const int r = p / (Dk / 4), c4 = p % (Dk / 4);
+                *(threadgroup vec<InT, 4>*)(&k_s[r][4 * c4]) = pk[j];
+                *(threadgroup vec<InT, 4>*)(&q_s[r][4 * c4]) = pq[j];
+            }}
+        }}
+        for (int j = 0; j < NV; ++j) {{
+            const int p = tid + j * NT;
+            if (p < tt * (DB / 4)) {{
+                const int r = p / (DB / 4), c4 = p % (DB / 4);
+                *(threadgroup float4*)(&v_s[r][4 * c4]) = float4(pv[j]);
+            }}
+        }}
+        if (tid < tt) {{
+            g_s[tid] = pg;
+            b_s[tid] = pb;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (t0 + TB < T) GDN_PIPE_FETCH(t0 + TB)
+{first_operands}
+        if (tt == TB) {{
+{full_block}
+        }} else {{
+{tail_block}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int p = tid; p < tt * (DB / 4); p += NT) {{
+            const int r = p / (DB / 4), c4 = p % (DB / 4);
+            *(device vec<InT, 4>*)(y_base + (size_t)(t0 + r) * vrow + 4 * c4) =
+                *(threadgroup vec<InT, 4>*)(&y_s[r][4 * c4]);
+        }}
+    }}
+#undef GDN_PIPE_FETCH
+
+    {{
+        device float4* S_out = (device float4*)(
+            state_out + (((size_t)b * Hv + hv) * Dv + dv0 + rg) * Dk);
+        for (int i = 0; i < 4; ++i) S_out[seg + 8 * i] = st[i];
+    }}
+"""
+
+
+_kernel_p = None
+
+
+def _get_kernel_p():
+    global _kernel_p
+    if _kernel_p is None:
+        _kernel_p = mx.fast.metal_kernel(
+            name=f"omlx_gdn_pipelined_tb{_PIPE_TB}",
+            input_names=["q", "k", "v", "g", "beta", "state_in", "T"],
+            output_names=["y", "state_out"],
+            source=_pipelined_source(_PIPE_TB),
+            header=_HEADER,
+        )
+    return _kernel_p
+
+
+_PIPE_DTYPES = (mx.bfloat16, mx.float16, mx.float32)
+
+
+def gated_delta_pipelined_supported(q: mx.array, k: mx.array, v: mx.array) -> bool:
+    """True for the layouts Kernel P covers (128-wide keys, 16-row value blocks)."""
+    B, T, Hk, Dk = q.shape
+    Hv, Dv = v.shape[2:]
+    return (
+        Dk == 128
+        and Dv % _PIPE_DB == 0
+        and Hk > 0
+        and Hv % Hk == 0
+        and T > 0
+        and q.dtype in _PIPE_DTYPES
+        and k.dtype == q.dtype
+        and v.dtype == q.dtype
+    )
+
+
+def gated_delta_pipelined(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    g: mx.array,
+    beta: mx.array,
+    state: Optional[mx.array] = None,
+) -> Tuple[mx.array, mx.array]:
+    """Software-pipelined blocked-sequential Gated DeltaNet prefill.
+
+    q,k: [B,T,Hk,Dk]; v: [B,T,Hv,Dv]; g,beta: [B,T,Hv]; state: [B,Hv,Dv,Dk]
+    fp32. Returns y [B,T,Hv,Dv] (q.dtype) and the fp32 state. Layouts that
+    ``gated_delta_pipelined_supported`` rejects run ``gated_delta_blocked_seq``.
+    """
+    if not gated_delta_pipelined_supported(q, k, v):
+        return gated_delta_blocked_seq(q, k, v, g, beta, state)
+    B, T, Hk, Dk = q.shape
+    Hv, Dv = v.shape[2:]
+    in_dtype = q.dtype
+    if state is None:
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+    y, state_out = _get_kernel_p()(
+        inputs=[
+            q,
+            k,
+            v,
+            g.astype(mx.float32),
+            beta.astype(mx.float32),
+            state.astype(mx.float32),
+            T,
+        ],
+        template=[("InT", in_dtype), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv)],
+        grid=(_PIPE_THREADS * (Dv // _PIPE_DB), Hv, B),
+        threadgroup=(_PIPE_THREADS, 1, 1),
+        output_shapes=[(B, T, Hv, Dv), (B, Hv, Dv, Dk)],
         output_dtypes=[in_dtype, mx.float32],
     )
     return y, state_out

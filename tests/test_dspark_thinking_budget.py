@@ -116,6 +116,9 @@ def _make_batch(proc, emitted: int, k: int):
         fallback_sampler=_greedy,
         logits_processors=[[proc]],
         _token_context=[buf],
+        max_tokens=[10000],
+        _num_tokens=[emitted],
+        _matchers=[SimpleNamespace(advance=lambda token: False)],
     )
     return batch, cache, buf
 

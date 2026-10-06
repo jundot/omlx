@@ -137,6 +137,15 @@ enum ProfileSettingsKey {
     static let chatTemplateKwargs = "chat_template_kwargs"
     static let forcedCtKwargs = "forced_ct_kwargs"
 
+    /// Keys a global template keeps (`UNIVERSAL_PROFILE_FIELDS`). The server
+    /// drops every other key from template settings.
+    static let templateKeys: Set<String> = [
+        maxContextWindow, maxTokens, temperature, topP, topK, minP,
+        repetitionPenalty, presencePenalty, enableThinking,
+        thinkingBudgetEnabled, thinkingBudgetTokens, reasoningParser,
+        maxToolResultTokens, forceSampling, chatTemplateKwargs, forcedCtKwargs,
+    ]
+
     // Model-specific
     static let modelTypeOverride = "model_type_override"
     static let trustRemoteCode = "trust_remote_code"
@@ -183,6 +192,7 @@ enum ProfileSettingsKey {
     static let dflashSsdCache = "dflash_ssd_cache"
     static let dflashSsdCacheMaxBytes = "dflash_ssd_cache_max_bytes"
     static let mtpEnabled = "mtp_enabled"
+    static let mtpAdaptiveMaxDepth = "mtp_adaptive_max_depth"
     static let vlmMtpEnabled = "vlm_mtp_enabled"
     static let vlmMtpDraftModel = "vlm_mtp_draft_model"
     static let vlmMtpDraftBlockSize = "vlm_mtp_draft_block_size"
@@ -207,11 +217,7 @@ func resolveActiveProfileDisplay(
     guard let activeName, !activeName.isEmpty else { return nil }
 
     if let profile = modelProfiles.first(where: { $0.name == activeName }),
-       let source = profile.sourceTemplate,
-       let template = templates.first(where: { $0.name == source }) {
-        return (template.templateScope, template.name)
-    }
-    if let template = templates.first(where: { $0.name == activeName }) {
+       let template = profile.matchingTemplate(in: templates) {
         return (template.templateScope, template.name)
     }
     if modelProfiles.contains(where: { $0.name == activeName }) {

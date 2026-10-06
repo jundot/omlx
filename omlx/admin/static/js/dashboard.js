@@ -8,6 +8,9 @@
     const DIFFUSION_CONFIG_MODEL_TYPES = new Set([
         'diffusion_gemma',
     ]);
+    // The API accepts fractions outside the UI range.
+    const MOE_EXPERT_OFFLOAD_MIN_PERCENT = 5;
+    const MOE_EXPERT_OFFLOAD_MAX_PERCENT = 95;
     const DIFFUSION_UNSUPPORTED_PROFILE_FIELDS = new Set([
         'top_p',
         'top_k',
@@ -68,6 +71,8 @@
         'dflash_block_size',
         'dflash_verify_mode',
         'mtp_enabled',
+        'mtp_adaptive_max_depth',
+        'mtp_fixed_depth',
         'qwen35_ane_prefill_shared_fraction',
         'vlm_mtp_enabled',
         'vlm_mtp_draft_model',
@@ -105,6 +110,11 @@
     const MANAGER_SORT_DEFAULT = { by: 'name', order: 'asc' };
 
     function dashboard() {
+        // GridStack instance and helpers stay outside the reactive Alpine state.
+        let dashGrid = null;
+        let dashObserver = null;
+        let dashRefitFrame = null;
+        let dashRefitTimer = null;
         return {
             // Theme
             theme: localStorage.getItem(THEME_STORAGE_KEY) || 'auto',
@@ -125,7 +135,7 @@
             // Global settings
             globalSettings: {
                 base_path: '',
-                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
+                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, qwen4_gdn_decode_wide_proj: false, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
@@ -144,6 +154,7 @@
                     openclaw_model: null,
                     hermes_model: null,
                     pi_model: null,
+                    dsh_model: null,
                     openclaw_tools_profile: 'full',
                     markitdown_enabled: true,
                     markitdown_expose_model: false,
@@ -159,7 +170,7 @@
                     web_search_content_truncate: true,
                     web_search_content_max_chars: 20000,
                 },
-                ui: { language: 'en' },
+                ui: { language: 'en', dashboard_layout: null },
                 idle_timeout: { idle_timeout_seconds: null },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
             },
@@ -251,6 +262,7 @@
                 trust_remote_code: false,
             },
             savingModelSettings: false,
+            settingsApply: { open: false, mode: 'optimal', phase: 'input', recipeText: '', result: null, candidates: null, error: '' },
             importingMtplx: false,
             loadingGenDefaults: false,
             reasoningParsers: [],
@@ -359,6 +371,14 @@
             },
 
             statsScope: 'session',
+            // Dashboard block layout (see dashboard_layout.js)
+            dashLayout: null,
+            dashDraft: null,
+            dashEditing: false,
+            dashSaving: false,
+            dashSaveError: '',
+            dashPlacedIds: [],
+            dashEditAvailable: true,
             selectedStatsModel: '',
             showClearStatsConfirm: false,
             showClearAlltimeConfirm: false,
@@ -595,44 +615,44 @@
             accSampleSizes: { mmlu: 1000, mmlu_pro: 300, kmmlu: 300, cmmlu: 300, jmmlu: 300, hellaswag: 200, truthfulqa: 0, arc_challenge: 300, winogrande: 300, gsm8k: 100, mathqa: 300, humaneval: 0, mbpp: 200, livecodebench: 100, bbq: 300, safetybench: 300 },
             accBenchmarkGroups: [
                 {
-                    name: 'Knowledge',
+                    name: window.t('acc_bench.benchmarks.group_knowledge'),
                     benchmarks: [
-                        { key: 'mmlu', label: 'MMLU', desc: 'Knowledge · 57 subjects', fullSize: 14042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
-                        { key: 'mmlu_pro', label: 'MMLU-Pro', desc: 'Hard knowledge · 14 subjects (10-way)', fullSize: 12032, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'mmlu', label: 'MMLU', desc: window.t('acc_bench.benchmarks.mmlu_desc'), fullSize: 14042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'mmlu_pro', label: 'MMLU-Pro', desc: window.t('acc_bench.benchmarks.mmlu_pro_desc'), fullSize: 12032, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                         { key: 'kmmlu', label: 'KMMLU', desc: '한국어 지식 · 45 과목', fullSize: 35030, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                         { key: 'cmmlu', label: 'CMMLU', desc: '中文知识 · 67 科目', fullSize: 11582, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                         { key: 'jmmlu', label: 'JMMLU', desc: '日本語知識 · 112 科目', fullSize: 7536, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                     ],
                 },
                 {
-                    name: 'Commonsense & Reasoning',
+                    name: window.t('acc_bench.benchmarks.group_commonsense'),
                     benchmarks: [
-                        { key: 'hellaswag', label: 'HellaSwag', desc: 'Commonsense reasoning', fullSize: 10042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
-                        { key: 'arc_challenge', label: 'ARC-C', desc: 'Science reasoning', fullSize: 1172, sizes: [30, 50, 100, 200, 300] },
-                        { key: 'winogrande', label: 'Winogrande', desc: 'Coreference resolution', fullSize: 1267, sizes: [30, 50, 100, 200, 300] },
-                        { key: 'truthfulqa', label: 'TruthfulQA', desc: 'Truthfulness', fullSize: 817, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'hellaswag', label: 'HellaSwag', desc: window.t('acc_bench.benchmarks.hellaswag_desc'), fullSize: 10042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'arc_challenge', label: 'ARC-C', desc: window.t('acc_bench.benchmarks.arc_desc'), fullSize: 1172, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'winogrande', label: 'Winogrande', desc: window.t('acc_bench.benchmarks.winogrande_desc'), fullSize: 1267, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'truthfulqa', label: 'TruthfulQA', desc: window.t('acc_bench.benchmarks.truthfulqa_desc'), fullSize: 817, sizes: [30, 50, 100, 200, 300] },
                     ],
                 },
                 {
-                    name: 'Math',
+                    name: window.t('acc_bench.benchmarks.group_math'),
                     benchmarks: [
-                        { key: 'gsm8k', label: 'GSM8K', desc: 'Math reasoning', fullSize: 1319, sizes: [30, 50, 100, 200, 300] },
-                        { key: 'mathqa', label: 'MathQA', desc: 'Quantitative reasoning · 5-way', fullSize: 2985, sizes: [30, 50, 100, 200, 300, 500, 1000] },
+                        { key: 'gsm8k', label: 'GSM8K', desc: window.t('acc_bench.benchmarks.gsm8k_desc'), fullSize: 1319, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'mathqa', label: 'MathQA', desc: window.t('acc_bench.benchmarks.mathqa_desc'), fullSize: 2985, sizes: [30, 50, 100, 200, 300, 500, 1000] },
                     ],
                 },
                 {
-                    name: 'Coding',
+                    name: window.t('acc_bench.benchmarks.group_coding'),
                     benchmarks: [
-                        { key: 'humaneval', label: 'HumanEval', desc: 'Function completion', fullSize: 164, sizes: [30, 50, 100] },
-                        { key: 'mbpp', label: 'MBPP', desc: 'Python problems', fullSize: 500, sizes: [30, 50, 100, 200, 300] },
-                        { key: 'livecodebench', label: 'LiveCodeBench', desc: 'Code generation', fullSize: 1055, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'humaneval', label: 'HumanEval', desc: window.t('acc_bench.benchmarks.humaneval_desc'), fullSize: 164, sizes: [30, 50, 100] },
+                        { key: 'mbpp', label: 'MBPP', desc: window.t('acc_bench.benchmarks.mbpp_desc'), fullSize: 500, sizes: [30, 50, 100, 200, 300] },
+                        { key: 'livecodebench', label: 'LiveCodeBench', desc: window.t('acc_bench.benchmarks.livecodebench_desc'), fullSize: 1055, sizes: [30, 50, 100, 200, 300] },
                     ],
                 },
                 {
-                    name: 'Safety & Alignment',
+                    name: window.t('acc_bench.benchmarks.group_safety'),
                     benchmarks: [
-                        { key: 'bbq', label: 'BBQ', desc: 'Social bias · 11 categories', fullSize: 10864, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
-                        { key: 'safetybench', label: 'SafetyBench', desc: 'Safety · 7 categories', fullSize: 11435, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'bbq', label: 'BBQ', desc: window.t('acc_bench.benchmarks.bbq_desc'), fullSize: 10864, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
+                        { key: 'safetybench', label: 'SafetyBench', desc: window.t('acc_bench.benchmarks.safetybench_desc'), fullSize: 11435, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                     ],
                 },
             ],
@@ -724,6 +744,8 @@
                     this.applyTabStateFromUrl();
                 });
 
+                window.addEventListener('focus', () => this.refreshOpenModelSettings());
+
                 // Pause stats polling when tab is hidden to reduce server load
                 document.addEventListener('visibilitychange', () => {
                     if (document.hidden) {
@@ -739,6 +761,7 @@
                 if (value === 'status') {
                     await this.loadStats();
                     this.startStatsRefresh();
+                    this.$nextTick(() => this.ensureDashboardGrid());
                 } else {
                     this.stopStatsRefresh();
                 }
@@ -828,6 +851,38 @@
                 this.syncTabStateToUrl();
             },
 
+            handleMainTabKeydown(event) {
+                if (!event.target.matches('[role="tab"]')
+                    || event.altKey || event.ctrlKey || event.metaKey) return;
+                if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+                const tabs = Array.from(event.currentTarget.querySelectorAll('[role="tab"]'))
+                    .filter(tab => !tab.disabled && tab.getClientRects().length);
+                const index = tabs.indexOf(event.target);
+                if (index < 0) return;
+                event.preventDefault();
+                let next;
+                if (event.key === 'Home') next = 0;
+                else if (event.key === 'End') next = tabs.length - 1;
+                else next = (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+                this.modelsDropdown = this.settingsDropdown = this.benchDropdown = false;
+                tabs[next].focus();
+                tabs[next].click();
+            },
+
+            trapDialogFocus(event) {
+                const dialog = event.currentTarget;
+                const controls = Array.from(dialog.querySelectorAll(
+                    'a[href], button, input, select, textarea, [tabindex]'
+                )).filter(el => el.tabIndex >= 0 && !el.matches(':disabled')
+                    && el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
+                const index = controls.indexOf(document.activeElement);
+                if (!controls.length || (event.shiftKey ? index <= 0 : index === controls.length - 1)) {
+                    event.preventDefault();
+                    const target = event.shiftKey ? controls.at(-1) : controls[0];
+                    (target || dialog.querySelector('[autofocus]')).focus();
+                }
+            },
+
             setSettingsTab(tab) {
                 if (!DASHBOARD_SETTINGS_TABS.has(tab)) return;
                 this.activeTab = tab;
@@ -874,7 +929,72 @@
                 }
             },
 
+            loadingGlobalSettings: false,
+            resettingGlobalSettings: false,
+            showGlobalResetNotice: false,
+            globalResetSnapshot: null,
+            globalDefaultsPending: false,
+
+            async resetGlobalSettingsDefaults() {
+                if (this.saving || this.loadingGlobalSettings || this.resettingGlobalSettings || this.showGlobalResetNotice) return;
+                const previous = {
+                    globalSettings: JSON.parse(JSON.stringify(this.globalSettings)),
+                    globalDefaultsPending: this.globalDefaultsPending,
+                    idleTimeoutValue: this.idleTimeoutValue,
+                    cachePercent: this.cachePercent,
+                    hotCachePercent: this.hotCachePercent,
+                    saveSuccess: this.saveSuccess,
+                    saveError: this.saveError,
+                };
+                this.resettingGlobalSettings = true;
+                this.saveSuccess = false;
+                this.saveError = '';
+                try {
+                    const response = await fetch('/admin/api/global-settings/defaults');
+                    if (!response.ok) throw new Error('Failed to load defaults');
+                    const defaults = await response.json();
+                    this.globalResetSnapshot = previous;
+                    const s = this.globalSettings;
+                    for (const section of ['server', 'model', 'memory', 'scheduler', 'cache',
+                        'sampling', 'mcp', 'usage', 'huggingface', 'network', 'auth', 'idle_timeout']) {
+                        for (const key of Object.keys(s[section])) {
+                            if (['base_path', 'model_dirs', 'model_dir', 'effective_model_dirs',
+                                'ssd_cache_dir', 'config_path', 'hf_cache_path', 'ca_bundle',
+                                'api_key', 'api_key_set', 'sub_keys', 'endpoint',
+                                'distributed_inference_active'].includes(key)) continue;
+                            if (Object.hasOwn(defaults[section], key)) {
+                                s[section][key] = defaults[section][key];
+                            }
+                        }
+                    }
+                    this.idleTimeoutValue = s.idle_timeout.idle_timeout_seconds == null
+                        ? '' : String(s.idle_timeout.idle_timeout_seconds);
+                    this.cachePercent = this.parseCacheToPercent(
+                        s.cache.ssd_cache_max_size, s.system.ssd_total_bytes);
+                    this.hotCachePercent = this.parseHotCacheToPercent(
+                        s.cache.hot_cache_max_size, s.system.total_memory_bytes);
+                    s.ui.language = defaults.ui.language;
+                    this.globalDefaultsPending = true;
+                    this.showGlobalResetNotice = true;
+                } catch (err) {
+                    this.saveError = window.t('settings.global.reset_failed');
+                } finally {
+                    this.resettingGlobalSettings = false;
+                }
+            },
+
+            cancelGlobalSettingsReset() {
+                if (this.globalResetSnapshot) Object.assign(this, this.globalResetSnapshot);
+                this.confirmGlobalSettingsReset();
+            },
+
+            confirmGlobalSettingsReset() {
+                this.globalResetSnapshot = null;
+                this.showGlobalResetNotice = false;
+            },
+
             async loadGlobalSettings() {
+                this.loadingGlobalSettings = true;
                 try {
                     const response = await fetch('/admin/api/global-settings');
                     if (response.ok) {
@@ -903,7 +1023,12 @@
                             idle_timeout: { ...this.globalSettings.idle_timeout, ...data.idle_timeout },
                             system: { ...this.globalSettings.system, ...data.system },
                         };
-                        this.globalSettings.ui = data.ui || { language: 'en' };
+                        this.globalSettings.ui = { language: 'en', dashboard_layout: null, ...(data.ui || {}) };
+                        const layoutLib = this._dashLayoutLib();
+                        this.dashLayout = layoutLib
+                            ? layoutLib.normalizeLayout(this.globalSettings.ui.dashboard_layout)
+                            : null;
+                        if (dashGrid && !this.dashEditing) this.applyDashboardLayout(this.dashLayout);
                         if (
                             !this.globalSettings.server.distributed_inference_active
                             && this.mainTab === 'cluster'
@@ -928,8 +1053,6 @@
                             this.globalSettings.cache.ssd_cache_max_size,
                             this.globalSettings.system.ssd_total_bytes
                         );
-                        // Sync the cache string value from percent
-                        this.updateCacheFromSlider();
 
                         // Calculate hot cache percent from stored value
                         this.globalSettings.cache.hot_cache_max_size = this.normalizeHotCacheMaxSize(
@@ -944,6 +1067,8 @@
                     }
                 } catch (err) {
                     console.error('Failed to load global settings:', err);
+                } finally {
+                    this.loadingGlobalSettings = false;
                 }
             },
 
@@ -977,6 +1102,7 @@
             },
 
             async saveGlobalSettings() {
+                if (this.resettingGlobalSettings) return;
                 this.saving = true;
                 this.saveSuccess = false;
                 this.saveError = '';
@@ -984,17 +1110,17 @@
                 // Validate required fields
                 const errors = [];
                 const s = this.globalSettings;
-                if (!s.server.host) errors.push('Host');
-                if (!s.server.port) errors.push('Port');
-                if (!s.server.max_audio_upload_size) errors.push('Maximum Audio Upload Size');
-                if (!s.model.model_dirs || !s.model.model_dirs.some(d => d.trim())) errors.push('Model Directory');
-                if (!s.scheduler.max_concurrent_requests) errors.push('Max Concurrent Requests');
-                if (!s.scheduler.embedding_batch_size) errors.push('Embedding Batch Size');
-                if (!s.cache.ssd_cache_max_size) errors.push('Max Cache Size');
-                if (!s.sampling.max_context_window) errors.push('Max Context Window');
-                if (!s.sampling.max_tokens) errors.push('Max Tokens');
+                if (!s.server.host) errors.push(window.t('settings.server.host'));
+                if (!s.server.port) errors.push(window.t('settings.server.port'));
+                if (!s.server.max_audio_upload_size) errors.push(window.t('settings.advanced.max_audio_upload_size'));
+                if (!s.model.model_dirs || !s.model.model_dirs.some(d => d.trim())) errors.push(window.t('js.error.model_directory'));
+                if (!s.scheduler.max_concurrent_requests) errors.push(window.t('settings.resource.max_concurrent_requests'));
+                if (!s.scheduler.embedding_batch_size) errors.push(window.t('settings.resource.embedding_batch_size'));
+                if (!s.cache.ssd_cache_max_size) errors.push(window.t('js.error.max_cache_size'));
+                if (!s.sampling.max_context_window) errors.push(window.t('js.error.max_context_window'));
+                if (!s.sampling.max_tokens) errors.push(window.t('settings.generation.max_tokens'));
                 if (s.cache.gdn_snapshot_storage === 'ssd_sidecar' && s.cache.hot_cache_only) {
-                    errors.push('GDN SSD sidecar requires Hot Cache Only to be disabled');
+                    errors.push(window.t('js.error.gdn_sidecar_hot_cache_conflict'));
                 }
 
                 if (errors.length > 0) {
@@ -1031,12 +1157,14 @@
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
+                            ...(this.globalDefaultsPending ? { ui_language: s.ui.language } : {}),
                             host: this.globalSettings.server.host,
                             port: this.globalSettings.server.port,
                             log_level: this.globalSettings.server.log_level,
                             sse_keepalive_mode: this.globalSettings.server.sse_keepalive_mode,
                             burst_decode_mode: this.globalSettings.server.burst_decode_mode,
                             preserve_mid_system_cache: this.globalSettings.server.preserve_mid_system_cache,
+                            qwen4_gdn_decode_wide_proj: this.globalSettings.server.qwen4_gdn_decode_wide_proj,
                             distributed_inference_enabled: this.globalSettings.server.distributed_inference_enabled,
                             max_audio_upload_size: this.globalSettings.server.max_audio_upload_size,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
@@ -1087,11 +1215,15 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.saveSuccess = true;
-                        this.saveMessage = data.message || 'Settings saved successfully';
+                        this.saveMessage = data.message || window.t('js.success.settings_saved');
                         // Refresh stats and model list (cache changes unload models)
                         await this.loadStats();
                         await this.loadModels();
                         setTimeout(() => { this.saveSuccess = false; }, 5000);
+                        if (this.globalDefaultsPending) {
+                            this.globalDefaultsPending = false;
+                            window.location.reload();
+                        }
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
@@ -1430,13 +1562,35 @@
                 if (description) lines.push(description);
                 return lines.join('\n');
             },
+            matchingProfileTemplate(profile) {
+                if (!profile?.source_template) return null;
+                const template = this.templates.find(t => t.name === profile.source_template);
+                if (!template) return null;
+                const canonical = value => {
+                    if (Array.isArray(value)) return value.map(canonical);
+                    if (value && typeof value === 'object') {
+                        return Object.fromEntries(Object.keys(value).sort().map(k => [k, canonical(value[k])]));
+                    }
+                    return value;
+                };
+                return JSON.stringify(canonical(profile.settings || {})) === JSON.stringify(canonical(template.settings || {}))
+                    ? template : null;
+            },
+            get visibleModelProfiles() {
+                return this.profiles.filter(p => p.expose_as_model || !this.matchingProfileTemplate(p));
+            },
+            get activeTemplateName() {
+                const profile = this.profiles.find(p => p.name === this.activeProfileName);
+                return this.matchingProfileTemplate(profile)?.name || null;
+            },
             async loadProfilesForModel(modelId) {
+                const seq = this._applySeq;
                 this.profiles = [];
                 try {
                     const r = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/profiles`);
                     if (r.ok) {
                         const data = await r.json();
-                        this.profiles = data.profiles || [];
+                        if (seq === this._applySeq) this.profiles = data.profiles || [];
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -1520,6 +1674,12 @@
 
             showTip(el, text) {
                 if (!text) return;
+                // A tooltip must share the dialog's top layer to remain visible.
+                const tooltip = this.$refs.floatingTooltip;
+                const container = el.closest('dialog') || this.$root;
+                if (tooltip.parentElement !== container) {
+                    Alpine.mutateDom(() => container.appendChild(tooltip));
+                }
                 const rect = el.getBoundingClientRect();
                 this.tip = {
                     visible: true,
@@ -1741,6 +1901,9 @@
                     turboquant_kv_bits: s.turboquant_kv_bits || 4,
                     moe_expert_offload_enabled: !isDiffusion && model?.moe_expert_offload_supported === true && !!s.moe_expert_offload_enabled,
                     moe_expert_offload_resident_fraction: s.moe_expert_offload_resident_fraction ?? 0.25,
+                    moe_expert_offload_resident_percent: Number(((s.moe_expert_offload_resident_fraction ?? 0.25) * 100).toPrecision(15)),
+                    moe_expert_offload_resident_touched: false,
+                    moe_offload_allows_mtp: model?.moe_offload_allows_mtp === true,
                     qwen35_oq_a8_enabled: s.qwen35_oq_a8_enabled || false,
                     qwen35_oq_a8_min_tokens: s.qwen35_oq_a8_min_tokens ?? 128,
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
@@ -1787,6 +1950,8 @@
                     dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
                     dflash_ssd_cache_available: !!model?.dflash_ssd_cache_available,
                     mtp_enabled: s.mtp_enabled || false,
+                    mtp_adaptive_max_depth: [3, 4, 5, 6].includes(s.mtp_adaptive_max_depth)
+                        ? String(s.mtp_adaptive_max_depth) : '3',
                     mtp_compatible: model?.mtp_compatible === true,
                     mtp_compatibility_reason: model?.mtp_compatibility_reason || '',
                     is_paroquant: model?.is_paroquant === true,
@@ -1799,6 +1964,40 @@
                     is_diffusion_model: isDiffusion,
                     trust_remote_code: s.trust_remote_code || false,
                 };
+            },
+
+            moeExpertOffloadResidentInvalid() {
+                const percent = Number(this.modelSettings.moe_expert_offload_resident_percent);
+                return (
+                    !Number.isFinite(percent)
+                    || percent < MOE_EXPERT_OFFLOAD_MIN_PERCENT
+                    || percent > MOE_EXPERT_OFFLOAD_MAX_PERCENT
+                );
+            },
+
+            onMoeExpertOffloadResidentBlur() {
+                // Preserve untouched API values outside the UI range.
+                if (!this.modelSettings.moe_expert_offload_resident_touched) return;
+                if (this.moeExpertOffloadResidentInvalid()) {
+                    const percent = Number(this.modelSettings.moe_expert_offload_resident_percent);
+                    this.modelSettings.moe_expert_offload_resident_percent = Math.min(
+                        MOE_EXPERT_OFFLOAD_MAX_PERCENT,
+                        Math.max(
+                            MOE_EXPERT_OFFLOAD_MIN_PERCENT,
+                            Number.isFinite(percent) ? percent : MOE_EXPERT_OFFLOAD_MIN_PERCENT,
+                        ),
+                    );
+                }
+                this.onMoeExpertOffloadResidentPercent();
+            },
+
+            onMoeExpertOffloadResidentPercent() {
+                // Defer clamping until blur so partial input remains editable.
+                this.modelSettings.moe_expert_offload_resident_touched = true;
+                const percent = Number(this.modelSettings.moe_expert_offload_resident_percent);
+                if (!this.moeExpertOffloadResidentInvalid()) {
+                    this.modelSettings.moe_expert_offload_resident_fraction = Number((percent / 100).toPrecision(15));
+                }
             },
 
             _resetPresetApplicableFields() {
@@ -1887,11 +2086,13 @@
                 return slug || 'profile';
             },
             async createProfile() {
+                const modelId = this.selectedModel?.id;
+                const seq = this._applySeq;
                 if (!this.selectedModel) return;
                 this.profileError = '';
                 const displayName = (this.newProfile.display_name || '').trim();
                 if (!displayName) {
-                    this.profileError = 'Name required';
+                    this.profileError = window.t('js.error.name_required');
                     return;
                 }
                 const apiName = (this.newProfile.api_name || this.slugifyProfileApiName(displayName)).trim();
@@ -1917,6 +2118,9 @@
                           body: JSON.stringify(body) }
                     );
                     if (r.ok) {
+                        const data = await r.json();
+                        if (this.selectedModel?.id !== modelId || seq !== this._applySeq) return;
+                        await this.applyProfileToForm(data.profile);
                         await this.loadProfilesForModel(this.selectedModel.id);
                         if (body.also_save_as_template) await this.loadTemplates();
                         this.showNewProfileForm = false;
@@ -1925,23 +2129,26 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to save profile';
+                        this.profileError = data.detail || window.t('js.error.save_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
                 }
             },
-            async applyProfileToForm(profile) {
+            async applyProfileToForm(profile, fromTemplate = false) {
+                const modelId = this.selectedModel?.id;
+                if (!modelId) return;
                 const seq = ++this._applySeq;
                 this.profileError = '';
                 try {
                     const r = await fetch(
-                        `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles/${encodeURIComponent(profile.name)}/apply`,
+                        `/admin/api/models/${encodeURIComponent(modelId)}/${fromTemplate ? "profile-templates" : "profiles"}/${encodeURIComponent(profile.name)}/apply`,
                         { method: 'POST' }
                     );
-                    if (seq !== this._applySeq) return;  // superseded by a newer click
+                    if (seq !== this._applySeq || this.selectedModel?.id !== modelId) return;  // superseded by a newer click
                     if (r.ok) {
                         const data = await r.json();
+                        if (seq !== this._applySeq || this.selectedModel?.id !== modelId) return;
                         const activeName = data.settings?.active_profile_name || profile.name;
                         const settings = {
                             ...(data.settings || {}),
@@ -1956,14 +2163,16 @@
                         }
                         this.activeProfileName = activeName;
                         this.profilesDrift = false;
+                        this._modelSettingsBaseline = JSON.stringify(this.modelSettings);
                         // Update the models list so the profile badge reflects the change
-                        const m = this.models.find(m => m.id === this.selectedModel.id);
+                        const m = this.models.find(m => m.id === modelId);
                         if (m) m.settings = { ...settings };
+                        await this.loadProfilesForModel(modelId);
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to apply profile';
+                        this.profileError = data.detail || window.t('js.error.apply_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -1971,48 +2180,7 @@
                 }
             },
             async applyTemplateToForm(template) {
-                // Check if a profile with this template's name already exists
-                const existingProfile = this.profiles.find(p => p.name === template.name);
-
-                if (existingProfile) {
-                    // Global templates are the source of truth in this scope.
-                    const updatedProfile = await this.updateProfile(existingProfile.name, {
-                        settings: template.settings,
-                        source_template: template.name,
-                    });
-                    if (updatedProfile) {
-                        await this.applyProfileToForm(updatedProfile);
-                    }
-                } else {
-                    // Create a new profile from the template
-                    const body = {
-                        name: template.name,
-                        display_name: template.display_name,
-                        api_name: this.slugifyProfileApiName(template.display_name || template.name),
-                        description: template.description || null,
-                        settings: template.settings,
-                        source_template: template.name,
-                    };
-                    
-                    try {
-                        const r = await fetch(
-                            `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles`,
-                            { method: 'POST', headers: {'Content-Type': 'application/json'},
-                              body: JSON.stringify(body) }
-                        );
-                        if (r.ok) {
-                            // Reload profiles first to include the new one
-                            await this.loadProfilesForModel(this.selectedModel.id);
-                            // Find the newly created profile in the refreshed list
-                            const newProfile = this.profiles.find(p => p.name === template.name);
-                            if (newProfile) {
-                                await this.applyProfileToForm(newProfile);
-                            }
-                        }
-                    } catch (e) {
-                        console.error('Failed to create profile from template:', e);
-                    }
-                }
+                await this.applyProfileToForm(template, true);
             },
             async deleteProfile(name) {
                 if (!this.selectedModel) return;
@@ -2042,7 +2210,7 @@
                 const description = (p._editDescription ?? p.description ?? '').trim();
                 const exposeAsModel = !!(p._editExposeAsModel ?? p.expose_as_model);
                 if (!displayName) {
-                    this.profileError = 'Name required';
+                    this.profileError = window.t('js.error.name_required');
                     return;
                 }
                 if (!this.isValidProfileName(apiName)) {
@@ -2057,10 +2225,13 @@
                 };
                 return this.updateProfile(p.name, patch);
             },
-            updateProfileSettingsFromForm(p) {
-                return this.updateProfile(p.name, {
+            async updateProfileSettingsFromForm(p) {
+                const updated = await this.updateProfile(p.name, {
                     settings: this.formValuesForProfile(),
                 });
+                if (updated && this.activeProfileName === p.name) {
+                    await this.applyProfileToForm(updated);
+                }
             },
             async updateProfile(name, patch) {
                 // patch: { new_name?, display_name?, api_name?, description?, expose_as_model?, settings?, also_save_as_template? }
@@ -2085,17 +2256,19 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to update profile';
+                        this.profileError = data.detail || window.t('js.error.update_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
                 }
             },
             async createTemplate() {
+                const modelId = this.selectedModel?.id;
+                const seq = this._applySeq;
                 this.profileError = '';
                 const displayName = this.newTemplate.display_name.trim();
                 if (!displayName) {
-                    this.profileError = 'Name required';
+                    this.profileError = window.t('js.error.name_required');
                     return;
                 }
                 const autoId = 't-' + Date.now().toString(36) + '-' +
@@ -2114,14 +2287,17 @@
                         body: JSON.stringify(body),
                     });
                     if (r.ok) {
+                        const data = await r.json();
+                        if (this.selectedModel?.id !== modelId || seq !== this._applySeq) return;
                         await this.loadTemplates();
+                        await this.applyTemplateToForm(data.template);
                         this.showNewTemplateForm = false;
                         this.newTemplate = { name: '', display_name: '', description: '' };
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to save template';
+                        this.profileError = data.detail || window.t('js.error.save_template_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -2137,12 +2313,17 @@
                     );
                     if (r.ok) {
                         await this.loadTemplates();
+                        const active = this.profiles.find(p => p.name === this.activeProfileName);
+                        if (patch.settings && active?.source_template === name) {
+                            const template = this.templates.find(t => t.name === name);
+                            if (template) await this.applyTemplateToForm(template);
+                        }
                         this.editingTemplate = null;
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || 'Failed to update template';
+                        this.profileError = data.detail || window.t('js.error.update_template_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -2156,6 +2337,7 @@
                     );
                     if (r.ok) {
                         await this.loadTemplates();
+                        if (this.selectedModel) await this.loadProfilesForModel(this.selectedModel.id);
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -2190,34 +2372,60 @@
                     ? ` · ${speed} prompt tok/s`
                     : '';
                 if (!recommendation.enabled) {
-                    return `Winner: GPU only${speedSuffix}`;
+                    return window.t('js.ane_tune.winner_gpu_only') + speedSuffix;
                 }
                 if (recommendation.backend === 'k2') {
-                    return `Winner: ANE dense ${Math.round(recommendation.mlp_fraction * 100)}% · shared expert ${Math.round(recommendation.shared_fraction * 100)}%${speedSuffix}`;
+                    return window.t('js.ane_tune.winner_ane_dense')
+                        .replace('{mlp}', Math.round(recommendation.mlp_fraction * 100))
+                        .replace('{shared}', Math.round(recommendation.shared_fraction * 100))
+                        + speedSuffix;
                 }
                 const parts = [
-                    `${recommendation.fused_down ? 'Fused MLP per ANE' : 'MLP'} ${Math.round(Number(recommendation.mlp_fraction) * 100)}%`,
+                    (recommendation.fused_down
+                        ? window.t('js.ane_tune.fused_mlp')
+                        : window.t('js.ane_tune.mlp')
+                    ).replace(
+                        '{pct}',
+                        Math.round(Number(recommendation.mlp_fraction) * 100),
+                    ),
                 ];
                 if (recommendation.gdn_enabled) {
                     parts.push(
-                        `GDN ${Math.round(Number(recommendation.gdn_fraction) * 100)}%`
+                        window.t('js.ane_tune.gdn').replace(
+                            '{pct}',
+                            Math.round(Number(recommendation.gdn_fraction) * 100),
+                        )
                     );
                 } else {
-                    parts.push('GDN off');
+                    parts.push(window.t('modal.model_settings.ane_gdn_off'));
                 }
                 if (recommendation.cpu_enabled) {
                     parts.push(
-                        `CPU gate ${Math.round(Number(recommendation.cpu_fraction || 0) * 100)}%`,
-                        `CPU down ${Math.round(Number(recommendation.cpu_down_fraction || 0) * 100)}%`,
-                        `CPU GDN ${Math.round(Number(recommendation.cpu_gdn_fraction || 0) * 100)}%`,
+                        window.t('js.ane_tune.cpu_gate').replace(
+                            '{pct}',
+                            Math.round(Number(recommendation.cpu_fraction || 0) * 100),
+                        ),
+                        window.t('js.ane_tune.cpu_down').replace(
+                            '{pct}',
+                            Math.round(Number(recommendation.cpu_down_fraction || 0) * 100),
+                        ),
+                        window.t('js.ane_tune.cpu_gdn').replace(
+                            '{pct}',
+                            Math.round(Number(recommendation.cpu_gdn_fraction || 0) * 100),
+                        ),
                     );
                 }
                 if (Number(recommendation.tail_padding_min_tokens || 0) > 0) {
                     parts.push(
-                        `Pad tails ≥${Number(recommendation.tail_padding_min_tokens)}`
+                        window.t('js.ane_tune.pad_tails').replace(
+                            '{n}',
+                            Number(recommendation.tail_padding_min_tokens),
+                        )
                     );
                 }
-                return `Winner: ${parts.join(' · ')}${speedSuffix}`;
+                return window.t('js.ane_tune.winner_parts')
+                    .replace('{parts}', parts.join(' · '))
+                    + speedSuffix;
             },
 
             _scheduleANETuningPoll() {
@@ -2278,7 +2486,7 @@
                         return;
                     }
                     if (!response.ok) {
-                        throw new Error(data.detail || 'Failed to start ANE tuning.');
+                        throw new Error(data.detail || window.t('js.error.start_ane_tuning_failed'));
                     }
                     this.aneTuning.tuningId = data.tuning_id;
                     this.aneTuning.total = Number(data.total || 0);
@@ -2302,11 +2510,11 @@
                         return;
                     }
                     if (!response.ok) {
-                        throw new Error(data.detail || 'Failed to read ANE tuning progress.');
+                        throw new Error(data.detail || window.t('js.error.read_ane_tuning_progress_failed'));
                     }
                     if (this.aneTuning.tuningId !== tuningId) return;
                     if (!data.termination_reason && data.status === 'error') {
-                        data.termination_reason = data.error || data.message || 'ANE tuning failed.';
+                        data.termination_reason = data.error || data.message || window.t('js.error.ane_tuning_failed');
                     }
                     this.aneTuning.status = data;
                     this.aneTuning.total = Number(data.total || this.aneTuning.total || 0);
@@ -2340,7 +2548,7 @@
                         return;
                     }
                     if (!response.ok) {
-                        throw new Error(data.detail || 'Failed to cancel ANE tuning.');
+                        throw new Error(data.detail || window.t('js.error.cancel_ane_tuning_failed'));
                     }
                     await this.pollANETuning();
                 } catch (error) {
@@ -2414,7 +2622,7 @@
                         return;
                     }
                     if (!response.ok) {
-                        throw new Error(data.detail || 'Failed to apply ANE tuning result.');
+                        throw new Error(data.detail || window.t('js.error.apply_ane_tuning_result_failed'));
                     }
                     Object.assign(this.modelSettings, patch);
                     const model = this.models.find(item => item.id === this.selectedModel.id);
@@ -2429,7 +2637,21 @@
                 }
             },
 
-            async openModelSettings(model) {
+            async refreshOpenModelSettings() {
+                if (!this.showModelSettingsModal || !this.selectedModel) return;
+                const modelId = this.selectedModel.id;
+                const baseline = this._modelSettingsBaseline;
+                if (JSON.stringify(this.modelSettings) !== baseline) return;
+                if (this.showNewProfileForm || this.showNewTemplateForm || this.editingProfile || this.editingTemplate) return;
+                await this.loadModels();
+                if (!this.showModelSettingsModal || this.selectedModel?.id !== modelId
+                    || JSON.stringify(this.modelSettings) !== baseline) return;
+                const model = this.models.find(m => m.id === modelId);
+                if (model) await this.openModelSettings(model, true);
+            },
+            async openModelSettings(model, preservingEdits = false) {
+                const baseline = JSON.stringify(this.modelSettings);
+                const seq = ++this._applySeq;
                 this.profileError = '';
                 this.showNewProfileForm = false;
                 this.showNewTemplateForm = false;
@@ -2464,6 +2686,10 @@
                         } catch (_) { /* network error */ }
                     }
                 }
+                if (seq !== this._applySeq) return;
+                if (preservingEdits && (!this.showModelSettingsModal
+                    || this.selectedModel?.id !== model.id
+                    || JSON.stringify(this.modelSettings) !== baseline)) return;
                 this.selectedModel = model;
                 this.modelSettings = this.buildModelSettingsState(
                     model,
@@ -2474,6 +2700,7 @@
                 } else {
                     this.computeDrift();
                 }
+                this._modelSettingsBaseline = JSON.stringify(this.modelSettings);
                 this.showModelSettingsModal = true;
             },
 
@@ -2512,12 +2739,11 @@
                 // disables one of them. Caught here so the modal explains it
                 // instead of surfacing the server's 400.
                 if (this.modelSettings.qwen35_ane_prefill_enabled) {
-                    return 'ANE prefill and INT8 activation prefill cannot both be '
-                        + 'enabled; they accelerate the same projections. Turn one off.';
+                    return window.t('js.error.ane_oq_a8_conflict');
                 }
                 const minTokens = Number(this.modelSettings.qwen35_oq_a8_min_tokens);
                 if (!Number.isInteger(minTokens) || minTokens < 1) {
-                    return 'oQ A8 minimum prompt tokens must be a positive integer.';
+                    return window.t('js.error.oq_a8_min_tokens_positive');
                 }
                 return null;
             },
@@ -2528,72 +2754,72 @@
 
                 const integer = (value, label, minimum) => {
                     if (value === '' || value === null || value === undefined) {
-                        return `${label} is required.`;
+                        return window.t('js.error.field_required').replace('{field}', label);
                     }
                     const number = Number(value);
-                    if (!Number.isInteger(number)) return `${label} must be an integer.`;
-                    if (number < minimum) return `${label} must be at least ${minimum}.`;
+                    if (!Number.isInteger(number)) return window.t('js.error.field_integer').replace('{field}', label);
+                    if (number < minimum) return window.t('js.error.field_min').replace('{field}', label).replace('{min}', minimum);
                     return null;
                 };
                 const fraction = (value, label, minimum, maximum) => {
                     if (value === '' || value === null || value === undefined) {
-                        return `${label} is required.`;
+                        return window.t('js.error.field_required').replace('{field}', label);
                     }
                     const number = Number(value);
-                    if (!Number.isFinite(number)) return `${label} must be a number.`;
+                    if (!Number.isFinite(number)) return window.t('js.error.field_number').replace('{field}', label);
                     if (number < minimum || number > maximum) {
-                        return `${label} must be between ${minimum} and ${maximum}.`;
+                        return window.t('js.error.field_range').replace('{field}', label).replace('{min}', minimum).replace('{max}', maximum);
                     }
                     return null;
                 };
 
                 const sequenceLength = Number(this.modelSettings.qwen35_ane_prefill_sequence_length);
-                let error = integer(sequenceLength, 'ANE prompt block', 1024);
+                let error = integer(sequenceLength, window.t('js.error.field.ane_prompt_block'), 1024);
                 if (!error && sequenceLength % 64 !== 0) {
-                    error = 'ANE prompt block must be a multiple of 64.';
+                    error = window.t('js.error.ane_prompt_block_multiple');
                 }
                 if (error) return error;
                 error = integer(
                     this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens,
-                    'ANE tail padding threshold',
+                    window.t('js.error.field.ane_tail_padding'),
                     0,
                 );
                 if (error) return error;
                 if (Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens) >= sequenceLength) {
-                    return 'ANE tail padding threshold must be less than the prompt block.';
+                    return window.t('js.error.ane_tail_padding_lt_prompt_block');
                 }
-                error = fraction(this.modelSettings.qwen35_ane_prefill_fraction, 'MLP ANE fraction', 0.05, 0.90);
+                error = fraction(this.modelSettings.qwen35_ane_prefill_fraction, window.t('js.error.field.mlp_ane_fraction'), 0.05, 0.90);
                 if (error) return error;
-                error = integer(this.modelSettings.qwen35_ane_prefill_max_layers, 'ANE MLP layer limit', 1);
+                error = integer(this.modelSettings.qwen35_ane_prefill_max_layers, window.t('js.error.field.ane_mlp_layers'), 1);
                 if (error) return error;
 
                 if (this.modelSettings.qwen35_ane_prefill_cpu_enabled) {
-                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_fraction, 'CPU MLP fraction', 0, 0.25);
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_fraction, window.t('js.error.field.cpu_mlp_fraction'), 0, 0.25);
                     if (error) return error;
-                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction, 'CPU MLP down fraction', 0, 0.50);
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction, window.t('js.error.field.cpu_mlp_down_fraction'), 0, 0.50);
                     if (error) return error;
-                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction, 'CPU GDN fraction', 0, 0.50);
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction, window.t('js.error.field.cpu_gdn_fraction'), 0, 0.50);
                     if (error) return error;
-                    error = integer(this.modelSettings.qwen35_ane_prefill_cpu_threads, 'CPU worker count', 0);
+                    error = integer(this.modelSettings.qwen35_ane_prefill_cpu_threads, window.t('js.error.field.cpu_workers'), 0);
                     if (error) return error;
                     if (Number(this.modelSettings.qwen35_ane_prefill_cpu_threads) > 64) {
-                        return 'CPU worker count must be between 0 and 64.';
+                        return window.t('js.error.cpu_workers_range');
                     }
                     if (Number(this.modelSettings.qwen35_ane_prefill_fraction)
                         + Number(this.modelSettings.qwen35_ane_prefill_cpu_fraction) >= 1) {
-                        return 'MLP ANE and CPU fractions must total less than 1.0.';
+                        return window.t('js.error.mlp_ane_cpu_total');
                     }
                 }
 
                 if (this.modelSettings.qwen35_ane_prefill_gdn) {
-                    error = fraction(this.modelSettings.qwen35_ane_prefill_gdn_fraction, 'GDN ANE fraction', 0.05, 0.90);
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_gdn_fraction, window.t('js.error.field.gdn_ane_fraction'), 0.05, 0.90);
                     if (error) return error;
                     if (this.modelSettings.qwen35_ane_prefill_cpu_enabled
                         && Number(this.modelSettings.qwen35_ane_prefill_gdn_fraction)
                         + Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction) >= 1) {
-                        return 'GDN ANE and CPU fractions must total less than 1.0.';
+                        return window.t('js.error.gdn_ane_cpu_total');
                     }
-                    error = integer(this.modelSettings.qwen35_ane_prefill_gdn_max_layers, 'ANE GDN layer limit', 0);
+                    error = integer(this.modelSettings.qwen35_ane_prefill_gdn_max_layers, window.t('js.error.field.ane_gdn_layers'), 0);
                     if (error) return error;
                 }
                 return null;
@@ -2784,6 +3010,10 @@
                                     ? (this.modelSettings.dflash_verify_mode || 'adaptive')
                                     : null,
                                 mtp_enabled: !!this.modelSettings.mtp_enabled,
+                                mtp_adaptive_max_depth: this.modelSettings.mtp_enabled
+                                    ? parseInt(this.modelSettings.mtp_adaptive_max_depth || '3')
+                                    : null,
+                                mtp_fixed_depth: null,
                                 qwen35_ane_prefill_shared_fraction: Number(this.modelSettings.qwen35_ane_prefill_shared_fraction),
                                 vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
                                 vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
@@ -2849,6 +3079,8 @@
                                     dflash_block_size: null,
                                     dflash_verify_mode: null,
                                     mtp_enabled: false,
+                                    mtp_adaptive_max_depth: null,
+                                    mtp_fixed_depth: null,
                                     vlm_mtp_enabled: false,
                                     vlm_mtp_draft_model: null,
                                     vlm_mtp_draft_block_size: null,
@@ -2868,6 +3100,8 @@
                                 alert(window.t('js.info.model_settings_auto_reloaded'));
                             } else if (data.auto_unloaded) {
                                 alert(window.t('js.info.model_settings_auto_unloaded'));
+                            } else if (data.reload_deferred) {
+                                alert(window.t('js.info.model_settings_reload_deferred'));
                             } else {
                                 alert(window.t('js.info.model_type_reload_required'));
                             }
@@ -2883,6 +3117,164 @@
                     alert(window.t('js.error.save_model_settings_failed'));
                 } finally {
                     this.savingModelSettings = false;
+                }
+            },
+
+            // Snapshot actions in the settings modal header. All three go
+            // through server endpoints that decode, validate and persist, so
+            // the form is rebuilt from the returned settings.
+            openSettingsApply(mode) {
+                this.settingsApply = {
+                    open: true,
+                    mode,
+                    phase: mode === 'recipe' ? 'input' : (mode === 'reset' ? 'confirm' : 'loading'),
+                    recipeText: '',
+                    result: null,
+                    candidates: null,
+                    error: '',
+                };
+                if (mode === 'optimal') this.loadOptimalCandidates();
+            },
+
+            closeSettingsApply() {
+                if (this.settingsApply.phase === 'loading') return;
+                this.settingsApply.open = false;
+            },
+
+            async _settingsActionRequest(method, path, body) {
+                if (!this.selectedModel) return null;
+                const url = `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/settings/${path}`;
+                const init = { method };
+                if (body !== undefined) {
+                    init.headers = { 'Content-Type': 'application/json' };
+                    init.body = JSON.stringify(body);
+                }
+                this.settingsApply.phase = 'loading';
+                this.settingsApply.error = '';
+                try {
+                    const response = await fetch(url, init);
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return null;
+                    }
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        this.settingsApply.error = data.detail || window.t('js.error.settings_apply_failed');
+                        this.settingsApply.phase = 'error';
+                        return null;
+                    }
+                    return data;
+                } catch (err) {
+                    console.error('Settings snapshot request failed:', err);
+                    this.settingsApply.error = window.t('js.error.settings_apply_failed');
+                    this.settingsApply.phase = 'error';
+                    return null;
+                }
+            },
+
+            async loadOptimalCandidates() {
+                const data = await this._settingsActionRequest('GET', 'optimal');
+                if (!data) return;
+                this.settingsApply.result = data;
+                if (!data.found) {
+                    this.settingsApply.phase = 'none';
+                    return;
+                }
+                this.settingsApply.candidates = data;
+                this.settingsApply.phase = 'choose';
+            },
+
+            async applyOptimalCandidate(benchmarkId) {
+                const data = await this._settingsActionRequest('POST', 'optimal', { benchmark_id: benchmarkId });
+                if (!data) return;
+                this.settingsApply.result = data;
+                await this._applySettingsResponse(data);
+                this.settingsApply.phase = 'done';
+            },
+
+            async runSettingsApply() {
+                const mode = this.settingsApply.mode;
+                const data = mode === 'recipe'
+                    ? await this._settingsActionRequest('POST', 'recipe', { recipe: this.settingsApply.recipeText.trim() })
+                    : await this._settingsActionRequest('POST', 'reset');
+                if (!data) return;
+                this.settingsApply.result = data;
+                await this._applySettingsResponse(data);
+                this.settingsApply.phase = 'done';
+            },
+
+            settingsApplyTitle() {
+                const mode = this.settingsApply.mode;
+                if (mode === 'reset') return window.t('modal.model_settings.actions.reset');
+                if (mode === 'recipe') return window.t('modal.model_settings.actions.apply_title_recipe');
+                return window.t('modal.model_settings.actions.apply_title_optimal');
+            },
+
+            settingsApplyLoadingText() {
+                const mode = this.settingsApply.mode;
+                if (mode === 'reset') return window.t('modal.model_settings.actions.loading_reset');
+                if (mode === 'recipe') return window.t('modal.model_settings.actions.loading_recipe');
+                return this.settingsApply.candidates
+                    ? window.t('modal.model_settings.actions.loading_apply')
+                    : window.t('modal.model_settings.actions.loading_optimal');
+            },
+
+            settingsApplyDoneText() {
+                const mode = this.settingsApply.mode;
+                const result = this.settingsApply.result;
+                if (mode === 'reset') return window.t('modal.model_settings.actions.done_reset');
+                if (result && result.changed === false) return window.t('modal.model_settings.actions.no_change');
+                return mode === 'recipe'
+                    ? window.t('modal.model_settings.actions.done_recipe')
+                    : window.t('modal.model_settings.actions.done_optimal');
+            },
+
+            settingsApplyGroups() {
+                const c = this.settingsApply.candidates;
+                if (!c) return [];
+                return [
+                    { key: 'pp', label: window.t('modal.model_settings.actions.group_pp'), items: c.by_pp || [] },
+                    { key: 'tg', label: window.t('modal.model_settings.actions.group_tg'), items: c.by_tg || [] },
+                ].filter(g => g.items.length);
+            },
+
+            settingsApplyJson() {
+                const result = this.settingsApply.result;
+                return result && result.applied ? JSON.stringify(result.applied, null, 2) : '';
+            },
+
+            settingsApplyStats(item) {
+                if (!item || item.pp_tps == null) return '';
+                const parts = [`PP ${Number(item.pp_tps).toFixed(1)} tok/s`];
+                if (item.tg_tps != null) parts.push(`TG ${Number(item.tg_tps).toFixed(1)} tok/s`);
+                if (item.memory_gb != null) parts.push(`${item.memory_gb} GB`);
+                if (item.quantization) parts.push(item.quantization);
+                if (item.omlx_version) parts.push(`oMLX ${item.omlx_version}`);
+                if (item.created_at) parts.push(String(item.created_at).slice(0, 10));
+                return parts.join(' · ');
+            },
+
+            async _applySettingsResponse(data) {
+                if (data.settings && this.selectedModel) {
+                    this.modelSettings = this.buildModelSettingsState(this.selectedModel, data.settings);
+                    this.activeProfileName = data.settings.active_profile_name || null;
+                    if (!this.modelSettings.is_diffusion_model) this.computeDrift();
+                }
+                await this.loadModels();
+                if (this.selectedModel) {
+                    const fresh = (this.models || []).find(m => m.id === this.selectedModel.id);
+                    if (fresh) this.selectedModel = fresh;
+                }
+                if (data.requires_reload) {
+                    if (data.auto_reloaded) {
+                        alert(window.t('js.info.model_settings_auto_reloaded'));
+                    } else if (data.auto_unloaded) {
+                        alert(window.t('js.info.model_settings_auto_unloaded'));
+                    } else if (data.reload_deferred) {
+                        alert(window.t('js.info.model_settings_reload_deferred'));
+                    } else {
+                        alert(window.t('js.info.model_type_reload_required'));
+                    }
                 }
             },
 
@@ -2953,6 +3345,7 @@
                         this.modelSettings.dflash_block_size = null;
                         this.modelSettings.dflash_verify_mode = 'adaptive';
                         this.modelSettings.mtp_enabled = false;
+                        this.modelSettings.mtp_adaptive_max_depth = '3';
                         this.modelSettings.trust_remote_code = false;
                     } else if (response.status === 404) {
                         alert(window.t('js.error.no_config_defaults'));
@@ -3193,6 +3586,219 @@
                 }
             },
 
+            // ---- Dashboard block layout ----
+            _dashLayoutLib() {
+                return typeof DashboardLayout !== 'undefined' ? DashboardLayout : null;
+            },
+            get dashboardWidthClass() {
+                const lib = this._dashLayoutLib();
+                const width = this.dashEditing && this.dashDraft ? this.dashDraft.width : this.dashLayout?.width;
+                return lib ? lib.widthClass(width) : 'max-w-7xl';
+            },
+            get dashWidthOptions() {
+                const lib = this._dashLayoutLib();
+                if (!lib) return [];
+                return lib.WIDTH_IDS.map(id => ({ id, label: window.t(`status.layout.width_${id}`) }));
+            },
+            get dashTrayEmpty() {
+                const lib = this._dashLayoutLib();
+                return !!lib && this.dashPlacedIds.length >= lib.BLOCK_IDS.length;
+            },
+            dashPlaced(id) {
+                return this.dashPlacedIds.includes(id);
+            },
+            _dashBlockEl(id) {
+                return this.$refs.dashGrid?.querySelector(`.dash-block[data-block="${id}"]`) || null;
+            },
+            // Creates the grid the first time the status tab is visible; GridStack
+            // needs a measurable width. Later calls only refit block heights.
+            ensureDashboardGrid() {
+                const lib = this._dashLayoutLib();
+                if (!lib || typeof GridStack === 'undefined' || this.mainTab !== 'status') return;
+                if (dashGrid) {
+                    this.refitDashboardBlocks();
+                    return;
+                }
+                const el = this.$refs.dashGrid;
+                if (!el || !el.offsetWidth) return;
+                dashGrid = GridStack.init({
+                    column: lib.COLUMNS,
+                    cellHeight: 8,
+                    margin: 12,
+                    sizeToContent: true,
+                    float: false,
+                    animate: true,
+                    minRow: 1,
+                    disableDrag: true,
+                    disableResize: true,
+                    acceptWidgets: '.dash-tray-pill',
+                    draggable: { handle: '.dash-block-handle', appendTo: 'body' },
+                    resizable: { handles: 'e, w, se' },
+                    columnOpts: {
+                        columnMax: lib.COLUMNS,
+                        breakpointForWindow: true,
+                        breakpoints: [{ w: 752, c: 1, layout: 'list' }],
+                    },
+                }, el);
+                dashGrid.on('dropped', (event, previous, node) => this._onDashTrayDrop(node));
+                dashGrid.on('dragstop resizestop', () => this.refitDashboardBlocks());
+                GridStack.setupDragIn('.dash-tray-pill', { appendTo: 'body', helper: 'clone' });
+                if (typeof ResizeObserver !== 'undefined') {
+                    dashObserver = new ResizeObserver(() => this.refitDashboardBlocks());
+                    el.querySelectorAll('.dash-block-body').forEach(body => dashObserver.observe(body));
+                }
+                const narrow = window.matchMedia('(max-width: 751.98px)');
+                const syncNarrow = () => {
+                    this.dashEditAvailable = !narrow.matches;
+                    if (narrow.matches && this.dashEditing) this.cancelDashboardEdit();
+                };
+                narrow.addEventListener('change', syncNarrow);
+                syncNarrow();
+                this.applyDashboardLayout(this.dashLayout || lib.defaultLayout());
+            },
+            // Block heights follow their content (stats polling, x-show toggles).
+            // GridStack measures the item's current box, which is still mid-transition
+            // right after a move or resize, so run a second pass once it settles.
+            refitDashboardBlocks() {
+                if (!dashGrid || this.mainTab !== 'status') return;
+                const run = () => {
+                    if (!dashGrid || !this.$refs.dashGrid?.offsetWidth) return;
+                    dashGrid.getGridItems().forEach(item => dashGrid.resizeToContent(item));
+                };
+                if (!dashRefitFrame) {
+                    dashRefitFrame = requestAnimationFrame(() => {
+                        dashRefitFrame = null;
+                        run();
+                    });
+                }
+                clearTimeout(dashRefitTimer);
+                dashRefitTimer = setTimeout(run, 400);
+            },
+            _dashPark(el) {
+                dashGrid.removeWidget(el, false, false);
+                el.classList.add('dash-block-parked');
+            },
+            _dashPlace(id, pos) {
+                const lib = this._dashLayoutLib();
+                const el = this._dashBlockEl(id);
+                if (!el || el.gridstackNode) return null;
+                el.classList.remove('dash-block-parked');
+                dashGrid.makeWidget(el, { id, x: pos.x, y: pos.y, w: pos.w, h: 1, minW: lib.MIN_W });
+                dashGrid.resizeToContent(el);
+                if (!this.dashPlacedIds.includes(id)) this.dashPlacedIds = [...this.dashPlacedIds, id];
+                return el;
+            },
+            applyDashboardLayout(layout) {
+                const lib = this._dashLayoutLib();
+                if (!dashGrid || !lib) return;
+                layout = lib.normalizeLayout(layout);
+                // No transition while rebuilding: the first content measurement of a
+                // freshly placed item must see its final box, not an animating one.
+                dashGrid.setAnimation(false);
+                dashGrid.getGridItems().forEach(item => this._dashPark(item));
+                this.dashPlacedIds = [];
+                // Heights come from content, so saved y values only encode order. Pack
+                // each block under the tallest block already occupying its columns;
+                // a later block inserted at an occupied row would push earlier ones down.
+                const bottoms = new Array(lib.COLUMNS).fill(0);
+                [...layout.blocks]
+                    .sort((a, b) => a.y - b.y || a.x - b.x)
+                    .forEach(block => {
+                        const y = Math.max(...bottoms.slice(block.x, block.x + block.w));
+                        const el = this._dashPlace(block.id, { x: block.x, y, w: block.w });
+                        const h = el?.gridstackNode?.h || 1;
+                        for (let c = block.x; c < block.x + block.w; c++) bottoms[c] = y + h;
+                    });
+                dashGrid.setAnimation(true);
+                this.refitDashboardBlocks();
+            },
+            collectDashboardLayout() {
+                const lib = this._dashLayoutLib();
+                const blocks = dashGrid.save(false).map(n => ({ id: n.id, x: n.x, y: n.y, w: n.w }));
+                return lib.normalizeLayout({ version: 1, width: this.dashDraft?.width, blocks });
+            },
+            _onDashTrayDrop(node) {
+                const lib = this._dashLayoutLib();
+                if (!dashGrid || !lib || !node?.el) return;
+                const id = node.el.dataset.block;
+                const pos = { x: node.x, y: node.y, w: node.w };
+                // The dropped element is GridStack's clone of the tray pill.
+                dashGrid.removeWidget(node.el, true, false);
+                if (!lib.BLOCK_IDS.includes(id) || !this.dashEditing) return;
+                this._dashPlace(id, pos);
+                this.refitDashboardBlocks();
+            },
+            dashRemoveBlock(id) {
+                const el = this._dashBlockEl(id);
+                if (!dashGrid || !this.dashEditing || !el?.gridstackNode) return;
+                this._dashPark(el);
+                this.dashPlacedIds = this.dashPlacedIds.filter(placed => placed !== id);
+                dashGrid.compact();
+            },
+            _dashAfterLayoutChange() {
+                this.$nextTick(() => {
+                    dashGrid?.onResize();
+                    this.refitDashboardBlocks();
+                });
+            },
+            startDashboardEdit() {
+                if (!dashGrid || !this.dashLayout || !this.dashEditAvailable || this.dashEditing) return;
+                this.dashDraft = { width: this.dashLayout.width };
+                this.dashSaveError = '';
+                this.dashEditing = true;
+                dashGrid.enable();
+                this._dashAfterLayoutChange();
+            },
+            cancelDashboardEdit() {
+                if (!this.dashEditing) return;
+                this.dashEditing = false;
+                this.dashDraft = null;
+                this.dashSaveError = '';
+                if (dashGrid) {
+                    dashGrid.disable();
+                    this.applyDashboardLayout(this.dashLayout);
+                }
+                this._dashAfterLayoutChange();
+            },
+            resetDashboardLayout() {
+                const lib = this._dashLayoutLib();
+                if (!this.dashEditing || !lib) return;
+                this.dashDraft.width = 'default';
+                this.applyDashboardLayout(lib.defaultLayout());
+                this._dashAfterLayoutChange();
+            },
+            setDashboardWidth(width) {
+                const lib = this._dashLayoutLib();
+                if (!this.dashEditing || !lib || !lib.WIDTH_IDS.includes(width)) return;
+                this.dashDraft.width = width;
+                this._dashAfterLayoutChange();
+            },
+            async saveDashboardLayout() {
+                if (!dashGrid || !this.dashEditing || this.dashSaving) return;
+                const layout = this.collectDashboardLayout();
+                this.dashSaving = true;
+                this.dashSaveError = '';
+                try {
+                    const response = await fetch('/admin/api/global-settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ ui_dashboard_layout: layout }),
+                    });
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    this.dashLayout = layout;
+                    this.globalSettings.ui.dashboard_layout = layout;
+                    this.dashEditing = false;
+                    this.dashDraft = null;
+                    dashGrid.disable();
+                    this._dashAfterLayoutChange();
+                } catch (err) {
+                    console.error('Failed to save dashboard layout:', err);
+                    this.dashSaveError = window.t('status.layout.save_failed');
+                } finally {
+                    this.dashSaving = false;
+                }
+            },
+
             _launchCmd(tool) {
                 const raw = this.stats.cli_prefix || 'omlx';
                 const cli = raw === 'omlx' ? raw : this.shellQuote(raw);
@@ -3232,6 +3838,15 @@
                 return this._launchCmd('pi');
             },
 
+            get dshCommand() {
+                return this._launchCmd('dsh');
+            },
+
+            get markitdownOcrModelMissing() {
+                const id = this.globalSettings.integrations.markitdown_pdf_processing_engine;
+                return id !== 'markitdown' && !(this.models || []).some(model => model.id === id);
+            },
+
             get markitdownOcrModels() {
                 return (this.models || []).filter((model) => {
                     const configType = String(model.config_model_type || '').toLowerCase();
@@ -3251,6 +3866,7 @@
                             integrations_openclaw_model: this.globalSettings.integrations.openclaw_model,
                             integrations_hermes_model: this.globalSettings.integrations.hermes_model,
                             integrations_pi_model: this.globalSettings.integrations.pi_model,
+                            integrations_dsh_model: this.globalSettings.integrations.dsh_model,
                             integrations_openclaw_tools_profile: this.globalSettings.integrations.openclaw_tools_profile,
                             markitdown_enabled: this.globalSettings.integrations.markitdown_enabled,
                             markitdown_expose_model: this.globalSettings.integrations.markitdown_expose_model,
@@ -3540,7 +4156,7 @@
 
             formatActivityAge(seconds) {
                 if (seconds == null || !Number.isFinite(seconds)) return '';
-                return 'last token ' + this.formatDurationShort(seconds) + ' ago';
+                return window.t('status.active_models.last_token_ago').replace('{age}', this.formatDurationShort(seconds));
             },
 
             formatActivityMetadata(activity) {
@@ -3608,7 +4224,10 @@
                 if (!mp || !mp.enabled || !mp.hard_bytes) {
                     return window.t('status.active_models.enforcer_disabled');
                 }
-                return `${this.formatSizeBytes(mp.current_bytes)} / ${this.formatSizeBytes(mp.soft_bytes)} soft / ${this.formatSizeBytes(mp.hard_bytes)} hard`;
+                return window.t('status.active_models.pressure_label')
+                    .replace('{current}', this.formatSizeBytes(mp.current_bytes))
+                    .replace('{soft}', this.formatSizeBytes(mp.soft_bytes))
+                    .replace('{hard}', this.formatSizeBytes(mp.hard_bytes));
             },
 
             modelSizeLabel(model) {
@@ -3625,9 +4244,12 @@
                     return estimated;
                 }
                 if (!estimated || estimated === actual) {
-                    return `~${actual} obs`;
+                    return window.t('status.active_models.size_observed')
+                        .replace('{size}', actual);
                 }
-                return `~${actual} obs / ${estimated} est`;
+                return window.t('status.active_models.size_observed_estimated')
+                    .replace('{size}', actual)
+                    .replace('{estimated}', estimated);
             },
 
             clusterBadgeLabel(cluster) {
@@ -3882,7 +4504,7 @@
                             this.benchUploading = true;
                             this.benchProgress = {
                                 phase: 'upload',
-                                message: 'Uploading to community benchmarks...',
+                                message: window.t('bench.uploading_community'),
                                 current: 0,
                                 total: 0,
                             };
@@ -4148,9 +4770,14 @@
                 const requested = this.benchRequestedPp(result);
                 const actual = result?.pp;
                 if (requested !== actual) {
-                    return `pp${actual} (requested pp${requested})/tg${result.tg}`;
+                    return window.t('bench.results.test.requested')
+                        .replace('{actual}', actual)
+                        .replace('{requested}', requested)
+                        .replace('{tg}', result.tg);
                 }
-                return `pp${actual}/tg${result.tg}`;
+                return window.t('bench.results.test.plain')
+                    .replace('{actual}', actual)
+                    .replace('{tg}', result.tg);
             },
 
             benchBatchPromptSummary() {
@@ -4162,9 +4789,14 @@
                 const minimum = result.prompt_tokens_min ?? result.pp;
                 const maximum = result.prompt_tokens_max ?? result.pp;
                 const actual = minimum === maximum
-                    ? `actual pp${minimum}`
-                    : `actual pp${minimum}-${maximum}`;
-                return `requested pp${requested} / ${actual} / tg${result.tg}`;
+                    ? window.t('bench.results.batch.actual_pp').replace('{pp}', minimum)
+                    : window.t('bench.results.batch.actual_pp_range')
+                        .replace('{min}', minimum)
+                        .replace('{max}', maximum);
+                return window.t('bench.results.batch.requested_summary')
+                    .replace('{requested}', requested)
+                    .replace('{actual}', actual)
+                    .replace('{tg}', result.tg);
             },
 
             // Unmeasured metrics (tpot_ms/gen_tps/tg_tps, plus ttft/pp when
@@ -4195,24 +4827,39 @@
                 const rpad = (s, w) => s.toString().padEnd(w);
                 let lines = [];
 
-                lines.push('oMLX - LLM inference, optimized for your Mac');
+                lines.push(
+                    window.t('bench.results.text_export.title')
+                        .replace('{tagline}', window.t('app.tagline'))
+                );
                 lines.push('https://github.com/jundot/omlx');
                 if (this.benchRunExternal) {
-                    lines.push(`Benchmark Model: ${this.benchRunExternal.model} @ ${this.benchRunExternal.base_url}`);
-                    lines.push('Engine: External OpenAI-compatible endpoint');
+                    lines.push(
+                        window.t('bench.results.text_export.benchmark_model_endpoint')
+                            .replace('{model}', () => this.benchRunExternal.model)
+                            .replace('{url}', () => this.benchRunExternal.base_url)
+                    );
+                    lines.push(window.t('bench.results.text_export.engine_external'));
                 } else {
-                    lines.push(`Benchmark Model: ${this.benchModelId}`);
-                    lines.push(`Engine: ${this.benchForceLmEngine ? 'Force mlx-lm' : 'Auto'}`);
+                    lines.push(
+                        window.t('bench.results.text_export.benchmark_model')
+                            .replace('{model}', () => this.benchModelId)
+                    );
+                    lines.push(this.benchForceLmEngine
+                        ? window.t('bench.results.text_export.engine_force_lm')
+                        : window.t('bench.results.text_export.engine_auto'));
                 }
-                lines.push(`Context: ${this.benchContextLabel(this.benchContextProfile)}`);
+                lines.push(
+                    window.t('bench.results.text_export.context')
+                        .replace('{context}', this.benchContextLabel(this.benchContextProfile))
+                );
                 lines.push('='.repeat(80));
 
                 // Single Request Results
                 if (this.benchSingleResults.length > 0) {
                     lines.push('');
-                    lines.push('Single Request Results');
+                    lines.push(window.t('bench.results.single.section_label'));
                     lines.push('-'.repeat(80));
-                    const hdr = [rpad('Test', 32), pad('TTFT(ms)', 10), pad('TPOT(ms)', 10), pad('pp TPS', 12), pad('tg TPS', 12), pad('E2E(s)', 10), pad('Throughput', 12), pad('Peak Mem', 10)];
+                    const hdr = [rpad(window.t('bench.results.single.test'), 32), pad('TTFT(ms)', 10), pad('TPOT(ms)', 10), pad('pp TPS', 12), pad('tg TPS', 12), pad('E2E(s)', 10), pad(window.t('bench.results.single.throughput'), 12), pad(window.t('bench.results.single.peak_mem'), 10)];
                     lines.push(hdr.join('  '));
                     for (const r of this.benchSingleResults) {
                         const row = [
@@ -4237,7 +4884,7 @@
                     lines.push(`${title}`);
                     lines.push(subtitle);
                     lines.push('-'.repeat(80));
-                    const hdr = [rpad('Batch', 8), pad('tg TPS', 12), pad('Speedup', 8), pad('pp TPS', 12), pad('pp TPS/req', 12), pad('TTFT(ms)', 10), pad('E2E(s)', 10)];
+                    const hdr = [rpad(window.t('bench.results.text_export.batch'), 8), pad('tg TPS', 12), pad(window.t('bench.results.batch.speedup'), 8), pad('pp TPS', 12), pad('pp TPS/req', 12), pad('TTFT(ms)', 10), pad('E2E(s)', 10)];
                     lines.push(hdr.join('  '));
                     if (baseline) {
                         const row = [
@@ -4256,7 +4903,7 @@
                         const row = [
                             rpad(r.batch_size + 'x', 8),
                             pad(this.benchFmtNum(r.tg_tps, 1, ' tok/s'), 12),
-                            pad(speedup !== null ? speedup.toFixed(2) + 'x' : 'N/A', 8),
+                            pad(speedup !== null ? speedup.toFixed(2) + 'x' : window.t('bench.results.text_export.not_available'), 8),
                             pad(this.benchFmtNum(r.pp_tps, 1, ' tok/s'), 12),
                             pad(this.benchFmtNum(this.benchPpPerReq(r), 1, ' tok/s'), 12),
                             pad(this.benchFmtNum(r.avg_ttft_ms, 1), 10),
@@ -4267,7 +4914,7 @@
                 };
 
                 buildBatchText(
-                    'Continuous Batching',
+                    window.t('bench.results.batch.title'),
                     this.benchBatchPromptSummary(),
                     this.benchBatchResults
                 );
@@ -4523,7 +5170,7 @@
                     });
                     if (!resp.ok) {
                         const err = await resp.json();
-                        throw new Error(err.detail || 'Failed to add to queue');
+                        throw new Error(err.detail || window.t('js.error.add_to_queue_failed'));
                     }
                     const data = await resp.json();
                     this.accQueue = data.queue || [];
@@ -4695,6 +5342,16 @@
                 }
             },
 
+            accLocalTruncationLine(r) {
+                return window.t('acc_bench.results.text_export.local_truncation_line')
+                    .replace('{truncated}', r.truncated_count)
+                    .replace('{total}', r.total)
+                    .replace('{truncated_correct}', r.truncated_correct_count)
+                    .replace('{accuracy}', r.finished_accuracy == null
+                        ? '—' : (r.finished_accuracy * 100).toFixed(1) + '%')
+                    .replace('{finished}', r.finished_count);
+            },
+
             accBuildText() {
                 if (this.accAllResults.length === 0) return '';
                 const pad = (s, w) => s.toString().padStart(w);
@@ -4724,11 +5381,11 @@
                 const benchWidth = Math.max(14, ...benchmarks.map(b => b.length + 2));
 
                 let lines = [];
-                lines.push('Intelligence Benchmark Comparison');
+                lines.push(window.t('acc_bench.results.comparison_title'));
                 lines.push('');
 
                 // Header row
-                let header = rpad('', benchWidth) + rpad('Mode', modeW) + rpad('Sampled', sampledW);
+                let header = rpad('', benchWidth) + rpad(window.t('acc_bench.results.text_export.mode'), modeW) + rpad(window.t('acc_bench.results.text_export.sampled'), sampledW);
                 for (const m of models) header += pad(m, modelWidth);
                 lines.push(header);
                 lines.push('-'.repeat(benchWidth + modeW + sampledW + models.length * modelWidth));
@@ -4740,7 +5397,9 @@
                     const total = sample?.total || 0;
                     const full = fullSizes[b] || 0;
                     const isFull = total >= full;
-                    const mode = isFull ? 'Full' : 'Sample';
+                    const mode = isFull
+                        ? window.t('acc_bench.results.text_export.full')
+                        : window.t('acc_bench.results.text_export.sample');
                     const sampledStr = isFull ? String(full) : (total + '/' + full);
 
                     let row = rpad(b.toUpperCase(), benchWidth) + rpad(mode, modeW) + rpad(sampledStr, sampledW);
@@ -4753,11 +5412,14 @@
 
                 // Detail section per model
                 lines.push('');
-                lines.push('--- Detail ---');
+                lines.push(window.t('acc_bench.results.text_export.detail'));
                 for (const m of models) {
                     lines.push('');
-                    lines.push('Model: ' + m);
-                    lines.push(rpad('Benchmark', 16) + pad('Accuracy', 10) + pad('Correct', 10) + pad('Total', 8) + pad('Time(s)', 10) + pad('Think', 8));
+                    lines.push(
+                        window.t('acc_bench.results.text_export.model')
+                            .replace('{model}', () => m)
+                    );
+                    lines.push(rpad(window.t('acc_bench.results.text_export.benchmark'), 16) + pad(window.t('acc_bench.results.text_export.accuracy'), 10) + pad(window.t('acc_bench.results.text_export.correct'), 10) + pad(window.t('acc_bench.results.text_export.total'), 8) + pad('Time(s)', 10) + pad(window.t('acc_bench.results.text_export.think'), 8));
                     lines.push('-'.repeat(62));
                     for (const r of this.accAllResults.filter(r => r.model_id === m)) {
                         lines.push(
@@ -4766,21 +5428,27 @@
                             pad(r.correct, 10) +
                             pad(r.total, 8) +
                             pad(r.time_s, 10) +
-                            pad(r.thinking_used ? 'Yes' : 'No', 8)
+                            pad(r.thinking_used
+                                ? window.t('acc_bench.results.text_export.yes')
+                                : window.t('acc_bench.results.text_export.no'), 8)
                         );
                         if (r.external) {
                             lines.push(
-                                `  Valid responses: ${r.valid_response_count}/${r.total}` +
-                                ` (${(r.valid_response_rate * 100).toFixed(1)}%)` +
-                                ` · Valid-answer accuracy: ${(r.valid_answer_accuracy * 100).toFixed(1)}%` +
-                                ` · Empty: ${r.empty_content_count}` +
-                                ` · Truncated: ${r.truncated_count}` +
-                                ` · Timeout: ${r.timeout_count}` +
-                                ` · HTTP: ${r.http_error_count}` +
-                                ` · Connection: ${r.connection_error_count}` +
-                                ` · Invalid: ${r.invalid_response_count}` +
-                                ` · Parse: ${r.parse_error_count}`
+                                window.t('acc_bench.results.text_export.external_detail')
+                                    .replace('{valid}', r.valid_response_count)
+                                    .replace('{total}', r.total)
+                                    .replace('{rate}', (r.valid_response_rate * 100).toFixed(1))
+                                    .replace('{accuracy}', (r.valid_answer_accuracy * 100).toFixed(1))
+                                    .replace('{empty}', r.empty_content_count)
+                                    .replace('{truncated}', r.truncated_count)
+                                    .replace('{timeout}', r.timeout_count)
+                                    .replace('{http}', r.http_error_count)
+                                    .replace('{connection}', r.connection_error_count)
+                                    .replace('{invalid}', r.invalid_response_count)
+                                    .replace('{parse}', r.parse_error_count)
                             );
+                        } else if (r.truncated_count > 0) {
+                            lines.push('  ' + this.accLocalTruncationLine(r));
                         }
                     }
                 }
@@ -4837,6 +5505,13 @@
                             valid_answer_accuracy: r.valid_answer_accuracy,
                             reliability_warning: r.reliability_warning,
                         });
+                    } else if (r.truncated_count !== undefined) {
+                        Object.assign(exportData, {
+                            truncated_count: r.truncated_count,
+                            truncated_correct_count: r.truncated_correct_count,
+                            finished_count: r.finished_count,
+                            finished_accuracy: r.finished_accuracy,
+                        });
                     }
                     content = JSON.stringify(exportData, null, 2);
                     mime = 'application/json';
@@ -4844,7 +5519,7 @@
                     const esc = s => '"' + (s || '').replace(/"/g, '""') + '"';
                     const lines = [r.external
                         ? 'id,category,status,correct,expected,predicted,finish_reason,reasoning_fields,prompt_tokens,completion_tokens,error_message,question,raw_response,time_s'
-                        : 'id,category,correct,expected,predicted,question,raw_response,time_s'];
+                        : 'id,category,correct,expected,predicted,question,raw_response,time_s,finish_reason,completion_tokens'];
                     for (const q of qr) {
                         if (r.external) {
                             lines.push([
@@ -4856,38 +5531,97 @@
                                 esc(q.raw_response), q.time_s,
                             ].join(','));
                         } else {
-                            lines.push([q.id, esc(q.category || ''), q.correct, esc(q.expected), esc(q.predicted), esc(q.question), esc(q.raw_response), q.time_s].join(','));
+                            lines.push([q.id, esc(q.category || ''), q.correct, esc(q.expected), esc(q.predicted), esc(q.question), esc(q.raw_response), q.time_s, esc(q.finish_reason || ''), q.completion_tokens ?? ''].join(','));
                         }
                     }
                     content = lines.join('\n');
                     mime = 'text/csv';
                 } else {
                     const lines = [
-                        `Model: ${r.model_id}`,
-                        `Benchmark: ${r.benchmark.toUpperCase()}`,
-                        `Accuracy: ${(r.accuracy * 100).toFixed(1)}% (${r.correct}/${r.total})`,
-                        `Time: ${r.time_s}s`,
+                        window.t('acc_bench.results.text_export.model')
+                            .replace('{model}', () => r.model_id),
+                        window.t('acc_bench.results.text_export.benchmark_line')
+                            .replace('{benchmark}', () => r.benchmark.toUpperCase()),
+                        window.t('acc_bench.results.text_export.accuracy_line')
+                            .replace('{accuracy}', (r.accuracy * 100).toFixed(1))
+                            .replace('{correct}', r.correct)
+                            .replace('{total}', r.total),
+                        window.t('acc_bench.results.text_export.time_line')
+                            .replace('{seconds}', r.time_s),
                         '',
                     ];
                     if (r.external) {
                         lines.splice(4, 0,
-                            `Valid responses: ${r.valid_response_count}/${r.total} (${(r.valid_response_rate * 100).toFixed(1)}%)`,
-                            `Valid-answer accuracy: ${(r.valid_answer_accuracy * 100).toFixed(1)}%`,
-                            `Empty: ${r.empty_content_count}; Truncated: ${r.truncated_count}; Timeout: ${r.timeout_count}; HTTP errors: ${r.http_error_count}; Connection errors: ${r.connection_error_count}; Invalid responses: ${r.invalid_response_count}; Parse errors: ${r.parse_error_count}`
+                            window.t('acc_bench.results.text_export.valid_responses_line')
+                                .replace('{valid}', r.valid_response_count)
+                                .replace('{total}', r.total)
+                                .replace('{rate}', (r.valid_response_rate * 100).toFixed(1)),
+                            window.t('acc_bench.results.text_export.valid_answer_accuracy_line')
+                                .replace('{accuracy}', (r.valid_answer_accuracy * 100).toFixed(1)),
+                            window.t('acc_bench.results.text_export.external_summary')
+                                .replace('{empty}', r.empty_content_count)
+                                .replace('{truncated}', r.truncated_count)
+                                .replace('{timeout}', r.timeout_count)
+                                .replace('{http}', r.http_error_count)
+                                .replace('{connection}', r.connection_error_count)
+                                .replace('{invalid}', r.invalid_response_count)
+                                .replace('{parse}', r.parse_error_count)
                         );
+                    } else if (r.truncated_count > 0) {
+                        lines.splice(4, 0, this.accLocalTruncationLine(r));
                     }
                     for (const q of qr) {
                         const label = r.external ? (q.status || 'invalid_response').toUpperCase() : (q.correct ? 'CORRECT' : 'WRONG');
-                        lines.push(`--- Q${q.id} [${label}] ---`);
-                        if (q.category) lines.push(`Category: ${q.category}`);
-                        if (r.external && q.finish_reason) lines.push(`Finish reason: ${q.finish_reason}`);
-                        if (r.external && (q.reasoning_fields_nonempty || []).length) lines.push(`Reasoning fields: ${q.reasoning_fields_nonempty.join(', ')}`);
-                        if (r.external && q.error_message) lines.push(`Error: ${q.error_message}`);
-                        lines.push(`Question: ${q.question || ''}`);
-                        lines.push(`Expected: ${q.expected}`);
-                        lines.push(`Predicted: ${q.predicted}`);
-                        lines.push(`Raw response: ${q.raw_response || '(empty)'}`);
-                        lines.push(`Time: ${q.time_s}s`);
+                        lines.push(
+                            window.t('acc_bench.results.text_export.question_header')
+                                .replace('{id}', q.id)
+                                .replace('{label}', () => label)
+                        );
+                        if (q.category) {
+                            lines.push(
+                                window.t('acc_bench.results.text_export.category_line')
+                                    .replace('{category}', () => q.category)
+                            );
+                        }
+                        if (q.finish_reason && (r.external || q.finish_reason !== 'stop')) {
+                            lines.push(
+                                window.t('acc_bench.results.text_export.finish_reason_line')
+                                    .replace('{reason}', () => q.finish_reason)
+                            );
+                        }
+                        if (r.external && (q.reasoning_fields_nonempty || []).length) {
+                            lines.push(
+                                window.t('acc_bench.results.text_export.reasoning_fields_line')
+                                    .replace('{fields}', () => q.reasoning_fields_nonempty.join(', '))
+                            );
+                        }
+                        if (r.external && q.error_message) {
+                            lines.push(
+                                window.t('acc_bench.results.text_export.error_line')
+                                    .replace('{error}', () => q.error_message)
+                            );
+                        }
+                        lines.push(
+                            window.t('acc_bench.results.text_export.question_line')
+                                .replace('{question}', () => q.question || '')
+                        );
+                        lines.push(
+                            window.t('acc_bench.results.text_export.expected_line')
+                                .replace('{expected}', () => q.expected)
+                        );
+                        lines.push(
+                            window.t('acc_bench.results.text_export.predicted_line')
+                                .replace('{predicted}', () => q.predicted)
+                        );
+                        lines.push(
+                            window.t('acc_bench.results.text_export.raw_response_line')
+                                .replace('{response}', () => q.raw_response
+                                    || window.t('acc_bench.results.text_export.empty_value'))
+                        );
+                        lines.push(
+                            window.t('acc_bench.results.text_export.time_line')
+                                .replace('{seconds}', q.time_s)
+                        );
                         lines.push('');
                     }
                     content = lines.join('\n');
@@ -5102,12 +5836,10 @@
             },
 
             // Description text shown next to the Memory guard tier dropdown.
-            // safe / balanced / aggressive get a "free + inactive + N% of
-            // active (via macOS reclaim_method)" sentence. custom shows the
-            // user-supplied ceiling.
+            // Each tier says how much memory it leaves for other apps; the
+            // server computes it (ProcessMemoryEnforcer) for this Mac.
             get memoryGuardTierDescription() {
                 const tier = this.globalSettings.memory?.memory_guard_tier || 'balanced';
-                const tierLabel = window.t('settings.resource.guard_tier.' + tier);
                 if (tier === 'custom') {
                     const gb = Number(
                         this.globalSettings.memory?.memory_guard_custom_ceiling_gb || 0
@@ -5116,90 +5848,54 @@
                         .t('settings.resource.guard_tier.description_custom')
                         .replace('{custom_gb}', gb);
                 }
-                const pct = { safe: 20, balanced: 50, aggressive: 80 }[tier] ?? 50;
-                const method = window.t(
-                    'settings.resource.guard_tier.reclaim_method.' + tier
-                );
+                const preview = this.globalSettings.system?.memory_guard_preview?.[tier];
+                const reserveGB = Number((preview?.reserve_bytes || 0) / 1024 ** 3).toFixed(1);
                 return window
-                    .t('settings.resource.guard_tier.description_template')
-                    .replace('{tier}', tierLabel)
-                    .replace('{active_pct}', pct)
-                    .replace('{reclaim_method}', method);
+                    .t('settings.resource.guard_tier.description.' + tier)
+                    .replace('{reserve}', `${reserveGB} GB`);
             },
 
-            // Breakdown line. For ratio tiers: `Free X, inactive Y, active Z
-            // × N% = R → ceiling C`. For custom: `Custom ceiling X GB →
-            // effective ceiling C` (after clamp by static / metal cap).
+            // Breakdown line from the server preview. For reserve tiers:
+            // `Free X + inactive Y (+ Z of other apps' memory) - reserve R ->
+            // ceiling C`. For custom: `Custom ceiling X GB -> effective
+            // ceiling C` after the server's static / Metal clamp.
             get memoryGuardBreakdownHTML() {
                 const sys = this.globalSettings.system || {};
                 const GB = 1024 ** 3;
                 const tier = this.globalSettings.memory?.memory_guard_tier || 'balanced';
-                const fmt = (gb) => Number(gb).toFixed(1);
-                const bold = (gb) => `<strong>${fmt(gb)} GB</strong>`;
-
-                // Static / metal cap for the final clamp shown to the user.
-                // The small-system threshold must track
-                // ProcessMemoryEnforcer._SMALL_SYSTEM_THRESHOLD (24 GB): under
-                // it the server reserves a flat 4 GB regardless of tier. This
-                // read 16 and so understated the static ceiling by up to 4 GB
-                // on every 16-23 GB Mac.
-                const totalGB = (sys.total_memory_bytes || 0) / GB;
-                const staticReserveGB =
-                    tier === 'custom'
-                        ? 2
-                        : totalGB < 24
-                            ? 4
-                            : { safe: 8, balanced: 6, aggressive: 4 }[tier] ?? 6;
-                const staticCeiling = Math.max(0, totalGB - staticReserveGB);
-                const metalCapGB = (sys.iogpu_wired_limit_bytes || 0) / GB;
-
-                // Helper: is the kernel iogpu.wired_limit_mb the smallest
-                // of the three candidates? When yes we swap "→ ceiling" for
-                // "/ effective ceiling X (kernel limit)" so the user knows
-                // why the value isn't what their tier math suggested.
-                const kernelBinds = (candidates, finalCeiling) =>
-                    metalCapGB > 0 &&
-                    Math.abs(metalCapGB - finalCeiling) < 1e-6 &&
-                    candidates.every((c) => c >= metalCapGB - 1e-6);
+                const preview = sys.memory_guard_preview?.[tier];
+                if (!preview) return '';
+                const bold = (bytes) => `<strong>${Number(bytes / GB).toFixed(1)} GB</strong>`;
 
                 if (tier === 'custom') {
-                    const custom = Number(
-                        this.globalSettings.memory?.memory_guard_custom_ceiling_gb || 0
-                    );
-                    const candidates = [custom, staticCeiling];
-                    if (metalCapGB > 0) candidates.push(metalCapGB);
-                    const ceiling = Math.max(0, Math.min(...candidates));
-                    const tmpl = kernelBinds([custom, staticCeiling], ceiling)
-                        ? 'settings.resource.guard_tier.breakdown_custom_kernel_limit'
-                        : 'settings.resource.guard_tier.breakdown_custom';
+                    const custom =
+                        Number(this.globalSettings.memory?.memory_guard_custom_ceiling_gb || 0) * GB;
+                    const limits = [preview.static_bytes, preview.metal_cap_bytes].filter((v) => v > 0);
+                    const ceiling = Math.max(0, Math.min(custom, ...limits));
+                    const kernelBinds =
+                        preview.metal_cap_bytes > 0 &&
+                        ceiling === preview.metal_cap_bytes &&
+                        ceiling < custom;
                     return window
-                        .t(tmpl)
+                        .t(
+                            kernelBinds
+                                ? 'settings.resource.guard_tier.breakdown_custom_kernel_limit'
+                                : 'settings.resource.guard_tier.breakdown_custom'
+                        )
                         .replace('{custom_gb}', bold(custom))
                         .replace('{ceiling}', bold(ceiling));
                 }
 
-                const freeGB = (sys.free_memory_bytes || 0) / GB;
-                const inactiveGB = (sys.inactive_memory_bytes || 0) / GB;
-                const activeGB = (sys.active_memory_bytes || 0) / GB;
-                const ratio = { safe: 0.2, balanced: 0.5, aggressive: 0.8 }[tier] ?? 0.5;
-                const pct = Math.round(ratio * 100);
-                const reclaim = activeGB * ratio;
-                const omlxGB = (sys.omlx_phys_footprint_bytes || 0) / GB;
-                const dynamicCeiling = omlxGB + freeGB + inactiveGB + reclaim;
-                const candidates = [dynamicCeiling, staticCeiling];
-                if (metalCapGB > 0) candidates.push(metalCapGB);
-                const ceiling = Math.max(0, Math.min(...candidates));
-                const tmpl = kernelBinds([dynamicCeiling, staticCeiling], ceiling)
+                const key = preview.binding === 'metal_cap'
                     ? 'settings.resource.guard_tier.breakdown_kernel_limit'
                     : 'settings.resource.guard_tier.breakdown';
                 return window
-                    .t(tmpl)
-                    .replace('{free}', bold(freeGB))
-                    .replace('{inactive}', bold(inactiveGB))
-                    .replace('{active}', bold(activeGB))
-                    .replace(/{active_pct}/g, pct)
-                    .replace('{reclaim}', bold(reclaim))
-                    .replace('{ceiling}', bold(ceiling));
+                    .t(key)
+                    .replace('{free}', bold(preview.free_bytes))
+                    .replace('{inactive}', bold(preview.inactive_bytes))
+                    .replace('{other}', bold(preview.other_apps_bytes))
+                    .replace('{reserve}', bold(preview.reserve_bytes))
+                    .replace('{ceiling}', bold(preview.ceiling_bytes));
             },
 
             // Computed hot cache size in GB (for manual input)
@@ -5234,7 +5930,10 @@
             // Computed cache size in GB (for manual input)
             get cacheSizeGB() {
                 const val = this.globalSettings.cache?.ssd_cache_max_size;
-                if (val && val !== 'auto') {
+                if (val === 'auto') {
+                    return Math.round((this.globalSettings.cache.ssd_cache_auto_size_bytes || 0) / 1024 ** 3);
+                }
+                if (val) {
                     const parsed = this._parseSettingsGB(val);
                     if (parsed !== null) return parsed;
                 }
@@ -5539,7 +6238,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || 'Failed to save'));
+                        alert(Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || window.t('js.error.save_failed')));
                     }
                 } catch (err) {
                     console.error('Failed to save HF mirror endpoint:', err);
@@ -5587,7 +6286,7 @@
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_timeout');
                     } else {
                         this.hfError = window.t('js.error.start_download_connection');
                     }
@@ -5665,7 +6364,7 @@
                         this.startHFRefresh();
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.hfError = data.detail || 'Retry failed';
+                        this.hfError = data.detail || window.t('js.error.retry_failed');
                         setTimeout(() => { this.hfError = ''; }, 5000);
                     }
                 } catch (err) {
@@ -5711,7 +6410,7 @@
                 this.stopHFRefresh();
                 this._hfRefreshTimer = setInterval(() => {
                     this.loadHFTasks();
-                }, 2000);
+                }, 500);
             },
 
             stopHFRefresh() {
@@ -5725,7 +6424,21 @@
                 const pct = Math.round(task.progress || 0);
                 const dlGB = (task.downloaded_size / (1024 ** 3)).toFixed(1);
                 const totalGB = (task.total_size / (1024 ** 3)).toFixed(1);
-                return `${pct}% \u00b7 ${dlGB} GB / ${totalGB} GB`;
+                const base = `${pct}% \u00b7 ${dlGB} GB / ${totalGB} GB`;
+                return `${base} \u00b7 ${this.formatSpeed(task)}`;
+            },
+
+            formatSpeed(task) {
+                const bps = task.speed_bps || 0;
+                const units = ['B/s', 'KB/s', 'MB/s', 'GB/s', 'TB/s'];
+                let value = bps;
+                let unit = 0;
+                while (value >= 1024 && unit < units.length - 1) {
+                    value /= 1024;
+                    unit += 1;
+                }
+                const digits = unit === 0 || value >= 100 ? 0 : 1;
+                return `${value.toFixed(digits)} ${units[unit]}`;
             },
 
             // =================================================================
@@ -5778,15 +6491,15 @@
                     if (response.ok) {
                         const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                         const name = model ? model.name : this.oqSelectedModelPath;
-                        this.oqSuccess = `Quantization started: ${name} → oQ${this.oqLevel}${this.oqEnhanced ? 'e' : ''}`;
+                        this.oqSuccess = window.t('models.oq.quantization_started').replace('{name}', name).replace('{model}', 'oQ' + this.oqLevel + (this.oqEnhanced ? 'e' : ''));
                         await this.loadOQTasks();
                         this.startOQRefresh();
                         setTimeout(() => { this.oqSuccess = ''; }, 5000);
                     } else {
-                        this.oqError = data.detail || 'Failed to start quantization';
+                        this.oqError = data.detail || window.t('js.error.start_quantization_failed');
                     }
                 } catch (err) {
-                    this.oqError = 'Connection error. Server may be unavailable.';
+                    this.oqError = window.t('js.error.connection_error');
                 } finally {
                     this.oqStarting = false;
                 }
@@ -5909,6 +6622,19 @@
                 return model?.model_type || '';
             },
 
+            oqAvailableLevels() {
+                return this.oqSelectedModelType() === 'deepseek_v41'
+                    ? [3, 4] : [2, 2.5, 2.7, 3, 3.5, 4, 5, 6, 8];
+            },
+
+            oqApplyModelPolicy() {
+                if (this.oqSelectedModelType() !== 'deepseek_v41') return;
+                if (!this.oqAvailableLevels().includes(this.oqLevel)) this.oqLevel = 4;
+                this.oqDtype = 'bfloat16';
+                this.oqTextOnly = false;
+                if (this.oqLevel === 4) this.oqSensitivityModelPath = '';
+            },
+
             oqLevelLabel(level) {
                 return `oQ${level}${this.oqEnhanced ? 'e' : ''}`;
             },
@@ -6005,7 +6731,7 @@
                         this.uploadTokenValidated = false;
                     }
                 } catch (err) {
-                    this.uploadError = 'Connection error. Server may be unavailable.';
+                    this.uploadError = window.t('js.error.connection_error');
                 } finally {
                     this.uploadTokenValidating = false;
                 }
@@ -6058,15 +6784,15 @@
                     const data = await response.json().catch(() => ({}));
                     if (response.ok) {
                         this.uploadModalOpen = false;
-                        this.uploadSuccess = `Upload queued: ${this.uploadModalModelName}`;
+                        this.uploadSuccess = window.t('models.uploader.upload_queued').replace('{name}', this.uploadModalModelName);
                         await this.loadUploadTasks();
                         this.startUploadRefresh();
                         setTimeout(() => { this.uploadSuccess = ''; }, 5000);
                     } else {
-                        this.uploadError = data.detail || 'Failed to start upload';
+                        this.uploadError = data.detail || window.t('js.error.start_upload_failed');
                     }
                 } catch (err) {
-                    this.uploadError = 'Connection error. Server may be unavailable.';
+                    this.uploadError = window.t('js.error.connection_error');
                 } finally {
                     this.uploadStarting = false;
                 }
@@ -6158,14 +6884,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.hfError = data.detail || 'Failed to load recommended models';
+                        this.hfError = data.detail || window.t('js.error.load_recommended_failed');
                         setTimeout(() => { this.hfError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_timeout');
                     } else {
-                        this.hfError = 'Failed to connect to HuggingFace.';
+                        this.hfError = window.t('js.error.hf_connect_failed');
                     }
                     setTimeout(() => { this.hfError = ''; }, 5000);
                     console.error('Failed to load recommended models:', err);
@@ -6318,14 +7044,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.hfError = data.detail || 'Search failed';
+                        this.hfError = data.detail || window.t('js.error.search_failed');
                         setTimeout(() => { this.hfError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_timeout');
                     } else {
-                        this.hfError = 'Failed to connect to HuggingFace.';
+                        this.hfError = window.t('js.error.hf_connect_failed');
                     }
                     setTimeout(() => { this.hfError = ''; }, 5000);
                     console.error('Search failed:', err);
@@ -6396,14 +7122,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.hfError = data.detail || 'Failed to fetch model info';
+                        this.hfError = data.detail || window.t('js.error.fetch_model_info_failed');
                         setTimeout(() => { this.hfError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.hfError = 'HuggingFace request timed out. The service may be unavailable.';
+                        this.hfError = window.t('js.error.hf_timeout');
                     } else {
-                        this.hfError = 'Failed to connect to HuggingFace.';
+                        this.hfError = window.t('js.error.hf_connect_failed');
                     }
                     setTimeout(() => { this.hfError = ''; }, 5000);
                     console.error('Failed to fetch model info:', err);
@@ -6492,7 +7218,7 @@
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_timeout');
                     } else {
                         this.msError = window.t('js.error.start_download_connection');
                     }
@@ -6553,7 +7279,7 @@
                         this.startMSRefresh();
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.msError = data.detail || 'Retry failed';
+                        this.msError = data.detail || window.t('js.error.retry_failed');
                         setTimeout(() => { this.msError = ''; }, 5000);
                     }
                 } catch (err) {
@@ -6578,7 +7304,7 @@
                 this.stopMSRefresh();
                 this._msRefreshTimer = setInterval(() => {
                     this.loadMSTasks();
-                }, 2000);
+                }, 500);
             },
 
             stopMSRefresh() {
@@ -6610,14 +7336,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.msError = data.detail || 'Failed to load recommended models';
+                        this.msError = data.detail || window.t('js.error.load_recommended_failed');
                         setTimeout(() => { this.msError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_timeout');
                     } else {
-                        this.msError = 'Failed to connect to ModelScope.';
+                        this.msError = window.t('js.error.ms_connect_failed');
                     }
                     setTimeout(() => { this.msError = ''; }, 5000);
                     console.error('Failed to load MS recommended models:', err);
@@ -6675,14 +7401,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.msError = data.detail || 'Search failed';
+                        this.msError = data.detail || window.t('js.error.search_failed');
                         setTimeout(() => { this.msError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_timeout');
                     } else {
-                        this.msError = 'Failed to connect to ModelScope.';
+                        this.msError = window.t('js.error.ms_connect_failed');
                     }
                     setTimeout(() => { this.msError = ''; }, 5000);
                     console.error('MS search failed:', err);
@@ -6737,14 +7463,14 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.msError = data.detail || 'Failed to fetch model info';
+                        this.msError = data.detail || window.t('js.error.fetch_model_info_failed');
                         setTimeout(() => { this.msError = ''; }, 5000);
                     }
                 } catch (err) {
                     if (err.name === 'AbortError') {
-                        this.msError = 'ModelScope request timed out. The service may be unavailable.';
+                        this.msError = window.t('js.error.ms_timeout');
                     } else {
-                        this.msError = 'Failed to connect to ModelScope.';
+                        this.msError = window.t('js.error.ms_connect_failed');
                     }
                     setTimeout(() => { this.msError = ''; }, 5000);
                     console.error('Failed to fetch MS model info:', err);

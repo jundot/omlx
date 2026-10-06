@@ -29,8 +29,8 @@ _SLIDING_WINDOW_SLICE = os.environ.get("OMLX_INKLING_SLIDING_SLICE", "1") != "0"
 from ..base import LanguageModelOutput, scaled_dot_product_attention
 from ..cache import ArraysCache, CacheList, KVCache
 from ..mlp import SwiGLUMLP
-from ..switch_layers import SwitchGLU, _gather_sort, _scatter_unsort
 from .config import TextConfig as ModelConfig
+from .switch_layers import SwitchGLU, _gather_sort, _scatter_unsort
 
 
 def _clone_cache_tree(value):

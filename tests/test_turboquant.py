@@ -328,6 +328,54 @@ def test_batch_tq_dequantize():
     assert dv.shape[2] == 9
 
 
+@pytest.mark.parametrize("bits", [1.0, 4.0, 8.0])
+def test_batch_tq_finalize_matches_dequantized_roll_exactly(bits):
+    """finalize() rolls the quantized state directly (§F3/4.5) instead of
+    dequantize -> dynamic_roll -> requantize. dequantize is a pure per-token
+    unpack (bit-unpack + fixed codebook lookup + fixed rotation, no
+    cross-token state), so it must commute exactly with the token-axis
+    reindex: dequantize(finalize(state)) == dynamic_roll(dequantize(state)).
+    The old requantize-on-the-way-back-in step had no reason to be exact;
+    this asserts the new path is.
+    """
+    from mlx_lm.models.cache import dynamic_roll
+
+    batch = BatchTurboQuantKVCache([0, 0], bits=bits)
+    keys = mx.random.normal((2, 2, 8, 32))
+    values = mx.random.normal((2, 2, 8, 32))
+    batch.update_and_fetch(keys, values)
+
+    ref_k, ref_v = batch.dequantize()
+
+    right_padding = [3, 5]
+    batch.prepare(right_padding=right_padding)
+    batch.finalize()
+
+    rolled_k, rolled_v = batch.dequantize()
+    shift = mx.array(right_padding)
+    expected_k = dynamic_roll(ref_k, shift[:, None], axis=2)
+    expected_v = dynamic_roll(ref_v, shift[:, None], axis=2)
+
+    assert mx.array_equal(rolled_k, expected_k).item()
+    assert mx.array_equal(rolled_v, expected_v).item()
+    assert batch.offset[0].item() == 8 - right_padding[0]
+    assert batch.offset[1].item() == 8 - right_padding[1]
+    assert batch.left_padding[0].item() == right_padding[0]
+    assert batch.left_padding[1].item() == right_padding[1]
+
+
+def test_batch_tq_finalize_no_right_padding_is_noop():
+    batch = BatchTurboQuantKVCache([0], bits=4.0)
+    batch.update_and_fetch(
+        mx.random.normal((1, 2, 8, 32)), mx.random.normal((1, 2, 8, 32))
+    )
+    before_k, before_v = batch.dequantize()
+    batch.finalize()  # _right_padding is None -> must be a no-op
+    after_k, after_v = batch.dequantize()
+    assert mx.array_equal(before_k, after_k).item()
+    assert mx.array_equal(before_v, after_v).item()
+
+
 def test_batch_tq_state_property():
     batch = BatchTurboQuantKVCache([2, 0], bits=4.0)
     s = batch.state
@@ -809,7 +857,7 @@ def test_vlm_target_verify_attention_handles_tq_proxies():
     queries = mx.random.normal((B, n_q, L, D)).astype(mx.float16)
     scale = D**-0.5
 
-    out = q35_lang._target_verify_left_padded_attention(
+    out = q35_lang._qwen3_5_left_padded_attention(
         queries, ks, vs, cache=tq, scale=scale, mask=None
     )
     mx.eval(out)
@@ -837,9 +885,9 @@ def test_vlm_target_verify_attention_handles_tq_proxies():
 
     # Non-TurboQuant caches keep the original helper behavior (declines
     # plain KVCache with no left padding -> caller uses its own path).
-    plain_ks, plain_vs = fp_cache.state
+    plain_ks, plain_vs = fp_cache.keys_and_values()
     assert (
-        q35_lang._target_verify_left_padded_attention(
+        q35_lang._qwen3_5_left_padded_attention(
             queries, plain_ks, plain_vs, cache=fp_cache, scale=scale, mask=None
         )
         is None
@@ -1369,3 +1417,112 @@ def test_batch_tq_state_restore_resets_phys_end():
         f"stale batch-mode _phys_end leaked through restore "
         f"({batch._phys_end} != 20)"
     )
+
+
+@pytest.mark.parametrize("retained", [[2, 2, 2], [1, 2, 2], [1, 2, 3]])
+def test_batch_tq_speculative_commit_matches_dense(retained):
+    from mlx_vlm.speculative.cache_state import start_speculative_cache
+
+    tq = BatchTurboQuantKVCache([0, 1, 2], bits=4.0)
+    dense = BatchKVCache([0, 1, 2])
+    mx.random.seed(3767)
+
+    def append(n):
+        k = mx.random.normal((3, 2, n, 64)).astype(mx.float16)
+        for cache in (tq, dense):
+            cache.update_and_fetch(k, k)
+
+    append(8)
+    transaction = start_speculative_cache([tq, dense], 3)
+    append(3)
+    transaction.commit(retained)
+    assert tq.offset.tolist() == dense.offset.tolist()
+    assert tq.left_padding.tolist() == dense.left_padding.tolist()
+    assert tq._phys_end == dense._idx
+    assert tq.make_mask(1).shape == dense.make_mask(1).shape
+    append(1)
+    for i in range(3):
+        got, _ = tq.extract(i).dequantize()
+        expected = dense.extract(i).state[0]
+        assert got.shape == expected.shape
+        assert mx.abs(got - expected).mean().item() < 0.2
+
+
+@pytest.mark.parametrize("advance", [0, 3])
+def test_batch_tq_speculative_abort_tracks_physical_position(advance):
+    from mlx_vlm.speculative.cache_state import start_speculative_cache
+
+    tq = BatchTurboQuantKVCache([0, 1, 2], bits=4.0)
+    dense = BatchKVCache([0, 1, 2])
+    k = mx.ones((3, 2, 8, 64), dtype=mx.float16)
+    for cache in (tq, dense):
+        cache.update_and_fetch(k, k)
+    transaction = start_speculative_cache([tq, dense], 3)
+    if advance:
+        for cache in (tq, dense):
+            cache.update_and_fetch(k[:, :, :advance], k[:, :, :advance])
+    if advance:
+        transaction.abort()
+    else:
+        transaction.commit([1, 1, 1])
+    assert tq.offset.tolist() == dense.offset.tolist()
+    assert tq._phys_end == dense._idx
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+def test_batch_tq_single_row_rollback_then_join(filtered):
+    from mlx_vlm.speculative.cache_state import start_speculative_cache
+
+    tq = BatchTurboQuantKVCache([0, 0] if filtered else [0], bits=4.0)
+    dense = BatchKVCache([0, 0] if filtered else [0])
+    k = mx.ones((2 if filtered else 1, 2, 8, 64), dtype=mx.float16)
+    for cache in (tq, dense):
+        cache.update_and_fetch(k, k)
+        if filtered:
+            cache.filter(mx.array([0]))
+    transaction = start_speculative_cache([tq, dense], 3)
+    k = k[:1, :, :3]
+    for cache in (tq, dense):
+        cache.update_and_fetch(k, k)
+    transaction.commit([2])
+    mask = tq.make_mask(2, return_array=True)
+    assert mask.shape[-1] == dense._idx + 2
+    assert tq.dequantize()[0].shape[2] == dense._idx
+
+    joining_tq = BatchTurboQuantKVCache([0], bits=4.0)
+    joining_dense = BatchKVCache([0])
+    for cache in (joining_tq, joining_dense):
+        cache.update_and_fetch(k, k)
+    tq.extend(joining_tq)
+    dense.extend(joining_dense)
+    assert tq.offset.tolist() == dense.offset.tolist()
+    assert tq.left_padding.tolist() == dense.left_padding.tolist()
+    assert tq._phys_end == dense._idx
+
+
+def test_batch_tq_qwen_mask_keeps_physical_width_with_shared_padding():
+    from types import SimpleNamespace
+
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5Attention
+
+    tq = BatchTurboQuantKVCache([2, 3, 4], bits=4.0)
+    k = mx.ones((3, 2, 8, 64), dtype=mx.float16)
+    tq.update_and_fetch(k, k)
+    attention = SimpleNamespace(
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        q_norm=lambda x: x,
+        k_norm=lambda x: x,
+        rotary_emb=SimpleNamespace(apply_rotary=lambda q, k, *a, **kw: (q, k)),
+    )
+    _, keys, _, _, mask = Qwen3_5Attention._prepare_projected_qkv(
+        attention,
+        mx.ones((3, 1, 256), dtype=mx.float16),
+        mx.ones((3, 1, 128), dtype=mx.float16),
+        mx.ones((3, 1, 128), dtype=mx.float16),
+        tq,
+        mx.zeros((3, 3, 1), dtype=mx.int32),
+        None,
+        tq.make_mask(1),
+    )
+    assert mask.shape[-1] == keys.shape[2] == 9

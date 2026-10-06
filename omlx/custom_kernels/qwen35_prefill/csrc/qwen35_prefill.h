@@ -8,12 +8,18 @@
 
 namespace mx = mlx::core;
 
+#include <tuple>
+
 namespace omlx::qwen35_prefill_kernels {
 
 // Mirror of mlx::core::metal::is_nax_available() (not exported from libmlx):
 // macOS >= 26.2 and an applegpu generation with tensor units (gen >= 17, or
 // >= 18 for 'p'-suffix parts).
 bool is_nax_available();
+
+// Sets MLX's per-command-buffer caps (ops, MB of inputs) on the GPU device and
+// returns the previous ones. MLX reads them on every commit decision.
+std::tuple<int, int> set_command_buffer_caps(int ops, int mb);
 
 // True when the NAX metallib was built next to the extension. Kernel launch
 // still degrades to the classic kernels if loading it fails at runtime.
@@ -108,7 +114,8 @@ std::vector<mx::array> qwen35_oq_a8_quantize(
 
 // INT8 x INT8 -> INT32 GEMM against packed affine Q4/Q5 weights, with the
 // affine correction applied at every GS64 boundary. Output dtype follows
-// `scales`.
+// `scales`. `packed` reads Q4 weights and metadata in the PackedLinear tile
+// layout instead of row-major weights and [K/64, N] metadata.
 mx::array qwen35_oq_a8_qmm_t(
     const mx::array& qa,
     const mx::array& sa,
@@ -119,6 +126,7 @@ mx::array qwen35_oq_a8_qmm_t(
     int bits,
     int act_mode = 0,
     int variant = 800,
+    bool packed = false,
     mx::StreamOrDevice s = {});
 
 // Test helper: unpack Q4/Q5 codes to INT8 [N, group_count * 64]. Production

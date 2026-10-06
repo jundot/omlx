@@ -53,16 +53,15 @@ def _prompt(tok, n_tokens: int) -> list[int]:
 
 def _first_capacity(model) -> int | None:
     """Slot capacity of the first offloaded layer (module names vary by family)."""
-    from omlx.patches.moe_expert_offload import OffloadSwitchGLU
-
     stack, seen = [model], set()
     while stack:
         obj = stack.pop()
         if id(obj) in seen:
             continue
         seen.add(id(obj))
-        if isinstance(obj, OffloadSwitchGLU):
-            return obj.cache.capacity
+        cache = getattr(obj, "cache", None)
+        if getattr(cache, "moe_offload_cache", False):
+            return cache.capacity
         if isinstance(obj, dict):
             stack.extend(obj.values())
         elif isinstance(obj, (list, tuple)):

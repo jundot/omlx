@@ -96,7 +96,7 @@ OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 
 ### macOS 应用
 
-从 Applications 文件夹启动 oMLX。欢迎界面会引导你完成三个步骤 — 模型目录设置、服务器启动、首个模型下载。就是这样。要连接 OpenClaw、OpenCode、Codex、Hermes Agent 或 Copilot，请参阅[集成](#集成)。
+从 Applications 文件夹启动 oMLX。欢迎界面会引导你完成三个步骤 — 模型目录设置、服务器启动、首个模型下载。就是这样。要连接 OpenClaw、OpenCode、Codex、Hermes Agent、Copilot 或 DeepSeek Harness，请参阅[集成](#集成)。
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.36.32.png" alt="oMLX 欢迎界面" width="360">
@@ -161,7 +161,7 @@ brew services info omlx     # 查看状态
 
 ### Claude Code 优化
 
-支持在 Claude Code 中使用较小上下文模型的上下文缩放。通过缩放上报的 Token 数量，让自动压缩在合适的时机触发，同时提供 SSE keep-alive 防止长时间预填充导致的读取超时。
+支持在 Claude Code 中使用较小上下文模型：不再缩放上报的 Token 数量，而是按模型真实的上下文窗口触发自动压缩，同时提供 SSE keep-alive 防止长时间预填充导致的读取超时。
 
 ### 多模型服务
 
@@ -204,7 +204,7 @@ brew services info omlx     # 查看状态
 
 ### 集成
 
-在管理后台中一键设置 OpenClaw、OpenCode、Codex、Hermes Agent、Copilot 和 Pi。无需手动编辑配置文件。
+在管理后台中一键设置 OpenClaw、OpenCode、Codex、Hermes Agent、Copilot、Pi 和 DeepSeek Harness。无需手动编辑配置文件。
 
 <p align="center">
   <img src="docs/images/omlx_integrations.png" alt="oMLX 集成" width="720">
@@ -237,6 +237,7 @@ OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/embeddings` | 文本嵌入 |
 | `POST /v1/rerank` | 文档重排序 |
+| `POST /v1/systemone` | 决策模型的类型化判断 (TypeSafe System One) |
 | `GET /v1/models` | 列出可用模型 |
 
 ### 工具调用与结构化输出
@@ -278,6 +279,7 @@ OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream
 | OCR | DeepSeek-OCR、DOTS-OCR、GLM-OCR |
 | 嵌入 | BERT、BGE-M3、ModernBERT |
 | 重排序 | ModernBERT、XLM-RoBERTa |
+| 决策 | Clef、Clef-Flash、OpenJev |
 
 ## CLI 配置
 
@@ -320,7 +322,8 @@ FastAPI Server (OpenAI / Anthropic API)
     │   ├── BatchedEngine (LLM，连续批处理)
     │   ├── VLMEngine (视觉语言模型)
     │   ├── EmbeddingEngine
-    │   └── RerankerEngine
+    │   ├── RerankerEngine
+    │   └── DecisionEngine
     │
     ├── ProcessMemoryEnforcer (总内存限制、TTL 检查)
     │

@@ -117,9 +117,15 @@ def _normalize_ones_centered_rmsnorm_weights(model, weights):
             value.dtype, mx.floating
         ):
             continue
-        # Keep the residual in FP32. Subtracting in BF16 can lose information
-        # for direct gamma values below 0.5, which occur in the trained MTP head.
-        weights[key] = value.astype(mx.float32) - 1.0
+        # Subtract in FP32: in BF16 it can lose information for direct gamma
+        # values below 0.5, which occur in the trained MTP head. Keep the
+        # checkpoint dtype when it holds the residual exactly (gammas in
+        # [0.5, 2] always do), so 1 + weight is unchanged and BF16-only kernels
+        # such as the fused hyper-connection norm still apply.
+        residual = value.astype(mx.float32) - 1.0
+        narrow = residual.astype(value.dtype)
+        exact = mx.array_equal(narrow.astype(mx.float32), residual).item()
+        weights[key] = narrow if exact else residual
         normalized += 1
 
     logger.info(
