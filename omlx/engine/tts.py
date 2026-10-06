@@ -10,9 +10,7 @@ when mlx-audio is not installed.
 
 import asyncio
 import gc
-import inspect
 import logging
-import os
 import re
 from collections.abc import AsyncIterator
 from typing import Any, Dict, Optional, get_args, get_type_hints
@@ -59,91 +57,22 @@ def _accepts_preset_voice(model: Any) -> bool:
     return not (isinstance(speakers, list) and not speakers)
 
 
-_REF_AUDIO_PATH_TYPES = (str, os.PathLike)
+def _resolve_ref_audio(model: Any, ref_audio: str) -> Any:
+    """Load ref_audio for models whose generate() accepts only an array.
 
-
-def _ref_audio_needs_array(model: Any) -> bool:
-    """Return True when ``model.generate()`` declares ``ref_audio`` as an array.
-
-    mlx-audio's models disagree about what a reference clip is. Fish
-    (``fish_speech.py``: ``if audio.ndim == 1``), TADA and LongCat annotate the
-    parameter as an array and index it, so a path fails there (#1495). Every
-    other model either decodes the path itself — Confucius4 resamples the clip
-    to 16 kHz, OmniVoice trims and RMS-normalises it — or accepts both, and oMLX
-    has always handed those the temp-file path, so they keep receiving it.
-
-    The declared type is the only per-model signal available here; mlx-audio's
-    own ``generate_audio()`` decides with ``preserve_ref_audio_path`` instead,
-    which would hand an array to Confucius4 and OmniVoice as well. A missing,
-    unresolvable or path-accepting annotation always answers False, i.e. the
-    caller keeps the pre-existing behaviour.
+    Path-accepting models preprocess the file themselves (Confucius4 resamples
+    it to 16 kHz), so they keep the path.
     """
-    generate = getattr(model, "generate", None)
-    if generate is None:
-        return False
     try:
-        declared = inspect.signature(generate).parameters.get("ref_audio")
-        if declared is None or declared.annotation is inspect.Parameter.empty:
-            return False
-        annotation = declared.annotation
-        if isinstance(annotation, str):
-            # PEP 563 modules (Fish) keep annotations unevaluated.
-            annotation = get_type_hints(generate).get("ref_audio")
+        hint = get_type_hints(model.generate).get("ref_audio")
     except Exception:
-        return False
-    if annotation is None:
-        return False
-    members = get_args(annotation) or (annotation,)
-    if any(
-        isinstance(member, type) and issubclass(member, _REF_AUDIO_PATH_TYPES)
-        for member in members
-    ):
-        return False
-    return any(
-        isinstance(member, type) and issubclass(member, (mx.array, np.ndarray))
-        for member in members
-    )
-
-
-def _resolve_ref_audio(model: Any, ref_audio: Any) -> Any:
-    """Return ``ref_audio`` in the shape ``model.generate()`` expects.
-
-    oMLX writes the uploaded clip to a temp file. Models that declare an array
-    reference (see ``_ref_audio_needs_array``) need it decoded first; everyone
-    else keeps the path they already got, byte for byte.
-
-    The load is guarded: if the clip cannot be decoded the original value is
-    forwarded unchanged, so an unreadable reference degrades to the pre-existing
-    behaviour instead of introducing a new failure mode. Sample rate, mono
-    downmixing and resampling all come from ``mlx_audio.utils.load_audio``.
-    """
-    if ref_audio is None:
-        return None
-    if not isinstance(ref_audio, _REF_AUDIO_PATH_TYPES):
         return ref_audio
-    # Models that own reference preprocessing (ZonoS2, DramaBox) want the path
-    # string, matching generate_audio().
-    if getattr(model, "preserve_ref_audio_path", False) is True:
+    members = get_args(hint) or (hint,)
+    if mx.array not in members or str in members:
         return ref_audio
-    if not _ref_audio_needs_array(model):
-        return ref_audio
-    try:
-        from mlx_audio.utils import load_audio
+    from mlx_audio.utils import load_audio
 
-        # load_audio() only accepts str/mx.array; fspath() mirrors generate_audio().
-        ref_path = os.fspath(ref_audio)
-        load_kwargs: Dict[str, Any] = {}
-        sample_rate = getattr(model, "sample_rate", None)
-        if sample_rate is not None:
-            load_kwargs["sample_rate"] = int(sample_rate)
-        return load_audio(ref_path, **load_kwargs)
-    except Exception:
-        logger.warning(
-            "TTS: could not load ref_audio %r, forwarding it unchanged",
-            ref_audio,
-            exc_info=True,
-        )
-        return ref_audio
+    return load_audio(ref_audio, sample_rate=model.sample_rate)
 
 
 class TTSEngine(BaseNonStreamingEngine):
