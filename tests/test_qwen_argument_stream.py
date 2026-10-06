@@ -698,3 +698,24 @@ async def test_overflow_complete_prefix_is_not_resent_when_a_later_call_fails(
         )
     else:
         assert events[-1]["error"]["code"] == "invalid_tool_call"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [1, 13, 4096])
+@pytest.mark.parametrize("value", [
+    "a</parameter>\u00a0<parameter=path>literal",
+    "a</parameter>\v<parameter=path>literal",
+    "a</parameter></function>b",
+])
+@pytest.mark.parametrize("recover", [False, True])
+async def test_parameter_boundary_uses_common_structural_context(size, value, recover):
+    raw = envelope({"content": value} if recover else {"content": value, "number": "invalid"})
+    if recover:
+        raw = raw.removesuffix("</tool_call>")
+    native = await run(raw, size, False)
+    actual = await run(raw, size, True)
+    if native["errors"]:
+        assert actual["errors"] == native["errors"]
+    else:
+        assert not actual["errors"]
+        assert signature(actual) == signature(native)

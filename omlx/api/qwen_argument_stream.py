@@ -174,16 +174,17 @@ class QwenArgumentStream:
                 closed = end >= 0
                 if closed:
                     after = self.buf[end + 12 :]
-                    following = after.lstrip()
-                    boundaries = ("<parameter=", "</function>")
+                    following = after.lstrip(" \t\r\n")
+                    boundaries = ("<parameter=",)
                     if not any(following.startswith(marker) for marker in boundaries):
                         if len(after) <= self.MAX_HEADER_CHARS and any(
                             marker.startswith(following) for marker in boundaries
                         ):
                             break
-                        # A literal close belongs to a different value in the
-                        # recovery parser. Leave the JSON string open until
-                        # final parsing settles that interpretation.
+                        # Only a next parameter opener certifies a shared
+                        # boundary. A function close can still be literal text
+                        # inside the value until the full envelope is parsed.
+                        # The fallback skips ASCII whitespace only.
                         self.enabled = False
                         break
                 n = end if closed else max(0, len(self.buf) - 13)
