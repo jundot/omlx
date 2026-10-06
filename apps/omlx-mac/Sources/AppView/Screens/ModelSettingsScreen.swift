@@ -1044,6 +1044,50 @@ private struct BasicTab: View {
                         .disabled(vm.vlmMtpEnabled)
                         .help(vm.vlmMtpEnabled ? vm.vlmMtpProcessorLockedReason : "")
                 }
+                Row(label: String(localized: "settings.basic.dry_multiplier.label",
+                                  defaultValue: "DRY Multiplier",
+                                  comment: "Row label for the DRY repetition penalty strength field"),
+                    sublabel: String(localized: "settings.basic.dry_multiplier.sub",
+                                     defaultValue: "Penalize tokens that would extend a sequence already produced in this response. Empty or 0 = off; 0.8 is a common start.",
+                                     comment: "Sublabel describing the DRY multiplier field")) {
+                    TextInput(text: vm.bindProfile($vm.dryMultiplier),
+                              placeholder: String(localized: "settings.basic.dry_multiplier.placeholder",
+                                                  defaultValue: "Off",
+                                                  comment: "Placeholder shown when DRY is not configured"),
+                              mono: true, width: .controlNarrow)
+                }
+                Row(label: String(localized: "settings.basic.dry_base.label",
+                                  defaultValue: "DRY Base",
+                                  comment: "Row label for the DRY penalty growth field"),
+                    sublabel: String(localized: "settings.basic.dry_base.sub",
+                                     defaultValue: "Penalty growth per token past the allowed length (≥ 1).",
+                                     comment: "Sublabel describing the DRY base field")) {
+                    TextInput(text: vm.bindProfile($vm.dryBase), placeholder: "1.75", mono: true, width: .controlNarrow)
+                }
+                Row(label: String(localized: "settings.basic.dry_allowed_length.label",
+                                  defaultValue: "DRY Allowed Length",
+                                  comment: "Row label for the DRY allowed repeat length field"),
+                    sublabel: String(localized: "settings.basic.dry_allowed_length.sub",
+                                     defaultValue: "Longest repeat left unpenalized, in tokens (≥ 1).",
+                                     comment: "Sublabel describing the DRY allowed length field")) {
+                    TextInput(text: vm.bindProfile($vm.dryAllowedLength), placeholder: "2", mono: true, width: .controlNarrow)
+                }
+                Row(label: String(localized: "settings.basic.dry_penalty_last_n.label",
+                                  defaultValue: "DRY Last N",
+                                  comment: "Row label for the DRY look-back window field"),
+                    sublabel: String(localized: "settings.basic.dry_penalty_last_n.sub",
+                                     defaultValue: "Generated tokens searched for repeats (−1 = all).",
+                                     comment: "Sublabel describing the DRY look-back window field")) {
+                    TextInput(text: vm.bindProfile($vm.dryPenaltyLastN), placeholder: "4096", mono: true, width: .controlNarrow)
+                }
+                Row(label: String(localized: "settings.basic.dry_exclude_reasoning.label",
+                                  defaultValue: "DRY: Skip Reasoning",
+                                  comment: "Row label for the toggle that disables DRY inside the thinking block"),
+                    sublabel: String(localized: "settings.basic.dry_exclude_reasoning.sub",
+                                     defaultValue: "Apply no DRY penalty inside the thinking block.",
+                                     comment: "Sublabel describing the DRY skip-reasoning toggle")) {
+                    RowSwitch(isOn: vm.bindProfile($vm.dryExcludeReasoning))
+                }
             }
             Row(
                 label: String(localized: "settings.basic.ttl.label",

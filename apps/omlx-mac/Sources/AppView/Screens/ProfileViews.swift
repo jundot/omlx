@@ -688,7 +688,7 @@ struct ProfileDetailCard: View {
         let hasSampling = ["temperature", "top_p", "top_k", "min_p"].contains { s[$0] != nil }
         let hasCapacity = ["model_type_override", "max_context_window", "max_tokens", "ttl_seconds"]
             .contains { s[$0] != nil }
-        let hasPenalty = ["repetition_penalty", "presence_penalty"].contains { s[$0] != nil }
+        let hasPenalty = ["repetition_penalty", "presence_penalty", "dry_multiplier"].contains { s[$0] != nil }
         let behaviorKeys = [
             "enable_thinking", "thinking_budget_enabled", "max_tool_result_tokens",
             "force_sampling", "is_pinned",
@@ -817,6 +817,10 @@ struct ProfileDetailCard: View {
                     defaultValue: "Presence",
                     comment: "Penalty meter label: presence"),
              doubleOf(s["presence_penalty"]), -2, 2),
+            (String(localized: "profile.detail.penalty.dry",
+                    defaultValue: "DRY",
+                    comment: "Penalty meter label: DRY multiplier"),
+             doubleOf(s["dry_multiplier"]), 0, 2),
         ].filter { $0.1 != nil }
         HStack(alignment: .top, spacing: 18) {
             ForEach(Array(entries.enumerated()), id: \.offset) { _, e in

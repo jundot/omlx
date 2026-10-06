@@ -12711,6 +12711,30 @@
         }
       }
     },
+    "profile.detail.penalty.dry" : {
+      "comment" : "Penalty meter label: DRY multiplier",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DRY"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DRY"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DRY"
+          }
+        }
+      }
+    },
     "profile.detail.penalty.presence" : {
       "comment" : "Penalty meter label: presence",
       "extractionState" : "manual",
@@ -21318,6 +21342,270 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "惩罚已存在的 Token（-2 到 2）。"
+          }
+        }
+      }
+    },
+    "settings.basic.dry_multiplier.label" : {
+      "comment" : "Row label for the DRY repetition penalty strength field",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DRY Multiplier"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Множитель DRY"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DRY 乘数"
+          }
+        }
+      }
+    },
+    "settings.basic.dry_multiplier.placeholder" : {
+      "comment" : "Placeholder shown when DRY is not configured",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Off"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Выкл."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "关闭"
+          }
+        }
+      }
+    },
+    "settings.basic.dry_multiplier.sub" : {
+      "comment" : "Sublabel describing the DRY multiplier field",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Penalize tokens that would extend a sequence already produced in this response. Empty or 0 = off; 0.8 is a common start."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Штрафовать токены, продолжающие последовательность, уже созданную в этом ответе. Пусто или 0 = выкл.; обычно начинают с 0.8."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "惩罚会延续本次回复中已生成序列的 Token。留空或 0 = 关闭；通常从 0.8 开始。"
+          }
+        }
+      }
+    },
+    "settings.basic.dry_base.label" : {
+      "comment" : "Row label for the DRY penalty growth field",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DRY Base"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Основание DRY"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DRY 底数"
+          }
+        }
+      }
+    },
+    "settings.basic.dry_base.sub" : {
+      "comment" : "Sublabel describing the DRY base field",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Penalty growth per token past the allowed length (≥ 1)."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Рост штрафа за каждый токен сверх допустимой длины (≥ 1)."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "超出允许长度后每个 Token 的惩罚增长倍数（≥ 1）。"
+          }
+        }
+      }
+    },
+    "settings.basic.dry_allowed_length.label" : {
+      "comment" : "Row label for the DRY allowed repeat length field",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DRY Allowed Length"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Допустимая длина DRY"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DRY 允许长度"
+          }
+        }
+      }
+    },
+    "settings.basic.dry_allowed_length.sub" : {
+      "comment" : "Sublabel describing the DRY allowed length field",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Longest repeat left unpenalized, in tokens (≥ 1)."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Самый длинный повтор без штрафа, в токенах (≥ 1)."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "不受惩罚的最长重复长度，以 Token 计（≥ 1）。"
+          }
+        }
+      }
+    },
+    "settings.basic.dry_penalty_last_n.label" : {
+      "comment" : "Row label for the DRY look-back window field",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DRY Last N"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DRY: последние N"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DRY 最近 N"
+          }
+        }
+      }
+    },
+    "settings.basic.dry_penalty_last_n.sub" : {
+      "comment" : "Sublabel describing the DRY look-back window field",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Generated tokens searched for repeats (−1 = all)."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сколько сгенерированных токенов проверять на повторы (−1 = все)."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在多少个已生成的 Token 中查找重复（−1 = 全部）。"
+          }
+        }
+      }
+    },
+    "settings.basic.dry_exclude_reasoning.label" : {
+      "comment" : "Row label for the toggle that disables DRY inside the thinking block",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DRY: Skip Reasoning"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DRY: пропускать рассуждения"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DRY：跳过思考"
+          }
+        }
+      }
+    },
+    "settings.basic.dry_exclude_reasoning.sub" : {
+      "comment" : "Sublabel describing the DRY skip-reasoning toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apply no DRY penalty inside the thinking block."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не применять штраф DRY внутри блока рассуждений."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在思考块内不应用 DRY 惩罚。"
           }
         }
       }

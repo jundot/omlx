@@ -2191,6 +2191,14 @@
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
                             style="color: var(--text-primary);">
                     </div>
+                    <div class="space-y-1">
+                        <label class="text-[10px] font-bold uppercase tracking-wider"
+                            style="color: var(--text-secondary);">{{ t('modal.model_settings.dry_multiplier') }}</label>
+                        <input type="number" x-model.number="modelSettings.dry_multiplier"
+                            @input="onModelSettingsChange()" step="0.1" min="0" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
+                            class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
+                            style="color: var(--text-primary);">
+                    </div>
                 </div>
 
                 <!-- Thinking: Auto / On (Unlimit) / On (Limit) / Off -->
@@ -2708,6 +2716,7 @@
                 min_p: null,
                 repetition_penalty: null,
                 presence_penalty: null,
+                dry_multiplier: null,
                 enable_thinking: null,
                 thinking_budget_enabled: false,
                 thinking_budget_tokens: null,
@@ -2722,6 +2731,7 @@
                     min_p: null,
                     repetition_penalty: null,
                     presence_penalty: null,
+                    dry_multiplier: null,
                     enable_thinking: null,
                     thinking_budget_enabled: false,
                     thinking_budget_tokens: null,
@@ -3246,7 +3256,7 @@
                 }
                 const scalarKeys = [
                     'temperature', 'max_tokens', 'top_p', 'top_k', 'min_p',
-                    'repetition_penalty', 'presence_penalty',
+                    'repetition_penalty', 'presence_penalty', 'dry_multiplier',
                 ];
                 for (const key of scalarKeys) {
                     if (generation[key] != null) s[key] = generation[key];
@@ -3388,7 +3398,7 @@
                 const s = this.modelSettings;
                 const scalarKeys = [
                     'temperature', 'max_tokens', 'top_p', 'top_k', 'min_p',
-                    'repetition_penalty', 'presence_penalty'
+                    'repetition_penalty', 'presence_penalty', 'dry_multiplier'
                 ];
                 for (const key of scalarKeys) {
                     if (s[key] != null) gen[key] = s[key];
@@ -4873,6 +4883,7 @@
                 min_p: s.min_p ?? null,
                 repetition_penalty: s.repetition_penalty ?? null,
                 presence_penalty: s.presence_penalty ?? null,
+                dry_multiplier: s.dry_multiplier ?? null,
                 enable_thinking: s.enable_thinking ?? null,
                 thinking_budget_enabled: !!(s.thinking_budget_enabled || (s.thinking_budget_tokens != null && s.thinking_budget_tokens > 0)),
                 thinking_budget_tokens: (s.thinking_budget_enabled || (s.thinking_budget_tokens != null && s.thinking_budget_tokens > 0))
@@ -6582,6 +6593,7 @@
                             ['min_p', 'min_p'],
                             ['repetition_penalty', 'rep_pen'],
                             ['presence_penalty', 'pres_pen'],
+                            ['dry_multiplier', 'dry'],
                         ];
                         for (const [key, label] of scalarLabels) {
                             if (gen[key] != null) parts.push(`${label}=${gen[key]}`);

@@ -710,3 +710,55 @@ assert.equal(lib.widthClass('bogus'), 'max-w-7xl');
         timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+_DRY_FORM_FIELDS = (
+    "dry_multiplier",
+    "dry_base",
+    "dry_allowed_length",
+    "dry_penalty_last_n",
+    "dry_exclude_reasoning",
+)
+
+
+def test_dry_settings_are_registered_in_the_dashboard_script():
+    js = _dashboard_script()
+    for field in _DRY_FORM_FIELDS:
+        # Diffusion registry, modal defaults, server load, and save payload.
+        assert js.count(field) >= 4, field
+    # No form control, but a UI save must hand back what the API stored.
+    assert "dry_sequence_breakers: s.dry_sequence_breakers ?? null" in js
+    assert (
+        "dry_sequence_breakers: this.modelSettings.dry_sequence_breakers ?? null" in js
+    )
+
+
+def test_dry_controls_are_bound_and_hidden_for_diffusion_models():
+    html = _model_settings_template()
+    row = _section(html, "<!-- Row 5: DRY repetition penalty -->", "</template>")
+    assert 'x-show="!modelSettings.is_diffusion_model"' in row
+    for field in _DRY_FORM_FIELDS[:4]:
+        assert f'x-model.number="modelSettings.{field}"' in row, field
+    assert "modelSettings.dry_exclude_reasoning = !" in row
+    # DRY is stateless, so unlike the row above it stays editable with VLM MTP.
+    assert "vlm_mtp_enabled" not in row
+
+
+def test_dry_i18n_keys_exist_in_every_locale():
+    root = Path(__file__).resolve().parents[1]
+    html = _model_settings_template()
+    keys = {
+        "modal.model_settings.dry_multiplier",
+        "modal.model_settings.dry_base",
+        "modal.model_settings.dry_allowed_length",
+        "modal.model_settings.dry_penalty_last_n",
+        "modal.model_settings.dry_placeholder_off",
+        "modal.model_settings.dry_hint",
+        "modal.model_settings.dry_exclude_reasoning",
+        "modal.model_settings.dry_exclude_reasoning_hint",
+    }
+    for key in keys:
+        assert f"t('{key}')" in html, key
+    for path in sorted((root / "omlx/admin/i18n").glob("*.json")):
+        missing = keys - set(json.loads(path.read_text()))
+        assert not missing, f"{path.name} is missing {sorted(missing)}"

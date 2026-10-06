@@ -1686,7 +1686,7 @@
                                     </div>
 
                                     <!-- Profile / preset / per-field chips -->
-                                    <div x-show="(!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm') && ((model.exposed_profiles && model.exposed_profiles.length) || (model.settings && (model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.min_p !== null || model.settings.repetition_penalty !== null || model.settings.presence_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens || model.settings.reasoning_parser || model.settings.chat_template_kwargs || model.settings.enable_thinking === true)))"
+                                    <div x-show="(!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm') && ((model.exposed_profiles && model.exposed_profiles.length) || (model.settings && (model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.min_p !== null || model.settings.repetition_penalty !== null || model.settings.presence_penalty !== null || model.settings.dry_multiplier || model.settings.force_sampling || model.settings.max_tool_result_tokens || model.settings.reasoning_parser || model.settings.chat_template_kwargs || model.settings.enable_thinking === true)))"
                                          class="px-6 pb-4 -mt-2">
                                         <div class="ml-11 flex flex-wrap gap-2">
                                             <!-- 1. API-exposed profile pills -->
@@ -1745,6 +1745,11 @@
                                             <template x-if="model.settings?.presence_penalty !== null && model.settings?.presence_penalty !== undefined">
                                                 <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-rose-50 text-rose-700 border border-rose-200">
                                                     presence_penalty: <span class="ml-1" x-text="model.settings.presence_penalty"></span>
+                                                </span>
+                                            </template>
+                                            <template x-if="model.settings?.dry_multiplier">
+                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-rose-50 text-rose-700 border border-rose-200">
+                                                    dry: <span class="ml-1" x-text="model.settings.dry_multiplier"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.max_tool_result_tokens">

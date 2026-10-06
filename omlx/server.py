@@ -205,6 +205,7 @@ from .exceptions import (
     SchedulerQueueFullError,
 )
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
+from .request import DryParams
 from .server_metrics import get_server_metrics, reset_server_metrics
 
 logging.basicConfig(level=logging.INFO)
@@ -1896,6 +1897,53 @@ def _strip_synthetic_think_prefix(chunk_text: str, think_tag: str) -> str:
     """
     prefix = f"{think_tag}\n"
     return chunk_text[len(prefix) :] if chunk_text.startswith(prefix) else chunk_text
+
+
+def _resolve_dry_params(request, model_id: str | None) -> DryParams | None:
+    """Resolve DRY settings: request > model settings > disabled.
+
+    Each field resolves on its own, so a model default for the multiplier
+    still applies when a client only overrides, say, the allowed length.
+    With force_sampling on, model settings win over the request, as for the
+    other sampling knobs.
+    """
+    model_settings = get_model_settings_for_request(model_id)
+    force = _server_state.sampling.force_sampling or bool(
+        model_settings and model_settings.force_sampling
+    )
+
+    def pick(name: str):
+        requested = getattr(request, name, None)
+        configured = getattr(model_settings, name, None) if model_settings else None
+        first, second = (configured, requested) if force else (requested, configured)
+        return first if first is not None else second
+
+    multiplier = pick("dry_multiplier")
+    base = pick("dry_base")
+    # llama.cpp convention: a zero multiplier or base turns DRY off.
+    if not multiplier or (base is not None and base < 1):
+        return None
+    overrides = {
+        field: value
+        for field, value in (
+            ("base", base),
+            ("penalty_last_n", pick("dry_penalty_last_n")),
+        )
+        if value is not None
+    }
+    exclude_reasoning = pick("dry_exclude_reasoning")
+    if exclude_reasoning is not None:
+        overrides["exclude_reasoning"] = bool(exclude_reasoning)
+    allowed_length = pick("dry_allowed_length")
+    if allowed_length is not None:
+        overrides["allowed_length"] = max(int(allowed_length), 1)
+    breakers = pick("dry_sequence_breakers")
+    if breakers is not None:
+        # llama.cpp convention: "none" clears the breakers.
+        overrides["sequence_breakers"] = tuple(
+            b for b in breakers if b and b != "none"
+        )
+    return DryParams(multiplier=float(multiplier), **overrides)
 
 
 def _resolve_thinking_budget(request, model_id: str | None) -> int | None:
@@ -3951,6 +3999,9 @@ async def create_completion(
             )
             if repetition_context_size is not None:
                 gen_kwargs["repetition_context_size"] = repetition_context_size
+            dry = _resolve_dry_params(request, request.model)
+            if dry is not None:
+                gen_kwargs["dry"] = dry
 
             # First prompt's first-token timestamp only: later prompts start
             # after earlier generations, so their first_token_at would count
@@ -4345,6 +4396,9 @@ async def create_chat_completion(
         )
         if repetition_context_size is not None:
             chat_kwargs["repetition_context_size"] = repetition_context_size
+        dry = _resolve_dry_params(request, request.model)
+        if dry is not None:
+            chat_kwargs["dry"] = dry
 
         # Add seed for reproducible generation (best-effort)
         if request.seed is not None:
@@ -5106,6 +5160,9 @@ async def stream_completion(
     )
     if repetition_context_size is not None:
         gen_kwargs["repetition_context_size"] = repetition_context_size
+    dry = _resolve_dry_params(request, request.model)
+    if dry is not None:
+        gen_kwargs["dry"] = dry
     try:
         async for output in engine.stream_generate(
             prompt=prompt,
@@ -6701,6 +6758,9 @@ async def create_anthropic_message(
         )
         if repetition_context_size is not None:
             chat_kwargs["repetition_context_size"] = repetition_context_size
+        dry = _resolve_dry_params(request, request.model)
+        if dry is not None:
+            chat_kwargs["dry"] = dry
 
         # Add thinking budget if applicable
         thinking_budget = _resolve_thinking_budget(request, request.model)
@@ -7297,6 +7357,9 @@ async def create_response(
         )
         if repetition_context_size is not None:
             chat_kwargs["repetition_context_size"] = repetition_context_size
+        dry = _resolve_dry_params(request, request.model)
+        if dry is not None:
+            chat_kwargs["dry"] = dry
 
         # Add seed for reproducible generation (best-effort)
         if request.seed is not None:
