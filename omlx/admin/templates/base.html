@@ -82,8 +82,11 @@
             {% endif %}
         }
 
+        /* Let native controls (number spinners, scrollbars, select arrows,
+           checkboxes) follow the app theme instead of rendering light. */
         [data-theme="dark"] {
             --focus-ring-color: #efefef;
+            color-scheme: dark;
         }
 
         body {
