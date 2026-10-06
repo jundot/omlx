@@ -636,3 +636,14 @@ async def test_each_emitted_value_is_settled_for_native_and_fallback(size, recov
     else:
         assert not actual["errors"]
         assert signature(actual) == signature(native)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [1, 13, 4096])
+@pytest.mark.parametrize("header", [" content", "\tcontent", "content!"])
+async def test_native_only_parameter_names_defer_until_recovery_is_known(size, header):
+    raw = envelope({"content": "text"}).replace("<parameter=content>", "<parameter=" + header + ">").removesuffix("</tool_call>")
+    native = await run(raw, size, False)
+    actual = await run(raw, size, True)
+    assert not actual["errors"]
+    assert signature(actual) == signature(native)

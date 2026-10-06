@@ -58,7 +58,6 @@ class QwenArgumentStream:
         from mlx_lm.tool_parsers.qwen3_coder import (
             _convert_param_value,
             _get_arguments_config,
-            _name_regex,
             _string_types,
         )
 
@@ -136,15 +135,17 @@ class QwenArgumentStream:
                         self.enabled = False
                         self.buf = ""
                     break
-                header = self.buf[11 : i + 1]
-                match = _name_regex.match(header)
+                from .tool_calling import _XML_PARAMETER_OPEN_RE
+                # Native-only header spellings may disappear entirely during
+                # EOF recovery. Stream only their common exact grammar.
+                match = _XML_PARAMETER_OPEN_RE.fullmatch(self.buf[:i + 1])
                 if match is None:
                     self.enabled = False
                     break
                 self.param = match.group(1)
                 self.duplicate_parameter = self.param in self.seen_parameters
                 self.seen_parameters.add(self.param)
-                self.buf = header[match.end() :] + self.buf[i + 1 :]
+                self.buf = self.buf[i + 1 :]
                 self.state = "value"
                 self.raw = []
                 self.trailing_whitespace = []
