@@ -436,7 +436,10 @@ def test_async_remove_schedules_clear_after_extracted_cache_release(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_batched_engine_preflight_chat_raises_for_oversize_prompt(monkeypatch):
+@pytest.mark.parametrize("prepared", [False, True])
+async def test_batched_engine_preflight_chat_raises_for_oversize_prompt(
+    monkeypatch, prepared
+):
     from omlx.engine.batched import BatchedEngine
 
     scheduler = _make_scheduler()
@@ -453,8 +456,16 @@ async def test_batched_engine_preflight_chat_raises_for_oversize_prompt(monkeypa
     # it out so the test only exercises the preflight wiring.
     engine._preprocess_messages = lambda m: m
 
+    kwargs = {}
+    if prepared:
+        kwargs["_prepared_prompt"] = ("prepared", list(range(110_000)))
+        engine._tokenizer.encode.side_effect = AssertionError(
+            "prepared prompt was reencoded"
+        )
     with pytest.raises(PrefillMemoryExceededError):
-        await engine.preflight_chat(messages=[{"role": "user", "content": "x"}])
+        await engine.preflight_chat(
+            messages=[{"role": "user", "content": "x"}], **kwargs
+        )
 
 
 @pytest.mark.asyncio

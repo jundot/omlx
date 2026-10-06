@@ -11,6 +11,8 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import omlx.server as srv
+from omlx.engine.base import GenerationOutput
+from omlx.engine.batched import BatchedEngine
 from omlx.engine.decision import DecisionEngine
 from omlx.engine_pool import EngineEntry
 from omlx.exceptions import (
@@ -1248,3 +1250,162 @@ def test_anthropic_adaptive_thinking_reaches_minimax_m3_template(
         )
     assert response.status_code == 418, response.text
     assert engine.preflight_chat.call_args.kwargs["chat_template_kwargs"] == expected
+
+
+@pytest.fixture
+def prepared_chat_engine():
+    engine = BatchedEngine(model_name="test-model")
+    engine._loaded = True
+    engine._model = SimpleNamespace(config=SimpleNamespace(model_type="qwen3_5"))
+    engine._tokenizer = SimpleNamespace(
+        encode=MagicMock(return_value=[11, 12, 13]),
+        apply_chat_template=MagicMock(side_effect=AssertionError("Prompt rerendered")),
+    )
+    engine._preprocess_messages = MagicMock(side_effect=lambda messages: messages)
+    engine._apply_chat_template = MagicMock(return_value="canonical prompt")
+    engine.start = AsyncMock()
+    engine.supports_request_scoped_abort = False
+    return engine
+
+
+def test_prepare_chat_prompt_for_request_uses_batched_preparation(prepared_chat_engine):
+    messages = [{"role": "user", "content": "Hello"}]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Look up",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+    engine = prepared_chat_engine
+
+    count, prepared = srv._prepare_chat_prompt_for_request(
+        engine,
+        messages,
+        tools=tools,
+        chat_template_kwargs={"preserve_thinking": True},
+        is_partial=True,
+    )
+
+    assert count == 3
+    assert prepared == ("canonical prompt", [11, 12, 13])
+    engine._apply_chat_template.assert_called_once()
+    assert engine._apply_chat_template.call_args.args == (messages, tools)
+    assert engine._apply_chat_template.call_args.kwargs == {
+        "chat_template_kwargs": {"preserve_thinking": True},
+        "is_partial": True,
+        "add_generation_prompt": None,
+    }
+    engine._tokenizer.encode.assert_called_once_with("canonical prompt")
+
+
+@pytest.mark.parametrize("subclass", [False, True])
+def test_prepare_chat_prompt_for_request_keeps_other_engine_count_path(subclass):
+    class OtherBatchedEngine(BatchedEngine):
+        pass
+
+    engine = OtherBatchedEngine.__new__(OtherBatchedEngine) if subclass else MagicMock()
+    engine.count_chat_tokens = MagicMock(return_value=7)
+    messages = [{"role": "user", "content": "Hello"}]
+
+    assert srv._prepare_chat_prompt_for_request(
+        engine,
+        messages,
+        chat_template_kwargs={"enable_thinking": False},
+        is_partial=True,
+    ) == (7, None)
+    engine.count_chat_tokens.assert_called_once_with(
+        messages, None, chat_template_kwargs={"enable_thinking": False}, is_partial=True
+    )
+
+
+def test_thinking_detection_reuses_prepared_prompt_before_tokenizer_lookup():
+    prepared = ("canonical prompt<think>", [11, 12, 13])
+    engine = SimpleNamespace(tokenizer=None)
+
+    assert (
+        srv._render_chat_prompt_for_thinking_detection(
+            engine, [], {"_prepared_prompt": prepared}
+        )
+        is prepared
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "path", ["/v1/chat/completions", "/v1/messages", "/v1/responses"]
+)
+def test_chat_routes_reuse_final_prepared_prompt(
+    monkeypatch, prepared_chat_engine, path, stream
+):
+    engine = prepared_chat_engine
+    rendered_kwargs = []
+
+    def render(messages, tools=None, **kwargs):
+        rendered_kwargs.append(dict(kwargs.get("chat_template_kwargs") or {}))
+        return "canonical prompt"
+
+    engine._apply_chat_template.side_effect = render
+    engine.preflight_chat = AsyncMock()
+    output = GenerationOutput(
+        text="</think>Done.",
+        new_text="</think>Done.",
+        prompt_tokens=3,
+        completion_tokens=1,
+    )
+    engine.chat = AsyncMock(return_value=output)
+    streamed_kwargs = []
+
+    async def stream_chat(**kwargs):
+        streamed_kwargs.append(kwargs)
+        yield output
+
+    engine.stream_chat = stream_chat
+    pool = MagicMock()
+    pool.preload_pinned_models = AsyncMock()
+    pool.check_ttl_expirations = AsyncMock()
+    pool.shutdown = AsyncMock()
+    pool.get_entry.return_value = SimpleNamespace(
+        config_model_type="qwen3_5", preserve_thinking_default=True
+    )
+    state = ServerState()
+    state.engine_pool = pool
+    monkeypatch.setattr(srv, "_server_state", state)
+    monkeypatch.setattr(srv, "get_engine_for_model", AsyncMock(return_value=engine))
+    monkeypatch.setattr(srv, "resolve_model_id", lambda name: name)
+    monkeypatch.setattr(srv, "get_model_settings_for_request", lambda name: None)
+    context_check = MagicMock()
+    monkeypatch.setattr(srv, "validate_context_window", context_check)
+    monkeypatch.setitem(
+        srv.app.dependency_overrides, srv.verify_inference_api_key, lambda: True
+    )
+    body = {"model": "test-model", "stream": stream}
+    if path == "/v1/responses":
+        body.update(input="Hello", store=False)
+    else:
+        body.update(messages=[{"role": "user", "content": "Hello"}], max_tokens=16)
+
+    with TestClient(srv.app, raise_server_exceptions=False) as client:
+        response = client.post(path, json=body)
+
+    assert response.status_code == 200, response.text
+    assert rendered_kwargs == [{"preserve_thinking": True}]
+    engine._tokenizer.encode.assert_called_once_with("canonical prompt")
+    engine._tokenizer.apply_chat_template.assert_not_called()
+    context_check.assert_called_once_with(3, "test-model")
+    prepared = engine.preflight_chat.call_args.kwargs["_prepared_prompt"]
+    assert prepared == ("canonical prompt", [11, 12, 13])
+    generated = streamed_kwargs[0] if stream else engine.chat.call_args.kwargs
+    assert generated["_prepared_prompt"] is prepared
+    assert generated["chat_template_kwargs"]["preserve_thinking"] is True
+    if path == "/v1/messages" and stream:
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        start = next(event for event in events if event["type"] == "message_start")
+        assert start["message"]["usage"]["input_tokens"] == len(prepared[1])
