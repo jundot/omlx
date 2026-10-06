@@ -12,6 +12,7 @@ import base64
 import io
 import struct
 import wave
+from typing import Optional, Union
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import mlx.core as mx
@@ -1096,7 +1097,12 @@ class TestTTSVoiceClonePassthrough:
 
         from omlx.engine.tts import TTSEngine
 
-        def _run(ref_audio_path=None, ref_text=None, preserve_ref_audio_path=False):
+        def _run(
+            ref_audio_path=None,
+            ref_text=None,
+            preserve_ref_audio_path=False,
+            annotation=None,
+        ):
             engine = TTSEngine("test-model")
 
             import inspect
@@ -1112,29 +1118,41 @@ class TestTTSVoiceClonePassthrough:
                     "voice", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None
                 ),
                 "ref_audio": inspect.Parameter(
-                    "ref_audio", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None
+                    "ref_audio",
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    default=None,
+                    annotation=(
+                        inspect.Parameter.empty if annotation is None else annotation
+                    ),
                 ),
                 "ref_text": inspect.Parameter(
                     "ref_text", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None
                 ),
             }
 
-            generate_mock = MagicMock()
-            generate_mock.__signature__ = inspect.Signature(
-                parameters=list(sig_params.values())
-            )
-            generate_mock.return_value = []
-
             class FakeModel:
                 pass
 
             fake_model = FakeModel()
-            fake_model.generate = generate_mock
             fake_model.sample_rate = 24000
             if preserve_ref_audio_path:
                 # Models such as ZonoS2/DramaBox own reference preprocessing and
                 # want the path itself, not a decoded array.
                 fake_model.preserve_ref_audio_path = True
+            # A real function stands in for generate(): the engine reads the
+            # callable's own __annotations__ to decide the ref_audio shape.
+            calls = []
+
+            def generate(text=None, **kwargs):
+                calls.append({"text": text, **kwargs})
+                return []
+
+            if annotation is not None:
+                generate.__annotations__["ref_audio"] = annotation
+            generate.__signature__ = inspect.Signature(
+                parameters=list(sig_params.values())
+            )
+            fake_model.generate = generate
 
             engine._model = fake_model
 
@@ -1149,14 +1167,19 @@ class TestTTSVoiceClonePassthrough:
             except RuntimeError:
                 pass  # "no audio output" expected
 
-            return fake_model.generate.call_args
+            class Recorded:
+                kwargs = calls[-1] if calls else {}
+
+            return Recorded()
 
         return _run
 
     def test_ref_audio_loaded_into_array(self, _run_synthesize_clone, tmp_path):
         """ref_audio is decoded into an mx.array before model.generate() (#1495)."""
         ref_file = self._write_ref_wav(tmp_path / "ref.wav")
-        call = _run_synthesize_clone(ref_audio_path=ref_file, ref_text="hello")
+        call = _run_synthesize_clone(
+            ref_audio_path=ref_file, ref_text="hello", annotation=mx.array
+        )
         kwargs = call.kwargs if call else {}
         ref_audio = kwargs.get("ref_audio")
         # A raw path string would raise "'str' object has no attribute 'ndim'"
@@ -1176,7 +1199,9 @@ class TestTTSVoiceClonePassthrough:
     def test_ref_audio_without_ref_text(self, _run_synthesize_clone, tmp_path):
         """ref_audio without ref_text passes a loaded array and ref_text=None."""
         ref_file = self._write_ref_wav(tmp_path / "ref.wav")
-        call = _run_synthesize_clone(ref_audio_path=ref_file, ref_text=None)
+        call = _run_synthesize_clone(
+            ref_audio_path=ref_file, ref_text=None, annotation=mx.array
+        )
         kwargs = call.kwargs if call else {}
         assert isinstance(kwargs.get("ref_audio"), mx.array)
         assert kwargs.get("ref_text") is None
@@ -1186,7 +1211,63 @@ class TestTTSVoiceClonePassthrough:
     ):
         """A 16 kHz reference is resampled up to the model's 24 kHz rate."""
         ref_file = self._write_ref_wav(tmp_path / "ref16.wav", sample_rate=16000)
+        call = _run_synthesize_clone(
+            ref_audio_path=ref_file, ref_text="hello", annotation=mx.array
+        )
+        kwargs = call.kwargs if call else {}
+        ref_audio = kwargs.get("ref_audio")
+        assert isinstance(ref_audio, mx.array)
+        assert ref_audio.shape[0] == 24000
+
+    def test_ref_audio_path_kept_for_self_preprocessing_model(
+        self, _run_synthesize_clone, tmp_path
+    ):
+        """A model that declares ref_audio as a path keeps receiving the path.
+
+        Confucius4 annotates it ``str`` and resamples the clip to 16 kHz itself;
+        feeding it an array skips that step and garbles the output.
+        """
+        ref_file = self._write_ref_wav(tmp_path / "ref.wav")
+        call = _run_synthesize_clone(
+            ref_audio_path=ref_file, ref_text="hello", annotation=str
+        )
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("ref_audio") == ref_file
+
+    def test_ref_audio_path_kept_when_annotation_is_silent(
+        self, _run_synthesize_clone, tmp_path
+    ):
+        """An unannotated generate() keeps the path it got on main.
+
+        OmniVoice only trims, removes silence and RMS-normalises when it is
+        handed a path, so it must not be switched to an array.
+        """
+        ref_file = self._write_ref_wav(tmp_path / "ref.wav")
         call = _run_synthesize_clone(ref_audio_path=ref_file, ref_text="hello")
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("ref_audio") == ref_file
+
+    def test_ref_audio_path_kept_when_annotation_accepts_both(
+        self, _run_synthesize_clone, tmp_path
+    ):
+        """A ``str | mx.array`` model (Chatterbox, Qwen3) still gets the path."""
+        ref_file = self._write_ref_wav(tmp_path / "ref.wav")
+        call = _run_synthesize_clone(
+            ref_audio_path=ref_file,
+            ref_text="hello",
+            annotation=Optional[Union[str, mx.array]],
+        )
+        kwargs = call.kwargs if call else {}
+        assert kwargs.get("ref_audio") == ref_file
+
+    def test_ref_audio_path_kept_for_pep563_array_annotation(
+        self, _run_synthesize_clone, tmp_path
+    ):
+        """Fish declares ``Optional[mx.array]`` under ``from __future__ import annotations``."""
+        ref_file = self._write_ref_wav(tmp_path / "ref.wav")
+        call = _run_synthesize_clone(
+            ref_audio_path=ref_file, ref_text="hello", annotation="Optional[mx.array]"
+        )
         kwargs = call.kwargs if call else {}
         ref_audio = kwargs.get("ref_audio")
         assert isinstance(ref_audio, mx.array)
@@ -1201,6 +1282,7 @@ class TestTTSVoiceClonePassthrough:
             ref_audio_path=ref_file,
             ref_text="hello",
             preserve_ref_audio_path=True,
+            annotation=mx.array,
         )
         kwargs = call.kwargs if call else {}
         assert kwargs.get("ref_audio") == ref_file
@@ -1208,7 +1290,9 @@ class TestTTSVoiceClonePassthrough:
     def test_unreadable_ref_audio_falls_back_to_path(self, _run_synthesize_clone):
         """A reference that cannot be decoded is forwarded unchanged, not fatal."""
         missing = "/tmp/definitely-missing-ref-1495.wav"
-        call = _run_synthesize_clone(ref_audio_path=missing, ref_text="hello")
+        call = _run_synthesize_clone(
+            ref_audio_path=missing, ref_text="hello", annotation=mx.array
+        )
         kwargs = call.kwargs if call else {}
         assert kwargs.get("ref_audio") == missing
 
