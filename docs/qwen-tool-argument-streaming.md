@@ -40,3 +40,8 @@ Ported from ashhart's commits 3a1979a and 09400ec in
 https://github.com/jundot/omlx/pull/3646. The port retains the existing naked-function
 filter and terminal-generation accounting, then adapts activation and finalization
 for the custom GA stack.
+
+The incremental parser retains a SHA-256 digest and character count of emitted
+arguments, checked once against final parsing. Non-string values remain buffered
+until their parameter closes. The existing server transcript and envelope filter
+still retain raw output for final parsing; total request memory is not constant.

@@ -6,6 +6,7 @@ existing envelope filter in FIFO order. A JSON object stays open until native
 parsing confirms its entire emitted prefix; no tools execute in this module.
 """
 
+import hashlib
 import json
 import uuid
 
@@ -44,7 +45,8 @@ class QwenArgumentStream:
             f["name"] = name
         if argument:
             f["arguments"] = argument
-            self.current["parts"].append(argument)
+            self.current["digest"].update(argument.encode("utf-8", "surrogatepass"))
+            self.current["length"] += len(argument)
         tc = {"index": len(self.calls) - 1, "function": f}
         if name is not None:
             tc.update(id=self.current["id"], type="function")
@@ -105,7 +107,8 @@ class QwenArgumentStream:
                 self.current = {
                     "name": name,
                     "id": "call_" + uuid.uuid4().hex[:8],
-                    "parts": [],
+                    "digest": hashlib.sha256(),
+                    "length": 0,
                 }
                 self.calls.append(self.current)
                 out.append(self.emit("{", name))
@@ -232,11 +235,15 @@ class QwenArgumentStream:
             raise ValueError("Incremental tool count differs from native final parsing")
         out = []
         for i, (call, tc) in enumerate(zip(self.calls, actual)):
-            prefix = "".join(call["parts"])
+            length = call["length"]
             full = tc.function.arguments
-            if tc.function.name != call["name"] or not full.startswith(prefix):
+            # Compare once at envelope completion. Retain only the digest and
+            # character count while streaming, not a second argument body.
+            digest = hashlib.sha256(full[:length].encode("utf-8", "surrogatepass"))
+            if (tc.function.name != call["name"] or len(full) < length
+                    or digest.digest() != call["digest"].digest()):
                 raise ValueError(
                     "Incremental arguments differ from native final parsing"
                 )
-            out.append({"index": i, "function": {"arguments": full[len(prefix) :]}})
+            out.append({"index": i, "function": {"arguments": full[length:]}})
         return out

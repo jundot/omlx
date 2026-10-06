@@ -352,3 +352,21 @@ async def test_cancellation_closes_the_producer():
             break
     await output.aclose()
     assert engine.closed
+
+
+def test_emitted_string_body_is_not_retained():
+    import tracemalloc
+    from omlx.api.qwen_argument_stream import QwenArgumentStream
+
+    stream = QwenArgumentStream(TOOLS)
+    stream.feed("<tool_call><function=write><parameter=content>started")
+    tracemalloc.start()
+    try:
+        for _ in range(1024):
+            stream.feed("x" * 1024)
+        retained, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert stream.current["length"] > 1024 * 1023
+    assert retained < 65536
+    assert peak < 131072
