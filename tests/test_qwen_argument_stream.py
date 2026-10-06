@@ -702,14 +702,19 @@ async def test_overflow_complete_prefix_is_not_resent_when_a_later_call_fails(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("size", [1, 13, 4096])
-@pytest.mark.parametrize("value", [
-    "a</parameter>\u00a0<parameter=path>literal",
-    "a</parameter>\v<parameter=path>literal",
-    "a</parameter></function>b",
-])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "a</parameter>\u00a0<parameter=path>literal",
+        "a</parameter>\v<parameter=path>literal",
+        "a</parameter></function>b",
+    ],
+)
 @pytest.mark.parametrize("recover", [False, True])
 async def test_parameter_boundary_uses_common_structural_context(size, value, recover):
-    raw = envelope({"content": value} if recover else {"content": value, "number": "invalid"})
+    raw = envelope(
+        {"content": value} if recover else {"content": value, "number": "invalid"}
+    )
     if recover:
         raw = raw.removesuffix("</tool_call>")
     native = await run(raw, size, False)
@@ -719,3 +724,14 @@ async def test_parameter_boundary_uses_common_structural_context(size, value, re
     else:
         assert not actual["errors"]
         assert signature(actual) == signature(native)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [1, 13, 4096])
+async def test_deep_typed_value_defers_to_existing_final_parser(size):
+    # A following parameter exercises conversion before envelope completion.
+    raw = envelope({"items": "[" * 1100 + "0" + "]" * 1100, "path": "file"})
+    native = await run(raw, size, False)
+    actual = await run(raw, size, True)
+    assert not actual["errors"]
+    assert signature(actual) == signature(native)

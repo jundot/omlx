@@ -219,7 +219,13 @@ class QwenArgumentStream:
                             ):
                                 self.enabled = False
                                 break
-                        except (ValueError, SyntaxError, TypeError):
+                        except (
+                            ValueError,
+                            SyntaxError,
+                            TypeError,
+                            RecursionError,
+                            OverflowError,
+                        ):
                             self.enabled = False
                             break
                         out.append(
