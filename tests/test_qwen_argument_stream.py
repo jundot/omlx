@@ -403,3 +403,14 @@ async def test_untyped_properties_match_final_qwen_wrapper(size, schema, value):
     actual = await run(raw, size, True, tools=tools)
     assert not actual["errors"]
     assert signature(actual) == signature(native)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [1, 13, 1024])
+@pytest.mark.parametrize("header", [" content", "content ", "\tcontent", "content ignored"])
+async def test_parameter_header_matches_native_name_and_value_boundary(size, header):
+    raw = envelope({"content": "text"}).replace("<parameter=content>", "<parameter=" + header + ">")
+    native = await run(raw, size, False)
+    actual = await run(raw, size, True)
+    assert not actual["errors"]
+    assert signature(actual) == signature(native)
