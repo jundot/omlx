@@ -5552,3 +5552,31 @@ async def test_finished_output_tool_delta_cancellation_accounts_once(monkeypatch
             break
     assert len(metrics) == 1
     assert metrics[0]["completion_tokens"] == 123
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chunk_size", [1, 13, 4096])
+@pytest.mark.parametrize("paired_first", [False, True])
+@pytest.mark.parametrize("namespaced", [False, True])
+async def test_other_qwen_envelopes_preserve_literal_paired_openers(
+    chunk_size, paired_first, namespaced
+):
+    value = "<tool_call><function=write><parameter=content>" + "x" * 100
+    naked = (
+        "\n<function=write>\n<parameter=content>\n"
+        + value
+        + "\n</parameter>\n</function>\n"
+    )
+    paired = (
+        "<tool_call><function=write><parameter=content>ordinary"
+        "</parameter></function></tool_call>"
+    )
+    if namespaced:
+        naked = "<ns:tool_call>" + naked + "</ns:tool_call>"
+    raw = paired + naked if paired_first else naked + paired
+    events = await _recovery_stream(raw, chunk_size=chunk_size)
+    assert not any(event.get("error") for event in events)
+    calls = _chat_argument_calls(events)
+    expected = ["ordinary", value] if paired_first else [value, "ordinary"]
+    assert [json.loads(call["arguments"])["content"] for call in calls] == expected
+    assert len({call["id"] for call in calls}) == 2

@@ -2615,7 +2615,12 @@ class ToolCallStreamFilter:
             self._ordered_segments.append(ToolCallStreamSegment("content", text))
 
     def _record_envelope_fragment(self, text: str) -> None:
-        if self._capture_envelope_fragments and not self._completed_envelope_overflowed and text:
+        if (
+            self._capture_envelope_fragments
+            and self._pending_start_marker == "<tool_call>"
+            and not self._completed_envelope_overflowed
+            and text
+        ):
             self._ordered_segments.append(ToolCallStreamSegment("envelope_delta", text))
 
     def _record_completed_envelope(self, completed: str) -> None:
@@ -3390,8 +3395,8 @@ class ToolCallStreamFilter:
                         # Recover the exact opening bytes, including dynamic
                         # namespace markers, if the matching close never arrives.
                         self._pending_envelope_parts = [opening_marker]
-                        self._record_envelope_fragment(opening_marker)
                         self._pending_start_marker = opening_marker
+                        self._record_envelope_fragment(opening_marker)
                         # Fresh envelope: start the payload scan from scratch.
                         self._reset_json_scan()
                 continue

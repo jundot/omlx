@@ -56,3 +56,7 @@ still retain raw output for final parsing; total request memory is not constant.
 Strings with ambiguous leading quotes/whitespace or trailing whitespace defer
 those bytes to final parsing so missing-outer-close recovery keeps its existing
 semantics. Boolean schemas and untyped properties also use final parsing.
+
+Only literal `<tool_call>` outer envelopes supply incremental fragments. Bare
+functions and namespaced wrappers retain complete-envelope delivery, including
+when their string arguments contain literal paired-tool opening markup.
