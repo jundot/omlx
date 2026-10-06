@@ -138,6 +138,93 @@ class TestDiffusionStructuredOutputGuard:
             )
 
 
+class TestDowngradedVlmImageGuard:
+    """A VLM the pool had to serve text-only must refuse image input.
+
+    The text extractor drops image content parts, so without this guard the
+    caller gets an ordinary 200 built from the surrounding text alone and no
+    signal that the image never reached the prompt (#3688).
+    """
+
+    @staticmethod
+    def _downgraded_entry():
+        return SimpleNamespace(
+            vision_downgrade_reason="Received 785 parameters not in model: mtp."
+        )
+
+    @staticmethod
+    def _message(content):
+        return SimpleNamespace(role="user", content=content)
+
+    def test_rejects_openai_image_url_part(self):
+        messages = [
+            self._message(
+                [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;.."}},
+                ]
+            )
+        ]
+        with pytest.raises(InvalidRequestError, match="785 parameters not in model"):
+            srv._reject_image_input_on_downgraded_vlm(
+                self._downgraded_entry(), messages
+            )
+
+    def test_rejects_anthropic_image_block(self):
+        messages = [
+            self._message(
+                [{"type": "image", "source": {"type": "base64", "data": "iVBOR"}}]
+            )
+        ]
+        with pytest.raises(InvalidRequestError, match="cannot accept images"):
+            srv._reject_image_input_on_downgraded_vlm(
+                self._downgraded_entry(), messages
+            )
+
+    def test_rejects_image_part_given_as_an_object(self):
+        # Pydantic content parts reach the handler as objects, not dicts.
+        messages = [self._message([SimpleNamespace(type="input_image")])]
+        with pytest.raises(InvalidRequestError):
+            srv._reject_image_input_on_downgraded_vlm(
+                self._downgraded_entry(), messages
+            )
+
+    def test_rejects_image_nested_in_a_tool_result_block(self):
+        # Anthropic tool_result blocks carry their own content list.
+        messages = [
+            self._message(
+                [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t1",
+                        "content": [{"type": "image", "source": {"data": "iVBOR"}}],
+                    }
+                ]
+            )
+        ]
+        with pytest.raises(InvalidRequestError):
+            srv._reject_image_input_on_downgraded_vlm(
+                self._downgraded_entry(), messages
+            )
+
+    def test_allows_text_only_request_on_downgraded_model(self):
+        # The downgraded model still answers text; only vision is gone.
+        srv._reject_image_input_on_downgraded_vlm(
+            self._downgraded_entry(),
+            [
+                self._message("plain string content"),
+                self._message([{"type": "text", "text": "list content"}]),
+            ],
+        )
+
+    def test_allows_image_when_no_downgrade_was_recorded(self):
+        messages = [self._message([{"type": "image_url", "image_url": {"url": "x"}}])]
+        srv._reject_image_input_on_downgraded_vlm(
+            SimpleNamespace(vision_downgrade_reason=None), messages
+        )
+        srv._reject_image_input_on_downgraded_vlm(None, messages)
+
+
 class TestGenerationSpeedLog:
     def test_formats_plain_generation_speed(self):
         assert (
