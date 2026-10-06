@@ -60,3 +60,9 @@ semantics. Boolean schemas and untyped properties also use final parsing.
 Only literal `<tool_call>` outer envelopes supply incremental fragments. Bare
 functions and namespaced wrappers retain complete-envelope delivery, including
 when their string arguments contain literal paired-tool opening markup.
+
+The gate recognizes the exact Qwen parser functions shipped by both mlx-lm and
+mlx-vlm. Conversion helpers come from the registered function's own module;
+the pinned VLM parser has different integer and structured-value conversion
+rules. The local engine must still explicitly report a raw scheduler without
+a structured output parser.

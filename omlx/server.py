@@ -5396,26 +5396,27 @@ def _chat_can_stream_qwen_tool_envelopes(engine: BaseEngine) -> bool:
     """Narrow Chat-only early-tool gate.
 
     The engine capability is authoritative and defaults false. The tokenizer
-    must independently expose mlx-lm's qwen3_coder parser; all other APIs and
-    parser families remain terminal-buffered.
+    must independently expose mlx-lm's or mlx-vlm's qwen3_coder parser. Other
+    APIs and parser families remain terminal-buffered.
     """
 
     if getattr(engine, "supports_early_tool_call_streaming", False) is not True:
         return False
     tokenizer = getattr(engine, "tokenizer", None)
     parser = getattr(tokenizer, "tool_parser", None)
-    try:
-        from mlx_lm.tool_parsers.qwen3_coder import (
-            parse_tool_call as expected_parser,
-        )
-    except ImportError:
-        return False
-    return bool(
-        parser is expected_parser
-        and getattr(parser, "__name__", None) == "parse_tool_call"
-        and getattr(parser, "__module__", None)
-        == "mlx_lm.tool_parsers.qwen3_coder"
-    )
+    import importlib
+
+    for module_name in (
+        "mlx_lm.tool_parsers.qwen3_coder",
+        "mlx_vlm.tools.parsers.qwen3_coder",
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        if parser is module.parse_tool_call:
+            return True
+    return False
 
 
 def _merge_streamed_tool_call_prefix(streamed: list, terminal: list | None) -> list:
@@ -5512,7 +5513,9 @@ async def stream_chat_completion(
         stream_completed_qwen_tools = qwen_tool_envelope_streaming_capable
         if qwen_tool_envelope_streaming_capable:
             from .api.qwen_argument_stream import QwenArgumentStream
-            argument_stream = QwenArgumentStream(kwargs.get("tools"))
+            argument_stream = QwenArgumentStream(
+                kwargs.get("tools"), native_parser=engine.tokenizer.tool_parser
+            )
         _content_filter = ToolCallStreamFilter(
             engine.tokenizer,
             tools=kwargs.get("tools"),
@@ -5701,9 +5704,13 @@ async def stream_chat_completion(
                                     )
                                     mark_visible_delta()
                                     yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
-                                argument_stream = QwenArgumentStream(kwargs.get("tools"))
+                                argument_stream = QwenArgumentStream(
+                                    kwargs.get("tools"), native_parser=engine.tokenizer.tool_parser
+                                )
                                 continue
-                            argument_stream = QwenArgumentStream(kwargs.get("tools"))
+                            argument_stream = QwenArgumentStream(
+                                kwargs.get("tools"), native_parser=engine.tokenizer.tool_parser
+                            )
                         for tc in completed_calls:
                             index = len(streamed_tool_calls)
                             streamed_tool_calls.append(tc)

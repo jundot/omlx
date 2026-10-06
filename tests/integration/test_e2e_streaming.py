@@ -2405,8 +2405,9 @@ class TestStreamingHelperFunctions:
             scheduler._output_parser_factory = None
             assert engine.supports_early_tool_call_streaming
 
-    def test_early_tool_gate_requires_exact_qwen3_coder_parser(self):
-        from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+    @pytest.mark.parametrize("module_name", ["mlx_lm.tool_parsers.qwen3_coder", "mlx_vlm.tools.parsers.qwen3_coder"])
+    def test_early_tool_gate_requires_exact_qwen3_coder_parser(self, module_name):
+        parse_tool_call = pytest.importorskip(module_name).parse_tool_call
 
         from omlx.server import _chat_can_stream_qwen_tool_envelopes
 
@@ -2422,7 +2423,7 @@ class TestStreamingHelperFunctions:
         engine.tokenizer.tool_parser = lookalike
         assert not _chat_can_stream_qwen_tool_envelopes(engine)
 
-        lookalike.__module__ = "mlx_lm.tool_parsers.qwen3_coder"
+        lookalike.__module__ = module_name
         lookalike.__name__ = "parse_tool_call"
         assert not _chat_can_stream_qwen_tool_envelopes(engine)
 
@@ -4680,7 +4681,7 @@ _RECOVERY_CALL = (
 
 async def _recovery_stream(
     raw, api="chat", chunk_size=7, finish_reason="stop", closed=None, cancel=False,
-    completion_tokens=0, include_usage=False
+    completion_tokens=0, include_usage=False, native_parser=None
 ):
     from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
 
@@ -4698,7 +4699,7 @@ async def _recovery_stream(
     engine.tokenizer.has_tool_calling = True
     engine.tokenizer.tool_call_start = "<tool_call>"
     engine.tokenizer.tool_call_end = "</tool_call>"
-    engine.tokenizer.tool_parser = parse_tool_call
+    engine.tokenizer.tool_parser = native_parser or parse_tool_call
     engine.set_stream_outputs(
         [
             MockGenerationOutput(

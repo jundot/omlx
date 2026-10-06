@@ -78,6 +78,24 @@ class Engine:
             )
 
 
+@pytest.fixture(
+    params=["mlx_lm.tool_parsers.qwen3_coder", "mlx_vlm.tools.parsers.qwen3_coder"],
+    autouse=True,
+)
+def registered_native_parser(request, monkeypatch):
+    native = pytest.importorskip(request.param)
+    monkeypatch.setattr(
+        Engine,
+        "tokenizer",
+        SimpleNamespace(
+            has_tool_calling=True,
+            tool_call_start="<tool_call>",
+            tool_call_end="</tool_call>",
+            tool_parser=native.parse_tool_call,
+        ),
+    )
+
+
 async def run(raw, size, incremental, capable=True, tools=TOOLS):
     engine = Engine(raw, size, capable and incremental)
     request = ChatCompletionRequest(
@@ -735,3 +753,46 @@ async def test_deep_typed_value_defers_to_existing_final_parser(size):
     actual = await run(raw, size, True)
     assert not actual["errors"]
     assert signature(actual) == signature(native)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind,value",
+    [
+        ("integer", "9007199254740993"),
+        ("integer", "3.0"),
+        ("integer", "0x10"),
+        ("object", '{"value": "raw\nnewline"}'),
+        ("array", "[True]"),
+    ],
+)
+@pytest.mark.parametrize("size", [1, 13, 4096])
+async def test_registered_parser_conversion_matches_native(kind, value, size):
+    import copy
+
+    tools = copy.deepcopy(TOOLS)
+    tools[0]["function"]["parameters"]["properties"]["typed"] = {"type": kind}
+    raw = envelope({"typed": value, "content": "following"})
+    native = await run(raw, size, False, tools=tools)
+    actual = await run(raw, size, True, tools=tools)
+    assert not actual["errors"]
+    assert signature(actual) == signature(native)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("naked_first", [False, True])
+@pytest.mark.parametrize("size", [1, 13, 4096])
+async def test_registered_parser_survives_completed_envelope_reset(naked_first, size):
+    import copy
+
+    tools = copy.deepcopy(TOOLS)
+    tools[0]["function"]["parameters"]["properties"]["typed"] = {"type": "integer"}
+    first = envelope({"content": "first"})
+    if naked_first:
+        first = first.removeprefix("<tool_call>").removesuffix("</tool_call>")
+    raw = first + envelope({"typed": "9007199254740993", "content": "following"})
+    native = await run(raw, size, False, tools=tools)
+    actual = await run(raw, size, True, tools=tools)
+    assert not actual["errors"]
+    assert signature(actual) == signature(native)
+    assert len(actual["calls"]) == 2

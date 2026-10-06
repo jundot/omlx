@@ -7,6 +7,7 @@ parsing confirms its entire emitted prefix; no tools execute in this module.
 """
 
 import hashlib
+import importlib
 import json
 import uuid
 
@@ -17,7 +18,15 @@ class QwenArgumentStream:
     MAX_ENVELOPE_CHARS = 2 * 1024 * 1024
     MAX_HEADER_CHARS = 4096
 
-    def __init__(self, tools):
+    def __init__(self, tools, native_parser=None):
+        native = importlib.import_module(
+            native_parser.__module__
+            if native_parser is not None
+            else "mlx_lm.tool_parsers.qwen3_coder"
+        )
+        self.convert_param_value = native._convert_param_value
+        self.get_arguments_config = native._get_arguments_config
+        self.string_types = native._string_types
         self.enabled = bool(tools)
         self.tools = tools or []
         self.buf = ""
@@ -55,12 +64,6 @@ class QwenArgumentStream:
     def feed(self, text):
         if not self.enabled:
             return []
-        from mlx_lm.tool_parsers.qwen3_coder import (
-            _convert_param_value,
-            _get_arguments_config,
-            _string_types,
-        )
-
         self.received += len(text)
         if self.received > self.MAX_ENVELOPE_CHARS:
             self.enabled = False
@@ -97,7 +100,7 @@ class QwenArgumentStream:
                 ):
                     self.enabled = False
                     break
-                self.config = _get_arguments_config(name, self.tools)
+                self.config = self.get_arguments_config(name, self.tools)
                 if not isinstance(self.config, dict) or any(
                     not isinstance(spec, dict) for spec in self.config.values()
                 ):
@@ -160,7 +163,8 @@ class QwenArgumentStream:
                     break
                 self.string = (
                     not cfg
-                    or str(cfg.get("type", "string")).strip().lower() in _string_types
+                    or str(cfg.get("type", "string")).strip().lower()
+                    in self.string_types
                 )
                 self.prefix = (
                     ("" if self.first else ", ")
@@ -203,7 +207,7 @@ class QwenArgumentStream:
                     if closed:
                         try:
                             raw_value = "".join(self.raw)
-                            value = _convert_param_value(
+                            value = self.convert_param_value(
                                 raw_value, self.param, self.config
                             )
                             from .tool_calling import _coerce_param_value
