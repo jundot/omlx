@@ -23,7 +23,15 @@ from omlx.api.openai_models import (
     ToolCall,
     ToolDefinition,
 )
+
+# Shared qwen3_coder-style tool-call markers for parser tests.
+# U+2462 mirrors the GLM-5.3-Flash template's bare opening marker and
+# U+2461 its close, keeping tests free of ambiguous literal bytes.
+OPEN_MARK = "\u2462"
+CLOSE_MARK = "\u2461"
 from omlx.api.tool_calling import (
+
+
     ToolCallStreamFilter,
     _coerce_param_value,
     _gemma4_args_to_json_robust,
@@ -4105,10 +4113,17 @@ class TestToolCallMarkerInArguments:
         ]
 
     def test_unterminated_envelope_yields_no_span(self):
-        text = '<tool_call>{"name": "f", "arguments": {}}'
-        assert _marker_payloads(text, "<tool_call>", "</tool_call>") == []
-        assert _strip_marker_spans(text, "<tool_call>", "</tool_call>") == text
+        text = OPEN_MARK + '{"name": "f", "arguments": {}}'
+        assert _marker_payloads(text, OPEN_MARK, CLOSE_MARK) == []
+        # An unterminated envelope is dropped wholesale: templates whose
+        # instruction block shows only the opening marker (GLM-5.3-Flash)
+        # make models emit unclosed envelopes, and leaving the marker in
+        # cleaned text re-seeds the envelope on the next turn (tool-loop).
+        assert _strip_marker_spans(text, OPEN_MARK, CLOSE_MARK) == ""
 
+    def test_unterminated_envelope_after_prose_keeps_prose(self):
+        text = "before " + OPEN_MARK + '{"name": "f", "arguments": {}}'
+        assert _strip_marker_spans(text, OPEN_MARK, CLOSE_MARK) == "before "
     def test_incomplete_json_falls_back_to_first_marker(self):
         """Never-completing JSON must not swallow the rest of the message."""
         text = '<tool_call>{"name": "f", "arguments": {"s": "oops </tool_call>'
