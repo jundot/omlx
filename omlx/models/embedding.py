@@ -4,7 +4,8 @@ MLX Embedding Model wrapper.
 
 This module provides a wrapper around mlx-embeddings for generating
 text embeddings using Apple's MLX framework, with native fallback
-for XLMRoBERTa, BERT, and Qwen2-decoder embedding models.
+for XLMRoBERTa, BERT, and Qwen2-decoder embedding models, and mlx-vlm
+for embedding models that only mlx-vlm implements.
 """
 
 import gc
@@ -18,6 +19,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 from mlx.utils import tree_flatten, tree_map
+from mlx_vlm.embedding_loader import load_embedding_model
+from mlx_vlm.utils import load_config, load_processor
 
 from ..patches.modernbert_attention import patch_modernbert_attention
 from ..utils.image import validate_image_data_uri
@@ -50,6 +53,10 @@ _FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 # position, so it is mask-independent.
 _MASK_AWARE_POOLING_MODES = ("mean", "lasttoken")
 
+# Context windows from the model cards. EmbeddingGemma 2's config.json only
+# declares the RoPE limit (262144).
+_MLX_VLM_EMBEDDING_CONTEXT = {"embedding_gemma2": 8192}
+
 
 @dataclass
 class EmbeddingOutput:
@@ -65,6 +72,38 @@ class EmbeddingOutput:
     """Dimension of each embedding vector."""
 
 
+class _ChatTemplateEmbeddingInputs:
+    """Build text and image embedding inputs with an mlx-vlm processor."""
+
+    def __init__(self, processor, max_length: int):
+        self._processor = processor
+        self._max_length = max_length
+
+    def prepare_embedding_inputs(self, inputs, return_tensors: str = "mlx"):
+        conversations = []
+        for item in inputs:
+            content = []
+            if item.get("text"):
+                content.append({"type": "text", "text": item["text"]})
+            if item.get("image"):
+                content.append({"type": "image", "url": item["image"]})
+            conversations.append([{"role": "user", "content": content}])
+        batch = self._processor.apply_chat_template(
+            conversations,
+            tokenize=True,
+            return_dict=True,
+            return_tensors=return_tensors,
+        )
+        # Truncation can cut media placeholders, so reject long inputs instead.
+        length = batch["input_ids"].shape[1]
+        if length > self._max_length:
+            raise ValueError(
+                f"Embedding input is {length} tokens, which exceeds the "
+                f"{self._max_length}-token limit for image inputs"
+            )
+        return batch
+
+
 class MLXEmbeddingModel:
     """
     Wrapper around mlx-embeddings for generating text embeddings.
@@ -77,6 +116,7 @@ class MLXEmbeddingModel:
     - Native BERT embedding (no mlx-embeddings dependency)
     - Native Qwen2-decoder embedding (last-token + L2; jina-code, gte-Qwen2)
       — mlx-embeddings has no qwen2 module
+    - mlx-vlm for EmbeddingGemma 2 (text and image inputs)
     - mlx-embeddings fallback for other architectures
 
     Example:
@@ -107,6 +147,7 @@ class MLXEmbeddingModel:
         self._remap_input_ids_to_inputs = False
         self._pooling_mode: Optional[str] = None
         self._pooling_source: str = "not resolved"
+        self._media_processor = None
 
     # (hidden_size, num_hidden_layers) of Qwen3-Embedding-0.6B and -8B.
     _FP16_PROMOTE_SHAPES = {(1024, 28), (4096, 36)}
@@ -348,9 +389,53 @@ class MLXEmbeddingModel:
             logger.debug(f"Native loading failed for {self.model_name}: {e}")
             return False
 
+    def _load_mlx_vlm(self) -> bool:
+        """Load mlx-vlm-only model types. Errors propagate: no other loader fits."""
+        model_path = Path(self.model_name)
+        try:
+            with open(model_path / "config.json") as fh:
+                model_type = json.load(fh).get("model_type")
+        except (OSError, ValueError):
+            return False
+        context_length = _MLX_VLM_EMBEDDING_CONTEXT.get(model_type)
+        if context_length is None:
+            return False
+
+        logger.info(f"Loading embedding model via mlx-vlm: {self.model_name}")
+        config = load_config(model_path)
+        # /v1/embeddings has no audio input, so the audio tower is not loaded.
+        config["audio_config"] = None
+        model = load_embedding_model(model_path, config=config)
+        processor = load_processor(model_path, add_detokenizer=False)
+        model.max_input_length = context_length
+
+        self.model = model
+        # Text requests use the tokenizer path. The processor's own __call__
+        # takes images as its first positional argument.
+        self.processor = processor.tokenizer
+        self._media_processor = _ChatTemplateEmbeddingInputs(
+            processor, context_length
+        )
+        self._hidden_size = model.config.text_config.embedding_dim
+        self._using_native = False
+        self._detect_input_key_remapping()
+        self._is_compiled = self._try_compile()
+        self._loaded = True
+        logger.info(
+            f"Embedding model loaded via mlx-vlm: {self.model_name} "
+            f"(model_type={model_type}, dimensions={self._hidden_size}, "
+            f"compiled={self._is_compiled})"
+        )
+        return True
+
     def load(self) -> None:
         """Load the model and processor/tokenizer."""
         if self._loaded:
+            return
+
+        # mlx-vlm embedding models pool inside their forward and return
+        # float32 text_embeds, so the declared pooling mode is not applied.
+        if self._load_mlx_vlm():
             return
 
         self._pooling_mode, self._pooling_source = self._resolve_pooling_mode()
@@ -782,6 +867,7 @@ class MLXEmbeddingModel:
 
         self.model = None
         self.processor = None
+        self._media_processor = None
         self._hidden_size = None
         self._loaded = False
         self._using_native = False
@@ -832,6 +918,8 @@ class MLXEmbeddingModel:
         has_image_inputs = any("image" in item for item in normalized_inputs)
 
         processor = self.processor
+        if has_image_inputs and self._media_processor is not None:
+            processor = self._media_processor
         uses_custom_embedding_inputs = self._uses_custom_embedding_inputs(processor)
         # Unwrap only mlx-embeddings' TokenizerWrapper. transformers tokenizers
         # also have a Rust _tokenizer whose encode() applies tokenizer.json
@@ -957,7 +1045,13 @@ class MLXEmbeddingModel:
                 {"attention_mask": attention_mask, "input_ids": input_ids}
             )
         else:
-            if self._is_compiled and self._compiled_embed is not None:
+            # Media batches stay eager: the media merge calls .item(), and a
+            # compile failure here would disable compile for text requests too.
+            if (
+                self._is_compiled
+                and self._compiled_embed is not None
+                and processor is not self._media_processor
+            ):
                 try:
                     inputs = self._prepare_embedding_inputs(
                         processor,

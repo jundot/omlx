@@ -1,0 +1,45 @@
+name: Triage
+
+on:
+  issue_comment:
+    types: [created]
+  schedule:
+    - cron: "0 19 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: >-
+    triage-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    && 'daily'
+    || format('issue-{0}', github.event.issue.number) }}
+
+permissions:
+  contents: read
+
+jobs:
+  triage:
+    # Comment events only matter when the reporter answers a needs-info issue.
+    if: >-
+      github.event_name != 'issue_comment' || (
+      !github.event.issue.pull_request &&
+      contains(github.event.issue.labels.*.name, 'needs-info') &&
+      github.event.comment.user.login == github.event.issue.user.login)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: write # Required by convertPullRequestToDraft.
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          TRIAGE_LIVE: ${{ vars.TRIAGE_LIVE }}
+        with:
+          script: |
+            const triage = require('./.github/scripts/triage.js');
+            await triage({ github, context, core });

@@ -11,6 +11,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+from omlx.memory_monitor import qwen4_gathered_min_query_tokens
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 
 compat.apply_mlx_vlm_qwen4_exp_compat_patch()
@@ -707,7 +708,7 @@ def test_qwen4_gathered_prefill_requires_minimum_query_width(monkeypatch):
     wide = mx.random.normal((1, 16, config.hidden_size))
 
     monkeypatch.delenv("OMLX_QWEN4_GATHERED_MIN_QUERY", raising=False)
-    assert language._gathered_min_query_tokens() == 16
+    assert qwen4_gathered_min_query_tokens() == 16
     assert not attention._gathered_text_prefill_eligible(
         narrow, "causal", cache, None, None, False
     )
@@ -720,7 +721,7 @@ def test_qwen4_gathered_prefill_requires_minimum_query_width(monkeypatch):
         narrow, "causal", cache, None, None, False
     )
     monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "garbage")
-    assert language._gathered_min_query_tokens() == 16
+    assert qwen4_gathered_min_query_tokens() == 16
 
 
 def test_qwen4_trim_keeps_pooled_index_prefix_exact():

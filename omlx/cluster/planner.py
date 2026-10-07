@@ -768,10 +768,16 @@ def _supports_pipeline(config: dict[str, Any]) -> bool:
     # that offered pipeline for Qwen3.5/3.6-family VLMs and then failed at load.
     from omlx.model_discovery import _has_vision_subconfig
 
-    if _has_vision_subconfig(config):
+    if _has_vision_subconfig(config) and model_type not in _MLX_LM_TEXT_PIPELINE_TYPES:
         return False
     return _declares_pipeline(model_type)
 
+
+# VLM-shaped checkpoints whose DISTRIBUTED load goes through mlx-lm: the cluster
+# worker never uses mlx-vlm and mlx-lm's ``sanitize`` drops the vision tower, so
+# the vision guard above is a false positive for them (oMLX #3662). Qwen3.5/3.6/3.8
+# dense ships its vision config next to the text weights.
+_MLX_LM_TEXT_PIPELINE_TYPES = frozenset({"qwen3_5"})
 
 # Only about seven of mlx-lm's ~120 architectures can be pipelined, so the
 # answer is nearly always no — worth knowing before staging a hundred

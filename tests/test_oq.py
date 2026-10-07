@@ -68,6 +68,7 @@ from omlx.oq import (
     _should_quantize_tensor,
     _source_imatrix_signature,
     _source_has_nextn_tensors,
+    _source_weight_files,
     _TrackedTensor,
     _validate_oq_dtype_for_model,
     _uses_minimax_mxfp8_scale_inv_source,
@@ -4423,6 +4424,65 @@ class TestEstimateBpwHeaderOnly:
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestQuantizeOqStreamingPassthroughDtypes:
+    def test_clef_joint_head_is_copied_beside_an_indexed_backbone(self, tmp_path):
+        """The Clef decision head is not a backbone weight. It must stay out of
+        the quantized shards, and a single-shard output still needs an index
+        so mlx-vlm does not load every *.safetensors file."""
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        hidden = 64
+        np_save(
+            {
+                "model.layers.0.input_layernorm.weight": np.ones(
+                    hidden, dtype=np.float32
+                ),
+                "model.layers.0.self_attn.q_proj.weight": np.ones(
+                    (hidden, hidden), dtype=np.float32
+                ),
+            },
+            str(src / "model.safetensors"),
+        )
+        np_save(
+            {
+                "layers.0.linear1.weight": np.ones((hidden, hidden), dtype=np.float32),
+                "hidden_norm.weight": np.ones(hidden, dtype=np.float32),
+            },
+            str(src / "joint_head.safetensors"),
+        )
+        (src / "joint_head_config.json").write_text('{"hidden_size": 64}')
+        (src / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["TestModelForCausalLM"],
+                    "model_type": "test_passthrough",
+                    "num_hidden_layers": 1,
+                    "hidden_size": hidden,
+                    "vocab_size": 256,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (src / "oq_sensitivity_map.json").write_text(
+            json.dumps({"0": 0.1}), encoding="utf-8"
+        )
+        assert [f.name for f in _source_weight_files(src)] == ["model.safetensors"]
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        index = json.loads((out / "model.safetensors.index.json").read_text())
+        assert set(index["weight_map"]) == {
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.q_proj.scales",
+            "model.layers.0.self_attn.q_proj.biases",
+        }
+        assert set(index["weight_map"].values()) == {"model.safetensors"}
+        for name in ("joint_head.safetensors", "joint_head_config.json"):
+            assert (out / name).read_bytes() == (src / name).read_bytes()
+
     def test_float16_keeps_vision_audio_passthrough_tensors_float32(self, tmp_path):
         """Protected VLM/audio tensors must not be saved as FP16."""
         from safetensors.numpy import save_file as np_save

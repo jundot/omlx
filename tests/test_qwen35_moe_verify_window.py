@@ -62,22 +62,30 @@ def _patched(monkeypatch):
 _BLOCKS: dict = {}
 
 
-def _quantized_experts(experts, out_dims, in_dims, bits, chunk=32):
+def _quantized_experts(experts, out_dims, in_dims, bits, dtype, chunk=32):
     """Stacked gs64 expert weights, quantized a few experts at a time so the
     FP32 draws never exceed one chunk."""
     scale = in_dims**-0.5
     parts = []
     for _ in range(0, experts, chunk):
-        w = mx.random.uniform(-scale, scale, (chunk, out_dims, in_dims)).astype(mx.bfloat16)
+        w = mx.random.uniform(-scale, scale, (chunk, out_dims, in_dims)).astype(dtype)
         parts.append(mx.quantize(w, 64, bits))
         mx.eval(parts[-1])
     return tuple(mx.concatenate(p) for p in zip(*parts, strict=True))
 
 
-def _block(seed=0, bits=5, experts=BLOCK_EXPERTS):
+def _block(
+    seed=0,
+    bits=5,
+    experts=BLOCK_EXPERTS,
+    hidden=HIDDEN,
+    inter=INTER,
+    top_k=10,
+    dtype=mx.bfloat16,
+):
     """A real-shape oQ block: quantized routed experts, 8-bit gs128 shared
-    expert, 8-bit gs64 shared-expert gate, bf16 router."""
-    key = (seed, bits, experts)
+    expert, 8-bit gs64 shared-expert gate, ``dtype`` router."""
+    key = (seed, bits, experts, hidden, inter, top_k, dtype)
     if key in _BLOCKS:
         return _BLOCKS[key]
     from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
@@ -86,19 +94,19 @@ def _block(seed=0, bits=5, experts=BLOCK_EXPERTS):
 
     mx.random.seed(seed)
     args = SimpleNamespace(
-        hidden_size=HIDDEN,
-        moe_intermediate_size=INTER,
-        shared_expert_intermediate_size=INTER,
+        hidden_size=hidden,
+        moe_intermediate_size=inter,
+        shared_expert_intermediate_size=inter,
         num_experts=experts,
-        num_experts_per_tok=10,
+        num_experts_per_tok=top_k,
     )
     block = Qwen3_5MoeSparseMoeBlock(args)
-    block.set_dtype(mx.bfloat16)
+    block.set_dtype(dtype)
     sm = block.switch_mlp
     for name in ("gate_proj", "up_proj", "down_proj"):
         layer = getattr(sm, name).to_quantized(64, bits)
         layer.weight, layer.scales, layer.biases = _quantized_experts(
-            experts, layer.output_dims, layer.input_dims, bits
+            experts, layer.output_dims, layer.input_dims, bits, dtype
         )
         setattr(sm, name, layer)
     shared = block.shared_expert
@@ -140,7 +148,9 @@ def _verify(block, x, window):
     return out
 
 def _check(block, x, engaged):
-    """Window rows == one-token rows == the composed verifier's rows."""
+    """Window rows == one-token rows == the composed verifier's rows (the
+    latter only up to the shared router cap: past it the composed verifier
+    runs stock argpartition routing, not the one-token arithmetic)."""
     count = len(engaged)
     new = _verify(block, x, window=True)
     ref = _serial(block, x)
@@ -149,7 +159,8 @@ def _check(block, x, engaged):
     # Engaged for the window, declined with the kill switch set.
     assert engaged[count:] == [True, False]
     assert _same_bits(new, ref)
-    assert _same_bits(new, old)
+    if x.size // x.shape[-1] <= router._MAX_ROWS:
+        assert _same_bits(new, old)
 
 
 @pytest.fixture
@@ -166,15 +177,15 @@ def engaged(monkeypatch):
     return calls
 
 
-def _inputs(rows, step, batch=1):
-    shape = (batch, rows, HIDDEN)
+def _inputs(rows, step, batch=1, hidden=HIDDEN, dtype=mx.bfloat16):
+    shape = (batch, rows, hidden)
     if step == 0:  # independent rows, mostly distinct experts
-        return (mx.random.normal(shape) * 1.5).astype(mx.bfloat16)
+        return (mx.random.normal(shape) * 1.5).astype(dtype)
     if step == 1:  # consecutive-token-like rows sharing many experts
-        base = mx.random.normal((batch, 1, HIDDEN))
-        return (0.97 * base + 0.25 * mx.random.normal(shape)).astype(mx.bfloat16)
+        base = mx.random.normal((batch, 1, hidden))
+        return (0.97 * base + 0.25 * mx.random.normal(shape)).astype(dtype)
     # identical rows: every expert serves every row
-    row = mx.random.normal((batch, 1, HIDDEN)).astype(mx.bfloat16)
+    row = mx.random.normal((batch, 1, hidden)).astype(dtype)
     return mx.broadcast_to(row, shape)
 
 
@@ -203,6 +214,37 @@ def test_window_rows_equal_one_token_decode(seed, topk_fold, engaged):
             _check(block, _inputs(rows, step), engaged)
     # Batched verify rows (requests x drafts) are rows too.
     _check(block, _inputs(3, 1, batch=2), engaged)
+
+
+@pytest.mark.parametrize("rows", [2, 5, 8])
+def test_batched_decode_rows_equal_one_token_decode(rows, engaged):
+    """Several requests' one-token decode ([B, 1, hidden], not a verify
+    window) runs the window launches: every row equals its own fused
+    one-token call bit for bit."""
+    block = _block(0)
+    x = _inputs(rows, 0).reshape(rows, 1, HIDDEN)
+    count = len(engaged)
+    got = block(x)
+    ref = _serial(block, x)
+    assert engaged[count:] == [True]
+    assert _same_bits(got, ref.reshape(got.shape))
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_top8_window_and_batched_rows_equal_one_token_decode(dtype, engaged):
+    """Qwen3.5/3.6-35B-A3B oQ layout (hidden 2048, intermediate 512, top-8):
+    verify windows and batched decode rows equal the fused one-token decode
+    of each row."""
+    hidden = 2048
+    block = _block(4, bits=4, hidden=hidden, inter=512, top_k=8, dtype=dtype)
+    for rows in (1, 2, 3, 4, 8, 16):
+        for step in range(3):
+            _check(block, _inputs(rows, step, hidden=hidden, dtype=dtype), engaged)
+    x = _inputs(5, 0, hidden=hidden, dtype=dtype).reshape(5, 1, hidden)
+    count = len(engaged)
+    got = block(x)
+    assert engaged[count:] == [True]
+    assert _same_bits(got, _serial(block, x).reshape(got.shape))
 
 
 def test_four_bit_window_rows_equal_one_token_decode(engaged):
@@ -263,13 +305,16 @@ def _quantized(shape, group_size, bits):
     return mx.quantize(mx.random.normal(shape) * 0.05, group_size, bits)
 
 
+@pytest.mark.parametrize("window_rps,token_rps", [(4, 4), (4, 2)])
 @pytest.mark.parametrize("bits", [4, 5])
-def test_fp32_window_kernels_equal_one_token_kernels(bits):
+def test_fp32_window_kernels_equal_one_token_kernels(bits, window_rps, token_rps):
     """BF16 outputs hide one-ulp FP32 differences: run the window launches
     and the one-token launches in FP32 (the one-token ones equal MLX's FP32
     mat-vecs, see test_qwen35_moe_routed_decode) and compare row by row. The
-    rows share experts at different slots and read the last experts."""
-    f32, top_k, experts, rows = mx.float32, routed.TOP_K, 64, 4
+    rows share experts at different slots and read the last experts. The
+    down launches group rows per simdgroup as served (``_down_rows``): a
+    verify window must equal one-token decode under either grouping."""
+    f32, top_k, experts, rows = mx.float32, 10, 64, 4
     mx.random.seed(60 + bits)
     fmt = routed._Format
     routed_gu, shared_gu, gate_fmt = fmt(bits, 64, True), fmt(8, 128, True), fmt(8, 64, False)
@@ -292,6 +337,7 @@ def test_fp32_window_kernels_equal_one_token_kernels(bits):
     scores = mx.softmax(mx.random.normal((rows, top_k)), axis=-1)
     gate_up_template = [
         ("T", f32), ("K", HIDDEN), ("NI", INTER), ("RPS", 2), ("NSG", 2), ("NS", INTER),
+        ("TOPK", top_k),
     ]
     blocks = 1 + INTER // 4 + top_k * INTER // 4
     width = top_k * INTER + INTER + 1
@@ -304,12 +350,13 @@ def test_fp32_window_kernels_equal_one_token_kernels(bits):
         output_dtypes=[f32],
     )[0]
     down_template = [
-        ("T", f32), ("K", INTER), ("N", HIDDEN), ("RPS", 4), ("KS", INTER), ("NPART", top_k + 1),
+        ("T", f32), ("K", INTER), ("N", HIDDEN), ("KS", INTER), ("NPART", top_k + 1),
+        ("TOPK", top_k),
     ]
     y = routed._down_window_kernel(routed_d, shared_d)(
         inputs=[h, *experts_down, *shared_down, ids, scores],
-        template=down_template + [("M", rows)],
-        grid=(32, (top_k + 1) * HIDDEN // 4 * rows, 1),
+        template=down_template + [("RPS", window_rps), ("M", rows)],
+        grid=(32, (top_k + 1) * HIDDEN // window_rps * rows, 1),
         threadgroup=(32, top_k + 1, 1),
         output_shapes=[(rows, HIDDEN)],
         output_dtypes=[f32],
@@ -325,8 +372,8 @@ def test_fp32_window_kernels_equal_one_token_kernels(bits):
         )[0]
         y_r = routed._down_kernel(routed_d, shared_d)(
             inputs=[h_r, *experts_down, *shared_down, ids[r], scores[r]],
-            template=down_template,
-            grid=(32, (top_k + 1) * HIDDEN // 4, 1),
+            template=down_template + [("RPS", token_rps)],
+            grid=(32, (top_k + 1) * HIDDEN // token_rps, 1),
             threadgroup=(32, top_k + 1, 1),
             output_shapes=[(HIDDEN,)],
             output_dtypes=[f32],

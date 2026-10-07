@@ -1,3 +1,13 @@
+/* Numbers follow the UI language. Intl maps unknown tags to the OS locale, so fall back to 'en'. */
+function usageLocale() {
+    try {
+        const lang = document.documentElement.lang;
+        return Intl.NumberFormat.supportedLocalesOf(lang).length ? lang : 'en';
+    } catch (error) {
+        return 'en';
+    }
+}
+
 /* Local serving history; independent of the high-frequency live stats poll. */
 function usageHistory() {
     return {

@@ -42,7 +42,11 @@ from .engine.base import BaseNonStreamingEngine
 from .utils import psutil_compat
 from .utils.image import clear_image_decode_cache
 from .utils.metal_sync import unreleased_graphics_bytes
-from .utils.proc_memory import get_graphics_footprint, get_phys_footprint
+from .utils.proc_memory import (
+    get_graphics_footprint,
+    get_phys_footprint,
+    release_free_malloc_memory,
+)
 
 if TYPE_CHECKING:
     from .engine_pool import EnginePool
@@ -124,6 +128,8 @@ _PREFILL_ABORT_MARGIN: dict[str, float] = {
 _EMERGENCY_OVER_CEILING_MARGIN_BYTES = 2 * 1024**3
 _EMERGENCY_OVER_CEILING_POLLS = 2
 _HOT_CACHE_RESERVATION_SLACK_BYTES = 512 * 1024**2
+# Longest a prefill waits for released dirty hot-cache blocks to reach SSD.
+_HOT_CACHE_WRITE_WAIT_S = 5.0
 
 
 def _format_gb(b: int) -> str:
@@ -1126,12 +1132,67 @@ class ProcessMemoryEnforcer:
 
     def _shrink_hot_cache_for_pressure(self, current: int, target: int) -> int:
         """Try to shrink hot cache enough to move process usage toward target."""
+        if current <= target:
+            return 0
+        freed = self._shrink_hot_cache_by(current - target)
+        if freed > 0:
+            release_free_malloc_memory()
+        return freed
+
+    async def release_hot_cache_for_prefill(self, reserved_bytes: int) -> int:
+        """Shrink the hot cache until its reservation drops by ``reserved_bytes``.
+
+        Blocks of admitted or queued requests stay. Nothing is released when
+        the other blocks cannot cover the drop. Returns the actual drop.
+        """
+        before = self._hot_cache_reserved_bytes()
+        if before <= 0 or reserved_bytes <= 0:
+            return 0
+        # The reservation is used + slack, capped at max_bytes.
+        target_used = max(
+            0, before - reserved_bytes - _HOT_CACHE_RESERVATION_SLACK_BYTES
+        )
+        excess = self._hot_cache_used_bytes() - target_used
+        if excess <= 0:
+            return 0
+        protected = self._active_hot_cache_block_hashes()
+        releasable = getattr(self._hot_cache_budget(), "releasable_bytes", None)
+        if callable(releasable) and releasable(protected) < excess:
+            return 0
+        await asyncio.to_thread(self._release_hot_cache_blocks, excess, protected)
+        released = max(0, before - self._hot_cache_reserved_bytes())
+        if released > 0:
+            self._propagate_memory_limit()
+        return released
+
+    def _release_hot_cache_blocks(
+        self, bytes_to_free: int, protected_hashes: set[bytes]
+    ) -> None:
+        if self._shrink_hot_cache_by(bytes_to_free, protected_hashes) <= 0:
+            return
+        # Dirty blocks stay in RAM until the SSD writer has written them.
+        deadline = time.monotonic() + _HOT_CACHE_WRITE_WAIT_S
+        seen_managers: set[int] = set()
+        for entry in self._engine_pool._entries.values():
+            scheduler = self._resolve_scheduler(entry)
+            manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+            wait = getattr(manager, "wait_for_pending_writes", None)
+            if callable(wait) and id(manager) not in seen_managers:
+                seen_managers.add(id(manager))
+                wait(max(0.0, deadline - time.monotonic()))
+        release_free_malloc_memory()
+
+    def _shrink_hot_cache_by(
+        self, bytes_to_free: int, protected_hashes: set[bytes] | None = None
+    ) -> int:
+        """Free up to ``bytes_to_free`` of unprotected hot-cache blocks by LRU."""
         hot_used = self._hot_cache_used_bytes()
-        if hot_used <= 0 or current <= target:
+        if hot_used <= 0 or bytes_to_free <= 0:
             return 0
 
-        target_hot_bytes = max(0, hot_used - (current - target))
-        protected_hashes = self._active_hot_cache_block_hashes()
+        target_hot_bytes = max(0, hot_used - bytes_to_free)
+        if protected_hashes is None:
+            protected_hashes = self._active_hot_cache_block_hashes()
         budget = self._hot_cache_budget()
         if budget is not None:
             shrink = getattr(budget, "shrink_to", None)
@@ -1150,7 +1211,7 @@ class ProcessMemoryEnforcer:
                 return freed
 
         freed_total = 0
-        remaining_to_free = current - target
+        remaining_to_free = bytes_to_free
         seen_managers: set[int] = set()
         for entry in self._engine_pool._entries.values():
             if remaining_to_free <= 0:
@@ -1625,7 +1686,11 @@ class ProcessMemoryEnforcer:
             if dropped_images:
                 current = self._current_usage_bytes()
         prev_level = self._pressure_level
-        emergency = self._is_emergency_pressure(current, ceiling)
+        # Admission may follow a dynamic ceiling, but emergency aborts must
+        # use the stable physical cap, as the prefill guard already does.
+        abort_limit = self._get_abort_limit_bytes()
+        emergency_limit = abort_limit if abort_limit > 0 else ceiling
+        emergency = self._is_emergency_pressure(current, emergency_limit)
 
         if current < soft:
             new_level = "ok"
@@ -1696,7 +1761,7 @@ class ProcessMemoryEnforcer:
                 self._request_scheduler_cache_reclaim(freed_hot)
             if freed_hot > 0:
                 current = self._current_usage_bytes()
-                emergency = self._is_emergency_pressure(current, ceiling)
+                emergency = self._is_emergency_pressure(current, emergency_limit)
                 if current < soft:
                     recovered_level = "ok"
                 elif current < hard:
@@ -1834,7 +1899,7 @@ class ProcessMemoryEnforcer:
                                 emergency_current = self._current_usage_bytes()
                             else:
                                 emergency_current = 0
-                            if emergency and emergency_current >= ceiling:
+                            if emergency and emergency_current >= emergency_limit:
                                 aborted = await (
                                     self._abort_loaded_requests_for_memory_emergency()
                                 )

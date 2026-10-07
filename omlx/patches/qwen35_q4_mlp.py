@@ -445,7 +445,6 @@ def apply_qwen35_vlm_gdn_projection_hook():
         if cache is not None:
             if hasattr(cache, "advance"):
                 cache.advance(S)
-                language._qwen3_5_advance_left_padding_info(cache, S)
                 language._qwen3_5_advance_lengths_info(cache, S)
 
         out = self.norm(out, z)
