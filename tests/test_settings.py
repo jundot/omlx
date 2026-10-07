@@ -59,6 +59,8 @@ class TestServerSettings:
         assert settings.max_audio_upload_bytes() == 100 * 1024 * 1024
         assert settings.max_image_upload_size == "50MB"
         assert settings.max_image_upload_bytes() == 50 * 1024 * 1024
+        assert settings.max_video_upload_size == "200MB"
+        assert settings.max_video_upload_bytes() == 200 * 1024 * 1024
         assert settings.max_image_side_length == 2048
 
     def test_custom_values(self):
@@ -92,6 +94,7 @@ class TestServerSettings:
             "distributed_inference_enabled": False,
             "max_audio_upload_size": "100MB",
             "max_image_upload_size": "50MB",
+            "max_video_upload_size": "200MB",
             "max_image_side_length": 2048,
             "gpu_keep_warm_interval": 0.5,
         }
@@ -186,6 +189,25 @@ class TestServerSettings:
             ServerSettings(max_image_upload_size="0MB").max_image_upload_bytes()
         with pytest.raises(ValueError, match="must be positive"):
             ServerSettings(max_image_upload_size="-1MB").max_image_upload_bytes()
+
+    def test_from_dict_max_video_upload_size(self):
+        """max_video_upload_size round-trips through from_dict / to_dict."""
+        settings = ServerSettings.from_dict({"max_video_upload_size": "2GB"})
+        assert settings.max_video_upload_size == "2GB"
+        assert settings.max_video_upload_bytes() == 2 * 1024 * 1024 * 1024
+        assert settings.to_dict()["max_video_upload_size"] == "2GB"
+
+    def test_from_dict_max_video_upload_size_default(self):
+        """A settings.json without max_video_upload_size keeps the 200MB default."""
+        settings = ServerSettings.from_dict({})
+        assert settings.max_video_upload_size == "200MB"
+
+    def test_max_video_upload_bytes_rejects_non_positive(self):
+        """0MB / negative sizes parse as integers but are not usable limits."""
+        with pytest.raises(ValueError, match="must be positive"):
+            ServerSettings(max_video_upload_size="0MB").max_video_upload_bytes()
+        with pytest.raises(ValueError, match="must be positive"):
+            ServerSettings(max_video_upload_size="-1MB").max_video_upload_bytes()
 
     def test_from_dict(self):
         """Test creation from dictionary."""
@@ -1665,6 +1687,25 @@ class TestGlobalSettings:
         errors = settings.validate()
         assert not any("max_image_upload_size" in e for e in errors)
 
+    def test_validate_invalid_max_video_upload_size(self):
+        """Validation rejects unparseable or non-positive video upload limits."""
+        settings = GlobalSettings()
+        settings.server.max_video_upload_size = "bogus"
+        errors = settings.validate()
+        assert any("max_video_upload_size" in e for e in errors)
+
+        settings = GlobalSettings()
+        settings.server.max_video_upload_size = "0MB"
+        errors = settings.validate()
+        assert any("max_video_upload_size" in e for e in errors)
+
+    def test_validate_valid_max_video_upload_size(self):
+        """Validation accepts human-readable video upload sizes."""
+        settings = GlobalSettings()
+        settings.server.max_video_upload_size = "2GB"
+        errors = settings.validate()
+        assert not any("max_video_upload_size" in e for e in errors)
+
     def test_validate_max_image_side_length(self):
         """Validation rejects negative side length."""
         settings = GlobalSettings()
@@ -1940,6 +1981,26 @@ class TestGlobalSettings:
             assert settings.server.max_image_upload_size == "30MB"
             assert settings.server.max_image_upload_bytes() == 30 * 1024 * 1024
             assert settings.server.max_image_side_length == 1500
+
+    def test_env_override_max_video_upload_size(self):
+        """OMLX_MAX_VIDEO_UPLOAD_SIZE overrides the default."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch.dict(os.environ, {"OMLX_MAX_VIDEO_UPLOAD_SIZE": "1GB"}),
+        ):
+            settings = GlobalSettings.load(base_path=tmpdir)
+            assert settings.server.max_video_upload_size == "1GB"
+            assert settings.server.max_video_upload_bytes() == 1024 * 1024 * 1024
+
+    def test_cli_override_max_video_upload_size(self):
+        """--max-video-upload-size is applied via CLI overrides."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = GlobalSettings.load(
+                base_path=tmpdir,
+                cli_args=Namespace(max_video_upload_size="2GB"),
+            )
+            assert settings.server.max_video_upload_size == "2GB"
+            assert settings.server.max_video_upload_bytes() == 2 * 1024 * 1024 * 1024
 
     def test_env_override_model(self):
         """Test environment variable override for model settings."""
