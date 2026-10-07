@@ -3,8 +3,8 @@
 For Mixture-of-Experts models, most parameters sit idle on any given token —
 only the routed experts do work. Expert offload keeps a configurable fraction
 of each layer's experts resident in a fixed slot cache and streams the rest
-**from the checkpoint's own safetensors** on demand (mmap slab reads — no
-converted copy, no extra disk). Routing is computed exactly as shipped: a
+**from the checkpoint's own safetensors** on demand (positional `pread`
+slab reads — no converted copy, no extra disk). Routing is computed exactly as shipped: a
 cache miss changes *when* an expert's weights are read, never *which* expert
 runs, so accuracy is preserved by construction and the entire cost is
 latency.
@@ -76,12 +76,34 @@ step mlx-lm runs ahead of that yield, rather than measuring pure prefill:
 | 25% | 30,302 → 2,675 | 8.87 s → 0.85 s | 1.51 s | 43.5 |
 | 12.5% | 64,369 → 2,913 | 16.60 s → 0.97 s | 11.92 s | 31.7 |
 
-Decode is untouched by the change (it takes the no-sync fast path). The
-remaining follow-up is decode prefetch (layer L+1's fetches during layer
-L's compute), which has measured LRU→optimal headroom of +17pp hit rate at
-low residency.
+Decode is untouched by the change (it takes the no-sync fast path).
 
-A call's misses are read in parallel with `os.pread` on a shared thread pool. `ensure()` schedules missing experts before the serial install loop. Slot writes, LRU updates, and hit/miss counters stay on the calling thread.
+A miss evicts the resident expert with the lowest decayed routing count: each routed occurrence adds 1, and every count is multiplied by 0.7 every 4 calls. On replayed Qwen3.8-Flash-Next routing traces this misses 5-7% less often than LRU at 10-25% residency. Reading layer L+1's predicted experts ahead during layer L (its router applied to layer L's input) was measured as well and is not used: the prediction covered 59% of the misses at 10% residency, but the wrong predictions competed with the demand reads for the SSD and decode was 2-15% slower.
+
+A call's misses are read in parallel with `os.pread` on a shared thread pool. `ensure()` protects every expert the call routes to, so a miss never evicts one of them, then schedules the missing experts before the serial install loop. Slot writes, eviction state, and hit/miss counters stay on the calling thread. In an over-capacity prefill, the reads of the next expert-major chunk's first misses start before the current chunk is evaluated; their slot writes still wait for it.
+
+An expert-major prefill forward streams almost every expert once, so a wider prefill step reads the experts fewer times. With offload active, `qwen4_exp` uses the 8192-token prefill step on every host (otherwise only NAX hosts with 64 GB or more), the first chunk included. When the memory guard has no headroom for a chunk, the prefill headroom ladder releases the requesting model's offload slots right after the pooled-buffer reclaim, before the hot cache or any idle model gives way: each cache shrinks to its routing top-k floor and returns to its full capacity at the engine's next decode step. The release is skipped while another request runs on the engine.
+
+Measured on `Qwen3.8-Flash-Next-oQ4e` as a 24 GB host emulated on an M3 Ultra: system RAM, Metal working set (16 GiB) and VM statistics faked to 24 GB, every expert read from the SSD (`F_NOCACHE` after dropping the shards' page cache), 10% residency, PLE on SSD, Lightning MTP, aggressive memory tier, greedy, two runs each. Before is the common adapter as it was (LRU, no in-call protection, 2048-token prefill steps):
+
+| | before | after |
+|---|---|---|
+| decode tok/s, 43 / 53-token prompts | 6.53 / 6.53 | 8.17 / 7.56 |
+| decode tok/s, 6.2K / 4.3K-token prompts | 5.25 / 5.78 | 6.17 / 6.76 |
+| time to first token, 6.2K-token prompt | 47.5 s | 19.7 s |
+| time to first token, 4.3K-token prompt | 38.1 s | 19.5 s |
+
+Outputs of the short prompts are byte-identical before and after; the wider prefill changes the long prompts' chunk boundaries. The 6.2K prompt embeds a source file that grew to 6.3K tokens between the two runs.
+
+An over-capacity prefill call runs the experts it finds resident before its misses, so a miss only evicts an expert whose routes have already run, and each resident expert is used without a second read. Its chunks also take power-of-two route counts where possible, so the padding that keeps prefill buffer sizes reusable adds no rows; an expert whose routes span two adjacent chunks is installed once. Measured on `Qwen3.8-Flash-Next-oQ4e` on an M3 Ultra, 32,768-token prompt with no cached prefix, 8192-token prefill steps, Lightning MTP, greedy, one request per side after an 8192-token warm-up, the same output tokens on both sides. Prefill throughput is prompt tokens divided by time to first token:
+
+| residency, expert source | prefill before | prefill after | change | expert reads before | expert reads after |
+|---|---|---|---|---|---|
+| 50%, SSD (`F_NOCACHE`) | 396 tok/s | 636 tok/s | +61% | 233 GiB | 122 GiB |
+| 50%, page cache | 517 tok/s | 751 tok/s | +45% | 233 GiB | 122 GiB |
+| 10%, SSD (`F_NOCACHE`) | 422 tok/s | 466 tok/s | +10% | 251 GiB | 227 GiB |
+
+When offload is active, the server logs one line per finished request with the expert cache counters accrued while it ran: `MoE offload: request=<id> hit_rate=... hits=... misses=... fetched=... MB prompt=... output=...`. The counters belong to the engine, so requests that run at the same time share them.
 
 In decode, a slow read no longer leaves the GPU idle. The routing readback classifies the step's routes and the missing experts' reads are issued as before. If the first of them has not arrived 0.5 ms later, the step overlaps: the resident routes' `gather_qmm` is dispatched while the reads continue, a trivial kernel keeps the GPU busy until they finish, the missing routes are gathered once they are installed, and the layer's output is dispatched as soon as it is built. Each route is computed once, by the same kernel as the serial gather (`gather_qmm` is per-row), so the output is bit-identical. The resident gather is evaluated before the first slot write, because a write into an array a pending gather still references copies the whole array. The resident gather is only a fraction of a millisecond of GPU time, while a slow step waits a few milliseconds on its reads, and Apple GPUs lower their clock after a couple of milliseconds idle, which slows the next layer's work as well; keeping the GPU busy through the wait is what pays. Reads that arrive within 0.5 ms (page cache, fast internal storage) keep the serial order: an idle gap that short barely lowers the clock, and splitting the gather would cost more than it hides. Measured on `Qwen3.8-Flash-Next-oQ4e` (`qwen4_exp`, 48 layers wrapped), experts on a USB4 SSD, M4 Air 32 GB, greedy, output byte-identical with and without the overlap: 480 tokens after a 480-token warm-up at 18.8% residency, 3.56 tok/s serial and 5.03 with the overlap (two runs each, the drive's throttle stalls excluded); replaying two coding-agent sessions request by request (1.6k to 6k-token prompts with tool calls), 2.94 to 3.70 tok/s at 18.8% residency and 2.64 to 2.61 at 12.5%, where each decode step waits on about three misses and the reads set the pace. Time to first token is unchanged: prefill does not take this path.
 

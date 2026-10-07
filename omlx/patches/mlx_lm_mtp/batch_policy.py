@@ -4,6 +4,10 @@
 from collections import deque
 from statistics import median
 
+# Four decisions in a row with MTP below this fraction of ordinary decode
+# (expected tokens per ms) park at once instead of after 16 losing ones.
+_CLEAR_LOSS = 0.9
+
 
 class BatchPolicy:
     """A policy belongs to one UID cohort, never to a model or single row.
@@ -26,8 +30,11 @@ class BatchPolicy:
         self.costs = {}
         self.acceptance = [0.6] * self.max_depth
         self.losing = 0
+        self.clear_losing = 0
         self.cooldown = 128
         self.remaining = 0
+        # Measured MTP decisions since activation or the last park.
+        self.decisions = 0
         self.elapsed_ms = 0.0
         self.last_probe_ms = 0.0
         self.last_seen = {}
@@ -105,10 +112,15 @@ class BatchPolicy:
         if pending:
             self.cur = pending[0]
             return
+        self.decisions += 1
         best = max(range(1, self.max_depth + 1), key=self.score)
         if self.score(best) > self.score(self.cur) * 1.03:
             self.cur = best
         self.losing = self.losing + 1 if self.score(best) <= self.score(0) * 1.03 else 0
+        # A clear loss needs no long streak: at 8 rows on Qwen3.8-Flash-Next
+        # the best depth reaches about 0.86x ordinary decode (M5 Ultra).
+        clear = self.score(best) < self.score(0) * _CLEAR_LOSS
+        self.clear_losing = self.clear_losing + 1 if clear else 0
         # Refresh stale alternatives without probing on every decision.
         if self.elapsed_ms - self.last_probe_ms >= 1000:
             rival = min(self.last_seen, key=self.last_seen.get)
@@ -120,10 +132,77 @@ class BatchPolicy:
                 self.last_probe_ms = self.elapsed_ms
 
     def should_park(self):
-        return not self.fixed and self.losing >= 16
+        return not self.fixed and (self.losing >= 16 or self.clear_losing >= 4)
 
     def park(self):
-        self.remaining = self.cooldown
-        self.cooldown = min(4096, self.cooldown * 2)
+        self.start_parked(self.cooldown)
         self.standard_warmup = 2
         self.losing = 0
+        self.clear_losing = 0
+
+    def start_parked(self, cooldown, next_cooldown=None):
+        """Decode ordinarily for ``cooldown`` steps before measuring MTP again.
+
+        ``next_cooldown`` is the cooldown of the next park (default: twice
+        this one, up to 4096 steps).
+        """
+        self.remaining = cooldown
+        self.cooldown = (
+            min(4096, cooldown * 2) if next_cooldown is None else next_cooldown
+        )
+        self.decisions = 0
+
+    def held_up(self):
+        """Whether MTP ran long enough in this cohort without being parked."""
+        return not self.fixed and self.decisions >= 32
+
+
+class ParkMemory:
+    """Parking verdicts of one model that outlive a cohort.
+
+    Every join or finish starts a new cohort policy, which would measure
+    ordinary decode and MTP again from scratch. Where MTP just lost at k rows,
+    a new cohort of at least k rows starts parked (MTP does not get cheaper
+    per row as rows are added) for what is left of that park. The park runs
+    on one clock per model, counted in batched decode steps of any cohort,
+    so cohorts that come and go neither restart nor extend it: once it
+    expires, the next cohort measures MTP again. A cohort where MTP held up
+    for 32 measured decisions clears the verdicts it contradicts (those at
+    its row count or fewer).
+    """
+
+    def __init__(self):
+        self.clock = 0
+        # rows -> (clock value the park ends at, cooldown of the next park)
+        self._verdicts = {}
+
+    def tick(self):
+        """Count one batched decode step (ordinary or MTP) of this model."""
+        self.clock += 1
+
+    def seed(self, policy):
+        if policy.fixed:
+            return
+        rows = len(policy.uids)
+        live = [
+            verdict
+            for k, verdict in self._verdicts.items()
+            if k <= rows and verdict[0] > self.clock
+        ]
+        if live:
+            policy.start_parked(
+                max(until for until, _ in live) - self.clock,
+                next_cooldown=max(cooldown for _, cooldown in live),
+            )
+
+    def parked(self, policy):
+        self._verdicts[len(policy.uids)] = (
+            self.clock + policy.remaining,
+            policy.cooldown,
+        )
+
+    def retired(self, policy):
+        if policy.held_up():
+            rows = len(policy.uids)
+            for k in [k for k in self._verdicts if k <= rows]:
+                del self._verdicts[k]

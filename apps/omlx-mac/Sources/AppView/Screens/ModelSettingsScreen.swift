@@ -615,7 +615,7 @@ private struct ProfilesTab: View {
                         }
                     }
                 },
-                onSaveAsNew: { openSaveAs(scope: .global) },
+                onSaveAsNew: { openSaveAs(scope: vm.defaultSaveAsScope) },
                 onRevert: {
                     Task { await vm.revertWorking(client: client) }
                 }
@@ -1096,7 +1096,7 @@ private struct BasicEditBanner: View {
                         }
                     },
                     onSaveAsNew: {
-                        saveAsScope = .global
+                        saveAsScope = vm.defaultSaveAsScope
                         saveAsName = vm.suggestSaveAsName()
                         saveAsOpen = true
                     },
@@ -1868,28 +1868,34 @@ private struct ExperimentalSection: View {
                         }
                     }
                 }
+            }
+            // The oQ A8 rows do not depend on an ANE backend: Qwen3.8
+            // Flash-Next has none, but still supports oQ A8.
+            if vm.isQwenOqA8Model {
+                Row(label: String(localized: "settings.experimental.qwen_oq_a8.label",
+                                  defaultValue: "Qwen INT8 Activation Prefill",
+                                  comment: "Row label for the oQ INT8-activation prefill kernels"),
+                    sublabel: qwenOqA8Sublabel) {
+                    RowSwitch(isOn: vm.bindProfile($vm.qwen35OqA8Enabled))
+                        .disabled(vm.qwen35OqA8ConflictReason != nil)
+                        .help(vm.qwen35OqA8ConflictReason ?? "")
+                }
+                if vm.qwen35OqA8Enabled {
+                    Row(label: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.label",
+                                      defaultValue: "Minimum Prompt Tokens",
+                                      comment: "Row label for the oQ A8 minimum prompt length"),
+                        sublabel: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.sub",
+                                         defaultValue: "Shorter prompts stay on the existing path, where the activation-quantization pass costs more than the faster matmul saves.",
+                                         comment: "Sublabel explaining the oQ A8 minimum prompt length")) {
+                        TextInput(text: vm.bindProfile($vm.qwen35OqA8MinTokens),
+                                  placeholder: "128", mono: true,
+                                  isNumeric: true, range: 1...262_144,
+                                  step: 64, width: .controlCompact)
+                    }
+                }
+            }
+            if vm.model?.anePrefillBackend != nil {
                 if vm.isQwenOqA8Model {
-                    Row(label: String(localized: "settings.experimental.qwen_oq_a8.label",
-                                      defaultValue: "Qwen INT8 Activation Prefill",
-                                      comment: "Row label for the oQ INT8-activation prefill kernels"),
-                        sublabel: qwenOqA8Sublabel) {
-                        RowSwitch(isOn: vm.bindProfile($vm.qwen35OqA8Enabled))
-                            .disabled(vm.qwen35OqA8ConflictReason != nil)
-                            .help(vm.qwen35OqA8ConflictReason ?? "")
-                    }
-                    if vm.qwen35OqA8Enabled {
-                        Row(label: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.label",
-                                          defaultValue: "Minimum Prompt Tokens",
-                                          comment: "Row label for the oQ A8 minimum prompt length"),
-                            sublabel: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.sub",
-                                             defaultValue: "Shorter prompts stay on the existing path, where the activation-quantization pass costs more than the faster matmul saves.",
-                                             comment: "Sublabel explaining the oQ A8 minimum prompt length")) {
-                            TextInput(text: vm.bindProfile($vm.qwen35OqA8MinTokens),
-                                      placeholder: "128", mono: true,
-                                      isNumeric: true, range: 1...262_144,
-                                      step: 64, width: .controlCompact)
-                        }
-                    }
                     Row(label: String(localized: "settings.experimental.qwen_ane.label",
                                       defaultValue: "Qwen ANE Prefill",
                                       comment: "Row label for private Qwen ANE/GPU prefill acceleration"),
@@ -2258,7 +2264,7 @@ private struct ExperimentalSection: View {
     private var qwenOqA8Sublabel: String {
         if let reason = vm.qwen35OqA8ConflictReason { return reason }
         return String(localized: "settings.experimental.qwen_oq_a8.sub",
-                      defaultValue: "Experimental GPU INT8 activation quantization for supported Q4/Q5 prefill operations. Requires M5-series or newer and the native kernels. Outputs and model quality may change; some quantization formats receive no acceleration. Cannot be combined with ANE prefill. Applies after the model reloads.",
+                      defaultValue: "Experimental GPU INT8 activation quantization for supported Q4/Q5 prefill operations on Qwen3.5/3.6/3.8, and routed expert gate/up projections on Qwen3.8 Flash-Next. Requires M5-series or newer and the native kernels. Outputs and model quality may change; some quantization formats receive no acceleration. Cannot be combined with ANE prefill. Applies after the model reloads.",
                       comment: "Sublabel describing the oQ INT8-activation prefill kernels")
     }
 

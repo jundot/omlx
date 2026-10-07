@@ -5354,3 +5354,21 @@ async def test_stream_thinking_length_channels(api, with_tools):
         )
     assert content == ""
     assert reasoning == "unfinished</thi"
+
+
+async def test_responses_stream_reports_resolved_sampling():
+    from omlx.api.responses_models import ResponsesRequest
+    from omlx.server import stream_responses_api
+
+    engine = MockBaseEngine()
+    engine.set_stream_outputs(
+        [MockGenerationOutput(text="Hi", new_text="Hi", finished=True)]
+    )
+    request = ResponsesRequest(model="test-model", input="Hi", temperature=0.9)
+    stream = stream_responses_api(
+        engine, [], request, store_response=False, temperature=0.2, top_p=0.5
+    )
+    events = parse_sse_events("".join([frame async for frame in stream]))
+    for name in ("response.created", "response.completed"):
+        response = next(e["response"] for e in events if e["type"] == name)
+        assert (response["temperature"], response["top_p"]) == (0.2, 0.5)

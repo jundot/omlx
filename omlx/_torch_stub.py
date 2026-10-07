@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Minimal ``torch`` stub for the DMG bundle.
 
-xgrammar 0.2.3 declares ``torch>=1.10.0`` as a runtime dep, but oMLX never
+xgrammar 0.2.8 declares ``torch>=1.10.0`` as a runtime dep, but oMLX never
 exercises its torch-backed code paths: bitmasks are allocated as numpy
 ``int32`` buffers, the C++ binding fills them, and the MLX kernel applies the
 mask. The torch dep is load-bearing only at *import time* — module-level code
@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 #     raises a stub-identifying RuntimeError. Module-level
 #     ``_FULL_MASK = torch.tensor(-1, ...)`` patterns succeed at import
 #     time; any subsequent method call (.fill_, .item, ...) fails.
-_TARGET_XGRAMMAR_VERSIONS = ("0.2.3",)
+_TARGET_XGRAMMAR_VERSIONS = ("0.2.8",)
 _TARGET_TVM_FFI_VERSIONS = ("0.1.11",)
 
 # Serialize install() across threads. Without this, two threads that both
@@ -382,7 +382,7 @@ def warn_if_unexpected_versions() -> None:
     the versions this stub was tested against.
 
     Reads distribution metadata instead of module attributes: xgrammar
-    exposes no ``__version__`` (checked on 0.2.3 and 0.2.4), so the old
+    exposes no ``__version__`` (checked on 0.2.3, 0.2.4 and 0.2.8), so the old
     ``getattr(xgrammar, "__version__", None)`` probe never fired and the
     drift warning was dead code. Metadata also avoids importing the heavy
     C++ extension just to read a version string. Best-effort: silent when

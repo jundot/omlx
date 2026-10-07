@@ -15,6 +15,10 @@ from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import pytest
+from mlx.utils import tree_flatten
+from mlx_vlm.models.embedding_gemma2 import Model as EmbeddingGemma2
+from mlx_vlm.models.embedding_gemma2 import ModelConfig as EmbeddingGemma2Config
+from safetensors.numpy import save_file
 
 from omlx.api.embedding_models import (
     EmbeddingData,
@@ -1549,7 +1553,7 @@ class TestNativeEmbeddingLoading:
             "architectures": ["BertModel"],
             "hidden_size": 32,
             "num_hidden_layers": 1,
-            "vocab_size": 100,
+            "vocab_size": 128,
             "num_attention_heads": 4,
             "intermediate_size": 64,
             "max_position_embeddings": 64,
@@ -1698,7 +1702,7 @@ class TestNativeEmbeddingLoading:
             "architectures": ["BertModel"],
             "hidden_size": 32,
             "num_hidden_layers": 1,
-            "vocab_size": 100,
+            "vocab_size": 128,
             "num_attention_heads": 4,
             "intermediate_size": 64,
             "max_position_embeddings": 128,
@@ -2196,3 +2200,120 @@ class TestEmbeddingDtype:
     )
     def test_leaves_other_models_untouched(self, tmp_path, name, config):
         assert not self._promoted(tmp_path / name, **config)
+
+
+class TestMlxVlmEmbeddingGemma2:
+    """EmbeddingGemma 2 loads through mlx-vlm with an image input adapter."""
+
+    _CONFIG = {
+        "model_type": "embedding_gemma2",
+        "architectures": ["EmbeddingGemma2Model"],
+        "text_config": {
+            "vocab_size": 64,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "hidden_size_per_layer_input": 8,
+            "embedding_dim": 24,
+            "sliding_window": 4,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "per_layer_config": {"01": {"head_dim": 32, "num_key_value_heads": 1}},
+            "max_position_embeddings": 262144,
+        },
+        "vision_config": None,
+        "audio_config": {
+            "hidden_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "subsampling_conv_channels": [4, 4],
+            "output_proj_dims": 16,
+            "attention_chunk_size": 4,
+            "attention_context_left": 5,
+        },
+    }
+
+    class MockTokenizer:
+        """Right-padding tokenizer that records the requested max_length."""
+
+        def __init__(self):
+            self.max_lengths = []
+
+        def __call__(self, texts, *, max_length, **kwargs):
+            self.max_lengths.append(max_length)
+            encoded = [
+                [2, *(3 + len(word) % 60 for word in text.split()), 1][:max_length]
+                for text in texts
+            ]
+            width = max(len(ids) for ids in encoded)
+            input_ids = [ids + [0] * (width - len(ids)) for ids in encoded]
+            mask = [[1] * len(ids) + [0] * (width - len(ids)) for ids in encoded]
+            return {"input_ids": mx.array(input_ids), "attention_mask": mx.array(mask)}
+
+    @pytest.fixture
+    def model_dir(self, tmp_path):
+        (tmp_path / "config.json").write_text(json.dumps(self._CONFIG))
+        model = EmbeddingGemma2(EmbeddingGemma2Config.from_dict(self._CONFIG))
+        weights = {
+            name: np.array(value) for name, value in tree_flatten(model.parameters())
+        }
+        save_file(weights, str(tmp_path / "model.safetensors"))
+        return tmp_path
+
+    def _load(self, model_dir):
+        tokenizer = self.MockTokenizer()
+        processor = MagicMock()
+        processor.tokenizer = tokenizer
+        model = MLXEmbeddingModel(str(model_dir))
+        with patch(
+            "omlx.models.embedding.load_processor", return_value=processor
+        ) as load_processor:
+            model.load()
+        load_processor.assert_called_once_with(model_dir, add_detokenizer=False)
+        return model, tokenizer, processor
+
+    def test_text_embeddings_match_model_and_clamp_length(self, model_dir):
+        model, tokenizer, processor = self._load(model_dir)
+        texts = ["one two three", "four"]
+
+        output = model.embed(texts, max_length=262144)
+
+        assert model.model.audio_tower is None
+        assert tokenizer.max_lengths[-1] == 8192
+        inputs = tokenizer(texts, return_tensors="mlx", max_length=8192)
+        expected = model.model(**inputs).text_embeds
+        np.testing.assert_allclose(
+            np.array(output.embeddings), np.array(expected), atol=1e-5
+        )
+        processor.apply_chat_template.assert_not_called()
+
+    def test_image_batch_skips_compiled_path(self, model_dir):
+        model, _, processor = self._load(model_dir)
+        prepared = {
+            "input_ids": mx.array([[2, 5, 6, 1]]),
+            "attention_mask": mx.array([[1, 1, 1, 1]]),
+        }
+        processor.apply_chat_template.return_value = prepared
+        model._compiled_embed = MagicMock()
+
+        output = model.embed([{"text": "a cat", "image": IMAGE_DATA_URI}])
+
+        conversations = processor.apply_chat_template.call_args.args[0]
+        assert conversations == [
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "a cat"},
+                        {"type": "image", "url": IMAGE_DATA_URI},
+                    ],
+                }
+            ]
+        ]
+        model._compiled_embed.assert_not_called()
+        expected = model.model(**prepared).text_embeds
+        np.testing.assert_allclose(
+            np.array(output.embeddings), np.array(expected), atol=1e-6
+        )

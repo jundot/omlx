@@ -7,12 +7,12 @@
 """Fused tensor-unit (NAX) prefill attention for a narrower value head.
 
 MLA-style models such as MiMo-V2-Flash use query/key head dim 192 with value
-head dim 128. MLX 0.32.2 has no fused kernel for that pair: its prefill SDPA
+head dim 128. MLX 0.32.3 has no fused kernel for that pair: its prefill SDPA
 falls back to the unfused path (bf16 score matrix materialised in memory),
 and on M5 (NAX) GPUs its tensor-unit attention kernel only exists for head
-dims 64/96/128/256. ``mixed_head_dim_sdpa`` therefore zero-pads Q/K/V to 256
-to reach the head-dim-split NAX kernel, which spends a third of its
-multiply-adds on zero columns and copies Q/K/V every layer.
+dims 64/96/128/256/512 and the 96/64 pair. ``mixed_head_dim_sdpa`` therefore
+zero-pads Q/K/V to 256 to reach the head-dim-split NAX kernel, which spends a
+third of its multiply-adds on zero columns and copies Q/K/V every layer.
 
 This module JIT-compiles (``mx.fast.metal_kernel``) MLX's own NAX attention
 kernel with the value head dim as a separate template parameter (BD = 192,

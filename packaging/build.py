@@ -730,7 +730,7 @@ def build_venvstacks():
 
 
 # mlx-audio git commit — aligned with pyproject.toml [audio] extra
-_MLX_AUDIO_GIT = "git+https://github.com/Blaizzy/mlx-audio@49596ac8b69b9ed377db311a73df838795f38a3d"
+_MLX_AUDIO_GIT = "git+https://github.com/Blaizzy/mlx-audio@94c7716212b2228f178d2f9c7619a591fd1b0b78"
 
 
 def _install_mlx_audio(export_dir: Path):
@@ -821,7 +821,7 @@ try:
     _XGRAMMAR_VERSION = _TARGET_XGRAMMAR_VERSIONS[0]
     _TVM_FFI_VERSION = _TARGET_TVM_FFI_VERSIONS[0]
 except Exception:  # pragma: no cover — build runs may not have omlx on path yet
-    _XGRAMMAR_VERSION = "0.2.3"
+    _XGRAMMAR_VERSION = "0.2.8"
     _TVM_FFI_VERSION = "0.1.11"
 
 
