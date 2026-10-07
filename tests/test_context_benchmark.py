@@ -167,7 +167,6 @@ class _FakeScheduler:
         num_prompt_tokens,
         cached_tokens=0,
         request_id=None,
-        text_only=False,
     ):
         if num_prompt_tokens > self.boundary:
             raise PrefillMemoryExceededError(

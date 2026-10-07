@@ -1226,6 +1226,12 @@ class TestServeCommandFunctions:
             if previous_server is not None:
                 sys.modules["omlx.server"] = previous_server
 
+    def test_offline_secondary_bind_address_is_detected(self):
+        from omlx.cli import _is_local_address
+
+        assert _is_local_address("127.0.0.1")
+        assert not _is_local_address("192.0.2.1")
+
     def test_serve_hands_prebound_socket_to_uvicorn(self, tmp_path, monkeypatch):
         """Successful serve startup should pass the pre-bound socket into uvicorn."""
         import omlx

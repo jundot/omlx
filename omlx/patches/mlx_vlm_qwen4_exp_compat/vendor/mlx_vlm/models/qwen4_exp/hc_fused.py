@@ -7,7 +7,7 @@ Prefill fuses the stream norm, silu(down / HC), and the mixing/inject
 epilogue around the down/up projections; on GPUs with tensor units (M5) those
 projections run in hc_prefill_nax's kernels with the epilogues folded in
 (bit-identical to the MLX matmul path), elsewhere on MLX's quantized matmul.
-Both need four streams and affine group-size-64 projections with 4/5/6/8-bit
+Both need four streams and affine group-size-32 or -64 projections with 4/5/6/8-bit
 weights. FP32 epilogues can round differently from the canonical BF16
 operations.
 
@@ -41,7 +41,9 @@ from .hc_projection import _HEADER, env_enabled
 logger = logging.getLogger(__name__)
 
 MAX_ROWS = 16
-_GROUP_SIZE = 64
+# Each projection's group size is a template parameter (GS_D, GS_I, GS_U): the
+# traversal is the same for every group size, only the scale/bias index moves.
+_GROUP_SIZES = (32, 64)
 _SUPPORTED_BITS = (4, 5, 6, 8)
 _DISABLED = not env_enabled("OMLX_QWEN4_HC_FUSED")
 _WRITE_DISABLED = not env_enabled("OMLX_QWEN4_HC_FUSED_WRITE")
@@ -93,7 +95,7 @@ _D_SOURCE = r"""
     const uint lane = thread_index_in_simdgroup;
     constexpr int KS = 4;
     constexpr int SLICE = K / KS;
-    constexpr int GROUPS = K / 64;
+    constexpr int GROUPS = K / GS_D;
     threadgroup float part[KS][8];
     const device T* x = xn + (size_t)row * K;
     const int rg = int(sg & 1);
@@ -105,13 +107,13 @@ _D_SOURCE = r"""
         constexpr int PPT = 2;
         constexpr int VPT = PF * PPT;
         constexpr int BLOCK = VPT * 32;
-        constexpr int SCALE_STEP = 64 / VPT;
+        constexpr int SCALE_STEP = GS_D / VPT;
         const int out_row = int(tg) * 8 + rg * 4;
         const device uint8_t* wp = (const device uint8_t*)down_w
             + out_row * ROW_BYTES + ks * (SLICE * BP / PF) + int(lane) * PPT * BP;
-        const device T* sp = down_s + out_row * GROUPS + ks * (SLICE / 64)
+        const device T* sp = down_s + out_row * GROUPS + ks * (SLICE / GS_D)
             + int(lane) / SCALE_STEP;
-        const device T* bp = down_b + out_row * GROUPS + ks * (SLICE / 64)
+        const device T* bp = down_b + out_row * GROUPS + ks * (SLICE / GS_D)
             + int(lane) / SCALE_STEP;
         const device T* xp = x + ks * SLICE + int(lane) * VPT;
         float result[4] = {0.0f};
@@ -125,8 +127,8 @@ _D_SOURCE = r"""
                     float(sp[r * GROUPS]), float(bp[r * GROUPS]), sum);
             }
             wp += BLOCK * BP / PF;
-            sp += BLOCK / 64;
-            bp += BLOCK / 64;
+            sp += BLOCK / GS_D;
+            bp += BLOCK / GS_D;
             xp += BLOCK;
         }
         // Load only lanes inside the tail; all lanes must join simd_sum.
@@ -161,11 +163,12 @@ _D_SOURCE = r"""
         constexpr int PPT = 1;
         constexpr int VPT = PF;
         constexpr int BLOCK = VPT * 32;
-        constexpr int SCALE_STEP = 64 / VPT;
+        constexpr int GROUPS_I = K / GS_I;
+        constexpr int SCALE_STEP = GS_I / VPT;
         const device uint8_t* wp = (const device uint8_t*)inject_w
             + ks * (SLICE * BP / PF) + int(lane) * BP;
-        const device T* sp = inject_s + ks * (SLICE / 64) + int(lane) / SCALE_STEP;
-        const device T* bp = inject_b + ks * (SLICE / 64) + int(lane) / SCALE_STEP;
+        const device T* sp = inject_s + ks * (SLICE / GS_I) + int(lane) / SCALE_STEP;
+        const device T* bp = inject_b + ks * (SLICE / GS_I) + int(lane) / SCALE_STEP;
         const device T* xp = x + ks * SLICE + int(lane) * VPT;
         float result[HC] = {0.0f};
         float xv[VPT];
@@ -175,11 +178,11 @@ _D_SOURCE = r"""
             for (int r = 0; r < HC; ++r) {
                 result[r] += hc_qdot<VPT, BITS_I>(
                     wp + r * ROW_BYTES, xv,
-                    float(sp[r * GROUPS]), float(bp[r * GROUPS]), sum);
+                    float(sp[r * GROUPS_I]), float(bp[r * GROUPS_I]), sum);
             }
             wp += BLOCK * BP / PF;
-            sp += BLOCK / 64;
-            bp += BLOCK / 64;
+            sp += BLOCK / GS_I;
+            bp += BLOCK / GS_I;
             xp += BLOCK;
         }
         if (TAIL > 0 && int(lane) * VPT < TAIL) {
@@ -187,7 +190,7 @@ _D_SOURCE = r"""
             for (int r = 0; r < HC; ++r) {
                 result[r] += hc_qdot<VPT, BITS_I>(
                     wp + r * ROW_BYTES, xv,
-                    float(sp[r * GROUPS]), float(bp[r * GROUPS]), sum);
+                    float(sp[r * GROUPS_I]), float(bp[r * GROUPS_I]), sum);
             }
         }
         for (int r = 0; r < HC; ++r) {
@@ -213,9 +216,9 @@ _U_SOURCE = r"""
     constexpr int PF = hc_pack_factor<BITS_U>();
     constexpr int BP = hc_bytes_per_pack<BITS_U>();
     constexpr int ROW_BYTES = R * BP / PF;
-    constexpr int GROUPS_R = R / 64;
+    constexpr int GROUPS_R = R / GS_U;
     constexpr int CH = 2 * PF;
-    constexpr int CPG = 64 / CH;
+    constexpr int CPG = GS_U / CH;
     const device uint8_t* w = (const device uint8_t*)up_w + (size_t)n * ROW_BYTES;
     const device T* sp = up_s + (size_t)n * GROUPS_R;
     const device T* bp = up_b + (size_t)n * GROUPS_R;
@@ -227,7 +230,7 @@ _U_SOURCE = r"""
         const float sc = float(sp[gq]);
         const float bi = float(bp[gq]);
         for (int c = 0; c < CPG; ++c) {
-            const int e = gq * 64 + c * CH;
+            const int e = gq * GS_U + c * CH;
             float sum = hc_load_vector<T, CH, BITS_U>(a + e, xv);
             acc += hc_qdot<CH, BITS_U>(w + e * BP / PF, xv, sc, bi, sum);
         }
@@ -265,7 +268,8 @@ _NDN_SOURCE_TEMPLATE = r"""
     constexpr int PER = (H + 255) / 256;
     constexpr int KS = 4;
     constexpr int SLICE = K / KS;
-    constexpr int GROUPS = K / 64;
+    constexpr int GROUPS = K / GS_D;
+    constexpr int GROUPS_I = K / GS_I;
     constexpr int PR = R + HC;
     constexpr int ROWS_TG = 8 * RPS;
     constexpr int NDG = R / ROWS_TG;
@@ -312,13 +316,13 @@ _NDN_SOURCE_TEMPLATE = r"""
         constexpr int PPT = 2;
         constexpr int VPT = PF * PPT;
         constexpr int BLOCK = VPT * 32;
-        constexpr int SCALE_STEP = 64 / VPT;
+        constexpr int SCALE_STEP = GS_D / VPT;
         const int out_row = int(g) * ROWS_TG + int(sg) * RPS;
         const device uint8_t* wq = (const device uint8_t*)down_w
             + out_row * ROW_BYTES + ks * (SLICE * BP / PF) + int(lane) * PPT * BP;
-        const device T* sp = down_s + out_row * GROUPS + ks * (SLICE / 64)
+        const device T* sp = down_s + out_row * GROUPS + ks * (SLICE / GS_D)
             + int(lane) / SCALE_STEP;
-        const device T* bp = down_b + out_row * GROUPS + ks * (SLICE / 64)
+        const device T* bp = down_b + out_row * GROUPS + ks * (SLICE / GS_D)
             + int(lane) / SCALE_STEP;
         const threadgroup T* xp = xs + int(lane) * VPT;
         float result[RPS] = {0.0f};
@@ -332,8 +336,8 @@ _NDN_SOURCE_TEMPLATE = r"""
                     float(sp[r * GROUPS]), float(bp[r * GROUPS]), sum);
             }
             wq += BLOCK * BP / PF;
-            sp += BLOCK / 64;
-            bp += BLOCK / 64;
+            sp += BLOCK / GS_D;
+            bp += BLOCK / GS_D;
             xp += BLOCK;
         }
         // Load only lanes inside the tail; all lanes must join simd_sum.
@@ -355,13 +359,13 @@ _NDN_SOURCE_TEMPLATE = r"""
         constexpr int ROW_BYTES = K * BP / PF;
         constexpr int VPT = PF;
         constexpr int BLOCK = VPT * 32;
-        constexpr int SCALE_STEP = 64 / VPT;
+        constexpr int SCALE_STEP = GS_I / VPT;
         const int r = int(sg);
         const device uint8_t* wq = (const device uint8_t*)inject_w
             + r * ROW_BYTES + ks * (SLICE * BP / PF) + int(lane) * BP;
-        const device T* sp = inject_s + r * GROUPS + ks * (SLICE / 64)
+        const device T* sp = inject_s + r * GROUPS_I + ks * (SLICE / GS_I)
             + int(lane) / SCALE_STEP;
-        const device T* bp = inject_b + r * GROUPS + ks * (SLICE / 64)
+        const device T* bp = inject_b + r * GROUPS_I + ks * (SLICE / GS_I)
             + int(lane) / SCALE_STEP;
         const threadgroup T* xp = xs + int(lane) * VPT;
         float result = 0.0f;
@@ -371,8 +375,8 @@ _NDN_SOURCE_TEMPLATE = r"""
             float sum = hc_load_vector_tg<T, VPT, BITS_I>(xp, xv);
             result += hc_qdot<VPT, BITS_I>(wq, xv, float(sp[0]), float(bp[0]), sum);
             wq += BLOCK * BP / PF;
-            sp += BLOCK / 64;
-            bp += BLOCK / 64;
+            sp += BLOCK / GS_I;
+            bp += BLOCK / GS_I;
             xp += BLOCK;
         }
         if (TAIL > 0 && int(lane) * VPT < TAIL) {
@@ -434,9 +438,9 @@ _U2_SOURCE = r"""
     constexpr int PF = hc_pack_factor<BITS_U>();
     constexpr int BP = hc_bytes_per_pack<BITS_U>();
     constexpr int ROW_BYTES = R * BP / PF;
-    constexpr int GROUPS_R = R / 64;
+    constexpr int GROUPS_R = R / GS_U;
     constexpr int CH = 2 * PF;
-    constexpr int CPG = 64 / CH;
+    constexpr int CPG = GS_U / CH;
     constexpr int NC = R / CH;
     constexpr int NCP = NC + 1;
     constexpr int HB = NO / HC;
@@ -517,7 +521,7 @@ _TI_SOURCE = r"""
     constexpr int PF = hc_pack_factor<BITS_I>();
     constexpr int BP = hc_bytes_per_pack<BITS_I>();
     constexpr int ROW_BYTES = K * BP / PF;
-    constexpr int GROUPS = K / 64;
+    constexpr int GROUPS = K / GS_I;
     constexpr int PER = K / 256;
     constexpr int VT = H / PER;
     static_assert(K == HC * H && H % PER == 0 && VT % 32 == 0 && HC * VT == 256,
@@ -547,7 +551,7 @@ _TI_SOURCE = r"""
             for (int e = e0; e < e0 + PER; e += PF) {
                 const float sum = hc_load_vector_tg<T, PF, BITS_I>(xs + e, xv);
                 const int ge = s * H + e;
-                const int g = ge / 64;
+                const int g = ge / GS_I;
                 for (int r = 0; r < HC; ++r) {
                     res[r] += hc_qdot<PF, BITS_I>(
                         (const device uint8_t*)inject_w + r * ROW_BYTES + ge * BP / PF,
@@ -656,7 +660,7 @@ def write_enabled() -> bool:
 def _quantized_ok(projection) -> bool:
     return (
         type(projection) is nn.QuantizedLinear
-        and getattr(projection, "group_size", None) == _GROUP_SIZE
+        and getattr(projection, "group_size", None) in _GROUP_SIZES
         and getattr(projection, "bits", None) in _SUPPORTED_BITS
         and getattr(projection, "mode", "affine") == "affine"
         and "bias" not in projection
@@ -780,7 +784,7 @@ def _check_static_layout(module) -> bool:
         and _quantized_ok(getattr(module, "input_mix_weight_up", None))
     ):
         return _ineligible(
-            "projection quantisation (need affine group-size-64 4/5/6/8-bit with bf16 scales)"
+            "projection quantisation (need affine group-size-32/64 4/5/6/8-bit with bf16 scales)"
         )
     if "block_inject_weight" in module and not _quantized_ok(
         module.block_inject_weight
@@ -968,6 +972,8 @@ def _kernel_norm_down(module, flat, operands, rows, hc, hidden, lowrank, dtype, 
             ("T", dtype),
             ("BITS_D", down.bits),
             ("BITS_I", tensors.bits),
+            ("GS_D", down.group_size),
+            ("GS_I", tensors.group_size),
             ("K", width),
             ("H", hidden),
             ("R", lowrank),
@@ -1019,6 +1025,7 @@ def _kernel_up_mix(normed, parts, rows, hc, hidden, lowrank, dtype, up, inject: 
         template=[
             ("T", dtype),
             ("BITS_U", up.bits),
+            ("GS_U", up.group_size),
             ("K", hc * hidden),
             ("R", lowrank),
             ("HC", hc),
@@ -1081,14 +1088,23 @@ def _nax_prefill_ok(module, rows: int, width: int, inject) -> bool:
     """Whether the tensor-unit kernels reproduce this call bit for bit.
 
     They repeat MLX's unsplit NAX quantized matmul, so the up projection must
-    take that kernel in MLX too, and the inject partials need the tail
-    kernel's whole-pack thread slices.
+    take that kernel in MLX too, every projection must use the tile loop's
+    group size, and the inject partials need the tail kernel's whole-pack
+    thread slices.
     """
     return (
         not _NAX_DISABLED
         and not _NAX_BROKEN
         and inject is not None
         and width % (256 * _pack_factor(inject.bits)) == 0
+        and all(
+            projection.group_size == hc_prefill_nax.GROUP_SIZE
+            for projection in (
+                module.input_mix_weight_down,
+                module.input_mix_weight_up,
+                inject,
+            )
+        )
         and module.hidden_size % hc_prefill_nax.UP_COLS == 0
         and hc_prefill_nax.plain_qmm_nax(rows, width)
         and _nax_available()
@@ -1225,6 +1241,7 @@ def prefill_forward(module, hyper_input, write=None, nax=True):
                 template=[
                     ("T", dtype),
                     ("BITS_I", inject.bits),
+                    ("GS_I", inject.group_size),
                     ("K", width),
                     ("H", hidden),
                     ("HC", hc),
@@ -1244,6 +1261,7 @@ def prefill_forward(module, hyper_input, write=None, nax=True):
             module.hc_lowrank,
             module.input_mix_weight_down.bits,
             inject.bits if inject is not None else None,
+            inject.group_size if inject is not None else None,
             write is not None,
         )
         if signature not in _VALIDATED:
@@ -1318,6 +1336,8 @@ def fused_forward(module, hyper_input, write=None):
                     ("T", dtype),
                     ("BITS_D", down.bits),
                     ("BITS_I", inject.bits if inject is not None else down.bits),
+                    ("GS_D", down.group_size),
+                    ("GS_I", inject.group_size if inject is not None else down.group_size),
                     ("K", width),
                     ("R", lowrank),
                     ("HC", hc),
@@ -1339,6 +1359,7 @@ def fused_forward(module, hyper_input, write=None):
                 template=[
                     ("T", dtype),
                     ("BITS_U", up.bits),
+                    ("GS_U", up.group_size),
                     ("K", width),
                     ("R", lowrank),
                     ("HC", hc),
@@ -1360,6 +1381,9 @@ def fused_forward(module, hyper_input, write=None):
             down.bits,
             up.bits,
             inject.bits if inject is not None else None,
+            down.group_size,
+            up.group_size,
+            inject.group_size if inject is not None else None,
             write is not None,
             v2,
         )

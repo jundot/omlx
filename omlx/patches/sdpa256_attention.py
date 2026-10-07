@@ -1,19 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Keep head-dim-256 long-context prefill bounded on MLX 0.32.2.
+"""Keep head-dim-256 long-context prefill bounded on MLX 0.32.3.
 
-MLX 0.32.2 ships a fused full-attention kernel for head dimensions 192 and 256,
-but deliberately keeps the faster unfused path as the default on pre-NAX GPUs.
-That default materializes the full ``[n_q, query_len, kv_len]`` score matrix,
-quadratic in context length, and can still exceed oMLX's memory-guard ceiling.
+MLX 0.32.3 ships fused full-attention kernels for head dimension 256, but on
+pre-NAX GPUs its default dispatch still takes the unfused path for chunked
+prefill (more keys than queries) and for array masks. That path materializes
+the full ``[n_q, query_len, kv_len]`` score matrix, quadratic in context
+length, and can exceed oMLX's memory-guard ceiling.
 
-Qualifying calls use the bounded route. Metal uses native fused attention for supported FP16/BF16 calls, while FP32 and array masks use array tiling.
-The native FP32 full-attention kernel exceeds 32 KiB of threadgroup memory.
-On NAX, MLX's default selects its split-D head-dim-256 kernel for causal prefills with at least 1024 queries.
+Qualifying calls use the bounded route: MLX's fused kernel on Metal for causal,
+no-mask and array-mask calls in any float dtype. Pre-NAX GPUs run array-mask
+and FP32 calls in query chunks of about 10 ms each (issue #2225). On NAX, MLX's
+default already selects its split-D head-dim-256 kernel for causal and
+array-mask prefills with at least 1024 queries.
 
 ``OMLX_SDPA256_TILED=1/0`` remains accepted for compatibility and now forces or
-disables the bounded route. Metal uses the native fused kernel; CUDA retains
-the prior array-tiled implementation because MLX 0.32.2's CUDA fused kernel
-does not support head_dim 256.
+disables the bounded route. CUDA retains the array-tiled implementation because
+MLX 0.32.3's CUDA fused kernel does not support head_dim 256.
 
 Install mechanics mirror turboquant_attention.py (patch the module attr + rebind
 already-imported model modules). The route is strictly gated (see _should_route);
@@ -22,8 +24,11 @@ everything else passes through to the original SDPA unchanged.
 
 import logging
 import os
+import time
 
 import mlx.core as mx
+
+from omlx.custom_kernels.nax import is_nax_available
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +48,13 @@ _Q_TILE = 512
 # understate the bounded route's score working set.
 _KV_TILE = 1024
 _NEG_INF = -1e30
+# Per-dispatch wallclock target and clamp for the pre-NAX chunked route; the
+# same values as qwen35_fa256_attention's budget (issue #2225).
+_TARGET_DISPATCH_SECONDS = 0.010
+_DEFAULT_DISPATCH_BUDGET = 250_000_000
+_MIN_DISPATCH_BUDGET = 20_000_000
+_MAX_DISPATCH_BUDGET = 2_000_000_000
+_DISPATCH_BUDGET: int | None = None
 
 # Backward-compatible override: True = force the bounded route, False = never
 # force it (opt out of the #2025 memory fix), None = the default below.
@@ -185,28 +197,100 @@ def _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks=None):
 _NATIVE_FORCE_FUSED = True
 
 
-def _flash_sdpa256(queries, keys, values, scale, mask, sinks=None):
-    """Use MLX 0.32.2 native fused SDPA on Metal, portable tiling elsewhere.
+def _fused_dispatch_budget() -> int:
+    """Work (heads x query rows x keys) one fused dispatch runs in about
+    ``_TARGET_DISPATCH_SECONDS`` on this GPU, measured once."""
+    global _DISPATCH_BUDGET
+    if _DISPATCH_BUDGET is not None:
+        return _DISPATCH_BUDGET
+    try:
+        q = mx.zeros((1, 16, 1024, HEAD_DIM), dtype=mx.bfloat16)
+        kv = mx.zeros((1, 2, 8192, HEAD_DIM), dtype=mx.bfloat16)
+        mx.eval(q, kv)
+        best = None
+        for i in range(4):
+            start = time.perf_counter()
+            mx.eval(
+                mx.fast.scaled_dot_product_attention(
+                    q, kv, kv, scale=HEAD_DIM**-0.5, mask="causal", force_fused=True
+                )
+            )
+            elapsed = time.perf_counter() - start
+            if i > 0:
+                best = elapsed if best is None else min(best, elapsed)
+        budget = int(16 * 1024 * 8192 / best * _TARGET_DISPATCH_SECONDS)
+    except Exception:
+        # Traced (mx.compile) or no fused kernel: decide on a later eager call.
+        return _DEFAULT_DISPATCH_BUDGET
+    _DISPATCH_BUDGET = max(_MIN_DISPATCH_BUDGET, min(_MAX_DISPATCH_BUDGET, budget))
+    return _DISPATCH_BUDGET
 
-    Explicit array masks never take the native fused call: MLX's fused
-    array-mask support is unproven and may silently fall back to the
-    unfused fp32 score matrix, which is exactly the O(L^2) spike this patch
-    exists to bound. The array-tiled implementation already handles bool and
-    additive masks, so route them there directly."""
+
+def _chunked_fused_sdpa256(queries, keys, values, scale, mask, sinks):
+    """Fused SDPA as query chunks of one dispatch budget each.
+
+    A single dispatch over a long KV can trip the IOGPU interactivity
+    preemption on pre-NAX GPUs (issue #2225). A mask with one row per query
+    is sliced per chunk. A causal chunk ends its keys at its own last row,
+    since the "causal" mask aligns the queries to the end of the keys.
+    """
+    heads, q_len, kv_len = queries.shape[-3], queries.shape[-2], keys.shape[-2]
+    rows = max(16, _fused_dispatch_budget() // max(1, heads * kv_len))
+    if rows >= q_len:
+        return mx.fast.scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            scale=scale,
+            mask=mask,
+            sinks=sinks,
+            force_fused=True,
+        )
+    per_row_mask = (
+        isinstance(mask, mx.array) and mask.ndim >= 2 and mask.shape[-2] == q_len
+    )
+    causal = isinstance(mask, str) and mask == "causal"
+    outs = []
+    for start in range(0, q_len, rows):
+        stop = min(q_len, start + rows)
+        end = kv_len - q_len + stop if causal else kv_len
+        outs.append(
+            mx.fast.scaled_dot_product_attention(
+                queries[..., start:stop, :],
+                keys[..., :end, :],
+                values[..., :end, :],
+                scale=scale,
+                mask=mask[..., start:stop, :] if per_row_mask else mask,
+                sinks=sinks,
+                force_fused=True,
+            )
+        )
+    return mx.concatenate(outs, axis=-2)
+
+
+def _flash_sdpa256(queries, keys, values, scale, mask, sinks=None):
+    """Use MLX 0.32.3 native fused SDPA on Metal, portable tiling elsewhere.
+
+    The fused kernel keeps causal, no-mask and array-mask calls O(L) in every
+    float dtype. Pre-NAX GPUs run array-mask and FP32 calls in query chunks
+    (see ``_chunked_fused_sdpa256``). Calls the fused kernel rejects (more
+    queries than keys under a causal mask, a mask that does not promote to
+    the output dtype) take the array-tiled route."""
     global _NATIVE_FORCE_FUSED
 
-    if isinstance(mask, mx.array):
-        return _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks)
-    # MLX promotes Q/K/V together; any FP32 input selects the 53,760-byte kernel.
-    if mx.result_type(queries.dtype, keys.dtype, values.dtype) == mx.float32:
-        return _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks)
     native_shape = values.shape[-1] == HEAD_DIM and not (
         isinstance(mask, str)
         and mask == "causal"
         and queries.shape[-2] > keys.shape[-2]
     )
     if mx.metal.is_available() and native_shape and _NATIVE_FORCE_FUSED:
+        chunked = not is_nax_available() and (
+            isinstance(mask, mx.array)
+            or mx.result_type(queries.dtype, keys.dtype, values.dtype) == mx.float32
+        )
         try:
+            if chunked:
+                return _chunked_fused_sdpa256(queries, keys, values, scale, mask, sinks)
             return mx.fast.scaled_dot_product_attention(
                 queries,
                 keys,
@@ -226,6 +310,9 @@ def _flash_sdpa256(queries, keys, values, scale, mask, sinks=None):
                 "array-tiled bounded route instead of the native fused kernel",
                 getattr(mx, "__version__", "?"),
             )
+        except ValueError:
+            # A layout the fused kernel rejects; the tiled route covers it.
+            pass
     return _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks)
 
 

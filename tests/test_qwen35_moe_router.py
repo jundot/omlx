@@ -130,22 +130,21 @@ def _same_bits(a, b):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("top_k,hidden", [(10, 2560), (8, 2048)])
 @pytest.mark.parametrize("seed", [0, 1, 2])
-def test_fused_combine_matches_composed_ops(top_k, hidden, seed):
+def test_fused_combine_matches_composed_ops(dtype, top_k, hidden, seed):
     from omlx.patches.qwen35_moe_router import fused_moe_combine
 
     mx.random.seed(seed)
-    routed = (mx.random.normal((1, 1, top_k, hidden)) * (1 + 4 * seed)).astype(
-        mx.bfloat16
-    )
-    special = mx.array([float("inf"), -float("inf"), -0.0, 0.0, 3e38], mx.bfloat16)
+    routed = (mx.random.normal((1, 1, top_k, hidden)) * (1 + 4 * seed)).astype(dtype)
+    special = mx.array([float("inf"), -float("inf"), -0.0, 0.0, 3e38], dtype)
     routed[0, 0, 0, : special.size] = special
-    scores = mx.softmax(mx.random.normal((1, 1, top_k)), axis=-1).astype(mx.bfloat16)
-    shared = (mx.random.normal((1, 1, hidden)) * 2).astype(mx.bfloat16)
+    scores = mx.softmax(mx.random.normal((1, 1, top_k)), axis=-1).astype(dtype)
+    shared = (mx.random.normal((1, 1, hidden)) * 2).astype(dtype)
     # Gate logits cover both sigmoid branches and exp's rounding ties (-6.84375).
     for logit in (-6.84375, -20.0, -0.0, 0.3, 9.5):
-        gate = mx.array([[[logit]]], mx.bfloat16)
+        gate = mx.array([[[logit]]], dtype)
         expected = _composed_combine(routed, scores, shared, gate)
         actual = fused_moe_combine(routed, scores, shared, gate)
         assert actual is not None
@@ -154,14 +153,15 @@ def test_fused_combine_matches_composed_ops(top_k, hidden, seed):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-def test_fused_combine_sigmoid_matches_every_bf16_gate():
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_fused_combine_sigmoid_matches_every_gate_encoding(dtype):
     from omlx.patches.qwen35_moe_router import fused_moe_combine
 
     mx.random.seed(9)
-    routed = mx.random.normal((1, 1, 10, 64)).astype(mx.bfloat16)
-    scores = mx.softmax(mx.random.normal((1, 1, 10)), axis=-1).astype(mx.bfloat16)
-    shared = mx.random.normal((1, 1, 64)).astype(mx.bfloat16)
-    gates = mx.arange(0, 65536, dtype=mx.uint32).astype(mx.uint16).view(mx.bfloat16)
+    routed = mx.random.normal((1, 1, 10, 64)).astype(dtype)
+    scores = mx.softmax(mx.random.normal((1, 1, 10)), axis=-1).astype(dtype)
+    shared = mx.random.normal((1, 1, 64)).astype(dtype)
+    gates = mx.arange(0, 65536, dtype=mx.uint32).astype(mx.uint16).view(dtype)
     for start in range(0, gates.size, 2048):
         chunk = [gates[i].reshape(1, 1, 1) for i in range(start, start + 2048)]
         actual = mx.stack([fused_moe_combine(routed, scores, shared, g) for g in chunk])
@@ -183,7 +183,7 @@ def test_fused_combine_declines_other_layouts(monkeypatch):
 
     assert router.fused_moe_combine(*operands(rows=2)) is None  # verify rows stay composed
     assert router.fused_moe_combine(*operands(top_k=7)) is None
-    assert router.fused_moe_combine(*operands(dtype=mx.float16)) is None
+    assert router.fused_moe_combine(*operands(dtype=mx.float32)) is None
     monkeypatch.setattr(router, "_COMBINE_DISABLED", True)
     assert router.fused_moe_combine(*operands()) is None
 
@@ -255,13 +255,17 @@ def _near_tie_logits(kind, experts, seed):
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize("experts", [512, 128])
 @pytest.mark.parametrize("kind", ["random", "duplicates", "adjacent", "two_values"])
-def test_softmax_topk_row_matches_softmax_then_topk(experts, kind):
+@pytest.mark.parametrize(
+    "dtype,top_k", [(mx.bfloat16, 10), (mx.bfloat16, 8), (mx.float16, 8)]
+)
+def test_softmax_topk_row_matches_softmax_then_topk(experts, kind, dtype, top_k):
     from omlx.patches.qwen35_moe_router import softmax_topk_row
 
     for seed in range(40):
-        logits = _near_tie_logits(kind, experts, seed)
-        ref_i, ref_s = fused_router_topk(mx.softmax(logits, axis=-1, precise=True), 10)
-        out_i, out_s = softmax_topk_row(logits, 10)
+        logits = _near_tie_logits(kind, experts, seed).astype(dtype)
+        probs = mx.softmax(logits, axis=-1, precise=True)
+        ref_i, ref_s = fused_router_topk(probs, top_k)
+        out_i, out_s = softmax_topk_row(logits, top_k)
         assert mx.array_equal(ref_i, out_i).item()
         assert mx.array_equal(ref_s.view(mx.uint16), out_s.view(mx.uint16)).item()
 
@@ -308,12 +312,13 @@ def test_softmax_topk_row_declines_layouts_it_does_not_reproduce():
     # MLX's softmax ends 320 experts in a partial simdgroup.
     assert softmax_topk_row(mx.zeros((1, 1, 320), mx.bfloat16), 10) is None
     assert softmax_topk_row(mx.zeros((1, 2, 512), mx.bfloat16), 10) is None
-    assert softmax_topk_row(mx.zeros((1, 1, 512), mx.float16), 10) is None
+    assert softmax_topk_row(mx.zeros((1, 1, 512), mx.float32), 10) is None
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize("experts,width", [(512, 2560), (256, 2048), (128, 1024)])
-def test_router_gemv_matches_mlx_linear(experts, width):
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_router_gemv_matches_mlx_linear(experts, width, dtype):
     """BF16 logits and, because rounding hides one-ulp FP32 differences (a
     simd_sum in place of MLX's shuffle-down tree changes only a few BF16
     logits), the FP32 row sums against MLX's gemv on the same values in FP32."""
@@ -336,13 +341,14 @@ def test_router_gemv_matches_mlx_linear(experts, width):
     )
     for seed in range(12):
         mx.random.seed(seed)
-        weight = (mx.random.normal((experts, width)) * 0.02 * (1 + seed % 4)).astype(mx.bfloat16)
-        x = (mx.random.normal((1, 1, width)) * (1 + seed % 3)).astype(mx.bfloat16)
+        scale = 0.02 * (1 + seed % 4)
+        weight = (mx.random.normal((experts, width)) * scale).astype(dtype)
+        x = (mx.random.normal((1, 1, width)) * (1 + seed % 3)).astype(dtype)
         out = router.router_logits_row(x, weight)
         assert mx.array_equal(out.view(mx.uint16), (x @ weight.T).view(mx.uint16)).item()
         sums = probe(
             inputs=[x, weight],
-            template=[("T", mx.bfloat16), ("K", width)],
+            template=[("T", dtype), ("K", width)],
             grid=(32, experts, 1),
             threadgroup=(32, 4, 1),
             output_shapes=[(experts,)],
@@ -360,4 +366,7 @@ def test_router_gemv_declines_layouts_mlx_reduces_differently():
     assert router_logits_row(x, mx.zeros((128, 2048), mx.bfloat16)) is None
     # K % 128: MLX's guarded tail block.
     assert router_logits_row(x[..., :2000], mx.zeros((512, 2000), mx.bfloat16)) is None
-    assert router_logits_row(x.astype(mx.float16), mx.zeros((512, 2048), mx.float16)) is None
+    f32, f16 = x.astype(mx.float32), x.astype(mx.float16)
+    assert router_logits_row(f32, mx.zeros((512, 2048), mx.float32)) is None
+    # The weight sets the kernel dtype: rows of another dtype stay stock.
+    assert router_logits_row(f16, mx.zeros((512, 2048), mx.bfloat16)) is None

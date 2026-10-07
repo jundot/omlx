@@ -277,7 +277,9 @@ Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stat
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/embeddings` | Text embeddings |
 | `POST /v1/rerank` | Document reranking |
+| `POST /v1/systemone` | Typed decisions with decision models (TypeSafe System One) |
 | `GET /v1/models` | List available models |
+| `POST /tokenize`, `POST /detokenize` | vLLM-compatible tokenizer API (also under `/v1`) |
 
 ### Tool Calling & Structured Output
 
@@ -319,8 +321,9 @@ Models are auto-detected by type. You can also download models directly from the
 | LLM | Any model supported by [mlx-lm](https://github.com/ml-explore/mlx-lm) |
 | VLM | Qwen3.5 Series, GLM-4V, Pixtral, and other [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) models |
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
-| Embedding | BERT, BGE-M3, ModernBERT |
+| Embedding | BERT, BGE-M3, ModernBERT, EmbeddingGemma 2 |
 | Reranker | ModernBERT, XLM-RoBERTa |
+| Decision | Clef, Clef-Flash, OpenJev |
 
 ## CLI Configuration
 
@@ -380,7 +383,8 @@ FastAPI Server (OpenAI / Anthropic API)
     │   ├── BatchedEngine (LLMs, continuous batching)
     │   ├── VLMEngine (vision-language models)
     │   ├── EmbeddingEngine
-    │   └── RerankerEngine
+    │   ├── RerankerEngine
+    │   └── DecisionEngine
     │
     ├── ProcessMemoryEnforcer (total memory limit, TTL checks)
     │
@@ -403,7 +407,7 @@ FastAPI Server (OpenAI / Anthropic API)
 git clone https://github.com/jundot/omlx.git
 cd omlx
 pip install -e ".[dev]"
-pytest -m "not slow"
+pytest
 ```
 
 ### macOS App

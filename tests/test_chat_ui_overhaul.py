@@ -43,7 +43,7 @@ def test_regeneration_overrides_survive_stream_context():
     assert "context._generationOverride" in stream
 
 
-def test_one_off_regeneration_does_not_replace_session_model():
+def test_regeneration_model_override_reaches_the_request():
     html = _template()
     stream = _section(
         html,
@@ -231,3 +231,13 @@ def test_top_capsule_shows_the_model_name_alone_and_centred():
     assert "openRightDrawer('profile')" not in capsule
     assert "profile_default" not in capsule
     assert "availableModels.find(m => m.id === currentModel)?.name" in capsule
+
+
+def test_regenerate_with_model_switches_the_chat_model():
+    regenerate = _section(
+        _template(),
+        "async regenerateMessage(index, opts = {})",
+        "_copyFallback(text)",
+    )
+
+    assert "if (opts.model) await this.selectModel(opts.model);" in regenerate

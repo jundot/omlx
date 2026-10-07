@@ -121,6 +121,63 @@ def lm_load_compat(path_or_repo: str, *, trust_remote_code: bool = False, **kwar
     return load(path_or_repo, trust_remote_code=trust_remote_code, **kwargs)
 
 
+def _add_glm5_next_nextn_quant_keys(cfg: dict, quant: dict) -> None:
+    """Mirror the GLM nextn sanitizer's trailing-layer to MTP path mapping."""
+    text = cfg.get("text_config")
+    if not isinstance(text, dict):
+        text = cfg
+    if not any(
+        config.get("model_type") in ("glm5_next", "glm5_next_text")
+        for config in (cfg, text)
+    ):
+        return
+    n_layers = text.get("num_hidden_layers")
+    n_nextn = text.get("num_nextn_predict_layers", 0)
+    if not isinstance(n_layers, int) or not isinstance(n_nextn, int):
+        return
+    extras: dict[str, dict | bool] = {}
+    for key, val in quant.items():
+        if not isinstance(val, dict) and val is not False:
+            continue
+        for i in range(n_nextn):
+            # These are the source prefixes accepted by glm5_next_vlm_runtime.
+            for root in (_CKPT_TEXT_PREFIX, _RUNTIME_TEXT_PREFIX, "model."):
+                prefix = f"{root}layers.{n_layers + i}."
+                if not key.startswith(prefix):
+                    continue
+                tail = key[len(prefix) :]
+                if tail in ("shared_head.head", "embed_tokens") or tail.startswith(
+                    ("shared_head.head.", "embed_tokens.")
+                ):
+                    continue
+                if tail == "shared_head.norm":
+                    mapped = "norm"
+                elif tail in ("eh_proj", "enorm", "hnorm"):
+                    mapped = tail
+                else:
+                    mapped = f"block.{tail}"
+                target = f"{_VLM_TEXT_PREFIX}mtp.{i}.{mapped}"
+                if target not in quant and target not in extras:
+                    extras[target] = val
+    quant.update(extras)
+
+
+def _add_mla_split_quant_keys(quant: dict) -> None:
+    """Inherit kv_b_proj's recipe after explicit split-path aliases exist."""
+    extras: dict[str, dict | bool] = {}
+    for key, val in quant.items():
+        if (not isinstance(val, dict) and val is not False) or not key.endswith(
+            ".self_attn.kv_b_proj"
+        ):
+            continue
+        stem = key[: -len("kv_b_proj")]
+        for half in ("embed_q", "unembed_out"):
+            target = stem + half
+            if target not in quant and target not in extras:
+                extras[target] = val
+    quant.update(extras)
+
+
 def expand_per_layer_quant_keys(cfg: dict) -> dict:
     """Add module-tree-path variants of per-layer quantization keys.
 
@@ -143,9 +200,9 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
         quant = cfg.get(config_key)
         if not isinstance(quant, dict):
             continue
-        extras: dict[str, dict] = {}
+        extras: dict[str, dict | bool] = {}
         for key, val in quant.items():
-            if not isinstance(val, dict):
+            if not isinstance(val, dict) and val is not False:
                 continue
             if key.startswith(_CKPT_TEXT_PREFIX):
                 # model.language_model.X -> language_model.model.X
@@ -186,6 +243,10 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
                     extras[proj_variant] = val
         if extras:
             quant.update(extras)
+        _add_glm5_next_nextn_quant_keys(cfg, quant)
+        # sanitize splits MLA kv_b_proj using its own recipe. Inherit it only
+        # after explicit split and nextn overrides have their runtime aliases.
+        _add_mla_split_quant_keys(quant)
         if str(cfg.get("model_type", "")).startswith("minimax_m3"):
             # The mlx-lm adapter stores the vendored mlx-vlm tree under
             # ``Model.inner`` and sanitize() re-roots checkpoint weights to
@@ -879,13 +940,25 @@ def maybe_apply_pre_load_patches(
                 backend = (
                     "embedded DSpark" if _has_dspark_heads(config) else "Lightning MTP"
                 )
-                logger.info(
-                    "Speculative backend selected for %s: %s "
-                    "(model_type=%s, active)",
-                    model_name,
-                    backend,
-                    model_type,
-                )
+                # DSpark is declared in config only, so only Lightning MTP is probed.
+                if backend == "Lightning MTP" and not _checkpoint_has_mtp_weights(
+                    model_name
+                ):
+                    logger.warning(
+                        "Lightning MTP is inactive for %s (model_type=%s): the "
+                        "config declares MTP heads but the checkpoint has no MTP "
+                        "weights",
+                        model_name,
+                        model_type,
+                    )
+                else:
+                    logger.info(
+                        "Speculative backend selected for %s: %s "
+                        "(model_type=%s, active)",
+                        model_name,
+                        backend,
+                        model_type,
+                    )
             else:
                 logger.debug(
                     "Native MTP patch applied for %s for sanitize correctness "

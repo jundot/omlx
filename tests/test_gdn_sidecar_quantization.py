@@ -848,9 +848,6 @@ def test_rejected_sidecar_degrades_to_a_cache_miss(tmp_path):
         assert store.gdn_decode_failures == 0
 
         arrays, metadata = mx.load(str(staged), return_metadata=True)
-        # Materialize before overwriting the same backing file. MLX 0.32.2
-        # otherwise retains read primitives that fail after the truncate.
-        mx.eval(*arrays.values())
         info = json.loads(metadata["layer_info"])
         info[0]["state_1_original_dtype"] = "bfloat16"
         metadata["layer_info"] = json.dumps(info)

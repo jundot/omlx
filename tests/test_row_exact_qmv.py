@@ -65,7 +65,7 @@ SHAPES = [
 
 
 @pytest.mark.parametrize("shape", SHAPES)
-@pytest.mark.parametrize("rows", [3, 8])
+@pytest.mark.parametrize("rows", [3, 8, 16])
 def test_rows_equal_one_row_quantized_matmul(shape, rows):
     k, n, bits, group_size = shape
     linear = _linear(k, n, bits, group_size, seed=k + n + rows)

@@ -15,6 +15,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from ..utils.metal_sync import _sync_and_clear_cache
+
 try:
     import mlx.core as mx
 
@@ -90,6 +92,7 @@ def cachelist_pm_member_plan(
 
     return plan
 
+
 logger = logging.getLogger(__name__)
 
 # Cap on the supersede-on-extend lineage map (tip hash -> previous tip hash).
@@ -114,6 +117,62 @@ _BACKFILL_CHECKED_MAX_ENTRIES = 4096
 _MTP_PREFIX_SNAPSHOT_MAX_ENTRIES = 4
 
 
+# Bounded paged-SSD restore (see _drop_superseded_arrays_snapshots and
+# _settle_restored_layer). Active for restores of at least 65536 cached
+# tokens; drops each block's superseded top-level ArraysCache snapshot and
+# clears the MLX buffer pool only above 4GiB. The eager per-layer eval always
+# applies (the KV concat would otherwise need 2x its size at the first
+# prefill step); the snapshot drop matters when blocks are materialized on
+# load -- hot-cache promotion on, or blocks served from the hot or
+# pending-write tier.
+# Values measured, not tuned: the flush threshold fired rarely across the M5U
+# serving runs (the pool clears a few times per 1M restore) and the min-token
+# gate keeps repeated small restore churn on the lazy path.
+_RESTORE_POOL_FLUSH_BYTES = 4 * 1024**3
+_RESTORE_BOUND_MIN_TOKENS = 65536
+
+# Depth bound for collecting a rebuilt cache object's arrays (CacheList ->
+# SizedArraysCache -> ArraysCache -> list -> array is four levels).
+_RESTORED_ARRAYS_MAX_DEPTH = 8
+
+
+def _restored_cache_arrays(
+    obj: Any, _seen: set[int] | None = None, _depth: int = 0
+) -> list[Any]:
+    """Collect the MLX arrays a rebuilt cache object holds, without copying.
+
+    Walks attributes, lists, tuples (NamedTuple states included) and dicts
+    instead of calling ``.state``, which re-slices or reorders on some cache
+    classes and would materialize a throwaway copy. Only sees ``__dict__``-based
+    objects; every current cache class stores its state that way.
+    """
+    if isinstance(obj, mx.array):
+        return [obj]
+    if (
+        obj is None
+        or _depth > _RESTORED_ARRAYS_MAX_DEPTH
+        or isinstance(obj, (str, bytes, int, float, bool, type))
+    ):
+        return []
+    seen = _seen if _seen is not None else set()
+    if id(obj) in seen:
+        return []
+    seen.add(id(obj))
+    if isinstance(obj, dict):
+        children = list(obj.values())
+    elif isinstance(obj, (list, tuple)):
+        children = list(obj)
+    else:
+        attrs = getattr(obj, "__dict__", None)
+        if not isinstance(attrs, dict):
+            return []
+        children = list(attrs.values())
+    found: list[Any] = []
+    for child in children:
+        found.extend(_restored_cache_arrays(child, seen, _depth + 1))
+    return found
+
+
 def _wrap_cachelist_sub_marker(
     sub_idx: int,
     elements: list[Any],
@@ -133,6 +192,8 @@ def _wrap_cachelist_sub_marker(
     if name is None and sub_idx < len(sub_class_names):
         name = sub_class_names[sub_idx]
     return ("__nstate__", name, list(elements))
+
+
 _EXACT_PREFIX_TERMINAL_KEY = "specprefill-static-exact-v1"
 _EXACT_PREFIX_SPLIT_BLOCK_KEY = "specprefill-static-exact-split-v1"
 _POOLING_CACHE_SUB_CLASSES = frozenset({"PoolingCache", "BatchPoolingCache"})
@@ -228,7 +289,9 @@ class BlockAwarePrefixCache(CacheManager):
         self.block_size = paged_cache_manager.block_size
         self._gdn_ssd_split_enabled = bool(gdn_ssd_split_enabled)
         self._gdn_split_fallback_reported = False
-        self._gdn_checkpoint_loader: Callable[[Any], list[dict[str, Any]] | None] | None = None
+        self._gdn_checkpoint_loader: (
+            Callable[[Any], list[dict[str, Any]] | None] | None
+        ) = None
         self._exact_gdn_checkpoint_writer: Callable[..., bool] | None = None
 
         # Expected number of layers for cache validation
@@ -278,9 +341,7 @@ class BlockAwarePrefixCache(CacheManager):
         # Access can race with the asynchronous backbone store worker's hash
         # callbacks, so use a private lock rather than relying on the GIL for
         # the multi-step LRU operations.
-        self._mtp_prefix_snapshots: OrderedDict[bytes, tuple[int, Any]] = (
-            OrderedDict()
-        )
+        self._mtp_prefix_snapshots: OrderedDict[bytes, tuple[int, Any]] = OrderedDict()
         self._mtp_prefix_snapshot_lock = threading.RLock()
 
         # Callback for restoring cold blocks (deprecated in paged SSD-only mode)
@@ -352,7 +413,9 @@ class BlockAwarePrefixCache(CacheManager):
         for type_name in layer_cache_types:
             if CacheTypeRegistry.is_arrays_family(type_name):
                 continue
-            if type_name == "CacheList" or CacheTypeRegistry.is_rotating_family(type_name):
+            if type_name == "CacheList" or CacheTypeRegistry.is_rotating_family(
+                type_name
+            ):
                 if saw_arrays and not self._gdn_split_fallback_reported:
                     logger.info(
                         "GDN SSD sidecar is unsupported for layout %s; "
@@ -435,9 +498,7 @@ class BlockAwarePrefixCache(CacheManager):
         layer_meta_states: list[Any] | None,
     ) -> bool:
         """Commit one staged recurrent checkpoint through its provider."""
-        commit_checkpoint = getattr(
-            boundary_snapshots, "commit_gdn_checkpoint", None
-        )
+        commit_checkpoint = getattr(boundary_snapshots, "commit_gdn_checkpoint", None)
         if not callable(commit_checkpoint):
             return False
         try:
@@ -735,9 +796,7 @@ class BlockAwarePrefixCache(CacheManager):
             # Create block table for this request with shared blocks
             block_table = self.paged_cache.create_block_table(request_id)
 
-            for block_id, expected_hash in zip(
-                shared_block_ids, shared_block_hashes
-            ):
+            for block_id, expected_hash in zip(shared_block_ids, shared_block_hashes):
                 # Acquire atomically under the paged-cache lock, re-checking
                 # the hash this block still holds -- closes the TOCTOU
                 # window between find_shared_prefix's lookup (outside any
@@ -748,9 +807,7 @@ class BlockAwarePrefixCache(CacheManager):
                 # the first mismatch rather than skipping it: skip-and-
                 # continue would leave a hole mid-chain while still
                 # reporting the full prefix length.
-                block = self.paged_cache.acquire_cached_block(
-                    block_id, expected_hash
-                )
+                block = self.paged_cache.acquire_cached_block(block_id, expected_hash)
                 if block is None:
                     break
                 block_table.block_ids.append(block.block_id)
@@ -990,16 +1047,13 @@ class BlockAwarePrefixCache(CacheManager):
                 if not isinstance(layer_state, dict):
                     continue
                 type_name = str(
-                    layer_state.get("class_name")
-                    or layer_state.get("cache_type")
-                    or ""
+                    layer_state.get("class_name") or layer_state.get("cache_type") or ""
                 )
                 if type_name != "CacheList":
                     continue
                 state_list = layer_state.get("state")
                 if isinstance(state_list, list) and any(
-                    isinstance(ss, (list, tuple)) and len(ss) == 0
-                    for ss in state_list
+                    isinstance(ss, (list, tuple)) and len(ss) == 0 for ss in state_list
                 ):
                     # A CacheList store source with a blanked member has no
                     # storable state for that sub (a member-filtered snapshot
@@ -1040,7 +1094,8 @@ class BlockAwarePrefixCache(CacheManager):
             first_boundary = min(boundary_snapshots.keys())
             first_snapshot = (
                 boundary_snapshots[first_boundary]
-                if first_boundary > self.block_size else None
+                if first_boundary > self.block_size
+                else None
             )
             if first_snapshot and len(first_snapshot) == len(cache_data):
                 complete = all(
@@ -1155,9 +1210,9 @@ class BlockAwarePrefixCache(CacheManager):
                 )
 
             # Check if this block already exists (deduplication)
-            if (
-                len(block_tokens) == self.block_size or is_tail_terminal
-            ) and not (is_exact_terminal or is_exact_split_block):
+            if (len(block_tokens) == self.block_size or is_tail_terminal) and not (
+                is_exact_terminal or is_exact_split_block
+            ):
                 existing_block = self.paged_cache.find_cached_block(
                     block_tokens,
                     parent_hash,
@@ -1210,9 +1265,7 @@ class BlockAwarePrefixCache(CacheManager):
                             )
                         )
                         if backfilled:
-                            self._backfill_checked_hashes.add(
-                                existing_block.block_hash
-                            )
+                            self._backfill_checked_hashes.add(existing_block.block_hash)
                             if (
                                 len(self._backfill_checked_hashes)
                                 > _BACKFILL_CHECKED_MAX_ENTRIES
@@ -1643,9 +1696,7 @@ class BlockAwarePrefixCache(CacheManager):
         if model_cache_config:
             exact_layer_cache_types = model_cache_config.get_type_names()
         elif (
-            cache_data
-            and isinstance(cache_data[0], dict)
-            and "state" in cache_data[0]
+            cache_data and isinstance(cache_data[0], dict) and "state" in cache_data[0]
         ):
             exact_layer_cache_types = [
                 (
@@ -2231,17 +2282,14 @@ class BlockAwarePrefixCache(CacheManager):
                     continue
 
                 snap_layer = (
-                    snapshot_cache_data[i]
-                    if i < len(snapshot_cache_data)
-                    else None
+                    snapshot_cache_data[i] if i < len(snapshot_cache_data) else None
                 )
                 if not isinstance(snap_layer, dict) or "state" not in snap_layer:
                     return True
                 snap_state = snap_layer["state"]
                 if CacheTypeRegistry.is_rotating_family(type_name):
                     if not (
-                        isinstance(snap_state, (list, tuple))
-                        and len(snap_state) >= 2
+                        isinstance(snap_state, (list, tuple)) and len(snap_state) >= 2
                     ):
                         return True
                     new_data.append(
@@ -2644,18 +2692,14 @@ class BlockAwarePrefixCache(CacheManager):
                         pm_snapshot_state is not None
                         and all(
                             sub_idx < len(pm_snapshot_state)
-                            and isinstance(
-                                pm_snapshot_state[sub_idx], (list, tuple)
-                            )
+                            and isinstance(pm_snapshot_state[sub_idx], (list, tuple))
                             and len(pm_snapshot_state[sub_idx]) >= 1
                             for sub_idx, mode in enumerate(pm_plan)
                             if mode == "boundary"
                         )
                     )
                     pm_source_ok = pm_has_snapshot or (
-                        pm_plan is not None
-                        and is_last_block
-                        and live_state_at_true_end
+                        pm_plan is not None and is_last_block and live_state_at_true_end
                     )
 
                     if all_sub_sliceable:
@@ -3192,6 +3236,14 @@ class BlockAwarePrefixCache(CacheManager):
             )
             all_block_meta_states = []  # per-block meta_states for walk-back truncation
 
+            # Blocks are held as private list copies: dropping a consumed
+            # tensor never mutates a list the SSD manager handed out.
+            flush_bytes = _RESTORE_POOL_FLUSH_BYTES
+            bound_transient = (
+                flush_bytes > 0 and block_table.num_tokens >= _RESTORE_BOUND_MIN_TOKENS
+            )
+            snapshot_drop_state: dict[str, Any] = {}
+
             for idx, block_id in enumerate(block_table.block_ids):
                 block = self.paged_cache.allocated_blocks.get(block_id)
                 if not block:
@@ -3381,9 +3433,27 @@ class BlockAwarePrefixCache(CacheManager):
                     )
                     break  # Stop here, use valid prefix
 
-                all_block_data.append(block_data)
+                if bound_transient:
+                    all_block_data.append(list(block_data))
+                    self._drop_superseded_arrays_snapshots(
+                        all_block_data, layer_cache_types, snapshot_drop_state
+                    )
+                    self._flush_restore_pool_if_over(flush_bytes)
+                else:
+                    all_block_data.append(block_data)
                 valid_block_count += 1
                 valid_token_count += block.token_count
+
+            if bound_transient and snapshot_drop_state:
+                dropped_count = snapshot_drop_state.get("dropped", 0)
+                # Layouts with no droppable layer (pure KV, rotating-only,
+                # split-GDN) leave the plan at 0; stay quiet for them.
+                (logger.info if dropped_count else logger.debug)(
+                    "Bounded restore of %d tokens: dropped %d superseded "
+                    "snapshot payloads",
+                    valid_token_count,
+                    dropped_count,
+                )
 
             # If we have fewer valid blocks than requested, update block_table
             if valid_block_count < len(block_table.block_ids):
@@ -3436,8 +3506,7 @@ class BlockAwarePrefixCache(CacheManager):
                     self.paged_ssd_cache, "get_gdn_checkpoint_file", None
                 )
                 if not callable(signature_builder) or (
-                    not callable(sidecar_lookup_getter)
-                    and not callable(sidecar_getter)
+                    not callable(sidecar_lookup_getter) and not callable(sidecar_getter)
                 ):
                     logger.warning(
                         "Split GDN cache enabled but sidecar manager API is unavailable"
@@ -3502,9 +3571,7 @@ class BlockAwarePrefixCache(CacheManager):
                         dequantizations_before = self._gdn_dequantization_count()
                         snapshot = self._gdn_checkpoint_loader(checkpoint_path)
                         dequantizations_after = self._gdn_dequantization_count()
-                        load_latency_ms = (
-                            time.perf_counter() - load_started
-                        ) * 1000.0
+                        load_latency_ms = (time.perf_counter() - load_started) * 1000.0
                         if snapshot is None:
                             forgetter = getattr(
                                 self.paged_ssd_cache,
@@ -3548,20 +3615,19 @@ class BlockAwarePrefixCache(CacheManager):
                                 if isinstance(source_hash, (bytes, bytearray))
                                 else str(source_hash)[:16]
                             ),
-                            "requested_state_dtype": (
-                                lookup_diagnostic or {}
-                            ).get("requested_state_dtype"),
-                            "effective_state_codec": (
-                                lookup_diagnostic or {}
-                            ).get("effective_state_codec"),
-                            "used_legacy_fp32_fallback": (
-                                lookup_diagnostic or {}
-                            ).get("used_legacy_fp32_fallback"),
+                            "requested_state_dtype": (lookup_diagnostic or {}).get(
+                                "requested_state_dtype"
+                            ),
+                            "effective_state_codec": (lookup_diagnostic or {}).get(
+                                "effective_state_codec"
+                            ),
+                            "used_legacy_fp32_fallback": (lookup_diagnostic or {}).get(
+                                "used_legacy_fp32_fallback"
+                            ),
                             "dequantized_state_count": (
                                 max(
                                     0,
-                                    dequantizations_after
-                                    - dequantizations_before,
+                                    dequantizations_after - dequantizations_before,
                                 )
                                 if dequantizations_before is not None
                                 and dequantizations_after is not None
@@ -3663,7 +3729,40 @@ class BlockAwarePrefixCache(CacheManager):
             reconstructed_caches = []
             healed_tq_layers = 0
 
+            # Per-iteration references to the layer's block slices. Every
+            # branch reassigns them before reading, so clearing them here
+            # lets the settle below actually reclaim the slices.
+            layer_states: list[Any] | None = None
+            latest_keys: Any = None
+            latest_values: Any = None
+            concat_state: Any = None
+            cl_block_data: list[Any] | None = None
+
             for layer_idx in range(num_layers):
+                if bound_transient:
+                    layer_states = latest_keys = latest_values = None
+                    concat_state = None
+                    cl_block_data = None
+                # Every iteration appends exactly one cache or returns, so
+                # reconstructed_caches[-1] is the layer just rebuilt. If the
+                # invariant ever breaks, skip the settle and let the final
+                # count check reject the restore.
+                if bound_transient and layer_idx > 0:
+                    if len(reconstructed_caches) != layer_idx:
+                        logger.warning(
+                            "Layer %d: reconstructed %d caches, expected %d; "
+                            "skipping the bounded-restore settle",
+                            layer_idx,
+                            len(reconstructed_caches),
+                            layer_idx,
+                        )
+                    else:
+                        self._settle_restored_layer(
+                            all_block_data,
+                            layer_idx - 1,
+                            reconstructed_caches[-1],
+                            flush_bytes,
+                        )
                 # Determine cache type for this layer
                 cache_type_name = "KVCache"
                 if layer_cache_types and layer_idx < len(layer_cache_types):
@@ -3879,8 +3978,7 @@ class BlockAwarePrefixCache(CacheManager):
                             if (
                                 delta_start != pooled_length
                                 or delta_end < delta_start
-                                or int(elements[2].shape[1])
-                                != delta_end - delta_start
+                                or int(elements[2].shape[1]) != delta_end - delta_start
                             ):
                                 valid_pooling_chain = False
                                 break
@@ -3976,9 +4074,7 @@ class BlockAwarePrefixCache(CacheManager):
                                     ):
                                         if any(d == 0 for d in first.shape):
                                             shape = list(first.shape)
-                                            shape[2] = sum(
-                                                c.shape[2] for c in column
-                                            )
+                                            shape[2] = sum(c.shape[2] for c in column)
                                             cat_elements.append(
                                                 mx.zeros(
                                                     tuple(shape),
@@ -4558,6 +4654,14 @@ class BlockAwarePrefixCache(CacheManager):
 
                 reconstructed_caches.append(cache)
 
+            if bound_transient and len(reconstructed_caches) == num_layers:
+                self._settle_restored_layer(
+                    all_block_data,
+                    num_layers - 1,
+                    reconstructed_caches[-1],
+                    flush_bytes,
+                )
+
             if not reconstructed_caches:
                 return None
 
@@ -4609,6 +4713,140 @@ class BlockAwarePrefixCache(CacheManager):
 
             logger.debug(traceback.format_exc())
             return None
+
+    def _drop_superseded_arrays_snapshots(
+        self,
+        all_block_data: list[list[Any]],
+        layer_cache_types: list[str] | None,
+        state: dict[str, Any],
+    ) -> int:
+        """Release ArraysCache-family snapshots no restore outcome can use.
+
+        Called after each block is appended during a bounded restore. Every
+        saved block may carry a full recurrent snapshot for each top-level
+        ArraysCache layer (GLM-5.3 KDA: 34 layers x 4.1MiB per block), but
+        such a layer restores from exactly one block: the last kept block,
+        which the walk-back pre-scan never moves before the newest block
+        whose non-sliceable layers all carry real state. That gate is
+        strictly stronger than the walk-back's own condition (which only
+        looks at the last kept block), so the drop cutoff never precedes
+        the walk-back target. Once such a block
+        arrives, older blocks' ArraysCache payloads are dead, so they are
+        replaced with the standard ``(1,)`` placeholder. If anything ever did
+        read one, it would reject the hit (re-prefill) rather than restore
+        wrong state.
+
+        Left alone: CacheList layers (per-member pooling chains need every
+        block), rotating layers, DeepseekV41Cache (restores from the whole
+        chain), and split-GDN layouts (the sidecar endpoint may precede the
+        newest embedded snapshot).
+
+        Returns:
+            Number of payloads dropped by this call.
+        """
+        if not all_block_data or not layer_cache_types:
+            return 0
+        plan = state.get("plan")
+        if plan is None:
+            types = list(layer_cache_types)
+            non_sliceable: list[int] = []
+            droppable: list[int] = []
+            if not self._gdn_split_layout_supported(types):
+                for layer_idx, type_name in enumerate(types):
+                    handler = CacheTypeRegistry.get_handler_by_class_name(type_name)
+                    if handler.supports_block_slicing:
+                        continue
+                    non_sliceable.append(layer_idx)
+                    if (
+                        type_name != "DeepseekV41Cache"
+                        and CacheTypeRegistry.is_arrays_family(type_name)
+                    ):
+                        droppable.append(layer_idx)
+            plan = (tuple(non_sliceable), tuple(droppable))
+            state["plan"] = plan
+            state["next"] = 0
+            state["dropped"] = 0
+        non_sliceable_layers, droppable_layers = plan
+        if not droppable_layers:
+            return 0
+
+        newest = len(all_block_data) - 1
+        newest_block = all_block_data[newest]
+        for layer_idx in non_sliceable_layers:
+            if layer_idx >= len(newest_block) or self._is_placeholder_state(
+                newest_block[layer_idx]
+            ):
+                return 0
+
+        placeholder = state.get("placeholder")
+        if placeholder is None:
+            placeholder = (mx.zeros((1,)), mx.zeros((1,)))
+            state["placeholder"] = placeholder
+        dropped = 0
+        for block_idx in range(state["next"], newest):
+            older_block = all_block_data[block_idx]
+            for layer_idx in droppable_layers:
+                if layer_idx < len(older_block) and not self._is_placeholder_state(
+                    older_block[layer_idx]
+                ):
+                    older_block[layer_idx] = placeholder
+                    dropped += 1
+        state["next"] = newest
+        state["dropped"] += dropped
+        return dropped
+
+    @staticmethod
+    def _flush_restore_pool_if_over(flush_bytes: int) -> bool:
+        """Clear the MLX buffer pool when it holds more than ``flush_bytes``.
+
+        Gated on the pool size rather than done unconditionally, so a restore
+        whose freed buffers are immediately reused (same-sized block loads)
+        keeps them instead of paying a clear per layer or per block. The
+        buffer pool is process-global, so a clear also discards cached
+        buffers concurrent requests could reuse; the size gate keeps the
+        clear rare.
+        """
+        if flush_bytes <= 0:
+            return False
+        try:
+            pool_bytes = int(mx.get_cache_memory())
+            if pool_bytes <= flush_bytes:
+                return False
+            # The server clears the pool safely (synchronize in-flight work,
+            # under _mx_buffer_access_lock -- #300, #888, #1106); never clear
+            # unsynchronized mid-reconstruct.
+            _sync_and_clear_cache()
+            logger.debug("Restore pool flush cleared %d bytes", pool_bytes)
+            return True
+        except Exception:  # noqa: BLE001 - best effort, never fail a restore
+            logger.debug("Restore pool flush failed", exc_info=True)
+            return False
+
+    def _settle_restored_layer(
+        self,
+        all_block_data: list[list[Any]],
+        layer_idx: int,
+        cache: Any,
+        flush_bytes: int,
+    ) -> None:
+        """Materialize one rebuilt layer and release the block tensors it used.
+
+        Evaluating right away turns the lazy concat into a copy while only
+        this layer's block slices are alive; the slots in the private block
+        lists are nulled and the reconstruct loop drops its per-iteration
+        references, so the slice buffers return to the pool for the next
+        layer's flush check. (The layer settled here is fully reclaimable
+        only after the loop locals are cleared; the pool clear itself never
+        frees buffers live arrays still reference.) Values are unchanged:
+        the same graph is evaluated now instead of at the first prefill step.
+        """
+        arrays = _restored_cache_arrays(cache)
+        if arrays:
+            mx.eval(arrays)
+        for block_data in all_block_data:
+            if layer_idx < len(block_data):
+                block_data[layer_idx] = None
+        self._flush_restore_pool_if_over(flush_bytes)
 
     @staticmethod
     def _layer_has_turboquant_payload(
@@ -5231,6 +5469,16 @@ class BlockAwarePrefixCache(CacheManager):
         self._prefix_index.clear()
         with self._mtp_prefix_snapshot_lock:
             self._mtp_prefix_snapshots.clear()
+        # Session-scoped lineage state is tied to the block lifecycle: with
+        # every block wiped, stale entries would misclassify freshly stored
+        # blocks during recovery — e.g. a surviving store-tip hash makes the
+        # next store record lineage against a block that no longer exists,
+        # and a later supersede then strips a block that is still a live
+        # walk-back point (rewriting its SSD payload).
+        self._tip_lineage.clear()
+        self._store_tip_hashes.clear()
+        self._backfill_checked_hashes.clear()
+        self._tail_hashes.clear()
         self.paged_cache.clear()
         self.reset_stats()
         return cleared_count

@@ -229,13 +229,15 @@ def _assert_fused_equals_mlx(monkeypatch, attn, cache, rows, seeds):
 # rows) the indexer still leaves dense.
 @requires_kernels
 @pytest.mark.parametrize("context", [0, 700, 1016, 1023, 1500, 2043])
-@pytest.mark.parametrize("rows", [1, 2, 3, 4, 8])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 8, 16])
 def test_dense_rows_equal_mlx_path(monkeypatch, context, rows):
     attn = _attention(seed=3)
     cache = _prefill(attn, context, seed=4)
     prologues = _assert_fused_equals_mlx(monkeypatch, attn, cache, rows, (11, 12))
-    # Windows whose rows share an SDPA plan take the kernels.
-    if attn_fused.row_plan(context + 1, context + rows) is not None:
+    # Windows whose rows share an SDPA plan take the kernels (a 16-row window
+    # at 2043 already passes the indexer's dense budget).
+    dense = context + rows <= 2043 + 8
+    if dense and attn_fused.row_plan(context + 1, context + rows) is not None:
         assert prologues == [rows, rows]
 
 
@@ -247,7 +249,7 @@ def test_dense_rows_equal_mlx_path(monkeypatch, context, rows):
 def test_masked_rows_equal_mlx_path(monkeypatch, context):
     attn = _attention(seed=7)
     cache = _prefill_chunked(attn, context, seed=8)
-    for rows in (1, 2, 4, 8):
+    for rows in (1, 2, 4, 8, 16):
         prologues = _assert_fused_equals_mlx(monkeypatch, attn, cache, rows, (13,))
         assert prologues == [rows]
 
@@ -297,7 +299,7 @@ def _mlx_sdpa_gate(queries, keys, values, gate, scale):
 # cover one pass (1..1023, partial last chain groups) and two passes (1024+).
 @requires_kernels
 @pytest.mark.parametrize("keys", [1, 5, 33, 130, 1000, 1023, 1024, 1027, 1500, 2051])
-@pytest.mark.parametrize("rows", [1, 3, 4, 8])
+@pytest.mark.parametrize("rows", [1, 3, 4, 8, 16])
 @pytest.mark.parametrize("spread", [1.0, 6.0])
 def test_fp32_sdpa_gate_matches_mlx(keys, rows, spread):
     if keys < rows:
@@ -320,7 +322,7 @@ def test_fp32_sdpa_gate_matches_mlx(keys, rows, spread):
 
 
 @requires_kernels
-@pytest.mark.parametrize("rows", [1, 4, 8])
+@pytest.mark.parametrize("rows", [1, 4, 8, 16])
 @pytest.mark.parametrize("pos_ndim", [2, 3])
 def test_fp32_prep_matches_norms_and_mrope(rows, pos_ndim):
     attn = _attention(seed=9)

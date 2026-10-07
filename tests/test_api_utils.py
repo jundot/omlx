@@ -53,6 +53,7 @@ from omlx.api.utils import (
     extract_harmony_messages,
     extract_multimodal_content,
     extract_text_content,
+    find_lone_surrogate,
     merge_reasoning_effort_chat_template_kwargs,
     prepare_system_messages_for_template,
     uses_native_reasoning_content,
@@ -3673,3 +3674,13 @@ class TestCacheReasoningOutput:
             )
             is False
         )
+
+
+class TestFindLoneSurrogate:
+    def test_reports_lone_surrogate_path_and_accepts_paired(self):
+        part = {"type": "text", "text": "hi \U0001f600"}
+        body = {"messages": [{"content": [part]}]}
+        assert find_lone_surrogate(body) is None
+
+        part["text"] = "hi \ud83d"
+        assert find_lone_surrogate(body) == "messages[0].content[0].text"
