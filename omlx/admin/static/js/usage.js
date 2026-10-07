@@ -11,7 +11,7 @@ function usageLocale() {
 /* Local serving history; independent of the high-frequency live stats poll. */
 function usageHistory() {
     return {
-        range: 'today', model: '', models: [], data: null, error: '', disabled: false, loading: false, peak: 1, displayedQuery: '',
+        range: 'today', model: '', clientView: 'all', models: [], data: null, error: '', disabled: false, loading: false, peak: 1, displayedQuery: '',
         timer: null, request: null,
         init() {
             this.$watch('mainTab', tab => {
@@ -62,5 +62,26 @@ function usageHistory() {
         },
         number(value) { return new Intl.NumberFormat(usageLocale(), {notation: 'compact', maximumFractionDigits: 1}).format(value || 0); },
         speed(value) { return value == null ? '—' : value.toFixed(1); },
+        // Rows for the selected Clients tab: each key+IP pair, per key, or per IP.
+        clientRows() {
+            if (!this.data) return [];
+            if (this.clientView === 'ip') {
+                return (this.data.clients_by_ip || []).map(row => ({...row, id: row.client_ip, label: row.client_ip, detail: ''}));
+            }
+            if (this.clientView === 'key') {
+                return (this.data.clients_by_key || []).map(row => ({...row, id: row.key_kind + ':' + row.key_id, label: this.keyLabel(row), detail: this.keyDetail(row)}));
+            }
+            return (this.data.clients || []).map(row => ({
+                ...row, id: row.key_kind + ':' + row.key_id + '@' + row.client_ip,
+                label: this.keyLabel(row), detail: '· ' + row.client_ip,
+            }));
+        },
+        // Sub key name, or a fixed label for the main key and keyless requests.
+        keyLabel(row) {
+            if (row.key_kind === 'main_key') return window.t('usage.client_main_key');
+            if (row.key_kind === 'none') return window.t('usage.client_no_key');
+            return row.key_id;
+        },
+        keyDetail(row) { return row.key_kind === 'sub_key' ? window.t('usage.client_sub_key') : ''; },
     };
 }

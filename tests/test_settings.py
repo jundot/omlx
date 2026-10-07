@@ -850,7 +850,7 @@ class TestUsageSettings:
     def test_to_dict_from_dict_round_trip(self):
         settings = UsageSettings.from_dict({"usage_history": False})
         assert settings.usage_history is False
-        assert settings.to_dict() == {"usage_history": False}
+        assert settings.to_dict() == {"usage_history": False, "usage_by_client": False}
         assert UsageSettings.from_dict({}).usage_history is True
 
     def test_global_settings_save_load_round_trip(self, tmp_path):
@@ -858,10 +858,31 @@ class TestUsageSettings:
         gs.usage.usage_history = False
         gs.save()
         data = json.loads((tmp_path / "settings.json").read_text())
-        assert data["usage"] == {"usage_history": False}
-        assert gs.to_dict()["usage"] == {"usage_history": False}
+        assert data["usage"] == {"usage_history": False, "usage_by_client": False}
+        assert gs.to_dict()["usage"] == {
+            "usage_history": False,
+            "usage_by_client": False,
+        }
         restored = GlobalSettings.load(base_path=tmp_path)
         assert restored.usage.usage_history is False
+
+    def test_usage_by_client_defaults_off_and_round_trips(self, tmp_path):
+        assert UsageSettings().usage_by_client is False
+        assert UsageSettings.from_dict({}).usage_by_client is False
+        # Only a real boolean opts in to storing client identifiers.
+        assert (
+            UsageSettings.from_dict({"usage_by_client": "yes"}).usage_by_client is False
+        )
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.usage.usage_by_client = True
+        gs.save()
+        assert GlobalSettings.load(base_path=tmp_path).usage.usage_by_client is True
+
+    def test_usage_by_client_env_override(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("OMLX_USAGE_BY_CLIENT", "on")
+        assert GlobalSettings.load(base_path=tmp_path).usage.usage_by_client is True
+        monkeypatch.setenv("OMLX_USAGE_BY_CLIENT", "0")
+        assert GlobalSettings.load(base_path=tmp_path).usage.usage_by_client is False
 
     def test_legacy_settings_file_defaults_on(self, tmp_path):
         """Settings files written before the toggle existed keep recording."""

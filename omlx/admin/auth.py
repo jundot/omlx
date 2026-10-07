@@ -178,8 +178,10 @@ def verify_api_key(api_key: str, server_api_key: str) -> bool:
     return compare_keys(api_key, server_api_key)
 
 
-def verify_any_api_key(api_key: str, main_key: str, sub_keys: list) -> bool:
-    """Verify an API key against the main key and all sub keys.
+def identify_api_key(
+    api_key: str, main_key: str, sub_keys: list
+) -> tuple[str, str] | None:
+    """Return which configured key ``api_key`` matches, or None.
 
     Uses constant-time comparison for each key to prevent timing attacks.
     Checks the main key first, then iterates through sub keys.
@@ -187,21 +189,33 @@ def verify_any_api_key(api_key: str, main_key: str, sub_keys: list) -> bool:
     Args:
         api_key: The API key provided by the client.
         main_key: The server's main API key.
-        sub_keys: List of SubKeyEntry objects with .key attribute.
+        sub_keys: List of SubKeyEntry objects with .key and .name attributes.
+
+    Returns:
+        ``("main_key", "")`` for the main key, ``("sub_key", label)`` for a sub
+        key, where label is the sub key's name (or its fingerprint when it has
+        no name), or None if nothing matches. The key itself is never returned.
+    """
+    if not api_key:
+        return None
+    # Check main key
+    if main_key and compare_keys(api_key, main_key):
+        return ("main_key", "")
+    # Check sub keys
+    for sk in sub_keys:
+        if sk.key and compare_keys(api_key, sk.key):
+            name = (getattr(sk, "name", "") or "").strip()
+            return ("sub_key", name or fingerprint_key(sk.key))
+    return None
+
+
+def verify_any_api_key(api_key: str, main_key: str, sub_keys: list) -> bool:
+    """Verify an API key against the main key and all sub keys.
 
     Returns:
         True if the API key matches any configured key, False otherwise.
     """
-    if not api_key:
-        return False
-    # Check main key
-    if main_key and compare_keys(api_key, main_key):
-        return True
-    # Check sub keys
-    for sk in sub_keys:
-        if sk.key and compare_keys(api_key, sk.key):
-            return True
-    return False
+    return identify_api_key(api_key, main_key, sub_keys) is not None
 
 
 def validate_api_key(api_key: str) -> tuple[bool, str]:
