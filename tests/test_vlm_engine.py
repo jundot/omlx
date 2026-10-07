@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import numpy as np
 import pytest
 
+from omlx.exceptions import InvalidRequestError
 from omlx.patches.gemma4_audio import apply_gemma4_audio_patch
 from omlx.patches.mlx_vlm_glm5_next_compat import (
     apply_mlx_vlm_glm5_next_compat_patch,
@@ -1561,6 +1562,32 @@ class TestPrepareVisionInputs:
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     @patch("mlx_vlm.utils.prepare_inputs")
     @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_text_only_template_reports_missing_image_tokens(
+        self, mock_vlm_act, mock_prepare
+    ):
+        from PIL import Image
+
+        engine = self._setup_engine_for_vision()
+        engine._processor.image_token = "<|image_pad|>"
+        mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+        messages = [{"role": "user", "content": "Describe"}]
+        images = [Image.new("RGB", (4, 4), "red")]
+
+        with pytest.raises(InvalidRequestError, match="text-only chat template"):
+            engine._prepare_vision_inputs(messages, images)
+        mock_prepare.assert_not_called()
+
+        engine._processor.apply_chat_template.return_value = "<|image_pad|>Describe"
+        engine._prepare_vision_inputs(messages, images)
+        mock_prepare.assert_called_once()
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
     def test_bytesio_audio_survives_missing_resample_export(
         self, mock_vlm_act, mock_prepare, monkeypatch
     ):
@@ -2591,6 +2618,34 @@ class TestPartialModeVLM:
         assert call_kwargs["add_generation_prompt"] is True
         assert "continue_final_message" not in call_kwargs
 
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    async def test_tokenize_chat_returns_generation_path_ids(self, mock_prepare):
+        """tokenize_chat returns the ids the generation render produces."""
+        engine = self._vision_engine()
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[7, 8, 9]]),
+            "pixel_values": None,
+        }
+        executor = ThreadPoolExecutor(max_workers=1)
+        engine._engine = SimpleNamespace(_mlx_executor=executor)
+        try:
+            token_ids = await engine.tokenize_chat(
+                self._plain_messages(), add_generation_prompt=False
+            )
+            with pytest.raises(InvalidRequestError, match="add_special_tokens"):
+                await engine.tokenize_chat(
+                    self._plain_messages(), add_special_tokens=True
+                )
+        finally:
+            executor.shutdown(wait=False)
+
+        assert token_ids == [7, 8, 9]
+        call_kwargs = engine._processor.apply_chat_template.call_args[1]
+        assert call_kwargs["add_generation_prompt"] is False
+        assert "continue_final_message" not in call_kwargs
+
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     @patch("mlx_vlm.utils.prepare_inputs")
     def test_no_chat_template_fallback_drops_continue_final_message(
@@ -3550,4 +3605,3 @@ class TestNativeVideo:
         assert estimate.call_count == 2
         kwargs = engine._preflight_or_raise_with_eviction.call_args.kwargs
         assert kwargs["num_prompt_tokens"] == 1002
-        assert kwargs["text_only"] is False

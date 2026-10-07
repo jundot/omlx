@@ -237,7 +237,9 @@ OpenAIとAnthropic APIのドロップイン代替です。ストリーミング�
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/embeddings` | テキストエンベディング |
 | `POST /v1/rerank` | ドキュメントリランキング |
+| `POST /v1/systemone` | Decision モデルによる型付き判定 (TypeSafe System One) |
 | `GET /v1/models` | 利用可能なモデル一覧 |
+| `POST /tokenize`, `POST /detokenize` | vLLM 互換トークナイザー API（`/v1` 配下でも利用可） |
 
 ### ツール呼び出し＆構造化出力
 
@@ -276,8 +278,9 @@ mlx-lmで利用可能なすべての関数呼び出し形式、JSONスキーマ�
 | LLM | [mlx-lm](https://github.com/ml-explore/mlx-lm)がサポートするすべてのモデル |
 | VLM | Qwen3.5シリーズ、GLM-4V、Pixtralおよびその他の[mlx-vlm](https://github.com/Blaizzy/mlx-vlm)モデル |
 | OCR | DeepSeek-OCR、DOTS-OCR、GLM-OCR |
-| エンベディング | BERT、BGE-M3、ModernBERT |
+| エンベディング | BERT、BGE-M3、ModernBERT、EmbeddingGemma 2 |
 | リランカー | ModernBERT、XLM-RoBERTa |
+| Decision | Clef、Clef-Flash、OpenJev |
 
 ## CLI 設定
 
@@ -317,7 +320,8 @@ FastAPI Server (OpenAI / Anthropic API)
     │   ├── BatchedEngine (LLM、連続バッチング)
     │   ├── VLMEngine (ビジョン言語モデル)
     │   ├── EmbeddingEngine
-    │   └── RerankerEngine
+    │   ├── RerankerEngine
+    │   └── DecisionEngine
     │
     ├── ProcessMemoryEnforcer (合計メモリ制限、TTLチェック)
     │

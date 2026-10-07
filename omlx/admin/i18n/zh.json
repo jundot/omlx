@@ -1334,6 +1334,7 @@
   "modal.model_settings.draft_model": "草稿模型",
   "modal.model_settings.draft_model_placeholder": "选择草稿模型…",
   "modal.model_settings.model_type_audio_sts": "音频 STS",
+  "modal.model_settings.model_type_decision": "决策",
   "modal.model_settings.model_type_audio_stt": "音频 STT",
   "modal.model_settings.model_type_audio_tts": "音频 TTS",
   "modal.model_settings.model_type_embedding": "嵌入",

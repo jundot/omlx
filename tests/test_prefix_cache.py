@@ -22,7 +22,55 @@ from omlx.cache.paged_cache import (
 )
 from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
 from omlx.cache.prefix_cache import BlockAwarePrefixCache, BlockCacheEntry
+from omlx.cache.hybrid_cache import ModelCacheConfig
 from omlx.cache.stats import PrefixCacheStats
+
+try:
+    import mlx.core as mx
+    from mlx_lm.models.cache import (
+        ArraysCache,
+        CacheList,
+        KVCache,
+        RotatingKVCache,
+    )
+
+    HAS_MLX = True
+except ImportError:
+    HAS_MLX = False
+
+pytestmark = pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+
+import omlx.cache.prefix_cache as prefix_cache_module
+
+# New in the bounded-restore change. On a checkout without it (e.g. running
+# this file against upstream main to show the fail-before state) fall back to
+# a state() read so the regression test still fails on its peak assertion
+# instead of at import time.
+if hasattr(prefix_cache_module, "_restored_cache_arrays"):
+    _restored_cache_arrays = prefix_cache_module._restored_cache_arrays
+else:
+
+    def _restored_cache_arrays(obj):
+        if isinstance(obj, (list, tuple)):
+            out = []
+            for item in obj:
+                out.extend(_restored_cache_arrays(item))
+            return out
+        if isinstance(obj, CacheList):
+            return _restored_cache_arrays(obj.caches)
+        if isinstance(obj, mx.array):
+            return [obj]
+        st = obj.state
+        out = []
+        for item in st if isinstance(st, (list, tuple)) else [st]:
+            if isinstance(item, (list, tuple)):
+                out.extend(_restored_cache_arrays(item))
+            else:
+                out.append(item)
+        return out
+
+
+from omlx.cache.type_registry import CacheTypeRegistry
 
 
 class MockModel:
@@ -657,6 +705,26 @@ class TestBlockAwarePrefixCache:
         assert len(prefix_cache._request_tables) == 0
         assert len(prefix_cache._prefix_index) == 0
         assert prefix_cache._hits == 0
+
+    def test_clear_resets_session_lineage_state(self, prefix_cache, paged_cache):
+        """clear() must wipe session-scoped lineage state along with blocks.
+
+        Stale entries would misclassify freshly stored blocks after a
+        recovery clear(): a surviving store-tip hash records lineage against
+        a wiped block, and a later supersede then strips a live walk-back
+        point (rewriting its SSD payload).
+        """
+        prefix_cache._tip_lineage[b"a"] = b"b"
+        prefix_cache._store_tip_hashes.add(b"c")
+        prefix_cache._backfill_checked_hashes.add(b"d")
+        prefix_cache._tail_hashes.add(b"e")
+
+        prefix_cache.clear()
+
+        assert prefix_cache._tip_lineage == {}
+        assert prefix_cache._store_tip_hashes == set()
+        assert prefix_cache._backfill_checked_hashes == set()
+        assert prefix_cache._tail_hashes == set()
 
     def test_len(self, prefix_cache):
         """Test __len__ returns number of request entries."""
@@ -4920,3 +4988,339 @@ def test_pooling_snapshot_base_after_atomic_image_prefix(tmp_path, complete_base
         assert restored[0][0].offset == 16
     finally:
         ssd.close()
+
+
+# ===== Bounded paged-SSD restore tests (PR #4167) =====
+
+BLOCK_SIZE = 4
+NUM_BLOCKS = 4
+TYPES = ["ArraysCache", "KVCache", "CacheList"]
+
+
+## MockModel: uses the existing one in this module
+
+
+def _make_cache(cache_dir, *, num_layers=None):
+    if num_layers is None:
+        num_layers = len(TYPES)
+    ssd = PagedSSDCacheManager(
+        cache_dir=cache_dir,
+        max_size_bytes=1024**3,
+        hot_cache_max_bytes=64 * 1024**2,
+        hot_cache_only=True,
+        expected_model_name="test-model",
+        expected_num_layers=num_layers,
+        expected_block_size=BLOCK_SIZE,
+    )
+    paged = PagedCacheManager(
+        block_size=BLOCK_SIZE,
+        max_blocks=200,
+        model_name="test-model",
+        initial_blocks=200,
+    )
+    paged.set_paged_ssd_cache_manager(ssd)
+    cache = BlockAwarePrefixCache(
+        model=MockModel(num_layers),
+        paged_cache_manager=paged,
+        paged_ssd_cache_manager=ssd,
+    )
+    return cache, ssd
+
+
+def _position_kv(seq_len, dim=8):
+    pos = mx.arange(seq_len, dtype=mx.float32).reshape(1, 1, seq_len, 1)
+    keys = mx.contiguous(mx.broadcast_to(pos, (1, 2, seq_len, dim)))
+    return keys, keys + 1000.0
+
+
+def _arrays_state(seq_len, salt):
+    conv = mx.full((1, 3, 16), seq_len + salt, dtype=mx.float32)
+    recurrent = mx.full((1, 2, 8, 8), seq_len * 0.5 + salt, dtype=mx.float32)
+    return conv, recurrent
+
+
+def _cache_data(seq_len):
+    keys, values = _position_kv(seq_len)
+    conv, recurrent = _arrays_state(seq_len, 0.25)
+
+    member_kv = KVCache()
+    member_kv.update_and_fetch(*_position_kv(seq_len))
+    member_arrays = ArraysCache(size=2)
+    member_arrays[0], member_arrays[1] = _arrays_state(seq_len, 0.75)
+    cache_list = CacheList(member_kv, member_arrays)
+    handler = CacheTypeRegistry.get_handler_by_class_name("CacheList")
+    cl_state = handler.extract_state(cache_list)
+    mx.eval(keys, values, conv, recurrent, *member_arrays.cache)
+    return [
+        {
+            "state": (conv, recurrent),
+            "meta_state": (),
+            "class_name": "ArraysCache",
+            "cache_type": "ArraysCache",
+        },
+        {
+            "state": (keys, values),
+            "meta_state": (seq_len,),
+            "class_name": "KVCache",
+            "cache_type": "KVCache",
+        },
+        {
+            "state": list(cl_state["sub_states"]),
+            "meta_state": (
+                list(cl_state["sub_class_names"]),
+                list(cl_state["sub_meta_states"]),
+            ),
+            "class_name": "CacheList",
+            "cache_type": "CacheList",
+        },
+    ]
+
+
+def _store(
+    cache,
+    *,
+    snapshot_last=True,
+    placeholder_block_numbers=(),
+    snapshot_boundaries=None,
+):
+    total = NUM_BLOCKS * BLOCK_SIZE
+    boundaries = range(1, NUM_BLOCKS + 1 if snapshot_last else NUM_BLOCKS)
+    if snapshot_boundaries is not None:
+        boundaries = sorted(snapshot_boundaries)
+    snapshots = {BLOCK_SIZE * i: _cache_data(BLOCK_SIZE * i) for i in boundaries}
+    # 1-based block numbers, matching the block indices in the docstrings.
+    for block_number in placeholder_block_numbers or ():
+        # Store the standard (1,) placeholder as the block's arrays payload,
+        # as the store path does for non-last blocks of a save operation.
+        boundary = BLOCK_SIZE * block_number
+        snapshots[boundary] = [
+            (
+                dict(layer, state=(mx.zeros((1,)), mx.zeros((1,))))
+                if layer.get("class_name") == "ArraysCache"
+                else layer
+            )
+            for layer in snapshots[boundary]
+        ]
+    # Two trailing tokens past the last full block: its non-sliceable state
+    # then comes only from a boundary snapshot (live state is past it).
+    table = cache.store_cache(
+        "store",
+        list(range(total + 2)),
+        _cache_data(total + 2),
+        model_cache_config=ModelCacheConfig.from_type_list(
+            TYPES, model_name="test-model"
+        ),
+        boundary_snapshots=snapshots,
+    )
+    assert table is not None and len(table.block_ids) == NUM_BLOCKS
+    return total
+
+
+def _restore(cache, total, request_id):
+    table, _ = cache.fetch_cache(request_id, list(range(total)) + [99])
+    assert table is not None
+    restored = cache.reconstruct_cache(table)
+    assert restored is not None
+    return restored, table.num_tokens
+
+
+def _set_flush(monkeypatch, flush_bytes, min_tokens=1):
+    monkeypatch.setattr(
+        prefix_cache_module, "_RESTORE_POOL_FLUSH_BYTES", flush_bytes, raising=False
+    )
+    monkeypatch.setattr(
+        prefix_cache_module,
+        "_RESTORE_BOUND_MIN_TOKENS",
+        min_tokens,
+        raising=False,
+    )
+
+
+def _assert_same(lazy, bounded):
+    assert [type(c).__name__ for c in lazy] == [type(c).__name__ for c in bounded]
+    for layer_idx, (a, b) in enumerate(zip(lazy, bounded)):
+        a_arrays = [v for v in _restored_cache_arrays(a) if isinstance(v, mx.array)]
+        b_arrays = [v for v in _restored_cache_arrays(b) if isinstance(v, mx.array)]
+        assert len(a_arrays) == len(b_arrays) > 0, layer_idx
+        for x, y in zip(a_arrays, b_arrays):
+            assert x.shape == y.shape and x.dtype == y.dtype, layer_idx
+            assert mx.array_equal(x, y).item(), layer_idx
+
+
+def _spy_drops(monkeypatch):
+    calls: list[int] = []
+    real = getattr(BlockAwarePrefixCache, "_drop_superseded_arrays_snapshots", None)
+
+    def spy(self, *args, **kwargs):
+        dropped = real(self, *args, **kwargs)
+        calls.append(dropped)
+        return dropped
+
+    monkeypatch.setattr(
+        BlockAwarePrefixCache, "_drop_superseded_arrays_snapshots", spy, raising=False
+    )
+    if real is None:
+        # Not present on a checkout without the bounded path: reconstruct never
+        # calls it, so no drop is ever recorded.
+        calls.append(0)
+    return calls
+
+
+@pytest.mark.parametrize("snapshot_last", [True, False])
+def test_bounded_restore_matches_lazy_restore(tmp_path, monkeypatch, snapshot_last):
+    cache, ssd = _make_cache(tmp_path / "ssd")
+    total = _store(cache, snapshot_last=snapshot_last)
+
+    _set_flush(monkeypatch, 0)
+    lazy, lazy_tokens = _restore(cache, total, "lazy")
+
+    _set_flush(monkeypatch, 1)
+    drops = _spy_drops(monkeypatch)
+    bounded, bounded_tokens = _restore(cache, total, "bounded")
+
+    expected_tokens = total if snapshot_last else total - BLOCK_SIZE
+    assert lazy_tokens == bounded_tokens == expected_tokens
+    _assert_same(lazy, bounded)
+    # One top-level ArraysCache layer: every block but the last kept one
+    # carried a real snapshot that the bounded path released.
+    expected_drops = NUM_BLOCKS - 1 if snapshot_last else NUM_BLOCKS - 2
+    assert sum(drops) == expected_drops
+    # Restored KV really is the full prefix (not a duplicated sequence).
+    kv_keys = bounded[1].keys if hasattr(bounded[1], "keys") else bounded[1].state[0]
+    assert kv_keys.shape[2] == expected_tokens
+    assert mx.array_equal(kv_keys, _position_kv(expected_tokens)[0]).item()
+    ssd.close()
+
+
+def test_pool_flush_gated_on_allocator_size(tmp_path, monkeypatch):
+    cache, ssd = _make_cache(tmp_path / "ssd")
+    total = _store(cache)
+    cleared: list[bool] = []
+    monkeypatch.setattr(mx, "clear_cache", lambda: cleared.append(True))
+
+    threshold = 1024**3
+    _set_flush(monkeypatch, threshold)
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: threshold)
+    _restore(cache, total, "under")
+    assert cleared == []
+
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: threshold + 1)
+    _restore(cache, total, "over")
+    # Checked after each loaded block and after each rebuilt layer.
+    assert len(cleared) == NUM_BLOCKS + len(TYPES)
+    ssd.close()
+
+
+ROTATING_KEEP, ROTATING_MAX = 0, 16
+
+
+def _rotating_data(seq_len):
+    pos = mx.arange(seq_len, dtype=mx.float32).reshape(1, 1, seq_len, 1)
+    keys = mx.contiguous(mx.broadcast_to(pos, (1, 2, seq_len, 8)))
+    rotating = RotatingKVCache(max_size=ROTATING_MAX, keep=ROTATING_KEEP)
+    rotating.update_and_fetch(keys, keys + 5.0)
+    mx.eval(*rotating.state)
+    return {
+        "state": (rotating.keys, rotating.values),
+        "meta_state": (ROTATING_KEEP, ROTATING_MAX, seq_len % ROTATING_MAX, seq_len),
+        "class_name": "RotatingKVCache",
+        "cache_type": "RotatingKVCache",
+    }
+
+
+def test_bounded_restore_keeps_non_arrays_layers_intact(tmp_path, monkeypatch):
+    """With a non-arrays non-sliceable layer (RotatingKVCache) in the type
+    list, the drop plan must gate on it but never replace its payloads: the
+    bounded restore stays identical to the lazy one and drops stay confined
+    to the arrays layer."""
+    types = ["ArraysCache", "KVCache", "RotatingKVCache"]
+    cache, ssd = _make_cache(tmp_path / "ssd", num_layers=len(types))
+    total = NUM_BLOCKS * BLOCK_SIZE
+
+    def data(n):
+        layer_data = _cache_data(n)
+        layer_data[2] = _rotating_data(n)
+        return layer_data
+
+    snapshots = {BLOCK_SIZE * i: data(BLOCK_SIZE * i) for i in range(1, NUM_BLOCKS)}
+    table = cache.store_cache(
+        "store",
+        list(range(total + 2)),
+        data(total + 2),
+        model_cache_config=ModelCacheConfig.from_type_list(
+            types, model_name="test-model"
+        ),
+        boundary_snapshots=snapshots,
+    )
+    assert table is not None and len(table.block_ids) == NUM_BLOCKS
+
+    _set_flush(monkeypatch, 0)
+    lazy, lazy_tokens = _restore(cache, total, "lazy")
+
+    _set_flush(monkeypatch, 1)
+    drops = _spy_drops(monkeypatch)
+    bounded, bounded_tokens = _restore(cache, total, "bounded")
+
+    expected_tokens = total - BLOCK_SIZE
+    assert lazy_tokens == bounded_tokens == expected_tokens
+    _assert_same(lazy, bounded)
+    # One droppable (ArraysCache) layer: blocks 1..2 dropped, same as the
+    # arrays-only case; rotating payloads are never touched.
+    assert sum(drops) == NUM_BLOCKS - 2
+    ssd.close()
+
+
+def test_bounded_restore_with_mid_chain_placeholder(tmp_path, monkeypatch):
+    """A mid-chain block whose arrays snapshot is the standard placeholder
+    must not break the drop cutoff: the walk-back target (the newest block
+    with real state) stays at or after it, and the restore is identical to
+    the lazy one."""
+    cache, ssd = _make_cache(tmp_path / "ssd")
+    total = _store(cache, snapshot_last=False, placeholder_block_numbers={2})
+
+    _set_flush(monkeypatch, 0)
+    lazy, lazy_tokens = _restore(cache, total, "lazy")
+
+    _set_flush(monkeypatch, 1)
+    drops = _spy_drops(monkeypatch)
+    bounded, bounded_tokens = _restore(cache, total, "bounded")
+
+    expected_tokens = total - BLOCK_SIZE
+    assert lazy_tokens == bounded_tokens == expected_tokens
+    _assert_same(lazy, bounded)
+    # The gate fires once block 3 (real state for the arrays layer) loads:
+    # block 1's snapshot is dropped, block 2 is already a placeholder.
+    assert sum(drops) == 1
+    ssd.close()
+
+
+@pytest.mark.parametrize(
+    "flush_bytes,min_tokens",
+    [(0, 1), (1, NUM_BLOCKS * BLOCK_SIZE + 1)],
+    ids=["disabled-at-zero", "below-min-tokens"],
+)
+def test_bounded_path_inactive(tmp_path, monkeypatch, flush_bytes, min_tokens):
+    cache, ssd = _make_cache(tmp_path / "ssd")
+    total = _store(cache)
+    _set_flush(monkeypatch, flush_bytes, min_tokens)
+
+    touched: list[str] = []
+    monkeypatch.setattr(mx, "clear_cache", lambda: touched.append("clear"))
+    monkeypatch.setattr(
+        mx, "get_cache_memory", lambda: touched.append("pool") or 1 << 40
+    )
+    drops = _spy_drops(monkeypatch)
+    settle = MagicMock()
+    monkeypatch.setattr(
+        BlockAwarePrefixCache, "_settle_restored_layer", settle, raising=False
+    )
+
+    restored, _ = _restore(cache, total, "inactive")
+
+    assert touched == [] and settle.call_count == 0
+    # drops records bounded-path activity; on a checkout without it the spy
+    # leaves a single 0 sentinel instead.
+    assert drops == []
+    # Lazy path leaves the KV concat unevaluated, as before the change.
+    assert restored[1].keys.shape[2] == total
+    ssd.close()

@@ -14,7 +14,7 @@ Run `python -m pytest -q tests/test_vlm_vision_fallback.py` to check strict load
 
 # Test timing
 
-CI runs all default tests on Python 3.11, 3.12, and 3.13, reports the 50 slowest phases, and uploads `test-results.xml` as `test-results-py<version>`. Use `python -m pytest --durations=50 --junitxml=test-results.xml` to collect the same timing data locally. Compare runner queue time separately from test execution.
+CI runs all default tests on Python 3.11 for PRs and pushes to `main`. A daily scheduled run, which can also be started manually, covers Python 3.11, 3.12, and 3.13. Each run reports the 50 slowest phases and uploads `test-results.xml` as `test-results-py<version>`. Use `python -m pytest --durations=50 --junitxml=test-results.xml` to collect the same timing data locally. Compare runner queue time separately from test execution.
 
 The automatic Qwen FP16/BF16 decode route has numerical, cache-state and
 fallback tests in `tests/test_qwen35_fp16_decode.py`. Run it with
@@ -58,6 +58,10 @@ Run `python -m pytest -q tests/test_cli.py tests/test_integrations.py` to check 
 
 Run `python -m pytest -q tests/test_modernbert_attention.py tests/test_embedding.py tests/test_mlx_embeddings_compat.py` to check finite padded attention, single-input equivalence, local-window masking, and embedding integration. The attention regression covers fp16, bf16, and fp32 at lengths around the affected SDPA tile boundaries.
 
+# Decision model tests
+
+Run `python -m pytest -q tests/test_systemone.py` to check the `/v1/systemone` decision models. Clef cases cover the prompt layout and question/option spans, state truncation, answer formatting, the joint head parameter names against the released checkpoint layout, and one logit per option for each question. OpenJev cases cover the text and screenshot prompt layouts, image sources, the two-stage readout for more than 52 options, and the calibration and confidence formulas. A tiny random Qwen3.5 backbone checks that chunked prefill matches a single pass and that a copied prefix cache gives the same readout as a full prefill. Detection, pool dispatch, the endpoint and the oQ head passthrough are tested in `test_model_discovery.py`, `test_engine_pool.py`, `integration/test_server_endpoints.py` and `test_oq.py`. No model download is required.
+
 # QSA reservation tests
 
 Run `python -m pytest -q tests/test_qwen4_qsa_reserved_capacity.py` to check QSA capacity reservations.
@@ -83,6 +87,10 @@ Run `python -m pytest -q tests/test_prefill_transient_tracker.py tests/test_pref
 # Prefix cache completion tests
 
 Run `python -m pytest -q tests/test_scheduler.py tests/test_scheduler_boundary_completion.py tests/test_prefix_cache_gdn_split.py` to check cache-freshness admission and completed boundary recovery. The completion tests use a small initialized Qwen3.5 hybrid model and the real BatchGenerator, then compare restored-prefix logits with a fresh forward pass. They cover embedded snapshots, GDN sidecars, exact SpecPrefill static-prefix sidecars, off-boundary completion, and unknown or inconsistent cache positions.
+
+# Batch KV capacity tests
+
+Run `python -m pytest -q tests/test_vlm_batch_kv_capacity.py` after changing `omlx/patches/vlm_batch_kv_capacity.py` or bumping the mlx-lm or mlx-vlm pin. The tests load the installed, unpatched cache module next to the patched one and compare cache state and attention output bit for bit through random appends, trims, rollbacks, merges, joins, filters and restores. They cover the mlx-vlm class, the mlx-lm class that prefix restore builds, and a batch that mixes both.
 
 # Cluster join recovery tests
 

@@ -237,7 +237,9 @@ OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/embeddings` | 文本嵌入 |
 | `POST /v1/rerank` | 文档重排序 |
+| `POST /v1/systemone` | 决策模型的类型化判断 (TypeSafe System One) |
 | `GET /v1/models` | 列出可用模型 |
+| `POST /tokenize`, `POST /detokenize` | 兼容 vLLM 的分词器 API（也可通过 `/v1` 访问） |
 
 ### 工具调用与结构化输出
 
@@ -276,8 +278,9 @@ OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream
 | LLM | [mlx-lm](https://github.com/ml-explore/mlx-lm) 支持的所有模型 |
 | VLM | Qwen3.5 系列、GLM-4V、Pixtral 及其他 [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) 模型 |
 | OCR | DeepSeek-OCR、DOTS-OCR、GLM-OCR |
-| 嵌入 | BERT、BGE-M3、ModernBERT |
+| 嵌入 | BERT、BGE-M3、ModernBERT、EmbeddingGemma 2 |
 | 重排序 | ModernBERT、XLM-RoBERTa |
+| 决策 | Clef、Clef-Flash、OpenJev |
 
 ## CLI 配置
 
@@ -320,7 +323,8 @@ FastAPI Server (OpenAI / Anthropic API)
     │   ├── BatchedEngine (LLM，连续批处理)
     │   ├── VLMEngine (视觉语言模型)
     │   ├── EmbeddingEngine
-    │   └── RerankerEngine
+    │   ├── RerankerEngine
+    │   └── DecisionEngine
     │
     ├── ProcessMemoryEnforcer (总内存限制、TTL 检查)
     │

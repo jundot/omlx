@@ -106,6 +106,34 @@ class TestPreflightOrRaise:
         # Must not raise
         scheduler.preflight_or_raise(num_prompt_tokens=1024)
 
+    def test_counts_releasable_hot_cache(self, monkeypatch):
+        """The request has no block table yet, so route preflight counts the
+        hot cache the scheduler releases after admission (#4213)."""
+        gb = 1024**3
+        scheduler = _make_scheduler()
+        scheduler._prefill_memory_guard = True
+        scheduler._memory_abort_limit_bytes = 10**18
+
+        import omlx.scheduler as scheduler_mod
+
+        monkeypatch.setattr(scheduler_mod.mx, "get_active_memory", lambda: 0)
+        monkeypatch.setattr(scheduler_mod, "get_phys_footprint", lambda: 0)
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=65536, cached_tokens=0, current=0
+        )
+        scheduler._memory_hard_limit_bytes = est.estimated - gb
+        scheduler._memory_hot_cache_reserved_bytes = est.kv_exact + 4 * gb
+        # Up to the prompt's own KV may be its protected prefix, not credit.
+        hot = [est.kv_exact + 2 * gb]
+        monkeypatch.setattr(scheduler, "_hot_cache_cpu_bytes", lambda: hot[0])
+
+        scheduler.preflight_or_raise(num_prompt_tokens=65536, request_id="r")
+        assert scheduler.preflight_eviction_request(num_prompt_tokens=65536) is None
+
+        hot[0] = est.kv_exact + gb // 2
+        with pytest.raises(PrefillMemoryExceededError):
+            scheduler.preflight_or_raise(num_prompt_tokens=65536, request_id="r")
+
     def test_skips_when_guard_disabled(self):
         scheduler = _make_scheduler()
         scheduler._prefill_memory_guard = False
@@ -193,12 +221,10 @@ async def test_batched_engine_preflight_runs_eviction_before_final_check():
     scheduler.preflight_eviction_request.assert_called_once_with(
         num_prompt_tokens=123,
         request_id="req-evict",
-        text_only=True,
     )
     scheduler.preflight_or_raise.assert_called_once_with(
         num_prompt_tokens=123,
         request_id="req-evict",
-        text_only=True,
     )
     assert order == [("evict", "req-evict"), ("final", "checked")]
 
@@ -243,7 +269,6 @@ async def test_batched_engine_retries_transient_rejection_after_cleanup(monkeypa
     scheduler.preflight_or_raise.assert_called_once_with(
         num_prompt_tokens=60_000,
         request_id="req-next",
-        text_only=True,
     )
     evict.assert_not_awaited()
 
@@ -293,7 +318,6 @@ async def test_stale_idle_preflight_refreshes_before_eviction():
             request_id="req-stale",
             eviction_callback=evict,
             executor=executor,
-            text_only=True,
         )
     finally:
         executor.shutdown(wait=True)
@@ -303,7 +327,6 @@ async def test_stale_idle_preflight_refreshes_before_eviction():
     scheduler.preflight_or_raise.assert_called_once_with(
         num_prompt_tokens=60_000,
         request_id="req-stale",
-        text_only=True,
     )
     evict.assert_not_awaited()
 
@@ -1029,6 +1052,27 @@ class TestRejectionMessageNamesBindingCeiling:
         assert "metal_cap ceiling" in rej.message
         assert "effective ceiling" not in rej.message
         assert "caps Metal at 16.00 GB" in rej.message
+
+    def test_message_breaks_down_prefill_limit(self, monkeypatch):
+        """Usage excludes the hot cache while the ceilings include it, so the
+        message must subtract it before calling memory reclaimable (#4213)."""
+        sched = _make_scheduler()
+        self._arm_ceilings(
+            sched,
+            static=64 * 1024**3,
+            dynamic=32 * 1024**3,
+            metal_cap=48 * 1024**3,
+            hot_cache_reserved=8 * 1024**3,
+        )
+        sched._prefill_headroom_safety = 0.92
+        rej = self._force_rejection(sched, monkeypatch)
+        assert "but the prefill limit is 22.08 GB" in rej.message
+        assert (
+            "(dynamic ceiling 32.00 GB - hot cache 8.00 GB - safety margin 1.92 GB)"
+            in rej.message
+        )
+        assert "only 24.00 GB is reclaimable right now" in rej.message
+        assert "lower hot_cache_max_size" in rej.message
 
     def test_static_binding_falls_back_to_generic_advice(self, monkeypatch):
         sched = _make_scheduler()

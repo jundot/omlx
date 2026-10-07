@@ -204,7 +204,8 @@ class ModelSettings:
         chat_template_kwargs: Extra chat template keyword arguments.
         forced_ct_kwargs: Keys in chat_template_kwargs that cannot be overridden.
         ttl_seconds: Auto-unload after idle seconds (None = no TTL).
-        model_type_override: "llm", "vlm", "embedding", "reranker", or None (auto-detect).
+        model_type_override: "llm", "vlm", "embedding", "reranker", "decision",
+            or None (auto-detect).
         model_alias: API-visible alternative to the directory name.
         index_cache_freq: IndexCache: every Nth layer keeps indexer (DeepSeek DSA
             only; GLM-5.2 uses its native checkpoint schedule).
@@ -251,6 +252,9 @@ class ModelSettings:
             tensor operations -- M5-series and newer. On anything older the
             kernels do not load and the setting is refused. Decode is
             unaffected. Changes numerics: activations are quantized to INT8.
+            Also covers the routed-expert gate/up of Qwen3.8-Flash-Next
+            (affine Q4 / GS64 experts); the MTP draft layer and the down
+            projection stay on the A16 path.
             Mutually exclusive with qwen35_ane_prefill_enabled.
         qwen35_oq_a8_min_tokens: Shortest sequence routed to the kernels.
         moe_expert_offload_enabled: Stream MoE expert weights from the
@@ -325,7 +329,7 @@ class ModelSettings:
     )
     ttl_seconds: Optional[int] = None  # Auto-unload after idle seconds (None = no TTL)
     model_type_override: Optional[str] = (
-        None  # "llm", "vlm", "embedding", "reranker", or None (auto-detect)
+        None  # "llm", "vlm", "embedding", "reranker", "decision", or None (auto)
     )
     model_alias: Optional[str] = (
         None  # API-visible name (alternative to directory name)
@@ -388,7 +392,7 @@ class ModelSettings:
     qwen35_ane_prefill_cpu_threads: int = 8
     qwen35_ane_prefill_cpu_shared_resource: bool = True
 
-    # oQ mixed-bit QxA8 prefill kernels for Qwen3.5/3.6/3.8.
+    # oQ mixed-bit QxA8 prefill kernels for Qwen3.5/3.6/3.8 and Qwen3.8 Flash-Next.
     #
     # Off by default because it is an accuracy decision, not just a speed one:
     # activations are quantized to INT8 per row, which the W4/W5A16 path does

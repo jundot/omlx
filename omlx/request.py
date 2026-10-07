@@ -157,6 +157,8 @@ class Request:
     benchmark_requested_steps: List[int] = field(default_factory=list)
     benchmark_boundary_enabled: bool = False
     benchmark_cache_block_size: int = 0
+    # MoE expert offload counters when the request was added.
+    moe_offload_start: Optional[Dict[str, Any]] = None
 
     # Multimodal content (images, video)
     images: Optional[List[Any]] = None

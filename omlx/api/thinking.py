@@ -408,6 +408,8 @@ class ThinkingBudgetProcessor:
         think_end_token_ids: Token ID(s) for the close-think tag.
         budget: Maximum number of thinking tokens before forcing close.
         think_start_token_id: Token ID for the open-think tag (re-entry detection).
+        start_in_thinking: False when the model, not the prompt, opens
+            thinking. Counting then starts at ``think_start_token_id``.
     """
 
     def __init__(
@@ -418,6 +420,7 @@ class ThinkingBudgetProcessor:
         leading_token_ids: Optional[List[int]] = None,
         trailing_token_ids: Optional[List[int]] = None,
         token_to_piece: Optional[Callable[[int], str | bytes | None]] = None,
+        start_in_thinking: bool = True,
     ):
         self._think_end_ids = think_end_token_ids
         # Full force sequence: \n + </think> + \n\n (matches training pattern)
@@ -432,7 +435,7 @@ class ThinkingBudgetProcessor:
 
         # State
         self._thinking_tokens: int = 0
-        self._in_thinking: bool = True  # Starts True (prompt ends with <think>)
+        self._in_thinking: bool = start_in_thinking
         self._forcing: bool = False
         self._waiting_utf8: bool = False
         self._force_idx: int = 0

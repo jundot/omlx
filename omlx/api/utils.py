@@ -26,6 +26,26 @@ _NATIVE_REASONING_MODEL_TYPES = {
 }
 
 
+_LONE_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
+
+def find_lone_surrogate(value: Any, path: str = "") -> str | None:
+    """Return the path of the first string with an unpaired UTF-16 surrogate."""
+    if isinstance(value, str):
+        return (path or "body") if _LONE_SURROGATE_RE.search(value) else None
+    if isinstance(value, dict):
+        for key, item in value.items():
+            found = find_lone_surrogate(item, f"{path}.{key}" if path else str(key))
+            if found:
+                return found
+    elif isinstance(value, (list, tuple)):
+        for i, item in enumerate(value):
+            found = find_lone_surrogate(item, f"{path}[{i}]")
+            if found:
+                return found
+    return None
+
+
 def uses_native_reasoning_content(
     model_name: str | None = None,
     *,

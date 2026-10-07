@@ -288,6 +288,7 @@ def test_common_entry_point_dispatches_glm(tmp_path, reference):
         "hits": 0,
         "misses": 2,
         "hit_rate": 0.0,
+        "fetched_bytes": 2 * wrapped.cache.expert_bytes,
     }
 
 

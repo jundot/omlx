@@ -165,6 +165,48 @@ def test_prefill_patch_passthrough_for_decode_mask_and_unsupported_shape(monkeyp
     )
 
 
+def test_prefill_patch_rejects_non_128_head_dims_satisfying_old_modulus(
+    monkeypatch,
+):
+    """E2: the route gate used to admit any Dk % 16 == 0 / Dv % 32 == 0, but
+    both the chunked kernel (A) and the default blocked_seq kernel (S)
+    hard-assume Dk=128/Dv=128 internally -- a shape satisfying the old
+    modulus without being exactly 128 would silently misbehave rather than
+    error. Dk=144 (16*9) and Dv=160 (32*5) both satisfy the old modulus but
+    must now be rejected.
+    See docs/qwen35-hardening-and-optimization.md E2."""
+    import omlx.custom_kernels.qwen35_prefill as kernels
+    import omlx.patches.qwen35_gdn_chunked as patch
+
+    gd, _ = _install_fake_qwen35(monkeypatch)
+    monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
+    monkeypatch.setattr(
+        kernels,
+        "gated_delta_blocked_seq",
+        lambda *args: pytest.fail("blocked kernel should not be routed"),
+    )
+
+    assert patch.apply_qwen35_gdn_prefill_patch() is True
+
+    a = _Tensor((1, 128, 48))
+
+    # Dk=144: divisible by 16 (old gate), not 128 (new gate).
+    q_bad_dk = _Tensor((1, 128, 16, 144))
+    v_ok = _Tensor((1, 128, 48, 128))
+    assert (
+        gd.gated_delta_update(q_bad_dk, q_bad_dk, v_ok, a, None, None, None)[0]
+        == "original"
+    )
+
+    # Dv=160: divisible by 32 (old gate), not 128 (new gate).
+    q_ok = _Tensor((1, 128, 16, 128))
+    v_bad_dv = _Tensor((1, 128, 48, 160))
+    assert (
+        gd.gated_delta_update(q_ok, q_ok, v_bad_dv, a, None, None, None)[0]
+        == "original"
+    )
+
+
 def test_prefill_patch_chunked_impl_opt_in(monkeypatch):
     import omlx.custom_kernels.qwen35_prefill as kernels
     import omlx.patches.qwen35_gdn_chunked as patch
@@ -280,7 +322,7 @@ def test_prefill_patch_preserves_cache_owned_kernel_dispatch(monkeypatch):
     monkeypatch.setattr(gated_delta, "gated_delta_update", gated_delta.gated_delta_update)
     monkeypatch.setattr(language, "gated_delta_update", language.gated_delta_update)
     monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
-    initial = mx.zeros((1, 1, 32, 32))
+    initial = mx.zeros((1, 1, 128, 128))
     final = mx.ones_like(initial)
     calls = []
 
@@ -292,7 +334,7 @@ def test_prefill_patch_preserves_cache_owned_kernel_dispatch(monkeypatch):
     assert patch.apply_qwen35_gdn_prefill_patch()
     cache = ArraysCache(2)
     cache[1] = initial
-    q = mx.zeros((1, 64, 1, 32))
+    q = mx.zeros((1, 64, 1, 128))
     a = mx.zeros((1, 64, 1))
     output, state = gated_delta.gated_delta_update(
         q, q, q, a, a, mx.zeros((1,)), mx.zeros((1,)), cache=cache
