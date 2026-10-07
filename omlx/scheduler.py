@@ -6473,13 +6473,17 @@ class Scheduler:
         request: "Request",
         state: _PrefillState,
         scheduled: "list[Request]",
-    ) -> None:
+    ) -> bool:
         """Insert a fully-prefilled request into BatchGenerator.
 
         Handles the batch_generator.insert() call, uid bookkeeping, and moving
         the request to self.running. Called from both the inline chunked path
         (first chunk completed immediately) and _advance_chunked_prefills()
         (last chunk completed across steps).
+
+        Returns True when the request was scheduled into the batch. On an
+        empty insert() result the request is fully cleaned up and False is
+        returned; the caller must surface a finish_reason="error" output.
 
         Precondition: state.sampler, state.sm, state.per_row_lps are set.
         """
@@ -6573,6 +6577,22 @@ class Scheduler:
                 request.num_prompt_tokens,
                 cache_info,
             )
+            return True
+
+        # insert() refusing the request would otherwise drop it silently:
+        # it has already been popped from waiting / prefilling and lives in
+        # neither self.waiting nor self.running, so its collector would wait
+        # forever. Fail it loudly instead.
+        logger.error(
+            "BatchGenerator.insert returned no uid for chunked-prefill "
+            "request %s; failing the request.",
+            request.request_id,
+        )
+        self._release_paged_cache_for_request(request.request_id)
+        self._drop_boundary_snapshots_for_request(request.request_id)
+        self.requests.pop(request.request_id, None)
+        self._clear_request_admission_bookkeeping(request.request_id)
+        return False
 
     def _advance_chunked_prefills(
         self,
@@ -6695,7 +6715,15 @@ class Scheduler:
             # Clean up the prefill-progress tracker entry.
             get_prefill_tracker().remove(rid)
 
-            self._insert_prefilled_request(request, state, scheduled)
+            if not self._insert_prefilled_request(request, state, scheduled):
+                rejected.append(
+                    RequestOutput(
+                        request_id=rid,
+                        finished=True,
+                        finish_reason="error",
+                        error="BatchGenerator.insert returned no uid for request",
+                    )
+                )
 
         self.prefilling = still_prefilling
 
@@ -12095,7 +12123,20 @@ class Scheduler:
                         self._emit_final_boundary_if_needed(state)
                         Scheduler._clear_cache(self)
                         get_prefill_tracker().remove(request.request_id)
-                        self._insert_prefilled_request(request, state, scheduled)
+                        if not self._insert_prefilled_request(
+                            request, state, scheduled
+                        ):
+                            rejected_outputs.append(
+                                RequestOutput(
+                                    request_id=request.request_id,
+                                    finished=True,
+                                    finish_reason="error",
+                                    error=(
+                                        "BatchGenerator.insert returned no uid "
+                                        "for request"
+                                    ),
+                                )
+                            )
                     else:
                         self.prefilling.append(request)
                         self._prefill_states[request.request_id] = state
@@ -12299,6 +12340,28 @@ class Scheduler:
                     f"with {len(tokens_to_process)} tokens to process "
                     f"({request.num_prompt_tokens} total){cache_info}, {cache_used}"
                 )
+            else:
+                # insert() refusing the request would otherwise drop it
+                # silently: it has been popped from waiting and lives in
+                # neither self.waiting nor self.running, so its collector
+                # would wait forever. Fail it loudly instead.
+                logger.error(
+                    "BatchGenerator.insert returned no uid for request %s; "
+                    "failing the request.",
+                    request.request_id,
+                )
+                self._release_paged_cache_for_request(request.request_id)
+                self.requests.pop(request.request_id, None)
+                self._clear_request_admission_bookkeeping(request.request_id)
+                get_prefill_tracker().remove(request.request_id)
+                rejected_outputs.append(
+                    RequestOutput(
+                        request_id=request.request_id,
+                        finished=True,
+                        finish_reason="error",
+                        error="BatchGenerator.insert returned no uid for request",
+                    )
+                )
 
         return scheduled, rejected_outputs
 
@@ -12466,7 +12529,13 @@ class Scheduler:
                 request_id=request_id,
                 new_token_ids=[response.token] if not is_stop else [],
                 new_text=new_text,
-                output_token_ids=list(request.output_token_ids),
+                # Only the terminal chunk's cumulative ids are ever read
+                # (stop-sequence suppression re-decodes a clipped prefix;
+                # OutputCollector merges carry the latest cumulative).
+                # Copying them on every chunk made decode O(n^2) per request.
+                output_token_ids=(
+                    list(request.output_token_ids) if is_finished else []
+                ),
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
                 generated_at=output_generated_at,

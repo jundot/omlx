@@ -1271,13 +1271,29 @@ class BlockAwarePrefixCache(CacheManager):
                                 > _BACKFILL_CHECKED_MAX_ENTRIES
                             ):
                                 self._backfill_checked_hashes.clear()
-                    # Reuse existing block
-                    self.paged_cache.increment_ref(existing_block.block_id)
-                    block_table.block_ids.append(existing_block.block_id)
-                    block_table.num_tokens += len(block_tokens)
-                    if is_tail_terminal:
-                        tail_in_table = True
-                    continue
+                    # Reuse existing block. find_cached_block() drops its lock
+                    # on return, so between the lookup and this point the
+                    # block may have been freed and its id reused for other
+                    # content (store worker racing fetch/reconstruct on the
+                    # inference thread). acquire_cached_block() re-validates
+                    # the chain hash and takes the reference under one lock;
+                    # on mismatch fall through and store a fresh block.
+                    acquired = self.paged_cache.acquire_cached_block(
+                        existing_block.block_id, existing_block.block_hash
+                    )
+                    if acquired is not None:
+                        block_table.block_ids.append(existing_block.block_id)
+                        block_table.num_tokens += len(block_tokens)
+                        if is_tail_terminal:
+                            tail_in_table = True
+                        continue
+                    logger.debug(
+                        "Dedup block %d for %s vanished before acquire at "
+                        "%d tokens; storing a fresh block",
+                        existing_block.block_id,
+                        request_id,
+                        global_end,
+                    )
 
             # Allocate new block
             if first_new_block_idx is None:

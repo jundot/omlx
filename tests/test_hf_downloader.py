@@ -211,6 +211,18 @@ class TestHFDownloader:
             await downloader.start_download("a/b/c")
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "repo_id", ["../..", "..", "a/..", "../b", "./b", "a/", "/b", "a/./b"]
+    )
+    async def test_start_download_rejects_traversal_repo_id(
+        self, downloader, repo_id
+    ):
+        # repo_id is joined onto the model directory; relative or separator
+        # segments must not pass the "one slash" format check.
+        with pytest.raises(ValueError, match="Invalid repository ID"):
+            await downloader.start_download(repo_id)
+
+    @pytest.mark.asyncio
     async def test_start_download_strips_whitespace(self, downloader):
         with patch(
             "omlx.admin.hf_downloader.HfApi"
