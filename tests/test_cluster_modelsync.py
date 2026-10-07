@@ -124,6 +124,27 @@ def test_build_manifest_without_index_still_identifies(tmp_path):
     assert manifest.total_bytes > 0
 
 
+def test_build_manifest_includes_index_declared_subdir_weight(tmp_path):
+    """Root-relative weights (OptiQ ``optiq/…``) must appear in peer manifests."""
+
+    root = _model(tmp_path / "model-subdir")
+    optiq = root / "optiq"
+    optiq.mkdir()
+    _write_shard(optiq, "optiq_vision.safetensors", ["vision.embed_tokens.weight"])
+    index_path = root / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    index["weight_map"]["vision.embed_tokens.weight"] = (
+        "optiq/optiq_vision.safetensors"
+    )
+    index_path.write_text(json.dumps(index))
+
+    manifest = build_manifest(root)
+
+    names = [item.name for item in manifest.files]
+    assert "optiq/optiq_vision.safetensors" in names
+    assert "model-00000.safetensors" in names
+
+
 def test_build_manifest_rejects_non_model_dir(tmp_path):
     root = tmp_path / "empty"
     root.mkdir()
