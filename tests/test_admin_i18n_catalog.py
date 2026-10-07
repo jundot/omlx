@@ -152,6 +152,9 @@ TEMPLATE_LITERALS = [
 ]
 
 KEY_CALL = re.compile(r"""(?:window\.)?\bt\(\s*'([^']*)'""")
+# Jinja substitutes these at render time — `bench_th` takes `{{ tooltip_key }}`
+# and its call sites carry the real key — so the literal is not a catalogue key.
+JINJA_PLACEHOLDER = re.compile(r"\{\{|\}\}|\{%|%\}")
 TEXT_NODE = re.compile(r">([^<>]+)<")
 ENGLISH_TEXT = re.compile(r"^[A-Za-z][A-Za-z0-9 ,.'’()/%+-]{2,}$")
 
@@ -172,7 +175,11 @@ def _without_comments(text: str) -> str:
 def _keys_used() -> set:
     keys = set()
     for path in TRANSLATED_SOURCES:
-        keys.update(KEY_CALL.findall(_without_comments(path.read_text(encoding="utf-8"))))
+        keys.update(
+            key
+            for key in KEY_CALL.findall(_without_comments(path.read_text(encoding="utf-8")))
+            if not JINJA_PLACEHOLDER.search(key)
+        )
     return keys
 
 
