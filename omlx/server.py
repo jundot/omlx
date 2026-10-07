@@ -5325,6 +5325,7 @@ def _withholding_is_recoverable(
     withheld_is_payload: bool,
     streamed_tool_calls: list | None = None,
     parse_errors: tuple = (),
+    withheld_has_later_opener: bool = False,
 ) -> bool:
     """Whether an unterminated envelope's withheld text may become content.
 
@@ -5343,13 +5344,24 @@ def _withholding_is_recoverable(
     model really attempted.  ``withheld_is_payload`` now covers both channels,
     so a payload-shaped tail in either one keeps the failure whenever there is
     one to keep.
+
+    ``withheld_has_later_opener`` closes the streaming half of the same review:
+    the tail opens with a quoted marker, so the shape rule above calls it prose,
+    but a *payload-shaped* opener further inside it is a genuine truncated call.
+    Delivering that tail is the #3834 leak direction, and refusing it is the
+    behaviour vogel61 asked for as answer (a): the prose before the first marker
+    has already streamed, the tail stays hidden, and the call still fails.
+    Both flags are failure-gated, so a tail nothing complained about is still
+    delivered rather than turned into an error.
     """
 
     if tool_calls or streamed_tool_calls:
         return False
     if any(error != "incomplete" for error in parse_errors):
         return False
-    return not (tool_failure and withheld_is_payload)
+    if not tool_failure:
+        return True
+    return not (withheld_is_payload or withheld_has_later_opener)
 
 
 def _nonstream_recovery_text(
@@ -5898,6 +5910,16 @@ async def stream_chat_completion(
     # Surface an unterminated paired envelope only when final parsing could not
     # recover a structured tool call. The candidate begins at the opening marker,
     # so prose already streamed before it is never duplicated.
+    # The later-opener rule judges the withheld text itself, so read it before
+    # the drains below clear both channels (#4300 review).
+    withheld_has_later_opener = bool(
+        (tool_filter.recovery_tail_has_later_opener() if tool_filter else False)
+        or (
+            thinking_filter.recovery_tail_has_later_opener()
+            if thinking_filter
+            else False
+        )
+    )
     recovered_thinking = (
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
@@ -5910,7 +5932,12 @@ async def stream_chat_completion(
         or (thinking_filter.take_recovery_is_payload() if thinking_filter else False)
     )
     if _withholding_is_recoverable(
-        tool_calls, tool_failure, withheld_is_payload, streamed_tool_calls, parse_errors
+        tool_calls,
+        tool_failure,
+        withheld_is_payload,
+        streamed_tool_calls,
+        parse_errors,
+        withheld_has_later_opener,
     ):
         if recovered_thinking:
             chunk = ChatCompletionChunk(
@@ -6458,6 +6485,16 @@ async def stream_anthropic_messages(
         parse_errors = extraction.parse_errors
         tool_failure = _tool_call_failure(extraction)
 
+    # The later-opener rule judges the withheld text itself, so read it before
+    # the drains below clear both channels (#4300 review).
+    withheld_has_later_opener = bool(
+        (tool_filter.recovery_tail_has_later_opener() if tool_filter else False)
+        or (
+            thinking_filter.recovery_tail_has_later_opener()
+            if thinking_filter
+            else False
+        )
+    )
     recovered_thinking = (
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
@@ -6470,7 +6507,11 @@ async def stream_anthropic_messages(
         or (thinking_filter.take_recovery_is_payload() if thinking_filter else False)
     )
     if _withholding_is_recoverable(
-        tool_calls, tool_failure, withheld_is_payload, parse_errors=parse_errors
+        tool_calls,
+        tool_failure,
+        withheld_is_payload,
+        parse_errors=parse_errors,
+        withheld_has_later_opener=withheld_has_later_opener,
     ):
         if recovered_thinking:
             if text_block_started:
@@ -8140,6 +8181,16 @@ async def stream_responses_api(
         )
         cleaned_text = clean_special_tokens(regular_content) if regular_content else ""
 
+    # The later-opener rule judges the withheld text itself, so read it before
+    # the drains below clear both channels (#4300 review).
+    withheld_has_later_opener = bool(
+        (tool_filter.recovery_tail_has_later_opener() if tool_filter else False)
+        or (
+            thinking_filter.recovery_tail_has_later_opener()
+            if thinking_filter
+            else False
+        )
+    )
     recovered_thinking = (
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
@@ -8153,7 +8204,11 @@ async def stream_responses_api(
     )
     recovered_content_visible = ""
     if _withholding_is_recoverable(
-        tool_calls, tool_failure, withheld_is_payload, parse_errors=parse_errors
+        tool_calls,
+        tool_failure,
+        withheld_is_payload,
+        parse_errors=parse_errors,
+        withheld_has_later_opener=withheld_has_later_opener,
     ):
         for ev in _emit_reasoning_delta(recovered_thinking):
             yield ev

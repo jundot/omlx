@@ -2618,7 +2618,7 @@ class ToolCallStreamFilter:
         return flag
 
     def recovery_tail_has_later_opener(self) -> bool:
-        """Whether the withheld tail holds a second opening marker.
+        """Whether a later opener inside the withheld tail opens a payload.
 
         Envelopes do not nest: everything from the first opening marker to EOF is
         withheld as one tail, so a further opener inside it is model text the
@@ -2627,17 +2627,44 @@ class ToolCallStreamFilter:
         when a genuine (truncated) call follows the quoted marker, so this guard
         lets it refuse the tail instead (#4300 review).
 
+        Only a later opener that opens a payload blocks.  A marker the model
+        quoted a second time in prose opens nothing, so that tail stays
+        recoverable prose (#4300 review, Barty13's code-fence reproduction):
+        judging every repeat as a call cost the non-streaming caller the whole
+        answer while the same text streamed back intact.
+
+        Walks the tail once.  Each opener keeps its own forward cursor, so no
+        suffix is copied or rescanned per marker: a tail that repeats the marker
+        is linear rather than quadratic (#1854/#1905).
+
         Must be read before ``take_recovery_candidate`` drains the text.
         """
 
         tail = self._recovery_candidate
         if not tail:
             return False
-        opener = self._withheld_opener(tail)
-        rest = tail[len(opener) :]
-        return any(
-            marker and marker in rest for marker, _close in self._marker_pairs
-        )
+        # The first opener owns the head of the tail, so later ones start after
+        # it -- including the longest matching marker, as ``_withheld_opener``
+        # resolves overlapping spellings.
+        start = len(self._withheld_opener(tail))
+        # Next position of each opener, or -1 once it stops appearing.  Advancing
+        # one cursor at a time is what keeps a marker-heavy tail linear: no
+        # opener is ever searched from the front twice.
+        cursors = {
+            marker: tail.find(marker, start)
+            for marker, _close in self._marker_pairs
+            if marker
+        }
+        while True:
+            found = [
+                (index, marker) for marker, index in cursors.items() if index != -1
+            ]
+            if not found:
+                return False
+            index, marker = min(found)
+            if self._withheld_payload_at(tail, index):
+                return True
+            cursors[marker] = tail.find(marker, index + len(marker))
 
     def take_completed_envelopes(self) -> List[str]:
         """Return complete suppressed envelopes ready for exact parsing.
@@ -3301,15 +3328,36 @@ class ToolCallStreamFilter:
           or Gemma's ``call:name{...}``.
         """
 
-        opener = self._withheld_opener(withheld)
+        return self._withheld_payload_at(withheld, 0)
+
+    def _withheld_payload_at(self, withheld: str, index: int) -> bool:
+        """``_withheld_is_payload`` for an opener already located at ``index``.
+
+        Indexing instead of slicing keeps ``recovery_tail_has_later_opener``
+        linear when the tail repeats the marker: the suffix is never copied,
+        and only the byte after the opener decides, so a bounded lookahead
+        replaces the whole-body ``lstrip``.
+        """
+
+        opener = ""
+        for marker, _close in self._marker_pairs:
+            if (
+                marker
+                and withheld.startswith(marker, index)
+                and len(marker) > len(opener)
+            ):
+                opener = marker
         if opener == _XML_FUNCTION_OPEN:
             return True
-        body = withheld[len(opener) :].lstrip()
-        if not body:
+        pos = index + len(opener)
+        end = len(withheld)
+        while pos < end and withheld[pos].isspace():
+            pos += 1
+        if pos >= end:
             return True
-        if body[0] in "<{[":
+        if withheld[pos] in "<{[":
             return True
-        return body.startswith("call:")
+        return withheld.startswith("call:", pos)
 
     def _unwind_withheld_at_eof(
         self, candidate: str, marker: str, start_marker: str

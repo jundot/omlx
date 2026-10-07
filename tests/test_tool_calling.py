@@ -1697,7 +1697,7 @@ def test_recovery_tail_without_a_second_marker_is_recoverable():
 
 
 def test_recovery_tail_with_a_second_marker_is_refused():
-    """A later opener inside the withheld tail must be visible (#4300)."""
+    """A payload-shaped later opener must be visible (#4300)."""
 
     f = ToolCallStreamFilter(_make_tokenizer())
 
@@ -1712,6 +1712,42 @@ def test_recovery_tail_with_a_second_marker_is_refused():
     assert f.take_recovery_candidate().startswith(
         "<tool_call> is how qwen calls a tool. Now calling:"
     )
+
+
+def test_recovery_tail_with_a_second_marker_in_prose_is_recoverable():
+    """A repeat of the marker in prose opens nothing, so the tail is prose.
+
+    Barty13's #4300 reproduction: the withheld tail is ordinary prose that
+    names the marker a second time inside a fence.  Refusing every repeat kept
+    the non-streaming caller at a hard 500 while the same text streamed back
+    intact.
+    """
+
+    f = ToolCallStreamFilter(_make_tokenizer())
+
+    f.feed(
+        "<tool_call> is how qwen calls a tool. It is named again in a fence:\n"
+        "```\n<tool_call>\n```\nOnly the name is quoted. END"
+    )
+    f.finish()
+
+    assert f.recovery_tail_has_later_opener() is False
+    assert f.take_recovery_candidate().endswith("Only the name is quoted. END")
+
+
+def test_recovery_tail_scan_passes_prose_before_a_later_payload_opener():
+    """The scan judges each later opener, so prose markers do not mask a call."""
+
+    f = ToolCallStreamFilter(_make_tokenizer())
+
+    f.feed(
+        "<tool_call> is how qwen calls a tool. Named again: "
+        "<tool_call> in prose. Now calling: "
+        '<tool_call>{"name":"write"'
+    )
+    f.finish()
+
+    assert f.recovery_tail_has_later_opener() is True
 
 
 def test_recovery_tail_guard_sees_a_later_naked_function_opener():

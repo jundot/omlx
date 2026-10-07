@@ -5105,6 +5105,12 @@ _REVIEW_PROSE_THEN_CALL = (
     + _REVIEW_TRUNCATED_CALL
 )
 _REVIEW_TRUNCATED_XML = "<tool_call><function=write><parameter=content>cut"
+# Barty13's reproduction: the withheld tail is plain prose that names the
+# marker a second time, inside a fence.  Nothing behind that repeat is a payload.
+_REVIEW_MARKER_REPEAT_PROSE = (
+    "The tag <tool_call> is how qwen calls a tool. It is named again in a "
+    "fence:\n```\n<tool_call>\n```\nOnly the name is quoted. END"
+)
 
 
 def _recovery_reasoning(events, api):
@@ -5179,18 +5185,22 @@ async def test_thinking_channel_truncated_call_still_streams_pending_review(api)
 
 
 @pytest.mark.asyncio
-async def test_prose_then_later_opener_still_streams_as_content():
-    """Known gap, deliberately unchanged until the maintainer settles item 2.
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+async def test_prose_then_later_call_opener_is_not_streamed_as_content(api):
+    """Answer (a): the leading prose is delivered, the tail is held, it fails.
 
-    The withheld tail is judged by the text right after its *first* marker, so a
-    genuine call opener later in the same tail is streamed as answer text.
-    Tightening that changes what "recoverable prose" means, so it is left alone
-    here (#4300 review, item 2).
+    The withheld tail opens with a quoted marker, so judging it by the bytes
+    right after that marker calls the whole thing prose -- but the call opener
+    further inside it is payload-shaped, and delivering that tail is the #3834
+    leak direction.  vogel61 settled the (a)/(b) question on #4300 as (a): the
+    text before the first marker stays content, the tail is never delivered,
+    and the turn still fails as an incomplete call.
     """
-    events = await _recovery_stream(_REVIEW_PROSE_THEN_CALL, "chat")
+    events = await _recovery_stream(_REVIEW_PROSE_THEN_CALL, api)
 
-    assert _recovery_error_codes(events, "chat") == []
-    assert _recovery_text(events, "chat") == _REVIEW_PROSE_THEN_CALL
+    assert _recovery_error_codes(events, api) == ["incomplete_tool_call"]
+    assert not _recovery_calls(events, api)
+    assert _recovery_text(events, api) == "The tag "
 
 
 def _nonstream_tool_call_client(monkeypatch, body: str):
@@ -5335,10 +5345,12 @@ def test_nonstream_quoted_marker_reaches_other_api_bodies(monkeypatch, path, pay
 def test_nonstream_truncated_or_malformed_call_still_fails(monkeypatch, raw, code):
     """A call the generator cut short must keep the 500 on the non-stream path.
 
-    Recovery there is additionally gated on the withheld tail holding no later
-    opening marker (#4300 review, item 3): without that guard the leading prose
-    would be judged alone and ``... Now calling: <tool_call>{"name": ...cut``
-    would be returned as answer text.
+    Recovery there is additionally gated on the withheld tail holding no
+    payload-shaped opener after its first marker (#4300 review, item 3): without
+    that guard the leading prose would be judged alone and
+    ``... Now calling: <tool_call>{"name": ...cut`` would be returned as answer
+    text.  A marker merely repeated in prose opens nothing, so it no longer
+    blocks the tail (see the ``_REVIEW_MARKER_REPEAT_PROSE`` case).
     """
     client = _nonstream_tool_call_client(monkeypatch, raw)
     response = client.post("/v1/chat/completions", json=_CHAT_REVIEW_PAYLOAD)
@@ -5347,6 +5359,42 @@ def test_nonstream_truncated_or_malformed_call_still_fails(monkeypatch, raw, cod
     assert response.status_code == 500, response.text
     assert response.json()["error"]["code"] == code
     assert "<tool_call>" not in response.text
+
+
+@pytest.mark.parametrize(
+    "path,payload",
+    [
+        ("/v1/chat/completions", _CHAT_REVIEW_PAYLOAD),
+        ("/v1/messages", _ANTHROPIC_REVIEW_PAYLOAD),
+        ("/v1/responses", _RESPONSES_REVIEW_PAYLOAD),
+    ],
+)
+def test_nonstream_marker_repeat_in_prose_is_delivered(monkeypatch, path, payload):
+    """A repeat of the marker in prose must not cost the caller the answer.
+
+    Barty13's #4300 reproduction: the same text streamed back intact while the
+    non-streaming path answered 500, because the guard refused the tail for any
+    later opener.  It now judges the text behind each later opener, so only a
+    payload-shaped one blocks.
+    """
+    client = _nonstream_tool_call_client(monkeypatch, _REVIEW_MARKER_REPEAT_PROSE)
+    response = client.post(path, json=payload)
+    client.close()
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    if path == "/v1/chat/completions":
+        assert body["choices"][0]["message"]["content"] == _REVIEW_MARKER_REPEAT_PROSE
+    elif path == "/v1/messages":
+        assert body["content"][0]["text"] == _REVIEW_MARKER_REPEAT_PROSE
+    else:
+        texts = [
+            part["text"]
+            for item in body["output"]
+            if item["type"] == "message"
+            for part in item["content"]
+        ]
+        assert texts == [_REVIEW_MARKER_REPEAT_PROSE]
 
 
 @pytest.mark.parametrize(
