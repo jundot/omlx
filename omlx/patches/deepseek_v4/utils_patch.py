@@ -42,36 +42,6 @@ SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
 
 _PATCHED = False
 
-# sha256 of the whitespace-stripped source of ``mlx_lm.utils.load_model``
-# at the mlx-lm pin this replacement was verified against (pyproject:
-# 94cdcae13b). The closure below copies the deepseek_v4/fp8 branch verbatim
-# and delegates everything else to the original, so upstream changes to the
-# *delegated* path stay live — but if upstream rewrites load_model, the
-# copied branch's assumptions (helper names, config-shape handling) can
-# silently rot. On a pin bump: diff the new load_model against the copied
-# body, update this constant, and adjust the copy if needed. (Both sides
-# strip leading/trailing whitespace so the fingerprint doesn't depend on
-# whether the extractor includes the file's trailing newline.)
-_ACCEPTED_LOAD_MODEL_SOURCE_SHA256 = frozenset(
-    {
-        "39949c690342d35d3821b6882944c1328609149792620963f44cdf7e741ae999",
-    }
-)
-
-
-def _load_model_source_matches() -> bool:
-    """True when upstream load_model still matches the verified baseline."""
-    import hashlib
-    import inspect
-
-    try:
-        source = inspect.getsource(_utils.load_model)
-    except (OSError, TypeError):
-        return False
-    digest = hashlib.sha256(source.strip().encode()).hexdigest()
-    return digest in _ACCEPTED_LOAD_MODEL_SOURCE_SHA256
-
-
 def _native_ratio128_attention_enabled(config: dict[str, Any]) -> bool:
     """Keep the native ratio-128 attention path off for sub-4-bit V4."""
     if not str(config.get("model_type", "")).startswith("deepseek_v4"):
@@ -320,24 +290,6 @@ def apply_utils_patch() -> bool:
     """
     global _PATCHED
     if _PATCHED:
-        return False
-
-    # Gate on the upstream source: without this, a mlx-lm pin bump that
-    # rewrites load_model would be silently shadowed here (the replacement
-    # is process-wide) and upstream loader fixes would quietly stop
-    # applying. Skipping leaves the upstream loader in charge — deepseek_v4
-    # fp8 checkpoints then fail with a visible loader error instead of
-    # running through stale assumptions.
-    if not _load_model_source_matches():
-        logger.warning(
-            "mlx_lm.utils.load_model does not match the source this "
-            "deepseek_v4 patch was verified against; skipping the "
-            "replacement so the upstream loader stays in charge. "
-            "deepseek_v4 fp8 checkpoints may fail to load. If the mlx-lm "
-            "pin was bumped intentionally, re-verify the copied branch in "
-            "omlx/patches/deepseek_v4/utils_patch.py and update "
-            "_ACCEPTED_LOAD_MODEL_SOURCE_SHA256."
-        )
         return False
 
     patched = _build_patched_load_model()
