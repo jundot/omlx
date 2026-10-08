@@ -121,6 +121,31 @@ class TestPcm16Conversion:
         session.feed_pcm16(b"")
         assert received == []
 
+    def test_feed_pcm16_odd_length_frame_drops_partial_sample(self):
+        """A 3-byte frame must not raise: it used to kill the receiver task
+        and leak the session flag for the process lifetime."""
+        received = []
+        backend = SimpleNamespace(feed=received.append)
+        session = RealtimeTranscriptionSession(
+            MagicMock(spec=STTEngine), backend, "act"
+        )
+
+        session.feed_pcm16(b"\x01\x02\x03")
+
+        assert len(received) == 1
+        assert received[0].shape == (1,)
+
+    def test_feed_pcm16_single_byte_frame_is_noop(self):
+        received = []
+        backend = SimpleNamespace(feed=received.append)
+        session = RealtimeTranscriptionSession(
+            MagicMock(spec=STTEngine), backend, "act"
+        )
+
+        session.feed_pcm16(b"\xff")
+
+        assert received == []
+
 
 class TestWhisperBackendBuffering:
     def test_take_respects_chunk_threshold(self):
