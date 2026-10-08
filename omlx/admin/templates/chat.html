@@ -4796,7 +4796,7 @@
                 allModels.filter(m => {
                     const gatewayId = this.aliasToGateway[m.id] || m.id;
                     const t = (this.modelTypeMap[gatewayId] || '').toLowerCase();
-                    return t !== 'audio_tts' && t !== 'audio_sts' && t !== 'embedding' && t !== 'reranker';
+                    return t !== 'audio_tts' && t !== 'audio_sts' && t !== 'embedding' && t !== 'reranker' && t !== 'decision';
                 }).map(m => ({
                     id: this.aliasToGateway[m.id] || m.id, // gateway id for API calls
                     name: m.id, // original name (alias or directory name) for display
@@ -6662,14 +6662,16 @@
         this.messages = session.messages;
         this.scheduleEnhanceMessages();
 
-        // Optional one-off overrides from the regenerate dropdown. These apply to
-        // this single call only and never mutate the session's saved settings.
+        // The creative temperature applies to this call only.
         let generationOverride = null;
         if (opts.creative) {
             const base = Number(this.modelSettings?.temperature);
             const temp = Number.isFinite(base) && base > 0 ? Math.min(2, base + 0.4) : 1.2;
             generationOverride = { temperature: temp };
         }
+
+        // "Regenerate with" switches the chat to the chosen model.
+        if (opts.model) await this.selectModel(opts.model);
 
         await this.streamResponse({
             chatId: this.currentChatId,

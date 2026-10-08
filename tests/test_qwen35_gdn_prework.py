@@ -1295,9 +1295,9 @@ def qwen4_verify(monkeypatch):
     launches = []
     step = prework_mod.qwen4_verify_step_fused
 
-    def counted(*args):
+    def counted(*args, **kwargs):
         launches.append(args[0].shape[1])
-        return step(*args)
+        return step(*args, **kwargs)
 
     monkeypatch.setattr(prework_mod, "qwen4_verify_step_fused", counted)
     yield launches
@@ -1353,10 +1353,11 @@ _PARAVIRTUAL_GPU = mx.metal.is_available() and not str(
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.skipif(_PARAVIRTUAL_GPU, reason="per-op reference is not row-exact here")
 @pytest.mark.parametrize("signatures", [((6, 64),) * 4, ((8, 64),) * 4])
-@pytest.mark.parametrize("rows", [1, 2, 3, 4, 9])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 6, 7, 8, 9])
 @pytest.mark.parametrize("seed", [3, 11])
+@pytest.mark.parametrize("deferred", [True, False])
 def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
-    monkeypatch, qwen4_verify, signatures, rows, seed
+    monkeypatch, qwen4_verify, signatures, rows, seed, deferred
 ):
     """Outputs, next states, rollback records and every accepted prefix."""
     import copy
@@ -1364,6 +1365,7 @@ def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
     from mlx.utils import tree_flatten
 
     module = _real_qwen4_decode_module(signatures, seed)
+    monkeypatch.setattr(prework_mod, "_QWEN4_VERIFY_DEFERRED_STATES", deferred)
     inputs, conv_state, recurrent_state = _verify_inputs(rows, seed + rows)
     monkeypatch.setattr(prework_mod, "_QWEN4_VERIFY_FUSED", False)
     want, want_cache, want_tx = _verify_block(module, inputs, conv_state, recurrent_state)
@@ -1381,10 +1383,17 @@ def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
     assert got_window[0] == kind == "window" and got_window[2] == width == 3
     assert _same(want_window, got_window[1])
     (kind, want_history, want_final), got_states = want_records[1], got_records[1]
-    assert got_states[0] == kind == "states"
+    assert kind == "states"
     if rows == 1:
+        assert got_states[0] == "states"
         assert want_history is None and got_states[1] is None
+    elif deferred:
+        # No per-step states are written; each is recomputed on demand.
+        assert got_states[0] == "deferred" and got_states[3] == rows
+        for kept in range(1, rows):
+            assert _same(want_history[:, kept - 1], got_states[4](kept)), kept
     else:
+        assert got_states[0] == "states"
         assert _same(want_history, got_states[1])
     assert _same(want_final, got_states[2])
     for keep in range(rows + 1):
@@ -1401,7 +1410,7 @@ def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("rows", [2, 3, 4])
+@pytest.mark.parametrize("rows", [2, 3, 4, 5, 6, 7, 8, 12, 16])
 @pytest.mark.parametrize("seed", [5, 23])
 def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
     monkeypatch, qwen4_verify, rows, seed
@@ -1437,11 +1446,12 @@ def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
     for t in range(rows):
         assert _same(outputs[t][:, 0], got[:, t]), t
     window = cache._speculation["records"][0][1]
-    _, history, final = cache._speculation["records"][1]
+    kind, _, final, _, state_after = cache._speculation["records"][1]
+    assert kind == "deferred"
     for t in range(rows + 1):
         assert _same(convs[t], window[:, t : t + 3]), t
     for t in range(rows - 1):
-        assert _same(states[t + 1], history[:, t]), t
+        assert _same(states[t + 1], state_after(t + 1)), t
     assert _same(states[rows], final)
     assert _same(convs[rows], cache[0]) and _same(states[rows], cache[1])
     for keep in range(rows + 1):
@@ -1452,12 +1462,86 @@ def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("rows", [2, 3])
+def test_qwen4_batched_decode_rows_equal_their_one_row_decode(
+    monkeypatch, qwen4_verify, rows
+):
+    """Up to the per-row projection limit, every row of a batched one-token
+    decode, and its next conv and recurrent states, equal that row decoded
+    alone (B1) bit for bit."""
+    from mlx_vlm.models.cache import ArraysCache
+
+    assert rows <= prework_mod._QWEN4_BATCH_ROW_EXACT_ROWS
+    module = _real_qwen4_decode_module(((6, 64),) * 4, 17)
+    mx.random.seed(rows)
+    inputs = (mx.random.normal((rows, 1, 2560)) * 0.5).astype(mx.bfloat16)
+    conv_state = (mx.random.normal((rows, 3, C)) * 0.5).astype(mx.bfloat16)
+    recurrent_state = mx.random.normal((rows, HV, DV, DK)) * 0.05
+    batch = ArraysCache(size=2)
+    batch[0], batch[1] = conv_state, recurrent_state
+    engaged = []
+    launch = prework_mod.qwen4_batch_decode_step_fused
+
+    def counted(*args):
+        engaged.append(args[0].shape[0])
+        return launch(*args)
+
+    monkeypatch.setattr(prework_mod, "qwen4_batch_decode_step_fused", counted)
+    got = module(inputs, cache=batch)
+    mx.eval(got, batch[0], batch[1])
+    assert engaged == [rows]
+    for r in range(rows):
+        alone = ArraysCache(size=2)
+        alone[0], alone[1] = conv_state[r : r + 1], recurrent_state[r : r + 1]
+        want = module(inputs[r : r + 1], cache=alone)
+        mx.eval(want, alone[0], alone[1])
+        assert _same(want, got[r : r + 1]), r
+        assert _same(alone[0], batch[0][r : r + 1]), r
+        assert _same(alone[1], batch[1][r : r + 1]), r
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("rows", [2, 5, 8, 16])
+def test_qwen4_batched_decode_step_equals_one_row_steps(rows):
+    """Each row of the batched step launch (outputs, next conv and recurrent
+    states) equals the B1 decode step on that row's inputs and states."""
+    mx.random.seed(40 + rows)
+    conv_w = (mx.random.normal((C, 4, 1)) * 0.3).astype(mx.bfloat16)
+    q_scale = mx.array(DK**-0.5, dtype=mx.bfloat16)
+    A_log = (mx.random.normal((HV,)) * 0.5).astype(mx.bfloat16)
+    dt_bias = (mx.random.normal((HV,)) * 0.5).astype(mx.bfloat16)
+    norm_w = (1 + mx.random.normal((DV,)) * 0.1).astype(mx.bfloat16)
+    eps = mx.array(1e-6, dtype=mx.float32)
+    qkv = (mx.random.normal((rows, 1, C)) * 0.8).astype(mx.bfloat16)
+    z = (mx.random.normal((rows, 1, HV * DV)) * 0.8).astype(mx.bfloat16)
+    b = (mx.random.normal((rows, 1, HV)) * 0.8).astype(mx.bfloat16)
+    a = (mx.random.normal((rows, 1, HV)) * 0.8).astype(mx.bfloat16)
+    conv_state = (mx.random.normal((rows, 3, C)) * 0.5).astype(mx.bfloat16)
+    state = mx.random.normal((rows, HV, DV, DK)) * 0.1
+    operands = (conv_w, q_scale, A_log, dt_bias)
+    conv_out, state_out, out = prework_mod.qwen4_batch_decode_step_fused(
+        qkv, z, b, a, conv_state, *operands, state, norm_w, eps, HK, HV, DK, DV
+    )
+    for r in range(rows):
+        row = slice(r, r + 1)
+        want = prework_mod.qwen4_decode_step_fused(
+            qkv[row], z[row], b[row], a[row], conv_state[row], *operands, state[row],
+            norm_w, eps, HK, HV, DK, DV,
+        )
+        for have, expected in zip((conv_out[row], state_out[row], out[row]), want):
+            assert _same(expected, have), r
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
-@pytest.mark.parametrize("rows", [1, 2, 4, 9])
+@pytest.mark.parametrize("rows", [1, 2, 4, 9, 16])
 @pytest.mark.parametrize("seed", [7, 29])
 def test_qwen4_verify_step_kernel_equals_chained_decode_step_kernels(dtype, rows, seed):
     """The FP32 instantiation carries the unrounded conv, q/k/v, recurrence
     output and gate products that BF16 rounds away."""
+    if dtype == mx.float32 and rows > 9:
+        pytest.skip("FP32 staging exceeds 32 KB of threadgroup memory past 15 rows; "
+                    "served verify windows are BF16")
     mx.random.seed(seed)
     conv_w = (mx.random.normal((C, 4, 1)) * 0.3).astype(dtype)
     q_scale = mx.array(DK**-0.5, dtype=dtype)

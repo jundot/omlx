@@ -36,6 +36,8 @@ except ImportError:
     HAS_MLX = False
 
 from omlx.model_discovery import (
+    CLEF_HEAD_CONFIG,
+    CLEF_HEAD_WEIGHTS,
     MLX_LM_TEXT_ONLY_MODEL_TYPES,
     VLM_NATIVE_TEXT_MODEL_TYPES,
     _has_vision_subconfig,
@@ -3640,7 +3642,9 @@ def _metal_available_memory_bytes() -> int:
 
 def _source_weight_files(model_path: str | Path) -> list[Path]:
     source = Path(model_path)
-    files = sorted(source.glob("*.safetensors"))
+    files = sorted(
+        f for f in source.glob("*.safetensors") if f.name != CLEF_HEAD_WEIGHTS
+    )
     sidecar = source / "mtp" / "model_mtp.safetensors"
     if sidecar.is_file():
         config = json.loads((source / "config.json").read_text())
@@ -6809,7 +6813,10 @@ def quantize_oq_streaming(
 
     cb("saving", 92.0, "Writing model metadata")
 
-    if total_shards > 1:
+    # Without an index, mlx-vlm loads every *.safetensors file, which would
+    # include the Clef decision head copied next to the shards.
+    has_clef_head = (source / CLEF_HEAD_WEIGHTS).is_file()
+    if total_shards > 1 or has_clef_head:
         total_size = sum(f.stat().st_size for f in output.glob("*.safetensors"))
         index = {
             "metadata": {"total_size": total_size},
@@ -6879,6 +6886,10 @@ def quantize_oq_streaming(
             json.dump(imatrix_report, f, indent=2, ensure_ascii=False)
 
     _copy_model_sidecars(source, output, text_only=text_only)
+    if has_clef_head:
+        for name in (CLEF_HEAD_WEIGHTS, CLEF_HEAD_CONFIG):
+            if (source / name).is_file():
+                shutil.copy2(source / name, output / name)
 
     if mimo_multimodal:
         from .patches.mimo_v2.omnimodal import export_sidecars

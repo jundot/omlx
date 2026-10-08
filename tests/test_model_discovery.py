@@ -19,6 +19,7 @@ from omlx.model_discovery import (
     _register_model,
     _resolve_hf_cache_entry,
     _vision_weight_bytes,
+    decision_kind,
     detect_model_type,
     discover_models,
     discover_models_from_dirs,
@@ -589,6 +590,43 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
+    def test_detect_clef_needs_both_joint_head_files(self, tmp_path):
+        """Clef is a Qwen3.5 VLM checkpoint plus its decision head files."""
+        config = {
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "vision_config": {"depth": 27, "hidden_size": 1152},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        (tmp_path / "joint_head.safetensors").write_bytes(b"")
+        assert detect_model_type(tmp_path) == "vlm"
+
+        (tmp_path / "joint_head_config.json").write_text("{}")
+        assert detect_model_type(tmp_path) == "decision"
+        assert decision_kind(tmp_path) == "clef"
+
+    def test_detect_openjev_by_helper_or_directory_name(self, tmp_path):
+        config = {
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "vision_config": {"depth": 27, "hidden_size": 1152},
+        }
+        renamed = tmp_path / "jev-27b"
+        mlx_copy = tmp_path / "openjev-MLX-4bit"
+        other_family = tmp_path / "openjev-llama"
+        for path in (renamed, mlx_copy, other_family):
+            path.mkdir()
+            (path / "config.json").write_text(json.dumps(config))
+        (other_family / "config.json").write_text(json.dumps({"model_type": "llama"}))
+
+        assert detect_model_type(renamed) == "vlm"
+        (renamed / "helper").mkdir()
+        (renamed / "helper" / "shim.py").write_text("")
+        assert detect_model_type(renamed) == "decision"
+        assert decision_kind(renamed) == "openjev"
+        assert detect_model_type(mlx_copy) == "decision"
+        assert detect_model_type(other_family) == "llm"
+
     def test_detect_qwen3_causal_lm_is_llm(self, tmp_path):
         """Qwen3 with CausalLM architecture should be LLM, not embedding."""
         config = {
@@ -680,6 +718,31 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         (tmp_path / "modules.json").write_text(json.dumps(modules))
         assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_embedding_gemma2_with_vision_config_as_embedding(self, tmp_path):
+        """EmbeddingGemma 2 ships a vision_config and sentence-transformers v6 modules."""
+        config = {
+            "model_type": "embedding_gemma2",
+            "architectures": ["EmbeddingGemma2Model"],
+            "vision_config": {"model_type": "gemma4_vision", "hidden_size": 768},
+        }
+        modules = [
+            {
+                "idx": 0,
+                "name": "0",
+                "path": "",
+                "type": "sentence_transformers.base.modules.transformer.Transformer",
+            },
+            {
+                "idx": 1,
+                "name": "1",
+                "path": "1_Pooling",
+                "type": "sentence_transformers.sentence_transformer.modules.pooling.Pooling",
+            },
+        ]
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        (tmp_path / "modules.json").write_text(json.dumps(modules))
+        assert detect_model_type(tmp_path) == "embedding"
 
     def test_detect_vlm_model_type_requires_vision_config(self, tmp_path):
         """VLM_MODEL_TYPES match without vision_config should fall back to LLM."""
@@ -865,6 +928,21 @@ class TestDiscoverModels:
         assert "llama-3b" in models
         assert models["llama-3b"].model_type == "llm"
         assert models["llama-3b"].engine_type == "batched"
+
+    def test_discover_clef_as_decision_model(self, tmp_path):
+        model_dir = tmp_path / "clef-flash-4bit"
+        model_dir.mkdir()
+        config = {"model_type": "qwen3_5", "vision_config": {"depth": 27}}
+        (model_dir / "config.json").write_text(json.dumps(config))
+        (model_dir / "model.safetensors").write_bytes(b"0" * 1000)
+        (model_dir / "joint_head.safetensors").write_bytes(b"0" * 100)
+        (model_dir / "joint_head_config.json").write_text("{}")
+
+        model = discover_models(tmp_path)["clef-flash-4bit"]
+        assert model.model_type == "decision"
+        assert model.engine_type == "decision"
+        # The head is resident too, so it counts toward the memory estimate.
+        assert model.estimated_size == int(1100 * 1.05)
 
     def test_register_model_skips_duplicate_id(self, tmp_path, caplog):
         """Collision guard: a second model with an already-registered model_id is

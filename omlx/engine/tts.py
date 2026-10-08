@@ -13,7 +13,7 @@ import gc
 import logging
 import re
 from collections.abc import AsyncIterator
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, get_args, get_type_hints
 
 import mlx.core as mx
 import numpy as np
@@ -45,6 +45,34 @@ def _infer_kokoro_lang_code(voice: Optional[str]) -> Optional[str]:
         return None
     match = _KOKORO_VOICE_RE.match(voice.lower())
     return match.group(1) if match else None
+
+
+def _accepts_preset_voice(model: Any) -> bool:
+    """Return False for models with an empty preset speaker table.
+
+    Qwen3-TTS Base checkpoints have no preset speakers and reject any
+    ``voice``. OpenAI clients always send one, so it is not forwarded.
+    """
+    speakers = getattr(model, "supported_speakers", None)
+    return not (isinstance(speakers, list) and not speakers)
+
+
+def _resolve_ref_audio(model: Any, ref_audio: str) -> Any:
+    """Load ref_audio for models whose generate() accepts only an array.
+
+    Path-accepting models preprocess the file themselves (Confucius4 resamples
+    it to 16 kHz), so they keep the path.
+    """
+    try:
+        hint = get_type_hints(model.generate).get("ref_audio")
+    except Exception:
+        return ref_audio
+    members = get_args(hint) or (hint,)
+    if mx.array not in members or str in members:
+        return ref_audio
+    from mlx_audio.utils import load_audio
+
+    return load_audio(ref_audio, sample_rate=model.sample_rate)
 
 
 class TTSEngine(BaseNonStreamingEngine):
@@ -224,7 +252,8 @@ class TTSEngine(BaseNonStreamingEngine):
                 # a speaker name. Models with only 'instruct' (non-Qwen TTS)
                 # get it as a voice description fallback.
                 if "voice" in gen_params:
-                    gen_kwargs["voice"] = voice
+                    if _accepts_preset_voice(model):
+                        gen_kwargs["voice"] = voice
                 elif "instruct" in gen_params:
                     gen_kwargs["instruct"] = voice
             if instructions is not None and "instruct" in gen_params:
@@ -239,7 +268,7 @@ class TTSEngine(BaseNonStreamingEngine):
             if speed != 1.0:
                 gen_kwargs["speed"] = speed
             if ref_audio is not None and "ref_audio" in gen_params:
-                gen_kwargs["ref_audio"] = ref_audio
+                gen_kwargs["ref_audio"] = _resolve_ref_audio(model, ref_audio)
                 gen_kwargs["ref_text"] = ref_text
             # Generation params (only add non-None values)
             if temperature is not None:
@@ -349,7 +378,8 @@ class TTSEngine(BaseNonStreamingEngine):
                 gen_kwargs["streaming_interval"] = streaming_interval
             if voice is not None:
                 if "voice" in gen_params:
-                    gen_kwargs["voice"] = voice
+                    if _accepts_preset_voice(model):
+                        gen_kwargs["voice"] = voice
                 elif "instruct" in gen_params:
                     gen_kwargs["instruct"] = voice
             if instructions is not None and "instruct" in gen_params:
@@ -364,7 +394,7 @@ class TTSEngine(BaseNonStreamingEngine):
             if speed != 1.0:
                 gen_kwargs["speed"] = speed
             if ref_audio is not None and "ref_audio" in gen_params:
-                gen_kwargs["ref_audio"] = ref_audio
+                gen_kwargs["ref_audio"] = _resolve_ref_audio(model, ref_audio)
                 gen_kwargs["ref_text"] = ref_text
             if temperature is not None:
                 gen_kwargs["temperature"] = temperature

@@ -118,11 +118,11 @@ def test_long_bool_mask_turboquant_prefill_is_tiled_first(monkeypatch):
     assert calls == ["quantized"]
 
 
-def test_qwen4_mask_dense_seam_reaches_array_tiled_sdpa256(monkeypatch):
+def test_qwen4_mask_dense_seam_reaches_bounded_sdpa256(monkeypatch):
     """Production seam: on the official mask_dense path the QSA indexer
     builds an explicit array mask; with the sdpa256 patch installed that mask
-    must reach _array_tiled_sdpa256 (bounded) and never the native fused call
-    whose array-mask support could silently unfuse into the O(L^2) fp32
+    must take the bounded route, MLX's fused kernel with force_fused=True,
+    never the default dispatch that unfuses array masks into the O(L^2)
     score matrix. Uses a real Qwen4ExpAttention at production head_dim=256
     with gathered attention disabled by non-broadcast MRoPE positions."""
     from omlx import memory_monitor
@@ -209,17 +209,15 @@ def test_qwen4_mask_dense_seam_reaches_array_tiled_sdpa256(monkeypatch):
 
     calls = []
 
-    def tiled(queries, keys, values, scale, mask, sinks=None):
-        calls.append(mask)
+    def fused(queries, keys, values, **kwargs):
+        calls.append(kwargs)
         return mx.zeros(queries.shape, queries.dtype)
 
-    def boom(*args, **kwargs):
-        raise AssertionError(
-            "native fused SDPA must not see the Qwen4 explicit array mask"
-        )
+    def tiled(*args, **kwargs):
+        raise AssertionError("the fused kernel covers the Qwen4 array mask")
 
     monkeypatch.setattr(sdpa256, "_array_tiled_sdpa256", tiled)
-    monkeypatch.setattr(sdpa256.mx.fast, "scaled_dot_product_attention", boom)
+    monkeypatch.setattr(sdpa256.mx.fast, "scaled_dot_product_attention", fused)
 
     try:
         mx.random.seed(7)
@@ -229,10 +227,11 @@ def test_qwen4_mask_dense_seam_reaches_array_tiled_sdpa256(monkeypatch):
         mx.eval(out)
 
         assert out.shape == (1, prefill_len, 512)
-        assert len(calls) == 1
-        mask = calls[0]
-        assert isinstance(mask, mx.array)
-        assert 1 <= mask.ndim <= 4
+        # Other fused calls of the layer pass string masks.
+        masked = [c for c in calls if isinstance(c["mask"], mx.array)]
+        assert len(masked) == 1
+        assert masked[0]["force_fused"] is True
+        assert 1 <= masked[0]["mask"].ndim <= 4
         assert cache._omlx_last_prefill_gathered is False
     finally:
         for mod, fn in sdpa_snap.items():

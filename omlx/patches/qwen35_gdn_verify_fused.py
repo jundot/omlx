@@ -69,16 +69,14 @@ inline float gdn_decay(InT a, InT dt, float neg_a) {
     return metal::precise::exp(neg_a * static_cast<float>(sp));
 }
 
+// MLX's Sigmoid functor, rounded to InT once.
 template <typename InT>
 inline float gdn_beta(InT x) {
-    InT ax = static_cast<InT>(metal::abs(static_cast<float>(x)));
-    InT e = static_cast<InT>(metal::precise::exp(static_cast<float>(ax)));
-    auto y = 1 / (1 + e);
-    InT r = (x < 0) ? y : 1 - y;
-    return static_cast<float>(r);
+    auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
+    return static_cast<float>(static_cast<InT>((x < InT(0)) ? y : 1 - y));
 }
 
-// MLX's half softplus and sigmoid round every half op, which fast math would
+// MLX's half softplus rounds every half op, which fast math would
 // fuse away here, so each step runs in float and rounds to half explicitly.
 inline half gdn_h(float x) {
     return static_cast<half>(x);
@@ -112,14 +110,6 @@ inline float gdn_decay(half a, half dt, float neg_a) {
     return metal::precise::exp(neg_a * static_cast<float>(sp));
 }
 
-inline float gdn_beta(half x) {
-    half ax = metal::abs(x);
-    half e = gdn_h(metal::precise::exp(static_cast<float>(ax)));
-    half d = gdn_h(1.0f + static_cast<float>(e));
-    half y = gdn_h(metal::precise::divide(1.0f, static_cast<float>(d)));
-    half r = (x < half(0)) ? y : gdn_h(1.0f - static_cast<float>(y));
-    return static_cast<float>(r);
-}
 """
 
 _PROLOGUE = """
@@ -485,8 +475,43 @@ def _commit_replay(cache, index, record, lengths):
     cache._omlx_gdn_pending = (state, start, rows, keep)
 
 
+def deferred_states_ready(cache, index, length) -> bool:
+    """Whether ``record_deferred_states`` can record slot ``index`` for one
+    block covering the whole speculative window."""
+    transaction = getattr(cache, "_speculation", None)
+    return (
+        _PATCHED
+        and transaction is not None
+        and transaction["length"] == length
+        and int(index) not in transaction["records"]
+    )
+
+
+def record_deferred_states(cache, index, start, final, length, resolve):
+    """Record a recurrent slot without its per-token states: a commit keeping
+    ``0 < m < length`` tokens assigns ``resolve(m)`` (a lazy recomputation
+    of the state after ``m`` tokens), ``m = length`` keeps ``final`` and
+    ``m = 0`` restores ``start``."""
+    transaction = cache._speculation
+    transaction["records"][int(index)] = ("deferred", start, final, int(length), resolve)
+
+
+def _commit_deferred(cache, index, record, lengths):
+    _, start, final, length, resolve = record
+    if len(set(lengths)) != 1:
+        raise ValueError("Deferred recurrent states commit one shared length.")
+    keep = lengths[0]
+    if keep == 0:
+        cache[index] = start
+    elif keep == length:
+        cache[index] = final
+    else:
+        cache[index] = resolve(keep)
+
+
 def apply_arrays_cache_replay_patch() -> bool:
-    """Teach ArraysCache transactions the ``replay`` and ``window_pair`` kinds."""
+    """Teach ArraysCache transactions the ``replay``, ``window_pair`` and
+    ``deferred`` kinds."""
     global _PATCHED, _NORM_CLASS
     if _PATCHED:
         return True
@@ -498,7 +523,7 @@ def apply_arrays_cache_replay_patch() -> bool:
 
     def _recorded_length(self, index):
         record = self._speculation["records"].get(index)
-        if record is not None and record[0] == "replay":
+        if record is not None and record[0] in ("replay", "deferred"):
             return record[3]
         if record is not None and record[0] == "window_pair":
             return record[2].shape[1]
@@ -511,7 +536,7 @@ def apply_arrays_cache_replay_patch() -> bool:
             custom = {
                 index: record
                 for index, record in transaction["records"].items()
-                if record[0] in ("replay", "window_pair")
+                if record[0] in ("replay", "window_pair", "deferred")
             }
         if not custom:
             return orig_commit(self, lengths, generation)
@@ -524,6 +549,8 @@ def apply_arrays_cache_replay_patch() -> bool:
         for index, record in custom.items():
             if record[0] == "replay":
                 _commit_replay(self, index, record, resolved)
+            elif record[0] == "deferred":
+                _commit_deferred(self, index, record, resolved)
             else:
                 _commit_window(self, index, record, resolved)
 

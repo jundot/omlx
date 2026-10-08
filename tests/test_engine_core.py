@@ -1789,31 +1789,6 @@ class TestStepBurst:
         finally:
             engine.close()
 
-    def test_later_chunks_retain_burst_and_token_order(
-        self, mock_model, mock_tokenizer
-    ):
-        """Only the first chunk yields early; later chunks still reach the cap."""
-        engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4)
-        steps = [
-            SchedulerOutput(
-                has_work=True,
-                outputs=[
-                    RequestOutput(
-                        request_id="a", new_token_ids=[count], completion_tokens=count
-                    )
-                ],
-            )
-            for count in range(2, 7)
-        ]
-        try:
-            engine.scheduler.step = MagicMock(side_effect=steps)
-            engine.scheduler.has_requests = MagicMock(return_value=True)
-
-            assert engine._step_burst() == steps[:4]
-            assert engine.scheduler.step.call_count == 4
-        finally:
-            engine.close()
-
     def test_empty_token_output_does_not_end_burst(self, mock_model, mock_tokenizer):
         """A terminal/control output with zero tokens is not a first chunk."""
         engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4)

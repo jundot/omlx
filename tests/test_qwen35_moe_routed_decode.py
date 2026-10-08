@@ -49,12 +49,20 @@ def _patched_block(monkeypatch):
 
 
 def _block(
-    hidden, inter, top_k=10, bits=4, group_size=64, seed=0, experts=EXPERTS, quantized_shared=True
+    hidden,
+    inter,
+    top_k=10,
+    bits=4,
+    group_size=64,
+    seed=0,
+    experts=EXPERTS,
+    quantized_shared=True,
+    dtype=mx.bfloat16,
 ):
     """A block laid out like Qwen3.8-Flash-Next oQ: quantized routed experts,
     8-bit shared expert (gs128 where the shape allows), 8-bit gs64
-    shared-expert gate, bf16 router. ``quantized_shared=False`` keeps the
-    shared expert and its gate in bf16."""
+    shared-expert gate, ``dtype`` router. ``quantized_shared=False`` keeps the
+    shared expert and its gate in ``dtype``."""
     from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 
     from omlx.patches.qwen35_moe_gate_up import apply_qwen35_moe_gate_up_fusion
@@ -68,7 +76,7 @@ def _block(
         num_experts_per_tok=top_k,
     )
     block = Qwen3_5MoeSparseMoeBlock(args)
-    block.set_dtype(mx.bfloat16)
+    block.set_dtype(dtype)
     sm = block.switch_mlp
     for name in ("gate_proj", "up_proj", "down_proj"):
         setattr(sm, name, getattr(sm, name).to_quantized(group_size, bits))
@@ -130,11 +138,17 @@ def test_fused_decode_is_bit_identical(hidden, inter, bits, group_size, monkeypa
     assert not routed._DISABLED
 
 
-def test_bf16_shared_expert_stays_composed_and_bit_identical():
-    block = _block(2560, 640, bits=5, quantized_shared=False)
+@pytest.mark.parametrize("experts", [EXPERTS, 512])
+def test_bf16_shared_expert_stays_composed_and_bit_identical(experts):
+    # 512 experts select inside the gate+up launch, 32 in the routing launch.
+    # The 512-expert block takes the smaller shape to fit CI runner memory.
+    hidden, inter = (2560, 640) if experts == EXPERTS else (1024, 320)
+    block = _block(hidden, inter, bits=5, quantized_shared=False, experts=experts)
     for step in range(4):
-        x = (mx.random.normal((1, 1, 2560)) * (0.5 + step)).astype(mx.bfloat16)
-        assert not routed.routed_decode_plan(block, x).fold
+        x = (mx.random.normal((1, 1, hidden)) * (0.5 + step)).astype(mx.bfloat16)
+        plan = routed.routed_decode_plan(block, x)
+        assert not plan.fold
+        assert routed._topk_folds(plan, block.gate(x)) == (experts == 512)
         ref, out = _pair(block, x)
         assert _same_bits(ref, out)
     assert routed._PROVEN and not routed._DISABLED
@@ -149,7 +163,7 @@ def test_fp32_kernels_match_mlx_mat_vecs(bits):
     reads one expert; zero scores with the gate at sigmoid 1 the shared one)."""
     from mlx_vlm.models.activations import swiglu
 
-    hidden, inter, gs, top_k = 2560, 640, 64, routed.TOP_K
+    hidden, inter, gs, top_k = 2560, 640, 64, 10
     f32 = mx.float32
     mx.random.seed(40 + bits)
 
@@ -186,6 +200,7 @@ def test_fp32_kernels_match_mlx_mat_vecs(bits):
             inputs=[x, *experts_gate_up, ids, *shared_gate, *shared_up, *gate_row],
             template=[
                 ("T", f32), ("K", hidden), ("NI", inter), ("RPS", 2), ("NSG", 2), ("NS", inter),
+                ("TOPK", top_k),
             ],
             grid=(32, 2 * (1 + inter // 4 + top_k * inter // 4), 1),
             threadgroup=(32, 2, 1),
@@ -208,16 +223,76 @@ def test_fp32_kernels_match_mlx_mat_vecs(bits):
                     scores,
                 ],
                 template=[
-                    ("T", f32), ("K", inter), ("N", hidden), ("RPS", 4), ("KS", inter),
-                    ("NPART", top_k + 1),
+                    ("T", f32), ("K", inter), ("N", hidden), ("RPS", routed._down_rows(1)),
+                    ("KS", inter), ("NPART", top_k + 1), ("TOPK", top_k),
                 ],
-                grid=(32, (top_k + 1) * hidden // 4, 1),
+                grid=(32, (top_k + 1) * hidden // routed._down_rows(1), 1),
                 threadgroup=(32, top_k + 1, 1),
                 output_shapes=[(hidden,)],
                 output_dtypes=[f32],
             )[0]
             # The +0 folds of the combine turn -0 into +0, so compare values.
             assert mx.array_equal(row, ref_down[j] if j < top_k else ref_shared).item()
+
+
+@pytest.mark.parametrize("bits", [4, 5])
+def test_fp32_folded_routing_matches_the_routing_launch(bits):
+    """The gate+up launch that selects its rows' experts itself, in FP32 (BF16
+    outputs hide one-ulp differences): per row, the selection and scores of
+    the routing launch, and the gate+up rows of the launch fed with them.
+    Router logits repeat, so probabilities tie."""
+    from omlx.patches import qwen35_moe_router as router
+
+    hidden, inter, gs, experts, rows, top_k = 1024, 384, 64, 128, 3, 10
+    f32 = mx.float32
+    mx.random.seed(50 + bits)
+
+    def quantized(shape, group_size, b):
+        return mx.quantize(mx.random.normal(shape) * 0.05, group_size, b)
+
+    experts_gate_up = quantized((experts, 2 * inter, hidden), gs, bits)
+    shared = quantized((inter, hidden), 128, 8) + quantized((inter, hidden), 128, 8)
+    gate_row = quantized((1, hidden), 64, 8)
+    fmt = routed._Format
+    formats = (fmt(bits, gs, True), fmt(8, 128, True), fmt(8, 64, False))
+    x = mx.random.normal((rows, hidden))
+    logits = mx.random.normal((rows, experts // 2)) * 2
+    logits = mx.concatenate([logits, logits[:, ::-1]], axis=-1)
+    template = [
+        ("T", f32), ("K", hidden), ("NI", inter), ("RPS", 2), ("NSG", 2), ("NS", inter),
+        ("TOPK", top_k),
+    ]
+    width = top_k * inter + inter + 1
+    blocks = 1 + inter // 4 + top_k * inter // 4
+    h, inds, scores = routed._gate_up_topk_kernel(*formats)(
+        inputs=[x, *experts_gate_up, logits, *shared, *gate_row],
+        template=template + [("NE", experts), ("M", rows), ("YW", width)],
+        grid=(32, 2 * blocks * rows, 1),
+        threadgroup=(32, 2, 1),
+        output_shapes=[(rows, width), (rows, top_k), (rows, top_k)],
+        output_dtypes=[f32, mx.uint32, f32],
+    )
+    mx.eval(router.softmax_topk_rows(logits.astype(mx.bfloat16), top_k))
+    ref_inds, ref_scores = router._SOFTMAX_TOPK_ROWS_KERNEL(
+        inputs=[logits],
+        template=[("T", f32), ("NE", experts), ("K", top_k)],
+        grid=(32, rows, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(rows, top_k), (rows, top_k)],
+        output_dtypes=[mx.uint32, f32],
+    )
+    assert mx.array_equal(inds, ref_inds).item()
+    assert mx.array_equal(scores.view(mx.uint32), ref_scores.view(mx.uint32)).item()
+    for r in range(rows):
+        ref_h = routed._gate_up_kernel(*formats)(
+            inputs=[x[r], *experts_gate_up, ref_inds[r], *shared, *gate_row],
+            template=template,
+            grid=(32, 2 * blocks, 1),
+            threadgroup=(32, 2, 1),
+            output_shapes=[(width,)],
+            output_dtypes=[f32],
+        )[0]
+        assert mx.array_equal(h[r].view(mx.uint32), ref_h.view(mx.uint32)).item()
 
 
 def test_experts_past_the_bound_view_are_read_from_the_stacked_weights():
@@ -260,6 +335,55 @@ def test_tied_router_logits_route_like_the_served_block():
 
 
 
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("top_k", [8, 10])
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+def test_fast_down_and_top8_are_bit_identical(dtype, top_k, bits):
+    """Qwen3.5/3.6-35B-A3B layout: hidden 2048 and intermediate 512 put the
+    down projection on ``qmv_fast`` too."""
+    block = _block(1024, 512, bits=bits, top_k=top_k, dtype=dtype)
+    for step in range(8):
+        x = (mx.random.normal((1, 1, 1024)) * (0.5 + step)).astype(dtype)
+        plan = routed.routed_decode_plan(block, x)
+        assert plan.fold and plan.dtype == dtype and plan.top_k == top_k
+        ref, out = _pair(block, x)
+        assert _same_bits(ref, out)
+    assert not routed._DISABLED
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("quantized_shared", [True, False])
+def test_top8_routing_folded_into_gate_up_is_bit_identical(dtype, quantized_shared):
+    """128 experts select inside the gate+up launch; an unquantized shared
+    expert runs composed and enters the combine."""
+    block = _block(
+        1024, 512, top_k=8, experts=128, quantized_shared=quantized_shared, dtype=dtype
+    )
+    for step in range(4):
+        x = (mx.random.normal((1, 1, 1024)) * (0.5 + step)).astype(dtype)
+        plan = routed.routed_decode_plan(block, x)
+        assert plan.fold == quantized_shared
+        assert routed._topk_folds(plan, block.gate(x))
+        ref, out = _pair(block, x)
+        assert _same_bits(ref, out)
+    assert routed._PROVEN and not routed._DISABLED
+
+
+def test_mismatched_dtypes_keep_the_composed_body():
+    block = _block(1024, 512, top_k=8, dtype=mx.float16)
+    x = mx.zeros((1, 1, 1024), mx.float16)
+    # A router of another dtype runs as the block's own linear.
+    gate = block.gate["weight"]
+    block.gate["weight"] = gate.astype(mx.bfloat16)
+    assert routed.routed_decode_plan(block, x).router_logits is None
+    block.gate["weight"] = gate
+    assert routed.routed_decode_plan(block, x.astype(mx.bfloat16)) is None
+    down = block.switch_mlp.down_proj
+    down["scales"] = down["scales"].astype(mx.bfloat16)
+    down["biases"] = down["biases"].astype(mx.bfloat16)
+    assert routed.routed_decode_plan(block, x) is None
+
+
 @pytest.mark.parametrize(
     "owner,names",
     [
@@ -283,9 +407,8 @@ def test_plan_follows_replaced_weights(owner, names):
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"hidden": 1024, "inter": 512},  # down would take qmv_fast
         {"hidden": 960, "inter": 320},  # gate+up would take qmv
-        {"hidden": 1024, "inter": 320, "top_k": 8},
+        {"hidden": 1024, "inter": 320, "top_k": 6},
         {"hidden": 1024, "inter": 320, "bits": 3},
     ],
 )

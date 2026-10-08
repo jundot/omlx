@@ -491,14 +491,24 @@ def test_qwen4_exp_sanitize_recenters_ones_centered_base_and_mtp(tmp_path, caplo
             )
             for key, value in canonical.items()
         }
+        # A direct gamma below 0.5 with more mantissa bits than its BF16
+        # residual can keep (0.2001953125 - 1 needs nine).
+        fp32_key = "mtp.pre_fc_norm_embedding.weight"
+        shifted[fp32_key] = mx.array(
+            [0.2001953125, 0.25, 0.30078125, 0.3515625], dtype=mx.bfloat16
+        )
 
         with caplog.at_level("INFO"):
             result = Model.sanitize(model, dict(shifted))
 
+        # Every other gamma recentres exactly in BF16 and keeps that dtype.
         for key in target_keys:
-            assert result[key].dtype == mx.float32
+            assert result[key].dtype == (
+                mx.float32 if key == fp32_key else mx.bfloat16
+            )
             assert mx.array_equal(
-                1.0 + result[key], shifted[key].astype(mx.float32)
+                1.0 + result[key].astype(mx.float32),
+                shifted[key].astype(mx.float32),
             ).item()
 
         gated_key = "language_model.model.layers.0.linear_attn.norm.weight"

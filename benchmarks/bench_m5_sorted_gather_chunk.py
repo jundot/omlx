@@ -6,11 +6,9 @@ Qwen4-Exp, 512 experts / top-10 / hidden 2560 / inter 640, 4-bit gs64 with
 the fused gate+up layout) and times the sorted SwitchGLU path for several
 prefill chunk widths under three dispatch modes:
 
-- ``sorted``      raw ``sorted_indices=True`` (NAX rhs kernel; corrupt past
-                  32768 rows on mlx <= 0.32.2, timed for reference only)
-- ``unsorted``    what the pre-segmenting M5 reroute did past the row cap
-- ``segmented``   the oMLX reroute with <=32768-row sorted slices (the
-                  NAX route below switched off)
+- ``sorted``      raw ``sorted_indices=True`` (mlx's NAX rhs kernel, one call
+                  for any row count since mlx 0.32.3)
+- ``unsorted``    what the M5 reroute does for ``K % 64 != 0``
 - ``nax``         the oMLX NAX route (``m5_gather_qmm_nax``: segmented tile
                   scheduling, one call for any row count)
 
@@ -23,7 +21,6 @@ be judged on numbers. Run from a checkout with the reroute installed::
 from __future__ import annotations
 
 import argparse
-import os
 import time
 
 import mlx.core as mx
@@ -85,9 +82,7 @@ def main():
     ap.add_argument("--qmode", default="affine", choices=["affine", "mxfp4"])
     ap.add_argument("--chunks", type=int, nargs="+", default=[2048, 4096, 8192])
     ap.add_argument("--iters", type=int, default=5)
-    ap.add_argument(
-        "--modes", nargs="+", default=["sorted", "unsorted", "segmented", "nax"]
-    )
+    ap.add_argument("--modes", nargs="+", default=["sorted", "unsorted", "nax"])
     args = ap.parse_args()
 
     reroute.apply_m5_gather_qmm_workaround()
@@ -121,14 +116,10 @@ def main():
                 sorted_flag, gather = True, raw
             elif mode == "unsorted":
                 sorted_flag, gather = False, raw
-            elif mode in ("segmented", "nax"):
+            elif mode == "nax":
                 sorted_flag, gather = True, reroute._gather_qmm_rerouted
             else:
                 raise SystemExit(f"unknown mode {mode}")
-            if mode == "segmented":
-                os.environ["OMLX_M5_GATHER_QMM_NAX"] = "0"
-            else:
-                os.environ.pop("OMLX_M5_GATHER_QMM_NAX", None)
 
             def fn(x=x, inds=inds, sorted_flag=sorted_flag, gather=gather):
                 return _layer(

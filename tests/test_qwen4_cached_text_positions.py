@@ -18,7 +18,12 @@ def _adapter():
 
 
 @pytest.mark.parametrize("cached_tokens", [40000, 40001])
-def test_complete_text_cache_hit_keeps_gathered_decode_and_verify(cached_tokens):
+def test_complete_text_cache_hit_keeps_gathered_decode_and_verify(cached_tokens, monkeypatch):
+    import omlx.models.vlm as vlm_module
+
+    # This checks the cache-hit proof, not the threshold policy (which keeps
+    # the masked path while fused attention rows run): pin the gathered crossover.
+    monkeypatch.setattr(vlm_module, "_STEP_TEXT_POSITIONS_MIN_CONTEXT", vlm_module._GATHERED_STEP_MIN_CONTEXT)
     scheduler = _make_scheduler()
     request = _make_request("cached-text", 40001)
     scheduler.add_request(request)

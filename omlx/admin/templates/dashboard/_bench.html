@@ -4,7 +4,7 @@
                     <span>{{ t(label_key) }}</span>
                     <i data-lucide="info"
                        class="w-3 h-3 text-neutral-400 flex-shrink-0 cursor-help"
-                       @mouseenter="benchTip = { text: `{{ t(tooltip_key) }}`, el: $event.target }; $nextTick(() => { const r = $event.target.getBoundingClientRect(); const tip = $refs.benchTipEl; const tw = tip.offsetWidth; let x = r.left + r.width / 2 - tw / 2; if (x + tw > window.innerWidth - 8) x = window.innerWidth - 8 - tw; if (x < 8) x = 8; tip.style.left = x + 'px'; tip.style.top = (r.top - tip.offsetHeight - 8) + 'px'; })"
+                       @mouseenter="benchTip = { text: window.t('{{ tooltip_key }}'), el: $event.target }; $nextTick(() => { const r = $event.target.getBoundingClientRect(); const tip = $refs.benchTipEl; const tw = tip.offsetWidth; let x = r.left + r.width / 2 - tw / 2; if (x + tw > window.innerWidth - 8) x = window.innerWidth - 8 - tw; if (x < 8) x = 8; tip.style.left = x + 'px'; tip.style.top = (r.top - tip.offsetHeight - 8) + 'px'; })"
                        @mouseleave="benchTip = null"></i>
                 </div>
             </th>

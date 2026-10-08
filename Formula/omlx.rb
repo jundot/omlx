@@ -47,7 +47,11 @@ class Omlx < Formula
     working_dir var
     log_path var/"log/omlx.log"
     error_log_path var/"log/omlx.log"
-    environment_variables PATH: std_service_path_env
+    # launchd KeepAlive respawns the process, so it is a supervisor in the
+    # sense /admin/api/server/restart expects: declare it so the dashboard
+    # restart button works under `brew services` instead of returning 503.
+    environment_variables PATH: std_service_path_env,
+                          OMLX_SUPERVISED: "launchd"
   end
 
   def install
@@ -84,6 +88,18 @@ class Omlx < Formula
     pip_install = [libexec/"bin/pip", "install", *pip_flags, "--no-binary", no_binary]
 
     if build.with?("custom-kernel")
+      # `metal` ships with Xcode, not the Command Line Tools.
+      unless quiet_system("/usr/bin/xcrun", "-f", "metal")
+        odie <<~EOS
+          --with-custom-kernel requires the Metal compiler, but `xcrun -f metal` found none.
+          It ships with full Xcode, and on current Xcode versions is a separate component:
+
+            xcodebuild -downloadComponent MetalToolchain
+
+          Otherwise install omlx without the custom kernels: brew install omlx
+        EOS
+      end
+
       kernel_sources = CUSTOM_KERNELS.map do |kernel|
         buildpath/"omlx/custom_kernels/#{kernel}/csrc"
       end

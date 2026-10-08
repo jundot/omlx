@@ -424,22 +424,60 @@ def _patch_qwen3_5_text_model(q35: Any) -> None:
         input_embeddings=None,
         n_confirmed: int = 0,
     ):
+        import mlx.core as mx
+
         if input_embeddings is not None:
             hidden_states = input_embeddings
         else:
             hidden_states = self.embed_tokens(inputs)
 
+        # Pipeline-aware (oMLX #3518). Under ``pipeline(group)`` each rank owns
+        # ``pipeline_layers`` (``self.layers`` holds ``None`` for the other
+        # ranks' layers) and hands the hidden state to its neighbour. With one
+        # rank (``pipeline_rank=0``, ``pipeline_size=1``) this is exactly the
+        # single-host forward.
+        pipeline_rank = getattr(self, "pipeline_rank", 0)
+        pipeline_size = getattr(self, "pipeline_size", 1)
+        layers = self.pipeline_layers
+
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(layers)
 
-        fa_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
-        ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
+        fa_mask = None
+        ssm_mask = None
+        if self.fa_idx is not None:
+            fa_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
+        if self.ssm_idx is not None:
+            ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
 
-        for layer, c in zip(self.layers, cache):
+        if pipeline_rank < pipeline_size - 1:
+            hidden_states = mx.distributed.recv_like(hidden_states, pipeline_rank + 1)
+
+        for layer, c in zip(layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(
                 hidden_states, mask=mask, cache=c, n_confirmed=n_confirmed
             )
+
+        if pipeline_rank != 0:
+            hidden_states = mx.distributed.send(
+                hidden_states, (pipeline_rank - 1) % pipeline_size
+            )
+            if cache and cache[-1] is not None:
+                # Keep the send in the lazy graph (same device as mlx-lm).
+                last = cache[-1]
+                if hasattr(last, "keys"):
+                    last.keys = mx.depends(last.keys, hidden_states)
+                else:
+                    last[0] = mx.depends(last[0], hidden_states)
+
+        if pipeline_size > 1:
+            # Every rank needs the final hidden state (norm, lm_head and the
+            # MTP head run redundantly on all ranks). Rank 0 holds the LAST
+            # layers, so its slice is the true output.
+            hidden_states = mx.distributed.all_gather(hidden_states)[
+                : hidden_states.shape[0]
+            ]
 
         # PR 990: return pre-norm hidden so the MTP head can fuse it. The
         # wrapping ``TextModel.__call__`` applies ``self.model.norm`` on top

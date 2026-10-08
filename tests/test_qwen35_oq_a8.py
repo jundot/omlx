@@ -442,6 +442,40 @@ def test_unsupported_bit_widths_are_not_claimed(bits):
     assert dispatch.classify_linear(_quantized_linear(256, 128, bits)) is None
 
 
+@requires_kernels
+@pytest.mark.parametrize(
+    "bits, kernel", [(4, "q4a8_g64"), (5, "q5a8_g64")]
+)
+def test_q4_and_q5_gs64_projections_get_an_a8_plan(bits, kernel):
+    """The supported dense contract: affine Q4 and Q5 at GS64 route to A8."""
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    plan = dispatch.classify_linear(_quantized_linear(256, 128, bits))
+    assert plan is not None
+    assert (plan.bits, plan.group_size, plan.kernel) == (bits, 64, kernel)
+
+
+@pytest.mark.parametrize("bits", [6, 8])
+def test_q6_and_q8_projections_have_no_a8_plan(bits):
+    """Q6/Q8 stay on the A16 path, at either supported group size."""
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    for group_size in (64, 128):
+        linear = _quantized_linear(256, 128, bits, group_size=group_size)
+        assert dispatch.classify_linear(linear) is None
+
+
+@requires_kernels
+@pytest.mark.parametrize("bits", [4, 5])
+def test_output_width_that_does_not_tile_has_no_a8_plan(bits):
+    """N must be a multiple of the tile width (64). Qwen3.8's linear-attention
+    in_proj_a / in_proj_b are N=48, so those projections stay on the A16 path."""
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    assert dispatch.classify_linear(_quantized_linear(256, 48, bits)) is None
+    assert dispatch.classify_linear(_quantized_linear(256, 64, bits)) is not None
+
+
 def test_group_size_128_is_not_claimed():
     from omlx.patches import qwen35_oq_a8 as dispatch
 

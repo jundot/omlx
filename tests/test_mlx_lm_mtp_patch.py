@@ -82,7 +82,9 @@ class TestCacheRollback:
 
 class TestMtpBoundaryCommit:
     @staticmethod
-    def _run_full_accept_cycle(monkeypatch, *, emitted, drafts, clamp=None):
+    def _run_full_accept_cycle(
+        monkeypatch, *, emitted, drafts, clamp=None, context_copy=None
+    ):
         import mlx.core as mx
 
         from omlx.patches.mlx_lm_mtp import batch_generator as bg
@@ -104,6 +106,8 @@ class TestMtpBoundaryCommit:
             drafts=mx.array(draft_ids, dtype=mx.uint32),
             draft_lps=[mx.zeros((32,)) for _ in draft_ids],
         )
+        if context_copy is not None:
+            state.context_copy = context_copy
 
         def logits_for(targets):
             rows = []
@@ -180,6 +184,29 @@ class TestMtpBoundaryCommit:
         assert emitted_sources[-1] == boundary_source
         assert len(batch.tokens[0]) == 4
         assert cache.offset == 4
+
+    def test_boundary_emit_replaces_copied_drafts(self, monkeypatch):
+        from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+        copier = SimpleNamespace(
+            extend=lambda history, committed: False,
+            propose=lambda limit: [1, 2],
+            observe=lambda accepted, drafted=None: None,
+        )
+        original = bg._materialize_mtp_boundary_emit
+        copy_labels = []
+
+        def materialize(batch, state):
+            copy_labels.append(state.copy_drafts)
+            original(batch, state)
+
+        monkeypatch.setattr(bg, "_materialize_mtp_boundary_emit", materialize)
+        _batch, state, _cache = self._run_full_accept_cycle(
+            monkeypatch, emitted=2, drafts=1, context_copy=copier
+        )
+
+        assert copy_labels == [True]
+        assert state.copy_drafts is False
 
 
 class TestQwen35Model:
@@ -2791,8 +2818,12 @@ def _quiet_prefill_tracker():
     from omlx.prefill_progress import get_prefill_tracker
 
     get_prefill_tracker().clear()
+    # Batch parking verdicts outlive a cohort (per model object); a model a
+    # fixture reuses must not start a test parked by an earlier one.
+    bg._BATCH_PARK_MEMORY.clear()
     yield
     get_prefill_tracker().clear()
+    bg._BATCH_PARK_MEMORY.clear()
 
 
 class TestLoopTaxHygiene:
@@ -4034,6 +4065,42 @@ def test_sparse_stochastic_acceptance_preserves_filtered_target_marginal():
         mx.set_default_device(previous_device)
 
 
+@pytest.mark.parametrize("top_k", [0, 3])
+@pytest.mark.parametrize("copied", [3, 1, 0])
+def test_copied_drafts_preserve_filtered_target_marginal(top_k, copied):
+    """A context copy is a deterministic draft; with its one-hot q the emitted
+    token still follows the filtered target, whether the copied token is the
+    likely one (3), an unlikely one (1) or, at top-k 3, outside the support (0).
+    """
+    from omlx.utils.sampling import make_sampler
+
+    previous_device = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        mx.random.seed(787 + copied)
+        sampler = make_sampler(temp=0.6, top_k=top_k)
+        target = mx.array([0.05, 0.1, 0.3, 0.55])
+        lp = mx.broadcast_to(mx.log(target), (3, 4))
+        scaled = mx.log(target) / 0.6
+        if top_k:
+            scaled = mx.where(mx.arange(4) == 0, -float("inf"), scaled)
+        filtered = mx.softmax(scaled, axis=-1)
+        drafts = mx.array([copied, copied], dtype=mx.uint32)
+        q = bg._copy_draft_q([copied, copied], 4)
+        counts = mx.zeros((4,), dtype=mx.int32)
+        for _ in range(64):
+            samples = []
+            for _ in range(64):
+                result = bg._stochastic_verify_tokens(sampler, lp, drafts, q)
+                samples.append(mx.where(result[0] > 0, result[1], result[3]))
+            emitted = mx.stack(samples)
+            counts += (emitted[:, None] == mx.arange(4)).sum(axis=0)
+            mx.eval(counts)
+        assert mx.all(mx.abs(counts / 4096 - filtered) < 0.03), counts.tolist()
+    finally:
+        mx.set_default_device(previous_device)
+
+
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("temperature", [0.7, 1.0])
 def test_acceptance_density_matches_low_precision_sampler(dtype, temperature):
@@ -4150,12 +4217,14 @@ def _model(family):
 
         return nh.Model(nh.ModelArgs.from_dict(TINY_CONFIG))
     if family == "glm":
+        from test_glm_moe_dsa_patch import _glm_generate_patch_installed
         from test_glm_mtp_patch import TINY_CFG
 
         from omlx.patches.glm_moe_dsa import apply_glm_moe_dsa_patch
         from omlx.patches.mlx_lm_mtp import glm_moe_dsa_model
 
-        apply_glm_moe_dsa_patch()
+        with _glm_generate_patch_installed():
+            apply_glm_moe_dsa_patch()
         glm_moe_dsa_model.apply()
         from mlx_lm.models.glm_moe_dsa import Model, ModelArgs
 
@@ -4307,6 +4376,8 @@ def _join_as_batch_row_finishes(model, prompts, joined_prompt, max_tokens=40):
     that singleton with the pending prompt. A one-token prompt splits into
     generation at once, like the scheduler's externally prefilled inserts.
     """
+    # Shared MTP must activate: no parking verdict from an earlier run.
+    bg._BATCH_PARK_MEMORY.clear()
     gen = BatchGenerator(
         model,
         sampler=lambda lp: mx.argmax(lp, -1),
@@ -4515,6 +4586,71 @@ def test_multi_request_mtp_or_singleton_only_matches_standard(
     finally:
         mlx_lm_mtp.set_mtp_active(previous)
         mlx_lm_mtp.set_mtp_depth(depth)
+
+
+@pytest.mark.parametrize("family", ["qwen", "qwen4"])
+def test_context_copy_drafts_keep_greedy_output(family, monkeypatch):
+    """Copied drafts never change greedy output, whichever of them is wrong.
+
+    The proposer is replaced by the true continuation with one token flipped
+    at a position that moves every cycle, so the widest (16-row) windows are
+    verified with accepted lengths from none to all.
+    """
+    from omlx.patches.mlx_lm_mtp import context_copy
+
+    widest = context_copy.MAX_COPY
+    flips = (0, 1, 7, widest - 1, widest)  # ``widest``: nothing flipped
+    previous = mlx_lm_mtp.is_mtp_active()
+    try:
+        mlx_lm_mtp.set_mtp_active(True)
+        mx.random.seed(173)
+        model = _model(family)
+        mx.eval(model.parameters())
+        host = getattr(
+            model, "_language_model", getattr(model, "language_model", model)
+        )
+        prompt = [3, 4, 5, 6, 7, 8, 9, 10]
+        host._omlx_mtp_decode_enabled = False
+        expected, _ = generate(model, [prompt], [64])
+        host._omlx_mtp_decode_enabled = True
+        accepted = []
+
+        def propose(self, limit):
+            done = len(self._ids) - len(prompt)
+            copied = list(expected[0][done : done + min(limit, widest)])
+            wrong = flips[len(accepted) % len(flips)]
+            if wrong < len(copied):
+                copied[wrong] ^= 1
+            return copied if len(copied) >= 2 else []
+
+        def observe(self, count, drafted):
+            accepted.append(count)
+
+        monkeypatch.setattr(context_copy.ContextCopy, "propose", propose)
+        monkeypatch.setattr(context_copy.ContextCopy, "observe", observe)
+        actual, _ = generate(model, [prompt], [64])
+        assert actual == expected
+        assert set(flips) <= set(accepted)
+    finally:
+        mlx_lm_mtp.set_mtp_active(previous)
+
+
+@pytest.mark.parametrize("wide_window", [False, True])
+def test_context_copy_width_follows_the_targets_verify_window(wide_window):
+    """A verbatim run after a whole accept copies 15 tokens only for a target
+    that verifies 16-row windows; other targets (GLM-5.3 rolls back at most
+    8 rows) keep 7-token copies."""
+    from omlx.patches.mlx_lm_mtp import context_copy
+
+    source = list(range(1000, 1200))
+    history = source + source[:100]  # the tail repeats the source verbatim
+    copier = context_copy.ContextCopy(wide_window=wide_window)
+    copier.extend(history, [])
+    assert copier.propose(64) == source[100:107]
+    copier.observe(7, 7)
+    copier.extend(history + source[100:107], [])
+    expected = 15 if wide_window else 7
+    assert copier.propose(64) == source[107 : 107 + expected]
 
 
 @pytest.mark.parametrize("size", [2, 4])
@@ -5595,3 +5731,73 @@ def test_spec_command_buffers_restore_caps_after_the_step(monkeypatch, raised):
         raise RuntimeError("step failed")
     assert inside == (bg._SPEC_BUFFER_CAPS if raised else (50, 50))
     assert caps[-1] == (50, 50)
+
+
+def test_batch_park_verdict_outlives_its_cohort():
+    """MTP parked at k rows keeps new cohorts of k or more rows parked for what
+    is left of the park, until a cohort where MTP holds up clears it."""
+    from omlx.patches.mlx_lm_mtp.batch_policy import ParkMemory
+
+    memory = ParkMemory()
+    lost = BatchPolicy(range(4), 3)
+    lost.park()
+    memory.parked(lost)
+    for _ in range(28):
+        memory.tick()
+    wider, narrower = BatchPolicy(range(8), 3), BatchPolicy(range(2), 3)
+    memory.seed(wider)
+    memory.seed(narrower)
+    # 128 - 28 steps of the park are left; the next park doubles once.
+    assert wider.remaining == 100 and wider.cooldown == 256
+    assert narrower.remaining == 0
+    fixed = BatchPolicy(range(8), 3, fixed=True)
+    memory.seed(fixed)
+    assert not fixed.needs_standard()
+
+    short = BatchPolicy(range(8), 3)
+    short.decisions = 31
+    memory.retired(short)
+    again = BatchPolicy(range(4), 3)
+    memory.seed(again)
+    assert again.remaining == 100
+    held = BatchPolicy(range(8), 3)
+    held.decisions = 32
+    memory.retired(held)
+    fresh = BatchPolicy(range(8), 3)
+    memory.seed(fresh)
+    assert fresh.remaining == 0
+
+
+def test_batch_park_expires_while_cohorts_come_and_go():
+    """A park ends on the model's step clock, not per cohort: with a cohort
+    change every 50-150 steps and MTP winning once measured again, new
+    cohorts measure MTP after the park and keep running it."""
+    import random
+
+    from omlx.patches.mlx_lm_mtp.batch_policy import ParkMemory
+
+    memory = ParkMemory()
+    lost = BatchPolicy(range(8), 3)
+    lost.park()
+    memory.parked(lost)
+    rng = random.Random(0)
+    steps = mtp_cycles = 0
+    first_mtp = None
+    while steps < 6000:
+        policy = BatchPolicy(range(8), 3)
+        memory.seed(policy)
+        for _ in range(rng.randint(50, 150)):
+            memory.tick()
+            steps += 1
+            if policy.needs_standard():
+                policy.observe_standard(10.0)
+                continue
+            # Every draft accepted at 6 ms a cycle: MTP clearly wins.
+            policy.observe_mtp(policy.cur, [policy.cur] * 8, 6.0, stable=True)
+            mtp_cycles += 1
+            first_mtp = steps if first_mtp is None else first_mtp
+            assert not policy.should_park()
+        memory.retired(policy)
+    # The 128-step park, then one cohort's calibration (2 warmup + 3 samples).
+    assert first_mtp is not None and first_mtp <= 128 + 150 + 5
+    assert mtp_cycles > 0.9 * (6000 - first_mtp) - 5 * 6000 / 50

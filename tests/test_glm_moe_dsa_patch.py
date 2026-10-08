@@ -23,7 +23,8 @@ def _write_config(tmp_path, body: str) -> str:
 def _load_patched_glm_module():
     from omlx.patches.glm_moe_dsa import apply_glm_moe_dsa_patch
 
-    apply_glm_moe_dsa_patch()
+    with _glm_generate_patch_installed():
+        apply_glm_moe_dsa_patch()
     from mlx_lm.models import glm_moe_dsa
 
     return glm_moe_dsa

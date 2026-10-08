@@ -73,8 +73,26 @@ _QWEN4_DECODE_QMV = os.environ.get("OMLX_QWEN4_GDN_DECODE_QMV", "1") != "0"
 # launch for every row's prework, recurrence (with the per-step rollback
 # states) and norm-gate, and the out-projection (=0 keeps the per-op path).
 _QWEN4_VERIFY_FUSED = os.environ.get("OMLX_QWEN4_GDN_VERIFY_FUSED", "1") != "0"
+_QWEN4_BATCH_DECODE = os.environ.get("OMLX_QWEN4_GDN_BATCH_DECODE", "1") != "0"
+# Rows of a batched one-token decode per step launch, and the widest batch
+# whose projections run per row (bit-identical to each row decoded alone).
+_QWEN4_BATCH_DECODE_MAX_ROWS = 16
+_QWEN4_BATCH_ROW_EXACT_ROWS = 3
+# Its 2..8-row projections on the fully unrolled row-exact tile with the
+# per-row-count tiles below (=0 keeps the rolled tiles of the first geometry).
+_QWEN4_VERIFY_TILES = os.environ.get("OMLX_QWEN4_GDN_VERIFY_TILES", "1") != "0"
+# Its rollback records skip the per-step recurrent states (S-1 x 3 MB per
+# layer, written on every verify and read only on a partial accept): a commit
+# keeping m of S rows reruns the fused step on the first m rows (=0 writes
+# them per verify).
+_QWEN4_VERIFY_DEFERRED_STATES = (
+    os.environ.get("OMLX_QWEN4_GDN_VERIFY_DEFERRED_STATES", "1") != "0"
+)
 _QWEN4_VERIFY_STEP_KERNELS: dict = {}
 _QWEN4_VERIFY_ENGAGED_LOGGED = False
+# The fused verify's norm-gate stage runs step t on simdgroup t of its
+# head_v_dim // 8 = 16 simdgroups, so a window holds at most 16 rows.
+_QWEN4_VERIFY_MAX_ROWS = 16
 _VERIFY_REJECT_DIAG = 0
 
 _SOURCE = """
@@ -106,8 +124,8 @@ _SOURCE = """
             acc += float(xv) * float(conv_w[channel * 4 + tap]);
         }
         const T conv = T(acc);
-        T sy = T(1) / (T(1) + metal::exp(metal::abs(conv)));
-        const T act = conv * ((conv < T(0)) ? sy : T(1) - sy);
+        const auto sy = 1 / (1 + metal::precise::exp(metal::abs(conv)));
+        const T act = conv * T((conv < T(0)) ? sy : 1 - sy);
         activated[i] = act;
         if (L2) {
             const T sqv = T(float(act) * float(act));
@@ -256,8 +274,8 @@ _QWEN4_DECODE_SOURCE = """
         }
         acc += float(qkv[channel]) * float(conv_w[channel * 4 + 3]);
         const T conv = T(acc);
-        T sy = T(1) / (T(1) + metal::exp(metal::abs(conv)));
-        const T act = conv * ((conv < T(0)) ? sy : T(1) - sy);
+        const auto sy = 1 / (1 + metal::precise::exp(metal::abs(conv)));
+        const T act = conv * T((conv < T(0)) ? sy : 1 - sy);
         activated[i] = act;
         const T sqv = T(float(act) * float(act));
         l2acc = T(float(l2acc) + float(sqv));
@@ -297,9 +315,9 @@ _QWEN4_DECODE_SOURCE = """
         }
         if (lane == 0) {
             const T bv = b_in[head];
-            // MLX's Sigmoid takes a precise FP32 exp; a fast bf16 exp rounds some b apart.
-            T by = T(1) / (T(1) + T(metal::precise::exp(metal::abs(float(bv)))));
-            beta_out[head] = (bv < T(0)) ? by : T(1) - by;
+            // MLX's Sigmoid functor, rounded to T once.
+            const auto by = 1 / (1 + metal::precise::exp(metal::abs(bv)));
+            beta_out[head] = T((bv < T(0)) ? by : 1 - by);
 
             // compute_g casts A_log to FP32 but keeps softplus(a+dt_bias)
             // in BF16 before the FP32 multiply and outer exp.
@@ -404,8 +422,8 @@ _QWEN4_DECODE_STEP_SOURCE = """
             }
             acc += float(qkv[channel]) * float(conv_w[channel * 4 + 3]);
             const T conv = T(acc);
-            T sy = T(1) / (T(1) + metal::exp(metal::abs(conv)));
-            const T act = conv * ((conv < T(0)) ? sy : T(1) - sy);
+            const auto sy = 1 / (1 + metal::precise::exp(metal::abs(conv)));
+            const T act = conv * T((conv < T(0)) ? sy : 1 - sy);
             activated[i] = act;
             const T sqv = T(float(act) * float(act));
             l2acc = T(float(l2acc) + float(sqv));
@@ -441,9 +459,9 @@ _QWEN4_DECODE_STEP_SOURCE = """
     } else if (sg == 3 && lane == 0) {
         const uint head = hv;
         const T bv = b_in[head];
-        // MLX's Sigmoid takes a precise FP32 exp; a fast bf16 exp rounds some b apart.
-        T by = T(1) / (T(1) + T(metal::precise::exp(metal::abs(float(bv)))));
-        tg_beta[0] = (bv < T(0)) ? by : T(1) - by;
+        // MLX's Sigmoid functor, rounded to T once.
+        const auto by = 1 / (1 + metal::precise::exp(metal::abs(bv)));
+        tg_beta[0] = T((bv < T(0)) ? by : 1 - by);
 
         const T apd = T(float(a_in[head]) + float(dt_bias[head]));
         const T neg_abs = -metal::abs(apd);
@@ -601,8 +619,8 @@ _QWEN4_VERIFY_STEP_SOURCE = """
             const T x_t = proj[t * P + channel];
             acc += float(x_t) * float(conv_w[channel * 4 + 3]);
             const T conv = T(acc);
-            T sy = T(1) / (T(1) + metal::exp(metal::abs(conv)));
-            const T act = conv * ((conv < T(0)) ? sy : T(1) - sy);
+            const auto sy = 1 / (1 + metal::precise::exp(metal::abs(conv)));
+            const T act = conv * T((conv < T(0)) ? sy : 1 - sy);
             activated[i] = act;
             const T sqv = T(float(act) * float(act));
             l2acc = T(float(l2acc) + float(sqv));
@@ -647,9 +665,9 @@ _QWEN4_VERIFY_STEP_SOURCE = """
         const uint t = lane;
         const uint head = hv;
         const T bv = proj[t * P + b_off + head];
-        // MLX's Sigmoid takes a precise FP32 exp; a fast bf16 exp rounds some b apart.
-        T by = T(1) / (T(1) + T(metal::precise::exp(metal::abs(float(bv)))));
-        tg_beta[t] = (bv < T(0)) ? by : T(1) - by;
+        // MLX's Sigmoid functor, rounded to T once.
+        const auto by = 1 / (1 + metal::precise::exp(metal::abs(bv)));
+        tg_beta[t] = T((bv < T(0)) ? by : 1 - by);
 
         const T apd = T(float(proj[t * P + a_off + head]) + float(dt_bias[head]));
         const T neg_abs = -metal::abs(apd);
@@ -1019,7 +1037,6 @@ def _qwen4_prefill(module, inputs, cache):
     )
     if hasattr(cache, "advance"):
         cache.advance(length)
-        q35._qwen3_5_advance_left_padding_info(cache, length)
         q35._qwen3_5_advance_lengths_info(cache, length)
     flat = norm_gate(
         inputs=[
@@ -1136,6 +1153,79 @@ def qwen4_decode_step_fused(
     )
 
 
+# The decode step above for every row of a batched one-token decode: grid z
+# is (row, value head); each threadgroup rebinds the kernel's buffers to its
+# row and runs the one-row source verbatim, so row r's outputs and next
+# states are bit-identical to a B1 decode step of that row alone.
+_QWEN4_BATCH_DECODE_STEP_SOURCE = (
+    """
+    const uint batch_row = threadgroup_position_in_grid.z / uint(HV);
+    const uint head_in_row = threadgroup_position_in_grid.z % uint(HV);
+    const auto qkv_row = qkv + batch_row * uint(C);
+    const auto z_row = z + batch_row * uint(HV) * uint(DV);
+    const auto b_row = b_in + batch_row * uint(HV);
+    const auto a_row = a_in + batch_row * uint(HV);
+    const auto conv_state_row = conv_state + batch_row * 3 * uint(C);
+    const auto state_in_row = state_in + batch_row * uint(HV) * uint(DV) * uint(DK);
+    const auto conv_out_row = conv_out + batch_row * 3 * uint(C);
+    const auto state_out_row = state_out + batch_row * uint(HV) * uint(DV) * uint(DK);
+    const auto out_row = out + batch_row * uint(HV) * uint(DV);
+    {
+    const auto qkv = qkv_row;
+    const auto z = z_row;
+    const auto b_in = b_row;
+    const auto a_in = a_row;
+    const auto conv_state = conv_state_row;
+    const auto state_in = state_in_row;
+    const auto conv_out = conv_out_row;
+    const auto state_out = state_out_row;
+    const auto out = out_row;
+"""
+    + _QWEN4_DECODE_STEP_SOURCE.replace("threadgroup_position_in_grid.z", "head_in_row")
+    + """
+    }
+"""
+)
+_QWEN4_BATCH_DECODE_STEP_KERNEL = None
+
+
+def qwen4_batch_decode_step_fused(
+    qkv, z, b, a, conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w, eps,
+    hk, hv, dk, dv,
+):
+    """``qwen4_decode_step_fused`` for each of B rows ([B, 1, ...] inputs and
+    [B, ...] states) in one launch."""
+    global _QWEN4_BATCH_DECODE_STEP_KERNEL
+    if _QWEN4_BATCH_DECODE_STEP_KERNEL is None:
+        _QWEN4_BATCH_DECODE_STEP_KERNEL = mx.fast.metal_kernel(
+            name="omlx_qwen4_gdn_batch_decode_step",
+            input_names=[
+                "qkv", "z", "b_in", "a_in", "conv_state", "conv_w", "q_scale",
+                "A_log", "dt_bias", "state_in", "norm_w", "eps",
+            ],
+            output_names=["conv_out", "state_out", "out"],
+            header=_QWEN4_DECODE_HEADER,
+            source=_QWEN4_BATCH_DECODE_STEP_SOURCE,
+        )
+    batch = qkv.shape[0]
+    rows = dv // 8
+    return _QWEN4_BATCH_DECODE_STEP_KERNEL(
+        inputs=[qkv, z, b, a, conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w, eps],
+        template=[
+            ("T", qkv.dtype),
+            ("HK", hk),
+            ("HV", hv),
+            ("DK", dk),
+            ("DV", dv),
+            ("C", int(qkv.shape[-1])),
+        ],
+        grid=(32, rows, hv * batch),
+        threadgroup=(32, rows, 1),
+        output_shapes=[conv_state.shape, state.shape, (batch, 1, hv * dv)],
+        output_dtypes=[qkv.dtype, state.dtype, qkv.dtype],
+    )
+
+
 def _qwen4_verify_step_kernel(states: bool):
     kernel = _QWEN4_VERIFY_STEP_KERNELS.get(states)
     if kernel is None:
@@ -1164,9 +1254,9 @@ def _qwen4_verify_step_kernel(states: bool):
 
 
 @functools.cache
-def _qwen4_verify_step_launch(steps, dtype, state_dtype, c_dim, hk, hv, dk, dv):
+def _qwen4_verify_step_launch(steps, dtype, state_dtype, c_dim, hk, hv, dk, dv, history=True):
     """Launch parameters of ``qwen4_verify_step_fused`` for one block shape."""
-    history = steps > 1
+    history = history and steps > 1
     rows = dv // 8
     return _qwen4_verify_step_kernel(history), {
         "template": [
@@ -1191,27 +1281,29 @@ def _qwen4_verify_step_launch(steps, dtype, state_dtype, c_dim, hk, hv, dk, dv):
 
 def qwen4_verify_step_fused(
     proj, conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w, eps, hk, hv, dk, dv,
+    history=True,
 ):
     """``S = proj.shape[1]`` decode steps from (conv_state, state) in one launch
     (B = 1, dk = dv = 128, a 4-tap convolution: conv_state [1, 3, C]).
 
     Row t of ``proj`` is the stacked in-projection [qkv | z | b | a] of step t.
     Returns (next conv state, rollback window [1, 3 + S, C] = [conv_state; qkv
-    rows], the states after steps 0..S-2 [1, S-1, hv, dv, dk] or None at S = 1,
-    the state after step S-1, gated output [1, S, hv*dv]); step t's values are
-    bit-identical to the (t+1)-th of S chained ``qwen4_decode_step_fused`` calls.
+    rows], the states after steps 0..S-2 [1, S-1, hv, dv, dk] or None at S = 1
+    or without ``history``, the state after step S-1, gated output [1, S,
+    hv*dv]); step t's values are bit-identical to the (t+1)-th of S chained
+    ``qwen4_decode_step_fused`` calls.
     """
     steps = proj.shape[1]
     kernel, launch = _qwen4_verify_step_launch(
-        steps, proj.dtype, state.dtype, conv_state.shape[-1], hk, hv, dk, dv
+        steps, proj.dtype, state.dtype, conv_state.shape[-1], hk, hv, dk, dv, history
     )
     outputs = kernel(
         inputs=[proj, conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w, eps],
         **launch,
     )
-    if steps > 1:
-        conv_out, window, state_out, history, out = outputs
-        return conv_out, window, history, state_out, out
+    if len(outputs) == 5:
+        conv_out, window, state_out, states, out = outputs
+        return conv_out, window, states, state_out, out
     conv_out, window, state_out, out = outputs
     return conv_out, window, None, state_out, out
 
@@ -1513,6 +1605,23 @@ def _qwen4_verify_out_geometry(rows):
     return (_QWEN4_OUT_QMV_RPS, 1) if rows == 1 else (4, 1)
 
 
+# The same (columns per simdgroup, rows per threadgroup) pairs for the
+# unrolled tile, per block size: the fastest over a chain of 36 layers on M5
+# Ultra (oQ5e: 6-bit in-, 5-bit out-projection), each inside the unrolled
+# tile's register envelope at every bit width the kernel serves (at most 16
+# values per lane). Other block sizes keep the pairs above.
+_QWEN4_VERIFY_IN_TILES = {2: (1, 2), 3: (2, 3), 4: (4, 2), 5: (2, 5), 6: (4, 3), 7: (8, 1), 8: (4, 2)}
+_QWEN4_VERIFY_OUT_TILES = {2: (4, 1), 3: (4, 3), 4: (2, 4), 5: (2, 5), 6: (4, 3), 7: (4, 1), 8: (2, 4)}
+
+
+def _qwen4_verify_in_tile(rows):
+    return _QWEN4_VERIFY_IN_TILES.get(rows) or _qwen4_verify_in_geometry(rows)
+
+
+def _qwen4_verify_out_tile(rows):
+    return _QWEN4_VERIFY_OUT_TILES.get(rows) or _qwen4_verify_out_geometry(rows)
+
+
 def _build_qwen4_verify_plan(module):
     """Resolved operands of the fused speculative verify, or None when ineligible.
 
@@ -1538,13 +1647,16 @@ def _build_qwen4_verify_plan(module):
     if fused is None:
         return None
     weights, scales, biases, _, group_size, bits, mode = fused
+    tiles = _QWEN4_VERIFY_TILES
     in_rows = rows_qmv(
         weights, scales, biases, bits, group_size, mode, mx.bfloat16,
-        _qwen4_verify_in_geometry,
+        _qwen4_verify_in_tile if tiles else _qwen4_verify_in_geometry,
+        unrolled=tiles,
     )
     out_rows = rows_qmv(
         out.weight, out.scales, out.biases, out.bits, out.group_size, out.mode,
-        mx.bfloat16, _qwen4_verify_out_geometry,
+        mx.bfloat16, _qwen4_verify_out_tile if tiles else _qwen4_verify_out_geometry,
+        unrolled=tiles,
     )
     if in_rows is None or out_rows is None:
         return None
@@ -1595,8 +1707,9 @@ def _qwen4_verify_state_eligible(inputs, cache) -> bool:
 
 def _qwen4_verify(plan, inputs, cache):
     """Fused verify rows on a cached plan: bit-identical outputs, next states
-    and rollback records (the conv window and the per-step recurrent states)
-    to the per-op verify path below."""
+    and committed rollback states (the conv window, and the per-step
+    recurrent states or their deferred recomputation) to the per-op verify
+    path below."""
     (
         in_rows,
         out_rows,
@@ -1611,15 +1724,119 @@ def _qwen4_verify(plan, inputs, cache):
         dk,
         dv,
     ) = plan
+    proj = in_rows(inputs)
+    steps = proj.shape[1]
+    conv_start, start = cache[0], cache[1]
+    deferred = (
+        _QWEN4_VERIFY_DEFERRED_STATES
+        and steps > 1
+        and qwen35_gdn_verify_fused.deferred_states_ready(cache, 1, steps)
+    )
     conv_state, window, states, state, gated = qwen4_verify_step_fused(
-        in_rows(inputs), cache[0], conv_w, q_scale, A_log, dt_bias, cache[1], norm_w,
-        eps, hk, hv, dk, dv,
+        proj, conv_start, conv_w, q_scale, A_log, dt_bias, start, norm_w,
+        eps, hk, hv, dk, dv, not deferred,
     )
     cache.record_speculative_window(0, window, 3)
     cache[0] = conv_state
-    cache.record_speculative_states(1, states, state)
+    if deferred:
+        qwen35_gdn_verify_fused.record_deferred_states(
+            cache, 1, start, state, steps,
+            functools.partial(
+                _qwen4_state_after, proj, conv_start, conv_w, q_scale, A_log, dt_bias,
+                start, norm_w, eps, hk, hv, dk, dv,
+            ),
+        )
+    else:
+        cache.record_speculative_states(1, states, state)
     cache[1] = state
     return out_rows(gated)
+
+
+def _qwen4_state_after(
+    proj, conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w, eps, hk, hv, dk, dv,
+    keep,
+):
+    """The recurrent state after the first ``keep`` rows of a verify block:
+    the fused step on those rows, whose last state is the block's state
+    after row ``keep - 1`` bit for bit (row t's arithmetic does not depend
+    on the block length)."""
+    return qwen4_verify_step_fused(
+        proj[:, :keep], conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w,
+        eps, hk, hv, dk, dv, False,
+    )[3]
+
+
+def _qwen4_batch_decode_state_eligible(inputs, cache) -> bool:
+    """2..16 bf16 one-token rows against canonical per-row conv and
+    recurrent states, outside a speculative transaction."""
+    if not (
+        isinstance(inputs, mx.array)
+        and inputs.ndim == 3
+        and 2 <= inputs.shape[0] <= _QWEN4_BATCH_DECODE_MAX_ROWS
+        and inputs.shape[1] == 1
+        and inputs.shape[2] == _QWEN4_HIDDEN_SIZE
+        and inputs.dtype == mx.bfloat16
+        and getattr(cache, "lengths", None) is None
+        and not getattr(cache, "is_speculating", False)
+    ):
+        return False
+    rows = inputs.shape[0]
+    conv_state = cache[0]
+    recurrent_state = cache[1]
+    return (
+        isinstance(conv_state, mx.array)
+        and conv_state.shape == (rows, 3, 10240)
+        and conv_state.dtype == mx.bfloat16
+        and isinstance(recurrent_state, mx.array)
+        and recurrent_state.shape == (rows, 48, 128, 128)
+        and recurrent_state.dtype == mx.float32
+    )
+
+
+def _qwen4_batch_decode(module, plan, inputs, cache):
+    """A batched one-token decode: the in-projection, one launch of the
+    fused decode step for every row, and the out-projection.
+
+    Up to ``_QWEN4_BATCH_ROW_EXACT_ROWS`` rows take the verify plan's per-row
+    projections (one-row qmv bits), so each row is bit-identical to that row
+    decoded alone; wider batches take one stock quantized matmul per
+    projection, which reads the weights once for all rows (faster from four
+    rows on, M5 Ultra)."""
+    (
+        projections, fused, conv_w, q_scale, A_log, dt_bias, norm_w, eps, out_proj,
+        hk, hv, dk, dv, _, _,
+    ) = plan
+    rows = inputs.shape[0]
+    verify = _qwen4_verify_plan(module) if rows <= _QWEN4_BATCH_ROW_EXACT_ROWS else None
+    if verify is not None:
+        c_dim = 2 * hk * dk + hv * dv
+        proj = verify[0](inputs.reshape(1, rows, -1)).reshape(rows, 1, -1)
+        split = [c_dim, c_dim + hv * dv, c_dim + hv * dv + hv]
+        mixed_qkv, z, b, a = mx.split(proj, split, axis=-1)
+    elif fused is not None:
+        weights, w_scales, w_biases, split, group_size, bits, mode = fused
+        proj = mx.quantized_matmul(
+            inputs, weights, scales=w_scales, biases=w_biases, transpose=True,
+            group_size=group_size, bits=bits, mode=mode,
+        )
+        mixed_qkv, z, b, a = mx.split(proj, split, axis=-1)
+    else:
+        mixed_qkv, z, b, a = (linear(inputs) for linear in projections)
+    conv_state, state, gated = qwen4_batch_decode_step_fused(
+        mixed_qkv, z, b, a, cache[0], conv_w, q_scale, A_log, dt_bias, cache[1], norm_w,
+        eps, hk, hv, dk, dv,
+    )
+    if verify is not None:
+        result = verify[1](gated.reshape(1, rows, -1)).reshape(rows, 1, -1)
+    else:
+        result = out_proj(gated)
+    cache[0], cache[1] = conv_state, state
+    if hasattr(cache, "advance"):
+        from mlx_vlm.models.qwen3_5 import language as q35
+
+        cache.advance(1)
+        q35._qwen3_5_advance_lengths_info(cache, 1)
+    return result
 
 
 def _qwen4_decode_dynamic_eligible(
@@ -1806,7 +2023,6 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         cache[0], cache[1] = conv_state, state
         if hasattr(cache, "advance"):
             cache.advance(1)
-            q35._qwen3_5_advance_left_padding_info(cache, 1)
             q35._qwen3_5_advance_lengths_info(cache, 1)
         global _QWEN4_DECODE_ENGAGED_LOGGED
         if not _QWEN4_DECODE_ENGAGED_LOGGED:
@@ -1826,6 +2042,12 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             plan = _qwen4_decode_plan(self)
             if plan is not None and _qwen4_decode_state_eligible(inputs, cache):
                 return qwen4_decode(self, plan, inputs, cache)
+            if (
+                _QWEN4_BATCH_DECODE
+                and plan is not None
+                and _qwen4_batch_decode_state_eligible(inputs, cache)
+            ):
+                return _qwen4_batch_decode(self, plan, inputs, cache)
         if _qwen4_prefill_eligible(self, inputs, mask, cache):
             return _qwen4_prefill(self, inputs, cache)
         if _qwen35_decode_eligible(self, inputs, mask, cache):
@@ -1869,7 +2091,6 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             result = self.out_proj(out.reshape(1, 1, -1))
             cache[0], cache[1] = conv_state, state
             cache.advance(1)
-            q35._qwen3_5_advance_left_padding_info(cache, 1)
             q35._qwen3_5_advance_lengths_info(cache, 1)
             global _QWEN35_DECODE_ENGAGED_LOGGED
             if not _QWEN35_DECODE_ENGAGED_LOGGED:
@@ -1909,7 +2130,6 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         cache[0], cache[1] = conv_state, state
         if hasattr(cache, "advance"):
             cache.advance(1)
-            q35._qwen3_5_advance_left_padding_info(cache, 1)
             q35._qwen3_5_advance_lengths_info(cache, 1)
         global _QWEN4_DECODE_ENGAGED_LOGGED
         if not _QWEN4_DECODE_ENGAGED_LOGGED:
@@ -1947,7 +2167,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             and cache is not None
             and cache.is_speculating
             and cache.lengths is None
-            and 1 <= length <= 9
+            and 1 <= length <= _QWEN4_VERIFY_MAX_ROWS
             and (length == 1 or is_row_exact_armed())
             and _qwen4_verify_state_eligible(inputs, cache)
         ):
@@ -1956,7 +2176,6 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                 result = _qwen4_verify(plan, inputs, cache)
                 if hasattr(cache, "advance"):
                     cache.advance(length)
-                    q35._qwen3_5_advance_left_padding_info(cache, length)
                     q35._qwen3_5_advance_lengths_info(cache, length)
                 global _QWEN4_VERIFY_ENGAGED_LOGGED
                 if not _QWEN4_VERIFY_ENGAGED_LOGGED:
@@ -2071,7 +2290,6 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             )
         if hasattr(cache, "advance"):
             cache.advance(length)
-            q35._qwen3_5_advance_left_padding_info(cache, length)
             q35._qwen3_5_advance_lengths_info(cache, length)
         if not fused:
             out = layer.norm(

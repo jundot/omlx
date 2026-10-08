@@ -1551,6 +1551,15 @@ class SharedHotCacheBudget:
                     )
         return cleared
 
+    def releasable_bytes(self, protected_hashes: set[bytes]) -> int:
+        """Bytes ``shrink_to`` can free while keeping ``protected_hashes``."""
+        with self._lock:
+            return sum(
+                entry.size_bytes
+                for entry in self._entries.values()
+                if entry.block_hash not in protected_hashes
+            )
+
     def shrink_to(
         self,
         target_bytes: int,
@@ -2380,9 +2389,12 @@ class PagedSSDCacheManager(CacheManager):
         # SSD budget. Converge immediately before serving requests.
         tracked_size = self._tracked_ssd_size()
         if tracked_size > 0 and tracked_size > self._get_effective_max_size():
+            tracked_count = self._tracked_ssd_count()
             self._enforce_size_limit_for_new_block(0, unbounded=True)
-            logger.info(
-                "SSD cache startup cleanup: freed=%s, remaining=%s, limit=%s",
+            logger.warning(
+                "SSD cache startup cleanup: evicted=%d, freed=%s, remaining=%s, "
+                "limit=%s",
+                tracked_count - self._tracked_ssd_count(),
                 format_bytes(tracked_size - self._tracked_ssd_size()),
                 format_bytes(self._tracked_ssd_size()),
                 format_bytes(self._get_effective_max_size()),
@@ -3182,6 +3194,17 @@ class PagedSSDCacheManager(CacheManager):
                         if p is not None and isinstance(p, Path) and p.exists():
                             p.unlink()
                 return False
+
+    def wait_for_pending_writes(self, timeout: float) -> bool:
+        """Wait until queued SSD writes finish. Returns False on timeout."""
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._pending_write_hashes_lock:
+                if not self._pending_write_hashes:
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
 
     def _clear_pending_write(
         self, block_hash: bytes, *, remove_hot_cache: bool = False

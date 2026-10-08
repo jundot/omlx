@@ -810,6 +810,9 @@ def test_owned_batch_calibration_history_matches_full_prompt_fold(strict_model):
     for uid, tokens in zip([11, 12], histories):
         ctx = owned.uids[uid][0]
         assert ctx.expected_offset == 11
+        # Ordinary decode collects its pairs; they fold at activation.
+        assert ctx.folded == 5 and len(ctx.deferred_pairs) == 5
+        prompt_priming._flush_deferred_history(model, ctx)
         assert ctx.folded == 10
         ref = _reference_head_cache(model, tokens)
         for (keys, values), (ref_keys, ref_values) in zip(
