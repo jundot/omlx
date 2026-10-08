@@ -371,7 +371,35 @@ async def verify_api_key(
         if global_settings is not None
         else []
     )
-    if not verify_any_api_key(api_key_value, _server_state.api_key, sub_keys):
+    key_ok = verify_any_api_key(api_key_value, _server_state.api_key, sub_keys)
+
+    # Brute-force budget for the /v1 surface, network binds only: on
+    # loopback there is no remote guessing to stop, and the per-peer
+    # counter would only add cross-test/state noise. A correct key
+    # always passes, even mid-lockout (the budget stops wrong-key
+    # guessing, not authenticated clients).
+    if not key_ok and not loopback_only:
+        from .admin.auth import login_throttle
+
+        peer = request.client.host if request.client else "local"
+        if not login_throttle.verify_through_lockout(peer, key_ok):
+            retry_after = int(login_throttle.remaining_lockout(peer)) + 1
+            logger.warning(
+                "Rejected API key (fp=%s): peer locked out (%ds)",
+                fingerprint_key(api_key_value),
+                retry_after,
+            )
+            raise HTTPException(
+                status_code=429,
+                detail="Too many failed attempts. Retry later.",
+                headers={"Retry-After": str(retry_after)},
+            )
+        logger.warning(
+            "Rejected API key (fp=%s)", fingerprint_key(api_key_value)
+        )
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    if not key_ok:
         logger.warning("Rejected API key (fp=%s)", fingerprint_key(api_key_value))
         raise HTTPException(status_code=401, detail="Invalid API key")
 
@@ -922,7 +950,11 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
         )
     else:
         content = {"detail": exc.detail}
-    return JSONResponse(status_code=exc.status_code, content=content)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=content,
+        headers=getattr(exc, "headers", None),
+    )
 
 
 @app.exception_handler(RequestValidationError)

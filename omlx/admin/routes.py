@@ -1933,16 +1933,6 @@ async def login(
         if http_request is not None and http_request.client is not None
         else "local"
     )
-    lockout = login_throttle.remaining_lockout(peer)
-    if lockout > 0:
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                "Too many failed login attempts. "
-                f"Try again in {int(lockout) + 1} seconds."
-            ),
-            headers={"Retry-After": str(int(lockout) + 1)},
-        )
 
     global_settings = _get_global_settings()
     server_api_key = global_settings.auth.api_key if global_settings else None
@@ -1954,14 +1944,26 @@ async def login(
             detail="No API key configured. Please set up an API key first.",
         )
 
-    # Main key only — sub keys must not grant admin login
-    if not verify_api_key(request.api_key, server_api_key):
-        login_throttle.record_failure(peer)
+    # Main key only — sub keys must not grant admin login. The key is
+    # verified exactly once and gated by the peer's lockout state: a
+    # correct key always passes (clearing the state), a wrong one during
+    # lockout gets 429 + Retry-After.
+    key_ok = verify_api_key(request.api_key, server_api_key)
+    if not login_throttle.verify_through_lockout(peer, key_ok):
+        retry_after = int(login_throttle.remaining_lockout(peer)) + 1
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Too many failed login attempts. "
+                f"Try again in {retry_after} seconds."
+            ),
+            headers={"Retry-After": str(retry_after)},
+        )
+    if not key_ok:
         raise HTTPException(
             status_code=401,
             detail="Invalid API key",
         )
-    login_throttle.record_success(peer)
 
     # Create session token and set cookie
     token = create_session_token(remember=request.remember)
@@ -2104,21 +2106,21 @@ async def auto_login(
         if http_request is not None and http_request.client is not None
         else "local"
     )
-    # Share the login form's failure budget: the key arrives via a URL query
-    # here, so this endpoint is otherwise the cheaper brute-force oracle.
-    # A locked peer just gets the same silent redirect as a wrong key.
-    if login_throttle.remaining_lockout(peer) > 0:
-        return RedirectResponse(url="/admin", status_code=302)
-
     global_settings = _get_global_settings()
     server_api_key = global_settings.auth.api_key if global_settings else None
 
-    # Main key only — sub keys must not grant admin login
-    if not key or not server_api_key or not verify_api_key(key, server_api_key):
-        if key and server_api_key:
-            login_throttle.record_failure(peer)
+    # Main key only — sub keys must not grant admin login. Shares the
+    # login form's failure budget: the key arrives via a URL query here,
+    # so this endpoint is otherwise the cheaper brute-force oracle. A
+    # locked peer with a wrong key gets the same silent redirect as any
+    # wrong key; a correct key passes even mid-lockout.
+    key_ok = bool(key) and bool(server_api_key) and verify_api_key(
+        key, server_api_key
+    )
+    if not login_throttle.verify_through_lockout(peer, key_ok):
         return RedirectResponse(url="/admin", status_code=302)
-    login_throttle.record_success(peer)
+    if not key_ok:
+        return RedirectResponse(url="/admin", status_code=302)
 
     token = create_session_token()
     response = RedirectResponse(url=redirect, status_code=302)

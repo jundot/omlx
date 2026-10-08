@@ -343,6 +343,24 @@ class LoginThrottle:
                 return 0.0
             return remaining
 
+    def verify_through_lockout(self, peer: str, key_ok: bool) -> bool:
+        """Gate a key verification by the peer's lockout state.
+
+        Returns False when the peer is locked out AND the key is wrong —
+        the caller rejects with 429. A correct key always passes and
+        clears the peer's state: the lockout exists to stop wrong-key
+        guessing, not to punish a client that can actually authenticate
+        (so a legitimate user is never stuck behind an attacker's noise).
+        Callers verify the key exactly once and pass the result here.
+        """
+        if key_ok:
+            self.record_success(peer)
+            return True
+        if self.remaining_lockout(peer) <= 0:
+            self.record_failure(peer)
+            return True
+        return False
+
     def record_failure(self, peer: str) -> None:
         with self._lock:
             failures = self._failures.get(peer, 0) + 1

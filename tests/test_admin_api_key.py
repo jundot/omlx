@@ -981,19 +981,28 @@ class TestLoginThrottle:
                     )
                 )
                 assert response.status_code == 302
-            # The login form is now locked for the same peer even with the
-            # correct key.
+            # A wrong key on the login form is now locked out (429), while
+            # the correct key still passes: the budget stops wrong-key
+            # guessing, not authenticated clients.
             from fastapi import HTTPException
 
             with pytest.raises(HTTPException) as exc_info:
                 asyncio.run(
                     admin_routes.login(
-                        admin_routes.LoginRequest(api_key="correct-key"),
+                        admin_routes.LoginRequest(api_key="wrong"),
                         MagicMock(),
                         self._peer_request(),
                     )
                 )
             assert exc_info.value.status_code == 429
+            result = asyncio.run(
+                admin_routes.login(
+                    admin_routes.LoginRequest(api_key="correct-key"),
+                    MagicMock(),
+                    self._peer_request(),
+                )
+            )
+            assert result["success"] is True
         finally:
             _restore_getter(original)
 
