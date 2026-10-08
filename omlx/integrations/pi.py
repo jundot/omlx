@@ -83,7 +83,7 @@ class PiIntegration(Integration):
             if ctx.model:
                 config["defaultModel"] = ctx.model
 
-        self._write_json_config(self.MODELS_PATH, update_models)
+        self._write_json_config(self.MODELS_PATH, update_models, secret=True)
         self._write_json_config(self.SETTINGS_PATH, update_settings)
 
     def launch(self, ctx: IntegrationContext) -> None:

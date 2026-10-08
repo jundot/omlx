@@ -80,7 +80,7 @@ class OpenClawIntegration(Integration):
             config.setdefault("tools", {})
             config["tools"]["profile"] = ctx.tools_profile
 
-        self._write_json_config(self.CONFIG_PATH, updater)
+        self._write_json_config(self.CONFIG_PATH, updater, secret=True)
 
     def _gateway_info(self) -> tuple[str, int]:
         """Read gateway token and port from OpenClaw config."""

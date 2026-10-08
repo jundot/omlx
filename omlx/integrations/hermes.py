@@ -136,6 +136,12 @@ class HermesIntegration(Integration):
             yaml_content.rstrip() + "\n",
             encoding="utf-8",
         )
+        # The file embeds the oMLX key next to other providers' keys and is
+        # world-readable by default; tighten it (matches the dsh store).
+        import contextlib
+
+        with contextlib.suppress(OSError):
+            config_path.chmod(0o600)
         print(f"Config written: {config_path}")
 
     def launch(self, ctx: IntegrationContext) -> None:
