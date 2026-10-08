@@ -445,6 +445,28 @@ def test_extract_truncated_thinking_preserves_channels(text, expected):
     assert extract_thinking(text, truncated=True) == expected
 
 
+@pytest.mark.parametrize(
+    "text, truncated, expected",
+    [
+        ("unfinished", True, ("unfinished", "")),
+        ("<think>\nunfinished", True, ("unfinished", "")),
+        ("done</think>partial answer", True, ("done", "partial answer")),
+        ("done</think>answer", False, ("done", "answer")),
+        ("<mm:think>unfinished", True, ("unfinished", "")),
+        ("<think:opensource>unfinished", True, ("unfinished", "")),
+        ("  <think>unfinished", True, ("unfinished", "")),
+    ],
+)
+def test_extract_prompt_opened_thinking(text, truncated, expected):
+    """The chat template opened <think>, so the output starts inside it.
+
+    The MiniMax/HY3 tag and the leading-whitespace cases check that the
+    ``<think>`` prefix is not added twice: normalization to the plain tag
+    (and the ``lstrip()`` in the guard) must run before the prefix check.
+    """
+    assert extract_thinking(text, truncated=truncated, prompt_opened=True) == expected
+
+
 @pytest.mark.parametrize("prompt_opened", [False, True])
 def test_truncated_stream_flushes_partial_tag_only_as_thinking(prompt_opened):
     parser = ThinkingParser(start_in_thinking=prompt_opened)
