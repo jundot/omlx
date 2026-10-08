@@ -1220,8 +1220,14 @@ class BatchKVCache(_BaseCache):
         Dv = max(c.values.shape[3] for c in caches if c.values is not None)
         dt = next(iter(c.keys.dtype for c in caches if c.keys is not None))
 
-        keys = mx.zeros((B, H, max_length, Dk), dtype=dt)
-        values = mx.zeros((B, H, max_length, Dv), dtype=dt)
+        # Reserve the first append's step now. An exact-width merge made the
+        # next update_and_fetch concatenate a second full copy of every row and
+        # strand the exact buffer in MLX's pool (it can never satisfy a larger
+        # request). max_length + step is exactly the capacity that first
+        # append would have produced, and the reserved tail is zeros either way.
+        capacity = max_length + cls.step
+        keys = mx.zeros((B, H, capacity, Dk), dtype=dt)
+        values = mx.zeros((B, H, capacity, Dv), dtype=dt)
         for i, (p, c) in enumerate(zip(padding, caches)):
             if c.keys is None:
                 continue
@@ -1231,8 +1237,8 @@ class BatchKVCache(_BaseCache):
         cache = cls(padding)
         cache.keys = keys
         cache.values = values
-        cache.offset += keys.shape[2]
-        cache._idx = keys.shape[2]
+        cache.offset += max_length
+        cache._idx = max_length
 
         return cache
 
