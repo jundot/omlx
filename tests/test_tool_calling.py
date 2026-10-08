@@ -5813,3 +5813,19 @@ class TestQwenSplitRecoveryRegression:
         assert "".join(out) == "Before "
         assert f.take_recovery_candidate() == ""
 
+    def test_truncated_undeclared_name_stays_suppressed_when_tools_declared(self):
+        """With tools declared, an undeclared truncated name stays suppressed.
+
+        The complete path parses any name to a structured call; the
+        truncated path must not disagree by re-emitting undeclared-name
+        markup as content.
+        """
+        f = ToolCallStreamFilter(
+            _make_tokenizer(), tools={"get_weather"}
+        )
+        text = 'Before [Calling tool: unknown_fn({"x":1}'
+        out = [f.feed(ch) for ch in text]
+        out.append(f.finish())
+        assert "".join(out) == "Before "
+        assert f.take_recovery_candidate() == ""
+

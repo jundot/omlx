@@ -3124,6 +3124,16 @@ class ToolCallStreamFilter:
     def _partial_suffix_len(self, text: str) -> int:
         """Length of trailing suffix that might be an opening-marker prefix."""
         keep = 0
+        # Hold window for an in-progress open-tag candidate. Open-tag
+        # candidates grow with the tool or namespace name, so the fixed
+        # 128-char default would chop them mid-tag — after which the
+        # complete open tag can never reassemble inside the buffer and
+        # the whole envelope leaks as visible content. When a candidate
+        # is in play the window widens to the declared-name-derived bound
+        # (plus a floor for the namespaced form, whose namespace is not
+        # registry-constrained); the bracket hold below can still raise
+        # keep past it, and the widened cap also applies at the return.
+        cap = 128
         for marker, _close in self._marker_pairs:
             keep = max(keep, self._partial_prefix_len(text, marker))
 
@@ -3133,19 +3143,11 @@ class ToolCallStreamFilter:
             if self._could_be_partial_namespaced_open(
                 candidate
             ) or self._could_be_partial_attr_function_open(candidate):
-                keep = max(keep, len(candidate))
-                # An open-tag candidate grows with the tool or namespace
-                # name, so the fixed 128-char window below would chop it
-                # mid-tag — after which the complete open tag can never
-                # reassemble inside the buffer and the whole envelope
-                # leaks as visible content. Hold candidates up to a bound
-                # derived from the declared tool names instead (plus a
-                # floor for the namespaced form, whose namespace is not
-                # registry-constrained).
                 longest = max(
                     (len(n) for n in self._registered_tool_names), default=0
                 )
-                return min(keep, max(512, longest + 64))
+                cap = max(cap, 512, longest + 64)
+                keep = max(keep, min(len(candidate), cap))
 
         # Partial prefix detection for bracket markers (e.g. "[", "[C",
         # "[Cal" could be start of "[Calling tool:" or "[Tool call:").
@@ -3175,29 +3177,22 @@ class ToolCallStreamFilter:
                 return keep
 
         # Cap retained suffix window to avoid unbounded buffering on malformed text.
-        return min(keep, 128)
+        return min(keep, cap)
 
     def _bracket_tail_names_declared_tool(self, tail: str) -> bool:
         """Whether an unresolved bracket hold looks like a truncated call.
 
         ``True`` means the markup must stay suppressed at finish (the
-        drops-unresolved-bracket-fragment contract): the token right after
-        the marker is a declared tool name, so this is a truncated
-        invocation carrying half-written JSON. With no tools declared the
-        bracket can never become a structured call, so the answer is False
-        and the prose stays recoverable.
+        drops-unresolved-bracket-fragment contract). Once any tools are
+        declared, every unresolved bracket tail stays suppressed: a
+        declared name is a truncated invocation carrying half-written
+        JSON, and an undeclared one must not disagree with the complete
+        path (a complete envelope parses to a structured call either way,
+        but a truncated one re-emitted as content would split the two
+        paths). With no tools declared the bracket can never become a
+        structured call, so the prose stays recoverable.
         """
-        for bp in self._bracket_prefixes:
-            if not tail.startswith(bp):
-                continue
-            rest = tail[len(bp) :].lstrip()
-            token = re.match(r"[A-Za-z_][\w.\-]*", rest)
-            if token is None:
-                return False
-            if not self._registered_tool_names:
-                return False
-            return token.group(0) in self._registered_tool_names
-        return False
+        return bool(self._registered_tool_names)
 
     def _should_drop_tail_at_finish(self, tail: str) -> bool:
         """Whether unresolved tail should be suppressed under strict mode."""
