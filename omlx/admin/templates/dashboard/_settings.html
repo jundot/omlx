@@ -1499,9 +1499,9 @@
                             <template x-for="model in sortedModels" :key="model.id">
                                 <div class="hover:bg-neutral-50 transition-colors">
                                     <!-- Main Row -->
-                                    <div class="flex items-center gap-4 px-6 py-4">
+                                    <div class="flex flex-wrap sm:flex-nowrap items-center gap-3 sm:gap-4 px-4 sm:px-6 py-4">
                                         <!-- Model Name -->
-                                        <div class="flex-1 min-w-0 flex items-center gap-3">
+                                        <div class="flex-1 min-w-0 grid sm:flex grid-cols-[minmax(0,1fr)_2.75rem] items-center gap-x-2 gap-y-1.5 sm:gap-3 max-sm:flex-[1_1_100%]">
                                             <template x-if="!model.virtual">
                                                 <button
                                                     @click="updateModelSetting(model.id, 'is_favorite', !model.is_favorite)"
@@ -1510,7 +1510,7 @@
                                                     @focus="showTip($event.currentTarget, model.is_favorite ? window.t('settings.models.table.favorite_on_tooltip') : window.t('settings.models.table.favorite_off_tooltip'))"
                                                     @blur="hideTip()"
                                                     :class="model.is_favorite ? 'text-amber-400' : 'text-neutral-300 hover:text-neutral-600'"
-                                                    class="hidden sm:flex w-8 h-8 items-center justify-center flex-shrink-0 rounded-lg hover:bg-neutral-100 transition-colors focus:outline-none">
+                                                    class="hidden sm:flex w-8 h-8 max-sm:min-w-11 max-sm:min-h-11 items-center justify-center flex-shrink-0 rounded-lg hover:bg-neutral-100 transition-colors focus:outline-none">
                                                     <svg class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" :fill="model.is_favorite ? 'currentColor' : 'none'" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
                                                 </button>
                                             </template>
@@ -1519,27 +1519,27 @@
                                                     <i data-lucide="box" class="w-4 h-4 text-neutral-500"></i>
                                                 </div>
                                             </template>
-                                            <p class="text-sm font-medium text-neutral-900 break-all sm:truncate"
+                                            <p class="col-start-1 row-start-1 min-w-0 text-sm font-medium text-neutral-900 break-normal sm:break-all sm:truncate max-sm:[overflow-wrap:anywhere]"
                                                :title="model.display_name || model.id"
                                                x-text="model.display_name || model.id"></p>
                                             <span x-show="model.settings?.model_alias" x-cloak
-                                                  class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 truncate max-w-[120px]"
+                                                  class="max-sm:col-start-1 max-sm:justify-self-start max-sm:max-w-full px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 truncate max-w-[120px]"
                                                   x-text="model.settings?.model_alias"></span>
                                             <span x-show="model.is_helper" x-cloak
-                                                  class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200"
+                                                  class="max-sm:col-start-1 max-sm:justify-self-start max-sm:max-w-full px-1.5 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200"
                                                   @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.helper_tooltip'))"
                                                   @mouseleave="hideTip()"
                                                   x-text="window.t('settings.models.table.helper_badge')"></span>
                                             <span x-show="model.is_hidden" x-cloak
-                                                  class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200"
+                                                  class="max-sm:col-start-1 max-sm:justify-self-start max-sm:max-w-full px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200"
                                                   @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.hidden_tooltip'))"
                                                   @mouseleave="hideTip()"
                                                   x-text="window.t('settings.models.table.hidden_badge')"></span>
                                             <button x-data="{ copied: false }"
                                                     @click.stop="copyToClipboard(model.id); copied = true; setTimeout(() => copied = false, 2000)"
-                                                    class="p-1 rounded-md transition-all flex-shrink-0"
+                                                    class="col-start-2 row-start-1 self-start sm:self-auto max-sm:flex items-center justify-center max-sm:min-w-11 max-sm:min-h-11 p-1 rounded-md transition-all flex-shrink-0"
                                                     :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
-                                                    :title="window.t('settings.models.table.copy_model_name_tooltip')"
+                                                    :title="window.t('settings.models.table.copy_model_name_tooltip')">
                                                 <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
                                                 <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
                                             </button>
@@ -1669,11 +1669,11 @@
                                         </div>
 
                                         <!-- Actions (icon only) -->
-                                        <div class="w-10 flex justify-center flex-shrink-0">
+                                        <div class="w-auto sm:w-10 ml-auto sm:ml-0 flex flex-wrap sm:flex-nowrap justify-center flex-shrink-0">
                                             <template x-if="!model.virtual">
                                                 <button
                                                     @click="openModelSettings(model)"
-                                                    class="p-2 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all"
+                                                    class="max-sm:min-w-11 max-sm:min-h-11 p-2 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all"
                                                     :title="window.t('settings.models.table.sampling_settings_tooltip')"
                                                 >
                                                     <i data-lucide="settings" class="w-4 h-4"></i>
@@ -1687,8 +1687,8 @@
 
                                     <!-- Profile / preset / per-field chips -->
                                     <div x-show="(!model.model_type || model.model_type === 'llm' || model.model_type === 'vlm') && ((model.exposed_profiles && model.exposed_profiles.length) || (model.settings && (model.settings.max_context_window || model.settings.max_tokens || model.settings.temperature !== null || model.settings.top_p !== null || model.settings.top_k !== null || model.settings.min_p !== null || model.settings.repetition_penalty !== null || model.settings.presence_penalty !== null || model.settings.force_sampling || model.settings.max_tool_result_tokens || model.settings.reasoning_parser || model.settings.chat_template_kwargs || model.settings.enable_thinking === true)))"
-                                         class="px-6 pb-4 -mt-2">
-                                        <div class="ml-11 flex flex-wrap gap-2">
+                                         class="model-list-details px-4 sm:px-6 pb-4 -mt-2">
+                                        <div class="ml-0 sm:ml-11 flex flex-wrap gap-2">
                                             <!-- 1. API-exposed profile pills -->
                                             <template x-for="profile in (model.exposed_profiles || [])" :key="profile.name">
                                                 <span class="inline-flex items-center gap-1 px-2.5 py-0.5 text-xs font-medium rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200"

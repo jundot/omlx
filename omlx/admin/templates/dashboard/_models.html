@@ -1,13 +1,13 @@
             <div x-show="mainTab === 'models'" x-cloak role="tabpanel" id="panel-models" aria-labelledby="tab-models">
                 <div class="animate-fade-in-up">
                     <!-- Sub-tab navigation (Manager / Downloader) -->
-                    <div class="flex flex-wrap items-center gap-2 mb-10 animate-fade-in-up">
+                    <div class="grid grid-cols-2 sm:flex sm:flex-wrap items-center gap-2 mb-6 sm:mb-10 animate-fade-in-up">
                         <button
                             @click="setModelsTab('manager')"
                             :class="modelsTab === 'manager'
                                 ? 'bg-neutral-900 text-white'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
-                            class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200">
+                            class="min-w-0 max-sm:min-h-11 px-2 sm:px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200 max-sm:[overflow-wrap:anywhere]">
                             {{ t('models.tab.manager') }}
                         </button>
                         <button
@@ -15,7 +15,7 @@
                             :class="modelsTab === 'downloader'
                                 ? 'bg-neutral-900 text-white'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
-                            class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200">
+                            class="min-w-0 max-sm:min-h-11 px-2 sm:px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200 max-sm:[overflow-wrap:anywhere]">
                             {{ t('models.tab.downloader') }}
                         </button>
                         <button
@@ -23,7 +23,7 @@
                             :class="modelsTab === 'quantizer'
                                 ? 'bg-neutral-900 text-white'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
-                            class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200">
+                            class="min-w-0 max-sm:min-h-11 px-2 sm:px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200 max-sm:[overflow-wrap:anywhere]">
                             {{ t('models.tab.quantizer') }}
                         </button>
                         <button
@@ -31,7 +31,7 @@
                             :class="modelsTab === 'uploader'
                                 ? 'bg-neutral-900 text-white'
                                 : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
-                            class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200">
+                            class="min-w-0 max-sm:min-h-11 px-2 sm:px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200 max-sm:[overflow-wrap:anywhere]">
                             {{ t('models.tab.uploader') }}
                         </button>
                     </div>
@@ -41,7 +41,7 @@
                         <!-- Header -->
                         <div class="mb-8">
                             <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('models.manager.section_label') }}</h2>
-                            <div class="flex items-center gap-3">
+                            <div class="flex flex-wrap items-center gap-3">
                                 <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('models.manager.heading') }}</h3>
                                 <button @click="reloadModels()"
                                         :disabled="reloading"
@@ -57,8 +57,8 @@
 
                         <!-- Local Models Section -->
                         <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
-                            <div class="flex items-center justify-between px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200">
-                                <div class="flex items-center gap-3">
+                            <div class="flex flex-wrap items-center justify-between gap-2 px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex flex-wrap items-center gap-3">
                                     <i data-lucide="hard-drive" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('models.manager.local_models') }}</span>
                                     <span class="text-xs text-neutral-400" x-text="window.t('models.manager.models_count').replace('{count}', sortedManagerModels.length)"></span>
