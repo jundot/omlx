@@ -219,6 +219,10 @@
             saveSuccess: false,
             saveMessage: '',
             saveError: '',
+            // Transient toast queue for actions with no dedicated status
+            // surface (SSH pairing flow, save failures in peripheral panels).
+            // Rendered by the container in dashboard.html.
+            notifications: [],
 
             // Model settings modal
             showModelSettingsModal: false,
@@ -1048,7 +1052,17 @@
                             this.globalSettings.memory.memory_guard_tier = 'balanced';
                         }
 
-                        // Calculate cache percent from stored value (based on total capacity)
+                        // Calculate cache percent from stored value (based on total
+                        // capacity) — only to position the slider's initial display.
+                        // Do NOT call updateCacheFromSlider() here: it round-trips
+                        // the server's string through percent -> GB (whole-percent
+                        // rounding, tens of GB on a large disk) and clobbers 'auto'
+                        // with a concrete size, persisted the next time the user
+                        // saves ANY unrelated setting. globalSettings.cache was
+                        // already correctly populated straight from the server
+                        // above; only rewrite ssd_cache_max_size when the user
+                        // actually moves the slider (@input="updateCacheFromSlider()"
+                        // in _settings.html) or edits the GB input.
                         this.cachePercent = this.parseCacheToPercent(
                             this.globalSettings.cache.ssd_cache_max_size,
                             this.globalSettings.system.ssd_total_bytes
@@ -1690,6 +1704,19 @@
             },
             hideTip() {
                 this.tip.visible = false;
+            },
+
+            // Transient toast for actions with no dedicated status surface
+            // (e.g. the SSH pairing flow's generate/exchange/keychain-store
+            // calls). Auto-dismisses; also removable via dismissNotification.
+            showNotification(message, level = 'info') {
+                const id = 'n-' + Date.now().toString(36) + '-' +
+                           Math.random().toString(36).slice(2, 6);
+                this.notifications.push({ id, message, level });
+                setTimeout(() => this.dismissNotification(id), 5000);
+            },
+            dismissNotification(id) {
+                this.notifications = this.notifications.filter(n => n.id !== id);
             },
 
             isDiffusionModel(model) {
@@ -4733,6 +4760,37 @@
 
             // Narrow-patch save of the global Prefill Priority setting from
             // the bench tab (mirrors the Settings row; applied live server-side).
+            async saveIdleTimeout(value) {
+                // Narrow patch instead of saveGlobalSettings() — the dropdown's
+                // @change previously posted the ENTIRE settings form, so
+                // changing idle timeout silently committed (or, on a
+                // validation failure, silently discarded via the reload in
+                // loadGlobalSettings) every other unsaved edit on the page.
+                const seconds = value === '' ? null : Number(value);
+                const prev = this.globalSettings.idle_timeout.idle_timeout_seconds;
+                if (prev === seconds) return;
+                if (this.globalDefaultsPending) {
+                    // A defaults-apply is queued — it will persist this when it
+                    // runs (matches the inline-change flow's deferral).
+                    this.globalSettings.idle_timeout.idle_timeout_seconds = seconds;
+                    return;
+                }
+                this.globalSettings.idle_timeout.idle_timeout_seconds = seconds;
+                try {
+                    const resp = await fetch('/admin/api/global-settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ idle_timeout_seconds: seconds }),
+                    });
+                    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                } catch (err) {
+                    console.error('Failed to save idle timeout:', err);
+                    this.globalSettings.idle_timeout.idle_timeout_seconds = prev;
+                    this.idleTimeoutValue = prev == null ? '' : String(prev);
+                    this.showNotification(window.t('js.error.save_settings_failed'), 'error');
+                }
+            },
+
             async saveCtxBenchPriority(value) {
                 if (this.ctxBenchRunning) return;
                 const prev = this.globalSettings.scheduler.prefill_priority;
@@ -5218,15 +5276,27 @@
                                 this.accCurrentModel = data.model_id || this.accCurrentModel;
                                 break;
                             case 'result':
-                                // Dedupe on replay: accuracy results are unique by
-                                // (model_id, benchmark).
+                                // (model_id, benchmark) is NOT unique across runs —
+                                // re-running the same model+benchmark (the normal
+                                // "changed a setting, run again" flow) is keyed
+                                // identically to an SSE replay of the prior run's
+                                // own result event. Replace-in-place instead of
+                                // dropping: idempotent on a true replay (same
+                                // data back in) and correct on a fresh re-run
+                                // (the new result actually shows), and it keeps
+                                // the follow-up 'upload' event's (model_id,
+                                // benchmark) findIndex pointed at the current
+                                // card instead of a stale one.
                                 {
-                                    const exists = this.accAllResults.some(
+                                    const idx = this.accAllResults.findIndex(
                                         r => r.model_id === data.data.model_id
                                           && r.benchmark === data.data.benchmark
                                     );
-                                    if (!exists) {
-                                        data.data._showCategories = false;
+                                    data.data._showCategories = false;
+                                    if (idx >= 0) {
+                                        this.accAllResults.splice(idx, 1, data.data);
+                                        this.accAllResults = [...this.accAllResults];
+                                    } else {
                                         this.accAllResults.push(data.data);
                                     }
                                 }
