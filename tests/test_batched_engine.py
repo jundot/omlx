@@ -1004,17 +1004,22 @@ class TestBatchedEngineSpecPrefillForwarding:
             generate=AsyncMock(return_value=self._fake_output())
         )
 
-        # Full (system+user) prompt renders longer than the non-system prompt,
-        # so system_end = full_tokens - non_system_tokens = 10 - 4 = 6.
+        # A fake template with a static leading block, then the conversation.
+        static_block = "<sys> you are helpful </sys>"
+
         def fake_template(msgs, *args, **kwargs):
-            has_system = any(m["role"] == "system" for m in msgs)
-            return "SYS_AND_USER" if has_system else "USER_ONLY"
+            parts = [static_block]
+            for m in msgs:
+                if m["role"] in ("system", "developer"):
+                    continue
+                parts.append(f"<{m['role']}> {m['content']} </{m['role']}>")
+            return " ".join(parts)
 
         engine._apply_chat_template = fake_template
         engine._tokenizer = MagicMock()
-        engine._tokenizer.encode.side_effect = lambda text: (
-            [0] * 10 if "SYS" in text else [0] * 4
-        )
+        engine._tokenizer.encode.side_effect = lambda text: [
+            hash(piece) % 5000 for piece in text.split()
+        ]
 
         messages = [
             {"role": "system", "content": "you are helpful"},
@@ -1023,7 +1028,11 @@ class TestBatchedEngineSpecPrefillForwarding:
         await engine.chat(messages)
 
         call_kwargs = engine._engine.generate.call_args.kwargs
-        assert call_kwargs["specprefill_system_end"] == 6
+        system_end = call_kwargs["specprefill_system_end"]
+        assert system_end >= len(engine._tokenizer.encode(static_block))
+        assert system_end < len(
+            engine._tokenizer.encode(fake_template(messages))
+        )
 
     @pytest.mark.asyncio
     async def test_chat_skips_system_end_when_specprefill_disabled(self):

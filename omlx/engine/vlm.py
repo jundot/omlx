@@ -53,6 +53,7 @@ from ..models.vlm import VLMModelAdapter
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
+from ..specprefill.boundary import resolve_static_prefix_end
 from ..utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
@@ -4707,20 +4708,19 @@ class VLMBatchedEngine(BaseEngine):
         self,
         messages: list[dict[str, Any]],
         prompt: str | list[int],
+        template_tools: Any,
+        ct_kwargs: dict[str, Any] | None,
         kwargs: dict[str, Any],
     ) -> None:
-        """Compute the system-prompt token boundary and add it to ``kwargs``.
+        """Compute the static-prefix token boundary and add it to ``kwargs``.
 
-        SpecPrefill protects the system-prompt region from token dropping. The
-        boundary is derived by subtracting the non-system prompt token count
-        from the full prompt token count (system-only messages usually can't be
-        templated on their own). Shared by ``chat`` and ``stream_chat`` so the
-        non-streaming path protects the system prompt identically. No-op unless
-        the model has SpecPrefill enabled and the request has a system prompt.
+        SpecPrefill never drops tokens from the system/developer and tool
+        block ahead of the first turn. Shared by ``chat`` and ``stream_chat``.
+        No-op unless SpecPrefill is enabled and the request has a system or
+        developer message.
 
-        ``prompt`` is the already-tokenized VLM prompt (a list of token IDs,
-        per ``_process_chat_messages``), so the full-prompt count is just its
-        length rather than a re-encode.
+        ``prompt`` is usually token IDs from ``_process_chat_messages``. Image
+        turns render differently, so the boundary can only come out shorter.
         """
         specprefill_model_enabled = (
             getattr(self._model_settings, "specprefill_enabled", False)
@@ -4729,23 +4729,29 @@ class VLMBatchedEngine(BaseEngine):
         )
         if not (specprefill_model_enabled and kwargs.get("specprefill") is not False):
             return
-        non_system = [
-            m for m in messages if m.get("role") not in ("system", "developer")
-        ]
-        if len(non_system) < len(messages) and non_system:
-            try:
-                non_system_prompt = self._tokenizer.apply_chat_template(
-                    non_system,
-                    tokenize=False,
-                    add_generation_prompt=True,
+        try:
+            prompt_token_ids = (
+                prompt
+                if not isinstance(prompt, str)
+                else self._tokenizer.encode(prompt)
+            )
+
+            def render_tokens(probe_messages: list[dict[str, Any]]) -> list[int]:
+                return self._tokenizer.encode(
+                    self._apply_chat_template(
+                        probe_messages,
+                        template_tools,
+                        chat_template_kwargs=ct_kwargs,
+                    )
                 )
-                full_tokens = len(prompt)
-                non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
-                system_end = full_tokens - non_system_tokens
-                if system_end > 0:
-                    kwargs["specprefill_system_end"] = system_end
-            except Exception as e:
-                logger.debug(f"SpecPrefill: system_end calc failed: {e}")
+
+            system_end = resolve_static_prefix_end(
+                messages, prompt_token_ids, render_tokens
+            )
+            if system_end > 0:
+                kwargs["specprefill_system_end"] = system_end
+        except Exception as e:
+            logger.debug(f"SpecPrefill: system_end calc failed: {e}")
 
     async def generate(
         self,
@@ -5050,8 +5056,15 @@ class VLMBatchedEngine(BaseEngine):
                 cached_tokens=0,
             )
 
+        # The SpecPrefill boundary probe must render through the same tools
+        # as the real prompt.
+        specprefill_template_tools = (
+            convert_tools_for_template(tools) if tools else None
+        )
+
         loop = asyncio.get_running_loop()
-        # _process_chat_messages pops these; the tail marker needs them too.
+        # _process_chat_messages pops these; the tail marker and the
+        # SpecPrefill boundary probe need them too.
         ct_kwargs = kwargs.get("chat_template_kwargs")
         partial = kwargs.get("is_partial")
         (
@@ -5070,7 +5083,13 @@ class VLMBatchedEngine(BaseEngine):
         )
 
         # SpecPrefill: protect the system-prompt region, mirroring stream_chat.
-        self._inject_specprefill_system_end(messages, prompt, kwargs)
+        self._inject_specprefill_system_end(
+            messages,
+            prompt,
+            specprefill_template_tools,
+            ct_kwargs,
+            kwargs,
+        )
         generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
         if generation_prompt:
             kwargs["generation_prompt_text"] = generation_prompt
@@ -5299,8 +5318,15 @@ class VLMBatchedEngine(BaseEngine):
         # the event loop.  Blocking here (synchronous mx.eval) prevents
         # uvicorn from managing HTTP keep-alive connections, causing
         # TransferEncodingError on the next request (issue #80).
+        # The SpecPrefill boundary probe must render through the same tools
+        # as the real prompt.
+        specprefill_template_tools = (
+            convert_tools_for_template(tools) if tools else None
+        )
+
         loop = asyncio.get_running_loop()
-        # _process_chat_messages pops these; the tail marker needs them too.
+        # _process_chat_messages pops these; the tail marker and the
+        # SpecPrefill boundary probe need them too.
         ct_kwargs = kwargs.get("chat_template_kwargs")
         partial = kwargs.get("is_partial")
         (
@@ -5319,7 +5345,13 @@ class VLMBatchedEngine(BaseEngine):
         )
 
         # SpecPrefill: protect the system-prompt region from token dropping.
-        self._inject_specprefill_system_end(messages, prompt, kwargs)
+        self._inject_specprefill_system_end(
+            messages,
+            prompt,
+            specprefill_template_tools,
+            ct_kwargs,
+            kwargs,
+        )
         generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
         if generation_prompt:
             kwargs["generation_prompt_text"] = generation_prompt
