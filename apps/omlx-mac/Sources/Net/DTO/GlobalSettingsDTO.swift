@@ -178,6 +178,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let opencodeModel: String?
         let openclawModel: String?
         let piModel: String?
+        let vibeModel: String?
         let openclawToolsProfile: String?
         let hermesModel: String?
         let copilotModel: String?
@@ -250,6 +251,7 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var integrationsOpencodeModel: String? = nil
     var integrationsOpenclawModel: String? = nil
     var integrationsPiModel: String? = nil
+    var integrationsVibeModel: String? = nil
     var integrationsOpenclawToolsProfile: String? = nil
     var integrationsHermesModel: String? = nil
     var integrationsCopilotModel: String? = nil

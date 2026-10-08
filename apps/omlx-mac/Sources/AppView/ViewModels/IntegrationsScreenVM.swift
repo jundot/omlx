@@ -6,7 +6,7 @@ final class IntegrationsScreenVM {
     enum Field: Sendable {
         case claudeMode, opusModel, sonnetModel, haikuModel
         case codexModel, opencodeModel, openclawModel, piModel, openclawToolsProfile
-        case hermesModel, copilotModel, dshModel
+        case hermesModel, copilotModel, dshModel, vibeModel
         case mcpConfig
     }
 
@@ -21,6 +21,7 @@ final class IntegrationsScreenVM {
     var opencodeModel: String = ""
     var openclawModel: String = ""
     var piModel: String = ""
+    var vibeModel: String = ""
     var openclawToolsProfile: String = "coding"
     var hermesModel: String = ""
     var copilotModel: String = ""
@@ -103,6 +104,10 @@ final class IntegrationsScreenVM {
     }
     var hermesCommand: String   { "\(cliCommandPrefix) launch hermes" }
     var piCommand: String       { "\(cliCommandPrefix) launch pi" }
+    var vibeCommand: String {
+        let command = "\(cliCommandPrefix) launch vibe"
+        return vibeModel.isEmpty ? command : "\(command) --model \(Self.shellQuote(vibeModel))"
+    }
     var copilotCommand: String  { "\(cliCommandPrefix) launch copilot" }
     var dshCommand: String      { "\(cliCommandPrefix) launch dsh" }
 
@@ -139,6 +144,7 @@ final class IntegrationsScreenVM {
                 self.opencodeModel        = it.opencodeModel ?? ""
                 self.openclawModel        = it.openclawModel ?? ""
                 self.piModel              = it.piModel ?? ""
+                self.vibeModel            = it.vibeModel ?? ""
                 self.openclawToolsProfile = it.openclawToolsProfile ?? "coding"
                 self.hermesModel          = it.hermesModel ?? ""
                 self.copilotModel         = it.copilotModel ?? ""
@@ -182,6 +188,7 @@ final class IntegrationsScreenVM {
         case .opencodeModel:        patch.integrationsOpencodeModel = opencodeModel
         case .openclawModel:        patch.integrationsOpenclawModel = openclawModel
         case .piModel:              patch.integrationsPiModel = piModel
+        case .vibeModel:            patch.integrationsVibeModel = vibeModel
         case .openclawToolsProfile: patch.integrationsOpenclawToolsProfile = openclawToolsProfile
         case .hermesModel:          patch.integrationsHermesModel = hermesModel
         case .copilotModel:         patch.integrationsCopilotModel = copilotModel
