@@ -869,6 +869,144 @@ class TestLoginEndpoint:
             _restore_getter(original)
 
 
+class TestLoginThrottle:
+    """Failure budget for the unauthenticated admin login endpoints."""
+
+    def setup_method(self):
+        admin_routes.login_throttle.reset()
+
+    def teardown_method(self):
+        admin_routes.login_throttle.reset()
+
+    @staticmethod
+    def _peer_request(host="10.9.9.9"):
+        req = MagicMock()
+        req.client.host = host
+        return req
+
+    def test_lockout_after_repeated_failures(self):
+        """Eight failures from one peer lock it out with 429 + Retry-After."""
+        from fastapi import HTTPException
+
+        mock_settings = _mock_global_settings(api_key="correct-key")
+        original = _patch_getter(mock_settings)
+        try:
+            statuses = []
+            for _ in range(9):
+                request = admin_routes.LoginRequest(api_key="wrong")
+                with pytest.raises(HTTPException) as exc_info:
+                    asyncio.run(
+                        admin_routes.login(
+                            request, MagicMock(), self._peer_request()
+                        )
+                    )
+                statuses.append(exc_info.value.status_code)
+            assert statuses[:8] == [401] * 8
+            assert statuses[8] == 429
+            assert "Retry-After" in exc_info.value.headers
+        finally:
+            _restore_getter(original)
+
+    def test_lockout_is_per_peer(self):
+        """A locked peer does not affect a different peer's login."""
+        mock_settings = _mock_global_settings(api_key="correct-key")
+        original = _patch_getter(mock_settings)
+        try:
+            for _ in range(10):
+                with pytest.raises(Exception):
+                    asyncio.run(
+                        admin_routes.login(
+                            admin_routes.LoginRequest(api_key="wrong"),
+                            MagicMock(),
+                            self._peer_request("10.9.9.9"),
+                        )
+                    )
+            result = asyncio.run(
+                admin_routes.login(
+                    admin_routes.LoginRequest(api_key="correct-key"),
+                    MagicMock(),
+                    self._peer_request("10.9.9.8"),
+                )
+            )
+            assert result["success"] is True
+        finally:
+            _restore_getter(original)
+
+    def test_success_resets_failure_budget(self):
+        """A successful login clears the peer's failure count."""
+        from fastapi import HTTPException
+
+        mock_settings = _mock_global_settings(api_key="correct-key")
+        original = _patch_getter(mock_settings)
+        try:
+            for _ in range(7):
+                with pytest.raises(HTTPException) as exc_info:
+                    asyncio.run(
+                        admin_routes.login(
+                            admin_routes.LoginRequest(api_key="wrong"),
+                            MagicMock(),
+                            self._peer_request(),
+                        )
+                    )
+                assert exc_info.value.status_code == 401
+            asyncio.run(
+                admin_routes.login(
+                    admin_routes.LoginRequest(api_key="correct-key"),
+                    MagicMock(),
+                    self._peer_request(),
+                )
+            )
+            for _ in range(7):
+                with pytest.raises(HTTPException) as exc_info:
+                    asyncio.run(
+                        admin_routes.login(
+                            admin_routes.LoginRequest(api_key="wrong"),
+                            MagicMock(),
+                            self._peer_request(),
+                        )
+                    )
+                assert exc_info.value.status_code == 401
+        finally:
+            _restore_getter(original)
+
+    def test_auto_login_shares_the_failure_budget(self):
+        """auto-login failures count toward the same peer lockout."""
+        mock_settings = _mock_global_settings(api_key="correct-key")
+        original = _patch_getter(mock_settings)
+        try:
+            for _ in range(10):
+                response = asyncio.run(
+                    admin_routes.auto_login(
+                        key="wrong", http_request=self._peer_request()
+                    )
+                )
+                assert response.status_code == 302
+            # A wrong key on the login form is now locked out (429), while
+            # the correct key still passes: the budget stops wrong-key
+            # guessing, not authenticated clients.
+            from fastapi import HTTPException
+
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.login(
+                        admin_routes.LoginRequest(api_key="wrong"),
+                        MagicMock(),
+                        self._peer_request(),
+                    )
+                )
+            assert exc_info.value.status_code == 429
+            result = asyncio.run(
+                admin_routes.login(
+                    admin_routes.LoginRequest(api_key="correct-key"),
+                    MagicMock(),
+                    self._peer_request(),
+                )
+            )
+            assert result["success"] is True
+        finally:
+            _restore_getter(original)
+
+
 class TestStatsSecurity:
     """Tests for /admin/api/stats response hardening."""
 
