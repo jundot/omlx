@@ -137,3 +137,19 @@ assert.equal(app.vibeCommand, "'/My Apps/oMLX.app/omlx-cli' launch vibe --model 
     subprocess.run(
         ["node", "-e", script, str(source)], check=True, capture_output=True, text=True
     )
+
+
+def test_alias_survives_resume_and_separates_models_and_servers():
+    aliases = []
+    contexts = [
+        IntegrationContext(host="localhost", port=8000, model="local"),
+        IntegrationContext(host="localhost", port=8000, model="local"),
+        IntegrationContext(host="localhost", port=8000, model="other"),
+        IntegrationContext(host="localhost", port=8001, model="local"),
+    ]
+    for context in contexts:
+        with patch("omlx.integrations.vibe.os.execvpe") as execute:
+            VibeIntegration().launch(context)
+        aliases.append(execute.call_args.args[2]["VIBE_ACTIVE_MODEL"])
+    assert aliases[0] == aliases[1]
+    assert len(set(aliases)) == 3

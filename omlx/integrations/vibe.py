@@ -3,10 +3,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
-import uuid
 
 from omlx.integrations.base import Integration, IntegrationContext
 from omlx.utils.install import get_cli_command_prefix
@@ -30,7 +30,10 @@ class VibeIntegration(Integration):
 
     def launch(self, ctx: IntegrationContext) -> None:
         env = self._scrubbed_env()
-        alias = f"omlx-{uuid.uuid4().hex}"
+        # Saved Vibe sessions refer to this alias. Keep it stable for the same
+        # endpoint/model while avoiding collisions with user-defined entries.
+        identity = json.dumps([ctx.openai_base_url, ctx.model]).encode()
+        alias = f"omlx-{hashlib.sha256(identity).hexdigest()[:16]}"
         env["OMLX_API_KEY"] = ctx.auth_token
         # Vibe's environment layer merges these named entries with the existing
         # user/project TOML. The key itself never goes into config or arguments.
