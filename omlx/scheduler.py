@@ -64,6 +64,7 @@ from .exceptions import (
 )
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import _drafter_for as _block_drafter_for
+from .patches.mlx_lm_mtp.batch_generator import _model_mtp_decode_enabled
 from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
 from .patches.vlm_batch_kv_capacity import apply_batch_kv_capacity_patch
 from .prefill_boundaries import (
@@ -72,7 +73,7 @@ from .prefill_boundaries import (
 )
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
-from .request import Request, RequestOutput, RequestStatus, SamplingParams
+from .request import Request, RequestOutput, RequestStatus, SamplingParams, TokenLogprob
 from .speculative.processing_sampler import (
     MTPProcessingSampler,
     MTPProcessorContractError,
@@ -276,6 +277,26 @@ def _safe_sync_stream(stream=None):
     except RuntimeError as e:
         if "no Stream" not in str(e):
             raise
+
+
+def _token_logprob(logprobs: mx.array, token: int, top_n: int) -> TokenLogprob:
+    """Read one generated token's log probability and its top alternatives.
+
+    ``logprobs`` is the row mlx-lm's GenerationBatch normalized right before
+    sampling (processed logits minus their logsumexp), so ``token`` was drawn
+    from it; at temperature 0 the token is its argmax. GenerationBatch has
+    already evaluated the row, so the reads run on the CPU stream instead of
+    queueing behind the next decode step already dispatched on the GPU.
+    """
+    with mx.stream(mx.cpu):
+        row = logprobs.reshape(-1).astype(mx.float32)
+        chosen = row[token].item()
+        top_n = min(top_n, row.shape[0])
+        if top_n <= 0:
+            return TokenLogprob(token, chosen, [])
+        ids = mx.argpartition(row, kth=row.shape[0] - top_n)[-top_n:]
+        pairs = list(zip(ids.tolist(), row[ids].tolist()))
+    return TokenLogprob(token, chosen, sorted(pairs, key=lambda p: (-p[1], p[0])))
 
 
 def _env_int(name: str, default: int = 0) -> int:
@@ -12317,6 +12338,37 @@ class Scheduler:
 
         return scheduled, rejected_outputs
 
+    def _record_token_logprob(
+        self, request: Request, response: Any, tokens_before: int
+    ) -> None:
+        """Keep one logprob record per output token of a logprobs request.
+
+        Records follow output_token_ids: a step that adds no output token (EOS,
+        a matched stop token, a token a protocol parser drops) adds no record.
+        Re-prefill paths reset output_token_ids, so trimming to the current
+        count keeps both aligned. A token without the target model's
+        distribution records None, and the request then reports no logprobs
+        rather than misaligned or approximate ones.
+        """
+        records = request.output_logprobs
+        if records is None:
+            records = request.output_logprobs = []
+        count = request.num_output_tokens
+        if count > tokens_before:
+            del records[count - 1 :]
+            records.extend([None] * (count - 1 - len(records)))
+            row = getattr(response, "logprobs", None)
+            # Lightning MTP and block drafters report an accepted draft with
+            # the draft head's distribution, not the target model's.
+            if _model_mtp_decode_enabled(self.model):
+                row = None
+            top_n = request.sampling_params.top_logprobs or 0
+            records.append(
+                None if row is None else _token_logprob(row, int(response.token), top_n)
+            )
+        # Drop the vocab-sized row as soon as it has been read.
+        response.logprobs = None
+
     def _process_batch_responses(
         self, responses: list[Any]
     ) -> tuple[list[RequestOutput], set[str]]:
@@ -12470,6 +12522,8 @@ class Scheduler:
                 and not request.sampling_params.logprobs
             ):
                 response.logprobs = None
+            elif request.sampling_params.logprobs:
+                self._record_token_logprob(request, response, completion_tokens_before)
 
             # Create output
             output_generated_at = (
@@ -12518,6 +12572,12 @@ class Scheduler:
                 output.finished = True
                 output.finish_reason = response.finish_reason
                 finished_ids.add(request_id)
+                if request.output_logprobs is not None:
+                    output.logprobs = (
+                        None
+                        if None in request.output_logprobs
+                        else list(request.output_logprobs)
+                    )
 
                 if parser_session is not None:
                     final_result = parser_session.finalize()

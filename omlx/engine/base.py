@@ -210,6 +210,9 @@ class GenerationOutput:
     finished: bool = True
     # For tool calling (Harmony and other models)
     tool_calls: Optional[List[Dict[str, Any]]] = None
+    # Per-token logprob records (omlx.request.TokenLogprob) for requests that
+    # asked for logprobs; None when not requested or not available.
+    logprobs: list[Any] | None = None
     # Prefix cache stats
     cached_tokens: int = 0
     # Optional engine-native throughput stats. Diffusion models report

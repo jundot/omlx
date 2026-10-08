@@ -4727,6 +4727,11 @@ async def create_chat_completion(
                 headers=sse_headers,
             )
 
+        # Token logprobs are returned for non-streaming responses only.
+        if request.logprobs:
+            chat_kwargs["logprobs"] = True
+            chat_kwargs["top_logprobs"] = request.top_logprobs or 0
+
         # Non-streaming response with keepalive during prefill
         async def _build_chat_completion():
             await _raise_if_llm_lease_abort_requested(lease)
@@ -4847,6 +4852,11 @@ async def create_chat_completion(
                             tool_calls=tool_calls,
                         ),
                         finish_reason=finish_reason,
+                        logprobs=(
+                            _chat_logprobs(output.logprobs, engine.tokenizer)
+                            if request.logprobs
+                            else None
+                        ),
                     )
                 ],
                 usage=Usage(
@@ -4883,6 +4893,38 @@ async def create_chat_completion(
     except BaseException:
         await lease.release()
         raise
+
+
+# JSON has no -inf; OpenAI reports tokens masked to -inf as -9999.0.
+_MIN_LOGPROB = -9999.0
+
+
+def _chat_logprobs(records, tokenizer) -> dict | None:
+    """Format scheduler logprob records as OpenAI ``choices[].logprobs``.
+
+    One entry per generated token (``usage.completion_tokens``) in generation
+    order, including reasoning and tool-call markup tokens.
+    """
+    if records is None or tokenizer is None:
+        return None
+
+    def entry(token: int, logprob: float) -> dict:
+        text = tokenizer.decode([token])
+        return {
+            "token": text,
+            # The comparison also maps NaN to the floor.
+            "logprob": logprob if logprob > _MIN_LOGPROB else _MIN_LOGPROB,
+            # A token that ends inside a multi-byte character decodes to
+            # U+FFFD on its own and has no faithful byte form.
+            "bytes": None if "\ufffd" in text else list(text.encode("utf-8")),
+        }
+
+    content = []
+    for record in records:
+        item = entry(record.token, record.logprob)
+        item["top_logprobs"] = [entry(t, lp) for t, lp in record.top_logprobs]
+        content.append(item)
+    return {"content": content}
 
 
 def _inject_json_instruction(messages: list, instruction: str) -> list:

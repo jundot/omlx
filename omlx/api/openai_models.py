@@ -377,6 +377,10 @@ class ChatCompletionRequest(BaseModel):
     specprefill_threshold: Optional[int] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
+    # Per-token log probabilities (OpenAI-compatible). Returned only on
+    # non-streaming responses; streaming requests ignore them.
+    logprobs: bool | None = None
+    top_logprobs: int | None = Field(default=None, ge=0, le=20)
 
     @field_validator("stop", mode="before")
     @classmethod
@@ -418,6 +422,10 @@ class ChatCompletionChoice(BaseModel):
     index: int = 0
     message: AssistantMessage
     finish_reason: Optional[str] = "stop"
+    # {"content": [{"token", "logprob", "bytes", "top_logprobs"}, ...]} when
+    # the request set logprobs. A plain dict keeps OpenAI's explicit
+    # "bytes": null through the exclude_none response serialization.
+    logprobs: dict[str, Any] | None = None
 
 
 class PromptTokensDetails(BaseModel):
