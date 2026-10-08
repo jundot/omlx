@@ -1,4 +1,5 @@
 import logging
+import os
 from functools import partial
 from typing import Any, Optional
 
@@ -66,7 +67,16 @@ def _cache_parts(cache):
 # DECODE_BLOCK_SIZE of the shared HC helpers) run fused kernels that
 # reproduce the reference op graph bit for bit; see decode_kernels.py.
 # They are validated on M5 (NAX) GPUs and used there.
-_DECODE_FUSION = is_nax_available()
+# M3/M4 experiment (2026-10-07): every decode_kernels entry point gates on
+# shape/dtype/quant-layout and returns None when not covered, and the NAX-only
+# kernels (hc_expand_one, moe_router_rows, hc_defer) additionally check
+# nax_relaxed_fp32_matmul() internally, so enabling the dispatch attempts on
+# non-NAX hosts only adds failed attempts that fall back to the reference
+# path. Kernels verified working on M3 Ultra by direct invocation:
+# hc_mix, kda_decode_step, moe_router (1-tok), moe_gate_up_swiglu,
+# moe_down_combine, mlp_gate_up_swiglu, multi_qmv, mla_head_qmv,
+# dsa_decode_scores, dsa_topk_rows, dsa_expand_topk.
+_DECODE_FUSION = is_nax_available() or os.environ.get("OMLX_M3_DECODE_FUSION") == "1"
 _DECODE_BLOCK = 8
 
 # One-token decode forwards start evaluating every this many layers.
