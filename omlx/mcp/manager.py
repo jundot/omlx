@@ -5,6 +5,7 @@ MCP Client Manager for handling multiple MCP server connections.
 """
 
 import asyncio
+import contextlib
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -102,10 +103,17 @@ class MCPClientManager:
 
             logger.info("Stopping MCP client manager")
 
-            # Disconnect from all servers in parallel
+            # Disconnect from all servers in parallel. A hung or SIGSTOP'd
+            # server child must not wedge server shutdown: the SDK's exit
+            # path terminates the subprocess and waits for it, so bound the
+            # whole drain and let the OS reap whatever is left.
             tasks = [client.disconnect() for client in self._clients.values()]
             if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=10.0,
+                    )
 
             self._started = False
             logger.info("MCP client manager stopped")
