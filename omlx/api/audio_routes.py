@@ -585,7 +585,16 @@ async def create_transcription(
                 engine, tmp_path, resolved_model, transcribe_kwargs
             )
             tmp_path = None
-            first_event = await events.__anext__()
+            try:
+                first_event = await events.__anext__()
+            except StopAsyncIteration:
+                # All-silence/no-speech audio can yield zero events; the
+                # TTS route handles this case, the STT path used to 500
+                # with an unhandled StopAsyncIteration.
+                raise HTTPException(
+                    status_code=422,
+                    detail="No speech detected in the uploaded audio.",
+                )
             return StreamingResponse(
                 _stream_with_prefetched_chunk(first_event, events),
                 media_type="text/event-stream",
@@ -733,7 +742,14 @@ async def realtime_transcription(websocket: WebSocket) -> None:
                 return
             data = message.get("bytes")
             if data:
-                session.feed_pcm16(data)
+                # The receiver task must never die on a bad frame: its
+                # death stops the disconnect from being observed and the
+                # main loop spins forever. Any feed failure is logged and
+                # the frame dropped.
+                try:
+                    session.feed_pcm16(data)
+                except Exception:
+                    logger.exception("Dropping malformed audio frame")
                 continue
             text = message.get("text")
             if text:
@@ -780,9 +796,13 @@ async def realtime_transcription(websocket: WebSocket) -> None:
             await websocket.close(code=1011)
     finally:
         receiver.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await receiver
+        # Release the engine session first: if the receiver task died with
+        # an exception, awaiting it used to re-raise here and skip the
+        # release — pinning _realtime_active forever and rejecting every
+        # later realtime connection for the model.
         await session.release()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await receiver
 
 
 @router.get("/v1/audio/voices")

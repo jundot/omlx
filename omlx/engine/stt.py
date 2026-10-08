@@ -484,6 +484,15 @@ class RealtimeTranscriptionSession:
     def feed_pcm16(self, data: bytes) -> None:
         if self._closed or not data:
             return
+        if len(data) % 2:
+            # A partial trailing sample cannot be decoded; drop it. The
+            # alternative — letting frombuffer raise — killed the receiver
+            # task and (via the route's finally ordering) leaked the
+            # session flag for the rest of the process lifetime.
+            logger.debug("Dropping partial PCM16 sample byte (%d bytes)", len(data))
+            data = data[: len(data) - 1]
+            if not data:
+                return
         samples = np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
         self._backend.feed(samples)
 
