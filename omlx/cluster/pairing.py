@@ -793,7 +793,18 @@ def normalize_ssh_public_key(public_key: str) -> str:
 def _pairing_caps(caps: dict[str, Any]) -> dict[str, Any]:
     # Enrollment installs keys in this account's ~/.ssh. Older peers reject new
     # top-level fields but keep any caps key; discovery HELLO never sends it.
-    return {**caps, "ssh_user": pwd.getpwuid(os.geteuid()).pw_name}
+    # A missing passwd entry (some containers, broken nsswitch) must degrade
+    # to "don't advertise a user", not break pairing/join outright.
+    try:
+        ssh_user = pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError:
+        logger.warning(
+            "No passwd entry for euid %d; pairing caps will not advertise "
+            "an ssh_user",
+            os.geteuid(),
+        )
+        return dict(caps)
+    return {**caps, "ssh_user": ssh_user}
 
 
 def _advertised_ssh_user(caps: Any) -> str | None:

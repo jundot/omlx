@@ -1226,6 +1226,7 @@ class BatchedEngine(BaseEngine):
         request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_id=kwargs.pop("_request_id", None),
             tools=tools,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
             preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),

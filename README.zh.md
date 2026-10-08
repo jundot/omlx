@@ -228,7 +228,7 @@ brew services info omlx     # 查看状态
 
 ### API 兼容性
 
-OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream_options.include_usage`）、Anthropic adaptive thinking 和视觉输入（base64、URL）。
+OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream_options.include_usage`）、llama.cpp 风格的 prefill 进度（`return_progress`）、Anthropic adaptive thinking 和视觉输入（base64、URL）。
 
 | 端点 | 说明 |
 |----------|------|

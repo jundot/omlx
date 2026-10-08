@@ -4647,6 +4647,89 @@ def _stock_verify_router(fused):
     return router
 
 
+@pytest.mark.parametrize("bits", [4, 8])
+def test_sanitize_dequantizes_quantized_router_gate(bits):
+    config_dict = _tiny_config_dict()
+    config_dict["text_config"]["hidden_size"] = 256
+    sanitizer = _build_model_sanitizer(config_dict)
+    gate = mx.random.normal((8, 256)).astype(mx.bfloat16)
+    packed, scales, biases = mx.quantize(gate, group_size=128, bits=bits)
+    prefix = "model.language_model.layers.0.mlp.gate."
+    sanitized = sanitizer(
+        {
+            prefix + "weight": packed,
+            prefix + "scales": scales,
+            prefix + "biases": biases,
+        }
+    )
+
+    out = "language_model.model.layers.0.mlp.gate."
+    assert out + "scales" not in sanitized
+    assert out + "biases" not in sanitized
+    expected = mx.dequantize(packed, scales, biases, group_size=128, bits=bits)
+    assert sanitized[out + "weight"].dtype == mx.float32
+    assert mx.array_equal(sanitized[out + "weight"], expected.astype(mx.float32)).item()
+
+
+def test_sanitize_keeps_unquantized_router_gate():
+    config_dict = _tiny_config_dict()
+    sanitizer = _build_model_sanitizer(config_dict)
+    hidden = config_dict["text_config"]["hidden_size"]
+    gate = mx.random.normal((8, hidden)).astype(mx.bfloat16)
+    sanitized = sanitizer({"model.language_model.layers.0.mlp.gate.weight": gate})
+    weight = sanitized["language_model.model.layers.0.mlp.gate.weight"]
+    assert weight.dtype == mx.float32
+    assert mx.array_equal(weight, gate.astype(mx.float32)).item()
+
+
+def test_sanitize_rejects_invalid_router_quantization_shapes():
+    sanitizer = _build_model_sanitizer(_tiny_config_dict())
+    prefix = "model.language_model.layers.0.mlp.gate."
+    with pytest.raises(ValueError, match="mlp.gate.weight.*cannot infer quantization"):
+        sanitizer(
+            {
+                prefix + "weight": mx.zeros((8, 4), dtype=mx.uint32),
+                prefix + "scales": mx.ones((8, 3)),
+                prefix + "biases": mx.zeros((8, 3)),
+            }
+        )
+
+
+def test_load_model_dequantizes_quantized_router_gate(monkeypatch):
+    import mlx_vlm.utils as utils
+    from mlx.utils import tree_flatten
+    from mlx_vlm.models import glm5_next
+
+    config = _tiny_config_dict()
+    config["text_config"].update(
+        hidden_size=128,
+        n_routed_experts=8,
+        mlp_layer_types=["sparse", "sparse"],
+        first_k_dense_replace=0,
+    )
+    args = glm5_next.ModelConfig.from_dict(config)
+    args = utils.update_module_configs(args, glm5_next, config, ["text", "vision"])
+    weights = dict(tree_flatten(glm5_next.Model(args).parameters()))
+    gate = mx.random.normal((8, 128)).astype(mx.bfloat16)
+    packed, scales, biases = mx.quantize(gate, group_size=32, bits=4)
+    key = "language_model.model.layers.0.mlp.gate"
+    weights.update(
+        {key + ".weight": packed, key + ".scales": scales, key + ".biases": biases}
+    )
+    config["quantization"] = {"bits": 4, "group_size": 32}
+    monkeypatch.setattr(utils, "load_config", lambda *_a, **_kw: config)
+    monkeypatch.setattr(
+        utils.glob, "glob", lambda *_a, **_kw: ["/fixture/router.safetensors"]
+    )
+    monkeypatch.setattr(utils, "_load_safetensors", lambda *_a, **_kw: weights)
+
+    loaded = utils.load_model(Path("/fixture/router"), lazy=True, strict=True)
+    router = loaded.language_model.model.layers[0].mlp.gate
+    expected = mx.dequantize(packed, scales, biases, group_size=32, bits=4)
+    assert router.weight.dtype == mx.float32
+    assert mx.array_equal(router.weight, expected.astype(mx.float32)).item()
+
+
 @pytest.fixture(autouse=True)
 def _pin_verify_router(monkeypatch):
     monkeypatch.setattr(dk, "moe_router", _stock_verify_router(dk.moe_router))

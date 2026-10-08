@@ -3433,11 +3433,17 @@ class Scheduler:
             request_id = self.uid_to_request_id.get(uid)
             if request_id is None:
                 continue
+            request = self.requests.get(request_id)
             tracker.update(
                 request_id=request_id,
                 processed=processed,
                 total=total,
                 model_id=model_id,
+                extra={
+                    "prompt_tokens": getattr(request, "num_prompt_tokens", 0),
+                    "cached_tokens": getattr(request, "cached_tokens", 0),
+                    "prefill_started_at": getattr(request, "prefill_started_at", None),
+                },
             )
 
     # ------------------------------------------------------------------
@@ -3861,6 +3867,7 @@ class Scheduler:
             RuntimeError: If memory limit exceeded during prefill.
         """
         _mtp_priming.activate_request(self.model, request.request_id)
+        request.prefill_started_at = time.monotonic()
         n_tokens = len(tokens)
         if n_tokens <= 1:
             # Nothing to prefill, return cache + tokens as-is.
@@ -6048,6 +6055,7 @@ class Scheduler:
         Performs all once-per-request setup (cache creation, boundary config,
         token splitting) without running any model forward passes.
         """
+        request.prefill_started_at = time.monotonic()
         if hasattr(self.model, "clear_vlm_position_state"):
             self.model.clear_vlm_position_state()
             _seed_text_only_mrope_delta_for_cached_prefill(self.model, request)
@@ -6328,6 +6336,13 @@ class Scheduler:
                 if self.config.model_name
                 else ""
             ),
+            extra={
+                "prompt_tokens": getattr(state.request, "num_prompt_tokens", 0),
+                "cached_tokens": getattr(state.request, "cached_tokens", 0),
+                "prefill_started_at": getattr(
+                    state.request, "prefill_started_at", None
+                ),
+            },
         )
 
         # Memory monitoring — use max(active, phys_footprint) so MLX cache

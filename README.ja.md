@@ -228,7 +228,7 @@ Claude Codeで小さなコンテキストモデルを実行するため、トー
 
 ### API互換性
 
-OpenAIとAnthropic APIのドロップイン代替です。ストリーミング使用統計（`stream_options.include_usage`）、Anthropic adaptive thinking、ビジョン入力（base64、URL）をサポートします。
+OpenAIとAnthropic APIのドロップイン代替です。ストリーミング使用統計（`stream_options.include_usage`）、llama.cpp互換のprefill進捗（`return_progress`）、Anthropic adaptive thinking、ビジョン入力（base64、URL）をサポートします。
 
 | エンドポイント | 説明 |
 |----------|------|
