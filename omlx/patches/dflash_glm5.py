@@ -30,9 +30,11 @@ This module provides:
   -- backend registration and the class-hook lifecycle shared with the
   other oMLX DFlash adapters.
 
-The adapter fails closed: prefix snapshots (the dflash L1/L2 cache), DDTree
-verification, verify-linear kernels and target KV quantization are refused
-rather than silently approximated.
+The adapter fails closed: DDTree verification, verify-linear kernels and target
+KV quantization are refused rather than silently approximated. DFlashEngine
+publishes and restores prefixes through the native oMLX cache handlers. The
+stock dflash-mlx snapshot codec does not support GLM's composite cache.
+
 """
 
 from __future__ import annotations
@@ -119,6 +121,31 @@ def _contract_mhc_hidden(hidden: mx.array) -> mx.array:
     if hidden.ndim != 3:
         raise ValueError(f"Unexpected GLM hidden-state rank: {hidden.ndim}")
     return hidden
+
+
+def _cache_components(cache_entry: Any) -> tuple[Any, ...]:
+    """Sub-caches of a GLM DSA composite entry (``CacheList.caches``)."""
+    return tuple(getattr(cache_entry, "caches", ()) or ())
+
+
+def _is_glm_dsa_cache(cache_entry: Any) -> bool:
+    """True for the ``CacheList(KVCache, PoolingCache)`` DSA layer entries.
+
+    Matched by structure (a KV-ish first component plus a pooling second)
+    rather than a strict ``CacheList`` import so the VLM and mlx-lm cache
+    modules — and future flavors — serialize through the same branch.
+    """
+    components = _cache_components(cache_entry)
+    if len(components) != 2:
+        return False
+    kv_cache, pool_cache = components
+    if not hasattr(kv_cache, "keys") or not hasattr(kv_cache, "offset"):
+        return False
+    if not hasattr(pool_cache, "state") or not hasattr(pool_cache, "ratio"):
+        return False
+    if type(pool_cache).__name__ not in ("PoolingCache", "BatchPoolingCache"):
+        return False
+    return "caches" in dir(cache_entry) or hasattr(cache_entry, "caches")
 
 
 def validate_glm5_dflash_pair(
@@ -213,6 +240,13 @@ def _install_glm5_recurrent_hook(linear_attn: Any) -> None:
             cache, "_armed", False
         ):
             return original_call(self, inputs, mask=mask, cache=cache)
+        decode_step = getattr(self, "_decode_step", None)
+        if decode_step is not None:
+            captures = []
+            output = decode_step(inputs, mask, cache, capture=captures)
+            if output is not None:
+                setattr(cache, _VERIFY_STATE_ATTR, captures[0])
+                return output
         output = original_call(self, inputs, mask=mask, cache=cache)
         setattr(cache, _VERIFY_STATE_ATTR, (self, inputs, mask))
         return output
@@ -270,8 +304,7 @@ class Glm5NextTargetOps:
             supports_dflash=True,
             supports_recurrent_rollback=True,
             supports_kv_trim=True,
-            # dflash-mlx's snapshot codec only serializes bare KVCache and its
-            # own recurrent cache; GLM DSA layers use CacheList(KV, Pooling).
+            # Native integration supplies this capability at the engine boundary.
             supports_prefix_snapshot=False,
             supports_rotating_cache_snapshot=False,
             supports_shared_kv=False,
@@ -572,7 +605,7 @@ class Glm5NextTargetOps:
     @staticmethod
     def _clear_composite_undo(cache_entry: Any) -> None:
         """Drop accepted verify-block undo arrays retained by PoolingCache."""
-        for component in getattr(cache_entry, "caches", ()):
+        for component in _cache_components(cache_entry):
             if hasattr(component, "_undo"):
                 component._undo = None
             if hasattr(component, "_undo_chain"):
@@ -590,6 +623,15 @@ class Glm5NextTargetOps:
         if snapshot is None or verify is None:
             cls._clear_glm_recurrent_transients(cache_entry)
             raise RuntimeError("GLM-5.3 recurrent rollback state is missing")
+
+        from mlx_vlm.models.glm5_next.language import KdaStepCapture
+
+        if isinstance(verify, KdaStepCapture):
+            # Replay the kernel inputs already projected during verification,
+            # as MTP does, rather than running the full layer a second time.
+            cache_entry.cache = list(verify.replay(int(accepted_steps)))
+            cls._clear_glm_recurrent_transients(cache_entry)
+            return
 
         attention, inputs, mask = verify
         accepted_steps = max(0, min(int(accepted_steps), int(inputs.shape[1])))
@@ -647,6 +689,7 @@ class Glm5NextTargetOps:
             if trim_count <= 0:
                 if fully_accepted:
                     self._clear_composite_undo(cache_entry)
+                changed = True
                 continue
             trim = getattr(cache_entry, "trim", None)
             if not callable(trim):
@@ -669,6 +712,11 @@ class Glm5NextTargetOps:
         for entry in target_cache:
             if isinstance(entry, RecurrentRollbackCache):
                 self._clear_glm_recurrent_transients(entry)
+            elif _is_glm_dsa_cache(entry):
+                # Drop any undo log a final acceptance left behind so an L2
+                # snapshot writer never reaches arrays the live pool could
+                # still rewrite (the undo pins pre-acceptance rows).
+                self._clear_composite_undo(entry)
         draft_cache.clear()
         target_cache.clear()
 
@@ -755,8 +803,14 @@ def load_glm5_target_bundle(
 
 
 def install_dflash_glm5_backend() -> bool:
-    """Register the GLM target ops in dflash-mlx's backend registry."""
+    """Register the GLM target ops and snapshot-serializer extension in dflash-mlx."""
     from dflash_mlx.engine import target_ops
+
+    # Teach dflash's snapshot codec about GLM's composite DSA cache entries
+    # before any target (or snapshot) is loaded.
+    from .dflash_lifecycle import install_dflash_lifecycle_wrap
+
+    install_dflash_lifecycle_wrap()
 
     if _BACKEND_PATH in target_ops.TARGET_BACKENDS:
         return False

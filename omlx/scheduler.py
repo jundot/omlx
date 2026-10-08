@@ -1898,6 +1898,111 @@ class _BoundarySnapshotProvider:
         )
 
 
+def _is_mimo_hybrid(model) -> bool:
+    """MiMo hybrid MoE (standard softmax attn + rotating KV).
+
+    Wides prefill blocks so gather_qmm tiles fill at realistic
+    skewed top-k routing. Detected by model family name.
+    """
+    for target in (model, getattr(model, "model", None)):
+        if target is None:
+            continue
+        mt = str(getattr(target, "model_type", "") or "")
+        if not mt:
+            mt = str(getattr(getattr(target, "config", None),
+                           "model_type", "") or "")
+        if "mimo" in mt.lower():
+            return True
+    return False
+
+
+def _detect_qwen35_prefill_floor(model) -> int:
+    """Return the wide-prefill floor for Qwen/GLM hybrid architectures."""
+    try:
+        model_type = str(getattr(model, "model_type", "") or "")
+        if not model_type:
+            model_type = str(
+                getattr(getattr(model, "config", None), "model_type", "") or ""
+            )
+        # Ternary Bonsai 2 packs run the Qwen3.5 GDN stack under their own type.
+        is_qwen35 = (
+            model_type.startswith("qwen3_5")
+            or model_type == "prism_hadamard_qwen35"
+        )
+        is_qwen4 = model_type.startswith("qwen4_exp")
+        if is_qwen4:
+            from .custom_kernels.glm_moe_dsa import fast
+
+            if not fast.is_native_available() or not fast.has_symbol(
+                "qwen4_qsa_sparse_gqa_attention"
+            ):
+                return 0
+        if model_type.startswith("glm5_next"):
+            return _glm5_next_prefill_floor()
+        if is_qwen35 or is_qwen4:
+            from .custom_kernels.nax import is_nax_available
+            from .settings import get_system_memory
+
+            if get_system_memory() < 64 * 1024**3:
+                return 0
+            # NAX hosts keep the default chunk.
+            if not is_nax_available():
+                return 4096
+        if _is_mimo_hybrid(model):
+            from .custom_kernels.nax import is_nax_available
+            from .settings import get_system_memory
+
+            # MiMo's top-8-of-256 routing leaves ~64 rows per expert at a
+            # 2048-token chunk; 4096 fills the gather_qmm tiles better and
+            # the doubled activation footprint is small next to the model
+            # on hosts with this much memory. Only with fused full
+            # attention: otherwise its 9 full-attention layers (192/128
+            # head dims) materialise [heads, chunk, context] scores and
+            # the wider chunk is slower. On NAX GPUs 8192 (~256 rows per
+            # expert) lifts the expert GEMMs further: the >32768-row
+            # sorted gather runs as one dispatch (the fused attention's
+            # causal work is the same in any chunking).
+            if (
+                get_system_memory() >= 128 * 1024**3
+                and _mimo_fused_full_attention()
+            ):
+                if is_nax_available():
+                    return 8192
+                return 4096
+    except Exception:
+        logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)
+    return 0
+
+
+def _detect_qwen4_wide_prefill_step(model, *, moe_offload_active=False) -> int:
+    """Return the wide Qwen4-Exp prefill step (0 when the host cannot use it)."""
+    try:
+        model_type = str(getattr(model, "model_type", "") or "")
+        if not model_type:
+            model_type = str(
+                getattr(getattr(model, "config", None), "model_type", "") or ""
+            )
+        if not model_type.startswith("qwen4_exp"):
+            return 0
+        from .custom_kernels.glm_moe_dsa import fast
+        from .custom_kernels.nax import is_nax_available
+        from .settings import get_system_memory
+
+        if not (
+            fast.is_native_available()
+            and fast.has_symbol("qwen4_qsa_sparse_gqa_attention")
+        ):
+            return 0
+        # Offloaded experts are streamed once per prefill forward, so a
+        # wider step reads them fewer times; the memory guard still clamps it.
+        if moe_offload_active or (
+            is_nax_available() and get_system_memory() >= 64 * 1024**3
+        ):
+            return _QWEN4_WIDE_PREFILL_STEP
+    except Exception:
+        logger.debug("qwen4 wide prefill probe failed", exc_info=True)
+    return 0
+
 class Scheduler:
     """
     Scheduler for continuous batching using mlx-lm BatchGenerator.
@@ -2879,181 +2984,28 @@ class Scheduler:
     # NAX hosts with at least 128 GB; other large hosts keep 4096.
     _MIMO_NAX_PREFILL_FLOOR = 8192
 
-    def _is_mimo_hybrid(self) -> bool:
-        """MiMo hybrid MoE (standard softmax attn + rotating KV).
-
-        Wides prefill blocks so gather_qmm tiles fill at realistic
-        skewed top-k routing. Detected by model family name.
-        """
-        for target in (self.model, getattr(self.model, "model", None)):
-            if target is None:
-                continue
-            mt = str(getattr(target, "model_type", "") or "")
-            if not mt:
-                mt = str(getattr(getattr(target, "config", None),
-                               "model_type", "") or "")
-            if "mimo" in mt.lower():
-                return True
-        return False
+    def _is_mimo_hybrid(self):
+        return _is_mimo_hybrid(self.model)
 
     def _align_block_size_with_rotating_window(self) -> None:
-        """
-        Align paged cache block size to a multiple of RotatingKVCache
-        window size, targeting 512-1024 tokens per block.
-
-        Block size must be a multiple of window_size so that block
-        boundaries align with rotation boundaries. When window_size is
-        small (e.g. 128), using it directly as block_size creates too
-        many small files. Instead we pick the smallest multiple of
-        window_size that falls within [_ROTATING_BLOCK_SIZE_MIN,
-        _ROTATING_BLOCK_SIZE_MAX].
-
-        Models with a PoolingCache (DeepSeek V4 family) target
-        _POOLING_ROTATING_BLOCK_SIZE instead, since their prefill
-        kernels need 2048-token chunks to reach the measured gains.
-        """
         if not self.config.paged_ssd_cache_dir:
             return
+        from .cache.state import cache_block_size
 
-        window_sizes = self._detect_rotating_window_sizes()
-        if not window_sizes:
-            return
+        self.config.paged_cache_block_size = cache_block_size(
+            self.config.paged_cache_block_size,
+            window_sizes=self._detect_rotating_window_sizes(),
+            has_pooling=self._detect_pooling_cache(), is_mimo=self._is_mimo_hybrid(),
+            prefill_floor=self._qwen35_prefill_floor,
+        )
 
-        if len(window_sizes) > 1:
-            raise ValueError(
-                "Multiple RotatingKVCache window sizes detected "
-                f"({sorted(window_sizes)}). Set a single aligned block size or "
-                "disable paged cache for this model."
-            )
+    def _detect_qwen35_prefill_floor(self):
+        return _detect_qwen35_prefill_floor(self.model)
 
-        window_size = next(iter(window_sizes))
-
-        # Find the smallest multiple of window_size >= _ROTATING_BLOCK_SIZE_MIN.
-        # If window_size itself is already >= max, just use window_size.
-        lo = self._ROTATING_BLOCK_SIZE_MIN
-        hi = self._ROTATING_BLOCK_SIZE_MAX
-        if self._detect_pooling_cache() or self._is_mimo_hybrid():
-            # MiMo hybrid MoE: skewed top-8 routing leaves ~10 rows
-            # per expert at a 512-token chunk, so the gather_qmm BM
-            # tiles mostly compute padding; a 2048-token chunk fills
-            # them for a measured ~+34% MoE prefill throughput on
-            # M3 Ultra. 2048 is a multiple of the 128 window.
-            lo = hi = self._POOLING_ROTATING_BLOCK_SIZE
-            # With the cache on every chunk is clamped to the next block
-            # boundary, so a wider prefill floor (MiMo on 128 GB+ hosts)
-            # only takes effect if the block grows with it.
-            floor = int(getattr(self, "_qwen35_prefill_floor", 0) or 0)
-            if floor > hi and floor % window_size == 0:
-                lo = hi = floor
-
-        if window_size >= hi or window_size >= lo:
-            target_block_size = window_size
-        else:
-            # window_size < lo: pick smallest multiple in [lo, hi]
-            multiplier = (lo + window_size - 1) // window_size  # ceil(lo / ws)
-            target_block_size = multiplier * window_size
-            if target_block_size > hi:
-                # Fall back to largest multiple <= hi
-                target_block_size = (hi // window_size) * window_size
-                if target_block_size < window_size:
-                    target_block_size = window_size
-
-        if self.config.paged_cache_block_size != target_block_size:
-            logger.info(
-                "Aligning paged cache block_size=%s to %s "
-                "(RotatingKVCache window_size=%s, multiplier=%sx)",
-                self.config.paged_cache_block_size,
-                target_block_size,
-                window_size,
-                target_block_size // window_size,
-            )
-            self.config.paged_cache_block_size = target_block_size
-
-    def _detect_qwen35_prefill_floor(self) -> int:
-        """Return the wide-prefill floor for Qwen/GLM hybrid architectures."""
-        try:
-            model_type = str(getattr(self.model, "model_type", "") or "")
-            if not model_type:
-                model_type = str(
-                    getattr(getattr(self.model, "config", None), "model_type", "") or ""
-                )
-            # Ternary Bonsai 2 packs run the Qwen3.5 GDN stack under their own type.
-            is_qwen35 = (
-                model_type.startswith("qwen3_5")
-                or model_type == "prism_hadamard_qwen35"
-            )
-            is_qwen4 = model_type.startswith("qwen4_exp")
-            if is_qwen4:
-                from .custom_kernels.glm_moe_dsa import fast
-
-                if not fast.is_native_available() or not fast.has_symbol(
-                    "qwen4_qsa_sparse_gqa_attention"
-                ):
-                    return 0
-            if model_type.startswith("glm5_next"):
-                return _glm5_next_prefill_floor()
-            if is_qwen35 or is_qwen4:
-                from .custom_kernels.nax import is_nax_available
-                from .settings import get_system_memory
-
-                if get_system_memory() < 64 * 1024**3:
-                    return 0
-                # NAX hosts keep the default chunk.
-                if not is_nax_available():
-                    return 4096
-            if self._is_mimo_hybrid():
-                from .custom_kernels.nax import is_nax_available
-                from .settings import get_system_memory
-
-                # MiMo's top-8-of-256 routing leaves ~64 rows per expert at a
-                # 2048-token chunk; 4096 fills the gather_qmm tiles better and
-                # the doubled activation footprint is small next to the model
-                # on hosts with this much memory. Only with fused full
-                # attention: otherwise its 9 full-attention layers (192/128
-                # head dims) materialise [heads, chunk, context] scores and
-                # the wider chunk is slower. On NAX GPUs 8192 (~256 rows per
-                # expert) lifts the expert GEMMs further: the >32768-row
-                # sorted gather runs as one dispatch (the fused attention's
-                # causal work is the same in any chunking).
-                if (
-                    get_system_memory() >= 128 * 1024**3
-                    and _mimo_fused_full_attention()
-                ):
-                    if is_nax_available():
-                        return self._MIMO_NAX_PREFILL_FLOOR
-                    return 4096
-        except Exception:
-            logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)
-        return 0
-
-    def _detect_qwen4_wide_prefill_step(self) -> int:
-        """Return the wide Qwen4-Exp prefill step (0 when the host cannot use it)."""
-        try:
-            model_type = str(getattr(self.model, "model_type", "") or "")
-            if not model_type:
-                model_type = str(
-                    getattr(getattr(self.model, "config", None), "model_type", "") or ""
-                )
-            if not model_type.startswith("qwen4_exp"):
-                return 0
-            from .custom_kernels.glm_moe_dsa import fast
-            from .custom_kernels.nax import is_nax_available
-            from .settings import get_system_memory
-
-            if not (
-                fast.is_native_available()
-                and fast.has_symbol("qwen4_qsa_sparse_gqa_attention")
-            ):
-                return 0
-            # Offloaded experts are streamed once per prefill forward, so a
-            # wider step reads them fewer times; the memory guard still clamps it.
-            if self.config.moe_offload_active or (
-                is_nax_available() and get_system_memory() >= 64 * 1024**3
-            ):
-                return _QWEN4_WIDE_PREFILL_STEP
-        except Exception:
-            logger.debug("qwen4 wide prefill probe failed", exc_info=True)
-        return 0
+    def _detect_qwen4_wide_prefill_step(self):
+        return _detect_qwen4_wide_prefill_step(
+            self.model, moe_offload_active=self.config.moe_offload_active
+        )
 
     def _qwen4_ple_gathers_ahead(self) -> bool:
         """True when SSD-backed PLE rows are gathered one prefill chunk ahead.
@@ -3082,58 +3034,16 @@ class Scheduler:
     _ARRAYS_CACHE_BLOCK_SIZE = 2048
 
     def _enlarge_block_size_for_arrays_cache(self) -> None:
-        """Enlarge block size for ArraysCache-only hybrid models.
-
-        When a model uses ArraysCache (GatedDeltaNet) but not RotatingKVCache,
-        a larger block size reduces the number of boundary snapshot stops during
-        prefill while still storing valid per-block recurrent state.
-
-        This is skipped if RotatingKVCache was already detected (block size was
-        aligned to its window size) or if the configured block size already
-        meets the effective model-specific target.
-        """
-        if not self.config.paged_ssd_cache_dir:
+        if not self.config.paged_ssd_cache_dir or self._detect_rotating_window_sizes():
             return
+        from .cache.state import cache_block_size
 
-        # Skip if RotatingKVCache already adjusted block size.
-        rotating_sizes = self._detect_rotating_window_sizes()
-        if rotating_sizes:
-            return
-
-        # Detect ArraysCache from model.make_cache()
-        if not hasattr(self.model, "make_cache"):
-            return
-
-        try:
-            cache_list = self.model.make_cache()
-        except Exception:
-            return
-
-        if cache_list is None:
-            return
-
-        has_arrays_cache = any(
-            self._cache_tree_has_arrays_cache(cache_obj) for cache_obj in cache_list
+        self.config.paged_cache_block_size = cache_block_size(
+            self.config.paged_cache_block_size, has_arrays=self._model_has_arrays_cache(),
+            prefill_step_size=int(self.config.prefill_step_size or 0),
+            prefill_floor=self._qwen35_prefill_floor,
+            wide_prefill_step=self._qwen4_wide_prefill_step,
         )
-        if not has_arrays_cache:
-            return
-
-        target = max(
-            self._ARRAYS_CACHE_BLOCK_SIZE,
-            int(self.config.prefill_step_size or 0),
-            self._qwen35_prefill_floor,
-            self._qwen4_wide_prefill_step,
-        )
-        if self.config.paged_cache_block_size >= target:
-            return
-
-        logger.info(
-            "Enlarging paged cache block_size=%s to %s for "
-            "ArraysCache hybrid model (reduces boundary snapshot overhead)",
-            self.config.paged_cache_block_size,
-            target,
-        )
-        self.config.paged_cache_block_size = target
 
     def _model_has_arrays_cache(self) -> bool:
         """Whether the model's cache layout contains ArraysCache layers."""
@@ -8750,422 +8660,13 @@ class Scheduler:
 
         return True
 
-    def _normalize_rotating_snapshot_state(
-        self,
-        layer_cache: Any,
-        state: tuple[Any, Any],
-        meta_state: Any,
-        layer_idx: int | None = None,
-    ) -> tuple[tuple[Any, Any], tuple[str, str, str, str]]:
-        """
-        Normalize RotatingKVCache state into merge-safe canonical form.
+    def _normalize_rotating_snapshot_state(self, layer_cache, state, meta_state, layer_idx=None):
+        from .cache.state import normalize_rotating_snapshot_state
+        return normalize_rotating_snapshot_state(layer_cache, state, meta_state, layer_idx)
 
-        Boundary snapshots captured mid-prefill can expose oversized rotating
-        buffers (e.g., max_size + chunk_size - 1). Those states are valid for
-        in-flight prefill but break BatchRotatingKVCache.merge() after SSD
-        restore because merge expects per-request rotating buffers capped to
-        max_size. This method canonicalizes to the latest max_size tokens.
-        """
-        if not isinstance(state, (list, tuple)) or len(state) < 2:
-            return state, (
-                tuple(meta_state) if isinstance(meta_state, (list, tuple)) else ()
-            )
-
-        keys = state[0]
-        values = state[1]
-        if keys is None or values is None or not hasattr(keys, "shape"):
-            return state, (
-                tuple(meta_state) if isinstance(meta_state, (list, tuple)) else ()
-            )
-
-        try:
-            keep = (
-                int(meta_state[0])
-                if meta_state and len(meta_state) >= 1
-                else int(getattr(layer_cache, "keep", 0))
-            )
-            max_size = (
-                int(meta_state[1])
-                if meta_state and len(meta_state) >= 2
-                else int(getattr(layer_cache, "max_size", keys.shape[2]))
-            )
-            offset = (
-                int(meta_state[2])
-                if meta_state and len(meta_state) >= 3
-                else int(getattr(layer_cache, "offset", keys.shape[2]))
-            )
-            idx = (
-                int(meta_state[3])
-                if meta_state and len(meta_state) >= 4
-                else int(getattr(layer_cache, "_idx", keys.shape[2]))
-            )
-        except Exception:
-            return state, (
-                tuple(meta_state) if isinstance(meta_state, (list, tuple)) else ()
-            )
-
-        ordered_keys = keys
-        ordered_values = values
-        temporal_order = getattr(layer_cache, "_temporal_order", None)
-        if callable(temporal_order):
-            try:
-                ordered_keys = temporal_order(keys)
-                ordered_values = temporal_order(values)
-            except Exception:
-                ordered_keys = keys
-                ordered_values = values
-
-        original_len = int(ordered_keys.shape[2]) if len(ordered_keys.shape) >= 3 else 0
-        normalized_keys = ordered_keys
-        normalized_values = ordered_values
-
-        if max_size > 0 and original_len > max_size:
-            if keep > 0 and keep < max_size:
-                tail_len = max_size - keep
-                normalized_keys = mx.concatenate(
-                    [
-                        ordered_keys[..., :keep, :],
-                        ordered_keys[..., -tail_len:, :],
-                    ],
-                    axis=2,
-                )
-                normalized_values = mx.concatenate(
-                    [
-                        ordered_values[..., :keep, :],
-                        ordered_values[..., -tail_len:, :],
-                    ],
-                    axis=2,
-                )
-            else:
-                normalized_keys = ordered_keys[..., -max_size:, :]
-                normalized_values = ordered_values[..., -max_size:, :]
-
-            try:
-                normalized_keys = mx.contiguous(normalized_keys)
-                normalized_values = mx.contiguous(normalized_values)
-            except Exception:
-                pass
-
-        normalized_len = (
-            int(normalized_keys.shape[2]) if len(normalized_keys.shape) >= 3 else 0
-        )
-        # Force case 1 of _temporal_order: _idx == keys.shape[2] means the
-        # buffer is already in temporal order (which is exactly what the
-        # oversized trim above produces — the contiguous tail of the most
-        # recent tokens). Anything else lets _temporal_order re-slice the
-        # buffer in the rotated branch (case 2), which is wasted work and
-        # obscures the merge contract. See cache.py:431-447 for the branches.
-        normalized_idx = normalized_len
-
-        normalized_meta = (
-            str(keep),
-            str(max_size),
-            str(offset),
-            str(normalized_idx),
-        )
-
-        if original_len != normalized_len or idx != normalized_idx:
-            layer_tag = f"layer {layer_idx}: " if layer_idx is not None else ""
-            logger.debug(
-                "%sNormalized RotatingKVCache snapshot: len %s->%s, idx %s->%s, "
-                "offset=%s, max_size=%s",
-                layer_tag,
-                original_len,
-                normalized_len,
-                idx,
-                normalized_idx,
-                offset,
-                max_size,
-            )
-
-        return (normalized_keys, normalized_values), normalized_meta
-
-    def _extract_cache_states(
-        self,
-        raw_cache: list[Any],
-    ) -> tuple[list[dict[str, Any]], Optional["ModelCacheConfig"]]:
-        """
-        Extract actual tensor state from each layer cache.
-
-        This extracts the real KV data using mlx-lm's cache.state property,
-        allowing the data to be stored and reconstructed later even after
-        the BatchGenerator is recreated.
-
-        Also creates a ModelCacheConfig with per-layer type information to
-        support hybrid cache models (e.g., KVCache + ArraysCache).
-
-        Args:
-            raw_cache: List of cache objects from mlx-lm (KVCache, ArraysCache, etc.)
-
-        Returns:
-            Tuple of:
-            - List of dicts with {state, meta_state, class_name, cache_type}
-            - ModelCacheConfig with per-layer type information (or None)
-        """
-        if not raw_cache:
-            return [], None
-
-        # Build ModelCacheConfig for type information.
-        # Skip if raw_cache contains None entries (boundary snapshots with
-        # sliceable layers replaced by None) — from_cache_list expects real
-        # cache objects and would log noisy NoneType warnings.
-        model_cache_config = None
-        has_none_layers = any(c is None for c in raw_cache)
-        if (
-            HAS_CACHE_TYPE_HANDLERS
-            and ModelCacheConfig is not None
-            and not has_none_layers
-        ):
-            try:
-                model_cache_config = ModelCacheConfig.from_cache_list(
-                    raw_cache,
-                    model_name=self.model_name if hasattr(self, "model_name") else "",
-                )
-            except Exception as e:
-                logger.debug(f"Failed to build ModelCacheConfig: {e}")
-
-        extracted = []
-        for layer_idx, layer_cache in enumerate(raw_cache):
-            # Boundary snapshots may contain None for sliceable layers
-            # (KVCache) that were skipped during capture to save memory.
-            # Insert a placeholder to preserve layer index alignment.
-            if layer_cache is None:
-                extracted.append(
-                    {
-                        "state": (),
-                        "meta_state": (),
-                        "class_name": "KVCache",
-                        "cache_type": "KVCache",
-                    }
-                )
-                continue
-            try:
-                class_name = type(layer_cache).__name__
-
-                # Determine cache type using registry if available
-                cache_type_name = class_name
-                handler = None
-                if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
-                    try:
-                        cache_type = CacheTypeRegistry.detect_cache_type(layer_cache)
-                        cache_type_name = cache_type.value
-                        handler = CacheTypeRegistry.get_handler(cache_type)
-                    except Exception:
-                        pass
-
-                # CacheList: composite cache with multiple sub-caches
-                if cache_type_name == "CacheList" or class_name == "CacheList":
-                    if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
-                        try:
-                            handler = CacheTypeRegistry.get_handler_by_class_name(
-                                "CacheList"
-                            )
-                            state_dict = handler.extract_state(layer_cache)
-                            sub_states = list(state_dict.get("sub_states", []))
-                            sub_class_names = list(
-                                state_dict.get("sub_class_names", [])
-                            )
-                            sub_meta_states = list(
-                                state_dict.get("sub_meta_states", [])
-                            )
-
-                            sub_caches = getattr(layer_cache, "caches", ())
-                            for sub_idx, sub_cache in enumerate(sub_caches):
-                                if sub_idx >= len(sub_states):
-                                    break
-
-                                sub_class_name = type(sub_cache).__name__
-                                if sub_class_name in (
-                                    "RotatingKVCache",
-                                    "BatchRotatingKVCache",
-                                    "PrefillReadyRotatingKVCache",
-                                ):
-                                    normalized_state, normalized_meta = (
-                                        self._normalize_rotating_snapshot_state(
-                                            sub_cache,
-                                            sub_states[sub_idx],
-                                            (
-                                                sub_meta_states[sub_idx]
-                                                if sub_idx < len(sub_meta_states)
-                                                else getattr(
-                                                    sub_cache, "meta_state", ()
-                                                )
-                                            ),
-                                            layer_idx=layer_idx,
-                                        )
-                                    )
-                                    sub_states[sub_idx] = normalized_state
-                                    if sub_idx < len(sub_meta_states):
-                                        sub_meta_states[sub_idx] = normalized_meta
-
-                            extracted.append(
-                                {
-                                    "state": sub_states,
-                                    "meta_state": (
-                                        sub_class_names,
-                                        sub_meta_states,
-                                    ),
-                                    # prefix_cache's store path reads this to
-                                    # tag __nstate__ markers and to record
-                                    # per-sub class names in SSD metadata;
-                                    # without it both stay unnamed.
-                                    "sub_class_names": sub_class_names,
-                                    "class_name": "CacheList",
-                                    "cache_type": "CacheList",
-                                }
-                            )
-                        except Exception as e:
-                            logger.debug(f"CacheList handler extraction failed: {e}")
-                            extracted.append(
-                                {
-                                    "state": [],
-                                    "meta_state": ([], []),
-                                    "class_name": "CacheList",
-                                    "cache_type": "CacheList",
-                                }
-                            )
-                    else:
-                        # Fallback: extract sub-cache state/meta without handlers
-                        # MUST append to extracted to prevent layer count mismatch (Issue #1)
-                        sub_caches = getattr(layer_cache, "caches", ())
-                        sub_states = []
-                        sub_class_names = []
-                        sub_meta_states = []
-                        for sc in sub_caches:
-                            sub_states.append(sc.state if hasattr(sc, "state") else ())
-                            sub_class_names.append(type(sc).__name__)
-                            sub_meta_states.append(getattr(sc, "meta_state", ()))
-                        extracted.append(
-                            {
-                                "state": sub_states,
-                                "meta_state": (sub_class_names, sub_meta_states),
-                                "sub_class_names": sub_class_names,
-                                "class_name": "CacheList",
-                                "cache_type": "CacheList",
-                            }
-                        )
-                    continue
-
-                if hasattr(layer_cache, "state"):
-                    if handler is not None:
-                        state = handler.serialize_state(layer_cache)
-                        meta = handler.serialize_meta_state(layer_cache)
-                    else:
-                        state = layer_cache.state
-                        meta = getattr(layer_cache, "meta_state", ())
-
-                    is_rotating_cache = class_name in (
-                        "RotatingKVCache",
-                        "BatchRotatingKVCache",
-                        "PrefillReadyRotatingKVCache",
-                        "BufferedRotatingKVCache",
-                    )
-                    if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
-                        is_rotating_cache = (
-                            is_rotating_cache
-                            or CacheTypeRegistry.is_rotating_family(class_name)
-                        )
-                    if is_rotating_cache:
-                        state, meta = self._normalize_rotating_snapshot_state(
-                            layer_cache,
-                            state,
-                            meta,
-                            layer_idx=layer_idx,
-                        )
-
-                    # Preserve the full state tuple regardless of length.
-                    # Legacy 2-tuple caches (KVCache, RotatingKVCache, ...)
-                    # surface as (keys, values); 3-tuple caches like
-                    # PoolingCache surface as (buf_kv, buf_gate, pooled);
-                    # 4-tuple caches like BatchKVCache surface with the
-                    # extra offset/padding metadata. Downstream
-                    # serialization (paged_ssd_cache, boundary_snapshot)
-                    # is N-tuple aware after the cache architecture
-                    # refactor — see Section 6 of the implementation
-                    # plan.
-                    if isinstance(state, (list, tuple)) and len(state) >= 1:
-                        # Validate non-None for legacy KV-style caches only.
-                        # PoolingCache's buf_kv may legitimately be None
-                        # (fresh cache before any update), so skip the
-                        # null guard for non-KV cache classes.
-                        if (
-                            class_name in ("KVCache", "RotatingKVCache", "BatchKVCache")
-                            or (
-                                HAS_CACHE_TYPE_HANDLERS
-                                and CacheTypeRegistry is not None
-                                and CacheTypeRegistry.is_rotating_family(class_name)
-                            )
-                        ) and len(state) >= 2:
-                            if state[0] is None or state[1] is None:
-                                logger.debug(
-                                    f"Layer {layer_idx} ({class_name}) has None keys/values, "
-                                    f"skipping cache extraction"
-                                )
-                                return [], None  # Return empty - cache is corrupted
-
-                        extracted.append(
-                            {
-                                "state": tuple(state),
-                                "meta_state": meta,
-                                "class_name": class_name,
-                                "cache_type": cache_type_name,
-                            }
-                        )
-                    else:
-                        # Unexpected state format (e.g. a non-tuple scalar).
-                        logger.debug(
-                            f"Layer {layer_idx} ({class_name}) has unexpected state format"
-                        )
-                        meta = getattr(layer_cache, "meta_state", ())
-                        # Wrap the scalar so downstream code still gets a
-                        # tuple-shaped state. This path is essentially dead
-                        # in practice — kept defensive only.
-                        extracted.append(
-                            {
-                                "state": (state,),
-                                "meta_state": meta,
-                                "class_name": class_name,
-                                "cache_type": cache_type_name,
-                            }
-                        )
-                elif hasattr(layer_cache, "cache"):
-                    # ArraysCache style: state stored in .cache list
-                    cache_list = layer_cache.cache
-                    if isinstance(cache_list, list) and len(cache_list) >= 2:
-                        state = (cache_list[0], cache_list[1])
-                        meta = getattr(layer_cache, "meta_state", ())
-                        extracted.append(
-                            {
-                                "state": state,
-                                "meta_state": meta,
-                                "class_name": class_name,
-                                "cache_type": cache_type_name,
-                            }
-                        )
-                    else:
-                        logger.debug(
-                            f"Layer {layer_idx} ({class_name}) has invalid cache list"
-                        )
-                        continue
-                else:
-                    logger.debug(
-                        f"Layer {layer_idx} ({class_name}) has no state or cache attribute"
-                    )
-                    continue
-
-            except Exception as e:
-                logger.debug(
-                    f"Failed to extract state from cache layer {layer_idx}: {e}"
-                )
-                continue
-
-        if len(extracted) != len(raw_cache):
-            logger.debug(
-                f"Incomplete cache extraction: {len(extracted)}/{len(raw_cache)} layers"
-            )
-            return [], None
-
-        return extracted, model_cache_config
+    def _extract_cache_states(self, raw_cache):
+        from .cache.state import extract_cache_states
+        return extract_cache_states(raw_cache, getattr(self, "model_name", ""))
 
     @staticmethod
     def _common_prefix_len(a: list[int], b: list[int]) -> int:

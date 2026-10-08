@@ -28,6 +28,7 @@ import stat
 import struct
 import threading
 import time
+import tempfile
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -234,6 +235,8 @@ def _canonicalize_layer_cache_types(
         return None
     wrapper_to_canonical = {
         "SizedArraysCache": "ArraysCache",
+        "RecurrentRollbackCache": "ArraysCache",
+        "_Glm5RecurrentRollbackCache": "ArraysCache",
         "PrefillReadyRotatingKVCache": "RotatingKVCache",
         POOLING_CACHE_DELTA_CLASS: "PoolingCache",
         # Batch and single-request TurboQuant caches persist the same packed
@@ -1735,6 +1738,12 @@ class PagedSSDCacheManager(CacheManager):
         # promoted into the raw-byte hot cache.  They still consume the same
         # shared SSD budget as the two main block indexes.
         self._gdn_sidecar_index = GDNCheckpointIndex(max_size_bytes)
+        # Durable prefix-context sidecars (drafter hidden windows + logits,
+        # written by save_prefix_context) share the sidecar index with
+        # recurrent GDN checkpoints. This map tracks only context entries so
+        # diagnostics can report them without counting recurrent checkpoints;
+        # it is rebuilt empty after a restart and refilled on rewrite.
+        self._prefix_context_sizes: dict[tuple[str, bytes], int] = {}
         self._hot_cache_only = hot_cache_only
         self._expected_model_name = expected_model_name
         self._expected_num_layers = expected_num_layers
@@ -2458,6 +2467,76 @@ class PagedSSDCacheManager(CacheManager):
                     logger.debug("Skipping GDN sidecar %s: %s", file_path, e)
         return indexed, skipped, total_bytes
 
+    def save_prefix_context(
+        self, source_hash: bytes, signature: str, tensors: dict[str, Any],
+        metadata: dict[str, str], *, token_count: int,
+    ) -> bool:
+        """Store opaque drafter tensors with the native hot/SSD byte budgets.
+
+        Context namespaces are independent of the backbone cache signature.
+        The existing checkpoint index accounts their durable files alongside KV.
+        Call on the inference thread: tensor evaluation never reaches a writer.
+        """
+        key = hashlib.sha256(b"prefix-context:" + source_hash + signature.encode()).digest()
+        raw = {name: _extract_tensor_bytes(value) for name, value in tensors.items()}
+        size = sum(len(value[0]) for value in raw.values())
+        entry = {"tensors_raw": raw, "file_metadata": metadata, "dirty": False}
+        durable = False
+        if not self._hot_cache_only and self._cache_dir is not None:
+            if size > self._get_effective_max_size():
+                return False
+            fd, staged = tempfile.mkstemp(suffix=".safetensors", dir=self._cache_dir)
+            os.close(fd)
+            try:
+                # bounded context writes are synchronous; move raw-byte
+                # writes onto the existing writer queue if boundary latency warrants it.
+                _write_safetensors_no_mx(staged, raw, metadata)
+                durable = self.commit_gdn_checkpoint_file(
+                    source_hash, Path(staged), token_count=token_count,
+                    model_name=self._expected_model_name, cache_signature=signature,
+                    block_size=self._expected_block_size,
+                ) is not None
+                if durable:
+                    committed_meta = self._gdn_sidecar_index.get(
+                        source_hash, self._gdn_signature_digest(signature)
+                    )
+                    self._prefix_context_sizes[
+                        (self._gdn_signature_digest(signature), source_hash)
+                    ] = (
+                        committed_meta.file_size
+                        if committed_meta is not None
+                        else size
+                    )
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(staged)
+        if self._hot_cache_enabled and size <= self._effective_hot_cache_max_bytes():
+            self._hot_cache_put(key, entry)
+            return True
+        return durable
+
+    def load_prefix_context(
+        self, source_hash: bytes, signature: str,
+    ) -> tuple[dict[str, Any], dict[str, str]] | None:
+        """Restore an opaque context without requiring hot-cache promotion."""
+        key = hashlib.sha256(b"prefix-context:" + source_hash + signature.encode()).digest()
+        entry = self._hot_cache_get(key) if self._hot_cache_enabled else None
+        if entry is not None:
+            return (
+                {name: _restore_tensor_from_bytes(*value)
+                 for name, value in entry["tensors_raw"].items()},
+                entry["file_metadata"],
+            )
+        path = self.get_gdn_checkpoint_file(source_hash, signature)
+        if path is None:
+            return None
+        try:
+            return mx.load(str(path), return_metadata=True)
+        except (OSError, ValueError, RuntimeError) as exc:
+            logger.warning("Cannot restore prefix context: %s", exc)
+            self.forget_gdn_checkpoint(source_hash, signature)
+            return None
+
     def commit_gdn_checkpoint_file(
         self,
         source_block_hash: bytes,
@@ -2676,6 +2755,8 @@ class PagedSSDCacheManager(CacheManager):
                 deleted = self._unlink_gdn_sidecar_file(metadata)
                 if not deleted:
                     self._gdn_sidecar_index.add(metadata)
+                else:
+                    self._prefix_context_sizes.pop(metadata.key, None)
                 return deleted
             except OSError as e:
                 # Restore accounting if the file could not be removed. The
@@ -2685,6 +2766,25 @@ class PagedSSDCacheManager(CacheManager):
                     "Failed to forget GDN sidecar %s: %s", metadata.file_path, e
                 )
                 return False
+
+    def forget_prefix_context(self, source_hash: bytes, cache_signature: str) -> bool:
+        """Drop a drafter-context blob from the hot tier and the durable index.
+
+        Contexts live in the hot cache in hot-only mode, where nothing durable
+        exists; a durable-only forget would leave the blob resident and
+        reachable by the next lookup. Returns True when anything was removed.
+        """
+        if not isinstance(source_hash, bytes) or not source_hash:
+            return False
+        if not isinstance(cache_signature, str):
+            return False
+        key = hashlib.sha256(
+            b"prefix-context:" + source_hash + cache_signature.encode()
+        ).digest()
+        removed = self._hot_cache_remove(key) is not None
+        if self._hot_cache_only or self._cache_dir is None:
+            return removed
+        return self.forget_gdn_checkpoint(source_hash, cache_signature) or removed
 
     def _is_compatible_block(self, metadata: PagedSSDBlockMetadata) -> bool:
         """Return True when a block can be indexed for this manager."""
@@ -4891,6 +4991,7 @@ class PagedSSDCacheManager(CacheManager):
                     restore_index.add(metadata)
                     self._stats["evict_unlink_failures"] += 1
                     return
+                self._prefix_context_sizes.pop(metadata.key, None)
             else:
                 metadata.file_path.unlink(missing_ok=True)
             self._stats["evictions"] += 1
@@ -5023,6 +5124,7 @@ class PagedSSDCacheManager(CacheManager):
                 try:
                     if self._unlink_gdn_sidecar_file(metadata):
                         count += 1
+                        self._prefix_context_sizes.pop(metadata.key, None)
                     else:
                         self._gdn_sidecar_index.add(metadata)
                 except OSError as e:
@@ -5082,6 +5184,16 @@ class PagedSSDCacheManager(CacheManager):
     def gdn_sidecar_size_bytes(self) -> int:
         """Tracked durable recurrent checkpoint bytes (never hot-cached)."""
         return self._gdn_sidecar_index.total_size
+
+    @property
+    def prefix_context_count(self) -> int:
+        """Number of durable drafter-context sidecar files."""
+        return len(self._prefix_context_sizes)
+
+    @property
+    def prefix_context_size_bytes(self) -> int:
+        """Tracked durable drafter-context sidecar bytes."""
+        return sum(self._prefix_context_sizes.values())
 
     @property
     def gdn_legacy_fp32_fallbacks(self) -> int:
@@ -5191,6 +5303,10 @@ class PagedSSDCacheManager(CacheManager):
                 ),
                 "gdn_sidecar_count": self._gdn_sidecar_index.count,
                 "gdn_sidecar_size_bytes": self._gdn_sidecar_index.total_size,
+                "prefix_context_count": len(self._prefix_context_sizes),
+                "prefix_context_size_bytes": sum(
+                    self._prefix_context_sizes.values()
+                ),
                 **self._stats,
             }
 

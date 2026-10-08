@@ -284,74 +284,8 @@ class VLMModelAdapter(nn.Module):
 
     def restore_cache(self, caches):
         """Bind the stable SSD tensor format to the active model's cache classes."""
-        from mlx_lm.models import cache as lm_cache
-        from mlx_vlm.models.cache import PoolingCache
-
-        from ..cache._rotating_subclass import (
-            PrefillReadyRotatingKVCache as LMRestoredRotatingKVCache,
-        )
-
-        def restore(source, target):
-            if hasattr(source, "_inner"):
-                source = source._inner
-            children = getattr(target, "caches", None)
-            if children is not None:
-                return type(target)(
-                    *(
-                        restore(old, new)
-                        for old, new in zip(source.caches, children, strict=True)
-                    )
-                )
-            restored_rotating = (
-                type(source) is LMRestoredRotatingKVCache
-                and type(target) is RotatingKVCache
-            )
-            if restored_rotating:
-                target = PrefillReadyRotatingKVCache(source.max_size, source.keep)
-            if not restored_rotating and (
-                type(source) is type(target)
-                or type(source).__name__ != type(target).__name__
-            ):
-                return source
-            if type(source) is lm_cache.ArraysCache:
-                target.cache = list(source.cache)
-                target.left_padding = source.left_padding
-                target.lengths = source.lengths
-            elif type(source) in (
-                lm_cache.KVCache,
-                lm_cache.RotatingKVCache,
-                lm_cache.ChunkedKVCache,
-                LMRestoredRotatingKVCache,
-            ):
-                target.keys, target.values = source.keys, source.values
-                target.offset = source.offset
-                if isinstance(source, lm_cache.RotatingKVCache):
-                    target.keep, target.max_size = source.keep, source.max_size
-                    target._idx = source._idx
-                elif type(source) is lm_cache.ChunkedKVCache:
-                    target.chunk_size = source.chunk_size
-                    target.start_position = source.start_position
-            elif type(target) is PoolingCache:
-                state = source.state
-                if len(state) == 5:
-                    # SSD reconstruction uses the oMLX text cache layout.
-                    if any(value is not None for value in state[3:]):
-                        raise ValueError(
-                            "Cannot restore text pooling overlap into VLM cache"
-                        )
-                    state = state[:3]
-                target.meta_state = source.meta_state
-                target.state = state
-            else:
-                target.meta_state = source.meta_state
-                target.state = source.state
-            return target
-
-        return [
-            restore(old, new)
-            for old, new in zip(caches, self.make_cache(), strict=True)
-        ]
-
+        from ..cache.state import restore_cache
+        return restore_cache(caches, self.make_cache())
     def set_pending_embeddings(
         self,
         inputs_embeds: mx.array,

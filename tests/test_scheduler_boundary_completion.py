@@ -357,6 +357,9 @@ def test_prefill_tail_reuse_matches_cold_forward(
         expected_layer_cache_types=layer_types,
         gdn_ssd_split_enabled=split,
     )
+    # Fetch-only probes used to leak block refs, masking this missing connection.
+    # Releasing them requires the same SSD restore wiring as production.
+    paged.set_paged_ssd_cache_manager(ssd)
     boundary = BoundarySnapshotSSDStore(tmp_path / "cache")
     prefix = BlockAwarePrefixCache(
         model=model,

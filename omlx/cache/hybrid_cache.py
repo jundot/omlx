@@ -86,7 +86,7 @@ class ModelCacheConfig:
         for idx, cache_obj in enumerate(cache_list):
             cache_type = CacheTypeRegistry.detect_cache_type(cache_obj)
             handler = CacheTypeRegistry.get_handler(cache_type)
-            class_name = type(cache_obj).__name__
+            class_name = CacheTypeRegistry.canonical_name(cache_obj)
 
             cache_types_seen.add(cache_type)
             if handler.supports_block_slicing:

@@ -65,6 +65,8 @@ class CacheTypeRegistry:
         "BatchKVCache": CacheType.BATCH_KVCACHE,
         "BatchRotatingKVCache": CacheType.BATCH_ROTATING_KVCACHE,
         "ArraysCache": CacheType.ARRAYS_CACHE,
+        "RecurrentRollbackCache": CacheType.ARRAYS_CACHE,
+        "_Glm5RecurrentRollbackCache": CacheType.ARRAYS_CACHE,
         "QuantizedKVCache": CacheType.QUANTIZED_KVCACHE,
         "CacheList": CacheType.CACHE_LIST,
         # TurboQuant: handled specially in prefix_cache/paged_ssd_cache,
@@ -85,6 +87,14 @@ class CacheTypeRegistry:
 
     # Default handler instance
     _default_handler: CacheTypeHandler = DefaultCacheHandler()
+
+    @classmethod
+    def canonical_name(cls, cache_obj: Any) -> str:
+        """Use native storage names for wrappers with identical stable state."""
+        name = type(cache_obj).__name__
+        if name in ("SizedArraysCache", "RecurrentRollbackCache", "_Glm5RecurrentRollbackCache"):
+            return "ArraysCache"
+        return name
 
     @classmethod
     def register(cls, handler: CacheTypeHandler) -> None:

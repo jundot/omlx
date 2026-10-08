@@ -308,7 +308,8 @@ class TestDFlashEngineInit:
         )
         assert engine.get_cache_stats() is None
 
-    def test_stream_events_passes_suppress_token_ids(self, monkeypatch):
+    @pytest.mark.parametrize("skip_cache_store", [False, True])
+    def test_stream_events_passes_suppress_token_ids(self, monkeypatch, skip_cache_store):
         try:
             from dflash_mlx import runtime as dflash_runtime
             from dflash_mlx.server.prefix_cache_flow import PrefixCacheFlow
@@ -338,9 +339,9 @@ class TestDFlashEngineInit:
 
         fake_flow = SimpleNamespace(
             snapshot=snapshot,
-            snapshot_service=None,
+            snapshot_service=object(),
             stable_prefix_len=None,
-            cache_active=False,
+            cache_active=True,
             publish_generation_snapshot=True,
             hit_kind="l2_prefix",
         )
@@ -374,6 +375,7 @@ class TestDFlashEngineInit:
             min_p=0.05,
             repetition_penalty=1.2,
             repetition_context_size=128,
+            skip_cache_store=skip_cache_store,
         )
 
         assert list(event_iter) == []
@@ -388,6 +390,9 @@ class TestDFlashEngineInit:
         assert captured["min_p"] == 0.05
         assert captured["repetition_penalty"] == 1.2
         assert captured["repetition_context_size"] == 128
+        assert captured["prefix_cache_active"] is (not skip_cache_store)
+        assert captured["publish_generation_snapshot"] is (not skip_cache_store)
+        assert (captured["snapshot_service"] is None) is skip_cache_store
         assert captured["block_tokens"] == 5
         assert fake_flow.snapshot is None
         assert prefix_kwargs["max_new_tokens"] == 3
@@ -395,52 +400,6 @@ class TestDFlashEngineInit:
         assert model_provider.model is target_model
         assert model_provider.target_ops is target_ops
 
-    def test_runtime_cache_request_boundary_calls_supported_manager(self, monkeypatch):
-        try:
-            from dflash_mlx.cache import manager as cache_manager_mod
-
-            from omlx.engine.dflash import DFlashEngine
-        except ImportError:
-            pytest.skip("dflash-mlx not installed")
-
-        calls = []
-
-        class FakeManager:
-            def begin_request(self):
-                calls.append("begin")
-
-            def end_request(self):
-                calls.append("end")
-
-        fake_manager = FakeManager()
-        monkeypatch.setattr(
-            cache_manager_mod,
-            "current_runtime_cache_manager",
-            lambda: fake_manager,
-        )
-
-        manager = DFlashEngine._begin_runtime_cache_request()
-        DFlashEngine._end_runtime_cache_request(manager)
-
-        assert manager is fake_manager
-        assert calls == ["begin", "end"]
-
-    def test_runtime_cache_request_boundary_is_noop_on_old_manager(self, monkeypatch):
-        try:
-            from dflash_mlx.cache import manager as cache_manager_mod
-
-            from omlx.engine.dflash import DFlashEngine
-        except ImportError:
-            pytest.skip("dflash-mlx not installed")
-
-        monkeypatch.setattr(
-            cache_manager_mod,
-            "current_runtime_cache_manager",
-            lambda: object(),
-        )
-
-        assert DFlashEngine._begin_runtime_cache_request() is None
-        DFlashEngine._end_runtime_cache_request(object())
 
     @pytest.mark.asyncio
     async def test_start_passes_verify_config_to_target_load(self, monkeypatch):
@@ -512,7 +471,7 @@ class TestDFlashEngineInit:
         engine = DFlashEngine(
             model_name="test-model",
             draft_model_path="test-draft",
-            model_settings=ModelSettings(dflash_verify_mode="off"),
+            model_settings=ModelSettings(dflash_verify_mode="off", dflash_in_memory_cache=False),
         )
 
         await engine.start()
@@ -596,7 +555,7 @@ class TestDFlashEngineInit:
         )
         assert engine._resolve_dflash_l2_dir() is None
 
-    def test_resolve_dflash_l2_dir_uses_subdir(self, tmp_path):
+    def test_native_cache_uses_normal_ssd_root(self, tmp_path):
         try:
             from omlx.engine.dflash import DFlashEngine
         except ImportError:
@@ -612,9 +571,9 @@ class TestDFlashEngineInit:
             omlx_ssd_cache_dir=tmp_path,
         )
         resolved = engine._resolve_dflash_l2_dir()
-        assert resolved == tmp_path / "dflash_l2"
+        assert resolved == tmp_path
 
-    def test_resolve_dflash_l2_dir_disabled_when_l1_off(self, tmp_path):
+    def test_native_ssd_cache_works_when_hot_tier_off(self, tmp_path):
         try:
             from omlx.engine.dflash import DFlashEngine
         except ImportError:
@@ -629,7 +588,7 @@ class TestDFlashEngineInit:
             ),
             omlx_ssd_cache_dir=tmp_path,
         )
-        assert engine._resolve_dflash_l2_dir() is None
+        assert engine._resolve_dflash_l2_dir() == tmp_path
 
     def test_long_context_knobs_default_to_none(self):
         """No settings → engine stores None → dflash-mlx fills DEFAULT_RUNTIME_CONFIG."""
@@ -752,8 +711,7 @@ class TestDFlashEngineInit:
         assert runtime.verify_mode == "adaptive"
 
     def test_l2_max_bytes_from_settings(self, tmp_path):
-        """Issue #1326 — dflash L2 disk budget comes from the per-model setting,
-        not a hard-coded 1 TiB sentinel, so dflash_l2/ stays bounded."""
+        """Standalone engines retain the configured SSD byte budget."""
         try:
             from omlx.engine.dflash import DFlashEngine
         except ImportError:
@@ -771,7 +729,8 @@ class TestDFlashEngineInit:
         )
         ctx = engine._build_runtime_context()
         runtime = ctx.runtime
-        assert runtime.prefix_cache_l2_max_bytes == 5 * 1024**3
+        assert not runtime.prefix_cache and not runtime.prefix_cache_l2
+        assert engine._ssd_cache_max_bytes == 5 * 1024**3
 
     def test_l2_max_bytes_defaults_to_20gib(self, tmp_path):
         """No explicit setting → engine falls back to the 20 GiB default budget."""
@@ -791,7 +750,8 @@ class TestDFlashEngineInit:
         )
         ctx = engine._build_runtime_context()
         runtime = ctx.runtime
-        assert runtime.prefix_cache_l2_max_bytes == 20 * 1024**3
+        assert not runtime.prefix_cache and not runtime.prefix_cache_l2
+        assert engine._ssd_cache_max_bytes == 20 * 1024**3
 
 
 class TestDFlashCompatibility:
@@ -1656,10 +1616,12 @@ class TestDFlashCachedTokensWiring:
             min_p,
             repetition_penalty,
             repetition_context_size,
+            skip_cache_store=False,
         ):
             assert (temperature, top_p, top_k, min_p) == (0.7, 0.9, 0, 0.0)
             assert repetition_penalty == 1.2
             assert repetition_context_size == 128
+            assert not skip_cache_store
             return iter([summary]), fake_flow, [2]
 
         monkeypatch.setattr(engine, "_stream_dflash_events", fake_stream_events)
@@ -1765,134 +1727,33 @@ class TestDFlashActivityTracking:
 
 
 class TestDFlashRuntimeCacheStats:
-    """DFlash adapts its dflash-mlx runtime cache to the scheduler stats
-    shape so the admin cache observability panel can render it (#2396)."""
-
-    def _engine(self, model_settings=None, omlx_ssd_cache_dir=None):
-        try:
-            from omlx.engine.dflash import DFlashEngine
-        except ImportError:
-            pytest.skip("dflash-mlx not installed")
-        return DFlashEngine(
-            model_name="test-model",
-            draft_model_path="test-draft",
-            model_settings=model_settings,
-            omlx_ssd_cache_dir=omlx_ssd_cache_dir,
-        )
-
-    def test_returns_none_when_memory_cache_disabled(self):
-        settings = ModelSettings(dflash_in_memory_cache=False)
-        engine = self._engine(model_settings=settings)
+    def test_unloaded_engine_has_no_cache_stats(self):
+        from omlx.engine.dflash import DFlashEngine
+        engine = DFlashEngine("target", "draft")
         assert engine.get_runtime_cache_stats() is None
+        assert engine.prefix_cache_enabled is False
 
-    def test_returns_none_in_fallback_mode(self):
-        engine = self._engine()
-        engine._in_fallback_mode = True
-        assert engine.get_runtime_cache_stats() is None
-
-    def test_budget_fallback_before_first_request(self, monkeypatch):
-        engine = self._engine()
-        import dflash_mlx.cache.manager as manager_mod
-
-        monkeypatch.setattr(manager_mod, "current_runtime_cache_manager", lambda: None)
-
+    def test_stats_come_from_owned_native_manager(self):
+        from omlx.engine.dflash import DFlashEngine
+        engine = DFlashEngine("target", "draft")
+        engine._native_cache = SimpleNamespace(
+            _hits=5, _misses=4, _tokens_saved=999, block_size=2048,
+            prefix=SimpleNamespace(get_stats_dict=lambda: {"hits":5}),
+            ssd=SimpleNamespace(get_stats_dict=lambda: {
+                "hot_cache_entries":2, "hot_cache_size_bytes":1234,
+                "hot_cache_max_bytes":5678, "hot_cache_hits":3,
+                "loads":5, "saves":7, "evictions":6,
+            }))
         stats = engine.get_runtime_cache_stats()
-        assert stats is not None
-        assert "cache_rates" not in stats
-        ssd = stats["ssd_cache"]
-        assert ssd["hot_cache_max_bytes"] == 8 * 1024**3
-        assert ssd["hot_cache_size_bytes"] == 0
-        assert ssd["hot_cache_entries"] == 0
-        assert ssd["num_files"] == 0
-        assert ssd["total_size_bytes"] == 0
-        assert ssd["max_size_bytes"] == 0  # SSD cache not requested
-
-    def test_manager_stats_mapped_to_panel_shape(self, monkeypatch):
-        engine = self._engine()
-        import dflash_mlx.cache.manager as manager_mod
-
-        manager = SimpleNamespace(
-            stats=lambda: {
-                "exact_hits": 3,
-                "prefix_hits": 2,
-                "misses": 4,
-                "evictions": 1,
-                "prefill_tokens_saved": 999,
-                "current_entries": 2,
-                "current_bytes": 1234,
-                "max_bytes": 5678,
-                "l2_hits": 2,
-                "l2_misses": 3,
-                "l2": {
-                    "current_bytes": 10,
-                    "max_bytes": 100,
-                    "writes": 7,
-                    "evictions": 5,
-                },
-            }
-        )
-        monkeypatch.setattr(
-            manager_mod, "current_runtime_cache_manager", lambda: manager
-        )
-
-        stats = engine.get_runtime_cache_stats()
-        ssd = stats["ssd_cache"]
-        assert ssd["hot_cache_entries"] == 2
-        assert ssd["hot_cache_size_bytes"] == 1234
-        assert ssd["hot_cache_max_bytes"] == 5678
-
+        assert engine.prefix_cache_enabled is True
+        assert stats["block_size"] == 2048
+        assert stats["ssd_cache"]["hot_cache_size_bytes"] == 1234
         cumulative = stats["cache_rates"]["cumulative"]
         assert cumulative["prefix_hits"] == 5
-        assert cumulative["prefix_misses"] == 4
         assert cumulative["prefix_tokens_saved"] == 999
-        assert cumulative["evictions"] == 6
-        assert cumulative["ssd_hot_hits"] == 3
         assert cumulative["ssd_disk_loads"] == 2
-        assert cumulative["ssd_saves"] == 7
-        assert cumulative["hot_cache_evictions"] == 1
-
-    def test_closed_manager_falls_back_to_budgets(self, monkeypatch):
-        engine = self._engine()
-        import dflash_mlx.cache.manager as manager_mod
-
-        def _raise():
-            raise manager_mod.RuntimeCacheManagerClosed("retired")
-
-        manager = SimpleNamespace(stats=_raise)
-        monkeypatch.setattr(
-            manager_mod, "current_runtime_cache_manager", lambda: manager
-        )
-
-        stats = engine.get_runtime_cache_stats()
-        assert stats is not None
-        assert "cache_rates" not in stats
-        assert stats["ssd_cache"]["hot_cache_max_bytes"] == 8 * 1024**3
-
-    def test_l2_scan_counts_snapshot_files(self, tmp_path, monkeypatch):
-        settings = ModelSettings(dflash_ssd_cache=True)
-        engine = self._engine(model_settings=settings, omlx_ssd_cache_dir=tmp_path)
-        import dflash_mlx.cache.manager as manager_mod
-
-        monkeypatch.setattr(manager_mod, "current_runtime_cache_manager", lambda: None)
-
-        bucket = tmp_path / "dflash_l2" / "ab"
-        bucket.mkdir(parents=True)
-        (bucket / "snap1.safetensors").write_bytes(b"x" * 128)
-        (bucket / ".snap1.tmp123.safetensors").write_bytes(b"y" * 64)
-
-        stats = engine.get_runtime_cache_stats()
-        ssd = stats["ssd_cache"]
-        assert ssd["num_files"] == 1
-        assert ssd["total_size_bytes"] == 128
-        assert ssd["max_size_bytes"] == 20 * 1024**3
-
-    def test_map_cache_counters_clamps_hot_hits(self):
-        engine = self._engine()
-        counters = engine._map_cache_counters(
-            {"exact_hits": 1, "prefix_hits": 0, "l2_hits": 5, "l2": {}}
-        )
-        assert counters["ssd_hot_hits"] == 0
-        assert counters["ssd_disk_loads"] == 5
+        engine._in_fallback_mode = True
+        assert engine.get_runtime_cache_stats() is None
 
 
 class TestFormatPhaseTimings:
@@ -2306,6 +2167,37 @@ async def test_generation_abort_lifetime(monkeypatch, caplog, streaming, scenari
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("skip_cache_store", [False, True])
+async def test_generation_forwards_skip_cache_store(monkeypatch, streaming, skip_cache_store):
+    from dflash_mlx.engine.events import SummaryEvent
+    from omlx.engine.dflash import DFlashEngine
+
+    engine = DFlashEngine(model_name="test-model", draft_model_path="test-draft")
+    engine._loaded = True
+    engine._tokenizer_obj = SimpleNamespace(decode=lambda *args, **kwargs: "")
+    engine._executor_tokenizer = engine._tokenizer_obj
+    summary = SummaryEvent(
+        elapsed_us=1000, prompt_token_count=1, generated_token_ids=(5,),
+        generation_tokens=1, accepted_from_draft=0, acceptance_ratio=0.0,
+        cycles_completed=1, phase_timings_us={},
+    )
+    engine._stream_dflash_events = MagicMock(return_value=(iter([summary]), None, []))
+    monkeypatch.setattr(
+        "omlx.engine.dflash.create_streaming_detokenizer", lambda *args, **kwargs: None
+    )
+    kwargs = {"skip_cache_store": True} if skip_cache_store else {}
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr("omlx.engine_core.get_mlx_executor", lambda: executor)
+        if streaming:
+            outputs = [o async for o in engine.stream_generate([1], **kwargs)]
+            assert outputs[-1].finished
+        else:
+            await engine.generate([1], **kwargs)
+    assert engine._stream_dflash_events.call_args.kwargs["skip_cache_store"] is skip_cache_store
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize(
     ("generated", "expected"),
     [((5, 6), "length"), ((5, 2), "stop"), ((2, 5), "stop")],
@@ -2349,7 +2241,7 @@ async def test_finish_reason_at_max_tokens(monkeypatch, streaming, generated, ex
 async def test_shutdown_persists_snapshot_on_generation_thread(
     monkeypatch, tmp_path, method
 ):
-    cache_manager = pytest.importorskip("dflash_mlx.cache.manager")
+    pytest.importorskip("dflash_mlx")
     from omlx import engine_core
     from omlx.engine import batched, dflash
 
@@ -2375,10 +2267,73 @@ async def test_shutdown_persists_snapshot_on_generation_thread(
             assert engine._target_model is target
             persisted.write_bytes(b"snapshot")
 
-        monkeypatch.setattr(cache_manager, "shutdown_runtime_cache_manager", persist)
+        engine._native_cache = SimpleNamespace(close=persist)
         await getattr(engine, method)()
 
     assert persisted.read_bytes() == b"snapshot"
     assert engine._target_model is None
     if method != "stop":
         fallback.start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_start_restores_wired_limit_when_native_close_fails(monkeypatch):
+    from omlx.engine.dflash import DFlashEngine
+    engine = DFlashEngine("target", "draft")
+    monkeypatch.setattr(engine, "_start_impl", AsyncMock(side_effect=RuntimeError("load failed")))
+    def fail_close():
+        raise OSError("cache drive unavailable")
+    engine._native_cache = SimpleNamespace(close=fail_close)
+    restore = AsyncMock(return_value=True)
+    monkeypatch.setattr(engine, "_restore_wired_limit_async", restore)
+    with pytest.raises(RuntimeError, match="load failed"):
+        await engine.start()
+    restore.assert_awaited_once_with()
+    assert engine._native_cache is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hot,ssd", [(True, False), (False, True), (True, True)])
+async def test_fallback_cache_clear_reaches_scheduler_manager(hot, ssd):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from omlx.engine.dflash import DFlashEngine
+
+    manager = Mock()
+    manager.clear_hot_cache.return_value = 3
+    manager.clear.return_value = 5
+    tracker = Mock()
+    scheduler = SimpleNamespace(paged_ssd_cache_manager=manager, _cache_rate_tracker=tracker)
+    fallback = SimpleNamespace(_engine=SimpleNamespace(engine=SimpleNamespace(scheduler=scheduler)))
+    engine = DFlashEngine("target", "draft")
+    engine._fallback_engine = fallback
+    engine._in_fallback_mode = True
+    report = await engine.clear_prompt_caches(hot=hot, ssd=ssd)
+    assert report == {"hot_cleared": 3 if hot else 0, "ssd_deleted": 5 if ssd else 0, "ranks": []}
+    assert manager.clear_hot_cache.call_count == int(hot)
+    assert manager.clear.call_count == int(ssd)
+    tracker.clear.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_ssd_clear_reaches_dflash_fallback(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from omlx.admin import routes
+    from omlx.engine.dflash import DFlashEngine
+
+    manager = Mock()
+    manager.clear.return_value = 7
+    scheduler = SimpleNamespace(paged_ssd_cache_manager=manager)
+    engine = DFlashEngine("target", "draft")
+    engine._fallback_engine = SimpleNamespace(_engine=SimpleNamespace(engine=SimpleNamespace(scheduler=scheduler)))
+    engine._in_fallback_mode = True
+    pool = SimpleNamespace(
+        get_status=lambda: {"models": [{"id": "target", "loaded": True}]},
+        _entries={"target": SimpleNamespace(engine=engine)},
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(routes, "_get_global_settings", lambda: None)
+    result = await routes.clear_ssd_cache(is_admin=True)
+    assert result["total_deleted"] == 7
+    manager.clear.assert_called_once()

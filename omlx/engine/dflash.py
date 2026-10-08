@@ -20,7 +20,9 @@ import re
 import threading
 import time
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import mlx.core as mx
@@ -36,7 +38,6 @@ from ..memory_monitor import (
     set_model_info_from_model,
 )
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
-from ..scheduler import _glm5_next_prefill_floor
 from ..utils.generation_config import load_generation_config_token_ids
 from ..utils.model_loading import maybe_apply_pre_load_patches
 from ..utils.proc_memory import get_phys_footprint
@@ -155,9 +156,8 @@ def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
 def _format_phase_timings(phase_timings_us: object) -> str:
     """Compact per-phase summary for the completion log, in milliseconds.
 
-    The dflash SummaryEvent reports where each cycle's time went
-    (prefill / draft / verify / replay / commit); without surfacing it the
-    server log gives no way to tell which phase dominates a slow request.
+    Without cycle profiling, draft/verify/replay measure host dispatch;
+    GPU execution is waited for later by acceptance and is absent here.
     """
     if not isinstance(phase_timings_us, dict) or not phase_timings_us:
         return ""
@@ -270,18 +270,6 @@ def check_draft_target_precision_pairing(
     )
 
 
-def _adapter_prefill_chunk(target_ops, runtime_step: int) -> int:
-    """Cold-prefill chunk for a target adapter that chunks prefill itself.
-
-    GLM-5.3 follows the batched scheduler's prefill floor, so DFlash prefill
-    runs the same chunks as the batched engine.
-    """
-    step = int(runtime_step or 0)
-    if getattr(target_ops, "backend_name", "") == "glm5_next":
-        step = max(step, _glm5_next_prefill_floor())
-    return step
-
-
 class _DFlashPrefillGuard:
     """Prefill-memory guard target for DFlash's primary (speculative) path,
     which bypasses the Scheduler entirely.
@@ -388,9 +376,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._scheduler_config = (
             copy.copy(scheduler_config) if scheduler_config else scheduler_config
         )
-        self._omlx_ssd_cache_dir = (
-            Path(omlx_ssd_cache_dir) if omlx_ssd_cache_dir else None
-        )
+        self._omlx_ssd_cache_dir = Path(omlx_ssd_cache_dir) if omlx_ssd_cache_dir else None
 
         self._target_model = None
         self._target_ops = None
@@ -414,7 +400,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         # stands in (built in start(), resolved by the enforcer).
         self._prefill_guard: _DFlashPrefillGuard | None = None
         self._runtime_context: Any | None = None
-        self._dflash_prefix_cache: Any | None = None
+        self._native_cache: Any | None = None
         self._suppress_token_ids: set[int] = set()
         # Protocol-specific output parser factory (gemma4 / harmony).
         # Detected once in start() after the target model is loaded; None means
@@ -446,11 +432,6 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             if model_settings
             else True
         )
-        self._in_memory_cache_max_entries = int(
-            getattr(model_settings, "dflash_in_memory_cache_max_entries", 4)
-            if model_settings
-            else 4
-        )
         self._in_memory_cache_max_bytes = int(
             getattr(model_settings, "dflash_in_memory_cache_max_bytes", 8 * 1024**3)
             if model_settings
@@ -478,14 +459,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         )
         self._draft_sink_size = 0 if draft_sink_size is None else draft_sink_size
         self._block_size = (
-            getattr(model_settings, "dflash_block_size", None)
-            if model_settings
-            else None
+            getattr(model_settings, "dflash_block_size", None) if model_settings else None
         )
         self._verify_mode = (
-            getattr(model_settings, "dflash_verify_mode", None)
-            if model_settings
-            else None
+            getattr(model_settings, "dflash_verify_mode", None) if model_settings else None
         )
         # Extra stop tokens from the target's generation_config.json; unioned
         # with the tokenizer's EOS set when the runtime stop list is built.
@@ -642,50 +619,23 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         return f"w{wb}a{ab}:gs{gs}"
 
     def _resolve_dflash_l2_dir(self, quiet: bool = False) -> Path | None:
-        """Compute the dflash L2 cache directory under the omlx SSD cache root.
-
-        ``quiet`` suppresses the misconfiguration warnings for callers that
-        poll (the admin stats path); the load-time callers keep them.
-        """
-        if not self._ssd_cache_requested:
-            return None
-        if self._omlx_ssd_cache_dir is None:
-            if not quiet:
-                logger.warning(
-                    "DFlash SSD cache requested but omlx paged SSD cache directory "
-                    "is not configured; disabling L2."
-                )
-            return None
-        if not self._in_memory_cache_enabled:
-            if not quiet:
-                logger.warning(
-                    "DFlash SSD cache requires in-memory cache; disabling L2."
-                )
-            return None
-        return self._omlx_ssd_cache_dir / "dflash_l2"
+        """Native SSD root; SSD reuse is independent of the hot tier."""
+        if self._scheduler_config is not None:
+            if getattr(self._scheduler_config, "hot_cache_only", False):
+                return None
+            root = getattr(self._scheduler_config, "paged_ssd_cache_dir", None)
+            return Path(root) if root else None
+        return self._omlx_ssd_cache_dir if self._ssd_cache_requested else None
 
     def _build_runtime_context(self) -> Any:
         from dflash_mlx.runtime.config import runtime_config_from_defaults
         from dflash_mlx.runtime.context import build_runtime_context
 
-        l2_dir = self._resolve_dflash_l2_dir()
-        l2_enabled = l2_dir is not None
-        cfg = runtime_config_from_defaults(
-            prefix_cache=self._in_memory_cache_enabled,
-            prefix_cache_max_entries=self._in_memory_cache_max_entries,
-            prefix_cache_max_bytes=self._in_memory_cache_max_bytes,
-            prefix_cache_l2=l2_enabled,
-            prefix_cache_l2_dir=str(l2_dir) if l2_dir else "",
-            # Per-model L2 disk budget. dflash-mlx's _evict_to_budget drops the
-            # oldest snapshots once dflash_l2/ exceeds this, so the directory
-            # stays bounded instead of filling the disk (issue #1326).
-            prefix_cache_l2_max_bytes=self._ssd_cache_max_bytes if l2_enabled else 0,
-            # None → dflash-mlx fills in DEFAULT_RUNTIME_CONFIG values.
+        return build_runtime_context(runtime_config_from_defaults(
+            prefix_cache=False, prefix_cache_l2=False,
             draft_window_size=self._draft_window_size,
-            draft_sink_size=self._draft_sink_size,
-            verify_mode=self._verify_mode,
-        )
-        return build_runtime_context(cfg)
+            draft_sink_size=self._draft_sink_size, verify_mode=self._verify_mode,
+        ))
 
     @staticmethod
     def _checkpoint_draft_window_size(draft_meta: Any) -> int | None:
@@ -719,10 +669,19 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             await self._start_impl()
         except BaseException:
             try:
-                await asyncio.shield(self._restore_wired_limit_async())
+                from ..engine_core import get_mlx_executor
+
+                try:
+                    await asyncio.shield(
+                        asyncio.get_running_loop().run_in_executor(
+                            get_mlx_executor(), self._close_native_cache
+                        )
+                    )
+                finally:
+                    await asyncio.shield(self._restore_wired_limit_async())
             except Exception:
                 logger.warning(
-                    "DFlash wired-limit restore failed after start error",
+                    "DFlash cleanup failed after start error",
                     exc_info=True,
                 )
             raise
@@ -859,43 +818,78 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         )
         target_bundle, self._draft_model, self._draft_backend, draft_meta = result
         self._draft_window_size = self._resolve_draft_window_size(draft_meta)
-        capabilities_for = getattr(target_bundle.target_ops, "capabilities_for", None)
-        target_capabilities = (
-            capabilities_for(target_bundle.model)
-            if callable(capabilities_for)
-            else None
-        )
-        if (
-            self._in_memory_cache_enabled
-            and target_capabilities is not None
-            and not target_capabilities.supports_prefix_snapshot
-        ):
-            # Do not advertise or initialize an inert cache. GLM-5.3's DSA
-            # layers use CacheList(KVCache, PoolingCache), which the pinned
-            # dflash snapshot codec cannot serialize.
-            logger.warning(
-                "DFlash prefix snapshots are not supported by target backend %s; "
-                "disabling DFlash L1/L2 cache for this load",
-                getattr(target_bundle.target_ops, "backend_name", "unknown"),
-            )
-            self._in_memory_cache_enabled = False
-            self._ssd_cache_requested = False
         runtime_context = self._build_runtime_context()
         self._runtime_context = runtime_context
         self._target_model = target_bundle.model
         self._tokenizer_obj = target_bundle.tokenizer
         self._target_ops = target_bundle.target_ops
         target_meta = target_bundle.meta
-        if hasattr(self._target_ops, "prefill_chunk_size"):
-            # Adapters that chunk cold prefill themselves follow the runtime's
-            # prefill_step_size (GLM-5.3: the runtime only chunks
-            # snapshot-capable targets).
-            step = _adapter_prefill_chunk(
-                self._target_ops,
-                int(getattr(runtime_context.runtime, "prefill_step_size", 0) or 0),
+
+        def initialize_cache():
+            from ..cache.dflash import DFlashNativeCache, install_native_cache_hooks
+            from ..scheduler import (
+                _detect_qwen35_prefill_floor,
+                _detect_qwen4_wide_prefill_step,
             )
-            if step > 0:
+
+            cfg = self._scheduler_config
+            root = self._resolve_dflash_l2_dir()
+            hot_only = bool(getattr(cfg, "hot_cache_only", False)) if cfg else root is None
+            hot_bytes = (
+                getattr(cfg, "hot_cache_max_size", 0)
+                if cfg
+                else (
+                    self._in_memory_cache_max_bytes if self._in_memory_cache_enabled else 0
+                )
+            )
+            step = max(
+                int(
+                    getattr(cfg, "prefill_step_size", 0)
+                    or runtime_context.runtime.prefill_step_size
+                ),
+                _detect_qwen35_prefill_floor(self._target_model),
+                _detect_qwen4_wide_prefill_step(self._target_model),
+            )
+            context = replace(
+                runtime_context,
+                runtime=replace(runtime_context.runtime, prefill_step_size=step),
+            )
+            if hasattr(self._target_ops, "prefill_chunk_size"):
                 self._target_ops.prefill_chunk_size = step
+            # Global scheduler settings own served-model caches. Per-model
+            # DFlash cache settings remain a standalone-engine fallback.
+            enabled = (
+                bool(getattr(cfg, "paged_ssd_cache_dir", None))
+                if cfg
+                else bool(root or hot_bytes)
+            )
+            if not enabled:
+                return context, None
+            native = DFlashNativeCache(
+                model=self._target_model,
+                target_ops=self._target_ops,
+                model_name=getattr(cfg, "model_name", "") or self._model_name,
+                cache_dir=root,
+                config=cfg or SimpleNamespace(),
+                hot_cache_max_bytes=hot_bytes,
+                hot_cache_only=hot_only,
+                max_size_bytes=(
+                    getattr(cfg, "paged_ssd_cache_max_size", 0)
+                    if cfg
+                    else self._ssd_cache_max_bytes
+                ),
+                prefill_step_size=step,
+            )
+            try:
+                install_native_cache_hooks()
+            except BaseException:
+                native.close()
+                raise
+            return context, native
+
+        self._runtime_context, self._native_cache = await loop.run_in_executor(
+            get_mlx_executor(), initialize_cache
+        )
 
         # Deep-copy tokenizer for executor-thread usage (dflash generation).
         # The original self._tokenizer_obj stays for event-loop operations
@@ -962,13 +956,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._prefill_guard = None
         if self._target_model is not None:
             try:
-                monitor = MemoryMonitor(
-                    max_kv_cache_memory=None, eviction_enabled=False
-                )
+                monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
                 set_model_info_from_model(monitor, self._target_model)
-                step = (
-                    getattr(self._scheduler_config, "prefill_step_size", 2048) or 2048
-                )
+                step = self._runtime_context.runtime.prefill_step_size
                 self._prefill_guard = _DFlashPrefillGuard(monitor, step)
             except Exception as exc:
                 # Warn (not debug): a missing guard silently disables the
@@ -986,14 +976,16 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         window_used = getattr(runtime_cfg, "draft_window_size", "?")
         sink_used = getattr(runtime_cfg, "draft_sink_size", "?")
         verify_used = getattr(runtime_cfg, "verify_mode", "?")
+        step_used = getattr(runtime_cfg, "prefill_step_size", "?")
         logger.info(
             f"DFlashEngine loaded: target={self._model_name}, "
             f"draft={self._draft_model_path}, "
             f"max_ctx={max_ctx_display}, "
             f"fallback={self._fallback_engine_type}, "
-            f"l1_cache={self._in_memory_cache_enabled}, "
+            f"native_cache={self._native_cache is not None}, "
             f"l2_cache={self._resolve_dflash_l2_dir() is not None}, "
-            f"draft_window={window_used}, draft_sink={sink_used}, verify={verify_used}"
+            f"draft_window={window_used}, draft_sink={sink_used}, verify={verify_used}, "
+            f"prefill_step={step_used}"
         )
 
     def _record_prefill_guard_active_memory(self) -> None:
@@ -1005,46 +997,43 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         except Exception as exc:
             logger.debug(f"DFlash active-memory sample failed: {exc}")
 
-    @staticmethod
-    def _begin_runtime_cache_request() -> Any | None:
-        """Mark a DFlash cache request boundary when supported by dflash-mlx."""
-        try:
-            from dflash_mlx.cache.manager import current_runtime_cache_manager
-        except ImportError:
-            return None
-        try:
-            manager = current_runtime_cache_manager()
-        except Exception as exc:
-            logger.debug(f"current_runtime_cache_manager failed: {exc}")
-            return None
-        if manager is None:
-            return None
-        begin = getattr(manager, "begin_request", None)
-        if not callable(begin):
-            return None
-        try:
-            begin()
-        except Exception as exc:
-            logger.debug(f"dflash cache begin_request failed: {exc}")
-            return None
-        return manager
 
-    @staticmethod
-    def _end_runtime_cache_request(manager: Any | None) -> None:
-        if manager is None:
-            return
-        end = getattr(manager, "end_request", None)
-        if not callable(end):
-            return
-        try:
-            end()
-        except Exception as exc:
-            logger.debug(f"dflash cache end_request failed: {exc}")
+    def _close_native_cache(self):
+        cache, self._native_cache = self._native_cache, None
+        if cache is not None:
+            cache.close()
+
+    @property
+    def prefix_cache_enabled(self) -> bool:
+        if self._fallback_engine is not None:
+            return self._fallback_engine.prefix_cache_enabled
+        return self._native_cache is not None
+
+    async def clear_prompt_caches(self, *, hot=False, ssd=False):
+        from ..engine_core import get_mlx_executor
+
+        def clear():
+            if self._native_cache is not None:
+                report = self._native_cache.clear(hot=hot, ssd=ssd)
+            else:
+                # Batched fallbacks expose their cache through the scheduler.
+                scheduler = self.scheduler
+                manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+                report = {"hot_cleared": 0, "ssd_deleted": 0, "ranks": []}
+                if manager is not None:
+                    if hot:
+                        report["hot_cleared"] = manager.clear_hot_cache()
+                    if ssd:
+                        report["ssd_deleted"] = manager.clear()
+                tracker = getattr(scheduler, "_cache_rate_tracker", None)
+                if tracker is not None:
+                    tracker.clear()
+            self._cache_rate_tracker.clear()
+            return report
+        return await asyncio.get_running_loop().run_in_executor(get_mlx_executor(), clear)
 
     async def _evict_dflash_and_start_fallback(self) -> None:
         """Evict dflash models from memory, verify release, then start fallback engine."""
-        from dflash_mlx.cache.manager import shutdown_runtime_cache_manager
-
         from ..engine_core import get_mlx_executor
 
         loop = asyncio.get_running_loop()
@@ -1055,8 +1044,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         await self._restore_wired_limit_async()
 
         # Release dflash model and cache references
-        await loop.run_in_executor(get_mlx_executor(), shutdown_runtime_cache_manager)
-        self._dflash_prefix_cache = None
+        await loop.run_in_executor(get_mlx_executor(), self._close_native_cache)
         self._runtime_context = None
         self._target_model = None
         self._target_ops = None
@@ -1130,8 +1118,6 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         logger.info(f"DFlash fallback engine started: {self._fallback_engine_type}")
 
     async def stop(self) -> None:
-        from dflash_mlx.cache.manager import shutdown_runtime_cache_manager
-
         if self._fallback_engine is not None:
             await self._fallback_engine.stop()
             self._fallback_engine = None
@@ -1141,11 +1127,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
         try:
             await asyncio.get_running_loop().run_in_executor(
-                get_mlx_executor(), shutdown_runtime_cache_manager
+                get_mlx_executor(), self._close_native_cache
             )
         except Exception as exc:
-            logger.debug(f"shutdown_runtime_cache_manager: {exc}")
-        self._dflash_prefix_cache = None
+            logger.debug(f"Native cache shutdown: {exc}")
         self._runtime_context = None
         self._target_model = None
         self._target_ops = None
@@ -1495,6 +1480,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         min_p: float = 0.0,
         repetition_penalty: float = 1.0,
         repetition_context_size: int = 20,
+        skip_cache_store: bool = False,
     ):
         """Build the dflash event iterator with prefix cache plumbed in."""
         from dflash_mlx.runtime import stream_dflash_generate
@@ -1516,8 +1502,12 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             target_ops = self._target_ops
             tokenizer = self._executor_tokenizer
             cli_args = None
+            draft_cache_identity = (self._draft_quant_enabled, self._draft_quant_weight_bits,
+                                    self._draft_quant_activation_bits, self._draft_quant_group_size)
 
-        prefix_flow = PrefixCacheFlow.for_request(
+        from ..cache.dflash import NativeCacheTargetOps
+
+        prefix_flow = (self._native_cache.for_request if self._native_cache else PrefixCacheFlow.for_request)(
             model_provider=_ModelProviderShim(),
             draft_model=self._draft_model,
             tokenizer=self._executor_tokenizer,
@@ -1525,10 +1515,15 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             max_new_tokens=max_tokens,
             runtime_context=self._runtime_context,
         )
+        if skip_cache_store:
+            if self._native_cache:
+                prefix_flow.snapshot_service.active = False
+            else:
+                prefix_flow.snapshot_service = None
 
         event_iter = stream_dflash_generate(
             target_model=self._target_model,
-            target_ops=self._target_ops,
+            target_ops=NativeCacheTargetOps(self._target_ops) if self._native_cache else self._target_ops,
             tokenizer=self._executor_tokenizer,
             draft_model=self._draft_model,
             draft_backend=self._draft_backend,
@@ -1549,14 +1544,43 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             prefix_snapshot=prefix_flow.snapshot,
             snapshot_service=prefix_flow.snapshot_service,
             stable_prefix_len=prefix_flow.stable_prefix_len,
-            prefix_cache_active=prefix_flow.cache_active,
-            publish_generation_snapshot=prefix_flow.publish_generation_snapshot,
+            prefix_cache_active=prefix_flow.cache_active and not skip_cache_store,
+            publish_generation_snapshot=(
+                prefix_flow.publish_generation_snapshot and not skip_cache_store
+            ),
             prefix_hit_kind=str(getattr(prefix_flow, "hit_kind", "miss") or "miss"),
             runtime_context=self._runtime_context,
         )
         if hasattr(prefix_flow, "snapshot"):
             prefix_flow.snapshot = None
-        return event_iter, prefix_flow, stop_ids
+        def events():
+            from dflash_mlx.engine.events import PrefillCompleteEvent
+            try:
+                for event in event_iter:
+                    if isinstance(event, PrefillCompleteEvent):
+                        restored = max(0, event.prefill_tokens_restored)
+                        if self._native_cache is not None:
+                            cache = self._native_cache
+                            cache._tokens_saved += restored - prefix_flow.hit_tokens
+                            cache._hits += int(restored > 0) - int(prefix_flow.hit_tokens > 0)
+                            cache._misses += int(restored == 0) - int(prefix_flow.hit_tokens == 0)
+                        prefix_flow.hit_tokens = restored
+                        computed = max(0, event.prefill_tokens_computed)
+                        prefill_s = event.prefill_us / 1e6
+                        logger.info(
+                            "DFlash prefill: %.1f tok/s over %d computed tokens "
+                            "(%.0fms, %d restored from prefix cache)",
+                            computed / prefill_s if prefill_s > 0 else 0.0,
+                            computed,
+                            event.prefill_us / 1000.0,
+                            restored,
+                        )
+                    yield event
+            finally:
+                close = getattr(event_iter, "close", None)
+                if close is not None:
+                    close()
+        return events(), prefix_flow, stop_ids
 
     @staticmethod
     def _cached_tokens_from_flow(prefix_flow) -> int:
@@ -1606,6 +1630,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         queue: asyncio.Queue,
         loop: asyncio.AbstractEventLoop,
         stop_event: threading.Event,
+        skip_cache_store: bool = False,
     ) -> None:
         """Run dflash generation with streaming on MLX executor thread.
 
@@ -1617,7 +1642,6 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         from dflash_mlx.engine.events import SummaryEvent, TokenEvent
 
         event_iter = None
-        cache_manager = None
         try:
             self._record_prefill_guard_active_memory()
             if seed is not None:
@@ -1633,8 +1657,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 min_p=min_p,
                 repetition_penalty=repetition_penalty,
                 repetition_context_size=repetition_context_size,
+                skip_cache_store=skip_cache_store,
             )
-            cache_manager = self._begin_runtime_cache_request()
             self._record_prefill_guard_active_memory()
 
             # Protocol-specific parser (gemma4 channel markers → <think> tags,
@@ -1707,7 +1731,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         f"{gen_tokens} tokens, "
                         f"{gen_tps:.1f} tok/s, "
                         f"acceptance={accept_ratio:.1%}, "
-                        f"cycles={cycles}"
+                        f"cycles={cycles}, tokens/cycle={gen_tokens / max(1, cycles):.2f}, "
+                        f"temperature={temperature}, top_p={top_p}, top_k={top_k}, "
+                        f"block={getattr(event, 'block_tokens', self._block_size)}, "
+                        f"window={getattr(event, 'draft_window_size', self._draft_window_size)}, "
+                        f"cache_insert={getattr(prefix_flow, 'insert_ms', 0.0):.1f}ms"
                         f"{', fallback=AR' if fallback else ''}"
                         f"{phase_summary}"
                     )
@@ -1751,7 +1779,6 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         close()
                     except Exception as exc:
                         logger.debug(f"event_iter.close() raised: {exc}")
-            self._end_runtime_cache_request(cache_manager)
             # Always send a sentinel so the async consumer doesn't deadlock
             # when an abort happened before the dflash summary was emitted.
             asyncio.run_coroutine_threadsafe(
@@ -1831,6 +1858,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
         tools = kwargs.pop("tools", None)
         seed = kwargs.pop("seed", None)
+        skip_cache_store = bool(kwargs.pop("skip_cache_store", False))
         repetition_context_size = kwargs.pop("repetition_context_size", None)
         if repetition_context_size is None:
             repetition_context_size = 20
@@ -1846,7 +1874,6 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             from dflash_mlx.engine.events import SummaryEvent, TokenEvent
 
             event_iter = None
-            cache_manager = None
             # Per-request parser session (gemma4 channel markers, harmony
             # channels). Lives only inside the executor thread so the parser
             # state cannot leak across requests.
@@ -1866,8 +1893,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     min_p=min_p,
                     repetition_penalty=repetition_penalty,
                     repetition_context_size=int(repetition_context_size),
+                    skip_cache_store=skip_cache_store,
                 )
-                cache_manager = self._begin_runtime_cache_request()
                 self._record_prefill_guard_active_memory()
                 tokens: list[int] = []
                 parsed_visible_parts: list[str] = []
@@ -1916,7 +1943,6 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                             close()
                         except Exception as exc:
                             logger.debug(f"event_iter.close() raised: {exc}")
-                self._end_runtime_cache_request(cache_manager)
 
         self._register_stop_event(stop_event)
         try:
@@ -2073,6 +2099,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
         tools = kwargs.pop("tools", None)
         seed = kwargs.pop("seed", None)
+        skip_cache_store = bool(kwargs.pop("skip_cache_store", False))
         repetition_context_size = kwargs.pop("repetition_context_size", None)
         if repetition_context_size is None:
             repetition_context_size = 20
@@ -2118,6 +2145,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 queue,
                 loop,
                 stop_event,
+                skip_cache_store=skip_cache_store,
             )
         except Exception:
             self._unregister_stop_event(stop_event)
@@ -2421,7 +2449,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             "fallback_engine_type": self._fallback_engine_type,
             "in_fallback_mode": self._in_fallback_mode,
             "loaded": self._loaded,
-            "in_memory_cache": self._in_memory_cache_enabled,
+            "in_memory_cache": bool(
+                self._native_cache and self._native_cache.ssd._hot_cache_enabled
+            ),
             "ssd_cache": self._resolve_dflash_l2_dir() is not None,
             "pairing_warning": self._pairing_warning,
             "speculation": self.get_speculation_stats(),
@@ -2512,129 +2542,31 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
     def get_cache_stats(self) -> dict[str, Any] | None:
         if self._fallback_engine is not None:
             return self._fallback_engine.get_cache_stats()
-        return None
+        cache = self._native_cache
+        if cache is None:
+            return None
+        return {**cache.prefix.get_stats_dict(), "hits": cache._hits, "misses": cache._misses,
+                "tokens_saved": cache._tokens_saved,
+                "hit_rate": cache._hits / max(1, cache._hits + cache._misses)}
 
-    def _scan_dflash_l2_files(self) -> tuple[int, int]:
-        """Count L2 snapshot files and their total bytes on disk.
-
-        The dflash-mlx L2 stats only track bytes written this session, so the
-        directory scan is the source of truth — it also covers snapshots
-        persisted by previous runs. Dot-prefixed temp files from in-flight
-        writes are skipped.
-        """
-        l2_dir = self._resolve_dflash_l2_dir(quiet=True)
-        if l2_dir is None:
-            return 0, 0
-        num_files = 0
-        total_bytes = 0
-        try:
-            if not l2_dir.exists():
-                return 0, 0
-            for path in l2_dir.rglob("*.safetensors"):
-                if path.name.startswith("."):
-                    continue
-                try:
-                    total_bytes += path.stat().st_size
-                except OSError:
-                    continue
-                num_files += 1
-        except OSError as exc:
-            logger.debug(f"DFlash L2 cache scan failed: {exc}")
-        return num_files, total_bytes
 
     def get_runtime_cache_stats(self) -> dict[str, Any] | None:
-        """Runtime cache stats for the admin observability panel.
-
-        Returns the same shape as ``Scheduler.get_ssd_cache_stats()`` so the
-        admin route can render DFlash models with the existing pipeline: the
-        dflash-mlx L1 in-memory cache maps to the hot tier and the L2
-        snapshot directory to the SSD tier. Block fields are omitted because
-        the dflash cache is snapshot-based, not block-based.
-        """
-        if self._in_fallback_mode:
-            # The fallback engine's scheduler owns the caches in this mode;
-            # the admin route reads it through the ``scheduler`` property.
+        cache = self._native_cache
+        if cache is None or self._in_fallback_mode:
             return None
-        if not self._in_memory_cache_enabled:
-            return None
-
-        manager_stats: dict[str, Any] | None = None
-        try:
-            from dflash_mlx.cache.manager import (
-                RuntimeCacheManagerClosed,
-                current_runtime_cache_manager,
-            )
-
-            manager = current_runtime_cache_manager()
-            if manager is not None:
-                try:
-                    manager_stats = manager.stats()
-                except RuntimeCacheManagerClosed:
-                    manager_stats = None
-        except ImportError:
-            return None
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(f"DFlash runtime cache stats unavailable: {exc}")
-
-        num_files, total_size_bytes = self._scan_dflash_l2_files()
-        l2_enabled = self._resolve_dflash_l2_dir(quiet=True) is not None
-
-        # The manager is created lazily on the first request; before that,
-        # fall back to the configured budgets so the panel shows real caps.
-        hot_max = self._in_memory_cache_max_bytes
-        hot_size = 0
-        hot_entries = 0
-        stats: dict[str, Any] = {}
-        if manager_stats is not None:
-            hot_max = int(manager_stats.get("max_bytes", hot_max) or 0)
-            hot_size = int(manager_stats.get("current_bytes", 0) or 0)
-            hot_entries = int(manager_stats.get("current_entries", 0) or 0)
-            stats["cache_rates"] = self._cache_rate_tracker.snapshot_and_get_rates(
-                self._map_cache_counters(manager_stats)
-            )
-        stats["ssd_cache"] = {
-            "num_files": num_files,
-            "total_size_bytes": total_size_bytes,
-            "max_size_bytes": self._ssd_cache_max_bytes if l2_enabled else 0,
-            "hot_cache_max_bytes": hot_max,
-            "hot_cache_size_bytes": hot_size,
-            "hot_cache_entries": hot_entries,
+        ssd = cache.ssd.get_stats_dict()
+        counters = {
+            "prefix_hits": cache._hits, "prefix_misses": cache._misses,
+            "prefix_tokens_saved": cache._tokens_saved,
+            "evictions": ssd.get("evictions", 0),
+            "ssd_hot_hits": ssd.get("hot_cache_hits", 0),
+            "ssd_disk_loads": max(0, ssd.get("loads", 0) - ssd.get("hot_cache_hits", 0)),
+            "ssd_saves": ssd.get("saves", 0),
+            "hot_cache_evictions": ssd.get("hot_cache_evictions", 0),
+            "hot_cache_promotions": ssd.get("hot_cache_promotions", 0),
         }
-        return stats
-
-    @staticmethod
-    def _map_cache_counters(manager_stats: dict[str, Any]) -> dict[str, int]:
-        """Map dflash-mlx runtime cache counters onto the scheduler's
-        CacheRateTracker keys: L1 acts as the hot tier and L2 as the disk
-        tier. ``exact_hits``/``prefix_hits``/``misses`` are already merged
-        across both tiers by the dflash-mlx snapshot store, so the L1-only
-        hit count is recovered by subtracting ``l2_hits``.
-        """
-
-        def _int(value: Any) -> int:
-            try:
-                return int(value or 0)
-            except (TypeError, ValueError):
-                return 0
-
-        l2 = manager_stats.get("l2")
-        if not isinstance(l2, dict):
-            l2 = {}
-        merged_hits = _int(manager_stats.get("exact_hits")) + _int(
-            manager_stats.get("prefix_hits")
-        )
-        misses = _int(manager_stats.get("misses"))
-        l1_evictions = _int(manager_stats.get("evictions"))
-        l2_hits = _int(manager_stats.get("l2_hits"))
-        l2_evictions = _int(l2.get("evictions"))
         return {
-            "prefix_hits": merged_hits,
-            "prefix_misses": misses,
-            "prefix_tokens_saved": _int(manager_stats.get("prefill_tokens_saved")),
-            "evictions": l1_evictions + l2_evictions,
-            "ssd_hot_hits": max(0, merged_hits - l2_hits),
-            "ssd_disk_loads": l2_hits,
-            "ssd_saves": _int(l2.get("writes")),
-            "hot_cache_evictions": l1_evictions,
-            "hot_cache_promotions": l2_hits,
+            "ssd_cache": ssd, "prefix_cache": self.get_cache_stats(),
+            "block_size": cache.block_size,
+            "cache_rates": self._cache_rate_tracker.snapshot_and_get_rates(counters),
         }

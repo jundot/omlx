@@ -1032,7 +1032,7 @@ class CacheListHandler(CacheTypeHandler):
             sub_states.append(handler.serialize_state(sc))
 
             # Get class name (normalize SizedArraysCache → ArraysCache)
-            raw_name = type(sc).__name__
+            raw_name = CacheTypeRegistry.canonical_name(sc)
             # Unwrap SizedArraysCache
             if isinstance(sc, SizedArraysCache):
                 raw_name = "ArraysCache"

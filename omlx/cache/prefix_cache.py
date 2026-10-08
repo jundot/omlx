@@ -828,6 +828,15 @@ class BlockAwarePrefixCache(CacheManager):
                     f"{len(block_table.block_ids)} blocks, {num_prefix_tokens} tokens"
                 )
 
+                # Register the acquired refs so release_cache() can free them.
+                # Fetch-only callers (the DFlash native cache looks up without
+                # storing) otherwise pin every matched block — including the
+                # previous turn's tail — and tip-lineage pruning silently
+                # no-ops against the pinned ref counts.
+                self._request_tables[request_id] = BlockCacheEntry(
+                    block_table=block_table,
+                    last_access=time.time(),
+                )
                 return block_table, remaining
 
             # Every shared block was already gone or reassigned by the time
@@ -878,6 +887,11 @@ class BlockAwarePrefixCache(CacheManager):
                     f"{matched_tokens} tokens matched"
                 )
 
+                # Same registration as the shared-prefix path above.
+                self._request_tables[request_id] = BlockCacheEntry(
+                    block_table=block_table,
+                    last_access=time.time(),
+                )
                 return block_table, remaining
 
         # No cache hit
@@ -899,6 +913,7 @@ class BlockAwarePrefixCache(CacheManager):
         hot_cache_write_back: bool = True,
         _store_exact_terminal: bool = False,
         _store_tail_terminal: bool = False,
+        _track_tip_lineage: bool = True,
     ) -> BlockTable | None:
         """
         Store computed cache for future reuse.
@@ -926,6 +941,8 @@ class BlockAwarePrefixCache(CacheManager):
                 ordinary prefix matching.
             _store_tail_terminal: Persist the trailing partial block as a tail
                 block; ``tokens`` must end on a snapshot in ``boundary_snapshots``.
+            _track_tip_lineage: False for incremental boundary stores; carry the
+                published predecessor forward without advancing its retention.
 
         Returns:
             BlockTable for the stored cache, or None on failure
@@ -1610,7 +1627,7 @@ class BlockAwarePrefixCache(CacheManager):
             tip_block_saved
             and first_new_block_idx is not None
             and first_new_block_idx < len(block_table.block_ids)
-            and (rotating_layout or tail_in_table)
+            and (rotating_layout or tail_in_table or not _track_tip_lineage)
         ):
             new_tip_id = block_table.block_ids[-1]
             new_tip = self.paged_cache.allocated_blocks.get(new_tip_id)
@@ -1628,22 +1645,16 @@ class BlockAwarePrefixCache(CacheManager):
                 # a boundary-snapshot block), and recording it here would get
                 # it stripped two stores later, permanently breaking
                 # partial-match walk-back restores.
-                if (
-                    prev_tip_hash is not None
-                    and prev_tip_hash in self._store_tip_hashes
-                ):
-                    superseded = self._tip_lineage.pop(prev_tip_hash, None)
-                    if superseded is not None:
-                        if superseded in self._tail_hashes:
-                            self._discard_tail_block(superseded, layer_cache_types)
-                        elif rotating_layout:
-                            self._strip_rotating_payload(superseded)
+                if prev_tip_hash not in self._store_tip_hashes:
+                    prev_tip_hash = self._tip_lineage.get(prev_tip_hash)
+                if _track_tip_lineage:
+                    self.record_tip(new_tip.block_hash, prev_tip_hash, layer_cache_types)
+                elif prev_tip_hash is not None:
+                    # An incremental boundary is an alias for the preceding
+                    # publication, not another conversation turn.
                     self._tip_lineage[new_tip.block_hash] = prev_tip_hash
                     if len(self._tip_lineage) > _TIP_LINEAGE_MAX_ENTRIES:
                         self._tip_lineage.clear()
-                self._store_tip_hashes.add(new_tip.block_hash)
-                if len(self._store_tip_hashes) > _TIP_LINEAGE_MAX_ENTRIES:
-                    self._store_tip_hashes.clear()
 
         # Exact terminal blocks are discoverable only through
         # fetch_exact_prefix(); never expose them to general prefix matching.
@@ -2053,6 +2064,35 @@ class BlockAwarePrefixCache(CacheManager):
                             return seq_len
 
         return 0
+
+    def record_tip(
+        self,
+        block_hash: bytes,
+        previous_tip: bytes | None,
+        layer_cache_types: list[str] | None = None,
+    ) -> None:
+        """Advance publication lineage, retaining the immediate predecessor."""
+        if block_hash == previous_tip:
+            return
+        if previous_tip in self._store_tip_hashes:
+            superseded = self._tip_lineage.pop(previous_tip, None)
+            if superseded is not None:
+                self._retire_tip(superseded, layer_cache_types)
+            self._tip_lineage[block_hash] = previous_tip
+            if len(self._tip_lineage) > _TIP_LINEAGE_MAX_ENTRIES:
+                self._tip_lineage.clear()
+        self._store_tip_hashes.add(block_hash)
+        if len(self._store_tip_hashes) > _TIP_LINEAGE_MAX_ENTRIES:
+            self._store_tip_hashes.clear()
+
+    def _retire_tip(
+        self, block_hash: bytes, layer_cache_types: list[str] | None = None
+    ) -> bool:
+        if block_hash in self._tail_hashes:
+            return self._discard_tail_block(block_hash, layer_cache_types)
+        if any(CacheTypeRegistry.is_rotating_family(t) for t in layer_cache_types or []):
+            return self._strip_rotating_payload(block_hash)
+        return False
 
     def _discard_tail_block(
         self,

@@ -270,18 +270,19 @@ class ModelSettings:
             targets draft inside the batched engine (Lightning MTP verify path
             with greedy or sampled acceptance, continuous batching); other
             targets use the single-stream DFlash engine, which alone honours
-            the max_ctx, cache, window, sink and verify_mode settings below.
+            the max_ctx, window, sink and verify_mode settings below.
+            Served engines share the global native cache settings.
         dflash_draft_model: Path/repo for DFlash draft checkpoint.
         dflash_draft_quant_enabled: Enable draft model quantization.
         dflash_draft_quant_weight_bits: Quantization weight bits (2, 4, 8).
         dflash_draft_quant_activation_bits: Quantization activation bits (16, 32).
         dflash_draft_quant_group_size: Quantization group size (32, 64, 128).
         dflash_max_ctx: Token threshold to fall back to BatchedEngine (None = unlimited).
-        dflash_in_memory_cache: Enable DFlash L1 (RAM) prefix cache.
-        dflash_in_memory_cache_max_entries: L1 cache max entries (default 4, matches dflash balanced profile).
-        dflash_in_memory_cache_max_bytes: L1 cache byte budget.
-        dflash_ssd_cache: Enable DFlash L2 (SSD) prefix cache spill (uses omlx SSD cache dir).
-        dflash_ssd_cache_max_bytes: L2 (SSD) disk budget; dflash evicts oldest entries when exceeded.
+        dflash_in_memory_cache: Standalone-engine hot cache fallback.
+        dflash_in_memory_cache_max_entries: Legacy snapshot setting; native caches are byte-budgeted.
+        dflash_in_memory_cache_max_bytes: Standalone-engine hot cache byte budget.
+        dflash_ssd_cache: Standalone-engine SSD cache fallback (independent of hot cache).
+        dflash_ssd_cache_max_bytes: Standalone-engine native SSD byte budget.
         dflash_draft_window_size: Draft model sliding-attention window
             (None = use the draft checkpoint's sliding_window when present).
             Helps stabilise acceptance rate on long-context prompts.
@@ -429,8 +430,8 @@ class ModelSettings:
     dflash_max_ctx: Optional[int] = (
         None  # None = unlimited; trigger BatchedEngine fallback when prompt_len >= this
     )
-    # DFlash prefix cache (private to dflash; separate from omlx tiered cache because
-    # snapshots include draft model GDN state and target hidden chunks omlx never tracks)
+    # Legacy standalone DFlash cache settings. Served engines use the global
+    # native hot/SSD settings; drafter features share those same byte budgets.
     dflash_in_memory_cache: bool = True
     dflash_in_memory_cache_max_entries: int = (
         4  # Matches dflash balanced profile default
@@ -439,7 +440,7 @@ class ModelSettings:
         8 * 1024 * 1024 * 1024
     )  # 8 GiB (balanced profile default)
     dflash_ssd_cache: bool = (
-        False  # Requires in-memory cache and an omlx paged SSD cache dir
+        False  # Standalone SSD fallback requires an omlx paged SSD cache dir
     )
     dflash_ssd_cache_max_bytes: int = 20 * 1024 * 1024 * 1024  # 20 GiB L2 disk budget
     # DFlash runtime tuning knobs. None window size uses the draft checkpoint's

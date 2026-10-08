@@ -4733,3 +4733,115 @@ class TestTurboquantBitsSignature:
             assert payload["turboquant_kv_bits"] == 6.0
         finally:
             mgr.close()
+
+
+class TestPrefixContextMetrics:
+    """Drafter-context sidecars report separately from recurrent checkpoints."""
+
+    @staticmethod
+    def _context_tensors(mx):
+        return {
+            "hidden_0": mx.zeros((1, 2, 4)),
+            "logits": mx.zeros((1, 8)),
+        }
+
+    def test_metrics_count_contexts_not_recurrent_sidecars(self, tmp_path: Path):
+        import mlx.core as mx
+
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+        )
+        try:
+            tip = b"\x11" * 32
+            recurrent = b"\x22" * 32
+            assert manager.save_prefix_context(
+                tip,
+                "ctx-signature",
+                self._context_tensors(mx),
+                {"prefix_len": "12", "spans": "[[0, 2]]"},
+                token_count=12,
+            )
+            staged = tmp_path / "recurrent.safetensors"
+            state = _extract_tensor_bytes(mx.zeros((1, 2, 4)))
+            _write_safetensors_no_mx(
+                str(staged), {"state": state}, {"n": "1"}
+            )
+            committed = manager.commit_gdn_checkpoint_file(
+                recurrent,
+                staged,
+                token_count=12,
+                model_name="test-model",
+                cache_signature="gdn-signature",
+                block_size=64,
+            )
+            assert committed is not None
+
+            stats = manager.get_stats_dict()
+            assert stats["prefix_context_count"] == 1
+            assert stats["gdn_sidecar_count"] == 2
+            assert 0 < stats["prefix_context_size_bytes"] < stats["gdn_sidecar_size_bytes"]
+            assert manager.prefix_context_count == 1
+        finally:
+            manager.close()
+
+    def test_forget_prefix_context_covers_hot_only_mode(self, tmp_path: Path):
+        """A hot-only forget removes the resident context, not nothing."""
+        import mlx.core as mx
+
+        manager = PagedSSDCacheManager(
+            max_size_bytes=1024**3,
+            cache_dir=None,
+            hot_cache_only=True,
+            hot_cache_max_bytes=1024**3,
+        )
+        try:
+            tip = b"\x33" * 32
+            assert manager.save_prefix_context(
+                tip,
+                "ctx-signature",
+                self._context_tensors(mx),
+                {"prefix_len": "12", "spans": "[[0, 2]]"},
+                token_count=12,
+            )
+            key = __import__("hashlib").sha256(
+                b"prefix-context:" + tip + b"ctx-signature"
+            ).digest()
+            assert manager._hot_cache_get(key) is not None
+
+            assert manager.forget_prefix_context(tip, "ctx-signature")
+            assert manager._hot_cache_get(key) is None
+            assert not manager.forget_prefix_context(tip, "ctx-signature")
+        finally:
+            manager.close()
+
+    def test_forget_prefix_context_drops_hot_and_durable(self, tmp_path: Path):
+        """In mixed mode the hot entry and the durable sidecar both go."""
+        import mlx.core as mx
+
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=1024**3,
+        )
+        try:
+            tip = b"\x44" * 32
+            assert manager.save_prefix_context(
+                tip,
+                "ctx-signature",
+                self._context_tensors(mx),
+                {"prefix_len": "12", "spans": "[[0, 2]]"},
+                token_count=12,
+            )
+            key = __import__("hashlib").sha256(
+                b"prefix-context:" + tip + b"ctx-signature"
+            ).digest()
+            assert manager._hot_cache_get(key) is not None
+            assert manager.has_gdn_checkpoint(tip, "ctx-signature")
+
+            assert manager.forget_prefix_context(tip, "ctx-signature")
+            assert manager._hot_cache_get(key) is None
+            assert not manager.has_gdn_checkpoint(tip, "ctx-signature")
+            assert manager.get_stats_dict()["prefix_context_count"] == 0
+        finally:
+            manager.close()
