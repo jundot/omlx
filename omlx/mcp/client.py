@@ -111,21 +111,49 @@ class MCPClient:
             self._state = MCPServerState.CONNECTING
             self._error = None
 
+            # Startup must never hang the server: a stdio server that
+            # downloads dependencies on first run (npx -y) or one that
+            # never answers `initialize` used to block init_mcp forever —
+            # uvicorn would not start serving at all. Each stage gets the
+            # configured timeout budget (npx cold starts can be slow, so
+            # transport setup gets a multiple of it).
+            # MCPServerConfig has no timeout field of its own; fall back
+            # to a 30s floor (npx cold starts are slow). An explicit
+            # default_timeout on the server config (tests, tight setups)
+            # overrides the floor.
+            raw_budget = getattr(self.config, "default_timeout", None)
+            startup_budget = float(raw_budget) if raw_budget else 30.0
+
             try:
+                async def _with_timeout(stage, coro, budget):
+                    return await asyncio.wait_for(coro, timeout=budget)
+
                 if self.config.transport == MCPTransport.STDIO:
-                    await self._connect_stdio()
+                    await _with_timeout(
+                        "stdio", self._connect_stdio(), startup_budget * 4
+                    )
                 elif self.config.transport == MCPTransport.SSE:
-                    await self._connect_sse()
+                    await _with_timeout(
+                        "sse", self._connect_sse(), startup_budget * 4
+                    )
                 elif self.config.transport == MCPTransport.STREAMABLE_HTTP:
-                    await self._connect_streamable_http()
+                    await _with_timeout(
+                        "streamable-http",
+                        self._connect_streamable_http(),
+                        startup_budget * 4,
+                    )
                 else:
                     raise ValueError(f"Unknown transport: {self.config.transport}")
 
                 # Initialize session
-                await self._initialize_session()
+                await _with_timeout(
+                    "initialize", self._initialize_session(), startup_budget
+                )
 
                 # Discover tools
-                await self._discover_tools()
+                await _with_timeout(
+                    "list_tools", self._discover_tools(), startup_budget
+                )
 
                 self._state = MCPServerState.CONNECTED
                 self._last_connected = time.time()
@@ -137,7 +165,15 @@ class MCPClient:
 
             except Exception as e:
                 self._state = MCPServerState.ERROR
-                self._error = str(e)
+                # str(TimeoutError()) is the empty string — a bare timeout
+                # would surface as a blank error in /v1/mcp/servers.
+                if isinstance(e, asyncio.TimeoutError):
+                    self._error = (
+                        f"connection timed out after {startup_budget:.0f}s "
+                        "(startup budget)"
+                    )
+                else:
+                    self._error = str(e)
                 logger.error(f"Failed to connect to MCP server '{self.name}': {e}")
                 await self._cleanup_resources()
                 return False
@@ -389,13 +425,23 @@ class MCPClient:
                 return structured
             return None
 
-        # Handle list of content items
+        # Handle list of content items. Non-text payloads are normalized:
+        # raw bytes (ImageContent.data et al.) used to flow into the JSON
+        # response and blow up FastAPI's serialization with a 500.
         contents = []
         for item in result.content:
             if hasattr(item, "text"):
-                contents.append(item.text)
+                contents.append(self._truncate(item.text))
             elif hasattr(item, "data"):
-                contents.append(item.data)
+                data = item.data
+                if isinstance(data, bytes):
+                    # Raw bytes (ImageContent.data et al.) broke FastAPI's
+                    # JSON serialization with a 500; summarize instead.
+                    contents.append(f"[binary content omitted: {len(data)} bytes]")
+                elif isinstance(data, str):
+                    contents.append(self._truncate(data))
+                else:
+                    contents.append(data)
             else:
                 contents.append(str(item))
 
@@ -403,6 +449,17 @@ class MCPClient:
         if len(contents) == 1:
             return contents[0]
         return contents
+
+    @staticmethod
+    def _truncate(text: str, limit: int = 20_000) -> str:
+        """Cap tool-result text, mirroring the built-in web-fetch tool.
+
+        Without this, a file-read style tool returning hundreds of MB flows
+        into the HTTP response and the next chat request verbatim.
+        """
+        if len(text) <= limit:
+            return text
+        return text[:limit] + f"\n…[truncated {len(text) - limit} characters]"
 
     async def refresh_tools(self):
         """Refresh the list of available tools."""

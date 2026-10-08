@@ -148,7 +148,11 @@ class TestOpenAICallToMCP:
         assert arguments == {}
 
     def test_parse_invalid_json_arguments(self):
-        """Test parsing with invalid JSON arguments."""
+        """Invalid JSON arguments raise instead of silently becoming {}.
+
+        Executing with empty arguments ran the tool's defaults (which can
+        have side effects) and hid the model's formatting error.
+        """
         tool_call = {
             "function": {
                 "name": "test",
@@ -156,9 +160,8 @@ class TestOpenAICallToMCP:
             },
         }
 
-        _, _, arguments = openai_call_to_mcp(tool_call)
-
-        assert arguments == {}
+        with pytest.raises(ValueError, match="not valid JSON"):
+            openai_call_to_mcp(tool_call)
 
     def test_parse_dict_arguments(self):
         """Test parsing with already-parsed dict arguments."""
