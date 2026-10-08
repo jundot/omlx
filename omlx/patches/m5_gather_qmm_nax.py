@@ -456,7 +456,11 @@ struct TileLoader {
     const device uint32_t* ptr = src + kb * (G::kBK * kBits / 32);
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kWords; i++) {
-      if (col + i * kPer < k_valid) {
+      // 3-bit: word i covers chunk bits [32i, 32i + 32); keep it while it
+      // holds a bit of a value below k_valid (k_valid - col is a multiple
+      // of 32, so the reads stop exactly at the row's last byte).
+      if (kBits == 3 ? 32 * i < 3 * (k_valid - col)
+                     : col + i * kPer < k_valid) {
         raw[i] = ptr[i];
       }
     }
@@ -471,15 +475,41 @@ struct TileLoader {
   METAL_FUNC void store_words(threadgroup WT* Ws, const int k_valid) const
       thread {
     threadgroup WT* dst = Ws + row * kBKP + col;
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < kWords; i++) {
-      if (col + i * kPer < k_valid) {
-        vec<WT, kPer> v;
-        STEEL_PRAGMA_UNROLL
-        for (short j = 0; j < kPer; j++) {
-          v[j] = Q::dq(p[i / kWPG], (raw[i] >> (kBits * j)) & kMask);
+    if constexpr (kBits == 3) {
+      // 8 values per 24 bits: every fourth pack lies inside one uint32
+      // word, the others straddle two (chunks start word-aligned and hold
+      // a whole number of words, kVPT % 32 == 0). Packs never straddle a
+      // quantization group (kGV is a multiple of 8).
+      STEEL_PRAGMA_UNROLL
+      for (short t = 0; t < kVPT / 8; t++) {
+        if (col + 8 * t < k_valid) {
+          thread const uint32_t* wp = raw + 3 * t / 4;
+          uint32_t pack;
+          switch (t & 3) {
+            case 0: pack = wp[0] & 0xFFFFFFu; break;
+            case 1: pack = (wp[0] >> 24) | (wp[1] << 8); break;
+            case 2: pack = (wp[0] >> 16) | (wp[1] << 16); break;
+            default: pack = wp[0] >> 8; break;
+          }
+          vec<WT, 8> v;
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < 8; j++) {
+            v[j] = Q::dq(p[8 * t / kGV], (pack >> (3 * j)) & kMask);
+          }
+          *(threadgroup vec<WT, 8>*)(dst + 8 * t) = v;
         }
-        *(threadgroup vec<WT, kPer>*)(dst + i * kPer) = v;
+      }
+    } else {
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < kWords; i++) {
+        if (col + i * kPer < k_valid) {
+          vec<WT, kPer> v;
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < kPer; j++) {
+            v[j] = Q::dq(p[i / kWPG], (raw[i] >> (kBits * j)) & kMask);
+          }
+          *(threadgroup vec<WT, kPer>*)(dst + i * kPer) = v;
+        }
       }
     }
   }
@@ -1318,6 +1348,13 @@ def _parse_plan(text: str) -> Optional[Plan]:
     return Plan(sched, bm, bk, gx, pad)
 
 
+def _b3_loader_ok(plan: Plan) -> bool:
+    """3-bit rows split into whole uint32 words only when the loader's
+    chunks are 32-value multiples: 128-row tiles split a 64-deep K step
+    into 16-value chunks (48 bits, not whole words)."""
+    return not (plan.bm == 128 and plan.bk == 64)
+
+
 def _plan(rows: int, experts: int, K: int, N: int) -> Plan:
     """Kernel configuration for a call (mean rows per expert and K).
 
@@ -1396,7 +1433,11 @@ def supports(
     if E == 0 or E > _MAX_EXPERTS or N == 0 or N % 32 or K % 32:
         return False
     if mode == "affine":
-        if bits not in (4, 8) or group_size not in (32, 64, 128):
+        # 3-bit packs 8 values into 3 bytes with values straddling the
+        # uint32 words of a loader chunk (TileLoader::store_words); K % 32
+        # == 0 (required above) makes every chunk a whole number of words
+        # and every group of 32+ values word-aligned.
+        if bits not in (3, 4, 8) or group_size not in (32, 64, 128):
             return False
         if biases is None or K % group_size:
             return False
@@ -1788,6 +1829,8 @@ def sorted_gather_qmm(
     if plan.sched == _SCHED_DB and (K % 64 or N % 64 or plan.bk != 64):
         # db runs aligned 64-deep K steps only.
         plan = plan._replace(sched=_SCHED_SEG)
+    if bits == 3 and not _b3_loader_ok(plan):
+        return None
     if verify:
         key = (x.dtype, mode, bits, group_size, plan, N % _BN == 0, K % plan.bk == 0)
         if not _checked(key, _self_test):
@@ -1853,6 +1896,8 @@ def sorted_gather_qmm_swiglu(
         plan = _plan(M, E, K, N)
     if plan.sched == _SCHED_DB and (K % 64 or plan.bk != 64):
         plan = plan._replace(sched=_SCHED_SEG)
+    if bits == 3 and not _b3_loader_ok(plan):
+        return None
     epi = _EPI_SWIGLU if limit is None else _EPI_CLAMPED
     if verify:
         key = (x.dtype, mode, bits, group_size, plan, True, K % plan.bk == 0)
