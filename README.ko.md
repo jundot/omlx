@@ -265,7 +265,7 @@ Claude Code에서 작은 컨텍스트 모델을 실행할 수 있도록 토큰 �
 
 ### API 호환성
 
-OpenAI 및 Anthropic API를 그대로 대체합니다. 스트리밍 사용량 통계 (`stream_options.include_usage`), Anthropic adaptive thinking, 비전 입력 (base64, URL)을 지원합니다.
+OpenAI 및 Anthropic API를 그대로 대체합니다. 스트리밍 사용량 통계 (`stream_options.include_usage`), llama.cpp 방식 prefill 진행률 (`return_progress`), Anthropic adaptive thinking, 비전 입력 (base64, URL)을 지원합니다.
 
 | 엔드포인트 | 설명 |
 |----------|------|

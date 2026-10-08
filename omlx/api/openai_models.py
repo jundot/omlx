@@ -341,6 +341,8 @@ class ChatCompletionRequest(BaseModel):
     )
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
+    # llama.cpp extension: stream prompt_progress chunks during prefill.
+    return_progress: bool = False
     stop: Optional[List[str]] = None
     min_p: float | None = None
     xtc_probability: float | None = None
@@ -477,6 +479,8 @@ class CompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
+    # llama.cpp extension: stream prompt_progress chunks during prefill.
+    return_progress: bool = False
     stop: Optional[List[str]] = None
     min_p: float | None = None
     xtc_probability: float | None = None

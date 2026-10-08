@@ -48,7 +48,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Union
@@ -88,6 +88,7 @@ from .api.anthropic_utils import (
     map_finish_reason_to_stop_reason,
     request_has_cache_control,
 )
+from .api.body_limit import RequestBodySizeLimitMiddleware
 from .api.embedding_models import (
     EmbeddingData,
     EmbeddingRequest,
@@ -191,7 +192,7 @@ from .api.utils import (
     cache_reasoning_output,
     uses_native_reasoning_content,
 )
-from .engine import BaseEngine, VLMBatchedEngine
+from .engine import BaseEngine, GenerationOutput, VLMBatchedEngine
 from .engine.distributed import DistributedInferenceError
 from .engine.vlm import MINIMAX_M3_MODEL_TYPES
 from .engine.embedding import EmbeddingEngine
@@ -213,6 +214,7 @@ from .exceptions import (
 )
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
 from .models.decision import DecisionContextLengthError, DecisionRequestError
+from .prefill_progress import get_prefill_tracker
 from .server_metrics import get_server_metrics, reset_server_metrics
 
 logging.basicConfig(level=logging.INFO)
@@ -1332,6 +1334,9 @@ class ClientDisconnectTrackingMiddleware:
 # passes through the same one-shot disconnect fan-out.
 app.add_middleware(ClientDisconnectTrackingMiddleware)
 app.add_middleware(DebugRequestLoggingMiddleware)
+# Outermost so oversized bodies are rejected before any buffering below
+# (the debug middleware caches the whole textual body at trace level).
+app.add_middleware(RequestBodySizeLimitMiddleware)
 
 
 # =============================================================================
@@ -2653,6 +2658,85 @@ async def _aclose_async_iterator(iterator: object) -> None:
     close = getattr(iterator, "aclose", None)
     if callable(close):
         await close()
+
+
+_PROMPT_PROGRESS_POLL_S = 0.5
+
+
+@dataclass(frozen=True)
+class _PromptProgress:
+    """llama.cpp ``prompt_progress`` payload. Token counts include the cache."""
+
+    total: int
+    cache: int
+    processed: int
+    time_ms: int
+
+
+async def _with_prompt_progress(
+    outputs: AsyncIterator[GenerationOutput],
+    request_id: str,
+) -> AsyncIterator[GenerationOutput | _PromptProgress]:
+    """Interleave ``_PromptProgress`` events before the first engine output.
+
+    Event order matches llama.cpp: 0% (``processed == cache``), strictly
+    increasing updates, then 100% right before the first output.
+    """
+    tracker = get_prefill_tracker()
+    ait = outputs.__aiter__()
+    start = time.monotonic()
+    task: asyncio.Future | None = asyncio.ensure_future(_safe_anext(ait))
+    totals: tuple[int, int] | None = None
+    sent = -1
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=_PROMPT_PROGRESS_POLL_S)
+            if done:
+                break
+            entry = tracker.get(request_id)
+            # SpecPrefill phases count draft-scored and sparse tokens, not the prompt.
+            if (
+                not entry
+                or entry.get("phase") != "prefill"
+                or not entry.get("prompt_tokens")
+                or entry["total"] <= 0
+            ):
+                continue
+            if totals is None:
+                totals = (entry["prompt_tokens"], entry["cached_tokens"])
+                # Like llama.cpp, count time from prefill start, not queue entry.
+                start = entry.get("prefill_started_at") or start
+                yield _PromptProgress(totals[0], totals[1], totals[1], 0)
+                sent = totals[1]
+            total, cache = totals
+            # Tracker counts cover only the uncached suffix.
+            processed = cache + (total - cache) * entry["processed"] // entry["total"]
+            if sent < processed < total:
+                # Stamp with the scheduler's update time, not the poll time.
+                time_ms = int((entry["last_time"] - start) * 1000)
+                yield _PromptProgress(total, cache, processed, time_ms)
+                sent = processed
+        first = task.result()
+        task = None
+        if first is _KEEPALIVE_SENTINEL:
+            return
+        if totals is None and first.prompt_tokens > 0:
+            cache = min(first.cached_tokens, first.prompt_tokens)
+            totals = (first.prompt_tokens, cache)
+            yield _PromptProgress(totals[0], totals[1], totals[1], 0)
+            sent = totals[1]
+        if totals is not None and sent < totals[0]:
+            time_ms = int((time.monotonic() - start) * 1000)
+            yield _PromptProgress(totals[0], totals[1], totals[0], time_ms)
+        yield first
+        async for output in ait:
+            yield output
+    finally:
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        await _aclose_async_iterator(outputs)
 
 
 def _request_abort_id(engine: BaseEngine) -> str | None:
@@ -4715,7 +4799,16 @@ async def create_chat_completion(
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
-                if failure := _tool_call_failure(extraction):
+                recovered = _nonstream_recovery_text(
+                    extraction,
+                    regular_content,
+                    output,
+                    engine.tokenizer,
+                    tools_for_template,
+                )
+                if recovered is not None:
+                    cleaned_text = recovered
+                elif failure := _tool_call_failure(extraction):
                     raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
@@ -5317,6 +5410,10 @@ async def stream_completion(
         gen_kwargs["thinking_budget"] = thinking_budget
     if inference_request_id is not None:
         gen_kwargs["_request_id"] = inference_request_id
+    progress_request_id = None
+    if request.return_progress:
+        # The engine keys the prefill tracker by this id.
+        progress_request_id = gen_kwargs.setdefault("_request_id", str(uuid.uuid4()))
     # Widen the repetition-penalty look-back window when the client
     # asks for it (mlx-lm default window is 20 tokens).
     repetition_context_size = getattr(
@@ -5324,23 +5421,37 @@ async def stream_completion(
     )
     if repetition_context_size is not None:
         gen_kwargs["repetition_context_size"] = repetition_context_size
+    outputs = engine.stream_generate(
+        prompt=prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        min_p=min_p,
+        repetition_penalty=repetition_penalty,
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
+        xtc_probability=xtc_probability,
+        xtc_threshold=xtc_threshold,
+        stop=request.stop,
+        seed=request.seed,
+        **gen_kwargs,
+    )
+    if progress_request_id is not None:
+        outputs = _with_prompt_progress(outputs, progress_request_id)
     try:
-        async for output in engine.stream_generate(
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            min_p=min_p,
-            repetition_penalty=repetition_penalty,
-            presence_penalty=presence_penalty,
-            frequency_penalty=frequency_penalty,
-            xtc_probability=xtc_probability,
-            xtc_threshold=xtc_threshold,
-            stop=request.stop,
-            seed=request.seed,
-            **gen_kwargs,
-        ):
+        async for output in outputs:
+            if isinstance(output, _PromptProgress):
+                data = {
+                    "id": response_id,
+                    "object": "text_completion",
+                    "created": int(time.time()),
+                    "model": request.model,
+                    "choices": [{"index": 0, "text": "", "finish_reason": None}],
+                    "prompt_progress": asdict(output),
+                }
+                yield f"data: {json.dumps(data)}\n\n"
+                continue
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
             last_output = output
@@ -5543,6 +5654,60 @@ def _tool_call_failure(extraction: ToolCallExtraction) -> dict | None:
     return _openai_error_body(message, 500, code=code)
 
 
+def _take_recoverable_withheld_text(
+    tool_filter: ToolCallStreamFilter | None,
+    thinking_filter: ToolCallStreamFilter | None,
+    tool_calls: object,
+    parse_errors: tuple,
+    streamed_tool_calls: list | None = None,
+) -> tuple[str, str]:
+    """Drain withheld envelope text and return the (thinking, content) to emit.
+
+    A marker quoted in prose fails parsing as "incomplete" like a truncated
+    call. Recover the text only when no call was produced, every error is
+    "incomplete" and no withheld opener in either channel starts a payload.
+    """
+    is_payload = any(
+        f.recovery_candidate_is_payload() for f in (tool_filter, thinking_filter) if f
+    )
+    thinking = thinking_filter.take_recovery_candidate() if thinking_filter else ""
+    content = tool_filter.take_recovery_candidate() if tool_filter else ""
+    if (
+        tool_calls
+        or streamed_tool_calls
+        or any(error != "incomplete" for error in parse_errors)
+        or (parse_errors and is_payload)
+    ):
+        return "", ""
+    return thinking, content
+
+
+def _nonstream_recovery_text(
+    extraction: ToolCallExtraction,
+    raw_text: str,
+    output: GenerationOutput,
+    tokenizer: object,
+    tools: object,
+) -> str | None:
+    """Return the raw answer when the only failure is a marker quoted in prose."""
+    if extraction.tool_calls:
+        return None
+    failed = extraction.parse_errors
+    if not failed or any(error != "incomplete" for error in failed):
+        return None
+    # Judge the text the stream filter would see, before special tokens are
+    # cleaned out of it.
+    _, generated = extract_thinking(
+        output.text or "", truncated=output.finish_reason == "length"
+    )
+    probe = ToolCallStreamFilter(tokenizer, tools=tools)
+    probe.feed(generated)
+    probe.finish()
+    if probe.recovery_candidate_is_payload() or not probe.take_recovery_candidate():
+        return None
+    return raw_text
+
+
 def _registered_tool_names(tools: object) -> set[str]:
     """Return nonempty function names explicitly registered by the request."""
 
@@ -5724,9 +5889,30 @@ async def stream_chat_completion(
             thinking_filter = _thinking_filter
         else:
             stream_content = False
+    progress_request_id = None
+    if request.return_progress:
+        # The engine keys the prefill tracker by this id.
+        progress_request_id = kwargs.setdefault("_request_id", str(uuid.uuid4()))
     engine_stream = engine.stream_chat(messages=messages, **kwargs)
+    if progress_request_id is not None:
+        engine_stream = _with_prompt_progress(engine_stream, progress_request_id)
     try:
         async for output in engine_stream:
+            if isinstance(output, _PromptProgress):
+                progress_chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=request.model,
+                    choices=[
+                        ChatCompletionChunkChoice(
+                            delta=ChatCompletionChunkDelta(
+                                role="assistant", content=""
+                            ),
+                        )
+                    ],
+                ).model_dump(exclude_none=True)
+                progress_chunk["prompt_progress"] = asdict(output)
+                yield f"data: {json.dumps(progress_chunk)}\n\n"
+                continue
             if first_token_time is None:
                 produced_at = getattr(output, "first_token_at", None)
                 if produced_at is None:
@@ -5975,6 +6161,7 @@ async def stream_chat_completion(
     # Parse tool calls from accumulated text
     tool_calls = None
     tool_failure = None
+    parse_errors: tuple = ()
     cleaned_text = accumulated_text
     terminal_tool_calls_authoritative = bool(last_output and last_output.tool_calls)
     if last_output and last_output.tool_calls:
@@ -5997,6 +6184,7 @@ async def stream_chat_completion(
         )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
+        parse_errors = extraction.parse_errors
         tool_failure = _tool_call_failure(extraction)
         cleaned_thinking = extraction.cleaned_thinking
         # Process response_format if specified
@@ -6045,10 +6233,12 @@ async def stream_chat_completion(
     # Surface an unterminated paired envelope only when final parsing could not
     # recover a structured tool call. The candidate begins at the opening marker,
     # so prose already streamed before it is never duplicated.
-    recovered_thinking = (
-        thinking_filter.take_recovery_candidate() if thinking_filter else ""
+    recovered_thinking, recovered_content = _take_recoverable_withheld_text(
+        tool_filter, thinking_filter, tool_calls, parse_errors, streamed_tool_calls
     )
-    recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
+    if recovered_thinking or recovered_content:
+        # The marker was quoted in prose, so this is not a failed tool call.
+        tool_failure = None
     if not tool_calls and not tool_failure:
         if recovered_thinking:
             chunk = ChatCompletionChunk(
@@ -6571,6 +6761,7 @@ async def stream_anthropic_messages(
     # For other models, parse from accumulated text
     tool_calls = None
     tool_failure = None
+    parse_errors: tuple = ()
     if last_output and last_output.tool_calls:
         # Protocol parser already extracted structured tool calls.
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
@@ -6589,12 +6780,15 @@ async def stream_anthropic_messages(
             finish_reason=last_output.finish_reason if last_output else "stop",
         )
         tool_calls = extraction.tool_calls
+        parse_errors = extraction.parse_errors
         tool_failure = _tool_call_failure(extraction)
 
-    recovered_thinking = (
-        thinking_filter.take_recovery_candidate() if thinking_filter else ""
+    recovered_thinking, recovered_content = _take_recoverable_withheld_text(
+        tool_filter, thinking_filter, tool_calls, parse_errors
     )
-    recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
+    if recovered_thinking or recovered_content:
+        # The marker was quoted in prose, so this is not a failed tool call.
+        tool_failure = None
     if not tool_calls and not tool_failure:
         if recovered_thinking:
             if text_block_started:
@@ -7117,7 +7311,16 @@ async def create_anthropic_message(
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
-                if failure := _tool_call_failure(extraction):
+                recovered = _nonstream_recovery_text(
+                    extraction,
+                    regular_content,
+                    output,
+                    engine.tokenizer,
+                    internal_tools,
+                )
+                if recovered is not None:
+                    cleaned_text = recovered
+                elif failure := _tool_call_failure(extraction):
                     raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
@@ -7867,7 +8070,16 @@ async def create_response(
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
-                if failure := _tool_call_failure(extraction):
+                recovered = _nonstream_recovery_text(
+                    extraction,
+                    regular_content,
+                    output,
+                    engine.tokenizer,
+                    tools_for_template,
+                )
+                if recovered is not None:
+                    cleaned_text = recovered
+                elif failure := _tool_call_failure(extraction):
                     raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
@@ -8389,6 +8601,7 @@ async def stream_responses_api(
     # Parse tool calls from accumulated text
     tool_calls = None
     tool_failure = None
+    parse_errors: tuple = ()
     cleaned_text = accumulated_text
     if last_output and last_output.tool_calls:
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
@@ -8407,6 +8620,7 @@ async def stream_responses_api(
         )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
+        parse_errors = extraction.parse_errors
         tool_failure = _tool_call_failure(extraction)
         if not stream_content:
             cleaned_thinking = (extraction.cleaned_thinking or "").strip()
@@ -8438,10 +8652,16 @@ async def stream_responses_api(
         )
         cleaned_text = clean_special_tokens(regular_content) if regular_content else ""
 
-    recovered_thinking = (
-        thinking_filter.take_recovery_candidate() if thinking_filter else ""
+    recovered_thinking, recovered_content = _take_recoverable_withheld_text(
+        tool_filter, thinking_filter, tool_calls, parse_errors
     )
-    recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
+    if recovered_thinking or recovered_content:
+        # The marker was quoted in prose, so this is not a failed tool call.
+        tool_failure = None
+    if recovered_content:
+        # The parser strips the prose before the marker, so rebuild the final
+        # text from the raw answer to match the streamed deltas.
+        cleaned_text = clean_special_tokens(regular_content)
     if not tool_calls and not tool_failure:
         for ev in _emit_reasoning_delta(recovered_thinking):
             yield ev

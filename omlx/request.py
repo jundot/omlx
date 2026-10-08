@@ -127,6 +127,7 @@ class Request:
     output_token_ids: List[int] = field(default_factory=list)
     output_text: str = ""
     generation_started_at: Optional[float] = None
+    prefill_started_at: Optional[float] = None
     last_activity_at: Optional[float] = None
 
     # For BatchGenerator integration

@@ -268,7 +268,7 @@ Native Swift / SwiftUI menubar app (not Electron). Start, stop, and monitor the 
 
 ### API Compatibility
 
-Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stats (`stream_options.include_usage`), Anthropic adaptive thinking, and vision inputs (images as base64 or URL, video as base64).
+Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stats (`stream_options.include_usage`), llama.cpp-style prefill progress (`return_progress`), Anthropic adaptive thinking, and vision inputs (images as base64 or URL, video as base64).
 
 | Endpoint | Description |
 |----------|-------------|

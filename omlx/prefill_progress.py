@@ -86,6 +86,12 @@ class PrefillProgressTracker:
             if self._progress.pop(request_id, None) is not None:
                 self._last_activity_ts = time.monotonic()
 
+    def get(self, request_id: str) -> Optional[Dict[str, Any]]:
+        """Return a copy of one request's raw entry, or None."""
+        with self._lock:
+            entry = self._progress.get(request_id)
+            return dict(entry) if entry is not None else None
+
     def recently_active(self, within_s: float) -> bool:
         """True while any prefill is live, or within ``within_s`` of the
         last prefill activity (update, completion, or abort).

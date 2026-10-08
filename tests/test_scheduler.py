@@ -8009,6 +8009,34 @@ class TestSchedulerModelIdDerivation:
         assert len(progress_none) == 0
         tracker.clear()
 
+    def test_prompt_progress_records_prompt_and_cached_tokens(
+        self, mock_model, mock_tokenizer
+    ):
+        """Tracker counts cover the uncached suffix; the stream's
+        prompt_progress needs the full prompt, cache size and start time."""
+        from omlx.prefill_progress import get_prefill_tracker
+
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(model_name="model"),
+        )
+        tracker = get_prefill_tracker()
+        tracker.clear()
+
+        scheduler.uid_to_request_id[0] = "test-req"
+        scheduler.requests["test-req"] = SimpleNamespace(
+            num_prompt_tokens=48000, cached_tokens=30000, prefill_started_at=12.5
+        )
+        scheduler._on_prompt_progress([(0, 2048, 18000)])
+
+        entry = tracker.get("test-req")
+        assert entry["processed"] == 2048
+        assert entry["prompt_tokens"] == 48000
+        assert entry["cached_tokens"] == 30000
+        assert entry["prefill_started_at"] == 12.5
+        tracker.clear()
+
 
 class TestSupportsSkipLmHead:
     """Regression coverage for Scheduler._supports_skip_lm_head.
