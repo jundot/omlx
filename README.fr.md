@@ -228,7 +228,7 @@ Application native Swift / SwiftUI dans la barre de menus (pas Electron). Démar
 
 ### Compatibilité API
 
-Remplacement direct des APIs OpenAI et Anthropic. Supporte les statistiques d'usage en streaming (`stream_options.include_usage`), le thinking adaptatif Anthropic, et les entrées visuelles (base64, URL).
+Remplacement direct des APIs OpenAI et Anthropic. Supporte les statistiques d'usage en streaming (`stream_options.include_usage`), la progression du prefill façon llama.cpp (`return_progress`), le thinking adaptatif Anthropic, et les entrées visuelles (base64, URL).
 
 | Endpoint | Description |
 |----------|-------------|

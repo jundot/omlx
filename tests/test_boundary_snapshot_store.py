@@ -306,8 +306,9 @@ class TestBoundarySnapshotSSDStore:
         from omlx.cache import boundary_snapshot_store as mod
 
         request_id = "req-staging"
-        last_tmp = self.store._file_path(request_id, 3072)
-        last_tmp = last_tmp.with_name(last_tmp.stem + "_tmp.safetensors")
+        last_final = self.store._file_path(request_id, 3072)
+        # Temp names carry a per-writer suffix.
+        last_tmp_prefix = last_final.stem + "_tmp"
         original_write = mod._write_safetensors_no_mx
         promoted: list[Path | None] = []
 
@@ -315,7 +316,7 @@ class TestBoundarySnapshotSSDStore:
             # The writer has just created the request directory and is about
             # to stage the last boundary; the store thread promotes the two
             # earlier boundaries at exactly that moment.
-            if Path(path) == last_tmp and not promoted:
+            if Path(path).name.startswith(last_tmp_prefix) and not promoted:
                 promoted.append(
                     self.store.take_staged_file(request_id, 1024, timeout_s=5.0)
                 )
