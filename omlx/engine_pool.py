@@ -64,6 +64,7 @@ from .model_settings import (
     validate_ane_prefill,
 )
 from .scheduler import SchedulerConfig
+from .utils.fatal import exit_if_gpu_submissions_ignored
 from .utils.metal_sync import unreleased_graphics_bytes
 from .utils.model_loading import dflash_batched_requested, dflash_batched_supported
 from .utils.proc_memory import get_phys_footprint
@@ -3152,6 +3153,38 @@ class EnginePool:
         if cancelled:
             raise asyncio.CancelledError
 
+    async def _metal_sync_clear_cache(self, model_id: str) -> None:
+        """Run ``mx.synchronize()`` + ``mx.clear_cache()`` tolerating a pending
+        Metal command-buffer error left behind by a failed prefill.
+
+        A prefill that OOMs on Metal leaves a pending error on the command
+        buffer, and the first ``mx.synchronize()`` during teardown re-raises
+        it. That first raise consumes the pending error, so a single retry
+        succeeds and the settle barrier / memory release can still run
+        (#3737/#4344); otherwise memory accounting leaks and every later load
+        is refused with 507 until restart.
+
+        Catch ONLY ``RuntimeError`` whose message contains
+        "Command buffer execution failed"; any other exception propagates
+        unchanged. Honour fatal GPU-submission errors first via
+        ``exit_if_gpu_submissions_ignored`` (which exits the process) before
+        logging and retrying once.
+        """
+        loop = asyncio.get_running_loop()
+        run = lambda: (mx.synchronize(), mx.clear_cache())
+        try:
+            await loop.run_in_executor(get_mlx_executor(), run)
+        except RuntimeError as e:
+            if "Command buffer execution failed" not in str(e):
+                raise
+            exit_if_gpu_submissions_ignored(e)
+            logger.warning(
+                f"Metal command-buffer error on synchronize/clear_cache while "
+                f"unloading '{model_id}': {e}; the pending error was consumed "
+                f"by the raise, retrying once"
+            )
+            await loop.run_in_executor(get_mlx_executor(), run)
+
     async def _stop_and_unload_engine(
         self, model_id: str, *, local_only: bool = False
     ) -> None:
@@ -3254,9 +3287,7 @@ class EnginePool:
         # still referenced by in-flight command buffers. See issue #300.
         gc.collect()
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
-        )
+        await self._metal_sync_clear_cache(model_id)
 
         # RAM Engram tables share MLX buffers with CPU views, so their packed
         # bytes are included in both admission and Metal unload settlement.
@@ -3336,9 +3367,7 @@ class EnginePool:
             )
             await asyncio.sleep(0.5)
             gc.collect()
-            await loop.run_in_executor(
-                get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
-            )
+            await self._metal_sync_clear_cache(model_id)
 
         # Release memory tracking AFTER barrier
         self._current_model_memory = max(0, self._current_model_memory - resident_size)
@@ -3372,10 +3401,7 @@ class EnginePool:
             )
             for _ in range(3):
                 gc.collect()
-                await loop.run_in_executor(
-                    get_mlx_executor(),
-                    lambda: (mx.synchronize(), mx.clear_cache()),
-                )
+                await self._metal_sync_clear_cache(model_id)
                 await asyncio.sleep(1.0)
             active_after = mx.get_active_memory()
             if active_after > self._current_model_memory + 5 * 1024**3:
