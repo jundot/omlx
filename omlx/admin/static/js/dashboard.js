@@ -710,11 +710,25 @@
                 // When the user returns to this browser tab after looking
                 // elsewhere, re-check whether a different bench just started
                 // in another tab. Fires the banner without requiring an
-                // in-app tab switch.
+                // in-app tab switch. The same listener re-attaches the stream
+                // of the bench sub-tab that is open: a suspended tab can lose
+                // its socket without the EventSource ever firing `error` (iOS
+                // Safari keeps `readyState` at OPEN), and `loadBenchState()` /
+                // `loadCtxBenchState()` return early while a handle is still
+                // set — so drop it first. Re-attaching is what a page refresh
+                // does anyway: the server replays every event on subscribe and
+                // the listeners dedupe the append-only arrays.
                 document.addEventListener('visibilitychange', () => {
                     if (document.visibilityState !== 'visible') return;
-                    if (this.mainTab === 'bench' && this.benchTab === 'throughput') {
+                    if (this.mainTab !== 'bench') return;
+                    if (this.benchTab === 'throughput') {
+                        if (this.benchEventSource) this.benchEventSource.close();
+                        this.benchEventSource = null;
                         this.loadBenchState();
+                    } else if (this.benchTab === 'context') {
+                        if (this.ctxBenchEventSource) this.ctxBenchEventSource.close();
+                        this.ctxBenchEventSource = null;
+                        this.loadCtxBenchState();
                     }
                 });
 
@@ -4554,6 +4568,9 @@
                 };
 
                 es.onerror = () => {
+                    // A stream dropped on foreground can still have this error
+                    // queued; it must not tear down its own replacement.
+                    if (this.benchEventSource !== es) return;
                     if (this.benchRunning) {
                         this.benchError = window.t('js.error.benchmark_connection_lost');
                         this.benchRunning = false;
@@ -4657,6 +4674,9 @@
                 };
 
                 es.onerror = () => {
+                    // See connectBenchSSE: a deliberately dropped stream must
+                    // not clear the handle it was replaced by.
+                    if (this.ctxBenchEventSource !== es) return;
                     if (this.ctxBenchRunning) {
                         this.ctxBenchError = window.t('js.error.benchmark_connection_lost');
                         this.ctxBenchRunning = false;
