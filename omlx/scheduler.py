@@ -10836,6 +10836,12 @@ class Scheduler:
         if req_to_remove is not None:
             req_to_remove._extracted_cache = None
             req_to_remove.prompt_cache = None
+            # Multi-image/video embeds are the largest per-request arrays;
+            # clear them with the caches so a client disconnect doesn't
+            # hold wired vision memory until an abandoned generator chain
+            # is finally collected (see _reap_orphaned_collectors).
+            req_to_remove.vlm_inputs_embeds = None
+            req_to_remove.vlm_extra_kwargs = None
 
         # Schedule the deferred Metal clear that _cleanup_finished would have
         # scheduled: aborts free KV/activation arrays into MLX's buffer pool

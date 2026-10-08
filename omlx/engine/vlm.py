@@ -4961,6 +4961,13 @@ class VLMBatchedEngine(BaseEngine):
             tools=tools,
             **specprefill_kwargs,
         )
+        # The request now owns the embeddings; drop this generator frame's
+        # references. Without this, the arrays stayed alive for the whole
+        # stream (the scheduler clears the Request-side fields after the
+        # first decode token, but this frame kept a second reference), so
+        # multi-image/video embeds stayed wired for the entire decode.
+        vlm_inputs_embeds = None
+        vlm_extra_kwargs = None
 
         finished_normally = False
         try:
@@ -5325,7 +5332,7 @@ class VLMBatchedEngine(BaseEngine):
             kwargs["generation_prompt_text"] = generation_prompt
             kwargs["generation_prompt_persists"] = persists
 
-        async for output in self.stream_generate(
+        generator = self.stream_generate(
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -5341,7 +5348,13 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_ranges=image_cache_key_ranges,
             tools=tools,
             **kwargs,
-        ):
+        )
+        # stream_generate's frame owns the embeds from here; drop this
+        # frame's references so the arrays aren't held twice for the whole
+        # stream.
+        vlm_embeds = None
+        vlm_kwargs = None
+        async for output in generator:
             yield output
 
     def _apply_ocr_prompt(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
