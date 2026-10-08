@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import sys
 import threading
+from types import SimpleNamespace
 
 import pytest
 from rdma_loopback import LoopbackLink, PythonWordOps
@@ -17,8 +19,11 @@ from omlx.cluster.rdma.link_probe import (
     ProbeService,
     ProbeSettings,
     probe_link,
+    probe_remote_link,
+    read_remote_status,
     start_probe_service,
     verify_link,
+    verify_remote_link,
 )
 from omlx.cluster.rdma.link_probe_service import serve_probe
 from omlx.cluster.rdma.links import NodeAddress, RdmaLink
@@ -331,3 +336,145 @@ def test_a_node_without_a_worker_python_cannot_host_the_probe():
         start_probe_service(
             NodeAddress("spark-a", "worker@10.0.0.2"), "linka", "/tmp/s.sock"
         )
+
+
+def _finished(stdout, returncode=0, stderr=""):
+    return SimpleNamespace(stdout=stdout, stderr=stderr, returncode=returncode)
+
+
+def test_a_workers_daemon_status_is_read_over_the_cluster_ssh_policy():
+    captured = {}
+    peers = [{"name": "linkb", "up": True, "host": "10.0.0.3", "since": 9.0}]
+    answer = {
+        "socket_path": "/tmp/mcdma-rpcd.sock",
+        "reachable": True,
+        "reason": "1 of 1 peer links up",
+        "version": "0.1.19",
+        "peers": peers,
+    }
+
+    def run(argv, **kwargs):
+        captured["argv"], captured["stdin"] = argv, kwargs.get("stdin")
+        return _finished("noise\n" + json.dumps(answer) + "\n")
+
+    status = read_remote_status(_NODE, run=run)
+    assert status.reachable and status.version == "0.1.19"
+    assert status.peer("linkb").host == "10.0.0.3"
+    assert status.peer("linkb").since == 9.0
+    assert captured["stdin"] is subprocess.DEVNULL
+    assert captured["argv"][-2] == "worker@10.0.0.2"
+    assert (
+        captured["argv"][-1] == "/opt/py -m omlx.cluster.rdma.link_probe_client status"
+    )
+
+
+@pytest.mark.parametrize(
+    ("finished", "reason"),
+    [
+        (_finished("", 255, "ssh: connect to host 10.0.0.2: refused"), "refused"),
+        (_finished('{"socket_path": "/tmp/x", "reachable": true, "peers": [{}]}'), ""),
+        (
+            _finished(
+                '{"socket_path": "/tmp/x", "reachable": true, '
+                '"peers": [{"name": "l", "up": true, "since": "soon"}]}'
+            ),
+            "",
+        ),
+    ],
+)
+def test_an_unreadable_worker_daemon_reads_as_unreachable(finished, reason):
+    status = read_remote_status(_NODE, run=lambda argv, **kwargs: finished)
+    assert not status.reachable
+    assert status.reason.startswith("could not read mcdma-rpcd on spark-a")
+    assert reason in status.reason
+
+
+def test_the_remote_probe_client_runs_the_requested_settings():
+    captured = {}
+    measured = {
+        "round_trips": 20,
+        "latency_p50_us": 4.0,
+        "latency_p99_us": 6.0,
+        "to_peer_bytes": 2,
+        "to_peer_gbit_s": 90.0,
+        "from_peer_bytes": 2,
+        "from_peer_gbit_s": 95.0,
+    }
+
+    def run(argv, **kwargs):
+        captured["argv"] = argv
+        return _finished(json.dumps({"ok": True, "measurements": measured}))
+
+    result = probe_remote_link(_NODE, "linkb", _SMALL, run=run)
+    assert result.from_peer_gbit_s == 95.0
+    assert shlex.split(captured["argv"][-1])[3:] == [
+        "probe",
+        "--name",
+        "linkb",
+        "--warmup",
+        "2",
+        "--round-trips",
+        "20",
+        "--bulk-bytes",
+        str(256 * 1024),
+        "--repeats",
+        "2",
+        "--call-timeout",
+        "5.0",
+    ]
+
+
+def test_a_failed_remote_probe_raises_its_reason():
+    finished = _finished(json.dumps({"ok": False, "error": "echo reply did not match"}))
+    with pytest.raises(ProbeError, match="echo reply did not match"):
+        probe_remote_link(_NODE, "linkb", _SMALL, run=lambda argv, **kwargs: finished)
+
+
+def test_a_remote_link_is_verified_from_its_client_worker():
+    service = _Service({"ended": "end"})
+    probed = []
+    measured = SimpleNamespace(round_trips=50, to_dict=lambda: {"round_trips": 50})
+    client = NodeAddress("spark-a", "worker@10.0.0.2", python_executable="/opt/py")
+    node = NodeAddress("spark-b", "worker@10.0.0.3", python_executable="/opt/py")
+    link = RdmaLink("linkb", True, "", "10.0.0.3", "spark-b")
+
+    def probe(where, name, settings):
+        probed.append((where.node_id, name, settings.round_trips))
+        return measured
+
+    evidence = verify_remote_link(
+        link,
+        client,
+        node,
+        status=_STATUS,
+        start_service=lambda where, name, socket_path: service,
+        probe=probe,
+    )
+    assert evidence.verified and evidence.peer_node_id == "spark-b"
+    assert evidence.identity["client_node_id"] == "spark-a"
+    assert "driver_uuid" not in evidence.identity
+    assert probed == [("spark-a", "linkb", 50)]
+    assert service.closed
+
+
+def _local_run(argv, **kwargs):
+    # Runs the command the coordinator would send over SSH on this machine instead.
+    return subprocess.run(shlex.split(argv[-1]), **kwargs)
+
+
+@pytest.mark.skipif(load_word_ops()[0] is None, reason="libmcdma-rpc is not installed")
+def test_the_real_probe_client_checks_every_byte_against_the_real_service(link):
+    thread, result = _serve_in_thread(link, load_word_ops()[0])
+    node = NodeAddress("spark-a", "worker@10.0.0.2", python_executable=sys.executable)
+    measured = probe_remote_link(node, link.name, _SMALL, run=_local_run)
+    thread.join(timeout=10)
+    assert result["summary"]["ended"] == "end"
+    assert measured.round_trips == _SMALL.round_trips
+    assert measured.to_peer_bytes == 2 * 256 * 1024
+
+
+@pytest.mark.skipif(load_word_ops()[0] is None, reason="libmcdma-rpc is not installed")
+def test_the_real_probe_client_reports_a_missing_mailbox():
+    node = NodeAddress("spark-a", "worker@10.0.0.2", python_executable=sys.executable)
+    with pytest.raises(ProbeError, match="no mailbox /mcdma-rpc.nosuchlink"):
+        probe_remote_link(node, "nosuchlink", _SMALL, run=_local_run)

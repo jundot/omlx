@@ -88,6 +88,16 @@ def test_advanced_tools_preserve_cuda_connectx_and_diagnostics():
     assert "clusterLegacyView" not in template + source
 
 
+def test_a_running_deployment_shows_how_each_stage_hop_and_its_tokens_travel():
+    rendered = admin_routes.templates.get_template("dashboard.html").render()
+    source = JAVASCRIPT.read_text(encoding="utf-8")
+
+    assert "data-cluster-v2-rdma-transport" in rendered
+    assert "data-cluster-v2-token-relay" in rendered
+    # The panel reads the launch's own stage_links report, one entry per edge.
+    assert "deploymentRuntimeLauncher(deployment)?.stage_links" in source
+
+
 def test_dashboard_does_not_reference_an_unbundled_alpine_plugin():
     rendered = admin_routes.templates.get_template("dashboard.html").render()
     assert "@alpinejs/" not in rendered

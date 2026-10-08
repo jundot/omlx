@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Two real MLX ring ranks decode through an RDMA stage edge and match a single-process run."""
+"""Real MLX ring ranks decode through RDMA stage edges and match a single-process run."""
 
 from __future__ import annotations
 
@@ -29,15 +29,26 @@ def _free_port() -> int:
     shutil.which("mlx.launch", path=os.path.dirname(sys.executable)) is None,
     reason="mlx.launch is not installed",
 )
-def test_pipeline_tokens_match_with_the_stage_edge_on_rdma():
-    link = LoopbackLink(request_bytes=64 * 1024, reply_bytes=64 * 1024)
+@pytest.mark.parametrize("model,ranks", [("qwen2", 2), ("qwen2", 3), ("kimi_k3", 2)])
+def test_pipeline_tokens_match_with_every_edge_and_the_tokens_on_rdma(model, ranks):
+    links = [
+        LoopbackLink(request_bytes=64 * 1024, reply_bytes=64 * 1024)
+        for _ in range(ranks - 1)
+    ]
     try:
+        edges = [
+            {
+                "name": link.name,
+                "socket": link.socket_path,
+                "mailbox": link.mailbox_path,
+            }
+            for link in links
+        ]
         environment = {
             **os.environ,
-            "RDMA_TEST_LINK": link.name,
-            "RDMA_TEST_SOCKET": link.socket_path,
-            "RDMA_TEST_MAILBOX": link.mailbox_path,
+            "RDMA_TEST_LINKS": json.dumps(edges),
             "RDMA_TEST_TOKENS": str(_NEW_TOKENS),
+            "RDMA_TEST_MODEL": model,
             "PYTHONPATH": os.pathsep.join(
                 [str(_TESTS), os.environ.get("PYTHONPATH", "")]
             ),
@@ -47,7 +58,7 @@ def test_pipeline_tokens_match_with_the_stage_edge_on_rdma():
             [
                 launcher,
                 "-n",
-                "2",
+                str(ranks),
                 "--backend",
                 "ring",
                 "--starting-port",
@@ -61,15 +72,24 @@ def test_pipeline_tokens_match_with_the_stage_edge_on_rdma():
             timeout=240,
         )
     finally:
-        link.close()
+        for link in links:
+            link.close()
     results = [
         json.loads(line)
         for line in completed.stdout.splitlines()
         if line.startswith('{"rank"')
     ]
-    assert len(results) == 2, completed.stdout + completed.stderr
+    assert len(results) == ranks, completed.stdout + completed.stderr
     for result in results:
         assert result["stage_links_active"] and result["matches"], result
+        # Every stage message took its edge, whichever receive call the model makes.
+        assert result["ring_recvs"] == 0, result
+        if model == "kimi_k3":
+            # Its two send paths keep MLX-LM's sampler, so no token relay here.
+            continue
         assert result["sampling_rank_only"] and result["prefill_overlap"], result
-    # Every generated token crossed the stage edge, so the link carried at least that many replies.
-    assert link.replies >= _NEW_TOKENS
+        assert result["token_relay"]["active"], result
+        # No decode step used the ring for its tokens.
+        assert result["ring_sums"] == 0, result
+    # Every generated token crossed every edge, so each link carried at least that many replies.
+    assert all(link.replies >= _NEW_TOKENS for link in links)

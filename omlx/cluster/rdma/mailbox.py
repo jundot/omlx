@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 
 from . import layout
+from .metal_view import MetalWindow
 from .words import WordOps
 
 
@@ -85,6 +86,7 @@ class ClientMailbox(_Mailbox):
         # A random start keeps a restarted client from reusing a served sequence.
         self._seq = secrets.randbits(31) | 1
         self._staged_generation = self.generation
+        self._window: MetalWindow | None | bool = False
 
     @classmethod
     def attach(cls, name: str, ops: WordOps) -> ClientMailbox:
@@ -149,8 +151,24 @@ class ClientMailbox(_Mailbox):
             raise MailboxError("reply length exceeds the reply half")
         return self._buffer[start : start + length]
 
+    def reply_window(self, mx: Any) -> MetalWindow | None:
+        """A no-copy Metal view of the reply half, when the helper and MLX can share it."""
+        if self._window is False:
+            library = getattr(self._ops, "library", None)
+            self._window = (
+                MetalWindow.open(
+                    mx, library, self._base + self.sizes.request, self.sizes.reply
+                )
+                if library is not None
+                else None
+            )
+        return self._window or None
+
     def close(self) -> None:
         """Detach; the daemon keeps the shared memory object."""
+        if self._window:
+            self._window.close()
+        self._window = None
         self._release()
         with suppress(BufferError):
             self._shared.close()

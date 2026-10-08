@@ -60,6 +60,39 @@ def test_frame_headers_round_trip():
     assert frames.unpack(frames.pack(frames.request(9, 0))) == frames.request(9, 0)
 
 
+def test_token_requests_round_trip_and_carry_one_uint32_per_sequence():
+    header = frames.tokens(7, 3)
+    assert (header.kind, header.message, header.frame) == (frames.TOKENS, 7, 0)
+    assert (header.nbytes, header.dtype, header.shape) == (12, "uint32", (3,))
+    assert frames.unpack(frames.pack(header) + b"\0" * 12) == header
+    with pytest.raises(frames.FrameError, match="shorter than its header says"):
+        frames.unpack(frames.pack(header) + b"\0" * 11)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"dtype": "int32"},
+        {"nbytes": 8, "total": 8},
+        {"frame": 1, "frames": 2},
+        {"shape": (1, 3)},
+    ],
+)
+def test_malformed_token_requests_are_refused(kwargs):
+    base = {
+        "kind": frames.TOKENS,
+        "message": 1,
+        "frame": 0,
+        "frames": 1,
+        "total": 12,
+        "nbytes": 12,
+        "dtype": "uint32",
+        "shape": (3,),
+    }
+    with pytest.raises(frames.FrameError):
+        frames.Frame(**{**base, **kwargs})
+
+
 def test_frames_shorter_than_their_payload_are_refused():
     frame = frames.Frame(frames.FRAME, 1, 0, 1, 0, 64, 64, "float32", (16,))
     with pytest.raises(frames.FrameError, match="shorter than its header says"):

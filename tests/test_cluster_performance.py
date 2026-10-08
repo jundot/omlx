@@ -494,6 +494,81 @@ def test_worker_rank_skips_vocab_projection_when_adapter_declares_contract(
     assert batch._next_logprobs[0].shape == (32,)
 
 
+class _Relay:
+    def __init__(self):
+        self.decisions = []
+        self.broadcasts = []
+
+    def activate(self, sampling_active):
+        self.decisions.append(sampling_active)
+        return sampling_active
+
+    def broadcast(self, mx_module, sampled, count):
+        self.broadcasts.append((sampled.tolist(), count))
+        return sampled
+
+
+class _CoordinatorBatch:
+    def __init__(self, model):
+        self.model = model
+        self.uids = [1]
+        self.prompt_cache = []
+        self.tokens = [[]]
+        self.samplers = [None]
+        self.fallback_sampler = lambda value: mx.argmax(value, axis=-1).astype(
+            mx.uint32
+        )
+        self.logits_processors = [[]]
+        self._current_tokens = None
+        self._current_logprobs = []
+        self._next_tokens = mx.array([3], dtype=mx.uint32)
+        self._next_logprobs = []
+        self._token_context = []
+
+
+def test_live_rdma_links_carry_the_sampled_tokens_instead_of_the_ring(monkeypatch):
+    class CoordinatorModel:
+        def __init__(self):
+            self.model = _ValidatedPipeline()
+
+        def __call__(self, value, cache=None):
+            self.model(value, cache=cache)
+            return mx.array([[[0.0, 5.0, 1.0]]])
+
+    def no_ring(*_args, **_kwargs):
+        raise AssertionError("the tokens must not use the ring")
+
+    model = CoordinatorModel()
+    relay = _Relay()
+    settings = replace(execution_profile("balanced"), sampling_rank_only=True)
+    monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
+    with install_runtime_optimizations(
+        model, _Group(), settings, batchable=True, token_relay=relay
+    ):
+        monkeypatch.setattr(mx.distributed, "all_sum", no_ring)
+        batch = _CoordinatorBatch(model)
+        mlx_generate.GenerationBatch._step(batch)
+
+    assert relay.decisions == [True]
+    assert relay.broadcasts == [([1], 1)]
+    assert batch._next_tokens.tolist() == [1]
+
+
+def test_the_relay_stays_off_when_rank_zero_sampling_is_disabled():
+    relay = _Relay()
+    original_step = mlx_generate.GenerationBatch._step
+    settings = replace(execution_profile("balanced"), sampling_rank_only=False)
+    with install_runtime_optimizations(
+        SimpleNamespace(model=_ValidatedPipeline()),
+        _Group(),
+        settings,
+        batchable=True,
+        token_relay=relay,
+    ):
+        assert mlx_generate.GenerationBatch._step is original_step
+    assert relay.decisions == [False]
+
+
 def test_pipeline_prefill_schedule_has_equal_fill_and_drain_timeline():
     schedules = [
         pipeline_prefill_schedule(10, 4, rank=rank, world_size=3)

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import json
+import threading
 import zlib
 from dataclasses import replace
 
@@ -322,3 +323,126 @@ def test_tensor_parallel_deployments_keep_mlx_collectives():
     deployment, report, _ = _attach(tp)
     assert deployment.stage_links == ()
     assert report["reason"] == "tensor-parallel deployments keep MLX's collectives"
+
+
+def _three_ranks() -> ClusterDeployment:
+    return _deployment(
+        hosts=(
+            ClusterHost("mac", "127.0.0.1", ("10.0.0.1",)),
+            ClusterHost("spark-a", "worker@10.0.0.2", ("10.0.0.2",)),
+            ClusterHost("spark-b", "worker@10.0.0.3", ("10.0.0.3",)),
+        ),
+        assignments=(
+            PipelineAssignment("mac", 0, 6, 8, 5, 1, 1, 16),
+            PipelineAssignment("spark-a", 1, 3, 6, 3, 1, 1, 8),
+            PipelineAssignment("spark-b", 2, 0, 3, 3, 1, 1, 8),
+        ),
+    )
+
+
+_TWO_WORKERS = (
+    *_NODES,
+    NodeAddress(
+        "spark-b", "worker@10.0.0.3", ("10.0.0.3",), python_executable="/opt/py"
+    ),
+)
+
+
+def _verify_remote(verified=True, reason="", probed=None):
+    def verify_remote(link, client, node, **kwargs):
+        assert kwargs["settings"].round_trips == 50
+        if probed is not None:
+            probed.append((client.ssh, link.name, node.ssh))
+        return LinkVerification(link.name, node.node_id, verified, reason, 1.0)
+
+    return verify_remote
+
+
+def _attach_three(**overrides):
+    kwargs = {
+        "nodes": lambda: _TWO_WORKERS,
+        "remote_status": lambda client: _up("linkb", "10.0.0.3"),
+        "verify_remote": _verify_remote(),
+    }
+    kwargs.update(overrides)
+    return _attach(_three_ranks(), **kwargs)
+
+
+def test_every_stage_edge_gets_its_own_verified_link():
+    probed = []
+    deployment, report, store = _attach_three(
+        verify_remote=_verify_remote(probed=probed)
+    )
+    assert deployment.stage_links == (
+        StageLink(1, 0, "linka", "/tmp/mcdma-rpcd.linka.sock"),
+        StageLink(2, 1, "linkb", "/tmp/mcdma-rpcd.linkb.sock"),
+    )
+    assert report["active"]
+    assert report["reason"] == (
+        "rank 1 sends to rank 0 over linka; rank 2 sends to rank 1 over linkb"
+    )
+    assert [edge["sender_rank"] for edge in report["edges"]] == [1, 2]
+    # The worker-to-worker probe runs from rank 1's host to rank 2's host.
+    assert probed == [("worker@10.0.0.2", "linkb", "worker@10.0.0.3")]
+    assert launch_links.claimed_links() == {
+        "linka": "cluster-rdma",
+        "spark-a/linkb": "cluster-rdma",
+    }
+    # Only the coordinator's own link has a dashboard row to keep evidence for.
+    assert [record.link for record in store.recorded] == ["linka"]
+
+
+def test_a_failed_worker_edge_leaves_the_others_on_rdma():
+    deployment, report, _ = _attach_three(
+        verify_remote=_verify_remote(False, "no reply within 10 s")
+    )
+    assert deployment.stage_links == (
+        StageLink(1, 0, "linka", "/tmp/mcdma-rpcd.linka.sock"),
+    )
+    assert report["active"]
+    assert report["reason"] == (
+        "rank 1 sends to rank 0 over linka; "
+        "link linkb failed its pre-launch check: no reply within 10 s"
+    )
+    assert launch_links.claimed_links() == {"linka": "cluster-rdma"}
+
+
+def test_a_worker_whose_daemon_cannot_be_read_keeps_its_edge_on_the_ring():
+    down = DaemonStatus(
+        "spark-a:mcdma-rpcd", False, "could not read mcdma-rpcd on spark-a: refused"
+    )
+    deployment, report, _ = _attach_three(remote_status=lambda client: down)
+    assert [link.sender_rank for link in deployment.stage_links] == [1]
+    assert report["edges"][1] == {
+        "sender_rank": 2,
+        "receiver_rank": 1,
+        "verified": False,
+        "reason": "could not read mcdma-rpcd on spark-a: refused",
+    }
+
+
+def test_two_edges_cannot_share_a_link_name():
+    deployment, report, _ = _attach_three(
+        remote_status=lambda client: _up("linka", "10.0.0.3")
+    )
+    assert [link.sender_rank for link in deployment.stage_links] == [1]
+    assert report["edges"][1]["reason"] == (
+        "link name linka is used by two edges; give each link its own name"
+    )
+    assert launch_links.claimed_links() == {"linka": "cluster-rdma"}
+
+
+def test_every_edge_is_probed_at_the_same_time():
+    # Each probe waits for the other; probing one edge after another would time out.
+    both = threading.Barrier(2, timeout=5)
+
+    def verify(link, node, **kwargs):
+        both.wait()
+        return LinkVerification(link.name, node.node_id, True, "", 1.0)
+
+    def verify_remote(link, client, node, **kwargs):
+        both.wait()
+        return LinkVerification(link.name, node.node_id, True, "", 1.0)
+
+    deployment, _, _ = _attach_three(verify=verify, verify_remote=verify_remote)
+    assert len(deployment.stage_links) == 2

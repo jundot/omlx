@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""One rank of the two-rank RDMA pipeline test, launched by mlx.launch."""
+"""One rank of the RDMA pipeline test, launched by mlx.launch with one stand-in link per edge."""
 
 from __future__ import annotations
 
@@ -7,9 +7,10 @@ import importlib
 import json
 import os
 import sys
+from typing import Any
 
 import mlx.core as mx
-from mlx_lm.models import qwen2
+from mlx_lm.models import kimi_k3, qwen2
 from rdma_loopback import PythonWordOps
 
 from omlx.cluster.performance import ExecutionSettings
@@ -21,28 +22,58 @@ from omlx.cluster.runtime_optimizations import install_runtime_optimizations
 mlx_generate = importlib.import_module("mlx_lm.generate")
 PROMPTS = [[3, 17, 42, 9, 128, 5, 77, 31], [11, 200, 31, 4]]
 NEW_TOKENS = int(os.environ.get("RDMA_TEST_TOKENS", "12"))
+MODEL = os.environ.get("RDMA_TEST_MODEL", "qwen2")
 
 
-def build() -> qwen2.Model:
-    args = qwen2.ModelArgs(
-        model_type="qwen2",
-        hidden_size=64,
-        num_hidden_layers=4,
-        intermediate_size=128,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        rms_norm_eps=1e-6,
-        vocab_size=256,
-        rope_theta=10000.0,
-        tie_word_embeddings=True,
-    )
+def build() -> Any:
     mx.random.seed(1234)
-    model = qwen2.Model(args)
+    if MODEL == "kimi_k3":
+        # Attention residual blocks make each rank receive with recv(shape, dtype, src).
+        model = kimi_k3.Model(
+            kimi_k3.ModelArgs.from_dict(
+                {
+                    "model_type": "kimi_k3",
+                    "vocab_size": 256,
+                    "hidden_size": 64,
+                    "num_hidden_layers": 6,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 4,
+                    "intermediate_size": 128,
+                    "linear_attn_config": {
+                        "kda_layers": [2, 5],
+                        "num_heads": 4,
+                        "head_dim": 16,
+                        "short_conv_kernel_size": 4,
+                    },
+                    "attn_res_block_size": 2,
+                    "kv_lora_rank": 32,
+                    "qk_nope_head_dim": 16,
+                    "qk_rope_head_dim": 8,
+                    "v_head_dim": 16,
+                    "tie_word_embeddings": True,
+                }
+            )
+        )
+    else:
+        model = qwen2.Model(
+            qwen2.ModelArgs(
+                model_type="qwen2",
+                hidden_size=64,
+                num_hidden_layers=6,
+                intermediate_size=128,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                rms_norm_eps=1e-6,
+                vocab_size=256,
+                rope_theta=10000.0,
+                tie_word_embeddings=True,
+            )
+        )
     mx.eval(model.parameters())
     return model
 
 
-def decode(model: qwen2.Model) -> list[list[int]]:
+def decode(model: Any) -> list[list[int]]:
     gen = mlx_generate.BatchGenerator(model, max_tokens=NEW_TOKENS, prefill_step_size=4)
     try:
         uids = gen.insert(PROMPTS, max_tokens=[NEW_TOKENS] * len(PROMPTS))
@@ -65,32 +96,60 @@ def main() -> int:
     group = mx.distributed.init(backend="ring", strict=True)
     rank = group.rank()
     reference = decode(build())
-    link = StageLink(1, 0, os.environ["RDMA_TEST_LINK"], os.environ["RDMA_TEST_SOCKET"])
-    mailbox_path = os.environ["RDMA_TEST_MAILBOX"]
+    # Edge r+1 -> r uses entry r: {"name", "socket", "mailbox"}.
+    edges = json.loads(os.environ["RDMA_TEST_LINKS"])
+    links = tuple(
+        StageLink(index + 1, index, edge["name"], edge["socket"])
+        for index, edge in enumerate(edges)
+    )
+    mailboxes = {edge["name"]: edge["mailbox"] for edge in edges}
     model = build()
     model.model.pipeline(group)
+    # Whatever still reaches the ring's point-to-point receives is counted; live edges take none.
+    ring_recvs = []
+    for name in ("recv", "recv_like"):
+        ring = getattr(mx.distributed, name)
+        setattr(
+            mx.distributed,
+            name,
+            lambda *a, _ring=ring, **k: ring_recvs.append(1) or _ring(*a, **k),
+        )
     with (
         install_stage_links(
             mx,
             group,
-            (link,),
+            links,
             rank=rank,
             ops_loader=lambda: (PythonWordOps(), ""),
             attach_service=lambda name, socket_path, ops: ServiceMailbox.attach(
-                name, socket_path, ops, mailbox_path=mailbox_path
+                name, socket_path, ops, mailbox_path=mailboxes[name]
             ),
             timeout_s=60,
         ) as stage_links,
         install_runtime_optimizations(
-            model, group, ExecutionSettings(prefill_step_size=4), batchable=True
+            model,
+            group,
+            ExecutionSettings(prefill_step_size=4),
+            batchable=True,
+            token_relay=stage_links.relay,
         ) as optimizations,
     ):
-        tokens = decode(model)
+        # Counts ring all-sums while decoding; tokens on the relay need none.
+        ring_sums = []
+        all_sum = mx.distributed.all_sum
+        mx.distributed.all_sum = lambda *a, **k: ring_sums.append(1) or all_sum(*a, **k)
+        try:
+            tokens = decode(model)
+        finally:
+            mx.distributed.all_sum = all_sum
     print(
         json.dumps(
             {
                 "rank": rank,
-                "stage_links_active": stage_links["active"],
+                "stage_links_active": stage_links.report["active"],
+                "token_relay": stage_links.report["token_relay"],
+                "ring_sums": len(ring_sums),
+                "ring_recvs": len(ring_recvs),
                 "sampling_rank_only": optimizations["sampling_rank_only"]["active"],
                 "prefill_overlap": optimizations["pipeline_prefill_overlap"]["active"],
                 "matches": tokens == reference,

@@ -52,6 +52,22 @@ class PeerStatus:
             "since": self.since,
         }
 
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> PeerStatus:
+        return cls(
+            name=str(payload["name"]),
+            up=bool(payload["up"]),
+            calls=int(payload.get("calls") or 0),
+            failures=int(payload.get("failures") or 0),
+            mib=int(payload.get("mib") or 0),
+            host=_text(payload.get("host")),
+            port=_number(payload.get("port"), int),
+            device=_text(payload.get("device")),
+            request_bytes=_number(payload.get("request_bytes"), int),
+            reply_bytes=_number(payload.get("reply_bytes"), int),
+            since=_number(payload.get("since"), float),
+        )
+
 
 @dataclass(frozen=True)
 class DaemonStatus:
@@ -74,6 +90,26 @@ class DaemonStatus:
             "version": self.version,
             "peers": [peer.to_dict() for peer in self.peers],
         }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> DaemonStatus:
+        return cls(
+            socket_path=str(payload["socket_path"]),
+            reachable=bool(payload["reachable"]),
+            reason=str(payload.get("reason", "")),
+            version=_text(payload.get("version")),
+            peers=tuple(
+                PeerStatus.from_dict(peer) for peer in payload.get("peers", [])
+            ),
+        )
+
+
+def _text(value: Any) -> str | None:
+    return None if value is None else str(value)
+
+
+def _number(value: Any, kind: Callable[[Any], Any]) -> Any:
+    return None if value is None else kind(value)
 
 
 def _int(value: str | None) -> int | None:
