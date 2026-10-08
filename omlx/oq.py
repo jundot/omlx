@@ -1534,13 +1534,16 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
         with tempfile.NamedTemporaryFile(
             "w", dir=path.parent, prefix=f"{path.name}.tmp.", delete=False
         ) as tmp:
+            # Record the name before dumping: json.dump raises on a
+            # non-serializable payload with delete=False, and a name that
+            # is only set afterwards would leave the temp file behind.
+            temp_name = tmp.name
             json.dump(payload, tmp, indent=2)
             tmp.flush()
             # Durable before the rename: without the fsync a crash can
             # commit the rename while the file's data is still only in the
             # page cache, leaving a truncated/zero-filled index behind.
             os.fsync(tmp.fileno())
-            temp_name = tmp.name
         Path(temp_name).replace(path)
         temp_name = None
     finally:

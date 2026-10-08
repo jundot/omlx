@@ -1934,6 +1934,11 @@ class PagedSSDCacheManager(CacheManager):
 
     def _handle_hot_cache_eviction(self, block_hash: bytes, entry: dict) -> None:
         self._stats["hot_cache_evictions"] += 1
+        if entry.get("staging"):
+            # Transient read-back buffer for an in-flight first write: the
+            # SSD write is already queued; enqueueing again would write the
+            # file twice. Drop the entry only.
+            return
         if not entry.get("dirty", True):
             logger.debug(
                 "Evicted clean hot cache block %s; SSD copy already exists",
@@ -3713,12 +3718,17 @@ class PagedSSDCacheManager(CacheManager):
             self._index.add(block_metadata)
 
             # Hot cache disabled: use temporary buffer + immediate SSD write
+            cache_entry["staging"] = True
             with self._hot_cache_lock:
                 self._hot_cache[block_hash] = cache_entry
                 # Account symmetrically with _hot_cache_remove(), which
                 # always subtracts on pop: without this the counter drifts
                 # negative by each staging block's size, skewing
                 # hot_cache_size_bytes and defeating shrink targets.
+                # Staging entries are marked so shrink/eviction skips them:
+                # their SSD write is already queued, and re-handling one
+                # would queue a duplicate write and report bytes freed that
+                # the queue still holds.
                 self._hot_cache_total_bytes += self._hot_cache_entry_size(
                     cache_entry
                 )
@@ -5004,9 +5014,12 @@ class PagedSSDCacheManager(CacheManager):
             while self._hot_cache_total_bytes > target_bytes and self._hot_cache:
                 victim_hash = None
                 for block_hash in self._hot_cache:
-                    if block_hash not in protected_hashes:
-                        victim_hash = block_hash
-                        break
+                    if block_hash in protected_hashes:
+                        continue
+                    if self._hot_cache[block_hash].get("staging"):
+                        continue
+                    victim_hash = block_hash
+                    break
                 if victim_hash is None:
                     break
 
