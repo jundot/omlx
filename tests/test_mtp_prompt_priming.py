@@ -1311,16 +1311,28 @@ def test_decode_scope_restores_after_exception_and_models_do_not_share_state():
     assert prompt_priming._owned(first)[1] is not prompt_priming._owned(second)[1]
 
 
-def test_dspark_context_is_owned_by_custom_hook():
+def test_dspark_contexts_move_with_their_requests():
     host = HeadHost()
     host._omlx_dspark_decode_enabled = True
-    custom = object()
-    setattr(host, prompt_priming._CTX_ATTR, custom)
+    first, second = object(), object()
+    setattr(host, prompt_priming._CTX_ATTR, first)
+    # Registration leaves the slot to the request that is still prefilling.
+    prepare(host, "b", [3, 4])
+    assert prompt_priming._find_ctx(host) is first
     prepare(host, "a", [1, 2])
-    prompt_priming.release_request(host, "a")
+    for request_id, ctx in (("a", first), ("b", second)):
+        prompt_priming.activate_request(host, request_id)
+        prompt_priming.owned_capture(
+            host, lambda ctx=ctx: setattr(host, prompt_priming._CTX_ATTR, ctx)
+        )
+    prompt_priming.activate_request(host, "a")
+    assert prompt_priming._find_ctx(host) is first
+    prompt_priming.bind_uid(host, "a", 1)
+    assert prompt_priming._find_ctx(host) is None
+    state = prompt_priming._owned(host)[1]
+    assert state.uids[1][0] is first and state.requests["b"][0] is second
     prompt_priming.clear_owned(host)
-    assert prompt_priming._find_ctx(host) is custom
-    assert prompt_priming._owned(host)[1] is None
+    assert not state.requests and not state.uids
 
 
 @pytest.mark.parametrize("operation", ["reset", "deep_reset", "shutdown"])

@@ -2906,6 +2906,7 @@ def _dspark_next_drafts(
     hidden_rows: Any,
     committed: Any,
     prev_buf: Optional[Any],
+    depth: Optional[int] = None,
 ) -> None:
     """Append committed target taps and sample one DSpark block.
 
@@ -2919,7 +2920,8 @@ def _dspark_next_drafts(
     if host is None:
         raise _MtpStepFallback("embedded DSpark host is unavailable")
 
-    depth = state.controller.cur if state.controller is not None else state.depth
+    if depth is None:
+        depth = state.controller.cur if state.controller is not None else state.depth
     depth = min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
     n = int(committed.shape[0])
     if depth <= 0:
@@ -3013,6 +3015,7 @@ def _chain_next_drafts(
             hidden_rows,
             committed,
             prev_buf,
+            depth,
         )
     sampler = _resolve_draft_sampler(gen_batch, state)
     procs = _proc_list(gen_batch)
@@ -3358,6 +3361,9 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
         policy = None
     saved = [(state.controller, state.depth) for state in states]
     depths = [int(state.drafts.shape[0]) if state.chain else 1 for state in states]
+    # Copied windows are not draft-depth decisions; the singleton depth
+    # controller skips them too.
+    copied = any(state.copy_drafts for state in states)
     previous = [(state.stats.cycles, state.stats.accepts) for state in states]
     requested = policy.cur if policy is not None else None
     if policy is not None:
@@ -3383,6 +3389,7 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
     )
     if (
         policy is not None
+        and not copied
         and tuple(gen_batch.uids) == policy.uids
         and len(set(depths)) == 1
         and depths[0] > 0
@@ -3988,11 +3995,10 @@ def _context_copy_drafts(
     ``[]`` when the MTP head should draft instead.
     """
     if state.context_copy is None:
-        # False marks a request that never copies (disabled, or a DSpark
-        # host whose drafter owns the window).
+        # False marks a request that never copies.
         state.context_copy = (
             _context_copy.ContextCopy(wide_window=_row_exact_verify(gen_batch.model))
-            if _context_copy.ENABLED and _dspark_host(gen_batch.model) is None
+            if _context_copy.ENABLED
             else False
         )
     copier = state.context_copy
@@ -4003,7 +4009,12 @@ def _context_copy_drafts(
     room = (
         gen_batch.max_tokens[0] - gen_batch._num_tokens[0] - len(committed_ids) - 1
     )
-    return copier.propose(room)
+    if _dspark_host(gen_batch.model) is None:
+        return copier.propose(room)
+    # Copies verify in DSpark's window sizes, and only a copy that fills the
+    # block replaces it: DSpark already drafts repeated text accurately.
+    copied = copier.propose(min(room, state.depth))
+    return copied if len(copied) == state.depth else []
 
 
 def _copy_draft_q(copied: List[int], vocab: int) -> SparseDraftQ:
