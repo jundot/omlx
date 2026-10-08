@@ -1274,6 +1274,29 @@ class HFDownloader(_QueuePersistenceMixin):
         logger.info(f"Download cancelled: {task.repo_id} (task_id={task_id})")
         return True
 
+    async def cancel_download_for_dir(self, target_dir: Path) -> bool:
+        """Cancel the running download that writes into ``target_dir``.
+
+        Called before the dashboard removes a model directory: the worker
+        thread would otherwise keep downloading into the tree being deleted.
+
+        Args:
+            target_dir: Directory the download writes to.
+
+        Returns:
+            True if a running task for that directory was cancelled.
+        """
+        resolved = Path(target_dir).resolve()
+        for task in list(self._tasks.values()):
+            if task.status not in (
+                DownloadStatus.PENDING,
+                DownloadStatus.DOWNLOADING,
+            ):
+                continue
+            if (self._model_dir / task.repo_id).resolve() == resolved:
+                return await self.cancel_download(task.task_id)
+        return False
+
     def remove_task(self, task_id: str) -> bool:
         """Remove a completed, failed, or cancelled task from the list.
 
@@ -1804,13 +1827,18 @@ class HFDownloader(_QueuePersistenceMixin):
         return total
 
     def _cleanup_partial(self, task: DownloadTask) -> None:
-        """Remove in-progress shards while keeping finalized files for resume.
+        """Remove in-progress files while keeping finalized files for resume.
 
-        Hub stages partial downloads inside a hidden ``._____temp`` directory
-        and only renames a shard into the target on completion. Wiping the
-        whole target dir would also nuke shards the user has already paid
-        for; finalized files are visible in the file browser, so users can
-        keep them for auto-resume on retry or remove them themselves.
+        Hub 1.x stages an unfinished file inside
+        ``<target>/.cache/huggingface/download`` as
+        ``<name>.<hash>.<etag>.incomplete`` and renames it into place only
+        when the transfer completes; the hidden ``._____temp`` directory is
+        the layout hub 0.x used. ``.metadata`` files in that staging tree
+        stay: they are what lets the next attempt skip files it already
+        verified. Wiping the whole target dir would also nuke shards the user
+        has already paid for; finalized files are visible in the file
+        browser, so users can keep them for auto-resume on retry or remove
+        them themselves.
         """
         target_dir = self._model_dir / task.repo_id
         temp_dir = target_dir / "._____temp"
@@ -1820,3 +1848,18 @@ class HFDownloader(_QueuePersistenceMixin):
                 logger.info(f"Cleaned up in-progress shards: {temp_dir}")
             except Exception as e:
                 logger.error(f"Failed to clean up {temp_dir}: {e}")
+
+        staging_dir = target_dir / ".cache" / "huggingface" / "download"
+        if not staging_dir.is_dir():
+            return
+        partials = list(staging_dir.rglob("*.incomplete"))
+        for partial in partials:
+            try:
+                partial.unlink()
+            except OSError as e:
+                logger.error(f"Failed to clean up {partial}: {e}")
+        if partials:
+            logger.info(
+                f"Cleaned up {len(partials)} in-progress file(s): "
+                f"{staging_dir}"
+            )
