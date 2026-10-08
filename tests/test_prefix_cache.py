@@ -916,8 +916,9 @@ class TestBlockAwarePrefixCacheWithSSD:
         result = prefix_cache_with_ssd.reconstruct_cache(table)
 
         assert result is None
+        # free_block() clears the live hash, so compare against the stored one.
         prefix_cache_with_ssd.paged_ssd_cache.forget_block.assert_called_once_with(
-            block.block_hash
+            b"\xcd" * 32
         )
         prefix_cache_with_ssd.paged_ssd_cache.delete_block.assert_not_called()
 
