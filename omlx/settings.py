@@ -210,7 +210,7 @@ class ServerSettings:
     # stay above max_audio_upload_size plus base64 expansion and any
     # realistic multi-image payload; the per-endpoint limits below still
     # apply on top of it.
-    max_request_body_size: str = "256MB"
+    max_request_body_size: str = "512MB"
     # Maximum side length in pixels for VLM input images (0 to disable downscaling).
     max_image_side_length: int = 2048
     # Seconds between trivial GPU kernels submitted while a model is loaded
@@ -266,6 +266,7 @@ class ServerSettings:
             ),
             max_audio_upload_size=data.get("max_audio_upload_size", "100MB"),
             max_image_upload_size=data.get("max_image_upload_size", "50MB"),
+            max_request_body_size=data.get("max_request_body_size", "512MB"),
             max_image_side_length=data.get("max_image_side_length", 2048),
             gpu_keep_warm_interval=float(data.get("gpu_keep_warm_interval", 0.5)),
         )

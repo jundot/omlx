@@ -32,10 +32,10 @@ from starlette.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
 
-# 256 MB comfortably fits the largest legitimate payload (several
-# max-size base64 images plus overhead, or a ~100 MB inline audio clip)
-# while keeping pathological bodies out of memory.
-DEFAULT_MAX_REQUEST_BODY_BYTES = 256 * 1024 * 1024
+# 512 MB covers the largest legitimate payloads: a 200 MB video
+# (~267 MB as base64), several max-size images, or a ~100 MB inline
+# audio clip — while keeping pathological bodies out of memory.
+DEFAULT_MAX_REQUEST_BODY_BYTES = 512 * 1024 * 1024
 
 
 def _resolve_limit() -> int:

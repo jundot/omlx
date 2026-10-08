@@ -145,4 +145,4 @@ def test_non_http_scope_passthrough():
 
 def test_default_limit_is_generous():
     """The module default must fit several max-size images plus overhead."""
-    assert DEFAULT_MAX_REQUEST_BODY_BYTES >= 200 * 1024 * 1024
+    assert DEFAULT_MAX_REQUEST_BODY_BYTES >= 400 * 1024 * 1024
