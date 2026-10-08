@@ -4,6 +4,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+from omlx.patches.deepseek_v41 import activation, hyper_connection, kernels, routing
 from omlx.patches.deepseek_v41.kernels import (
     packed_index_scores,
     packed_sparse_attention,
@@ -446,3 +447,59 @@ def test_sinkhorn_fused_exact(length, iters, eps):
     np.testing.assert_array_equal(
         sinkhorn(zeros, eps, iters), sinkhorn_reference(zeros, eps, iters)
     )
+
+
+def test_kernel_templates_do_not_depend_on_token_counts(monkeypatch):
+    """Each distinct template compiles a new Metal pipeline. Selection counts,
+    tile counts and row counts change with prompt length and causal key count,
+    so they must reach the kernels as runtime data."""
+    templates = {}
+
+    def record(module, factory):
+        make = getattr(module, factory)
+
+        def wrapped(*args, **kwargs):
+            kernel = make(*args, **kwargs)
+            key = (module.__name__, factory, args, tuple(sorted(kwargs.items())))
+
+            def call(**call_kwargs):
+                templates.setdefault(key, set()).add(tuple(call_kwargs["template"]))
+                return kernel(**call_kwargs)
+
+            return call
+
+        monkeypatch.setattr(module, factory, wrapped)
+
+    record(kernels, "_topk_kernel")
+    record(kernels, "_topk_merge_kernel")
+    record(activation, "_kernel")
+    record(hyper_connection, "_sinkhorn_kernel")
+    record(hyper_connection, "_post_kernel")
+    record(routing, "_kernel")
+
+    mx.random.seed(509)
+    for count in (100, 101, 129):
+        # Two 1024-wide tiles: one tile sort, then one grouped merge.
+        values, ids = kernels._tile_topk(mx.random.normal((1, 2, 1500)), count)
+        assert values.shape == ids.shape == (1, 2, count)
+    for rows in (1, 3, 7):
+        x = mx.random.normal((1, rows, 128)).astype(mx.bfloat16)
+        activation.quantize_fp8_activation(x)
+        activation.quantize_swiglu_activation(x, x, None, mx.bfloat16, 0.0)
+        activation.quantize_paired_swiglu_activation(
+            mx.concatenate([x, x], -1), None, mx.bfloat16, 0.0
+        )
+        comb = mx.softmax(mx.random.normal((1, rows, 4, 4)), -1)
+        hyper_connection.sinkhorn(comb, 1e-6, 20)
+        hyper_connection.fused_hc_post(
+            x,
+            mx.random.normal((1, rows, 4, 128)).astype(mx.bfloat16),
+            mx.ones((1, rows, 4)),
+            comb,
+        )
+        routed = mx.random.normal((6 * rows, 1, 128)).astype(mx.bfloat16)
+        inverse = mx.arange(6 * rows, dtype=mx.uint32)
+        assert routing.combine_sorted_experts(routed, inverse, x) is not None
+
+    assert len(templates) == 8
+    assert {key: len(seen) for key, seen in templates.items() if len(seen) != 1} == {}
