@@ -68,8 +68,14 @@ def openai_call_to_mcp(tool_call: Dict[str, Any]) -> Tuple[str, str, Dict[str, A
     if isinstance(arguments_str, str):
         try:
             arguments = json.loads(arguments_str)
-        except json.JSONDecodeError:
-            arguments = {}
+        except json.JSONDecodeError as e:
+            # Executing with silently-empty arguments runs the tool's
+            # defaults (which can have side effects) and hides the model's
+            # formatting error from it; surface it instead so callers can
+            # return an error result the model can self-correct on.
+            raise ValueError(
+                f"tool arguments are not valid JSON: {e}"
+            ) from e
     else:
         arguments = arguments_str or {}
 

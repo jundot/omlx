@@ -755,6 +755,62 @@ class TestMCPClientCallTool:
         assert result.is_error is True
         assert result.content == {"answer": 42}
 
+    @pytest.mark.asyncio
+    async def test_call_tool_bytes_content_summarized(self, connected_client: MCPClient):
+        """Raw bytes content must not reach the JSON response (was a 500)."""
+        mock_result = SimpleNamespace(
+            content=[SimpleNamespace(data=b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)],
+            isError=False,
+        )
+        connected_client._session.call_tool.return_value = mock_result
+
+        result = await connected_client.call_tool("screenshot", {})
+
+        assert result.content == "[binary content omitted: 72 bytes]"
+
+    @pytest.mark.asyncio
+    async def test_call_tool_text_content_truncated(self, connected_client: MCPClient):
+        """Oversized text results are capped like the built-in web-fetch."""
+        mock_result = SimpleNamespace(
+            content=[SimpleNamespace(text="x" * 30_000)],
+            isError=False,
+        )
+        connected_client._session.call_tool.return_value = mock_result
+
+        result = await connected_client.call_tool("read_file", {})
+
+        assert len(result.content) < 21_000
+        assert "[truncated" in result.content
+
+    @pytest.mark.asyncio
+    async def test_connect_hung_initialize_times_out(self):
+        """A server that never answers initialize must not hang startup."""
+        config = MCPServerConfig(
+            name="hung", transport=MCPTransport.STDIO, command="python"
+        )
+        # Keep the CI-fast budget: the production floor is 30s (npx cold
+        # starts), overridable explicitly like here.
+        config.default_timeout = 1.0
+        client = MCPClient(config)
+
+        async def _hang():
+            await asyncio.Event().wait()
+
+        client._connect_stdio = _hang
+        client._initialize_session = _hang
+        client._discover_tools = _hang
+
+        async def _noop_cleanup():
+            return None
+
+        client._cleanup_resources = _noop_cleanup
+
+        result = await asyncio.wait_for(client.connect(), timeout=180.0)
+
+        assert result is False
+        assert client.state == MCPServerState.ERROR
+        assert "timed out" in (client._error or "").lower()
+
 
 class TestMCPClientRefreshTools:
     """Tests for MCPClient.refresh_tools()."""
