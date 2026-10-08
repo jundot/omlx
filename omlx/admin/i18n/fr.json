@@ -2032,5 +2032,9 @@
   "cluster.v2.join.cleanup_forgotten": "Ancien nettoyage oublié sur ce Mac. Le nettoyage distant n’a pas été confirmé.",
   "cluster.v2.join.forget_cleanup_error": "Impossible d’oublier ce nettoyage.",
   "cluster.v2.membership.waiting_request": "En attente du code et de la demande de couplage de ce Mac.",
-  "cluster.v2.membership.add_device": "Ajouter ce Mac"
+  "cluster.v2.membership.add_device": "Ajouter ce Mac",
+  "chat.confirm_delete_message": "This will delete this message and every message after it in this chat. Continue?",
+  "js.error.save_claude_code_settings_failed": "Failed to save Claude Code settings",
+  "js.error.save_integration_settings_failed": "Failed to save integration settings",
+  "models.downloader.ms_checking": "Checking ModelScope availability…"
 }
