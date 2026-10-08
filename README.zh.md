@@ -142,7 +142,7 @@ brew services info omlx     # 查看状态
 
 ### 视觉语言模型
 
-使用与文本 LLM 相同的连续批处理和分层 KV 缓存堆栈运行 VLM。支持多图聊天、base64/URL/文件图像输入，以及带视觉上下文的工具调用。OCR 模型（DeepSeek-OCR、DOTS-OCR、GLM-OCR）会被自动识别，并使用优化的提示词。
+使用与文本 LLM 相同的连续批处理和分层 KV 缓存堆栈运行 VLM。支持多图聊天、base64/URL/文件图像输入，以及带视觉上下文的工具调用。MiMo V2.6 权重（包含配套 sidecar）还支持抽帧视频和 24 kHz 音频输入。Qwen3.5、Qwen3.6 和 Qwen3.8 权重（包括密集模型与 MoE）支持通过 base64 `video_url` / `input_video` 数据 URI 进行原生视频输入；视频输入需要 OpenCV (`opencv-python-headless`)。官方 MiMo V2.6 权重的 oQ 格式转换完整保留图像和音频支持。OCR 模型（DeepSeek-OCR、DOTS-OCR、GLM-OCR）会被自动识别，并使用优化的提示词。
 
 ### 分层 KV 缓存（热缓存 + 冷缓存）
 
@@ -228,7 +228,7 @@ brew services info omlx     # 查看状态
 
 ### API 兼容性
 
-OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream_options.include_usage`）、Anthropic adaptive thinking 和视觉输入（base64、URL）。
+无缝替代 OpenAI 和 Anthropic API。支持流式用量统计（`stream_options.include_usage`）、Anthropic 自适应思考（adaptive thinking）以及视觉输入（图像支持 base64 或 URL，视频支持 base64）。
 
 | 端点 | 说明 |
 |----------|------|
@@ -257,6 +257,8 @@ OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream
 | Longcat | `<longcat_tool_call>` |
 
 上表未列出的模型，只要聊天模板支持 `tools` 参数且输出采用可识别的 `<tool_call>` XML 格式，也有可能正常工作。针对支持工具调用的流式请求，系统会增量发射助手文本，同时隐藏已知的工具调用控制标记；结构化工具调用将在完成整个回合解析后发射。
+
+裸 JSON、EBNF 或正则表达式语法会从第一个生成的 token 开始约束回答，因此会忽略 `thinking_budget`。如需将受约束的结构化输出与独立的、带预算的推理阶段相结合，请配置兼容的 `reasoning_parser`。
 
 ## 模型
 
@@ -390,3 +392,8 @@ apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 - [venvstacks](https://venvstacks.lmstudio.ai) - macOS 应用包的便携 Python 环境分层
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Apple Silicon 嵌入模型支持
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Apple Silicon 上的块扩散推测解码 (Block diffusion speculative decoding)
+
+---
+
+> 💡 **文档维护说明**：本中文文档由社区志愿者（@JasonYeYuhe）翻译维护，最后同步更新于 2026年10月7日。如发现内容与官方英文原版存在差异或新特性滞后，欢迎提交 PR 共同完善！
+
