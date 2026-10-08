@@ -71,7 +71,7 @@ class OpenCodeIntegration(Integration):
             if ctx.model:
                 config["model"] = f"omlx/{ctx.model}"
 
-        self._write_json_config(self.CONFIG_PATH, updater)
+        self._write_json_config(self.CONFIG_PATH, updater, secret=True)
 
     def launch(self, ctx: IntegrationContext) -> None:
         self.configure(ctx)

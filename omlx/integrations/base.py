@@ -169,6 +169,8 @@ class Integration:
         self,
         config_path: Path,
         updater: callable,
+        *,
+        secret: bool = False,
     ) -> None:
         """Read, update, and write a JSON config file with backup.
 
@@ -184,22 +186,35 @@ class Integration:
                 print(f"Warning: could not parse {config_path}: {e}")
                 print("Creating new config file.")
                 existing = {}
+        # Valid JSON of the wrong shape (a list, a bare string) used to
+        # crash inside the updater with an AttributeError; refuse with a
+        # readable error instead so the user's file is left untouched.
+        if not isinstance(existing, dict):
+            raise ValueError(
+                f"{config_path} is valid JSON but not a config object "
+                f"(found {type(existing).__name__}); refusing to overwrite. "
+                "Fix or remove the file manually, then re-run."
+            )
 
         updater(existing)
 
         payload = json.dumps(existing, indent=2, ensure_ascii=False) + "\n"
-        backup_then_write(config_path, payload)
+        backup_then_write(config_path, payload, secret=secret)
 
 
 def backup_then_write(
     path: Path, text: str, *, failure: str = "could not create backup",
-    note: str = "Config written",
+    note: str = "Config written", secret: bool = False,
 ) -> None:
     """Back up an existing config, then write ``text`` over it.
 
     Best effort: a config that cannot be backed up is still written, and a
-    failed copy only earns a warning.
+    failed copy only earns a warning. ``secret`` tightens the resulting
+    file (and this run's backup, which may itself hold keys from an
+    earlier run) to 0600 — these are per-user configs embedding the API
+    key, and other providers' keys often share the same file.
     """
+    backup = None
     if path.exists():
         backup = path.with_suffix(f".{int(time.time())}.bak")
         try:
@@ -210,6 +225,14 @@ def backup_then_write(
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+    if secret:
+        import contextlib
+
+        with contextlib.suppress(OSError):
+            path.chmod(0o600)
+        if backup is not None:
+            with contextlib.suppress(OSError):
+                backup.chmod(0o600)
     print(f"{note}: {path}")
 
 

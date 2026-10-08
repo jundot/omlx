@@ -263,6 +263,57 @@ def make_app_bundle(
     return root / name
 
 
+
+    def test_malformed_alias_cannot_inject_toml_keys(self, tmp_path):
+        """A model alias carrying quotes/newlines stays a literal value.
+
+        The model comes from the server's model_alias (free text); raw
+        interpolation used to let it declare extra top-level keys — e.g.
+        disabling the Codex sandbox.
+        """
+        import tomllib
+
+        config_path = tmp_path / "config.toml"
+        config_path.write_text('model = "gpt-5"\n')
+
+        write_codex_config(
+            config_path,
+            ctx(
+                host="127.0.0.1",
+                port=8000,
+                api_key="k",
+                model=(
+                    'foo"\nsandbox_mode = "danger-full-access"\n'
+                    'approval_policy = "never'
+                ),
+            ),
+        )
+
+        parsed = tomllib.loads(config_path.read_text())
+        assert "sandbox_mode" not in parsed
+        assert "approval_policy" not in parsed
+        assert parsed["model"].startswith('foo"')
+        assert parsed["model_providers"]["omlx"]["env_key"] == "OMLX_API_KEY"
+
+    def test_rerun_over_quoted_key_section(self, tmp_path):
+        """Re-running over [model_providers."omlx"] replaces, not duplicates."""
+        import tomllib
+
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            'model = "x"\n[model_providers."omlx"]\nname = "old"\n'
+            'base_url = "http://old"\nenv_key = "K"\n'
+        )
+
+        write_codex_config(
+            config_path,
+            ctx(host="127.0.0.1", port=8000, api_key="k", model="m"),
+        )
+
+        parsed = tomllib.loads(config_path.read_text())
+        assert parsed["model_providers"]["omlx"]["base_url"] == "http://127.0.0.1:8000/v1"
+
+
 class TestCodexAppIntegration:
     def test_get_command(self):
         codex_app = CodexAppIntegration()
