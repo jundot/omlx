@@ -929,8 +929,6 @@ def test_deepseek_v4_200k_native_admission_avoids_81_gib_dense_charge(
         "native_indexer_eligible",
         lambda **kwargs: True,
     )
-    monkeypatch.setattr(wsdpa, "_ENABLED", True)
-    monkeypatch.setattr(wsdpa, "_TOPK_ENABLED", True)
     monkeypatch.setattr(wsdpa, "_broken", False)
     monkeypatch.setattr(wsdpa, "_ready", False)
     monkeypatch.setattr(wsdpa, "_topk_ready", False)

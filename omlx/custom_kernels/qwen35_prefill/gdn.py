@@ -29,7 +29,6 @@ qK^T) go through threadgroup-staged 32-wide d-tiles.
 Numerics: all accumulation in fp32; state kept fp32 (production accuracy).
 """
 
-import os
 from typing import Optional, Tuple
 
 import mlx.core as mx
@@ -534,19 +533,13 @@ _kernel_s_by_tb = {}
 
 def _normalize_block_t(block_t: int | str | None, input_dtype=None) -> int:
     if block_t is None:
-        configured_block_t = os.environ.get("OMLX_GDN_BLOCK_T")
-        if configured_block_t is not None:
-            block_t = configured_block_t
-        else:
-            # Qwen3.6 GDN inputs use float32 (mamba_ssm_dtype). TB=32 needs
-            # 40,192 bytes for the 128/128, 16/32 layout, exceeding Metal's
-            # 32 KiB threadgroup-memory limit. TB=16 needs 20,096 bytes.
-            block_t = 16 if input_dtype == mx.float32 else 32
+        # Qwen3.6 GDN inputs use float32 (mamba_ssm_dtype). TB=32 needs
+        # 40,192 bytes for the 128/128, 16/32 layout, exceeding Metal's
+        # 32 KiB threadgroup-memory limit. TB=16 needs 20,096 bytes.
+        block_t = 16 if input_dtype == mx.float32 else 32
     block_t = int(block_t)
     if block_t not in _SUPPORTED_BLOCK_T:
-        raise ValueError(
-            f"OMLX_GDN_BLOCK_T must be one of {_SUPPORTED_BLOCK_T}, got {block_t}"
-        )
+        raise ValueError(f"block_t must be one of {_SUPPORTED_BLOCK_T}, got {block_t}")
     return block_t
 
 
