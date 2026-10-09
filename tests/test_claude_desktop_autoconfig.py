@@ -442,13 +442,13 @@ class TestAdminRoutes:
 class TestAdminUI:
     def test_toggle_shows_state_and_reapply(self):
         root = Path(__file__).resolve().parents[1]
-        html = (root / "omlx/admin/templates/dashboard/blocks/_claude_code.html").read_text(
+        html = (root / "apps/omlx-web/omlx_web/templates/dashboard/blocks/_claude_code.html").read_text(
             encoding="utf-8"
         )
         assert "claudeDesktop.configured" in html
         assert "reapplyClaudeDesktopConfig()" in html
         assert "status.claude_code.desktop_side_effect" in html
-        js = (root / "omlx/admin/static/js/dashboard.js").read_text(encoding="utf-8")
+        js = (root / "apps/omlx-web/omlx_web/static/js/dashboard.js").read_text(encoding="utf-8")
         assert "fetchClaudeDesktopStatus" in js
         assert "/admin/api/claude-desktop/status" in js
         assert "/admin/api/claude-desktop/configure" in js
@@ -456,7 +456,7 @@ class TestAdminUI:
 
     def test_i18n_keys_present_in_every_locale(self):
         root = Path(__file__).resolve().parents[1]
-        locales = sorted((root / "omlx/admin/i18n").glob("*.json"))
+        locales = sorted((root / "apps/omlx-web/omlx_web/i18n").glob("*.json"))
         assert locales, "no locale files found"
         wanted = {
             "status.claude_code.desktop_configured",

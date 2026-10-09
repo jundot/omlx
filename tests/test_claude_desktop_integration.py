@@ -167,8 +167,9 @@ class TestDashboard:
     def test_js_getter_present(self):
         js_path = (
             Path(__file__).resolve().parent.parent
-            / "omlx"
-            / "admin"
+            / "apps"
+            / "omlx-web"
+            / "omlx_web"
             / "static"
             / "js"
             / "dashboard.js"
@@ -180,8 +181,9 @@ class TestDashboard:
     def test_status_template_has_launcher_block(self):
         html_path = (
             Path(__file__).resolve().parent.parent
-            / "omlx"
-            / "admin"
+            / "apps"
+            / "omlx-web"
+            / "omlx_web"
             / "templates"
             / "dashboard"
             / "blocks"

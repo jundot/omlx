@@ -350,19 +350,19 @@ class TestAdminRouteAndUI:
         from pathlib import Path
 
         root = Path(__file__).resolve().parents[1]
-        html = (root / "omlx/admin/templates/dashboard/blocks/_claude_code.html").read_text(
+        html = (root / "apps/omlx-web/omlx_web/templates/dashboard/blocks/_claude_code.html").read_text(
             encoding="utf-8"
         )
         assert "globalSettings.claude_code.desktop_enabled" in html
         assert "status.claude_code.desktop" in html
         assert "status.claude_code.desktop_hint" in html
-        js = (root / "omlx/admin/static/js/dashboard.js").read_text(encoding="utf-8")
+        js = (root / "apps/omlx-web/omlx_web/static/js/dashboard.js").read_text(encoding="utf-8")
         assert "claude_code_desktop_enabled" in js
 
     def test_i18n_keys_present_in_every_locale(self):
         from pathlib import Path
 
-        i18n_dir = Path(__file__).resolve().parents[1] / "omlx/admin/i18n"
+        i18n_dir = Path(__file__).resolve().parents[1] / "apps/omlx-web/omlx_web/i18n"
         locales = sorted(i18n_dir.glob("*.json"))
         assert locales, "no locale files found"
         for locale_path in locales:
@@ -448,13 +448,13 @@ class TestRestoreButton:
         from pathlib import Path
 
         root = Path(__file__).resolve().parents[1]
-        html = (root / "omlx/admin/templates/dashboard/blocks/_claude_code.html").read_text(
+        html = (root / "apps/omlx-web/omlx_web/templates/dashboard/blocks/_claude_code.html").read_text(
             encoding="utf-8"
         )
         assert "restoreClaudeDesktopConfig()" in html
         assert "status.claude_code.desktop_restore" in html
         assert "status.claude_code.desktop_restoring" in html
-        js = (root / "omlx/admin/static/js/dashboard.js").read_text(encoding="utf-8")
+        js = (root / "apps/omlx-web/omlx_web/static/js/dashboard.js").read_text(encoding="utf-8")
         assert "async restoreClaudeDesktopConfig()" in js
         assert "/admin/api/claude-desktop/restore" in js
         assert "desktop_enabled = false" in js
@@ -464,7 +464,7 @@ class TestRestoreButton:
     def test_restore_i18n_keys_present_in_every_locale(self):
         from pathlib import Path
 
-        i18n_dir = Path(__file__).resolve().parents[1] / "omlx/admin/i18n"
+        i18n_dir = Path(__file__).resolve().parents[1] / "apps/omlx-web/omlx_web/i18n"
         locales = sorted(i18n_dir.glob("*.json"))
         assert locales, "no locale files found"
         wanted = {
