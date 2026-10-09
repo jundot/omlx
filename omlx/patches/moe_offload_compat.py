@@ -15,6 +15,7 @@ _SUPPORTED_TYPES = frozenset(
         "qwen3_5_moe",
         "gemma4",
         "olmoe",
+        "qwen3_moe",
         "glm_moe_dsa",
         "glm5_next",
     }
@@ -72,13 +73,23 @@ def _inspect(path, signature):
         kind == "gemma4" and not text.get("enable_moe_block")
     ):
         return False, "The model does not have the supported MoE geometry."
-    # glm5_next picks sparse layers per layer, not by frequency.
+    # glm5_next and qwen3_moe pick sparse layers per layer, not by frequency.
     sparse_layers = None
     if kind == "glm5_next":
         types = text.get("mlp_layer_types")
         if not isinstance(types, list) or len(types) != layers:
             return False, "The model does not have the supported MoE geometry."
         sparse_layers = {i for i, t in enumerate(types) if t == "sparse"}
+        if not sparse_layers:
+            return False, "The model does not have the supported MoE geometry."
+    elif kind == "qwen3_moe":
+        # The model's own rule: a layer is sparse unless mlp_only_layers lists it
+        # or the (1-based) layer index misses decoder_sparse_step.
+        dense = set(text.get("mlp_only_layers") or [])
+        step = int(text.get("decoder_sparse_step") or 1)
+        sparse_layers = {
+            i for i in range(layers) if i not in dense and (i + 1) % step == 0
+        }
         if not sparse_layers:
             return False, "The model does not have the supported MoE geometry."
     quant = raw.get("quantization", text.get("quantization"))
@@ -91,8 +102,8 @@ def _inspect(path, signature):
         if layer < first_moe or layer % moe_freq:
             continue  # dense layer (GLM's first_k_dense_replace)
         if sparse_layers is not None and layer not in sparse_layers:
-            continue  # dense layer (glm5_next's mlp_layer_types)
-        if kind in ("olmoe", "glm_moe_dsa"):
+            continue  # dense layer (mlp_layer_types, mlp_only_layers, sparse step)
+        if kind in ("olmoe", "glm_moe_dsa", "qwen3_moe"):
             parent = f"model.layers.{layer}.mlp"
             prefix = parent + ".switch_mlp"
         elif kind in ("qwen4_exp", "qwen3_5_moe"):
