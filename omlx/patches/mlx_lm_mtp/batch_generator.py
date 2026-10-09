@@ -378,9 +378,6 @@ def _model_has_mtp_module(model: Any) -> bool:
 # raise its peak memory.
 _SPEC_BUFFER_CAPS = (200, 512)
 
-# Startup override: 0 keeps MLX caps; 1 raises them; otherwise select by target.
-_SPEC_BUFFER_CAPS_MODE = os.environ.get("OMLX_MTP_COMMAND_BUFFER_CAPS", "").strip()
-
 # Target model types supported by the Qwen Lightning MTP/DFlash paths.
 _SPEC_CAPS_TARGET_TYPES = frozenset(
     {
@@ -452,18 +449,14 @@ def _raises_spec_buffer_caps() -> bool:
 @contextlib.contextmanager
 def _spec_command_buffers(model: Any = None):
     """Raise caps for supported Qwen targets and GPUs, then restore them."""
-    if _SPEC_BUFFER_CAPS_MODE == "0":
-        yield
-        return
-
-    if _SPEC_BUFFER_CAPS_MODE != "1" and not _spec_caps_target(model):
+    if not _spec_caps_target(model):
         yield
         return
 
     from omlx.custom_kernels.qwen35_prefill.fast import set_command_buffer_caps
 
     previous = None
-    if _SPEC_BUFFER_CAPS_MODE == "1" or _raises_spec_buffer_caps():
+    if _raises_spec_buffer_caps():
         previous = set_command_buffer_caps(*_SPEC_BUFFER_CAPS)
     try:
         yield

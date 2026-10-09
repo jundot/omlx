@@ -169,9 +169,9 @@ Run `python -m pytest tests/test_mtp_xtc_sampling.py -q` for request sampler cha
 
 ### Lightning MTP command-buffer caps
 
-Run `python -m pytest -q tests/test_mlx_lm_mtp_patch.py -k "spec_command_buffers or spec_caps"` for target selection, startup overrides, and restoration after a speculative step. These cases mock GPU detection and the native setter; they do not load a model or measure throughput.
+Run `python -m pytest -q tests/test_mlx_lm_mtp_patch.py -k "spec_command_buffers or spec_caps"` for target selection and restoration after a speculative step. These cases mock GPU detection and the native setter; they do not load a model or measure throughput.
 
-`OMLX_MTP_COMMAND_BUFFER_CAPS=0` keeps MLX's caps, `=1` forces the raised caps, and unset or other values enable them only for supported Qwen target types on M5 and M3-family GPUs. The override is read at startup; drafter metadata does not affect target selection.
+The raised caps apply only to supported Qwen target types on M5 and M3-family GPUs. Other targets keep MLX's caps, and drafter metadata does not affect target selection.
 
 ### Batched DFlash drafter
 

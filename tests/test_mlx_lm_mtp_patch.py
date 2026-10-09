@@ -5798,7 +5798,6 @@ def test_spec_command_buffers_restore_caps_after_the_step(monkeypatch, raised):
         caps.append((ops, mb))
         return previous
 
-    monkeypatch.setattr(bg, "_SPEC_BUFFER_CAPS_MODE", "")
     target = SimpleNamespace(args=SimpleNamespace(model_type="qwen3_5"))
     monkeypatch.setattr(fast, "set_command_buffer_caps", fake_set)
     monkeypatch.setattr(bg, "_raises_spec_buffer_caps", lambda: raised)
@@ -5810,9 +5809,9 @@ def test_spec_command_buffers_restore_caps_after_the_step(monkeypatch, raised):
 
 
 @pytest.mark.parametrize(
-    "mode,model_type,draft_type,gpu,enabled,detected",
+    "model_type,draft_type,gpu,enabled,detected",
     [
-        ("", kind, "glm5_moe", True, True, True)
+        (kind, "glm5_moe", True, True, True)
         for kind in (
             "qwen3_5",
             "qwen3_5_moe",
@@ -5824,18 +5823,13 @@ def test_spec_command_buffers_restore_caps_after_the_step(monkeypatch, raised):
         )
     ]
     + [
-        ("", "glm5_moe", "qwen3_5", True, False, False),
-        ("", "unknown", "qwen3_5", True, False, False),
-        ("", None, "qwen3_5", True, False, False),
-        ("", "qwen3_5", None, False, False, True),
-        ("0", "qwen3_5", None, True, False, False),
-        ("1", "glm5_moe", None, False, True, False),
-        ("1", None, None, False, True, False),
+        ("glm5_moe", "qwen3_5", True, False, False),
+        ("unknown", "qwen3_5", True, False, False),
+        (None, "qwen3_5", True, False, False),
+        ("qwen3_5", None, False, False, True),
     ],
 )
-def test_spec_caps_target_and_override(
-    monkeypatch, mode, model_type, draft_type, gpu, enabled, detected
-):
+def test_spec_caps_target(monkeypatch, model_type, draft_type, gpu, enabled, detected):
     from omlx.custom_kernels.qwen35_prefill import fast
 
     target = SimpleNamespace(
@@ -5852,7 +5846,6 @@ def test_spec_caps_target_and_override(
         detections.append(True)
         return gpu
 
-    monkeypatch.setattr(bg, "_SPEC_BUFFER_CAPS_MODE", mode)
     monkeypatch.setattr(bg, "_raises_spec_buffer_caps", fake_gpu)
     monkeypatch.setattr(fast, "set_command_buffer_caps", fake_set)
     with bg._spec_command_buffers(target):
