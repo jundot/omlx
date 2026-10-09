@@ -1048,9 +1048,11 @@ class MLXRerankerModel:
         extracts relevance scores from the logits of yes/no tokens at the last
         position. Each document is processed individually since mlx-lm models
         generate their own causal mask internally and don't accept an external
-        padding mask.
+        padding mask. The prompt run the documents share (the instruction and
+        query) is forwarded once and reused through the KV cache.
         """
         import mlx.core as mx
+        from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
 
         tokenizer = self.processor
         prefix_tokens = self._prefix_tokens
@@ -1093,15 +1095,28 @@ class MLXRerankerModel:
             full_ids = prefix_tokens + content_ids + suffix_tokens
             all_input_ids.append(full_ids)
 
+        # Every document shares the prompt run up to "<Document>: ", so count
+        # how many leading tokens are identical across all of them: that run
+        # only has to be forwarded once per request.
+        shared_len = len(prefix_tokens)
+        for position in zip(*content_encodings["input_ids"]):
+            if len(set(position)) != 1:
+                break
+            shared_len += 1
+
         # Per-document forward pass and score extraction.
         # mlx-lm models generate their own causal attention mask internally
         # and don't support external padding masks, so we process each
         # document individually to ensure correct attention computation.
         scores = []
         total_tokens = 0
-        for ids in all_input_ids:
-            input_ids = mx.array([ids])  # (1, seq_len)
-            logits = self.model(input_ids)
+        cache = make_prompt_cache(self.model)
+        for index, ids in enumerate(all_input_ids):
+            # The first document's pass prefills the shared run; every pass
+            # leaves just that run in the cache for the next document.
+            tail = ids if index == 0 else ids[shared_len:]
+            logits = self.model(mx.array([tail]), cache=cache)
+            trim_prompt_cache(cache, len(ids) - shared_len)
             # Extract yes/no logits at the last position
             last_logits = logits[0, -1, :]
             true_logit = last_logits[self._token_true_id]
