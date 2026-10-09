@@ -98,7 +98,7 @@ mx::array qwen35_q8_affine_qmm_t(
     int group_size = 64,
     mx::StreamOrDevice s = {});
 
-// oQ mixed-bit QxA8 path (Q4/Q5, GS64, affine) on the M5 tensor units.
+// oQ mixed-bit QxA8 path (Q4/Q5/Q8, GS64, affine) on the M5 tensor units.
 
 // True when the INT8 NAX GEMM can actually run here: tensor units present,
 // the NAX metallib built next to the extension, and no earlier launch failure.
@@ -112,10 +112,13 @@ std::vector<mx::array> qwen35_oq_a8_quantize(
     int act_mode = 0,
     mx::StreamOrDevice s = {});
 
-// INT8 x INT8 -> INT32 GEMM against packed affine Q4/Q5 weights, with the
+// INT8 x INT8 -> INT32 GEMM against packed affine Q4/Q5/Q8 weights, with the
 // affine correction applied at every GS64 boundary. Output dtype follows
-// `scales`. `packed` reads Q4 weights and metadata in the PackedLinear tile
-// layout instead of row-major weights and [K/64, N] metadata.
+// `scales`. Q4/Q5 read [K/64, N] metadata, or with `packed` Q4 weights and
+// metadata in the PackedLinear tile layout. Q8 reads scales/biases in the
+// checkpoint layout [N, K/64]. Q4/Q5 read Qa in Stage A v8's permuted K order;
+// Q8 reads it in checkpoint order. `variant` selects the Q4/Q5 tile; Q8 picks
+// its tile from the row count.
 mx::array qwen35_oq_a8_qmm_t(
     const mx::array& qa,
     const mx::array& sa,
@@ -129,8 +132,8 @@ mx::array qwen35_oq_a8_qmm_t(
     bool packed = false,
     mx::StreamOrDevice s = {});
 
-// Test helper: unpack Q4/Q5 codes to INT8 [N, group_count * 64]. Production
-// code never materializes this.
+// Test helper: unpack Q4/Q5/Q8 codes to INT8 [N, group_count * 64] (Q8 is
+// centered to q - 128). Production code never materializes this.
 mx::array qwen35_oq_a8_decode_weights(
     const mx::array& weight,
     int bits,

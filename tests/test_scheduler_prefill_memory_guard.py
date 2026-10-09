@@ -929,8 +929,6 @@ def test_deepseek_v4_200k_native_admission_avoids_81_gib_dense_charge(
         "native_indexer_eligible",
         lambda **kwargs: True,
     )
-    monkeypatch.setattr(wsdpa, "_ENABLED", True)
-    monkeypatch.setattr(wsdpa, "_TOPK_ENABLED", True)
     monkeypatch.setattr(wsdpa, "_broken", False)
     monkeypatch.setattr(wsdpa, "_ready", False)
     monkeypatch.setattr(wsdpa, "_topk_ready", False)
@@ -1182,7 +1180,7 @@ def test_qwen4_admission_prices_the_gathered_route():
     )
 
 
-def test_qwen4_pricing_tracks_execution_route(monkeypatch):
+def test_qwen4_pricing_tracks_execution_route():
     from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
@@ -1191,7 +1189,6 @@ def test_qwen4_pricing_tracks_execution_route(monkeypatch):
         QSAQuantizedKVCache,
     )
 
-    monkeypatch.delenv("OMLX_QWEN4_GATHERED_MIN_QUERY", raising=False)
     scheduler = _make_scheduler()
     _attach_qwen4_profile(scheduler)
     route = scheduler._qwen4_text_gathered_pricing
@@ -1280,3 +1277,43 @@ def test_qwen4_image_request_preflight_admits_at_gathered_price():
     ):
         rejection = scheduler._preflight_memory_check(request)
     assert rejection is None
+
+
+@pytest.mark.parametrize(
+    "hard,abort,usage,reclaimed,raises,reclaims",
+    [
+        (200, 300, 250, 250, False, 0),  # Dynamic hard limit is not the abort cap.
+        (400, 300, 300, 300, False, 0),  # At the physical cap is allowed.
+        (400, 300, 301, 300, False, 1),  # Reclaim restores the physical bound.
+        (400, 300, 301, 301, True, 1),
+        (200, 0, 201, 201, True, 1),  # Before propagation, use the hard limit.
+    ],
+)
+def test_post_prefill_guard_uses_stable_physical_cap(
+    hard, abort, usage, reclaimed, raises, reclaims
+):
+    scheduler = SimpleNamespace(
+        _memory_limit_bytes=100,
+        _memory_hard_limit_bytes=hard,
+        _memory_abort_limit_bytes=abort,
+        _prefill_speed_priority=False,
+        _current_usage_bytes=MagicMock(return_value=usage),
+        _reclaim_prefill_headroom=MagicMock(return_value=reclaimed),
+    )
+
+    def check():
+        Scheduler._check_post_prefill_memory(
+            scheduler,
+            request_id="row",
+            chunk_tokens=4,
+            processed_tokens=4,
+            total_tokens=8,
+            loop_label="test",
+        )
+
+    if raises:
+        with pytest.raises(RuntimeError, match="Memory limit exceeded.*after reclaim"):
+            check()
+    else:
+        check()
+    assert scheduler._reclaim_prefill_headroom.call_count == reclaims

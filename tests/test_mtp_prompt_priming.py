@@ -17,6 +17,7 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 
 from omlx.patches.mlx_lm_mtp import prompt_priming
+from omlx.prefill.packed import PackedBatch, PackedRow, PackedRows
 
 
 TINY_CONFIG = {
@@ -428,12 +429,6 @@ class TestCaptureFold:
 
 
 class TestCaptureSkips:
-    def test_env_off_disables_capture(self, model, monkeypatch):
-        monkeypatch.setenv("OMLX_MTP_PROMPT_PRIMING", "0")
-        cache = _make_cache(model)
-        _chunked_prefill(model, cache, _tokens(6), [6])
-        assert prompt_priming.prime_ctx_stats(model) is None
-
     def test_suppress_capture(self, model):
         cache = _make_cache(model)
         with prompt_priming.suppress_capture():
@@ -488,45 +483,6 @@ class TestCaptureSkips:
         _chunked_prefill(model, cache, tokens[8:], [4])
         # Restarted mid-prompt: only the new chunk's internal pairs.
         assert prompt_priming.prime_ctx_stats(model) == 3
-
-    def test_window_cap_disables_long_prompts(self, model, monkeypatch):
-        monkeypatch.setenv("OMLX_MTP_PRIME_WINDOW", "4")
-        cache = _make_cache(model)
-        _chunked_prefill(model, cache, _tokens(10, seed=5), [5, 5])
-        assert prompt_priming.prime_ctx_stats(model) is None
-
-    def test_window_caps_folded_span_not_absolute_offset(self, model, monkeypatch):
-        """A warm prefix cache leaves only a small remainder to fold; the
-        window must cap that folded span (the head-KV it exists to bound),
-        not the absolute prompt offset — otherwise every long-context
-        warm-cache request runs unprimed even when the remainder is tiny
-        (#2909)."""
-        monkeypatch.setenv("OMLX_MTP_PRIME_WINDOW", "6")
-        tokens = _tokens(12, seed=8)
-        cache = _make_cache(model)
-        with prompt_priming.suppress_capture():
-            _chunked_prefill(model, cache, tokens[:8], [8])
-        assert prompt_priming.prime_ctx_stats(model) is None
-        # Remainder of 4 tokens at absolute offset 12: over the old
-        # absolute-offset guard (12 > 6), within the span guard (4 <= 6).
-        _chunked_prefill(model, cache, tokens[8:], [4])
-        assert prompt_priming.prime_ctx_stats(model) == 3
-
-    def test_window_overflow_stays_latched_across_small_chunks(
-        self, model, monkeypatch
-    ):
-        """An oversized multi-chunk remainder must not restart priming after
-        the first context is dropped."""
-        monkeypatch.setenv("OMLX_MTP_PRIME_WINDOW", "4")
-        tokens = _tokens(17, seed=9)
-        cache = _make_cache(model)
-        with prompt_priming.suppress_capture():
-            _chunked_prefill(model, cache, tokens[:8], [8])
-        _chunked_prefill(model, cache, tokens[8:], [3, 3, 3])
-        assert prompt_priming.prime_ctx_stats(model) is None
-        ctx = prompt_priming._find_ctx(model)
-        assert ctx is not None and ctx.window_exceeded
-        assert ctx.expected_offset == 17
 
     def test_take_primed_requires_seam_offset(self, model):
         """No activation forward ran: seam mismatch must discard the ctx."""
@@ -1178,6 +1134,31 @@ def capture(host, tokens, offset):
     )
 
 
+def test_packed_prefill_folds_each_row_into_its_own_request():
+
+    host = HeadHost()
+    prepare(host, "a", [1, 2, 3, 4])
+    capture(host, [1, 2], 2)
+    prepare(host, "b", [5, 6, 7, 8, 9])
+    capture(host, [5, 6], 2)
+    previous = prompt_priming._find_ctx(host)
+    batch = PackedBatch(
+        [
+            PackedRow("a", mx.array([[3, 4]]), [SimpleNamespace(offset=4)]),
+            PackedRow("b", mx.array([[7, 8, 9]]), [SimpleNamespace(offset=5)]),
+        ]
+    )
+    inputs = mx.array([[3, 4, 7, 8, 9]])
+    cache = [PackedRows(batch, [row.cache[0] for row in batch.rows])]
+    prompt_priming.maybe_capture(host, inputs, inputs[..., None], cache)
+    assert prompt_priming._find_ctx(host) is previous
+    prompt_priming.bind_uid(host, "a", 11)
+    prompt_priming.bind_uid(host, "b", 12)
+    _, state = prompt_priming._owned(host)
+    assert state.uids[11][0].mtp_cache[0].pairs == [(1, 2), (2, 3), (3, 4)]
+    assert state.uids[12][0].mtp_cache[0].pairs == [(5, 6), (6, 7), (7, 8), (8, 9)]
+
+
 def test_interleaved_equal_length_requests_keep_distinct_history():
     host = HeadHost()
     prepare(host, "a", [1, 2, 3, 4])
@@ -1285,16 +1266,28 @@ def test_decode_scope_restores_after_exception_and_models_do_not_share_state():
     assert prompt_priming._owned(first)[1] is not prompt_priming._owned(second)[1]
 
 
-def test_dspark_context_is_owned_by_custom_hook():
+def test_dspark_contexts_move_with_their_requests():
     host = HeadHost()
     host._omlx_dspark_decode_enabled = True
-    custom = object()
-    setattr(host, prompt_priming._CTX_ATTR, custom)
+    first, second = object(), object()
+    setattr(host, prompt_priming._CTX_ATTR, first)
+    # Registration leaves the slot to the request that is still prefilling.
+    prepare(host, "b", [3, 4])
+    assert prompt_priming._find_ctx(host) is first
     prepare(host, "a", [1, 2])
-    prompt_priming.release_request(host, "a")
+    for request_id, ctx in (("a", first), ("b", second)):
+        prompt_priming.activate_request(host, request_id)
+        prompt_priming.owned_capture(
+            host, lambda ctx=ctx: setattr(host, prompt_priming._CTX_ATTR, ctx)
+        )
+    prompt_priming.activate_request(host, "a")
+    assert prompt_priming._find_ctx(host) is first
+    prompt_priming.bind_uid(host, "a", 1)
+    assert prompt_priming._find_ctx(host) is None
+    state = prompt_priming._owned(host)[1]
+    assert state.uids[1][0] is first and state.requests["b"][0] is second
     prompt_priming.clear_owned(host)
-    assert prompt_priming._find_ctx(host) is custom
-    assert prompt_priming._owned(host)[1] is None
+    assert not state.requests and not state.uids
 
 
 @pytest.mark.parametrize("operation", ["reset", "deep_reset", "shutdown"])

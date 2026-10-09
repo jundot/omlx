@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,6 +14,8 @@ from fastapi.testclient import TestClient
 import omlx.api.body_limit as body_limit
 import omlx.server as srv
 from omlx.api.body_limit import RequestBodySizeLimitMiddleware
+from omlx.engine.base import GenerationOutput
+from omlx.engine.batched import BatchedEngine
 from omlx.engine.decision import DecisionEngine
 from omlx.engine_pool import EngineEntry
 from omlx.exceptions import (
@@ -106,6 +109,212 @@ async def test_text_completion_stream_forwards_transport_request_id():
 
     assert chunks == ["data: [DONE]\n\n"]
     assert engine.kwargs["_request_id"] == "transport-completion-1"
+
+
+class _PrefillingChatEngine:
+    """Fake chat engine that advances the prefill tracker like the scheduler."""
+
+    tokenizer = None
+
+    def __init__(self, prefill_steps=3, step_s=0.02, queue_s=0.0, phase="prefill"):
+        self.prefill_steps = prefill_steps
+        self.step_s = step_s
+        self.queue_s = queue_s
+        self.phase = phase
+        self.prefill_started_at = None
+        self.kwargs = None
+        self.closed = False
+
+    async def stream_chat(self, messages, **kwargs):
+        from omlx.engine.base import GenerationOutput
+        from omlx.prefill_progress import get_prefill_tracker
+
+        self.kwargs = kwargs
+        tracker = get_prefill_tracker()
+        request_id = kwargs.get("_request_id", "untracked")
+        try:
+            await asyncio.sleep(self.queue_s)
+            self.prefill_started_at = time.monotonic()
+            # 48000-token prompt, 30000 cached: 18000 tokens left to prefill.
+            for step in range(1, self.prefill_steps + 1):
+                await asyncio.sleep(self.step_s)
+                tracker.update(
+                    request_id,
+                    step * 18000 // (self.prefill_steps + 1),
+                    18000,
+                    "model",
+                    phase=self.phase,
+                    extra={
+                        "prompt_tokens": 48000,
+                        "cached_tokens": 30000,
+                        "prefill_started_at": self.prefill_started_at,
+                    },
+                )
+            await asyncio.sleep(self.step_s)
+            tracker.remove(request_id)
+            yield GenerationOutput(
+                text="hi",
+                new_text="hi",
+                prompt_tokens=48000,
+                cached_tokens=30000,
+                completion_tokens=1,
+                finished=True,
+                finish_reason="stop",
+            )
+        finally:
+            self.closed = True
+
+
+async def _chat_stream_payloads(engine, return_progress):
+    from omlx.api.openai_models import ChatCompletionRequest, Message
+    from omlx.server import stream_chat_completion
+
+    request = ChatCompletionRequest(
+        model="model",
+        messages=[Message(role="user", content="hello")],
+        stream=True,
+        return_progress=return_progress,
+    )
+    payloads = []
+    async for chunk in stream_chat_completion(
+        engine, [{"role": "user", "content": "hello"}], request, response_id="cc-1"
+    ):
+        body = chunk.removeprefix("data: ").strip()
+        if body != "[DONE]":
+            payloads.append(json.loads(body))
+    return payloads
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_prompt_progress_follows_llama_cpp_order(monkeypatch):
+    monkeypatch.setattr(srv, "_PROMPT_PROGRESS_POLL_S", 0.005)
+    engine = _PrefillingChatEngine()
+
+    payloads = await _chat_stream_payloads(engine, return_progress=True)
+
+    progress_at = [i for i, p in enumerate(payloads) if "prompt_progress" in p]
+    first_content = next(
+        i for i, p in enumerate(payloads) if p["choices"][0]["delta"].get("content")
+    )
+    frames = [payloads[i]["prompt_progress"] for i in progress_at]
+    assert engine.kwargs["_request_id"]
+    assert all(payloads[i]["id"] == "cc-1" for i in progress_at)
+    assert progress_at[-1] < first_content
+    assert frames[0]["processed"] == frames[0]["cache"] == 30000
+    assert {(f["total"], f["cache"]) for f in frames} == {(48000, 30000)}
+    assert all(b["processed"] > a["processed"] for a, b in zip(frames, frames[1:]))
+    assert frames[-1]["processed"] == 48000
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_prompt_progress_time_excludes_queue_wait(monkeypatch):
+    monkeypatch.setattr(srv, "_PROMPT_PROGRESS_POLL_S", 0.005)
+    engine = _PrefillingChatEngine(queue_s=0.1)
+
+    payloads = await _chat_stream_payloads(engine, return_progress=True)
+
+    since_prefill_ms = (time.monotonic() - engine.prefill_started_at) * 1000
+    frames = [p["prompt_progress"] for p in payloads if "prompt_progress" in p]
+    assert frames[-1]["processed"] == 48000
+    assert all(f["time_ms"] <= since_prefill_ms for f in frames)
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_prompt_progress_skips_specprefill_phases(monkeypatch):
+    monkeypatch.setattr(srv, "_PROMPT_PROGRESS_POLL_S", 0.005)
+    engine = _PrefillingChatEngine(phase="specprefill_scoring")
+
+    payloads = await _chat_stream_payloads(engine, return_progress=True)
+
+    frames = [p["prompt_progress"] for p in payloads if "prompt_progress" in p]
+    assert [f["processed"] for f in frames] == [30000, 48000]
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_without_return_progress_is_unchanged(monkeypatch):
+    monkeypatch.setattr(srv, "_PROMPT_PROGRESS_POLL_S", 0.005)
+    engine = _PrefillingChatEngine()
+
+    payloads = await _chat_stream_payloads(engine, return_progress=False)
+
+    assert not any("prompt_progress" in p for p in payloads)
+    assert "_request_id" not in engine.kwargs
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_prompt_progress_cancel_closes_engine_stream():
+    from omlx.api.openai_models import ChatCompletionRequest, Message
+    from omlx.server import stream_chat_completion
+
+    engine = _PrefillingChatEngine(prefill_steps=1, step_s=10.0)
+    request = ChatCompletionRequest(
+        model="model",
+        messages=[Message(role="user", content="hello")],
+        stream=True,
+        return_progress=True,
+    )
+    stream = stream_chat_completion(
+        engine, [{"role": "user", "content": "hello"}], request, response_id="cc-1"
+    )
+    assert '"role":"assistant"' in await stream.__anext__()
+
+    pending = asyncio.ensure_future(stream.__anext__())
+    await asyncio.sleep(0.05)
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+
+    assert engine.closed
+
+
+@pytest.mark.asyncio
+async def test_completion_stream_prompt_progress_without_tracker_entry():
+    from omlx.api.openai_models import CompletionRequest
+    from omlx.engine.base import GenerationOutput
+    from omlx.server import stream_completion
+
+    class Engine:
+        tokenizer = None
+
+        def __init__(self):
+            self.kwargs = None
+
+        async def stream_generate(self, **kwargs):
+            self.kwargs = kwargs
+            yield GenerationOutput(
+                text="hi",
+                new_text="hi",
+                prompt_tokens=900,
+                cached_tokens=512,
+                completion_tokens=1,
+                finished=True,
+                finish_reason="stop",
+            )
+
+    engine = Engine()
+    request = CompletionRequest(
+        model="model", prompt="hello", stream=True, return_progress=True
+    )
+
+    chunks = [
+        json.loads(chunk.removeprefix("data: "))
+        async for chunk in stream_completion(
+            engine,
+            "hello",
+            request,
+            prompt_token_ids=[],
+            response_id="cmpl-1",
+            inference_request_id="transport-completion-1",
+        )
+        if chunk.strip() != "data: [DONE]"
+    ]
+
+    # A prefill too short to reach the tracker still reports 0% and 100%.
+    assert engine.kwargs["_request_id"] == "transport-completion-1"
+    assert [c["prompt_progress"]["processed"] for c in chunks[:2]] == [512, 900]
+    assert chunks[0]["object"] == "text_completion"
+    assert chunks[0]["choices"][0]["text"] == ""
+    assert chunks[2]["choices"][0]["text"] == "hi"
 
 
 class TestDiffusionStructuredOutputGuard:
@@ -1305,3 +1514,116 @@ class TestRequestBodySizeLimit:
         settings.server.max_audio_upload_size = "1GB"
         monkeypatch.setattr(body_limit, "get_settings", lambda: settings)
         assert body_limit._resolve_limit() > 1024**3
+
+
+@pytest.fixture
+def prepared_chat_engine():
+    engine = BatchedEngine(model_name="test-model")
+    engine._loaded = True
+    engine._model = SimpleNamespace(config=SimpleNamespace(model_type="qwen3_5"))
+    engine._tokenizer = SimpleNamespace(
+        encode=MagicMock(return_value=[11, 12, 13]),
+        apply_chat_template=MagicMock(side_effect=AssertionError("Prompt rerendered")),
+    )
+    engine._preprocess_messages = MagicMock(side_effect=lambda messages: messages)
+    engine._apply_chat_template = MagicMock(return_value="canonical prompt")
+    engine.start = AsyncMock()
+    engine.supports_request_scoped_abort = False
+    return engine
+
+
+@pytest.mark.parametrize("subclass", [False, True])
+def test_prepare_chat_prompt_for_request_keeps_other_engine_count_path(subclass):
+    class OtherBatchedEngine(BatchedEngine):
+        pass
+
+    engine = OtherBatchedEngine.__new__(OtherBatchedEngine) if subclass else MagicMock()
+    engine.count_chat_tokens = MagicMock(return_value=7)
+    messages = [{"role": "user", "content": "Hello"}]
+
+    assert srv._prepare_chat_prompt_for_request(
+        engine,
+        messages,
+        chat_template_kwargs={"enable_thinking": False},
+        is_partial=True,
+    ) == (7, None)
+    engine.count_chat_tokens.assert_called_once_with(
+        messages, None, chat_template_kwargs={"enable_thinking": False}, is_partial=True
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "path", ["/v1/chat/completions", "/v1/messages", "/v1/responses"]
+)
+def test_chat_routes_reuse_final_prepared_prompt(
+    monkeypatch, prepared_chat_engine, path, stream
+):
+    engine = prepared_chat_engine
+    rendered_kwargs = []
+
+    def render(messages, tools=None, **kwargs):
+        rendered_kwargs.append(dict(kwargs.get("chat_template_kwargs") or {}))
+        return "canonical prompt"
+
+    engine._apply_chat_template.side_effect = render
+    engine.preflight_chat = AsyncMock()
+    output = GenerationOutput(
+        text="</think>Done.",
+        new_text="</think>Done.",
+        prompt_tokens=3,
+        completion_tokens=1,
+    )
+    engine.chat = AsyncMock(return_value=output)
+    streamed_kwargs = []
+
+    async def stream_chat(**kwargs):
+        streamed_kwargs.append(kwargs)
+        yield output
+
+    engine.stream_chat = stream_chat
+    pool = MagicMock()
+    pool.preload_pinned_models = AsyncMock()
+    pool.check_ttl_expirations = AsyncMock()
+    pool.shutdown = AsyncMock()
+    pool.get_entry.return_value = SimpleNamespace(
+        config_model_type="qwen3_5", preserve_thinking_default=True
+    )
+    state = ServerState()
+    state.engine_pool = pool
+    monkeypatch.setattr(srv, "_server_state", state)
+    monkeypatch.setattr(srv, "get_engine_for_model", AsyncMock(return_value=engine))
+    monkeypatch.setattr(srv, "resolve_model_id", lambda name: name)
+    monkeypatch.setattr(srv, "get_model_settings_for_request", lambda name: None)
+    context_check = MagicMock()
+    monkeypatch.setattr(srv, "validate_context_window", context_check)
+    monkeypatch.setitem(
+        srv.app.dependency_overrides, srv.verify_inference_api_key, lambda: True
+    )
+    body = {"model": "test-model", "stream": stream}
+    if path == "/v1/responses":
+        body.update(input="Hello", store=False)
+    else:
+        body.update(messages=[{"role": "user", "content": "Hello"}], max_tokens=16)
+
+    with TestClient(srv.app, raise_server_exceptions=False) as client:
+        response = client.post(path, json=body)
+
+    assert response.status_code == 200, response.text
+    assert rendered_kwargs == [{"preserve_thinking": True}]
+    engine._tokenizer.encode.assert_called_once_with("canonical prompt")
+    engine._tokenizer.apply_chat_template.assert_not_called()
+    context_check.assert_called_once_with(3, "test-model")
+    prepared = engine.preflight_chat.call_args.kwargs["_prepared_prompt"]
+    assert prepared == ("canonical prompt", [11, 12, 13])
+    generated = streamed_kwargs[0] if stream else engine.chat.call_args.kwargs
+    assert generated["_prepared_prompt"] is prepared
+    assert generated["chat_template_kwargs"]["preserve_thinking"] is True
+    if path == "/v1/messages" and stream:
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        start = next(event for event in events if event["type"] == "message_start")
+        assert start["message"]["usage"]["input_tokens"] == len(prepared[1])

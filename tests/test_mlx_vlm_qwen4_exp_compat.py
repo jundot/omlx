@@ -12,6 +12,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
+from omlx import memory_monitor
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 
 
@@ -675,7 +676,7 @@ def test_qwen4_exp_tiny_text_prefill_and_decode():
 def test_qwen4_gathered_qsa_prefill_matches_official_mask_path(
     monkeypatch, prefix, length, gathered_rows
 ):
-    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "2")
+    monkeypatch.setattr(memory_monitor, "_QWEN4_GATHERED_MIN_QUERY_TOKENS", 2)
     config = _tiny_config()
     import mlx_vlm.models.qwen4_exp.language as language
     from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpAttention

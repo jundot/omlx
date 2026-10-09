@@ -11,7 +11,8 @@ import mlx.nn as nn
 from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 
 from ..deepseek_v4.switch_layers import _AFFINE_NATIVE_MIN_ROUTES, QuantizedSwitchLinear
-from .activation import quantize_fp8_activation
+from .activation import pack_fp8_activation, quantize_fp8_activation
+from .gemv import mxfp8_gemv
 
 
 def _normal_power_of_two(exponent):
@@ -84,6 +85,19 @@ def pack_activation(x, bits=8, group_size=32, e4m3_scale=False):
     """Pack each row as value bytes followed by one scale byte per group."""
     if bits not in (4, 8) or x.shape[-1] % group_size:
         raise ValueError("Invalid packed activation geometry")
+    if (
+        bits == 8
+        and group_size == 32
+        and not e4m3_scale
+        and x.size
+        and x.dtype in (mx.float32, mx.float16, mx.bfloat16)
+        and mx.default_device() != mx.cpu
+    ):
+        return pack_fp8_activation(x)
+    return _pack_activation(x, bits, group_size, e4m3_scale)
+
+
+def _pack_activation(x, bits, group_size, e4m3_scale):
     grouped = x.astype(mx.float32).reshape(
         *x.shape[:-1], x.shape[-1] // group_size, group_size
     )
@@ -201,6 +215,10 @@ class QuantizedProjection(QuantizedSwitchLinear):
     def project_quantized(self, x, indices=None, sorted_indices=False, block_plan=None):
         """Project an input whose activation quantization is already complete."""
         if indices is None:
+            if self.mode == "mxfp8":
+                y = mxfp8_gemv(x, self.weight, self.scales)
+                if y is not None:
+                    return y
             return mx.quantized_matmul(
                 x,
                 self.weight,

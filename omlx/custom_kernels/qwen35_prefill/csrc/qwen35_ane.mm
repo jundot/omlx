@@ -64,19 +64,10 @@ using ProfileCategory =
     std::array<std::atomic<uint64_t>, kProfileMetricCount>;
 ProfileCategory g_ane_profile[2]{};
 std::atomic<uint64_t> g_previous_ane_done_ns{0};
-std::atomic<int> g_ane_profile_override{-1};
+std::atomic<bool> g_ane_profile_enabled{false};
 
 bool ane_profile_enabled() {
-  const int override =
-      g_ane_profile_override.load(std::memory_order_relaxed);
-  if (override >= 0) {
-    return override != 0;
-  }
-  static const bool enabled = [] {
-    const char *value = std::getenv("OMLX_ANE_PROFILE");
-    return value && std::strcmp(value, "1") == 0;
-  }();
-  return enabled;
+  return g_ane_profile_enabled.load(std::memory_order_relaxed);
 }
 
 uint64_t profile_now_ns() {
@@ -747,24 +738,8 @@ public:
 // and waited on before the evaluation thread is spawned) and a healthy
 // evaluation in milliseconds-to-seconds (first-eval JIT), but a wedged ANE
 // driver never signals at all (#2974) — without a bound, one lost signal
-// spins a core forever and hangs the server. OMLX_ANE_WAIT_TIMEOUT_S
-// overrides the 30s default; 0 restores the old unbounded behavior.
-static std::chrono::seconds ane_wait_timeout() {
-  static const std::chrono::seconds timeout = [] {
-    if (const char *raw = std::getenv("OMLX_ANE_WAIT_TIMEOUT_S")) {
-      char *end = nullptr;
-      const long parsed = std::strtol(raw, &end, 10);
-      if (end != raw) {
-        if (parsed <= 0) {
-          return std::chrono::seconds(std::chrono::hours(24 * 365));
-        }
-        return std::chrono::seconds(parsed);
-      }
-    }
-    return std::chrono::seconds(30);
-  }();
-  return timeout;
-}
+// spins a core forever and hangs the server.
+constexpr std::chrono::seconds kAneWaitTimeout{30};
 
 class AneLinearModel::Impl {
 public:
@@ -1085,8 +1060,7 @@ public:
       // grace period, then latch — a counter stuck past the timeout is the
       // wedged-driver state and must not stay indistinguishable from a race.
       const bool settled = completion_cv_.wait_for(
-          lock, ane_wait_timeout(),
-          [this] { return completed_ >= submitted_; });
+          lock, kAneWaitTimeout, [this] { return completed_ >= submitted_; });
       if (!settled) {
         if (completion_error_.empty()) {
           completion_error_ = "a prior ANE evaluation never completed";
@@ -1113,7 +1087,7 @@ public:
   }
 
   void evaluate_and_signal(AneLinearModel::Ticket ticket) {
-    const auto deadline = std::chrono::steady_clock::now() + ane_wait_timeout();
+    const auto deadline = std::chrono::steady_clock::now() + kAneWaitTimeout;
     while ([event_ signaledValue] < ticket.ready) {
       if (std::chrono::steady_clock::now() >= deadline) {
         {
@@ -1183,7 +1157,7 @@ public:
   void wait(AneLinearModel::Ticket) {
     std::unique_lock<std::mutex> lock(state_mutex_);
     const bool finished = completion_cv_.wait_for(
-        lock, ane_wait_timeout(), [this] { return completed_ >= submitted_; });
+        lock, kAneWaitTimeout, [this] { return completed_ >= submitted_; });
     if (!finished) {
       // The evaluation thread is parked inside the private ANE framework and
       // cannot be unblocked from here; latch the error so begin() refuses
@@ -1205,8 +1179,7 @@ public:
     {
       std::unique_lock<std::mutex> lock(state_mutex_);
       const bool idle = completion_cv_.wait_for(
-          lock, ane_wait_timeout(),
-          [this] { return submitted_ == completed_; });
+          lock, kAneWaitTimeout, [this] { return submitted_ == completed_; });
       if (!idle) {
         throw std::runtime_error(
             "Prior ANE evaluation never completed; refusing to warm this "
@@ -1404,7 +1377,7 @@ bool qwen35_ane_available() {
 }
 
 void qwen35_ane_profile_set_enabled(bool enabled) {
-  g_ane_profile_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
+  g_ane_profile_enabled.store(enabled, std::memory_order_relaxed);
 }
 
 void qwen35_ane_profile_reset() {
@@ -1911,12 +1884,6 @@ namespace {
 std::atomic<bool> g_hybrid_nax_runtime_ok{true};
 
 bool hybrid_nax_enabled() {
-  const char *override = std::getenv("OMLX_QWEN35_QMM_NAX");
-  if (override && (std::strcmp(override, "0") == 0 ||
-                   std::strcmp(override, "false") == 0 ||
-                   std::strcmp(override, "off") == 0)) {
-    return false;
-  }
   return g_hybrid_nax_runtime_ok.load(std::memory_order_relaxed) &&
          is_nax_available() && nax_qmm_kernels_built() &&
          nax_qmm_runtime_active();
@@ -2061,26 +2028,13 @@ private:
 void cpu_fp16_matmul(const array &input, const array &weight, array &output,
                      int M, int N, int K, int cpu_threads,
                      bool shared_resource) {
-  const char *manual_shards_value =
-      std::getenv("OMLX_QWEN35_CPU_MANUAL_SHARDS");
   const int requested_threads =
       shared_resource && cpu_threads == 0 ? 8 : std::max(cpu_threads, 0);
-  const int manual_shards =
-      shared_resource
-          ? requested_threads
-          : (manual_shards_value
-                 ? (std::strcmp(manual_shards_value, "threads") == 0
-                        ? requested_threads
-                        : std::max(std::atoi(manual_shards_value), 0))
-                 : 0);
-  const char *manual_axis_value = std::getenv("OMLX_QWEN35_CPU_MANUAL_AXIS");
-  const bool shard_columns =
-      manual_axis_value && std::strcmp(manual_axis_value, "columns") == 0;
-  const bool use_shared_resource = shared_resource && !shard_columns &&
-                                   cpu_shared_resource_policy_available();
-  const int shard_extent = shard_columns ? N : M;
-  if (manual_shards > 1 && shard_extent > 1) {
-    const int shards = std::min(manual_shards, shard_extent);
+  const int manual_shards = shared_resource ? requested_threads : 0;
+  const bool use_shared_resource =
+      shared_resource && cpu_shared_resource_policy_available();
+  if (manual_shards > 1 && M > 1) {
+    const int shards = std::min(manual_shards, M);
     auto failure = std::make_shared<std::atomic<int>>(0);
     auto *input_data = const_cast<_Float16 *>(input.data<_Float16>());
     auto *weight_data = const_cast<_Float16 *>(weight.data<_Float16>());
@@ -2095,35 +2049,23 @@ void cpu_fp16_matmul(const array &input, const array &weight, array &output,
                 ? static_cast<int>((static_cast<int64_t>(row_blocks) * index) /
                                    shards) *
                       64
-                : static_cast<int>(
-                      (static_cast<int64_t>(shard_extent) * index) / shards);
+                : static_cast<int>((static_cast<int64_t>(M) * index) / shards);
         const int end =
             align_rows ? static_cast<int>(
                              (static_cast<int64_t>(row_blocks) * (index + 1)) /
                              shards) *
                              64
-                       : static_cast<int>((static_cast<int64_t>(shard_extent) *
-                                           (index + 1)) /
-                                          shards);
-        const int row_begin = shard_columns ? 0 : begin;
-        const int row_end = shard_columns ? M : end;
-        const int column_begin = shard_columns ? begin : 0;
-        const int column_end = shard_columns ? end : N;
-        const int rows = row_end - row_begin;
-        const int columns = column_end - column_begin;
+                       : static_cast<int>(
+                             (static_cast<int64_t>(M) * (index + 1)) / shards);
+        const int rows = end - begin;
         auto input_desc = cpu_matrix_descriptor(
-            input_data + static_cast<size_t>(row_begin) * K, rows, K,
+            input_data + static_cast<size_t>(begin) * K, rows, K,
             BNNSDataTypeFloat16);
-        auto weight_desc = cpu_matrix_descriptor(
-            weight_data + static_cast<size_t>(column_begin) * K, columns, K,
-            BNNSDataTypeFloat16);
+        auto weight_desc =
+            cpu_matrix_descriptor(weight_data, N, K, BNNSDataTypeFloat16);
         auto output_desc = cpu_matrix_descriptor(
-            output_data + static_cast<size_t>(row_begin) * N + column_begin,
-            rows, columns, BNNSDataTypeFloat16);
-        if (shard_columns) {
-          output_desc.stride[0] = 1;
-          output_desc.stride[1] = static_cast<size_t>(N);
-        }
+            output_data + static_cast<size_t>(begin) * N, rows, N,
+            BNNSDataTypeFloat16);
         BNNSFilterParameters filter_params{};
         filter_params.n_threads = 1;
         const ssize_t workspace_size =

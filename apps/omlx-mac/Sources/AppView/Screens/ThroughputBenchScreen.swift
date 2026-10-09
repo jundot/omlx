@@ -1,7 +1,7 @@
 // PR 14 — Throughput Bench screen.
 //
 // Mirrors the "Throughput Bench" tab from the HTML admin panel
-// (omlx/admin/templates/dashboard/_bench.html + dashboard.js benchmark
+// (apps/omlx-web/omlx_web/templates/dashboard/_bench.html + dashboard.js benchmark
 // section). Wires the /api/bench/* endpoints onto a stack of sections:
 //
 //   Header          — title + one-line description, matches the rest of

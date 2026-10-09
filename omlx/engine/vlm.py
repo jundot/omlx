@@ -32,7 +32,6 @@ import importlib
 import inspect
 import json
 import logging
-import os
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -2127,7 +2126,6 @@ class VLMBatchedEngine(BaseEngine):
                                 "moe_expert_offload_enabled",
                                 False,
                             )
-                            and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
                             else None
                         ),
                         engram_ssd_offload=bool(
@@ -4947,6 +4945,7 @@ class VLMBatchedEngine(BaseEngine):
         request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_id=kwargs.pop("_request_id", None),
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,

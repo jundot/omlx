@@ -53,6 +53,7 @@ jobs:
         run: |
           echo "--- native artifacts in the wheel:"
           unzip -l dist/*.whl | grep -E "_ext|dylib|metallib" || { echo "no native artifacts in wheel"; exit 1; }
+          unzip -l dist/*.whl | grep -q "omlx_web/templates/dashboard.html" || { echo "web UI missing from wheel"; exit 1; }
           python -m venv /tmp/wheel-smoke
           /tmp/wheel-smoke/bin/pip install --quiet dist/*.whl
           # run from outside the checkout so `import omlx` resolves to the

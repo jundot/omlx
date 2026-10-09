@@ -61,8 +61,8 @@ DFlashEngine is a `BaseEngine` implementation that:
 | `omlx/engine_pool.py` | DFlash routing: checks `dflash_enabled` before engine type switch |
 | `omlx/model_settings.py` | Per-model settings: `dflash_enabled`, `dflash_draft_model`, `dflash_draft_quant_bits` |
 | `omlx/admin/routes.py` | Admin API: settings CRUD + `requires_reload` on dflash changes |
-| `omlx/admin/templates/dashboard/_modal_model_settings.html` | UI: toggle, draft model dropdown, quantization selector |
-| `omlx/admin/static/js/dashboard.js` | Frontend settings binding |
+| `apps/omlx-web/omlx_web/templates/dashboard/_modal_model_settings.html` | UI: toggle, draft model dropdown, quantization selector |
+| `apps/omlx-web/omlx_web/static/js/dashboard.js` | Frontend settings binding |
 | `omlx/admin/benchmark.py` | Batch test skip guard for DFlashEngine |
 | `tests/test_dflash_engine.py` | DFlash engine and routing tests |
 | `tests/test_dflash_laguna.py` | Laguna adapter parity, cache rollback, config, and checkpoint-layout tests |

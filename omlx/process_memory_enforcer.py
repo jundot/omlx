@@ -6,7 +6,8 @@ The memory guard tier says how much memory oMLX leaves for everything else
 on the Mac:
 
   safe        keeps ~20% of RAM (6-16 GB) free for heavy apps next to oMLX
-  balanced    keeps ~8% of RAM (3-8 GB) free for light apps
+  balanced    keeps ~8% of RAM (3-8 GB) free for light apps and may push a
+              quarter of other apps' active memory into the compressor
   aggressive  keeps 2% of RAM (1.5-4 GB) for the OS and may push half of
               other apps' active memory into the compressor
   custom      uses a user-pinned ceiling (2 GB static reserve)
@@ -29,7 +30,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-import os
 import subprocess
 import time
 from contextlib import suppress
@@ -71,7 +71,7 @@ _VALID_TIERS = frozenset((*_TIER_RESERVE, "custom"))
 # macOS compresses 2-3x, so half of active is reclaimable without swap.
 _OTHER_APP_RECLAIM_RATIO: dict[str, float] = {
     "safe": 0.0,
-    "balanced": 0.0,
+    "balanced": 0.25,
     "aggressive": 0.5,
 }
 
@@ -676,9 +676,9 @@ class ProcessMemoryEnforcer:
             (recomputed every call — never cached). Subtracting the tier
             reserve keeps that much memory free for other apps, so the
             ceiling shrinks as they grow. File-backed pages are dropped
-            without compression, so every tier counts them. Only aggressive
-            counts part of other apps' anonymous active memory, which macOS
-            must compress to hand over. oMLX's own CPU pages are removed
+            without compression, so every tier counts them. Balanced and
+            aggressive count part of other apps' anonymous active memory,
+            which macOS must compress to hand over. oMLX's own CPU pages are removed
             from that term; its Metal buffers are wired and never appear
             there.
             Speculative and purgeable pages are subsets of free /
@@ -1723,7 +1723,6 @@ class ProcessMemoryEnforcer:
         if (
             new_level != "ok"
             and not emergency
-            and os.environ.get("OMLX_DISABLE_PRESSURE_RECLAIM") != "1"
             and self._pressure_reclaim_grace_polls
             < self._PRESSURE_RECLAIM_GRACE_POLLS_MAX
         ):
@@ -1755,10 +1754,8 @@ class ProcessMemoryEnforcer:
             # pinned by set_cache_limit(total) (the #300 panic guard), so the
             # freed bytes never leave the process and phys_footprint does not
             # drop — the enforcer then wrongly concludes "no evictable models"
-            # and livelocks until restart. Env gate
-            # OMLX_DISABLE_PRESSURE_RECLAIM=1 restores stock behavior.
-            if os.environ.get("OMLX_DISABLE_PRESSURE_RECLAIM") != "1":
-                self._request_scheduler_cache_reclaim(freed_hot)
+            # and livelocks until restart.
+            self._request_scheduler_cache_reclaim(freed_hot)
             if freed_hot > 0:
                 current = self._current_usage_bytes()
                 emergency = self._is_emergency_pressure(current, emergency_limit)

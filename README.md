@@ -10,10 +10,6 @@
 <p align="center"><b>LLM inference, optimized for your Mac</b><br>Continuous batching and tiered KV caching, managed directly from your menu bar.</p>
 
 <p align="center">
-<a href="https://www.buymeacoffee.com/jundot"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
-</p>
-
-<p align="center">
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
   <img src="https://img.shields.io/badge/python-3.11--3.13-green" alt="Python 3.11-3.13">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
@@ -60,7 +56,8 @@ Download the `.dmg` from [Releases](https://github.com/jundot/omlx/releases), dr
 
 ```bash
 brew tap jundot/omlx https://github.com/jundot/omlx
-brew install jundot/omlx/omlx
+brew install jundot/omlx/omlx --with-custom-kernel   # With native custom kernels (needs full Xcode)
+# No full Xcode? brew install jundot/omlx/omlx installs without the kernels
 
 # Upgrade to the latest version
 brew update && brew upgrade omlx
@@ -72,37 +69,30 @@ omlx start
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
 ```
 
-Optional GLM-5.2 / MiniMax M3 native custom kernels currently require a HEAD build:
-
-```bash
-brew install jundot/omlx/omlx --HEAD --with-custom-kernel
-```
-
 ### From Source
 
 ```bash
 git clone https://github.com/jundot/omlx.git
 cd omlx
-pip install -e .          # Core only
-pip install -e ".[mcp]"   # With MCP (Model Context Protocol) support
-
-# GLM-5.2 / MiniMax M3 / Qwen3.5 native custom kernels (strongly recommended
-# if you serve those families -- see note below)
-OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
+make install                # Editable install with the web UI and native custom kernels
+# No full Xcode? make install-no-kernels installs without the kernels
+make mcp                    # Optional: MCP (Model Context Protocol) support
 ```
 
 Requires macOS 15.0+ (Sequoia), Python 3.11–3.13, and Apple Silicon (M1/M2/M3/M4/M5).
 
-> **Note on native custom kernels:** a plain `pip install -e .` does NOT build
-> them, and the affected model families then silently fall back to much slower
-> generic paths -- for GLM-5.2 the fused DSA prefill is roughly 30x faster with
-> the kernels (measured 845 vs ~29 tok/s on an M3 Ultra), and the fallback also
-> uses more memory (#2137). Building them requires the Metal toolchain, which
-> Command Line Tools alone do not provide (`xcrun: error: unable to find utility
-> "metal"`): install full Xcode, or use the official DMG which ships the kernels
-> precompiled. Homebrew can build them with `brew install jundot/omlx/omlx --HEAD
-> --with-custom-kernel`, but that build also needs full Xcode. To verify your
-> install:
+> **Note on native custom kernels:** GLM-5.2, MiniMax M3, and Qwen3.5 need them.
+> Without them those families silently fall back to much slower generic paths --
+> for GLM-5.2 the fused DSA prefill is roughly 30x faster with the kernels
+> (measured 845 vs ~29 tok/s on an M3 Ultra), and the fallback also uses more
+> memory (#2137). `make install` builds them and checks that each one loads. That
+> needs full Xcode with the Metal toolchain (`xcodebuild -downloadComponent
+> MetalToolchain`); Command Line Tools alone do not provide it (`xcrun: error:
+> unable to find utility "metal"`). Without Xcode, use the official DMG, which
+> ships the kernels precompiled, or `make install-no-kernels`. A plain
+> `pip install -e .` also skips them. `make kernels` rebuilds only the kernels
+> from scratch. Homebrew builds them with `--with-custom-kernel`, which also needs
+> full Xcode. To verify any install:
 >
 > ```bash
 > python -c "from omlx.custom_kernels import native_kernel_status; print(native_kernel_status())"
@@ -176,7 +166,7 @@ headroom-aware execution tuning, activation, and a live shard/performance map
 on both Macs. Interactive, balanced, and throughput profiles expose coalesced
 batching, prompt-cache affinity, rotating-KV limits, Ring connection tuning,
 and a capability-gated experimental token-only output path. See
-[Distributed inference across Macs](docs/distributed-cluster.md) for setup,
+[Distributed inference across Macs](docs/experimental/distributed-cluster.md) for setup,
 security boundaries, current limitations, and the physical-hardware validation
 checklist.
 
@@ -276,7 +266,7 @@ Native Swift / SwiftUI menubar app (not Electron). Start, stop, and monitor the 
 
 ### API Compatibility
 
-Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stats (`stream_options.include_usage`), Anthropic adaptive thinking, and vision inputs (images as base64 or URL, video as base64).
+Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stats (`stream_options.include_usage`), llama.cpp-style prefill progress (`return_progress`), Anthropic adaptive thinking, and vision inputs (images as base64 or URL, video as base64).
 
 | Endpoint | Description |
 |----------|-------------|
@@ -288,6 +278,8 @@ Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stat
 | `POST /v1/systemone` | Typed decisions with decision models (TypeSafe System One) |
 | `GET /v1/models` | List available models |
 | `POST /tokenize`, `POST /detokenize` | vLLM-compatible tokenizer API (also under `/v1`) |
+
+The admin API for settings, models, downloads, quantization, and benchmarks takes the main API key as a Bearer token and also works in headless mode. See [Admin API](docs/admin-api.md).
 
 ### Tool Calling & Structured Output
 
@@ -371,6 +363,9 @@ omlx serve --model-dir ~/models --api-key your-secret-key
 
 # Network access requires authentication
 OMLX_API_KEY=your-secret-key omlx serve --model-dir ~/models --host 0.0.0.0
+
+# Inference and admin APIs only, without the web UI (not saved to settings)
+omlx serve --model-dir ~/models --headless
 ```
 
 The default SSD cache limit, `auto`, uses 50% of the sum of free disk space and existing SSD cache files, including GDN sidecars. The budget is refreshed during use and does not shrink simply because the cache grows or the server restarts. Other disk usage can change the budget. Set `--paged-ssd-cache-max-size 20GB` for a fixed limit.
@@ -409,31 +404,46 @@ FastAPI Server (OpenAI / Anthropic API)
 
 ## Development
 
+### Build commands
+
+| Command | What it does |
+|---|---|
+| `make install` | Editable install of the server and the web UI, then the native custom kernels |
+| `make install-no-kernels` | The same without the kernels, for machines without full Xcode |
+| `make mcp` | Add MCP (Model Context Protocol) support |
+| `make dev` | Same as `make install`, with dev tools (`make dev-no-kernels` skips the kernels) |
+| `make kernels` | Delete any built native custom kernels, compile them again in place, and check that each one loads |
+| `make web` | Rebuild the web UI CSS and normalize the translation files |
+| `make app` | Stage a runnable `oMLX.app` with freshly compiled native custom kernels |
+
+The native custom kernels need full Xcode with the Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`).
+
 ### CLI Server
 
 ```bash
 git clone https://github.com/jundot/omlx.git
 cd omlx
-pip install -e ".[dev]"
+make dev
 pytest
 ```
 
+### Web UI
+
+The web admin UI lives in `apps/omlx-web/` and ships in the same package, so `make dev` installs it too. After editing its templates, JavaScript, or translations, run `make web` to rebuild the CSS and normalize the translation files.
+
 ### macOS App
 
-The native SwiftUI app lives at `apps/omlx-mac/`. Requires Xcode 26.5+ and Python 3.11+. venvstacks is declared as a dev dependency so `pip install -e ".[dev]"` (or `uv sync --dev`) brings the pinned version in. The build script also falls back to `uvx venvstacks` or `pipx run venvstacks` if you prefer a host-global tool runner.
+The native SwiftUI app lives at `apps/omlx-mac/`. Requires Xcode 26.5+ and Python 3.11+. venvstacks is declared as a dev dependency so `make dev` (or `uv sync --dev`) brings the pinned version in. The build script also falls back to `uvx venvstacks` or `pipx run venvstacks` if you prefer a host-global tool runner.
 
 ```bash
-# Stage a runnable oMLX.app (xcodebuild + venvstacks Python layers + ad-hoc sign)
-apps/omlx-mac/Scripts/build.sh release
+# Stage a runnable oMLX.app (xcodebuild + venvstacks Python layers + native kernels + ad-hoc sign)
+make app
 
 # Result lands at apps/omlx-mac/build/Stage/oMLX.app
 open apps/omlx-mac/build/Stage/oMLX.app
 
 # Force a fresh venvstacks rebuild (otherwise it's cached by fingerprint)
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
-
-# Stage with optional GLM-5.2 / MiniMax M3 native custom kernels
-apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 
 First cold build takes 10–20 minutes (venvstacks Python layer assembly). Subsequent builds reuse the cached `packaging/_export/` and finish in about 4 minutes. See [packaging/README.md](packaging/README.md) for the layer configuration and [apps/omlx-mac/](apps/omlx-mac/) for the Swift sources.

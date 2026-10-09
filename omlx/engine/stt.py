@@ -21,6 +21,7 @@ import mlx.core as mx
 import numpy as np
 
 from ..engine_core import get_mlx_executor
+from ..patches.mlx_audio_compat import ensure_qwen3_asr_audio_quantization
 from .base import BaseNonStreamingEngine
 
 logger = logging.getLogger(__name__)
@@ -564,6 +565,7 @@ class STTEngine(BaseNonStreamingEngine):
         model_name = self._model_name
 
         def _load_sync():
+            ensure_qwen3_asr_audio_quantization()
             # load_model returns a single nn.Module, not a tuple
             return _load_model(model_name)
 

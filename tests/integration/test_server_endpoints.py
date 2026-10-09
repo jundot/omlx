@@ -1899,6 +1899,21 @@ class TestRerankEndpoint:
         calls = mock_engine_pool._reranker_engine.calls
         assert [call["kwargs"]["max_length"] for call in calls] == [None, 8192]
 
+    def test_rerank_forwards_instruction(self, client, mock_engine_pool):
+        mock_engine_pool._models.append(
+            {"id": "test-rerank-model", "loaded": True, "pinned": False, "size": 500000}
+        )
+        body = {"model": "test-rerank-model", "query": "q", "documents": ["d"]}
+
+        for extra in ({}, {"instruction": "Find numeric limits"}):
+            assert client.post("/v1/rerank", json={**body, **extra}).status_code == 200
+
+        calls = mock_engine_pool._reranker_engine.calls
+        assert [call["kwargs"]["instruction"] for call in calls] == [
+            None,
+            "Find numeric limits",
+        ]
+
     def test_rerank_response_format(self, client, mock_engine_pool):
         """Test rerank response format."""
         mock_engine_pool._models.append(
@@ -2767,6 +2782,36 @@ class TestJsonOutputParsing:
         parsed = json.loads(output_text)
         assert parsed == {"city": "Seoul", "temp": 15}
 
+    def test_responses_stream_parses_markdown_json(self, client, mock_llm_engine):
+        model_text = 'Here it is:\n```json\n{"city": "Seoul"}\n```'
+
+        async def stream_chat(**kwargs):
+            yield MockGenerationOutput(text=model_text, new_text=model_text)
+
+        mock_llm_engine.stream_chat = stream_chat
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Return weather JSON",
+                "stream": True,
+                "text": {"format": {"type": "json_object"}},
+            },
+        )
+
+        assert response.status_code == 200
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        done = next(
+            event["text"]
+            for event in events
+            if event["type"] == "response.output_text.done"
+        )
+        assert done == '{"city": "Seoul"}'
+
     def test_responses_without_format_unchanged(self, client, mock_llm_engine):
         """Responses API without text.format should return raw text."""
         mock_llm_engine.chat = AsyncMock(
@@ -2791,6 +2836,117 @@ class TestJsonOutputParsing:
         data = response.json()
         output_text = data["output"][0]["content"][0]["text"]
         assert "Hello" in output_text
+
+
+@pytest.mark.parametrize("api", ["chat/completions", "responses"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("format_type", ["json_object", "json_schema"])
+def test_structured_output_preserves_unicode(
+    client, mock_llm_engine, monkeypatch, api, stream, format_type
+):
+    expected = {"име": "София", "city": "東京", "greeting": "café 👋"}
+    model_text = "\n" + json.dumps(expected, ensure_ascii=False, indent=2)
+    mock_llm_engine.chat = AsyncMock(return_value=MockGenerationOutput(text=model_text))
+
+    async def stream_chat(**kwargs):
+        yield MockGenerationOutput(text=model_text, new_text=model_text)
+
+    mock_llm_engine.stream_chat = stream_chat
+    body = {"model": "test-model", "stream": stream}
+    if stream and api == "chat/completions":
+        # An unsupported tool parser buffers content until JSON cleanup finishes.
+        monkeypatch.setattr(
+            "omlx.server.ToolCallStreamFilter",
+            lambda *args, **kwargs: SimpleNamespace(active=False),
+        )
+        body["tools"] = [
+            {"type": "function", "function": {"name": "lookup", "parameters": {}}}
+        ]
+    output_format = {"type": format_type}
+    if format_type == "json_schema":
+        schema = {
+            "type": "object",
+            "properties": {key: {"type": "string"} for key in expected},
+            "required": list(expected),
+            "additionalProperties": False,
+        }
+        output_format.update(name="unicode", schema=schema, strict=True)
+    if api == "chat/completions":
+        body["messages"] = [{"role": "user", "content": "Return JSON"}]
+        if format_type == "json_schema":
+            output_format = {"type": format_type, "json_schema": output_format}
+        body["response_format"] = output_format
+    else:
+        body.update(input="Return JSON", text={"format": output_format})
+
+    response = client.post(f"/v1/{api}", json=body)
+    assert response.status_code == 200
+    if stream:
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        if api == "chat/completions":
+            contents = [
+                "".join(
+                    event["choices"][0]["delta"].get("content", "")
+                    for event in events
+                    if event.get("choices")
+                )
+            ]
+        else:
+            contents = [
+                event["text"]
+                for event in events
+                if event["type"] == "response.output_text.done"
+            ]
+            completed = next(
+                event["response"]
+                for event in events
+                if event["type"] == "response.completed"
+            )
+            contents.append(completed["output"][0]["content"][0]["text"])
+            deltas = "".join(
+                event["delta"]
+                for event in events
+                if event["type"] == "response.output_text.delta"
+            )
+            assert contents == [deltas, deltas]
+    elif api == "chat/completions":
+        contents = [response.json()["choices"][0]["message"]["content"]]
+    else:
+        contents = [response.json()["output"][0]["content"][0]["text"]]
+
+    assert contents
+    for content in contents:
+        assert json.loads(content) == expected
+        assert "\\u" not in content
+        assert all(value in content for value in ["име", *expected.values()])
+
+
+@pytest.mark.parametrize("api", ["chat/completions", "responses"])
+def test_structured_output_keeps_lone_surrogate_escape(client, mock_llm_engine, api):
+    # json.loads accepts an unpaired surrogate escape, but the decoded
+    # character cannot be encoded as UTF-8.
+    model_text = '{"text": "x\\ud83dy"}'
+    mock_llm_engine.chat = AsyncMock(return_value=MockGenerationOutput(text=model_text))
+    if api == "chat/completions":
+        body = {
+            "messages": [{"role": "user", "content": "Return JSON"}],
+            "response_format": {"type": "json_object"},
+        }
+    else:
+        body = {"input": "Return JSON", "text": {"format": {"type": "json_object"}}}
+
+    response = client.post(f"/v1/{api}", json={"model": "test-model", **body})
+
+    assert response.status_code == 200
+    if api == "chat/completions":
+        content = response.json()["choices"][0]["message"]["content"]
+    else:
+        content = response.json()["output"][0]["content"][0]["text"]
+    assert content == model_text
 
 
 @pytest.mark.parametrize("api", ["chat/completions", "messages", "responses"])

@@ -2001,6 +2001,8 @@ class TestEnginePoolAsync:
             model_name=str(model_path),
             trust_remote_code=False,
             scheduler_config=scheduler_config,
+            audio_enabled=False,
+            audio_max_seconds=None,
         )
 
     @pytest.mark.asyncio
@@ -2032,6 +2034,8 @@ class TestEnginePoolAsync:
             model_name=str(model_path),
             trust_remote_code=False,
             scheduler_config=pool._scheduler_config,
+            audio_enabled=False,
+            audio_max_seconds=None,
         )
 
     @pytest.mark.asyncio
@@ -4370,6 +4374,62 @@ class TestMemorySettleBarrier:
 
         entry_b.in_use = 1
         assert pool._other_entries_serving("model-a") is True
+
+    @pytest.mark.asyncio
+    async def test_unload_survives_metal_command_buffer_error(
+        self, pool_with_loaded_model
+    ):
+        """A pending Metal error at unload must not leak the memory accounting."""
+        pool = pool_with_loaded_model
+        est_size = pool._entries["model-a"].estimated_size  # 5GB
+        initial_memory = pool._current_model_memory
+        oom_error = RuntimeError(
+            "[METAL] Command buffer execution failed: Insufficient Memory "
+            "(00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"
+        )
+
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("omlx.engine_pool.get_phys_footprint", return_value=0),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            mock_mx.get_active_memory = MagicMock(
+                side_effect=[10 * 1024**3, 5 * 1024**3]
+            )
+            mock_mx.synchronize = MagicMock(side_effect=[oom_error, None])
+            mock_mx.clear_cache = MagicMock()
+
+            await pool._unload_engine("model-a")
+
+        assert pool._entries["model-a"].engine is None
+        assert pool._current_model_memory == initial_memory - est_size
+
+    @pytest.mark.asyncio
+    async def test_unload_exits_on_submissions_ignored(self, pool_with_loaded_model):
+        """SubmissionsIgnored at unload exits instead of retrying."""
+        pool = pool_with_loaded_model
+        sub_ignored = RuntimeError(
+            "[METAL] Command buffer execution failed: GPU submissions ignored "
+            "(00000008:kIOGPUCommandBufferCallbackErrorSubmissionsIgnored)"
+        )
+
+        with (
+            patch("omlx.engine_pool.mx") as mock_mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch("omlx.engine_pool.get_phys_footprint", return_value=0),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+            patch("omlx.utils.fatal.fatal_exit", side_effect=SystemExit) as fatal_exit,
+        ):
+            mock_mx.get_active_memory = MagicMock(return_value=0)
+            mock_mx.synchronize = MagicMock(side_effect=[sub_ignored])
+            mock_mx.clear_cache = MagicMock()
+
+            with pytest.raises(SystemExit):
+                await pool._stop_and_unload_engine("model-a")
+
+        fatal_exit.assert_called_once()
+        assert str(sub_ignored) in str(fatal_exit.call_args.args[0])
 
 
 class TestEnginePoolInUseLease:

@@ -10,6 +10,7 @@ base bits and add targeted routed-expert protection plus a higher bpw budget.
 """
 
 import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -202,7 +203,7 @@ def _apply_output_dtype(config: dict, dtype: str) -> None:
     A source config describes the checkpoint oQ read, not the one it writes,
     and nothing in the load path corrects it, so a float16 build of a bfloat16
     source reads back as bfloat16. Follows ``_clone_config`` in
-    ``tools/clone_mlx_model_fp16.py``, but only rewrites keys the source
+    ``scripts/clone_mlx_model_fp16.py``, but only rewrites keys the source
     declared rather than adding any. ``vision_config`` is left alone: under a
     float16 target, vision and audio weights are stored as float32.
     """
@@ -5688,8 +5689,188 @@ def _pack_affine_codes(w, scales, biases, group_size: int, bits: int):
     return packed.reshape(packed_shape)
 
 
+_LSQ_ROUNDS = 5
+_LSQ_START_FACTORS = (0.55, 0.65, 0.75, 0.85, 0.95, 1.05, 1.15)
+
+
+def _weighted_lsq_refit(grouped, imp, scales, biases, bits, dtype):
+    """Refit each group's scale and bias by weighted least squares.
+
+    Rounding alternates with the closed-form fit of ``v ~ s * c + b`` for the
+    current codes, from the given parameters and from symmetric clipping
+    starts. Errors use the stored precision of scale and bias, and a group
+    keeps its parameters unless the weighted error drops.
+    """
+    n_bins = mx.array((1 << bits) - 1, mx.float32)
+    tiny = mx.array(1e-7, mx.float32)
+
+    def stored(x):
+        return x.astype(dtype).astype(mx.float32)
+
+    def fit(s, b):
+        codes = mx.clip(mx.round((grouped - b) / s), 0, n_bins)
+        err = mx.sum(imp * (grouped - (codes * s + b)) ** 2, axis=-1, keepdims=True)
+        return codes, err
+
+    total = mx.sum(imp, axis=-1, keepdims=True)
+    sum_v = mx.sum(imp * grouped, axis=-1, keepdims=True)
+    best_s, best_b = stored(scales), stored(biases)
+    _, best_err = fit(best_s, best_b)
+    w_min = mx.min(grouped, axis=-1, keepdims=True)
+    w_max = mx.max(grouped, axis=-1, keepdims=True)
+    starts = [(best_s, best_b)]
+    for factor in _LSQ_START_FACTORS:
+        s = mx.maximum((w_max - w_min) * factor / n_bins, tiny)
+        starts.append((s, (w_max + w_min) * 0.5 - n_bins * 0.5 * s))
+    for s, b in starts:
+        s, b = stored(s), stored(b)
+        for _ in range(_LSQ_ROUNDS):
+            codes, err = fit(s, b)
+            take = err < best_err
+            best_err = mx.where(take, err, best_err)
+            best_s = mx.where(take, s, best_s)
+            best_b = mx.where(take, b, best_b)
+            sum_c = mx.sum(imp * codes, axis=-1, keepdims=True)
+            sum_cc = mx.sum(imp * codes * codes, axis=-1, keepdims=True)
+            sum_cv = mx.sum(imp * codes * grouped, axis=-1, keepdims=True)
+            denom = sum_cc - sum_c * sum_c / total
+            safe = mx.where(denom > 0, denom, mx.array(1.0, mx.float32))
+            new_s = (sum_cv - sum_c * sum_v / total) / safe
+            ok = (denom > 0) & (mx.abs(new_s) > tiny)
+            new_b = (sum_v - new_s * sum_c) / total
+            s = stored(mx.where(ok, new_s, s))
+            b = stored(mx.where(ok, new_b, b))
+        mx.eval(best_s, best_b, best_err)
+    return best_s, best_b
+
+
+# One simdgroup per quantization group; the same steps as _weighted_lsq_refit.
+_LSQ_REFIT_SOURCE = """
+    constexpr int VPL = GS / 32;
+    constexpr float FACTORS[7] = {FACTOR_LIST};
+    const uint lane = thread_index_in_simdgroup;
+    const uint g = thread_position_in_grid.x / 32;
+    if (g >= meta[0]) {
+        return;
+    }
+    const float nb = float(NB);
+    const float tiny = 1e-7f;
+    float v[VPL];
+    float w[VPL];
+    float lo = INFINITY;
+    float hi = -INFINITY;
+    float part_w = 0.0f;
+    float part_v = 0.0f;
+    for (int k = 0; k < VPL; ++k) {
+        const uint i = g * GS + k * 32 + lane;
+        v[k] = x[i];
+        w[k] = imp[i];
+        lo = min(lo, v[k]);
+        hi = max(hi, v[k]);
+        part_w += w[k];
+        part_v += w[k] * v[k];
+    }
+    const float w_min = simd_min(lo);
+    const float w_max = simd_max(hi);
+    const float total = simd_sum(part_w);
+    const float sum_v = simd_sum(part_v);
+
+    float best_s = float(T(s0[g]));
+    float best_b = float(T(b0[g]));
+    float part = 0.0f;
+    for (int k = 0; k < VPL; ++k) {
+        const float c = clamp(rint((v[k] - best_b) / best_s), 0.0f, nb);
+        const float d = v[k] - (c * best_s + best_b);
+        part += w[k] * d * d;
+    }
+    float best_err = simd_sum(part);
+    const float start_s = best_s;
+    const float start_b = best_b;
+
+    for (int start = 0; start < 8; ++start) {
+        float s = start_s;
+        float b = start_b;
+        if (start > 0) {
+            s = max((w_max - w_min) * FACTORS[start - 1] / nb, tiny);
+            b = (w_max + w_min) * 0.5f - nb * 0.5f * s;
+        }
+        s = float(T(s));
+        b = float(T(b));
+        for (int round = 0; round < ROUNDS; ++round) {
+            float pe = 0.0f;
+            float pc = 0.0f;
+            float pcc = 0.0f;
+            float pcv = 0.0f;
+            for (int k = 0; k < VPL; ++k) {
+                const float c = clamp(rint((v[k] - b) / s), 0.0f, nb);
+                const float d = v[k] - (c * s + b);
+                pe += w[k] * d * d;
+                pc += w[k] * c;
+                pcc += w[k] * c * c;
+                pcv += w[k] * c * v[k];
+            }
+            const float err = simd_sum(pe);
+            if (err < best_err) {
+                best_err = err;
+                best_s = s;
+                best_b = b;
+            }
+            const float sum_c = simd_sum(pc);
+            const float sum_cc = simd_sum(pcc);
+            const float sum_cv = simd_sum(pcv);
+            const float denom = sum_cc - sum_c * sum_c / total;
+            const float new_s =
+                (sum_cv - sum_c * sum_v / total) / (denom > 0.0f ? denom : 1.0f);
+            if (denom > 0.0f && fabs(new_s) > tiny) {
+                s = float(T(new_s));
+                b = float(T((sum_v - new_s * sum_c) / total));
+            }
+        }
+    }
+    if (lane == 0) {
+        s_out[g] = best_s;
+        b_out[g] = best_b;
+    }
+""".replace("FACTOR_LIST", ", ".join(f"{f}f" for f in _LSQ_START_FACTORS))
+
+
+@functools.cache
+def _lsq_refit_kernel():
+    return mx.fast.metal_kernel(
+        name="oq_weighted_lsq_refit",
+        input_names=["x", "imp", "s0", "b0", "meta"],
+        output_names=["s_out", "b_out"],
+        source=_LSQ_REFIT_SOURCE,
+    )
+
+
+def _weighted_lsq_refit_metal(grouped, imp, scales, biases, bits, dtype):
+    """Metal version of :func:`_weighted_lsq_refit` for 32/64/128 groups."""
+    n = grouped.shape[0] * grouped.shape[1]
+    s, b = _lsq_refit_kernel()(
+        inputs=[
+            grouped.reshape(-1),
+            imp.reshape(-1),
+            scales.reshape(-1),
+            biases.reshape(-1),
+            mx.array([n], dtype=mx.uint32),
+        ],
+        template=[
+            ("T", dtype),
+            ("GS", grouped.shape[-1]),
+            ("NB", (1 << bits) - 1),
+            ("ROUNDS", _LSQ_ROUNDS),
+        ],
+        grid=(n * 32, 1, 1),
+        threadgroup=(min(256, n * 32), 1, 1),
+        output_shapes=[(n,), (n,)],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    return s.reshape(scales.shape), b.reshape(biases.shape)
+
+
 def _weighted_affine_quantize(w, group_size: int, bits: int, importance):
-    """Quantize with a small imatrix-weighted clipping search.
+    """Quantize with an imatrix-weighted clipping search and least-squares refit.
 
     The output layout intentionally matches ``mx.quantize(..., mode="affine")``.
     """
@@ -5742,6 +5923,15 @@ def _weighted_affine_quantize(w, group_size: int, bits: int, importance):
             best_err = mx.where(take, err, best_err)
             best_scales = mx.where(take, scales, best_scales)
             best_biases = mx.where(take, biases, best_biases)
+
+    refit = (
+        _weighted_lsq_refit_metal
+        if group_size in (32, 64, 128) and mx.default_device() == mx.gpu
+        else _weighted_lsq_refit
+    )
+    best_scales, best_biases = refit(
+        grouped_f, imp, best_scales, best_biases, bits, w.dtype
+    )
 
     packed = _pack_affine_codes(
         grouped_f.reshape(orig), best_scales, best_biases, group_size, bits
@@ -5872,16 +6062,15 @@ def _resolve_stream_calibration(
 ) -> bool:
     """Decide whether oQe calibration streams layers from the checkpoint.
 
-    Explicit argument first, then the OMLX_OQ_STREAM_CALIBRATION env var,
-    then the auto rule: stream when the source does not fit in RAM, where
-    the resident collector would otherwise calibrate on a lossy quantized
-    proxy of the model.
+    Explicit argument first, then the auto rule: stream when the source does
+    not fit in RAM, where the resident collector would otherwise calibrate on
+    a lossy quantized proxy of the model.
 
     Streaming only works for the layouts the sourcer understands
     (_STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES). For every other model_type
-    the auto rule and a truthy env var stay on the proxy path, and an
-    explicit stream_calibration=True fails fast here with a clear message
-    rather than an AttributeError deep in the sourcer.
+    the auto rule stays on the proxy path, and an explicit
+    stream_calibration=True fails fast here with a clear message rather than
+    an AttributeError deep in the sourcer.
     """
     supported = _stream_calibration_supported(model_type)
     if stream_calibration is not None:
@@ -5894,19 +6083,6 @@ def _resolve_stream_calibration(
                 "proxy, or extend the streamed sourcer for this layout."
             )
         return bool(stream_calibration)
-    env = os.environ.get("OMLX_OQ_STREAM_CALIBRATION", "").strip().lower()
-    if env in ("1", "true", "yes", "on"):
-        if not supported:
-            logger.warning(
-                "OMLX_OQ_STREAM_CALIBRATION asked for streaming calibration, but "
-                "model_type=%r has no streamed sourcer (supported: %s); using the "
-                "RAM-safe proxy instead.",
-                model_type,
-                sorted(_STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES),
-            )
-        return supported
-    if env in ("0", "false", "no", "off"):
-        return False
     return model_exceeds_ram and supported
 
 
@@ -5990,14 +6166,12 @@ def quantize_oq_streaming(
             standalone streamed pass on an imatrix cache hit. An existing
             oq_sensitivity_map.json or an explicit sensitivity_model_path
             still wins over both. None (default) auto-enables streaming when
-            the source exceeds the RAM budget; the OMLX_OQ_STREAM_CALIBRATION
-            environment variable overrides the auto rule. The streamed sourcer
-            supports the MiniMax-M3 (minimax_m3_vl) and Qwen4-Exp (qwen4_exp)
-            layouts, so both the auto rule and a truthy env var stay on the
-            RAM-safe proxy for every other model_type, and an explicit
-            stream_calibration=True on an unsupported layout raises a
-            ValueError up front instead of failing deep in the sourcer. Only
-            consulted when enhanced is True.
+            the source exceeds the RAM budget. The streamed sourcer supports
+            the MiniMax-M3 (minimax_m3_vl) and Qwen4-Exp (qwen4_exp) layouts,
+            so the auto rule stays on the RAM-safe proxy for every other
+            model_type, and an explicit stream_calibration=True on an
+            unsupported layout raises a ValueError up front instead of
+            failing deep in the sourcer. Only consulted when enhanced is True.
         preserve_ngram_table: Write the qwen4_exp N-gram PLE table
             (``ple_embedding.ngram_embedding`` shard tensors) unquantized, in
             the checkpoint dtype, instead of at the selected oQ level. The

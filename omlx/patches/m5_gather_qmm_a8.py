@@ -51,7 +51,6 @@ of the same layout with identical bits.
 from __future__ import annotations
 
 import logging
-import os
 import threading
 
 import mlx.core as mx
@@ -63,7 +62,6 @@ from .moe_expert_offload import OffloadSwitchGLU
 
 logger = logging.getLogger(__name__)
 
-_ENV_ENABLE = "OMLX_M5_GATHER_QMM_A8"
 
 _BN = 64
 _WN = 2
@@ -438,15 +436,6 @@ _A8_SOURCE = """
 """
 
 
-def enabled() -> bool:
-    """False when ``OMLX_M5_GATHER_QMM_A8`` disables the module."""
-    return os.environ.get(_ENV_ENABLE, "1").strip().lower() not in {
-        "0",
-        "false",
-        "off",
-    }
-
-
 def _get_kernel():
     """Build (once) the A8 gather kernel object, or None."""
     global _kernel, _kernel_failed
@@ -646,9 +635,7 @@ def sorted_gather_qmm_a8(
     ``init_value`` pre-fills the output, so tests can detect unwritten
     elements.
     """
-    if not enabled() or not supports(
-        x, w, scales, biases, indices, group_size, bits, mode, row_map
-    ):
+    if not supports(x, w, scales, biases, indices, group_size, bits, mode, row_map):
         return None
     # One canary verdict per kernel instantiation (dtype and K).
     if not _nax._checked(("a8", x.dtype, int(x.shape[2]) // _GROUP), _self_test):
@@ -766,7 +753,7 @@ def tag_routed_a8_modules(model, min_tokens: int) -> int:
     depend on how its modules are named. Never raises: on an error nothing
     stays tagged and the model keeps the A16 path.
     """
-    if not enabled() or not _is_measured_family(model):
+    if not _is_measured_family(model):
         return 0
     tagged = []
     try:
@@ -855,7 +842,6 @@ def try_routed_a8(switch_mlp, token_rows, idx, seq_len=None):
 
 
 __all__ = [
-    "enabled",
     "sorted_gather_qmm_a8",
     "supports",
     "tag_routed_a8_modules",

@@ -114,7 +114,7 @@ private struct ClaudeCodeSection: View {
 
 /// Houses both the primary `omlx launch claude` block and the "Advanced"
 /// env-var recipe that points the real `claude` binary at the local server.
-/// Mirrors `claudeCodeCommand` in `omlx/admin/static/js/dashboard.js`.
+/// Mirrors `claudeCodeCommand` in `apps/omlx-web/omlx_web/static/js/dashboard.js`.
 private struct ClaudeSetupCommandSection: View {
     var vm: IntegrationsScreenVM
     @State private var showAdvanced = false

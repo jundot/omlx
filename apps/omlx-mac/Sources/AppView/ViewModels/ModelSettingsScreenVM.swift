@@ -33,6 +33,7 @@ final class ModelSettingsScreenVM {
         case limitToolResults, toolResultLimitTokens
         case forceSampling, isPinned, isFavorite
         case trustRemoteCode
+        case embeddingAudioEnabled, embeddingAudioMaxSeconds
         case reasoningParser
         case chatTemplateKwargs
         case turboquantKvEnabled, turboquantKvBits
@@ -272,6 +273,10 @@ final class ModelSettingsScreenVM {
     // Security
     var trustRemoteCode: Bool = false
 
+    // Embedding audio tower. Empty seconds keeps the 30 s processor default.
+    var embeddingAudioEnabled: Bool = false
+    var embeddingAudioMaxSeconds: String = ""
+
     // Reasoning parser (free-form override; empty = auto)
     var reasoningParser: String = ""
 
@@ -470,6 +475,8 @@ final class ModelSettingsScreenVM {
             .replacingOccurrences(of: "-", with: "_") == "qwen4_exp"
     }
 
+    var embeddingAudioSupported: Bool { model?.embeddingAudioSupported == true }
+
     private func isDiffusionUnsupportedField(_ field: Field) -> Bool {
         switch field {
         case .topP, .topK, .minP, .repetitionPenalty, .presencePenalty:
@@ -527,6 +534,8 @@ final class ModelSettingsScreenVM {
         case .alias, .modelType, .contextLength, .maxTokens:
             return false
         case .temperature, .ttl, .isPinned, .isFavorite, .trustRemoteCode:
+            return false
+        case .embeddingAudioEnabled, .embeddingAudioMaxSeconds:
             return false
         case .chatTemplateKwargs:
             return false
@@ -633,6 +642,8 @@ final class ModelSettingsScreenVM {
                 self.isPinned = s?.isPinned ?? false
                 self.isFavorite = s?.isFavorite ?? false
                 self.trustRemoteCode = s?.trustRemoteCode ?? false
+                self.embeddingAudioEnabled = s?.embeddingAudioEnabled ?? false
+                self.embeddingAudioMaxSeconds = s?.embeddingAudioMaxSeconds.map { Self.formatPct($0) } ?? ""
                 self.reasoningParser = s?.reasoningParser ?? ""
                 self.chatTemplateEntries = diffusionCompatibleChatTemplateEntries(
                     ChatTemplateKwargsCodec.decode(
@@ -789,6 +800,17 @@ final class ModelSettingsScreenVM {
         case .isPinned:                patch.isPinned = isPinned
         case .isFavorite:              patch.isFavorite = isFavorite
         case .trustRemoteCode:         patch.trustRemoteCode = trustRemoteCode
+        case .embeddingAudioEnabled:   patch.embeddingAudioEnabled = embeddingAudioEnabled
+        case .embeddingAudioMaxSeconds:
+            let text = embeddingAudioMaxSeconds.trimmingCharacters(in: .whitespaces)
+            if text.isEmpty {
+                patch.embeddingAudioMaxSeconds = .some(nil)
+            } else if let seconds = Double(text), seconds > 0 {
+                patch.embeddingAudioMaxSeconds = seconds
+            } else {
+                lastError = "Max audio length must be a positive number of seconds."
+                return
+            }
         case .reasoningParser:
             patch.reasoningParser = reasoningParser.isEmpty ? nil : reasoningParser
         case .chatTemplateKwargs:

@@ -24,14 +24,14 @@ compile-time constants of one generated kernel per variant. On MLX builds
 that carry the native kernel, the output is bit-identical to it.
 
 Long contexts run as several dispatches over consecutive key ranges
-(``OMLX_NAX_ATTN_PASS_KEYS`` keys each, default 8192) that hand the fp32
+(``_PASS_KEYS`` = 8192 keys each) that hand the fp32
 online-softmax row state (O accumulator, running max and sum) from one to
 the next through device memory, so each row computes exactly what one
 dispatch computes (bit-identical output). One dispatch over a long key range
 lets its threadgroups drift apart until each streams its KV head from DRAM;
 per-slice dispatches keep the K/V they share in the on-chip caches. Those
 dispatches also split the head dims over simdgroup pairs (MLX's dsplit
-scheme, ``OMLX_NAX_ATTN_DSPLIT``), which only reorders the fp32 sums of
+scheme, ``_DSPLIT``), which only reorders the fp32 sums of
 Q @ K.T (last-bit differences in ~0.5% of the outputs).
 
 Inputs are read through their strides (no contiguity copies: KV-cache
@@ -44,13 +44,11 @@ contiguous, as for MLX's SDPA. The output is written in MLX's SDPA layout
 Fail-closed: only (192, 128) bf16/fp16 prefill on NAX GPUs is handled, the
 first use runs a small self-check against an fp32 reference, and any
 unsupported input returns None so the caller keeps its existing route.
-Kill switch: ``OMLX_NAX_JIT_ATTENTION=0``.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import struct
 from functools import lru_cache
 from typing import Optional
@@ -62,12 +60,6 @@ from omlx.custom_kernels.nax_tiles import NAX_TILE_HEADER
 
 logger = logging.getLogger(__name__)
 
-_ENABLED = os.environ.get("OMLX_NAX_JIT_ATTENTION", "1").strip().lower() not in {
-    "0",
-    "false",
-    "off",
-}
-
 # (query/key head dim, value head dim) pairs this kernel is validated for.
 SUPPORTED_HEAD_DIMS = frozenset({(192, 128)})
 
@@ -77,27 +69,20 @@ _WM = 4
 _THREADS = 32 * _WM
 
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, default))
-    except ValueError:
-        return default
-
-
 # Key-range passes: keys per dispatch (0 = one dispatch). Every threadgroup
 # of a dispatch streams this many keys of its KV head, so the key slice the
 # threadgroups in flight share stays in the on-chip caches (one dispatch over
 # 1M keys runs at ~85 TFLOPS against ~103 at 64k). Grids of a wave or two
 # (query tails under ~512 rows at 64 heads) keep one dispatch: their
 # threadgroups stay in step anyway.
-_PASS_KEYS = _env_int("OMLX_NAX_ATTN_PASS_KEYS", 8192)
+_PASS_KEYS = 8192
 _PASS_MIN_GROUPS = 512
 # Head-dim split over simdgroup pairs (MLX's attention_nax_dsplit scheme):
 # 0 = never, 1 = for calls that run in key-range passes (long contexts,
 # 3-4% faster there), 2 = always. It changes the summation order of
 # Q @ K.T (two 96-dim fp32 partial sums added), so its output differs from
 # the one-simdgroup kernel in the last bf16 bit of ~0.5% of the elements.
-_DSPLIT = _env_int("OMLX_NAX_ATTN_DSPLIT", 1)
+_DSPLIT = 1
 
 _METAL_TYPES = {mx.bfloat16: "bfloat16_t", mx.float16: "half"}
 
@@ -974,7 +959,7 @@ def uses_key_passes(queries: mx.array, keys: mx.array) -> bool:
     (on MLX builds that carry it) computes, at the same speed; split calls
     (long contexts) are faster, so callers may prefer this kernel then.
     """
-    if not _ENABLED or queries.ndim != 4 or keys.ndim != 4:
+    if queries.ndim != 4 or keys.ndim != 4:
         return False
     B, H, qL, _ = queries.shape
     NQ = (qL + _BQ - 1) // _BQ
@@ -999,8 +984,6 @@ def nax_mixed_head_dim_attention(
     boolean array broadcastable to [B, H, L, S]; ``sinks`` [H] or None.
     Returns [B, H, L, 128] in the query dtype.
     """
-    if not _ENABLED:
-        return None
     if queries.ndim != 4 or keys.ndim != 4 or values.ndim != 4:
         return None
     B, H, qL, qk_dim = queries.shape

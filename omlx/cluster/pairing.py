@@ -753,16 +753,10 @@ def _local_ssh_public_key() -> str | None:
 def _local_ssh_host_public_key() -> str | None:
     """Read the public half of the local SSH daemon host identity."""
 
-    override = os.environ.get("OMLX_CLUSTER_SSH_HOST_PUBLIC_KEY")
-    candidates = (
-        [Path(override).expanduser()]
-        if override
-        else [
-            Path("/etc/ssh/ssh_host_ed25519_key.pub"),
-            Path("/etc/ssh/ssh_host_rsa_key.pub"),
-        ]
-    )
-    for path in candidates:
+    for path in (
+        Path("/etc/ssh/ssh_host_ed25519_key.pub"),
+        Path("/etc/ssh/ssh_host_rsa_key.pub"),
+    ):
         try:
             return normalize_ssh_public_key(path.read_text(encoding="utf-8").strip())
         except (OSError, PairingRequestError):

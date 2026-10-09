@@ -143,6 +143,47 @@ def test_official_prefill_decode(expected, length):
         )
 
 
+def test_in_place_cache_growth_matches_concatenation(monkeypatch):
+    from omlx.patches.deepseek_v41 import growth
+
+    model = LanguageModel(tiny())
+    load_reference_weights(model)
+    ids = mx.array(np.random.default_rng(17).integers(3, 60, (1, 40), dtype=np.int32))
+
+    def run():
+        cache = model.make_cache()
+        logits = [model(ids[:, :9], cache=cache)]
+        for position in range(9, 40):
+            if position == 24:
+                # Extracting a single row keeps its storage.
+                cache = [layer.extract(0) for layer in cache]
+            logits.append(model(ids[:, position : position + 1], cache=cache))
+        return logits, cache
+
+    actual_logits, actual_cache = run()
+    assert any(
+        layer._ds41_buffers[2]["idle"] is not None
+        for layer in actual_cache
+        if getattr(layer, "_ds41_buffers", None) and 2 in layer._ds41_buffers
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            growth,
+            "append",
+            lambda cache, slot, previous, values, start: mx.concatenate(
+                [previous[:, :start], values], 1
+            ),
+        )
+        expected_logits, expected_cache = run()
+    for actual, expected in zip(actual_logits, expected_logits):
+        np.testing.assert_array_equal(actual, expected)
+    for actual, expected in zip(actual_cache, expected_cache):
+        for a, b in zip(actual.cache, expected.cache):
+            assert (a is None) == (b is None)
+            if a is not None:
+                np.testing.assert_array_equal(a, b)
+
+
 def test_chunk_boundaries_and_late_join():
     mx.random.seed(32)
     model = LanguageModel(tiny())

@@ -2258,6 +2258,18 @@ def _atoi(text: str) -> int:
 
 
 @lru_cache(maxsize=None)
+def fused_decode_supported() -> bool:
+    """True on gen-15+ GPUs (M3 and newer). From gen 15 MLX runs multi-row
+    affine qmv as qmv_wide, which these kernels replay, and the 1024-thread
+    kernels fit the pipeline limit; on older GPUs neither holds."""
+    if not mx.metal.is_available():
+        return False
+    arch = str(mx.device_info().get("architecture", ""))
+    match = re.match(r"applegpu_g(\d+)", arch)
+    return match is not None and int(match.group(1)) >= 15
+
+
+@lru_cache(maxsize=None)
 def nax_relaxed_fp32_matmul() -> bool:
     """True when MLX runs fp32 GEMMs on NAX with relaxed (TF32) precision:
     NAX available and ``env::enable_tf32()`` (MLX_ENABLE_TF32, default 1).

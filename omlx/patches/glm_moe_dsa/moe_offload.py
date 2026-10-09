@@ -33,7 +33,6 @@ reassembled routes the way the model does when the kernel is unavailable.
 from __future__ import annotations
 
 import logging
-import os
 from concurrent.futures import wait
 from pathlib import Path
 
@@ -58,9 +57,8 @@ logger = logging.getLogger(__name__)
 # checkpoint projections, in the order the fused row concatenates them
 _SOURCES = ("gate_proj", "up_proj", "down_proj")
 
-# Misses are positional reads through the common store on its shared pool
-# (``OMLX_MOE_OFFLOAD_IO_WORKERS`` / ``OMLX_MOE_OFFLOAD_IO_BATCH``), the
-# DeepSeek V4.1 adapter's shape: the store's memmap path faults a 20 MiB
+# Misses are positional reads through the common store on its shared pool,
+# the DeepSeek V4.1 adapter's shape: the store's memmap path faults a 20 MiB
 # expert in 16 KiB pages on the compute thread, which measured 0.4 GB/s on
 # the GLM-5.2 checkpoint against the 8 GB/s and more a positional read of the
 # whole slab gets from the same drive. GLM experts are large, so on top of the
@@ -205,9 +203,9 @@ class _SlotCache:
         start on the shared pool, at most the pool's window and
         ``INFLIGHT_BYTES`` ahead of the serial installs, which write slots in
         the order the misses were seen so victims and counters match a serial
-        fetch. Without a pool (``OMLX_MOE_OFFLOAD_IO_WORKERS`` <= 1) each miss
-        is read inline. A failed read leaves completed installs intact, and
-        every read this call started is drained before it raises.
+        fetch. Without a pool each miss is read inline. A failed read leaves
+        completed installs intact, and every read this call started is
+        drained before it raises.
         """
         needed = list(dict.fromkeys(int(e) for e in ids))
         misses = []
@@ -374,11 +372,9 @@ def apply_glm_moe_expert_offload(
     """Wrap every covered GLM SwitchGLU; returns the number wrapped.
 
     Same contract as ``apply_moe_expert_offload``: runs before lazy weights
-    materialize, honors the kill switch, and skips (with a logged reason)
-    any module the checkpoint does not cover.
+    materialize and skips (with a logged reason) any module the checkpoint
+    does not cover.
     """
-    if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
-        return 0
     targets = list(_iter_glm_switch_glus(model))
     if not targets:
         return 0

@@ -10,10 +10,6 @@
 <p align="center"><b>Inférence LLM, optimisée pour votre Mac</b><br>Batching continu et cache KV à plusieurs niveaux, géré directement depuis votre barre de menus.</p>
 
 <p align="center">
-<a href="https://www.buymeacoffee.com/jundot"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
-</p>
-
-<p align="center">
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
   <img src="https://img.shields.io/badge/python-3.10+-green" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
@@ -61,7 +57,8 @@ Téléchargez le `.dmg` depuis les [Releases](https://github.com/jundot/omlx/rel
 
 ```bash
 brew tap jundot/omlx https://github.com/jundot/omlx
-brew install omlx
+brew install omlx --with-custom-kernel   # Avec les kernels natifs (Xcode complet requis)
+# Sans Xcode complet : brew install omlx installe sans les kernels
 
 # Mettre à jour vers la dernière version
 brew update && brew upgrade omlx
@@ -73,25 +70,23 @@ brew services start omlx
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
 ```
 
-Les kernels natifs personnalisés optionnels pour GLM-5.2 / MiniMax M3 nécessitent actuellement un build HEAD :
-
-```bash
-brew install omlx --HEAD --with-custom-kernel
-```
-
 ### Depuis les sources
 
 ```bash
 git clone https://github.com/jundot/omlx.git
 cd omlx
-pip install -e .          # Core uniquement
-pip install -e ".[mcp]"   # Avec support MCP (Model Context Protocol)
-
-# Optionnel : kernels natifs personnalisés GLM-5.2 / MiniMax M3
-OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
+make install                # Installation editable avec l'interface web et les kernels natifs
+# Sans Xcode complet : make install-no-kernels installe sans les kernels
+make mcp                    # Optionnel : ajoute le support MCP (Model Context Protocol)
 ```
 
-Nécessite macOS 15.0+ (Sequoia), Python 3.10+, et Apple Silicon (M1/M2/M3/M4/M5).
+Nécessite macOS 15.0+ (Sequoia), Python 3.11–3.13, et Apple Silicon (M1/M2/M3/M4/M5).
+
+> **Note sur les kernels natifs :** GLM-5.2, MiniMax M3 et Qwen3.5 en ont besoin ; sans eux, ces familles retombent sans avertissement sur des chemins génériques bien plus lents. `make install` les compile aussi et vérifie que chacun se charge, ce qui demande Xcode complet avec la toolchain Metal (`xcodebuild -downloadComponent MetalToolchain`) ; les Command Line Tools seules ne suffisent pas. Sans Xcode, utilisez le DMG officiel qui inclut les kernels précompilés, ou `make install-no-kernels`. `make kernels` recompile seulement les kernels depuis zéro. Pour vérifier une installation :
+>
+> ```bash
+> python -c "from omlx.custom_kernels import native_kernel_status; print(native_kernel_status())"
+> ```
 
 ## Démarrage rapide
 
@@ -228,7 +223,7 @@ Application native Swift / SwiftUI dans la barre de menus (pas Electron). Démar
 
 ### Compatibilité API
 
-Remplacement direct des APIs OpenAI et Anthropic. Supporte les statistiques d'usage en streaming (`stream_options.include_usage`), le thinking adaptatif Anthropic, et les entrées visuelles (base64, URL).
+Remplacement direct des APIs OpenAI et Anthropic. Supporte les statistiques d'usage en streaming (`stream_options.include_usage`), la progression du prefill façon llama.cpp (`return_progress`), le thinking adaptatif Anthropic, et les entrées visuelles (base64, URL).
 
 | Endpoint | Description |
 |----------|-------------|
@@ -240,6 +235,8 @@ Remplacement direct des APIs OpenAI et Anthropic. Supporte les statistiques d'us
 | `POST /v1/systemone` | Décisions typées avec les modèles de décision (TypeSafe System One) |
 | `GET /v1/models` | Lister les modèles disponibles |
 | `POST /tokenize`, `POST /detokenize` | API de tokenisation compatible vLLM (aussi sous `/v1`) |
+
+L'API d'administration (réglages, modèles, téléchargements, quantification, benchmarks) accepte la clé API principale comme jeton Bearer et fonctionne aussi en mode headless. Voir [Admin API](docs/admin-api.md).
 
 ### Appel d'outils et sorties structurées
 
@@ -309,6 +306,9 @@ omlx serve --model-dir ~/models --hf-endpoint https://hf-mirror.com
 # Authentification par clé API
 omlx serve --model-dir ~/models --api-key votre-clé-secrète
 # Localhost uniquement : désactivez la vérification via les paramètres globaux du panneau d'admin
+
+# API d'inférence et d'administration seulement, sans l'interface web (non enregistré dans les réglages)
+omlx serve --model-dir ~/models --headless
 ```
 
 Tous les paramètres peuvent aussi être configurés depuis le panneau d'admin web sur `/admin`. Les paramètres sont sauvegardés dans `~/.omlx/settings.json`, et les flags CLI ont la priorité.
@@ -341,31 +341,46 @@ Serveur FastAPI (API OpenAI / Anthropic)
 
 ## Développement
 
+### Commandes de build
+
+| Commande | Rôle |
+|---|---|
+| `make install` | Installation editable du serveur et de l'interface web, puis compilation des kernels natifs |
+| `make install-no-kernels` | La même installation sans les kernels, pour les machines sans Xcode complet |
+| `make mcp` | Ajoute le support MCP (Model Context Protocol) |
+| `make dev` | Comme `make install`, avec les outils de dev (`make dev-no-kernels` sans les kernels) |
+| `make kernels` | Supprime les kernels natifs déjà compilés, les recompile sur place et vérifie que chacun se charge |
+| `make web` | Reconstruit le CSS de l'interface web et normalise les fichiers de traduction |
+| `make app` | Prépare un `oMLX.app` exécutable avec des kernels natifs fraîchement compilés |
+
+Les kernels natifs demandent Xcode complet avec la toolchain Metal (`xcodebuild -downloadComponent MetalToolchain`).
+
 ### Serveur CLI
 
 ```bash
 git clone https://github.com/jundot/omlx.git
 cd omlx
-pip install -e ".[dev]"
+make dev
 pytest -m "not slow"
 ```
 
+### Interface web
+
+L'interface web d'administration se trouve dans `apps/omlx-web/` et fait partie du même paquet, donc `make dev` l'installe aussi. Après avoir modifié ses templates, son JavaScript ou ses traductions, lancez `make web` pour reconstruire le CSS et normaliser les fichiers de traduction.
+
 ### Application macOS
 
-L'application SwiftUI native vit dans `apps/omlx-mac/`. Nécessite Xcode 26.5+ et Python 3.11+. venvstacks est déclaré comme dépendance dev, donc `pip install -e ".[dev]"` (ou `uv sync --dev`) installe la version épinglée. Le script de build retombe sur `uvx venvstacks` ou `pipx run venvstacks` si vous préférez un runner d'outils global.
+L'application SwiftUI native vit dans `apps/omlx-mac/`. Nécessite Xcode 26.5+ et Python 3.11+. venvstacks est déclaré comme dépendance dev, donc `make dev` (ou `uv sync --dev`) installe la version épinglée. Le script de build retombe sur `uvx venvstacks` ou `pipx run venvstacks` si vous préférez un runner d'outils global.
 
 ```bash
-# Préparer un oMLX.app exécutable (xcodebuild + couches Python venvstacks + signature ad-hoc)
-apps/omlx-mac/Scripts/build.sh release
+# Préparer un oMLX.app exécutable (xcodebuild + couches Python venvstacks + kernels natifs + signature ad-hoc)
+make app
 
 # Le résultat atterrit dans apps/omlx-mac/build/Stage/oMLX.app
 open apps/omlx-mac/build/Stage/oMLX.app
 
 # Forcer une reconstruction de venvstacks (sinon mis en cache par empreinte)
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
-
-# Préparer avec les kernels natifs personnalisés optionnels GLM-5.2 / MiniMax M3
-apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 
 Le premier build à froid prend 10–20 minutes (assemblage des couches Python venvstacks). Les builds suivants réutilisent `packaging/_export/` et finissent en environ 4 minutes. Voir [packaging/README.md](packaging/README.md) pour la configuration des couches et [apps/omlx-mac/](apps/omlx-mac/) pour les sources Swift.

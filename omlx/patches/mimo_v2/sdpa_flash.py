@@ -36,7 +36,6 @@ bit for bit, except where the two key counts straddle a chunk-size step.
 from __future__ import annotations
 
 import math
-import os
 from functools import lru_cache
 from typing import Optional
 
@@ -385,12 +384,6 @@ def chunk_size(n_keys: int) -> int:
     [256, 1024] (measured best on M5 Ultra from 8k to 1M keys).  The same for
     every row count, so a verify row matches the one-row decode at its
     position unless the two key counts straddle a power-of-two step."""
-    env = os.environ.get("OMLX_SDPA_FLASH_CHUNK", "")
-    if env:
-        try:
-            return max(TILE_KEYS, int(env) // TILE_KEYS * TILE_KEYS)
-        except ValueError:
-            pass
     c = 1 << max(0, math.ceil(math.log2(max(1, n_keys) / 128)))
     return max(256, min(1024, c))
 
@@ -399,9 +392,6 @@ def _head_split(rows: int) -> int:
     """Simdgroups per 8-qrow band: one-row forwards split each band's head
     and value dims over two simdgroups (more threads per key tile), multi-row
     forwards keep one; the arithmetic is the same either way."""
-    env = os.environ.get("OMLX_SDPA_FLASH_HS", "")
-    if env in ("1", "2"):
-        return int(env)
     return 2 if rows == 1 else 1
 
 

@@ -20620,6 +20620,102 @@
         }
       }
     },
+    "settings.advanced.embedding_audio.label" : {
+      "comment" : "Row label for the embedding audio-input toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Audio Input"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Аудиовход"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "音频输入"
+          }
+        }
+      }
+    },
+    "settings.advanced.embedding_audio.sub" : {
+      "comment" : "Sublabel for the embedding audio-input toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Load the audio encoder so /v1/embeddings accepts audio items. Uses more memory even for text-only requests. Applies after the model reloads."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Загружает аудиокодировщик, чтобы /v1/embeddings принимал аудиоэлементы. Использует больше памяти даже для текстовых запросов. Применяется после перезагрузки модели."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "加载音频编码器，使 /v1/embeddings 接受音频条目。即使只发送文本也会占用更多内存。重新加载模型后生效。"
+          }
+        }
+      }
+    },
+    "settings.advanced.embedding_audio_max_seconds.label" : {
+      "comment" : "Row label for the embedding audio length limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Max Audio Length"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Макс. длина аудио"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最大音频长度"
+          }
+        }
+      }
+    },
+    "settings.advanced.embedding_audio_max_seconds.sub" : {
+      "comment" : "Sublabel for the embedding audio length limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Longer audio is cut at this length (empty = 30 s). The model context caps it at about 5 minutes."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Более длинное аудио обрезается до этой длины (пусто = 30 с). Контекст модели ограничивает её примерно 5 минутами."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "超过此长度的音频会被截断（留空 = 30 秒）。受模型上下文限制，最长约 5 分钟。"
+          }
+        }
+      }
+    },
     "settings.advanced.enable_thinking.label" : {
       "comment" : "Row label for the enable-thinking toggle",
       "extractionState" : "manual",

@@ -1059,14 +1059,13 @@ def test_fused_verify_replays_committed_rows_in_the_next_block(
         assert same(actual, reference)
 
 
-def test_qwen4_decode_setting_is_captured_per_model(monkeypatch):
+def test_qwen4_decode_setting_is_captured_per_model():
     from omlx.scheduler import SchedulerConfig
 
     module = _canonical_qwen4_decode_module(((8, 64),) * 4)
     module.out_proj = _fake_quantized_linear(6144, 2560, 8, 64)
     model = SimpleNamespace(modules=lambda: [module])
     config = SchedulerConfig(qwen4_gdn_decode_wide_proj=True)
-    monkeypatch.setenv("OMLX_QWEN4_GDN_DECODE_WIDE_PROJ", "1")
     assert not prework_mod._qwen4_decode_static_eligible(module)
 
     prework_mod.configure_qwen4_decode(

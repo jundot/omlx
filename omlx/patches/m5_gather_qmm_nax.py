@@ -88,17 +88,12 @@ The index must hold each expert's rows as one contiguous run: the tile
 pre-pass relies on it (as mlx 0.32.3's own sorted kernel does), and an
 expert split over two runs leaves rows unwritten. Every caller sorts the
 routes globally first.
-
-``OMLX_M5_GATHER_QMM_NAX=0`` disables the module (plain gather, epilogue
-and row map); ``OMLX_M5_GATHER_QMM_NAX_PLAN=sched,bm,bk,gx,pad`` (e.g.
-``seg,128,128,32,8192``) pins a configuration (testing).
 """
 
 from __future__ import annotations
 
 import logging
 import math
-import os
 import threading
 from functools import partial
 from pathlib import Path
@@ -108,9 +103,6 @@ import mlx.core as mx
 import mlx.nn as nn
 
 logger = logging.getLogger(__name__)
-
-_ENV_ENABLE = "OMLX_M5_GATHER_QMM_NAX"
-_ENV_PLAN = "OMLX_M5_GATHER_QMM_NAX_PLAN"
 
 # Output tile width and column simdgroups (fixed; the Metal source assumes
 # them). Tile heights are multiples of 32 rows (one row simdgroup each).
@@ -1191,15 +1183,6 @@ _act_header_failed = False
 _verified: dict[tuple, bool] = {}
 
 
-def enabled() -> bool:
-    """False when ``OMLX_M5_GATHER_QMM_NAX`` disables the module."""
-    return os.environ.get(_ENV_ENABLE, "1").strip().lower() not in {
-        "0",
-        "false",
-        "off",
-    }
-
-
 def _get_act_kernel(kind: str):
     """Build (once) the ``affine_act`` or ``fp_act`` kernel object, or its
     row-mapped variant (``*_act_map``: sorted rows read through ``rmap``)."""
@@ -1304,20 +1287,6 @@ def _get_kernel(kind: str):
         return kernel
 
 
-def _parse_plan(text: str) -> Optional[Plan]:
-    parts = [p.strip().lower() for p in text.split(",")]
-    if len(parts) != 5 or parts[0] not in ("seg", "db"):
-        return None
-    try:
-        bm, bk, gx, pad = (int(p) for p in parts[1:])
-    except ValueError:
-        return None
-    sched = _SCHED_SEG if parts[0] == "seg" else _SCHED_DB
-    if bm not in _TILE_ROWS or bk not in (64, 128) or gx < 0 or not 0 <= pad <= 8192:
-        return None
-    return Plan(sched, bm, bk, gx, pad)
-
-
 def _plan(rows: int, experts: int, K: int, N: int) -> Plan:
     """Kernel configuration for a call (mean rows per expert and K).
 
@@ -1336,11 +1305,6 @@ def _plan(rows: int, experts: int, K: int, N: int) -> Plan:
 
     Ragged K or N keeps 64-row seg tiles in the plain layout.
     """
-    forced = os.environ.get(_ENV_PLAN, "").strip()
-    if forced:
-        plan = _parse_plan(forced)
-        if plan is not None:
-            return plan
     if K % 64 or N % 64:
         return Plan(_SCHED_SEG, 64, 64, 0, 0)
     per_expert = rows / max(1, experts)
@@ -1772,14 +1736,12 @@ def sorted_gather_qmm(
 
     ``indices`` must group each expert's rows in one contiguous run (see
     the module docstring). ``plan`` pins a configuration (testing); by
-    default ``_plan`` picks one. Returns None when the module is disabled,
-    the call is not supported (see ``supports``), the kernels cannot be
+    default ``_plan`` picks one. Returns None when the call is not
+    supported (see ``supports``), the kernels cannot be
     built or the instantiation failed its one-time self-test; the caller
     then keeps the stock path.
     """
-    if not enabled() or not supports(
-        x, w, scales, biases, indices, group_size, bits, mode
-    ):
+    if not supports(x, w, scales, biases, indices, group_size, bits, mode):
         return None
     M, K = int(x.shape[0]), int(x.shape[2])
     E, N = int(w.shape[0]), int(w.shape[1])
@@ -1832,13 +1794,11 @@ def sorted_gather_qmm_swiglu(
     ops, so the output is bit-identical to passing ``x[row_map]`` (checked
     per instantiation on a scrambled canary map).
 
-    Returns None when disabled (``OMLX_M5_GATHER_QMM_NAX=0``), unsupported
-    (``supports``, or ``2 * n % 64 != 0``), or not verified; the caller then
+    Returns None when unsupported (``supports``, or ``2 * n % 64 != 0``) or
+    not verified; the caller then
     keeps the unfused path (materialising ``x[row_map]``).
     """
-    if not enabled() or not supports(
-        x, w, scales, biases, indices, group_size, bits, mode, row_map
-    ):
+    if not supports(x, w, scales, biases, indices, group_size, bits, mode, row_map):
         return None
     M, K = int(indices.shape[0]), int(x.shape[2])
     E, N = int(w.shape[0]), int(w.shape[1])

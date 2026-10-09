@@ -261,6 +261,9 @@ class Omlx < Formula
   test do
     assert_match version.to_s, shell_output("#{bin}/omlx --version")
     system libexec/"bin/python", "-c",
+           "import pathlib, omlx_web; " \
+           "assert (pathlib.Path(omlx_web.__file__).parent / 'templates/dashboard.html').is_file()"
+    system libexec/"bin/python", "-c",
            "import spacy; spacy.load('en_core_web_sm')"
     verify_custom_kernels(libexec/"bin/python") if build.with?("custom-kernel")
   end

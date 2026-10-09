@@ -191,7 +191,7 @@ def _throttle_ctx(
     return ns
 
 
-def _call(ns, requested, kv_len=0, *, gathered_core=False):
+def _call(ns, requested, kv_len=0, *, gathered_core=False, probe=False):
     with (
         patch.object(sched_mod.mx, "get_active_memory", return_value=0),
         patch.object(sched_mod, "get_phys_footprint", return_value=ns._fake_current),
@@ -203,7 +203,27 @@ def _call(ns, requested, kv_len=0, *, gathered_core=False):
             loop_label="test",
             kv_len=kv_len,
             gathered_core=gathered_core,
+            probe=probe,
         )
+
+
+def test_adaptive_throttle_probe_neither_pauses_nor_notifies():
+    ns = _throttle_ctx(
+        current=50 * _GB,
+        hard=58 * _GB,
+        samples_bpt=2 * 1024**2,
+    )
+    ns._fake_current = 50 * _GB
+    request = SimpleNamespace(prefill_eviction_retries=0)
+    ns.requests = {"r": request}
+    ns.config = SimpleNamespace(model_name="model-b")
+    ns._raise_prefill_eviction_if_available = (
+        Scheduler._raise_prefill_eviction_if_available.__get__(ns, Scheduler)
+    )
+    # A packed forward only asks whether its rows fit.
+    assert _call(ns, 2048, probe=True) < 2048
+    assert request.prefill_eviction_retries == 0
+    assert ns._throttle_notified_requests == set()
 
 
 def test_adaptive_throttle_requests_eviction_before_shrinking():
@@ -825,13 +845,9 @@ def test_generic_reclaim_that_cannot_fit_still_aborts(gathered_core):
 
 
 @pytest.mark.parametrize("path", ["adaptive", "guard"])
-@pytest.mark.parametrize("snap", ["0", "1"])
 @pytest.mark.parametrize("budget_tokens", [32, 63, 64, 511, 512, 513])
-def test_generic_linear_chunk_sizing_keeps_grid_and_exact_fits(
-    monkeypatch, path, snap, budget_tokens
-):
-    """A linear predictor keeps its previous sizes, including the opt-out."""
-    monkeypatch.setenv("OMLX_CHUNK_SNAP", snap)
+def test_generic_linear_chunk_sizing_keeps_grid_and_exact_fits(path, budget_tokens):
+    """A linear predictor keeps its previous sizes."""
     hard = 20 * _GB
     cap = int(hard * Scheduler._PREFILL_ABORT_MARGIN)
     # A 10-byte observation produces an exactly representable 13-byte
@@ -842,9 +858,7 @@ def test_generic_linear_chunk_sizing_keeps_grid_and_exact_fits(
     call = _call if path == "adaptive" else _guard_call
     chosen = call(ns, 512)
 
-    expected = min(512, budget_tokens)
-    if snap == "1":
-        expected = expected // 32 * 32
+    expected = min(512, budget_tokens) // 32 * 32
     assert chosen == expected
     assert current + ns._admission_transient_bound(chosen, 0) <= cap
 
@@ -1364,6 +1378,7 @@ def _requeue_ctx():
         _MAX_PREFILL_OOM_RETRIES=2,
         _reclaim_prefill_headroom=lambda: 0,
     )
+    ns._requeue_prefill_retry = Scheduler._requeue_prefill_retry.__get__(ns, Scheduler)
     return ns
 
 
@@ -1459,11 +1474,6 @@ class TestSnapChunkSize:
         ns = self._ns()
         assert ns._snap_chunk_size(2048, 2048) == 2048
         assert ns._snap_chunk_size(2049, 2048) == 2049
-
-    def test_env_toggle_disables_snapping(self, monkeypatch):
-        monkeypatch.setenv("OMLX_CHUNK_SNAP", "0")
-        ns = self._ns()
-        assert ns._snap_chunk_size(33, 2048) == 33
 
     def test_respects_min_chunk_grid(self):
         ns = self._ns(min_chunk=256)

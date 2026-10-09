@@ -33,9 +33,8 @@ Its softmax and top-k run inside the gate+up launch where the shapes allow
 stores the row's selection and scores for the down launch, and every
 simdgroup of an expert block recomputes the selection it serves from the
 router logits with ``softmax_topk_row``'s arithmetic, so the block is three
-dependent launches instead of four. ``OMLX_QWEN35_MOE_TOPK_FOLD=0`` runs
-the softmax and top-k as their own launch
-(``qwen35_moe_router.softmax_topk_row``).
+dependent launches instead of four. Other shapes run the softmax and top-k
+as their own launch (``qwen35_moe_router.softmax_topk_row``).
 
 The result is bit-identical to the composed path. The quantized dot products
 reuse the MLX 0.32.2 transcription in ``moe_verify_gather`` (4, 5, 6 and
@@ -49,9 +48,7 @@ and 640). Down takes ``qmv_fast`` or ``qmv``. A shared expert or gate outside
 that format (unquantized, packed, ...) runs as composed launches and only its outputs
 enter the combine. Prefill, multi-row calls and every other shape keep the
 original body. If the first launch fails, the patch disables itself and the
-block keeps its composed body. ``OMLX_QWEN35_MOE_ROUTED_DECODE=0`` keeps the
-composed body; ``OMLX_QWEN35_MOE_SHARED_FOLD=0`` keeps the shared expert and
-its gate as composed launches.
+block keeps its composed body.
 
 Row-exact MTP verify windows (1..8 rows whose logits must equal serial
 decode) run the same arithmetic for the whole window in the same launches:
@@ -67,7 +64,6 @@ verifier's composed MoE (about fifteen launches, two of them binding the
 whole stacked experts) only while row-exact verify is armed and the block
 folds its shared expert; one-row windows run the one-token launches. If the
 first window launch fails, the verifier keeps its composed MoE.
-``OMLX_QWEN35_MOE_VERIFY_WINDOW=0`` keeps it too.
 
 MLX commits a command buffer once the inputs bound to it exceed its size cap
 (50 MB by default), counting each input array whole. The stacked expert
@@ -76,14 +72,12 @@ buffer (~10-20 us of host CPU and a GPU gap per commit, and the host blocks
 once too many are in flight). The kernels therefore bind a one-expert view
 that shares the stacked array's buffer at offset 0 and index the other
 experts from it. The weights are resident model parameters, so the cap has
-nothing to bound here. Only scheduling changes;
-``OMLX_QWEN35_MOE_ROUTED_DECODE_VIEWS=0`` binds the whole arrays.
+nothing to bound here. Only scheduling changes.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from functools import cache, wraps
 from typing import NamedTuple
 
@@ -112,14 +106,8 @@ TOP_KS = (8, 10)
 _GATE_UP_ROWS = 2  # gate rows (and as many up rows) per simdgroup
 _GATE_UP_SIMDGROUPS = 2
 _DOWN_ROWS = 4  # down rows per simdgroup unless tuned by window width
-_DOWN_ROWS_TUNED = os.environ.get("OMLX_QWEN35_MOE_DOWN_ROWS", "1") != "0"
-_ENABLED = os.environ.get("OMLX_QWEN35_MOE_ROUTED_DECODE", "1") != "0"
-_SHARED_FOLD = os.environ.get("OMLX_QWEN35_MOE_SHARED_FOLD", "1") != "0"
-_VIEWS_ENABLED = os.environ.get("OMLX_QWEN35_MOE_ROUTED_DECODE_VIEWS", "1") != "0"
 _DISABLED = False
 _PROVEN = False
-_VERIFY_WINDOW = os.environ.get("OMLX_QWEN35_MOE_VERIFY_WINDOW", "1") != "0"
-_TOPK_FOLD = os.environ.get("OMLX_QWEN35_MOE_TOPK_FOLD", "1") != "0"
 # Every gate+up simdgroup recomputes its row's selection, so the folded
 # routing's ALU grows with the rows while the launch it saves does not: from
 # four rows on the gate+up launch runs out of ALU headroom and the separate
@@ -136,9 +124,8 @@ def _down_rows(rows: int) -> int:
     """Down rows per simdgroup for a ``rows``-row launch. Every output row keeps
     its arithmetic under any grouping, so this only shapes the grid: one-token
     decode runs faster on more, smaller threadgroups (two rows); verify windows
-    keep four, which served windows measured fastest on (M5 Ultra, oQ5e).
-    OMLX_QWEN35_MOE_DOWN_ROWS=0 keeps four rows everywhere."""
-    return 2 if rows == 1 and _DOWN_ROWS_TUNED else _DOWN_ROWS
+    keep four, which served windows measured fastest on (M5 Ultra, oQ5e)."""
+    return 2 if rows == 1 else _DOWN_ROWS
 
 
 class _Format(NamedTuple):
@@ -716,10 +703,11 @@ def _build_plan(block) -> _Plan | None:
     ):
         return None
     dtype, top_k = gate_up["scales"].dtype, block.top_k
-    view = _expert_view if _VIEWS_ENABLED else (lambda a: a)
-    gate_up_operands = tuple(view(gate_up[k]) for k in ("weight", "scales", "biases"))
-    down_operands = tuple(view(down[k]) for k in ("weight", "scales", "biases"))
-    shared = _shared_formats(block, hidden, dtype) if _SHARED_FOLD else None
+    gate_up_operands = tuple(
+        _expert_view(gate_up[k]) for k in ("weight", "scales", "biases")
+    )
+    down_operands = tuple(_expert_view(down[k]) for k in ("weight", "scales", "biases"))
+    shared = _shared_formats(block, hidden, dtype)
     gate = block.get("gate")
     router_logits = None
     if (
@@ -760,7 +748,7 @@ def _build_plan(block) -> _Plan | None:
             down_operands=down_operands,
             down_template=down_template + [("NPART", top_k)],
             down_threadgroup=(32, top_k, 1),
-            topk_kernel=_gate_up_topk_kernel(gu_fmt, None, None) if _TOPK_FOLD else None,
+            topk_kernel=_gate_up_topk_kernel(gu_fmt, None, None),
             topk_blocks=1 + top_k * inter // rows,
             topk_width=top_k * inter,
         )
@@ -788,7 +776,7 @@ def _build_plan(block) -> _Plan | None:
         shared_down_operands=shared_down,
         window_gate_up_kernel=_gate_up_window_kernel(gu_fmt, sgu_fmt, g_fmt),
         window_down_kernel=_down_window_kernel(d_fmt, sd_fmt),
-        topk_kernel=_gate_up_topk_kernel(gu_fmt, sgu_fmt, g_fmt) if _TOPK_FOLD else None,
+        topk_kernel=_gate_up_topk_kernel(gu_fmt, sgu_fmt, g_fmt),
         topk_blocks=1 + width // rows + top_k * inter // rows,
         topk_width=top_k * inter + width + 1,
     )
@@ -922,8 +910,7 @@ def routed_verify_window(block, x):
     down/combine each run once for the whole window."""
     global _WINDOW_DISABLED, _WINDOW_PROVEN
     if (
-        not _VERIFY_WINDOW
-        or _WINDOW_DISABLED
+        _WINDOW_DISABLED
         or _DISABLED
         or x.ndim != 3
         or x.dtype not in (mx.bfloat16, mx.float16)
@@ -1001,7 +988,7 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
     Needs ``qwen35_moe_router`` applied first: the fast arm reuses its fused
     routing launch, so it selects the same experts with the same scores as
     the body it replaces."""
-    if not _ENABLED or not mx.metal.is_available():
+    if not mx.metal.is_available():
         return False
     try:
         from mlx_vlm.models.qwen3_5_moe import language as vlm_moe
@@ -1067,7 +1054,6 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
     patched_call._omlx_routed_decode_original = orig_call
     cls.__call__ = patched_call
     cls._omlx_routed_decode = True
-    if _VERIFY_WINDOW:
-        _ensure_verify_window_patch(cls)
+    _ensure_verify_window_patch(cls)
     logger.info("Qwen MoE fused routed-expert decode patch applied")
     return True

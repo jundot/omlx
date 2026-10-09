@@ -16,7 +16,7 @@ Note: mlx_lm.load() is mocked to avoid loading real models.
 from abc import ABC
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
-from unittest.mock import MagicMock, patch, AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -405,6 +405,21 @@ class TestBatchedEngineStreamingCleanup:
         await stream.aclose()
 
         assert fake_engine.add_request_kwargs["tools"] == tools
+
+    @pytest.mark.asyncio
+    async def test_stream_generate_uses_caller_request_id(self):
+        from omlx.engine.batched import BatchedEngine
+
+        fake_engine = FakeStreamingCore()
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = fake_engine
+
+        stream = engine.stream_generate("hello", _request_id="req-progress")
+        await stream.__anext__()
+        await stream.aclose()
+
+        assert fake_engine.add_request_kwargs["request_id"] == "req-progress"
 
 
 class TestBatchedEngineApplyChatTemplate:
@@ -1168,6 +1183,126 @@ class TestBatchedEngineTokenizeChat:
 
         assert token_ids == [ord(c) for c in "user:hi"]
 
+
+class TestBatchedEnginePreparedPrompt:
+    @staticmethod
+    def _engine():
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._preprocess_messages = lambda messages: messages
+        engine._tokenizer = MagicMock()
+        engine._tokenizer.apply_chat_template.return_value = "PREPARED"
+        engine._tokenizer.encode.return_value = [11, 22, 33]
+        # Generation-suffix probes render different, short prompts.
+        engine._generation_prompt_text = MagicMock(return_value=("suffix", True))
+        engine._engine = FakeStreamingCore()
+        engine._engine.generate = AsyncMock(
+            return_value=TestBatchedEngineSpecPrefillForwarding._fake_output()
+        )
+        engine._engine.engine = SimpleNamespace(scheduler=object())
+        engine._preflight_or_raise_with_eviction = AsyncMock()
+        return engine
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("streaming", [False, True])
+    @pytest.mark.parametrize(
+        ("tools", "thinking", "partial"),
+        [
+            (None, True, False),
+            ([{"type": "function", "function": {"name": "weather"}}], False, False),
+            (None, False, True),
+        ],
+    )
+    async def test_reuses_prepared_prompt_through_preflight_and_generation(
+        self, streaming, tools, thinking, partial
+    ):
+        engine = self._engine()
+        messages = [{"role": "assistant" if partial else "user", "content": "hello"}]
+        options = {
+            "chat_template_kwargs": {"enable_thinking": thinking},
+            "is_partial": partial,
+        }
+        if partial:
+            engine._generation_prompt_text.return_value = (None, False)
+        prepared = engine.prepare_chat_prompt(messages, tools=tools, **options)
+
+        await engine.preflight_chat(
+            messages,
+            tools=tools,
+            request_id="prepared-request",
+            _prepared_prompt=prepared,
+            **options,
+        )
+        if streaming:
+            outputs = [
+                output
+                async for output in engine.stream_chat(
+                    messages, tools=tools, _prepared_prompt=prepared, **options
+                )
+            ]
+            assert outputs
+            generation = engine._engine.add_request_kwargs
+        else:
+            await engine.chat(
+                messages, tools=tools, _prepared_prompt=prepared, **options
+            )
+            generation = engine._engine.generate.call_args.kwargs
+
+        assert prepared == ("PREPARED", [11, 22, 33])
+        assert generation["prompt"] == prepared[1]
+        assert generation["tools"] == tools
+        if partial:
+            assert "generation_prompt_text" not in generation
+        else:
+            assert generation["generation_prompt_text"] == "suffix"
+            assert generation["generation_prompt_persists"] is True
+        engine._preflight_or_raise_with_eviction.assert_awaited_once_with(
+            engine._engine.engine.scheduler,
+            num_prompt_tokens=3,
+            request_id="prepared-request",
+        )
+        engine._tokenizer.apply_chat_template.assert_called_once()
+        rendered_options = engine._tokenizer.apply_chat_template.call_args.kwargs
+        assert rendered_options["enable_thinking"] is thinking
+        assert rendered_options["add_generation_prompt"] is not partial
+        if tools:
+            assert rendered_options["tools"][0]["function"]["name"] == "weather"
+        engine._tokenizer.encode.assert_called_once_with("PREPARED")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("streaming", [False, True])
+    async def test_specprefill_keeps_boundary_without_reencoding_full_prompt(
+        self, streaming
+    ):
+        engine = self._engine()
+        engine._model_settings = SimpleNamespace(specprefill_enabled=True)
+        engine._apply_chat_template = MagicMock(return_value="USER_ONLY")
+        engine._tokenizer.encode.return_value = [1, 2, 3, 4]
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+        ]
+        prepared = ("FULL_PROMPT", list(range(10)))
+
+        if streaming:
+            _ = [
+                output
+                async for output in engine.stream_chat(
+                    messages, _prepared_prompt=prepared
+                )
+            ]
+            generation = engine._engine.add_request_kwargs
+        else:
+            await engine.chat(messages, _prepared_prompt=prepared)
+            generation = engine._engine.generate.call_args.kwargs
+
+        assert generation["prompt"] == prepared[1]
+        assert generation["specprefill_system_end"] == 6
+        engine._apply_chat_template.assert_called_once()
+        assert engine._apply_chat_template.call_args.args[0] == messages[1:]
+        engine._tokenizer.encode.assert_called_once_with("USER_ONLY")
 
 class TestBatchedEngineMoeOffloadWiring:
     """The text engine's offload call must carry the Lightning MTP residency flag.

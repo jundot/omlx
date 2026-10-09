@@ -1244,6 +1244,30 @@ private struct AdvancedTab: View {
                     Task { await vm.save(.isFavorite, client: client) }
                 }))
             }
+            if vm.embeddingAudioSupported {
+                Row(label: String(localized: "settings.advanced.embedding_audio.label",
+                                  defaultValue: "Audio Input",
+                                  comment: "Row label for the embedding audio-input toggle"),
+                    sublabel: String(localized: "settings.advanced.embedding_audio.sub",
+                                     defaultValue: "Load the audio encoder so /v1/embeddings accepts audio items. Uses more memory even for text-only requests. Applies after the model reloads.",
+                                     comment: "Sublabel for the embedding audio-input toggle")) {
+                    RowSwitch(isOn: vm.bind($vm.embeddingAudioEnabled, save: {
+                        Task { await vm.save(.embeddingAudioEnabled, client: client) }
+                    }))
+                }
+                if vm.embeddingAudioEnabled {
+                    Row(label: String(localized: "settings.advanced.embedding_audio_max_seconds.label",
+                                      defaultValue: "Max Audio Length",
+                                      comment: "Row label for the embedding audio length limit"),
+                        sublabel: String(localized: "settings.advanced.embedding_audio_max_seconds.sub",
+                                         defaultValue: "Longer audio is cut at this length (empty = 30 s). The model context caps it at about 5 minutes.",
+                                         comment: "Sublabel for the embedding audio length limit")) {
+                        TextInput(text: $vm.embeddingAudioMaxSeconds,
+                                  placeholder: "30", mono: true, suffix: "s", width: .controlCompact)
+                            .onSubmit { Task { await vm.save(.embeddingAudioMaxSeconds, client: client) } }
+                    }
+                }
+            }
             // Security-sensitive row — flagged red to match the HTML
             // editor's visual treatment. HF custom-code execution gives
             // the model author the ability to run arbitrary Python in
@@ -2264,7 +2288,7 @@ private struct ExperimentalSection: View {
     private var qwenOqA8Sublabel: String {
         if let reason = vm.qwen35OqA8ConflictReason { return reason }
         return String(localized: "settings.experimental.qwen_oq_a8.sub",
-                      defaultValue: "Experimental GPU INT8 activation quantization for supported Q4/Q5 prefill operations on Qwen3.5/3.6/3.8, and routed expert gate/up projections on Qwen3.8 Flash-Next. Requires M5-series or newer and the native kernels. Outputs and model quality may change; some quantization formats receive no acceleration. Cannot be combined with ANE prefill. Applies after the model reloads.",
+                      defaultValue: "Experimental GPU INT8 activation quantization for supported Q4/Q5/Q8 prefill operations on Qwen3.5/3.6/3.8, and routed expert gate/up projections on Qwen3.8 Flash-Next. Requires M5-series or newer and the native kernels. Outputs and model quality may change; some quantization formats receive no acceleration. Cannot be combined with ANE prefill. Applies after the model reloads.",
                       comment: "Sublabel describing the oQ INT8-activation prefill kernels")
     }
 

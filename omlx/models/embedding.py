@@ -10,9 +10,9 @@ for embedding models that only mlx-vlm implements.
 
 import gc
 import inspect
+import io
 import json
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -20,10 +20,10 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import mlx.core as mx
 from mlx.utils import tree_flatten, tree_map
 from mlx_vlm.embedding_loader import load_embedding_model
-from mlx_vlm.utils import load_config, load_processor
+from mlx_vlm.utils import load_audio, load_config, load_processor
 
 from ..patches.modernbert_attention import patch_modernbert_attention
-from ..utils.image import validate_image_data_uri
+from ..utils.image import _decode_input_audio_data, validate_image_data_uri
 from .base_model import (
     ENCODER_BATCH_TOKEN_BUDGET,
     last_token_pool,
@@ -47,7 +47,6 @@ _CONTEXT_LENGTH_ATTRS = (
     "seq_length",
     "n_positions",
 )
-_FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 
 # Pooling modes whose result depends on the attention mask. CLS reads a fixed
 # position, so it is mask-independent.
@@ -73,11 +72,22 @@ class EmbeddingOutput:
 
 
 class _ChatTemplateEmbeddingInputs:
-    """Build text and image embedding inputs with an mlx-vlm processor."""
+    """Build text, image, and audio embedding inputs with an mlx-vlm processor."""
 
-    def __init__(self, processor, max_length: int):
+    def __init__(
+        self, processor, max_length: int, audio_max_seconds: Optional[float] = None
+    ):
         self._processor = processor
         self._max_length = max_length
+        feature_extractor = getattr(processor, "feature_extractor", None)
+        self._sampling_rate = getattr(feature_extractor, "sampling_rate", 16000)
+        # The feature extractor cuts audio at its call-time max_length default
+        # (Gemma 4: 30 s); only the call can raise it.
+        self._audio_kwargs = (
+            {"max_length": int(audio_max_seconds * self._sampling_rate)}
+            if audio_max_seconds and audio_max_seconds > 0
+            else {}
+        )
 
     def prepare_embedding_inputs(self, inputs, return_tensors: str = "mlx"):
         conversations = []
@@ -87,19 +97,30 @@ class _ChatTemplateEmbeddingInputs:
                 content.append({"type": "text", "text": item["text"]})
             if item.get("image"):
                 content.append({"type": "image", "url": item["image"]})
+            if item.get("audio"):
+                # Decoded bytes from embed(); the processor takes the waveform
+                # as-is and only loads str/Path values itself.
+                waveform = load_audio(io.BytesIO(item["audio"]), sr=self._sampling_rate)
+                content.append({"type": "audio", "audio": waveform})
             conversations.append([{"role": "user", "content": content}])
+        has_audio = any(item.get("audio") for item in inputs)
         batch = self._processor.apply_chat_template(
             conversations,
             tokenize=True,
             return_dict=True,
             return_tensors=return_tensors,
+            **(
+                {"audio_kwargs": self._audio_kwargs}
+                if has_audio and self._audio_kwargs
+                else {}
+            ),
         )
         # Truncation can cut media placeholders, so reject long inputs instead.
         length = batch["input_ids"].shape[1]
         if length > self._max_length:
             raise ValueError(
                 f"Embedding input is {length} tokens, which exceeds the "
-                f"{self._max_length}-token limit for image inputs"
+                f"{self._max_length}-token limit for media inputs"
             )
         return batch
 
@@ -116,7 +137,7 @@ class MLXEmbeddingModel:
     - Native BERT embedding (no mlx-embeddings dependency)
     - Native Qwen2-decoder embedding (last-token + L2; jina-code, gte-Qwen2)
       — mlx-embeddings has no qwen2 module
-    - mlx-vlm for EmbeddingGemma 2 (text and image inputs)
+    - mlx-vlm for EmbeddingGemma 2 (text, image, and audio inputs)
     - mlx-embeddings fallback for other architectures
 
     Example:
@@ -125,7 +146,13 @@ class MLXEmbeddingModel:
         >>> print(len(output.embeddings))  # 2
     """
 
-    def __init__(self, model_name: str, trust_remote_code: bool = False):
+    def __init__(
+        self,
+        model_name: str,
+        trust_remote_code: bool = False,
+        audio_enabled: bool = False,
+        audio_max_seconds: Optional[float] = None,
+    ):
         """
         Initialize the MLX embedding model.
 
@@ -133,9 +160,15 @@ class MLXEmbeddingModel:
             model_name: HuggingFace model name or local path
             trust_remote_code: Allow execution of custom Python shipped inside
                 the model repository. Off by default for security (issue #926).
+            audio_enabled: Load the audio tower of models that have one, so
+                audio items are accepted. Off by default to save memory.
+            audio_max_seconds: Longest audio item read before the waveform is
+                cut. None keeps the processor default (Gemma 4 audio: 30 s).
         """
         self.model_name = model_name
         self.trust_remote_code = trust_remote_code
+        self.audio_enabled = audio_enabled
+        self.audio_max_seconds = audio_max_seconds
 
         self.model = None
         self.processor = None
@@ -148,6 +181,7 @@ class MLXEmbeddingModel:
         self._pooling_mode: Optional[str] = None
         self._pooling_source: str = "not resolved"
         self._media_processor = None
+        self._supports_audio = False
 
     # (hidden_size, num_hidden_layers) of Qwen3-Embedding-0.6B and -8B.
     _FP16_PROMOTE_SHAPES = {(1024, 28), (4096, 36)}
@@ -403,8 +437,10 @@ class MLXEmbeddingModel:
 
         logger.info(f"Loading embedding model via mlx-vlm: {self.model_name}")
         config = load_config(model_path)
-        # /v1/embeddings has no audio input, so the audio tower is not loaded.
-        config["audio_config"] = None
+        # The audio tower is resident even for text-only requests, so it loads
+        # only when the model's embedding_audio_enabled setting asks for it.
+        if not self.audio_enabled:
+            config["audio_config"] = None
         model = load_embedding_model(model_path, config=config)
         processor = load_processor(model_path, add_detokenizer=False)
         model.max_input_length = context_length
@@ -414,8 +450,9 @@ class MLXEmbeddingModel:
         # takes images as its first positional argument.
         self.processor = processor.tokenizer
         self._media_processor = _ChatTemplateEmbeddingInputs(
-            processor, context_length
+            processor, context_length, self.audio_max_seconds
         )
+        self._supports_audio = getattr(model, "audio_tower", None) is not None
         self._hidden_size = model.config.text_config.embedding_dim
         self._using_native = False
         self._detect_input_key_remapping()
@@ -803,15 +840,6 @@ class MLXEmbeddingModel:
           for some embedding/reranker models, causing eval() runtime errors.
         - We compile a narrower function that returns only the final embedding array.
         """
-        compile_env = os.getenv("OMLX_EMBEDDING_COMPILE", "1").strip().lower()
-        if compile_env in _FALSE_ENV_VALUES:
-            logger.info(
-                "mx.compile disabled for %s by OMLX_EMBEDDING_COMPILE",
-                self.model_name,
-            )
-            self._compiled_embed = None
-            return False
-
         base_model = self.model
 
         try:
@@ -868,6 +896,7 @@ class MLXEmbeddingModel:
         self.model = None
         self.processor = None
         self._media_processor = None
+        self._supports_audio = False
         self._hidden_size = None
         self._loaded = False
         self._using_native = False
@@ -914,11 +943,28 @@ class MLXEmbeddingModel:
                     image_ref,
                     field="items[].image",
                 )
+            audio_ref = item.get("audio")
+            if isinstance(audio_ref, str):
+                item["audio"] = _decode_input_audio_data(
+                    audio_ref,
+                    field="items[].audio",
+                )
         input_texts = [item["text"] for item in normalized_inputs if "text" in item]
         has_image_inputs = any("image" in item for item in normalized_inputs)
+        has_audio_inputs = any("audio" in item for item in normalized_inputs)
+        if has_audio_inputs and not self._supports_audio:
+            hint = (
+                " (enable embedding_audio_enabled in its model settings)"
+                if self._media_processor is not None and not self.audio_enabled
+                else ""
+            )
+            raise ValueError(
+                f"Embedding model '{self.model_name}' does not support audio "
+                f"inputs{hint}"
+            )
 
         processor = self.processor
-        if has_image_inputs and self._media_processor is not None:
+        if (has_image_inputs or has_audio_inputs) and self._media_processor is not None:
             processor = self._media_processor
         uses_custom_embedding_inputs = self._uses_custom_embedding_inputs(processor)
         # Unwrap only mlx-embeddings' TokenizerWrapper. transformers tokenizers

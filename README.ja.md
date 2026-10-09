@@ -10,10 +10,6 @@
 <p align="center"><b>Mac向けに最適化されたLLM推論サーバー</b><br>連続バッチングと階層型KVキャッシュを、メニューバーから直接管理します。</p>
 
 <p align="center">
-<a href="https://www.buymeacoffee.com/jundot"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
-</p>
-
-<p align="center">
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
   <img src="https://img.shields.io/badge/python-3.10+-green" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
@@ -60,7 +56,8 @@
 
 ```bash
 brew tap jundot/omlx https://github.com/jundot/omlx
-brew install omlx
+brew install omlx --with-custom-kernel   # ネイティブカスタムカーネル込み（フルXcodeが必要）
+# フルXcodeがない場合は brew install omlx でカーネルなしでインストール
 
 # 最新バージョンへアップグレード
 brew update && brew upgrade omlx
@@ -72,25 +69,23 @@ brew services start omlx
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
 ```
 
-オプションの GLM-5.2 / MiniMax M3 ネイティブカスタムカーネルは、現在 HEAD ビルドが必要です:
-
-```bash
-brew install omlx --HEAD --with-custom-kernel
-```
-
 ### ソースからインストール
 
 ```bash
 git clone https://github.com/jundot/omlx.git
 cd omlx
-pip install -e .          # コアのみ
-pip install -e ".[mcp]"   # MCP（Model Context Protocol）サポート付き
-
-# オプション: GLM-5.2 / MiniMax M3 ネイティブカスタムカーネル
-OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
+make install                # Web UIとネイティブカスタムカーネルを含むeditableインストール
+# フルXcodeがない場合は make install-no-kernels でカーネルなしでインストール
+make mcp                    # オプション: MCP（Model Context Protocol）サポートを追加
 ```
 
-Python 3.10+とApple Silicon（M1/M2/M3/M4/M5）が必要です。
+macOS 15.0+（Sequoia）、Python 3.11–3.13、Apple Silicon（M1/M2/M3/M4/M5）が必要です。
+
+> **ネイティブカスタムカーネルについて:** GLM-5.2、MiniMax M3、Qwen3.5にはカーネルが必要で、ないと警告なしにかなり遅い汎用パスにフォールバックします。`make install`はカーネルもビルドし、すべて読み込めるか確認します。これにはMetalツールチェーン入りのフルXcodeが必要です（`xcodebuild -downloadComponent MetalToolchain`）。Command Line Toolsだけでは足りません。Xcodeがない場合は、カーネルがコンパイル済みで同梱されている公式DMGを使うか、`make install-no-kernels`を使ってください。`make kernels`はカーネルだけを最初からビルドし直します。インストールの確認:
+>
+> ```bash
+> python -c "from omlx.custom_kernels import native_kernel_status; print(native_kernel_status())"
+> ```
 
 ## クイックスタート
 
@@ -228,7 +223,7 @@ Claude Codeで小さなコンテキストモデルを実行するため、トー
 
 ### API互換性
 
-OpenAIとAnthropic APIのドロップイン代替です。ストリーミング使用統計（`stream_options.include_usage`）、Anthropic adaptive thinking、ビジョン入力（base64、URL）をサポートします。
+OpenAIとAnthropic APIのドロップイン代替です。ストリーミング使用統計（`stream_options.include_usage`）、llama.cpp互換のprefill進捗（`return_progress`）、Anthropic adaptive thinking、ビジョン入力（base64、URL）をサポートします。
 
 | エンドポイント | 説明 |
 |----------|------|
@@ -240,6 +235,8 @@ OpenAIとAnthropic APIのドロップイン代替です。ストリーミング�
 | `POST /v1/systemone` | Decision モデルによる型付き判定 (TypeSafe System One) |
 | `GET /v1/models` | 利用可能なモデル一覧 |
 | `POST /tokenize`, `POST /detokenize` | vLLM 互換トークナイザー API（`/v1` 配下でも利用可） |
+
+設定、モデル、ダウンロード、量子化、ベンチマークを扱う管理APIは、メインAPIキーをBearerトークンとして受け付け、headlessモードでも動作します。[Admin API](docs/admin-api.md)を参照してください。
 
 ### ツール呼び出し＆構造化出力
 
@@ -306,6 +303,9 @@ omlx serve --model-dir ~/models --mcp-config mcp.json
 # APIキー認証
 omlx serve --model-dir ~/models --api-key your-secret-key
 # Localhost専用: 管理画面のグローバル設定で検証をスキップ
+
+# Web UIなしで推論・管理APIのみ起動（設定には保存されません）
+omlx serve --model-dir ~/models --headless
 ```
 
 すべての設定は`/admin`のWeb管理画面からも設定できます。設定は`~/.omlx/settings.json`に保存され、CLIフラグが優先されます。
@@ -338,31 +338,46 @@ FastAPI Server (OpenAI / Anthropic API)
 
 ## 開発
 
+### ビルドコマンド
+
+| コマンド | 内容 |
+|---|---|
+| `make install` | サーバーとWeb UIをeditableインストールし、ネイティブカスタムカーネルもビルド |
+| `make install-no-kernels` | カーネルなしで同じインストール（フルXcodeがない環境向け） |
+| `make mcp` | MCP（Model Context Protocol）サポートを追加 |
+| `make dev` | `make install`と同じで開発ツール付き（`make dev-no-kernels`はカーネルなし） |
+| `make kernels` | 既存のネイティブカスタムカーネルのビルドを削除して再コンパイルし、すべて読み込めるか確認 |
+| `make web` | Web UIのCSSを再ビルドし、翻訳ファイルを正規化 |
+| `make app` | ネイティブカスタムカーネルを新しくコンパイルして含めた`oMLX.app`をステージング |
+
+ネイティブカスタムカーネルのビルドにはMetalツールチェーン入りのフルXcodeが必要です（`xcodebuild -downloadComponent MetalToolchain`）。
+
 ### CLIサーバー
 
 ```bash
 git clone https://github.com/jundot/omlx.git
 cd omlx
-pip install -e ".[dev]"
+make dev
 pytest -m "not slow"
 ```
 
+### Web UI
+
+Web管理UIは`apps/omlx-web/`にあり、同じパッケージに含まれるため`make dev`で一緒にインストールされます。テンプレート、JavaScript、翻訳を編集したら`make web`でCSSを再ビルドし、翻訳ファイルを正規化してください。
+
 ### macOSアプリ
 
-ネイティブ SwiftUI アプリは `apps/omlx-mac/` にあります。Xcode 26.5+ と Python 3.11+ が必要です。venvstacks は dev 依存として宣言されているため、`pip install -e ".[dev]"`（または `uv sync --dev`）でピン留めされたバージョンが入ります。ホスト全体のツールランナーを使いたい場合は `uvx venvstacks` や `pipx run venvstacks` でも動作します。
+ネイティブ SwiftUI アプリは `apps/omlx-mac/` にあります。Xcode 26.5+ と Python 3.11+ が必要です。venvstacks は dev 依存として宣言されているため、`make dev`（または `uv sync --dev`）でピン留めされたバージョンが入ります。ホスト全体のツールランナーを使いたい場合は `uvx venvstacks` や `pipx run venvstacks` でも動作します。
 
 ```bash
-# 実行可能な oMLX.app をステージング（xcodebuild + venvstacks Python レイヤー + ad-hoc 署名）
-apps/omlx-mac/Scripts/build.sh release
+# 実行可能な oMLX.app をステージング（xcodebuild + venvstacks Python レイヤー + ネイティブカーネル + ad-hoc 署名）
+make app
 
 # 出力は apps/omlx-mac/build/Stage/oMLX.app
 open apps/omlx-mac/build/Stage/oMLX.app
 
 # venvstacks を強制的に再ビルド（通常は fingerprint でキャッシュ）
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
-
-# オプションの GLM-5.2 / MiniMax M3 ネイティブカスタムカーネルを含めてステージング
-apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 
 初回 cold ビルドは 10–20 分かかります（venvstacks Python レイヤーの組み立て）。以降のビルドは `packaging/_export/` のキャッシュを再利用し、約 4 分で完了します。レイヤー構成は [packaging/README.md](packaging/README.md)、Swift ソースは [apps/omlx-mac/](apps/omlx-mac/) を参照してください。

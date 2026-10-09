@@ -48,6 +48,7 @@ from ..qwen3_5 import language as q35_language
 from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from .config import ModelConfig, TextConfig
 from .qsa_fast import (
+    batched_causal_block_selection,
     contiguous_causal_gathered_qsa,
     contiguous_causal_gathered_qsa_decode,
     decode_block_selection_mask,
@@ -55,7 +56,6 @@ from .qsa_fast import (
     pool_completed_index_keys,
 )
 from . import attn_fused, hc_fused
-from .hc_projection import env_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +157,7 @@ def resolve_ple_runtime_mode(
     if requested == "ssd_mmap":
         requested = "mmap"
     if requested not in {"auto", "resident", "mmap"}:
-        raise ValueError("OMLX_QWEN4_PLE_MODE must be auto, resident, or mmap")
+        raise ValueError("Qwen4 PLE mode must be auto, resident, or mmap")
     if requested != "auto":
         return requested
     return "mmap" if checkpoint_bytes > physical_memory * 0.70 else "resident"
@@ -168,9 +168,7 @@ def configure_ple_runtime(model_path: str | Path, mode: str | None = None) -> st
     global _PLE_RUNTIME_MODEL_PATH, _PLE_RUNTIME_MODE
 
     compute_path = Path(model_path).expanduser().resolve()
-    requested = mode or os.environ.get("OMLX_QWEN4_PLE_MODE")
-    if requested is None:
-        requested = "auto"
+    requested = mode or "auto"
     checkpoint_bytes = sum(
         path.stat().st_size
         for path in compute_path.glob("*.safetensors")
@@ -603,17 +601,118 @@ class QSAKVCache(_QSAIndexerCache, KVCache):
         return super().nbytes + self.indexer_nbytes
 
 
+class _BatchPooledBank:
+    """Completed QSA blocks of every row of a batch, each row anchored at its
+    first real token: ``keys[i, j]`` pools row ``i``'s tokens ``ratio * j`` to
+    ``ratio * j + ratio - 1`` counted from that token, exactly what a fresh
+    singleton cache over the row pools.
+
+    ``blocks[i]`` is row ``i``'s pooled watermark and ``tokens[i]`` a lower
+    bound on its length, kept so a rollback can clamp the watermark on the
+    host, as ``_QSAIndexerCache._trim_indexer`` does for a singleton. The
+    owning indexer is held weakly (it also keeps deepcopy of the cache cheap).
+    """
+
+    __slots__ = ("keys", "blocks", "tokens", "ratio", "tag")
+
+    def __init__(self, rows: int, ratio: int, tag: Any):
+        self.keys = None
+        self.blocks = [0] * rows
+        self.tokens = [0] * rows
+        self.ratio = ratio
+        self.tag = None if tag is None else weakref.ref(tag)
+
+    def owned_by(self, rows: int, ratio: int, tag: Any) -> bool:
+        return (
+            len(self.blocks) == rows
+            and self.ratio == ratio
+            and (self.tag is None if tag is None else self.tag is not None and self.tag() is tag)
+        )
+
+    def drop_tail(self, row: int, tokens: int) -> None:
+        """Row ``row`` lost its last ``tokens`` tokens; keep only intact blocks."""
+        self.tokens[row] = max(0, self.tokens[row] - int(tokens))
+        self.blocks[row] = min(self.blocks[row], self.tokens[row] // self.ratio)
+
+    def select(self, rows: list[int]) -> "_BatchPooledBank":
+        kept = _BatchPooledBank(len(rows), self.ratio, None)
+        kept.tag = self.tag
+        kept.blocks = [self.blocks[row] for row in rows]
+        kept.tokens = [self.tokens[row] for row in rows]
+        if self.keys is not None and rows:
+            kept.keys = self.keys[mx.array(rows, dtype=mx.int32)]
+        return kept
+
+    def join(self, other: Optional["_BatchPooledBank"], other_rows: int) -> "_BatchPooledBank":
+        """This bank's rows followed by ``other``'s (or ``other_rows`` empty rows)."""
+        if other is not None and not (
+            other.ratio == self.ratio and other.tag is not None and self.tag is not None
+            and other.tag() is self.tag()
+        ):
+            other = None
+        joined = _BatchPooledBank(len(self.blocks) + other_rows, self.ratio, None)
+        joined.tag = self.tag
+        joined.blocks = self.blocks + (other.blocks if other else [0] * other_rows)
+        joined.tokens = self.tokens + (other.tokens if other else [0] * other_rows)
+        parts = [self.keys, None if other is None else other.keys]
+        if any(part is not None for part in parts):
+            width = max(int(part.shape[1]) for part in parts if part is not None)
+            sample = next(part for part in parts if part is not None)
+            padded = []
+            for part, rows in zip(parts, (len(self.blocks), other_rows)):
+                if part is None:
+                    part = mx.zeros((rows, width, sample.shape[-1]), dtype=sample.dtype)
+                elif part.shape[1] < width:
+                    part = mx.pad(part, [(0, 0), (0, width - part.shape[1]), (0, 0)])
+                padded.append(part)
+            joined.keys = mx.concatenate(padded, axis=0)
+        return joined
+
+
 class BatchQSAKVCache:
     """Batch KV cache that keeps QSA raw keys and text/MRoPE positions aligned."""
 
     _omlx_mtp_batch_rollback_cache = True
     _omlx_mtp_verify_attention_cache = True
 
+    # Completed-block bank of every row (_BatchPooledBank). The batched indexer
+    # pools each row anchored at its first real token; the bank keeps those
+    # blocks across steps so a step pools only the blocks it completes. It is
+    # derived state, never serialized: every path that reassigns the raw bank
+    # through the public setters drops it, and the paths that keep row content
+    # in place (append, rollback, filter, extend, trim) carry or clamp it.
+    _pooled_bank = None
+
+    # The bank grows by this many blocks at a time.
+    pooled_bank_step = 256
+
     def __init__(self, left_padding):
         self.kv_cache = BatchKVCache(left_padding)
         self.index_keys = None
         self.index_position_ids = None
         self.index_offset = 0
+
+    # ``index_keys`` / ``index_position_ids`` behave as plain attributes.
+    # Assigning either from outside (merge, state, cache restore, tests) drops
+    # the bank; the methods below that keep each row's content in place
+    # relative to its first real token write the backing fields instead.
+    @property
+    def index_keys(self):
+        return self._index_keys
+
+    @index_keys.setter
+    def index_keys(self, value):
+        self._index_keys = value
+        self._pooled_bank = None
+
+    @property
+    def index_position_ids(self):
+        return self._index_position_ids
+
+    @index_position_ids.setter
+    def index_position_ids(self, value):
+        self._index_position_ids = value
+        self._pooled_bank = None
 
     @property
     def keys(self):
@@ -646,29 +745,138 @@ class BatchQSAKVCache:
             self.index_keys = keys
             self.index_position_ids = position_ids
         else:
-            self.index_keys = mx.concatenate([self.index_keys, keys], axis=1)
-            self.index_position_ids = _append_indexer_positions(
-                self.index_position_ids, position_ids
+            if keys.dtype != self._index_keys.dtype:
+                # concatenate promotes; blocks pooled at the old dtype differ.
+                self._pooled_bank = None
+            # An append keeps every row's content in place: the bank stays.
+            self._index_keys = mx.concatenate([self._index_keys, keys], axis=1)
+            self._index_position_ids = _append_indexer_positions(
+                self._index_position_ids, position_ids
             )
         self.index_offset = self.index_keys.shape[1]
         return self.index_keys, self.index_position_ids
 
     def prepare(self, **kwargs):
+        right_padding = kwargs.get("right_padding")
+        if right_padding is not None:
+            # Rows whose last right_padding[i] columns finalize() will roll into
+            # their left padding: speculative tokens a vector rollback rejects,
+            # or the padding of a right-padded prompt that is appended in
+            # between. Kept on the host for the bank.
+            self._pending_right_padding = [int(value) for value in right_padding]
         self.kv_cache.prepare(**kwargs)
 
+    def pooled_indexer_rows(
+        self,
+        paddings: list[int],
+        compress_ratio: int,
+        index_key_norm,
+        apply_index_rope,
+        *,
+        cache_tag=None,
+        rows: Optional[list[int]] = None,
+    ) -> mx.array:
+        """Completed-block bank ``[B, blocks, D]`` of every row (or ``rows``),
+        row ``i``'s real tokens starting at column ``paddings[i]``: the blocks
+        a fresh singleton cache over ``index_keys[i, paddings[i]:]`` would
+        pool, left-aligned per row and zero past each row's own count. Only
+        blocks completed since the previous call are pooled."""
+
+        batch = int(self._index_keys.shape[0])
+        bank = self._pooled_bank
+        if bank is None or not bank.owned_by(batch, compress_ratio, cache_tag):
+            bank = self._pooled_bank = _BatchPooledBank(batch, compress_ratio, cache_tag)
+        positions = self.index_position_ids
+        needed = 0
+        for row in range(batch) if rows is None else rows:
+            padding = paddings[row]
+            tokens = self.index_offset - padding
+            complete = tokens // compress_ratio
+            needed = max(needed, complete)
+            # The row only grew since the watermark was set, or a rollback
+            # already clamped it; either way blocks below it are intact.
+            start = min(bank.blocks[row], complete)
+            bank.tokens[row] = tokens
+            bank.blocks[row] = complete
+            if start == complete:
+                continue
+            begin = padding + start * compress_ratio
+            end = padding + complete * compress_ratio
+            pooled = pool_completed_index_keys(
+                self.index_keys[row : row + 1, begin:end],
+                (
+                    positions[:, row : row + 1, begin:end]
+                    if positions.ndim == 3
+                    else positions[row : row + 1, begin:end]
+                ),
+                compress_ratio=compress_ratio,
+                index_key_norm=index_key_norm,
+                apply_index_rope=apply_index_rope,
+            )
+            capacity = 0 if bank.keys is None else int(bank.keys.shape[1])
+            if complete > capacity:
+                step = self.pooled_bank_step
+                grown = mx.zeros(
+                    (batch, -(-complete // step) * step, pooled.shape[-1]),
+                    dtype=pooled.dtype,
+                )
+                if capacity:
+                    grown[:, :capacity] = bank.keys
+                bank.keys = grown
+            bank.keys[row : row + 1, start:complete] = pooled
+        if bank.keys is None:
+            return mx.zeros(
+                (batch, 0, self._index_keys.shape[-1]), dtype=self._index_keys.dtype
+            )
+        return bank.keys[:, :needed]
+
+    def row_pooled_indexer_keys(
+        self,
+        row: int,
+        paddings: list[int],
+        compress_ratio: int,
+        index_key_norm,
+        apply_index_rope,
+        *,
+        cache_tag=None,
+    ) -> mx.array:
+        """Row ``row``'s completed-block bank ``[1, blocks, D]`` (see
+        :meth:`pooled_indexer_rows`)."""
+
+        self.pooled_indexer_rows(
+            paddings,
+            compress_ratio,
+            index_key_norm,
+            apply_index_rope,
+            cache_tag=cache_tag,
+            rows=[row],
+        )
+        return self._pooled_bank.keys[row : row + 1, : self._pooled_bank.blocks[row]]
+
     def finalize(self):
+        dropped = getattr(self, "_pending_right_padding", None)
+        self._pending_right_padding = None
+        if dropped is not None and self._pooled_bank is not None:
+            # Each row's last dropped[i] columns leave it. Content before them
+            # keeps its place relative to the row's first real token, so only
+            # blocks reaching into them are pooled again.
+            for row, tokens in enumerate(dropped):
+                if tokens:
+                    self._pooled_bank.drop_tail(row, tokens)
         right_padding = getattr(self.kv_cache, "_right_padding", None)
         self.kv_cache.finalize()
         if right_padding is None or self.index_keys is None:
             return
-        self.index_keys = dynamic_roll(self.index_keys, right_padding, axis=1)
-        if self.index_position_ids.ndim == 3:
-            self.index_position_ids = dynamic_roll(
-                self.index_position_ids, right_padding[None], axis=2
+        # Rolling the right padding into the left keeps each row's content in
+        # place relative to its first real token, so the bank stays.
+        self._index_keys = dynamic_roll(self._index_keys, right_padding, axis=1)
+        if self._index_position_ids.ndim == 3:
+            self._index_position_ids = dynamic_roll(
+                self._index_position_ids, right_padding[None], axis=2
             )
         else:
-            self.index_position_ids = dynamic_roll(
-                self.index_position_ids, right_padding, axis=1
+            self._index_position_ids = dynamic_roll(
+                self._index_position_ids, right_padding, axis=1
             )
 
     def make_mask(self, *args, **kwargs):
@@ -679,15 +887,24 @@ class BatchQSAKVCache:
         self.kv_cache.filter(batch_indices)
         if self.index_keys is None:
             return
-        self.index_keys = self.index_keys[batch_indices]
-        if self.index_position_ids.ndim == 3:
-            self.index_position_ids = self.index_position_ids[:, batch_indices]
+        self._index_keys = self._index_keys[batch_indices]
+        if self._index_position_ids.ndim == 3:
+            self._index_position_ids = self._index_position_ids[:, batch_indices]
         else:
-            self.index_position_ids = self.index_position_ids[batch_indices]
+            self._index_position_ids = self._index_position_ids[batch_indices]
         if min_left > 0:
-            self.index_keys = self.index_keys[:, min_left:]
-            self.index_position_ids = self.index_position_ids[..., min_left:]
+            self._index_keys = self._index_keys[:, min_left:]
+            self._index_position_ids = self._index_position_ids[..., min_left:]
             self.index_offset -= min_left
+        # Banks are anchored at each row's first real token, so the min_left
+        # shift leaves them valid; they follow their rows.
+        if self._pooled_bank is not None:
+            kept = (
+                batch_indices.tolist()
+                if isinstance(batch_indices, mx.array)
+                else list(batch_indices)
+            )
+            self._pooled_bank = self._pooled_bank.select(kept)
 
     @staticmethod
     def _pad_index(cache, target, sample_keys, sample_positions):
@@ -796,9 +1013,15 @@ class BatchQSAKVCache:
         )
 
         self.kv_cache.extend(other.kv_cache)
-        self.index_keys = index_keys
-        self.index_position_ids = index_position_ids
+        self._index_keys = index_keys
+        self._index_position_ids = index_position_ids
         self.index_offset = target
+        # Left-padding to the join width keeps every row's content in place
+        # relative to its first real token, so both sides' banks stay valid.
+        if self._pooled_bank is not None:
+            self._pooled_bank = self._pooled_bank.join(
+                other._pooled_bank, int(right[0].shape[0])
+            )
 
     def extract(self, idx):
         cache = QSAKVCache()
@@ -915,13 +1138,16 @@ class BatchQSAKVCache:
     def trim(self, n):
         trimmed = self.kv_cache.trim(n)
         self.index_offset = max(0, self.index_offset - trimmed)
+        if trimmed and self._pooled_bank is not None:
+            for row in range(len(self._pooled_bank.blocks)):
+                self._pooled_bank.drop_tail(row, trimmed)
         # Slice the physical arrays like the singleton trim does:
         # update_indexer concatenates onto them and re-derives index_offset
         # from shape[1], so stale draft columns would otherwise fossilize
         # and desync the indexer from the KV by the trimmed amount.
         if trimmed and self.index_keys is not None:
-            self.index_keys = self.index_keys[:, : self.index_offset]
-            self.index_position_ids = self.index_position_ids[
+            self._index_keys = self._index_keys[:, : self.index_offset]
+            self._index_position_ids = self._index_position_ids[
                 ..., : self.index_offset
             ]
         return trimmed
@@ -951,8 +1177,10 @@ class BatchQSAKVCache:
     @property
     def nbytes(self):
         extra = 0
-        if self.index_keys is not None:
-            extra = self.index_keys.nbytes + self.index_position_ids.nbytes
+        if self._index_keys is not None:
+            extra = self._index_keys.nbytes + self._index_position_ids.nbytes
+        if self._pooled_bank is not None and self._pooled_bank.keys is not None:
+            extra += self._pooled_bank.keys.nbytes
         return self.kv_cache.nbytes + extra
 
 
@@ -1037,40 +1265,26 @@ class QSAQuantizedKVCache(_QSAIndexerCache, QuantizedKVCache):
 # early as before and its queue fills), then every _EAGER_DISPATCH_EVERY-th
 # layer: each commit costs ~20 us of host CPU, and the queued GPU work covers
 # the host's build of the next group.
-# Scheduling only: outputs are bit-identical. Disable with OMLX_QWEN4_EAGER_DISPATCH=0;
-# OMLX_QWEN4_EAGER_DISPATCH_EVERY=1 commits every layer.
-_EAGER_DISPATCH = env_enabled("OMLX_QWEN4_EAGER_DISPATCH")
+# Scheduling only: outputs are bit-identical.
+_EAGER_DISPATCH = True
 _EAGER_DISPATCH_MAX_ROWS = 64
-_EAGER_DISPATCH_EVERY_DEFAULT = 3
-
-
-def _eager_dispatch_every() -> int:
-    raw = os.environ.get("OMLX_QWEN4_EAGER_DISPATCH_EVERY", "").strip()
-    try:
-        return max(1, int(raw)) if raw else _EAGER_DISPATCH_EVERY_DEFAULT
-    except ValueError:
-        return _EAGER_DISPATCH_EVERY_DEFAULT
-
-
-_EAGER_DISPATCH_EVERY = _eager_dispatch_every()
+_EAGER_DISPATCH_EVERY = 3
 _EAGER_DISPATCH_WARMUP = 6
-# Lightning MTP verify rows through the gathered QSA arm (OMLX_QWEN4_QSA_GATHERED_VERIFY=0 disables).
-_GATHERED_VERIFY_DISABLED = not env_enabled("OMLX_QWEN4_QSA_GATHERED_VERIFY")
-# Row-exact Lightning MTP verify rows on the masked QSA arm score and select
-# blocks and run SDPA per row with the serial decode kernels
-# (OMLX_QWEN4_QSA_MASKED_VERIFY=0 keeps the multi-row mask and MLX SDPA).
-_MASKED_VERIFY_DISABLED = not env_enabled("OMLX_QWEN4_QSA_MASKED_VERIFY")
-# Lightning MTP one-row windows (the activation step, depth-0 cycles) have no
-# draft to reject, so they run the serial decode step itself rather than a
-# verify forward (OMLX_QWEN4_MTP_ONE_ROW_DECODE=0 keeps the verify forward).
-_ONE_ROW_MTP_DECODE_DISABLED = not env_enabled("OMLX_QWEN4_MTP_ONE_ROW_DECODE")
-# Set while such a step runs: a verify forward never feeds prompt priming.
+# The batched indexer keeps each row's completed-block bank across steps and
+# pools only new blocks. Tests clear this to compare with fresh per-row caches.
+_BATCH_ROW_BANKS_ENABLED = True
+# Batched decode steps and Lightning MTP verify windows attend only each row's
+# QSA-selected K/V with one gather and one SDPA. Tests set this to compare with
+# the dense masked path.
+_GATHERED_BATCH_DISABLED = False
+# Decode is one query row and a verify window depth + 1; wider batched windows
+# are prefill and keep the dense masked path.
+_GATHERED_BATCH_MAX_QUERY = 16
+# Set while a Lightning MTP one-row window runs the serial decode step: a verify
+# forward never feeds prompt priming.
 _MTP_ONE_ROW_STEP: ContextVar[bool] = ContextVar(
     "omlx_qwen4_mtp_one_row_step", default=False
 )
-# Attention/indexer norms keep their FP32 1 + weight scale between calls
-# (OMLX_QWEN4_NORM_SCALE_CACHE=0 rebuilds it every call; same values).
-_NORM_SCALE_CACHE_DISABLED = not env_enabled("OMLX_QWEN4_NORM_SCALE_CACHE")
 
 
 def _fused_tile(rows: int) -> tuple[int, int, bool]:
@@ -1106,7 +1320,7 @@ class Qwen4ExpRMSNorm(nn.Module):
             raise ValueError(f"{dim=} must be divisible by {group_size=}")
         self.weight = mx.zeros(dim)
         # Plain attributes, not parameters: (weight the scale was built from, scale).
-        self._cache_scale = cache_scale and not _NORM_SCALE_CACHE_DISABLED
+        self._cache_scale = cache_scale
         self._cached_scale = None
 
     def _scale(self) -> mx.array:
@@ -1248,9 +1462,19 @@ class Qwen4ExpQSAIndexer(nn.Module):
         ):
             # Block pooling is anchored at each request's first real token,
             # not at column zero of the left-padded batch.
+            paddings = cache.left_padding.tolist()
+            if (
+                _BATCH_ROW_BANKS_ENABLED
+                and cache.index_keys is not None
+                and cache.index_keys.dtype == qk.dtype
+                and cache.index_offset == cache._idx
+                and max(paddings) <= cache.index_offset
+            ):
+                # Every row already has its first real token in the bank.
+                return self._batch_row_masks(qk, cache, position_ids, paddings)
             row_masks = []
             key_length = cache.index_offset + seq_len
-            for i, padding in enumerate(cache.left_padding.tolist()):
+            for i, padding in enumerate(paddings):
                 input_padding = min(seq_len, max(0, padding - cache.index_offset))
                 width = max(0, key_length - padding)
                 if input_padding == seq_len:
@@ -1333,8 +1557,20 @@ class Qwen4ExpQSAIndexer(nn.Module):
                 index_key_norm=self.k_layernorm,
                 apply_index_rope=self._apply_rope,
             )
-        pooled_keys = mx.expand_dims(pooled_keys, axis=1)
+        return self._pooled_selection_mask(query, pooled_keys, past_len, key_len)
 
+    def _pooled_selection_mask(
+        self,
+        query: mx.array,
+        pooled_keys: mx.array,
+        past_len: int,
+        key_len: int,
+    ) -> mx.array:
+        """Selection mask of normalized, rotated ``query`` ``[B, heads, L, D]``
+        against the completed-block bank ``[B, blocks, D]`` of ``key_len`` keys."""
+
+        batch, _, seq_len, _ = query.shape
+        pooled_keys = mx.expand_dims(pooled_keys, axis=1)
         # Score in float32, as the reference does: which blocks win is a discrete
         # choice, and rounding the products flips the ones near the cut-off.
         scores = query.astype(mx.float32) @ pooled_keys.astype(mx.float32).transpose(
@@ -1342,7 +1578,60 @@ class Qwen4ExpQSAIndexer(nn.Module):
         )
         if batch == 1 and seq_len == 1 and past_len == key_len - 1:
             return self.aligned_row_mask(scores, key_len)
-        return self._selection_mask(scores, past_len, key_len, max_complete_blocks)
+        return self._selection_mask(
+            scores, past_len, key_len, key_len // self.compress_ratio
+        )
+
+    def _batch_row_masks(
+        self,
+        qk: mx.array,
+        cache: "BatchQSAKVCache",
+        position_ids: mx.array,
+        paddings: list[int],
+    ) -> mx.array:
+        """The per-row masks of the batched branch below, from each row's
+        persistent completed-block bank instead of a fresh singleton cache.
+
+        Appending first and then reading row ``i`` at ``padding:`` sees exactly
+        the keys and positions the fresh row cache held after its own append,
+        and the bank pools the same blocks, so each mask is the same.
+        """
+
+        batch, seq_len, _ = qk.shape
+        qk = qk.reshape(batch, seq_len, self.n_heads + self.kv_heads, self.head_dim)
+        cache.update_indexer(qk[:, :, self.n_heads :].squeeze(2), position_ids)
+        key_length = cache.index_offset
+        row_masks = []
+        for i, padding in enumerate(paddings):
+            width = key_length - padding
+            if width // self.compress_ratio <= self.block_topk:
+                ends = width - seq_len + mx.arange(seq_len) + 1
+                row_mask = (mx.arange(width)[None, :] < ends[:, None])[None, None]
+            else:
+                query = self.q_layernorm(qk[i : i + 1, :, : self.n_heads]).transpose(
+                    0, 2, 1, 3
+                )
+                query = self._apply_rope(
+                    query,
+                    (
+                        position_ids[:, i : i + 1]
+                        if position_ids.ndim == 3
+                        else position_ids[i : i + 1]
+                    ),
+                )
+                pooled_keys = cache.row_pooled_indexer_keys(
+                    i,
+                    paddings,
+                    self.compress_ratio,
+                    self.k_layernorm,
+                    self._apply_rope,
+                    cache_tag=self,
+                )
+                row_mask = self._pooled_selection_mask(
+                    query, pooled_keys, width - seq_len, width
+                )
+            row_masks.append(mx.pad(row_mask, [(0, 0), (0, 0), (0, 0), (padding, 0)]))
+        return mx.concatenate(row_masks, axis=0)
 
     def aligned_row_mask(self, scores: mx.array, key_len: int) -> mx.array:
         """Token mask of one batch-one row whose query is the last of its
@@ -1530,7 +1819,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         """Lightning MTP verify rows (batch-one text, rank-two positions, aligned
         indexer) attend only the selected blocks; rollback is unaffected."""
 
-        if _GATHERED_VERIFY_DISABLED or not target_verify:
+        if not target_verify:
             return False
         causal_mask = mask is None or (isinstance(mask, str) and mask == "causal")
         if not (
@@ -1913,7 +2202,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         windows keep the path below, which already selects with the decode
         kernel and runs MLX's SDPA (same bits, faster below ~16K keys)."""
 
-        if _MASKED_VERIFY_DISABLED or not (target_verify and _row_exact_verify_armed()):
+        if not (target_verify and _row_exact_verify_armed()):
             return False
         causal_mask = mask is None or (isinstance(mask, str) and mask == "causal")
         if not (
@@ -2040,6 +2329,186 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             return self._fused_output(output, length)
         return _VERIFIER._linear(self.o_proj, output)
 
+    def _gathered_batch_paddings(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[Any],
+        position_ids: Optional[mx.array],
+        position_embeddings: Optional[tuple[mx.array, mx.array]],
+        target_verify: bool,
+    ) -> Optional[list[int]]:
+        """Per-row left padding of a batched text decode step or Lightning MTP
+        verify window that can attend each row's QSA-selected K/V, else None.
+
+        Only the masks the batch builds for itself qualify (the decode marker,
+        or the left-padded causal mask of the verify window), since this arm
+        applies padding and causality itself. Row-exact verify stays on its
+        own arms. Fails closed unless the indexer bank is aligned with the K/V
+        bank and every row's first real token is already cached.
+        """
+
+        if _GATHERED_BATCH_DISABLED or not _BATCH_ROW_BANKS_ENABLED:
+            return None
+        if not (
+            x.ndim == 3
+            and type(cache) is BatchQSAKVCache
+            and position_embeddings is None
+        ):
+            return None
+        batch, length = x.shape[:2]
+        if batch < 2 or not 1 <= length <= _GATHERED_BATCH_MAX_QUERY:
+            return None
+        if target_verify:
+            if length < 2 or _row_exact_verify_armed():
+                return None
+            if not (
+                mask is None
+                or (isinstance(mask, str) and mask == "causal")
+                or (
+                    isinstance(mask, mx.array)
+                    and mask.dtype == mx.bool_
+                    and tuple(mask.shape) == (batch, 1, length, cache._idx + length)
+                )
+            ):
+                return None
+        elif length != 1 or not (
+            mask is None or (isinstance(mask, str) and mask == "left_padded_decode")
+        ):
+            return None
+        if position_ids is not None and not (
+            position_ids.ndim in (2, 3)
+            and tuple(position_ids.shape[-2:]) == (batch, length)
+        ):
+            return None
+        index_keys = cache.index_keys
+        index_positions = cache.index_position_ids
+        width = cache.index_offset
+        if (
+            index_keys is None
+            or index_positions is None
+            or width != cache._idx
+            or index_keys.shape[0] != batch
+            or index_positions.shape[-1] != width
+        ):
+            return None
+        paddings = cache.left_padding.tolist()
+        if len(paddings) != batch or not all(0 <= pad <= width for pad in paddings):
+            return None
+        # Below the crossover every row is plain causal attention, which the
+        # dense path already runs without a sparse mask.
+        ratio, topk = self.indexer.compress_ratio, self.indexer.block_topk
+        if not any((width - pad + length) // ratio > topk for pad in paddings):
+            return None
+        return paddings
+
+    def _gathered_batch(
+        self,
+        x: mx.array,
+        cache: BatchQSAKVCache,
+        position_ids: Optional[mx.array],
+        target_verify: bool,
+        paddings: list[int],
+    ) -> mx.array:
+        """Attend every query row of a left-padded batch to its selected K/V.
+
+        Projections, norms, RoPE and both cache appends run batched exactly as
+        on the dense path. The indexer then scores every row's persistent
+        completed-block bank at once (FP32, as the batched indexer does),
+        keeps each query's top ``block_topk`` causal blocks -- all of them
+        below the crossover -- plus its incomplete tail, and one gather pulls
+        those at most ``token_budget + ratio - 1`` K/V rows per query out of
+        the padded bank for one masked SDPA. The keys a query attends are the
+        keys the dense path's sparse mask leaves visible, so the work per step
+        no longer grows with the rows' contexts.
+        """
+
+        batch, length, _ = x.shape
+        indexer = self.indexer
+        ratio = indexer.compress_ratio
+        projected = (
+            _target_verify_linear(indexer.index_qk_proj, x)
+            if target_verify
+            else indexer.index_qk_proj(x)
+        ).reshape(batch, length, indexer.n_heads + indexer.kv_heads, indexer.head_dim)
+        index_positions = (
+            position_ids
+            if position_ids is not None
+            else indexer._default_position_ids(batch, cache.offset, length)
+        )
+        cache.update_indexer(projected[:, :, indexer.n_heads :].squeeze(2), index_positions)
+        index_queries = indexer._apply_rope(
+            indexer.q_layernorm(projected[:, :, : indexer.n_heads]).transpose(0, 2, 1, 3),
+            index_positions,
+        )
+        pooled = cache.pooled_indexer_rows(
+            paddings,
+            ratio,
+            indexer.k_layernorm,
+            indexer._apply_rope,
+            cache_tag=indexer,
+        )
+
+        q_proj_output, keys, values = (
+            _target_verify_linears((self.q_proj, self.k_proj, self.v_proj), x)
+            if target_verify
+            else (self.q_proj(x), self.k_proj(x), self.v_proj(x))
+        )
+        queries, keys, values, gate, _ = self._prepare_projected_qkv(
+            q_proj_output, keys, values, cache, position_ids, None, None
+        )
+
+        # Each query sees its row's tokens up to itself.
+        width = cache.index_offset
+        visible = mx.array(
+            [width - pad - length + 1 for pad in paddings], dtype=mx.int32
+        )[:, None] + mx.arange(length, dtype=mx.int32)[None]
+        tokens, valid = batched_causal_block_selection(
+            index_queries,
+            pooled,
+            visible,
+            compress_ratio=ratio,
+            block_topk=indexer.block_topk,
+            indexer_head_dim=indexer.head_dim,
+        )
+        # Row-relative tokens -> columns of the left-padded bank.
+        tokens = tokens + mx.array(paddings, dtype=mx.int32)[:, None, None]
+        selected = tokens.shape[-1]
+        gather = tokens.reshape(batch, 1, length * selected, 1)
+        selected_keys = mx.take_along_axis(keys, gather, axis=2)
+        selected_values = mx.take_along_axis(values, gather, axis=2)
+        kv_heads, head_dim = selected_keys.shape[1], selected_keys.shape[-1]
+        if length == 1:
+            output = mx.fast.scaled_dot_product_attention(
+                queries,
+                selected_keys,
+                selected_values,
+                scale=self.scale,
+                mask=valid[:, None],
+            ).transpose(0, 2, 1, 3)
+        else:
+            # One query per SDPA batch entry, each over its own selected rows.
+            def per_query(rows):
+                return (
+                    rows.reshape(batch, kv_heads, length, selected, head_dim)
+                    .transpose(0, 2, 1, 3, 4)
+                    .reshape(batch * length, kv_heads, selected, head_dim)
+                )
+
+            output = mx.fast.scaled_dot_product_attention(
+                queries.transpose(0, 2, 1, 3).reshape(batch * length, -1, 1, head_dim),
+                per_query(selected_keys),
+                per_query(selected_values),
+                scale=self.scale,
+                mask=valid.reshape(batch * length, 1, 1, selected),
+            ).reshape(batch, length, -1, head_dim)
+        output = output.reshape(batch, length, -1)
+        return (
+            _target_verify_linear(self.o_proj, output * mx.sigmoid(gate))
+            if target_verify
+            else self.o_proj(output * mx.sigmoid(gate))
+        )
+
     def __call__(
         self,
         x: mx.array,
@@ -2100,6 +2569,14 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         ):
             cache._omlx_last_prefill_gathered = False
             return self._row_exact_masked_verify(x, cache, position_ids)
+
+        paddings = self._gathered_batch_paddings(
+            x, mask, cache, position_ids, position_embeddings, target_verify
+        )
+        if paddings is not None:
+            if x.shape[1] > 1:
+                cache._omlx_last_prefill_gathered = True
+            return self._gathered_batch(x, cache, position_ids, target_verify, paddings)
 
         if rows := self._fused_rows(
             x, mask, cache, position_ids, position_embeddings, target_verify
@@ -3578,7 +4055,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 # (one GEMM group per channel: ~8.7 ms for the 6k-row, 10240-channel PLE short
 # conv). This kernel is MLX's own depthwise_conv_1d arithmetic (sequential fp32
 # sum of bf16 products, one rounding) with a dilation; it is checked bit-equal
-# against mx.conv1d on first use. OMLX_QWEN4_PLE_CONV_KERNEL=0 disables it.
+# against mx.conv1d on first use.
 _DEPTHWISE_CONV_SOURCE = r"""
     const uint c = thread_position_in_grid.x;
     const uint t = thread_position_in_grid.y;
@@ -3596,7 +4073,7 @@ _DEPTHWISE_CONV_SOURCE = r"""
     y[((size_t)b * t_out + t) * C + c] = static_cast<T>(acc);
 """
 _DEPTHWISE_CONV_STATE = {
-    "enabled": env_enabled("OMLX_QWEN4_PLE_CONV_KERNEL"),
+    "enabled": True,
     "kernel": None,
     "validated": False,
 }
@@ -3904,7 +4381,7 @@ class Qwen4ExpModel(nn.Module):
         target_verify = gdn_sink is not None
         # Each layer's tail residual write stays pending and is applied inside
         # the next hyper-connection norm; ``hidden_states`` is the residual
-        # before it (OMLX_QWEN4_HC_FUSED_WRITE=0 applies it eagerly).
+        # before it.
         defer_write = hc_fused.write_enabled()
         # Every layer keeps the residual's leading (batch, rows) dims.
         eager = (
@@ -4150,9 +4627,10 @@ class LanguageModel(Qwen3_5LanguageModel):
         mtp_capture = return_hidden and kwargs.get("capture_layer_ids") is None
         if mtp_capture:
             kwargs["capture_layer_ids"] = []
+        # One-row windows (the activation step, depth-0 cycles) have no draft to
+        # reject, so they run the serial decode step rather than a verify forward.
         one_row_step = (
             mtp_capture
-            and not _ONE_ROW_MTP_DECODE_DISABLED
             and inputs_embeds is None
             and tuple(inputs.shape) == (1, 1)
             and cache is not None

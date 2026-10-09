@@ -152,16 +152,13 @@ def test_unquantized_and_already_fused_modules_are_skipped():
     assert not fusion.can_fuse(fused)
 
 
-def test_only_mimo_and_glm5_next_families_and_kill_switch(monkeypatch):
+def test_only_mimo_and_glm5_next_families():
     quant = (64, 4, "affine")
     other = _holder_class("deepseek_v4")(_make_glu(v4, quant))
     assert fusion.apply_switch_glu_gate_up_fusion(other) == 0
     assert fusion.apply_switch_glu_gate_up_fusion(object()) == 0
 
-    monkeypatch.setenv("OMLX_MOE_GATE_UP_FUSION", "0")
     glm = _holder_class("glm5_next")(_make_glu(v4, quant))
-    assert fusion.apply_switch_glu_gate_up_fusion(glm) == 0
-    monkeypatch.delenv("OMLX_MOE_GATE_UP_FUSION")
     assert fusion.apply_switch_glu_gate_up_fusion(glm) == 1
 
 

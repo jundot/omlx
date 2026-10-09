@@ -183,6 +183,15 @@ def test_mixed_cache_forward_and_continuous_batching():
     assert all(response.finish_reason == "length" for response in finished)
 
 
+def _disable_fast_attention(monkeypatch, mimo_v2):
+    """Route every attention layer to the masked full SDPA reference."""
+    monkeypatch.setattr(mimo_v2, "window_query_padding", lambda n: 0)
+    monkeypatch.setattr(
+        mimo_v2, "blocked_sliding_window_attention", lambda *a, **k: None
+    )
+    monkeypatch.setattr(mimo_v2, "mixed_head_dim_sdpa", lambda *a, **k: None)
+
+
 def test_window_layers_pad_the_projection_input_not_the_queries(monkeypatch):
     """Padding the q_proj input for the blocked window path is bit-exact."""
     mimo_v2 = _load_patch_module()
@@ -209,8 +218,8 @@ def test_window_layers_pad_the_projection_input_not_the_queries(monkeypatch):
     for a, b in zip(padded, unpadded):
         assert mx.array_equal(a, b).item()
 
-    monkeypatch.setattr(fast_attention, "_ENABLED", False)  # masked full SDPA
-    reference = run(real_pad)
+    _disable_fast_attention(monkeypatch, mimo_v2)
+    reference = run(lambda n: 0)
     for a, b in zip(padded, reference):
         assert mx.allclose(
             a.astype(mx.float32), b.astype(mx.float32), atol=5e-2, rtol=5e-2
@@ -914,7 +923,7 @@ def test_blocked_window_attention_declines_unsupported_layouts():
     assert f(short, short, short, scale=1.0, window=128) is None
 
 
-def test_window_layers_skip_query_padding_under_wrapped_rope():
+def test_window_layers_skip_query_padding_under_wrapped_rope(monkeypatch):
     """SpecPrefill maps RoPE positions per query row; padded window queries
     would outgrow the position slice on the last sparse chunk."""
     mimo_v2 = _load_patch_module()
@@ -924,8 +933,9 @@ def test_window_layers_skip_query_padding_under_wrapped_rope():
     positions = mx.arange(301) * 3
     tokens = mx.random.randint(0, 1000, (1, 301))
     outs = []
-    for enabled in (True, False):
-        fast_attention._ENABLED = enabled
+    for fast in (True, False):
+        if not fast:
+            _disable_fast_attention(monkeypatch, mimo_v2)
         try:
             for layer in model.model.layers:
                 attn = layer.self_attn
@@ -935,7 +945,6 @@ def test_window_layers_skip_query_padding_under_wrapped_rope():
             outs.append(model(tokens[:, 300:], cache=cache))
             mx.eval(outs[-1])
         finally:
-            fast_attention._ENABLED = True
             for layer in model.model.layers:
                 layer.self_attn.rope = layer.self_attn.rope._original
     assert mx.allclose(outs[0], outs[1], atol=1e-3, rtol=1e-3).item()
@@ -1232,7 +1241,7 @@ def _clone(caches):
 
 
 def _forward(model, tokens, cache, fast, monkeypatch):
-    monkeypatch.setenv("OMLX_MIMO_DECODE_FAST", "1" if fast else "0")
+    monkeypatch.setattr(df, "enabled", lambda: fast)
     out = model(tokens, cache=cache)
     mx.eval(out, [c.state for c in cache])
     return out
@@ -1349,7 +1358,7 @@ def test_decode_fast_declines_unsupported_forwards(monkeypatch):
     model = _decode_model(seed=5)
     inner = model.model
     cache = model.make_cache()
-    monkeypatch.setenv("OMLX_MIMO_DECODE_FAST", "1")
+    monkeypatch.setattr(df, "enabled", lambda: True)
     h1 = inner.embed_tokens(mx.array([[1]]))
     # 8 rows x top-8 would take SwitchGLU's sorted path.
     assert (
@@ -1358,7 +1367,7 @@ def test_decode_fast_declines_unsupported_forwards(monkeypatch):
     )
     assert df.run_layers(inner, h1, [None] * len(cache), None, None) is None
     assert df.run_layers(inner, h1.astype(mx.float32), cache, None, None) is None
-    monkeypatch.setenv("OMLX_MIMO_DECODE_FAST", "0")
+    monkeypatch.setattr(df, "enabled", lambda: False)
     assert df.run_layers(inner, h1, cache, None, None) is None
 
 
@@ -1386,7 +1395,7 @@ def test_decode_fast_runs_the_reference_under_wrapped_rope(monkeypatch):
     assert _mismatches(ref, fast) == 0
     for layer, rope in zip(inner.layers, originals):
         layer.self_attn.rope = rope
-    monkeypatch.setenv("OMLX_MIMO_DECODE_FAST", "1")
+    monkeypatch.setattr(df, "enabled", lambda: True)
     assert df.run_layers(inner, h, _clone(cache), None, None) is not None
 
 

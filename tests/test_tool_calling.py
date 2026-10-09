@@ -441,6 +441,18 @@ class TestParseJsonOutput:
         assert is_valid is True
         assert parsed == {"result": True}
 
+    def test_returns_extracted_json_text_verbatim(self):
+        json_text = '{\n  "name": "\\u0421",\n  "price": 1.50\n}'
+        text = f"Sure:\n```json\n{json_text}\n```"
+
+        cleaned, parsed, is_valid, error = parse_json_output(
+            text, {"type": "json_object"}
+        )
+
+        assert is_valid is True
+        assert cleaned == json_text
+        assert parsed == {"name": "С", "price": 1.5}
+
 
 class TestBuildJsonSystemPrompt:
     """Tests for build_json_system_prompt function."""

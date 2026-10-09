@@ -77,7 +77,7 @@ def test_affine_prefill_native_blocks_and_pair(monkeypatch, bits):
     from omlx.patches.deepseek_v4 import switch_layers
 
     # Exercise the native kernels even when NAX prefers stock prefill GEMMs.
-    monkeypatch.setattr(switch_layers, "_NAX_STOCK_MODE", "0")
+    monkeypatch.setattr(switch_layers, "_nax_prefers_stock", lambda num_routes: False)
     mx.random.seed(714)
     expert = expert_for(bits)
     x = mx.random.normal((1024, 1, 64)).astype(mx.bfloat16)

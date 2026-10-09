@@ -24,11 +24,7 @@ def _a8_ready() -> bool:
     try:
         from omlx.custom_kernels.qwen35_prefill import fast
 
-        return (
-            bool(fast.oq_a8_available())
-            and nax.enabled()
-            and a8._get_kernel() is not None
-        )
+        return bool(fast.oq_a8_available()) and a8._get_kernel() is not None
     except Exception:
         return False
 
@@ -218,7 +214,6 @@ def test_supports_declines_unsupported_layouts(kwargs):
 
 @pytest.fixture(autouse=True)
 def _restore_call_patch(monkeypatch):
-    monkeypatch.delenv("OMLX_M5_GATHER_QMM_A8", raising=False)
     monkeypatch.setattr(a8, "_warned", set())
     orig = getattr(SwitchGLU, "_omlx_gate_up_original_call", SwitchGLU.__call__)
     yield

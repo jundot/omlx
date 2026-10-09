@@ -1,7 +1,7 @@
 // PR 12 — Accuracy Benchmark screen.
 //
 // Mirrors the "Accuracy" tab from the HTML admin panel
-// (omlx/admin/templates/dashboard/_bench.html + dashboard.js accBench*).
+// (apps/omlx-web/omlx_web/templates/dashboard/_bench.html + dashboard.js accBench*).
 // Wires the /admin/api/bench/accuracy/* endpoints — queue add / status /
 // remove / results / reset / cancel — onto a stack of sections:
 //

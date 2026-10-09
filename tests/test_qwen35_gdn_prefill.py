@@ -53,11 +53,6 @@ def _fresh_gdn_patch(monkeypatch):
     import omlx.patches.qwen35_gdn_chunked as patch
 
     monkeypatch.setattr(patch, "_PATCHED", False, raising=False)
-    monkeypatch.delenv("OMLX_GDN_KERNEL", raising=False)
-    monkeypatch.delenv("OMLX_GDN_IMPL", raising=False)
-    monkeypatch.delenv("OMLX_GDN_BLOCK_T", raising=False)
-    monkeypatch.delenv("OMLX_GDN_MIN_T", raising=False)
-    monkeypatch.delenv("OMLX_GDN_STUB", raising=False)
     yield
     monkeypatch.setattr(patch, "_PATCHED", False, raising=False)
 
@@ -102,7 +97,7 @@ def test_prefill_patch_blocked_seq_impl_opt_in(monkeypatch):
 
     gd, _ = _install_fake_qwen35(monkeypatch)
     monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
-    monkeypatch.setenv("OMLX_GDN_IMPL", "blocked_seq")
+    monkeypatch.setattr(patch, "_IMPL", "blocked_seq")
     calls = []
     monkeypatch.setattr(
         kernels,
@@ -213,7 +208,7 @@ def test_prefill_patch_chunked_impl_opt_in(monkeypatch):
 
     gd, _ = _install_fake_qwen35(monkeypatch)
     monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
-    monkeypatch.setenv("OMLX_GDN_IMPL", "chunked")
+    monkeypatch.setattr(patch, "_IMPL", "chunked")
 
     calls = []
     monkeypatch.setattr(
@@ -232,15 +227,12 @@ def test_prefill_patch_chunked_impl_opt_in(monkeypatch):
     assert calls == ["chunked"]
 
 
-def test_blocked_seq_default_block_size_depends_on_input_dtype(monkeypatch):
+def test_blocked_seq_default_block_size_depends_on_input_dtype():
     from omlx.custom_kernels.qwen35_prefill.gdn import _normalize_block_t
 
     assert _normalize_block_t(None, mx.float32) == 16
     assert _normalize_block_t(None, mx.bfloat16) == 32
     assert _normalize_block_t(None, mx.float16) == 32
-
-    monkeypatch.setenv("OMLX_GDN_BLOCK_T", "48")
-    assert _normalize_block_t(None, mx.float32) == 48
     assert _normalize_block_t(32, mx.float32) == 32
 
 

@@ -346,6 +346,10 @@ def serve_command(args):
         )
         serve_sockets.append(extra_cfg.bind_socket())
 
+    # Read by omlx.server at import time.
+    if getattr(args, "headless", False):
+        os.environ["OMLX_HEADLESS"] = "1"
+
     try:
         # Import server and config after the port is known to be available.
         from .server import init_server
@@ -1245,7 +1249,7 @@ Example directory structure:
         type=str,
         choices=["off", "safe", "balanced", "aggressive"],
         default=None,
-        help="Memory guard tier, or 'off' to disable the guard. The tier sets how much memory stays free for other apps: safe keeps about 20%% of RAM (6-16 GB), balanced about 8%% (3-8 GB), aggressive 2%% (1.5-4 GB) and may compress other apps' memory. Passing a tier also turns the guard on. (default: balanced)",
+        help="Memory guard tier, or 'off' to disable the guard. The tier sets how much memory stays free for other apps: safe keeps about 20%% of RAM (6-16 GB), balanced about 8%% (3-8 GB) and may compress a quarter of other apps' memory, aggressive 2%% (1.5-4 GB) and may compress half of it. Passing a tier also turns the guard on. (default: balanced)",
     )
     serve_parser.add_argument(
         "--memory-guard-gb",
@@ -1362,6 +1366,12 @@ Example directory structure:
         type=str,
         default=None,
         help="API key for authentication (required for non-loopback binds)",
+    )
+    serve_parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Serve the inference and admin APIs without the web UI. "
+        "Not saved to settings; same as OMLX_HEADLESS=1",
     )
 
     # Launch command

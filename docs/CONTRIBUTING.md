@@ -16,10 +16,12 @@ oMLX requires Apple Silicon, macOS 15.0+, and Python 3.11–3.13. Fork the repos
 git clone https://github.com/<your-username>/omlx.git
 cd omlx
 git checkout -b fix/describe-the-change
-python -m pip install -e ".[dev]"
+make dev        # Editable install with dev tools and the native custom kernels
 ```
 
-See [Development](../README.md#development) for app builds and [installation instructions](../README.md#from-source) for native kernel requirements.
+`make dev` builds the native custom kernels, which needs full Xcode with the Metal toolchain. Use `make dev-no-kernels` on a machine without it.
+
+See [Development](../README.md#development) for the other `make` targets and app builds, and [installation instructions](../README.md#from-source) for native kernel requirements.
 
 ## Keep Changes Focused
 
@@ -42,17 +44,13 @@ python -m pytest                      # Excludes slow and integration tests
 
 See [TESTING.md](TESTING.md) for additional checks. For inference or cache changes, include a representative real-model check when possible, covering affected features such as prefix reuse, streaming, or concurrent requests. State what you ran and what remains untested; CI or mocked tests do not replace hardware validation.
 
-UI and UX changes, in the admin dashboard or the macOS app, must include before and after screenshots of the actual screen in the PR description. Use a short screen recording when the change is about interaction. UI PRs are reviewed once screenshots are attached. Run relevant JavaScript tests and build the macOS app when those components change. After editing admin templates or JavaScript, rebuild CSS:
+UI and UX changes, in the admin dashboard or the macOS app, must include before and after screenshots of the actual screen in the PR description. Use a short screen recording when the change is about interaction. UI PRs are reviewed once screenshots are attached. Run relevant JavaScript tests and build the macOS app (`make app`) when those components change. The web UI lives in `apps/omlx-web/omlx_web/` and its tests in `apps/omlx-web/tests/`. After editing its templates, JavaScript, or translation keys (`apps/omlx-web/omlx_web/i18n/en.json` is the source), rebuild the CSS and normalize the catalogs:
 
 ```bash
-python omlx/admin/build_css.py
+make web
 ```
 
-Use the existing translation catalogs and preserve placeholders. When web translation keys change, update `omlx/admin/i18n/en.json` and run:
-
-```bash
-python scripts/normalize_i18n.py
-```
+Use the existing translation catalogs and preserve placeholders.
 
 ## Performance PRs
 

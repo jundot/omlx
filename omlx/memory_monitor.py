@@ -13,7 +13,6 @@ Key features:
 from __future__ import annotations
 
 import logging
-import os
 import threading
 import time
 from collections import Counter
@@ -45,15 +44,8 @@ except ImportError:
 # score-matrix allocation.
 _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD = 8
 
-
-def qwen4_gathered_min_query_tokens() -> int:
-    """Keep narrow Lightning MTP windows on masked SDPA (M5 crossover)."""
-    try:
-        return max(
-            2, int(os.environ.get("OMLX_QWEN4_GATHERED_MIN_QUERY", "16"))
-        )
-    except ValueError:
-        return 16
+# Narrower Qwen4 windows (Lightning MTP) stay on masked SDPA (M5 crossover).
+_QWEN4_GATHERED_MIN_QUERY_TOKENS = 16
 
 
 def qwen4_gathered_prefill_route(
@@ -61,7 +53,7 @@ def qwen4_gathered_prefill_route(
 ) -> bool:
     """Whether Qwen4 text prefill uses sparse gathered QSA."""
     return (
-        query_tokens >= qwen4_gathered_min_query_tokens()
+        query_tokens >= _QWEN4_GATHERED_MIN_QUERY_TOKENS
         and cache_tokens + query_tokens > indexer_budget
     )
 

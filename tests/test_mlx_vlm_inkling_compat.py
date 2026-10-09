@@ -789,29 +789,23 @@ def test_cache_snapshot_restores_empty_composite_cache(applied):
     assert all(cache[0][1][slot] is None for slot in range(4))
 
 
-def test_sliding_window_slice_parity(applied, monkeypatch):
-    """Slicing sliding-layer K/V to the window must match full-sequence
-    SDPA (masked keys contribute exactly zero after softmax)."""
-    import importlib
-
-    language = importlib.import_module("mlx_vlm.models.inkling.language")
+def test_sliding_window_slice_parity(applied):
+    """Decode steps slice sliding-layer K/V to the window; that must match
+    full-sequence SDPA (masked keys contribute exactly zero after softmax).
+    One forward over the whole sequence never slices, so it is the reference."""
     model = _tiny_language_model()
     # window (sliding_window_size=8) well exceeded by prompt + decode.
     tokens = [(i * 37 + 11) % 128 for i in range(24)]
+    steps = [1, 2, 3, 4]
 
-    def run():
-        cache = model.make_cache()
-        logits = [model(mx.array([tokens]), cache=cache).logits[:, -1]]
-        for step in range(4):
-            logits.append(model(mx.array([[step + 1]]), cache=cache).logits[:, -1])
-        out = mx.concatenate(logits, axis=0)
-        mx.eval(out)
-        return out
-
-    monkeypatch.setattr(language, "_SLIDING_WINDOW_SLICE", False)
-    reference = run()
-    monkeypatch.setattr(language, "_SLIDING_WINDOW_SLICE", True)
-    sliced = run()
+    cache = model.make_cache()
+    logits = [model(mx.array([tokens]), cache=cache).logits[:, -1]]
+    for step in steps:
+        logits.append(model(mx.array([[step]]), cache=cache).logits[:, -1])
+    sliced = mx.concatenate(logits, axis=0)
+    reference = model(mx.array([tokens + steps]), cache=model.make_cache()).logits
+    reference = reference[0, len(tokens) - 1 :]
+    mx.eval(sliced, reference)
 
     diff = mx.max(mx.abs(reference - sliced)).item()
     assert diff < 2e-5, f"sliding-window slice diverged: {diff}"

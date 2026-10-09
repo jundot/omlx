@@ -10,10 +10,6 @@
 <p align="center"><b>LLM 推理，为你的 Mac 优化</b><br>连续批处理和分层 KV 缓存，直接从菜单栏管理。</p>
 
 <p align="center">
-<a href="https://www.buymeacoffee.com/jundot"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
-</p>
-
-<p align="center">
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
   <img src="https://img.shields.io/badge/python-3.10+-green" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
@@ -60,7 +56,8 @@
 
 ```bash
 brew tap jundot/omlx https://github.com/jundot/omlx
-brew install omlx
+brew install omlx --with-custom-kernel   # 包含原生自定义内核（需要完整 Xcode）
+# 没有完整 Xcode 时，用 brew install omlx 安装不含内核的版本
 
 # 升级到最新版本
 brew update && brew upgrade omlx
@@ -72,25 +69,23 @@ brew services start omlx
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
 ```
 
-可选的 GLM-5.2 / MiniMax M3 原生自定义内核目前需要 HEAD 构建：
-
-```bash
-brew install omlx --HEAD --with-custom-kernel
-```
-
 ### 从源码安装
 
 ```bash
 git clone https://github.com/jundot/omlx.git
 cd omlx
-pip install -e .          # 仅核心
-pip install -e ".[mcp]"   # 含 MCP（Model Context Protocol）支持
-
-# 可选：GLM-5.2 / MiniMax M3 原生自定义内核
-OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
+make install                # 以 editable 模式安装（含 Web UI 和原生自定义内核）
+# 没有完整 Xcode 时，用 make install-no-kernels 安装不含内核的版本
+make mcp                    # 可选：添加 MCP（Model Context Protocol）支持
 ```
 
-需要 macOS 15.0+ (Sequoia), Python 3.10+ 和 Apple Silicon（M1/M2/M3/M4/M5）。
+需要 macOS 15.0+ (Sequoia)、Python 3.11–3.13 和 Apple Silicon（M1/M2/M3/M4/M5）。
+
+> **关于原生自定义内核：** GLM-5.2、MiniMax M3 和 Qwen3.5 需要这些内核，缺少时会在没有提示的情况下回退到慢得多的通用路径。`make install` 会一并构建内核并检查每个内核都能加载，这需要带 Metal 工具链的完整 Xcode（`xcodebuild -downloadComponent MetalToolchain`），仅有 Command Line Tools 不够。没有 Xcode 时，请使用已预编译内核的官方 DMG，或使用 `make install-no-kernels`。`make kernels` 只从头重新构建内核。检查安装：
+>
+> ```bash
+> python -c "from omlx.custom_kernels import native_kernel_status; print(native_kernel_status())"
+> ```
 
 ## 快速开始
 
@@ -228,7 +223,7 @@ brew services info omlx     # 查看状态
 
 ### API 兼容性
 
-OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream_options.include_usage`）、Anthropic adaptive thinking 和视觉输入（base64、URL）。
+OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream_options.include_usage`）、llama.cpp 风格的 prefill 进度（`return_progress`）、Anthropic adaptive thinking 和视觉输入（base64、URL）。
 
 | 端点 | 说明 |
 |----------|------|
@@ -240,6 +235,8 @@ OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream
 | `POST /v1/systemone` | 决策模型的类型化判断 (TypeSafe System One) |
 | `GET /v1/models` | 列出可用模型 |
 | `POST /tokenize`, `POST /detokenize` | 兼容 vLLM 的分词器 API（也可通过 `/v1` 访问） |
+
+用于设置、模型、下载、量化和基准测试的管理 API 接受主 API 密钥作为 Bearer 令牌，在 headless 模式下同样可用。详见 [Admin API](docs/admin-api.md)。
 
 ### 工具调用与结构化输出
 
@@ -309,6 +306,9 @@ omlx serve --model-dir ~/models --hf-endpoint https://hf-mirror.com
 # API 密钥认证
 omlx serve --model-dir ~/models --api-key your-secret-key
 # 仅限 Localhost：在管理后台全局设置中跳过验证
+
+# 仅运行推理和管理 API，不启用 Web UI（不会保存到设置）
+omlx serve --model-dir ~/models --headless
 ```
 
 以上所有设置也可以在 `/admin` 的 Web 管理后台中配置。设置保存在 `~/.omlx/settings.json`，CLI 参数优先级更高。
@@ -341,31 +341,46 @@ FastAPI Server (OpenAI / Anthropic API)
 
 ## 开发
 
+### 构建命令
+
+| 命令 | 作用 |
+|---|---|
+| `make install` | 以 editable 模式安装服务器和 Web UI，并构建原生自定义内核 |
+| `make install-no-kernels` | 不含内核的相同安装（适用于没有完整 Xcode 的环境） |
+| `make mcp` | 添加 MCP（Model Context Protocol）支持 |
+| `make dev` | 与 `make install` 相同，另含开发工具（`make dev-no-kernels` 不含内核） |
+| `make kernels` | 删除已构建的原生自定义内核并重新编译，然后检查每个内核都能加载 |
+| `make web` | 重新构建 Web UI 的 CSS 并规范化翻译文件 |
+| `make app` | 暂存包含新编译原生自定义内核的 `oMLX.app` |
+
+构建原生自定义内核需要带 Metal 工具链的完整 Xcode（`xcodebuild -downloadComponent MetalToolchain`）。
+
 ### CLI 服务器
 
 ```bash
 git clone https://github.com/jundot/omlx.git
 cd omlx
-pip install -e ".[dev]"
+make dev
 pytest -m "not slow"
 ```
 
+### Web UI
+
+Web 管理界面位于 `apps/omlx-web/`，并包含在同一个包中，因此 `make dev` 会一并安装。修改模板、JavaScript 或翻译后，运行 `make web` 重新构建 CSS 并规范化翻译文件。
+
 ### macOS 应用
 
-原生 SwiftUI 应用位于 `apps/omlx-mac/`，需要 Xcode 26.5+ 和 Python 3.11+。venvstacks 已声明为 dev 依赖，因此 `pip install -e ".[dev]"`（或 `uv sync --dev`）会引入固定版本。若偏好主机全局工具运行器，也可使用 `uvx venvstacks` 或 `pipx run venvstacks`。
+原生 SwiftUI 应用位于 `apps/omlx-mac/`，需要 Xcode 26.5+ 和 Python 3.11+。venvstacks 已声明为 dev 依赖，因此 `make dev`（或 `uv sync --dev`）会引入固定版本。若偏好主机全局工具运行器，也可使用 `uvx venvstacks` 或 `pipx run venvstacks`。
 
 ```bash
-# 暂存可运行的 oMLX.app（xcodebuild + venvstacks Python 层 + ad-hoc 签名）
-apps/omlx-mac/Scripts/build.sh release
+# 暂存可运行的 oMLX.app（xcodebuild + venvstacks Python 层 + 原生内核 + ad-hoc 签名）
+make app
 
 # 结果在 apps/omlx-mac/build/Stage/oMLX.app
 open apps/omlx-mac/build/Stage/oMLX.app
 
 # 强制重建 venvstacks（默认按指纹缓存）
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
-
-# 暂存包含可选 GLM-5.2 / MiniMax M3 原生自定义内核的应用
-apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 
 首次 cold 构建需要 10–20 分钟（venvstacks Python 层组装）。后续构建复用 `packaging/_export/` 缓存，约 4 分钟完成。层配置请参阅 [packaging/README.md](packaging/README.md)，Swift 源码请参阅 [apps/omlx-mac/](apps/omlx-mac/)。

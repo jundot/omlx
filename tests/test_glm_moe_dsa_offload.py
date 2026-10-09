@@ -266,13 +266,6 @@ def test_uncovered_checkpoint_is_skipped(tmp_path):
     assert isinstance(model.model.layers[0].mlp.switch_mlp, SwitchGLU)
 
 
-def test_kill_switch(tmp_path, reference, monkeypatch):
-    monkeypatch.setenv("OMLX_MOE_EXPERT_OFFLOAD", "0")
-    model = _Model([_copy(reference)])
-    assert glm.apply_glm_moe_expert_offload(model, tmp_path, 0.25) == 0
-    assert apply_moe_expert_offload(model, tmp_path, 0.25) == 0
-
-
 def test_common_entry_point_dispatches_glm(tmp_path, reference):
     """The engine calls apply_moe_expert_offload; GLM blocks are wrapped by
     their adapter, counted once, and seen by the shared walkers."""
@@ -332,7 +325,7 @@ def test_wrap_and_release_return_descriptors_to_baseline(tmp_path, reference):
 def test_serial_reads_match_reference(tmp_path, reference, monkeypatch):
     from omlx.patches.moe_expert_offload import _shutdown_io_pool
 
-    monkeypatch.setenv("OMLX_MOE_OFFLOAD_IO_WORKERS", "1")
+    monkeypatch.setattr("omlx.patches.moe_expert_offload._IO_WORKERS", 1)
     _shutdown_io_pool()
     try:
         wrapped = _wrapped(tmp_path, reference, 0.25)

@@ -31,7 +31,7 @@ same math with fewer, cheaper dispatches:
   which is ALU-bound at GQA 16).
 
 Exactness: a one-row (decode) forward is bit-identical to the reference
-below ``_FLASH_MIN_KEYS`` keys (or with ``OMLX_MIMO_DECODE_FLASH=0``).
+below ``_FLASH_MIN_KEYS`` keys.
 For verify forwards (L > 1) two reductions run in another order than the
 reference: every row's router logits are the M=1 gemv a decode step computes
 (MLX's batched float32 matmul sums differently) and chunked attention rows
@@ -53,7 +53,6 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import logging
-import os
 import sys
 from functools import lru_cache
 from typing import Optional
@@ -75,57 +74,16 @@ _SELECT_MAX_EXPERTS = 1024
 _SELECT_MAX_TOPK = 32
 
 
-def _env_on(name: str) -> bool:
-    return os.environ.get(name, "1").strip().lower() not in ("0", "false", "off", "no")
-
-
 def enabled() -> bool:
-    """On by default on M5 (NAX) GPUs, where the fused path is validated.
-
-    OMLX_MIMO_DECODE_FAST=1 forces it on elsewhere, =0 turns it off.
-    """
-    value = os.environ.get("OMLX_MIMO_DECODE_FAST", "").strip().lower()
-    if value in ("0", "false", "off", "no"):
-        return False
-    if value in ("1", "true", "on", "yes"):
-        return True
-    return _nax_available()
-
-
-def _nax_available() -> bool:
+    """On M5 (NAX) GPUs, where the fused path is validated."""
     try:
         return bool(is_nax_available())
     except Exception:  # noqa: BLE001
         return False
 
 
-def sdpa_chunks_enabled() -> bool:
-    """Verify rows beyond the vector SDPA limit run as row chunks; on by default."""
-    return _env_on("OMLX_MIMO_DECODE_SDPA_CHUNKS")
-
-
-def experts_enabled() -> bool:
-    """Decode-time MXFP4 expert kernels (``moe_decode``); on by default."""
-    return _env_on("OMLX_MIMO_DECODE_EXPERTS")
-
-
-def sdpa_flash_enabled() -> bool:
-    """Long-context attention through the split-key matrix kernel
-    (``sdpa_flash``: MLX's float32 math in another summation order); on by
-    default."""
-    return _env_on("OMLX_MIMO_DECODE_FLASH")
-
-
 # Key count from which ``sdpa_flash`` serves decode / verify attention.
 _FLASH_MIN_KEYS = 4096
-
-
-def _flash_min_keys() -> int:
-    value = os.environ.get("OMLX_MIMO_DECODE_FLASH_MIN_KEYS", "")
-    try:
-        return max(1, int(value)) if value else _FLASH_MIN_KEYS
-    except ValueError:
-        return _FLASH_MIN_KEYS
 
 
 # ---------------------------------------------------------------------------
@@ -894,28 +852,26 @@ def _is_mlx_sdpa(fn) -> bool:
     return bool(names) and getattr(fn, "__name__", "") in names
 
 
-def _vector_attention(q, k, v, cache, scale, mask, sinks, kernels):
+def _vector_attention(q, k, v, cache, scale, mask, sinks):
     """``(B, L, H * Dv)`` attention of a short forward from the one-pass
     kernels, or ``None`` (the caller keeps MLX's SDPA).
 
-    ``kernels`` is ``(flash, flash_min_keys)``.  From ``flash_min_keys`` keys
-    ``sdpa_flash`` serves every row count, so a verify row's attention matches
-    the one-row decode's.
+    From ``_FLASH_MIN_KEYS`` keys ``sdpa_flash`` serves every row count, so a
+    verify row's attention matches the one-row decode's.
     """
-    flash_on, flash_min = kernels
-    if not flash_on or cache is None or hasattr(cache, "bits"):
+    if cache is None or hasattr(cache, "bits"):
         return None
     inner = getattr(cache, "_cache", None)
     if inner is not None and hasattr(inner, "bits"):
         return None
     if not isinstance(k, mx.array) or not isinstance(v, mx.array) or k.ndim != 4:
         return None
-    if k.shape[2] < flash_min:
+    if k.shape[2] < _FLASH_MIN_KEYS:
         return None
     return sdpa_flash.sdpa_flash(q, k, v, scale, mask, sinks)
 
 
-def _attention(attn, x, mask, cache, sdpa, offsets_memo, row_chunks, kernels=(False, 0)):
+def _attention(attn, x, mask, cache, sdpa, offsets_memo, flash=False):
     B, L, _ = x.shape
     fused = attn.__dict__.get("_omlx_qkv")
     if fused and not fused.current(attn):
@@ -964,13 +920,14 @@ def _attention(attn, x, mask, cache, sdpa, offsets_memo, row_chunks, kernels=(Fa
         queries = attn.rope(queries, offset=offset)
         keys = attn.rope(keys, offset=offset)
     keys, values = cache.update_and_fetch(keys, values)
-    output = _vector_attention(
-        queries, keys, values, cache, attn.scale, mask, attn.attention_sink_bias, kernels
-    )
-    if output is not None:
-        return attn.o_proj(output)
+    if flash:
+        output = _vector_attention(
+            queries, keys, values, cache, attn.scale, mask, attn.attention_sink_bias
+        )
+        if output is not None:
+            return attn.o_proj(output)
     n_rep = max(1, attn.n_heads // attn.n_kv_heads)
-    if row_chunks and L > 1 and L * n_rep > _SDPA_VECTOR_ROWS and n_rep <= _SDPA_VECTOR_ROWS:
+    if L > 1 and L * n_rep > _SDPA_VECTOR_ROWS and n_rep <= _SDPA_VECTOR_ROWS:
         output = _sdpa_row_chunks(
             sdpa,
             queries,
@@ -1050,19 +1007,13 @@ def run_layers(model, h, cache, full_mask, swa_mask):
     x = mx.fast.rms_norm(h, first.weight, first.eps)
     n = len(layers)
     offsets_memo = {}
-    use_experts = experts_enabled()
-    row_chunks = sdpa_chunks_enabled()
     # sdpa_flash replaces MLX's own SDPA only; a patched attention function
     # bound in the model module keeps serving its calls.
-    kernels = (False, 0)
-    if _is_mlx_sdpa(sdpa):
-        kernels = (sdpa_flash_enabled(), _flash_min_keys())
+    flash = _is_mlx_sdpa(sdpa)
     for i, layer in enumerate(layers):
         nxt = layers[i + 1].input_layernorm if i + 1 < n else model.norm
         mask = swa_mask if layer.is_sliding_window else full_mask
-        a = _attention(
-            layer.self_attn, x, mask, cache[i], sdpa, offsets_memo, row_chunks, kernels
-        )
+        a = _attention(layer.self_attn, x, mask, cache[i], sdpa, offsets_memo, flash)
         post = layer.post_attention_layernorm
         mlp = layer.mlp
         gate = getattr(mlp, "gate", None)
@@ -1080,7 +1031,7 @@ def run_layers(model, h, cache, full_mask, swa_mask):
         inds, scores = router_select(
             logits, gc.bias32, gate.top_k, gate.norm_topk_prob, gate.routed_scaling_factor
         )
-        kind = _expert_layout(mlp) if use_experts else None
+        kind = _expert_layout(mlp)
         if kind:
             y = _experts(mlp.switch_mlp, kind, xm, inds)
         else:
