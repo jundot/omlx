@@ -1471,9 +1471,13 @@ class TestCausalLMSharedPrefix:
         assert [round(score, 4) for score in result.scores] == [
             round(score, 4) for score in expected
         ]
-        assert result.indices == sorted(
-            range(len(documents)), key=lambda index: -expected[index]
-        )
+        if distinct:
+            # Identical documents tie, and reusing the cache can move a tie by
+            # less than the 1e-4 compared above, so only distinct scores pin
+            # the ordering.
+            assert result.indices == sorted(
+                range(len(documents)), key=lambda index: -expected[index]
+            )
 
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     def test_scores_match_a_per_document_forward_when_truncated(self, tmp_path):
