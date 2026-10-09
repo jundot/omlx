@@ -17,6 +17,7 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 
 from omlx.patches.mlx_lm_mtp import prompt_priming
+from omlx.prefill.packed import PackedBatch, PackedRow, PackedRows
 
 
 TINY_CONFIG = {
@@ -1176,6 +1177,31 @@ def capture(host, tokens, offset):
     prompt_priming.maybe_capture(
         host, inputs, inputs[..., None], [SimpleNamespace(offset=offset)]
     )
+
+
+def test_packed_prefill_folds_each_row_into_its_own_request():
+
+    host = HeadHost()
+    prepare(host, "a", [1, 2, 3, 4])
+    capture(host, [1, 2], 2)
+    prepare(host, "b", [5, 6, 7, 8, 9])
+    capture(host, [5, 6], 2)
+    previous = prompt_priming._find_ctx(host)
+    batch = PackedBatch(
+        [
+            PackedRow("a", mx.array([[3, 4]]), [SimpleNamespace(offset=4)]),
+            PackedRow("b", mx.array([[7, 8, 9]]), [SimpleNamespace(offset=5)]),
+        ]
+    )
+    inputs = mx.array([[3, 4, 7, 8, 9]])
+    cache = [PackedRows(batch, [row.cache[0] for row in batch.rows])]
+    prompt_priming.maybe_capture(host, inputs, inputs[..., None], cache)
+    assert prompt_priming._find_ctx(host) is previous
+    prompt_priming.bind_uid(host, "a", 11)
+    prompt_priming.bind_uid(host, "b", 12)
+    _, state = prompt_priming._owned(host)
+    assert state.uids[11][0].mtp_cache[0].pairs == [(1, 2), (2, 3), (3, 4)]
+    assert state.uids[12][0].mtp_cache[0].pairs == [(5, 6), (6, 7), (7, 8), (8, 9)]
 
 
 def test_interleaved_equal_length_requests_keep_distinct_history():

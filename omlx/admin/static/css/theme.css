@@ -1,0 +1,297 @@
+/*
+ * Web UI color tokens. Every color the web UI draws is defined in this file.
+ * Palette entries are "R G B" channels so `rgb(var(--palette-x) / <alpha>)`
+ * and Tailwind's opacity modifiers keep working. The semantic tokens below
+ * name roles and refer to the palette; stylesheets and templates refer to
+ * the semantic tokens or, for one-off marks, to the palette.
+ */
+:root {
+    /* neutral */
+    --palette-neutral-50: 250 250 250;
+    --palette-neutral-100: 245 245 245;
+    --palette-neutral-200: 229 229 229;
+    --palette-neutral-300: 212 212 212;
+    --palette-neutral-400: 163 163 163;
+    --palette-neutral-500: 115 115 115;
+    --palette-neutral-600: 82 82 82;
+    --palette-neutral-700: 64 64 64;
+    --palette-neutral-800: 38 38 38;
+    --palette-neutral-900: 23 23 23;
+    --palette-neutral-950: 10 10 10;
+    /* zinc */
+    --palette-zinc-200: 228 228 231;
+    --palette-zinc-300: 212 212 216;
+    --palette-zinc-400: 161 161 170;
+    --palette-zinc-500: 113 113 122;
+    --palette-zinc-600: 82 82 91;
+    --palette-zinc-700: 63 63 70;
+    --palette-zinc-800: 39 39 42;
+    --palette-zinc-900: 24 24 27;
+    /* white */
+    --palette-white: 255 255 255;
+    /* black */
+    --palette-black: 0 0 0;
+    /* gray */
+    --palette-gray-50: 249 250 251;
+    --palette-gray-100: 243 244 246;
+    --palette-gray-200: 229 231 235;
+    --palette-gray-300: 209 213 219;
+    --palette-gray-400: 156 163 175;
+    --palette-gray-500: 107 114 128;
+    --palette-gray-600: 75 85 99;
+    --palette-gray-700: 55 65 81;
+    --palette-gray-800: 31 41 55;
+    --palette-gray-900: 17 24 39;
+    --palette-gray-950: 3 7 18;
+    /* slate */
+    --palette-slate-50: 248 250 252;
+    --palette-slate-100: 241 245 249;
+    --palette-slate-200: 226 232 240;
+    --palette-slate-300: 203 213 225;
+    --palette-slate-400: 148 163 184;
+    --palette-slate-500: 100 116 139;
+    --palette-slate-600: 71 85 105;
+    --palette-slate-800: 30 41 59;
+    --palette-slate-900: 15 23 42;
+    /* red */
+    --palette-red-50: 254 242 242;
+    --palette-red-100: 254 226 226;
+    --palette-red-200: 254 202 202;
+    --palette-red-300: 252 165 165;
+    --palette-red-400: 248 113 113;
+    --palette-red-500: 239 68 68;
+    --palette-red-600: 220 38 38;
+    --palette-red-700: 185 28 28;
+    --palette-red-800: 153 27 27;
+    --palette-red-900: 127 29 29;
+    --palette-red-950: 69 10 10;
+    /* orange */
+    --palette-orange-50: 255 247 237;
+    --palette-orange-100: 255 237 213;
+    --palette-orange-200: 254 215 170;
+    --palette-orange-300: 253 186 116;
+    --palette-orange-400: 251 146 60;
+    --palette-orange-500: 249 115 22;
+    --palette-orange-600: 234 88 12;
+    --palette-orange-700: 194 65 12;
+    --palette-orange-800: 154 52 18;
+    --palette-orange-900: 124 45 18;
+    --palette-orange-950: 67 20 7;
+    /* amber */
+    --palette-amber-50: 255 251 235;
+    --palette-amber-100: 254 243 199;
+    --palette-amber-200: 253 230 138;
+    --palette-amber-300: 252 211 77;
+    --palette-amber-400: 251 191 36;
+    --palette-amber-500: 245 158 11;
+    --palette-amber-600: 217 119 6;
+    --palette-amber-700: 180 83 9;
+    --palette-amber-800: 146 64 14;
+    --palette-amber-900: 120 53 15;
+    --palette-amber-950: 69 26 3;
+    /* yellow */
+    --palette-yellow-400: 250 204 21;
+    /* lime */
+    --palette-lime-200: 217 249 157;
+    --palette-lime-300: 190 242 100;
+    /* green */
+    --palette-green-50: 240 253 244;
+    --palette-green-100: 220 252 231;
+    --palette-green-200: 187 247 208;
+    --palette-green-300: 134 239 172;
+    --palette-green-400: 74 222 128;
+    --palette-green-500: 34 197 94;
+    --palette-green-600: 22 163 74;
+    --palette-green-700: 21 128 61;
+    --palette-green-800: 22 101 52;
+    --palette-green-900: 20 83 45;
+    --palette-green-950: 5 46 22;
+    /* emerald */
+    --palette-emerald-50: 236 253 245;
+    --palette-emerald-100: 209 250 229;
+    --palette-emerald-200: 167 243 208;
+    --palette-emerald-300: 110 231 183;
+    --palette-emerald-400: 52 211 153;
+    --palette-emerald-500: 16 185 129;
+    --palette-emerald-600: 5 150 105;
+    --palette-emerald-700: 4 120 87;
+    --palette-emerald-800: 6 95 70;
+    --palette-emerald-900: 6 78 59;
+    --palette-emerald-950: 2 44 34;
+    /* teal */
+    --palette-teal-50: 240 253 250;
+    --palette-teal-100: 204 251 241;
+    --palette-teal-200: 153 246 228;
+    --palette-teal-300: 94 234 212;
+    --palette-teal-400: 45 212 191;
+    --palette-teal-500: 20 184 166;
+    --palette-teal-600: 13 148 136;
+    --palette-teal-700: 15 118 110;
+    --palette-teal-800: 17 94 89;
+    --palette-teal-900: 19 78 74;
+    --palette-teal-950: 4 47 46;
+    /* cyan */
+    --palette-cyan-50: 236 254 255;
+    --palette-cyan-100: 207 250 254;
+    --palette-cyan-200: 165 243 252;
+    --palette-cyan-300: 103 232 249;
+    --palette-cyan-400: 34 211 238;
+    --palette-cyan-500: 6 182 212;
+    --palette-cyan-600: 8 145 178;
+    --palette-cyan-700: 14 116 144;
+    --palette-cyan-800: 21 94 117;
+    --palette-cyan-900: 22 78 99;
+    --palette-cyan-950: 8 51 68;
+    /* sky */
+    --palette-sky-50: 240 249 255;
+    --palette-sky-100: 224 242 254;
+    --palette-sky-200: 186 230 253;
+    --palette-sky-300: 125 211 252;
+    --palette-sky-400: 56 189 248;
+    --palette-sky-500: 14 165 233;
+    --palette-sky-600: 2 132 199;
+    --palette-sky-700: 3 105 161;
+    --palette-sky-800: 7 89 133;
+    --palette-sky-900: 12 74 110;
+    --palette-sky-950: 8 47 73;
+    /* blue */
+    --palette-blue-50: 239 246 255;
+    --palette-blue-100: 219 234 254;
+    --palette-blue-200: 191 219 254;
+    --palette-blue-300: 147 197 253;
+    --palette-blue-400: 96 165 250;
+    --palette-blue-500: 59 130 246;
+    --palette-blue-600: 37 99 235;
+    --palette-blue-700: 29 78 216;
+    --palette-blue-800: 30 64 175;
+    --palette-blue-900: 30 58 138;
+    --palette-blue-950: 23 37 84;
+    /* indigo */
+    --palette-indigo-50: 238 242 255;
+    --palette-indigo-100: 224 231 255;
+    --palette-indigo-200: 199 210 254;
+    --palette-indigo-300: 165 180 252;
+    --palette-indigo-400: 129 140 248;
+    --palette-indigo-500: 99 102 241;
+    --palette-indigo-600: 79 70 229;
+    --palette-indigo-700: 67 56 202;
+    --palette-indigo-800: 55 48 163;
+    --palette-indigo-900: 49 46 129;
+    --palette-indigo-950: 30 27 75;
+    /* violet */
+    --palette-violet-50: 245 243 255;
+    --palette-violet-100: 237 233 254;
+    --palette-violet-200: 221 214 254;
+    --palette-violet-300: 196 181 253;
+    --palette-violet-400: 167 139 250;
+    --palette-violet-500: 139 92 246;
+    --palette-violet-600: 124 58 237;
+    --palette-violet-700: 109 40 217;
+    --palette-violet-800: 91 33 182;
+    --palette-violet-900: 76 29 149;
+    --palette-violet-950: 46 16 101;
+    /* purple */
+    --palette-purple-50: 250 245 255;
+    --palette-purple-100: 243 232 255;
+    --palette-purple-200: 233 213 255;
+    --palette-purple-300: 216 180 254;
+    --palette-purple-400: 192 132 252;
+    --palette-purple-500: 168 85 247;
+    --palette-purple-600: 147 51 234;
+    --palette-purple-700: 126 34 206;
+    --palette-purple-800: 107 33 168;
+    --palette-purple-900: 88 28 135;
+    --palette-purple-950: 59 7 100;
+    /* pink */
+    --palette-pink-50: 253 242 248;
+    --palette-pink-100: 252 231 243;
+    --palette-pink-200: 251 207 232;
+    --palette-pink-300: 249 168 212;
+    --palette-pink-400: 244 114 182;
+    --palette-pink-500: 236 72 153;
+    --palette-pink-600: 219 39 119;
+    --palette-pink-700: 190 24 93;
+    --palette-pink-800: 157 23 77;
+    --palette-pink-900: 131 24 67;
+    --palette-pink-950: 80 7 36;
+    /* rose */
+    --palette-rose-50: 255 241 242;
+    --palette-rose-100: 255 228 230;
+    --palette-rose-200: 254 205 211;
+    --palette-rose-300: 253 164 175;
+    --palette-rose-400: 251 113 133;
+    --palette-rose-500: 244 63 94;
+    --palette-rose-600: 225 29 72;
+    --palette-rose-700: 190 18 60;
+    --palette-rose-800: 159 18 57;
+    --palette-rose-900: 136 19 55;
+    --palette-rose-950: 76 5 25;
+    /* night */
+    --palette-night-50: 239 239 239;
+    --palette-night-700: 45 45 50;
+    --palette-night-800: 37 37 41;
+    --palette-night-850: 29 29 32;
+    --palette-night-900: 26 26 29;
+    --palette-night-950: 15 15 17;
+    /* signal-red */
+    --palette-signal-red-400: 239 91 84;
+    --palette-signal-red-600: 217 45 32;
+    /* mid-gray */
+    --palette-mid-gray: 128 128 128;
+    /* fabric-ink */
+    --palette-fabric-ink-450: 17 19 31;
+    --palette-fabric-ink-500: 17 19 26;
+    --palette-fabric-ink-550: 15 18 27;
+    --palette-fabric-ink-600: 16 21 34;
+    --palette-fabric-ink-700: 8 15 25;
+    --palette-fabric-ink-725: 8 13 22;
+    --palette-fabric-ink-750: 8 12 20;
+    --palette-fabric-ink-775: 10 13 20;
+    --palette-fabric-ink-800: 11 13 18;
+    --palette-fabric-ink-950: 2 6 15;
+    /* fabric-lime */
+    --palette-fabric-lime-300: 183 243 74;
+    --palette-fabric-lime-600: 118 185 0;
+    --palette-fabric-lime-800: 74 112 0;
+
+    /* Surfaces, text, borders and controls */
+    --bg-primary: rgb(var(--palette-white));
+    --bg-secondary: rgb(var(--palette-slate-50));
+    --bg-tertiary: rgb(var(--palette-slate-100));
+    --text-primary: rgb(var(--palette-slate-900));
+    --text-secondary: rgb(var(--palette-slate-600));
+    --text-tertiary: rgb(var(--palette-slate-500));
+    --text-muted: rgb(var(--palette-slate-400));
+    --border-faint: rgb(var(--palette-slate-200));
+    --border-normal: rgb(var(--palette-slate-300));
+    --code-bg: rgb(var(--palette-gray-100));
+    --link-color: rgb(var(--palette-blue-600));
+    --btn-primary: rgb(var(--palette-neutral-900));
+    --btn-primary-hover: rgb(var(--palette-zinc-800));
+    --btn-primary-text: rgb(var(--palette-white));
+    --text-danger: rgb(var(--palette-red-500));
+    --bg-danger-hover: rgb(var(--palette-red-500) / 0.1);
+    --timeline-accent: rgb(var(--palette-blue-500));
+    --focus-ring-color: rgb(var(--palette-neutral-900));
+}
+
+[data-theme="dark"] {
+    --bg-primary: rgb(var(--palette-night-850));
+    --bg-secondary: rgb(var(--palette-night-800));
+    --bg-tertiary: rgb(var(--palette-night-700));
+    --text-primary: rgb(var(--palette-night-50));
+    --text-secondary: rgb(var(--palette-zinc-400));
+    --text-tertiary: rgb(var(--palette-zinc-500));
+    --text-muted: rgb(var(--palette-zinc-600));
+    --border-faint: rgb(var(--palette-zinc-700));
+    --border-normal: rgb(var(--palette-zinc-600));
+    --code-bg: rgb(var(--palette-zinc-800));
+    --link-color: rgb(var(--palette-blue-400));
+    --btn-primary: rgb(var(--palette-neutral-200));
+    --btn-primary-hover: rgb(var(--palette-neutral-300));
+    --btn-primary-text: rgb(var(--palette-zinc-900));
+    --text-danger: rgb(var(--palette-red-400));
+    --bg-danger-hover: rgb(var(--palette-red-500) / 0.2);
+    --timeline-accent: rgb(var(--palette-blue-400));
+    --focus-ring-color: rgb(var(--palette-night-50));
+}

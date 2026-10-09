@@ -1,5 +1,9 @@
 import json
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SETTINGS = (
@@ -30,11 +34,6 @@ def test_decode_priority_toggle_keeps_its_fixed_width():
 
 
 def test_loading_cache_settings_preserves_size_until_slider_edit():
-    import shutil
-    import subprocess
-
-    import pytest
-
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node.js is required for dashboard behavior tests")
@@ -71,3 +70,47 @@ const source = fs.readFileSync('omlx/admin/static/js/dashboard.js', 'utf8');
         [node, "-e", script], cwd=ROOT, capture_output=True, text=True
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_settings_section_anchor_does_not_outlive_its_tab():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for dashboard behavior tests")
+    script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const source = fs.readFileSync('omlx/admin/static/js/dashboard.js', 'utf8');
+const location = {};
+const setUrl = (href) => {
+    const url = new URL(href, 'http://h/admin/dashboard');
+    Object.assign(location, {href: url.href, search: url.search, hash: url.hash,
+                             origin: url.origin, pathname: url.pathname});
+};
+const context = {
+    localStorage: {getItem: () => null},
+    THEME_STORAGE_KEY: 'theme', ENHANCED_READABILITY_KEY: 'readability',
+    window: {t: key => key, location, history: {replaceState: (_s, _t, url) => setUrl(String(url))}},
+    navigator: {language: 'en'}, document: {}, console, URL, URLSearchParams,
+};
+const state = vm.runInNewContext(source + '\n dashboard;', context)();
+state.globalSettings.server.distributed_inference_active = false;
+
+setUrl('/admin/dashboard#settings-cache');
+state.applyTabStateFromUrl();
+assert.equal(state.mainTab, 'settings');
+assert.equal(state.activeTab, 'global');
+assert.equal(state.settingsActiveSection, 'settings-cache');
+
+state.setMainTab('status');
+assert.equal(location.hash, '');
+
+setUrl('/admin/dashboard?tab=status#settings-cache');
+state.applyTabStateFromUrl();
+assert.equal(state.mainTab, 'status');
+"""
+    result = subprocess.run(
+        [node, "-e", script], cwd=ROOT, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+

@@ -237,3 +237,49 @@ def test_accuracy_extra_body_i18n_keys_exist_in_every_locale():
         translations = json.loads(locale_path.read_text())
         missing = keys - translations.keys()
         assert not missing, f"{locale_path.name} is missing {sorted(missing)}"
+
+
+def test_accuracy_presets_and_run_confirmation():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for dashboard behavior tests")
+    script = r"""
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const context = {window: {t: key => key}, localStorage: {getItem: () => null}, document: {}};
+const source = fs.readFileSync('omlx/admin/static/js/dashboard.js', 'utf8');
+const state = vm.runInNewContext(source + '\n dashboard;', context)();
+const selected = () => Object.keys(state.accBenchmarks).filter(k => state.accBenchmarks[k]);
+
+// The default selection is the standard preset.
+assert.equal(state.accActivePreset, 'standard');
+state.applyAccPreset('quick');
+assert.deepEqual(selected(), ['mmlu', 'arc_challenge', 'gsm8k']);
+assert.equal(state.accActivePreset, 'quick');
+state.applyAccPreset('full');
+assert.ok(Object.values(state.accBenchmarks).every(Boolean));
+assert.ok(Object.values(state.accSampleSizes).every(size => size === 0));
+state.accBenchmarks.mmlu = false;
+assert.equal(state.accActivePreset, 'custom');
+
+const calls = [];
+state.startBenchmark = () => calls.push('throughput');
+state.addToAccQueue = () => calls.push('accuracy');
+state.requestBenchConfirm('accuracy');
+assert.equal(state.benchConfirm, 'accuracy');
+assert.deepEqual(calls, []);
+state.confirmBenchRun();
+assert.deepEqual(calls, ['accuracy']);
+// External endpoints and additions to a running queue do not ask.
+state.benchExternalEnabled = true;
+state.requestBenchConfirm('throughput');
+state.accRunning = true;
+state.requestBenchConfirm('accuracy');
+assert.equal(state.benchConfirm, null);
+assert.deepEqual(calls, ['accuracy', 'throughput', 'accuracy']);
+"""
+    result = subprocess.run(
+        [node, "-e", script], cwd=ROOT, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

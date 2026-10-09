@@ -719,6 +719,31 @@ class TestDetectModelType:
         (tmp_path / "modules.json").write_text(json.dumps(modules))
         assert detect_model_type(tmp_path) == "llm"
 
+    def test_detect_embedding_gemma2_with_vision_config_as_embedding(self, tmp_path):
+        """EmbeddingGemma 2 ships a vision_config and sentence-transformers v6 modules."""
+        config = {
+            "model_type": "embedding_gemma2",
+            "architectures": ["EmbeddingGemma2Model"],
+            "vision_config": {"model_type": "gemma4_vision", "hidden_size": 768},
+        }
+        modules = [
+            {
+                "idx": 0,
+                "name": "0",
+                "path": "",
+                "type": "sentence_transformers.base.modules.transformer.Transformer",
+            },
+            {
+                "idx": 1,
+                "name": "1",
+                "path": "1_Pooling",
+                "type": "sentence_transformers.sentence_transformer.modules.pooling.Pooling",
+            },
+        ]
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        (tmp_path / "modules.json").write_text(json.dumps(modules))
+        assert detect_model_type(tmp_path) == "embedding"
+
     def test_detect_vlm_model_type_requires_vision_config(self, tmp_path):
         """VLM_MODEL_TYPES match without vision_config should fall back to LLM."""
         config = {

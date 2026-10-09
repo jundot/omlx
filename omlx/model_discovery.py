@@ -220,6 +220,7 @@ EMBEDDING_ARCHITECTURES = {
     "SiglipModel",
     "SiglipVisionModel",
     "SiglipTextModel",
+    "EmbeddingGemma2Model",  # via mlx-vlm; has vision_config, checked before VLM
 }
 
 # Supported reranker architectures

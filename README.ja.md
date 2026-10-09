@@ -228,7 +228,7 @@ Claude Codeで小さなコンテキストモデルを実行するため、トー
 
 ### API互換性
 
-OpenAIとAnthropic APIのドロップイン代替です。ストリーミング使用統計（`stream_options.include_usage`）、Anthropic adaptive thinking、ビジョン入力（base64、URL）をサポートします。
+OpenAIとAnthropic APIのドロップイン代替です。ストリーミング使用統計（`stream_options.include_usage`）、llama.cpp互換のprefill進捗（`return_progress`）、Anthropic adaptive thinking、ビジョン入力（base64、URL）をサポートします。
 
 | エンドポイント | 説明 |
 |----------|------|
@@ -278,7 +278,7 @@ mlx-lmで利用可能なすべての関数呼び出し形式、JSONスキーマ�
 | LLM | [mlx-lm](https://github.com/ml-explore/mlx-lm)がサポートするすべてのモデル |
 | VLM | Qwen3.5シリーズ、GLM-4V、Pixtralおよびその他の[mlx-vlm](https://github.com/Blaizzy/mlx-vlm)モデル |
 | OCR | DeepSeek-OCR、DOTS-OCR、GLM-OCR |
-| エンベディング | BERT、BGE-M3、ModernBERT |
+| エンベディング | BERT、BGE-M3、ModernBERT、EmbeddingGemma 2 |
 | リランカー | ModernBERT、XLM-RoBERTa |
 | Decision | Clef、Clef-Flash、OpenJev |
 

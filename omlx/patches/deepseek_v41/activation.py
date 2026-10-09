@@ -21,13 +21,15 @@ _ROUND = r"""
 
 _SOURCE = r"""
     const uint i = thread_position_in_grid.x;
-    const uint n = N;
+    uint n = 1;
+    for (int dim = 0; dim < x_ndim; ++dim) n *= x_shape[dim];
     const float v = i < n ? float(x[i]) : 0.0f;
 """ + _ROUND
 
 _TAIL_SOURCE = r"""
     const uint i = thread_position_in_grid.x;
-    const uint n = N;
+    uint n = 1;
+    for (int dim = 0; dim < gate_ndim; ++dim) n *= gate_shape[dim];
     float v = 0.0f;
     if (i < n) {
         float g = gate[i], u = up[i];
@@ -52,7 +54,10 @@ def _kernel(tail=False, paired=False):
             name="v41_paired_swiglu_fp8_activation",
             input_names=["pair", "weights", "limit"],
             output_names=["y"],
-            source=_TAIL_SOURCE.replace(
+            source=_TAIL_SOURCE.replace("gate_ndim", "pair_ndim")
+            .replace("gate_shape", "pair_shape")
+            .replace("float v = 0.0f;", "n /= 2;\n    float v = 0.0f;")
+            .replace(
                 "float g = gate[i], u = up[i];",
                 "const uint j = (i / D) * (2 * D) + i % D; "
                 "float g = pair[j], u = pair[j + D];",
@@ -69,7 +74,7 @@ def _kernel(tail=False, paired=False):
 def quantize_fp8_activation(x):
     return _kernel()(
         inputs=[x],
-        template=[("T", x.dtype), ("N", x.size)],
+        template=[("T", x.dtype)],
         grid=(x.size, 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[x.shape],
@@ -87,7 +92,6 @@ def quantize_swiglu_activation(gate, up, weights, dtype, limit):
         ],
         template=[
             ("T", dtype),
-            ("N", gate.size),
             ("D", gate.shape[-1]),
             ("WEIGHTED", weights is not None),
         ],
@@ -110,7 +114,6 @@ def quantize_paired_swiglu_activation(pair, weights, dtype, limit):
         ],
         template=[
             ("T", dtype),
-            ("N", size),
             ("D", shape[-1]),
             ("WEIGHTED", weights is not None),
         ],

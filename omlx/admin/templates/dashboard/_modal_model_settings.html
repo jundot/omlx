@@ -9,11 +9,11 @@
 
         <!-- Modal -->
         <div class="flex min-h-full items-center justify-center p-4">
-            <div class="relative bg-white rounded-2xl sm:rounded-3xl shadow-2xl w-full max-w-4xl p-4 sm:p-8"
+            <div class="relative bg-white rounded-2xl shadow-2xl w-full max-w-4xl flex flex-col max-h-[calc(100vh-2rem)] overflow-hidden"
                  @click.stop>
 
-                <!-- Header -->
-                <div class="flex items-start justify-between gap-4 mb-6">
+                <!-- Title bar; the body scrolls below it and the actions stay pinned -->
+                <div class="flex-shrink-0 flex items-start justify-between gap-4 px-4 sm:px-8 py-4 sm:py-5 bg-neutral-50 border-b border-neutral-200">
                     <div class="min-w-0">
                         <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-1">{{ t('modal.model_settings.section_label') }}</h3>
                         <h4 id="model-settings-modal-title" tabindex="-1" autofocus class="text-xl font-bold tracking-tight text-neutral-900 break-words" x-text="selectedModel?.display_name || selectedModel?.name || selectedModel?.id"></h4>
@@ -32,12 +32,13 @@
                                     class="px-3 py-1.5 text-xs font-medium text-neutral-700 bg-neutral-100 hover:bg-neutral-200 rounded-full border border-neutral-200 transition-all disabled:opacity-50 disabled:cursor-not-allowed">{{ t('modal.model_settings.actions.recipe') }}</button>
                         </div>
                         <button @click="showModelSettingsModal = false"
-                                class="p-2 text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 rounded-full transition-all">
+                                class="p-2 text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
                             <i data-lucide="x" class="w-5 h-5"></i>
                         </button>
                     </div>
                 </div>
 
+                <div class="flex-1 min-h-0 overflow-y-auto px-4 sm:px-8 py-6">
                 <!-- Profiles / Templates / Presets section -->
                 <div class="mb-6 p-4 bg-neutral-50 rounded-xl border border-neutral-200"
                      x-show="!modelSettings.is_diffusion_model" x-cloak
@@ -48,20 +49,20 @@
                         <div class="flex items-center gap-2">
                             <span x-show="profileError" x-cloak class="text-xs text-red-600" x-text="profileError"></span>
                             <!-- Scope toggle -->
-                            <div class="flex items-center gap-1 bg-neutral-100 rounded-lg p-0.5">
+                            <div class="segmented segmented--sm">
                                 <button type="button" @click="setScope('preset')"
-                                        :class="profileScope === 'preset' ? 'bg-white text-neutral-900 shadow-sm' : 'text-neutral-500 hover:text-neutral-700'"
-                                        class="px-3 py-1 text-xs font-medium rounded-md transition-all">
+                                        :class="profileScope === 'preset' ? 'segmented__item--active' : ''"
+                                        class="segmented__item">
                                     {{ t('modal.model_settings.profiles.scope_preset') }}
                                 </button>
                                 <button type="button" @click="setScope('global')"
-                                        :class="profileScope === 'global' ? 'bg-white text-neutral-900 shadow-sm' : 'text-neutral-500 hover:text-neutral-700'"
-                                        class="px-3 py-1 text-xs font-medium rounded-md transition-all">
+                                        :class="profileScope === 'global' ? 'segmented__item--active' : ''"
+                                        class="segmented__item">
                                     {{ t('modal.model_settings.profiles.scope_global') }}
                                 </button>
                                 <button type="button" @click="setScope('model')"
-                                        :class="profileScope === 'model' ? 'bg-white text-neutral-900 shadow-sm' : 'text-neutral-500 hover:text-neutral-700'"
-                                        class="px-3 py-1 text-xs font-medium rounded-md transition-all">
+                                        :class="profileScope === 'model' ? 'segmented__item--active' : ''"
+                                        class="segmented__item">
                                     {{ t('modal.model_settings.profiles.scope_model') }}
                                 </button>
                             </div>
@@ -71,7 +72,7 @@
                                     :disabled="refreshingPresets"
                                     @mouseenter="showTip($event.currentTarget, 'Fetch latest presets from omlx.ai')"
                                     @mouseleave="hideTip()"
-                                    class="p-1 rounded-full text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 transition-all disabled:opacity-50">
+                                    class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 transition-all disabled:opacity-50">
                                 <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
                                      :class="refreshingPresets ? 'animate-spin' : ''" class="w-3.5 h-3.5">
                                     <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/>
@@ -94,7 +95,7 @@
                                 <button type="button" @click="applyPresetToForm(p)"
                                         @mouseenter="showTip($event.currentTarget, p.description)"
                                         @mouseleave="hideTip()"
-                                        class="px-2.5 py-1 text-xs rounded-full border border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100 transition-all"
+                                        class="px-2.5 py-1 text-xs rounded-lg border border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100 transition-all"
                                         x-text="p.display_name || p.name"></button>
                             </template>
                             <span x-show="presets.length === 0" x-cloak class="text-xs text-neutral-400 italic">{{ t('modal.model_settings.profiles.no_presets') }}</span>
@@ -110,23 +111,23 @@
                                 <div class="inline-flex items-center gap-1">
                                     <button type="button" @click="applyTemplateToForm(tmpl)"
                                             :class="activeTemplateName === tmpl.name ? 'bg-blue-500 text-white border-blue-500' : 'border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100'"
-                                            class="px-2.5 py-1 text-xs rounded-full border transition-all"
+                                            class="px-2.5 py-1 text-xs rounded-lg border transition-all"
                                             x-text="tmpl.display_name || tmpl.name"></button>
                                     <button type="button" @click="editingTemplate = tmpl.name"
-                                            class="p-0.5 text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 rounded transition-colors"
+                                            class="p-0.5 text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 rounded-lg transition-colors"
                                             :title="t('modal.model_settings.profiles.update_from_form')">
                                         <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3 h-3"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
                                     </button>
                                     <button type="button" @click="templateDeleteConfirm = tmpl.name"
-                                            class="p-0.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded transition-colors"
+                                            class="p-0.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
                                             :title="t('modal.model_settings.profiles.delete')">
                                         <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3 h-3"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>
                                     </button>
                                     <span x-show="templateDeleteConfirm === tmpl.name" x-cloak class="flex items-center gap-1">
                                         <button type="button" @click="deleteTemplate(tmpl.name)"
-                                                class="px-1.5 py-0.5 text-[10px] text-white bg-red-500 rounded">{{ t('models.manager.delete_yes') }}</button>
+                                                class="px-1.5 py-0.5 text-caption text-white bg-red-500 rounded-lg">{{ t('models.manager.delete_yes') }}</button>
                                         <button type="button" @click="templateDeleteConfirm = null"
-                                                class="px-1.5 py-0.5 text-[10px] text-neutral-600">{{ t('models.manager.delete_no') }}</button>
+                                                class="px-1.5 py-0.5 text-caption text-neutral-600">{{ t('models.manager.delete_no') }}</button>
                                     </span>
                                 </div>
                             </template>
@@ -145,9 +146,9 @@
                                class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
                         <div class="flex justify-end gap-2">
                             <button type="button" @click="showNewTemplateForm = false"
-                                    class="px-3 py-1 text-xs text-neutral-600 hover:bg-neutral-100 rounded">{{ t('modal.model_settings.profiles.cancel') }}</button>
+                                    class="px-3 py-1 text-xs text-neutral-600 hover:bg-neutral-100 rounded-full">{{ t('modal.model_settings.profiles.cancel') }}</button>
                             <button type="button" @click="createTemplate()"
-                                    class="px-3 py-1 text-xs bg-neutral-900 text-white rounded hover:bg-neutral-800">{{ t('modal.model_settings.profiles.save') }}</button>
+                                    class="px-3 py-1 text-xs bg-neutral-900 text-white rounded-full hover:bg-neutral-800">{{ t('modal.model_settings.profiles.save') }}</button>
                         </div>
                     </div>
 
@@ -159,11 +160,11 @@
                             <div class="flex justify-between gap-2">
                                 <button type="button"
                                         @click="updateTemplate(tmpl.name, {display_name: tmpl.display_name, settings: formValuesForTemplate()})"
-                                        class="px-3 py-1 text-xs bg-neutral-900 text-white rounded hover:bg-neutral-800">
+                                        class="px-3 py-1 text-xs bg-neutral-900 text-white rounded-lg hover:bg-neutral-800">
                                     {{ t('modal.model_settings.profiles.update_from_form') }}
                                 </button>
                                 <button type="button" @click="editingTemplate = null"
-                                        class="px-3 py-1 text-xs text-neutral-600 hover:bg-neutral-100 rounded">
+                                        class="px-3 py-1 text-xs text-neutral-600 hover:bg-neutral-100 rounded-lg">
                                     {{ t('modal.model_settings.profiles.cancel') }}
                                 </button>
                             </div>
@@ -185,7 +186,7 @@
                                                 : 'bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100'"
                                             class="px-2.5 py-1 text-xs rounded-full transition-all flex items-center gap-1">
                                         <span x-show="p.expose_as_model"
-                                              class="px-1 py-0.5 text-[9px] font-bold rounded bg-white/70"
+                                              class="badge bg-white/70"
                                               :class="p.has_engine_fields ? 'text-amber-700' : 'text-emerald-700'">API</span>
                                         <span x-text="p.display_name || p.name"></span>
                                         <span x-show="activeProfileName === p.name && profilesDrift"
@@ -194,18 +195,18 @@
                                     </button>
                                     <button type="button"
                                             @click="editingProfile = p.name; p._editDisplayName = p.display_name || p.name; p._editApiName = p.api_name || p.name; p._editDescription = p.description || ''; p._editExposeAsModel = !!p.expose_as_model; profileError = ''"
-                                            class="p-0.5 text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 rounded transition-colors">
+                                            class="p-0.5 text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 rounded-lg transition-colors">
                                         <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3 h-3"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
                                     </button>
                                     <button type="button" @click="profileDeleteConfirm = p.name"
-                                            class="p-0.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded transition-colors">
+                                            class="p-0.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors">
                                         <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3 h-3"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>
                                     </button>
                                     <span x-show="profileDeleteConfirm === p.name" x-cloak class="flex items-center gap-1">
                                         <button type="button" @click="deleteProfile(p.name)"
-                                                class="px-1.5 py-0.5 text-[10px] text-white bg-red-500 rounded">{{ t('models.manager.delete_yes') }}</button>
+                                                class="px-1.5 py-0.5 text-caption text-white bg-red-500 rounded-lg">{{ t('models.manager.delete_yes') }}</button>
                                         <button type="button" @click="profileDeleteConfirm = null"
-                                                class="px-1.5 py-0.5 text-[10px] text-neutral-600">{{ t('models.manager.delete_no') }}</button>
+                                                class="px-1.5 py-0.5 text-caption text-neutral-600">{{ t('models.manager.delete_no') }}</button>
                                     </span>
                                 </div>
                             </template>
@@ -232,7 +233,7 @@
                                     :class="newProfile.expose_as_model
                                         ? 'bg-emerald-600 text-white border-emerald-600'
                                         : 'bg-white text-neutral-500 border-neutral-200 hover:text-neutral-900 hover:border-neutral-400'"
-                                    class="shrink-0 inline-flex items-center gap-1 px-2.5 py-1.5 border rounded-lg text-[10px] font-bold transition-colors">
+                                    class="shrink-0 inline-flex items-center gap-1 px-2.5 py-1.5 border rounded-full text-caption font-bold transition-colors">
                                 API
                                 <span x-text="newProfile.expose_as_model ? t('modal.model_settings.profiles.expose_as_model_on') : t('modal.model_settings.profiles.expose_as_model_off')"></span>
                             </button>
@@ -241,9 +242,9 @@
                                class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
                         <div class="flex justify-end gap-2">
                             <button type="button" @click="showNewProfileForm = false"
-                                    class="px-3 py-1 text-xs text-neutral-600 hover:bg-neutral-100 rounded">{{ t('modal.model_settings.profiles.cancel') }}</button>
+                                    class="px-3 py-1 text-xs text-neutral-600 hover:bg-neutral-100 rounded-full">{{ t('modal.model_settings.profiles.cancel') }}</button>
                             <button type="button" @click="createProfile()"
-                                    class="px-3 py-1 text-xs bg-neutral-900 text-white rounded hover:bg-neutral-800">{{ t('modal.model_settings.profiles.save') }}</button>
+                                    class="px-3 py-1 text-xs bg-neutral-900 text-white rounded-full hover:bg-neutral-800">{{ t('modal.model_settings.profiles.save') }}</button>
                         </div>
                     </div>
 
@@ -251,13 +252,13 @@
                     <template x-for="p in profiles" :key="'edit-'+p.name">
                         <div x-show="profileScope === 'model' && editingProfile === p.name" x-cloak class="mt-3 p-3 bg-white border border-neutral-200 rounded-lg space-y-2">
                             <div class="block">
-                                <span class="block mb-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-500">{{ t('modal.model_settings.profiles.display_name_label') }}</span>
+                                <span class="block mb-1 text-caption font-semibold uppercase tracking-wide text-neutral-500">{{ t('modal.model_settings.profiles.display_name_label') }}</span>
                                 <input type="text" :value="p._editDisplayName ?? p.display_name" @input="p._editDisplayName = $event.target.value"
                                        :placeholder="t('modal.model_settings.profiles.display_name_label')"
                                        class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
                             </div>
                             <div class="block">
-                                <span class="block mb-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-500">{{ t('modal.model_settings.profiles.name_placeholder') }}</span>
+                                <span class="block mb-1 text-caption font-semibold uppercase tracking-wide text-neutral-500">{{ t('modal.model_settings.profiles.name_placeholder') }}</span>
                                 <div class="flex gap-2">
                                     <input type="text" :value="p._editApiName ?? p.api_name" @input="p._editApiName = $event.target.value"
                                            :placeholder="t('modal.model_settings.profiles.name_placeholder')"
@@ -269,14 +270,14 @@
                                             :class="(p._editExposeAsModel ?? p.expose_as_model)
                                                 ? 'bg-emerald-600 text-white border-emerald-600'
                                                 : 'bg-white text-neutral-500 border-neutral-200 hover:text-neutral-900 hover:border-neutral-400'"
-                                            class="shrink-0 inline-flex items-center gap-1 px-2.5 py-1.5 border rounded-lg text-[10px] font-bold transition-colors">
+                                            class="shrink-0 inline-flex items-center gap-1 px-2.5 py-1.5 border rounded-lg text-caption font-bold transition-colors">
                                         API
                                         <span x-text="(p._editExposeAsModel ?? p.expose_as_model) ? t('modal.model_settings.profiles.expose_as_model_on') : t('modal.model_settings.profiles.expose_as_model_off')"></span>
                                     </button>
                                 </div>
                             </div>
                             <div class="block">
-                                <span class="block mb-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-500">{{ t('modal.model_settings.profiles.description_label') }}</span>
+                                <span class="block mb-1 text-caption font-semibold uppercase tracking-wide text-neutral-500">{{ t('modal.model_settings.profiles.description_label') }}</span>
                                 <input type="text" :value="p._editDescription ?? p.description" @input="p._editDescription = $event.target.value"
                                        :placeholder="t('modal.model_settings.profiles.description_label')"
                                        class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-xs">
@@ -285,22 +286,22 @@
                                 <div class="flex gap-2 flex-wrap">
                                     <button type="button"
                                             @click="updateProfileFromEdit(p)"
-                                            class="px-3 py-1 text-xs bg-neutral-900 text-white rounded hover:bg-neutral-800">
+                                            class="px-3 py-1 text-xs bg-neutral-900 text-white rounded-lg hover:bg-neutral-800">
                                         {{ t('modal.model_settings.profiles.save') }}
                                     </button>
                                     <button type="button"
                                             @click="updateProfileSettingsFromForm(p)"
-                                            class="px-3 py-1 text-xs border border-neutral-300 text-neutral-700 rounded hover:bg-neutral-100">
+                                            class="px-3 py-1 text-xs border border-neutral-300 text-neutral-700 rounded-lg hover:bg-neutral-100">
                                         {{ t('modal.model_settings.profiles.update_from_form') }}
                                     </button>
                                     <button type="button" x-show="p.source_template"
                                             @click="(() => { const tmpl = templates.find(t => t.name === p.source_template); if (tmpl) { applyTemplateToForm(tmpl); } })()"
-                                            class="px-3 py-1 text-xs border border-neutral-300 text-neutral-700 rounded hover:bg-neutral-100">
+                                            class="px-3 py-1 text-xs border border-neutral-300 text-neutral-700 rounded-lg hover:bg-neutral-100">
                                         {{ t('modal.model_settings.profiles.resync_template') }}
                                     </button>
                                 </div>
                                 <button type="button" @click="editingProfile = null"
-                                        class="px-3 py-1 text-xs text-neutral-600 hover:bg-neutral-100 rounded">
+                                        class="px-3 py-1 text-xs text-neutral-600 hover:bg-neutral-100 rounded-lg">
                                     {{ t('modal.model_settings.profiles.cancel') }}
                                 </button>
                             </div>
@@ -320,12 +321,12 @@
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.model_alias') }}</label>
                                     <input type="text" x-model="modelSettings.model_alias"
                                            :placeholder="selectedModel?.id"
-                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
                                 <div>
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.model_type') }}</label>
                                     <select x-model="modelSettings.model_type_override"
-                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                         <option value="">{{ t('modal.model_settings.model_type_auto') }}</option>
                                         <option value="llm">LLM</option>
                                         <option value="vlm">VLM</option>
@@ -340,7 +341,7 @@
                                 <div x-show="reasoningParsers.length > 0 && !modelSettings.is_diffusion_model">
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.reasoning_parser') }}</label>
                                     <select x-model="modelSettings.reasoning_parser"
-                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                         <option value="">{{ t('modal.model_settings.reasoning_parser_none') }}</option>
                                         <template x-for="p in reasoningParsers" :key="p.value">
                                             <option :value="p.value" x-text="p.label + ' (' + p.models.join(', ') + ')'"></option>
@@ -358,17 +359,17 @@
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.max_context_window') }}</label>
                                             <input type="number" x-model.number="modelSettings.max_context_window" placeholder="{{ t('modal.model_settings.placeholder_default') }}" min="1"
-                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                         </div>
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.max_tokens') }}</label>
                                             <input type="number" x-model.number="modelSettings.max_tokens" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
-                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                         </div>
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.temperature') }}</label>
                                             <input type="number" x-model.number="modelSettings.temperature" step="0.1" min="0" max="2" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
-                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                         </div>
                                     </div>
 
@@ -377,17 +378,17 @@
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.top_p') }}</label>
                                             <input type="number" x-model.number="modelSettings.top_p" step="0.05" min="0" max="1" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
-                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                         </div>
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.top_k') }}</label>
                                             <input type="number" x-model.number="modelSettings.top_k" min="0" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
-                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                         </div>
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.min_p') }}</label>
                                             <input type="number" x-model.number="modelSettings.min_p" step="0.01" min="0" max="1" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
-                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                         </div>
                                     </div>
 
@@ -399,14 +400,14 @@
                                             <input type="number" x-model.number="modelSettings.repetition_penalty" step="0.05" min="0" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
                                                    :disabled="modelSettings.vlm_mtp_enabled"
                                                    :class="modelSettings.vlm_mtp_enabled ? 'opacity-40 cursor-not-allowed' : ''"
-                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                         </div>
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.presence_penalty') }}</label>
                                             <input type="number" x-model.number="modelSettings.presence_penalty" step="0.05" min="-2" max="2" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
                                                    :disabled="modelSettings.vlm_mtp_enabled"
                                                    :class="modelSettings.vlm_mtp_enabled ? 'opacity-40 cursor-not-allowed' : ''"
-                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                         </div>
                                         <p x-show="modelSettings.vlm_mtp_enabled"
                                            class="sm:col-span-2 text-xs text-amber-600">{{ t('modal.model_settings.vlm_mtp_processor_locked') }}</p>
@@ -423,13 +424,13 @@
                                            :disabled="selectedModel?.pinned"
                                            min="0" step="60"
                                            :class="selectedModel?.pinned ? 'bg-neutral-100 text-neutral-400 cursor-not-allowed' : ''"
-                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
                                 <div class="flex items-end"
                                      x-show="!selectedModel?.model_type || selectedModel.model_type === 'llm' || selectedModel.model_type === 'vlm'">
                                     <button type="button" @click="loadGenerationDefaults"
                                             :disabled="loadingGenDefaults"
-                                            class="w-full px-4 py-2.5 text-sm font-medium text-neutral-700 bg-neutral-100 hover:bg-neutral-200 rounded-xl border border-neutral-200 transition-all disabled:opacity-50">
+                                            class="w-full px-4 py-2.5 text-sm font-medium text-neutral-700 bg-neutral-100 hover:bg-neutral-200 rounded-full border border-neutral-200 transition-all disabled:opacity-50">
                                         <span x-show="!loadingGenDefaults">{{ t('modal.model_settings.load_defaults') }}</span>
                                         <span x-show="loadingGenDefaults">{{ t('modal.model_settings.loading_defaults') }}</span>
                                     </button>
@@ -447,7 +448,7 @@
                         <div class="overflow-y-auto max-h-[28rem] space-y-4 pr-1"
                              x-show="!selectedModel?.model_type || selectedModel.model_type === 'llm' || selectedModel.model_type === 'vlm'">
                             <!-- Enable Thinking -->
-                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3"
+                            <div class="border border-neutral-200 p-4 bg-neutral-50 rounded-xl space-y-3"
                                  x-show="!modelSettings.is_diffusion_model" x-cloak>
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
@@ -473,7 +474,7 @@
                             </div>
 
                             <!-- Qwen4 PLE SSD Offload -->
-                            <div class="p-4 bg-neutral-50 rounded-xl space-y-2"
+                            <div class="border border-neutral-200 p-4 bg-neutral-50 rounded-xl space-y-2"
                                  x-show="modelSettings.qwen4_ple_ssd_offload_supported" x-cloak>
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
@@ -497,7 +498,7 @@
                             </div>
 
                             <!-- DeepSeek V4.1 CED Prefill -->
-                            <div class="p-4 bg-neutral-50 rounded-xl"
+                            <div class="border border-neutral-200 p-4 bg-neutral-50 rounded-xl"
                                  x-show="modelSettings.deepseek_v41_ced_prefill_supported" x-cloak>
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
@@ -517,7 +518,7 @@
                             </div>
 
                             <!-- DeepSeek V4.1 Engram SSD Offload -->
-                            <div class="p-4 bg-neutral-50 rounded-xl space-y-2"
+                            <div class="border border-neutral-200 p-4 bg-neutral-50 rounded-xl space-y-2"
                                  x-show="modelSettings.deepseek_v41_engram_ssd_offload_supported" x-cloak>
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
@@ -541,7 +542,7 @@
                             </div>
 
                             <!-- Thinking Budget -->
-                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3"
+                            <div class="border border-neutral-200 p-4 bg-neutral-50 rounded-xl space-y-3"
                                  x-show="!modelSettings.is_diffusion_model" x-cloak>
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
@@ -557,12 +558,12 @@
                                 </div>
                                 <div x-show="modelSettings.enableThinkingBudget" x-transition class="pt-1">
                                     <input type="number" x-model.number="modelSettings.thinking_budget_tokens" placeholder="{{ t('modal.model_settings.thinking_budget_placeholder') }}" min="1" step="100"
-                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
                             </div>
 
                             <!-- Guided Grammar -->
-                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3"
+                            <div class="border border-neutral-200 p-4 bg-neutral-50 rounded-xl space-y-3"
                                  x-show="!modelSettings.is_diffusion_model" x-cloak>
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
@@ -586,12 +587,12 @@
                                     <textarea x-model="modelSettings.guided_grammar"
                                               rows="6"
                                               placeholder="{{ t('modal.model_settings.guided_grammar_placeholder') }}"
-                                              class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm font-mono focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all"></textarea>
+                                              class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm font-mono focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all"></textarea>
                                 </div>
                             </div>
 
                             <!-- Limit Tool Result Tokens -->
-                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3"
+                            <div class="border border-neutral-200 p-4 bg-neutral-50 rounded-xl space-y-3"
                                  x-show="!modelSettings.is_diffusion_model" x-cloak>
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
@@ -607,12 +608,12 @@
                                 </div>
                                 <div x-show="modelSettings.enableToolResultLimit" x-transition class="pt-1">
                                     <input type="number" x-model.number="modelSettings.max_tool_result_tokens" placeholder="{{ t('modal.model_settings.limit_tool_placeholder') }}" min="100" step="100"
-                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
                             </div>
 
                             <!-- Force Sampling -->
-                            <div class="p-4 bg-neutral-50 rounded-xl"
+                            <div class="border border-neutral-200 p-4 bg-neutral-50 rounded-xl"
                                  x-show="!modelSettings.is_diffusion_model" x-cloak>
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
@@ -645,7 +646,7 @@
                             </div>
 
                             <!-- Chat Template Kwargs -->
-                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
+                            <div class="border border-neutral-200 p-4 bg-neutral-50 rounded-xl space-y-3">
                                 <div class="flex items-center justify-between">
                                     <div>
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.chat_template_kwargs') }}</span>
@@ -762,7 +763,7 @@
                                 <h4 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.acceleration_label') }}</h4>
 
                                 <!-- Lightning MTP (built-in MTP head speculative decoding) -->
-                                <div class="p-4 bg-neutral-50 rounded-xl space-y-3 mb-3">
+                                <div class="border border-neutral-200 p-4 bg-neutral-50 rounded-xl space-y-3 mb-3">
                                     <div class="flex items-start justify-between gap-3">
                                         <div class="min-w-0">
                                             <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.lightning_mtp') }}</span>
@@ -775,7 +776,7 @@
                                                     @click="importMtplxSidecar()"
                                                     :disabled="importingMtplx"
                                                     :class="importingMtplx ? 'opacity-40 cursor-not-allowed' : ''"
-                                                    class="mt-2 px-3 py-1.5 text-xs font-medium rounded-lg bg-neutral-900 text-white hover:bg-neutral-700 transition-colors"
+                                                    class="mt-2 px-3 py-1.5 text-xs font-medium rounded-full bg-neutral-900 text-white hover:bg-neutral-700 transition-colors"
                                                     x-text="importingMtplx ? '{{ t('modal.model_settings.mtplx_importing')|replace('\\', '\\\\')|replace("'", "\\'") }}' : '{{ t('modal.model_settings.mtplx_import')|replace('\\', '\\\\')|replace("'", "\\'") }}'"></button>
                                             <p x-show="modelSettings.mtp_compatible && modelSettings.dflash_enabled"
                                                class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.mtp_conflict_dflash') }}</p>
@@ -816,7 +817,7 @@
                                 </div>
 
                                 <!-- DFlash -->
-                                <div class="p-4 bg-neutral-50 rounded-xl space-y-3 mb-3">
+                                <div class="border border-neutral-200 p-4 bg-neutral-50 rounded-xl space-y-3 mb-3">
                                     <div class="flex items-start justify-between gap-3">
                                         <div class="min-w-0">
                                             <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.dflash') }}</span>
@@ -848,7 +849,7 @@
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.draft_model') }}</label>
                                             <select x-model="modelSettings.dflash_draft_model"
-                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                 <option value="">{{ t('modal.model_settings.draft_model_placeholder') }}</option>
                                                 <template x-for="m in dflashDraftModelCandidates()" :key="m.id">
                                                     <option :value="m.model_path || m.id" x-text="m.id" :selected="modelSettings.dflash_draft_model === (m.model_path || m.id)"></option>
@@ -874,7 +875,7 @@
                                             <div>
                                                 <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash_weight_bits') }}</label>
                                                 <select x-model="modelSettings.dflash_draft_quant_weight_bits"
-                                                        class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                        class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                     <option value="2">{{ t('modal.model_settings.bits_2') }}</option>
                                                     <option value="4" selected>{{ t('modal.model_settings.bits_4') }}</option>
                                                     <option value="8">{{ t('modal.model_settings.bits_8') }}</option>
@@ -883,7 +884,7 @@
                                             <div>
                                                 <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash_activation_bits') }}</label>
                                                 <select x-model="modelSettings.dflash_draft_quant_activation_bits"
-                                                        class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                        class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                     <option value="16" selected>{{ t('modal.model_settings.bits_16') }}</option>
                                                     <option value="32">{{ t('modal.model_settings.bits_32') }}</option>
                                                 </select>
@@ -891,7 +892,7 @@
                                             <div>
                                                 <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash_group_size') }}</label>
                                                 <select x-model="modelSettings.dflash_draft_quant_group_size"
-                                                        class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                        class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                     <option value="32">32</option>
                                                     <option value="64" selected>64</option>
                                                     <option value="128">128</option>
@@ -901,7 +902,7 @@
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash_max_ctx') }}</label>
                                             <input type="number" x-model.number="modelSettings.dflash_max_ctx" min="1" step="1024" placeholder="{{ t('modal.model_settings.dflash_max_ctx_placeholder') }}"
-                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                             <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash_max_ctx_hint') }}</p>
                                         </div>
                                         <div class="pt-2 border-t border-neutral-200 space-y-3">
@@ -910,26 +911,26 @@
                                                 <div>
                                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash_draft_window') }}</label>
                                                     <input type="number" x-model.number="modelSettings.dflash_draft_window_size" min="1" step="128" placeholder="2048"
-                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                                     <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash_draft_window_hint') }}</p>
                                                 </div>
                                                 <div>
                                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash_draft_sink') }}</label>
                                                     <input type="number" x-model.number="modelSettings.dflash_draft_sink_size" min="0" step="8" placeholder="0"
-                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                                     <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash_draft_sink_hint') }}</p>
                                                 </div>
                                             </div>
                                             <div>
                                                 <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash_block_size_label') }}</label>
                                                 <input type="number" x-model.number="modelSettings.dflash_block_size" min="1" step="1" placeholder="{{ t('modal.model_settings.dflash_block_size_placeholder') }}"
-                                                       class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                       class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                                 <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash_block_size_hint') }}</p>
                                             </div>
                                             <div>
                                                 <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash_verify_mode') }}</label>
                                                 <select x-model="modelSettings.dflash_verify_mode"
-                                                        class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                        class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                     <option value="adaptive">{{ t('modal.model_settings.dflash_verify_adaptive') }}</option>
                                                     <option value="dflash">dflash</option>
                                                     <option value="ddtree">ddtree</option>
@@ -953,13 +954,13 @@
                                         <div x-show="modelSettings.dflash_in_memory_cache" x-transition>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash_in_memory_cache_max_entries') }}</label>
                                             <input type="number" x-model.number="modelSettings.dflash_in_memory_cache_max_entries" min="1" max="128" step="1" placeholder="4"
-                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                             <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash_in_memory_cache_max_entries_hint') }}</p>
                                         </div>
                                         <div x-show="modelSettings.dflash_in_memory_cache" x-transition>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash_in_memory_cache_size') }}</label>
                                             <input type="number" x-model.number="modelSettings.dflash_in_memory_cache_max_gib" min="1" max="256" step="1" placeholder="8"
-                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                             <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash_in_memory_cache_size_hint') }}</p>
                                         </div>
                                         <div class="flex items-start justify-between gap-3">
@@ -984,14 +985,14 @@
                                         <div x-show="modelSettings.dflash_ssd_cache" x-transition>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash_ssd_cache_size') }}</label>
                                             <input type="number" x-model.number="modelSettings.dflash_ssd_cache_max_gib" min="1" max="1024" step="1" placeholder="20"
-                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                             <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.dflash_ssd_cache_size_hint') }}</p>
                                         </div>
                                     </div>
                                 </div>
 
                                 <!-- VLM MTP (mlx-vlm 191d7c8+, gemma4_assistant drafter) -->
-                                <div class="p-4 bg-neutral-50 rounded-xl space-y-3 mb-6">
+                                <div class="border border-neutral-200 p-4 bg-neutral-50 rounded-xl space-y-3 mb-6">
                                     <div class="flex items-start justify-between gap-3">
                                         <div class="min-w-0">
                                             <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.vlm_mtp') }}</span>
@@ -1038,7 +1039,7 @@
 
                                 <!-- Qwen 3.5/3.6/3.8 oQ INT8-activation prefill kernels -->
                                 <template x-if="isQwenOqA8Model(selectedModel)">
-                                    <div class="p-4 bg-neutral-50 rounded-xl space-y-4 mb-3">
+                                    <div class="border border-neutral-200 p-4 bg-neutral-50 rounded-xl space-y-4 mb-3">
                                         <div class="flex items-start justify-between gap-3">
                                             <div class="min-w-0">
                                                 <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.qwen_oq_a8') }}</span>
@@ -1069,7 +1070,7 @@
 
                                 <!-- Qwen 3.5/3.6/3.8 private ANE/GPU prompt processing -->
                                 <template x-if="selectedModel?.ane_prefill_backend === 'qwen'">
-                                    <div class="p-4 bg-neutral-50 rounded-xl space-y-4 mb-3">
+                                    <div class="border border-neutral-200 p-4 bg-neutral-50 rounded-xl space-y-4 mb-3">
                                         <div class="flex items-start justify-between gap-3">
                                             <div class="min-w-0">
                                                 <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.qwen_ane') }}</span>
@@ -1091,27 +1092,27 @@
                                                     <input type="number"
                                                            x-model.number="modelSettings.qwen35_ane_prefill_sequence_length"
                                                            min="1024" step="64" required placeholder="2048"
-                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                 </div>
                                                 <div>
                                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_tail_padding') }}</label>
                                                     <input type="number"
                                                            x-model.number="modelSettings.qwen35_ane_prefill_tail_padding_min_tokens"
                                                            min="0" step="1" required placeholder="0"
-                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                 </div>
                                                 <div>
                                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_mlp_fraction') }}</label>
                                                     <input type="number"
                                                            x-model.number="modelSettings.qwen35_ane_prefill_fraction"
                                                            min="0.05" max="0.90" step="0.005" required placeholder="0.53"
-                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                 </div>
                                                 <div>
                                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_mlp_layers') }}</label>
                                                     <input type="number" x-model.number="modelSettings.qwen35_ane_prefill_max_layers"
                                                            min="1" max="256" step="1" placeholder="64"
-                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                                 </div>
                                             </div>
 
@@ -1149,28 +1150,28 @@
                                                         <input type="number"
                                                                x-model.number="modelSettings.qwen35_ane_prefill_cpu_fraction"
                                                                min="0" max="0.25" step="0.005" required placeholder="0.135"
-                                                               class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                               class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                     </div>
                                                     <div>
                                                         <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_cpu_down_fraction') }}</label>
                                                         <input type="number"
                                                                x-model.number="modelSettings.qwen35_ane_prefill_cpu_down_fraction"
                                                                min="0" max="0.50" step="0.005" required placeholder="0"
-                                                               class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                               class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                     </div>
                                                     <div>
                                                         <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_cpu_gdn_fraction') }}</label>
                                                         <input type="number"
                                                                x-model.number="modelSettings.qwen35_ane_prefill_cpu_gdn_fraction"
                                                                min="0" max="0.50" step="0.005" required placeholder="0"
-                                                               class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                               class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                     </div>
                                                     <div>
                                                         <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_cpu_threads') }}</label>
                                                         <input type="number"
                                                                x-model.number="modelSettings.qwen35_ane_prefill_cpu_threads"
                                                                min="0" max="64" step="1" required placeholder="8"
-                                                               class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                               class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                     </div>
                                                 </div>
                                                 <div x-show="modelSettings.qwen35_ane_prefill_cpu_enabled" x-transition class="flex items-start justify-between gap-3">
@@ -1208,13 +1209,13 @@
                                                     <input type="number"
                                                            x-model.number="modelSettings.qwen35_ane_prefill_gdn_fraction"
                                                            min="0.05" max="0.90" step="0.005" required placeholder="0.5"
-                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                 </div>
                                                 <div>
                                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_gdn_layers') }}</label>
                                                     <input type="number" x-model.number="modelSettings.qwen35_ane_prefill_gdn_max_layers"
                                                            min="0" max="256" step="1" placeholder="48"
-                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                                 </div>
                                             </div>
                                         </div>
@@ -1231,14 +1232,14 @@
                                                             @click="startANETuning()"
                                                             :disabled="aneTuning.running"
                                                             :class="aneTuning.running ? 'opacity-40 cursor-not-allowed' : ''"
-                                                            class="px-3 py-1.5 text-xs font-medium rounded-lg border border-neutral-300 bg-white text-neutral-700 hover:bg-neutral-100 transition-colors">
+                                                            class="px-3 py-1.5 text-xs font-medium rounded-full border border-neutral-300 bg-white text-neutral-700 hover:bg-neutral-100 transition-colors">
                                                         {{ t('modal.model_settings.qwen_ane_tune_start') }}
                                                     </button>
                                                     <button type="button"
                                                             x-show="aneTuningForSelectedModel() && aneTuning.running"
                                                             @click="cancelANETuning()"
                                                             :disabled="aneTuning.cancelling"
-                                                            class="px-3 py-1.5 text-xs font-medium rounded-lg border border-red-200 bg-white text-red-600 hover:bg-red-50 transition-colors disabled:opacity-40">
+                                                            class="px-3 py-1.5 text-xs font-medium rounded-full border border-red-200 bg-white text-red-600 hover:bg-red-50 transition-colors disabled:opacity-40">
                                                         {{ t('modal.model_settings.qwen_ane_tune_cancel') }}
                                                     </button>
                                                 </div>
@@ -1305,7 +1306,7 @@
                                                             x-show="aneTuningForSelectedModel() && !aneTuning.running && aneTuning.status?.recommendation"
                                                             @click="applyANETuningRecommendation()"
                                                             :disabled="aneTuning.applying || aneTuning.applied"
-                                                            class="px-3 py-1.5 text-xs font-medium rounded-lg bg-neutral-900 text-white hover:bg-neutral-700 transition-colors disabled:opacity-40"
+                                                            class="px-3 py-1.5 text-xs font-medium rounded-full bg-neutral-900 text-white hover:bg-neutral-700 transition-colors disabled:opacity-40"
                                                             x-text="aneTuning.applied
                                                                 ? '{{ t('modal.model_settings.qwen_ane_tune_applied')|replace('\\', '\\\\')|replace("'", "\\'") }}'
                                                                 : (aneTuning.applying
@@ -1314,7 +1315,7 @@
                                                     <button type="button"
                                                             x-show="aneTuningForSelectedModel() && !aneTuning.running && aneTuning.status?.recommendation"
                                                             @click="startANETuning()"
-                                                            class="px-3 py-1.5 text-xs font-medium rounded-lg border border-neutral-300 bg-white text-neutral-700 hover:bg-neutral-100 transition-colors">
+                                                            class="px-3 py-1.5 text-xs font-medium rounded-full border border-neutral-300 bg-white text-neutral-700 hover:bg-neutral-100 transition-colors">
                                                         {{ t('modal.model_settings.qwen_ane_tune_again') }}
                                                     </button>
                                             </div>
@@ -1333,7 +1334,7 @@
                                 </template>
 
                                 <template x-if="selectedModel?.ane_prefill_backend === 'k2'">
-                                    <div class="p-4 bg-neutral-50 rounded-xl space-y-4 mb-3">
+                                    <div class="border border-neutral-200 p-4 bg-neutral-50 rounded-xl space-y-4 mb-3">
                                         <label class="flex items-center justify-between gap-3 text-sm font-medium">
                                             <span>{{ t('modal.model_settings.k2_ane') }}</span>
                                             <input type="checkbox" x-model="modelSettings.qwen35_ane_prefill_enabled" class="rounded border-neutral-300">
@@ -1363,7 +1364,7 @@
                                 </template>
 
                                 <!-- TurboQuant KV Cache -->
-                                <div class="p-4 bg-neutral-50 rounded-xl space-y-3 mb-3">
+                                <div class="border border-neutral-200 p-4 bg-neutral-50 rounded-xl space-y-3 mb-3">
                                     <div class="flex items-start justify-between gap-3">
                                         <div class="min-w-0">
                                             <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.turboquant_kv') }}</span>
@@ -1385,7 +1386,7 @@
                                     <div x-show="modelSettings.turboquant_kv_enabled" x-transition class="pt-1">
                                         <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.turboquant_kv_bits_label') }}</label>
                                         <select x-model="modelSettings.turboquant_kv_bits"
-                                                class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                             <option value="2">{{ t('modal.model_settings.bits_2') }}</option>
                                             <option value="2.5">{{ t('modal.model_settings.bits_2_5') }}</option>
                                             <option value="3">{{ t('modal.model_settings.bits_3') }}</option>
@@ -1399,7 +1400,7 @@
 
                                 <!-- MoE Expert Offload -->
                                 <template x-if="selectedModel?.moe_expert_offload_supported === true">
-                                    <div class="p-4 bg-neutral-50 rounded-xl space-y-3 mb-3">
+                                    <div class="border border-neutral-200 p-4 bg-neutral-50 rounded-xl space-y-3 mb-3">
                                         <div class="flex items-start justify-between gap-3">
                                             <div class="min-w-0">
                                                 <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.moe_expert_offload') }}</span>
@@ -1428,7 +1429,7 @@
                                                        @input="onMoeExpertOffloadResidentPercent()"
                                                        @blur="onMoeExpertOffloadResidentBlur()"
                                                        :class="moeExpertOffloadResidentInvalid() && modelSettings.moe_expert_offload_resident_touched ? 'border-red-200 focus:ring-red-500' : 'border-neutral-200 focus:ring-neutral-900'"
-                                                       class="w-24 px-4 py-2.5 border rounded-xl text-sm focus:ring-2 focus:border-transparent transition-all bg-white">
+                                                       class="w-24 px-4 py-2.5 border rounded-lg text-sm focus:ring-2 focus:border-transparent transition-all bg-white">
                                                 <span class="text-sm font-medium text-neutral-500">%</span>
                                                 <span class="text-xs text-neutral-500">{{ t('modal.model_settings.moe_expert_offload_resident_range') }}</span>
                                             </div>
@@ -1439,7 +1440,7 @@
 
                                 <!-- IndexCache (DSA models only) -->
                                 <template x-if="DSA_MODEL_TYPES.has(selectedModel?.config_model_type || '')">
-                                    <div class="p-4 bg-neutral-50 rounded-xl space-y-3 mb-3">
+                                    <div class="border border-neutral-200 p-4 bg-neutral-50 rounded-xl space-y-3 mb-3">
                                         <div class="flex items-start justify-between gap-3">
                                             <div class="min-w-0">
                                                 <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.index_cache') }}</span>
@@ -1461,13 +1462,13 @@
                                         <div x-show="modelSettings.enableIndexCache" x-transition class="pt-1">
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.index_cache_freq') }}</label>
                                             <input type="number" x-model.number="modelSettings.index_cache_freq" min="2" max="16" step="1" placeholder="4"
-                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                         </div>
                                     </div>
                                 </template>
 
                                 <!-- SpecPrefill -->
-                                <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
+                                <div class="border border-neutral-200 p-4 bg-neutral-50 rounded-xl space-y-3">
                                     <div class="flex items-start justify-between gap-3">
                                         <div class="min-w-0">
                                             <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.specprefill') }}</span>
@@ -1490,7 +1491,7 @@
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.draft_model') }}</label>
                                             <select x-model="modelSettings.specprefill_draft_model"
-                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                 <option value="">{{ t('modal.model_settings.draft_model_placeholder') }}</option>
                                                 <template x-for="m in specPrefillDraftModelCandidates()" :key="m.id">
                                                     <option :value="m.model_path || m.id" x-text="m.id" :selected="modelSettings.specprefill_draft_model === (m.model_path || m.id)"></option>
@@ -1501,7 +1502,7 @@
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.specprefill_keep_rate') }}</label>
                                             <select x-model="modelSettings.specprefill_keep_pct"
-                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                    class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                                                 <option value="0.1">{{ t('modal.model_settings.specprefill_keep_rate_10') }}</option>
                                                 <option value="0.2">{{ t('modal.model_settings.specprefill_keep_rate_20') }}</option>
                                                 <option value="0.25">{{ t('modal.model_settings.specprefill_keep_rate_25') }}</option>
@@ -1513,7 +1514,7 @@
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.specprefill_threshold') }}</label>
                                             <input type="number" x-model.number="modelSettings.specprefill_threshold" min="1024" max="131072" step="1024" placeholder="8192"
-                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                   class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                             <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.specprefill_threshold_hint') }}</p>
                                         </div>
                                     </div>
@@ -1523,8 +1524,10 @@
                     </div>
                 </div>
 
+                </div>
+
                 <!-- Actions -->
-                <div class="flex items-center justify-end gap-3 mt-8">
+                <div class="flex-shrink-0 flex items-center justify-end gap-3 px-4 sm:px-8 py-4 bg-neutral-50 border-t border-neutral-200">
                     <button @click="showModelSettingsModal = false"
                             class="px-5 py-2.5 text-sm font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-full transition-all">
                         {{ t('modal.model_settings.cancel') }}

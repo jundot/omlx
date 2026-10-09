@@ -7877,6 +7877,10 @@ async def delete_hf_model(
     if not model_path.is_dir():
         raise HTTPException(status_code=400, detail="Not a model directory")
 
+    # A download still writing here would recreate the tree.
+    if _hf_downloader is not None:
+        await _hf_downloader.cancel_download_for_dir(model_path)
+
     # Unload model if loaded
     if engine_pool is not None:
         loaded_ids = engine_pool.get_loaded_model_ids()

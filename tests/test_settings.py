@@ -92,6 +92,7 @@ class TestServerSettings:
             "distributed_inference_enabled": False,
             "max_audio_upload_size": "100MB",
             "max_image_upload_size": "50MB",
+            "max_request_body_size": "512MB",
             "max_image_side_length": 2048,
             "gpu_keep_warm_interval": 0.5,
         }

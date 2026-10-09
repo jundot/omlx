@@ -11,7 +11,7 @@
                     <h4 id="settings-apply-modal-title" tabindex="-1" autofocus class="text-lg font-bold tracking-tight text-neutral-900" x-text="settingsApplyTitle()"></h4>
                     <button type="button" @click="closeSettingsApply()"
                             :disabled="settingsApply.phase === 'loading'"
-                            class="p-2 text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 rounded-full transition-all disabled:opacity-50">
+                            class="p-2 text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all disabled:opacity-50">
                         <i data-lucide="x" class="w-5 h-5"></i>
                     </button>
                 </div>
@@ -34,7 +34,7 @@
                        class="inline-block text-sm text-neutral-700 underline hover:text-neutral-900">{{ t('modal.model_settings.actions.none_link') }}</a>
                     <textarea x-model="settingsApply.recipeText" rows="5" spellcheck="false"
                               :placeholder="t('modal.model_settings.actions.recipe_placeholder')"
-                              class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-xs font-mono focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all"></textarea>
+                              class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-xs font-mono focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all"></textarea>
                     <div class="flex items-center justify-end gap-3">
                         <button type="button" @click="closeSettingsApply()"
                                 class="px-5 py-2.5 text-sm font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-full transition-all">{{ t('modal.model_settings.cancel') }}</button>
@@ -103,7 +103,7 @@
                         <div class="space-y-1">
                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500">{{ t('modal.model_settings.actions.applied_settings') }}</label>
                             <textarea readonly rows="10" spellcheck="false"
-                                      class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-xs font-mono bg-neutral-50 text-neutral-700"
+                                      class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-xs font-mono bg-neutral-50 text-neutral-700"
                                       :value="settingsApplyJson()"></textarea>
                         </div>
                     </template>

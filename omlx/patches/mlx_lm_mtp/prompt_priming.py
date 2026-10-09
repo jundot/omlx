@@ -49,6 +49,8 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, List, Optional
 
+from ...prefill.packed import PackedBatch, packed_batch_of
+
 logger = logging.getLogger(__name__)
 
 # The MTP head is fed the trunk's *post-norm* hidden and chains on its own
@@ -795,8 +797,34 @@ def _row_offsets(cache, size):
     return None
 
 
+def _capture_packed(host, inputs, normed, batch: PackedBatch) -> None:
+    """Fold each packed row into its own request's priming slot."""
+    _, state = _owned(host)
+    if state is None:
+        return
+    previous = _slot(host)
+    try:
+        for row, (start, end) in zip(batch.rows, batch.spans):
+            record = state.requests.get(row.request_id)
+            if record is None:
+                continue
+            _restore_slot(host, record)
+            _capture_single(
+                host, inputs[:, start:end], normed[:, start:end], row.cache
+            )
+            plan = _find_plan(host)
+            if plan is not None and plan.request_id in state.requests:
+                state.requests[plan.request_id] = _slot(host)
+    finally:
+        _restore_slot(host, previous)
+
+
 def maybe_capture(host, inputs, normed, cache):
     if _suppressed() or not priming_enabled():
+        return
+    batch = packed_batch_of(cache)
+    if batch is not None:
+        _capture_packed(host, inputs, normed, batch)
         return
     _, state = _owned(host)
     prefill = _PREFILL_SCOPE.get()

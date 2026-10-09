@@ -1,33 +1,8 @@
+{% import "components/ui.html" as ui %}
             <div x-show="mainTab === 'settings'" x-cloak role="tabpanel" id="panel-settings" aria-labelledby="tab-settings">
-            <!-- Tab Navigation -->
-            <div class="flex items-center gap-2 mb-10 animate-fade-in-up">
-                <button
-                    @click="setSettingsTab('global')"
-                    :class="activeTab === 'global'
-                        ? 'bg-neutral-900 text-white'
-                        : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
-                    class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200"
-                >
-                    {{ t('settings.tab.global') }}
-                </button>
-                <button
-                    @click="setSettingsTab('models')"
-                    :class="activeTab === 'models'
-                        ? 'bg-neutral-900 text-white'
-                        : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
-                    class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200"
-                >
-                    {{ t('settings.tab.models') }}
-                </button>
-                <button
-                    @click="setSettingsTab('integrations')"
-                    :class="activeTab === 'integrations'
-                        ? 'bg-neutral-900 text-white'
-                        : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
-                    class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200"
-                >
-                    {{ t('settings.tab.integrations') }}
-                </button>
+            <div class="page-tabs mb-6 animate-fade-in-up">
+                {{ ui.segmented([('global', t('settings.tab.global')), ('models', t('settings.tab.models')), ('integrations', t('settings.tab.integrations'))],
+                                'activeTab', "setSettingsTab('{value}')", aria_label=t('navbar.tab.settings')) }}
             </div>
 
             <!-- Global Settings Tab -->
@@ -39,7 +14,7 @@
                             <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('settings.global.section_label') }}</h2>
                             <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('settings.global.heading') }}</h3>
                             <p class="text-sm text-neutral-500 mt-2">
-                                {{ t('settings.global.restart_notice') }} <span class="px-1 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">{{ t('settings.global.restart_badge') }}</span> {{ t('settings.global.restart_suffix') }}
+                                {{ t('settings.global.restart_notice') }} <span class="badge bg-amber-50 text-amber-600 border-amber-200">{{ t('settings.global.restart_badge') }}</span> {{ t('settings.global.restart_suffix') }}
                             </p>
                         </div>
                         <button type="button" @click="resetGlobalSettingsDefaults()"
@@ -51,15 +26,45 @@
                         </button>
                     </div>
 
-                    <!-- Settings Sections -->
-                    <div class="space-y-4">
+                    <!-- Settings Sections, with a rail that follows the scroll -->
+                    {%- set settings_rail = [
+                            ('settings-language', t('settings.language.section_label')),
+                            ('settings-appearance', t('settings.sections.appearance')),
+                            ('settings-auth', t('settings.auth.section_label')),
+                            ('settings-server', t('settings.server.section_label')),
+                            ('settings-model', t('settings.model.section_label')),
+                            ('settings-resource', t('settings.resource.section_label')),
+                            ('settings-cache', t('settings.cache.section_label')),
+                            ('settings-generation', t('settings.generation.section_label')),
+                            ('settings-mcp', t('settings.mcp.section_label')),
+                            ('settings-usage', t('settings.usage.section_label')),
+                            ('settings-network', t('settings.network.section_label')),
+                            ('settings-advanced', t('settings.advanced.section_label'))
+                    ] %}
+                    <div class="settings-layout" x-init="settingsWatchScroll()">
+                        <nav class="settings-rail" aria-label="{{ t('settings.sections.label') }}">
+                            {%- for sid, title in settings_rail %}
+                            <a href="#{{ sid }}" class="settings-rail__item"
+                               :class="settingsActiveSection === '{{ sid }}' ? 'settings-rail__item--active' : ''"
+                               :aria-current="settingsActiveSection === '{{ sid }}' ? 'location' : null"
+                               @click.prevent="settingsGoToSection('{{ sid }}')">{{ title }}</a>
+                            {%- endfor %}
+                        </nav>
+                    <div class="space-y-4 min-w-0">
 
                         <!-- Language Section -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                        <div id="settings-language" class="settings-section bg-white rounded-2xl border border-neutral-200 overflow-hidden">
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="globe" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.language.section_label') }}</span>
+                                    <button type="button" @click="settingsCopyAnchor('settings-language')"
+                                            class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 transition-colors"
+                                            :title="settingsCopiedAnchor === 'settings-language' ? window.t('cluster.v2.common.copied') : window.t('settings.sections.copy_link')"
+                                            :aria-label="window.t('settings.sections.copy_link')">
+                                        <i x-show="settingsCopiedAnchor !== 'settings-language'" data-lucide="link" class="w-3.5 h-3.5"></i>
+                                        <i x-show="settingsCopiedAnchor === 'settings-language'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
+                                    </button>
                                 </div>
                             </div>
                             <div class="divide-y divide-neutral-100">
@@ -83,12 +88,57 @@
                             </div>
                         </div>
 
+                        <!-- Appearance Section -->
+                        <div id="settings-appearance" class="settings-section bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex items-center gap-3">
+                                    <i data-lucide="sun-moon" class="w-4 h-4 text-neutral-500"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.sections.appearance') }}</span>
+                                    <button type="button" @click="settingsCopyAnchor('settings-appearance')"
+                                            class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 transition-colors"
+                                            :title="settingsCopiedAnchor === 'settings-appearance' ? window.t('cluster.v2.common.copied') : window.t('settings.sections.copy_link')"
+                                            :aria-label="window.t('settings.sections.copy_link')">
+                                        <i x-show="settingsCopiedAnchor !== 'settings-appearance'" data-lucide="link" class="w-3.5 h-3.5"></i>
+                                        <i x-show="settingsCopiedAnchor === 'settings-appearance'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="divide-y divide-neutral-100">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <label class="text-sm text-neutral-700">{{ t('chat.theme_label') }}</label>
+                                    {{ ui.segmented([('auto', t('navbar.theme.auto')), ('light', t('navbar.theme.light_mode')), ('dark', t('navbar.theme.dark_mode'))],
+                                                    'theme', "setTheme('{value}')", aria_label=t('chat.theme_label')) }}
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('chat.enhanced_readability') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('chat.enhanced_readability_desc') }}</p>
+                                    </div>
+                                    <button type="button" role="switch"
+                                            @click="setEnhancedReadability(!enhancedReadability)"
+                                            :aria-checked="enhancedReadability ? 'true' : 'false'"
+                                            :class="enhancedReadability ? 'bg-black' : 'bg-neutral-200'"
+                                            class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="enhancedReadability ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
                         <!-- Auth & Info Section -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                        <div id="settings-auth" class="settings-section bg-white rounded-2xl border border-neutral-200 overflow-hidden">
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="shield" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.auth.section_label') }}</span>
+                                    <button type="button" @click="settingsCopyAnchor('settings-auth')"
+                                            class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 transition-colors"
+                                            :title="settingsCopiedAnchor === 'settings-auth' ? window.t('cluster.v2.common.copied') : window.t('settings.sections.copy_link')"
+                                            :aria-label="window.t('settings.sections.copy_link')">
+                                        <i x-show="settingsCopiedAnchor !== 'settings-auth'" data-lucide="link" class="w-3.5 h-3.5"></i>
+                                        <i x-show="settingsCopiedAnchor === 'settings-auth'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
+                                    </button>
                                 </div>
                             </div>
                             <div class="divide-y divide-neutral-100">
@@ -145,7 +195,7 @@
                                             <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.auth.sub_keys_hint') }}</p>
                                         </div>
                                         <button type="button" @click="showNewSubKeyForm = !showNewSubKeyForm"
-                                                class="px-3 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100 rounded-lg hover:bg-neutral-200 transition-colors">
+                                                class="px-3 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100 rounded-full hover:bg-neutral-200 transition-colors">
                                             <span x-show="!showNewSubKeyForm">+ {{ t('settings.auth.sub_keys_add') }}</span>
                                             <span x-show="showNewSubKeyForm">{{ t('settings.auth.sub_keys_cancel') }}</span>
                                         </button>
@@ -178,7 +228,7 @@
                                         </div>
                                         <div x-show="subKeyError" class="text-xs text-red-500 mb-2" x-text="subKeyError"></div>
                                         <button type="button" @click="createSubKey()"
-                                                class="px-4 py-1.5 text-xs font-medium text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 transition-colors">
+                                                class="px-4 py-1.5 text-xs font-medium text-white bg-neutral-900 rounded-full hover:bg-neutral-800 transition-colors">
                                             {{ t('settings.auth.sub_keys_create') }}
                                         </button>
                                     </div>
@@ -198,7 +248,7 @@
                                                             <svg class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></svg>
                                                         </button>
                                                     </div>
-                                                    <div class="text-[10px] text-neutral-400 mt-1" x-text="sk.created_at ? new Date(sk.created_at).toLocaleDateString() : ''"></div>
+                                                    <div class="text-caption text-neutral-400 mt-1" x-text="sk.created_at ? new Date(sk.created_at).toLocaleDateString() : ''"></div>
                                                 </div>
                                                 <button type="button" @click="deleteSubKey(sk.key)"
                                                         class="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors ml-2"
@@ -217,11 +267,18 @@
                         </div>
 
                         <!-- Server Section -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                        <div id="settings-server" class="settings-section bg-white rounded-2xl border border-neutral-200 overflow-hidden">
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="server" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.server.section_label') }}</span>
+                                    <button type="button" @click="settingsCopyAnchor('settings-server')"
+                                            class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 transition-colors"
+                                            :title="settingsCopiedAnchor === 'settings-server' ? window.t('cluster.v2.common.copied') : window.t('settings.sections.copy_link')"
+                                            :aria-label="window.t('settings.sections.copy_link')">
+                                        <i x-show="settingsCopiedAnchor !== 'settings-server'" data-lucide="link" class="w-3.5 h-3.5"></i>
+                                        <i x-show="settingsCopiedAnchor === 'settings-server'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
+                                    </button>
                                 </div>
                             </div>
                             <div class="divide-y divide-neutral-100">
@@ -243,7 +300,7 @@
                                      }">
                                     <div class="flex items-center gap-2">
                                         <label class="text-sm text-neutral-700">{{ t('settings.server.host') }}</label>
-                                        <span class="px-1.5 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">{{ t('settings.global.restart_badge') }}</span>
+                                        <span class="badge bg-amber-50 text-amber-600 border-amber-200">{{ t('settings.global.restart_badge') }}</span>
                                     </div>
                                     <div class="flex flex-col items-end gap-1">
                                         <div class="flex items-center gap-2">
@@ -265,7 +322,7 @@
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div class="flex items-center gap-2">
                                         <label class="text-sm text-neutral-700">{{ t('settings.server.port') }}</label>
-                                        <span class="px-1.5 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">{{ t('settings.global.restart_badge') }}</span>
+                                        <span class="badge bg-amber-50 text-amber-600 border-amber-200">{{ t('settings.global.restart_badge') }}</span>
                                     </div>
                                     <input type="number" x-model.number="globalSettings.server.port"
                                            class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
@@ -287,11 +344,18 @@
                         </div>
 
                         <!-- Model Section -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                        <div id="settings-model" class="settings-section bg-white rounded-2xl border border-neutral-200 overflow-hidden">
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="box" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.model.section_label') }}</span>
+                                    <button type="button" @click="settingsCopyAnchor('settings-model')"
+                                            class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 transition-colors"
+                                            :title="settingsCopiedAnchor === 'settings-model' ? window.t('cluster.v2.common.copied') : window.t('settings.sections.copy_link')"
+                                            :aria-label="window.t('settings.sections.copy_link')">
+                                        <i x-show="settingsCopiedAnchor !== 'settings-model'" data-lucide="link" class="w-3.5 h-3.5"></i>
+                                        <i x-show="settingsCopiedAnchor === 'settings-model'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
+                                    </button>
                                 </div>
                             </div>
                             <div class="divide-y divide-neutral-100">
@@ -327,7 +391,7 @@
                                             <label class="text-sm text-neutral-700">{{ t('settings.model.model_directories') }}</label>
                                         </div>
                                         <button @click="globalSettings.model.model_dirs.push('')"
-                                                class="flex items-center gap-1 text-xs px-2 py-1 text-neutral-500 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-colors">
+                                                class="flex items-center gap-1 text-xs px-2 py-1 text-neutral-500 hover:text-neutral-700 hover:bg-neutral-100 rounded-full transition-colors">
                                             <i data-lucide="plus" class="w-3.5 h-3.5"></i>
                                             <span>{{ t('settings.model.add') }}</span>
                                         </button>
@@ -367,13 +431,20 @@
                         </div>
 
                         <!-- Memory Management Section -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                        <div id="settings-resource" class="settings-section bg-white rounded-2xl border border-neutral-200 overflow-hidden">
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="gauge" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.resource.section_label') }}</span>
+                                    <button type="button" @click="settingsCopyAnchor('settings-resource')"
+                                            class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 transition-colors"
+                                            :title="settingsCopiedAnchor === 'settings-resource' ? window.t('cluster.v2.common.copied') : window.t('settings.sections.copy_link')"
+                                            :aria-label="window.t('settings.sections.copy_link')">
+                                        <i x-show="settingsCopiedAnchor !== 'settings-resource'" data-lucide="link" class="w-3.5 h-3.5"></i>
+                                        <i x-show="settingsCopiedAnchor === 'settings-resource'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
+                                    </button>
                                 </div>
-                                <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-green-50 text-green-600 border border-green-200">
+                                <span class="badge bg-green-50 text-green-600 border-green-200">
                                     {{ t('settings.resource.live_badge') }}
                                 </span>
                             </div>
@@ -383,7 +454,7 @@
                                     <div>
                                         <div class="flex items-center gap-2">
                                             <label class="text-sm text-neutral-700">{{ t('settings.resource.prefill_memory_guard') }}</label>
-                                            <span class="px-1.5 py-0.5 text-[9px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">{{ t('settings.resource.restart_badge') }}</span>
+                                            <span class="badge bg-amber-50 text-amber-600 border-amber-200">{{ t('settings.resource.restart_badge') }}</span>
                                         </div>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.prefill_memory_guard_description') }}</p>
                                         <p class="text-xs text-neutral-500 mt-1"
@@ -465,7 +536,7 @@
                                                    @keydown.enter="updateHotCacheFromInput($event.target.value); editingHotCache = false"
                                                    @keydown.escape="editingHotCache = false"
                                                    x-init="if (editingHotCache) { $nextTick(() => $el.focus()) }"
-                                                   class="w-12 px-1 text-sm text-right border border-neutral-900 rounded focus:outline-none"
+                                                   class="w-12 px-1 text-sm text-right border border-neutral-900 rounded-lg focus:outline-none"
                                                    min="0"
                                                    step="1"><span class="text-neutral-400">GB)</span>
                                         </span>
@@ -502,7 +573,7 @@
                                                    @keydown.enter="updateCacheFromInput($event.target.value); editingCache = false"
                                                    @keydown.escape="editingCache = false"
                                                    x-init="if (editingCache) { $nextTick(() => $el.focus()) }"
-                                                   class="w-12 px-1 text-sm text-right border border-neutral-900 rounded focus:outline-none"
+                                                   class="w-12 px-1 text-sm text-right border border-neutral-900 rounded-lg focus:outline-none"
                                                    min="0"
                                                    step="1"><span class="text-neutral-400">GB)</span>
                                         </span>
@@ -515,7 +586,7 @@
                                             <label class="text-sm text-neutral-700">{{ t('settings.resource.max_concurrent_requests') }}</label>
                                             <!-- Applied live, except to distributed (cluster) engines -->
                                             <span x-show="globalSettings.server.distributed_inference_active" x-cloak
-                                                  class="px-1.5 py-0.5 text-[9px] font-medium rounded-full bg-amber-50 text-amber-600 border border-amber-200">
+                                                  class="badge bg-amber-50 text-amber-600 border-amber-200">
                                                 {{ t('settings.resource.restart_badge') }}
                                             </span>
                                         </div>
@@ -569,18 +640,18 @@
                                         <label class="text-sm text-neutral-700">{{ t('settings.resource.prefill_priority.label') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.prefill_priority.description') }}</p>
                                     </div>
-                                    <div class="flex rounded-lg border border-neutral-200 overflow-hidden flex-shrink-0">
+                                    <div class="segmented segmented--sm flex-shrink-0">
                                         <button type="button"
                                                 @click="globalSettings.scheduler.prefill_priority = 'context'"
-                                                :class="globalSettings.scheduler.prefill_priority !== 'speed' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
-                                                class="px-3 py-1.5 text-xs font-medium transition-all flex items-center gap-1.5">
+                                                :class="globalSettings.scheduler.prefill_priority !== 'speed' ? 'segmented__item--active' : ''"
+                                                class="segmented__item inline-flex items-center gap-1.5">
                                             <i data-lucide="maximize-2" class="w-3.5 h-3.5"></i>
                                             {{ t('settings.resource.prefill_priority.max_context') }}
                                         </button>
                                         <button type="button"
                                                 @click="globalSettings.scheduler.prefill_priority = 'speed'"
-                                                :class="globalSettings.scheduler.prefill_priority === 'speed' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
-                                                class="px-3 py-1.5 text-xs font-medium transition-all border-l border-neutral-200 flex items-center gap-1.5">
+                                                :class="globalSettings.scheduler.prefill_priority === 'speed' ? 'segmented__item--active' : ''"
+                                                class="segmented__item inline-flex items-center gap-1.5">
                                             <i data-lucide="gauge" class="w-3.5 h-3.5"></i>
                                             {{ t('settings.resource.prefill_priority.speed') }}
                                         </button>
@@ -608,11 +679,18 @@
                         </div>
 
                         <!-- Cache Section -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                        <div id="settings-cache" class="settings-section bg-white rounded-2xl border border-neutral-200 overflow-hidden">
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="hard-drive" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.cache.section_label') }}</span>
+                                    <button type="button" @click="settingsCopyAnchor('settings-cache')"
+                                            class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 transition-colors"
+                                            :title="settingsCopiedAnchor === 'settings-cache' ? window.t('cluster.v2.common.copied') : window.t('settings.sections.copy_link')"
+                                            :aria-label="window.t('settings.sections.copy_link')">
+                                        <i x-show="settingsCopiedAnchor !== 'settings-cache'" data-lucide="link" class="w-3.5 h-3.5"></i>
+                                        <i x-show="settingsCopiedAnchor === 'settings-cache'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
+                                    </button>
                                 </div>
                             </div>
                             <div class="divide-y divide-neutral-100">
@@ -631,7 +709,7 @@
                                     <div>
                                         <div class="flex items-center gap-2">
                                             <label class="text-sm text-neutral-700">{{ t('settings.cache.hot_cache_only') }}</label>
-                                            <span class="px-1.5 py-0.5 text-[9px] font-medium rounded-full bg-amber-50 text-amber-600 border border-amber-200">
+                                            <span class="badge bg-amber-50 text-amber-600 border-amber-200">
                                                 {{ t('settings.global.restart_badge') }}
                                             </span>
                                         </div>
@@ -655,11 +733,18 @@
                         </div>
 
                         <!-- Sampling Defaults Section -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                        <div id="settings-generation" class="settings-section bg-white rounded-2xl border border-neutral-200 overflow-hidden">
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="sliders" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.generation.section_label') }}</span>
+                                    <button type="button" @click="settingsCopyAnchor('settings-generation')"
+                                            class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 transition-colors"
+                                            :title="settingsCopiedAnchor === 'settings-generation' ? window.t('cluster.v2.common.copied') : window.t('settings.sections.copy_link')"
+                                            :aria-label="window.t('settings.sections.copy_link')">
+                                        <i x-show="settingsCopiedAnchor !== 'settings-generation'" data-lucide="link" class="w-3.5 h-3.5"></i>
+                                        <i x-show="settingsCopiedAnchor === 'settings-generation'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
+                                    </button>
                                 </div>
                             </div>
                             <div class="divide-y divide-neutral-100">
@@ -734,13 +819,20 @@
                         </div>
 
                         <!-- MCP Section -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                        <div id="settings-mcp" class="settings-section bg-white rounded-2xl border border-neutral-200 overflow-hidden">
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="plug" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.mcp.section_label') }}</span>
+                                    <button type="button" @click="settingsCopyAnchor('settings-mcp')"
+                                            class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 transition-colors"
+                                            :title="settingsCopiedAnchor === 'settings-mcp' ? window.t('cluster.v2.common.copied') : window.t('settings.sections.copy_link')"
+                                            :aria-label="window.t('settings.sections.copy_link')">
+                                        <i x-show="settingsCopiedAnchor !== 'settings-mcp'" data-lucide="link" class="w-3.5 h-3.5"></i>
+                                        <i x-show="settingsCopiedAnchor === 'settings-mcp'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
+                                    </button>
                                 </div>
-                                <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-amber-50 text-amber-600 border border-amber-200">
+                                <span class="badge bg-amber-50 text-amber-600 border-amber-200">
                                     {{ t('settings.mcp.restart_badge') }}
                                 </span>
                             </div>
@@ -767,13 +859,20 @@
                         </div>
 
                         <!-- Usage History Section -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                        <div id="settings-usage" class="settings-section bg-white rounded-2xl border border-neutral-200 overflow-hidden">
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="history" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.usage.section_label') }}</span>
+                                    <button type="button" @click="settingsCopyAnchor('settings-usage')"
+                                            class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 transition-colors"
+                                            :title="settingsCopiedAnchor === 'settings-usage' ? window.t('cluster.v2.common.copied') : window.t('settings.sections.copy_link')"
+                                            :aria-label="window.t('settings.sections.copy_link')">
+                                        <i x-show="settingsCopiedAnchor !== 'settings-usage'" data-lucide="link" class="w-3.5 h-3.5"></i>
+                                        <i x-show="settingsCopiedAnchor === 'settings-usage'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
+                                    </button>
                                 </div>
-                                <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-green-50 text-green-600 border border-green-200">
+                                <span class="badge bg-green-50 text-green-600 border-green-200">
                                     {{ t('settings.resource.live_badge') }}
                                 </span>
                             </div>
@@ -797,13 +896,20 @@
                         </div>
 
                         <!-- Network Section -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                        <div id="settings-network" class="settings-section bg-white rounded-2xl border border-neutral-200 overflow-hidden">
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
                                     <i data-lucide="network" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.network.section_label') }}</span>
+                                    <button type="button" @click="settingsCopyAnchor('settings-network')"
+                                            class="p-1 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-200 transition-colors"
+                                            :title="settingsCopiedAnchor === 'settings-network' ? window.t('cluster.v2.common.copied') : window.t('settings.sections.copy_link')"
+                                            :aria-label="window.t('settings.sections.copy_link')">
+                                        <i x-show="settingsCopiedAnchor !== 'settings-network'" data-lucide="link" class="w-3.5 h-3.5"></i>
+                                        <i x-show="settingsCopiedAnchor === 'settings-network'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
+                                    </button>
                                 </div>
-                                <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-green-50 text-green-600 border border-green-200">
+                                <span class="badge bg-green-50 text-green-600 border-green-200">
                                     {{ t('settings.resource.live_badge') }}
                                 </span>
                             </div>
@@ -844,8 +950,9 @@
                         </div>
 
                         <!-- Advanced Settings (collapsible, collapsed by default) -->
-                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden"
-                             x-data="{ advancedOpen: false }">
+                        <div id="settings-advanced" class="settings-section bg-white rounded-2xl border border-neutral-200 overflow-hidden"
+                             x-data="{ advancedOpen: false }"
+                             @settings-open-section.window="if ($event.detail === 'settings-advanced') advancedOpen = true">
                             <button @click="advancedOpen = !advancedOpen"
                                     class="w-full flex items-center justify-between px-6 py-4 bg-neutral-50 hover:bg-neutral-100 transition-colors cursor-pointer">
                                 <div class="flex items-center gap-3">
@@ -853,7 +960,7 @@
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.section_label') }}</span>
                                 </div>
                                 <div class="flex items-center gap-2">
-                                    <span class="px-2 py-0.5 text-[10px] font-medium rounded-full bg-amber-50 text-amber-600 border border-amber-200">
+                                    <span class="badge bg-amber-50 text-amber-600 border-amber-200">
                                         {{ t('settings.advanced.restart_badge') }}
                                     </span>
                                     <i data-lucide="chevron-down" class="w-4 h-4 text-neutral-400 transition-transform duration-200"
@@ -866,7 +973,7 @@
                                     <div class="px-6 py-3 bg-neutral-50">
                                         <div class="flex items-center gap-2">
                                             <i data-lucide="network" class="w-3.5 h-3.5 text-neutral-400"></i>
-                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.distributed_inference') }}</span>
+                                            <span class="text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.distributed_inference') }}</span>
                                         </div>
                                     </div>
                                     <div class="divide-y divide-neutral-100">
@@ -889,7 +996,7 @@
                                     <div class="px-6 py-3 bg-neutral-50 border-t border-neutral-200">
                                         <div class="flex items-center gap-2">
                                             <i data-lucide="zap" class="w-3.5 h-3.5 text-neutral-400"></i>
-                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.performance') }}</span>
+                                            <span class="text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.performance') }}</span>
                                         </div>
                                     </div>
                                     <div class="divide-y divide-neutral-100">
@@ -938,7 +1045,7 @@
                                     <div class="px-6 py-3 bg-neutral-50 border-t border-neutral-200">
                                         <div class="flex items-center gap-2">
                                             <i data-lucide="hard-drive" class="w-3.5 h-3.5 text-neutral-400"></i>
-                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.cache') }}</span>
+                                            <span class="text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.cache') }}</span>
                                         </div>
                                     </div>
                                     <div class="divide-y divide-neutral-100">
@@ -981,7 +1088,7 @@
                                     <div class="px-6 py-3 bg-neutral-50 border-t border-neutral-200">
                                         <div class="flex items-center gap-2">
                                             <i data-lucide="database-zap" class="w-3.5 h-3.5 text-neutral-400"></i>
-                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.gdn_cache_policy') }}</span>
+                                            <span class="text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.gdn_cache_policy') }}</span>
                                         </div>
                                         <p class="text-xs text-neutral-400 mt-1.5">{{ t('settings.advanced.gdn_cache_policy_hint') }}</p>
                                     </div>
@@ -1036,7 +1143,7 @@
                                     <div class="px-6 py-3 bg-neutral-50 border-t border-neutral-200">
                                         <div class="flex items-center gap-2">
                                             <i data-lucide="upload" class="w-3.5 h-3.5 text-neutral-400"></i>
-                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.uploads') }}</span>
+                                            <span class="text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.uploads') }}</span>
                                         </div>
                                     </div>
                                     <div class="divide-y divide-neutral-100">
@@ -1056,7 +1163,7 @@
                                     <div class="px-6 py-3 bg-neutral-50 border-t border-neutral-200">
                                         <div class="flex items-center gap-2">
                                             <i data-lucide="radio" class="w-3.5 h-3.5 text-neutral-400"></i>
-                                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.streaming') }}</span>
+                                            <span class="text-caption font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.streaming') }}</span>
                                         </div>
                                     </div>
                                     <div class="divide-y divide-neutral-100">
@@ -1077,6 +1184,7 @@
                             </div>
                         </div>
 
+                    </div>
                     </div>
 
                     <!-- Save / Restart Buttons -->
@@ -1173,7 +1281,7 @@
                                     <i data-lucide="file-text" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.integrations.markitdown.section_label') }}</span>
                                 </div>
-                                <span class="px-2 py-0.5 text-[10px] font-medium rounded bg-neutral-200 text-neutral-600 border border-neutral-300">{{ t('settings.integrations.markitdown.formats_badge') }}</span>
+                                <span class="badge bg-neutral-200 text-neutral-600 border-neutral-300">{{ t('settings.integrations.markitdown.formats_badge') }}</span>
                             </div>
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
@@ -1265,7 +1373,7 @@
                                     <i data-lucide="globe" class="w-4 h-4 text-neutral-500"></i>
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.integrations.websearch.section_label') }}</span>
                                 </div>
-                                <span class="px-2 py-0.5 text-[10px] font-medium rounded bg-neutral-200 text-neutral-600 border border-neutral-300">{{ t('settings.integrations.websearch.providers_badge') }}</span>
+                                <span class="badge bg-neutral-200 text-neutral-600 border-neutral-300">{{ t('settings.integrations.websearch.providers_badge') }}</span>
                             </div>
                             <div class="divide-y divide-neutral-100">
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
@@ -1388,7 +1496,7 @@
                                     <button type="button"
                                             @click="testWebSearch()"
                                             :disabled="webSearchTest.running"
-                                            class="px-4 py-2 text-sm font-medium border border-neutral-200 rounded-lg hover:bg-neutral-50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0">
+                                            class="px-4 py-2 text-sm font-medium border border-neutral-200 rounded-full hover:bg-neutral-50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0">
                                         <span x-show="!webSearchTest.running">{{ t('settings.integrations.websearch.test_button') }}</span>
                                         <span x-show="webSearchTest.running">{{ t('settings.integrations.websearch.testing') }}</span>
                                     </button>
@@ -1410,7 +1518,7 @@
                             <button @click="reloadModels()"
                                     :disabled="reloading"
                                     class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-700
-                                           hover:bg-neutral-100 rounded-lg transition-all flex items-center gap-1.5
+                                           hover:bg-neutral-100 rounded-full transition-all flex items-center gap-1.5
                                            disabled:opacity-50 disabled:cursor-not-allowed">
                                 <span class="inline-flex" :class="reloading && 'animate-spin'"><i data-lucide="rotate-cw" class="w-3.5 h-3.5"></i></span>
                                 <span x-text="reloading ? window.t('models.manager.reloading') : window.t('models.manager.reload')"></span>
@@ -1427,12 +1535,12 @@
                                    :placeholder="window.t('settings.models.search_placeholder')"
                                    class="w-full pl-9 pr-9 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
                             <button x-show="modelSearch" @click="modelSearch = ''"
-                                    class="absolute right-2.5 top-1/2 -translate-y-1/2 p-0.5 rounded text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 transition-all">
+                                    class="absolute right-2.5 top-1/2 -translate-y-1/2 p-0.5 rounded-lg text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100 transition-all">
                                 <i data-lucide="x" class="w-3.5 h-3.5"></i>
                             </button>
                         </div>
                         <button @click="resetSort()" :disabled="isModelsSortDefault"
-                                class="px-3 py-2 text-xs font-medium text-neutral-500 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-all flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap">
+                                class="px-3 py-2 text-xs font-medium text-neutral-500 hover:text-neutral-700 hover:bg-neutral-100 rounded-full transition-all flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap">
                             <i data-lucide="arrow-up-down" class="w-3.5 h-3.5"></i>
                             <span x-text="window.t('settings.models.reset_sort')"></span>
                         </button>
@@ -1463,31 +1571,31 @@
                         <div class="flex items-center gap-4 px-4 sm:px-6 py-3 bg-neutral-50 border-b border-neutral-200 text-xs font-bold uppercase tracking-wider text-neutral-500">
                             <div class="flex-1 min-w-0 flex items-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('id')">
                                 {{ t('settings.models.table.model') }}
-                                <span x-show="sortBy === 'id'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                                <span x-show="sortBy === 'id'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-caption"></span>
                             </div>
                             <div class="hidden sm:flex w-20 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('type')">
                                 {{ t('settings.models.table.type') }}
-                                <span x-show="sortBy === 'type'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                                <span x-show="sortBy === 'type'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-caption"></span>
                             </div>
                             <div class="hidden sm:flex w-60 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('size')">
                                 {{ t('settings.models.table.size') }}
-                                <span x-show="sortBy === 'size'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                                <span x-show="sortBy === 'size'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-caption"></span>
                             </div>
                             <div class="w-20 text-center flex items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('loaded')">
                                 {{ t('settings.models.table.status') }}
-                                <span x-show="sortBy === 'loaded'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                                <span x-show="sortBy === 'loaded'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-caption"></span>
                             </div>
                             <div class="hidden sm:flex w-12 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('pinned')">
                                 {{ t('settings.models.table.pin') }}
-                                <span x-show="sortBy === 'pinned'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                                <span x-show="sortBy === 'pinned'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-caption"></span>
                             </div>
                             <div class="hidden sm:flex w-12 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('is_hidden')">
                                 {{ t('settings.models.table.visible') }}
-                                <span x-show="sortBy === 'is_hidden'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                                <span x-show="sortBy === 'is_hidden'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-caption"></span>
                             </div>
                             <div class="hidden sm:flex w-14 text-center items-center justify-center gap-1 cursor-pointer hover:text-neutral-700 select-none" @click="toggleSort('is_default')">
                                 {{ t('settings.models.table.default') }}
-                                <span x-show="sortBy === 'is_default'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-[10px]"></span>
+                                <span x-show="sortBy === 'is_default'" x-text="sortOrder === 'asc' ? '▲' : '▼'" class="text-caption"></span>
                             </div>
                             <div class="w-10 text-center"></div>
                         </div>
@@ -1523,15 +1631,15 @@
                                                :title="model.display_name || model.id"
                                                x-text="model.display_name || model.id"></p>
                                             <span x-show="model.settings?.model_alias" x-cloak
-                                                  class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 truncate max-w-[120px]"
+                                                  class="badge bg-neutral-100 text-neutral-500 border-neutral-200 truncate max-w-[120px]"
                                                   x-text="model.settings?.model_alias"></span>
                                             <span x-show="model.is_helper" x-cloak
-                                                  class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200"
+                                                  class="badge bg-amber-50 text-amber-600 border-amber-200"
                                                   @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.helper_tooltip'))"
                                                   @mouseleave="hideTip()"
                                                   x-text="window.t('settings.models.table.helper_badge')"></span>
                                             <span x-show="model.is_hidden" x-cloak
-                                                  class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200"
+                                                  class="badge bg-neutral-100 text-neutral-500 border-neutral-200"
                                                   @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.hidden_tooltip'))"
                                                   @mouseleave="hideTip()"
                                                   x-text="window.t('settings.models.table.hidden_badge')"></span>
@@ -1547,7 +1655,7 @@
 
                                         <!-- Type -->
                                         <div class="hidden sm:block w-20 text-center flex-shrink-0">
-                                            <span class="px-2 py-0.5 text-xs font-medium rounded-full bg-neutral-100 text-neutral-600"
+                                            <span class="badge bg-neutral-100 text-neutral-600"
                                                   x-text="model.model_type || 'llm'"></span>
                                         </div>
 
@@ -1562,7 +1670,7 @@
                                              @mouseenter="hover = true" @mouseleave="hover = false">
                                             <!-- Loading state -->
                                             <template x-if="model.is_loading">
-                                                <span class="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full gap-1 bg-amber-100 text-amber-700">
+                                                <span class="badge gap-1 bg-amber-100 text-amber-700">
                                                     <svg class="w-3 h-3 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
                                                         <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
                                                         <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
@@ -1582,7 +1690,7 @@
                                                 </button>
                                             </template>
                                             <template x-if="model.virtual && !model.is_loading && model.loaded">
-                                                <span class="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full gap-1 bg-neutral-900 text-white">
+                                                <span class="badge gap-1 bg-neutral-900 text-white">
                                                     <span class="w-1.5 h-1.5 rounded-full bg-white"></span>
                                                     <span x-text="window.t('settings.models.table.status_loaded')"></span>
                                                 </span>
@@ -1593,7 +1701,7 @@
                                                         :class="hover
                                                             ? 'bg-green-100 text-green-700 border-green-200 cursor-pointer'
                                                             : 'bg-white text-neutral-500 border-neutral-200'"
-                                                        class="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full gap-1 border transition-all">
+                                                        class="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-lg gap-1 border transition-all">
                                                     <span :class="hover ? 'bg-green-500' : 'bg-neutral-400'" class="w-1.5 h-1.5 rounded-full"></span>
                                                     <span x-text="hover ? window.t('settings.models.table.status_load') : window.t('settings.models.table.status_ready')"></span>
                                                 </button>
@@ -1610,11 +1718,11 @@
                                                     @focus="showTip($event.currentTarget, model.pinned ? window.t('settings.models.table.pin_on_tooltip') : window.t('settings.models.table.pin_off_tooltip'))"
                                                     @blur="hideTip()"
                                                     :class="model.pinned ? 'bg-black' : 'bg-neutral-200'"
-                                                    class="relative w-9 h-5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black"
+                                                    class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black"
                                                 >
                                                     <span
-                                                        :class="model.pinned ? 'translate-x-4' : 'translate-x-0'"
-                                                        class="block w-4 h-4 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"
+                                                        :class="model.pinned ? 'translate-x-5' : 'translate-x-0'"
+                                                        class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"
                                                     ></span>
                                                 </button>
                                             </template>
@@ -1633,11 +1741,11 @@
                                                     @focus="showTip($event.currentTarget, !model.is_hidden ? window.t('settings.models.table.visible_on_tooltip') : window.t('settings.models.table.visible_off_tooltip'))"
                                                     @blur="hideTip()"
                                                     :class="!model.is_hidden ? 'bg-black' : 'bg-neutral-200'"
-                                                    class="relative w-9 h-5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black"
+                                                    class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black"
                                                 >
                                                     <span
-                                                        :class="!model.is_hidden ? 'translate-x-4' : 'translate-x-0'"
-                                                        class="block w-4 h-4 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"
+                                                        :class="!model.is_hidden ? 'translate-x-5' : 'translate-x-0'"
+                                                        class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"
                                                     ></span>
                                                 </button>
                                             </template>
@@ -1658,7 +1766,7 @@
                                                     :class="model.is_default
                                                         ? 'bg-black border-black'
                                                         : 'bg-white border-neutral-300 hover:border-neutral-400'"
-                                                    class="w-4 h-4 rounded-full border-2 flex items-center justify-center transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black"
+                                                    class="w-4 h-4 rounded-lg border-2 flex items-center justify-center transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black"
                                                 >
                                                     <span x-show="model.is_default" class="w-1.5 h-1.5 bg-white rounded-full"></span>
                                                 </button>
@@ -1691,85 +1799,85 @@
                                         <div class="ml-11 flex flex-wrap gap-2">
                                             <!-- 1. API-exposed profile pills -->
                                             <template x-for="profile in (model.exposed_profiles || [])" :key="profile.name">
-                                                <span class="inline-flex items-center gap-1 px-2.5 py-0.5 text-xs font-medium rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200"
+                                                <span class="badge gap-1 bg-emerald-50 text-emerald-700 border-emerald-200"
                                                       @mouseenter="showTip($event.currentTarget, profileTooltip(profile))"
                                                       @mouseleave="hideTip()">
-                                                    <span class="px-1 py-0.5 text-[9px] font-bold rounded bg-white/70"
+                                                    <span class="badge bg-white/70"
                                                           :class="profile.has_engine_fields ? 'text-amber-700' : 'text-emerald-700'">API</span>
                                                     <span x-text="profile.api_name || profile.name"></span>
                                                 </span>
                                             </template>
                                             <!-- 2. Preset pill (cyan) if settings match a preset exactly -->
                                             <template x-if="!model.settings?.active_profile_name && matchedPreset(model.settings)">
-                                                <span class="inline-flex items-center gap-1 px-2.5 py-0.5 text-xs font-medium rounded-full bg-cyan-50 text-cyan-700 border border-cyan-200">
+                                                <span class="badge gap-1 bg-cyan-50 text-cyan-700 border-cyan-200">
                                                     <i data-lucide="settings" class="w-3 h-3"></i>
                                                     <span x-text="matchedPreset(model.settings).display_name || matchedPreset(model.settings).name"></span>
                                                 </span>
                                             </template>
                                             <!-- 3. Per-field chips (original colors, rounded-full shape) -->
                                             <template x-if="model.settings?.max_context_window">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-amber-50 text-amber-700 border border-amber-200">
+                                                <span class="badge bg-amber-50 text-amber-700 border-amber-200">
                                                     ctx_window: <span class="ml-1" x-text="model.settings.max_context_window"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.max_tokens">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-blue-50 text-blue-700 border border-blue-200">
+                                                <span class="badge bg-blue-50 text-blue-700 border-blue-200">
                                                     max_tokens: <span class="ml-1" x-text="model.settings.max_tokens"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.temperature !== null && model.settings?.temperature !== undefined">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-orange-50 text-orange-700 border border-orange-200">
+                                                <span class="badge bg-orange-50 text-orange-700 border-orange-200">
                                                     temp: <span class="ml-1" x-text="model.settings.temperature"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.top_p !== null && model.settings?.top_p !== undefined">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-green-50 text-green-700 border border-green-200">
+                                                <span class="badge bg-green-50 text-green-700 border-green-200">
                                                     top_p: <span class="ml-1" x-text="model.settings.top_p"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.top_k !== null && model.settings?.top_k !== undefined">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-purple-50 text-purple-700 border border-purple-200">
+                                                <span class="badge bg-purple-50 text-purple-700 border-purple-200">
                                                     top_k: <span class="ml-1" x-text="model.settings.top_k"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.min_p !== null && model.settings?.min_p !== undefined">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">
+                                                <span class="badge bg-indigo-50 text-indigo-700 border-indigo-200">
                                                     min_p: <span class="ml-1" x-text="model.settings.min_p"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.repetition_penalty !== null && model.settings?.repetition_penalty !== undefined">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-pink-50 text-pink-700 border border-pink-200">
+                                                <span class="badge bg-pink-50 text-pink-700 border-pink-200">
                                                     rep_penalty: <span class="ml-1" x-text="model.settings.repetition_penalty"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.presence_penalty !== null && model.settings?.presence_penalty !== undefined">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-rose-50 text-rose-700 border border-rose-200">
+                                                <span class="badge bg-rose-50 text-rose-700 border-rose-200">
                                                     presence_penalty: <span class="ml-1" x-text="model.settings.presence_penalty"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.max_tool_result_tokens">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-teal-50 text-teal-700 border border-teal-200">
+                                                <span class="badge bg-teal-50 text-teal-700 border-teal-200">
                                                     tool_result_tokens: <span class="ml-1" x-text="model.settings.max_tool_result_tokens"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.reasoning_parser">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-violet-50 text-violet-700 border border-violet-200">
+                                                <span class="badge bg-violet-50 text-violet-700 border-violet-200">
                                                     reasoning_parser: <span class="ml-1" x-text="model.settings.reasoning_parser"></span>
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.enable_thinking === true">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-sky-50 text-sky-700 border border-sky-200">
+                                                <span class="badge bg-sky-50 text-sky-700 border-sky-200">
                                                     thinking
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.force_sampling">
-                                                <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-red-50 text-red-700 border border-red-200">
+                                                <span class="badge bg-red-50 text-red-700 border-red-200">
                                                     force_sampling
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.chat_template_kwargs">
                                                 <template x-for="[k, v] in Object.entries(model.settings.chat_template_kwargs)" :key="k">
-                                                    <span class="inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">
+                                                    <span class="badge bg-indigo-50 text-indigo-700 border-indigo-200">
                                                         <span x-text="k"></span>: <span class="ml-1" x-text="v"></span>
                                                     </span>
                                                 </template>

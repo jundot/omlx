@@ -407,6 +407,21 @@ class TestBatchedEngineStreamingCleanup:
 
         assert fake_engine.add_request_kwargs["tools"] == tools
 
+    @pytest.mark.asyncio
+    async def test_stream_generate_uses_caller_request_id(self):
+        from omlx.engine.batched import BatchedEngine
+
+        fake_engine = FakeStreamingCore()
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = fake_engine
+
+        stream = engine.stream_generate("hello", _request_id="req-progress")
+        await stream.__anext__()
+        await stream.aclose()
+
+        assert fake_engine.add_request_kwargs["request_id"] == "req-progress"
+
 
 class TestBatchedEngineApplyChatTemplate:
     """Tests for BatchedEngine._apply_chat_template()."""

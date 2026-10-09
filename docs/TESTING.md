@@ -208,3 +208,7 @@ Run `python -m pytest -q tests/test_video.py tests/test_image_utils.py tests/tes
 # Engine idle timing tests
 
 Run `python -m pytest -q tests/test_engine_pool.py tests/test_active_models_visibility.py` to check that lease completion refreshes the LRU/TTL timestamp and that busy models report zero idle time. The cases cover a request longer than its TTL, release with a pending unload, cancelled release, redundant releases, and models with a held lease, an active request, or a waiting request.
+
+# Structured output Unicode tests
+
+Run `python -m pytest -q tests/integration/test_server_endpoints.py -k structured_output_preserves_unicode` to check that JSON cleanup keeps Unicode keys and values readable. The cases cover `json_object` and `json_schema` on both OpenAI endpoints, including buffered chat streaming and Responses completion events.

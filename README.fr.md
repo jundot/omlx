@@ -228,7 +228,7 @@ Application native Swift / SwiftUI dans la barre de menus (pas Electron). Démar
 
 ### Compatibilité API
 
-Remplacement direct des APIs OpenAI et Anthropic. Supporte les statistiques d'usage en streaming (`stream_options.include_usage`), le thinking adaptatif Anthropic, et les entrées visuelles (base64, URL).
+Remplacement direct des APIs OpenAI et Anthropic. Supporte les statistiques d'usage en streaming (`stream_options.include_usage`), la progression du prefill façon llama.cpp (`return_progress`), le thinking adaptatif Anthropic, et les entrées visuelles (base64, URL).
 
 | Endpoint | Description |
 |----------|-------------|
@@ -278,7 +278,7 @@ Les modèles sont auto-détectés par type. Vous pouvez aussi télécharger des 
 | LLM | Tout modèle supporté par [mlx-lm](https://github.com/ml-explore/mlx-lm) |
 | VLM | Série Qwen3.5, GLM-4V, Pixtral, et autres modèles [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) |
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
-| Embedding | BERT, BGE-M3, ModernBERT |
+| Embedding | BERT, BGE-M3, ModernBERT, EmbeddingGemma 2 |
 | Reranker | ModernBERT, XLM-RoBERTa |
 | Decision | Clef, Clef-Flash, OpenJev |
 

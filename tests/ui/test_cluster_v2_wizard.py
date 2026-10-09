@@ -1192,13 +1192,12 @@ def test_dark_tensor_controls_use_explicit_high_contrast_palette():
     )
     assert "cluster-v2-tensor-segment" in template
     assert ':data-tensor-tone="index % 5"' in template
-    assert "[data-cluster-v2-strategy-picker]" in stylesheet
-    assert 'button[data-selected="true"]' in stylesheet
-    assert "[data-cluster-v2-strategy-recommended]" in stylesheet
-    assert "color: #f8fafc !important" in stylesheet
-    assert ".cluster-v2-tensor-segment--2 { background: #52525b; }" in stylesheet
+    assert (
+        ".cluster-v2-tensor-segment--2 { background: rgb(var(--palette-zinc-600)); }"
+        in stylesheet
+    )
     assert '[data-theme="dark"] [data-cluster-v2-active] .text-neutral-600' in stylesheet
-    assert "color: #d4d4d8 !important" in stylesheet
+    assert "color: rgb(var(--palette-zinc-300)) !important" in stylesheet
 
     tensor_bar = template.split("data-cluster-v2-split-bar-tensor", 1)[1].split(
         "</template>", 1
@@ -1593,11 +1592,11 @@ def test_strategy_picker_renders_between_models_and_roles():
     template = _read(TEMPLATE)
 
     assert "data-cluster-v2-strategy-picker" in template
-    # Same segmented-control pattern as the role picker (neutral-900 active).
+    # Same segmented control as the role picker.
     picker = template.split("data-cluster-v2-strategy-picker", 1)[1].split(
         "data-cluster-v2-node-roles", 1
     )[0]
-    assert "bg-neutral-900 text-white" in picker
+    assert "segmented__item--active" in picker
     assert ':data-cluster-v2-strategy="option.key"' in picker
     # Green "Recommended" pill, exactly one at a time.
     assert "data-cluster-v2-strategy-recommended" in picker

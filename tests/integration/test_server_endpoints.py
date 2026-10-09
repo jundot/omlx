@@ -2793,6 +2793,87 @@ class TestJsonOutputParsing:
         assert "Hello" in output_text
 
 
+@pytest.mark.parametrize("api", ["chat/completions", "responses"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("format_type", ["json_object", "json_schema"])
+def test_structured_output_preserves_unicode(
+    client, mock_llm_engine, monkeypatch, api, stream, format_type
+):
+    expected = {"име": "София", "city": "東京", "greeting": "café 👋"}
+    model_text = "```json\n" + json.dumps(expected, ensure_ascii=False) + "\n```"
+    mock_llm_engine.chat = AsyncMock(return_value=MockGenerationOutput(text=model_text))
+
+    async def stream_chat(**kwargs):
+        yield MockGenerationOutput(text=model_text, new_text=model_text)
+
+    mock_llm_engine.stream_chat = stream_chat
+    body = {"model": "test-model", "stream": stream}
+    if stream and api == "chat/completions":
+        # An unsupported tool parser buffers content until JSON cleanup finishes.
+        monkeypatch.setattr(
+            "omlx.server.ToolCallStreamFilter",
+            lambda *args, **kwargs: SimpleNamespace(active=False),
+        )
+        body["tools"] = [
+            {"type": "function", "function": {"name": "lookup", "parameters": {}}}
+        ]
+    output_format = {"type": format_type}
+    if format_type == "json_schema":
+        schema = {
+            "type": "object",
+            "properties": {key: {"type": "string"} for key in expected},
+            "required": list(expected),
+            "additionalProperties": False,
+        }
+        output_format.update(name="unicode", schema=schema, strict=True)
+    if api == "chat/completions":
+        body["messages"] = [{"role": "user", "content": "Return JSON"}]
+        if format_type == "json_schema":
+            output_format = {"type": format_type, "json_schema": output_format}
+        body["response_format"] = output_format
+    else:
+        body.update(input="Return JSON", text={"format": output_format})
+
+    response = client.post(f"/v1/{api}", json=body)
+    assert response.status_code == 200
+    if stream:
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        if api == "chat/completions":
+            contents = [
+                "".join(
+                    event["choices"][0]["delta"].get("content", "")
+                    for event in events
+                    if event.get("choices")
+                )
+            ]
+        else:
+            contents = [
+                event["text"]
+                for event in events
+                if event["type"] == "response.output_text.done"
+            ]
+            completed = next(
+                event["response"]
+                for event in events
+                if event["type"] == "response.completed"
+            )
+            contents.append(completed["output"][0]["content"][0]["text"])
+    elif api == "chat/completions":
+        contents = [response.json()["choices"][0]["message"]["content"]]
+    else:
+        contents = [response.json()["output"][0]["content"][0]["text"]]
+
+    assert contents
+    for content in contents:
+        assert json.loads(content) == expected
+        assert "\\u" not in content
+        assert all(value in content for value in ["име", *expected.values()])
+
+
 @pytest.mark.parametrize("api", ["chat/completions", "messages", "responses"])
 def test_nonstream_thinking_length_channels(client, mock_llm_engine, api):
     mock_llm_engine.chat = AsyncMock(

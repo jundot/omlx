@@ -205,6 +205,8 @@ class ServerSettings:
     max_audio_upload_size: str = "100MB"
     # Maximum raw image payload size accepted ("50MB", "100MB").
     max_image_upload_size: str = "50MB"
+    # Cap on any request body. It never drops below the upload limits.
+    max_request_body_size: str = "512MB"
     # Maximum side length in pixels for VLM input images (0 to disable downscaling).
     max_image_side_length: int = 2048
     # Seconds between trivial GPU kernels submitted while a model is loaded
@@ -226,6 +228,13 @@ class ServerSettings:
         size = parse_size(self.max_image_upload_size)
         if size <= 0:
             raise ValueError("max_image_upload_size must be positive")
+        return size
+
+    def max_request_body_bytes(self) -> int:
+        """Configured transport-level request body cap in bytes."""
+        size = parse_size(self.max_request_body_size)
+        if size <= 0:
+            raise ValueError("max_request_body_size must be positive")
         return size
 
     def to_dict(self) -> dict[str, Any]:
@@ -253,6 +262,7 @@ class ServerSettings:
             ),
             max_audio_upload_size=data.get("max_audio_upload_size", "100MB"),
             max_image_upload_size=data.get("max_image_upload_size", "50MB"),
+            max_request_body_size=data.get("max_request_body_size", "512MB"),
             max_image_side_length=data.get("max_image_side_length", 2048),
             gpu_keep_warm_interval=float(data.get("gpu_keep_warm_interval", 0.5)),
         )
@@ -1688,6 +1698,12 @@ class GlobalSettings:
                 errors.append("max_image_upload_size must be positive")
         except (AttributeError, TypeError, ValueError) as e:
             errors.append(f"Invalid max_image_upload_size: {e}")
+
+        try:
+            if parse_size(self.server.max_request_body_size) <= 0:
+                errors.append("max_request_body_size must be positive")
+        except (AttributeError, TypeError, ValueError) as e:
+            errors.append(f"Invalid max_request_body_size: {e}")
 
         if self.server.max_image_side_length < 0:
             errors.append("max_image_side_length must be non-negative")

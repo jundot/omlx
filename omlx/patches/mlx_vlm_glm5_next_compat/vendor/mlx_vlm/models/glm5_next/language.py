@@ -18,7 +18,6 @@ from ..deepseek_v4.hyper_connection import hc_expand as _hc_expand
 from ..fast_ops import exact_hc_norm
 from ..linear import DECODE_BLOCK_SIZE
 from mlx_lm.models.mla import MultiLinear
-from omlx.custom_kernels.nax import is_nax_available
 from omlx.patches import glm53_kda_prework
 from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as _decode_kernels
 from omlx.patches.deepseek_v4.switch_layers import SwitchGLU, _sort_threshold
@@ -65,8 +64,8 @@ def _cache_parts(cache):
 # Single-sequence decode (L == 1) and short verify blocks (L <= 8, the
 # DECODE_BLOCK_SIZE of the shared HC helpers) run fused kernels that
 # reproduce the reference op graph bit for bit; see decode_kernels.py.
-# They are validated on M5 (NAX) GPUs and used there.
-_DECODE_FUSION = is_nax_available()
+# They run on M3 and newer GPUs (decode_kernels.fused_decode_supported).
+_DECODE_FUSION = _decode_kernels.fused_decode_supported()
 _DECODE_BLOCK = 8
 
 # One-token decode forwards start evaluating every this many layers.
@@ -1929,6 +1928,49 @@ class Glm5NextModel(nn.Module):
         return self.norm(h)
 
 
+def _dequantize_router_gates(weights, hidden_size):
+    """Restore affine router weights before strict loading into a plain gate."""
+    for scales_key in [k for k in weights if k.endswith(".mlp.gate.scales")]:
+        prefix = scales_key[: -len("scales")]
+        weight_key = prefix + "weight"
+        if weight_key not in weights:
+            continue
+        packed = weights[weight_key]
+        scales = weights[scales_key]
+        biases = weights.get(prefix + "biases")
+        if (
+            hidden_size <= 0
+            or packed.ndim != 2
+            or scales.ndim != 2
+            or packed.dtype != mx.uint32
+            or not mx.issubdtype(scales.dtype, mx.floating)
+            or scales.shape[0] != packed.shape[0]
+            or scales.shape[-1] == 0
+            or hidden_size % scales.shape[-1]
+            or (packed.shape[-1] * 32) % hidden_size
+            or (packed.shape[-1] * 32 // hidden_size) not in (2, 3, 4, 5, 6, 8)
+            or (hidden_size // scales.shape[-1]) not in (32, 64, 128)
+            or biases is None
+            or biases.shape != scales.shape
+        ):
+            raise ValueError(
+                f"{weight_key}: cannot infer quantization from shapes "
+                f"{tuple(packed.shape)} / {tuple(scales.shape)}"
+            )
+        # The router has no quantized module, so restore fp32 like stock gates.
+        weights[weight_key] = mx.dequantize(
+            packed,
+            scales,
+            biases,
+            group_size=hidden_size // scales.shape[-1],
+            bits=packed.shape[-1] * 32 // hidden_size,
+            mode="affine",
+        ).astype(mx.float32)
+        weights.pop(scales_key)
+        weights.pop(prefix + "biases", None)
+    return weights
+
+
 class LanguageModel(nn.Module):
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()
@@ -1963,6 +2005,7 @@ class LanguageModel(nn.Module):
 
     def sanitize(self, weights):
         weights = {k: v for k, v in weights.items() if "mtp." not in k}
+        weights = _dequantize_router_gates(weights, self.args.hidden_size)
         weights = DSV32Model.sanitize(self, weights)
 
         remapped = {}

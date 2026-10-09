@@ -228,7 +228,7 @@ brew services info omlx     # 查看状态
 
 ### API 兼容性
 
-OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream_options.include_usage`）、Anthropic adaptive thinking 和视觉输入（base64、URL）。
+OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream_options.include_usage`）、llama.cpp 风格的 prefill 进度（`return_progress`）、Anthropic adaptive thinking 和视觉输入（base64、URL）。
 
 | 端点 | 说明 |
 |----------|------|
@@ -278,7 +278,7 @@ OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream
 | LLM | [mlx-lm](https://github.com/ml-explore/mlx-lm) 支持的所有模型 |
 | VLM | Qwen3.5 系列、GLM-4V、Pixtral 及其他 [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) 模型 |
 | OCR | DeepSeek-OCR、DOTS-OCR、GLM-OCR |
-| 嵌入 | BERT、BGE-M3、ModernBERT |
+| 嵌入 | BERT、BGE-M3、ModernBERT、EmbeddingGemma 2 |
 | 重排序 | ModernBERT、XLM-RoBERTa |
 | 决策 | Clef、Clef-Flash、OpenJev |
 

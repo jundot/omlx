@@ -191,7 +191,7 @@ def _throttle_ctx(
     return ns
 
 
-def _call(ns, requested, kv_len=0, *, gathered_core=False):
+def _call(ns, requested, kv_len=0, *, gathered_core=False, probe=False):
     with (
         patch.object(sched_mod.mx, "get_active_memory", return_value=0),
         patch.object(sched_mod, "get_phys_footprint", return_value=ns._fake_current),
@@ -203,7 +203,27 @@ def _call(ns, requested, kv_len=0, *, gathered_core=False):
             loop_label="test",
             kv_len=kv_len,
             gathered_core=gathered_core,
+            probe=probe,
         )
+
+
+def test_adaptive_throttle_probe_neither_pauses_nor_notifies():
+    ns = _throttle_ctx(
+        current=50 * _GB,
+        hard=58 * _GB,
+        samples_bpt=2 * 1024**2,
+    )
+    ns._fake_current = 50 * _GB
+    request = SimpleNamespace(prefill_eviction_retries=0)
+    ns.requests = {"r": request}
+    ns.config = SimpleNamespace(model_name="model-b")
+    ns._raise_prefill_eviction_if_available = (
+        Scheduler._raise_prefill_eviction_if_available.__get__(ns, Scheduler)
+    )
+    # A packed forward only asks whether its rows fit.
+    assert _call(ns, 2048, probe=True) < 2048
+    assert request.prefill_eviction_retries == 0
+    assert ns._throttle_notified_requests == set()
 
 
 def test_adaptive_throttle_requests_eviction_before_shrinking():
@@ -1364,6 +1384,7 @@ def _requeue_ctx():
         _MAX_PREFILL_OOM_RETRIES=2,
         _reclaim_prefill_headroom=lambda: 0,
     )
+    ns._requeue_prefill_retry = Scheduler._requeue_prefill_retry.__get__(ns, Scheduler)
     return ns
 
 

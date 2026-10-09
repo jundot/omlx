@@ -460,6 +460,8 @@ _TOPK = r"""
     const uint query = threadgroup_position_in_grid.y;
     const uint tile = threadgroup_position_in_grid.x;
     const int width = meta[0], base = meta[1];
+    // Runtime counts keep one pipeline as the causal key count grows.
+    const uint K = uint(meta[5]), NT = uint(meta[6]);
     threadgroup float exchange_values[TILE];
     threadgroup int exchange_ids[TILE];
     float values[TILE / THREADS], next_values[TILE / THREADS];
@@ -544,7 +546,7 @@ _TOPK_MERGE = r"""
     const uint pos = thread_position_in_grid.x;
     const uint query = threadgroup_position_in_grid.y;
     const uint group = threadgroup_position_in_grid.z;
-    const uint na = meta[0], nb = meta[1], runs = meta[2];
+    const uint na = meta[0], nb = meta[1], runs = meta[2], K = meta[3];
     const uint groups = GROUPED ? (runs + FANIN - 1) / FANIN : 1;
     if (GROUPED) {
         const uint source = pos / K, own = pos % K;
@@ -628,8 +630,8 @@ def _merge_topk(a, b, count, *, runs=0):
     width = fanin * count if runs else na + nb
     return tuple(
         _topk_merge_kernel()(
-            inputs=[*a, *b, mx.array([na, nb, runs], mx.int32)],
-            template=[("K", count), ("GROUPED", bool(runs)), ("FANIN", fanin)],
+            inputs=[*a, *b, mx.array([na, nb, runs, count], mx.int32)],
+            template=[("GROUPED", bool(runs)), ("FANIN", fanin)],
             grid=((width + 255) // 256 * 256, a[0].shape[1], groups),
             threadgroup=(256, 1, 1),
             output_shapes=[(1, a[0].shape[1], groups * count)] * 2,
@@ -688,12 +690,12 @@ def _tile_topk(
             inputs=[
                 scores,
                 ids if ids is not None else mx.zeros((1,), mx.int32),
-                mx.array([width, offset, score_width, start, ratio], mx.int32),
+                mx.array(
+                    [width, offset, score_width, start, ratio, count, tiles], mx.int32
+                ),
             ],
             template=[
                 ("TILE", tile),
-                ("K", count),
-                ("NT", tiles),
                 ("EXPLICIT", ids is not None),
                 ("BLOCK", block_size),
                 ("FORCE", force_latest),

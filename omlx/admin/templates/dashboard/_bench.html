@@ -1,3 +1,4 @@
+{% import "components/ui.html" as ui %}
             {% macro bench_th(label_key, tooltip_key, align='right') %}
             <th class="text-{{ align }} px-4 py-3 font-semibold text-neutral-600">
                 <div class="inline-flex items-center gap-1 {% if align == 'right' %}justify-end{% endif %}">
@@ -10,32 +11,9 @@
             </th>
             {% endmacro %}
             <div x-show="mainTab === 'bench'" x-cloak role="tabpanel" id="panel-bench" aria-labelledby="tab-bench">
-                <!-- Sub-tab navigation -->
-                <div class="flex flex-wrap items-center gap-2 mb-10 animate-fade-in-up">
-                    <button
-                        @click="setBenchTab('throughput')"
-                        :class="benchTab === 'throughput'
-                            ? 'bg-neutral-900 text-white'
-                            : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
-                        class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200">
-                        {{ t('navbar.dropdown.performance') }}
-                    </button>
-                    <button
-                        @click="setBenchTab('accuracy')"
-                        :class="benchTab === 'accuracy'
-                            ? 'bg-neutral-900 text-white'
-                            : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
-                        class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200">
-                        {{ t('navbar.dropdown.accuracy') }}
-                    </button>
-                    <button
-                        @click="setBenchTab('context')"
-                        :class="benchTab === 'context'
-                            ? 'bg-neutral-900 text-white'
-                            : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
-                        class="px-5 py-2.5 rounded-full text-sm font-medium transition-all duration-200">
-                        {{ t('navbar.dropdown.context') }}
-                    </button>
+                <div class="page-tabs mb-6 animate-fade-in-up">
+                    {{ ui.segmented([('throughput', t('navbar.dropdown.performance')), ('accuracy', t('navbar.dropdown.accuracy')), ('context', t('navbar.dropdown.context'))],
+                                    'benchTab', "setBenchTab('{value}')", aria_label=t('navbar.tab.bench')) }}
                 </div>
 
                 <!-- Throughput tab -->
@@ -52,7 +30,7 @@
                                x-cloak
                                :href="'https://omlx.ai/my/' + benchDeviceInfo?.owner_hash"
                                target="_blank"
-                               class="flex items-center gap-1.5 px-4 py-2 text-sm font-medium text-neutral-600 bg-neutral-100 rounded-lg hover:bg-neutral-200 hover:text-neutral-900 transition-all">
+                               class="flex items-center gap-1.5 px-4 py-2 text-sm font-medium text-neutral-600 bg-neutral-100 rounded-full hover:bg-neutral-200 hover:text-neutral-900 transition-all">
                                 <i data-lucide="external-link" class="w-3.5 h-3.5"></i>
                                 {{ t('bench.my_submissions') }}
                             </a>
@@ -77,7 +55,7 @@
                         </div>
                         <div class="flex items-center gap-2 flex-shrink-0">
                             <button @click="acceptOtherBench()"
-                                    class="px-3 py-1.5 bg-amber-600 text-white text-xs font-medium rounded-lg hover:bg-amber-700 transition-all">
+                                    class="px-3 py-1.5 bg-amber-600 text-white text-xs font-medium rounded-full hover:bg-amber-700 transition-all">
                                 {{ t('bench.other_active.view_live') }}
                             </button>
                             <button @click="dismissOtherBench()"
@@ -241,10 +219,10 @@
                             <!-- Run / Cancel Button -->
                             <div class="flex items-center gap-3 pt-2">
                                 <button x-show="!benchRunning"
-                                        @click="startBenchmark()"
+                                        @click="requestBenchConfirm('throughput')"
                                         :disabled="(benchExternalEnabled ? !externalConfigValid() : !benchModelId) || Object.values(benchPromptLengths).every(v => !v) || benchOtherActive !== null"
                                         :title="benchOtherActive ? window.t('bench.other_active.already_running') : ''"
-                                        class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-medium rounded-lg hover:bg-neutral-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2">
+                                        class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-medium rounded-full hover:bg-neutral-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2">
                                     <i data-lucide="play" class="w-4 h-4"></i>
                                     {{ t('bench.config.run_button') }}
                                 </button>
@@ -260,7 +238,7 @@
                                 <div class="flex items-center gap-3">
                                     <span class="text-sm text-neutral-500" x-text="benchProgress?.current + ' / ' + benchProgress?.total"></span>
                                     <button @click="cancelBenchmark()"
-                                            class="px-3 py-1 bg-neutral-900 text-white text-xs font-medium rounded-lg hover:bg-neutral-800 transition-all flex items-center gap-1">
+                                            class="px-3 py-1 bg-neutral-900 text-white text-xs font-medium rounded-full hover:bg-neutral-800 transition-all flex items-center gap-1">
                                         <i data-lucide="square" class="w-3 h-3"></i>
                                         {{ t('bench.progress.cancel') }}
                                     </button>
@@ -392,7 +370,7 @@
                         <div x-show="benchShowText" x-cloak>
                             <div class="px-4 py-3 flex justify-end border-b border-neutral-200">
                                 <button @click="benchCopyText()"
-                                        class="px-4 py-1.5 bg-neutral-900 text-white text-xs font-medium rounded-lg hover:bg-neutral-800 transition-all flex items-center gap-1.5">
+                                        class="px-4 py-1.5 bg-neutral-900 text-white text-xs font-medium rounded-full hover:bg-neutral-800 transition-all flex items-center gap-1.5">
                                     <i data-lucide="copy" class="w-3.5 h-3.5"></i>
                                     <span x-text="benchCopied ? window.t('bench.results.text_export.copied') : window.t('bench.results.text_export.copy')"></span>
                                 </button>
@@ -425,7 +403,7 @@
                             <div x-show="benchUploadFlags.length" x-cloak class="flex flex-wrap items-center gap-2 pb-2">
                                 <span class="text-xs text-neutral-500" x-text="t('bench.upload.flags_label')"></span>
                                 <template x-for="f in benchUploadFlags" :key="f.key">
-                                    <span class="px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 text-xs font-medium"
+                                    <span class="badge bg-emerald-50 text-emerald-700"
                                           x-text="f.label"></span>
                                 </template>
                             </div>
@@ -560,6 +538,36 @@
                      x-text="benchTip?.text"
                      class="bench-tip-fixed"></div>
                 </div>
+
+                <!-- Benchmark run confirmation (every bench unloads the resident models) -->
+                <dialog x-effect="benchConfirm ? $el.showModal() : $el.close()" x-cloak
+                        class="dashboard-dialog fixed inset-0 z-[60] overflow-y-auto"
+                        role="alertdialog" aria-modal="true"
+                        aria-labelledby="bench-confirm-title" aria-describedby="bench-confirm-body"
+                        @keydown.tab="trapDialogFocus($event)"
+                        @cancel.prevent="benchConfirm = null">
+                    <div class="fixed inset-0 bg-black/50" @click="benchConfirm = null"></div>
+                    <div class="flex min-h-full items-center justify-center p-4">
+                        <div class="relative bg-white rounded-2xl shadow-2xl w-full max-w-md p-6 text-center" @click.stop>
+                            <div class="mx-auto mb-4 w-12 h-12 rounded-full bg-amber-50 text-amber-600 flex items-center justify-center">
+                                <i data-lucide="alert-triangle" class="w-6 h-6"></i>
+                            </div>
+                            <h4 id="bench-confirm-title" class="text-lg font-bold tracking-tight text-neutral-900">{{ t('bench.confirm.title') }}</h4>
+                            <p id="bench-confirm-body" class="text-sm text-neutral-600 mt-2"
+                               x-text="benchConfirm ? window.t('bench.confirm.body.' + benchConfirm) : ''"></p>
+                            <div class="flex justify-center gap-3 mt-6">
+                                <button type="button" @click="benchConfirm = null" autofocus
+                                        class="px-5 py-2.5 text-sm font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-full transition-all">
+                                    {{ t('bench.progress.cancel') }}
+                                </button>
+                                <button type="button" @click="confirmBenchRun()"
+                                        class="px-6 py-2.5 bg-red-600 text-white text-sm font-semibold rounded-full hover:bg-red-700 transition-all">
+                                    {{ t('bench.confirm.action') }}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </dialog>
 
                 <!-- Accuracy tab -->
                 {% include "dashboard/_bench_accuracy.html" %}

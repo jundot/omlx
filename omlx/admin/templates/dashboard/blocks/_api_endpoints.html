@@ -6,10 +6,10 @@
             <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.api.section_label') }}</span>
         </div>
         <div x-show="serverAliases.length > 1" class="flex items-center gap-2">
-            <label for="server-alias-select" class="text-[11px] font-medium uppercase tracking-wider text-neutral-500">{{ t('status.api.host') }}</label>
+            <label for="server-alias-select" class="text-xs font-medium uppercase tracking-wider text-neutral-500">{{ t('status.api.host') }}</label>
             <select id="server-alias-select"
                     x-model="selectedAlias"
-                    class="text-xs font-mono bg-white border border-neutral-300 rounded-md px-2 py-1 text-neutral-700 focus:outline-none focus:ring-2 focus:ring-neutral-400">
+                    class="text-xs font-mono bg-white border border-neutral-300 rounded-lg px-2 py-1 text-neutral-700 focus:outline-none focus:ring-2 focus:ring-neutral-400">
                 <template x-for="alias in serverAliases" :key="alias">
                     <option :value="alias" x-text="alias"></option>
                 </template>

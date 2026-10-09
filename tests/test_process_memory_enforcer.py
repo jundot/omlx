@@ -983,24 +983,30 @@ class TestDynamicCeilingReserve:
         ):
             return enforcer._get_dynamic_ceiling()
 
-    @pytest.mark.parametrize("tier", ["safe", "balanced"])
-    def test_reserve_is_kept_free_without_squeezing_other_apps(
-        self, mock_engine_pool, tier
+    def test_safe_keeps_reserve_free_without_squeezing_other_apps(
+        self, mock_engine_pool
     ):
-        result = self._dynamic(mock_engine_pool, tier, phys=1 * self.GB)
-        reserve = tier_reserve_bytes(tier, 64 * self.GB)
+        result = self._dynamic(mock_engine_pool, "safe", phys=1 * self.GB)
+        reserve = tier_reserve_bytes("safe", 64 * self.GB)
         assert result == 1 * self.GB + 10 * self.GB + 4 * self.GB - reserve
 
-    def test_aggressive_compresses_half_of_other_apps_active(self, mock_engine_pool):
+    @pytest.mark.parametrize("tier,ratio", [("balanced", 0.25), ("aggressive", 0.5)])
+    def test_tier_compresses_part_of_other_apps_active(
+        self, mock_engine_pool, tier, ratio
+    ):
         # 3 GB of oMLX's 5 GB footprint is Metal (wired); its 2 GB CPU part
         # sits in the active count and is not another app's memory.
         result = self._dynamic(
-            mock_engine_pool, "aggressive", phys=5 * self.GB, graphics=3 * self.GB
+            mock_engine_pool, tier, phys=5 * self.GB, graphics=3 * self.GB
         )
-        reserve = tier_reserve_bytes("aggressive", 64 * self.GB)
+        reserve = tier_reserve_bytes(tier, 64 * self.GB)
         other_active = 8 * self.GB - 2 * self.GB
         assert result == (
-            5 * self.GB + 10 * self.GB + 4 * self.GB + other_active // 2 - reserve
+            5 * self.GB
+            + 10 * self.GB
+            + 4 * self.GB
+            + int(other_active * ratio)
+            - reserve
         )
 
     def test_active_file_cache_counts_as_reclaimable(self, mock_engine_pool):
@@ -1236,8 +1242,11 @@ class TestHardLimitCalculation:
         ):
             mock_mem.return_value = 48 * 1024**3
             reserve = tier_reserve_bytes("balanced", 48 * 1024**3)
-            # dynamic balanced = 1 + 5 + 2 - reserve → dynamic wins
-            assert enforcer._get_hard_limit_bytes() == 8 * 1024**3 - reserve
+            # dynamic balanced = 1 + 5 + 2 + (4 - 1) * 0.25 - reserve → dynamic
+            # wins; oMLX's 1 GB CPU part is not another app's active memory.
+            assert enforcer._get_hard_limit_bytes() == (
+                8 * 1024**3 + int(3 * 1024**3 * 0.25) - reserve
+            )
 
 
 class TestAbortLimitCalculation:
@@ -1272,10 +1281,12 @@ class TestAbortLimitCalculation:
         ):
             mock_mem.return_value = 48 * 1024**3
             reserve = tier_reserve_bytes("balanced", 48 * 1024**3)
-            # dynamic (~4 GB) is far below, but the abort limit ignores it.
+            # dynamic (~5 GB) is far below, but the abort limit ignores it.
             assert enforcer._get_abort_limit_bytes() == 48 * 1024**3 - reserve
             # Sanity: the (jittery) hard limit DID drop to dynamic.
-            assert enforcer._get_hard_limit_bytes() == 8 * 1024**3 - reserve
+            assert enforcer._get_hard_limit_bytes() == (
+                8 * 1024**3 + int(3 * 1024**3 * 0.25) - reserve
+            )
 
     def test_picks_metal_cap_when_smaller_than_static(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(

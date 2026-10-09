@@ -10,10 +10,10 @@ settings.json so a restart resumes interrupted downloads.
 import asyncio
 import enum
 import errno
+import functools
 import json
 import logging
 import os
-import shutil
 import signal
 import sys
 import threading
@@ -56,6 +56,9 @@ _STARTUP_STALL_TIMEOUT = 120
 
 _PROGRESS_POLL_INTERVAL = 0.5
 _SUBPROCESS_TERMINATE_TIMEOUT = 5
+
+# Seconds between xet aborts while a cancelled download's worker unwinds.
+_REAP_INTERVAL = 0.5
 
 # Seconds of byte-count history the reported speed averages over.
 _SPEED_WINDOW = 1.0
@@ -1253,11 +1256,8 @@ class HFDownloader(_QueuePersistenceMixin):
         task.status = DownloadStatus.CANCELLED
         self._persist()
 
-        # A task in DOWNLOADING owns the download semaphore, so the in-flight
-        # xet transfer is necessarily this one; aborting the (global) session
-        # makes its snapshot_download thread unwind immediately. Pending tasks
-        # must not abort, that would kill another task's transfer. The next
-        # download lazily creates a fresh session.
+        # Only the DOWNLOADING task owns the semaphore and the xet transfer.
+        # A pending cancel must not abort another task's transfer.
         if was_downloading:
             abort_xet_session()
 
@@ -1266,13 +1266,22 @@ class HFDownloader(_QueuePersistenceMixin):
         if progress_task and not progress_task.done():
             progress_task.cancel()
 
-        # Cancel the download task
-        active_task = self._active_tasks.pop(task_id, None)
+        # The task stays in _active_tasks until its worker stops writing.
+        active_task = self._active_tasks.get(task_id)
         if active_task and not active_task.done():
             active_task.cancel()
 
         logger.info(f"Download cancelled: {task.repo_id} (task_id={task_id})")
         return True
+
+    async def cancel_download_for_dir(self, target_dir: Path) -> None:
+        """Cancel the download writing into ``target_dir`` and wait for it."""
+        resolved = Path(target_dir).resolve()
+        for task_id, active in list(self._active_tasks.items()):
+            task = self._tasks.get(task_id)
+            if task and (self._model_dir / task.repo_id).resolve() == resolved:
+                await self.cancel_download(task_id)
+                await asyncio.gather(active, return_exceptions=True)
 
     def remove_task(self, task_id: str) -> bool:
         """Remove a completed, failed, or cancelled task from the list.
@@ -1370,6 +1379,16 @@ class HFDownloader(_QueuePersistenceMixin):
         abort_xet_session()
 
         logger.info("HF Downloader shut down")
+
+    async def _reap_payload(self, payload: asyncio.Future) -> None:
+        """Abort xet until the cancelled download call returns.
+
+        One abort misses the next file, which hub starts on a fresh session.
+        """
+        while not payload.done():
+            await asyncio.sleep(_REAP_INTERVAL)
+            abort_xet_session()
+        await asyncio.gather(payload, return_exceptions=True)
 
     async def _run_download(self, task_id: str, hf_token: str) -> None:
         """Execute a download task.
@@ -1479,19 +1498,25 @@ class HFDownloader(_QueuePersistenceMixin):
                     self._poll_progress(task_id, target_dir, wire_counter)
                 )
 
-                xet_error: Exception | None = None
-                try:
-                    # Awaiting the thread here is intentional: after a stall,
-                    # fallback cannot start until abort_xet_session() has made
-                    # the original writer return.
-                    await asyncio.to_thread(
+                payload = asyncio.get_running_loop().run_in_executor(
+                    None,
+                    functools.partial(
                         snapshot_download,
                         **dl_kwargs,
                         tqdm_class=_make_cancellable_tqdm(
                             lambda: task_id in self._cancelled,
                             on_wire_bytes=wire_counter.add,
                         ),
-                    )
+                    ),
+                )
+                xet_error: Exception | None = None
+                try:
+                    # The HTTP fallback must not overlap this writer.
+                    # A cancel holds the semaphore until the writer stops.
+                    await asyncio.shield(payload)
+                except asyncio.CancelledError:
+                    await self._reap_payload(payload)
+                    raise
                 except Exception as error:
                     stalled = self._stalled.pop(task_id, None)
                     if stalled is not None:
@@ -1804,19 +1829,23 @@ class HFDownloader(_QueuePersistenceMixin):
         return total
 
     def _cleanup_partial(self, task: DownloadTask) -> None:
-        """Remove in-progress shards while keeping finalized files for resume.
+        """Remove hub's partial files and keep finished files for resume.
 
-        Hub stages partial downloads inside a hidden ``._____temp`` directory
-        and only renames a shard into the target on completion. Wiping the
-        whole target dir would also nuke shards the user has already paid
-        for; finalized files are visible in the file browser, so users can
-        keep them for auto-resume on retry or remove them themselves.
+        ``.metadata`` files stay so a retry can skip files it already verified.
         """
-        target_dir = self._model_dir / task.repo_id
-        temp_dir = target_dir / "._____temp"
-        if temp_dir.exists():
+        staging_dir = (
+            self._model_dir / task.repo_id / ".cache" / "huggingface" / "download"
+        )
+        if not staging_dir.is_dir():
+            return
+        partials = list(staging_dir.rglob("*.incomplete"))
+        for partial in partials:
             try:
-                shutil.rmtree(temp_dir)
-                logger.info(f"Cleaned up in-progress shards: {temp_dir}")
-            except Exception as e:
-                logger.error(f"Failed to clean up {temp_dir}: {e}")
+                partial.unlink()
+            except OSError as e:
+                logger.error(f"Failed to clean up {partial}: {e}")
+        if partials:
+            logger.info(
+                f"Cleaned up {len(partials)} in-progress file(s): "
+                f"{staging_dir}"
+            )

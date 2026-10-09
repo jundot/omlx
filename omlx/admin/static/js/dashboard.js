@@ -108,6 +108,42 @@
     // state for the "reset sort" action.
     const MODELS_SORT_DEFAULT = { by: 'id', order: 'asc' };
     const MANAGER_SORT_DEFAULT = { by: 'name', order: 'asc' };
+    // A global settings section anchor, e.g. `settings-server`.
+    const SETTINGS_SECTION_ID = /^settings-[a-z][a-z-]*$/;
+    // Log rows mounted above and below the visible ones.
+    const LOG_OVERSCAN = 8;
+    // Accuracy bench presets: benchmark -> samples, where 0 is the full
+    // dataset. `standard` is the default selection; `full` is built from the
+    // catalogue.
+    const ACC_PRESETS = {
+        quick: { mmlu: 100, arc_challenge: 100, gsm8k: 100 },
+        standard: { mmlu: 1000, truthfulqa: 0, humaneval: 0 },
+    };
+    const ACC_PRESET_NAMES = ['quick', 'standard', 'full'];
+
+    // Chinese counts in ten-thousands: 万/亿/万亿 (zh) and 萬/億/兆 (zh-TW), the
+    // exact grouped figure below 10,000. Returns null for every other language.
+    function chineseCount(value) {
+        const lang = typeof document !== 'undefined' ? document.documentElement?.lang : '';
+        if (lang !== 'zh' && lang !== 'zh-TW') return null;
+        const number = Number(value);
+        if (!Number.isFinite(number)) return null;
+        const units = lang === 'zh-TW' ? ['萬', '億', '兆'] : ['万', '亿', '万亿'];
+        const scales = [1e4, 1e8, 1e12];
+        const magnitude = Math.abs(number);
+        let step = scales.length - 1;
+        while (step >= 0 && magnitude < scales[step]) step -= 1;
+        if (step < 0) return Math.round(number).toLocaleString(lang);
+        let mantissa = (magnitude / scales[step]).toFixed(1);
+        // 10,000万 is 1亿: the unit follows the printed mantissa.
+        if (Number(mantissa) >= 10000 && step < scales.length - 1) {
+            step += 1;
+            mantissa = (magnitude / scales[step]).toFixed(1);
+        }
+        const [whole, fraction] = mantissa.replace(/\.0$/, '').split('.');
+        const text = Number(whole).toLocaleString(lang) + (fraction ? '.' + fraction : '');
+        return (number < 0 ? '-' : '') + text + units[step];
+    }
 
     function dashboard() {
         // GridStack instance and helpers stay outside the reactive Alpine state.
@@ -121,6 +157,12 @@
             activeTheme: 'light', // Will be updated by applyTheme
             systemThemeListener: null,
             enhancedReadability: localStorage.getItem(ENHANCED_READABILITY_KEY) === 'on',
+
+            // Global settings section rail
+            settingsActiveSection: 'settings-language',
+            settingsCopiedAnchor: null,
+            _settingsSyncPausedUntil: 0,
+            _settingsScrollWatched: false,
 
             // Mobile menu
             mobileMenuOpen: false,
@@ -388,6 +430,13 @@
 
             // Log viewer state
             logContent: '',
+            logView: 'table',        // 'table' (records) or 'raw' (the text as served)
+            logRows: [],
+            logSelectedKey: '',
+            logScrollTop: 0,
+            logViewportHeight: 600,
+            logRowHeight: 30,
+            _logRecords: [],
             logLines: 500,
             logRefreshInterval: 5,  // seconds, 0 = disabled
             logAutoRefresh: false,
@@ -615,7 +664,9 @@
             accSampleSizes: { mmlu: 1000, mmlu_pro: 300, kmmlu: 300, cmmlu: 300, jmmlu: 300, hellaswag: 200, truthfulqa: 0, arc_challenge: 300, winogrande: 300, gsm8k: 100, mathqa: 300, humaneval: 0, mbpp: 200, livecodebench: 100, bbq: 300, safetybench: 300 },
             accBenchmarkGroups: [
                 {
+                    key: 'knowledge',
                     name: window.t('acc_bench.benchmarks.group_knowledge'),
+                    desc: window.t('acc_bench.benchmarks.group_knowledge_desc'),
                     benchmarks: [
                         { key: 'mmlu', label: 'MMLU', desc: window.t('acc_bench.benchmarks.mmlu_desc'), fullSize: 14042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                         { key: 'mmlu_pro', label: 'MMLU-Pro', desc: window.t('acc_bench.benchmarks.mmlu_pro_desc'), fullSize: 12032, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
@@ -625,7 +676,9 @@
                     ],
                 },
                 {
+                    key: 'commonsense',
                     name: window.t('acc_bench.benchmarks.group_commonsense'),
+                    desc: window.t('acc_bench.benchmarks.group_commonsense_desc'),
                     benchmarks: [
                         { key: 'hellaswag', label: 'HellaSwag', desc: window.t('acc_bench.benchmarks.hellaswag_desc'), fullSize: 10042, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                         { key: 'arc_challenge', label: 'ARC-C', desc: window.t('acc_bench.benchmarks.arc_desc'), fullSize: 1172, sizes: [30, 50, 100, 200, 300] },
@@ -634,14 +687,18 @@
                     ],
                 },
                 {
+                    key: 'math',
                     name: window.t('acc_bench.benchmarks.group_math'),
+                    desc: window.t('acc_bench.benchmarks.group_math_desc'),
                     benchmarks: [
                         { key: 'gsm8k', label: 'GSM8K', desc: window.t('acc_bench.benchmarks.gsm8k_desc'), fullSize: 1319, sizes: [30, 50, 100, 200, 300] },
                         { key: 'mathqa', label: 'MathQA', desc: window.t('acc_bench.benchmarks.mathqa_desc'), fullSize: 2985, sizes: [30, 50, 100, 200, 300, 500, 1000] },
                     ],
                 },
                 {
+                    key: 'coding',
                     name: window.t('acc_bench.benchmarks.group_coding'),
+                    desc: window.t('acc_bench.benchmarks.group_coding_desc'),
                     benchmarks: [
                         { key: 'humaneval', label: 'HumanEval', desc: window.t('acc_bench.benchmarks.humaneval_desc'), fullSize: 164, sizes: [30, 50, 100] },
                         { key: 'mbpp', label: 'MBPP', desc: window.t('acc_bench.benchmarks.mbpp_desc'), fullSize: 500, sizes: [30, 50, 100, 200, 300] },
@@ -649,7 +706,9 @@
                     ],
                 },
                 {
+                    key: 'safety',
                     name: window.t('acc_bench.benchmarks.group_safety'),
+                    desc: window.t('acc_bench.benchmarks.group_safety_desc'),
                     benchmarks: [
                         { key: 'bbq', label: 'BBQ', desc: window.t('acc_bench.benchmarks.bbq_desc'), fullSize: 10864, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
                         { key: 'safetybench', label: 'SafetyBench', desc: window.t('acc_bench.benchmarks.safetybench_desc'), fullSize: 11435, sizes: [30, 50, 100, 200, 300, 500, 1000, 2000] },
@@ -668,6 +727,8 @@
             // once per endpoint (thinking models need a larger budget).
             accExternalMaxTokens: localStorage.getItem('omlx_acc_external_max_tokens') || '',
             accRunning: false,
+            _managerStatusTimer: null,
+            benchConfirm: null,      // 'throughput' | 'accuracy' | 'context' while asking
             accCurrentModel: '',
             accCurrentBenchId: null,
             accProgress: null,
@@ -695,6 +756,7 @@
                 this.startUpdateCheckTimer();
 
                 await this.handleMainTabChange(this.mainTab);
+                this.settingsScrollToHash();
 
                 // Watch for main tab changes to manage refresh timers
                 this.$watch('mainTab', (value) => {
@@ -742,6 +804,7 @@
 
                 window.addEventListener('popstate', () => {
                     this.applyTabStateFromUrl();
+                    this.settingsScrollToHash();
                 });
 
                 window.addEventListener('focus', () => this.refreshOpenModelSettings());
@@ -772,7 +835,8 @@
                     this.stopLogRefresh();
                 }
                 if (value === 'models') {
-                    const loads = [this.loadHFModels(), this.loadHFTasks(), this.loadOQTasks()];
+                    const loads = [this.loadModels(), this.loadHFModels(), this.loadHFTasks(), this.loadOQTasks()];
+                    this.startManagerStatusRefresh();
                     if (this.modelsTab === 'downloader' && !this.hfRecommendedLoaded) {
                         loads.push(this.loadRecommendedModels());
                     }
@@ -796,6 +860,7 @@
                     this.stopHFRefresh();
                     this.stopMSRefresh();
                     this.stopOQRefresh();
+                    this.stopManagerStatusRefresh();
                 }
                 if (value === 'bench') {
                     if (!this.benchDeviceInfo) await this.loadBenchDeviceInfo();
@@ -817,6 +882,14 @@
                 this.activeTab = DASHBOARD_SETTINGS_TABS.has(settingsTab) ? settingsTab : 'global';
                 this.modelsTab = DASHBOARD_MODELS_TABS.has(modelsTab) ? modelsTab : 'manager';
                 this.benchTab = DASHBOARD_BENCH_TABS.has(benchTab) ? benchTab : 'throughput';
+
+                // A section anchor opens global settings unless the URL names another tab.
+                const section = window.location.hash.slice(1);
+                if (SETTINGS_SECTION_ID.test(section) && (!mainTab || mainTab === 'settings')) {
+                    this.mainTab = 'settings';
+                    this.activeTab = 'global';
+                    this.settingsActiveSection = section;
+                }
             },
 
             syncTabStateToUrl() {
@@ -839,6 +912,13 @@
                     url.searchParams.set('benchTab', this.benchTab);
                 } else {
                     url.searchParams.delete('benchTab');
+                }
+
+                // A section anchor outlives a tab change otherwise, and a reload
+                // would then jump back to settings.
+                if (!(this.mainTab === 'settings' && this.activeTab === 'global'
+                    && SETTINGS_SECTION_ID.test(url.hash.slice(1)))) {
+                    url.hash = '';
                 }
 
                 window.history.replaceState({}, '', url);
@@ -888,6 +968,77 @@
                 this.activeTab = tab;
                 this.mainTab = 'settings';
                 this.syncTabStateToUrl();
+            },
+
+            settingsGoToSection(id) {
+                this.settingsActiveSection = id;
+                // Smooth scrolling passes other sections; keep the clicked one marked.
+                this._settingsSyncPausedUntil = Date.now() + 1000;
+                window.dispatchEvent(new CustomEvent('settings-open-section', { detail: id }));
+                this.$nextTick(() => this.settingsScrollTo(id, true));
+                const url = new URL(window.location.href);
+                url.hash = id;
+                window.history.replaceState({}, '', url);
+            },
+
+            settingsScrollTo(id, smooth) {
+                const target = document.getElementById(id);
+                if (!target || !target.getClientRects().length) return;
+                const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+                target.scrollIntoView({ behavior: smooth && !reduce ? 'smooth' : 'auto', block: 'start' });
+            },
+
+            settingsScrollToHash() {
+                const id = window.location.hash.slice(1);
+                if (this.mainTab !== 'settings' || !SETTINGS_SECTION_ID.test(id)) return;
+                this._settingsSyncPausedUntil = Date.now() + 1000;
+                window.dispatchEvent(new CustomEvent('settings-open-section', { detail: id }));
+                this.$nextTick(() => this.settingsScrollTo(id, false));
+            },
+
+            settingsSyncActiveSection() {
+                if (this.mainTab !== 'settings' || this.activeTab !== 'global') return;
+                if (Date.now() < this._settingsSyncPausedUntil) return;
+                const sections = Array.from(document.querySelectorAll('#panel-settings .settings-section'))
+                    .filter((el) => el.getClientRects().length);
+                if (!sections.length) return;
+                // At the bottom of the page the last sections cannot reach the line.
+                const doc = document.documentElement;
+                if (window.scrollY > 0 && window.scrollY + window.innerHeight >= doc.scrollHeight - 2) {
+                    this.settingsActiveSection = sections[sections.length - 1].id;
+                    return;
+                }
+                // A section is current once its top passes the line it scrolls to.
+                let current = sections[0].id;
+                for (const el of sections) {
+                    const line = parseFloat(getComputedStyle(el).scrollMarginTop) || 0;
+                    if (el.getBoundingClientRect().top > line + 1) break;
+                    current = el.id;
+                }
+                this.settingsActiveSection = current;
+            },
+
+            settingsWatchScroll() {
+                if (this._settingsScrollWatched) return;
+                this._settingsScrollWatched = true;
+                let frame = 0;
+                const onScroll = () => {
+                    if (frame) return;
+                    frame = requestAnimationFrame(() => {
+                        frame = 0;
+                        this.settingsSyncActiveSection();
+                    });
+                };
+                window.addEventListener('scroll', onScroll, { passive: true });
+                window.addEventListener('resize', onScroll);
+            },
+
+            settingsCopyAnchor(id) {
+                this.copyToClipboard(window.location.origin + window.location.pathname + '#' + id);
+                this.settingsCopiedAnchor = id;
+                setTimeout(() => {
+                    if (this.settingsCopiedAnchor === id) this.settingsCopiedAnchor = null;
+                }, 2000);
             },
 
             setModelsTab(tab) {
@@ -4060,6 +4211,8 @@
             },
 
             formatNumber(num) {
+                const chinese = chineseCount(num);
+                if (chinese !== null) return chinese;
                 if (num >= 1000000000) return (num / 1000000000).toFixed(1) + 'B';
                 if (num >= 10000000) return (num / 1000000).toFixed(1) + 'M';
                 return num.toLocaleString();
@@ -4095,12 +4248,6 @@
                 return agg;
             },
 
-            getStatFontClass(value) {
-                if (value >= 1000000000) return 'text-2xl';
-                if (value >= 1000000) return 'text-3xl';
-                return 'text-5xl';
-            },
-
             formatSizeBytes(bytes) {
                 if (bytes >= 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
                 if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(0) + ' MB';
@@ -4116,6 +4263,8 @@
             },
 
             formatTokenCount(n) {
+                const chinese = chineseCount(n);
+                if (chinese !== null) return chinese;
                 if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
                 if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
                 return String(n);
@@ -4207,11 +4356,11 @@
 
             get activeModelsPressureBarColor() {
                 const pct = this.activeModelsPressurePercent;
-                if (pct >= 90) return '#ef4444';
-                if (pct >= 80) return '#f97316';
-                if (pct >= 70) return '#f59e0b';
-                if (pct >= 60) return '#facc15';
-                return '#22c55e';
+                if (pct >= 90) return 'rgb(var(--palette-red-500))';
+                if (pct >= 80) return 'rgb(var(--palette-orange-500))';
+                if (pct >= 70) return 'rgb(var(--palette-amber-500))';
+                if (pct >= 60) return 'rgb(var(--palette-yellow-400))';
+                return 'rgb(var(--palette-green-500))';
             },
 
             get activeModelsPressureBarStyle() {
@@ -4219,7 +4368,30 @@
             },
 
             get activeModelsSoftMarkerStyle() {
-                return `left: ${this.activeModelsSoftPercent}%; width: 1px; background-color: rgba(64, 64, 64, 0.6);`;
+                return `left: ${this.activeModelsSoftPercent}%; width: 1px; background-color: rgb(var(--palette-neutral-700) / 0.6);`;
+            },
+
+            formatUptime(seconds) {
+                if (seconds == null || !Number.isFinite(seconds)) return '';
+                const total = Math.floor(seconds);
+                const days = Math.floor(total / 86400);
+                const hours = Math.floor((total % 86400) / 3600);
+                const minutes = Math.floor((total % 3600) / 60);
+                if (days > 0) return `${days}d ${hours}h`;
+                if (hours > 0) return `${hours}h ${minutes}m`;
+                return `${minutes}m`;
+            },
+
+            async unloadAllModels() {
+                const loaded = (this.stats.active_models?.models || []).filter(m => !m.is_loading);
+                if (!loaded.length) return;
+                if (!window.confirm(window.t('status.header.unload_all_confirm').replace('{count}', String(loaded.length)))) {
+                    return;
+                }
+                for (const model of loaded) {
+                    await this.unloadModel(model.id);
+                }
+                await this.loadStats();
             },
 
             activeModelsPressureLabel() {
@@ -5133,6 +5305,84 @@
                 }
             },
 
+            // The selection a preset stands for, over the whole catalogue.
+            // Benchmarks the preset does not name keep their sample size.
+            accPresetSelection(preset) {
+                const wanted = preset === 'full'
+                    ? Object.fromEntries(this.accBenchmarkGroups.flatMap(
+                        group => group.benchmarks.map(b => [b.key, 0])))
+                    : (ACC_PRESETS[preset] || ACC_PRESETS.standard);
+                const benchmarks = {};
+                const sampleSizes = {};
+                for (const group of this.accBenchmarkGroups) {
+                    for (const b of group.benchmarks) {
+                        benchmarks[b.key] = b.key in wanted;
+                        sampleSizes[b.key] = b.key in wanted
+                            ? wanted[b.key]
+                            : (this.accSampleSizes[b.key] ?? b.sizes[0]);
+                    }
+                }
+                return { benchmarks, sampleSizes };
+            },
+
+            applyAccPreset(preset) {
+                const { benchmarks, sampleSizes } = this.accPresetSelection(preset);
+                this.accBenchmarks = benchmarks;
+                this.accSampleSizes = sampleSizes;
+                this.accError = '';
+            },
+
+            // The preset the current selection matches, or 'custom'.
+            get accActivePreset() {
+                for (const name of ACC_PRESET_NAMES) {
+                    const { benchmarks, sampleSizes } = this.accPresetSelection(name);
+                    const matches = Object.keys(benchmarks).every(key => (
+                        !!this.accBenchmarks[key] === benchmarks[key]
+                        && Number(this.accSampleSizes[key]) === Number(sampleSizes[key])
+                    ));
+                    if (matches) return name;
+                }
+                return 'custom';
+            },
+
+            accGroupSelected(group) {
+                return group.benchmarks.filter(b => this.accBenchmarks[b.key]);
+            },
+
+            accGroupSamples(group) {
+                return this.accGroupSelected(group).reduce(
+                    (total, b) => total + (Number(this.accSampleSizes[b.key]) || b.fullSize), 0
+                );
+            },
+
+            applyGroupFull(group) {
+                const benchmarks = { ...this.accBenchmarks };
+                const sampleSizes = { ...this.accSampleSizes };
+                for (const b of group.benchmarks) {
+                    benchmarks[b.key] = true;
+                    sampleSizes[b.key] = 0;
+                }
+                this.accBenchmarks = benchmarks;
+                this.accSampleSizes = sampleSizes;
+                this.accError = '';
+            },
+
+            // Local runs unload the resident models, so they ask first. External
+            // endpoints and additions to a running accuracy queue do not.
+            requestBenchConfirm(kind) {
+                if (kind === 'throughput' && this.benchExternalEnabled) return this.startBenchmark();
+                if (kind === 'accuracy' && (this.accExternalEnabled || this.accRunning)) return this.addToAccQueue();
+                this.benchConfirm = kind;
+            },
+
+            confirmBenchRun() {
+                const kind = this.benchConfirm;
+                this.benchConfirm = null;
+                if (kind === 'throughput') this.startBenchmark();
+                else if (kind === 'accuracy') this.addToAccQueue();
+                else if (kind === 'context') this.startContextBenchmark();
+            },
+
             async addToAccQueue() {
                 let externalRequest = null;
                 if (this.accExternalEnabled) {
@@ -5654,15 +5904,144 @@
                 }).join('\n');
             },
 
-            levelButtonClass(lvl) {
-                const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
-                const idx = LEVELS.indexOf(lvl);
-                const minIdx = LEVELS.indexOf(this.logMinLevel);
-                // Levels at or above the minimum are all shown dark so the
-                // included range is obvious; the selected minimum keeps the ring.
-                if (idx < minIdx) return 'bg-neutral-100 text-neutral-300';
-                if (idx === minIdx) return 'bg-neutral-900 text-white';
-                return 'bg-neutral-700 text-white';
+            get logWindow() {
+                return window.OmlxLogs.visibleRange(
+                    this.logRows.length, this.logScrollTop, this.logViewportHeight,
+                    this.logRowHeight, LOG_OVERSCAN
+                );
+            },
+
+            get visibleLogRows() {
+                const frame = this.logWindow;
+                return this.logRows.slice(frame.start, frame.end);
+            },
+
+            get logSelectedRow() {
+                if (!this.logSelectedKey) return null;
+                return this.logRows.find(row => row.key === this.logSelectedKey) || null;
+            },
+
+            get logOccurrences() {
+                return window.OmlxLogs.occurrenceWindow(
+                    this.logSelectedRow ? this.logSelectedRow.occurrences : []
+                );
+            },
+
+            logLevelTone(level) {
+                const rank = window.OmlxLogs.levelRank(level);
+                if (rank >= 5) return 'log-level--critical';
+                if (rank === 4) return 'log-level--error';
+                if (rank === 3) return 'log-level--warning';
+                if (rank === 2) return 'log-level--info';
+                if (rank === 1) return 'log-level--debug';
+                return '';
+            },
+
+            logMemoryChips(row) {
+                if (!row || !row.memory) return [];
+                return window.OmlxLogs.memoryGuardChips(row.memory, {
+                    usage: window.t('logs.memory.usage'),
+                    watermark: window.t('logs.memory.watermark'),
+                    ceiling: window.t('logs.memory.ceiling'),
+                    peak: window.t('logs.memory.peak'),
+                });
+            },
+
+            // The two levers the guard suggests, as jumps to their settings sections.
+            get logMemoryActions() {
+                return [
+                    { section: 'settings-resource', label: window.t('logs.action.raise_tier') },
+                    { section: 'settings-generation', label: window.t('logs.action.reduce_context') },
+                ];
+            },
+
+            openLogAction(section) {
+                this.setSettingsTab('global');
+                this.$nextTick(() => this.settingsGoToSection(section));
+            },
+
+            ingestLogText(text, totalLines) {
+                if (!window.OmlxLogs) return;
+                const anchor = this.logAnchor();
+                this._logRecords = window.OmlxLogs.parseLogText(text, totalLines);
+                this.rebuildLogRows();
+                this.restoreLogAnchor(anchor);
+            },
+
+            rebuildLogRows() {
+                this.logRows = window.OmlxLogs.aggregateLogRows(this._logRecords, this.logMinLevel, this.logRows);
+                if (this.logSelectedKey && !this.logRows.some(row => row.key === this.logSelectedKey)) {
+                    this.logSelectedKey = '';
+                }
+            },
+
+            // The row at the top of the window, so a poll that drops lines off the
+            // front does not move what the reader is looking at.
+            logAnchor() {
+                const row = this.logRows[this.logWindow.start];
+                return row ? { key: row.key, index: this.logWindow.start } : null;
+            },
+
+            restoreLogAnchor(anchor) {
+                if (!anchor || this.logAutoScroll) return;
+                const index = this.logRows.findIndex(row => row.key === anchor.key);
+                const viewport = this.$refs.logViewport;
+                if (index < 0 || index === anchor.index || !viewport) return;
+                viewport.scrollTop = Math.max(0, viewport.scrollTop + (index - anchor.index) * this.logRowHeight);
+                this.logScrollTop = viewport.scrollTop;
+            },
+
+            setLogMinLevel(level) {
+                this.logMinLevel = level;
+                this.logSelectedKey = '';
+                this.rebuildLogRows();
+                this.$nextTick(() => this.scrollLogToEdge());
+            },
+
+            setLogView(view) {
+                this.logView = view;
+                this.$nextTick(() => {
+                    this.measureLogViewport();
+                    this.measureLogRowHeight();
+                    this.scrollLogToEdge();
+                });
+            },
+
+            changeLogFile() {
+                this.logSelectedKey = '';
+                this.logRows = [];
+                this.loadLogs();
+            },
+
+            selectLogRow(row) {
+                this.logSelectedKey = row && this.logSelectedKey !== row.key ? row.key : '';
+            },
+
+            measureLogViewport() {
+                const viewport = this.$refs.logViewport;
+                if (!viewport || !viewport.clientHeight) return;
+                this.logViewportHeight = viewport.clientHeight;
+                this.logScrollTop = viewport.scrollTop;
+            },
+
+            // Rows have one fixed height; take it from a real row so a font
+            // size change cannot desynchronise the window.
+            measureLogRowHeight() {
+                const row = this.$refs.logViewport?.querySelector('.log-row');
+                if (row && row.offsetHeight) this.logRowHeight = row.offsetHeight;
+            },
+
+            onLogScroll(event) {
+                this.logScrollTop = event.target.scrollTop;
+                if (event.target.clientHeight) this.logViewportHeight = event.target.clientHeight;
+            },
+
+            // Bottom while auto-scroll is on, otherwise the top.
+            scrollLogToEdge() {
+                for (const el of [this.$refs.logViewport, this.$refs.logTextarea]) {
+                    if (el) el.scrollTop = this.logAutoScroll ? el.scrollHeight : 0;
+                }
+                if (this.$refs.logViewport) this.logScrollTop = this.$refs.logViewport.scrollTop;
             },
 
             async loadLogs() {
@@ -5681,20 +6060,17 @@
 
                     if (response.ok) {
                         const data = await response.json();
-                        this.logContent = data.logs;
+                        this.logContent = data.logs || '';
                         this.logTotalLines = data.total_lines;
                         this.logAvailableFiles = data.available_files || ['server.log'];
                         this.logLastUpdated = new Date().toLocaleTimeString();
+                        this.ingestLogText(this.logContent, data.total_lines);
 
-                        // Auto-scroll to bottom
-                        if (this.logAutoScroll) {
-                            this.$nextTick(() => {
-                                const textarea = this.$refs.logTextarea;
-                                if (textarea) {
-                                    textarea.scrollTop = textarea.scrollHeight;
-                                }
-                            });
-                        }
+                        this.$nextTick(() => {
+                            this.measureLogViewport();
+                            this.measureLogRowHeight();
+                            if (this.logAutoScroll) this.scrollLogToEdge();
+                        });
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
@@ -6086,6 +6462,31 @@
 
             // Cross-reference the richer /api/models entry (has model_type,
             // settings) for a manager row keyed by its model name.
+            // Loaded state of a manager row. Requests can load and unload models
+            // on their own, so the list refreshes while the Models tab is open.
+            managerModelStatus(name) {
+                const info = this.managerModelInfo(name);
+                if (!info) return '';
+                if (info.is_loading) return 'loading';
+                return info.loaded ? 'loaded' : 'unloaded';
+            },
+
+            startManagerStatusRefresh() {
+                this.stopManagerStatusRefresh();
+                this._managerStatusTimer = setInterval(() => {
+                    if (this.mainTab === 'models' && this.modelsTab === 'manager' && !document.hidden) {
+                        this.loadModels();
+                    }
+                }, 5000);
+            },
+
+            stopManagerStatusRefresh() {
+                if (this._managerStatusTimer) {
+                    clearInterval(this._managerStatusTimer);
+                    this._managerStatusTimer = null;
+                }
+            },
+
             managerModelInfo(name) {
                 return this.models.find(m => m.id === name);
             },
@@ -6919,6 +7320,8 @@
             },
 
             formatDownloads(count) {
+                const chinese = chineseCount(count);
+                if (chinese !== null) return chinese;
                 if (count >= 1000000) return (count / 1000000).toFixed(1) + 'M';
                 if (count >= 1000) return (count / 1000).toFixed(1) + 'K';
                 return count.toString();

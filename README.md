@@ -268,7 +268,7 @@ Native Swift / SwiftUI menubar app (not Electron). Start, stop, and monitor the 
 
 ### API Compatibility
 
-Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stats (`stream_options.include_usage`), Anthropic adaptive thinking, and vision inputs (images as base64 or URL, video as base64).
+Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stats (`stream_options.include_usage`), llama.cpp-style prefill progress (`return_progress`), Anthropic adaptive thinking, and vision inputs (images as base64 or URL, video as base64).
 
 | Endpoint | Description |
 |----------|-------------|
@@ -321,7 +321,7 @@ Models are auto-detected by type. You can also download models directly from the
 | LLM | Any model supported by [mlx-lm](https://github.com/ml-explore/mlx-lm) |
 | VLM | Qwen3.5 Series, GLM-4V, Pixtral, and other [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) models |
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
-| Embedding | BERT, BGE-M3, ModernBERT |
+| Embedding | BERT, BGE-M3, ModernBERT, EmbeddingGemma 2 |
 | Reranker | ModernBERT, XLM-RoBERTa |
 | Decision | Clef, Clef-Flash, OpenJev |
 

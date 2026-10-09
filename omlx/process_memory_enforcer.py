@@ -6,7 +6,8 @@ The memory guard tier says how much memory oMLX leaves for everything else
 on the Mac:
 
   safe        keeps ~20% of RAM (6-16 GB) free for heavy apps next to oMLX
-  balanced    keeps ~8% of RAM (3-8 GB) free for light apps
+  balanced    keeps ~8% of RAM (3-8 GB) free for light apps and may push a
+              quarter of other apps' active memory into the compressor
   aggressive  keeps 2% of RAM (1.5-4 GB) for the OS and may push half of
               other apps' active memory into the compressor
   custom      uses a user-pinned ceiling (2 GB static reserve)
@@ -71,7 +72,7 @@ _VALID_TIERS = frozenset((*_TIER_RESERVE, "custom"))
 # macOS compresses 2-3x, so half of active is reclaimable without swap.
 _OTHER_APP_RECLAIM_RATIO: dict[str, float] = {
     "safe": 0.0,
-    "balanced": 0.0,
+    "balanced": 0.25,
     "aggressive": 0.5,
 }
 
@@ -676,9 +677,9 @@ class ProcessMemoryEnforcer:
             (recomputed every call — never cached). Subtracting the tier
             reserve keeps that much memory free for other apps, so the
             ceiling shrinks as they grow. File-backed pages are dropped
-            without compression, so every tier counts them. Only aggressive
-            counts part of other apps' anonymous active memory, which macOS
-            must compress to hand over. oMLX's own CPU pages are removed
+            without compression, so every tier counts them. Balanced and
+            aggressive count part of other apps' anonymous active memory,
+            which macOS must compress to hand over. oMLX's own CPU pages are removed
             from that term; its Metal buffers are wired and never appear
             there.
             Speculative and purgeable pages are subsets of free /

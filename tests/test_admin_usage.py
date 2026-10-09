@@ -3,6 +3,8 @@
 
 import asyncio
 import json
+import shutil
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -277,3 +279,34 @@ def test_usage_details_are_optional_and_preserve_summary(client, model):
     assert sum(row["requests"] for row in daily) == compact_data["totals"]["requests"]
     assert sum(row["requests"] for row in hourly) == compact_data["totals"]["requests"]
     assert len(compact.content) < len(detailed.content)
+
+
+def test_dashboard_counts_use_wan_and_yi_only_in_chinese():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for dashboard behavior tests")
+    script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const source = fs.readFileSync('omlx/admin/static/js/dashboard.js', 'utf8');
+const render = (lang, fn, value) => {
+    const context = {localStorage: {getItem: () => null}, window: {t: key => key},
+                     document: {documentElement: {lang}}};
+    return vm.runInNewContext(source + '\n dashboard;', context)()[fn](value);
+};
+assert.equal(render('zh', 'formatNumber', 9999), '9,999');
+assert.equal(render('zh', 'formatNumber', 19290), '1.9万');
+assert.equal(render('zh', 'formatNumber', 12345678), '1,234.6万');
+assert.equal(render('zh', 'formatNumber', 99999999), '1亿');
+assert.equal(render('zh', 'formatTokenCount', 1.2e12), '1.2万亿');
+assert.equal(render('zh-TW', 'formatDownloads', 123456789), '1.2億');
+// Every other language keeps its current output.
+assert.equal(render('en', 'formatNumber', 12345678), '12.3M');
+assert.equal(render('ko', 'formatTokenCount', 19290), '19.3k');
+assert.equal(render('ja', 'formatDownloads', 19290), '19.3K');
+"""
+    result = subprocess.run(
+        [node, "-e", script], cwd=ROOT, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
