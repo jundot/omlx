@@ -5872,16 +5872,15 @@ def _resolve_stream_calibration(
 ) -> bool:
     """Decide whether oQe calibration streams layers from the checkpoint.
 
-    Explicit argument first, then the OMLX_OQ_STREAM_CALIBRATION env var,
-    then the auto rule: stream when the source does not fit in RAM, where
-    the resident collector would otherwise calibrate on a lossy quantized
-    proxy of the model.
+    Explicit argument first, then the auto rule: stream when the source does
+    not fit in RAM, where the resident collector would otherwise calibrate on
+    a lossy quantized proxy of the model.
 
     Streaming only works for the layouts the sourcer understands
     (_STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES). For every other model_type
-    the auto rule and a truthy env var stay on the proxy path, and an
-    explicit stream_calibration=True fails fast here with a clear message
-    rather than an AttributeError deep in the sourcer.
+    the auto rule stays on the proxy path, and an explicit
+    stream_calibration=True fails fast here with a clear message rather than
+    an AttributeError deep in the sourcer.
     """
     supported = _stream_calibration_supported(model_type)
     if stream_calibration is not None:
@@ -5894,19 +5893,6 @@ def _resolve_stream_calibration(
                 "proxy, or extend the streamed sourcer for this layout."
             )
         return bool(stream_calibration)
-    env = os.environ.get("OMLX_OQ_STREAM_CALIBRATION", "").strip().lower()
-    if env in ("1", "true", "yes", "on"):
-        if not supported:
-            logger.warning(
-                "OMLX_OQ_STREAM_CALIBRATION asked for streaming calibration, but "
-                "model_type=%r has no streamed sourcer (supported: %s); using the "
-                "RAM-safe proxy instead.",
-                model_type,
-                sorted(_STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES),
-            )
-        return supported
-    if env in ("0", "false", "no", "off"):
-        return False
     return model_exceeds_ram and supported
 
 
@@ -5990,14 +5976,12 @@ def quantize_oq_streaming(
             standalone streamed pass on an imatrix cache hit. An existing
             oq_sensitivity_map.json or an explicit sensitivity_model_path
             still wins over both. None (default) auto-enables streaming when
-            the source exceeds the RAM budget; the OMLX_OQ_STREAM_CALIBRATION
-            environment variable overrides the auto rule. The streamed sourcer
-            supports the MiniMax-M3 (minimax_m3_vl) and Qwen4-Exp (qwen4_exp)
-            layouts, so both the auto rule and a truthy env var stay on the
-            RAM-safe proxy for every other model_type, and an explicit
-            stream_calibration=True on an unsupported layout raises a
-            ValueError up front instead of failing deep in the sourcer. Only
-            consulted when enhanced is True.
+            the source exceeds the RAM budget. The streamed sourcer supports
+            the MiniMax-M3 (minimax_m3_vl) and Qwen4-Exp (qwen4_exp) layouts,
+            so the auto rule stays on the RAM-safe proxy for every other
+            model_type, and an explicit stream_calibration=True on an
+            unsupported layout raises a ValueError up front instead of
+            failing deep in the sourcer. Only consulted when enhanced is True.
         preserve_ngram_table: Write the qwen4_exp N-gram PLE table
             (``ple_embedding.ngram_embedding`` shard tensors) unquantized, in
             the checkpoint dtype, instead of at the selected oQ level. The

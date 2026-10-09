@@ -17,7 +17,6 @@ import functools
 import inspect
 import logging
 import math
-import os
 import time
 import weakref
 from collections import deque
@@ -50,9 +49,6 @@ def _set_verify_qmm_armed(flag: bool, *, row_exact: bool = False) -> None:
         pass
 
 
-_ROW_EXACT_DISABLED = os.environ.get("OMLX_MTP_ROW_EXACT_VERIFY", "1").strip() == "0"
-
-
 def _row_exact_verify(model: Any) -> bool:
     """Whether the target's verify rows must reproduce its one-row decode.
 
@@ -60,10 +56,7 @@ def _row_exact_verify(model: Any) -> bool:
     armed verify forwards then run every multi-row quantized projection,
     DeltaNet prework and attention row with the arithmetic of a serial
     decode step, so greedy MTP output equals MTP-off output byte for byte.
-    ``OMLX_MTP_ROW_EXACT_VERIFY=0`` restores the faster verify kernels.
     """
-    if _ROW_EXACT_DISABLED:
-        return False
     for candidate in (
         model,
         getattr(model, "_language_model", None),
@@ -859,10 +852,10 @@ class _MtpState:
     # Boundary tokens need a one-row forward on a private cache.
     boundary_emit_pending: bool = False
 
-    # Context-copy proposer (greedy chain cycles; False when this request
-    # never copies), whether the pending drafts came from it rather than the
-    # MTP head, and whether this cycle rebuilt its index (a one-off host
-    # cost the depth controller must not time as the window's).
+    # Context-copy proposer (greedy chain cycles), whether the pending drafts
+    # came from it rather than the MTP head, and whether this cycle rebuilt
+    # its index (a one-off host cost the depth controller must not time as
+    # the window's).
     context_copy: Optional[Any] = None
     copy_drafts: bool = False
     copy_untimed: bool = False
@@ -3995,15 +3988,10 @@ def _context_copy_drafts(
     ``[]`` when the MTP head should draft instead.
     """
     if state.context_copy is None:
-        # False marks a request that never copies.
-        state.context_copy = (
-            _context_copy.ContextCopy(wide_window=_row_exact_verify(gen_batch.model))
-            if _context_copy.ENABLED
-            else False
+        state.context_copy = _context_copy.ContextCopy(
+            wide_window=_row_exact_verify(gen_batch.model)
         )
     copier = state.context_copy
-    if not copier:
-        return []
     state.copy_untimed = copier.extend(gen_batch.tokens[0], committed_ids)
     # The next cycle emits up to len(drafts) + 1 tokens after the queued ones.
     room = (

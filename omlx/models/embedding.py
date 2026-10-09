@@ -12,7 +12,6 @@ import gc
 import inspect
 import json
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -47,7 +46,6 @@ _CONTEXT_LENGTH_ATTRS = (
     "seq_length",
     "n_positions",
 )
-_FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 
 # Pooling modes whose result depends on the attention mask. CLS reads a fixed
 # position, so it is mask-independent.
@@ -803,15 +801,6 @@ class MLXEmbeddingModel:
           for some embedding/reranker models, causing eval() runtime errors.
         - We compile a narrower function that returns only the final embedding array.
         """
-        compile_env = os.getenv("OMLX_EMBEDDING_COMPILE", "1").strip().lower()
-        if compile_env in _FALSE_ENV_VALUES:
-            logger.info(
-                "mx.compile disabled for %s by OMLX_EMBEDDING_COMPILE",
-                self.model_name,
-            )
-            self._compiled_embed = None
-            return False
-
         base_model = self.model
 
         try:

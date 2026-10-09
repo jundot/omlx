@@ -41,7 +41,6 @@ main_tok) pair is folded by :func:`take_primed` at activation instead.
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -65,31 +64,6 @@ _CTX_ATTR = "_omlx_mtp_prime_ctx"
 _PLAN_ATTR = "_omlx_mtp_prime_plan"
 
 _SUPPRESS = threading.local()
-
-
-def priming_enabled() -> bool:
-    """Prompt priming is on by default for MTP-enabled models."""
-    return os.environ.get("OMLX_MTP_PROMPT_PRIMING", "1").strip().lower() not in (
-        "0",
-        "false",
-        "off",
-    )
-
-
-def prime_window() -> int:
-    """Max tokens to fold into one prime context; 0 = unlimited.
-
-    Escape hatch for the head-cache memory cost of priming (one
-    full-attention layer of KV over the folded span). The cap is measured
-    against the span actually folded this request — with a warm prefix cache
-    that is only the boundary remainder, not the full prompt — so a
-    long-context request with a small remainder still primes. A remainder
-    larger than the window runs unprimed.
-    """
-    try:
-        return max(0, int(os.environ.get("OMLX_MTP_PRIME_WINDOW", "0")))
-    except ValueError:
-        return 0
 
 
 @contextmanager
@@ -120,14 +94,6 @@ class _PrimeCtx:
     # capture requires offset_now - S == expected_offset (contiguity).
     expected_offset: int = 0
     valid: bool = True
-    # The current contiguous timeline exceeded OMLX_MTP_PRIME_WINDOW. Keep a
-    # lightweight marker so later small chunks cannot restart priming.
-    window_exceeded: bool = False
-    # Absolute MTP history is ``folded``; this counter is only the work folded
-    # by the current request.  A warm prefix restore starts at a nonzero
-    # absolute history but must still apply OMLX_MTP_PRIME_WINDOW to the small
-    # uncached suffix, preserving the option's documented meaning.
-    folded_this_request: int = 0
     # Committed pairs collected during ordinary decoding. None means
     # ordinary prompt priming; a list resumes an already active head.
     deferred_pairs: Optional[List[Any]] = None
@@ -407,12 +373,7 @@ def capture_eligible(host: Any, cache: Optional[List[Any]]) -> bool:
     :func:`maybe_capture`; this exists purely to keep the ineligible path
     identical to stock.
     """
-    return (
-        not _suppressed()
-        and priming_enabled()
-        and cache is not None
-        and _host_eligible(host)
-    )
+    return not _suppressed() and cache is not None and _host_eligible(host)
 
 
 @dataclass
@@ -559,7 +520,7 @@ def prefill_scope(model, uids, tokens, cache):
     ):
         yield
         return
-    host, state = _owned(model, create=bool(tokens) and priming_enabled())
+    host, state = _owned(model, create=bool(tokens))
     if state is None or not tokens or len(uids) != len(tokens):
         yield
         return
@@ -597,7 +558,7 @@ def decode_scope(model, uids):
 
 
 def prepare_prefix_context(model, *, request_id, **kwargs):
-    host, state = _owned(model, create=priming_enabled())
+    host, state = _owned(model, create=True)
     if state is None:
         return _prepare_prefix_context(model, request_id=request_id, **kwargs)
     if _dspark(host):
@@ -641,7 +602,7 @@ def _prepare_prefix_context(
         # request may still need it at activation; generic sidecar preparation
         # must neither interpret it nor replace it with a generic plan.
         return False
-    if host is None or not priming_enabled():
+    if host is None:
         drop_ctx(model)
         return False
 
@@ -873,7 +834,7 @@ def _capture_packed(host, inputs, normed, batch: PackedBatch) -> None:
 
 
 def maybe_capture(host, inputs, normed, cache):
-    if _suppressed() or not priming_enabled():
+    if _suppressed():
         return
     batch = packed_batch_of(cache)
     if batch is not None:
@@ -944,8 +905,6 @@ def maybe_capture(host, inputs, normed, cache):
 
 def retain_batch_head_history(batch, owner):
     """Keep committed head history at a drained handoff to ordinary decode."""
-    if not priming_enabled():
-        return
     host, registry = _owned(batch.model, create=True)
     if registry is None or _dspark(host):
         # Models with their own priming transport retain their existing path.
@@ -991,8 +950,6 @@ def retain_parked_head_history(model, uid, mtp_cache, folded, pending_hidden, ca
     ``pending_hidden`` is the head input of the token the park handoff just
     fed, so the next ordinary decode token continues the same timeline.
     """
-    if not priming_enabled():
-        return
     host, registry = _owned(model, create=True)
     anchor = _anchor(cache)
     if registry is None or _dspark(host) or anchor is None or uid in registry.uids:
@@ -1026,7 +983,6 @@ def _defer_decode_history(host):
         isinstance(ctx, _PrimeCtx)
         and ctx.deferred_pairs is None
         and ctx.valid
-        and not ctx.window_exceeded
         and ctx.folded > 0
     ):
         ctx.deferred_pairs = []
@@ -1097,7 +1053,6 @@ def _flush_deferred_history(model, ctx, chunk_size=512):
                 )
         mx.async_eval(values)
     ctx.folded += count
-    ctx.folded_this_request += count
     ctx.deferred_pairs = []
 
 
@@ -1116,7 +1071,7 @@ def _capture_single(
     inputs_embeds) before calling; everything here re-checks what is
     load-bearing and bails silently, so a miss degrades to unprimed.
     """
-    if _suppressed() or not priming_enabled():
+    if _suppressed():
         return
     if cache is None or not _host_eligible(host):
         return
@@ -1153,26 +1108,6 @@ def _capture_single(
         if plan is not None:
             setattr(host, _PLAN_ATTR, plan)
         ctx = None
-    if ctx is not None and ctx.window_exceeded:
-        ctx.expected_offset = offset_after
-        return
-    window = prime_window()
-    if window:
-        # Cap by the primed span (the head-KV the window exists to bound),
-        # not the absolute prompt offset: on a warm prefix cache only the
-        # boundary remainder is ever folded, so a long-context request with a
-        # small remainder is exactly the cheap case priming is for (#2909).
-        folded = ctx.folded_this_request if ctx is not None else 0
-        if folded + seq_len > window:
-            setattr(
-                host,
-                _CTX_ATTR,
-                _PrimeCtx(
-                    expected_offset=offset_after,
-                    window_exceeded=True,
-                ),
-            )
-            return
     if ctx is None:
         if seq_len <= 1:
             # A lone decode step cannot start a prompt timeline.
@@ -1214,7 +1149,6 @@ def _capture_single(
     # on them, so the lm_head tail costs nothing.
     host.mtp_forward(pairs_hidden, pairs_tokens, ctx.mtp_cache, logits_keep=1)
     ctx.folded += int(pairs_tokens.shape[1])
-    ctx.folded_this_request += int(pairs_tokens.shape[1])
     ctx.pending_hidden = normed[:, -1:]
     ctx.expected_offset = offset_after
     _capture_boundary_candidate(
@@ -1332,13 +1266,11 @@ def _take_primed(
 def prime_ctx_stats(model: Any) -> Optional[int]:
     """Folded pair count of a live context (introspection / tests)."""
     ctx = _find_ctx(model)
-    return ctx.folded if ctx is not None and not ctx.window_exceeded else None
+    return ctx.folded if ctx is not None else None
 
 
 __all__ = [
     "HEAD_HIDDEN_POST_NORM",
-    "priming_enabled",
-    "prime_window",
     "prepare_prefix_context",
     "capture_tail_boundary",
     "suppress_capture",

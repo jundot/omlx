@@ -783,21 +783,6 @@ class TestEmbeddingCompileFallback:
         with pytest.raises(ValueError, match="does not support image inputs"):
             model.embed([{"image": IMAGE_DATA_URI}])
 
-    def test_try_compile_respects_disable_env(self, monkeypatch):
-        """OMLX_EMBEDDING_COMPILE=0 should skip mx.compile for root-cause probes."""
-        from omlx.models.embedding import MLXEmbeddingModel
-
-        monkeypatch.setenv("OMLX_EMBEDDING_COMPILE", "0")
-        model = MLXEmbeddingModel("test-model")
-        model.model = MagicMock()
-
-        with patch("omlx.models.embedding.mx") as mock_mx:
-            result = model._try_compile()
-
-        assert result is False
-        assert model._compiled_embed is None
-        mock_mx.compile.assert_not_called()
-
     def test_close_releases_compiled_model_and_processor_resources(self):
         """close() should drop wrapper references before clearing MLX caches."""
         from omlx.models.embedding import MLXEmbeddingModel
@@ -2100,8 +2085,8 @@ class TestDeclaredPoolingMode:
         """compile off + right-padded batch: the tokenizer path must pool real tokens.
 
         ``mlx_embeddings.generate`` drops the mask it builds, so this path
-        pooled a pad token for every mixed-length batch whenever
-        ``OMLX_EMBEDDING_COMPILE=0`` or a compile failure sent it here.
+        pooled a pad token for every mixed-length batch whenever a compile
+        failure sent it here.
         """
         import mlx.core as mx
 

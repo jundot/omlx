@@ -7489,21 +7489,18 @@ class TestStreamedCalibration:
         assert mx.isfinite(loaded(tokens).logits).all().item()
 
     @pytest.mark.parametrize(
-        "explicit,env,kind,over_budget,expected",
+        "explicit,kind,over_budget,expected",
         [
-            (None, "", "llama", True, False),
-            (None, "1", "llama", True, False),
-            (None, "", "minimax_m3_vl", True, True),
-            (None, "", "qwen4_exp", False, False),
-            (None, "0", "qwen4_exp", True, False),
-            (False, "1", "qwen4_exp", True, False),
-            (True, "0", "qwen4_exp", False, True),
+            (None, "llama", True, False),
+            (None, "minimax_m3_vl", True, True),
+            (None, "qwen4_exp", False, False),
+            (False, "qwen4_exp", True, False),
+            (True, "qwen4_exp", False, True),
         ],
     )
-    def test_selection(self, monkeypatch, explicit, env, kind, over_budget, expected):
+    def test_selection(self, explicit, kind, over_budget, expected):
         import omlx.oq as oq
 
-        monkeypatch.setenv("OMLX_OQ_STREAM_CALIBRATION", env)
         assert (
             oq._resolve_stream_calibration(
                 explicit, model_exceeds_ram=over_budget, model_type=kind

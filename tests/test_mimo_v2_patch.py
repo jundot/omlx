@@ -1241,7 +1241,7 @@ def _clone(caches):
 
 
 def _forward(model, tokens, cache, fast, monkeypatch):
-    monkeypatch.setenv("OMLX_MIMO_DECODE_FAST", "1" if fast else "0")
+    monkeypatch.setattr(df, "enabled", lambda: fast)
     out = model(tokens, cache=cache)
     mx.eval(out, [c.state for c in cache])
     return out
@@ -1358,7 +1358,7 @@ def test_decode_fast_declines_unsupported_forwards(monkeypatch):
     model = _decode_model(seed=5)
     inner = model.model
     cache = model.make_cache()
-    monkeypatch.setenv("OMLX_MIMO_DECODE_FAST", "1")
+    monkeypatch.setattr(df, "enabled", lambda: True)
     h1 = inner.embed_tokens(mx.array([[1]]))
     # 8 rows x top-8 would take SwitchGLU's sorted path.
     assert (
@@ -1367,7 +1367,7 @@ def test_decode_fast_declines_unsupported_forwards(monkeypatch):
     )
     assert df.run_layers(inner, h1, [None] * len(cache), None, None) is None
     assert df.run_layers(inner, h1.astype(mx.float32), cache, None, None) is None
-    monkeypatch.setenv("OMLX_MIMO_DECODE_FAST", "0")
+    monkeypatch.setattr(df, "enabled", lambda: False)
     assert df.run_layers(inner, h1, cache, None, None) is None
 
 
@@ -1395,7 +1395,7 @@ def test_decode_fast_runs_the_reference_under_wrapped_rope(monkeypatch):
     assert _mismatches(ref, fast) == 0
     for layer, rope in zip(inner.layers, originals):
         layer.self_attn.rope = rope
-    monkeypatch.setenv("OMLX_MIMO_DECODE_FAST", "1")
+    monkeypatch.setattr(df, "enabled", lambda: True)
     assert df.run_layers(inner, h, _clone(cache), None, None) is not None
 
 

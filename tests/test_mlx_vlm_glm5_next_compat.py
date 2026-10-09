@@ -1419,14 +1419,15 @@ def test_kda_fused_prefill_matches_stock(monkeypatch):
     model = _kda_model(77)[0]
     prompt = mx.arange(70, dtype=mx.int32)[None] + 1
 
-    monkeypatch.setattr(kda, "_GLM53_KDA_PREFILL_ENABLED", False)
+    eligible = kda.glm53_kda_prefill_eligible
+    monkeypatch.setattr(kda, "glm53_kda_prefill_eligible", lambda *args: False)
     reference_cache = model.make_cache()
     reference = model(prompt, cache=reference_cache).logits
     mx.eval(reference)
     ref_conv = [cache[0] for cache in reference_cache]
     ref_state = [cache[1] for cache in reference_cache]
 
-    monkeypatch.setattr(kda, "_GLM53_KDA_PREFILL_ENABLED", True)
+    monkeypatch.setattr(kda, "glm53_kda_prefill_eligible", eligible)
     engaged = []
     original = kda.glm53_kda_prefill
 
@@ -1500,18 +1501,13 @@ def test_kda_prefill_eligibility_gating(monkeypatch):
     padded.lengths = mx.array([70])
     assert not glm53_kda_prefill_eligible(layer, inputs, None, padded)
 
-    monkeypatch.setattr(
-        "omlx.patches.glm53_kda_prework._GLM53_KDA_PREFILL_ENABLED", False
-    )
-    assert not glm53_kda_prefill_eligible(layer, inputs, None, cache)
-    monkeypatch.undo()
-
     # The fused driver runs end to end and matches the module's own route.
     fused_cache = model.make_cache()[0]
     out_fused = glm53_kda_prefill(layer, inputs, fused_cache)
     stock_cache = model.make_cache()[0]
     monkeypatch.setattr(
-        "omlx.patches.glm53_kda_prework._GLM53_KDA_PREFILL_ENABLED", False
+        "omlx.patches.glm53_kda_prework.glm53_kda_prefill_eligible",
+        lambda *args: False,
     )
     out_stock = layer(inputs, None, stock_cache)
     mx.eval(out_fused, out_stock)
@@ -1536,11 +1532,12 @@ def test_kda_fused_prefill_survives_mtp_runtime_patch(monkeypatch):
     model = _kda_model(80)[0]
     prompt = mx.arange(70, dtype=mx.int32)[None] + 1
 
-    monkeypatch.setattr(kda, "_GLM53_KDA_PREFILL_ENABLED", False)
+    eligible = kda.glm53_kda_prefill_eligible
+    monkeypatch.setattr(kda, "glm53_kda_prefill_eligible", lambda *args: False)
     reference_cache = model.make_cache()
     reference = model(prompt, cache=reference_cache).logits
 
-    monkeypatch.setattr(kda, "_GLM53_KDA_PREFILL_ENABLED", True)
+    monkeypatch.setattr(kda, "glm53_kda_prefill_eligible", eligible)
     engaged = []
     original = kda.glm53_kda_prefill
 
@@ -2195,8 +2192,9 @@ def _kda_run(attn, x, conv0, state0, fused, chunks=None):
 
     from omlx.patches import glm53_kda_prework as kda
 
-    enabled = kda._GLM53_KDA_PREFILL_ENABLED
-    kda._GLM53_KDA_PREFILL_ENABLED = fused
+    eligible = kda.glm53_kda_prefill_eligible
+    if not fused:
+        kda.glm53_kda_prefill_eligible = lambda *args: False
     try:
         cache = ArraysCache(size=2)
         cache[0] = conv0
@@ -2209,7 +2207,7 @@ def _kda_run(attn, x, conv0, state0, fused, chunks=None):
         mx.eval(out, cache[0], cache[1])
         return out, cache[0], cache[1]
     finally:
-        kda._GLM53_KDA_PREFILL_ENABLED = enabled
+        kda.glm53_kda_prefill_eligible = eligible
 
 
 def test_fused_prefill_runs_blocked_recurrence(monkeypatch):
@@ -4493,8 +4491,6 @@ def test_upstream_kda_prefill_then_fused_decode_is_bitwise_reference(monkeypatch
     except ImportError:
         pytest.skip("this build has no glm53 fused KDA prefill")
     _language()
-    if not getattr(prework, "_GLM53_KDA_PREFILL_ENABLED", False):
-        pytest.skip("glm53 fused KDA prefill disabled")
     if not _native_indexer_available():
         pytest.skip("GLM DSA native indexer extension is not built")
 
