@@ -1182,7 +1182,7 @@ def test_qwen4_admission_prices_the_gathered_route():
     )
 
 
-def test_qwen4_pricing_tracks_execution_route(monkeypatch):
+def test_qwen4_pricing_tracks_execution_route():
     from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
@@ -1191,7 +1191,6 @@ def test_qwen4_pricing_tracks_execution_route(monkeypatch):
         QSAQuantizedKVCache,
     )
 
-    monkeypatch.delenv("OMLX_QWEN4_GATHERED_MIN_QUERY", raising=False)
     scheduler = _make_scheduler()
     _attach_qwen4_profile(scheduler)
     route = scheduler._qwen4_text_gathered_pricing

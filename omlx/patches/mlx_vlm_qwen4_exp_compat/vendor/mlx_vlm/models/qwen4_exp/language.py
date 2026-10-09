@@ -56,7 +56,6 @@ from .qsa_fast import (
     pool_completed_index_keys,
 )
 from . import attn_fused, hc_fused
-from .hc_projection import env_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +157,7 @@ def resolve_ple_runtime_mode(
     if requested == "ssd_mmap":
         requested = "mmap"
     if requested not in {"auto", "resident", "mmap"}:
-        raise ValueError("OMLX_QWEN4_PLE_MODE must be auto, resident, or mmap")
+        raise ValueError("Qwen4 PLE mode must be auto, resident, or mmap")
     if requested != "auto":
         return requested
     return "mmap" if checkpoint_bytes > physical_memory * 0.70 else "resident"
@@ -169,9 +168,7 @@ def configure_ple_runtime(model_path: str | Path, mode: str | None = None) -> st
     global _PLE_RUNTIME_MODEL_PATH, _PLE_RUNTIME_MODE
 
     compute_path = Path(model_path).expanduser().resolve()
-    requested = mode or os.environ.get("OMLX_QWEN4_PLE_MODE")
-    if requested is None:
-        requested = "auto"
+    requested = mode or "auto"
     checkpoint_bytes = sum(
         path.stat().st_size
         for path in compute_path.glob("*.safetensors")
@@ -1268,25 +1265,11 @@ class QSAQuantizedKVCache(_QSAIndexerCache, QuantizedKVCache):
 # early as before and its queue fills), then every _EAGER_DISPATCH_EVERY-th
 # layer: each commit costs ~20 us of host CPU, and the queued GPU work covers
 # the host's build of the next group.
-# Scheduling only: outputs are bit-identical. Disable with OMLX_QWEN4_EAGER_DISPATCH=0;
-# OMLX_QWEN4_EAGER_DISPATCH_EVERY=1 commits every layer.
-_EAGER_DISPATCH = env_enabled("OMLX_QWEN4_EAGER_DISPATCH")
+# Scheduling only: outputs are bit-identical.
+_EAGER_DISPATCH = True
 _EAGER_DISPATCH_MAX_ROWS = 64
-_EAGER_DISPATCH_EVERY_DEFAULT = 3
-
-
-def _eager_dispatch_every() -> int:
-    raw = os.environ.get("OMLX_QWEN4_EAGER_DISPATCH_EVERY", "").strip()
-    try:
-        return max(1, int(raw)) if raw else _EAGER_DISPATCH_EVERY_DEFAULT
-    except ValueError:
-        return _EAGER_DISPATCH_EVERY_DEFAULT
-
-
-_EAGER_DISPATCH_EVERY = _eager_dispatch_every()
+_EAGER_DISPATCH_EVERY = 3
 _EAGER_DISPATCH_WARMUP = 6
-# Lightning MTP verify rows through the gathered QSA arm (OMLX_QWEN4_QSA_GATHERED_VERIFY=0 disables).
-_GATHERED_VERIFY_DISABLED = not env_enabled("OMLX_QWEN4_QSA_GATHERED_VERIFY")
 # The batched indexer keeps each row's completed-block bank across steps and
 # pools only new blocks. Tests clear this to compare with fresh per-row caches.
 _BATCH_ROW_BANKS_ENABLED = True
@@ -1297,21 +1280,11 @@ _GATHERED_BATCH_DISABLED = False
 # Decode is one query row and a verify window depth + 1; wider batched windows
 # are prefill and keep the dense masked path.
 _GATHERED_BATCH_MAX_QUERY = 16
-# Row-exact Lightning MTP verify rows on the masked QSA arm score and select
-# blocks and run SDPA per row with the serial decode kernels
-# (OMLX_QWEN4_QSA_MASKED_VERIFY=0 keeps the multi-row mask and MLX SDPA).
-_MASKED_VERIFY_DISABLED = not env_enabled("OMLX_QWEN4_QSA_MASKED_VERIFY")
-# Lightning MTP one-row windows (the activation step, depth-0 cycles) have no
-# draft to reject, so they run the serial decode step itself rather than a
-# verify forward (OMLX_QWEN4_MTP_ONE_ROW_DECODE=0 keeps the verify forward).
-_ONE_ROW_MTP_DECODE_DISABLED = not env_enabled("OMLX_QWEN4_MTP_ONE_ROW_DECODE")
-# Set while such a step runs: a verify forward never feeds prompt priming.
+# Set while a Lightning MTP one-row window runs the serial decode step: a verify
+# forward never feeds prompt priming.
 _MTP_ONE_ROW_STEP: ContextVar[bool] = ContextVar(
     "omlx_qwen4_mtp_one_row_step", default=False
 )
-# Attention/indexer norms keep their FP32 1 + weight scale between calls
-# (OMLX_QWEN4_NORM_SCALE_CACHE=0 rebuilds it every call; same values).
-_NORM_SCALE_CACHE_DISABLED = not env_enabled("OMLX_QWEN4_NORM_SCALE_CACHE")
 
 
 def _fused_tile(rows: int) -> tuple[int, int, bool]:
@@ -1347,7 +1320,7 @@ class Qwen4ExpRMSNorm(nn.Module):
             raise ValueError(f"{dim=} must be divisible by {group_size=}")
         self.weight = mx.zeros(dim)
         # Plain attributes, not parameters: (weight the scale was built from, scale).
-        self._cache_scale = cache_scale and not _NORM_SCALE_CACHE_DISABLED
+        self._cache_scale = cache_scale
         self._cached_scale = None
 
     def _scale(self) -> mx.array:
@@ -1846,7 +1819,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         """Lightning MTP verify rows (batch-one text, rank-two positions, aligned
         indexer) attend only the selected blocks; rollback is unaffected."""
 
-        if _GATHERED_VERIFY_DISABLED or not target_verify:
+        if not target_verify:
             return False
         causal_mask = mask is None or (isinstance(mask, str) and mask == "causal")
         if not (
@@ -2229,7 +2202,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         windows keep the path below, which already selects with the decode
         kernel and runs MLX's SDPA (same bits, faster below ~16K keys)."""
 
-        if _MASKED_VERIFY_DISABLED or not (target_verify and _row_exact_verify_armed()):
+        if not (target_verify and _row_exact_verify_armed()):
             return False
         causal_mask = mask is None or (isinstance(mask, str) and mask == "causal")
         if not (
@@ -2387,7 +2360,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         if batch < 2 or not 1 <= length <= _GATHERED_BATCH_MAX_QUERY:
             return None
         if target_verify:
-            if length < 2 or _GATHERED_VERIFY_DISABLED or _row_exact_verify_armed():
+            if length < 2 or _row_exact_verify_armed():
                 return None
             if not (
                 mask is None
@@ -4082,7 +4055,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 # (one GEMM group per channel: ~8.7 ms for the 6k-row, 10240-channel PLE short
 # conv). This kernel is MLX's own depthwise_conv_1d arithmetic (sequential fp32
 # sum of bf16 products, one rounding) with a dilation; it is checked bit-equal
-# against mx.conv1d on first use. OMLX_QWEN4_PLE_CONV_KERNEL=0 disables it.
+# against mx.conv1d on first use.
 _DEPTHWISE_CONV_SOURCE = r"""
     const uint c = thread_position_in_grid.x;
     const uint t = thread_position_in_grid.y;
@@ -4100,7 +4073,7 @@ _DEPTHWISE_CONV_SOURCE = r"""
     y[((size_t)b * t_out + t) * C + c] = static_cast<T>(acc);
 """
 _DEPTHWISE_CONV_STATE = {
-    "enabled": env_enabled("OMLX_QWEN4_PLE_CONV_KERNEL"),
+    "enabled": True,
     "kernel": None,
     "validated": False,
 }
@@ -4408,7 +4381,7 @@ class Qwen4ExpModel(nn.Module):
         target_verify = gdn_sink is not None
         # Each layer's tail residual write stays pending and is applied inside
         # the next hyper-connection norm; ``hidden_states`` is the residual
-        # before it (OMLX_QWEN4_HC_FUSED_WRITE=0 applies it eagerly).
+        # before it.
         defer_write = hc_fused.write_enabled()
         # Every layer keeps the residual's leading (batch, rows) dims.
         eager = (
@@ -4654,9 +4627,10 @@ class LanguageModel(Qwen3_5LanguageModel):
         mtp_capture = return_hidden and kwargs.get("capture_layer_ids") is None
         if mtp_capture:
             kwargs["capture_layer_ids"] = []
+        # One-row windows (the activation step, depth-0 cycles) have no draft to
+        # reject, so they run the serial decode step rather than a verify forward.
         one_row_step = (
             mtp_capture
-            and not _ONE_ROW_MTP_DECODE_DISABLED
             and inputs_embeds is None
             and tuple(inputs.shape) == (1, 1)
             and cache is not None

@@ -23,7 +23,7 @@ replace most of them with the same float operations in the same order:
 
 ``ready`` runs each specialization once on tiny inputs first; a compile or
 launch failure turns the kernels off for the process and callers keep the
-MLX path. Disable with OMLX_QWEN4_ATTN_FUSED=0.
+MLX path.
 """
 
 from __future__ import annotations
@@ -33,11 +33,9 @@ import logging
 
 import mlx.core as mx
 
-from .hc_projection import env_enabled
-
 logger = logging.getLogger(__name__)
 
-_DISABLED = not env_enabled("OMLX_QWEN4_ATTN_FUSED")
+_DISABLED = False
 MAX_ROWS = 16
 # MLX's vector SDPA: one pass below this many keys on 'd'/'s' GPUs.
 _TWO_PASS_KEYS = 1024

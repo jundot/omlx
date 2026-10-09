@@ -32,17 +32,11 @@ SOFTWARE.
 from __future__ import annotations
 
 import logging
-import os
 
 import mlx.core as mx
 import mlx.nn as nn
 
 logger = logging.getLogger(__name__)
-
-
-def env_enabled(name: str) -> bool:
-    """False when the switch ``name`` is set to 0, false, no or off."""
-    return os.environ.get(name, "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
 _HC_COUNT = 4
@@ -53,7 +47,6 @@ _LOW_RANK = 320
 # pointers move with it (lane / (GS / VPT), then BLOCK / GS per block).
 _GROUP_SIZES = (32, 64)
 _SUPPORTED_BITS = (4, 5, 6, 8)
-_DISABLED = not env_enabled("OMLX_QWEN4_HC_HYBRID")
 _KERNEL = None
 _RUNTIME_FAILED = False
 _FAILURE_LOGGED = False
@@ -330,8 +323,6 @@ def _kernel():
 
 def compatible_projections(down, injection) -> bool:
     """Whether two raw Qwen4 projection banks match the native contract."""
-    if _DISABLED:
-        return False
     if not (
         type(down) is nn.QuantizedLinear
         and type(injection) is nn.QuantizedLinear

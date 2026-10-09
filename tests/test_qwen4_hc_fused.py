@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import dataclasses
-import importlib
 from unittest.mock import Mock
 
 import mlx.core as mx
@@ -278,22 +277,6 @@ def test_compatible_fails_closed():
         mx.float16
     )
     assert not hc_fused.compatible(module, ok)
-
-
-def test_kill_switch_disables_fused_path(monkeypatch):
-    monkeypatch.setenv("OMLX_QWEN4_HC_FUSED", "0")
-    from mlx_vlm.models.qwen4_exp import hc_fused
-
-    reloaded = importlib.reload(hc_fused)
-    try:
-        assert not reloaded.enabled()
-        assert not reloaded.write_enabled()
-        assert not reloaded.compatible(
-            _module(4), mx.random.normal((1, 4, WIDTH)).astype(mx.bfloat16)
-        )
-    finally:
-        monkeypatch.delenv("OMLX_QWEN4_HC_FUSED")
-        importlib.reload(hc_fused)
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -1309,7 +1292,7 @@ def test_two_launch_decode_keeps_three_launch_fp32_sums(bits, rows, group_size, 
 
 # Deferred residual writes: a real-shape stack must match eager writes bit for bit.
 # Each layer's tail write is carried into the next hyper-connection norm (and the
-# final mixer); the reference runs with OMLX_QWEN4_HC_FUSED_WRITE off.
+# final mixer); the reference runs with deferred writes off.
 
 
 def _stack(seed: int):

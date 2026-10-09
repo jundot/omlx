@@ -11,7 +11,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from omlx.memory_monitor import qwen4_gathered_min_query_tokens
+from omlx import memory_monitor
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 
 compat.apply_mlx_vlm_qwen4_exp_compat_patch()
@@ -75,7 +75,7 @@ def _tiny_text_config(budget=8, ratio=2, max_positions=128):
 
 
 def test_qwen4_decode_gathers_budget_and_tail_and_matches_official(monkeypatch):
-    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "2")
+    monkeypatch.setattr(memory_monitor, "_QWEN4_GATHERED_MIN_QUERY_TOKENS", 2)
     config = _tiny_text_config()
     import mlx_vlm.models.qwen4_exp.language as language
     import mlx_vlm.models.qwen4_exp.qsa_fast as qsa_fast
@@ -129,7 +129,7 @@ def test_qwen4_decode_gathers_budget_and_tail_and_matches_official(monkeypatch):
 
 def test_qwen4_language_wrapper_routes_2d_text_positions_to_gather(monkeypatch):
     # The fixture prefill is 10 rows; lower the gathered width gate for it.
-    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "2")
+    monkeypatch.setattr(memory_monitor, "_QWEN4_GATHERED_MIN_QUERY_TOKENS", 2)
     config = _tiny_text_config()
     import mlx_vlm.models.qwen4_exp.language as language
 
@@ -656,29 +656,6 @@ def test_qwen4_verify_rows_survive_rollback_like_official(monkeypatch):
         assert mx.array_equal(fast_value, reference_value).item()
 
 
-def test_qwen4_verify_gather_kill_switch_keeps_official_path(monkeypatch):
-    import mlx_vlm.models.qwen4_exp.language as language
-
-    config, attention, fast_cache, _ = _layer_and_prefix()
-    calls = []
-    original = language.contiguous_causal_gathered_qsa
-    monkeypatch.setattr(
-        language,
-        "contiguous_causal_gathered_qsa",
-        lambda *a, **k: calls.append(1) or original(*a, **k),
-    )
-    monkeypatch.setattr(language, "_GATHERED_VERIFY_DISABLED", True)
-    mx.eval(
-        attention(
-            mx.random.normal((1, 4, config.hidden_size)),
-            mask="causal",
-            cache=fast_cache,
-            target_verify=True,
-        )
-    )
-    assert calls == []
-
-
 def test_qwen4_verify_gather_requires_rank_two_positions():
     config, attention, fast_cache, _ = _layer_and_prefix()
     rows = 4
@@ -707,8 +684,6 @@ def test_qwen4_gathered_prefill_requires_minimum_query_width(monkeypatch):
     narrow = mx.random.normal((1, 4, config.hidden_size))
     wide = mx.random.normal((1, 16, config.hidden_size))
 
-    monkeypatch.delenv("OMLX_QWEN4_GATHERED_MIN_QUERY", raising=False)
-    assert qwen4_gathered_min_query_tokens() == 16
     assert not attention._gathered_text_prefill_eligible(
         narrow, "causal", cache, None, None, False
     )
@@ -716,12 +691,10 @@ def test_qwen4_gathered_prefill_requires_minimum_query_width(monkeypatch):
         wide, "causal", cache, None, None, False
     )
 
-    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "2")
+    monkeypatch.setattr(memory_monitor, "_QWEN4_GATHERED_MIN_QUERY_TOKENS", 2)
     assert attention._gathered_text_prefill_eligible(
         narrow, "causal", cache, None, None, False
     )
-    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "garbage")
-    assert qwen4_gathered_min_query_tokens() == 16
 
 
 def test_qwen4_trim_keeps_pooled_index_prefix_exact():
@@ -780,7 +753,7 @@ def test_qwen4_trim_then_decode_matches_official_after_partial_invalidation(
     """Verify -> rollback -> decode stays exact with the retained pooled prefix."""
     config = _tiny_text_config()
     language = _language()
-    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "2")
+    monkeypatch.setattr(memory_monitor, "_QWEN4_GATHERED_MIN_QUERY_TOKENS", 2)
     attention = language.Qwen4ExpAttention(config)
     mx.eval(attention.parameters())
     fast_cache = _crossover_cache(config, attention, length=12, seed=61)
