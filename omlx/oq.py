@@ -10,6 +10,7 @@ base bits and add targeted routed-expert protection plus a higher bpw budget.
 """
 
 import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -5689,6 +5690,7 @@ def _pack_affine_codes(w, scales, biases, group_size: int, bits: int):
 
 
 _LSQ_ROUNDS = 5
+_LSQ_START_FACTORS = (0.55, 0.65, 0.75, 0.85, 0.95, 1.05, 1.15)
 
 
 def _weighted_lsq_refit(grouped, imp, scales, biases, bits, dtype):
@@ -5717,7 +5719,7 @@ def _weighted_lsq_refit(grouped, imp, scales, biases, bits, dtype):
     w_min = mx.min(grouped, axis=-1, keepdims=True)
     w_max = mx.max(grouped, axis=-1, keepdims=True)
     starts = [(best_s, best_b)]
-    for factor in (0.55, 0.65, 0.75, 0.85, 0.95, 1.05, 1.15):
+    for factor in _LSQ_START_FACTORS:
         s = mx.maximum((w_max - w_min) * factor / n_bins, tiny)
         starts.append((s, (w_max + w_min) * 0.5 - n_bins * 0.5 * s))
     for s, b in starts:
@@ -5740,6 +5742,131 @@ def _weighted_lsq_refit(grouped, imp, scales, biases, bits, dtype):
             b = stored(mx.where(ok, new_b, b))
         mx.eval(best_s, best_b, best_err)
     return best_s, best_b
+
+
+# One simdgroup per quantization group; the same steps as _weighted_lsq_refit.
+_LSQ_REFIT_SOURCE = """
+    constexpr int VPL = GS / 32;
+    constexpr float FACTORS[7] = {FACTOR_LIST};
+    const uint lane = thread_index_in_simdgroup;
+    const uint g = thread_position_in_grid.x / 32;
+    if (g >= meta[0]) {
+        return;
+    }
+    const float nb = float(NB);
+    const float tiny = 1e-7f;
+    float v[VPL];
+    float w[VPL];
+    float lo = INFINITY;
+    float hi = -INFINITY;
+    float part_w = 0.0f;
+    float part_v = 0.0f;
+    for (int k = 0; k < VPL; ++k) {
+        const uint i = g * GS + k * 32 + lane;
+        v[k] = x[i];
+        w[k] = imp[i];
+        lo = min(lo, v[k]);
+        hi = max(hi, v[k]);
+        part_w += w[k];
+        part_v += w[k] * v[k];
+    }
+    const float w_min = simd_min(lo);
+    const float w_max = simd_max(hi);
+    const float total = simd_sum(part_w);
+    const float sum_v = simd_sum(part_v);
+
+    float best_s = float(T(s0[g]));
+    float best_b = float(T(b0[g]));
+    float part = 0.0f;
+    for (int k = 0; k < VPL; ++k) {
+        const float c = clamp(rint((v[k] - best_b) / best_s), 0.0f, nb);
+        const float d = v[k] - (c * best_s + best_b);
+        part += w[k] * d * d;
+    }
+    float best_err = simd_sum(part);
+    const float start_s = best_s;
+    const float start_b = best_b;
+
+    for (int start = 0; start < 8; ++start) {
+        float s = start_s;
+        float b = start_b;
+        if (start > 0) {
+            s = max((w_max - w_min) * FACTORS[start - 1] / nb, tiny);
+            b = (w_max + w_min) * 0.5f - nb * 0.5f * s;
+        }
+        s = float(T(s));
+        b = float(T(b));
+        for (int round = 0; round < ROUNDS; ++round) {
+            float pe = 0.0f;
+            float pc = 0.0f;
+            float pcc = 0.0f;
+            float pcv = 0.0f;
+            for (int k = 0; k < VPL; ++k) {
+                const float c = clamp(rint((v[k] - b) / s), 0.0f, nb);
+                const float d = v[k] - (c * s + b);
+                pe += w[k] * d * d;
+                pc += w[k] * c;
+                pcc += w[k] * c * c;
+                pcv += w[k] * c * v[k];
+            }
+            const float err = simd_sum(pe);
+            if (err < best_err) {
+                best_err = err;
+                best_s = s;
+                best_b = b;
+            }
+            const float sum_c = simd_sum(pc);
+            const float sum_cc = simd_sum(pcc);
+            const float sum_cv = simd_sum(pcv);
+            const float denom = sum_cc - sum_c * sum_c / total;
+            const float new_s =
+                (sum_cv - sum_c * sum_v / total) / (denom > 0.0f ? denom : 1.0f);
+            if (denom > 0.0f && fabs(new_s) > tiny) {
+                s = float(T(new_s));
+                b = float(T((sum_v - new_s * sum_c) / total));
+            }
+        }
+    }
+    if (lane == 0) {
+        s_out[g] = best_s;
+        b_out[g] = best_b;
+    }
+""".replace("FACTOR_LIST", ", ".join(f"{f}f" for f in _LSQ_START_FACTORS))
+
+
+@functools.cache
+def _lsq_refit_kernel():
+    return mx.fast.metal_kernel(
+        name="oq_weighted_lsq_refit",
+        input_names=["x", "imp", "s0", "b0", "meta"],
+        output_names=["s_out", "b_out"],
+        source=_LSQ_REFIT_SOURCE,
+    )
+
+
+def _weighted_lsq_refit_metal(grouped, imp, scales, biases, bits, dtype):
+    """Metal version of :func:`_weighted_lsq_refit` for 32/64/128 groups."""
+    n = grouped.shape[0] * grouped.shape[1]
+    s, b = _lsq_refit_kernel()(
+        inputs=[
+            grouped.reshape(-1),
+            imp.reshape(-1),
+            scales.reshape(-1),
+            biases.reshape(-1),
+            mx.array([n], dtype=mx.uint32),
+        ],
+        template=[
+            ("T", dtype),
+            ("GS", grouped.shape[-1]),
+            ("NB", (1 << bits) - 1),
+            ("ROUNDS", _LSQ_ROUNDS),
+        ],
+        grid=(n * 32, 1, 1),
+        threadgroup=(min(256, n * 32), 1, 1),
+        output_shapes=[(n,), (n,)],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    return s.reshape(scales.shape), b.reshape(biases.shape)
 
 
 def _weighted_affine_quantize(w, group_size: int, bits: int, importance):
@@ -5797,7 +5924,12 @@ def _weighted_affine_quantize(w, group_size: int, bits: int, importance):
             best_scales = mx.where(take, scales, best_scales)
             best_biases = mx.where(take, biases, best_biases)
 
-    best_scales, best_biases = _weighted_lsq_refit(
+    refit = (
+        _weighted_lsq_refit_metal
+        if group_size in (32, 64, 128) and mx.default_device() == mx.gpu
+        else _weighted_lsq_refit
+    )
+    best_scales, best_biases = refit(
         grouped_f, imp, best_scales, best_biases, bits, w.dtype
     )
 
