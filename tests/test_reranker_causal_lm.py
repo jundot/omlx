@@ -176,7 +176,9 @@ class TestCausalLMReranker:
 
         call_count = [0]
 
-        def mock_forward(input_ids):
+        def mock_forward(input_ids, **_kwargs):
+            # CausalLM reranking passes a KV cache alongside the token run; the
+            # fresh logits below are keyed off the call order either way.
             vocab_size = 10000
             seq_len = input_ids.shape[1]
             logits = mx.zeros((1, seq_len, vocab_size))
@@ -1292,3 +1294,223 @@ class TestRerankerClose:
         mock_mx.synchronize.assert_called_once()
         mock_mx.clear_cache.assert_called_once()
         assert collect.call_count == 2
+
+
+class TestCausalLMSharedPrefix:
+    """The instruction + query run is forwarded once per request, not per document.
+
+    Every document in a request shares the prompt run up to "<Document>: ",
+    so only the first document needs it inside its own forward pass; the
+    remaining documents continue from that cache. Regression tests for
+    jundot/omlx#3913, where the shared run was recomputed for every document.
+
+    Scores are compared on a tiny float32 model, where replaying a document on
+    the prefilled run is exact; real quantized models also carry
+    shape-dependent kernel rounding that is invisible to this comparison.
+    """
+
+    _PREFIX = [1, 2]
+    _SUFFIX = [3]
+    _SHARED = [100, 101, 102, 103, 104]
+
+    class _RecordingModel:
+        """Forwards to a model and records the length of every token run."""
+
+        def __init__(self, inner):
+            self.inner = inner
+            self.runs: list[int] = []
+
+        def __getattr__(self, name):
+            # make_prompt_cache reads make_cache/layers off the model.
+            return getattr(self.inner, name)
+
+        def __call__(self, input_ids, cache=None):
+            self.runs.append(input_ids.shape[1])
+            return self.inner(input_ids, cache=cache)
+
+    class _PromptTokenizer:
+        """Yields the shared prompt run plus the document's own characters."""
+
+        def __init__(self, shared):
+            self._shared = shared
+
+        def __call__(self, texts, max_length=None, **_kwargs):
+            runs = [
+                list(self._shared)
+                + [ord(char) for char in text.split("<Document>: ")[1]]
+                for text in texts
+            ]
+            if max_length is not None:
+                runs = [run[:max_length] for run in runs]
+            return {"input_ids": runs}
+
+    @staticmethod
+    def _tiny_qwen3():
+        """A real Qwen3 CausalLM with tiny dimensions and random weights.
+
+        Random weights are enough to exercise the genuine mlx-lm
+        attention/cache path, and comparing the two scoring strategies on one
+        model instance isolates the change under test.
+        """
+        from mlx_lm.models import qwen3
+
+        mx.random.seed(0)
+        return qwen3.Model(
+            qwen3.ModelArgs(
+                model_type="qwen3",
+                hidden_size=32,
+                num_hidden_layers=2,
+                intermediate_size=64,
+                num_attention_heads=4,
+                rms_norm_eps=1e-6,
+                vocab_size=512,
+                num_key_value_heads=2,
+                max_position_embeddings=512,
+                head_dim=8,
+                tie_word_embeddings=False,
+                rope_theta=1_000_000.0,
+            )
+        )
+
+    @classmethod
+    def _pair_runs(cls, documents, max_content_tokens=None):
+        """The full prefix + content + suffix sequence of every pair."""
+        runs = [list(cls._SHARED) + [ord(char) for char in doc] for doc in documents]
+        if max_content_tokens is not None:
+            runs = [run[:max_content_tokens] for run in runs]
+        return [list(cls._PREFIX) + run + list(cls._SUFFIX) for run in runs]
+
+    @staticmethod
+    def _per_document_scores(model, runs, true_id, false_id):
+        """The pre-#3913 scoring loop: one full forward pass per document."""
+        scores = []
+        for ids in runs:
+            logits = model(mx.array([ids]))
+            last_logits = logits[0, -1, :]
+            paired = mx.array([last_logits[false_id], last_logits[true_id]])
+            probs = mx.softmax(paired)
+            mx.eval(probs)
+            scores.append(probs[1].item())
+        return scores
+
+    def _make_reranker(self, tmp_path, model, tokenizer):
+        model_dir = tmp_path / "Qwen3-Reranker-tiny"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps({"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"]})
+        )
+        reranker = MLXRerankerModel(str(model_dir))
+        reranker._is_causal_lm = True
+        reranker._loaded = True
+        reranker._token_true_id = 1
+        reranker._token_false_id = 0
+        reranker._prefix_tokens = self._PREFIX
+        reranker._suffix_tokens = self._SUFFIX
+        reranker.processor = tokenizer
+        reranker.model = model
+        return reranker
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @pytest.mark.parametrize(
+        ("documents", "expected_runs"),
+        [
+            pytest.param(["aa", "bb", "cc", "dd"], [10, 3, 3, 3], id="four-documents"),
+            pytest.param(["aa"], [10], id="single-document"),
+        ],
+    )
+    def test_shared_prompt_run_is_forwarded_once(
+        self, tmp_path, documents, expected_runs
+    ):
+        """Only the first pass carries the shared run; a single-document request
+        is still exactly one full pass."""
+        model = self._RecordingModel(self._tiny_qwen3())
+        reranker = self._make_reranker(
+            tmp_path, model, self._PromptTokenizer(self._SHARED)
+        )
+
+        result = reranker._rerank_causal_lm("query", documents)
+
+        # 2 prefix + 5 shared + 2 document + 1 suffix for the first pass, then
+        # 2 document + 1 suffix per remaining document.
+        assert model.runs == expected_runs
+        # The API-visible token accounting still counts every pair in full.
+        assert result.total_tokens == 10 * len(documents)
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @pytest.mark.parametrize(
+        ("documents", "distinct"),
+        [
+            pytest.param(["aa"], True, id="one-document"),
+            pytest.param(["aa", "bb"], True, id="two-documents"),
+            pytest.param(
+                ["alpha", "beta", "gamma", "delta", "epsilon"],
+                True,
+                id="five-documents",
+            ),
+            pytest.param(["aa", "aa", "aa"], False, id="identical-documents"),
+            pytest.param(["", "aa"], True, id="shortest-document-first"),
+        ],
+    )
+    def test_scores_match_a_per_document_forward(self, tmp_path, documents, distinct):
+        """Replaying a document's own tokens on the prefilled cache must yield
+        the same yes/no probability as the full per-document forward."""
+        model = self._tiny_qwen3()
+        reranker = self._make_reranker(
+            tmp_path, model, self._PromptTokenizer(self._SHARED)
+        )
+        runs = self._pair_runs(documents)
+        expected = self._per_document_scores(model, runs, 1, 0)
+        # Guards against a vacuous comparison: documents that differ must
+        # actually score differently before the change.
+        assert len({round(score, 4) for score in expected}) == (
+            len(documents) if distinct else 1
+        )
+
+        result = reranker._rerank_causal_lm("query", documents)
+
+        assert [round(score, 4) for score in result.scores] == [
+            round(score, 4) for score in expected
+        ]
+        if distinct:
+            # Identical documents tie, and reusing the cache can move a tie by
+            # less than the 1e-4 compared above, so only distinct scores pin
+            # the ordering.
+            assert result.indices == sorted(
+                range(len(documents)), key=lambda index: -expected[index]
+            )
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_scores_match_a_per_document_forward_when_truncated(self, tmp_path):
+        """Truncation still applies to the content run only, and the truncated
+        shared run is still forwarded once."""
+        documents = ["aa", "bb", "cc"]
+        # max_length 9 leaves 9 - 2 prefix - 1 suffix = 6 content tokens, so
+        # every content keeps the 5-token shared run plus its first character.
+        max_content_tokens = 9 - len(self._PREFIX) - len(self._SUFFIX)
+        model = self._tiny_qwen3()
+        recorder = self._RecordingModel(model)
+        reranker = self._make_reranker(
+            tmp_path, recorder, self._PromptTokenizer(self._SHARED)
+        )
+        runs = self._pair_runs(documents, max_content_tokens)
+        expected = self._per_document_scores(model, runs, 1, 0)
+
+        result = reranker._rerank_causal_lm("query", documents, max_length=9)
+
+        assert recorder.runs == [9, 2, 2]
+        assert [round(score, 4) for score in result.scores] == [
+            round(score, 4) for score in expected
+        ]
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_no_documents_forwards_nothing(self, tmp_path):
+        """An empty document list still forwards nothing and returns empty."""
+        model = self._RecordingModel(self._tiny_qwen3())
+        reranker = self._make_reranker(
+            tmp_path, model, self._PromptTokenizer(self._SHARED)
+        )
+
+        result = reranker._rerank_causal_lm("query", [])
+
+        assert (result.scores, result.indices, result.total_tokens) == ([], [], 0)
+        assert model.runs == []
