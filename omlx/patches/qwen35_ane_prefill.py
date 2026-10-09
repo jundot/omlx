@@ -304,17 +304,14 @@ def _tail_qmm_or_linear(linear: Any, x: mx.array, variant: int) -> mx.array:
     # min-tokens boundary (2048 default, 16384 for q8); shorter tails use
     # stock MLX.
     from omlx.patches.qwen35_q4_mlp import (
+        _MIN_TOKENS,
         _Q8_MIN_TOKENS,
         _linear_qmm,
         _route_min_tokens_for_bits,
     )
 
     bits = getattr(linear, "bits", None)
-    min_tokens = int(os.environ.get("OMLX_QWEN35_Q4_LINEAR_MIN_TOKENS", "2048"))
-    q8_min_tokens = int(
-        os.environ.get("OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS", str(_Q8_MIN_TOKENS))
-    )
-    if x.shape[-2] < _route_min_tokens_for_bits(bits, min_tokens, q8_min_tokens):
+    if x.shape[-2] < _route_min_tokens_for_bits(bits, _MIN_TOKENS, _Q8_MIN_TOKENS):
         return linear(x)
     return _linear_qmm(linear, x, variant)
 
@@ -934,7 +931,6 @@ def _post_ane_linear(
     x: mx.array,
     variant: int,
     *,
-    q8_threshold_env: str,
     cpu_state: _CpuLinearState | None = None,
     cpu_threads: int = 8,
     cpu_shared_resource: bool = True,
@@ -962,11 +958,10 @@ def _post_ane_linear(
             cpu_shared_resource,
         )
 
-    from omlx.patches.qwen35_q4_mlp import _linear_qmm
+    from omlx.patches.qwen35_q4_mlp import _Q8_MIN_TOKENS, _linear_qmm
 
     if getattr(linear, "bits", None) == 8:
-        q8_min_tokens = int(os.environ.get(q8_threshold_env, "16384"))
-        if x.ndim >= 3 and int(x.shape[-2]) < q8_min_tokens:
+        if x.ndim >= 3 and int(x.shape[-2]) < _Q8_MIN_TOKENS:
             return linear(x)
     return _linear_qmm(linear, x, variant)
 
@@ -983,7 +978,6 @@ def _post_ane_down(
             linear,
             x,
             config.variant,
-            q8_threshold_env="OMLX_QWEN35_Q8_MLP_MIN_TOKENS",
             cpu_state=fallback,
             cpu_threads=config.cpu_threads,
             cpu_shared_resource=config.cpu_shared_resource,

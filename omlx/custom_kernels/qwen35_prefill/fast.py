@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import platform
 import re
 from pathlib import Path
@@ -845,30 +844,7 @@ _qmm_nax_cache: bool | None = None
 #   0: 64x64x64 wm2 wn2 (stock MLX tile, default)   1: bm 32   2: bm 128
 #   3: bn 128   4: bk 32   5: wm4 wn1
 NAX_QMM_VARIANTS = range(6)
-_qmm_nax_variant_warned = False
-
-
-def _resolve_qmm_nax_variant() -> int:
-    global _qmm_nax_variant_warned
-    raw = os.environ.get("OMLX_QWEN35_QMM_NAX_VARIANT", "0").strip()
-    try:
-        variant = int(raw)
-    except ValueError:
-        variant = -1
-    if variant in NAX_QMM_VARIANTS:
-        return variant
-    if not _qmm_nax_variant_warned:
-        _qmm_nax_variant_warned = True
-        logger.warning(
-            "OMLX_QWEN35_QMM_NAX_VARIANT=%r is not a bundled NAX tile "
-            "(valid: 0-%d); using variant 0",
-            raw,
-            NAX_QMM_VARIANTS[-1],
-        )
-    return 0
-
-
-QMM_NAX_VARIANT = _resolve_qmm_nax_variant()
+QMM_NAX_VARIANT = 0
 
 
 def _nax_available_fallback(
@@ -937,16 +913,9 @@ def is_nax_available() -> bool:
     """True when stock MLX will dispatch to the M5 tensor-unit (NAX) kernels.
 
     Requires both NAX hardware (mirroring mlx metal::is_nax_available) and an
-    mlx install whose metallib actually ships the NAX kernels. OMLX_NAX=0/1
-    overrides detection (testing only; the native op still refuses NAX
-    pipelines on hardware without tensor units).
+    mlx install whose metallib actually ships the NAX kernels.
     """
     global _nax_available_cache
-    env = os.environ.get("OMLX_NAX", "").strip().lower()
-    if env in ("0", "false", "off"):
-        return False
-    if env in ("1", "true", "on"):
-        return True
     if _nax_available_cache is None:
         if _EXT_HAS_NAX:
             hardware = bool(_ext.is_nax_available())
@@ -965,18 +934,11 @@ def nax_qmm_kernels_built() -> bool:
 def _qmm_use_nax() -> bool:
     global _qmm_nax_cache
     if _qmm_nax_cache is None:
-        if os.environ.get("OMLX_QWEN35_QMM_NAX", "").strip().lower() in (
-            "0",
-            "false",
-            "off",
-        ):
-            _qmm_nax_cache = False
-        else:
-            _qmm_nax_cache = (
-                _EXT_HAS_NAX
-                and bool(_ext.is_nax_available())
-                and bool(_ext.nax_qmm_kernels_built())
-            )
+        _qmm_nax_cache = (
+            _EXT_HAS_NAX
+            and bool(_ext.is_nax_available())
+            and bool(_ext.nax_qmm_kernels_built())
+        )
         if _qmm_nax_cache:
             logger.info(
                 "Qwen qmm NAX dispatch enabled (nax_variant=%d)",

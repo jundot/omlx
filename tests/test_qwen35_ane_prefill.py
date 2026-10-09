@@ -801,7 +801,6 @@ def test_down_projection_cpu_share_is_prepared_and_dispatched(monkeypatch):
         linear,
         mx.zeros((1, 1, 256), dtype=mx.float16),
         8,
-        q8_threshold_env="OMLX_TEST_Q8_THRESHOLD",
         cpu_state=state,
         cpu_threads=8,
         cpu_shared_resource=True,

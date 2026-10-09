@@ -1911,12 +1911,6 @@ namespace {
 std::atomic<bool> g_hybrid_nax_runtime_ok{true};
 
 bool hybrid_nax_enabled() {
-  const char *override = std::getenv("OMLX_QWEN35_QMM_NAX");
-  if (override && (std::strcmp(override, "0") == 0 ||
-                   std::strcmp(override, "false") == 0 ||
-                   std::strcmp(override, "off") == 0)) {
-    return false;
-  }
   return g_hybrid_nax_runtime_ok.load(std::memory_order_relaxed) &&
          is_nax_available() && nax_qmm_kernels_built() &&
          nax_qmm_runtime_active();
