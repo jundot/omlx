@@ -250,6 +250,10 @@ class OpenJevModel:
         self._letter_ids = letter_ids
         self._vision_end_id = tokenizer.convert_tokens_to_ids("<|vision_end|>")
 
+    @property
+    def has_vision(self) -> bool:
+        return self.backbone.has_vision
+
     def close(self) -> None:
         self.backbone.close()
 
@@ -258,6 +262,8 @@ class OpenJevModel:
 
         OpenJev never truncates; ``truncate`` is accepted for API symmetry.
         """
+        if any(q["type"] == "ranking" for q in request["questions"].values()):
+            raise DecisionRequestError("ranking is supported only by FRIDA")
         state = split_state(request["state"], request.get("images"))
         plan = OpenJevPlan(questions=request["questions"], state=state, items=[])
         if state.image is not None:

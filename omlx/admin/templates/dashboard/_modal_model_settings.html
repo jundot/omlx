@@ -315,6 +315,13 @@
                     <div class="w-full lg:w-3/5 lg:pr-6 lg:border-r border-neutral-200">
                         <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-5">{{ t('modal.model_settings.basic_label') }}</h3>
                         <div class="space-y-5">
+                            <div x-show="selectedModel?.model_type === 'decision' &amp;&amp; selectedModel?.config_model_type === 't5'">
+                                <label class="block text-xs font-bold text-neutral-500 mb-2">{{ t('modal.model_settings.frida_precision') }}</label>
+                                <select x-model="modelSettings.frida_precision" class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm bg-white">
+                                    <option value="fp32">{{ t('modal.model_settings.frida_precision_fp32') }}</option>
+                                    <option value="bf16">{{ t('modal.model_settings.frida_precision_bf16') }}</option>
+                                </select>
+                            </div>
                             <!-- Row 1: Model Alias / Model Type / Reasoning Parser -->
                             <div class="grid grid-cols-1 gap-4" :class="reasoningParsers.length > 0 && !modelSettings.is_diffusion_model ? 'sm:grid-cols-3' : 'sm:grid-cols-2'">
                                 <div>

@@ -495,7 +495,11 @@ class ModelSettings:
     description: Optional[str] = None
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
 
+    frida_precision: str = "fp32"
+
     def __post_init__(self) -> None:
+        if self.frida_precision not in ("fp32", "bf16"):
+            raise ValueError("frida_precision must be fp32 or bf16")
         # Profiles retain raw JSON types; engine signatures use repr().
         self.turboquant_kv_bits = normalize_turboquant_kv_bits(self.turboquant_kv_bits)
         if self.qwen35_oq_a8_enabled and self.qwen35_oq_a8_min_tokens < 1:

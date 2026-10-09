@@ -1977,6 +1977,154 @@ class TestSystemOneEndpoint:
         assert response.status_code == status
         assert str(error) in response.text
 
+    def test_frida_mixed_questions_and_usage(self, client, mock_decision_engine):
+        from frida_decisions.base import BaseJudge
+        from frida_decisions.protocol import aggregate
+        from frida_decisions.config import DecisionsConfig
+        from omlx.models.frida import FridaModel
+
+        # Exercise the real protocol adapter, with CPU tokenizer only.
+        adapter = FridaModel("unused")
+        compiler = object.__new__(BaseJudge)
+        compiler.config = DecisionsConfig()
+        compiler.state_max = 384
+        compiler.text = SimpleNamespace(
+            encode=lambda text, cap=None: list(
+                range(min(len(text.split()), cap or len(text.split())))
+            ),
+            count=lambda text: len(text.split()),
+        )
+        adapter.judge = compiler
+
+        async def encode(body, truncate=True):
+            return adapter.encode(body, truncate)
+
+        async def run(plan):
+            return {
+                "answers": aggregate(
+                    plan.parsed, plan.candidates, [0.0] * len(plan.candidates)
+                ),
+                "input_tokens": 10,
+                "usage": {
+                    "state_tokens": len(plan.tokenized.state),
+                    "state_truncated": plan.state_truncated,
+                },
+            }
+
+        mock_decision_engine.encode = encode
+        mock_decision_engine.systemone = run
+        body = {
+            **self._BODY,
+            "questions": {
+                "ranking": {
+                    "type": "ranking",
+                    "instructions": "Порядок",
+                    "criteria": {"b": {"text": "Б"}, "a": "А"},
+                },
+                "choice": {
+                    "type": "choice",
+                    "instructions": "Выбор",
+                    "criteria": {"a": None, "b": None},
+                },
+                "score": {
+                    "type": "score",
+                    "instructions": "Уровень",
+                    "criteria": ["низкий", "высокий"],
+                },
+                "yes": {"type": "noul", "instructions": "Верно?"},
+            },
+        }
+        response = client.post("/v1/systemone", json=body)
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["answers"]["ranking"]["ranking"] == ["a", "b"]
+        assert payload["answers"]["ranking"]["confidence"] == 0
+        assert payload["usage"]["state_truncated"] is False
+        assert payload["usage"]["output_tokens"] == 0
+        for change, status in [
+            ({"images": ["broken"]}, 400),
+            ({"state": "слово " * 385, "truncate": False}, 413),
+            ({"questions": {"q": {"type": "ranking", "criteria": ["one"]}}}, 400),
+            ({"questions": {"q": {"type": "unknown"}}}, 422),
+        ]:
+            assert (
+                client.post("/v1/systemone", json={**body, **change}).status_code
+                == status
+            )
+
+    @pytest.mark.parametrize("kind", ["clef", "openjev"])
+    def test_ranking_rejected_by_legacy_engine(
+        self, client, mock_decision_engine, kind
+    ):
+        engine = DecisionEngine("unused")
+        engine._kind = kind
+        engine._model = SimpleNamespace()
+        mock_decision_engine.encode = engine.encode
+        response = client.post(
+            "/v1/systemone",
+            json={
+                **self._BODY,
+                "questions": {
+                    "q": {
+                        "type": "ranking",
+                        "instructions": "Порядок",
+                        "criteria": ["a", "b"],
+                    }
+                },
+            },
+        )
+        assert response.status_code == 400
+
+    @pytest.mark.parametrize("kind", ["clef", "openjev", "frida"])
+    def test_unsupported_inputs_rejected_before_load(
+        self, client, mock_engine_pool, tmp_path, kind
+    ):
+        if kind == "clef":
+            (tmp_path / "joint_head.safetensors").touch()
+            (tmp_path / "joint_head_config.json").touch()
+        else:
+            (tmp_path / "config.json").write_text(
+                json.dumps({"model_type": "t5" if kind == "frida" else "qwen3_5"})
+            )
+            if kind == "openjev":
+                (tmp_path / "openjev").mkdir()
+                # Directory-name detection also supports converted OpenJev.
+                renamed = tmp_path / "openjev-model"
+                renamed.mkdir()
+                (renamed / "config.json").write_text(
+                    (tmp_path / "config.json").read_text()
+                )
+                tmp_path = renamed
+            else:
+                for name in (
+                    "model.safetensors",
+                    "head.safetensors",
+                    "decisions_config.json",
+                    "tokenizer.json",
+                ):
+                    (tmp_path / name).touch()
+        mock_engine_pool._entries["test-clef-model"] = SimpleNamespace(
+            engine_type="decision", model_path=str(tmp_path)
+        )
+        change = (
+            {"images": ["invalid"]}
+            if kind == "frida"
+            else {
+                "questions": {
+                    "q": {
+                        "type": "ranking",
+                        "instructions": "Rank",
+                        "criteria": ["a", "b"],
+                    }
+                }
+            }
+        )
+        assert (
+            client.post("/v1/systemone", json={**self._BODY, **change}).status_code
+            == 400
+        )
+        assert mock_engine_pool.get_engine_calls == []
+
     def test_systemone_rejects_non_decision_model(self, client):
         response = client.post(
             "/v1/systemone", json={**self._BODY, "model": "test-model"}

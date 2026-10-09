@@ -373,12 +373,18 @@ class ClefModel:
         mx.eval(head.parameters())
         self.head = head
 
+    @property
+    def has_vision(self) -> bool:
+        return self.backbone.has_vision
+
     def close(self) -> None:
         self.backbone.close()
         self.head = None
 
     def encode(self, request: dict, truncate: bool = True) -> ClefPlan:
         """Tokenize and preprocess on the CPU; raises the request errors."""
+        if any(q["type"] == "ranking" for q in request["questions"].values()):
+            raise DecisionRequestError("ranking is supported only by FRIDA")
         backbone = self.backbone
         images = decode_images(request.get("images"))
         pixel_values = image_grid_thw = None

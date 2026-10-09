@@ -1503,7 +1503,7 @@ async def get_engine(
                 raise HTTPException(
                     status_code=400,
                     detail=f"Model '{model_id}' is not a decision model. "
-                    f"Use a decision model such as Clef or OpenJev.",
+                    f"Use a decision model such as Clef, OpenJev or FRIDA.",
                 )
         elif engine_type == EngineType.LLM:
             # #507: non-LLM engines (STT/TTS/STS/Embedding/Reranker) previously
@@ -4012,9 +4012,25 @@ async def create_systemone(
 
     # Tokenize and preprocess images before the keepalive response starts, so
     # request errors keep their real status codes.
-    engine = await get_decision_engine(request.model)
+    # Reject family-specific unsupported inputs before even loading weights.
+    from .model_discovery import decision_kind
+
+    pool = get_engine_pool()
+    model_id = pool.resolve_model_id(request.model, _server_state.settings_manager)
+    entry = pool.get_entry(model_id)
+    if entry is not None and getattr(entry, "engine_type", None) == "decision":
+        kind = decision_kind(Path(entry.model_path))
+        if kind in ("clef", "openjev") and any(
+            q.type == "ranking" for q in request.questions.values()
+        ):
+            raise HTTPException(
+                status_code=400, detail="ranking is supported only by FRIDA"
+            )
+        if kind == "frida" and request.images:
+            raise HTTPException(status_code=400, detail="FRIDA does not support images")
     try:
-        plan = await engine.encode(request.model_dump(), truncate=request.truncate)
+        async with acquire_decision_engine(request.model) as engine:
+            plan = await engine.encode(request.model_dump(), truncate=request.truncate)
     except DecisionContextLengthError as e:
         raise HTTPException(status_code=413, detail=str(e)) from e
     except DecisionRequestError as e:
@@ -4043,7 +4059,11 @@ async def create_systemone(
             {
                 "model": request.model,
                 "answers": result["answers"],
-                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": 0,
+                    **result.get("usage", {}),
+                },
             },
             ensure_ascii=False,
         )

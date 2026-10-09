@@ -267,6 +267,7 @@
             selectedModel: null,
             modelSettings: {
                 model_alias: '',
+                frida_precision: 'fp32',
                 model_type_override: '',
                 max_context_window: null,
                 max_tokens: null,
@@ -2008,6 +2009,7 @@
                 const isOcr = OCR_CONFIG_MODEL_TYPES.has(model?.config_model_type || '');
                 return {
                     model_alias: s.model_alias || '',
+                    frida_precision: s.frida_precision || 'fp32',
                     model_type_override: s.model_type_override || '',
                     max_context_window: s.max_context_window || null,
                     max_tokens: s.max_tokens || null,
@@ -3031,6 +3033,7 @@
                             }
                             const payload = {
                                 model_alias: this.modelSettings.model_alias?.trim() || null,
+                                frida_precision: this.modelSettings.frida_precision,
                                 model_type_override: this.modelSettings.model_type_override || null,
                                 max_context_window: this.modelSettings.max_context_window || null,
                                 max_tokens: this.modelSettings.max_tokens || null,

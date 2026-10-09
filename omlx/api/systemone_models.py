@@ -17,15 +17,17 @@ from pydantic import BaseModel, Field, field_validator
 class SystemOneQuestion(BaseModel):
     """One typed question about the state."""
 
-    type: Literal["noul", "choice", "score"]
-    """noul: yes/no probability. choice: one option key. score: ordered level."""
+    type: Literal["noul", "choice", "score", "ranking"]
+    """noul: yes/no probability. choice: one option key. score: ordered level.
+    ranking: candidate IDs ordered best first."""
 
     instructions: Any = None
     """The question text, or any JSON value."""
 
     criteria: dict[str, Any] | list[Any] | None = None
     """choice: option -> description or null. score: ordered level
-    descriptions. noul: optional {"true": ..., "false": ...} descriptions."""
+    descriptions. ranking: candidate ID -> content, or a content list.
+    noul: optional {"true": ..., "false": ...} descriptions."""
 
 
 class SystemOneRequest(BaseModel):
@@ -44,7 +46,7 @@ class SystemOneRequest(BaseModel):
     """Base64 image data URIs. An oMLX extension to the System One API."""
 
     truncate: bool = True
-    """Clef only: cut the state to fit the context instead of returning 413."""
+    """Clef/FRIDA: cut segments to fit the context instead of returning 413."""
 
     @field_validator("state")
     @classmethod

@@ -321,6 +321,7 @@ class ModelSettingsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     model_alias: str | None = None
+    frida_precision: Literal["fp32", "bf16"] | None = None
     model_type_override: str | None = None
     max_context_window: int | None = None
     max_tokens: int | None = None
@@ -2789,6 +2790,8 @@ async def update_model_settings(
         model_id, current_settings
     )
     is_diffusion_model = _entry_is_diffusion_model(entry)
+    if "frida_precision" in sent:
+        current_settings.frida_precision = request.frida_precision or "fp32"
     if "model_alias" in sent:
         alias_value = request.model_alias.strip() if request.model_alias else None
         if alias_value == "":
@@ -3494,7 +3497,13 @@ async def update_model_settings(
             logger.warning(f"Auto-unload failed for {model_id}: {e}")
         if auto_unloaded and was_pinned:
             try:
-                await engine_pool._load_engine(model_id)
+                from ..model_discovery import decision_kind
+
+                if decision_kind(Path(entry.model_path)) == "frida":
+                    # Precision changes must pass loading-peak admission too.
+                    await engine_pool.get_engine(model_id)
+                else:
+                    await engine_pool._load_engine(model_id)
                 auto_reloaded = True
                 logger.info(f"Auto-reloaded pinned model {model_id} with new settings.")
             except Exception as e:

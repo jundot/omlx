@@ -32,7 +32,7 @@ ModelType = Literal[
 EngineType = Literal[
     "batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "decision"
 ]
-DecisionKind = Literal["clef", "openjev"]
+DecisionKind = Literal["clef", "openjev", "frida"]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -466,6 +466,7 @@ def _model_name_hint(model_path: Path) -> str:
 def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind | None:
     """Return the decision-model family of a checkpoint, or None.
 
+    FRIDA requires a T5 config and all original encoder/head/tokenizer files.
     Clef is identified by its joint head files. OpenJev is a plain Qwen3.5
     checkpoint, so it is identified by its helper directory or, for MLX
     conversions without the helper, by the directory name.
@@ -480,6 +481,18 @@ def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind 
                 config = json.load(f)
         except (OSError, ValueError):
             return None
+    if not isinstance(config, dict):
+        return None
+    if config.get("model_type") == "t5" and all(
+        (model_path / name).is_file()
+        for name in (
+            "model.safetensors",
+            "head.safetensors",
+            "decisions_config.json",
+            "tokenizer.json",
+        )
+    ):
+        return "frida"
     if config.get("model_type") != "qwen3_5":
         return None
     if (model_path / _OPENJEV_HELPER).is_file() or "openjev" in _model_name_hint(
@@ -1048,6 +1061,10 @@ def estimate_model_size(model_path: Path) -> int:
     Returns:
         Estimated memory usage in bytes
     """
+    if decision_kind(model_path) == "frida":
+        from .models.frida_memory import estimate_frida_memory
+
+        return estimate_frida_memory(model_path).resident_bytes
     total_size = 0
 
     # Primary: safetensors files
@@ -1555,6 +1572,8 @@ def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
             "Treating HF cache model as MLX-compatible DeepSeek V4.1 checkpoint: "
             f"{source_repo_id}"
         )
+        return True
+    if decision_kind(model_dir, config) == "frida":
         return True
     if _safetensors_has_mlx_metadata(model_dir):
         return True

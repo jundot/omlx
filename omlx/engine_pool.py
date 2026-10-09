@@ -54,6 +54,7 @@ from .exceptions import (
 )
 from .model_discovery import (
     VLM_NATIVE_TEXT_MODEL_TYPES,
+    decision_kind,
     discover_models,
     format_size,
     is_realtime_stt_model,
@@ -508,6 +509,15 @@ class EnginePool:
     ) -> int:
         """Include Engram runtime storage and optional K2 ANE reservations."""
 
+        if (
+            entry.engine_type == "decision"
+            and decision_kind(Path(entry.model_path)) == "frida"
+        ):
+            from .models.frida_memory import estimate_frida_memory
+
+            return estimate_frida_memory(
+                entry.model_path, getattr(runtime_settings, "frida_precision", "fp32")
+            ).resident_bytes
         base = self._entry_resident_size(entry) if base_size is None else base_size
         if self._distributed_deployment_for_entry(entry) is not None:
             return base
@@ -1055,6 +1065,9 @@ class EnginePool:
 
         def add(key: str, value: object) -> None:
             signature.append((key, self._canonical_signature_value(value)))
+
+        if entry is not None and decision_kind(Path(entry.model_path)) == "frida":
+            add("frida_precision", data.get("frida_precision", "fp32"))
 
         # Security/load gates.
         add("trust_remote_code", bool(data.get("trust_remote_code", False)))
@@ -2293,6 +2306,15 @@ class EnginePool:
                 load_settings,
                 base_size=admission_size,
             )
+            if (
+                entry.engine_type == "decision"
+                and decision_kind(Path(entry.model_path)) == "frida"
+            ):
+                from .models.frida_memory import estimate_frida_memory
+
+                admission_size = estimate_frida_memory(
+                    entry.model_path, getattr(load_settings, "frida_precision", "fp32")
+                ).loading_bytes
             admission_kind = "local shard" if deployment is not None else "model"
 
             ceiling = self._current_ceiling()
@@ -3702,6 +3724,15 @@ class EnginePool:
                         model_name=entry.model_path,
                         trust_remote_code=trc,
                         scheduler_config=self._scheduler_config,
+                        **(
+                            {
+                                "frida_precision": getattr(
+                                    model_settings, "frida_precision", "fp32"
+                                )
+                            }
+                            if decision_kind(Path(entry.model_path)) == "frida"
+                            else {}
+                        ),
                     )
                 elif effective_type == "vlm":
                     engine = VLMBatchedEngine(

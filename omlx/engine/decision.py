@@ -2,9 +2,9 @@
 """
 Decision engine for oMLX.
 
-Serves decision models (Clef, OpenJev) through ``/v1/systemone``. A request
-runs causal prefills and no decoding. The engine steps the model's prefill
-generator one chunk per executor call, so active chat decodes get the GPU
+Serves decision models (Clef, OpenJev, FRIDA) through ``/v1/systemone``. A request
+runs encoder forwards or causal prefills and no decoding. The engine steps
+the model generator once per executor call, so active chat decodes get the GPU
 between chunks.
 """
 
@@ -21,6 +21,8 @@ import mlx.core as mx
 from ..engine_core import get_mlx_executor
 from ..model_discovery import decision_kind
 from ..models.clef import ClefModel
+from ..models.decision import DecisionRequestError
+from ..models.frida import FridaModel
 from ..models.openjev import OpenJevModel
 from ..scheduler import _CONTENDED_CHUNK_FLOOR, SchedulerConfig
 from .base import BaseNonStreamingEngine
@@ -28,7 +30,7 @@ from .forward_fairness import ForwardFairnessGate
 
 logger = logging.getLogger(__name__)
 
-_MODEL_CLASSES = {"clef": ClefModel, "openjev": OpenJevModel}
+_MODEL_CLASSES = {"clef": ClefModel, "openjev": OpenJevModel, "frida": FridaModel}
 
 
 class DecisionEngine(BaseNonStreamingEngine):
@@ -39,14 +41,16 @@ class DecisionEngine(BaseNonStreamingEngine):
         model_name: str,
         trust_remote_code: bool = False,
         scheduler_config: SchedulerConfig | None = None,
+        frida_precision: str = "fp32",
     ):
         super().__init__()
+        self._frida_precision = frida_precision
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
         self._prefill_step = max(
             1, int(getattr(scheduler_config, "prefill_step_size", 0) or 2048)
         )
-        self._model: ClefModel | OpenJevModel | None = None
+        self._model: ClefModel | OpenJevModel | FridaModel | None = None
         self._kind: str | None = None
         # One request at a time: requests share one GPU executor, so running
         # them interleaved only multiplies the activation memory.
@@ -74,33 +78,56 @@ class DecisionEngine(BaseNonStreamingEngine):
         if kind is None:
             raise ValueError(
                 f"{self._model_name} is not a supported decision model "
-                "(Clef or OpenJev)"
+                "(Clef, OpenJev or FRIDA)"
             )
         logger.info(f"Starting decision engine ({kind}): {self._model_name}")
         model = _MODEL_CLASSES[kind](
-            self._model_name, trust_remote_code=self._trust_remote_code
+            self._model_name,
+            trust_remote_code=self._trust_remote_code,
+            **({"precision": self._frida_precision} if kind == "frida" else {}),
         )
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(get_mlx_executor(), model.load)
+        loading = loop.run_in_executor(get_mlx_executor(), model.load)
+        try:
+            await asyncio.shield(loading)
+        except BaseException:
+            # A cancelled asyncio future does not stop an executor forward.
+            # Drain it before releasing weights on the same executor.
+            try:
+                await asyncio.shield(loading)
+            finally:
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    lambda: (
+                        model.close(),
+                        gc.collect(),
+                        mx.synchronize(),
+                        mx.clear_cache(),
+                    ),
+                )
+            raise
         self._model = model
         self._kind = kind
         logger.info(f"Decision engine started: {self._model_name}")
 
     async def stop(self) -> None:
+        async with self._lock:
+            await self._stop_locked()
+
+    async def _stop_locked(self) -> None:
         if self._model is None:
             return
         logger.info(f"Stopping decision engine: {self._model_name}")
         model = self._model
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(get_mlx_executor(), model.close)
-        self._model = None
-        gc.collect()
         await loop.run_in_executor(
-            get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
+            get_mlx_executor(),
+            lambda: (model.close(), gc.collect(), mx.synchronize(), mx.clear_cache()),
         )
+        self._model = None
         logger.info(f"Decision engine stopped: {self._model_name}")
 
-    def _require_model(self) -> ClefModel | OpenJevModel:
+    def _require_model(self) -> ClefModel | OpenJevModel | FridaModel:
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
         return self._model
@@ -111,12 +138,16 @@ class DecisionEngine(BaseNonStreamingEngine):
         Raises the model's request errors before any GPU work starts.
         """
         model = self._require_model()
+        if self._kind != "frida" and any(
+            q["type"] == "ranking" for q in request["questions"].values()
+        ):
+            raise DecisionRequestError("ranking is supported only by FRIDA")
         return await asyncio.to_thread(model.encode, request, truncate)
 
     async def systemone(self, plan: Any) -> dict:
         """Run an encoded request and return ``answers`` and ``input_tokens``."""
-        model = self._require_model()
         async with self._lock:
+            model = self._require_model()
             activity_id = self._begin_activity(
                 "decision",
                 detail="Deciding",
@@ -128,9 +159,16 @@ class DecisionEngine(BaseNonStreamingEngine):
             done_tokens = 0
             try:
                 while True:
-                    finished, value = await loop.run_in_executor(
+                    forward = loop.run_in_executor(
                         get_mlx_executor(), self._step, steps
                     )
+                    try:
+                        finished, value = await asyncio.shield(forward)
+                    except asyncio.CancelledError:
+                        # Hold the request activity and pool lease until GPU
+                        # execution completes and generator cleanup can run.
+                        await asyncio.shield(forward)
+                        raise
                     if finished:
                         return value
                     done_tokens += value
@@ -149,7 +187,7 @@ class DecisionEngine(BaseNonStreamingEngine):
         return max(_CONTENDED_CHUNK_FLOOR, min(self._prefill_step, cap))
 
     def _step(self, steps: Generator[int, None, dict]) -> tuple[bool, Any]:
-        """Advance the request by one prefill chunk on the executor."""
+        """Advance by one causal chunk or complete encoder row on the executor."""
         contended = self._fairness.wait_turn()
         start = time.perf_counter()
         tokens = 0
@@ -176,7 +214,7 @@ class DecisionEngine(BaseNonStreamingEngine):
         }
         if self._model is not None:
             info["decision_kind"] = self._kind
-            info["vision"] = self._model.backbone.has_vision
+            info["vision"] = self._model.has_vision
         return info
 
     def __repr__(self) -> str:
