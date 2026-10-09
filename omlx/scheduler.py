@@ -3558,7 +3558,12 @@ class Scheduler:
                 pass
 
         if detected:
-            logger.info(
+            # WARNING, not INFO: this detector is only reachable through
+            # _turboquant_eligible(), whose callers all gate on
+            # ``self._turboquant_kv_bits is not None`` — i.e. the user
+            # explicitly requested quantized KV and is silently getting fp16
+            # instead (#2859).
+            logger.warning(
                 "TurboQuant disabled: model uses Multi-head Latent Attention "
                 "(MLA), which is incompatible with quantized KV cache states; "
                 "keeping fp16 KV cache (#1613)."
@@ -3612,7 +3617,9 @@ class Scheduler:
                 pass
 
         if detected:
-            logger.info(
+            # WARNING for the same reason as the MLA veto above: reaching this
+            # detector means TurboQuant was armed for an explicit request.
+            logger.warning(
                 "TurboQuant disabled: model uses attention sinks, which are "
                 "not supported by TurboQuant's quantized attention kernels; "
                 "keeping fp16 KV cache."

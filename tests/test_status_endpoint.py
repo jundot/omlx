@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for GET /api/status endpoint."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -260,3 +261,227 @@ class TestStatusCustomKernels:
         for name, report in status.items():
             assert report["available"] is False, name
             assert "simulated native import explosion" in report["import_error"]
+
+
+def _engine_with_scheduler(scheduler, settings=None):
+    """A pool-entry engine shaped like the loaded engines (#2859).
+
+    Real engines expose the request core as ``_engine.engine`` and keep the
+    per-model ``ModelSettings`` on ``_model_settings``.
+    """
+    core = SimpleNamespace(scheduler=scheduler)
+    return SimpleNamespace(
+        _engine=SimpleNamespace(engine=core),
+        _model_settings=settings,
+    )
+
+
+def _pool_with_entries(entries):
+    pool = MagicMock(
+        spec=[
+            "model_count",
+            "loaded_model_count",
+            "get_loaded_model_ids",
+            "current_model_memory",
+            "_entries",
+        ]
+    )
+    pool.model_count = len(entries)
+    pool.loaded_model_count = sum(1 for e in entries.values() if e.engine)
+    pool.get_loaded_model_ids.return_value = [
+        mid for mid, e in entries.items() if e.engine
+    ]
+    pool.current_model_memory = 0
+    pool._entries = entries
+    return pool
+
+
+def _entry(engine):
+    return SimpleNamespace(is_loading=False, engine=engine)
+
+
+class _ExplodingEngine:
+    """Engine that fails every attribute probe (unload racing a status poll)."""
+
+    def __getattr__(self, name):
+        raise RuntimeError("engine went away mid-poll")
+
+
+class TestStatusTurboQuant:
+    """/api/status exposes the effective per-model TurboQuant decision (#2859).
+
+    Whether TQ engaged used to be discoverable only by grepping server logs,
+    which contradict themselves inside a single load: "TurboQuant KV cache
+    enabled for VLM: 8.0 bits" followed a second later by "TurboQuant
+    disabled: model uses Multi-head Latent Attention". The engine-level bit
+    depth is still reported as armed, so the status field is the only place
+    a user can see the downgrade.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup_server_state(self):
+        state = ServerState()
+        with patch("omlx.server._server_state", state):
+            self._state = state
+            yield
+
+    def test_armed_eligible_model_reports_active(self, client):
+        settings = SimpleNamespace(turboquant_kv_enabled=True, turboquant_kv_bits=8)
+        scheduler = SimpleNamespace(
+            _turboquant_kv_bits=8.0,
+            _model_uses_mla=lambda: False,
+            _model_uses_attention_sinks=lambda: False,
+        )
+        self._state.engine_pool = _pool_with_entries(
+            {
+                "qwen3.6-35b-a3b-4bit": _entry(
+                    _engine_with_scheduler(scheduler, settings)
+                ),
+            }
+        )
+
+        data = client.get("/api/status").json()
+
+        assert data["turboquant"] == {
+            "requested_models": 1,
+            "active_models": 1,
+            "models": [
+                {
+                    "model_id": "qwen3.6-35b-a3b-4bit",
+                    "requested": True,
+                    "bits": 8.0,
+                    "active": True,
+                }
+            ],
+        }
+
+    @pytest.mark.parametrize(
+        ("armed_bits", "mla", "sinks", "expected_reason"),
+        [
+            (8.0, True, False, "Multi-head Latent Attention"),
+            (8.0, False, True, "attention sinks"),
+            # Requested in settings but the engine never armed it (GLM-5.3
+            # composite latent/indexer cache bails out before setting bits).
+            (None, False, False, "engine did not arm TurboQuant"),
+        ],
+    )
+    def test_ineligible_model_reports_reason(
+        self, client, armed_bits, mla, sinks, expected_reason
+    ):
+        settings = SimpleNamespace(turboquant_kv_enabled=True, turboquant_kv_bits=8)
+        scheduler = SimpleNamespace(
+            _turboquant_kv_bits=armed_bits,
+            _model_uses_mla=lambda: mla,
+            _model_uses_attention_sinks=lambda: sinks,
+        )
+        self._state.engine_pool = _pool_with_entries(
+            {
+                "deepseek-v4.1-flash-oq4e": _entry(
+                    _engine_with_scheduler(scheduler, settings)
+                ),
+            }
+        )
+
+        data = client.get("/api/status").json()
+
+        assert data["turboquant"]["requested_models"] == 1
+        assert data["turboquant"]["active_models"] == 0
+        report = data["turboquant"]["models"][0]
+        assert report["requested"] is True
+        assert report["bits"] == 8.0
+        assert report["active"] is False
+        assert expected_reason in report["reason"]
+
+    def test_unrequested_and_unloaded_models_are_omitted(self, client):
+        scheduler = SimpleNamespace(
+            _turboquant_kv_bits=None,
+            _model_uses_mla=lambda: False,
+            _model_uses_attention_sinks=lambda: False,
+        )
+        settings = SimpleNamespace(turboquant_kv_enabled=False, turboquant_kv_bits=4)
+        self._state.engine_pool = _pool_with_entries(
+            {
+                "fp16-model": _entry(_engine_with_scheduler(scheduler, settings)),
+                "not-loaded-model": _entry(None),
+            }
+        )
+
+        data = client.get("/api/status").json()
+
+        assert data["turboquant"] == {
+            "requested_models": 0,
+            "active_models": 0,
+            "models": [],
+        }
+
+    def test_engine_that_fails_attribute_probe_does_not_break_status(self, client):
+        self._state.engine_pool = _pool_with_entries(
+            {
+                "racing-model": _entry(_ExplodingEngine()),
+            }
+        )
+
+        resp = client.get("/api/status")
+
+        assert resp.status_code == 200
+        assert resp.json()["turboquant"]["models"] == []
+
+
+class TestStatusCacheMemory:
+    """`/api/status` reports per-model cache-tier occupancy (#2859).
+
+    ``model_memory_used`` is the settled load footprint, not a KV gauge, and
+    omlx keeps no resident-KV byte counter. Rather than inventing an estimate
+    this block surfaces the counter the reporter used to measure KV growth
+    indirectly: bytes written to the paged SSD tier, plus the in-memory hot
+    cache, scoped to the owning model.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup_server_state(self):
+        state = ServerState()
+        with patch("omlx.server._server_state", state):
+            self._state = state
+            yield
+
+    def test_reports_ssd_tier_bytes_for_models_that_own_a_manager(self, client):
+        manager = SimpleNamespace(
+            get_stats_for_model=lambda name: SimpleNamespace(
+                total_size_bytes=1_978_000_000,
+                hot_cache_size_bytes=52_428_800,
+                hot_cache_entries=12,
+                num_files=640,
+            )
+        )
+        ssd_scheduler = SimpleNamespace(
+            _turboquant_kv_bits=None,
+            config=SimpleNamespace(model_name="qwen3.6-35b-a3b-4bit"),
+            paged_ssd_cache_manager=manager,
+        )
+        # No SSD cache configured for this one: it has no cache tier to report
+        # and must be left out rather than rendered as zeros.
+        memory_only_scheduler = SimpleNamespace(
+            _turboquant_kv_bits=None,
+            config=SimpleNamespace(model_name="memory-only-model"),
+            paged_ssd_cache_manager=None,
+        )
+        self._state.engine_pool = _pool_with_entries(
+            {
+                "qwen3.6-35b-a3b-4bit": _entry(_engine_with_scheduler(ssd_scheduler)),
+                "memory-only-model": _entry(
+                    _engine_with_scheduler(memory_only_scheduler)
+                ),
+            }
+        )
+
+        data = client.get("/api/status").json()
+
+        assert data["cache_memory"]["models"] == [
+            {
+                "model_id": "qwen3.6-35b-a3b-4bit",
+                "ssd_cache_bytes": 1_978_000_000,
+                "hot_cache_bytes": 52_428_800,
+                "hot_cache_entries": 12,
+                "num_files": 640,
+            }
+        ]

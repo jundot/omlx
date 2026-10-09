@@ -18,6 +18,7 @@ Note: BatchGenerator is mocked; step() coverage is limited to targeted paths.
 import concurrent.futures
 import gc
 import json
+import logging
 import sys
 import threading
 import weakref
@@ -7972,6 +7973,60 @@ class TestTurboQuantAttentionSinkGuard:
 
         assert scheduler._model_uses_attention_sinks() is False
         assert scheduler._turboquant_eligible([KVCache()]) is True
+
+
+def _ineligible_model(kind: str) -> SimpleNamespace:
+    """A model stub that trips one of the two TurboQuant vetoes."""
+    if kind == "mla":
+        return SimpleNamespace(args=SimpleNamespace(kv_lora_rank=512))
+    return SimpleNamespace(
+        args=SimpleNamespace(), modules=lambda: [{"sinks": mx.zeros((8,))}]
+    )
+
+
+class TestTurboQuantDowngradeWarns:
+    """A requested TurboQuant downgrade must be a WARNING, not an INFO (#2859).
+
+    Both vetoes keep the model on fp16 after the engine armed TurboQuant, and
+    every caller reaches them through a gate that first checks
+    ``self._turboquant_kv_bits is not None`` — i.e. the user explicitly asked
+    for quantized KV. So the line is a downgrade of an explicit request and
+    must be visible without enabling INFO logs; with nothing armed the gate
+    never consults the detectors, so the logs stay quiet for everyone else.
+    """
+
+    @pytest.mark.parametrize(
+        ("model_kind", "armed_bits", "expected_level"),
+        [
+            ("mla", 8.0, logging.WARNING),
+            ("attention_sinks", 8.0, logging.WARNING),
+            ("mla", None, None),
+        ],
+    )
+    def test_downgrade_level_follows_the_armed_gate(
+        self, caplog, model_kind, armed_bits, expected_level
+    ):
+        from mlx_lm.models.cache import KVCache
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler._turboquant_kv_bits = armed_bits
+        scheduler.model = _ineligible_model(model_kind)
+        scheduler._mla_model = None
+        scheduler._attention_sink_model = None
+
+        with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+            # Shipped gate: chunked-prefill finalization is a no-op unless
+            # TurboQuant was armed for this model.
+            scheduler._finalize_chunked_prefill_cache_for_insert(
+                SimpleNamespace(cached_tokens=0), [KVCache()]
+            )
+
+        logged = [
+            record.levelno
+            for record in caplog.records
+            if "TurboQuant disabled" in record.getMessage()
+        ]
+        assert logged == ([] if expected_level is None else [expected_level])
 
 
 class TestSchedulerModelIdDerivation:

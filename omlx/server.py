@@ -3214,10 +3214,7 @@ async def server_status(_: bool = Depends(verify_api_key)):
             engine = entry.engine
             if engine is None:
                 continue
-            async_core = getattr(engine, "_engine", None)
-            if async_core is None:
-                continue
-            core = getattr(async_core, "engine", None)
+            core = _entry_core(engine)
             if core is None:
                 continue
             active_requests += len(getattr(core, "_output_collectors", {}))
@@ -3253,6 +3250,8 @@ async def server_status(_: bool = Depends(verify_api_key)):
         ),
         "custom_kernels": native_kernel_status(),
         "ane_prefill": _ane_prefill_status(pool),
+        "turboquant": _turboquant_status(pool),
+        "cache_memory": _cache_memory_status(pool),
     }
 
 
@@ -3292,6 +3291,165 @@ def _ane_prefill_status(pool) -> dict:
                 result["configured_models"] += 1
     except Exception as exc:  # noqa: BLE001 - status must never fail the endpoint
         logger.warning("ANE prefill status unavailable: %s", exc)
+    return result
+
+
+def _entry_core(engine):
+    """The request core behind a loaded engine, or None.
+
+    Best-effort: an engine that is mid-load or mid-unload can fail the
+    attribute probe, and status polling must never fail the endpoint on it.
+    """
+    try:
+        async_core = getattr(engine, "_engine", None)
+        if async_core is None:
+            return None
+        return getattr(async_core, "engine", None)
+    except Exception:  # noqa: BLE001 - status must never fail the endpoint
+        return None
+
+
+def _entry_scheduler(engine):
+    """The scheduler that owns a loaded engine's caches, or None.
+
+    Engines without an ``AsyncEngineCore`` (DFlash) expose their fallback
+    scheduler directly, the same traversal the admin dashboard uses.
+    """
+    core = _entry_core(engine)
+    scheduler = getattr(core, "scheduler", None) if core is not None else None
+    if scheduler is not None:
+        return scheduler
+    try:
+        return getattr(engine, "scheduler", None)
+    except Exception:  # noqa: BLE001 - status must never fail the endpoint
+        return None
+
+
+def _turboquant_ineligible_reason(scheduler) -> str | None:
+    """Why an armed model's TurboQuant KV still falls back to fp16, or None.
+
+    Reuses the scheduler's own (memoized) vetoes instead of duplicating the
+    model introspection, so the reason reported here is the one the request
+    path acted on.
+    """
+    if scheduler._model_uses_mla():
+        return "model uses Multi-head Latent Attention (MLA)"
+    if scheduler._model_uses_attention_sinks():
+        return "model uses attention sinks"
+    return None
+
+
+def _turboquant_status(pool) -> dict:
+    """Aggregate TurboQuant KV state across loaded models (#2859).
+
+    Whether TurboQuant engaged used to be discoverable only by grepping the
+    server logs, which can contradict themselves inside a single load
+    ("TurboQuant KV cache enabled for VLM: 8.0 bits" followed by "TurboQuant
+    disabled: model uses Multi-head Latent Attention"). Models that never
+    requested TurboQuant are omitted, so an empty ``models`` list means no
+    loaded model opted in.
+
+    ``active`` mirrors the scheduler's model-level vetoes; cache-layout
+    vetoes (composite CacheList layers) stay visible only in the log line,
+    because deciding them needs a live prompt cache.
+
+    Best-effort and defensive: a model whose engine cannot be probed is
+    skipped rather than failing the endpoint.
+    """
+    result = {"requested_models": 0, "active_models": 0, "models": []}
+    if pool is None:
+        return result
+    for model_id, entry in pool._entries.items():
+        engine = getattr(entry, "engine", None)
+        if engine is None:
+            continue
+        try:
+            scheduler = _entry_scheduler(engine)
+            settings = getattr(engine, "_model_settings", None)
+            requested = bool(getattr(settings, "turboquant_kv_enabled", False))
+            bits = getattr(settings, "turboquant_kv_bits", None)
+            armed_bits = getattr(scheduler, "_turboquant_kv_bits", None)
+            if armed_bits is not None:
+                # Only the engine's own arming proves TurboQuant was enabled
+                # for a model; settings alone cannot (they survive a bail-out).
+                requested = True
+                bits = armed_bits
+            if not requested:
+                continue
+            reason = (
+                _turboquant_ineligible_reason(scheduler)
+                if armed_bits is not None
+                else "engine did not arm TurboQuant KV for this model"
+            )
+            bits_value = float(bits) if bits is not None else None
+        except Exception as exc:  # noqa: BLE001 - status must never fail
+            logger.warning(
+                "TurboQuant status unavailable for model '%s': %s", model_id, exc
+            )
+            continue
+        report = {
+            "model_id": model_id,
+            "requested": True,
+            "bits": bits_value,
+            "active": reason is None,
+        }
+        if reason is not None:
+            report["reason"] = reason
+        result["models"].append(report)
+        result["requested_models"] += 1
+        if reason is None:
+            result["active_models"] += 1
+    return result
+
+
+def _cache_memory_status(pool) -> dict:
+    """Cache-tier occupancy per loaded model (#2859).
+
+    ``model_memory_used`` is the settled load footprint (weights plus fixed
+    runtime buffers), not a KV gauge, and omlx keeps no resident-KV byte
+    counter to report. This block surfaces the counter that does exist —
+    bytes written to the paged SSD tier plus the shared in-memory hot cache,
+    scoped to the owning model — which is how the reporter measured KV
+    growth indirectly. Models with no paged SSD cache configured are
+    omitted rather than reported as zeros.
+
+    Best-effort and defensive: a model whose cache tier cannot be read is
+    skipped rather than failing the endpoint.
+    """
+    result = {"models": []}
+    if pool is None:
+        return result
+    for model_id, entry in pool._entries.items():
+        engine = getattr(entry, "engine", None)
+        if engine is None:
+            continue
+        try:
+            scheduler = _entry_scheduler(engine)
+            manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+            if manager is None:
+                continue
+            model_name = (
+                getattr(getattr(scheduler, "config", None), "model_name", "")
+                or model_id
+            )
+            stats = manager.get_stats_for_model(model_name)
+            result["models"].append(
+                {
+                    "model_id": model_id,
+                    "ssd_cache_bytes": int(getattr(stats, "total_size_bytes", 0) or 0),
+                    "hot_cache_bytes": int(
+                        getattr(stats, "hot_cache_size_bytes", 0) or 0
+                    ),
+                    "hot_cache_entries": int(
+                        getattr(stats, "hot_cache_entries", 0) or 0
+                    ),
+                    "num_files": int(getattr(stats, "num_files", 0) or 0),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - status must never fail
+            logger.warning(
+                "Cache memory stats unavailable for model '%s': %s", model_id, exc
+            )
     return result
 
 
