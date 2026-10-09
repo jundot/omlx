@@ -665,13 +665,15 @@ def test_decode_multirow_matches_dequantize_reference(q_len):
 
 
 @pytest.mark.parametrize("q_len", [2, 3, 4])
-def test_fused_multirow_kernel_matches_dequantize_reference(q_len):
-    """Above the token floor, MSE-codec MTP verify takes the fused multi-row
-    kernel (one KV unpack shared across rows, issue #2215). Its output must
-    match the dequantize+SDPA reference with the causal tail mask, and the
-    dispatcher must route to it bit-exactly."""
+def test_fused_multirow_kernel_matches_dequantize_reference(q_len, monkeypatch):
+    """Above the token floor, MSE-codec MTP verify outside the MMA kernel's
+    envelope takes the fused multi-row kernel (one KV unpack shared across
+    rows, issue #2215). Its output must match the dequantize+SDPA reference
+    with the causal tail mask, and the dispatcher must route to it
+    bit-exactly."""
     from omlx.patches import turboquant_attention as tq_attention
 
+    monkeypatch.setattr(tq_attention, "_mma_mse_attention", lambda *a, **k: None)
     mx.random.seed(0)
     B, n_q, n_kv, D = 1, 16, 2, 256
     T = tq_attention._FUSED_MULTIROW_MIN_TOKENS + 512
@@ -733,6 +735,125 @@ def test_fused_multirow_kernel_handles_mixed_bit_codecs(bits):
         queries.astype(mx.float32), dk, dv, scale=scale, mask=causal
     )
     assert mx.abs(fused.astype(mx.float32) - ref).max().item() < 5e-3
+
+
+def _mma_reference(tq, queries, ks, vs, scale):
+    dk, dv = tq.dequantize(keys_state=ks, values_state=vs)
+    T, q_len = dk.shape[-2], queries.shape[-2]
+    causal = mx.arange(T)[None, :] <= mx.arange(T - q_len, T)[:, None]
+    return mx.fast.scaled_dot_product_attention(
+        queries.astype(mx.float32), dk, dv, scale=scale, mask=causal
+    )
+
+
+@pytest.mark.parametrize("bits", [4.0, 2.0, 8.0])
+@pytest.mark.parametrize("q_len", [1, 2, 5, 9])
+@pytest.mark.parametrize("tokens", [37, 600])
+def test_mma_attention_matches_dequantize_reference(bits, q_len, tokens):
+    """The simdgroup-matrix kernel serves decode and verify rows of every GQA
+    repeat; it must match dequantize+SDPA with the causal tail, including
+    partial token tiles and rows past the last 8-row tile."""
+    from omlx.patches import turboquant_attention as tq_attention
+
+    mx.random.seed(1)
+    B, n_q, n_kv, D = 1, 12, 2, 128
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((B, n_kv, tokens, D)).astype(mx.float16),
+        mx.random.normal((B, n_kv, tokens, D)).astype(mx.float16),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=bits)
+    ks, vs = tq.state
+    queries = mx.random.normal((B, n_q, q_len, D)).astype(mx.float16)
+    scale = D**-0.5
+
+    out = tq_attention._mma_mse_attention(tq, queries, ks, vs, scale)
+    assert out is not None
+    assert out.shape == queries.shape
+    ref = _mma_reference(tq, queries, ks, vs, scale)
+    assert mx.abs(out.astype(mx.float32) - ref).max().item() < 5e-3
+
+
+def test_mma_attention_reads_step_allocated_buffers():
+    """After an append the cache's buffers outgrow the attended prefix; the
+    kernel reads them in place and must give the result of the sliced state."""
+    from omlx.patches import turboquant_attention as tq_attention
+
+    mx.random.seed(2)
+    n_q, n_kv, D = 8, 2, 128
+    tq = TurboQuantKVCache(bits=4.0)
+    tq.update_and_fetch(
+        mx.random.normal((1, n_kv, 300, D)).astype(mx.float16),
+        mx.random.normal((1, n_kv, 300, D)).astype(mx.float16),
+    )
+    ks, vs = tq.update_and_fetch(
+        mx.random.normal((1, n_kv, 3, D)).astype(mx.float16),
+        mx.random.normal((1, n_kv, 3, D)).astype(mx.float16),
+    )
+    assert tq.keys.norms.shape[2] > tq.offset
+    queries = mx.random.normal((1, n_q, 3, D)).astype(mx.float16)
+    out = tq_attention._mma_mse_attention(tq, queries, ks, vs, D**-0.5)
+    ref = _mma_reference(tq, queries, ks, vs, D**-0.5)
+    assert mx.abs(out.astype(mx.float32) - ref).max().item() < 5e-3
+
+
+def test_mma_attention_declines_straddling_bits_and_batches():
+    """3-bit codes straddle packed words and batches carry per-row padding;
+    both stay on the existing kernels."""
+    from omlx.patches import turboquant_attention as tq_attention
+
+    mx.random.seed(3)
+    D = 128
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(
+        mx.random.normal((1, 2, 64, D)).astype(mx.float16),
+        mx.random.normal((1, 2, 64, D)).astype(mx.float16),
+    )
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=3.5)
+    ks, vs = tq.state
+    queries = mx.random.normal((1, 4, 2, D)).astype(mx.float16)
+    assert tq_attention._mma_mse_attention(tq, queries, ks, vs, 1.0) is None
+
+    batch = BatchTurboQuantKVCache([0, 2], bits=4.0)
+    ks, vs = batch.update_and_fetch(
+        mx.random.normal((2, 2, 16, D)).astype(mx.float16),
+        mx.random.normal((2, 2, 16, D)).astype(mx.float16),
+    )
+    queries = mx.random.normal((2, 4, 1, D)).astype(mx.float16)
+    assert tq_attention._mma_mse_attention(batch, queries, ks, vs, 1.0) is None
+
+
+def test_attention_patch_routes_single_token_decode_to_mma(monkeypatch):
+    """Unmasked one-sequence decode takes the MMA kernel; masked (batched)
+    decode keeps decode_attention."""
+    from mlx_lm.models import base as mlx_base
+
+    from omlx.patches import turboquant_attention as tq_attention
+
+    tq_attention.apply_turboquant_attention_patch()
+    mx.random.seed(4)
+    D = 128
+    tq = TurboQuantKVCache(bits=4.0)
+    ks, vs = tq.update_and_fetch(
+        mx.random.normal((1, 2, 40, D)).astype(mx.float16),
+        mx.random.normal((1, 2, 40, D)).astype(mx.float16),
+    )
+    calls = []
+    original = tq_attention._mma_mse_attention
+
+    def spy(*args, **kwargs):
+        out = original(*args, **kwargs)
+        calls.append(out is not None)
+        return out
+
+    monkeypatch.setattr(tq_attention, "_mma_mse_attention", spy)
+    queries = mx.random.normal((1, 4, 1, D)).astype(mx.float16)
+    out = mlx_base.scaled_dot_product_attention(
+        queries, ks, vs, tq, scale=D**-0.5, mask=None
+    )
+    assert calls == [True]
+    ref = _mma_reference(tq, queries, ks, vs, D**-0.5)
+    assert mx.abs(out.astype(mx.float32) - ref).max().item() < 5e-3
 
 
 def test_fused_multirow_kernel_respects_token_floor(monkeypatch):
