@@ -211,4 +211,4 @@ Run `python -m pytest -q tests/test_engine_pool.py tests/test_active_models_visi
 
 # Structured output Unicode tests
 
-Run `python -m pytest -q tests/integration/test_server_endpoints.py -k structured_output` to check that JSON cleanup keeps Unicode keys and values readable. The cases cover `json_object` and `json_schema` on both OpenAI endpoints, including buffered chat streaming and Responses completion events. They also check that an unpaired surrogate escape in the model JSON is returned unchanged instead of failing response serialization.
+Run `python -m pytest -q tests/integration/test_server_endpoints.py -k structured_output` to check that JSON cleanup keeps Unicode keys and values readable. The cases cover `json_object` and `json_schema` on both OpenAI endpoints, including buffered chat streaming and Responses completion events. Responses streaming must finish with the same text as the emitted deltas. They also check that an unpaired surrogate escape in the model JSON is returned unchanged instead of failing response serialization.

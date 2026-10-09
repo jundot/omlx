@@ -2767,6 +2767,36 @@ class TestJsonOutputParsing:
         parsed = json.loads(output_text)
         assert parsed == {"city": "Seoul", "temp": 15}
 
+    def test_responses_stream_parses_markdown_json(self, client, mock_llm_engine):
+        model_text = 'Here it is:\n```json\n{"city": "Seoul"}\n```'
+
+        async def stream_chat(**kwargs):
+            yield MockGenerationOutput(text=model_text, new_text=model_text)
+
+        mock_llm_engine.stream_chat = stream_chat
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Return weather JSON",
+                "stream": True,
+                "text": {"format": {"type": "json_object"}},
+            },
+        )
+
+        assert response.status_code == 200
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        done = next(
+            event["text"]
+            for event in events
+            if event["type"] == "response.output_text.done"
+        )
+        assert done == '{"city": "Seoul"}'
+
     def test_responses_without_format_unchanged(self, client, mock_llm_engine):
         """Responses API without text.format should return raw text."""
         mock_llm_engine.chat = AsyncMock(
@@ -2800,7 +2830,7 @@ def test_structured_output_preserves_unicode(
     client, mock_llm_engine, monkeypatch, api, stream, format_type
 ):
     expected = {"име": "София", "city": "東京", "greeting": "café 👋"}
-    model_text = "```json\n" + json.dumps(expected, ensure_ascii=False) + "\n```"
+    model_text = "\n" + json.dumps(expected, ensure_ascii=False, indent=2)
     mock_llm_engine.chat = AsyncMock(return_value=MockGenerationOutput(text=model_text))
 
     async def stream_chat(**kwargs):
@@ -2862,6 +2892,12 @@ def test_structured_output_preserves_unicode(
                 if event["type"] == "response.completed"
             )
             contents.append(completed["output"][0]["content"][0]["text"])
+            deltas = "".join(
+                event["delta"]
+                for event in events
+                if event["type"] == "response.output_text.delta"
+            )
+            assert contents == [deltas, deltas]
     elif api == "chat/completions":
         contents = [response.json()["choices"][0]["message"]["content"]]
     else:

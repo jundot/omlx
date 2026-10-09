@@ -8701,7 +8701,11 @@ async def stream_responses_api(
 
     # Process response_format if specified
     if response_format and not tool_calls:
-        _, _, is_valid, error = parse_json_output(final_text, response_format)
+        json_text, _, is_valid, error = parse_json_output(final_text, response_format)
+        # Unconstrained output can wrap the JSON in prose or a code fence.
+        # Strip those so clients can parse the final text as JSON.
+        if json_text != final_text.strip():
+            final_text = json_text
         if not is_valid:
             logger.warning(f"JSON validation failed: {error}")
 
