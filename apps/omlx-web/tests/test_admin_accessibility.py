@@ -5,6 +5,10 @@ ROOT = Path(__file__).parents[1]
 BASE = (ROOT / "omlx_web/templates/base.html").read_text(encoding="utf-8")
 LOGIN = (ROOT / "omlx_web/templates/login.html").read_text(encoding="utf-8")
 THEME = (ROOT / "omlx_web/static/css/theme.css").read_text(encoding="utf-8")
+TAILWIND = (ROOT / "omlx_web/static/css/tailwind.css").read_text(encoding="utf-8")
+PAGES = sorted((ROOT / "omlx_web/templates").rglob("*.html")) + sorted(
+    (ROOT / "omlx_web/static/js").glob("*.js")
+)
 
 
 def _palette_hex(name: str) -> str:
@@ -61,3 +65,26 @@ def test_focus_ring_contrasts_with_login_backgrounds():
     assert _contrast_ratio(light_ring, "#ffffff") >= 3
     assert _contrast_ratio(dark_ring, dark_page) >= 3
     assert _contrast_ratio(dark_ring, dark_control) >= 3
+
+
+# docs/web-ui-design.md spells out the ramp: caption 10, xs 12, sm 14, base/lg
+# 16/18, xl/2xl 20/24, and it names one arbitrary value — the serving stat
+# figures at `lg:text-[32px]`. Everything else must name a step.
+ALLOWED_ARBITRARY_SIZES = frozenset({"32px"})
+ARBITRARY_SIZE = re.compile(r"text-\[(\d+(?:\.\d+)?px)\]")
+
+
+def test_no_font_size_outside_the_ramp():
+    stray = []
+    for page in PAGES:
+        source = page.read_text(encoding="utf-8")
+        for match in ARBITRARY_SIZE.finditer(source):
+            if match.group(1) not in ALLOWED_ARBITRARY_SIZES:
+                stray.append(f"{page.relative_to(ROOT)}: text-[{match.group(1)}]")
+    assert not stray, "name a step of the ramp instead:\n" + "\n".join(stray)
+
+
+def test_the_step_below_xs_reaches_the_compiled_stylesheet():
+    # `caption` comes from theme.extend.fontSize, so a config change that drops
+    # it would silently leave the 10px labels at the browser default.
+    assert ".text-caption{font-size:10px}" in TAILWIND

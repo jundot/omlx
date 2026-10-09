@@ -9,13 +9,13 @@
                 <div class="flex flex-col gap-0">
                     <a href="/admin/dashboard" class="font-bold tracking-tight text-xl leading-none">oMLX</a>
                     <a :href="updateAvailable && releaseUrl ? releaseUrl : 'https://github.com/jundot/omlx'" target="_blank"
-                       class="relative text-[10px] text-neutral-500 dark:text-neutral-400 leading-none hover:text-neutral-700 dark:hover:text-neutral-300"
+                       class="relative text-caption text-neutral-500 dark:text-neutral-400 leading-none hover:text-neutral-700 dark:hover:text-neutral-300"
                        @mouseenter="versionHover = true" @mouseleave="versionHover = false">
                         v{{ version }}
                         <span x-show="updateAvailable" x-cloak
                               class="inline-block w-1.5 h-1.5 bg-green-500 rounded-full ml-0.5 align-middle"></span>
                         <span x-show="versionHover" x-cloak
-                              class="absolute left-1/2 -translate-x-1/2 top-full mt-1 px-2 py-1 text-[10px] text-white bg-neutral-800 rounded whitespace-nowrap z-50"
+                              class="absolute left-1/2 -translate-x-1/2 top-full mt-1 px-2 py-1 text-caption text-white bg-neutral-800 rounded whitespace-nowrap z-50"
                               x-text="updateAvailable && latestVersion
                                   ? window.t('navbar.update_available').replace('{version}', latestVersion)
                                   : window.t('navbar.go_to_github')"></span>
@@ -85,7 +85,7 @@
                     <!-- Download count badge -->
                     <span x-show="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length > 0"
                           x-text="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length"
-                          class="absolute -top-1 -right-1 w-4 h-4 bg-blue-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center pointer-events-none"
+                          class="absolute -top-1 -right-1 w-4 h-4 bg-blue-500 text-white text-caption font-bold rounded-full flex items-center justify-center pointer-events-none"
                           x-cloak></span>
                     <!-- Dropdown menu -->
                     <div
@@ -423,7 +423,7 @@
                     {{ t('navbar.tab.models') }}
                     <span x-show="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length > 0"
                           x-text="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length"
-                          class="w-4 h-4 bg-blue-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center"
+                          class="w-4 h-4 bg-blue-500 text-white text-caption font-bold rounded-full flex items-center justify-center"
                           x-cloak></span>
                 </button>
                 <button @click="setMainTab('settings'); mobileMenuOpen = false"

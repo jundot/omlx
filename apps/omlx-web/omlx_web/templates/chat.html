@@ -994,14 +994,14 @@
                     <div class="flex flex-col gap-0">
                         <a href="/admin/dashboard" class="font-semibold leading-tight">{{ t('chat.brand') }}</a>
                         <a :href="updateAvailable && releaseUrl ? releaseUrl : 'https://github.com/jundot/omlx'" target="_blank"
-                           class="relative text-[10px] leading-none hover:opacity-80 transition-opacity"
+                           class="relative text-caption leading-none hover:opacity-80 transition-opacity"
                            style="color: var(--text-muted);"
                            @mouseenter="versionHover = true" @mouseleave="versionHover = false">
                             v{{ version }}
                             <span x-show="updateAvailable" x-cloak
                                   class="inline-block w-1.5 h-1.5 bg-green-500 rounded-full ml-0.5 align-middle"></span>
                             <span x-show="versionHover" x-cloak
-                                  class="absolute left-1/2 -translate-x-1/2 top-full mt-1 px-2 py-1 text-[10px] text-white bg-neutral-800 rounded whitespace-nowrap z-50"
+                                  class="absolute left-1/2 -translate-x-1/2 top-full mt-1 px-2 py-1 text-caption text-white bg-neutral-800 rounded whitespace-nowrap z-50"
                                   x-text="updateAvailable && latestVersion
                                       ? window.t('navbar.update_available').replace('{version}', latestVersion)
                                       : window.t('navbar.go_to_github')"></span>
@@ -1249,7 +1249,7 @@
                                             <div class="flex flex-wrap gap-2 mb-2">
                                                 <template x-for="(_, i) in getStrippedImageCount(msg.content)" :key="i">
                                                     <div
-                                                        class="w-20 h-20 bg-surface-muted border border-dashed border-line-strong rounded-lg flex flex-col items-center justify-center text-fg-muted text-[10px] gap-0.5">
+                                                        class="w-20 h-20 bg-surface-muted border border-dashed border-line-strong rounded-lg flex flex-col items-center justify-center text-fg-muted text-caption gap-0.5">
                                                         <i data-lucide="image" class="w-5 h-5"></i>
                                                         <span
                                                             x-text="window.t('chat.image_not_available')"></span>
@@ -1272,7 +1272,7 @@
                                             <div class="inline-flex items-center gap-2 max-w-full px-2.5 py-1.5 rounded-lg border border-line bg-surface-muted text-xs">
                                                 <i data-lucide="audio-lines" class="w-4 h-4 flex-shrink-0"></i>
                                                 <span class="truncate max-w-56" x-text="msg._audio.filename"></span>
-                                                <span x-show="msg._audio.size" class="text-[10px]" style="color: var(--text-tertiary);"
+                                                <span x-show="msg._audio.size" class="text-caption" style="color: var(--text-tertiary);"
                                                     x-text="formatAudioSize(msg._audio.size)"></span>
                                             </div>
                                         </template>
@@ -1435,7 +1435,7 @@
                                     <i data-lucide="cpu" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
                                     <span x-text="variantModelLabel(msg)"></span>
                                     <span x-show="variantProfileLabel(msg)"
-                                        class="text-[10px] px-1.5 py-0.5 rounded-full bg-surface-muted border border-line"
+                                        class="text-caption px-1.5 py-0.5 rounded-full bg-surface-muted border border-line"
                                         style="color: var(--text-tertiary);"
                                         x-text="variantProfileLabel(msg)"></span>
                                 </div>
@@ -1495,7 +1495,7 @@
                                             </button>
                                             <template x-if="availableModels.length > 1">
                                                 <div class="max-h-40 overflow-y-auto custom-scrollbar">
-                                                    <div class="px-3 pt-1 pb-0.5 text-[10px] font-bold uppercase tracking-wider"
+                                                    <div class="px-3 pt-1 pb-0.5 text-caption font-bold uppercase tracking-wider"
                                                         style="color: var(--text-tertiary);"
                                                         x-text="window.t('chat.regenerate_with')"></div>
                                                     <template x-for="m in availableModels" :key="m.id">
@@ -1570,7 +1570,7 @@
                             <span
                                 x-text="currentStream()?.sourceModel || currentModel || window.t('chat.assistant_label')"></span>
                             <span x-show="currentStream()?.sourceProfile && currentStream()?.sourceProfile !== 'System Default'"
-                                class="text-[10px] px-1.5 py-0.5 rounded-full bg-surface-muted border border-line"
+                                class="text-caption px-1.5 py-0.5 rounded-full bg-surface-muted border border-line"
                                 style="color: var(--text-tertiary);"
                                 x-text="currentStream()?.sourceProfile"></span>
                         </div>
@@ -1725,7 +1725,7 @@
 
                     <!-- Many-images context warning (non-blocking) -->
                     <div x-show="uploadImages.length >= 12" x-cloak
-                        class="mx-2 mt-2 px-2.5 py-1.5 rounded-lg text-[11px] flex items-center gap-1.5 border"
+                        class="mx-2 mt-2 px-2.5 py-1.5 rounded-lg text-xs flex items-center gap-1.5 border"
                         style="color: var(--text-secondary); background-color: var(--bg-tertiary); border-color: var(--border-faint);">
                         <i data-lucide="alert-triangle" class="w-3.5 h-3.5 flex-shrink-0" style="color: var(--text-tertiary);"></i>
                         <span><span x-text="uploadImages.length"></span> <span x-text="window.t('chat.many_images_warning')"></span></span>
@@ -1752,7 +1752,7 @@
                             <div class="relative group flex items-center gap-2 max-w-full px-2.5 py-1.5 rounded-lg border border-line bg-surface-muted text-xs">
                                 <i data-lucide="file-text" class="w-4 h-4 flex-shrink-0" style="color: var(--text-tertiary);"></i>
                                 <span class="truncate max-w-48" x-text="doc.filename"></span>
-                                <span x-show="!doc.base64" class="text-[10px]" style="color: var(--text-tertiary);">...</span>
+                                <span x-show="!doc.base64" class="text-caption" style="color: var(--text-tertiary);">...</span>
                                 <button @click="removeDocument(idx)"
                                     class="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full flex items-center justify-center bg-surface-alt border border-line-strong text-fg-tertiary cursor-pointer transition-all opacity-0 group-hover:opacity-100 hover:bg-surface-muted hover:text-fg"
                                     :title="window.t('chat.remove_document')">
@@ -1765,7 +1765,7 @@
                         <div class="relative group flex items-center gap-2 max-w-full px-2.5 py-1.5 rounded-lg border border-line bg-surface-muted text-xs">
                             <i data-lucide="audio-lines" class="w-4 h-4 flex-shrink-0" style="color: var(--text-tertiary);"></i>
                             <span class="truncate max-w-48" x-text="uploadAudio?.filename"></span>
-                            <span class="text-[10px]" style="color: var(--text-tertiary);" x-text="formatAudioSize(uploadAudio?.size)"></span>
+                            <span class="text-caption" style="color: var(--text-tertiary);" x-text="formatAudioSize(uploadAudio?.size)"></span>
                             <button @click="removeAudio()"
                                 class="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full flex items-center justify-center bg-surface-alt border border-line-strong text-fg-tertiary cursor-pointer transition-all opacity-0 group-hover:opacity-100 hover:bg-surface-muted hover:text-fg"
                                 :title="window.t('chat.remove_audio')">
@@ -1804,7 +1804,7 @@
                             <i x-show="!micActive()" data-lucide="mic" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
                             <div x-show="micActive()" class="w-3 h-3 rounded-[2px]" style="background-color: var(--text-danger);"></div>
                         </button>
-                        <span x-show="micActive()" x-cloak class="self-center text-[11px] font-mono px-1"
+                        <span x-show="micActive()" x-cloak class="self-center text-xs font-mono px-1"
                             style="color: var(--text-danger);" x-text="formatRecordingTime(micSeconds)"></span>
                         <!-- Web search toggle -->
                         <button x-show="!hasAsrSupport()" @click="chatSettings.webSearchEnabled = !chatSettings.webSearchEnabled; saveChatSettings()"
@@ -1836,10 +1836,10 @@
                             </button>
                             <!-- Image count badge -->
                             <div x-show="uploadImages.length > 0"
-                                class="absolute -top-0.5 -right-0.5 w-4.5 h-4.5 bg-accent text-accent-fg text-[10px] flex items-center justify-center rounded-full pointer-events-none"
+                                class="absolute -top-0.5 -right-0.5 w-4.5 h-4.5 bg-accent text-accent-fg text-caption flex items-center justify-center rounded-full pointer-events-none"
                                 x-text="uploadImages.length"></div>
                             <div x-show="uploadDocuments.length > 0 && uploadImages.length === 0"
-                                class="absolute -top-0.5 -right-0.5 w-4.5 h-4.5 bg-accent text-accent-fg text-[10px] flex items-center justify-center rounded-full pointer-events-none"
+                                class="absolute -top-0.5 -right-0.5 w-4.5 h-4.5 bg-accent text-accent-fg text-caption flex items-center justify-center rounded-full pointer-events-none"
                                 x-text="uploadDocuments.length"></div>
                         </div>
                     </div>
@@ -1877,14 +1877,14 @@
                         </span>
                         <!-- Hover tooltip with exact usage -->
                         <div x-show="ctxHover" x-transition.opacity x-cloak
-                            class="absolute right-0 mb-1.5 whitespace-nowrap px-2 py-1 rounded-lg text-[10px] tabular-nums shadow-lg border border-line bg-surface pointer-events-none"
+                            class="absolute right-0 mb-1.5 whitespace-nowrap px-2 py-1 rounded-lg text-caption tabular-nums shadow-lg border border-line bg-surface pointer-events-none"
                             style="bottom: 100%; z-index: 40; color: var(--text-primary);"
                             x-text="contextTokensUsed().toLocaleString() + ' / ' + contextWindowForCurrentModel().toLocaleString() + ' ' + window.t('chat.context_abbr') + ' (' + contextUsagePercent() + '%)'"></div>
                     </div>
                 </div>
                 <!-- Placeholder when no token count exists yet (new chat, or cut off mid-prefill) -->
                 <div x-show="currentModel && contextTokensUsed() === 0 && !isCurrentChatStreaming()" x-cloak
-                    class="mt-1.5 px-1 text-[10px]" style="color: var(--text-tertiary);"
+                    class="mt-1.5 px-1 text-caption" style="color: var(--text-tertiary);"
                     x-text="window.t('chat.context_pending')"></div>
             </div>
         </div>
@@ -1908,7 +1908,7 @@
             <div class="flex items-center gap-1">
                 <div class="flex flex-1 items-center gap-1">
                     <button @click="rightSidebarTab = 'settings'"
-                        class="flex-1 flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-colors"
+                        class="flex-1 flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg text-caption font-bold uppercase tracking-wider transition-colors"
                         :class="rightSidebarTab === 'settings'
                             ? 'bg-neutral-200 dark:bg-neutral-700 text-neutral-900 dark:text-neutral-100'
                             : 'text-neutral-500 hover:bg-neutral-100 dark:hover:bg-neutral-800'">
@@ -1916,7 +1916,7 @@
                         <span>{{ t('chat.model_tab') }}</span>
                     </button>
                     <button @click="rightSidebarTab = 'profile'"
-                        class="flex-1 flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-colors"
+                        class="flex-1 flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg text-caption font-bold uppercase tracking-wider transition-colors"
                         :class="rightSidebarTab === 'profile'
                             ? 'bg-neutral-200 dark:bg-neutral-700 text-neutral-900 dark:text-neutral-100'
                             : 'text-neutral-500 hover:bg-neutral-100 dark:hover:bg-neutral-800'">
@@ -1924,7 +1924,7 @@
                         <span>{{ t('chat.profile_tab') }}</span>
                     </button>
                     <button @click="rightSidebarTab = 'chat'"
-                        class="flex-1 flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-colors"
+                        class="flex-1 flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg text-caption font-bold uppercase tracking-wider transition-colors"
                         :class="rightSidebarTab === 'chat'
                             ? 'bg-neutral-200 dark:bg-neutral-700 text-neutral-900 dark:text-neutral-100'
                             : 'text-neutral-500 hover:bg-neutral-100 dark:hover:bg-neutral-800'">
@@ -2021,7 +2021,7 @@
 
                 <!-- Prompt textarea -->
                 <div class="space-y-1">
-                    <label class="text-[10px] font-bold uppercase tracking-wider block"
+                    <label class="text-caption font-bold uppercase tracking-wider block"
                         style="color: var(--text-secondary);">{{ t('chat.prompt_content_label') }}</label>
                     <textarea x-model="systemPrompt" rows="5"
                         @input="promptDirty = (activePromptProfile && systemPrompt !== promptProfiles.find(p => p.name === activePromptProfile)?.content); const s = getChatSession(currentChatId, true); if (s) s.systemPrompt = systemPrompt;"
@@ -2034,7 +2034,7 @@
                 <div class="flex justify-center pt-1">
                     <button @click="savePromptProfile()"
                         :disabled="!activePromptProfile || !promptDirty"
-                        class="flex items-center gap-1.5 px-4 py-2 rounded-lg text-[10px] font-semibold transition-all duration-200"
+                        class="flex items-center gap-1.5 px-4 py-2 rounded-lg text-caption font-semibold transition-all duration-200"
                         :class="promptDirty && activePromptProfile
                             ? 'bg-neutral-900 text-white hover:bg-neutral-800 dark:bg-neutral-100 dark:text-neutral-900'
                             : 'bg-neutral-200 text-neutral-500 cursor-not-allowed'">
@@ -2051,7 +2051,7 @@
                 <div class="space-y-1">
                     <div class="flex items-center gap-1.5 mb-1">
                         <i data-lucide="user" class="w-3 h-3" style="color: var(--text-secondary);"></i>
-                        <label class="text-[10px] font-bold uppercase tracking-wider"
+                        <label class="text-caption font-bold uppercase tracking-wider"
                             style="color: var(--text-secondary);">{{ t('chat.active_profile') }}</label>
                     </div>
                     <div class="relative">
@@ -2072,7 +2072,7 @@
 
                 <!-- Active Model Selector -->
                 <div class="space-y-1">
-                    <label class="text-[10px] font-bold uppercase tracking-wider block"
+                    <label class="text-caption font-bold uppercase tracking-wider block"
                         style="color: var(--text-secondary);">{{ t('chat.active_model') }}</label>
                     <div class="relative">
                         <select x-model="currentModel"
@@ -2095,7 +2095,7 @@
                 <!-- Temperature & Max Tokens -->
                 <div class="grid grid-cols-2 gap-3">
                     <div class="space-y-1">
-                        <label class="text-[10px] font-bold uppercase tracking-wider"
+                        <label class="text-caption font-bold uppercase tracking-wider"
                             style="color: var(--text-secondary);">{{ t('modal.model_settings.temperature') }}</label>
                         <input type="number" x-model.number="modelSettings.temperature" @input="onModelSettingsChange()"
                             step="0.1" min="0" max="2" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
@@ -2103,7 +2103,7 @@
                             style="color: var(--text-primary);">
                     </div>
                     <div class="space-y-1">
-                        <label class="text-[10px] font-bold uppercase tracking-wider"
+                        <label class="text-caption font-bold uppercase tracking-wider"
                             style="color: var(--text-secondary);">{{ t('modal.model_settings.max_tokens') }}</label>
                         <input type="number" x-model.number="modelSettings.max_tokens" @input="onModelSettingsChange()"
                             min="1" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
@@ -2115,7 +2115,7 @@
                 <!-- Sampling Advanced parameters: Top P, Top K, Min P -->
                 <div class="grid grid-cols-3 gap-2">
                     <div class="space-y-1">
-                        <label class="text-[10px] font-bold uppercase tracking-wider"
+                        <label class="text-caption font-bold uppercase tracking-wider"
                             style="color: var(--text-secondary);">{{ t('modal.model_settings.top_p') }}</label>
                         <input type="number" x-model.number="modelSettings.top_p" @input="onModelSettingsChange()"
                             step="0.05" min="0" max="1" placeholder="—"
@@ -2123,7 +2123,7 @@
                             style="color: var(--text-primary);">
                     </div>
                     <div class="space-y-1">
-                        <label class="text-[10px] font-bold uppercase tracking-wider"
+                        <label class="text-caption font-bold uppercase tracking-wider"
                             style="color: var(--text-secondary);">{{ t('modal.model_settings.top_k') }}</label>
                         <input type="number" x-model.number="modelSettings.top_k" @input="onModelSettingsChange()" min="0"
                             placeholder="—"
@@ -2131,7 +2131,7 @@
                             style="color: var(--text-primary);">
                     </div>
                     <div class="space-y-1">
-                        <label class="text-[10px] font-bold uppercase tracking-wider"
+                        <label class="text-caption font-bold uppercase tracking-wider"
                             style="color: var(--text-secondary);">{{ t('modal.model_settings.min_p') }}</label>
                         <input type="number" x-model.number="modelSettings.min_p" @input="onModelSettingsChange()"
                             step="0.01" min="0" max="1" placeholder="—"
@@ -2143,7 +2143,7 @@
                 <!-- Repetition Penalty & Presence Penalty -->
                 <div class="grid grid-cols-2 gap-3">
                     <div class="space-y-1">
-                        <label class="text-[10px] font-bold uppercase tracking-wider"
+                        <label class="text-caption font-bold uppercase tracking-wider"
                             style="color: var(--text-secondary);">{{ t('modal.model_settings.repetition_penalty_short') }}</label>
                         <input type="number" x-model.number="modelSettings.repetition_penalty"
                             @input="onModelSettingsChange()" step="0.05" min="0" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
@@ -2151,7 +2151,7 @@
                             style="color: var(--text-primary);">
                     </div>
                     <div class="space-y-1">
-                        <label class="text-[10px] font-bold uppercase tracking-wider"
+                        <label class="text-caption font-bold uppercase tracking-wider"
                             style="color: var(--text-secondary);">{{ t('modal.model_settings.presence_penalty') }}</label>
                         <input type="number" x-model.number="modelSettings.presence_penalty"
                             @input="onModelSettingsChange()" step="0.05" min="-2" max="2" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
@@ -2162,7 +2162,7 @@
 
                 <!-- Thinking: Auto / On (Unlimit) / On (Limit) / Off -->
                 <div class="p-3 bg-surface-muted rounded-xl border border-line space-y-2">
-                    <label class="text-[10px] font-bold uppercase tracking-wider block"
+                    <label class="text-caption font-bold uppercase tracking-wider block"
                         style="color: var(--text-secondary);">{{ t('chat.thinking_label') }}</label>
                     <select :value="thinkingModeValue()" @change="setThinkingMode($event.target.value)"
                         class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
@@ -2172,9 +2172,9 @@
                         <option value="on_limit" :disabled="!thinkingModes().includes('on_limit')">{{ t('chat.thinking_mode.on_limited') }}</option>
                         <option value="off" :disabled="!thinkingModes().includes('off')">{{ t('chat.thinking_mode.off') }}</option>
                     </select>
-                    <p x-show="currentModelInfo()?.thinking_forced" class="text-[10px]" style="color: var(--text-tertiary);">{{ t('modal.model_settings.k2_thinking_hint') }}</p>
+                    <p x-show="currentModelInfo()?.thinking_forced" class="text-caption" style="color: var(--text-tertiary);">{{ t('modal.model_settings.k2_thinking_hint') }}</p>
                     <div x-show="thinkingModeValue() === 'on_limit'" x-collapse class="space-y-1">
-                        <label class="text-[10px] font-bold uppercase tracking-wider block"
+                        <label class="text-caption font-bold uppercase tracking-wider block"
                             style="color: var(--text-secondary);">{{ t('chat.thinking_tokens') }}</label>
                         <input type="number"
                             :value="modelSettings.thinking_budget_tokens ?? ''"
@@ -2186,7 +2186,7 @@
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface thinking-budget-input"
                             style="color: var(--text-primary);">
                     </div>
-                    <p class="text-[10px]" style="color: var(--text-tertiary);">
+                    <p class="text-caption" style="color: var(--text-tertiary);">
                         {{ t('chat.model_settings_advanced_hint') }}
                     </p>
                 </div>
@@ -2198,7 +2198,7 @@
 
                 <!-- Keyboard shortcuts -->
                 <div class="space-y-1">
-                    <label class="text-[10px] font-bold uppercase tracking-wider block"
+                    <label class="text-caption font-bold uppercase tracking-wider block"
                         style="color: var(--text-secondary);">{{ t('chat.shortcuts') }}</label>
                     <button @click="showShortcutsHelp = true"
                         class="w-full px-3 py-2 text-xs border border-line rounded-xl font-medium bg-surface-muted hover:bg-surface-alt transition-colors flex items-center justify-center gap-2"
@@ -2210,20 +2210,20 @@
 
                 <!-- Attachments -->
                 <div class="space-y-2">
-                    <label class="text-[10px] font-bold uppercase tracking-wider block"
+                    <label class="text-caption font-bold uppercase tracking-wider block"
                         style="color: var(--text-secondary);">{{ t('chat.attachments') }}</label>
                     <div class="grid grid-cols-2 gap-3">
                         <div class="space-y-1">
-                            <label class="text-[10px] font-bold uppercase tracking-wider"
+                            <label class="text-caption font-bold uppercase tracking-wider"
                                 style="color: var(--text-secondary);">{{ t('chat.max_images') }}</label>
                             <input type="number" min="0" step="1" x-model.number="chatSettings.maxImages"
                                 @change="saveChatSettings()"
                                 class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
                                 style="color: var(--text-primary);">
-                            <p class="text-[10px]" style="color: var(--text-tertiary);">{{ t('chat.unlimited_hint') }}</p>
+                            <p class="text-caption" style="color: var(--text-tertiary);">{{ t('chat.unlimited_hint') }}</p>
                         </div>
                         <div class="space-y-1">
-                            <label class="text-[10px] font-bold uppercase tracking-wider"
+                            <label class="text-caption font-bold uppercase tracking-wider"
                                 style="color: var(--text-secondary);">{{ t('chat.max_image_size') }}</label>
                             <input type="number" min="1" step="1" x-model.number="chatSettings.maxImageSizeMb"
                                 @change="saveChatSettings()"
@@ -2235,7 +2235,7 @@
 
                 <!-- Appearance -->
                 <div class="space-y-2">
-                    <label class="text-[10px] font-bold uppercase tracking-wider block"
+                    <label class="text-caption font-bold uppercase tracking-wider block"
                         style="color: var(--text-secondary);">{{ t('chat.appearance') }}</label>
                     <div class="p-3 bg-surface-muted rounded-xl border border-line">
                         <div class="svg-allow-row">
@@ -2258,7 +2258,7 @@
 
                 <!-- Behavior -->
                 <div class="space-y-2">
-                    <label class="text-[10px] font-bold uppercase tracking-wider block"
+                    <label class="text-caption font-bold uppercase tracking-wider block"
                         style="color: var(--text-secondary);">{{ t('chat.behavior') }}</label>
                     <div class="p-3 bg-surface-muted rounded-xl border border-line space-y-3">
                         <div class="svg-allow-row">
@@ -2285,7 +2285,7 @@
                                     class="w-20 px-2 py-1.5 text-xs text-right border border-line rounded-lg focus:outline-none focus:border-line-strong bg-surface"
                                     style="color: var(--text-primary);">
                             </div>
-                            <p class="text-[10px]" style="color: var(--text-tertiary);"
+                            <p class="text-caption" style="color: var(--text-tertiary);"
                                 x-text="window.t('chat.max_tool_rounds_hint')"></p>
                         </div>
                     </div>
@@ -2299,41 +2299,41 @@
         <div class="p-3 border-t border-line bg-surface flex-shrink-0">
             <div class="grid grid-cols-2 gap-2">
                 <div class="bg-surface-muted p-2 rounded-xl border border-line flex flex-col justify-between">
-                    <span class="text-[9px] font-bold uppercase tracking-wider"
+                    <span class="text-caption font-bold uppercase tracking-wider"
                         style="color: var(--text-tertiary);">{{ t('chat.stats.prefill') }}</span>
                     <div class="flex items-end justify-between">
                         <div class="text-sm font-semibold" style="color: var(--text-primary);"
                             x-text="recentStats?.avg_prefill_tps ? Number(recentStats.avg_prefill_tps).toFixed(1) : '0.0'">
                         </div>
-                        <div class="text-[10px]" style="color: var(--text-primary);"
+                        <div class="text-caption" style="color: var(--text-primary);"
                             x-show="recentStats?.prompt_tokens > 0" x-text="recentStats.prompt_tokens + ' ' + window.t('chat.stats.token_suffix')"></div>
                     </div>
                 </div>
                 <div class="bg-surface-muted p-2 rounded-xl border border-line flex flex-col justify-between">
-                    <span class="text-[9px] font-bold uppercase tracking-wider"
+                    <span class="text-caption font-bold uppercase tracking-wider"
                         style="color: var(--text-tertiary);">{{ t('chat.stats.token_generation') }}</span>
                     <div class="flex items-end justify-between">
                         <div class="text-sm font-semibold" style="color: var(--text-primary);"
                             x-text="recentStats?.avg_generation_tps ? Number(recentStats.avg_generation_tps).toFixed(1) : '0.0'">
                         </div>
-                        <div class="text-[10px]" style="color: var(--text-primary);"
+                        <div class="text-caption" style="color: var(--text-primary);"
                             x-show="recentStats?.total_tokens > 0" x-text="recentStats.total_tokens + ' ' + window.t('chat.stats.token_suffix')"></div>
                     </div>
                 </div>
                 <div class="bg-surface-muted p-2 rounded-xl border border-line flex flex-col justify-between">
-                    <span class="text-[9px] font-bold uppercase tracking-wider"
+                    <span class="text-caption font-bold uppercase tracking-wider"
                         style="color: var(--text-tertiary);">{{ t('chat.stats.thinking') }}</span>
                     <div class="flex items-end justify-between">
                         <div class="text-sm font-semibold" style="color: var(--text-primary);"
                             x-text="recentStats?.thinking_time ? Number(recentStats.thinking_time).toFixed(1) : '-'">
                         </div>
-                        <div class="text-[10px]" style="color: var(--text-primary);"
+                        <div class="text-caption" style="color: var(--text-primary);"
                             x-show="recentStats?.thinking_tokens > 0" x-text="recentStats.thinking_tokens + ' ' + window.t('chat.stats.token_suffix')">
                         </div>
                     </div>
                 </div>
                 <div class="bg-surface-muted p-2 rounded-xl border border-line flex flex-col justify-between">
-                    <span class="text-[9px] font-bold uppercase tracking-wider"
+                    <span class="text-caption font-bold uppercase tracking-wider"
                         style="color: var(--text-tertiary);">{{ t('chat.stats.duration') }}</span>
                     <div class="flex items-end justify-between">
                         <div class="text-sm font-semibold" style="color: var(--text-primary);"
@@ -2446,19 +2446,19 @@
             <div class="px-5 py-4 space-y-3 text-sm" style="color: var(--text-primary);">
                 <div class="flex items-center justify-between gap-4">
                     <span>{{ t('chat.shortcut_send') }}</span>
-                    <kbd class="text-[11px] px-2 py-1 rounded-md border border-line bg-surface-muted flex-shrink-0">{{ t('chat.shortcut_key_enter') }}</kbd>
+                    <kbd class="text-xs px-2 py-1 rounded-md border border-line bg-surface-muted flex-shrink-0">{{ t('chat.shortcut_key_enter') }}</kbd>
                 </div>
                 <div class="flex items-center justify-between gap-4">
                     <span>{{ t('chat.shortcut_newline') }}</span>
-                    <kbd class="text-[11px] px-2 py-1 rounded-md border border-line bg-surface-muted flex-shrink-0">{{ t('chat.shortcut_shift_enter') }}</kbd>
+                    <kbd class="text-xs px-2 py-1 rounded-md border border-line bg-surface-muted flex-shrink-0">{{ t('chat.shortcut_shift_enter') }}</kbd>
                 </div>
                 <div class="flex items-center justify-between gap-4">
                     <span>{{ t('chat.shortcut_stop') }}</span>
-                    <kbd class="text-[11px] px-2 py-1 rounded-md border border-line bg-surface-muted flex-shrink-0">{{ t('chat.shortcut_key_esc') }}</kbd>
+                    <kbd class="text-xs px-2 py-1 rounded-md border border-line bg-surface-muted flex-shrink-0">{{ t('chat.shortcut_key_esc') }}</kbd>
                 </div>
                 <div class="flex items-center justify-between gap-4">
                     <span>{{ t('chat.shortcut_help') }}</span>
-                    <kbd class="text-[11px] px-2 py-1 rounded-md border border-line bg-surface-muted flex-shrink-0">?</kbd>
+                    <kbd class="text-xs px-2 py-1 rounded-md border border-line bg-surface-muted flex-shrink-0">?</kbd>
                 </div>
             </div>
         </div>
