@@ -112,6 +112,16 @@
     const SETTINGS_SECTION_ID = /^settings-[a-z][a-z-]*$/;
     // Log rows mounted above and below the visible ones.
     const LOG_OVERSCAN = 8;
+    // Serving Stats tiles by id (see DashboardLayout.SERVING_TILE_IDS).
+    const SERVING_STAT_TILES = {
+        requests: { label: 'status.kpi.requests', field: 'total_requests' },
+        prefill_tokens: { label: 'status.stat.total_tokens', field: 'total_prompt_tokens' },
+        cached_tokens: { label: 'status.stat.cached_tokens', field: 'total_cached_tokens' },
+        cache_efficiency: { label: 'status.stat.cache_efficiency', field: 'cache_efficiency', unit: '%' },
+        generated_tokens: { label: 'status.stat.generated_tokens', field: 'total_completion_tokens' },
+    };
+    // Static class strings so Tailwind keeps them; indexed by tile count.
+    const SERVING_STAT_GRID_CLASSES = ['', '', 'sm:grid-cols-2', 'sm:grid-cols-2 lg:grid-cols-3', 'sm:grid-cols-2 lg:grid-cols-4'];
     // Accuracy bench presets: benchmark -> samples, where 0 is the full
     // dataset. `standard` is the default selection; `full` is built from the
     // catalogue.
@@ -354,6 +364,7 @@
             // Status tab state
             stats: {
                 total_prompt_tokens: 0,
+                total_completion_tokens: 0,
                 total_cached_tokens: 0,
                 cache_efficiency: 0.0,
                 avg_prefill_tps: 0.0,
@@ -393,6 +404,7 @@
             },
             alltimeStats: {
                 total_prompt_tokens: 0,
+                total_completion_tokens: 0,
                 total_cached_tokens: 0,
                 cache_efficiency: 0.0,
                 avg_prefill_tps: 0.0,
@@ -423,6 +435,8 @@
             dashSaveError: '',
             dashPlacedIds: [],
             dashEditAvailable: true,
+            dashTilePickerOpen: false,
+            dashTileDragId: null,
             selectedStatsModel: '',
             showClearStatsConfirm: false,
             showClearAlltimeConfirm: false,
@@ -3773,6 +3787,73 @@
             dashPlaced(id) {
                 return this.dashPlacedIds.includes(id);
             },
+            get servingStatTiles() {
+                const lib = this._dashLayoutLib();
+                const draft = this.dashEditing ? this.dashDraft : null;
+                const ids = draft
+                    ? draft.servingTileOrder.filter(id => draft.servingTiles.includes(id))
+                    : this.dashLayout?.serving_stats_tiles || lib?.DEFAULT_SERVING_TILES || [];
+                const source = this.statsScope === 'alltime' ? this.alltimeStats : this.stats;
+                return ids.map(id => {
+                    const tile = SERVING_STAT_TILES[id];
+                    const raw = source[tile.field] ?? 0;
+                    return {
+                        id,
+                        label: window.t(tile.label),
+                        value: tile.unit === '%' ? raw.toFixed(1) : this.formatNumber(raw),
+                        unit: tile.unit || '',
+                    };
+                });
+            },
+            get servingStatGridClass() {
+                return SERVING_STAT_GRID_CLASSES[this.servingStatTiles.length] || '';
+            },
+            // Every tile in picker order, selected ones first.
+            _dashServingTileDraft(tiles) {
+                const lib = this._dashLayoutLib();
+                const rest = lib.SERVING_TILE_IDS.filter(id => !tiles.includes(id));
+                return { servingTileOrder: [...tiles, ...rest], servingTiles: [...tiles] };
+            },
+            dashTileLabel(id) {
+                return window.t(SERVING_STAT_TILES[id]?.label || id);
+            },
+            dashTileChecked(id) {
+                return !!this.dashDraft?.servingTiles.includes(id);
+            },
+            // At least one tile stays selected and at most SERVING_TILE_MAX.
+            dashTileLocked(id) {
+                const lib = this._dashLayoutLib();
+                const count = this.dashDraft?.servingTiles.length || 0;
+                return this.dashTileChecked(id) ? count <= 1 : count >= lib.SERVING_TILE_MAX;
+            },
+            toggleDashTile(id) {
+                if (!this.dashEditing || !this.dashDraft || this.dashTileLocked(id)) return;
+                const tiles = this.dashDraft.servingTiles;
+                this.dashDraft.servingTiles = tiles.includes(id)
+                    ? tiles.filter(t => t !== id)
+                    : [...tiles, id];
+            },
+            dashTileDragStart(id, event) {
+                this.dashTileDragId = id;
+                const transfer = event.dataTransfer;
+                if (!transfer) return;
+                transfer.effectAllowed = 'move';
+                transfer.setData('text/plain', id);  // Firefox starts no drag without data.
+                const row = event.target.closest('li');
+                if (row) transfer.setDragImage(row, 12, row.offsetHeight / 2);
+            },
+            // Reorders live while the pointer passes rows, like SortableJS.
+            dashTileDragOver(id) {
+                const dragId = this.dashTileDragId;
+                const order = this.dashDraft?.servingTileOrder;
+                if (!dragId || dragId === id || !order) return;
+                const next = order.filter(t => t !== dragId);
+                next.splice(order.indexOf(id), 0, dragId);
+                this.dashDraft.servingTileOrder = next;
+            },
+            dashTileDragEnd() {
+                this.dashTileDragId = null;
+            },
             _dashBlockEl(id) {
                 return this.$refs.dashGrid?.querySelector(`.dash-block[data-block="${id}"]`) || null;
             },
@@ -3881,7 +3962,9 @@
             collectDashboardLayout() {
                 const lib = this._dashLayoutLib();
                 const blocks = dashGrid.save(false).map(n => ({ id: n.id, x: n.x, y: n.y, w: n.w }));
-                return lib.normalizeLayout({ version: 1, width: this.dashDraft?.width, blocks });
+                const draft = this.dashDraft;
+                const serving_stats_tiles = draft?.servingTileOrder.filter(id => draft.servingTiles.includes(id));
+                return lib.normalizeLayout({ version: 1, width: draft?.width, blocks, serving_stats_tiles });
             },
             _onDashTrayDrop(node) {
                 const lib = this._dashLayoutLib();
@@ -3909,8 +3992,12 @@
             },
             startDashboardEdit() {
                 if (!dashGrid || !this.dashLayout || !this.dashEditAvailable || this.dashEditing) return;
-                this.dashDraft = { width: this.dashLayout.width };
+                this.dashDraft = {
+                    width: this.dashLayout.width,
+                    ...this._dashServingTileDraft(this.dashLayout.serving_stats_tiles),
+                };
                 this.dashSaveError = '';
+                this.dashTilePickerOpen = false;
                 this.dashEditing = true;
                 dashGrid.enable();
                 this._dashAfterLayoutChange();
@@ -3920,6 +4007,7 @@
                 this.dashEditing = false;
                 this.dashDraft = null;
                 this.dashSaveError = '';
+                this.dashTilePickerOpen = false;
                 if (dashGrid) {
                     dashGrid.disable();
                     this.applyDashboardLayout(this.dashLayout);
@@ -3930,6 +4018,7 @@
                 const lib = this._dashLayoutLib();
                 if (!this.dashEditing || !lib) return;
                 this.dashDraft.width = 'default';
+                Object.assign(this.dashDraft, this._dashServingTileDraft(lib.DEFAULT_SERVING_TILES));
                 this.applyDashboardLayout(lib.defaultLayout());
                 this._dashAfterLayoutChange();
             },
@@ -3955,6 +4044,7 @@
                     this.globalSettings.ui.dashboard_layout = layout;
                     this.dashEditing = false;
                     this.dashDraft = null;
+                    this.dashTilePickerOpen = false;
                     dashGrid.disable();
                     this._dashAfterLayoutChange();
                 } catch (err) {

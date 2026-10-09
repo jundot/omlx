@@ -577,6 +577,18 @@ DASHBOARD_BLOCK_IDS = (
     "applications",
     "engine_versions",
 )
+DASHBOARD_SERVING_TILE_IDS = (
+    "requests",
+    "prefill_tokens",
+    "cached_tokens",
+    "cache_efficiency",
+    "generated_tokens",
+)
+DASHBOARD_SERVING_TILE_MAX = 4
+
+
+def _default_serving_tiles() -> list[str]:
+    return list(DASHBOARD_SERVING_TILE_IDS[:DASHBOARD_SERVING_TILE_MAX])
 
 
 class DashboardLayoutBlock(BaseModel):
@@ -600,6 +612,8 @@ class DashboardLayoutRequest(BaseModel):
     version: Literal[1] = 1
     width: Literal["default", "wide", "wider", "full"] = "default"
     blocks: list[DashboardLayoutBlock] = Field(default_factory=list)
+    # Serving Stats tiles in left-to-right order.
+    serving_stats_tiles: list[str] = Field(default_factory=_default_serving_tiles)
 
     @field_validator("blocks")
     @classmethod
@@ -614,6 +628,16 @@ class DashboardLayoutRequest(BaseModel):
             seen.add(block.id)
             kept.append(block)
         return kept
+
+    @field_validator("serving_stats_tiles")
+    @classmethod
+    def _known_unique_tiles(cls, tiles):
+        kept = list(dict.fromkeys(t for t in tiles if t in DASHBOARD_SERVING_TILE_IDS))
+        if len(kept) > DASHBOARD_SERVING_TILE_MAX:
+            raise ValueError(
+                f"at most {DASHBOARD_SERVING_TILE_MAX} serving stats tiles allowed"
+            )
+        return kept or _default_serving_tiles()
 
 
 class GlobalSettingsRequest(BaseModel):

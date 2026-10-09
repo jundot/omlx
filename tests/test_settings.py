@@ -3072,6 +3072,7 @@ class TestDashboardLayoutRoute:
                 {"id": "serving_stats", "x": 0, "y": 0, "w": 12},
                 {"id": "active_models", "x": 12, "y": 0, "w": 12},
             ],
+            "serving_stats_tiles": ["generated_tokens", "requests"],
         }
         layout.update(overrides)
         return layout
@@ -3154,6 +3155,40 @@ class TestDashboardLayoutRoute:
         )
         assert [b.id for b in layout.blocks] == ["serving_stats"]
         assert layout.blocks[0].w == 24
+
+    def test_serving_stats_tiles_keep_order_and_drop_unknown(self):
+        from omlx.admin.routes import DashboardLayoutRequest
+
+        layout = DashboardLayoutRequest.model_validate(
+            self._layout(
+                serving_stats_tiles=[
+                    "generated_tokens",
+                    "not_a_tile",
+                    "requests",
+                    "generated_tokens",
+                ]
+            )
+        )
+        assert layout.serving_stats_tiles == ["generated_tokens", "requests"]
+        # Layouts saved before the tile picker existed get the original tiles.
+        legacy = self._layout()
+        del legacy["serving_stats_tiles"]
+        assert DashboardLayoutRequest.model_validate(legacy).serving_stats_tiles == [
+            "requests",
+            "prefill_tokens",
+            "cached_tokens",
+            "cache_efficiency",
+        ]
+
+    def test_more_than_four_serving_stats_tiles_is_rejected(self):
+        import pydantic
+
+        from omlx.admin.routes import DASHBOARD_SERVING_TILE_IDS, DashboardLayoutRequest
+
+        with pytest.raises(pydantic.ValidationError):
+            DashboardLayoutRequest.model_validate(
+                self._layout(serving_stats_tiles=list(DASHBOARD_SERVING_TILE_IDS))
+            )
 
     @pytest.mark.parametrize(
         "block",

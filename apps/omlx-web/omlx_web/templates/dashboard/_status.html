@@ -123,6 +123,51 @@
                                             <i data-lucide="grip-horizontal" class="w-4 h-4"></i>
                                             <span>{{ t('status.layout.block.' ~ block_id) }}</span>
                                         </div>
+                                        {% if block_id == 'serving_stats' %}
+                                        <div class="relative" @click.outside="dashTilePickerOpen = false" @keydown.escape="dashTilePickerOpen = false">
+                                            <button type="button" class="dash-block-remove"
+                                                @click="dashTilePickerOpen = !dashTilePickerOpen"
+                                                :class="dashTilePickerOpen ? 'dash-block-remove--active' : ''"
+                                                :title="window.t('status.layout.tiles')"
+                                                :aria-label="window.t('status.layout.tiles')"
+                                                :aria-expanded="dashTilePickerOpen">
+                                                <i data-lucide="sliders-horizontal" class="w-3.5 h-3.5"></i>
+                                            </button>
+                                            <template x-if="dashEditing && dashTilePickerOpen">
+                                                <div class="dash-tile-picker absolute right-0 top-full mt-2 w-64 z-20 bg-white rounded-xl shadow-lg border border-neutral-200 p-2">
+                                                    <div class="flex items-center justify-between px-2 pt-1">
+                                                        <span class="text-xs font-semibold text-neutral-700">{{ t('status.layout.tiles') }}</span>
+                                                        <span class="text-xs text-neutral-400 tabular-nums" x-text="dashDraft.servingTiles.length + '/' + DashboardLayout.SERVING_TILE_MAX"></span>
+                                                    </div>
+                                                    <p class="px-2 pb-2 text-xs leading-snug font-normal text-neutral-400">{{ t('status.layout.tiles_hint') }}</p>
+                                                    <ul>
+                                                        <template x-for="id in dashDraft.servingTileOrder" :key="id">
+                                                            <li class="flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-neutral-50"
+                                                                :class="dashTileDragId === id ? 'opacity-40' : ''"
+                                                                @dragover.prevent="dashTileDragOver(id)"
+                                                                @drop.prevent
+                                                                @dragend="dashTileDragEnd()">
+                                                                <span class="dash-tile-grip" draggable="true"
+                                                                    @dragstart="dashTileDragStart(id, $event)"
+                                                                    :title="window.t('status.layout.tile_drag')"
+                                                                    :aria-label="window.t('status.layout.tile_drag')">
+                                                                    <i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i>
+                                                                </span>
+                                                                <label class="flex items-center gap-2 flex-1 min-w-0 text-xs font-medium text-neutral-700"
+                                                                    :class="dashTileLocked(id) && !dashTileChecked(id) ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'">
+                                                                    <input type="checkbox" class="rounded border-neutral-300"
+                                                                        :checked="dashTileChecked(id)"
+                                                                        :disabled="dashTileLocked(id)"
+                                                                        @change="toggleDashTile(id)">
+                                                                    <span class="truncate" x-text="dashTileLabel(id)"></span>
+                                                                </label>
+                                                            </li>
+                                                        </template>
+                                                    </ul>
+                                                </div>
+                                            </template>
+                                        </div>
+                                        {% endif %}
                                         <button type="button" class="dash-block-remove"
                                             @click="dashRemoveBlock('{{ block_id }}')"
                                             :title="window.t('status.layout.remove')"
