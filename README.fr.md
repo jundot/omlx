@@ -97,7 +97,7 @@ Nécessite macOS 15.0+ (Sequoia), Python 3.10+, et Apple Silicon (M1/M2/M3/M4/M5
 
 ### Application macOS
 
-Lancez oMLX depuis votre dossier Applications. L'écran de bienvenue vous guide en trois étapes — répertoire des modèles, démarrage du serveur, et premier téléchargement de modèle. C'est tout. Pour connecter OpenClaw, OpenCode, Codex ou Hermes Agent, voir [Intégrations](#intégrations).
+Lancez oMLX depuis votre dossier Applications. L'écran de bienvenue vous guide en trois étapes — répertoire des modèles, démarrage du serveur, et premier téléchargement de modèle. C'est tout. Pour connecter OpenClaw, OpenCode, Codex, Hermes Agent, Copilot ou DeepSeek Harness, voir [Intégrations](#intégrations).
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.36.32.png" alt="oMLX Welcome Screen" width="360">
@@ -162,7 +162,7 @@ Gère les requêtes concurrentes via le BatchGenerator de mlx-lm. Le nombre maxi
 
 ### Optimisation Claude Code
 
-Support du context scaling pour faire tourner des modèles avec un contexte réduit avec Claude Code. Ajuste les compteurs de tokens reportés pour que l'auto-compactage se déclenche au bon moment, et un keep-alive SSE évite les timeouts de lecture pendant les longs prefills.
+Fait tourner des modèles à contexte réduit avec Claude Code en transmettant la fenêtre de contexte réelle du modèle à l'auto-compactage au lieu de mettre à l'échelle les compteurs de tokens, et un keep-alive SSE évite les timeouts de lecture pendant les longs prefills.
 
 ### Service multi-modèles
 
@@ -204,7 +204,7 @@ Recherchez et téléchargez des modèles MLX depuis HuggingFace directement dans
 
 ### Intégrations
 
-Configurez OpenClaw, OpenCode, Codex, Hermes Agent et Pi directement depuis le tableau de bord en un clic. Aucune édition manuelle de config requise.
+Configurez OpenClaw, OpenCode, Codex, Hermes Agent, Copilot, Pi et DeepSeek Harness directement depuis le tableau de bord en un clic. Aucune édition manuelle de config requise.
 
 <p align="center">
   <img src="docs/images/omlx_integrations.png" alt="oMLX Integrations" width="720">
@@ -228,7 +228,7 @@ Application native Swift / SwiftUI dans la barre de menus (pas Electron). Démar
 
 ### Compatibilité API
 
-Remplacement direct des APIs OpenAI et Anthropic. Supporte les statistiques d'usage en streaming (`stream_options.include_usage`), le thinking adaptatif Anthropic, et les entrées visuelles (base64, URL).
+Remplacement direct des APIs OpenAI et Anthropic. Supporte les statistiques d'usage en streaming (`stream_options.include_usage`), la progression du prefill façon llama.cpp (`return_progress`), le thinking adaptatif Anthropic, et les entrées visuelles (base64, URL).
 
 | Endpoint | Description |
 |----------|-------------|
@@ -237,7 +237,9 @@ Remplacement direct des APIs OpenAI et Anthropic. Supporte les statistiques d'us
 | `POST /v1/messages` | API Messages Anthropic |
 | `POST /v1/embeddings` | Embeddings texte |
 | `POST /v1/rerank` | Reranking de documents |
+| `POST /v1/systemone` | Décisions typées avec les modèles de décision (TypeSafe System One) |
 | `GET /v1/models` | Lister les modèles disponibles |
+| `POST /tokenize`, `POST /detokenize` | API de tokenisation compatible vLLM (aussi sous `/v1`) |
 
 ### Appel d'outils et sorties structurées
 
@@ -276,8 +278,9 @@ Les modèles sont auto-détectés par type. Vous pouvez aussi télécharger des 
 | LLM | Tout modèle supporté par [mlx-lm](https://github.com/ml-explore/mlx-lm) |
 | VLM | Série Qwen3.5, GLM-4V, Pixtral, et autres modèles [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) |
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
-| Embedding | BERT, BGE-M3, ModernBERT |
+| Embedding | BERT, BGE-M3, ModernBERT, EmbeddingGemma 2 |
 | Reranker | ModernBERT, XLM-RoBERTa |
+| Decision | Clef, Clef-Flash, OpenJev |
 
 ## Configuration CLI
 
@@ -320,7 +323,8 @@ Serveur FastAPI (API OpenAI / Anthropic)
     │   ├── BatchedEngine (LLMs, batching continu)
     │   ├── VLMEngine (modèles vision-langage)
     │   ├── EmbeddingEngine
-    │   └── RerankerEngine
+    │   ├── RerankerEngine
+    │   └── DecisionEngine
     │
     ├── ProcessMemoryEnforcer (limite mémoire totale, vérifications TTL)
     │

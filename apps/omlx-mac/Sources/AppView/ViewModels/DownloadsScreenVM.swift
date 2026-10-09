@@ -141,7 +141,7 @@ final class DownloadsScreenVM {
             while !Task.isCancelled {
                 guard let self else { return }
                 await self.refreshTasks()
-                try? await Task.sleep(for: .seconds(1))
+                try? await Task.sleep(for: .milliseconds(500))
             }
         }
         await refreshMirrors(client: client)

@@ -127,6 +127,7 @@ class Request:
     output_token_ids: List[int] = field(default_factory=list)
     output_text: str = ""
     generation_started_at: Optional[float] = None
+    prefill_started_at: Optional[float] = None
     last_activity_at: Optional[float] = None
 
     # For BatchGenerator integration
@@ -157,6 +158,8 @@ class Request:
     benchmark_requested_steps: List[int] = field(default_factory=list)
     benchmark_boundary_enabled: bool = False
     benchmark_cache_block_size: int = 0
+    # MoE expert offload counters when the request was added.
+    moe_offload_start: Optional[Dict[str, Any]] = None
 
     # Multimodal content (images, video)
     images: Optional[List[Any]] = None
@@ -220,6 +223,11 @@ class Request:
     specprefill_position_offset: int = 0  # RoPE offset = M - N
     specprefill_system_end: int = 0  # Token index where system prompt ends
 
+    # Chat template suffix after the last message; the tail snapshot ends before it.
+    generation_prompt_text: Optional[str] = None
+    generation_prompt_start: int = 0  # Token index where the generation prompt starts
+    generation_prompt_persists: bool = False  # History keeps the generation prompt
+
     # Cache corruption recovery
     cache_corruption_retries: int = 0  # Per-request corruption retry counter
     generation_overflow_retries: int = 0  # Per-request __next_prime retry counter
@@ -229,6 +237,7 @@ class Request:
     prefill_eviction_retries: int = (
         0  # Per-request prefill-headroom eviction phase counter
     )
+    packed_prefill_excluded: bool = False  # Retries alone after a failed pack
 
     # Request-scoped tool schemas used by protocol output parsers.
     tools: list[dict[str, Any]] | None = None

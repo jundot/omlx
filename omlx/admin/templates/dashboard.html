@@ -13,10 +13,13 @@
     {% include "dashboard/_navbar.html" %}
 
     <!-- Main Content -->
-    <main class="flex-grow relative overflow-hidden">
-        <!-- Background Effects -->
-        <div class="absolute inset-0 bg-grain pointer-events-none z-0"></div>
-        <div class="absolute top-0 left-1/2 -translate-x-1/2 w-[800px] h-[400px] bg-gradient-to-b from-neutral-50 to-transparent rounded-full blur-3xl -z-10 opacity-50"></div>
+    <main class="flex-grow relative">
+        <!-- Background Effects. They clip themselves: overflow-hidden on <main>
+             would stop the sub-tab row and the settings rail from sticking. -->
+        <div class="absolute inset-0 overflow-hidden pointer-events-none" aria-hidden="true">
+            <div class="absolute inset-0 bg-grain z-0"></div>
+            <div class="absolute top-0 left-1/2 -translate-x-1/2 w-[800px] h-[400px] bg-gradient-to-b from-neutral-50 to-transparent rounded-full blur-3xl -z-10 opacity-50"></div>
+        </div>
 
         <div class="mx-auto px-4 sm:px-6 py-6 sm:py-10 relative z-10" :class="mainTab === 'status' ? dashboardWidthClass : 'max-w-7xl'">
             <!-- Status Main Tab -->
@@ -79,7 +82,7 @@
                     </button>
                     <button @click="saveHfMirrorEndpoint()"
                             :disabled="hfMirrorSaving"
-                            class="px-4 py-2 text-sm font-medium text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-50 transition-all">
+                            class="px-4 py-2 text-sm font-medium text-white bg-neutral-900 rounded-full hover:bg-neutral-800 disabled:opacity-50 transition-all">
                         <span x-show="!hfMirrorSaving">{{ t('models.downloader.mirror_save') }}</span>
                         <span x-show="hfMirrorSaving" class="flex items-center gap-2">
                             <svg class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
@@ -105,5 +108,6 @@
 <script src="{{ static('js/cluster_v2.js') }}"></script>
 <script src="{{ static('js/gridstack-all.js') }}"></script>
 <script src="{{ static('js/dashboard_layout.js') }}"></script>
+<script src="{{ static('js/logs.js') }}"></script>
 <script src="{{ static('js/dashboard.js') }}"></script>
 {% endblock %}

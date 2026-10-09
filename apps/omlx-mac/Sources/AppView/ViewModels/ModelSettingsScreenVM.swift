@@ -55,7 +55,7 @@ final class ModelSettingsScreenVM {
         case dflashVerifyMode, dflashDraftWindowSize, dflashDraftSinkSize, dflashBlockSize
         case dflashInMemoryCache, dflashInMemoryCacheGib, dflashInMemoryCacheMaxEntries
         case dflashSsdCache, dflashSsdCacheGib
-        case mtpEnabled
+        case mtpEnabled, mtpAdaptiveMaxDepth
         case vlmMtpEnabled, vlmMtpDraftModel, vlmMtpDraftBlockSize
     }
 
@@ -85,6 +85,9 @@ final class ModelSettingsScreenVM {
             ("audio_sts", String(localized: "settings.model_type.audio_sts",
                                  defaultValue: "Audio STS",
                                  comment: "Model type option label for speech-to-speech models")),
+            ("decision", String(localized: "settings.model_type.decision",
+                                defaultValue: "Decision",
+                                comment: "Model type option label for decision models served by /v1/systemone")),
         ]
     }
 
@@ -176,6 +179,17 @@ final class ModelSettingsScreenVM {
             ("64", "64"),
             ("128", "128"),
         ]
+    }
+
+    static var mtpDepthOptions: [(String, String)] {
+        let adaptive = String(localized: "settings.acceleration.mtp.depth.adaptive",
+                              defaultValue: "3 tokens (Default)",
+                              comment: "Default Lightning MTP adaptive maximum draft depth")
+        return [("3", adaptive)] + (4...6).map { depth in
+            ("\(depth)", String(localized: "settings.acceleration.mtp.depth.option",
+                                defaultValue: "\(depth) tokens",
+                                comment: "Lightning MTP depth option; placeholder is the maximum draft token count"))
+        }
     }
 
     static var dflashVerifyModeOptions: [(String, String)] {
@@ -343,6 +357,8 @@ final class ModelSettingsScreenVM {
 
     // Experimental: native MTP
     var mtpEnabled: Bool = false
+    /// Empty = adaptive depth.
+    var mtpAdaptiveMaxDepth: String = "3"
 
     // Experimental: VLM MTP (assistant-drafter speculative decoding for VLMs).
     // Block size is held as a string for the editor; empty = mlx-vlm default.
@@ -365,6 +381,33 @@ final class ModelSettingsScreenVM {
     /// "Working profile" state. Per-model fields (alias / modelType /
     /// ttl / isPinned / trustRemoteCode) auto-save and never set this.
     var profileDirty: Bool = false
+    /// Model-specific profile values at the last load. Global templates drop
+    /// these keys, so edits to them need a model-scope save.
+    private var loadedModelSpecificSettings: [String: AnyCodable] = [:]
+
+    /// True when the working profile changes a setting that a global
+    /// template cannot store.
+    var hasModelSpecificEdits: Bool {
+        profileDirty && modelSpecificSettings() != loadedModelSpecificSettings
+    }
+
+    var defaultSaveAsScope: ProfileScope { hasModelSpecificEdits ? .model : .global }
+
+    private func modelSpecificSettings() -> [String: AnyCodable] {
+        currentSettingsDict().filter { !ProfileSettingsKey.templateKeys.contains($0.key) }
+    }
+
+    /// Record the current values as the clean, loaded state.
+    func resetWorkingBaseline() {
+        loadedModelSpecificSettings = modelSpecificSettings()
+        profileDirty = false
+    }
+
+    private var globalProfileDropsEditsMessage: String {
+        String(localized: "profile.save.global_drops_model_settings",
+               defaultValue: "Global profiles keep sampling settings only. Save as a Model profile to keep Lightning MTP, TurboQuant, and other model settings.",
+               comment: "Error shown when saving to a global profile would drop model-specific settings")
+    }
 
     /// State machine the banner and ProfileDetailCard render against.
     /// Cheap to recompute — pure function of (profileDirty, activeProfileScope,
@@ -477,7 +520,7 @@ final class ModelSettingsScreenVM {
             return true
         case .dflashSsdCache, .dflashSsdCacheGib:
             return true
-        case .mtpEnabled, .vlmMtpEnabled, .vlmMtpDraftModel:
+        case .mtpEnabled, .mtpAdaptiveMaxDepth, .vlmMtpEnabled, .vlmMtpDraftModel:
             return true
         case .vlmMtpDraftBlockSize:
             return true
@@ -643,6 +686,7 @@ final class ModelSettingsScreenVM {
                 self.dflashSsdCacheGib = DflashByteSize.bytesToGib(s?.dflashSsdCacheMaxBytes)
                     .map(String.init) ?? "20"
                 self.mtpEnabled = s?.mtpEnabled ?? false
+                self.mtpAdaptiveMaxDepth = s?.mtpAdaptiveMaxDepth.flatMap { (3...6).contains($0) ? String($0) : nil } ?? "3"
                 self.vlmMtpEnabled = s?.vlmMtpEnabled ?? false
                 self.vlmMtpDraftModel = s?.vlmMtpDraftModel ?? ""
                 self.vlmMtpDraftBlockSize = s?.vlmMtpDraftBlockSize.map(String.init) ?? ""
@@ -666,7 +710,7 @@ final class ModelSettingsScreenVM {
                 self.activeProfileName = nil
             }
             // Reload always re-establishes the baseline.
-            self.profileDirty = false
+            resetWorkingBaseline()
             self.lastError = nil
         } catch {
             self.lastError = error.omlxDescription
@@ -874,7 +918,10 @@ final class ModelSettingsScreenVM {
         case .dflashSsdCache:          patch.dflashSsdCache = dflashSsdCache
         case .dflashSsdCacheGib:
             patch.dflashSsdCacheMaxBytes = DflashByteSize.gibToBytes(Int(dflashSsdCacheGib))
-        case .mtpEnabled:              patch.mtpEnabled = mtpEnabled
+        case .mtpEnabled, .mtpAdaptiveMaxDepth:
+            patch.mtpEnabled = mtpEnabled
+            patch.mtpAdaptiveMaxDepth = Int(mtpAdaptiveMaxDepth) ?? 3
+            patch.mtpFixedDepth = .some(nil)
         case .vlmMtpEnabled:           patch.vlmMtpEnabled = vlmMtpEnabled
         case .vlmMtpDraftModel:        patch.vlmMtpDraftModel = vlmMtpDraftModel.isEmpty ? nil : vlmMtpDraftModel
         case .vlmMtpDraftBlockSize:    patch.vlmMtpDraftBlockSize = Int(vlmMtpDraftBlockSize)
@@ -1089,6 +1136,9 @@ final class ModelSettingsScreenVM {
     }
 
     var isQwenOqA8Model: Bool {
+        // qwen4_exp (Qwen3.8-Flash-Next) matches exactly: only that validated
+        // family has routed-expert A8, not every qwen4*.
+        if isQwen4Exp { return true }
         let type = (model?.configModelType ?? "").lowercased().replacingOccurrences(of: "-", with: "_")
         return ["qwen3_5", "qwen3_6", "qwen3_8"].contains { type.hasPrefix($0) }
     }
@@ -1326,6 +1376,9 @@ final class ModelSettingsScreenVM {
                 }
             }
             putBool(ProfileSettingsKey.mtpEnabled, mtpEnabled)
+            if mtpEnabled {
+                putInt(ProfileSettingsKey.mtpAdaptiveMaxDepth, mtpAdaptiveMaxDepth)
+            }
             putBool(ProfileSettingsKey.vlmMtpEnabled, vlmMtpEnabled)
             if vlmMtpEnabled {
                 putString(ProfileSettingsKey.vlmMtpDraftModel, vlmMtpDraftModel)
@@ -1530,6 +1583,10 @@ final class ModelSettingsScreenVM {
         let displayName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanName = "p-" + UUID().uuidString.lowercased().prefix(28)
         guard !displayName.isEmpty, scope != .preset else { return }
+        guard scope != .global || !hasModelSpecificEdits else {
+            lastError = globalProfileDropsEditsMessage
+            return
+        }
         guard validateAneWorkingSettings() else { return }
         let settings = currentSettingsDict()
         do {
@@ -1574,6 +1631,10 @@ final class ModelSettingsScreenVM {
     func updateProfileWithWorking(scope: ProfileScope, name: String, client: OMLXClient) async {
         let targetModelID = modelID
         guard scope != .preset else { return }
+        guard scope != .global || !hasModelSpecificEdits else {
+            lastError = globalProfileDropsEditsMessage
+            return
+        }
         guard validateAneWorkingSettings() else { return }
         let settings = currentSettingsDict()
         do {

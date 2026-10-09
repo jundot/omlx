@@ -142,7 +142,7 @@ def prompt_opens_thinking(
     return True, think_tag
 
 
-def extract_thinking(text: str) -> Tuple[str, str]:
+def extract_thinking(text: str, *, truncated: bool = False) -> Tuple[str, str]:
     """Extract thinking and content from complete text.
 
     Handles:
@@ -157,6 +157,8 @@ def extract_thinking(text: str) -> Tuple[str, str]:
       fallback the entire body would be classified as thinking and the
       visible answer would be empty.
 
+    With ``truncated=True``, unfinished thinking stays in the thinking channel.
+
     Tag-free text is always classified as content. Mirrors
     ``ThinkingParser.finish()`` recovery semantics (`_content_emitted`
     fallback): when the model emits no thinking markers, surface the body
@@ -164,6 +166,7 @@ def extract_thinking(text: str) -> Tuple[str, str]:
 
     Args:
         text: Complete model output text.
+        truncated: Keep unfinished thinking in its channel on length termination.
 
     Returns:
         Tuple of (thinking_content, regular_content).
@@ -188,6 +191,11 @@ def extract_thinking(text: str) -> Tuple[str, str]:
             break
         thinking_parts.append(match.group(1))
         remaining = remaining[:match.start()] + remaining[match.end():]
+
+    if truncated and _OPEN_TAG in remaining:
+        before, after = remaining.split(_OPEN_TAG, 1)
+        thinking_parts.append(after)
+        remaining = before
 
     if thinking_parts:
         thinking = "\n".join(thinking_parts).strip()
@@ -323,15 +331,12 @@ class ThinkingParser:
             self._content_emitted = True
         return (thinking_delta, content_delta)
 
-    def finish(self) -> Tuple[str, str]:
+    def finish(self, *, truncated: bool = False) -> Tuple[str, str]:
         """Flush any remaining buffered content.
 
         Should be called when the stream is complete to emit any
         buffered characters that were waiting for potential tag completion.
-        Also recovers from malformed thinking — when the model never
-        emitted ``</think>`` and no content was ever produced, returns
-        the accumulated thinking text as content so the client surfaces
-        a non-empty answer body.
+        Unless truncated, recover an unclosed thinking block as content when no answer was emitted.
 
         Returns:
             Tuple of (thinking_text, content_text) from remaining buffer
@@ -348,7 +353,8 @@ class ThinkingParser:
         # the same text twice — once in the thinking panel, once as the
         # answer. UX trade-off documented in the chat template plan.
         if (
-            self._in_thinking
+            not truncated
+            and self._in_thinking
             and not self._close_seen
             and not self._content_emitted
             and self._thinking_accumulated
@@ -402,6 +408,8 @@ class ThinkingBudgetProcessor:
         think_end_token_ids: Token ID(s) for the close-think tag.
         budget: Maximum number of thinking tokens before forcing close.
         think_start_token_id: Token ID for the open-think tag (re-entry detection).
+        start_in_thinking: False when the model, not the prompt, opens
+            thinking. Counting then starts at ``think_start_token_id``.
     """
 
     def __init__(
@@ -412,6 +420,7 @@ class ThinkingBudgetProcessor:
         leading_token_ids: Optional[List[int]] = None,
         trailing_token_ids: Optional[List[int]] = None,
         token_to_piece: Optional[Callable[[int], str | bytes | None]] = None,
+        start_in_thinking: bool = True,
     ):
         self._think_end_ids = think_end_token_ids
         # Full force sequence: \n + </think> + \n\n (matches training pattern)
@@ -426,7 +435,7 @@ class ThinkingBudgetProcessor:
 
         # State
         self._thinking_tokens: int = 0
-        self._in_thinking: bool = True  # Starts True (prompt ends with <think>)
+        self._in_thinking: bool = start_in_thinking
         self._forcing: bool = False
         self._waiting_utf8: bool = False
         self._force_idx: int = 0

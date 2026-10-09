@@ -66,6 +66,14 @@ def test_unlimited_ocr_prompt_uses_single_image_token():
     assistant = get_message_json("unlimited-ocr", "ok", role="assistant", num_images=1)
     assert assistant == {"role": "assistant", "content": "ok"}
 
+    # apply_chat_template passes OpenAI list content through unchanged.
+    parts = [
+        {"type": "text", "text": "document parsing."},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+    ]
+    listed = get_message_json("unlimited-ocr", parts, num_images=1)
+    assert listed == {"role": "user", "content": "<image>document parsing."}
+
 
 def test_unlimited_ocr_prompt_leaves_other_models_untouched():
     from omlx.patches.mlx_vlm_unlimited_ocr_compat import (

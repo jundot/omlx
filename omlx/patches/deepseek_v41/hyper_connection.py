@@ -7,7 +7,9 @@ import mlx.core as mx
 
 _SOURCE = r"""
     const uint row = thread_position_in_grid.x;
-    if (row >= ROWS) return;
+    uint rows = 1;
+    for (int dim = 0; dim + 2 < x_ndim; ++dim) rows *= x_shape[dim];
+    if (row >= rows) return;
     float values[16];
     for (int i = 0; i < 16; ++i) values[i] = x[row * 16 + i];
     for (int iteration = 0; iteration < ITERS; ++iteration) {
@@ -61,7 +63,7 @@ def sinkhorn(comb, eps, iters):
     rows = comb.size // 16
     return _sinkhorn_kernel()(
         inputs=[comb, mx.array([eps], mx.float32)],
-        template=[("ROWS", rows), ("ITERS", max(1, iters))],
+        template=[("ITERS", max(1, iters))],
         grid=(rows, 1, 1),
         threadgroup=(32, 1, 1),
         output_shapes=[comb.shape],
@@ -71,7 +73,9 @@ def sinkhorn(comb, eps, iters):
 
 _POST_SOURCE = r"""
     const uint z = thread_position_in_grid.x;
-    if (z >= ROWS * D) return;
+    uint size = D;
+    for (int dim = 0; dim + 1 < x_ndim; ++dim) size *= x_shape[dim];
+    if (z >= size) return;
     const uint row = z / D, d = z % D;
     float values[4];
     for (uint i = 0; i < 4; ++i)
@@ -101,7 +105,7 @@ def fused_hc_post(x, residual, post, comb):
     """Mix four residual streams without expanding the residual to FP32."""
     return _post_kernel()(
         inputs=[x, residual, post, comb],
-        template=[("T", x.dtype), ("ROWS", x.size // x.shape[-1]), ("D", x.shape[-1])],
+        template=[("T", x.dtype), ("D", x.shape[-1])],
         grid=(x.size, 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[residual.shape],

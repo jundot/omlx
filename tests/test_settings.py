@@ -6,7 +6,7 @@ import os
 import tempfile
 from argparse import Namespace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -53,6 +53,7 @@ class TestServerSettings:
         assert settings.auto_start_on_launch is True
         assert settings.burst_decode_mode == "balanced"
         assert settings.preserve_mid_system_cache is True
+        assert settings.qwen4_gdn_decode_wide_proj is False
         assert settings.distributed_inference_enabled is False
         assert settings.max_audio_upload_size == "100MB"
         assert settings.max_audio_upload_bytes() == 100 * 1024 * 1024
@@ -87,11 +88,21 @@ class TestServerSettings:
             "auto_start_on_launch": True,
             "burst_decode_mode": "balanced",
             "preserve_mid_system_cache": True,
+            "qwen4_gdn_decode_wide_proj": False,
             "distributed_inference_enabled": False,
             "max_audio_upload_size": "100MB",
             "max_image_upload_size": "50MB",
+            "max_request_body_size": "512MB",
             "max_image_side_length": 2048,
+            "gpu_keep_warm_interval": 0.5,
         }
+
+    def test_qwen4_decode_setting_round_trip(self):
+        settings = GlobalSettings()
+        assert ServerSettings.from_dict({}).qwen4_gdn_decode_wide_proj is False
+        settings.server = ServerSettings.from_dict({"qwen4_gdn_decode_wide_proj": True})
+        assert settings.server.to_dict()["qwen4_gdn_decode_wide_proj"] is True
+        assert settings.to_scheduler_config().qwen4_gdn_decode_wide_proj is True
 
     def test_from_dict_distributed_inference_is_opt_in(self):
         assert ServerSettings.from_dict({}).distributed_inference_enabled is False
@@ -458,13 +469,21 @@ class TestCacheSettings:
         base_path = Path("/tmp/omlx")
         assert settings.get_ssd_cache_dir(base_path) == Path("/custom/cache")
 
-    def test_get_ssd_cache_max_size_bytes_auto(self):
-        """Test auto SSD cache size calculation."""
+    def test_get_ssd_cache_max_size_bytes_auto(self, tmp_path):
         settings = CacheSettings(ssd_cache_max_size="auto")
-        base_path = Path("/tmp/omlx")
-        cache_dir = settings.get_ssd_cache_dir(base_path)
-        expected = int(get_ssd_capacity(cache_dir) * 0.1)
-        assert settings.get_ssd_cache_max_size_bytes(base_path) == expected
+        cache_dir = settings.get_ssd_cache_dir(tmp_path)
+        (cache_dir / "a").mkdir(parents=True)
+        (cache_dir / "a" / "block.safetensors").write_bytes(b"x" * 60)
+        sidecars = cache_dir / "_gdn_sidecars" / ("b" * 64)
+        sidecars.mkdir(parents=True)
+        (sidecars / "state.safetensors").write_bytes(b"x" * 40)
+        (cache_dir / "unrelated").write_bytes(b"x" * 100)
+        with patch("omlx.settings.shutil.disk_usage") as usage:
+            usage.return_value.free = 200
+            assert settings.get_ssd_cache_max_size_bytes(tmp_path) == 150
+            config = GlobalSettings(base_path=tmp_path).to_scheduler_config()
+            assert config.paged_ssd_cache_auto_size is True
+            assert config.paged_ssd_cache_max_size == 150
 
     def test_get_ssd_cache_max_size_bytes_explicit(self):
         """Test explicit SSD cache size."""
@@ -676,6 +695,7 @@ class TestAuthSettings:
             "api_key": "my-key",
             "secret_key": None,
             "skip_api_key_verification": False,
+            "allow_unauthenticated_inference": False,
             "sub_keys": [],
         }
 
@@ -1093,6 +1113,35 @@ class TestMemorySettings:
         """Test deserialization with prefill guard disabled."""
         settings = MemorySettings.from_dict({"prefill_memory_guard": False})
         assert settings.prefill_memory_guard is False
+
+    def test_admin_rejects_custom_tier_without_ceiling_before_applying(
+        self, tmp_path, monkeypatch
+    ):
+        """A zero custom ceiling must never reach the live enforcer."""
+        import asyncio
+
+        from fastapi import HTTPException
+
+        from omlx.admin import routes as admin_routes
+        from omlx.server import _server_state
+
+        gs = GlobalSettings(base_path=tmp_path)
+        enforcer = MagicMock()
+        enforcer.memory_guard_tier = "balanced"
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+        monkeypatch.setattr(_server_state, "process_memory_enforcer", enforcer)
+
+        request = admin_routes.GlobalSettingsRequest.model_validate(
+            {"memory_guard_tier": "custom", "memory_guard_custom_ceiling_gb": 0}
+        )
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert exc.value.status_code == 400
+        assert gs.memory.memory_guard_tier == "balanced"
+        assert enforcer.memory_guard_tier == "balanced"
 
 
 class TestGlobalSettings:
@@ -2967,15 +3016,19 @@ class TestClaudeCodeRouteIntegration:
 class TestCORSMiddleware:
     """Test that CORS middleware is correctly applied to the server."""
 
-    def test_cors_preflight(self):
+    def test_cors_preflight(self, monkeypatch):
         """Test that CORS preflight requests get proper response headers."""
         from fastapi.testclient import TestClient
 
-        from omlx.server import app, init_server
+        from omlx.server import _server_state, app, init_server
 
         # Reset middleware stack so add_middleware works even if app was
         # already started by another test in the same process.
         app.middleware_stack = None
+        # init_server points the Responses store into tmpdir; restore it afterwards.
+        monkeypatch.setattr(
+            _server_state, "responses_store", _server_state.responses_store
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = GlobalSettings(base_path=Path(tmpdir))
@@ -3160,3 +3213,56 @@ class TestDashboardLayoutRoute:
 
         with pytest.raises(pydantic.ValidationError):
             DashboardLayoutRequest.model_validate(self._layout(width="huge"))
+
+
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None])
+def test_unauthenticated_inference_requires_boolean(tmp_path, value):
+    settings = GlobalSettings(base_path=tmp_path)
+    settings.auth = AuthSettings.from_dict({"allow_unauthenticated_inference": value})
+    assert (
+        "auth.allow_unauthenticated_inference must be a boolean" in settings.validate()
+    )
+
+
+def test_inference_auth_default_preserves_saved_data(tmp_path, monkeypatch):
+    path = tmp_path / "settings.json"
+    data = {"auth": {"api_key": "saved-key"}, "custom": {"keep": True}}
+    path.write_text(json.dumps(data))
+    monkeypatch.setenv("OMLX_API_KEY", "runtime-key")
+    settings = GlobalSettings.load(base_path=tmp_path)
+    settings.ensure_inference_auth_setting()
+    data["auth"]["allow_unauthenticated_inference"] = False
+    assert json.loads(path.read_text()) == data
+    data["auth"]["allow_unauthenticated_inference"] = True
+    path.write_text(json.dumps(data))
+    before = path.read_bytes()
+    settings = GlobalSettings.load(base_path=tmp_path)
+    settings.ensure_inference_auth_setting()
+    assert path.read_bytes() == before
+    assert settings.auth.allow_unauthenticated_inference is True
+    settings.save_cli_overrides(Namespace(port=8123))
+    saved = json.loads(path.read_text())
+    assert saved["auth"]["allow_unauthenticated_inference"] is True
+    assert saved["auth"]["api_key"] == "saved-key"
+
+
+def test_inference_auth_default_creates_settings_file(tmp_path):
+    settings = GlobalSettings(base_path=tmp_path)
+    settings.ensure_inference_auth_setting()
+    assert json.loads((tmp_path / "settings.json").read_text()) == {
+        "auth": {"allow_unauthenticated_inference": False}
+    }
+
+
+@pytest.mark.parametrize("api_key,skip", [(None, False), ("admin-key", True)])
+def test_inference_opt_in_keeps_network_management_requirements(
+    tmp_path, api_key, skip
+):
+    settings = GlobalSettings(base_path=tmp_path)
+    settings.server.host = "0.0.0.0"
+    settings.auth = AuthSettings(
+        api_key=api_key,
+        skip_api_key_verification=skip,
+        allow_unauthenticated_inference=True,
+    )
+    assert any("non-loopback" in error for error in settings.validate())

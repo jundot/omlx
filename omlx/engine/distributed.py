@@ -226,6 +226,7 @@ class DistributedBatchedEngine(BatchedEngine):
         self._active_requests = 0
         self._active_lock = asyncio.Lock()
         self._peer_health: tuple[float, bool, str] | None = None
+        self._peer_reach: tuple[float, bool] | None = None
         self._peer_health_lock = asyncio.Lock()
         self._abort_drain_timeout = float(abort_drain_timeout)
         self._orphan_reap_grace = float(orphan_reap_grace)
@@ -482,6 +483,7 @@ raise SystemExit(2)
                 "mtp_enabled",
                 "vlm_mtp_enabled",
                 "turboquant_kv_enabled",
+                "qwen35_ane_prefill_enabled",
             )
             if bool(getattr(settings, name, False))
         ]
@@ -491,14 +493,17 @@ raise SystemExit(2)
                 + ", ".join(incompatible)
             )
 
-    async def stop(self) -> None:
+    async def stop(self, *, local_only: bool = False) -> None:
         client, self._client = self._client, None
         try:
             if client is not None:
                 await client.aclose()
         finally:
             try:
-                await asyncio.to_thread(self._supervisor.stop)
+                await asyncio.to_thread(
+                    self._supervisor.stop,
+                    **({"local_only": True} if local_only else {}),
+                )
             finally:
                 self._tokenizer = None
                 self._model_type = None
@@ -1900,6 +1905,38 @@ raise SystemExit(2)
                     self._peer_health = cached
         if not cached[1]:
             raise DistributedInferenceError(f"cluster is not serving: {cached[2]}")
+
+    async def peers_reachable(self) -> bool:
+        """Does every Mac of the deployment still answer over SSH?
+
+        A dead worker group can only be torn down and relaunched while its
+        peers are reachable: ``stop()`` verifies the rank exit on every host,
+        which cannot succeed against a Mac that is off or off the network.
+        The verdict is cached for ``_PEER_HEALTH_TTL`` seconds and the probe
+        is bounded by the SSH connect timeout, so asking is cheap and safe to
+        do per request. A probe that itself fails counts as reachable, like
+        the health gate above: the teardown will then report the real error.
+        """
+
+        cached = self._peer_reach
+        if cached is None or time.monotonic() - cached[0] >= _PEER_HEALTH_TTL:
+            async with self._peer_health_lock:
+                cached = self._peer_reach
+                if cached is None or (time.monotonic() - cached[0] >= _PEER_HEALTH_TTL):
+                    hosts_by_rank = {
+                        rank: (host.node_id, host.ssh)
+                        for rank, host in enumerate(self.deployment.hosts)
+                    }
+                    try:
+                        health = await asyncio.to_thread(check_peers, hosts_by_rank)
+                    except Exception as exc:  # noqa: BLE001 - probe plumbing
+                        logger.warning("peer reachability probe failed: %s", exc)
+                        reachable = True
+                    else:
+                        reachable = all(item.reachable for item in health)
+                    cached = (time.monotonic(), reachable)
+                    self._peer_reach = cached
+        return cached[1]
 
     async def preflight_chat(self, *args: Any, **kwargs: Any) -> None:
         self._validate_request_features(kwargs)

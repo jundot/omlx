@@ -6,15 +6,15 @@
     </div>
     <div class="flex flex-wrap items-center gap-2">
         <!-- Scope toggle -->
-        <div class="flex rounded-lg border border-neutral-200 overflow-hidden">
+        <div class="segmented segmented--sm">
             <button @click="statsScope = 'session'; showClearStatsConfirm = false; showClearAlltimeConfirm = false"
-                    :class="statsScope === 'session' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
-                    class="px-3 py-1.5 text-xs font-medium transition-all">
+                    :class="statsScope === 'session' ? 'segmented__item--active' : ''"
+                    class="segmented__item">
                 {{ t('status.scope_session') }}
             </button>
             <button @click="statsScope = 'alltime'; showClearStatsConfirm = false; showClearAlltimeConfirm = false"
-                    :class="statsScope === 'alltime' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-500 hover:bg-neutral-50'"
-                    class="px-3 py-1.5 text-xs font-medium transition-all border-l border-neutral-200">
+                    :class="statsScope === 'alltime' ? 'segmented__item--active' : ''"
+                    class="segmented__item">
                 {{ t('status.scope_alltime') }}
             </button>
         </div>
@@ -22,7 +22,7 @@
         <div class="flex items-center gap-1.5">
             <button x-show="(statsScope === 'session' && !showClearStatsConfirm) || (statsScope === 'alltime' && !showClearAlltimeConfirm)"
                     @click="statsScope === 'session' ? showClearStatsConfirm = true : showClearAlltimeConfirm = true"
-                    class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-all flex items-center gap-1.5"
+                    class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-700 hover:bg-neutral-100 rounded-full transition-all flex items-center gap-1.5"
                     :title="statsScope === 'session' ? window.t('status.clear_tooltip') : window.t('status.clear_alltime_tooltip')">
                 <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>
                 {{ t('status.clear') }}
@@ -31,11 +31,11 @@
                  x-cloak class="flex items-center gap-1.5">
                 <span class="text-xs text-red-600">{{ t('status.clear_confirm') }}</span>
                 <button @click="statsScope === 'session' ? clearStats() : clearAlltimeStats()"
-                        class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
+                        class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-full transition-all">
                     {{ t('status.clear_yes') }}
                 </button>
                 <button @click="showClearStatsConfirm = false; showClearAlltimeConfirm = false"
-                        class="px-2.5 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">
+                        class="px-2.5 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-full transition-all">
                     {{ t('status.clear_cancel') }}
                 </button>
             </div>
@@ -51,30 +51,26 @@
     </div>
 </div>
 
-<!-- Three Stat Cards -->
-<div class="grid grid-cols-1 sm:grid-cols-3 gap-4 sm:gap-6 mb-8">
-    <!-- Total Prefill Tokens -->
-    <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
-        <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.total_tokens') }}</p>
-        <p class="font-bold tracking-tight text-neutral-900 transition-all"
-           :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_prompt_tokens)"
-           x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_prompt_tokens)"></p>
+<!-- Stat cards: label above a left-aligned figure -->
+<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 sm:gap-6 mb-8">
+    <div class="bg-white rounded-2xl border border-neutral-200 p-5 flex flex-col gap-1 min-w-0">
+        <p class="text-xs font-semibold text-neutral-500">{{ t('status.kpi.requests') }}</p>
+        <p class="text-2xl lg:text-[32px] leading-tight font-semibold tracking-tight text-neutral-900 tabular-nums" x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_requests)"></p>
     </div>
-
-    <!-- Cached Tokens Served -->
-    <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
-        <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.cached_tokens') }}</p>
-        <p class="font-bold tracking-tight text-neutral-900 transition-all"
-           :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).total_cached_tokens)"
-           x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_cached_tokens)"></p>
+    <div class="bg-white rounded-2xl border border-neutral-200 p-5 flex flex-col gap-1 min-w-0">
+        <p class="text-xs font-semibold text-neutral-500">{{ t('status.stat.total_tokens') }}</p>
+        <p class="text-2xl lg:text-[32px] leading-tight font-semibold tracking-tight text-neutral-900 tabular-nums" x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_prompt_tokens)"></p>
     </div>
-
-    <!-- Cache Efficiency -->
-    <div class="bg-white rounded-2xl border border-neutral-200 p-5 sm:p-8 text-center">
-        <p class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('status.stat.cache_efficiency') }}</p>
-        <p class="font-bold tracking-tight text-neutral-900 transition-all"
-           :class="getStatFontClass((statsScope === 'alltime' ? alltimeStats : stats).cache_efficiency)"
-           x-text="(statsScope === 'alltime' ? alltimeStats : stats).cache_efficiency.toFixed(1) + '%'"></p>
+    <div class="bg-white rounded-2xl border border-neutral-200 p-5 flex flex-col gap-1 min-w-0">
+        <p class="text-xs font-semibold text-neutral-500">{{ t('status.stat.cached_tokens') }}</p>
+        <p class="text-2xl lg:text-[32px] leading-tight font-semibold tracking-tight text-neutral-900 tabular-nums" x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_cached_tokens)"></p>
+    </div>
+    <div class="bg-white rounded-2xl border border-neutral-200 p-5 flex flex-col gap-1 min-w-0">
+        <p class="text-xs font-semibold text-neutral-500">{{ t('status.stat.cache_efficiency') }}</p>
+        <p class="flex items-baseline gap-1">
+            <span class="text-2xl lg:text-[32px] leading-tight font-semibold tracking-tight text-neutral-900 tabular-nums" x-text="(statsScope === 'alltime' ? alltimeStats : stats).cache_efficiency.toFixed(1)"></span>
+            <span class="text-sm text-neutral-500">%</span>
+        </p>
     </div>
 </div>
 

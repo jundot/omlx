@@ -19,6 +19,7 @@ import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, ConfigDict, Field
 
 from .._version import __version__
 from ..admin.auth import require_admin
@@ -276,6 +277,30 @@ def _enrich_paired_row(row: dict[str, Any], record: dict[str, Any] | None) -> No
         row["http_port"] = http_port
 
 
+class DeviceSSHUserRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ssh_user: str | None = Field(
+        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$"
+    )
+
+
+@discovery_router.put("/devices/{node_id}/ssh-user")
+async def set_device_ssh_user(
+    node_id: str, body: DeviceSSHUserRequest, is_admin: bool = Depends(require_admin)
+):
+    """Set or clear a login override without changing SSH keys or pairing trust."""
+    try:
+        registry = get_device_registry()
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=503, detail="cluster registry is not configured"
+        ) from exc
+    try:
+        return registry.set_ssh_user(node_id, body.ssh_user)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="paired device not found") from exc
+
+
 @discovery_router.get("/devices")
 async def cluster_devices(is_admin: bool = Depends(require_admin)):
     """Cluster device inventory for the wizard UI.
@@ -346,6 +371,9 @@ async def cluster_devices(is_admin: bool = Depends(require_admin)):
     # their node_ids from the discovered list below.
     for row in paired:
         _enrich_paired_row(row, observed_records.get(row.get("node_id")))
+        if service is not None:
+            health = service.address_health(row["node_id"])
+            row["address_health"] = health
 
     # Nothing flips the discovery service's in-memory ``PeerRecord.paired``
     # the moment pairing completes, so a stale (possibly dead) record for a

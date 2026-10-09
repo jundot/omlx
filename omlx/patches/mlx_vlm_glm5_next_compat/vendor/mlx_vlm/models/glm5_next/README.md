@@ -15,7 +15,8 @@ oMLX runtime integration:
   GLM-5.3 tensor contracts match;
 - shared affine prefill QMM kernels for supported Q2/Q4/Q5/Q6/Q8 projections;
 - a torch-free NumPy/Pillow image processor compatible with the official
-  checkpoint metadata and oMLX's pinned Transformers release.
+  checkpoint metadata and oMLX's pinned Transformers release;
+- affine-quantized MoE router gates restored to fp32 during sanitization.
 
 Lightning MTP is intentionally not included in this compatibility layer. The
 base model drops `mtp.*` tensors during sanitization; GLM-5.3 Lightning MTP can

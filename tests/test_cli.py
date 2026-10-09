@@ -7,6 +7,7 @@ Note: Configuration validation tests are in test_config.py.
 """
 
 import argparse
+import json
 import socket
 import subprocess
 import sys
@@ -16,6 +17,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from omlx._version import __version__
+from omlx.cli import _migrate_saved_network_auth
+from omlx.settings import GlobalSettings
 
 
 class TestCLIModule:
@@ -377,6 +380,18 @@ class TestLaunchCommandOptions:
         assert "codex_app" in result.stdout
         assert "Codex App" in " ".join(result.stdout.split())
 
+    def test_launch_lists_dsh(self):
+        """Test that launch help lists the DeepSeek Harness target."""
+        result = subprocess.run(
+            [sys.executable, "-m", "omlx.cli", "launch", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0
+        assert "dsh" in result.stdout
+        assert "DeepSeek Harness" in " ".join(result.stdout.split())
+
 
 class TestLaunchCommandFunction:
     """Tests for launch command runtime behavior."""
@@ -479,6 +494,54 @@ class TestLaunchCommandFunction:
 
         ctx = integration.launch.call_args.args[0]
         assert ctx.cross_session is True
+
+    def test_launch_command_skips_picker_when_integration_registers_catalog(self):
+        """Tools with requires_model_selection=False never prompt.
+
+        The model comes from the saved per-tool default (or --model) and
+        seeds only the tool's own default-model setting.
+        """
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.display_name = "DeepSeek Harness"
+        integration.is_installed.return_value = True
+        integration.requires_model_selection = False
+
+        health_response = MagicMock()
+        health_response.raise_for_status.return_value = None
+
+        status_response = MagicMock()
+        status_response.ok = True
+        status_response.json.return_value = {"models": []}
+
+        settings = MagicMock()
+        settings.server.host = "127.0.0.1"
+        settings.server.port = 8000
+        settings.claude_code = None
+        settings.integrations.dsh_model = "Qwen3.8-27B-oQ5e-mtp"
+
+        args = argparse.Namespace(
+            tool="dsh",
+            host=None,
+            port=None,
+            api_key="test-key",
+            model=None,
+            tools_profile="coding",
+        )
+
+        with (
+            # Exactly two requests (health + status): the picker's
+            # /v1/models call must not happen.
+            patch("requests.get", side_effect=[health_response, status_response]),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+        ):
+            launch_command(args)
+
+        integration.launch.assert_called_once()
+        ctx = integration.launch.call_args.args[0]
+        assert ctx.model == "Qwen3.8-27B-oQ5e-mtp"
 
     def test_launch_command_resolves_alias_status_metadata(self):
         """Alias model IDs should keep status metadata from the real model."""
@@ -1163,6 +1226,12 @@ class TestServeCommandFunctions:
             if previous_server is not None:
                 sys.modules["omlx.server"] = previous_server
 
+    def test_offline_secondary_bind_address_is_detected(self):
+        from omlx.cli import _is_local_address
+
+        assert _is_local_address("127.0.0.1")
+        assert not _is_local_address("192.0.2.1")
+
     def test_serve_hands_prebound_socket_to_uvicorn(self, tmp_path, monkeypatch):
         """Successful serve startup should pass the pre-bound socket into uvicorn."""
         import omlx
@@ -1557,3 +1626,89 @@ class TestLaunchClaudeTierPrecedence:
         assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "haiku-cfg"
         assert env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS") == expected_window
         assert env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW") == expected_window
+
+
+class TestSavedNetworkAuthMigration:
+    @pytest.fixture(autouse=True)
+    def setup_migration(self, tmp_path, monkeypatch):
+        for name in ("OMLX_HOST", "OMLX_API_KEY", "OMLX_STARTUP_NOTICE_PATH"):
+            monkeypatch.delenv(name, raising=False)
+        self.path = tmp_path / "settings.json"
+        self.data = {
+            "server": {"host": "0.0.0.0"},
+            "auth": {"api_key": "existing-key", "skip_api_key_verification": True},
+            "custom": {"preserve": True},
+        }
+        self.args = argparse.Namespace(host=None)
+        with patch("builtins.input", return_value="") as self.prompt:
+            yield
+
+    def load(self):
+        return GlobalSettings.load(base_path=str(self.path.parent))
+
+    def write_settings(self):
+        self.path.write_text(json.dumps(self.data))
+        return self.path.read_bytes()
+
+    @pytest.mark.parametrize("api_key,skip", [("existing-key", True), (None, False)])
+    def test_saved_unsafe_host_is_migrated_once(self, capsys, api_key, skip):
+        self.data["auth"].update(api_key=api_key, skip_api_key_verification=skip)
+        self.write_settings()
+        settings = self.load()
+        _migrate_saved_network_auth(settings, self.args)
+        _migrate_saved_network_auth(self.load(), self.args)
+        self.prompt.assert_called_once()
+        assert "Enter" in self.prompt.call_args.args[0]
+        self.data["server"]["host"] = "127.0.0.1"
+        assert json.loads(self.path.read_text()) == self.data
+        assert settings.server.host == "127.0.0.1"
+        assert "enable authentication" in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        "case", ["cli", "env", "authenticated", "loopback", "invalid"]
+    )
+    def test_non_migration_cases_preserve_settings(self, monkeypatch, case):
+        if case == "cli":
+            self.args.host = "0.0.0.0"
+        elif case == "env":
+            monkeypatch.setenv("OMLX_HOST", "0.0.0.0")
+        elif case == "authenticated":
+            self.data["auth"]["skip_api_key_verification"] = False
+        elif case == "loopback":
+            self.data["server"]["host"] = "127.0.0.1,::1"
+        else:
+            self.data["server"]["port"] = -1
+        before = self.write_settings()
+        settings = self.load()
+        _migrate_saved_network_auth(settings, self.args)
+        self.prompt.assert_not_called()
+        assert self.path.read_bytes() == before
+        assert settings.server.host == self.data["server"]["host"]
+
+    def test_app_receives_notice_without_cli_prompt(self, tmp_path, monkeypatch):
+        notice = tmp_path / "notice.txt"
+        monkeypatch.setenv("OMLX_STARTUP_NOTICE_PATH", str(notice))
+        self.write_settings()
+        _migrate_saved_network_auth(self.load(), self.args)
+        self.prompt.assert_not_called()
+        assert "127.0.0.1" in notice.read_text()
+
+    @pytest.mark.parametrize("interruption", [EOFError, KeyboardInterrupt])
+    def test_canceled_migration_preserves_settings(self, interruption):
+        before = self.write_settings()
+        self.prompt.side_effect = interruption
+        with pytest.raises(SystemExit):
+            _migrate_saved_network_auth(self.load(), self.args)
+        assert self.path.read_bytes() == before
+
+    def test_inference_opt_in_keeps_authenticated_network_bind(self):
+        self.data["auth"].update(
+            skip_api_key_verification=False, allow_unauthenticated_inference=True
+        )
+        before = self.write_settings()
+        settings = self.load()
+        _migrate_saved_network_auth(settings, self.args)
+        self.prompt.assert_not_called()
+        assert self.path.read_bytes() == before
+        assert settings.server.host == "0.0.0.0"
+        assert settings.validate() == []

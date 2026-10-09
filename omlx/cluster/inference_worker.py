@@ -16,7 +16,7 @@ import time
 from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext, suppress
 from datetime import UTC, datetime
-from functools import wraps
+from functools import partial, wraps
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -25,6 +25,7 @@ from .control_plane import RankControlPlane
 from .deployment import (
     decode_worker_contract,
     decode_worker_path_map,
+    decode_worker_stage_links,
 )
 from .jaccl_lease import acquire_jaccl_communicator_lease
 from .liveness import PeerWatchdog
@@ -43,6 +44,7 @@ from .pipeline_compat import (
 from .planner import PipelineAssignment
 from .prefill_guard import build_guard
 from .progressive_loading import install_progressive_loader
+from .rdma.stage_transport import install_stage_links
 from .runtime_optimizations import install_runtime_optimizations
 from .telemetry import install_server_telemetry
 
@@ -467,6 +469,11 @@ def _server_arguments(
         prompt_cache_size=args.prompt_cache_size,
         prompt_cache_bytes=args.prompt_cache_bytes,
         max_kv_size=args.max_kv_size,
+        # MLX-LM CLI defaults. kv_bits=None keeps KV quantization off and
+        # the generator batchable.
+        kv_bits=None,
+        kv_group_size=64,
+        quantized_kv_start=5000,
     )
 
 
@@ -487,8 +494,10 @@ def _install_distributed_model_protocol(tokenizer: Any, model_path: str | Path) 
     model_type = _distributed_model_type(model_path)
     from omlx.adapter.output_parser import (
         install_minimax_m3_tokenizer_protocol,
+        repair_tool_parser,
     )
 
+    repair_tool_parser(tokenizer)
     installed = install_minimax_m3_tokenizer_protocol(
         tokenizer,
         str(model_path),
@@ -721,6 +730,32 @@ def _watch_launcher_parent(
             logger.warning("Launcher watchdog Metal release failed", exc_info=True)
         exit_process(1)
         return
+
+
+def _exit_on_generation_failure(
+    marker: RuntimeMarker,
+    rank: int,
+    error: str,
+    *,
+    emit_event: Any = _emit_event,
+    release_memory: Any = _release_metal_memory,
+    exit_process: Any = os._exit,
+) -> None:
+    """End a rank whose MLX-LM generation thread died.
+
+    The rank cannot generate again. Exiting through the same path as the
+    watchdogs lets the launcher report the failure and lets unload proceed,
+    instead of leaving a rank that still counts the dead request as active.
+    """
+
+    reason = f"rank {rank} generation thread died: {error}"[:1000]
+    with suppress(Exception):
+        marker.update("failed", error=reason)
+    with suppress(Exception):
+        emit_event({"type": "generation_failed", "reason": reason})
+    with suppress(Exception):
+        release_memory(f"generation failure exit: {reason}")
+    exit_process(1)
 
 
 def _peer_hosts_by_rank(
@@ -1406,13 +1441,22 @@ def run_worker(args: argparse.Namespace) -> int:
             # Doing it here as well would shard every projection twice.
             measured_weight_bytes = _measured_weight_bytes(provider.model)
             _validate_measured_weight_bytes(measured_weight_bytes, assignment)
-            with install_runtime_optimizations(
-                provider.model,
-                group,
-                execution,
-                batchable=provider.is_batchable,
-                pipeline_parallel=tensor_parallel_size == 1,
-            ) as optimizations:
+            # Installed first so the runtime optimizations wrap the RDMA-aware send.
+            with (
+                install_stage_links(
+                    mx,
+                    group,
+                    decode_worker_stage_links(args.plan),
+                    rank=rank,
+                ) as stage_links,
+                install_runtime_optimizations(
+                    provider.model,
+                    group,
+                    execution,
+                    batchable=provider.is_batchable,
+                    pipeline_parallel=tensor_parallel_size == 1,
+                ) as optimizations,
+            ):
                 marker.update(
                     "ready",
                     load_stage="ready",
@@ -1430,6 +1474,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         profile.to_dict() for profile in performance_profiles
                     ],
                     optimizations=optimizations,
+                    stage_links=stage_links,
                     output_protocol=protocol or None,
                 )
                 _emit_event(
@@ -1448,6 +1493,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         "capacity_bytes": assignment.capacity_bytes,
                         "reserve_bytes": assignment.reserve_bytes,
                         "headroom_bytes": assignment.headroom_bytes,
+                        "stage_links": stage_links,
                     }
                 )
                 if rank == 0:
@@ -1504,6 +1550,9 @@ def run_worker(args: argparse.Namespace) -> int:
                             prefill_step_size=args.prefill_step_size,
                         ),
                         control_plane=control_plane,
+                        on_generation_failed=partial(
+                            _exit_on_generation_failure, marker, rank
+                        ),
                     ),
                     _bind_generation_thread_stream(
                         ResponseGenerator,

@@ -49,6 +49,8 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, List, Optional
 
+from ...prefill.packed import PackedBatch, packed_batch_of
+
 logger = logging.getLogger(__name__)
 
 # The MTP head is fed the trunk's *post-norm* hidden and chains on its own
@@ -129,8 +131,12 @@ class _PrimeCtx:
     # Committed pairs collected during ordinary decoding. None means
     # ordinary prompt priming; a list resumes an already active head.
     deferred_pairs: Optional[List[Any]] = None
+    # The pairs are deferred only to batch the prompt priming's decode folds
+    # (``_defer_decode_history``): a broken timeline drops the history, as
+    # an eager fold would, instead of failing a resumed head's handoff.
+    decode_deferred: bool = False
     # Request/prefix-cache metadata used to publish and restore one exact
-    # full-block MTP boundary snapshot.  The cache itself remains generic and
+    # MTP boundary snapshot. The cache itself remains generic and
     # treats the snapshot as an opaque sidecar.
     request_id: Optional[str] = None
     prompt_tokens: Optional[tuple[int, ...]] = None
@@ -157,7 +163,7 @@ class _PrimePlan:
 
 @dataclass
 class _MtpPrefixSnapshot:
-    """Detached MTP-head state at a backbone full-block boundary."""
+    """Detached MTP-head state at a backbone cache boundary."""
 
     boundary_tokens: int
     mtp_cache: List[Any]
@@ -674,23 +680,40 @@ def _prepare_prefix_context(
     return True
 
 
+def capture_tail_boundary(model: Any, request_id: str, boundary_tokens: int) -> None:
+    """Retain MTP history at the scheduler's current backbone tail boundary."""
+    ctx = _find_ctx(model)
+    if (
+        not isinstance(ctx, _PrimeCtx)
+        or not ctx.valid
+        or ctx.request_id != request_id
+        or ctx.expected_offset != boundary_tokens
+        or ctx.pending_hidden is None
+    ):
+        return
+    _capture_boundary_candidate(
+        ctx,
+        ctx.pending_hidden,
+        seq_start=boundary_tokens - 1,
+        seq_end=boundary_tokens,
+        boundary=boundary_tokens,
+    )
+
+
 def _capture_boundary_candidate(
     ctx: _PrimeCtx,
     normed: Any,
     *,
     seq_start: int,
     seq_end: int,
+    boundary: Optional[int] = None,
 ) -> None:
-    """Detach the newest full-block MTP boundary crossed by this chunk."""
+    """Detach a retained tail or the newest full-block boundary in this chunk."""
     block = int(ctx.block_size or 0)
-    if (
-        block <= 0
-        or ctx.prefix_cache is None
-        or not ctx.prompt_tokens
-        or seq_end < block
-    ):
+    if block <= 0 or ctx.prefix_cache is None or not ctx.prompt_tokens:
         return
-    boundary = (seq_end // block) * block
+    if boundary is None:
+        boundary = (seq_end // block) * block
     if boundary <= seq_start or boundary > len(ctx.prompt_tokens):
         return
     previous = ctx.snapshot_candidate
@@ -774,8 +797,34 @@ def _row_offsets(cache, size):
     return None
 
 
+def _capture_packed(host, inputs, normed, batch: PackedBatch) -> None:
+    """Fold each packed row into its own request's priming slot."""
+    _, state = _owned(host)
+    if state is None:
+        return
+    previous = _slot(host)
+    try:
+        for row, (start, end) in zip(batch.rows, batch.spans):
+            record = state.requests.get(row.request_id)
+            if record is None:
+                continue
+            _restore_slot(host, record)
+            _capture_single(
+                host, inputs[:, start:end], normed[:, start:end], row.cache
+            )
+            plan = _find_plan(host)
+            if plan is not None and plan.request_id in state.requests:
+                state.requests[plan.request_id] = _slot(host)
+    finally:
+        _restore_slot(host, previous)
+
+
 def maybe_capture(host, inputs, normed, cache):
     if _suppressed() or not priming_enabled():
+        return
+    batch = packed_batch_of(cache)
+    if batch is not None:
+        _capture_packed(host, inputs, normed, batch)
         return
     _, state = _owned(host)
     prefill = _PREFILL_SCOPE.get()
@@ -819,6 +868,8 @@ def maybe_capture(host, inputs, normed, cache):
                 if not valid:
                     continue
                 _restore_slot(host, record)
+                if prefill is None:
+                    _defer_decode_history(host)
                 _capture_single(
                     host,
                     inputs[row : row + 1, :valid],
@@ -881,6 +932,54 @@ def retain_batch_head_history(batch, owner):
         registry.uids[uid] = (ctx, None)
 
 
+def retain_parked_head_history(model, uid, mtp_cache, folded, pending_hidden, cache):
+    """Keep a parked singleton's committed head history for its re-entry probe.
+
+    ``pending_hidden`` is the head input of the token the park handoff just
+    fed, so the next ordinary decode token continues the same timeline.
+    """
+    if not priming_enabled():
+        return
+    host, registry = _owned(model, create=True)
+    anchor = _anchor(cache)
+    if registry is None or anchor is None or uid in registry.uids:
+        return
+    ctx = _PrimeCtx(
+        mtp_cache=mtp_cache,
+        pending_hidden=pending_hidden,
+        folded=folded,
+        expected_offset=anchor.offset,
+        deferred_pairs=[],
+    )
+    registry.uids[uid] = (ctx, None)
+
+
+# Deferred decode pairs fold once this many have collected, in one head
+# forward per row (bounds the held hidden rows: ~20 KB per token on Qwen4).
+_DEFERRED_FOLD_TOKENS = 256
+
+
+def _defer_decode_history(host):
+    """Collect a primed row's ordinary-decode pairs instead of folding them.
+
+    A batched ordinary decode step would otherwise run one MTP-head forward
+    per row per token (about 7% of an 8-row step on Qwen3.8-Flash-Next).
+    The pairs fold in chunks of ``_DEFERRED_FOLD_TOKENS`` and at activation,
+    through the same deferred-history path a parked batch uses; the head
+    history is the same sequence of committed pairs.
+    """
+    ctx = _find_ctx(host)
+    if (
+        isinstance(ctx, _PrimeCtx)
+        and ctx.deferred_pairs is None
+        and ctx.valid
+        and not ctx.window_exceeded
+        and ctx.folded > 0
+    ):
+        ctx.deferred_pairs = []
+        ctx.decode_deferred = True
+
+
 def _capture_deferred_history(host, inputs, hidden, cache):
     import mlx.core as mx
 
@@ -896,6 +995,9 @@ def _capture_deferred_history(host, inputs, hidden, cache):
         or after is None
         or ctx.expected_offset != after - count
     ):
+        if ctx.decode_deferred:
+            drop_ctx(host)
+            return True
         raise RuntimeError("Deferred head history lost its request timeline")
     if ctx.pending_hidden is None:
         paired_hidden, paired_tokens = hidden[:, :-1], inputs[:, 1:]
@@ -906,6 +1008,8 @@ def _capture_deferred_history(host, inputs, hidden, cache):
         ctx.deferred_pairs.append((paired_hidden, paired_tokens))
     ctx.pending_hidden = hidden[:, -1:]
     ctx.expected_offset = after
+    if len(ctx.deferred_pairs) >= _DEFERRED_FOLD_TOKENS:
+        _flush_deferred_history(host, ctx)
     return True
 
 
@@ -1143,12 +1247,12 @@ def _take_primed(
         return None
     drop_ctx(model)
     if not (ctx.valid and ctx.folded > 0 and ctx.pending_hidden is not None):
-        if ctx.deferred_pairs is not None:
+        if ctx.deferred_pairs is not None and not ctx.decode_deferred:
             raise RuntimeError("Deferred head history activation seam is invalid")
         return None
     offset = _activation_offset(cache) if cache_offset is None else cache_offset
     if offset is None or ctx.expected_offset != offset - 1:
-        if ctx.deferred_pairs is not None:
+        if ctx.deferred_pairs is not None and not ctx.decode_deferred:
             raise RuntimeError("Deferred head history activation seam is invalid")
         logger.debug(
             "MTP priming discarded: seam offset mismatch (ctx=%s cache=%s)",
@@ -1183,6 +1287,7 @@ __all__ = [
     "priming_enabled",
     "prime_window",
     "prepare_prefix_context",
+    "capture_tail_boundary",
     "suppress_capture",
     "maybe_capture",
     "take_primed",

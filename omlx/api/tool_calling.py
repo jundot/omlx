@@ -26,7 +26,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import regex
-from jsonschema import SchemaError, ValidationError, validate
+from jsonschema import Draft202012Validator, SchemaError, ValidationError, validate
+from jsonschema.exceptions import UndefinedTypeCheck
 
 from .openai_models import FunctionCall, ResponseFormat, ToolCall
 
@@ -43,16 +44,19 @@ def _template_safe_description(value: Any) -> str:
 
 
 def _copy_schema_with_template_defaults(value: Any, *, is_schema: bool) -> Any:
-    """Copy JSON Schema data while filling missing schema descriptions."""
+    """Copy JSON Schema with stable object order and template descriptions."""
     if isinstance(value, dict):
         copied = {}
-        for key, child in value.items():
+        # Equivalent client JSON key orders must render the same token prefix.
+        # Keep array order intact: only object member order is canonicalized.
+        for key in sorted(value):
+            child = value[key]
             if key == "properties" and isinstance(child, dict):
                 copied[key] = {
                     name: _copy_schema_with_template_defaults(
-                        prop_schema, is_schema=True
+                        child[name], is_schema=True
                     )
-                    for name, prop_schema in child.items()
+                    for name in sorted(child)
                 }
             elif key in {
                 "items",
@@ -296,6 +300,21 @@ def _repair_json_value(val: str) -> Optional[Any]:
         return None
 
 
+def _matches_union_type(value: Any, types: list) -> bool | None:
+    """Check declared alternatives, preserving malformed schemas' legacy behavior."""
+    if not types:
+        return None
+    # Native Qwen parsers can return tuples; tool-call serialization emits arrays.
+    if isinstance(value, tuple):
+        value = list(value)
+    try:
+        return any(
+            Draft202012Validator.TYPE_CHECKER.is_type(value, ptype) for ptype in types
+        )
+    except (UndefinedTypeCheck, TypeError):
+        return None
+
+
 def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
     """Convert an XML-extracted parameter value per its declared schema type.
 
@@ -307,11 +326,16 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
     spec = props.get(key)
     raw_type = spec.get("type") if isinstance(spec, dict) else None
     if not isinstance(raw_type, str):
-        # Undeclared param, union type list, or anyOf: legacy behavior.
         try:
-            return json.loads(val)
+            decoded = json.loads(val)
         except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
             return val
+        if isinstance(raw_type, list):
+            # Plain 123 remains a string for ["string", "null"].
+            matches = _matches_union_type(decoded, raw_type)
+            return val if matches is False else decoded
+        # Undeclared params and oneOf/anyOf retain best-effort JSON parsing.
+        return decoded
     if val.strip().lower() == "null":
         return None
     ptype = raw_type.strip().lower()
@@ -609,6 +633,17 @@ def _xml_element_value_end(text: str, start: int, close_tag: str, next_open: str
 # while accepting hyphens and dots in parameter names.
 _XML_PARAMETER_OPEN_RE = re.compile(r"<parameter=([\w.-]+)>")
 
+# Models sometimes drop the ``>`` of an empty parameter's open tag and emit
+# ``<parameter=name=`` or ``<parameter=name`` right before the close tag.
+_PARAMETER_OPEN_LOST_GT_RE = re.compile(
+    r"<parameter=([\w.-]+)=?(?=\s*(?:</parameter>|</function>|$))"
+)
+
+
+def repair_parameter_open_tags(text: str) -> str:
+    """Restore ``<parameter=name>`` for empty parameters that lost their ``>``."""
+    return _PARAMETER_OPEN_LOST_GT_RE.sub(r"<parameter=\1>", text)
+
 
 def _iter_xml_parameters(params_text: str) -> Iterator[Tuple[str, str]]:
     """Yield ``(key, value)`` for each ``<parameter=k>v</parameter>`` element.
@@ -850,7 +885,9 @@ def _parse_xml_tool_calls(
         func_close = content.rfind(_XML_FUNCTION_CLOSE)
         if func_open and func_close >= func_open.end():
             func_name = func_open.group(1)
-            params_text = content[func_open.end() : func_close]
+            params_text = repair_parameter_open_tags(
+                content[func_open.end() : func_close]
+            )
             props = _tool_param_properties(func_name, tools)
             arguments = {}
             for key, val in _iter_xml_parameters(params_text):
@@ -1979,6 +2016,7 @@ def _parse_tool_calls_impl(
                 matches = [p for p in parts[1:] if p.strip()]
 
             for match in matches:
+                match = repair_parameter_open_tags(match)
                 try:
                     parsed = tool_parser(match.strip(), tools)
                     # MiniMax M2 parser returns a list when a single
@@ -1987,6 +2025,33 @@ def _parse_tool_calls_impl(
                     for p in items:
                         name = p.get("name", "")
                         arguments = p.get("arguments", {})
+                        if (
+                            getattr(tool_parser, "__module__", None)
+                            in (
+                                "mlx_lm.tool_parsers.qwen3_coder",
+                                "mlx_vlm.tools.parsers.qwen3_coder",
+                            )
+                            and isinstance(arguments, dict)
+                        ):
+                            props = _tool_param_properties(name, tools)
+                            # Use XML values to avoid decoding parsed strings twice.
+                            for key, val in _iter_xml_parameters(match):
+                                spec = props.get(key)
+                                if not isinstance(spec, dict):
+                                    continue
+                                value = arguments.get(key)
+                                union_mismatch = (
+                                    isinstance(spec.get("type"), list)
+                                    and _matches_union_type(value, spec["type"])
+                                    is False
+                                )
+                                untyped_string = "type" not in spec and isinstance(
+                                    value, str
+                                )
+                                if union_mismatch or untyped_string:
+                                    arguments[key] = _coerce_param_value(
+                                        val, key, props, name
+                                    )
                         _built = _build_tool_call(name, arguments)
                         if _built is not None:
                             tool_calls.append(_built)
@@ -2195,6 +2260,15 @@ def parse_qwen_tool_calls(
             )
             if relative_end is not None:
                 function_end = function_start + relative_end
+                if (
+                    paired
+                    and found is not None
+                    and function_end < found[0]
+                    and _QWEN_OPEN_RE.search(text[function_end : found[0]])
+                ):
+                    # The outer close belongs to a later call. Split here so
+                    # the first call is not merged into the second.
+                    found = None
             elif (
                 paired
                 and found
@@ -2218,7 +2292,14 @@ def parse_qwen_tool_calls(
         else:
             end = function_end
             if end is None or (
-                paired and (finish_reason != "stop" or text[end:].strip())
+                paired
+                and (
+                    finish_reason != "stop"
+                    or (
+                        bool(text[end:].strip())
+                        and _QWEN_OPEN_RE.match(text[end:].lstrip()) is None
+                    )
+                )
             ):
                 errors.append("incomplete")
                 pos = len(text)
@@ -2300,7 +2381,11 @@ def extract_tool_calls_with_thinking(
     if (
         finish_reason is not None
         and tools
-        and getattr(parser, "__module__", None) == "mlx_lm.tool_parsers.qwen3_coder"
+        and getattr(parser, "__module__", None)
+        in (
+            "mlx_lm.tool_parsers.qwen3_coder",
+            "mlx_vlm.tools.parsers.qwen3_coder",
+        )
     ):
         cleaned_text, tool_calls, parse_errors = parse_qwen_tool_calls(
             regular_content, tokenizer, tools, finish_reason
@@ -2533,6 +2618,35 @@ class ToolCallStreamFilter:
         candidate = self._recovery_candidate
         self._recovery_candidate = ""
         return candidate
+
+    def recovery_candidate_is_payload(self) -> bool:
+        """Whether the withheld tail holds a truncated call, not quoted prose.
+
+        Unsure cases count as calls, so they keep failing instead of leaking
+        call markup. Read it before ``take_recovery_candidate``.
+        """
+        tail = self._recovery_candidate
+        if not tail:
+            return False
+        if self._opens_payload_at(tail, 0):
+            return True
+        start = len(self._opener_at(tail, 0))
+        # A declared tool name is call evidence in any call format.
+        for name in self._registered_tool_names:
+            if re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", tail[start:]):
+                return True
+        # One forward cursor per marker keeps marker-heavy tails linear.
+        cursors = {
+            marker: tail.find(marker, start)
+            for marker, _close in self._marker_pairs
+            if marker
+        }
+        while found := [(i, m) for m, i in cursors.items() if i != -1]:
+            index, marker = min(found)
+            if self._opens_payload_at(tail, index):
+                return True
+            cursors[marker] = tail.find(marker, index + len(marker))
+        return False
 
     def take_completed_envelopes(self) -> List[str]:
         """Return complete suppressed envelopes ready for exact parsing.
@@ -3033,6 +3147,7 @@ class ToolCallStreamFilter:
     def _partial_suffix_len(self, text: str) -> int:
         """Length of trailing suffix that might be an opening-marker prefix."""
         keep = 0
+        cap = 128
         for marker, _close in self._marker_pairs:
             keep = max(keep, self._partial_prefix_len(text, marker))
 
@@ -3042,7 +3157,11 @@ class ToolCallStreamFilter:
             if self._could_be_partial_namespaced_open(
                 candidate
             ) or self._could_be_partial_attr_function_open(candidate):
-                keep = max(keep, len(candidate))
+                # Open tags grow with the tool or namespace name, so widen the
+                # window to keep a long tag whole until it closes.
+                longest = max((len(n) for n in self._registered_tool_names), default=0)
+                cap = max(cap, 512, longest + 64)
+                keep = max(keep, min(len(candidate), cap))
 
         # Partial prefix detection for bracket markers (e.g. "[", "[C",
         # "[Cal" could be start of "[Calling tool:" or "[Tool call:").
@@ -3072,7 +3191,7 @@ class ToolCallStreamFilter:
                 return keep
 
         # Cap retained suffix window to avoid unbounded buffering on malformed text.
-        return min(keep, 128)
+        return min(keep, cap)
 
     def _should_drop_tail_at_finish(self, tail: str) -> bool:
         """Whether unresolved tail should be suppressed under strict mode."""
@@ -3162,6 +3281,30 @@ class ToolCallStreamFilter:
             cursor = close_idx + 1
 
         return "".join(out)
+
+    def _opener_at(self, text: str, index: int) -> str:
+        """Return the longest opening marker at ``index``, or ``""``."""
+        return max(
+            (m for m, _close in self._marker_pairs if m and text.startswith(m, index)),
+            key=len,
+            default="",
+        )
+
+    def _opens_payload_at(self, text: str, index: int) -> bool:
+        """Whether the opener at ``index`` starts a call payload, not prose.
+
+        A model that quotes a control marker in prose fails parsing the same
+        way as a truncated call, so the text after the marker decides.
+        """
+        opener = self._opener_at(text, index)
+        if opener == _XML_FUNCTION_OPEN:
+            return True
+        pos = index + len(opener)
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        if pos >= len(text) or text[pos] in "<{[":
+            return True
+        return text.startswith("call:", pos)
 
     def _unwind_withheld_at_eof(
         self, candidate: str, marker: str, start_marker: str
@@ -3611,22 +3754,30 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     """
     Extract JSON from model output text.
 
-    Tries multiple strategies:
-    1. Parse entire text as JSON
-    2. Extract JSON from markdown code blocks
-    3. Find JSON object/array in text
-
     Args:
         text: Raw model output text
 
     Returns:
         Parsed JSON data, or None if no valid JSON found
     """
+    extracted = _extract_json_span(text)
+    return extracted[0] if extracted is not None else None
+
+
+def _extract_json_span(text: str) -> Optional[Tuple[Any, str]]:
+    """
+    Extract JSON from model output text, with the exact text it was parsed from.
+
+    Tries multiple strategies:
+    1. Parse entire text as JSON
+    2. Extract JSON from markdown code blocks
+    3. Find JSON object/array in text
+    """
     text = text.strip()
 
     # Strategy 1: Try to parse entire text as JSON
     try:
-        return json.loads(text)
+        return json.loads(text), text
     except (json.JSONDecodeError, *_DEEP_NEST_ERRORS):
         pass
 
@@ -3635,8 +3786,9 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     code_block_pattern = r"```(?:json)?\s*([\s\S]*?)\s*```"
     matches = re.findall(code_block_pattern, text)
     for match in matches:
+        candidate = match.strip()
         try:
-            return json.loads(match.strip())
+            return json.loads(candidate), candidate
         except (json.JSONDecodeError, *_DEEP_NEST_ERRORS):
             continue
 
@@ -3650,7 +3802,7 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
         match = re.search(pattern, text)
         if match:
             try:
-                return json.loads(match.group(1))
+                return json.loads(match.group(1)), match.group(1)
             except (json.JSONDecodeError, *_DEEP_NEST_ERRORS):
                 continue
 
@@ -3671,7 +3823,8 @@ def parse_json_output(
 
     Returns:
         Tuple of (cleaned_text, parsed_json, is_valid, error_message)
-        - cleaned_text: Original text (preserved for reference)
+        - cleaned_text: Exact JSON text extracted from the output, or the
+          original text if extraction failed
         - parsed_json: Extracted JSON data, or None if extraction failed
         - is_valid: True if JSON is valid (and matches schema if specified)
         - error_message: Error description if invalid, None if valid
@@ -3700,10 +3853,12 @@ def parse_json_output(
         return text, None, True, None
 
     # json_object or json_schema - extract JSON
-    parsed = extract_json_from_text(text)
-
-    if parsed is None:
+    extracted = _extract_json_span(text)
+    if extracted is None or extracted[0] is None:
         return text, None, False, "Failed to extract valid JSON from output"
+    # Return the model's own JSON text. Re-serializing it would change
+    # formatting and escapes.
+    parsed, text = extracted
 
     # json_object - just verify it's valid JSON (already done by extraction)
     if format_type == "json_object":

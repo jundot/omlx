@@ -68,6 +68,7 @@ from omlx.oq import (
     _should_quantize_tensor,
     _source_imatrix_signature,
     _source_has_nextn_tensors,
+    _source_weight_files,
     _TrackedTensor,
     _validate_oq_dtype_for_model,
     _uses_minimax_mxfp8_scale_inv_source,
@@ -538,6 +539,9 @@ class TestHelpers:
 
     def test_is_moe_router_router(self):
         assert _is_moe_router("model.layers.0.block_sparse_moe.router") is True
+
+    def test_is_moe_router_gemma4_router_proj(self):
+        assert _is_moe_router("language_model.model.layers.0.router.proj") is True
 
     def test_is_moe_router_gate_proj_not_router(self):
         assert _is_moe_router("model.layers.0.mlp.gate_proj") is False
@@ -1173,6 +1177,13 @@ class TestStreamingHelpers:
         config = {"num_hidden_layers": 32, "num_local_experts": 8}
         bits, gs, mode = _get_predicate_bits("model.layers.0.mlp.gate", config, 4, 64)
         assert bits is None  # Router → fp16 (not quantized)
+
+    def test_get_predicate_bits_gemma4_router_fp16(self):
+        config = {"num_hidden_layers": 30, "text_config": {"num_experts": 128}}
+        bits, gs, mode = _get_predicate_bits(
+            "language_model.model.layers.0.router.proj.weight", config, 4, 64
+        )
+        assert bits is None
 
     def test_get_predicate_bits_default_affine4(self):
         config = {"num_hidden_layers": 32}
@@ -2197,6 +2208,38 @@ class TestLazyTensorIndex:
         del idx["layer.0.weight"]
         assert "layer.0.weight" not in idx
 
+    @pytest.fixture
+    def scalar_sf_file(self, tmp_path):
+        # Gemma 4 audio-tower clamp bounds are 0-dim BF16 (0x414D == 12.8125).
+        import struct
+
+        path = tmp_path / "scalars.safetensors"
+        tensors = {
+            "audio_tower.input_max": (struct.pack("<H", 0x414D), [], "BF16"),
+            "layer.0.weight": np.random.randn(4, 8).astype(np.float16),
+        }
+        _write_safetensors(str(path), tensors)
+        return str(path)
+
+    def test_scalar_items_getitem_and_pop(self, scalar_sf_file):
+        idx = _LazyTensorIndex([scalar_sf_file])
+        key = "audio_tower.input_max"
+        loaded = [dict(idx.items())[key], idx[key], idx.pop(key)]
+        for arr in loaded:
+            assert arr.shape == ()
+            assert arr.dtype == mx.bfloat16
+            assert arr.item() == 12.8125
+
+    def test_scalar_through_discovered_plan(self, scalar_sf_file):
+        idx = _LazyTensorIndex([scalar_sf_file])
+        plan = _discover_sanitize_plan(
+            lambda weights: {"m." + k: v for k, v in weights.items()}, idx
+        )
+        assert plan is not None
+        arr = _DiscoveredPlan(plan, idx).pop("m.audio_tower.input_max")
+        assert arr.shape == ()
+        assert arr.item() == 12.8125
+
 
 # =============================================================================
 # Test _quantize_chunked
@@ -2921,39 +2964,6 @@ class TestDiscoverSanitizePlan:
         )
         np.testing.assert_array_equal(
             np.array(discovered.pop("switch.down.weight")), expected_down
-        )
-
-    def test_conditional_mtp_norm_add_materializes_by_mean(self, tmp_path):
-        path = tmp_path / "mtp_norms.safetensors"
-        tensors = {
-            "raw.weight": np.full((8,), 0.04, dtype=np.float16),
-            "shifted.weight": np.full((8,), 1.27, dtype=np.float16),
-        }
-        _write_safetensors(str(path), tensors)
-        idx = _LazyTensorIndex([str(path)])
-
-        plan = {
-            "raw.weight": {
-                "sources": ["raw.weight"],
-                "transform": "add_if_mean_lt_0_5",
-                "shape": (8,),
-                "axis": None,
-            },
-            "shifted.weight": {
-                "sources": ["shifted.weight"],
-                "transform": "add_if_mean_lt_0_5",
-                "shape": (8,),
-                "axis": None,
-            },
-        }
-        discovered = _DiscoveredPlan(plan, idx)
-
-        raw = discovered.pop("raw.weight")
-        shifted = discovered.pop("shifted.weight")
-
-        assert float(raw.astype(mx.float32)[0].item()) == pytest.approx(1.04, abs=1e-3)
-        assert float(shifted.astype(mx.float32)[0].item()) == pytest.approx(
-            1.27, abs=1e-3
         )
 
 
@@ -4414,6 +4424,65 @@ class TestEstimateBpwHeaderOnly:
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestQuantizeOqStreamingPassthroughDtypes:
+    def test_clef_joint_head_is_copied_beside_an_indexed_backbone(self, tmp_path):
+        """The Clef decision head is not a backbone weight. It must stay out of
+        the quantized shards, and a single-shard output still needs an index
+        so mlx-vlm does not load every *.safetensors file."""
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        hidden = 64
+        np_save(
+            {
+                "model.layers.0.input_layernorm.weight": np.ones(
+                    hidden, dtype=np.float32
+                ),
+                "model.layers.0.self_attn.q_proj.weight": np.ones(
+                    (hidden, hidden), dtype=np.float32
+                ),
+            },
+            str(src / "model.safetensors"),
+        )
+        np_save(
+            {
+                "layers.0.linear1.weight": np.ones((hidden, hidden), dtype=np.float32),
+                "hidden_norm.weight": np.ones(hidden, dtype=np.float32),
+            },
+            str(src / "joint_head.safetensors"),
+        )
+        (src / "joint_head_config.json").write_text('{"hidden_size": 64}')
+        (src / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["TestModelForCausalLM"],
+                    "model_type": "test_passthrough",
+                    "num_hidden_layers": 1,
+                    "hidden_size": hidden,
+                    "vocab_size": 256,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (src / "oq_sensitivity_map.json").write_text(
+            json.dumps({"0": 0.1}), encoding="utf-8"
+        )
+        assert [f.name for f in _source_weight_files(src)] == ["model.safetensors"]
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        index = json.loads((out / "model.safetensors.index.json").read_text())
+        assert set(index["weight_map"]) == {
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.q_proj.scales",
+            "model.layers.0.self_attn.q_proj.biases",
+        }
+        assert set(index["weight_map"].values()) == {"model.safetensors"}
+        for name in ("joint_head.safetensors", "joint_head_config.json"):
+            assert (out / name).read_bytes() == (src / name).read_bytes()
+
     def test_float16_keeps_vision_audio_passthrough_tensors_float32(self, tmp_path):
         """Protected VLM/audio tensors must not be saved as FP16."""
         from safetensors.numpy import save_file as np_save
@@ -5612,17 +5681,14 @@ class TestMeasureSensitivityVlmMtp:
         mock_set_active.assert_not_called()
 
     def test_text_load_forwards_trust_remote_code(self, monkeypatch):
-        """Text sensitivity load forwards the mlx-lm custom-code opt-in when
-        the installed mlx-lm supports it."""
+        """Text sensitivity load forwards the mlx-lm custom-code opt-in."""
         import omlx.utils.model_loading as real_ml
 
         self._patch_common(monkeypatch, has_mtp=True)
         mock_load = MagicMock(return_value=(MagicMock(), MagicMock()))
         monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(load=mock_load))
         # _patch_common swapped model_loading for a MagicMock; oq imports
-        # lm_load_compat from it. Expose the real shim and pin the capability
-        # flag so forwarding is deterministic regardless of installed mlx-lm.
-        monkeypatch.setattr(real_ml, "_LM_LOAD_ACCEPTS_TRC", True)
+        # lm_load_compat from it, so expose the real shim.
         sys.modules["omlx.utils.model_loading"].lm_load_compat = real_ml.lm_load_compat
 
         _measure_sensitivity(
@@ -5636,14 +5702,13 @@ class TestMeasureSensitivityVlmMtp:
 
 
 class TestCollectImatrixTextLoad:
-    def test_uses_compat_loader_without_trust_remote_code(self, monkeypatch):
-        """oQe calibration works with current mlx-lm, which removed this kwarg."""
+    def test_uses_compat_loader_with_trust_remote_code(self, monkeypatch):
+        """oQe calibration forwards the custom-code opt-in to mlx-lm."""
         from omlx import oq as oq_mod
         import omlx.utils.model_loading as real_ml
 
         mock_load = MagicMock(return_value=(MagicMock(), MagicMock()))
         monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(load=mock_load))
-        monkeypatch.setattr(real_ml, "_LM_LOAD_ACCEPTS_TRC", False)
         monkeypatch.setattr(real_ml, "_has_mtp_heads", MagicMock(return_value=False))
         monkeypatch.setattr(
             real_ml, "_checkpoint_has_mtp_weights", MagicMock(return_value=False)
@@ -5655,7 +5720,7 @@ class TestCollectImatrixTextLoad:
 
         oq_mod._collect_imatrix("/fake/text", {}, trust_remote_code=True)
 
-        assert "trust_remote_code" not in mock_load.call_args.kwargs
+        assert mock_load.call_args.kwargs["trust_remote_code"] is True
 
     def test_vlm_proxy_passes_lenient_load_directly(self, monkeypatch):
         """SSD-mapped proxy tensors are not normal model parameters.

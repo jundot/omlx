@@ -66,8 +66,15 @@ def _make_model(
 
 @pytest.fixture(autouse=True)
 def _restore_call(monkeypatch):
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+
     monkeypatch.delenv("OMLX_QWEN35_MOE_GATE_UP", raising=False)
     orig = getattr(SwitchGLU, "_omlx_gate_up_original_call", SwitchGLU.__call__)
+    monkeypatch.setattr(
+        Qwen3_5BatchInvariantForward,
+        "_switch_glu",
+        Qwen3_5BatchInvariantForward._switch_glu,
+    )
     yield
     SwitchGLU.__call__ = orig
     for attr in ("_omlx_gate_up_fused_call", "_omlx_gate_up_original_call"):
@@ -292,3 +299,127 @@ def test_vlm_fused_projection_views_cross_execution_threads():
         glu = loader.submit(load).result()
     with ThreadPoolExecutor(max_workers=1) as decoder:
         assert decoder.submit(verify, glu).result()
+
+
+@pytest.mark.parametrize("bits,dtype", [(4, mx.bfloat16), (5, mx.float16)])
+@pytest.mark.parametrize("batch,length", [(1, 3), (2, 6), (16, 2)])
+def test_vlm_fused_short_block_matches_verifier_without_copying_views(
+    monkeypatch, bits, dtype, batch, length
+):
+    from mlx_vlm.models import fast_ops
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+    from mlx_vlm.models.switch_layers import SwitchGLU as VLMSwitchGLU
+
+    mx.random.seed(19)
+    glu = VLMSwitchGLU(512, 64, 8)
+    glu.set_dtype(dtype)
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        setattr(glu, name, getattr(glu, name).to_quantized(32, bits))
+    glu.eval()
+    verifier = Qwen3_5BatchInvariantForward()
+    x = mx.random.normal((batch, length, 512)).astype(dtype)
+    indices = mx.random.randint(0, 8, (batch, length, 6))
+    expected_head = glu(x, indices)
+    expected_verify = verifier._switch_glu(glu, x, indices)
+    mx.eval(expected_head, expected_verify)
+
+    model = _FakeQwen4Model()
+    model.named_modules = lambda: [("experts", glu)]
+    assert apply_qwen35_moe_gate_up_fusion(model) == 1
+
+    def reject_view_kernel(*args):
+        pytest.fail("Fused verification must not materialize gate/up views")
+
+    monkeypatch.setattr(fast_ops, "exact_affine_switch_gate_up", reject_view_kernel)
+    head = glu(x, indices)
+    verified = verifier._switch_glu(glu, x, indices)
+    mx.eval(head, verified)
+    assert mx.array_equal(head, expected_head).item()
+    assert mx.array_equal(verified, expected_verify).item()
+
+
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+def test_expert_ordered_verify_gather_matches_gather_qmm(bits):
+    from mlx_vlm.models.switch_layers import SwitchLinear as VLMSwitchLinear
+
+    from omlx.patches import moe_verify_gather
+
+    mx.random.seed(bits)
+    experts, top_k = 16, 10
+    # K = 1024 takes the qmv_fast traversal, K = 320 the qmv one with a tail.
+    for k, n in ((1024, 64), (320, 1024)):
+        linear = VLMSwitchLinear(k, n, experts, bias=False)
+        linear.set_dtype(mx.bfloat16)
+        linear = linear.to_quantized(group_size=32, bits=bits)
+        assert moe_verify_gather.supported(linear, mx.bfloat16)
+        for rows in (2, 8):
+            indices = mx.stack(
+                [mx.random.permutation(experts)[:top_k] for _ in range(rows)]
+            ).astype(mx.uint32)
+            x = mx.random.normal((rows, k)).astype(mx.bfloat16)
+            expected = mx.gather_qmm(
+                mx.expand_dims(x, (-2, -3)),
+                linear["weight"],
+                linear["scales"],
+                linear["biases"],
+                rhs_indices=indices,
+                transpose=True,
+                group_size=32,
+                bits=bits,
+            ).reshape(rows * top_k, n)
+            got = moe_verify_gather.gather_qmv(linear, x, indices.reshape(-1), top_k)
+            assert mx.array_equal(got, expected).item()
+
+
+def _vlm_decode_switch(bits, seed):
+    from mlx_vlm.models.switch_layers import SwitchGLU as VLMSwitchGLU
+
+    mx.random.seed(seed)
+    glu = VLMSwitchGLU(2560, 640, 16)
+    glu.set_dtype(mx.bfloat16)
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        setattr(glu, name, getattr(glu, name).to_quantized(64, bits))
+    glu.eval()
+    model = _FakeQwen4Model()
+    model.named_modules = lambda: [("experts", glu)]
+    assert apply_qwen35_moe_gate_up_fusion(model) == 1
+    return glu
+
+
+def _assert_decode_plan_matches_per_call(monkeypatch, glu, seed):
+    mx.random.seed(seed)
+    for batch in (1, 3):
+        x = (mx.random.normal((batch, 1, 2560)) * 0.5).astype(mx.bfloat16)
+        idx = mx.random.randint(0, 16, shape=(batch, 1, 10)).astype(mx.uint32)
+        monkeypatch.setattr(patch_mod, "_DECODE_PLAN_ENABLED", False)
+        ref = glu(x, idx)
+        mx.eval(ref)
+        monkeypatch.setattr(patch_mod, "_DECODE_PLAN_ENABLED", True)
+        out = glu(x, idx)
+        mx.eval(out)
+        assert out.shape == ref.shape and out.dtype == ref.dtype == mx.bfloat16
+        assert mx.array_equal(out.view(mx.uint16), ref.view(mx.uint16)).item()
+
+
+@pytest.mark.parametrize("bits", [4, 5])
+@pytest.mark.parametrize("seed", [1, 2])
+def test_vlm_decode_plan_is_bit_identical_to_per_call_path(monkeypatch, bits, seed):
+    glu = _vlm_decode_switch(bits, seed)
+    _assert_decode_plan_matches_per_call(monkeypatch, glu, seed)
+
+
+def test_vlm_decode_plan_follows_replaced_experts(monkeypatch):
+    from mlx_vlm.models.switch_layers import SwitchLinear as VLMSwitchLinear
+
+    glu = _vlm_decode_switch(5, 3)
+    _assert_decode_plan_matches_per_call(monkeypatch, glu, 3)
+    down = VLMSwitchLinear(640, 2560, 16, bias=False)
+    down.set_dtype(mx.bfloat16)
+    glu.down_proj = down.to_quantized(64, 4)
+    _assert_decode_plan_matches_per_call(monkeypatch, glu, 4)
+    gate_up = glu.gate_up_proj
+    gate_up.weight = mx.random.randint(
+        0, 2**32 - 1, gate_up.weight.shape, dtype=mx.uint32
+    )
+    gate_up.scales = (gate_up.scales * 0.5).astype(gate_up.scales.dtype)
+    _assert_decode_plan_matches_per_call(monkeypatch, glu, 5)

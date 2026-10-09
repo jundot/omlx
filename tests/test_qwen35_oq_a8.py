@@ -442,6 +442,40 @@ def test_unsupported_bit_widths_are_not_claimed(bits):
     assert dispatch.classify_linear(_quantized_linear(256, 128, bits)) is None
 
 
+@requires_kernels
+@pytest.mark.parametrize(
+    "bits, kernel", [(4, "q4a8_g64"), (5, "q5a8_g64")]
+)
+def test_q4_and_q5_gs64_projections_get_an_a8_plan(bits, kernel):
+    """The supported dense contract: affine Q4 and Q5 at GS64 route to A8."""
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    plan = dispatch.classify_linear(_quantized_linear(256, 128, bits))
+    assert plan is not None
+    assert (plan.bits, plan.group_size, plan.kernel) == (bits, 64, kernel)
+
+
+@pytest.mark.parametrize("bits", [6, 8])
+def test_q6_and_q8_projections_have_no_a8_plan(bits):
+    """Q6/Q8 stay on the A16 path, at either supported group size."""
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    for group_size in (64, 128):
+        linear = _quantized_linear(256, 128, bits, group_size=group_size)
+        assert dispatch.classify_linear(linear) is None
+
+
+@requires_kernels
+@pytest.mark.parametrize("bits", [4, 5])
+def test_output_width_that_does_not_tile_has_no_a8_plan(bits):
+    """N must be a multiple of the tile width (64). Qwen3.8's linear-attention
+    in_proj_a / in_proj_b are N=48, so those projections stay on the A16 path."""
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    assert dispatch.classify_linear(_quantized_linear(256, 48, bits)) is None
+    assert dispatch.classify_linear(_quantized_linear(256, 64, bits)) is not None
+
+
 def test_group_size_128_is_not_claimed():
     from omlx.patches import qwen35_oq_a8 as dispatch
 
@@ -588,6 +622,55 @@ def test_v8_tiles_agree_with_each_other(variant, bits):
         rtol=0,
         atol=0,
     )
+
+
+@requires_kernels
+@pytest.mark.parametrize("variant", [800, 801, 802, 803, 804, 805, 806])
+@pytest.mark.parametrize("act_mode", [0, 1])
+def test_packed_linear_matches_the_row_major_layout(variant, act_mode):
+    """A PackedLinear routes to A8 and computes exactly what its source did.
+
+    Two projections share one store, so the second reads from a tile offset.
+    """
+    import mlx.nn as nn
+
+    from omlx.patches import qwen35_oq_a8 as dispatch
+    from omlx.patches.qwen35_packed_linear import _pack
+
+    fast = _kernels()
+    M, K, N = 96, 512, 384
+    sources = []
+    for _ in range(2):
+        linear = nn.QuantizedLinear(K, N, bias=False, group_size=64, bits=4)
+        linear.set_dtype(mx.bfloat16)
+        sources.append(linear)
+    packed = _pack(sources)
+    rng = np.random.default_rng(9)
+    x = mx.array((rng.standard_normal((M, K)) * 0.5).astype(np.float32), mx.bfloat16)
+    qa, sa, ra = fast.qwen35_oq_a8_stage_a_v8(x, act_mode)
+
+    for source, linear in zip(sources, packed):
+        plan = dispatch.classify_linear(linear)
+        assert plan is not None and plan.packed and plan.bits == 4
+        want = fast.qwen35_oq_a8_qmm_t(
+            qa,
+            sa,
+            ra,
+            source.weight,
+            mx.contiguous(source.scales.T),
+            mx.contiguous(source.biases.T),
+            4,
+            act_mode,
+            variant,
+        )
+        weight, scales, biases = dispatch._prepared_weights(linear)
+        got = fast.qwen35_oq_a8_qmm_t(
+            qa, sa, ra, weight, scales, biases, 4, act_mode, variant, packed=True
+        )
+        mx.eval(want, got)
+        np.testing.assert_array_equal(
+            np.array(got.astype(mx.float32)), np.array(want.astype(mx.float32))
+        )
 
 
 @requires_kernels

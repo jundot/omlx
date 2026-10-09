@@ -57,6 +57,24 @@ class DeepseekV41Cache(ArraysCache):
     def extract(self, idx):
         result = type(self)(self.compress_ratio)
         result.cache = [x[idx : idx + 1] if x is not None else None for x in self.cache]
+        ratio = self.compress_ratio
+        if result.cache[0] is None or ratio is None:
+            return result
+        # extend() pads every slot to the widest row; a padded row fails the
+        # cumulative-state checks in the prefix cache, so trim to this row's
+        # own offset. The window keeps min(offset, width) rows.
+        offset = int(result.cache[0].item())
+        limits = {
+            1: offset,
+            2: offset // ratio if ratio else 0,
+            3: offset // ratio if ratio else 0,
+            4: offset % ratio if ratio > 1 else 0,
+            5: offset % ratio if ratio > 1 else 0,
+        }
+        for slot, limit in limits.items():
+            value = result.cache[slot]
+            if value is not None and value.ndim > 1 and value.shape[1] > limit:
+                result.cache[slot] = value[:, :limit]
         return result
 
     @classmethod

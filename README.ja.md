@@ -96,7 +96,7 @@ Python 3.10+とApple Silicon（M1/M2/M3/M4/M5）が必要です。
 
 ### macOSアプリ
 
-ApplicationsフォルダからoMLXを起動します。ウェルカム画面が3つのステップを案内します — モデルディレクトリの設定、サーバー起動、最初のモデルダウンロード。以上です。OpenClaw、OpenCode、Codex、Hermes Agent、Copilotに接続するには、[統合](#統合)を参照してください。
+ApplicationsフォルダからoMLXを起動します。ウェルカム画面が3つのステップを案内します — モデルディレクトリの設定、サーバー起動、最初のモデルダウンロード。以上です。OpenClaw、OpenCode、Codex、Hermes Agent、Copilot、DeepSeek Harnessに接続するには、[統合](#統合)を参照してください。
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.36.32.png" alt="oMLX ウェルカム画面" width="360">
@@ -161,7 +161,7 @@ mlx-lmのBatchGeneratorを通じて同時リクエストを処理します。最
 
 ### Claude Code最適化
 
-Claude Codeで小さなコンテキストモデルを実行するためのコンテキストスケーリングをサポートします。報告されるトークン数をスケーリングすることで自動圧縮が適切なタイミングでトリガーされ、長いプリフィル中の読み取りタイムアウトを防ぐSSE keep-aliveを提供します。
+Claude Codeで小さなコンテキストモデルを実行するため、トークン数をスケーリングする代わりにモデルの実際のコンテキストウィンドウで自動圧縮を制御し、長いプリフィル中の読み取りタイムアウトを防ぐSSE keep-aliveを提供します。
 
 ### マルチモデルサービング
 
@@ -204,7 +204,7 @@ Claude Codeで小さなコンテキストモデルを実行するためのコン
 
 ### 統合
 
-管理画面からOpenClaw、OpenCode、Codex、Hermes Agent、Copilot、Piをワンクリックで設定できます。設定ファイルを手動で編集する必要はありません。
+管理画面からOpenClaw、OpenCode、Codex、Hermes Agent、Copilot、Pi、DeepSeek Harnessをワンクリックで設定できます。設定ファイルを手動で編集する必要はありません。
 
 <p align="center">
   <img src="docs/images/omlx_integrations.png" alt="oMLX 統合" width="720">
@@ -228,7 +228,7 @@ Claude Codeで小さなコンテキストモデルを実行するためのコン
 
 ### API互換性
 
-OpenAIとAnthropic APIのドロップイン代替です。ストリーミング使用統計（`stream_options.include_usage`）、Anthropic adaptive thinking、ビジョン入力（base64、URL）をサポートします。
+OpenAIとAnthropic APIのドロップイン代替です。ストリーミング使用統計（`stream_options.include_usage`）、llama.cpp互換のprefill進捗（`return_progress`）、Anthropic adaptive thinking、ビジョン入力（base64、URL）をサポートします。
 
 | エンドポイント | 説明 |
 |----------|------|
@@ -237,7 +237,9 @@ OpenAIとAnthropic APIのドロップイン代替です。ストリーミング�
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/embeddings` | テキストエンベディング |
 | `POST /v1/rerank` | ドキュメントリランキング |
+| `POST /v1/systemone` | Decision モデルによる型付き判定 (TypeSafe System One) |
 | `GET /v1/models` | 利用可能なモデル一覧 |
+| `POST /tokenize`, `POST /detokenize` | vLLM 互換トークナイザー API（`/v1` 配下でも利用可） |
 
 ### ツール呼び出し＆構造化出力
 
@@ -276,8 +278,9 @@ mlx-lmで利用可能なすべての関数呼び出し形式、JSONスキーマ�
 | LLM | [mlx-lm](https://github.com/ml-explore/mlx-lm)がサポートするすべてのモデル |
 | VLM | Qwen3.5シリーズ、GLM-4V、Pixtralおよびその他の[mlx-vlm](https://github.com/Blaizzy/mlx-vlm)モデル |
 | OCR | DeepSeek-OCR、DOTS-OCR、GLM-OCR |
-| エンベディング | BERT、BGE-M3、ModernBERT |
+| エンベディング | BERT、BGE-M3、ModernBERT、EmbeddingGemma 2 |
 | リランカー | ModernBERT、XLM-RoBERTa |
+| Decision | Clef、Clef-Flash、OpenJev |
 
 ## CLI 設定
 
@@ -317,7 +320,8 @@ FastAPI Server (OpenAI / Anthropic API)
     │   ├── BatchedEngine (LLM、連続バッチング)
     │   ├── VLMEngine (ビジョン言語モデル)
     │   ├── EmbeddingEngine
-    │   └── RerankerEngine
+    │   ├── RerankerEngine
+    │   └── DecisionEngine
     │
     ├── ProcessMemoryEnforcer (合計メモリ制限、TTLチェック)
     │

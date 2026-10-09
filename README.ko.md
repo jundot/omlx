@@ -111,7 +111,7 @@ macOS 15.0+ (Sequoia), Python 3.11–3.13, Apple Silicon (M1/M2/M3/M4/M5)이 필
 
 ### macOS 앱
 
-Applications 폴더에서 oMLX를 실행하세요. 환영 화면에서 세 단계만 따라하면 됩니다 — 모델 디렉토리 설정, 서버 시작, 첫 모델 다운로드. 끝입니다. OpenClaw, OpenCode, Codex, Hermes Agent, Copilot에 연결하려면 [통합](#통합)을 참조하세요.
+Applications 폴더에서 oMLX를 실행하세요. 환영 화면에서 세 단계만 따라하면 됩니다 — 모델 디렉토리 설정, 서버 시작, 첫 모델 다운로드. 끝입니다. OpenClaw, OpenCode, Codex, Hermes Agent, Copilot, DeepSeek Harness에 연결하려면 [통합](#통합)을 참조하세요.
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.36.32.png" alt="oMLX 환영 화면" width="360">
@@ -198,7 +198,7 @@ mlx-lm의 BatchGenerator를 통해 동시 요청을 처리합니다. 최대 동�
 
 ### Claude Code 최적화
 
-Claude Code에서 작은 컨텍스트 모델을 실행하기 위한 컨텍스트 스케일링을 지원합니다. Claude code에 리포팅되는 토큰 수를 스케일링하여 자동 Compact가 적절한 타이밍에 트리거되고, 긴 프리필 동안 읽기 타임아웃을 방지하는 SSE keep-alive를 제공합니다.
+Claude Code에서 작은 컨텍스트 모델을 실행할 수 있도록 토큰 수를 스케일링하는 대신 모델의 실제 컨텍스트 윈도우를 기준으로 자동 Compact를 트리거하고, 긴 프리필 동안 읽기 타임아웃을 방지하는 SSE keep-alive를 제공합니다.
 
 ### 멀티 모델 서빙
 
@@ -241,7 +241,7 @@ Claude Code에서 작은 컨텍스트 모델을 실행하기 위한 컨텍스트
 
 ### 통합
 
-관리자 대시보드에서 OpenClaw, OpenCode, Codex, Hermes Agent, Copilot, Pi를 원클릭으로 설정합니다. 설정 파일을 수동으로 편집할 필요가 없습니다.
+관리자 대시보드에서 OpenClaw, OpenCode, Codex, Hermes Agent, Copilot, Pi, DeepSeek Harness를 원클릭으로 설정합니다. 설정 파일을 수동으로 편집할 필요가 없습니다.
 
 <p align="center">
   <img src="docs/images/omlx_integrations.png" alt="oMLX 통합" width="720">
@@ -265,7 +265,7 @@ Claude Code에서 작은 컨텍스트 모델을 실행하기 위한 컨텍스트
 
 ### API 호환성
 
-OpenAI 및 Anthropic API를 그대로 대체합니다. 스트리밍 사용량 통계 (`stream_options.include_usage`), Anthropic adaptive thinking, 비전 입력 (base64, URL)을 지원합니다.
+OpenAI 및 Anthropic API를 그대로 대체합니다. 스트리밍 사용량 통계 (`stream_options.include_usage`), llama.cpp 방식 prefill 진행률 (`return_progress`), Anthropic adaptive thinking, 비전 입력 (base64, URL)을 지원합니다.
 
 | 엔드포인트 | 설명 |
 |----------|------|
@@ -274,7 +274,9 @@ OpenAI 및 Anthropic API를 그대로 대체합니다. 스트리밍 사용량 �
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/embeddings` | 텍스트 임베딩 |
 | `POST /v1/rerank` | 문서 리랭킹 |
+| `POST /v1/systemone` | Decision 모델의 타입별 판단 (TypeSafe System One) |
 | `GET /v1/models` | 사용 가능한 모델 목록 |
+| `POST /tokenize`, `POST /detokenize` | vLLM 호환 토크나이저 API (`/v1` 경로도 지원) |
 
 ### Tool calling & 구조화된 출력
 
@@ -313,8 +315,9 @@ mlx-lm에서 사용 가능한 모든 함수 호출 형식, JSON 스키마 검증
 | LLM | [mlx-lm](https://github.com/ml-explore/mlx-lm)이 지원하는 모든 모델 |
 | VLM | Qwen3.5 시리즈, GLM-4V, Pixtral 및 기타 [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) 모델 |
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
-| 임베딩 | BERT, BGE-M3, ModernBERT |
+| 임베딩 | BERT, BGE-M3, ModernBERT, EmbeddingGemma 2 |
 | 리랭커 | ModernBERT, XLM-RoBERTa |
+| Decision | Clef, Clef-Flash, OpenJev |
 
 ## CLI 설정
 
@@ -365,7 +368,8 @@ FastAPI Server (OpenAI / Anthropic API)
     │   ├── BatchedEngine (LLM, 연속 배칭)
     │   ├── VLMEngine (비전-언어 모델)
     │   ├── EmbeddingEngine
-    │   └── RerankerEngine
+    │   ├── RerankerEngine
+    │   └── DecisionEngine
     │
     ├── ProcessMemoryEnforcer (전체 메모리 제한, TTL 체크)
     │
@@ -432,5 +436,5 @@ apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Apple Silicon을 위한 임베딩 모델 지원
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Apple Silicon에서의 블록 디퓨전 speculative decoding
 - [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP의 verify-shape Metal 커널은 Youssof Altoukhi의 MTPLX를 기반으로 하며, depth-k 파이프라인도 여기서 영감을 받았습니다
-- [mlx-serve](https://github.com/ddalcu/mlx-serve) - fused GDN verify prework 커널은 mlx-serve가 포팅한 mlxfast-challenge의 qwen35_packed_gdn_prework 커널을 바탕으로 수정되었습니다
+- [mlx-serve](https://github.com/ddalcu/mlx-serve) - fused GDN verify prework 커널은 mlx-serve가 포팅한 mlxfast-challenge의 qwen35_packed_gdn_prework 커널을 바탕으로 수정되었고, Qwen4의 fused GDN decode·prefill 커널은 mlx-serve의 MIT 라이선스 `transformer.zig`를 바탕으로 수정되었습니다
 - [SiliconScope](https://github.com/kennss/SiliconScope) - 메뉴 바 통계의 디자인과 렌더링 방식은 Kennt Kim의 SiliconScope에서 가져왔으며, 에너지 효율적인 리렌더 게이팅도 여기서 영감을 받았습니다

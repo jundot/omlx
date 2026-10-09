@@ -234,6 +234,12 @@ class MiniMaxM3KVCache:
     def update_and_fetch(self, keys: mx.array, values: mx.array):
         return self.kv_cache.update_and_fetch(keys, values)
 
+    def _keys_and_values(self):
+        # kv_cache is the mlx_vlm KVCache, or the mlx_lm KVCache returned by
+        # BatchKVCache.extract(). Only the mlx_lm class has keys_and_values().
+        kv = self.kv_cache
+        return kv.keys[..., : kv.offset, :], kv.values[..., : kv.offset, :]
+
     def to_batch(self, left_padding):
         batch_cache = MiniMaxM3BatchKVCache(left_padding)
         left_padding = mx.array(left_padding)
@@ -248,7 +254,7 @@ class MiniMaxM3KVCache:
             )
 
         pad = int(left_padding.item())
-        keys, values = self.kv_cache.keys_and_values()
+        keys, values = self._keys_and_values()
         if pad:
             keys = mx.pad(keys, [(0, 0), (0, 0), (pad, 0), (0, 0)])
             values = mx.pad(values, [(0, 0), (0, 0), (pad, 0), (0, 0)])
@@ -311,7 +317,7 @@ class MiniMaxM3KVCache:
 
     @property
     def state(self):
-        kv_state = None if self.kv_cache.empty() else self.kv_cache.keys_and_values()
+        kv_state = None if self.kv_cache.empty() else self._keys_and_values()
         index_state = (
             None
             if self.index_keys is None

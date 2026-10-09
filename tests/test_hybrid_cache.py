@@ -31,6 +31,7 @@ from omlx.cache.paged_cache import (
     PagedCacheManager,
     compute_block_hash,
 )
+from omlx.cache._rotating_subclass import PrefillReadyRotatingKVCache
 from omlx.cache.prefix_cache import BlockAwarePrefixCache, BlockCacheEntry
 from omlx.cache.type_handlers import CacheType
 
@@ -660,126 +661,6 @@ class TestFetchCachePrefixMatching:
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
-class TestCreateEmptyRotatingCache:
-    """Tests for _create_empty_rotating_cache method."""
-
-    @pytest.fixture
-    def prefix_cache(self):
-        """Create a BlockAwarePrefixCache."""
-        paged_cache = PagedCacheManager(
-            block_size=256,
-            max_blocks=100,
-            model_name="test-model",
-            initial_blocks=100,
-        )
-        model = MockModel(num_layers=4)
-        return BlockAwarePrefixCache(
-            model=model,
-            paged_cache_manager=paged_cache,
-        )
-
-    def test_create_with_valid_meta_state_and_shape(self, prefix_cache):
-        """Test creating empty RotatingKVCache with zero-length keys."""
-        meta_state = (4, 1024, 500, 100)  # (keep, max_size, offset, _idx)
-        kv_shape_ref = (8, 64)  # (kv_heads, head_dim)
-        cache = prefix_cache._create_empty_rotating_cache(
-            meta_state, kvcache_offset=768, kv_shape_ref=kv_shape_ref,
-        )
-
-        assert cache is not None
-        assert cache.max_size == 1024
-        assert cache.keep == 4
-        assert cache.offset == 768
-        # Zero-length keys so empty() returns False
-        assert cache.keys is not None
-        assert cache.keys.shape == (1, 8, 0, 64)
-        assert cache.values is not None
-        assert cache.values.shape == (1, 8, 0, 64)
-        assert cache._idx == 0
-        assert not cache.empty()
-
-    def test_create_without_shape_ref(self, prefix_cache):
-        """Test creating with no shape ref falls back to keys=None."""
-        meta_state = (0, 512)
-        cache = prefix_cache._create_empty_rotating_cache(meta_state)
-
-        assert cache is not None
-        assert cache.max_size == 512
-        assert cache.keep == 0
-        # Without shape ref, keys remain None
-        assert cache.keys is None
-
-    def test_create_with_none_meta_state(self, prefix_cache):
-        """Test creating with None meta_state returns None."""
-        cache = prefix_cache._create_empty_rotating_cache(None)
-        assert cache is None
-
-    def test_create_with_empty_meta_state(self, prefix_cache):
-        """Test creating with empty tuple returns None."""
-        cache = prefix_cache._create_empty_rotating_cache(())
-        assert cache is None
-
-    def test_create_with_short_meta_state(self, prefix_cache):
-        """Test creating with meta_state shorter than 2 returns None."""
-        cache = prefix_cache._create_empty_rotating_cache((64,))
-        assert cache is None
-
-    def test_empty_cache_reports_size_zero(self, prefix_cache):
-        """Test that empty RotatingKVCache reports size=0, not min(offset, max_size).
-
-        This is critical for BatchRotatingKVCache.merge(): standard
-        RotatingKVCache.size() returns min(offset, max_size) which incorrectly
-        claims data exists when keys are zero-length, causing merge() to
-        create unmasked zero-filled buffers that dilute attention scores.
-        """
-        meta_state = (0, 128, 500, 64)  # (keep, max_size, offset, _idx)
-        kv_shape_ref = (8, 64)
-        cache = prefix_cache._create_empty_rotating_cache(
-            meta_state, kvcache_offset=512, kv_shape_ref=kv_shape_ref,
-        )
-
-        assert cache is not None
-        # Standard RotatingKVCache.size() would return min(512, 128) = 128
-        # Our subclass must return 0 for zero-length keys
-        assert cache.size() == 0
-        # offset is still correct for RoPE alignment
-        assert cache.offset == 512
-
-    def test_prefill_ready_subclass_type(self, prefix_cache):
-        """Test _create_empty_rotating_cache returns the correct subclass type."""
-        from mlx_lm.models.cache import RotatingKVCache
-
-        meta_state = (0, 128)
-        kv_shape_ref = (8, 64)
-        cache = prefix_cache._create_empty_rotating_cache(
-            meta_state, kvcache_offset=256, kv_shape_ref=kv_shape_ref,
-        )
-
-        assert cache is not None
-        # Must be a RotatingKVCache (for merge/empty compatibility)
-        assert isinstance(cache, RotatingKVCache)
-        # But with overridden size()
-        assert cache.size() == 0
-
-    def test_prefill_ready_size_normal_after_data(self, prefix_cache):
-        """Test that size() returns normal value after keys have data."""
-        meta_state = (0, 128)
-        kv_shape_ref = (8, 64)
-        cache = prefix_cache._create_empty_rotating_cache(
-            meta_state, kvcache_offset=256, kv_shape_ref=kv_shape_ref,
-        )
-
-        assert cache.size() == 0
-
-        # Simulate adding data (as happens during prefill)
-        cache.keys = mx.zeros((1, 8, 64, 64))
-        cache.values = mx.zeros((1, 8, 64, 64))
-        cache.offset = 64
-        # Now size() should return normal value: min(64, 128) = 64
-        assert cache.size() == 64
-
-
-@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestPrefillReadyMergeBehavior:
     """Tests for correct merge behavior with _PrefillReadyRotatingKVCache.
 
@@ -787,21 +668,7 @@ class TestPrefillReadyMergeBehavior:
     (not zero-filled) when merging empty RotatingKVCaches from SSD restore.
     """
 
-    @pytest.fixture
-    def prefix_cache(self):
-        paged_cache = PagedCacheManager(
-            block_size=256,
-            max_blocks=100,
-            model_name="test-model",
-            initial_blocks=100,
-        )
-        model = MockModel(num_layers=4)
-        return BlockAwarePrefixCache(
-            model=model,
-            paged_cache_manager=paged_cache,
-        )
-
-    def test_merge_creates_zero_length_buffer(self, prefix_cache):
+    def test_merge_creates_zero_length_buffer(self):
         """Test merge creates zero-length buffer, not zero-filled.
 
         Without the fix, merge creates a (1, H, 128, D) zero-filled buffer
@@ -810,11 +677,12 @@ class TestPrefillReadyMergeBehavior:
         """
         from mlx_lm.models.cache import BatchRotatingKVCache
 
-        meta_state = (0, 128, 500, 64)
-        kv_shape_ref = (8, 64)
-        cache = prefix_cache._create_empty_rotating_cache(
-            meta_state, kvcache_offset=512, kv_shape_ref=kv_shape_ref,
-        )
+        cache = PrefillReadyRotatingKVCache(max_size=128, keep=0)
+        cache.offset = 512
+        cache.keys = mx.zeros((1, 8, 0, 64))
+        cache.values = mx.zeros((1, 8, 0, 64))
+        cache._idx = 0
+        assert cache.size() == 0
 
         # Merge single cache (as happens with single request in batch)
         batch_cache = BatchRotatingKVCache.merge([cache])
@@ -829,7 +697,7 @@ class TestPrefillReadyMergeBehavior:
         # The original per-request offset (512) is consumed by
         # the merge → left_padding → offset arithmetic.
 
-    def test_merge_old_behavior_would_create_zero_filled(self, prefix_cache):
+    def test_merge_old_behavior_would_create_zero_filled(self):
         """Demonstrate what standard RotatingKVCache.size() reports.
 
         With standard RotatingKVCache.size() = min(512, 128) = 128,
@@ -854,48 +722,6 @@ class TestPrefillReadyMergeBehavior:
         # (tries to broadcast (1,8,0,64) slice onto (1,8,128,64) slot)
         with pytest.raises((ValueError, IndexError)):
             BatchRotatingKVCache.merge([old_cache])
-
-
-@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
-class TestFindKVShapeRef:
-    """Tests for _find_kv_shape_ref helper."""
-
-    @pytest.fixture
-    def prefix_cache(self):
-        paged_cache = PagedCacheManager(
-            block_size=256, max_blocks=100,
-            model_name="test-model", initial_blocks=100,
-        )
-        return BlockAwarePrefixCache(
-            model=MockModel(num_layers=4),
-            paged_cache_manager=paged_cache,
-        )
-
-    def test_finds_shape_from_kvcache_layer(self, prefix_cache):
-        """Find kv_heads and head_dim from a KVCache layer."""
-        block_data = [
-            [(mx.zeros((1, 8, 256, 64)), mx.zeros((1, 8, 256, 64))),  # KVCache
-             (mx.zeros((1,)), mx.zeros((1,)))],  # RotatingKVCache placeholder
-        ]
-        result = prefix_cache._find_kv_shape_ref(
-            block_data, ['KVCache', 'RotatingKVCache']
-        )
-        assert result == (8, 64)
-
-    def test_skips_non_kvcache_layers(self, prefix_cache):
-        """Skip RotatingKVCache layers when finding shape ref."""
-        block_data = [
-            [(mx.zeros((1, 4, 256, 128)), mx.zeros((1, 4, 256, 128))),  # Rot placeholder
-             (mx.zeros((1, 8, 256, 64)), mx.zeros((1, 8, 256, 64)))],   # KVCache
-        ]
-        result = prefix_cache._find_kv_shape_ref(
-            block_data, ['RotatingKVCache', 'KVCache']
-        )
-        assert result == (8, 64)
-
-    def test_returns_none_for_empty_data(self, prefix_cache):
-        """Return None when no block data available."""
-        assert prefix_cache._find_kv_shape_ref([], None) is None
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")

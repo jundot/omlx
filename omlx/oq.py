@@ -9,6 +9,7 @@ Supported levels: oQ2, oQ2.5, oQ2.7, oQ3, oQ3.5, oQ4, oQ5, oQ6, oQ8
 base bits and add targeted routed-expert protection plus a higher bpw budget.
 """
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -36,6 +37,8 @@ except ImportError:
     HAS_MLX = False
 
 from omlx.model_discovery import (
+    CLEF_HEAD_CONFIG,
+    CLEF_HEAD_WEIGHTS,
     MLX_LM_TEXT_ONLY_MODEL_TYPES,
     VLM_NATIVE_TEXT_MODEL_TYPES,
     _has_vision_subconfig,
@@ -168,6 +171,20 @@ def _validate_oq_dtype_for_model(config: dict, dtype: str) -> None:
         )
 
 
+def _validate_v41_oq_settings(oq_level, dtype="bfloat16", group_size=64):
+    if oq_level not in (3, 4):
+        raise ValueError(
+            f"DeepSeek V4.1 does not support oQ{oq_level:g}/oQ{oq_level:g}e. "
+            "Choose oQ3/oQ3e or oQ4/oQ4e. oQ4 preserves the original "
+            "FP4/FP8 projection precision and quantizes Engram tables to 4 bits."
+        )
+    if dtype != "bfloat16" or group_size != 64:
+        raise ValueError(
+            "DeepSeek V4.1 requires dtype='bfloat16' and group_size=64 "
+            "for oQ export."
+        )
+
+
 def _canonical_output_dtype(dtype: str) -> str:
     """Name the dtype oQ will actually store, mirroring ``target_dtype``.
 
@@ -231,7 +248,7 @@ def _calibration_model_settings(
 
     return SimpleNamespace(
         mtp_enabled=mtp_enabled,
-        mtp_num_draft_tokens=1,
+        mtp_adaptive_max_depth=1,
         # Calibration executes Qwen4 PLE, but only as sparse row gathers.
         # Force the existing SSD mmap path even when a compact proxy falls
         # below serving's automatic offload threshold.
@@ -250,6 +267,10 @@ def _uses_quantized_source_sensitivity(config: dict) -> bool:
     return quant_method == "fp8" and (
         _is_deepseek_v4_config(config)
         or config.get("model_type") == "bailing_hybrid"
+        or (
+            config.get("model_type") in {"mimo_v2", "mimo_v2_flash"}
+            and quantization_config.get("store_dtype") == "mxfp4"
+        )
     )
 
 
@@ -719,7 +740,9 @@ def _is_audio_tensor(name: str) -> bool:
 
 def _is_moe_router(path: str) -> bool:
     """Detect MoE router/gate layers (distinct from gate_proj)."""
-    if path.endswith(("mlp.gate", ".router", ".router.layer", ".v_router")):
+    if path.endswith(
+        ("mlp.gate", ".router", ".router.layer", ".v_router", ".router.proj")
+    ):
         return True
     if path.endswith(".gate") and "gate_proj" not in path:
         return True
@@ -1508,13 +1531,23 @@ def combine_gemma4_assistant_mtp(
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
     """Atomically replace a JSON file (tmp write + rename)."""
-    with tempfile.NamedTemporaryFile(
-        "w", dir=path.parent, prefix=f"{path.name}.tmp.", delete=False
-    ) as tmp:
-        json.dump(payload, tmp, indent=2)
-        tmp.flush()
-        temp_name = tmp.name
-    Path(temp_name).replace(path)
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", dir=path.parent, prefix=f"{path.name}.tmp.", delete=False
+        ) as tmp:
+            # Record the name first so a failed dump still cleans up.
+            temp_name = tmp.name
+            json.dump(payload, tmp, indent=2)
+            tmp.flush()
+            # Make the data durable before the rename.
+            os.fsync(tmp.fileno())
+        Path(temp_name).replace(path)
+        temp_name = None
+    finally:
+        if temp_name is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temp_name)
 
 
 def _write_mtp_shard_and_merge_index(
@@ -1830,6 +1863,38 @@ def _shard_key_map(model_dir: Path) -> dict:
     return key_map
 
 
+# Qwen3-Next RMSNorm gammas inside the MTP head. Raw-HF stores them
+# zero-centered; the MLX runtime expects the +1 form.
+_QWEN_MTP_NORM_SUFFIXES = (
+    ".input_layernorm.weight",
+    ".post_attention_layernorm.weight",
+    ".q_norm.weight",
+    ".k_norm.weight",
+    ".pre_fc_norm_hidden.weight",
+    ".pre_fc_norm_embedding.weight",
+    "mtp.norm.weight",
+)
+
+
+def _checkpoint_has_unsanitized_conv1d(model_dir: Path, key_map: dict) -> bool:
+    """True when a backbone conv1d tensor still has the raw-HF layout.
+
+    Reads only the safetensors header of one shard. Mirrors the raw-HF
+    discriminator the Qwen3.5 sanitizers use, so a donor head gets the
+    same norm treatment it would get when loaded directly.
+    """
+    conv_key = next(
+        (k for k in key_map if "conv1d.weight" in k and "mtp." not in k), None
+    )
+    if conv_key is None:
+        return False
+    with open(model_dir / key_map[conv_key], "rb") as f:
+        header_len = int.from_bytes(f.read(8), "little")
+        header = json.loads(f.read(header_len))
+    shape = header.get(conv_key, {}).get("shape") or ()
+    return bool(shape) and shape[-1] != 1
+
+
 def _strip_mtp_key_prefix(key: str) -> Optional[str]:
     """Normalize an mtp tensor key to its bare ``mtp.<rest>`` form."""
     from omlx.utils.model_loading import _MTP_WEIGHT_PREFIXES
@@ -1917,10 +1982,9 @@ def combine_mtp_donor(
     dtype: bf16 heads stay bf16 and pre-quantized heads pass through
     packed, with explicit per-layer entries synthesized into the output's
     quantization config (the donor's global bits may differ from the
-    recipient's). The norm +1 convention is left untouched on purpose —
-    the qwen sanitize decides the shift per-key by tensor mean and
-    norm_repair anchors the outliers, so raw-HF and MLX-convention donors
-    both load correctly.
+    recipient's). Head RMSNorm gammas follow the same rule as model
+    loading: a raw-HF donor (unsanitized conv1d layout) gets +1 on every
+    zero-centered gamma, an MLX-format donor is copied as stored.
     """
     output = Path(output_path)
     donor = Path(donor_path)
@@ -1950,13 +2014,21 @@ def combine_mtp_donor(
 
     # Load only the donor shards that contain mtp keys, one shard at a
     # time, dropping non-mtp tensors immediately (peak memory = 1 shard).
+    donor_is_raw_hf = _checkpoint_has_unsanitized_conv1d(donor, donor_key_map)
     mtp_weights: dict = {}
     for shard in sorted(set(mtp_key_shards.values())):
         shard_weights = mx.load(str(donor / shard))
         for key, value in shard_weights.items():
             bare = _strip_mtp_key_prefix(key)
-            if bare is not None:
-                mtp_weights[recipient_prefix + bare] = value
+            if bare is None:
+                continue
+            if (
+                donor_is_raw_hf
+                and value.ndim == 1
+                and bare.endswith(_QWEN_MTP_NORM_SUFFIXES)
+            ):
+                value = value + 1.0
+            mtp_weights[recipient_prefix + bare] = value
         del shard_weights
 
     mtp_size = _write_mtp_shard_and_merge_index(output, mtp_weights)
@@ -2740,7 +2812,6 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
         "stack",
         "concatenate",
         "add",
-        "add_if_mean_lt_0_5",
         "transpose_",
         "moveaxis_",
         "split_",
@@ -2953,19 +3024,8 @@ class _DiscoveredPlan:
         if meta is None:
             raise KeyError(f"source tensor {src_key!r} not in lazy index")
         sf_path, data_offset, start, end, shape, dtype = meta
-        if len(shape) == 0:
-            import numpy as _np
-
-            with open(sf_path, "rb") as f:
-                f.seek(data_offset + start)
-                raw = f.read(end - start)
-            lt_tmp = _LazyTensor(sf_path, data_offset, start, end, (1,), dtype)
-            np_view = _np.frombuffer(raw, dtype=lt_tmp._np_view_dtype())
-            arr = mx.array(np_view).view(lt_tmp._mlx_dtype()).reshape(())
-            mx.eval(arr)
-            return arr
         lt = _LazyTensor(sf_path, data_offset, start, end, shape, dtype)
-        arr = lt[:]
+        arr = lt.load()
         mx.eval(arr)
         return arr
 
@@ -3111,13 +3171,6 @@ class _DiscoveredPlan:
             arr = self._materialize_source(sources[0])
             return arr + 1.0  # norm weight += 1.0 pattern
 
-        if transform == "add_if_mean_lt_0_5":
-            arr = self._materialize_source(sources[0])
-            mean = float(mx.mean(arr.astype(mx.float32)).item())
-            if mean < 0.5:
-                return arr + 1.0
-            return arr
-
         if transform == "reshape":
             arr = self._materialize_source(sources[0])
             return mx.reshape(arr, info["shape"])
@@ -3221,15 +3274,17 @@ def validate_quantizable(config: dict) -> bool:
     return True
 
 
-def _sensitivity_lm_config_override(config: dict) -> dict | None:
-    """Return a model_config override for mlx_lm.load when the model has a
-    QAT quantization_config that mlx-lm cannot process (missing quant_method).
-
-    mlx-lm does ``quantization_config["quant_method"]`` without a fallback, so
-    QAT configs (e.g. Google Gemma 4 QAT) raise KeyError and abort the load.
-    Passing ``{"quantization_config": None}`` via model_config causes
-    config.update() to replace the offending key before that branch runs.
-    """
+def _sensitivity_lm_config_override(
+    config: dict, model_path: str | Path | None = None
+) -> dict | None:
+    """Include MiMo sidecars and bypass unsupported QAT metadata during calibration."""
+    if model_path is not None and config.get("model_type") in {
+        "mimo_v2",
+        "mimo_v2_flash",
+    }:
+        sidecar = Path(model_path) / "mtp" / "model_mtp.safetensors"
+        if sidecar.is_file():
+            return {"omlx_mtp_sidecar": str(sidecar)}
     for qc in (
         config.get("quantization_config"),
         config.get("text_config", {}).get("quantization_config"),
@@ -3275,7 +3330,7 @@ def estimate_bpw_and_size(
     with open(config_path) as f:
         config = json.load(f)
 
-    weight_files = sorted(source.glob("*.safetensors"))
+    weight_files = _source_weight_files(source)
     if not weight_files:
         return {
             "effective_bpw": float(oq_level),
@@ -3292,8 +3347,7 @@ def estimate_bpw_and_size(
     if config.get("model_type") == "deepseek_v41":
         from .patches.deepseek_v41.oq import source_budget
 
-        if oq_level not in (3, 4) or group_size != 64:
-            raise ValueError("V4.1 supports oQ3/oQ4 with group size 64")
+        _validate_v41_oq_settings(oq_level, group_size=group_size)
         if "omlx_deepseek_v41" in config:
             raise ValueError("V4.1 quantization requires the original checkpoint")
         mapping = json.loads((source / "model.safetensors.index.json").read_text())[
@@ -3521,7 +3575,7 @@ def estimate_bpw_and_size(
             effective_bpw += 0.3 * _down_boost
             total_output_bytes = int(effective_bpw * total_params / 8)
 
-    source_total = sum(sf.stat().st_size for sf in source.glob("*.safetensors"))
+    source_total = sum(sf.stat().st_size for sf in _source_weight_files(source))
     streaming_peak = int(source_total * 1.5) + 5 * 1024**3
 
     return {
@@ -3597,6 +3651,19 @@ def _metal_available_memory_bytes() -> int:
     return max(0, max_working_set - active)
 
 
+def _source_weight_files(model_path: str | Path) -> list[Path]:
+    source = Path(model_path)
+    files = sorted(
+        f for f in source.glob("*.safetensors") if f.name != CLEF_HEAD_WEIGHTS
+    )
+    sidecar = source / "mtp" / "model_mtp.safetensors"
+    if sidecar.is_file():
+        config = json.loads((source / "config.json").read_text())
+        if config.get("model_type") in {"mimo_v2", "mimo_v2_flash"}:
+            files.append(sidecar)
+    return files
+
+
 def _checkpoint_storage_bytes(weight_files) -> int:
     """Return the complete on-disk size of checkpoint weight shards.
 
@@ -3625,7 +3692,7 @@ def _calibration_resident_checkpoint_bytes(
     layer walk invokes neither the vision tower nor the ordinary ``lm_head``.
     Safetensors headers and every other tensor remain charged to the model.
     """
-    weight_files = sorted(Path(model_path).glob("*.safetensors"))
+    weight_files = _source_weight_files(model_path)
     checkpoint_bytes = _checkpoint_storage_bytes(weight_files)
     if not _is_qwen4_exp_config(config):
         return checkpoint_bytes
@@ -3977,10 +4044,8 @@ def _build_model_sanitizer(
 
     For VLM models, uses mlx-vlm's model class (preserves vision weights).
     For LLM models, uses mlx-lm's model class.
-    When text_only is True, always uses the LLM path even for VLM
-    architectures so that mlx_lm_mtp patches (which handle MTP sanitize
-    for both dense and MoE) are used instead of the VLM path whose
-    _Proxy-based sanitize drops the MTP head.
+    Text-only conversion normally uses mlx-lm for MTP sanitization.
+    GLM-5.3 requires mlx-vlm even when vision weights are excluded.
 
     Returns:
         A function that takes a dict of weights and returns sanitized weights,
@@ -3999,7 +4064,7 @@ def _build_model_sanitizer(
         any("ForConditionalGeneration" in a for a in architectures)
         or _has_vision_subconfig(config)
         or model_type in VLM_NATIVE_TEXT_MODEL_TYPES
-    ) and not (text_only or mlx_lm_text_only)
+    ) and not (mlx_lm_text_only or (text_only and model_type != "glm5_next"))
 
     # Serving normally registers oMLX's vendored Qwen4 implementation before
     # mlx-vlm class lookup. Quantization does not pass through that loader.
@@ -4020,7 +4085,7 @@ def _build_model_sanitizer(
 
                 apply_mlx_vlm_qwen4_exp_compat_patch()
         except Exception as patch_err:
-            logger.debug("Qwen4-Exp quantization patch not applied: %s", patch_err)
+            logger.warning("Qwen4-Exp quantization patch not applied: %s", patch_err)
 
     if is_vlm:
         try:
@@ -4058,8 +4123,12 @@ def _build_model_sanitizer(
                     )
 
                     apply_mlx_vlm_glm5_next_compat_patch()
+                    if preserve_mtp:
+                        from omlx.patches.mlx_vlm_mtp import glm5_next_vlm_runtime
+
+                        glm5_next_vlm_runtime.apply()
             except Exception as patch_err:
-                logger.debug(f"mlx-vlm compatibility patch not applied: {patch_err}")
+                logger.warning(f"mlx-vlm compatibility patch not applied: {patch_err}")
 
             from mlx_vlm.utils import get_model_and_args, sanitize_weights
 
@@ -4075,7 +4144,7 @@ def _build_model_sanitizer(
 
                 apply_mlx_vlm_mtp_patch()
             except Exception as patch_err:
-                logger.debug(f"mlx-vlm MTP patch not applied: {patch_err}")
+                logger.warning(f"mlx-vlm MTP patch not applied: {patch_err}")
 
             # Remap language_model.model.visual.* -> vision_tower.* for
             # Qwen3.6-35B-A3B's nested ViT layout. Wraps whichever
@@ -4088,7 +4157,7 @@ def _build_model_sanitizer(
 
                 apply_qwen3_6_nested_visual_patch()
             except Exception as patch_err:
-                logger.debug(f"qwen3_6 nested-visual patch not applied: {patch_err}")
+                logger.warning(f"qwen3_6 nested-visual patch not applied: {patch_err}")
 
             model_module, _ = get_model_and_args(config)
             model_config_cls = model_module.ModelConfig
@@ -4213,7 +4282,7 @@ def _build_model_sanitizer(
             )
             return _vlm_sanitize
         except Exception as e:
-            logger.debug(f"mlx-vlm sanitizer not available: {e}")
+            logger.warning(f"mlx-vlm sanitizer not available for a VLM config: {e}")
 
     try:
         from mlx_lm.utils import _get_classes
@@ -4224,7 +4293,7 @@ def _build_model_sanitizer(
 
                 apply_glm_moe_dsa_patch()
             except Exception as patch_err:
-                logger.debug(f"glm_moe_dsa patch not applied: {patch_err}")
+                logger.warning(f"glm_moe_dsa patch not applied: {patch_err}")
 
         # DeepSeek-V4 isn't in stock mlx-lm — its model class is injected
         # into ``sys.modules`` by oMLX's base patch. Trigger that here so
@@ -4236,7 +4305,7 @@ def _build_model_sanitizer(
 
                 apply_deepseek_v4_patch()
             except Exception as patch_err:
-                logger.debug(f"deepseek_v4 base patch not applied: {patch_err}")
+                logger.warning(f"deepseek_v4 base patch not applied: {patch_err}")
 
         # Laguna is likewise vendored into ``sys.modules`` by its pre-load
         # patch; register it so sanitizer/proxy builds resolve the class.
@@ -4246,7 +4315,7 @@ def _build_model_sanitizer(
 
                 apply_laguna_patch()
             except Exception as patch_err:
-                logger.debug(f"laguna patch not applied: {patch_err}")
+                logger.warning(f"laguna patch not applied: {patch_err}")
 
         # Hy3 is vendored into ``sys.modules`` like Laguna, but its published
         # Hy-MT2 checkpoints also use the legacy root-level ``rope_theta``
@@ -4261,15 +4330,15 @@ def _build_model_sanitizer(
                 normalize_hy_v3_rope_config(config)
                 apply_hy_v3_patch()
             except Exception as patch_err:
-                logger.debug(f"hy_v3 patch not applied: {patch_err}")
+                logger.warning(f"hy_v3 patch not applied: {patch_err}")
 
-        if config.get("model_type") == "mimo_v2":
+        if config.get("model_type") in {"mimo_v2", "mimo_v2_flash"}:
             try:
                 from omlx.patches.mimo_v2 import apply_mimo_v2_patch
 
                 apply_mimo_v2_patch()
             except Exception as patch_err:
-                logger.debug(f"mimo_v2 patch not applied: {patch_err}")
+                logger.warning(f"mimo_v2 patch not applied: {patch_err}")
 
         if config.get("model_type") == "bailing_hybrid":
             try:
@@ -4277,7 +4346,7 @@ def _build_model_sanitizer(
 
                 apply_bailing_hybrid_patch()
             except Exception as patch_err:
-                logger.debug(f"bailing_hybrid patch not applied: {patch_err}")
+                logger.warning(f"bailing_hybrid patch not applied: {patch_err}")
 
         # Apply mlx-lm MTP patch so the patched __init__/sanitize handle
         # mtp.* tensors correctly. Idempotent — apply() is a no-op once
@@ -4292,7 +4361,7 @@ def _build_model_sanitizer(
             apply_mlx_lm_mtp_patch()
             _have_mtp_patch = True
         except Exception as patch_err:
-            logger.debug(f"mlx-lm MTP patch not applied: {patch_err}")
+            logger.warning(f"mlx-lm MTP patch not applied: {patch_err}")
             _have_mtp_patch = False
 
         model_class, model_args_class = _get_classes(config)
@@ -4611,6 +4680,11 @@ class _LazyTensorIndex:
         config: dict | None = None,
     ):
         self._allow_mxfp8_scale_inv_passthrough = allow_mxfp8_scale_inv_passthrough
+        self._mimo_mxfp4 = bool(
+            config
+            and config.get("model_type") in {"mimo_v2", "mimo_v2_flash"}
+            and (config.get("quantization_config") or {}).get("store_dtype") == "mxfp4"
+        )
         self._index = {}
         for sf_path in weight_files:
             with open(sf_path, "rb") as f:
@@ -4743,7 +4817,10 @@ class _LazyTensorIndex:
                 if (
                     wk in self._index
                     and wk not in seen
-                    and self._index[wk][5] in _FP8_WEIGHT_DTYPES
+                    and (
+                        self._index[wk][5] in _FP8_WEIGHT_DTYPES
+                        or (self._mimo_mxfp4 and self._index[wk][5] == "U8")
+                    )
                 ):
                     self._fp8_pairs[wk] = k
                     seen.add(wk)
@@ -4770,6 +4847,10 @@ class _LazyTensorIndex:
         if len(w_shape) != 2 or len(s_shape) != 2:
             return None
         rows, cols = w_shape
+        if self._mimo_mxfp4 and sk.endswith(".weight_scale") and w_dtype == "U8":
+            if s_dtype != "U8" or cols % 16 or tuple(s_shape) != (rows, cols // 16):
+                raise ValueError(f"Invalid MiMo MXFP4 weight/scale pair: {wk}")
+            return {"kind": "mxfp4", "bits": 4, "group_size": 32, "mode": "mxfp4"}
         # MiniMax MXFP8 checkpoints store E8M0 exponent bytes under the
         # ``weight_scale_inv`` suffix even though the model sanitizer passes
         # them directly to MLX as ``.scales``. Enable this only from an
@@ -4826,8 +4907,8 @@ class _LazyTensorIndex:
         s_lt = _LazyTensor(
             s_meta[0], s_meta[1], s_meta[2], s_meta[3], s_meta[4], s_meta[5]
         )
-        weight_raw = w_lt[:]
-        scale_raw = s_lt[:]
+        weight_raw = w_lt.load()
+        scale_raw = s_lt.load()
         mx.eval(weight_raw, scale_raw)
         info = self._src_quant.get(wk)
         if info is not None and info["kind"] == "mxfp4":
@@ -4942,7 +5023,7 @@ class _LazyTensorIndex:
     def _load_raw(self, key):
         sf_path, data_offset, start, end, shape, dtype = self._index[key]
         lt = _LazyTensor(sf_path, data_offset, start, end, shape, dtype)
-        return lt[:]
+        return lt.load()
 
     def __getitem__(self, key):
         if key in self._overrides:
@@ -5013,7 +5094,7 @@ class _LazyTensorIndex:
             return result
         sf_path, data_offset, start, end, shape, dtype = self._index.pop(key)
         lt = _LazyTensor(sf_path, data_offset, start, end, shape, dtype)
-        arr = lt[:]
+        arr = lt.load()
         mx.eval(arr)
         return arr
 
@@ -5121,12 +5202,22 @@ class _LazyTensor:
         mx.eval(result)
         return result
 
+    def load(self):
+        """Read the whole tensor. Unlike ``[:]``, also handles 0-dim scalars
+        (e.g. Gemma 4's audio-tower clamp bounds)."""
+        if self.ndim == 0:
+            with open(self._sf_path, "rb") as f:
+                f.seek(self._data_offset + self._start)
+                raw = f.read(self._end - self._start)
+            arr = _np.frombuffer(raw, dtype=self._np_view_dtype())
+            t = mx.array(arr).view(self._mlx_dtype()).reshape(())
+            mx.eval(t)
+            return t
+        return self._load_rows(0, self.shape[0])
+
     def __getitem__(self, idx):
         if len(self.shape) == 0:
-            raise IndexError(
-                "0-dim _LazyTensor cannot be indexed; caller should use "
-                "_materialize_source scalar path"
-            )
+            raise IndexError("0-dim _LazyTensor cannot be indexed; use load()")
         if isinstance(idx, tuple):
             return self._load_rows(0, self.shape[0])[idx]
         if isinstance(idx, slice):
@@ -5186,7 +5277,7 @@ def _progress_total_bytes(all_weights, source: Path) -> int:
     lets progress exceed 100% and makes ETA negative.
     """
     candidates = [
-        sum(sf.stat().st_size for sf in source.glob("*.safetensors")),
+        sum(sf.stat().st_size for sf in _source_weight_files(source)),
     ]
 
     if hasattr(all_weights, "nbytes"):
@@ -5237,9 +5328,9 @@ def _source_imatrix_signature(
     stable_config = {k: v for k, v in config.items() if not str(k).startswith("_oq_")}
     cfg_bytes = json.dumps(stable_config, sort_keys=True, default=str).encode("utf-8")
     h = hashlib.sha256(cfg_bytes)
-    for sf in sorted(source.glob("*.safetensors")):
+    for sf in _source_weight_files(source):
         st = sf.stat()
-        h.update(sf.name.encode("utf-8"))
+        h.update(str(sf.relative_to(source)).encode("utf-8"))
         h.update(str(st.st_size).encode("ascii"))
         h.update(str(int(st.st_mtime_ns)).encode("ascii"))
     calib_hash = ""
@@ -5955,6 +6046,11 @@ def quantize_oq_streaming(
     normalized_model_type = str(config.get("model_type", "")).lower().replace(
         "-", "_"
     )
+    mimo_multimodal = (
+        normalized_model_type in {"mimo_v2", "mimo_v2_flash"}
+        and _has_vision_subconfig(config)
+        and not text_only
+    )
     if normalized_model_type == "deepseek_v41":
         from .patches.deepseek_v41.oq import quantize as quantize_v41
 
@@ -5982,6 +6078,7 @@ def quantize_oq_streaming(
         normalized_model_type in MLX_LM_TEXT_ONLY_MODEL_TYPES
         and _has_vision_subconfig(config)
         and not text_only
+        and not mimo_multimodal
     ):
         logger.warning(
             "oQ only supports the %s text backbone; enabling text-only output",
@@ -6004,7 +6101,7 @@ def quantize_oq_streaming(
 
     cb("loading", 5.0, "Reading model config")
 
-    weight_files = sorted(source.glob("*.safetensors"))
+    weight_files = _source_weight_files(source)
     if not weight_files:
         raise ValueError(f"No .safetensors files found in {model_path}")
 
@@ -6390,9 +6487,10 @@ def quantize_oq_streaming(
         model_path=source,
         preserve_mtp=preserve_mtp,
     )
-    if sanitize_fn is None and _stream_source_model_type(config) == "qwen4_exp":
+    source_model_type = _stream_source_model_type(config)
+    if sanitize_fn is None and source_model_type in {"qwen4_exp", "glm5_next"}:
         raise RuntimeError(
-            "no model sanitizer for qwen4_exp: refusing to quantize on raw "
+            f"no model sanitizer for {source_model_type}: refusing to quantize on raw "
             "checkpoint keys (the recipe's tensor rules would not match)"
         )
     cast_predicate = getattr(sanitize_fn, "_omlx_cast_predicate", None)
@@ -6726,7 +6824,10 @@ def quantize_oq_streaming(
 
     cb("saving", 92.0, "Writing model metadata")
 
-    if total_shards > 1:
+    # Without an index, mlx-vlm loads every *.safetensors file, which would
+    # include the Clef decision head copied next to the shards.
+    has_clef_head = (source / CLEF_HEAD_WEIGHTS).is_file()
+    if total_shards > 1 or has_clef_head:
         total_size = sum(f.stat().st_size for f in output.glob("*.safetensors"))
         index = {
             "metadata": {"total_size": total_size},
@@ -6796,6 +6897,15 @@ def quantize_oq_streaming(
             json.dump(imatrix_report, f, indent=2, ensure_ascii=False)
 
     _copy_model_sidecars(source, output, text_only=text_only)
+    if has_clef_head:
+        for name in (CLEF_HEAD_WEIGHTS, CLEF_HEAD_CONFIG):
+            if (source / name).is_file():
+                shutil.copy2(source / name, output / name)
+
+    if mimo_multimodal:
+        from .patches.mimo_v2.omnimodal import export_sidecars
+
+        export_sidecars(source, output, config)
 
     cb("saving", 100.0, "Quantized model saved")
     logger.info(
@@ -7971,14 +8081,9 @@ def _collect_mtp_head_imatrix(
     hidden,
     dspark_hiddens=None,
 ) -> bool:
-    """Run the MTP head over a calibration micro-batch.
+    """Collect head activations with shifted tokens and decode-time normalization.
 
-    The trunk-layer walk never invokes the head, so without this pass every
-    ``mtp.*`` linear lands in the imatrix "missing" list and gets quantized
-    without calibration — measurably hurting draft acceptance. Mirrors the
-    decode-time contract: fuse the trunk's post-norm hidden at position t
-    with the embedding of token t+1 (the head's own input RMSNorms make the
-    residual pre/post-norm difference negligible for activation statistics).
+    The trunk-layer walk does not invoke MTP heads, so they need a separate pass.
     """
     inner = getattr(model, "language_model", None) or model
     mtp = getattr(inner, "mtp", None)
@@ -8042,7 +8147,9 @@ def _collect_mtp_head_imatrix(
             from mlx_lm.models.cache import KVCache
 
             mtp_cache = [KVCache() for _ in mtp.layers]
-        h = norm(hidden[:, :-1, :])
+        h = hidden[:, :-1, :]
+        if not getattr(inner, "_omlx_mtp_head_prenorm", False):
+            h = norm(h)
         out = mtp(h, batch[:, 1:], embed, mtp_cache)
         mx.eval(out)
         return True
@@ -8227,10 +8334,7 @@ def _collect_imatrix_from_model(
                 _collect_glm5_next_lm_head_imatrix(model, inputs, collector)
                 _collect_k2_horizon_lm_head_imatrix(model, inputs, collector)
 
-                # MTP-head pass: the layer walk above leaves ``inputs`` as
-                # the final-layer hidden states; feed them (post-norm) plus
-                # the shifted token ids through the head so its linears
-                # contribute imatrix entries too.
+                # Match the head's decode-time hidden-state normalization.
                 if _collect_mtp_head_imatrix(
                     model,
                     batch,
@@ -8432,7 +8536,7 @@ def _streamed_source_plan(
     own instance instead of sharing the quantize loop's. The rebuild is
     header-only and costs seconds.
     """
-    weight_files = sorted(Path(model_path).glob("*.safetensors"))
+    weight_files = _source_weight_files(model_path)
     if not weight_files:
         raise FileNotFoundError(f"no safetensors shards under {model_path}")
     lazy_index = _LazyTensorIndex(weight_files, config=config)
@@ -9352,7 +9456,7 @@ def _collect_imatrix(
                 model_path,
                 lazy=True,
                 trust_remote_code=trust_remote_code,
-                model_config=_sensitivity_lm_config_override(config),
+                model_config=_sensitivity_lm_config_override(config, model_path),
             )
     except Exception as e:
         logger.error("oQe imatrix: model load failed (%s)", e)
@@ -9750,7 +9854,7 @@ def _measure_sensitivity(
                 model_path,
                 lazy=True,
                 trust_remote_code=trust_remote_code,
-                model_config=_sensitivity_lm_config_override(config),
+                model_config=_sensitivity_lm_config_override(config, model_path),
             )
     except Exception as e:
         logger.error(f"Sensitivity measurement: model load failed ({e})")
@@ -9938,7 +10042,7 @@ def _build_streaming_proxy_for_sensitivity(
     _validate_oq_dtype_for_model(config, dtype)
     target_dtype = mx.bfloat16 if dtype == "bfloat16" else mx.float16
 
-    weight_files = sorted(source.glob("*.safetensors"))
+    weight_files = _source_weight_files(source)
     if not weight_files:
         raise ValueError(f"No .safetensors files found in {model_path}")
 

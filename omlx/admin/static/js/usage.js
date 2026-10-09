@@ -1,3 +1,13 @@
+/* Numbers follow the UI language. Intl maps unknown tags to the OS locale, so fall back to 'en'. */
+function usageLocale() {
+    try {
+        const lang = document.documentElement.lang;
+        return Intl.NumberFormat.supportedLocalesOf(lang).length ? lang : 'en';
+    } catch (error) {
+        return 'en';
+    }
+}
+
 /* Local serving history; independent of the high-frequency live stats poll. */
 function usageHistory() {
     return {
@@ -47,10 +57,24 @@ function usageHistory() {
                 if (this.request === request) this.loading = false;
             }
         },
-        shade(tokens) {
-            return tokens ? `rgba(22, 163, 74, ${0.2 + 0.8 * Math.sqrt(tokens / this.peak)})` : 'rgba(128, 128, 128, 0.12)';
+        // Totals per hour of day across every day in the range.
+        hourlyTotals() {
+            const totals = new Array(24).fill(0);
+            (this.data?.heatmap || []).forEach(day => {
+                (day.tokens || []).forEach((tokens, hour) => { totals[hour] += tokens || 0; });
+            });
+            return totals;
         },
-        number(value) { return new Intl.NumberFormat(undefined, {notation: 'compact', maximumFractionDigits: 1}).format(value || 0); },
+        hourlyPeak() { return Math.max(...this.hourlyTotals()); },
+        hourlyBarStyle(total) {
+            const peak = this.hourlyPeak();
+            const ratio = peak > 0 ? total / peak : 0;
+            return `height: ${total > 0 ? Math.max(4, Math.round(ratio * 100)) : 0}%;`;
+        },
+        shade(tokens) {
+            return tokens ? `rgb(var(--palette-green-600) / ${0.2 + 0.8 * Math.sqrt(tokens / this.peak)})` : 'rgb(var(--palette-mid-gray) / 0.12)';
+        },
+        number(value) { return new Intl.NumberFormat(usageLocale(), {notation: 'compact', maximumFractionDigits: 1}).format(value || 0); },
         speed(value) { return value == null ? '—' : value.toFixed(1); },
     };
 }

@@ -16,9 +16,8 @@ replaces ``gate_proj``/``up_proj`` (mirroring the vendored GLM DSA
 switch layers), and the class ``__call__`` gains a fused branch.
 Instances without ``gate_up_proj`` keep the original code path.
 
-mlx-vlm's exact verifier reads separate gate/up views of the fused storage.
-Its short-block verify path keeps the upstream numerical contract; normal
-prefill and decode use the fused projection.
+mlx-vlm verification uses the same fused projection without sorting routes.
+Separate gate/up views remain available to other upstream callers.
 """
 
 from __future__ import annotations
@@ -26,6 +25,7 @@ from __future__ import annotations
 import copy
 import logging
 import os
+from functools import wraps
 from typing import Any
 
 import mlx.core as mx
@@ -33,7 +33,6 @@ from mlx_lm.models.switch_layers import (
     QuantizedSwitchLinear,
     SwitchGLU,
     SwitchLinear,
-    _gather_sort,
     _scatter_unsort,
 )
 from mlx_vlm.models.switch_layers import (
@@ -50,10 +49,18 @@ from mlx_vlm.models.switch_layers import (
 )
 
 from ..scheduler import _sync_and_clear_cache
+from . import moe_verify_gather
+from .m5_gather_qmm import fused_gate_up_activation
+from .m5_gather_qmm_a8 import try_routed_a8
+from .moe_routes import sort_routes
+from .module_cache import cached_per_module
 
 logger = logging.getLogger(__name__)
 
 _CALL_PATCHED = False
+# Unsorted routed-expert calls (decode) read the fused operands resolved once
+# per SwitchGLU; OMLX_QWEN35_MOE_DECODE_PLAN=0 resolves them per call.
+_DECODE_PLAN_ENABLED = os.environ.get("OMLX_QWEN35_MOE_DECODE_PLAN", "1") != "0"
 
 # Loaded model classes whose module path marks a supported SwitchGLU family:
 # mlx-lm Qwen3.5/3.6 and HyV3, Qwen4-Exp's inherited SwitchGLU, the oMLX
@@ -144,14 +151,40 @@ def _make_patched_call(orig_call):
         do_sort = indices.size >= 64
         idx = indices
         inv_order = None
+        token_rows = None
         if do_sort:
-            x, idx, inv_order = _gather_sort(x, indices)
+            # mlx-lm's _gather_sort with the replicated rows left lazy.
+            x_tok, row_map, idx, inv_order = sort_routes(x, indices)
+            x = x_tok[row_map]
+            token_rows = (x_tok, row_map)
         if self.training:
             idx = mx.stop_gradient(idx)
-        x_gate_up = gate_up(x, idx, sorted_indices=do_sort)
-        x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+        x_act = None
+        if do_sort and not self.training:
+            # Routed A8 (opt-in per model, see m5_gather_qmm_a8): the Gate+Up
+            # on INT8 operands and the A16 Down; None keeps the A16 path.
+            routed = try_routed_a8(
+                self,
+                token_rows,
+                idx,
+                # [B, L, k] routes: the sequence length, not B * L
+                seq_len=int(indices.shape[-2]) if indices.ndim >= 3 else None,
+            )
+            if routed is not None:
+                x = _scatter_unsort(routed, inv_order, indices.shape)
+                return x.squeeze(-2)
+            # Sorted prefill on M5: the activation in the [gate; up]
+            # matmul's epilogue, token rows read in place (bit-identical;
+            # None keeps this path).
+            x_act = fused_gate_up_activation(
+                gate_up, x, idx, self.activation, token_rows=token_rows
+            )
+        if x_act is None:
+            x_gate_up = gate_up(x, idx, sorted_indices=do_sort)
+            x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+            x_act = self.activation(x_up, x_gate)
         x = self.down_proj(
-            self.activation(x_up, x_gate),
+            x_act,
             idx,
             sorted_indices=do_sort,
         )
@@ -162,17 +195,124 @@ def _make_patched_call(orig_call):
     return patched
 
 
+def _quantized_operands(linear) -> tuple | None:
+    """``mx.gather_qmm`` operands of an mlx-vlm QuantizedSwitchLinear without bias."""
+    if type(linear) is not VLMQuantizedSwitchLinear or "bias" in linear:
+        return None
+    return (
+        linear["weight"],
+        linear["scales"],
+        linear.get("biases"),
+        linear.group_size,
+        linear.bits,
+        linear.mode,
+    )
+
+
+def _build_decode_plan(switch_mlp) -> tuple | None:
+    # Training decode stops gradients through the routes; keep the stock body.
+    if switch_mlp.training:
+        return None
+    gate_up = _quantized_operands(switch_mlp.get("gate_up_proj"))
+    down = _quantized_operands(switch_mlp.get("down_proj"))
+    activation = switch_mlp.get("activation")
+    if gate_up is None or down is None or activation is None:
+        return None
+    return gate_up, down, activation
+
+
+def _unsorted_switch(plan, x, indices):
+    """The unsorted branch of the fused call on resolved operands.
+
+    Same ops as ``gate_up(x, idx, sorted_indices=False)``, the split, the
+    activation and ``down_proj(..., sorted_indices=False)`` through
+    mlx-vlm's ``QuantizedSwitchLinear.__call__``.
+    """
+    (gw, gs, gb, g_group, g_bits, g_mode), (dw, ds, db, d_group, d_bits, d_mode), act = plan
+    x_gate_up = mx.gather_qmm(
+        mx.expand_dims(x, (-2, -3)),
+        gw,
+        gs,
+        gb,
+        rhs_indices=indices,
+        transpose=True,
+        group_size=g_group,
+        bits=g_bits,
+        mode=g_mode,
+        sorted_indices=False,
+    )
+    x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+    x = mx.gather_qmm(
+        act(x_up, x_gate),
+        dw,
+        ds,
+        db,
+        rhs_indices=indices,
+        transpose=True,
+        group_size=d_group,
+        bits=d_bits,
+        mode=d_mode,
+        sorted_indices=False,
+    )
+    return x.squeeze(-2)
+
+
 def _make_vlm_patched_call(original):
     fused_call = _make_patched_call(original)
 
     def patched(self, x, indices, weights=None, shared=None, residual=None):
-        # Exact verification reads gate/up views of the same fused storage.
-        if not self.training and x.ndim == 3 and 1 < x.shape[1] <= DECODE_BLOCK_SIZE:
+        if getattr(self, "gate_up_proj", None) is None:
             return original(self, x, indices, weights, shared, residual)
+        if not self.training and x.ndim == 3 and 1 < x.shape[1] <= DECODE_BLOCK_SIZE:
+            if x.shape[0] * indices.shape[-1] >= 64:
+                return original(self, x, indices, weights, shared, residual)
+            # The upstream kernel would copy the strided gate/up views.
+            routed = _fused_verify_switch(self, x, indices)
+            return self._combine(routed, weights, shared, residual)
+        if _DECODE_PLAN_ENABLED and indices.size < 64:
+            # fused_call's unsorted branch (decode rows) with cached operands.
+            plan = cached_per_module(self, "_omlx_gate_up_decode_plan", _build_decode_plan)
+            if plan is not None:
+                routed = _unsorted_switch(plan, x, indices)
+                return self._combine(routed, weights, shared, residual)
         routed = fused_call(self, x, indices)
         return self._combine(routed, weights, shared, residual)
 
     return patched
+
+
+def _fused_verify_switch(switch_mlp, x, indices):
+    """Keep unsorted routing for the verifier's per-position reductions."""
+    batch, length, width = x.shape
+    top_k = indices.shape[-1]
+    routed = moe_verify_gather.fused_switch(switch_mlp, x, indices)
+    if routed is not None:
+        return routed
+    flat_x = mx.expand_dims(x.reshape(batch * length, width), (-2, -3))
+    flat_indices = indices.reshape(batch * length, top_k)
+    gate_up = switch_mlp.gate_up_proj(flat_x, flat_indices, sorted_indices=False)
+    gate, up = mx.split(gate_up, 2, axis=-1)
+    out = switch_mlp.down_proj(
+        switch_mlp.activation(up, gate), flat_indices, sorted_indices=False
+    )
+    return out.squeeze(-2).reshape(batch, length, top_k, -1)
+
+
+def _ensure_vlm_verify_patch() -> None:
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+
+    original = Qwen3_5BatchInvariantForward._switch_glu
+    if getattr(original, "_omlx_gate_up_fused_verify", False):
+        return
+
+    @wraps(original)
+    def fused_verify(self, switch_mlp, x, indices):
+        if x.ndim == 3 and getattr(switch_mlp, "gate_up_proj", None) is not None:
+            return _fused_verify_switch(switch_mlp, x, indices)
+        return original(self, switch_mlp, x, indices)
+
+    fused_verify._omlx_gate_up_fused_verify = True
+    Qwen3_5BatchInvariantForward._switch_glu = fused_verify
 
 
 def _ensure_call_patch() -> None:
@@ -209,6 +349,7 @@ def apply_qwen35_moe_gate_up_fusion(model: Any) -> int:
     if not targets:
         return 0
     _ensure_call_patch()
+    _ensure_vlm_verify_patch()
     for switch_mlp in targets:
         _fuse_one(switch_mlp)
         # The freed gate/up buffers land in the MLX buffer pool, which the

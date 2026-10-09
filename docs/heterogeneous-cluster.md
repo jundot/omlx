@@ -77,9 +77,9 @@ contiguous-layer and physical-memory checks may adjust or refuse.
 ## Current platform reality
 
 This design no longer depends on treating CUDA support as an unofficial MLX
-experiment. [MLX 0.32.2 officially supports CUDA 12 and CUDA 13](https://ml-explore.github.io/mlx/build/html/install.html),
+experiment. [MLX 0.32.3 officially supports CUDA 12 and CUDA 13](https://ml-explore.github.io/mlx/build/html/install.html),
 including Linux ARM wheels relevant to DGX Spark. oMLX already pins
-`mlx==0.32.2` in this branch.
+`mlx==0.32.3` in this branch.
 
 MLX provides several distributed transports:
 
@@ -339,7 +339,7 @@ The Mac application remains a Metal distribution. The GUI bootstrap creates a
 headless Linux ARM64 environment using the official CUDA wheel set:
 
 ```text
-mlx[cuda13]==0.32.2
+mlx[cuda13]==0.32.3
 same pinned MLX-LM revision
 same oMLX cluster/runtime code
 no macOS app, Metal-only extension, or Mac authorization dependency
@@ -463,6 +463,10 @@ adding this CUDA node improves the selected workload
 A slower node can increase maximum model capacity while reducing token rate.
 The dashboard must present both effects rather than reducing cluster quality to
 one aggregate-memory number.
+
+A Mac with a ConnectX card driven by MCDMA can move the rank 1 to rank 0 stage
+activation over RDMA instead of the 10 GbE Ring hop, after a byte-checked probe
+proves the link before each launch. See [RDMA stage links](rdma-links.md).
 
 ## Hardware feasibility probe
 

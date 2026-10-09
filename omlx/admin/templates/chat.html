@@ -23,47 +23,8 @@
 <script defer src="/admin/static/js/katex-auto-render.min.js"></script>
 
 <style>
-    /* CSS Variables for theming */
-    :root {
-        --bg-primary: #ffffff;
-        --bg-secondary: #f8fafc;
-        --bg-tertiary: #f1f5f9;
-        --text-primary: #0f172a;
-        --text-secondary: #475569;
-        --text-tertiary: #64748b;
-        --text-muted: #94a3b8;
-        --border-faint: #e2e8f0;
-        --border-normal: #cbd5e1;
-        --code-bg: #f3f4f6;
-        --btn-primary: #171717;
-        --btn-primary-hover: #27272a;
-        --btn-primary-text: #ffffff;
-        --text-danger: #ef4444;
-        --bg-danger-hover: rgba(239, 68, 68, 0.1);
-        --timeline-accent: #3b82f6;
-    }
-
-    [data-theme="dark"] {
-        --bg-primary: #1d1d20;
-        --bg-secondary: #252529;
-        --bg-tertiary: #2d2d32;
-        --text-primary: #efefef;
-        --text-secondary: #a1a1aa;
-        --text-tertiary: #71717a;
-        --text-muted: #52525b;
-        --border-faint: #3f3f46;
-        --border-normal: #52525b;
-        --code-bg: #27272a;
-        --btn-primary: #e5e5e5;
-        --btn-primary-hover: #d4d4d4;
-        --btn-primary-text: #18181b;
-        --text-danger: #f87171;
-        --bg-danger-hover: rgba(239, 68, 68, 0.2);
-        --timeline-accent: #60a5fa;
-    }
-
     [data-theme="dark"] ::selection {
-        background-color: #3f3f46;
+        background-color: rgb(var(--palette-zinc-700));
         color: var(--text-primary);
     }
 
@@ -200,12 +161,12 @@
     }
 
     .response-tab-group.response-tab-group--active-missing {
-        border: 1.5px solid #ef4444;
+        border: 1.5px solid rgb(var(--palette-red-500));
     }
 
     .response-tab-group.response-tab-group--active-missing:hover {
-        background: color-mix(in srgb, #ef4444 12%, var(--bg-secondary));
-        border-color: #ef4444;
+        background: color-mix(in srgb, rgb(var(--palette-red-500)) 12%, var(--bg-secondary));
+        border-color: rgb(var(--palette-red-500));
     }
 
     .response-tab-streaming-dot {
@@ -232,7 +193,7 @@
     }
 
     .response-tab-delete:hover {
-        background: var(--bg-danger-hover, rgba(239, 68, 68, 0.12));
+        background: var(--bg-danger-hover, rgb(var(--palette-red-500) / 0.12));
         color: var(--text-danger);
     }
 
@@ -513,7 +474,7 @@
     .svg-preview-container {
         margin: 0.5em 0;
         padding: 1em;
-        background: #ffffff;
+        background: rgb(var(--palette-white));
         border: 1px solid var(--border-faint);
         border-radius: 0.5em;
         text-align: center;
@@ -567,8 +528,8 @@
         width: 0.875rem;
         height: 0.875rem;
         border-radius: 50%;
-        background: #fff;
-        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+        background: rgb(var(--palette-white));
+        box-shadow: 0 1px 2px rgb(var(--palette-black) / 0.15);
         transition: transform 0.2s ease;
     }
 
@@ -801,7 +762,7 @@
         .sidebar-overlay {
             position: fixed;
             inset: 0;
-            background: rgba(0, 0, 0, 0.5);
+            background: rgb(var(--palette-black) / 0.5);
             z-index: 40;
         }
 
@@ -826,7 +787,7 @@
     .image-modal {
         position: fixed;
         inset: 0;
-        background: rgba(0, 0, 0, 0.9);
+        background: rgb(var(--palette-black) / 0.9);
         display: flex;
         align-items: center;
         justify-content: center;
@@ -839,7 +800,7 @@
         max-height: 90%;
         object-fit: contain;
         border-radius: 8px;
-        box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+        box-shadow: 0 4px 24px rgb(var(--palette-black) / 0.5);
     }
 
     .image-modal-close {
@@ -848,7 +809,7 @@
         right: 20px;
         width: 40px;
         height: 40px;
-        background: rgba(255, 255, 255, 0.1);
+        background: rgb(var(--palette-white) / 0.1);
         border: none;
         border-radius: 50%;
         color: white;
@@ -860,7 +821,7 @@
     }
 
     .image-modal-close:hover {
-        background: rgba(255, 255, 255, 0.2);
+        background: rgb(var(--palette-white) / 0.2);
     }
 
     /* Edit image preview */
@@ -920,7 +881,7 @@
         .right-sidebar-overlay {
             position: fixed;
             inset: 0;
-            background: rgba(0, 0, 0, 0.5);
+            background: rgb(var(--palette-black) / 0.5);
             z-index: 40;
         }
 
@@ -971,7 +932,7 @@
         border-radius: 8px;
         padding: 8px 12px;
         max-width: 260px;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+        box-shadow: 0 4px 12px rgb(var(--palette-black) / 0.25);
         font-size: 12px;
         color: var(--text-primary);
         line-height: 1.4;
@@ -1104,7 +1065,7 @@
                             <button @click.stop="saveRenamedChat(chat.id)"
                                 class="p-1 hover:bg-surface-alt rounded transition-colors"
                                 :title="window.t('chat.rename_save_tooltip')">
-                                <i data-lucide="check" class="w-3 h-3" style="color: var(--success, #16a34a);"></i>
+                                <i data-lucide="check" class="w-3 h-3" style="color: var(--success, rgb(var(--palette-green-600)));"></i>
                             </button>
                             <button @click.stop="cancelRenamingChat()"
                                 class="p-1 hover:bg-surface-alt rounded transition-colors"
@@ -1890,7 +1851,7 @@
                     <!-- Active model -->
                     <span class="flex items-center gap-1.5 min-w-0" style="font-size: 11px; color: var(--text-secondary);">
                         <span class="w-1.5 h-1.5 rounded-full flex-shrink-0"
-                            style="background-color: #34d399; box-shadow: 0 0 0 3px rgba(52,211,153,0.22);"></span>
+                            style="background-color: rgb(var(--palette-emerald-400)); box-shadow: 0 0 0 3px rgb(var(--palette-emerald-400) / 0.22);"></span>
                         <span class="truncate" x-text="(availableModels.find(m => m.id === currentModel)?.name) || currentModel"></span>
                     </span>
                     <!-- Context capsule -->
@@ -2209,13 +2170,13 @@
                     <div x-show="thinkingModeValue() === 'on_limit'" x-collapse class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider block"
                             style="color: var(--text-secondary);">{{ t('chat.thinking_tokens') }}</label>
-                        <input type="number" x-model.number="modelSettings.thinking_budget_tokens"
-                            @focus="_thinkingBudgetBeforeInput = modelSettings.thinking_budget_tokens"
+                        <input type="number"
+                            :value="modelSettings.thinking_budget_tokens ?? ''"
                             @keydown.arrow-up.prevent="stepThinkingBudgetTokens(1)"
                             @keydown.arrow-down.prevent="stepThinkingBudgetTokens(-1)"
                             @input="onThinkingBudgetTokensInput($event)"
                             @change="clampThinkingBudgetTokens()"
-                            placeholder="4001" min="1" step="1000"
+                            placeholder="4096" min="0" step="1024"
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface thinking-budget-input"
                             style="color: var(--text-primary);">
                     </div>
@@ -2468,7 +2429,7 @@
     <!-- Keyboard Shortcuts Help -->
     <div x-show="showShortcutsHelp" x-cloak x-transition.opacity
         class="fixed inset-0 z-[200] flex items-center justify-center px-4"
-        style="background-color: rgba(0,0,0,0.6);" @click="showShortcutsHelp = false">
+        style="background-color: rgb(var(--palette-black) / 0.6);" @click="showShortcutsHelp = false">
         <div class="w-full max-w-sm rounded-2xl border border-line bg-surface shadow-2xl overflow-hidden" @click.stop>
             <div class="flex items-center justify-between px-5 py-3.5 border-b border-line">
                 <h3 class="text-sm font-bold" style="color: var(--text-primary);">{{ t('chat.keyboard_shortcuts') }}</h3>
@@ -2589,8 +2550,6 @@
             _thinkingDomSeq: 0,
             _adminModelsList: null,
             _adminModelsListPromise: null,
-            _thinkingBudgetBeforeInput: null,
-            _thinkingBudgetStepping: false,
             chatSessions: {},
             messages: [],
             inputMessage: '',
@@ -2771,29 +2730,18 @@
                 } else {
                     this.modelSettings.thinking_budget_tokens = v - step;
                 }
-                this._thinkingBudgetBeforeInput = this.modelSettings.thinking_budget_tokens;
                 this.onModelSettingsChange();
             },
 
             onThinkingBudgetTokensInput(event) {
-                if (this._thinkingBudgetStepping) return;
                 const el = event.target;
-                const raw = Number(el.value);
-                const prev = Number(this._thinkingBudgetBeforeInput);
-                if (Number.isFinite(prev) && Number.isFinite(raw) && raw !== prev) {
-                    const delta = raw - prev;
-                    // Native spinners use (min + n*step); 4096 is off-grid when min=1, step=100/1024
-                    if (delta !== 0 && Math.abs(delta) < 1024) {
-                        this._thinkingBudgetStepping = true;
-                        this.modelSettings.thinking_budget_tokens = prev;
-                        this.stepThinkingBudgetTokens(delta > 0 ? 1 : -1);
-                        el.value = this.modelSettings.thinking_budget_tokens;
-                        this._thinkingBudgetBeforeInput = this.modelSettings.thinking_budget_tokens;
-                        this._thinkingBudgetStepping = false;
-                        return;
-                    }
+                if (el.value === '') {
+                    this.modelSettings.thinking_budget_tokens = null;
+                    this.onModelSettingsChange();
+                    return;
                 }
-                this._thinkingBudgetBeforeInput = raw;
+                const raw = Number(el.value);
+                if (!Number.isFinite(raw)) return;
                 this.modelSettings.thinking_budget_tokens = raw;
                 this.onModelSettingsChange();
             },
@@ -2803,7 +2751,6 @@
                 this.modelSettings.thinking_budget_tokens = this.normalizeThinkingBudgetTokens(
                     this.modelSettings.thinking_budget_tokens
                 );
-                this._thinkingBudgetBeforeInput = this.modelSettings.thinking_budget_tokens;
             },
 
             setThinkingMode(mode) {
@@ -2816,13 +2763,14 @@
             },
 
             captureSessionModelSettings() {
-                if (this.modelSettings.thinking_budget_enabled) {
-                    this.modelSettings.thinking_budget_tokens = this.normalizeThinkingBudgetTokens(
-                        this.modelSettings.thinking_budget_tokens
+                const modelSettings = this.cloneData(this.modelSettings);
+                if (modelSettings.thinking_budget_enabled) {
+                    modelSettings.thinking_budget_tokens = this.normalizeThinkingBudgetTokens(
+                        modelSettings.thinking_budget_tokens
                     );
                 }
                 return {
-                    modelSettings: this.cloneData(this.modelSettings),
+                    modelSettings,
                     speculativeEngine: this.speculativeEngine,
                     speculativeDraftModel: this.speculativeDraftModel,
                 };
@@ -3586,6 +3534,7 @@
                     }),
                     stream: true,
                     stream_options: { include_usage: true },
+                    return_progress: true,
                     ...generation,
                     // One-off per-call overrides (e.g. "regenerate creative") without
                     // mutating the session's saved settings.
@@ -3720,6 +3669,16 @@
                 const modelData = this.findModelStatsEntry(data, modelId);
                 const claimed = this.getClaimedRequestStats(stream, modelData);
                 const base = { ...(stream._liveFooterStats || this.emptyStats()) };
+
+                const progress = stream._promptProgress;
+                if (progress && progress.processed < progress.total) {
+                    base.avg_prefill_tps = progress.rate || 0;
+                    base.prompt_tokens = progress.total;
+                    if (stream._statusStart) {
+                        base.total_time = ((Date.now() - stream._statusStart) / 1000).toFixed(1);
+                    }
+                    return base;
+                }
 
                 if (!claimed) {
                     return {
@@ -4230,6 +4189,32 @@
         }
     },
 
+    // llama.cpp-style prompt_progress from this request's own stream.
+    // Unlike the stats poll, it cannot pick up another request's prefill.
+    applyPromptProgress(chatId, progress) {
+        const stream = this.getStreamSession(chatId, false);
+        if (!stream) return;
+        this.stopPrefillPolling(chatId);
+        const prev = stream._promptProgress;
+        const dTokens = prev ? progress.processed - prev.processed : 0;
+        const dMs = prev ? progress.time_ms - prev.time_ms : 0;
+        const rate = dTokens > 0 && dMs > 0 ? dTokens / (dMs / 1000) : (prev?.rate || 0);
+        stream._promptProgress = { ...progress, rate };
+        if (stream.engineStatus?.icon === 'wrench') return; // don't overwrite tool status
+        const uncached = progress.total - progress.cache;
+        if (uncached <= 0 || progress.processed >= progress.total) {
+            stream.engineStatus = { text: window.t('chat.status.generating') };
+            return;
+        }
+        const pct = Math.round((progress.processed - progress.cache) / uncached * 100);
+        const speed = rate > 0 ? ` · ${Math.round(rate)} ${window.t('chat.stats.tokens_per_second_suffix')}` : '';
+        stream.engineStatus = {
+            text: window.t('chat.status.prefilling_percent')
+                .replace('{percent}', pct)
+                .replace('{speed}', speed)
+        };
+    },
+
             async _pollPrefill(chatId) {
         const stream = this.getStreamSession(chatId, false);
         if (!stream?.isStreaming) return;
@@ -4437,12 +4422,6 @@
     loadAudioFile(file) {
         if (!this.isSupportedAudioFile(file)) {
             alert(window.t('chat.error.invalid_audio_type'));
-            return;
-        }
-        // Mirrors MAX_AUDIO_UPLOAD_BYTES on the server
-        const maxMb = 100;
-        if (file.size > maxMb * 1024 * 1024) {
-            alert(window.t('chat.error.audio_too_large').replace('{max}', maxMb));
             return;
         }
         const id = `aud_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
@@ -4815,7 +4794,7 @@
                 allModels.filter(m => {
                     const gatewayId = this.aliasToGateway[m.id] || m.id;
                     const t = (this.modelTypeMap[gatewayId] || '').toLowerCase();
-                    return t !== 'audio_tts' && t !== 'audio_sts' && t !== 'embedding' && t !== 'reranker';
+                    return t !== 'audio_tts' && t !== 'audio_sts' && t !== 'embedding' && t !== 'reranker' && t !== 'decision';
                 }).map(m => ({
                     id: this.aliasToGateway[m.id] || m.id, // gateway id for API calls
                     name: m.id, // original name (alias or directory name) for display
@@ -5664,7 +5643,10 @@
                 }
                 const errorText = await response.text();
                 let detail = null;
-                try { detail = JSON.parse(errorText)?.detail; } catch (e) { }
+                try {
+                    const payload = JSON.parse(errorText);
+                    detail = payload?.error?.message || payload?.detail;
+                } catch (e) { }
                 throw new Error(
                     (typeof detail === 'string' && detail) || errorText || `Error: ${response.status}`
                 );
@@ -6142,6 +6124,7 @@
         const requestBody = this.buildChatCompletionBody(chatSession.messages, context, depth);
         stream._toolRoundContent = '';
         this.setEngineStatus(context.chatId, { text: window.t('chat.status.starting') });
+        stream._promptProgress = null;
         this.startPrefillPolling(context.chatId);
 
         try {
@@ -6183,6 +6166,10 @@
                     if (line.startsWith('data: ')) {
                         try {
                             const data = JSON.parse(line.slice(6));
+                            if (data.prompt_progress) {
+                                this.applyPromptProgress(context.chatId, data.prompt_progress);
+                                continue;
+                            }
                             const choice = data.choices?.[0];
                             const delta = choice?.delta;
                             if (choice?.finish_reason) finishReason = choice.finish_reason;
@@ -6678,14 +6665,16 @@
         this.messages = session.messages;
         this.scheduleEnhanceMessages();
 
-        // Optional one-off overrides from the regenerate dropdown. These apply to
-        // this single call only and never mutate the session's saved settings.
+        // The creative temperature applies to this call only.
         let generationOverride = null;
         if (opts.creative) {
             const base = Number(this.modelSettings?.temperature);
             const temp = Number.isFinite(base) && base > 0 ? Math.min(2, base + 0.4) : 1.2;
             generationOverride = { temperature: temp };
         }
+
+        // "Regenerate with" switches the chat to the chosen model.
+        if (opts.model) await this.selectModel(opts.model);
 
         await this.streamResponse({
             chatId: this.currentChatId,

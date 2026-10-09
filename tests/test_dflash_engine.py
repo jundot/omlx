@@ -327,7 +327,10 @@ class TestDFlashEngineInit:
         snapshot = object()
         engine._target_model = target_model
         engine._target_ops = target_ops
-        engine._executor_tokenizer = object()
+        # mlx-vlm tokenizers (GLM-5.3) expose a scalar eos_token_id only; the
+        # oMLX boundary normalizes it and unions generation_config EOS ids.
+        engine._executor_tokenizer = SimpleNamespace(eos_token_ids=2, eos_token_id=3)
+        engine._generation_config_eos = {5, 3}
         engine._draft_model = object()
         engine._draft_backend = object()
         engine._runtime_context = object()
@@ -351,7 +354,6 @@ class TestDFlashEngineInit:
         monkeypatch.setattr(
             PrefixCacheFlow, "for_request", classmethod(fake_for_request)
         )
-        monkeypatch.setattr(dflash_runtime, "get_stop_token_ids", lambda tokenizer: [2])
 
         def fake_stream_dflash_generate(**kwargs):
             captured.update(kwargs)
@@ -375,7 +377,8 @@ class TestDFlashEngineInit:
         )
 
         assert list(event_iter) == []
-        assert stop_ids == [2]
+        assert stop_ids == [2, 3, 5]
+        assert captured["stop_token_ids"] == [2, 3, 5]
         assert captured["suppress_token_ids"] == [258882, 258883]
         assert captured["prefix_snapshot"] is snapshot
         assert captured["prefix_hit_kind"] == "l2_prefix"
@@ -962,6 +965,203 @@ class TestDFlashCompatibility:
         assert "Qwen" in reason
         assert "Gemma4" in reason
         assert "Laguna" in reason
+        assert "GLM-5.3" in reason
+
+    @pytest.mark.parametrize("model_type", ["glm5_next", "glm5_next_text"])
+    def test_glm5_next_is_compatible(self, tmp_path, model_type):
+        try:
+            from omlx.engine.dflash import is_dflash_compatible
+        except ImportError:
+            pytest.skip("dflash-mlx not installed")
+        self._write_config(tmp_path, model_type)
+        compatible, reason = is_dflash_compatible(tmp_path)
+        assert compatible is True
+        assert reason == ""
+
+
+class TestDFlashStopTokenIds:
+    """Stop IDs are normalized at the oMLX boundary (mlx-vlm scalars, GLM
+    generation_config terminators) instead of relying on dflash-mlx's
+    iterable-only helper."""
+
+    def test_scalar_and_iterable_eos_are_unioned_and_sorted(self):
+        from omlx.engine.dflash import _get_dflash_stop_token_ids
+
+        tokenizer = SimpleNamespace(eos_token_id=7, eos_token_ids={3, 7, 9})
+        assert _get_dflash_stop_token_ids(tokenizer) == [3, 7, 9]
+        scalar = SimpleNamespace(eos_token_id=7, eos_token_ids=2)
+        assert _get_dflash_stop_token_ids(scalar) == [2, 7]
+
+    def test_generation_config_eos_and_missing_attrs(self):
+        from omlx.engine.dflash import _get_dflash_stop_token_ids
+
+        assert _get_dflash_stop_token_ids(object()) == []
+        assert _get_dflash_stop_token_ids(object(), {154827, 154820}) == [
+            154820,
+            154827,
+        ]
+        tokenizer = SimpleNamespace(eos_token_id=154820, eos_token_ids=None)
+        assert _get_dflash_stop_token_ids(tokenizer, {154829}) == [154820, 154829]
+
+    def test_non_integer_entries_are_ignored(self):
+        from omlx.engine.dflash import _get_dflash_stop_token_ids
+
+        tokenizer = SimpleNamespace(eos_token_id=True, eos_token_ids=[1, "x", None, 2])
+        assert _get_dflash_stop_token_ids(tokenizer) == [1, 2]
+
+
+class TestDFlashGlm5EngineWiring:
+    """GLM-5.3 specific engine behaviour: wired-limit ownership, tool
+    parser injection, and tool-calling capability reporting."""
+
+    def test_supports_tool_calling_reads_tokenizer_flag(self):
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine("target", "draft")
+        assert engine.supports_tool_calling is False
+        engine._tokenizer_obj = SimpleNamespace(has_tool_calling=True)
+        assert engine.supports_tool_calling is True
+
+    def test_glm_tool_parser_installed_on_both_tokenizer_copies(self):
+        from mlx_lm.tool_parsers import glm47
+
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine("target", "draft")
+        engine._model_type_str = "glm5_next"
+        vocab = {"<tool_call>": 1, "</tool_call>": 2}
+        engine._tokenizer_obj = SimpleNamespace(get_vocab=lambda: vocab)
+        engine._executor_tokenizer = SimpleNamespace(get_vocab=lambda: vocab)
+        engine._install_glm_tool_parser()
+        for tokenizer in (engine._tokenizer_obj, engine._executor_tokenizer):
+            assert tokenizer.has_tool_calling is True
+            assert tokenizer.tool_call_start == glm47.tool_call_start
+            assert tokenizer.tool_call_end == glm47.tool_call_end
+            assert tokenizer.tool_parser is glm47.parse_tool_call
+        assert engine.supports_tool_calling is True
+
+    def test_glm_tool_parser_skips_other_targets_and_missing_markers(self):
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine("target", "draft")
+        engine._model_type_str = "qwen3_5"
+        engine._tokenizer_obj = SimpleNamespace(get_vocab=lambda: {"<tool_call>": 1})
+        engine._executor_tokenizer = engine._tokenizer_obj
+        engine._install_glm_tool_parser()
+        assert not hasattr(engine._tokenizer_obj, "has_tool_calling")
+
+        engine._model_type_str = "glm5_next"
+        engine._install_glm_tool_parser()  # vocab lacks </tool_call>
+        assert not hasattr(engine._tokenizer_obj, "has_tool_calling")
+
+    def test_wired_limit_uses_recommended_working_set_and_is_idempotent(
+        self, monkeypatch
+    ):
+        from omlx.engine import dflash as dflash_mod
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine("target", "draft")
+        calls = []
+        synchronized = []
+        monkeypatch.setattr(dflash_mod.mx.metal, "is_available", lambda: True)
+        monkeypatch.setattr(
+            dflash_mod.mx,
+            "device_info",
+            lambda: {"max_recommended_working_set_size": 96, "memory_size": 256},
+        )
+
+        def set_wired_limit(value):
+            calls.append(value)
+            return 41
+
+        monkeypatch.setattr(dflash_mod.mx, "set_wired_limit", set_wired_limit)
+        monkeypatch.setattr(
+            dflash_mod.mx, "synchronize", lambda: synchronized.append(True)
+        )
+
+        engine._acquire_wired_limit()
+        engine._acquire_wired_limit()
+        assert calls == [96]
+        assert engine._old_wired_limit == 41
+        assert engine._wired_limit_owned is True
+
+        assert engine._restore_wired_limit() is True
+        assert engine._restore_wired_limit() is False
+        assert calls == [96, 41]
+        assert synchronized == [True]
+
+    def test_load_with_wired_limit_only_owns_glm_targets(self, monkeypatch):
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine("target", "draft")
+        events = []
+        monkeypatch.setattr(
+            engine, "_acquire_wired_limit", lambda: events.append("acquire")
+        )
+        monkeypatch.setattr(
+            engine, "_restore_wired_limit", lambda: events.append("restore")
+        )
+
+        monkeypatch.setattr(engine, "_is_glm5_target", lambda: False)
+        assert engine._load_with_wired_limit(lambda: "loaded") == "loaded"
+        assert events == []
+
+        monkeypatch.setattr(engine, "_is_glm5_target", lambda: True)
+        assert engine._load_with_wired_limit(lambda: "loaded") == "loaded"
+        assert events == ["acquire"]
+
+        def fail_load():
+            events.append("load")
+            raise RuntimeError("load failed")
+
+        with pytest.raises(RuntimeError, match="load failed"):
+            engine._load_with_wired_limit(fail_load)
+        assert events == ["acquire", "acquire", "load", "restore"]
+
+    @pytest.mark.asyncio
+    async def test_start_restores_wired_limit_after_start_failure(self, monkeypatch):
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine("target", "draft")
+        monkeypatch.setattr(
+            engine, "_start_impl", AsyncMock(side_effect=RuntimeError("load failed"))
+        )
+        restore = AsyncMock(return_value=True)
+        monkeypatch.setattr(engine, "_restore_wired_limit_async", restore)
+
+        with pytest.raises(RuntimeError, match="load failed"):
+            await engine.start()
+        restore.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_double_stop_restores_wired_limit_once(self, monkeypatch):
+        from dflash_mlx.cache import manager as cache_manager
+
+        from omlx import engine_core
+        from omlx.engine.dflash import DFlashEngine
+
+        engine = DFlashEngine("target", "draft")
+        engine._wired_limit_owned = True
+        engine._generation_config_eos = {154827}
+        restores = []
+
+        def restore():
+            if not engine._wired_limit_owned:
+                return False
+            engine._wired_limit_owned = False
+            restores.append(True)
+            return True
+
+        monkeypatch.setattr(engine, "_restore_wired_limit", restore)
+        monkeypatch.setattr(engine_core, "get_mlx_executor", lambda: None)
+        monkeypatch.setattr(
+            cache_manager, "shutdown_runtime_cache_manager", lambda: None
+        )
+
+        await engine.stop()
+        await engine.stop()
+        assert restores == [True]
+        assert engine._generation_config_eos == set()
 
 
 class TestDFlashEnginePoolRouting:
@@ -2102,6 +2302,46 @@ async def test_generation_abort_lifetime(monkeypatch, caplog, streaming, scenari
         assert not engine._active_stop_events
         assert closed.is_set() is (blocker is None)
         assert engine.get_activity_snapshot()["active_requests"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize(
+    ("generated", "expected"),
+    [((5, 6), "length"), ((5, 2), "stop"), ((2, 5), "stop")],
+)
+async def test_finish_reason_at_max_tokens(monkeypatch, streaming, generated, expected):
+    from dflash_mlx.engine.events import SummaryEvent
+
+    from omlx.engine.dflash import DFlashEngine
+
+    engine = DFlashEngine(model_name="test-model", draft_model_path="test-draft")
+    engine._loaded = True
+    engine._tokenizer_obj = SimpleNamespace(decode=lambda *args, **kwargs: "")
+    engine._executor_tokenizer = engine._tokenizer_obj
+    summary = SummaryEvent(
+        elapsed_us=1000,
+        prompt_token_count=1,
+        generated_token_ids=generated,
+        generation_tokens=len(generated),
+        accepted_from_draft=0,
+        acceptance_ratio=0.0,
+        cycles_completed=1,
+        phase_timings_us={},
+    )
+    engine._stream_dflash_events = lambda **kwargs: (iter([summary]), None, [2])
+    monkeypatch.setattr(
+        "omlx.engine.dflash.create_streaming_detokenizer", lambda *args, **kwargs: None
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr("omlx.engine_core.get_mlx_executor", lambda: executor)
+        if streaming:
+            outputs = [o async for o in engine.stream_generate([1], max_tokens=2)]
+            finish_reason = outputs[-1].finish_reason
+        else:
+            finish_reason = (await engine.generate([1], max_tokens=2)).finish_reason
+    assert finish_reason == expected
 
 
 @pytest.mark.asyncio

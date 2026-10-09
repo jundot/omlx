@@ -1,3 +1,9 @@
+# Cluster test filesystem isolation
+
+The autouse `cluster_home` fixture gives each test a temporary directory for cluster interpreter shims and SSH files. It preserves explicit shim `home` arguments and leaves `HOME` unchanged so model discovery paths still work. The shim unit tests import the original function directly and provide their own temporary paths or patch `HOME` to verify the real default-path behavior.
+
+The audio model-list smoke test checks that app startup publishes its shim inside the isolated directory. The cluster GET-route smoke test checks that `/ssh-key` creates its key pair there.
+
 # macOS readability theme tests
 
 Run `xcodebuild -project apps/omlx-mac/oMLX.xcodeproj -scheme oMLX -destination 'platform=macOS' -only-testing:oMLXTests/ThemeTests test` to check theme colors. The readability case renders a probe through `.omlxThemed()` with isolated saved preferences, checking disabled and enabled colors in light and dark appearances. It covers the shared theme path used by popovers, not app relaunch or full-screen layout.
@@ -8,7 +14,31 @@ Run `python -m pytest -q tests/test_vlm_vision_fallback.py` to check strict load
 
 # Test timing
 
-CI runs all default tests on Python 3.11, 3.12, and 3.13, reports the 50 slowest phases, and uploads `test-results.xml` as `test-results-py<version>`. Use `python -m pytest --durations=50 --junitxml=test-results.xml` to collect the same timing data locally. Compare runner queue time separately from test execution.
+CI runs all default tests on Python 3.11 for PRs and pushes to `main`. A daily scheduled run, which can also be started manually, covers Python 3.11, 3.12, and 3.13. Each run reports the 50 slowest phases and uploads `test-results.xml` as `test-results-py<version>`. Use `python -m pytest --durations=50 --junitxml=test-results.xml` to collect the same timing data locally. Compare runner queue time separately from test execution.
+
+The automatic Qwen FP16/BF16 decode route has numerical, cache-state and
+fallback tests in `tests/test_qwen35_fp16_decode.py`. Run it with
+`tests/test_qwen35_gdn_prework.py` to check that the existing BF16 Qwen4 and
+speculative routes remain intact. See
+[GDN decode prework](experimental/qwen35_fp16_decode.md) for the hardware, geometry
+limits and real-model benchmark requirements.
+
+# First-token burst release
+
+Run `python -m pytest -q tests/test_engine_core.py tests/test_output_collector.py`
+to check first-chunk delivery across the executor boundary, late admission,
+multi-token chunks, output ordering, later burst limits and request cancellation.
+Burst decode releases each request's first generated chunk before continuing
+with the configured burst policy. This adds one executor hand-off per request;
+it does not shorten prefill or bypass parser, stop-string or stream-interval
+buffering. Subsequent chunks still follow the selected Burst Decode setting.
+
+For a real-server comparison, use the same model, prompt, output length and
+cache state on main and the branch. Measure client-observed first content and
+complete-response time separately from producer-side token timestamps, with
+balanced (0.1 s) and aggressive (0.2 s) burst settings. Include short replies,
+long replies, a second request admitted during decode, and disconnect/recovery.
+Report any custom budgets separately from the stock modes.
 
 Cluster process-group tests use the `mock_cluster_ssh` fixture; remote teardown and serve-marker tests retain their own transport assertions. Mock-model engine tests skip explicit GC, while `test_engine_teardown.py` and `test_per_engine_threads.py` retain teardown and reclamation coverage. GLM5 execution tests reuse the eight-layer KDA/DSA fixture with dense and MoE layers; checkpoint-key tests retain the 45-layer configuration. The SDPA memory test retains the 8K/32K length ratio, head dimension 256, and 6:1 GQA ratio with fewer heads. DeepSeek V4.1 direct and converted engine checks run sequentially in one isolated subprocess with separate checkpoint directories.
 
@@ -28,6 +58,10 @@ Run `python -m pytest -q tests/test_cli.py tests/test_integrations.py` to check 
 
 Run `python -m pytest -q tests/test_modernbert_attention.py tests/test_embedding.py tests/test_mlx_embeddings_compat.py` to check finite padded attention, single-input equivalence, local-window masking, and embedding integration. The attention regression covers fp16, bf16, and fp32 at lengths around the affected SDPA tile boundaries.
 
+# Decision model tests
+
+Run `python -m pytest -q tests/test_systemone.py` to check the `/v1/systemone` decision models. Clef cases cover the prompt layout and question/option spans, state truncation, answer formatting, the joint head parameter names against the released checkpoint layout, and one logit per option for each question. OpenJev cases cover the text and screenshot prompt layouts, image sources, the two-stage readout for more than 52 options, and the calibration and confidence formulas. A tiny random Qwen3.5 backbone checks that chunked prefill matches a single pass and that a copied prefix cache gives the same readout as a full prefill. Detection, pool dispatch, the endpoint and the oQ head passthrough are tested in `test_model_discovery.py`, `test_engine_pool.py`, `integration/test_server_endpoints.py` and `test_oq.py`. No model download is required.
+
 # QSA reservation tests
 
 Run `python -m pytest -q tests/test_qwen4_qsa_reserved_capacity.py` to check QSA capacity reservations.
@@ -36,13 +70,27 @@ The integration tests cover restored-prefix lengths with boundary snapshots enab
 
 Related regression suites are `test_qwen4_qsa_incremental_cache.py`, `test_qwen4_qsa_decode_gather.py`, and `test_prefill_oom_graceful.py`.
 
+For Qwen4 native sparse-GQA prefill measurements, run `python benchmarks/bench_qwen4_qsa_sparse_gqa.py --key-tokens 24576 --query-tokens 1024 --repetitions 30`. The benchmark reports index scoring, top-k selection, the combined native pipeline, every supported main-attention tile, the portable reference, and maximum error. Production groups native query rows into 4,096-row tiles through 32K keys, 2,048-row tiles through 64K, and 1,024-row tiles above 64K; this bounds the FP32 score sheet while amortizing per-tile dispatch.
+
+# Qwen4 verify attention row tests
+
+Run `python -m pytest -q tests/test_qwen4_verify_attention_rows.py` to check that row-exact Lightning MTP verify windows through Qwen4 attention give every row the bits of the serial one-row decode step and leave the same KV and QSA indexer state. The tests build one attention layer at the real Flash-Next shapes with synthetic 6-bit weights. Masked-arm windows (past the 2,048-token QSA budget, rank-three positions) cover 2 to 8 rows at 2,060, 16,382 and 24,000 cached tokens and compare each row's FP32 block scores and token mask; a rollback case accepts one draft and decodes on. Dense windows below the budget include rows on both sides of MLX's one-pass/two-pass vector SDPA switch at 1,024 keys. `OMLX_QWEN4_QSA_MASKED_VERIFY=0` restores the multi-row masked path.
+
+`test_mlx_vlm_qwen4_exp_compat.py::test_qwen4_mtp_one_row_step_is_the_serial_decode_step` checks that a one-row Lightning MTP window (the activation step and depth-0 cycles) runs the serial decode step: equal logits and cache state, no speculative transaction, and a following verify window that rolls back as usual. `OMLX_QWEN4_MTP_ONE_ROW_DECODE=0` keeps the verify forward for those windows.
+
 # Prefill memory accounting tests
+
+`python -m pytest -q tests/test_engine_preflight.py` checks route admission after eviction or reclaim. Both batched wrappers must refresh their cached MLX sample on the owning executor, including when the pool reports that no action was necessary. Controlled memory readings cover newly available headroom, insufficient headroom, and requests that already fit without executor work.
 
 Run `python -m pytest -q tests/test_prefill_transient_tracker.py tests/test_prefill_oom_graceful.py` to check retained versus reclaimed overhead, configured chunk sizes, and abort-cap enforcement. The loop tests run a small initialized MLX model with controlled footprint readings through external and chunked prefill; they do not load a checkpoint.
 
 # Prefix cache completion tests
 
-Run `python -m pytest -q tests/test_scheduler.py tests/test_scheduler_boundary_completion.py tests/test_prefix_cache_gdn_split.py` to check cache-freshness admission and completed boundary recovery. The completion tests use a small initialized Qwen3.5 hybrid model and the real BatchGenerator, then compare restored-prefix logits with a fresh forward pass. They cover embedded snapshots, GDN sidecars, off-boundary completion, and unknown or inconsistent cache positions.
+Run `python -m pytest -q tests/test_scheduler.py tests/test_scheduler_boundary_completion.py tests/test_prefix_cache_gdn_split.py` to check cache-freshness admission and completed boundary recovery. The completion tests use a small initialized Qwen3.5 hybrid model and the real BatchGenerator, then compare restored-prefix logits with a fresh forward pass. They cover embedded snapshots, GDN sidecars, exact SpecPrefill static-prefix sidecars, off-boundary completion, and unknown or inconsistent cache positions.
+
+# Batch KV capacity tests
+
+Run `python -m pytest -q tests/test_vlm_batch_kv_capacity.py` after changing `omlx/patches/vlm_batch_kv_capacity.py` or bumping the mlx-lm or mlx-vlm pin. The tests load the installed, unpatched cache module next to the patched one and compare cache state and attention output bit for bit through random appends, trims, rollbacks, merges, joins, filters and restores. They cover the mlx-vlm class, the mlx-lm class that prefix restore builds, and a batch that mixes both.
 
 # Cluster join recovery tests
 
@@ -79,14 +127,19 @@ expert reads from shared shards and any expert slab read through the Engram
 mapping. Further cases check that consumed read buffers are released within the
 in-flight byte window and pin the serial LRU order under concurrent reads,
 expert-boundary chunking of sorted routes, and the fit-to-budget residency
-helper against the admission arithmetic. Run alongside `test_deepseek_v41_offload.py`,
+helper against the admission arithmetic. `tests/test_deepseek_v41_affine_source.py`
+covers community `mlx_lm` affine source checkpoints: packed and declared-dense
+projections, exact force-dense dequantization, the affine Engram table spec, a
+convert round-trip against a direct load, the declared-format resolver, and
+offload eligibility. Run alongside `test_deepseek_v41_offload.py`,
 `test_moe_expert_offload.py`, and the engine-pool/model-settings suites.
 `node tests/moe_expert_offload_ui.test.cjs` checks the actual dashboard
 save/reopen payload and speculative-decoding toggle exclusion.
 
 `tests/test_moe_expert_offload.py` also exercises Qwen4-Exp MoE routing with
 512 experts, top-k 10, 64 resident slots, shared experts, and repeated
-evictions. `tests/test_moe_offload_compat.py` covers the model-type allowlist,
+evictions, plus the resident Lightning MTP head (`mtp.*`) and its admission
+pricing. `tests/test_moe_offload_compat.py` covers the model-type allowlist,
 checkpoint completeness, dense-model exclusion, API/runtime rejection, and
 PLE/Engram metadata after expert savings.
 
@@ -107,6 +160,10 @@ Run `python -m pytest -q tests/test_admin_new_profile_expose_as_model.py tests/t
 ### Lightning MTP with XTC sampling
 
 Run `python -m pytest tests/test_mtp_xtc_sampling.py -q` for request sampler changes, late-joining mixed batches, row removal, and greedy sampling. These tests use a small MLX model and observe the MTP eligibility boundary; they do not execute a trained MTP head.
+
+### Batched DFlash drafter
+
+Run `python -m pytest tests/test_dflash_batched.py tests/test_mlx_lm_mtp_patch.py -q -k "dflash_batched or block_drafter"`. `test_dflash_batched.py` builds a tiny DFlash2 drafter with random weights and checks that rows drafted together match the same rows drafted alone across ring wrap-around, ragged context segments and cohort changes, plus the prefill seed window slicing and block-size clamping. The `block_drafter` cases in `test_mlx_lm_mtp_patch.py` drive the Lightning MTP verify path with a table drafter on the CountingModel harness and require token parity with standard decoding, one context entry per committed position (including late joins) and release of finished rows. Real drafter acceptance and throughput need a Qwen3.5-family VLM checkpoint with its `z-lab` DFlash draft and are measured against the standard batched engine.
 
 # VLM cache boundary tests
 
@@ -130,3 +187,28 @@ For a real-server check, request a small `write(content: string)` call with thin
 # Streamed oQ calibration tests
 
 Run `python -m pytest tests/test_oq.py -k TestStreamedCalibration` for streamed calibration. The small BF16 Qwen4 fixture exercises GDN, sparse attention, mmap PLE and the MTP head. It compares imatrix statistics and fused sensitivity with resident collection, verifies cache reuse with and without MTP, and converts and reloads the artifact with its shared PLE scale intact. A small MiniMax decoder fixture also compares dense and MoE collection. These cases replace the separate streaming test modules and need no external checkpoint.
+
+# Fused routed-expert decode tests
+
+Run `python -m pytest -q tests/test_qwen35_moe_routed_decode.py tests/test_qwen35_moe_router.py tests/test_qwen35_moe_gate_up.py` to check the one-token routed-expert kernels. Real `Qwen3_5MoeSparseMoeBlock` instances laid out like Qwen3.8-Flash-Next oQ (quantized routed experts, 8-bit shared expert and shared-expert gate, bf16 router) must match the served body bit for bit, with the shared expert and its gate folded into the two launches: 5-bit (oQ5e) and 4-bit experts at the Flash-Next shape (hidden 2560, intermediate 640, top-k 10), and 5-bit gs32, 6-bit gs128 and 8-bit experts at smaller shapes. A bf16 shared expert stays composed and must match too. Both launches are also run in FP32 against MLX's FP32 mat-vecs (routed and shared gate+up after SwiGLU, the gate row, every routed and shared down row), because BF16 outputs hide one-ulp FP32 differences (a fast-math `exp` in the SwiGLU sigmoid passes most BF16 cases but fails these). The kernels bind a one-expert view of the stacked weights; routing to experts 500+ of 512 checks that the view still reads the stacked buffer, and replacing the expert or shared-expert arrays must rebuild the cached plan. The other cases check that shapes where MLX would pick a different mat-vec partition, 3-bit experts, top-k 8, prefill and verify rows, float16, blocks without the gate+up fusion and a kernel failure all keep the served body. The one-launch router softmax + top-k must return the indices and scores of the softmax and top-k launches for random logits and engineered near-ties (every logit repeated eight times, logits on adjacent bf16 values, two-valued rows), a block whose router rows repeat eight times must route like the served block, and the softmax runs in FP32 against MLX's FP32 softmax (a fast reciprocal or a precise `exp` still routes identically but fails there). The router gemv must return MLX's `x @ W.T` logits bit for bit at 512x2560, 256x2048 and 128x1024, and its FP32 row sums must equal MLX's FP32 gemv on the same values (a `simd_sum` in place of MLX's shuffle-down tree changes only a few BF16 logits but every FP32 sum); shapes where MLX reduces K differently (K >= 16 N, a guarded K tail) keep `nn.Linear`. Where the router has 128 to 4,096 experts, its softmax + top-k run inside the gate+up launch for one to three rows: 512-expert blocks (with a folded or a bf16 shared expert) must still match the served body, and in FP32, with router logits tied in pairs, the launch must return the routing launch's indices and scores and the gate+up rows of the launch fed with them. `tests/test_qwen35_moe_verify_window.py` runs every window size with the folded and with the separate routing launch (`OMLX_QWEN35_MOE_TOPK_FOLD=0`).
+
+# Qwen3.5 fused verifier norm
+
+Run `python -m pytest -q tests/test_qwen35_gdn_norm_gate.py` on a Metal-capable
+Mac to compare the fused gated RMS norm with the served SiLU graph. Tests cover
+FP16/BF16, varied RMS weights, three epsilon values, every gate encoding, and
+fallback when the installed MLX arithmetic is unsupported. The check supports
+both released and nightly MLX builds; it does not assume the exponential from
+the version number.
+
+# Native Qwen video input
+
+Run `python -m pytest -q tests/test_video.py tests/test_image_utils.py tests/test_vlm_engine.py -k "video or media"` to check video input for Qwen3.5-family checkpoints without weights. The cases cover data-URI extraction and the unchanged rejection for other models, the video processor attached after load (official pixel budget, checkpoint config, frame cap), the prompt-token count against mlx-vlm's real processor both under and over the pixel budget, rejection of undecodable or degenerate clips, the order of video and text in the formatted prompt, per-clip prefix-cache ranges, video feature caching, temporary-file cleanup when preprocessing fails, and the preflight budget. Changes to the video path also need a real-model check with Lightning MTP and the batched DFlash drafter, including a follow-up turn on the same clip that reuses the cached prefix.
+
+# Engine idle timing tests
+
+Run `python -m pytest -q tests/test_engine_pool.py tests/test_active_models_visibility.py` to check that lease completion refreshes the LRU/TTL timestamp and that busy models report zero idle time. The cases cover a request longer than its TTL, release with a pending unload, cancelled release, redundant releases, and models with a held lease, an active request, or a waiting request.
+
+# Structured output Unicode tests
+
+Run `python -m pytest -q tests/integration/test_server_endpoints.py -k structured_output` to check that JSON cleanup keeps Unicode keys and values readable. The cases cover `json_object` and `json_schema` on both OpenAI endpoints, including buffered chat streaming and Responses completion events. They also check that an unpaired surrogate escape in the model JSON is returned unchanged instead of failing response serialization.

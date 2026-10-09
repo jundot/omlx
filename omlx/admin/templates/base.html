@@ -20,6 +20,9 @@
     <link rel="stylesheet" href="/admin/static/fonts/noto-sans-jp/noto-sans-jp.css">
     {% endif %}
 
+    <!-- Color tokens: every color the web UI draws (static/css/theme.css) -->
+    <link rel="stylesheet" href="{{ static('css/theme.css') }}">
+
     <!-- Tailwind CSS (pre-compiled) -->
     <link rel="stylesheet" href="{{ static('css/tailwind.css') }}">
 
@@ -68,7 +71,6 @@
 
         /* Global UI tokens */
         :root {
-            --focus-ring-color: #171717;
             {% if current_lang == 'ko' %}
             --font-sans: 'Noto Sans KR', 'Inter', system-ui, sans-serif;
             {% elif current_lang == 'zh' %}
@@ -80,10 +82,6 @@
             {% else %}
             --font-sans: 'Inter', system-ui, sans-serif;
             {% endif %}
-        }
-
-        [data-theme="dark"] {
-            --focus-ring-color: #efefef;
         }
 
         body {
@@ -105,13 +103,13 @@
         }
         .card-hover:hover {
             transform: translateY(-4px);
-            box-shadow: 0 20px 40px -10px rgba(0,0,0,0.1);
+            box-shadow: 0 20px 40px -10px rgb(var(--palette-black) / 0.1);
         }
 
         /* Input focus ring */
         input:focus, select:focus, textarea:focus {
             outline: none;
-            box-shadow: 0 0 0 2px rgba(0,0,0,0.1);
+            box-shadow: 0 0 0 2px rgb(var(--palette-black) / 0.1);
         }
 
         /* Clear keyboard focus indicator (complements the enhanced-readability
@@ -155,8 +153,8 @@
             z-index: 9999;
             max-width: 320px;
             padding: 10px 12px;
-            background: #171717;
-            color: #e5e5e5;
+            background: rgb(var(--palette-neutral-900));
+            color: rgb(var(--palette-neutral-200));
             font-size: 12px;
             font-weight: 400;
             line-height: 1.5;
@@ -164,7 +162,7 @@
             white-space: normal;
             text-align: left;
             pointer-events: none;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            box-shadow: 0 4px 12px rgb(var(--palette-black) / 0.15);
         }
     </style>
 
@@ -177,10 +175,10 @@
             --text-secondary: var(--text-primary) !important;
             --text-tertiary: var(--text-primary) !important;
             --text-muted: var(--text-primary) !important;
-            --text-danger: #d92d20 !important;
+            --text-danger: rgb(var(--palette-signal-red-600)) !important;
         }
         [data-theme="dark"][data-enhanced-readability] {
-            --text-danger: #ef5b54 !important;
+            --text-danger: rgb(var(--palette-signal-red-400)) !important;
         }
         /* Gray helper text -> primary (keep red). Selector weight (0,3,0) beats
            dashboard.css dark-mode !important (0,2,0). */
@@ -203,6 +201,8 @@
            excluded (its font-size stays untouched, preserving 1.21em scaling).
            Tailwind arbitrary-value classes MUST use the escaped form
            (.text-\[10px\]) to match the compiled selector. */
+        [data-enhanced-readability] .text-caption,
+        [data-enhanced-readability] .badge,
         [data-enhanced-readability] .text-\[9px\],
         [data-enhanced-readability] .text-\[10px\],
         [data-enhanced-readability] .text-\[11px\],

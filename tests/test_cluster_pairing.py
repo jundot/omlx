@@ -17,7 +17,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from omlx.cluster import pairing_routes
+from omlx.cluster import pairing, pairing_routes
 from omlx.cluster.pairing import (
     CODE_TTL_SECONDS,
     LOCKOUT_SECONDS,
@@ -904,6 +904,7 @@ def test_registry_bridge_against_real_module_a_registry(tmp_path):
             "caps": {"chip": "M3"},
             "paired_at": 42.0,
             "last_addrs": ["192.168.5.2"],
+            "ssh_user": "worker.user",
             "state": "paired",
         }
     )
@@ -911,6 +912,7 @@ def test_registry_bridge_against_real_module_a_registry(tmp_path):
     assert registry.is_paired("peer-real")
     stored = bridge.get("peer-real")
     assert stored["friendly_name"] == "studio"
+    assert stored["ssh_user"] == "worker.user"
     assert stored["paired_at"] == 42.0
     assert [d["node_id"] for d in bridge.list_paired()] == ["peer-real"]
     # Persisted to disk, not memory-only.
@@ -1159,26 +1161,48 @@ def test_legacy_pairing_token_flow_still_works():
     assert verify_pairing_token(token, shared_secret="y" * 32) is False
 
 
-def test_join_status_carries_coordinator_caps_and_key(tmp_path):
+def _run_as(monkeypatch, user):
+    monkeypatch.setattr(
+        pairing.pwd, "getpwuid", lambda uid: SimpleNamespace(pw_name=user)
+    )
+
+
+def test_join_status_carries_coordinator_caps_and_key(tmp_path, monkeypatch):
     """The poll path is the only one the UI drives: complete_join persists
     whatever join_status returns, so the coordinator block must carry the
     same caps/ssh key that approve() returns synchronously."""
 
     coordinator, joiner, _, _, _ = _loopback_pair(tmp_path)
+    _run_as(monkeypatch, "joiner.user")
     shown = joiner.start_join()
     joiner.request_join("coord:8000")
+    _run_as(monkeypatch, "coord_user")
     coordinator.approve("join-node", shown["code"])
 
     status = coordinator.join_status("join-node")
     assert status["state"] == "approved"
-    assert status["coordinator"]["caps"] == {"chip": "M4 Max", "ram_gb": 128}
+    caps = {"chip": "M4 Max", "ram_gb": 128, "ssh_user": "coord_user"}
+    assert status["coordinator"]["caps"] == caps
     assert status["coordinator"]["ssh_public_key"] == _test_public_key("coord-node")
     assert status["coordinator"]["ssh_host_public_key"] == _test_public_key(
         "host-coord-node"
     )
 
     record = joiner.complete_join(status)
-    assert record["caps"] == {"chip": "M4 Max", "ram_gb": 128}
+    assert record["caps"] == caps
+    assert record["ssh_user"] == "coord_user"
+    assert coordinator.paired_devices()[0]["ssh_user"] == "joiner.user"
+
+
+def test_peer_without_advertised_ssh_user_keeps_default_login(tmp_path):
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+    shown = joiner.start_join()
+    payload = joiner.build_join_request()
+    del payload["caps"]["ssh_user"]
+    coordinator.handle_join_request(payload)
+    coordinator.approve("join-node", shown["code"])
+
+    assert "ssh_user" not in coordinator.paired_devices()[0]
 
 
 def test_join_status_rejects_substituted_coordinator_identity(tmp_path):

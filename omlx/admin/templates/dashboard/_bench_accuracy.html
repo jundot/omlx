@@ -1,3 +1,4 @@
+{% import "components/ui.html" as ui %}
                 <div x-show="benchTab === 'accuracy'" x-cloak>
                 <div class="animate-fade-in-up">
                     <!-- Header -->
@@ -47,7 +48,7 @@
                                         <span :class="accEnableThinking ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
-                                    <span class="text-sm text-neutral-600" x-text="accEnableThinking ? '{{ t('acc_bench.config.thinking_on') }}' : '{{ t('acc_bench.config.thinking_off') }}'"></span>
+                                    <span class="text-sm text-neutral-600" x-text="accEnableThinking ? window.t('acc_bench.config.thinking_on') : window.t('acc_bench.config.thinking_off')"></span>
                                 </div>
                                 <p class="text-xs text-neutral-400 mt-1.5">{{ t('acc_bench.config.thinking_hint') }}</p>
                             </div>
@@ -92,7 +93,7 @@
                                                 <span :class="accSamplingProfile === 'model_settings' ? 'translate-x-5' : 'translate-x-0'"
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                             </button>
-                                            <span class="text-sm text-neutral-600" x-text="accSamplingProfile === 'model_settings' ? '{{ t('acc_bench.config.sampling_model') }}' : '{{ t('acc_bench.config.sampling_deterministic') }}'"></span>
+                                            <span class="text-sm text-neutral-600" x-text="accSamplingProfile === 'model_settings' ? window.t('acc_bench.config.sampling_model') : window.t('acc_bench.config.sampling_deterministic')"></span>
                                         </div>
                                         <p class="text-xs text-neutral-400 mt-1.5">{{ t('acc_bench.config.sampling_hint') }}</p>
                                     </div>
@@ -158,61 +159,79 @@
                                 </div>
                             </div>
 
-                            <!-- Benchmark Selection — Card Grid -->
+                            <!-- Benchmark Selection: a preset, then one card per group -->
                             <div>
-                                <label class="block text-sm font-medium text-neutral-700 mb-3">{{ t('acc_bench.config.benchmarks') }}</label>
-                                <div class="space-y-5">
-                                    <template x-for="group in accBenchmarkGroups" :key="group.name">
-                                        <div>
-                                            <!-- Group header -->
-                                            <div class="flex items-center gap-2 mb-2">
-                                                <span class="text-[11px] font-bold uppercase tracking-wider text-neutral-500" x-text="group.name"></span>
-                                                <span class="text-[11px] text-neutral-400" x-text="'(' + group.benchmarks.length + ')'"></span>
-                                                <div class="flex-1 border-t border-neutral-200"></div>
+                                <div class="flex flex-wrap items-start justify-between gap-3 mb-4">
+                                    <div>
+                                        <label class="block text-sm font-medium text-neutral-700">{{ t('acc_bench.config.benchmarks') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-1 max-w-md">{{ t('acc_bench.presets.hint') }}</p>
+                                    </div>
+                                    {{ ui.segmented([('quick', t('acc_bench.presets.quick')), ('standard', t('acc_bench.presets.standard')), ('full', t('acc_bench.presets.full'))],
+                                                    'accActivePreset', "applyAccPreset('{value}')", aria_label=t('acc_bench.presets.label')) }}
+                                </div>
+                                <div class="space-y-4">
+                                    <template x-for="group in accBenchmarkGroups" :key="group.key">
+                                        <div class="rounded-2xl border border-neutral-200 overflow-hidden">
+                                            <div class="flex flex-wrap items-center justify-between gap-3 px-5 py-3 bg-neutral-50 border-b border-neutral-200">
+                                                <div class="min-w-0">
+                                                    <div class="text-sm font-semibold text-neutral-800" x-text="group.name"></div>
+                                                    <div class="text-xs text-neutral-500 mt-0.5" x-text="group.desc"></div>
+                                                </div>
+                                                <div class="flex items-center gap-3">
+                                                    <span class="text-xs text-neutral-500 tabular-nums"
+                                                          x-text="accGroupSelected(group).length + ' / ' + group.benchmarks.length + ' · ' + accGroupSamples(group).toLocaleString() + ' ' + window.t('acc_bench.config.samples_unit')"></span>
+                                                    <button type="button" @click="applyGroupFull(group)"
+                                                            title="{{ t('acc_bench.config.group_full_hint') }}"
+                                                            class="px-3 py-1 text-xs font-medium rounded-lg border border-neutral-200 text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 transition-colors">
+                                                        {{ t('acc_bench.presets.full') }}
+                                                    </button>
+                                                </div>
                                             </div>
-                                            <!-- Benchmarks grid -->
-                                            <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-                                                <template x-for="b in group.benchmarks" :key="b.key">
-                                                    <div @click="accBenchmarks[b.key] = !accBenchmarks[b.key]"
-                                                         class="relative rounded-xl border-2 p-4 cursor-pointer transition-all select-none"
-                                                         :class="accBenchmarks[b.key]
-                                                             ? 'border-neutral-900 bg-neutral-900 text-white shadow-md'
-                                                             : 'border-neutral-200 bg-white text-neutral-500 hover:border-neutral-300 hover:shadow-sm'">
-                                                        <!-- Check icon -->
-                                                        <div class="absolute top-2 right-2">
-                                                            <svg x-show="accBenchmarks[b.key]" class="w-4 h-4 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-                                                        </div>
-                                                        <!-- Benchmark name -->
-                                                        <div class="text-lg font-bold mb-1" x-text="b.label"></div>
-                                                        <!-- Description -->
-                                                        <div class="text-[10px] mb-3 opacity-70" x-text="b.desc"></div>
-                                                        <!-- Sample size selector -->
-                                                        <select x-model.number="accSampleSizes[b.key]"
-                                                                x-init="$nextTick(() => $el.value = accSampleSizes[b.key])"
-                                                                @click.stop
-                                                                :disabled="!accBenchmarks[b.key]"
-                                                                class="w-full px-2 py-1 text-xs rounded-lg border transition-all tabular-nums"
-                                                                :class="accBenchmarks[b.key]
-                                                                    ? 'bg-white/20 border-white/30 text-white disabled:opacity-40 [&>option]:text-neutral-900'
-                                                                    : 'bg-neutral-50 border-neutral-200 text-neutral-600 disabled:opacity-40'">
-                                                            <template x-for="s in b.sizes" :key="s">
-                                                                <option :value="s" x-text="s"></option>
-                                                            </template>
-                                                            <option value="0" x-text="window.t('acc_bench.config.full_option').replace('{count}', b.fullSize.toLocaleString())"></option>
-                                                        </select>
-                                                        <!-- Code exec warning badge -->
-                                                        <template x-if="b.key === 'livecodebench' || b.key === 'humaneval' || b.key === 'mbpp'">
-                                                            <div class="mt-2">
-                                                                <span class="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-medium rounded"
-                                                                      :class="accBenchmarks[b.key] ? 'bg-amber-400/20 text-amber-200' : 'bg-amber-50 text-amber-500'"
-                                                                      title="{{ t('acc_bench.config.livecodebench_warning') }}">
-                                                                    <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-                                                                    {{ t('acc_bench.config.code_exec') }}
-                                                                </span>
+                                            <div class="p-4">
+                                                <!-- Benchmarks grid -->
+                                                <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+                                                    <template x-for="b in group.benchmarks" :key="b.key">
+                                                        <div @click="accBenchmarks[b.key] = !accBenchmarks[b.key]"
+                                                             class="relative rounded-xl border-2 p-4 cursor-pointer transition-all select-none"
+                                                             :class="accBenchmarks[b.key]
+                                                                 ? 'border-neutral-900 bg-neutral-900 text-white shadow-md'
+                                                                 : 'border-neutral-200 bg-white text-neutral-500 hover:border-neutral-300 hover:shadow-sm'">
+                                                            <!-- Check icon -->
+                                                            <div class="absolute top-2 right-2">
+                                                                <svg x-show="accBenchmarks[b.key]" class="w-4 h-4 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
                                                             </div>
-                                                        </template>
-                                                    </div>
-                                                </template>
+                                                            <!-- Benchmark name -->
+                                                            <div class="text-lg font-bold mb-1" x-text="b.label"></div>
+                                                            <!-- Description -->
+                                                            <div class="text-caption mb-3 opacity-70" x-text="b.desc"></div>
+                                                            <!-- Sample size selector -->
+                                                            <select x-model.number="accSampleSizes[b.key]"
+                                                                    x-init="$nextTick(() => $el.value = accSampleSizes[b.key])"
+                                                                    @click.stop
+                                                                    :disabled="!accBenchmarks[b.key]"
+                                                                    class="w-full px-2 py-1 text-xs rounded-lg border transition-all tabular-nums"
+                                                                    :class="accBenchmarks[b.key]
+                                                                        ? 'bg-white/20 border-white/30 text-white disabled:opacity-40 [&>option]:text-neutral-900'
+                                                                        : 'bg-neutral-50 border-neutral-200 text-neutral-600 disabled:opacity-40'">
+                                                                <template x-for="s in b.sizes" :key="s">
+                                                                    <option :value="s" x-text="s"></option>
+                                                                </template>
+                                                                <option value="0" x-text="window.t('acc_bench.config.full_option').replace('{count}', b.fullSize.toLocaleString())"></option>
+                                                            </select>
+                                                            <!-- Code exec warning badge -->
+                                                            <template x-if="b.key === 'livecodebench' || b.key === 'humaneval' || b.key === 'mbpp'">
+                                                                <div class="mt-2">
+                                                                    <span class="badge gap-1"
+                                                                          :class="accBenchmarks[b.key] ? 'bg-amber-400/20 text-amber-200' : 'bg-amber-50 text-amber-500'"
+                                                                          title="{{ t('acc_bench.config.livecodebench_warning') }}">
+                                                                        <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                                                                        {{ t('acc_bench.config.code_exec') }}
+                                                                    </span>
+                                                                </div>
+                                                            </template>
+                                                        </div>
+                                                    </template>
+                                                </div>
                                             </div>
                                         </div>
                                     </template>
@@ -222,15 +241,15 @@
 
                             <!-- Add & Run Button -->
                             <div class="flex items-center gap-3 pt-2">
-                                <button @click="addToAccQueue()"
+                                <button @click="requestBenchConfirm('accuracy')"
                                         :disabled="(accExternalEnabled ? !externalConfigValid() : !accModelId) || !Object.values(accBenchmarks).some(v => v)"
-                                        class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-medium rounded-lg hover:bg-neutral-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2">
+                                        class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-medium rounded-full hover:bg-neutral-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2">
                                     <i data-lucide="play" class="w-4 h-4"></i>
                                     {{ t('acc_bench.config.add_run') }}
                                 </button>
                                 <button x-show="accRunning"
                                         @click="cancelAccuracyBenchmark()"
-                                        class="px-5 py-2.5 bg-red-600 text-white text-sm font-medium rounded-lg hover:bg-red-700 transition-all flex items-center gap-2">
+                                        class="px-5 py-2.5 bg-red-600 text-white text-sm font-medium rounded-full hover:bg-red-700 transition-all flex items-center gap-2">
                                     <i data-lucide="square" class="w-4 h-4"></i>
                                     {{ t('acc_bench.config.cancel_button') }}
                                 </button>
@@ -275,7 +294,7 @@
                                 <div class="flex items-center gap-3">
                                     <span class="text-xs text-neutral-400" x-text="accProgress?.bench_current && accProgress?.bench_total ? (accProgress.bench_current + ' / ' + accProgress.bench_total) : ''"></span>
                                     <button @click="cancelAccuracyBenchmark()"
-                                            class="px-3 py-1 bg-neutral-900 text-white text-xs font-medium rounded-lg hover:bg-neutral-800 transition-all flex items-center gap-1">
+                                            class="px-3 py-1 bg-neutral-900 text-white text-xs font-medium rounded-full hover:bg-neutral-800 transition-all flex items-center gap-1">
                                         <i data-lucide="square" class="w-3 h-3"></i>
                                         {{ t('acc_bench.config.cancel_button') }}
                                     </button>
@@ -310,12 +329,12 @@
                                x-cloak
                                :href="'https://omlx.ai/my/' + benchDeviceInfo?.owner_hash"
                                target="_blank"
-                               class="px-3 py-1.5 text-xs font-medium text-neutral-500 bg-neutral-100 rounded-lg hover:bg-neutral-200 hover:text-neutral-700 transition-all flex items-center gap-1.5">
+                               class="px-3 py-1.5 text-xs font-medium text-neutral-500 bg-neutral-100 rounded-full hover:bg-neutral-200 hover:text-neutral-700 transition-all flex items-center gap-1.5">
                                 <i data-lucide="external-link" class="w-3 h-3"></i>
                                 {{ t('bench.my_submissions') }}
                             </a>
                             <button @click="resetAccResults()"
-                                    class="px-3 py-1.5 text-xs font-medium text-neutral-500 bg-neutral-100 rounded-lg hover:bg-neutral-200 hover:text-neutral-700 transition-all flex items-center gap-1.5">
+                                    class="px-3 py-1.5 text-xs font-medium text-neutral-500 bg-neutral-100 rounded-full hover:bg-neutral-200 hover:text-neutral-700 transition-all flex items-center gap-1.5">
                                 <i data-lucide="trash-2" class="w-3 h-3"></i>
                                 {{ t('acc_bench.results.clear') }}
                             </button>
@@ -335,19 +354,19 @@
                                         <div>
                                             <div class="flex items-center gap-2">
                                                 <h4 class="text-sm font-semibold text-neutral-900" x-text="r.benchmark.toUpperCase()"></h4>
-                                                <span class="text-xs font-medium text-neutral-400 bg-neutral-100 px-1.5 py-0.5 rounded" x-text="r.model_id"></span>
+                                                <span class="badge text-neutral-400 bg-neutral-100" x-text="r.model_id"></span>
                                                 <template x-if="r.thinking_used">
-                                                    <span class="text-xs font-medium text-purple-600 bg-purple-50 px-1.5 py-0.5 rounded">{{ t('acc_bench.results.thinking_badge') }}</span>
+                                                    <span class="badge text-purple-600 bg-purple-50">{{ t('acc_bench.results.thinking_badge') }}</span>
                                                 </template>
                                                 <template x-if="r.external">
-                                                    <span class="text-xs font-medium text-sky-600 bg-sky-50 px-1.5 py-0.5 rounded">{{ t('acc_bench.results.external_badge') }}</span>
+                                                    <span class="badge text-sky-600 bg-sky-50">{{ t('acc_bench.results.external_badge') }}</span>
                                                 </template>
                                             </div>
                                             <span class="text-xs text-neutral-400" x-text="window.t('acc_bench.results.correct_line').replace('{correct}', r.correct).replace('{total}', r.total).replace('{time}', r.time_s)"></span>
                                         </div>
                                     </div>
                                     <div class="text-right">
-                                        <div x-show="r.external" class="text-[10px] uppercase tracking-wide text-neutral-400 mb-0.5">{{ t('acc_bench.results.total_accuracy') }}</div>
+                                        <div x-show="r.external" class="text-caption uppercase tracking-wide text-neutral-400 mb-0.5">{{ t('acc_bench.results.total_accuracy') }}</div>
                                         <span class="text-2xl font-bold tabular-nums"
                                               :class="r.accuracy >= 0.7 ? 'text-green-600' : r.accuracy >= 0.4 ? 'text-amber-600' : 'text-red-600'"
                                               x-text="(r.accuracy * 100).toFixed(1) + '%'"></span>
@@ -387,44 +406,64 @@
                                 </div>
                                 <div x-show="r.external" x-cloak class="mt-4 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2">
                                     <div class="rounded-lg bg-neutral-50 px-3 py-2">
-                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.valid_responses') }}</div>
+                                        <div class="text-caption text-neutral-400">{{ t('acc_bench.results.valid_responses') }}</div>
                                         <div class="text-sm font-semibold tabular-nums" x-text="r.valid_response_count + ' / ' + r.total"></div>
                                     </div>
                                     <div class="rounded-lg bg-neutral-50 px-3 py-2">
-                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.valid_response_rate') }}</div>
+                                        <div class="text-caption text-neutral-400">{{ t('acc_bench.results.valid_response_rate') }}</div>
                                         <div class="text-sm font-semibold tabular-nums" x-text="(r.valid_response_rate * 100).toFixed(1) + '%'"></div>
                                     </div>
                                     <div class="rounded-lg bg-neutral-50 px-3 py-2">
-                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.valid_answer_accuracy') }}</div>
+                                        <div class="text-caption text-neutral-400">{{ t('acc_bench.results.valid_answer_accuracy') }}</div>
                                         <div class="text-sm font-semibold tabular-nums" x-text="(r.valid_answer_accuracy * 100).toFixed(1) + '%'"></div>
                                     </div>
                                     <div class="rounded-lg bg-neutral-50 px-3 py-2">
-                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.empty_content') }}</div>
+                                        <div class="text-caption text-neutral-400">{{ t('acc_bench.results.empty_content') }}</div>
                                         <div class="text-sm font-semibold tabular-nums" x-text="r.empty_content_count"></div>
                                     </div>
                                     <div class="rounded-lg bg-neutral-50 px-3 py-2">
-                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.truncated') }}</div>
+                                        <div class="text-caption text-neutral-400">{{ t('acc_bench.results.truncated') }}</div>
                                         <div class="text-sm font-semibold tabular-nums" x-text="r.truncated_count"></div>
                                     </div>
                                     <div class="rounded-lg bg-neutral-50 px-3 py-2">
-                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.timeout') }}</div>
+                                        <div class="text-caption text-neutral-400">{{ t('acc_bench.results.timeout') }}</div>
                                         <div class="text-sm font-semibold tabular-nums" x-text="r.timeout_count"></div>
                                     </div>
                                     <div class="rounded-lg bg-neutral-50 px-3 py-2">
-                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.http_errors') }}</div>
+                                        <div class="text-caption text-neutral-400">{{ t('acc_bench.results.http_errors') }}</div>
                                         <div class="text-sm font-semibold tabular-nums" x-text="r.http_error_count"></div>
                                     </div>
                                     <div class="rounded-lg bg-neutral-50 px-3 py-2">
-                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.invalid_responses') }}</div>
+                                        <div class="text-caption text-neutral-400">{{ t('acc_bench.results.invalid_responses') }}</div>
                                         <div class="text-sm font-semibold tabular-nums" x-text="r.invalid_response_count"></div>
                                     </div>
                                     <div class="rounded-lg bg-neutral-50 px-3 py-2">
-                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.parse_errors') }}</div>
+                                        <div class="text-caption text-neutral-400">{{ t('acc_bench.results.parse_errors') }}</div>
                                         <div class="text-sm font-semibold tabular-nums" x-text="r.parse_error_count"></div>
                                     </div>
                                     <div x-show="r.connection_error_count > 0" class="rounded-lg bg-neutral-50 px-3 py-2">
-                                        <div class="text-[10px] text-neutral-400">{{ t('acc_bench.results.connection_errors') }}</div>
+                                        <div class="text-caption text-neutral-400">{{ t('acc_bench.results.connection_errors') }}</div>
                                         <div class="text-sm font-semibold tabular-nums" x-text="r.connection_error_count"></div>
+                                    </div>
+                                </div>
+
+                                <div x-show="!r.external && r.truncated_count > 0" x-cloak
+                                     class="mt-4 flex items-start gap-2 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-amber-800">
+                                    <i data-lucide="triangle-alert" class="w-4 h-4 flex-shrink-0 mt-0.5"></i>
+                                    <span class="text-xs font-medium">{{ t('acc_bench.results.local_truncation_warning') }}</span>
+                                </div>
+                                <div x-show="!r.external && r.truncated_count > 0" x-cloak class="mt-4 grid grid-cols-2 sm:grid-cols-3 gap-2">
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-caption text-neutral-400">{{ t('acc_bench.results.hit_token_limit') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="r.truncated_count + ' / ' + r.total"></div>
+                                    </div>
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-caption text-neutral-400">{{ t('acc_bench.results.finished_within_limit') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="r.finished_count + ' / ' + r.total"></div>
+                                    </div>
+                                    <div class="rounded-lg bg-neutral-50 px-3 py-2">
+                                        <div class="text-caption text-neutral-400">{{ t('acc_bench.results.finished_accuracy') }}</div>
+                                        <div class="text-sm font-semibold tabular-nums" x-text="r.finished_accuracy == null ? '—' : (r.finished_accuracy * 100).toFixed(1) + '%'"></div>
                                     </div>
                                 </div>
 
@@ -435,7 +474,7 @@
                                             @click="r._showCategories = !r._showCategories"
                                             class="text-xs text-neutral-500 hover:text-neutral-700 flex items-center gap-1 transition-colors">
                                         <i data-lucide="chevron-right" class="w-3 h-3 transition-transform" :class="r._showCategories ? 'rotate-90' : ''"></i>
-                                        <span x-text="r._showCategories ? '{{ t('acc_bench.results.hide_categories') }}' : '{{ t('acc_bench.results.show_categories') }}'"></span>
+                                        <span x-text="r._showCategories ? window.t('acc_bench.results.hide_categories') : window.t('acc_bench.results.show_categories')"></span>
                                     </button>
                                     <!-- Download raw results -->
                                     <div class="relative" x-data="{ dlOpen: false }">
@@ -488,14 +527,14 @@
                         <button @click="accShowText = !accShowText"
                                 class="flex items-center gap-2 text-sm text-neutral-500 hover:text-neutral-700 transition-colors mb-3">
                             <i data-lucide="file-text" class="w-4 h-4"></i>
-                            <span x-text="accShowText ? '{{ t('acc_bench.results.hide_text') }}' : '{{ t('acc_bench.results.show_text') }}'"></span>
+                            <span x-text="accShowText ? window.t('acc_bench.results.hide_text') : window.t('acc_bench.results.show_text')"></span>
                         </button>
                         <div x-show="accShowText" x-transition class="relative">
                             <textarea id="accTextarea" readonly
-                                      class="w-full h-96 px-4 py-3 text-xs font-mono bg-neutral-50 border border-neutral-200 rounded-xl resize-y focus:outline-none"
+                                      class="w-full h-96 px-4 py-3 text-xs font-mono bg-neutral-50 border border-neutral-200 rounded-lg resize-y focus:outline-none"
                                       x-text="accBuildText()"></textarea>
                             <button @click="accCopyText()"
-                                    class="absolute top-3 right-3 px-3 py-1.5 text-xs font-medium bg-white border border-neutral-200 rounded-lg hover:bg-neutral-50 transition-all flex items-center gap-1.5">
+                                    class="absolute top-3 right-3 px-3 py-1.5 text-xs font-medium bg-white border border-neutral-200 rounded-full hover:bg-neutral-50 transition-all flex items-center gap-1.5">
                                 <i :data-lucide="accCopied ? 'check' : 'copy'" class="w-3.5 h-3.5"></i>
                                 <span x-text="accCopied ? 'Copied' : 'Copy'"></span>
                             </button>

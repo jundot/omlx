@@ -45,7 +45,7 @@ jobs:
         # we build against the job's Python and pin it for CMake explicitly.
         run: |
           python -m pip install --upgrade pip
-          python -m pip install build setuptools wheel "cmake>=3.27" "nanobind==2.15.0" "mlx==0.32.2"
+          python -m pip install build setuptools wheel "cmake>=3.27" "nanobind==3.0.1" "mlx==0.32.3"
           export CMAKE_ARGS="-DPython_EXECUTABLE=$(python -c 'import sys; print(sys.executable)')"
           python -m build --wheel --no-isolation
 
@@ -80,7 +80,7 @@ jobs:
 
           # Exercise a real primitive from the newest native package, not just
           # its nanobind ABI probe, so the wheel also proves dylib/metallib
-          # lookup and MLX 0.32.2 runtime dispatch.
+          # lookup and MLX 0.32.3 runtime dispatch.
           from omlx.custom_kernels.decode_fast import fast as decode_fast
 
           mx.random.seed(3142)

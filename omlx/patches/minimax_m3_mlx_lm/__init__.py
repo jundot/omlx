@@ -17,12 +17,14 @@ drift.
 
 Gated on ``model_type == "minimax_m3_vl"``; other models pay nothing.
 
-Removable in one delete once mlx-lm ships MiniMax-M3 upstream, along with the
-dispatch in ``omlx/utils/model_loading.py``.
+mlx-lm now ships its own ``minimax_m3_vl``. It lacks the oMLX cache types,
+pipeline split, ``inner.`` quantization paths, and the rank-0 ``skip_logits``
+contract, so the vendored module replaces it even when it was imported first.
 """
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import logging
 import sys
@@ -43,10 +45,17 @@ def _register_module(qualname: str, file_name: str) -> None:
     the loaded file resolves through the real mlx-lm package, not through omlx.
     """
 
-    if qualname in sys.modules:
-        return
-
     file_path = Path(__file__).parent / file_name
+    existing = sys.modules.get(qualname)
+    if existing is not None:
+        if getattr(existing, "__file__", None) == str(file_path):
+            return
+        logger.warning(
+            "Replacing %s (%s) with the vendored module",
+            qualname,
+            getattr(existing, "__file__", "?"),
+        )
+
     spec = importlib.util.spec_from_file_location(qualname, str(file_path))
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not create spec for {qualname} from {file_path}")
@@ -60,8 +69,14 @@ def _register_module(qualname: str, file_name: str) -> None:
     try:
         spec.loader.exec_module(module)
     except BaseException:
-        sys.modules.pop(qualname, None)
+        if existing is None:
+            sys.modules.pop(qualname, None)
+        else:
+            sys.modules[qualname] = existing
         raise
+    # ``from mlx_lm.models import x`` reads the package attribute first.
+    models_pkg = importlib.import_module("mlx_lm.models")
+    setattr(models_pkg, qualname.rsplit(".", 1)[1], module)
     logger.info("Registered %s from %s", qualname, file_path.name)
 
 
@@ -74,10 +89,9 @@ def apply_minimax_m3_mlx_lm_patch() -> bool:
         logger.warning("Could not register %s: %s", _QUALNAME, exc)
         return False
 
-    base = sys.modules.get(_QUALNAME)
+    base = sys.modules[_QUALNAME]
     for alias in _ALIASES:
-        if base is not None:
-            sys.modules.setdefault(alias, base)
+        sys.modules[alias] = base
     return True
 
 

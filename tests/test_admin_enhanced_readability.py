@@ -59,6 +59,8 @@ def test_font_size_floor_uses_escaped_selectors():
     assert ".text-\\[10px\\]" in BASE, "escaped .text-[10px] selector missing"
     assert ".text-\\[11px\\]" in BASE, "escaped .text-[11px] selector missing"
     assert ".text-\\[9px\\]" in BASE, "escaped .text-[9px] selector missing"
+    assert "[data-enhanced-readability] .text-caption" in BASE
+    assert "[data-enhanced-readability] .badge," in BASE
     assert ".svg-allow-warning" in BASE
     assert ".model-card-content pre code" in BASE
     assert ".code-copy-btn" in BASE
@@ -73,8 +75,11 @@ def test_gray_text_mapped_to_primary():
 
 
 def test_red_kept_as_functional_red():
-    assert "#d92d20 !important" in BASE
-    assert "#ef5b54 !important" in BASE
+    theme = (TEMPLATES.parent / "static/css/theme.css").read_text(encoding="utf-8")
+    assert "--text-danger: rgb(var(--palette-signal-red-600)) !important" in BASE
+    assert "--text-danger: rgb(var(--palette-signal-red-400)) !important" in BASE
+    assert "--palette-signal-red-600: 217 45 32;" in theme
+    assert "--palette-signal-red-400: 239 91 84;" in theme
 
 
 def test_no_blanket_disabled_text_color_override():

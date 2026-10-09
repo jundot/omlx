@@ -7,7 +7,18 @@ import json
 from functools import lru_cache
 from pathlib import Path
 
-_SUPPORTED_TYPES = frozenset({"deepseek_v41", "qwen4_exp", "gemma4", "olmoe"})
+_SUPPORTED_TYPES = frozenset(
+    {
+        "deepseek_v41",
+        "deepseek_v4",
+        "qwen4_exp",
+        "qwen3_5_moe",
+        "gemma4",
+        "olmoe",
+        "glm_moe_dsa",
+        "glm5_next",
+    }
+)
 
 
 def moe_offload_compatibility(model_path):
@@ -41,10 +52,16 @@ def _inspect(path, signature):
             return True, ""
         return False, "The checkpoint has no offloadable routed experts."
 
-    from .moe_expert_offload import CheckpointExpertStore
+    from .moe_expert_offload import CheckpointExpertStore, _qwen35_checkpoint_prefix
 
     text = raw.get("text_config", raw)
-    count = int(text.get("num_experts") or 0)
+    if kind in ("glm_moe_dsa", "deepseek_v4", "glm5_next"):
+        count = int(text.get("n_routed_experts") or 0)
+        first_moe = int(text.get("first_k_dense_replace") or 0)
+        moe_freq = int(text.get("moe_layer_freq") or 1)
+    else:
+        count = int(text.get("num_experts") or 0)
+        first_moe, moe_freq = 0, 1
     layers = int(text.get("num_hidden_layers") or 0)
     hidden = int(text.get("hidden_size") or 0)
     intermediate = int(
@@ -55,20 +72,52 @@ def _inspect(path, signature):
         kind == "gemma4" and not text.get("enable_moe_block")
     ):
         return False, "The model does not have the supported MoE geometry."
+    # glm5_next picks sparse layers per layer, not by frequency.
+    sparse_layers = None
+    if kind == "glm5_next":
+        types = text.get("mlp_layer_types")
+        if not isinstance(types, list) or len(types) != layers:
+            return False, "The model does not have the supported MoE geometry."
+        sparse_layers = {i for i, t in enumerate(types) if t == "sparse"}
+        if not sparse_layers:
+            return False, "The model does not have the supported MoE geometry."
     quant = raw.get("quantization", text.get("quantization"))
     if not isinstance(quant, dict):
         return False, "Expert offload requires an MLX quantized checkpoint."
     store = CheckpointExpertStore(path)
+    if min(layers - first_moe, moe_freq) <= 0:
+        return False, "The model does not have the supported MoE geometry."
     for layer in range(layers):
-        if kind == "olmoe":
+        if layer < first_moe or layer % moe_freq:
+            continue  # dense layer (GLM's first_k_dense_replace)
+        if sparse_layers is not None and layer not in sparse_layers:
+            continue  # dense layer (glm5_next's mlp_layer_types)
+        if kind in ("olmoe", "glm_moe_dsa"):
             parent = f"model.layers.{layer}.mlp"
             prefix = parent + ".switch_mlp"
-        elif kind == "qwen4_exp":
+        elif kind in ("qwen4_exp", "qwen3_5_moe"):
+            parent = f"language_model.model.layers.{layer}.mlp"
+            prefix = parent + ".switch_mlp"
+        elif kind == "deepseek_v4":
+            parent = f"model.layers.{layer}.ffn"
+            prefix = parent + ".switch_mlp"
+        elif kind == "glm5_next":
             parent = f"language_model.model.layers.{layer}.mlp"
             prefix = parent + ".switch_mlp"
         else:
             parent = f"language_model.model.layers.{layer}.experts"
             prefix = parent + ".switch_glu"
+        if kind == "qwen3_5_moe":
+            prefix = _qwen35_checkpoint_prefix(store, prefix)
+        if kind in ("deepseek_v4", "glm5_next", "qwen3_5_moe") and not store.has(
+            prefix + ".gate_proj.weight"
+        ):
+            # These adapters read the stacked slabs positionally; a
+            # per-expert layout wraps nothing.
+            return (
+                False,
+                f"Checkpoint is missing expert tensor: {prefix}.gate_proj.weight",
+            )
         per_expert = not store.has(prefix + ".gate_proj.weight")
         for proj in ("gate_proj", "up_proj", "down_proj"):
             key = prefix + "." + proj

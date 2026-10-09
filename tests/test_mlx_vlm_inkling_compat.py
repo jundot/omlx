@@ -89,6 +89,14 @@ def test_prompt_formatting_image_first(applied):
     assistant = get_message_json("inkling", "hello", role="assistant")
     assert assistant["content"] == "hello"
 
+    # apply_chat_template passes OpenAI list content through unchanged.
+    parts = [
+        {"type": "text", "text": "describe this"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+    ]
+    message = get_message_json("inkling", parts, role="user", num_images=1)
+    assert message["content"][-1] == {"type": "text", "text": "describe this"}
+
 
 def test_other_models_untouched(applied):
     from mlx_vlm.prompt_utils import get_message_json

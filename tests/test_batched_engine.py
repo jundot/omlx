@@ -322,6 +322,51 @@ class TestBatchedEngineInitialization:
         assert engine._loaded is False
         inner_engine.close.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_stop_releases_ane_state_before_dropping_model(self):
+        """stop() releases ANE banks while the model is still reachable."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        model = object()
+        events = []
+        engine._model = model
+        engine._engine = MagicMock()
+        engine._engine.stop = AsyncMock(side_effect=lambda: events.append("stop"))
+        engine._engine.engine.close.side_effect = lambda: events.append("close")
+
+        def release_ane_state(value):
+            events.append(("release", value is model, engine._model is model))
+            return 2, 4
+
+        with patch(
+            "omlx.patches.qwen35_ane_prefill.release_qwen35_ane_prefill",
+            side_effect=release_ane_state,
+        ):
+            await engine.stop()
+
+        assert events == ["stop", "close", ("release", True, True)]
+        assert engine._model is None
+
+    @pytest.mark.asyncio
+    async def test_stop_continues_when_ane_state_release_fails(self):
+        """An optional ANE release failure does not block wrapper teardown."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._model = object()
+        engine._engine = MagicMock()
+        engine._engine.stop = AsyncMock()
+
+        with patch(
+            "omlx.patches.qwen35_ane_prefill.release_qwen35_ane_prefill",
+            side_effect=RuntimeError("native release unavailable"),
+        ):
+            await engine.stop()
+
+        assert engine._model is None
+        assert engine._engine is None
+
 
 class TestBatchedEngineStreamingCleanup:
     """Tests for streaming generator cleanup paths."""
@@ -360,6 +405,21 @@ class TestBatchedEngineStreamingCleanup:
         await stream.aclose()
 
         assert fake_engine.add_request_kwargs["tools"] == tools
+
+    @pytest.mark.asyncio
+    async def test_stream_generate_uses_caller_request_id(self):
+        from omlx.engine.batched import BatchedEngine
+
+        fake_engine = FakeStreamingCore()
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = fake_engine
+
+        stream = engine.stream_generate("hello", _request_id="req-progress")
+        await stream.__anext__()
+        await stream.aclose()
+
+        assert fake_engine.add_request_kwargs["request_id"] == "req-progress"
 
 
 class TestBatchedEngineApplyChatTemplate:
@@ -1003,3 +1063,179 @@ class TestBatchedEngineSpecPrefillForwarding:
 
         call_kwargs = engine._engine.generate.call_args.kwargs
         assert "specprefill_system_end" not in call_kwargs
+
+    @pytest.mark.asyncio
+    async def test_chat_injects_generation_prompt_text(self):
+        """The suffix past the no-generation-prompt rendering reaches the engine."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._model_settings = SimpleNamespace(specprefill_enabled=False)
+        engine._preprocess_messages = lambda m: m
+        engine._tokenizer = MagicMock()
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        def fake_template(msgs, *args, **kwargs):
+            # History renders the reply behind an empty think block, so the
+            # generation prompt does not persist into the next turn.
+            if any(m["role"] == "assistant" for m in msgs):
+                return "PROMPT<|im_start|>assistant\nreply<|im_end|>"
+            if kwargs.get("add_generation_prompt") is False:
+                return "PROMPT"
+            return "PROMPT<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+        engine._apply_chat_template = fake_template
+        messages = [{"role": "user", "content": "hi"}]
+
+        await engine.chat(messages)
+        call_kwargs = engine._engine.generate.call_args.kwargs
+        assert (
+            call_kwargs["generation_prompt_text"]
+            == "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        )
+        assert call_kwargs["generation_prompt_persists"] is False
+
+        # A continued (partial) final message has no generation prompt.
+        await engine.chat(messages, is_partial=True)
+        call_kwargs = engine._engine.generate.call_args.kwargs
+        assert "generation_prompt_text" not in call_kwargs
+
+
+class _TemplateTokenizer:
+    """Renders a readable prompt and encodes one id per character."""
+
+    bos_token_id = 1
+
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        continue_final_message=False,
+        tools=None,
+        **kwargs,
+    ):
+        text = "|".join(f"{m['role']}:{m['content']}" for m in messages)
+        if tools:
+            text = f"tools={len(tools)}|{text}"
+        if kwargs.get("enable_thinking") is False:
+            text += "|nothink"
+        if add_generation_prompt:
+            text += "|assistant:"
+        return text
+
+    def encode(self, text, add_special_tokens=True):
+        ids = [ord(c) for c in text]
+        return [self.bos_token_id, *ids] if add_special_tokens else ids
+
+
+class TestBatchedEngineTokenizeChat:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_partial", [False, True])
+    async def test_matches_prompt_submitted_by_chat(self, is_partial):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._tokenizer = _TemplateTokenizer()
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(
+                return_value=TestBatchedEngineSpecPrefillForwarding._fake_output()
+            )
+        )
+        tools = [{"type": "function", "function": {"name": "lookup"}}]
+        ct_kwargs = {"enable_thinking": False}
+
+        def messages():
+            return [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "Sure,"},
+            ]
+
+        await engine.chat(
+            messages(),
+            tools=tools,
+            chat_template_kwargs=ct_kwargs,
+            is_partial=is_partial,
+        )
+        submitted = engine._engine.generate.call_args.kwargs["prompt"]
+        token_ids = await engine.tokenize_chat(
+            messages(), tools, chat_template_kwargs=ct_kwargs, is_partial=is_partial
+        )
+
+        assert token_ids == engine._tokenizer.encode(submitted)
+
+    @pytest.mark.asyncio
+    async def test_generation_prompt_and_special_token_overrides(self):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._tokenizer = _TemplateTokenizer()
+        token_ids = await engine.tokenize_chat(
+            [{"role": "user", "content": "hi"}],
+            add_generation_prompt=False,
+            add_special_tokens=False,
+        )
+
+        assert token_ids == [ord(c) for c in "user:hi"]
+
+
+class TestBatchedEngineMoeOffloadWiring:
+    """The text engine's offload call must carry the Lightning MTP residency flag.
+
+    Admission prices the draft head as resident when MTP is on, so the wrapper
+    must keep it resident on this path too (the VLM engine already does).
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("mtp_enabled", "expected"), [(True, True), (False, False)]
+    )
+    async def test_offload_call_forwards_mtp_residency(self, mtp_enabled, expected):
+        from omlx.engine.batched import BatchedEngine
+        from omlx.model_settings import ModelSettings
+
+        seen: dict = {}
+
+        class _Abort(Exception):
+            """Unwinds start() once the call site has been observed."""
+
+        def _recorder(model, model_name, fraction, **kwargs):
+            seen["kwargs"] = kwargs
+            seen["args"] = (model_name, fraction)
+            raise _Abort
+
+        engine = BatchedEngine(
+            model_name="test-model",
+            model_settings=ModelSettings(
+                moe_expert_offload_enabled=True, mtp_enabled=mtp_enabled
+            ),
+        )
+        with (
+            patch("omlx.engine.batched.get_tokenizer_config", return_value={}),
+            patch("omlx.utils.model_loading.maybe_apply_pre_load_patches"),
+            patch(
+                "omlx.utils.model_loading.maybe_load_custom_quantization",
+                return_value=(object(), object()),
+            ),
+            patch(
+                "omlx.utils.model_loading.apply_post_load_transforms",
+                side_effect=lambda model, settings: model,
+            ),
+            patch(
+                "omlx.patches.moe_expert_offload.apply_moe_expert_offload", _recorder
+            ),
+            patch("omlx.engine_core.get_mlx_executor", return_value=None),
+        ):
+            with pytest.raises(_Abort):
+                await engine.start()
+
+        assert seen["kwargs"] == {"mtp_resident": expected}
+        assert seen["args"] == (
+            "test-model",
+            engine._model_settings.moe_expert_offload_resident_fraction,
+        )
