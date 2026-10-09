@@ -128,6 +128,7 @@ def apply() -> bool:
                     logger.debug("MTP path not active: %s", reason)
 
         def patched_next(self, *args, **kwargs):
+            model = getattr(self, "model", None)
             if _is_mtp_batch_eligible(self):
                 policy = _batch_policy_for_next(self)
                 _batch_park_memory(self.model).tick()
@@ -156,7 +157,7 @@ def apply() -> bool:
                 try:
                     batch_state = _prepare_mtp_batch_state_for_next(self)
                     if batch_state is not None:
-                        with _spec_command_buffers():
+                        with _spec_command_buffers(model):
                             return _mtp_batch_next(self, batch_state)
                 except _MtpStepFallback as exc:
                     logger.debug("MTP batch next() fallback to standard step: %s", exc)
@@ -183,7 +184,7 @@ def apply() -> bool:
                     try:
                         state = _prepare_mtp_state_for_next(self)
                         if state is not None:
-                            with _spec_command_buffers():
+                            with _spec_command_buffers(model):
                                 return _mtp_next(self, state)
                     except _MtpStepFallback as exc:
                         logger.debug("MTP next() fallback to standard step: %s", exc)
@@ -377,6 +378,60 @@ def _model_has_mtp_module(model: Any) -> bool:
 # raise its peak memory.
 _SPEC_BUFFER_CAPS = (200, 512)
 
+# Startup override: 0 keeps MLX caps; 1 raises them; otherwise select by target.
+_SPEC_BUFFER_CAPS_MODE = os.environ.get("OMLX_MTP_COMMAND_BUFFER_CAPS", "").strip()
+
+# Target model types supported by the Qwen Lightning MTP/DFlash paths.
+_SPEC_CAPS_TARGET_TYPES = frozenset(
+    {
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen3_5_vl",
+        "qwen3_6",
+        "qwen3_6_moe",
+        "qwen4_exp",
+        "qwen4_exp_text",
+    }
+)
+
+
+def _spec_caps_field(config: Any, key: str) -> Any:
+    """One field of a config, which a runtime may expose as a dict or object."""
+    return config.get(key) if isinstance(config, dict) else getattr(config, key, None)
+
+
+def _spec_caps_model_types(model: Any) -> tuple[str, ...]:
+    """Read target metadata from text and VLM wrappers, excluding the drafter."""
+    if model is None:
+        return ()
+    hosts = [model]
+    for attr in ("language_model", "_language_model"):
+        inner = getattr(model, attr, None)
+        if inner is not None and inner is not model:
+            hosts.append(inner)
+    types: list[str] = []
+    for host in hosts:
+        config = getattr(host, "config", None)
+        args = getattr(host, "args", None)
+        for value in (
+            getattr(host, "model_type", None),
+            getattr(args, "model_type", None),
+            _spec_caps_field(config, "model_type"),
+            # VLM checkpoints nest the text stack's own type one level down.
+            _spec_caps_field(_spec_caps_field(config, "text_config"), "model_type"),
+        ):
+            if isinstance(value, str) and value not in types:
+                types.append(value)
+    return tuple(types)
+
+
+def _spec_caps_target(model: Any) -> bool:
+    """Whether the loaded target belongs to the selected Qwen family."""
+    return any(
+        model_type in _SPEC_CAPS_TARGET_TYPES
+        for model_type in _spec_caps_model_types(model)
+    )
+
 
 @functools.lru_cache(maxsize=1)
 def _raises_spec_buffer_caps() -> bool:
@@ -395,15 +450,20 @@ def _raises_spec_buffer_caps() -> bool:
 
 
 @contextlib.contextmanager
-def _spec_command_buffers():
-    """Raise MLX's command-buffer caps for one speculative decode step.
+def _spec_command_buffers(model: Any = None):
+    """Raise caps for supported Qwen targets and GPUs, then restore them."""
+    if _SPEC_BUFFER_CAPS_MODE == "0":
+        yield
+        return
 
-    Measured on M5 and M3 Ultra, so other GPUs keep MLX's caps.
-    """
+    if _SPEC_BUFFER_CAPS_MODE != "1" and not _spec_caps_target(model):
+        yield
+        return
+
     from omlx.custom_kernels.qwen35_prefill.fast import set_command_buffer_caps
 
     previous = None
-    if _raises_spec_buffer_caps():
+    if _SPEC_BUFFER_CAPS_MODE == "1" or _raises_spec_buffer_caps():
         previous = set_command_buffer_caps(*_SPEC_BUFFER_CAPS)
     try:
         yield
