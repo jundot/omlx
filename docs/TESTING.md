@@ -208,3 +208,7 @@ Run `python -m pytest -q tests/test_video.py tests/test_image_utils.py tests/tes
 # Engine idle timing tests
 
 Run `python -m pytest -q tests/test_engine_pool.py tests/test_active_models_visibility.py` to check that lease completion refreshes the LRU/TTL timestamp and that busy models report zero idle time. The cases cover a request longer than its TTL, release with a pending unload, cancelled release, redundant releases, and models with a held lease, an active request, or a waiting request.
+
+# Chat completion logprobs tests
+
+Run `python -m pytest -q tests/test_chat_logprobs.py tests/test_output_collector.py` to check `logprobs` and `top_logprobs` on non-streaming `/v1/chat/completions`. Scheduler cases cover one record per output token from the row the sampler used, batched rows that are not mixed, EOS and missing rows, MTP decode, and re-prefill alignment. Route cases cover the OpenAI response shape, `-inf` and partial-UTF-8 tokens, unchanged responses without logprobs, ignored streaming requests, and the 0–20 range. No model download is required.

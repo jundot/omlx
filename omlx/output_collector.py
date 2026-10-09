@@ -161,6 +161,7 @@ class RequestOutputCollector:
             error=new.error or existing.error,
             error_code=new.error_code or existing.error_code,
             error_metadata=new.error_metadata or existing.error_metadata,
+            logprobs=new.logprobs if new.logprobs is not None else existing.logprobs,
         )
 
     def clear(self) -> None:

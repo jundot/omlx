@@ -1136,6 +1136,8 @@ class BatchedEngine(BaseEngine):
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
+            logprobs=bool(kwargs.get("logprobs", False)),
+            top_logprobs=kwargs.get("top_logprobs"),
         )
 
         # SpecPrefill: forward per-request overrides to the engine, mirroring
@@ -1159,6 +1161,7 @@ class BatchedEngine(BaseEngine):
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
             tool_calls=output.tool_calls,
+            logprobs=getattr(output, "logprobs", None),
             cached_tokens=output.cached_tokens,
             first_token_at=output.first_token_at,
         )

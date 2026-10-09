@@ -10,7 +10,7 @@ request management system, simplified for MLX backend.
 import enum
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     from .cache.paged_cache import BlockTable
@@ -72,7 +72,7 @@ class SamplingParams:
 
     # Logprobs settings (memory optimization: disabled by default)
     logprobs: bool = False  # Whether to return logprobs
-    top_logprobs: Optional[int] = None  # Number of top logprobs (1-20)
+    top_logprobs: Optional[int] = None  # Number of top logprobs (0-20)
 
     # Thinking budget (None = unlimited thinking)
     thinking_budget: Optional[int] = None
@@ -89,6 +89,15 @@ class SamplingParams:
             self.stop = []
         if self.stop_token_ids is None:
             self.stop_token_ids = []
+
+
+class TokenLogprob(NamedTuple):
+    """Log probability of one generated token and its top alternatives."""
+
+    token: int
+    logprob: float
+    # (token_id, logprob) pairs, most likely first.
+    top_logprobs: list[tuple[int, float]]
 
 
 @dataclass
@@ -241,6 +250,10 @@ class Request:
     # Request-scoped tool schemas used by protocol output parsers.
     tools: list[dict[str, Any]] | None = None
 
+    # One record per output_token_ids entry when sampling_params.logprobs is
+    # set; None marks a token whose decode path supplied no distribution.
+    output_logprobs: list[TokenLogprob | None] | None = None
+
     @property
     def num_output_tokens(self) -> int:
         """Number of output tokens generated so far."""
@@ -332,6 +345,9 @@ class RequestOutput:
     # Structured internal error classification for API-layer mapping.
     error_code: Optional[str] = None
     error_metadata: Optional[Dict[str, Any]] = None
+    # Logprob records for output_token_ids, set on the finished output of a
+    # request that asked for logprobs.
+    logprobs: list[TokenLogprob] | None = None
     # Internal benchmark instrumentation copied from the originating request.
     benchmark_prefill_chunks: List[int] = field(default_factory=list)
     benchmark_requested_steps: List[int] = field(default_factory=list)
