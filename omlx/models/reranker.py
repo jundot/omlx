@@ -965,6 +965,7 @@ class MLXRerankerModel:
         query: "str | dict",
         documents: "list[str] | list[dict]",
         max_length: int | None = None,
+        instruction: str | None = None,
     ) -> RerankOutput:
         """
         Rerank documents by relevance to the query.
@@ -1014,7 +1015,9 @@ class MLXRerankerModel:
                 if max_length is not None
                 else self._DEFAULT_MAX_LENGTH_CAUSAL_LM
             )
-            return self._rerank_causal_lm(query_str, docs_str, effective_max_length)
+            return self._rerank_causal_lm(
+                query_str, docs_str, effective_max_length, instruction=instruction
+            )
         else:
             # Absolute position tables read out of range without an error, so
             # never exceed the tokenizer's declared limit.
@@ -1031,6 +1034,7 @@ class MLXRerankerModel:
         query: str,
         documents: list[str],
         max_length: int = 8192,
+        instruction: str | None = None,
     ) -> RerankOutput:
         """
         Rerank using CausalLM yes/no logit scoring (e.g., Qwen3-Reranker).
@@ -1053,6 +1057,11 @@ class MLXRerankerModel:
         if not callable(self.model):
             raise ValueError("CausalLM reranker model is not initialized.")
 
+        # A caller-supplied instruction replaces the default in the <Instruct>
+        # slot. An empty string falls back to the default: the slot is part of
+        # the model's native prompt format and is not meaningful left blank.
+        effective_instruction = instruction or self._CAUSAL_LM_DEFAULT_INSTRUCTION
+
         # Compute max tokens available for the instruction content
         max_content_tokens = max_length - len(prefix_tokens) - len(suffix_tokens)
 
@@ -1060,7 +1069,7 @@ class MLXRerankerModel:
         pairs_text = []
         for doc in documents:
             content = (
-                f"<Instruct>: {self._CAUSAL_LM_DEFAULT_INSTRUCTION}\n"
+                f"<Instruct>: {effective_instruction}\n"
                 f"<Query>: {query}\n"
                 f"<Document>: {doc}"
             )

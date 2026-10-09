@@ -3967,6 +3967,7 @@ async def create_rerank(
             documents=documents_raw,
             top_n=request.top_n,
             max_length=request.max_length,
+            instruction=request.instruction,
         )
 
     elapsed = time.perf_counter() - start_time

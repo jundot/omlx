@@ -188,7 +188,7 @@ class TestRerankDispatchCoerce:
 
         captured = {}
 
-        def fake_causal_lm(query, docs, max_length):
+        def fake_causal_lm(query, docs, max_length, instruction=None):
             captured["query"] = query
             captured["docs"] = docs
             return RerankOutput(scores=[0.5, 0.5], indices=[0, 1], total_tokens=0)

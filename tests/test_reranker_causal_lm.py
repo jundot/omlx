@@ -1265,3 +1265,127 @@ class TestRerankerClose:
         mock_mx.synchronize.assert_called_once()
         mock_mx.clear_cache.assert_called_once()
         assert collect.call_count == 2
+
+
+class TestCausalLMRerankerInstruction:
+    """The `<Instruct>:` slot of the Qwen3-Reranker prompt is caller-supplied.
+
+    Qwen3-Reranker's documented prompt format carries the task instruction in
+    its own slot, and the system prompt tells the model to judge the Document
+    "based on the Query and the Instruct provided". When that slot is pinned to
+    a fixed default, a caller's instruction can only reach the model smuggled
+    inside the query text -- where it lands under a `<Query>:` label and
+    competes with the default instruction rather than replacing it.
+    """
+
+    def _make_scoring_model(self, tmp_path):
+        """A CausalLM reranker whose tokenizer records the prompts it is given."""
+        model_dir = tmp_path / "Qwen3-Reranker-0.6B"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps(
+                {"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"]}
+            )
+        )
+
+        model = MLXRerankerModel(str(model_dir))
+        model._is_causal_lm = True
+        model._loaded = True
+        model._token_true_id = 9693  # "yes"
+        model._token_false_id = 2152  # "no"
+        model._prefix_tokens = [1, 2, 3]
+        model._suffix_tokens = [4, 5]
+
+        seen_prompts: list[str] = []
+
+        def fake_tokenizer(pairs_text, **kwargs):
+            seen_prompts.extend(pairs_text)
+            return {"input_ids": [[10, 11, 12] for _ in pairs_text]}
+
+        model.processor = MagicMock(side_effect=fake_tokenizer)
+
+        def mock_forward(input_ids):
+            vocab_size = 10000
+            logits = np.zeros((1, input_ids.shape[1], vocab_size), dtype=np.float32)
+            logits[0, -1, 9693] = 5.0
+            return mx.array(logits)
+
+        model.model = MagicMock(side_effect=mock_forward)
+        return model, seen_prompts
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_custom_instruction_replaces_the_default(self, tmp_path):
+        """A caller instruction occupies the <Instruct> slot, not the query."""
+        model, seen_prompts = self._make_scoring_model(tmp_path)
+
+        model._rerank_causal_lm(
+            "a query",
+            ["a document"],
+            instruction="Retrieve passages stating a numeric limit",
+        )
+
+        assert len(seen_prompts) == 1
+        prompt = seen_prompts[0]
+        assert prompt.startswith(
+            "<Instruct>: Retrieve passages stating a numeric limit\n"
+        )
+        assert MLXRerankerModel._CAUSAL_LM_DEFAULT_INSTRUCTION not in prompt
+        # The query keeps its own slot: the instruction must not be folded in.
+        assert "<Query>: a query\n" in prompt
+        assert prompt.count("<Instruct>:") == 1
+        assert prompt.count("<Query>:") == 1
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_absent_instruction_keeps_the_default(self, tmp_path):
+        """Omitting the field leaves today's prompt byte-for-byte unchanged."""
+        model, seen_prompts = self._make_scoring_model(tmp_path)
+
+        model._rerank_causal_lm("a query", ["a document"])
+
+        assert seen_prompts[0].startswith(
+            f"<Instruct>: {MLXRerankerModel._CAUSAL_LM_DEFAULT_INSTRUCTION}\n"
+        )
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_empty_instruction_falls_back_to_the_default(self, tmp_path):
+        """The slot is part of the model's format and is not left blank."""
+        model, seen_prompts = self._make_scoring_model(tmp_path)
+
+        model._rerank_causal_lm("a query", ["a document"], instruction="")
+
+        assert seen_prompts[0].startswith(
+            f"<Instruct>: {MLXRerankerModel._CAUSAL_LM_DEFAULT_INSTRUCTION}\n"
+        )
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_every_document_gets_the_instruction(self, tmp_path):
+        """Scoring is per-document; each pair carries the same instruction."""
+        model, seen_prompts = self._make_scoring_model(tmp_path)
+
+        model._rerank_causal_lm(
+            "a query", ["first", "second", "third"], instruction="Custom task"
+        )
+
+        assert len(seen_prompts) == 3
+        assert all(p.startswith("<Instruct>: Custom task\n") for p in seen_prompts)
+
+    def test_rerank_forwards_the_instruction_to_the_causal_lm_path(self, tmp_path):
+        """rerank() is the public entry point and must not drop the field."""
+        model_dir = tmp_path / "Qwen3-Reranker-0.6B"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps(
+                {"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"]}
+            )
+        )
+        model = MLXRerankerModel(str(model_dir))
+        model._is_causal_lm = True
+        model._loaded = True
+
+        mock_result = RerankOutput(scores=[0.9], indices=[0], total_tokens=4)
+        with patch.object(
+            model, "_rerank_causal_lm", return_value=mock_result
+        ) as mock_causal:
+            model.rerank("q", ["d"], instruction="Custom task")
+
+        assert mock_causal.call_args.kwargs["instruction"] == "Custom task"

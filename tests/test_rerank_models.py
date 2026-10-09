@@ -190,3 +190,27 @@ class TestRerankResponse:
         assert len(restored.results) == 2
         assert restored.results[0].relevance_score == 0.95
         assert restored.usage.total_tokens == 64
+
+
+class TestRerankRequestInstruction:
+    """`instruction` is optional and additive: omitting it changes nothing."""
+
+    def test_defaults_to_none(self):
+        request = RerankRequest(model="m", query="q", documents=["d"])
+        assert request.instruction is None
+
+    def test_accepts_an_instruction(self):
+        request = RerankRequest(
+            model="m",
+            query="q",
+            documents=["d"],
+            instruction="Retrieve passages stating a numeric limit",
+        )
+        assert request.instruction == "Retrieve passages stating a numeric limit"
+
+    def test_round_trip_via_json(self):
+        original = RerankRequest(
+            model="m", query="q", documents=["d"], instruction="Custom task"
+        )
+        restored = RerankRequest.model_validate_json(original.model_dump_json())
+        assert restored.instruction == "Custom task"
