@@ -244,26 +244,15 @@ class _GLUStoreView:
 
 
 # One reader pool for the whole process. A miss is IO, not compute: the
-# useful width is the storage queue depth, so the default is wider than the
-# core count. ``OMLX_MOE_OFFLOAD_IO_WORKERS`` <= 1 (or unparseable) keeps the
-# serial path and creates no threads at all;
-# ``OMLX_MOE_OFFLOAD_IO_BATCH`` caps how many experts' payloads may be in
-# flight, which is what bounds the extra host memory the pipeline holds.
+# useful width is the storage queue depth, so it is wider than the core
+# count. ``_IO_WORKERS`` <= 1 keeps the serial path and creates no threads.
+# At most 4 x workers experts' payloads are in flight, which is what bounds
+# the extra host memory the pipeline holds.
 _IO_WORKERS = 12
 _IO_LOCK = threading.Lock()
 _IO_POOL: ThreadPoolExecutor | None = None
 _IO_BATCH = 0
 _IO_CONFIGURED = False
-
-
-def _env_int(name: str, default: int, invalid: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return invalid
 
 
 def _io_pool() -> ThreadPoolExecutor | None:
@@ -272,12 +261,9 @@ def _io_pool() -> ThreadPoolExecutor | None:
     with _IO_LOCK:
         if not _IO_CONFIGURED:
             _IO_CONFIGURED = True
-            workers = _env_int("OMLX_MOE_OFFLOAD_IO_WORKERS", _IO_WORKERS, 0)
+            workers = _IO_WORKERS
             if workers > 1:
-                _IO_BATCH = max(
-                    1,
-                    _env_int("OMLX_MOE_OFFLOAD_IO_BATCH", 4 * workers, 4 * workers),
-                )
+                _IO_BATCH = 4 * workers
                 _IO_POOL = ThreadPoolExecutor(
                     max_workers=workers, thread_name_prefix="omlx-moe-io"
                 )
@@ -291,7 +277,7 @@ def _io_batch() -> int:
 
 
 def _shutdown_io_pool() -> None:
-    """Drop the pool; the next fetch re-reads the environment (tests)."""
+    """Drop the pool; the next fetch rebuilds it from ``_IO_WORKERS`` (tests)."""
     global _IO_POOL, _IO_BATCH, _IO_CONFIGURED
     with _IO_LOCK:
         pool, _IO_POOL, _IO_BATCH, _IO_CONFIGURED = _IO_POOL, None, 0, False
@@ -675,9 +661,8 @@ class OffloadSwitchGLU(nn.Module):
         self.cache = ExpertCache(glu, capacity, disk, floor)
         self.activation = glu.activation
         # Fetch/compute overlap in decode: the GPU stays busy while slow
-        # reads of missing experts are pending. OMLX_MOE_OFFLOAD_OVERLAP=0
-        # keeps the serial order (read, then compute) for every step.
-        self._overlap = os.environ.get("OMLX_MOE_OFFLOAD_OVERLAP", "1") != "0"
+        # reads of missing experts are pending.
+        self._overlap = True
 
     def _glu(self, x: mx.array, slots: mx.array) -> mx.array:
         c = self.cache
@@ -1053,10 +1038,9 @@ def apply_moe_expert_offload(
 ) -> int:
     """Replace covered SwitchGLU instances with offloaded ones.
 
-    Returns the number of layers wrapped (0 when disabled via
-    ``OMLX_MOE_EXPERT_OFFLOAD=0``, the model has no stock SwitchGLU, or the
-    checkpoint does not cover them). Must run before lazy weights are
-    materialized for the memory saving to exist.
+    Returns the number of layers wrapped (0 when the model has no stock
+    SwitchGLU or the checkpoint does not cover them). Must run before lazy
+    weights are materialized for the memory saving to exist.
 
     ``mtp_resident`` keeps the embedded MTP draft head's experts resident
     (glm5_next Lightning MTP + offload; see
@@ -1064,8 +1048,6 @@ def apply_moe_expert_offload(
     ``mtp.*`` is skipped by the generic traversal below). Other families
     reject the combination at validation.
     """
-    if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
-        return 0
     model_dir = _resolve_model_dir(model_path)
     if model_dir is None:
         return 0
@@ -1166,8 +1148,6 @@ def estimate_offload_admission_bytes(
     do not under-report the resident share. Falls back to ``full_size`` on
     any failure — admission must never get more permissive by accident.
     """
-    if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
-        return full_size
     try:
         model_dir = _resolve_model_dir(model_path)
         if model_dir is None:

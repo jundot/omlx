@@ -243,13 +243,6 @@ def test_uncovered_checkpoint_is_skipped(tmp_path):
     assert isinstance(model.model.layers[0].ffn.switch_mlp, SwitchGLU)
 
 
-def test_kill_switch(tmp_path, reference, monkeypatch):
-    monkeypatch.setenv("OMLX_MOE_EXPERT_OFFLOAD", "0")
-    model = _Model([_copy(reference)])
-    assert dsv4.apply_deepseek_v4_moe_expert_offload(model, tmp_path, 0.25) == 0
-    assert apply_moe_expert_offload(model, tmp_path, 0.25) == 0
-
-
 def test_common_entry_point_dispatches_dsv4(tmp_path, reference):
     """The engine calls apply_moe_expert_offload; DeepSeek V4 blocks are
     wrapped by their adapter, counted once, and seen by the shared walkers."""
@@ -401,7 +394,7 @@ def test_admission_estimate_excludes_resident_draft_head(tmp_path):
     )
 
 
-@pytest.mark.parametrize("workers", ["1", "4"])
+@pytest.mark.parametrize("workers", [1, 4])
 def test_wrap_and_release_return_descriptors_to_baseline(
     tmp_path, reference, monkeypatch, workers
 ):
@@ -410,7 +403,7 @@ def test_wrap_and_release_return_descriptors_to_baseline(
 
     from omlx.patches.moe_expert_offload import _shutdown_io_pool
 
-    monkeypatch.setenv("OMLX_MOE_OFFLOAD_IO_WORKERS", workers)
+    monkeypatch.setattr("omlx.patches.moe_expert_offload._IO_WORKERS", workers)
     _shutdown_io_pool()
 
     def cycle():

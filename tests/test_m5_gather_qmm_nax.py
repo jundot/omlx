@@ -1273,7 +1273,6 @@ def qwen_regroup(monkeypatch):
 
     import omlx.patches.qwen35_moe_gate_up as gate_up
 
-    monkeypatch.delenv("OMLX_QWEN35_MOE_GATE_UP", raising=False)
     verifier = Qwen3_5BatchInvariantForward
     monkeypatch.setattr(verifier, "_switch_glu", verifier._switch_glu)
     saved = {cls: cls.__dict__.get("__call__") for cls in (SwitchGLU, VLMSwitchGLU)}

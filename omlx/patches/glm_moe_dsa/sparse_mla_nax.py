@@ -34,14 +34,10 @@ software-pipelined variant nondeterministic on M5.
 
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 from typing import Optional
 
 import mlx.core as mx
-
-_ENV = os.environ.get("OMLX_GLM_SPARSE_MLA_NAX", "1").strip().lower()
-_ENABLED = _ENV not in {"0", "false", "off"}
 
 _D_LATENT = 512
 _HEADS_PER_GROUP = 32
@@ -340,8 +336,6 @@ def _kernel():
 
 @lru_cache(maxsize=1)
 def nax_sparse_mla_available() -> bool:
-    if not _ENABLED:
-        return False
     try:
         from omlx.custom_kernels.nax import is_nax_available
 

@@ -50,7 +50,6 @@ def _patched(monkeypatch):
     had_flag = "_omlx_routed_decode" in cls.__dict__
     for name in ("_DISABLED", "_PROVEN", "_WINDOW_DISABLED", "_WINDOW_PROVEN"):
         monkeypatch.setattr(routed, name, False)
-    monkeypatch.setattr(routed, "_VERIFY_WINDOW", True)
     assert routed.apply_qwen35_moe_routed_decode_patch()
     yield
     qwen35_verify_qmm.set_verify_qmm_armed(False)
@@ -137,13 +136,15 @@ def _serial(block, x):
 def _verify(block, x, window):
     from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
 
-    routed._VERIFY_WINDOW = window
+    fused = routed.routed_verify_window
+    if not window:
+        routed.routed_verify_window = lambda block, x: None
     qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=True)
     try:
         out = Qwen3_5BatchInvariantForward()._feed_forward(block, x)
     finally:
         qwen35_verify_qmm.set_verify_qmm_armed(False)
-        routed._VERIFY_WINDOW = True
+        routed.routed_verify_window = fused
     mx.eval(out)
     return out
 
@@ -156,8 +157,7 @@ def _check(block, x, engaged):
     ref = _serial(block, x)
     old = _verify(block, x, window=False)
     mx.eval(ref, old)
-    # Engaged for the window, declined with the kill switch set.
-    assert engaged[count:] == [True, False]
+    assert engaged[count:] == [True]
     assert _same_bits(new, ref)
     if x.size // x.shape[-1] <= router._MAX_ROWS:
         assert _same_bits(new, old)
@@ -191,24 +191,17 @@ def _inputs(rows, step, batch=1, hidden=HIDDEN, dtype=mx.bfloat16):
 
 @pytest.fixture(params=[True, False], ids=["topk_fold", "topk_launch"])
 def topk_fold(request, monkeypatch):
-    """Routing folded into the gate+up launch, or OMLX_QWEN35_MOE_TOPK_FOLD=0
-    (the separate routing launch); cached plans are rebuilt either way."""
-
-    def drop_plans():
-        for block in _BLOCKS.values():
-            block.__dict__.pop("_omlx_routed_decode_plan", None)
-
-    monkeypatch.setattr(routed, "_TOPK_FOLD", request.param)
-    drop_plans()
-    yield request.param
-    drop_plans()
+    """Routing folded into the gate+up launch, or the separate routing launch."""
+    if not request.param:
+        monkeypatch.setattr(routed, "_topk_folds", lambda plan, logits: False)
+    return request.param
 
 
 @pytest.mark.parametrize("seed", [0, 1])
 def test_window_rows_equal_one_token_decode(seed, topk_fold, engaged):
     block = _block(seed)
     plan = routed.routed_decode_plan(block, mx.zeros((1, 1, HIDDEN), mx.bfloat16))
-    assert (plan.topk_kernel is not None) == topk_fold
+    assert plan.topk_kernel is not None
     for rows in range(1, routed.WINDOW_MAX_ROWS + 1):
         for step in range(3):
             _check(block, _inputs(rows, step), engaged)

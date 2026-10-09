@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Any
 
@@ -558,10 +557,7 @@ def maybe_apply_pre_load_patches(
             model_type=_config_model_type(model_name),
         )
 
-    if (
-        getattr(model_settings, "moe_expert_offload_enabled", False)
-        and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
-    ):
+    if getattr(model_settings, "moe_expert_offload_enabled", False):
         from ..patches.moe_offload_compat import moe_offload_compatibility
 
         supported, reason = moe_offload_compatibility(model_name)

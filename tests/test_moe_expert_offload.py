@@ -646,12 +646,6 @@ class TestApplyAndForward:
         full = 10**6
         assert estimate_offload_admission_bytes(tmp_path, full, 0.25) == full
 
-    def test_kill_switch(self, tmp_path, monkeypatch):
-        model, _ = self._wrapped_model(tmp_path)
-        monkeypatch.setenv("OMLX_MOE_EXPERT_OFFLOAD", "0")
-        assert apply_moe_expert_offload(model, tmp_path, 0.25) == 0
-        assert type(model.layers[0].experts.switch_glu) is SwitchGLU
-
     def test_idempotent_second_apply_is_noop(self, tmp_path):
         model, _ = self._wrapped_model(tmp_path)
         assert apply_moe_expert_offload(model, tmp_path, 0.25) == 2
@@ -674,10 +668,8 @@ class TestParallelFetch:
         _shutdown_io_pool()
 
     def _wrap(self, tmp_path, glu, workers, monkeypatch, fraction=0.25):
-        if workers is None:
-            monkeypatch.delenv("OMLX_MOE_OFFLOAD_IO_WORKERS", raising=False)
-        else:
-            monkeypatch.setenv("OMLX_MOE_OFFLOAD_IO_WORKERS", workers)
+        if workers is not None:
+            monkeypatch.setattr(offload_module, "_IO_WORKERS", int(workers))
         _shutdown_io_pool()
         model = _MiniMoE([glu])
         assert apply_moe_expert_offload(model, tmp_path, fraction) == 1
@@ -769,19 +761,6 @@ class TestParallelFetch:
             cache.ensure(mx.array(ids))
         assert 0 in cache.slot_of  # Last routed 9 one-off experts ago
 
-    @pytest.mark.parametrize("workers", ["0", "-4", "abc", "1", None])
-    def test_io_workers_env_degenerate_values(self, tmp_path, monkeypatch, workers):
-        glu = _make_glu(seed=5)
-        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
-        x, i = mx.random.normal((4, 1, D)), _ri(4, 1, K)
-        ref = glu(x, i)
-        mx.eval(ref)
-        model, _ = self._wrap(tmp_path, glu, workers, monkeypatch)
-        got = model.layers[0].experts.switch_glu(x, i)
-        mx.eval(got)
-        assert bool(mx.array_equal(ref, got))
-        assert (_io_pool() is None) is (workers is not None)
-
     @pytest.mark.parametrize("workers", ["1", "4"])
     @pytest.mark.parametrize("full", [False, True])
     def test_read_failure_preserves_cache_for_retry(
@@ -852,8 +831,8 @@ class TestParallelFetch:
     def test_single_expert_window_keeps_reads_on_pool(self, tmp_path, monkeypatch):
         glu = _make_glu(seed=10)
         _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
-        monkeypatch.setenv("OMLX_MOE_OFFLOAD_IO_BATCH", "1")
         _, cache = self._wrap(tmp_path, glu, "4", monkeypatch)
+        monkeypatch.setattr(offload_module, "_io_batch", lambda: 1)
         read = CheckpointExpertStore.read
         threads = []
 
@@ -892,7 +871,7 @@ class TestParallelFetch:
         buffering a whole layer's expert table in host memory."""
         glu = _make_glu(seed=7)
         _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
-        monkeypatch.setenv("OMLX_MOE_OFFLOAD_IO_BATCH", "4")
+        monkeypatch.setattr(offload_module, "_io_batch", lambda: 4)
         real_read, real_to_mx = CheckpointExpertStore.read, CheckpointExpertStore.to_mx
         lock = threading.Lock()
         live = {"now": 0, "peak": 0}

@@ -32,16 +32,9 @@ with a resident-fraction field accepting 5% to 95%, including fractional percent
 {"moe_expert_offload_enabled": true, "moe_expert_offload_resident_fraction": 0.25}
 ```
 
-Toggling triggers an engine reload (it is a load-time transform). The env
-kill switch `OMLX_MOE_EXPERT_OFFLOAD=0` disables it regardless of settings.
+Toggling triggers an engine reload (it is a load-time transform).
 
-Three env vars tune the read path, and none changes what is computed:
-
-| variable | default | effect |
-|---|---|---|
-| `OMLX_MOE_OFFLOAD_IO_WORKERS` | 12 | threads reading missing experts. `1` or less (or an unparseable value) keeps the serial path and starts no threads |
-| `OMLX_MOE_OFFLOAD_IO_BATCH` | `4 x workers` | experts whose reads may be in flight at once — the bound on the host memory the pipeline holds ahead of the slot writes |
-| `OMLX_MOE_OFFLOAD_OVERLAP` | 1 | in decode, when a step's reads are slow, keep the GPU busy while they finish: compute the resident routes, keep the GPU clocked for the rest of the read, and dispatch each layer's output as soon as it is built (needs the parallel reader). Steps whose reads arrive within 0.5 ms keep the serial order. `0` keeps the serial order for every step: read, then compute |
+Missing experts are read by 12 threads, with at most 48 experts' reads in flight, which bounds the host memory the pipeline holds ahead of the slot writes. In decode, when a step's reads are slow, the GPU stays busy while they finish: it computes the resident routes, stays clocked for the rest of the read, and dispatches each layer's output as soon as it is built. Steps whose reads arrive within 0.5 ms keep the serial order: read, then compute. None of this changes what is computed.
 
 ## Performance
 

@@ -18,7 +18,6 @@ import copy
 import gc
 import json
 import logging
-import os
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager, suppress
@@ -570,10 +569,7 @@ class EnginePool:
 
             fraction = runtime_settings.moe_expert_offload_resident_fraction
             if entry.config_model_type == "deepseek_v41":
-                if (
-                    v41_estimate is None
-                    and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
-                ):
+                if v41_estimate is None:
                     from .patches.deepseek_v41.moe_offload import (
                         estimate_expert_savings,
                     )
@@ -785,10 +781,7 @@ class EnginePool:
             estimate = deepseek_v41_residency_estimate(entry.model_path)
             if not estimate.supported:
                 return False, False, None
-            if (
-                getattr(settings, "moe_expert_offload_enabled", False)
-                and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
-            ):
+            if getattr(settings, "moe_expert_offload_enabled", False):
                 from .patches.deepseek_v41.moe_offload import estimate_expert_savings
 
                 saved = estimate_expert_savings(

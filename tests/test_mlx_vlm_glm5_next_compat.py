@@ -2810,17 +2810,6 @@ def test_nax_sparse_mla_unsupported_shapes_return_none():
 
 
 @_needs_nax_sparse_mla
-def test_nax_sparse_mla_disabled_by_env(monkeypatch):
-    monkeypatch.setattr(sparse_mla_nax, "_ENABLED", False)
-    sparse_mla_nax.nax_sparse_mla_available.cache_clear()
-    try:
-        q, kv, idx = _smla_inputs(16, 64, 32)
-        assert sparse_mla_nax.sparse_mla_attention_nax(q, kv, idx, 1.0) is None
-    finally:
-        sparse_mla_nax.nax_sparse_mla_available.cache_clear()
-
-
-@_needs_nax_sparse_mla
 def test_nax_sparse_mla_deterministic_across_runs():
     # Large enough to keep many threadgroups in flight; every run must be
     # bit-identical (guards against threadgroup-memory races).
@@ -2935,13 +2924,9 @@ def test_nax_sparse_mla_call_site_matches_fallback_paths(monkeypatch):
     products, so bf16 intermediate rounding differs)."""
     attn = _make_sparse_attention()
     chunks = [2600, 1600]  # sparse at 2600 keys, then at 4200 keys
-    monkeypatch.setattr(sparse_mla_nax, "_ENABLED", False)
-    sparse_mla_nax.nax_sparse_mla_available.cache_clear()
-    try:
+    with monkeypatch.context() as off:
+        off.setattr(sparse_mla_nax, "nax_sparse_mla_available", lambda: False)
         expected = _run_attention(attn, chunks)
-    finally:
-        monkeypatch.setattr(sparse_mla_nax, "_ENABLED", True)
-        sparse_mla_nax.nax_sparse_mla_available.cache_clear()
     calls = []
     orig = sparse_mla_nax.sparse_mla_attention_nax
 
