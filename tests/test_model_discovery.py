@@ -2342,6 +2342,105 @@ class TestHfCacheDiscovery:
         assert len(models) == 1
         assert "mlx-community--Qwen3-8B-4bit" in models
 
+    def test_hf_cache_diffusion_checkpoint_is_not_advertised(self, tmp_path):
+        """An ``*-mlx-*`` repo name is not evidence that an engine can build the
+        checkpoint: Wan2.2 TI2V is a diffusion transformer (#4381)."""
+        repo = "Anes1032/Wan2.2-TI2V-5B-mlx-q8"
+        _, snapshot = self._make_hf_cache_entry(
+            tmp_path, "Anes1032", "Wan2.2-TI2V-5B-mlx-q8"
+        )
+        (snapshot / "config.json").write_text(json.dumps({"model_type": "ti2v"}))
+        (snapshot / "model.safetensors").write_bytes(b"0" * 1000)
+
+        assert _is_hf_cache_mlx_compatible(snapshot, repo) is False
+        assert discover_models(tmp_path) == {}
+
+    def test_hf_cache_audio_checkpoint_keeps_name_admission(self, tmp_path):
+        """mlx-audio owns the checkpoint, so the mlx-lm probe must not veto a
+        name-based admission (#4381)."""
+        _, snapshot = self._make_hf_cache_entry(
+            tmp_path, "mlx-community", "Kokoro-82M-4bit"
+        )
+        (snapshot / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "kokoro",
+                    "architectures": ["KokoroForConditionalGeneration"],
+                }
+            )
+        )
+        (snapshot / "model.safetensors").write_bytes(b"0" * 1000)
+
+        models = discover_models(tmp_path)
+        assert models["mlx-community--Kokoro-82M-4bit"].engine_type == "audio_tts"
+
+
+class TestUnsupportedArchitectureAdmission:
+    """Discovery must not advertise a checkpoint no engine can build (#4381).
+
+    ``detect_model_type`` defaults to ``llm`` and the engine mapping then falls
+    through to ``batched``, so a diffusion transformer is listed as a loadable
+    chat model and only fails inside the engine at load time."""
+
+    @staticmethod
+    def _make_local_model(
+        root: Path, name: str, *, config: dict, tokenizer: bool = False
+    ) -> Path:
+        model_dir = root / "mlx-community" / name
+        model_dir.mkdir(parents=True)
+        (model_dir / "config.json").write_text(json.dumps(config))
+        (model_dir / "model.safetensors").write_bytes(b"\x00" * 100)
+        if tokenizer:
+            (model_dir / "tokenizer.json").write_text("{}")
+        return model_dir
+
+    def test_local_diffusion_checkpoint_is_not_advertised(self, tmp_path):
+        """LTX-2.5 declares ``AudioVideo``, which neither engine implements."""
+        self._make_local_model(
+            tmp_path, "ltx-2.5-mlx-q8", config={"model_type": "AudioVideo"}
+        )
+
+        assert discover_models(tmp_path) == {}
+
+    @pytest.mark.parametrize(
+        "config, expected",
+        [
+            ({"model_type": "k2_horizon"}, ("llm", "batched")),
+            (
+                {
+                    "model_type": "deepseek_v4",
+                    "architectures": ["DeepseekV4ForCausalLM"],
+                },
+                ("llm", "batched"),
+            ),
+            ({"model_type": "step3p7"}, ("llm", "batched")),
+            (
+                {"model_type": "qwen2_vl", "vision_config": {"hidden_size": 1024}},
+                ("vlm", "vlm"),
+            ),
+        ],
+    )
+    def test_engine_supported_checkpoints_stay_advertised(
+        self, tmp_path, config, expected
+    ):
+        """oMLX registers these families' modules just before loading them, so
+        the discovery-time registries cannot see them yet."""
+        self._make_local_model(
+            tmp_path, "supported-family", config=config, tokenizer=True
+        )
+
+        model = discover_models(tmp_path)["supported-family"]
+        assert (model.model_type, model.engine_type) == expected
+
+    def test_drafter_checkpoint_without_tokenizer_stays_advertised(self, tmp_path):
+        """Drafters are loaded outside the chat registries (#1643), so an
+        architecture they do not register must not hide them either."""
+        self._make_local_model(
+            tmp_path, "drafter", config={"model_type": "gemma4_assistant"}
+        )
+
+        assert discover_models(tmp_path)["drafter"].is_helper is True
+
 
 class TestTextOnlySizeEstimation:
     """Language-only size estimate for VLM-shaped checkpoints (#2385).

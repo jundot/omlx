@@ -1526,6 +1526,59 @@ def _declared_int(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _is_loadable_by_mlx_engines(
+    model_dir: Path, config: dict, *, is_drafter: bool = False
+) -> bool:
+    """True when an mlx engine's own registry can build ``config``.
+
+    ``detect_model_type`` defaults to ``llm`` for anything it does not
+    recognise, and the engine mapping then falls through to ``batched``, so a
+    non-chat checkpoint (Wan2.2's ``ti2v``, LTX-2.5's ``AudioVideo``) is
+    advertised as a loadable chat model and only fails when the engine imports
+    the architecture at load time (#4381). Ask the registries the engines load
+    through — ``mlx_lm.utils._get_classes`` and
+    ``mlx_vlm.utils.get_model_and_args`` — never a second architecture list to
+    keep in sync by hand.
+
+    Three carve-outs, all keyed on evidence the registries cannot see:
+
+    * ``is_drafter`` — dFlash/assistant/MTP checkpoints are loaded outside the
+      chat registries (#1643).
+    * ``tokenizer.json`` — the families oMLX registers just before loading
+      them (K2 Horizon, Step 3.7, DeepSeek V4, MiMo V2) are absent from
+      mlx-lm's registry during discovery, but they are text models.
+    * a config without a usable ``model_type``, and any probe failure that is
+      not the engines' "not supported" ``ValueError``, report True. A failed
+      probe is not evidence that a checkpoint cannot run, and this also runs
+      outside ``_register_model``'s per-model guard.
+    """
+    model_type = config.get("model_type") if isinstance(config, dict) else None
+    if not isinstance(model_type, str) or not model_type:
+        return True
+    if is_drafter or (model_dir / "tokenizer.json").is_file():
+        return True
+    try:
+        from mlx_lm.utils import _get_classes
+
+        _get_classes(config)
+        return True
+    except ValueError:
+        pass
+    except Exception as error:
+        logger.debug(f"mlx-lm registry unavailable for {model_type!r}: {error}")
+        return True
+    try:
+        from mlx_vlm.utils import get_model_and_args
+
+        get_model_and_args(config)
+    except ValueError:
+        return False
+    except Exception as error:
+        logger.debug(f"mlx-vlm registry unavailable for {model_type!r}: {error}")
+        return True
+    return True
+
+
 def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
     """Heuristic for HF cache entries that can be loaded without conversion."""
     if not _is_model_dir(model_dir):
@@ -1560,7 +1613,18 @@ def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
         return True
 
     repo_lower = source_repo_id.lower()
-    if repo_lower.startswith("mlx-community/") or _MLX_NAME_RE.search(source_repo_id):
+    name_hint = repo_lower.startswith("mlx-community/") or _MLX_NAME_RE.search(
+        source_repo_id
+    )
+    # A name is admission evidence for a checkpoint another engine owns
+    # (audio/embedding/reranker/decision/VLM) and for a text model an mlx engine
+    # can actually build — a diffusion checkpoint carries neither (#4381). The
+    # engine probe runs first so detect_model_type, which assumes a config dict,
+    # is only reached for configs the probe already rejected.
+    if name_hint and (
+        _is_loadable_by_mlx_engines(model_dir, config)
+        or detect_model_type(model_dir) != "llm"
+    ):
         logger.info(
             f"Treating HF cache model as MLX-compatible by repo name: {source_repo_id}"
         )
@@ -1674,6 +1738,20 @@ def _register_model(
             is_helper = is_helper_model_config(_config)
         except Exception:
             pass
+
+        # ``batched`` is the verdict for every config detect_model_type does not
+        # recognise, so a checkpoint no engine can build — a diffusion
+        # transformer such as LTX-2.5's ``AudioVideo`` — would be advertised as
+        # a loadable chat model and only fail inside the engine (#4381).
+        if engine_type == "batched" and not _is_loadable_by_mlx_engines(
+            model_dir, _config, is_drafter=is_helper
+        ):
+            logger.info(
+                f"Skipping unloadable llm checkpoint '{model_id}': no mlx engine "
+                f"implements model_type {config_model_type!r} and the checkpoint "
+                "ships no tokenizer.json"
+            )
+            return
 
         # Keep text-only capability metadata when selecting the VLM MTP engine.
         if model_type == "llm" and _gemma4_text_only_wants_vlm_engine(_config):
