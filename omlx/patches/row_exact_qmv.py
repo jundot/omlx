@@ -33,7 +33,7 @@ from .moe_verify_gather import _BITS, _GROUP_SIZES, _HEADER, qmv_fast_layout
 
 logger = logging.getLogger(__name__)
 
-MAX_ROWS = 8
+MAX_ROWS = 16
 # Output columns per simdgroup (qmv's own tile: a threadgroup owns 8).
 _RPS = 4
 # Verify projections run in a dependent chain, so latency wins: below this

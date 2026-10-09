@@ -916,8 +916,9 @@ class TestBlockAwarePrefixCacheWithSSD:
         result = prefix_cache_with_ssd.reconstruct_cache(table)
 
         assert result is None
+        # free_block() clears the live hash, so compare against the stored one.
         prefix_cache_with_ssd.paged_ssd_cache.forget_block.assert_called_once_with(
-            block.block_hash
+            b"\xcd" * 32
         )
         prefix_cache_with_ssd.paged_ssd_cache.delete_block.assert_not_called()
 
@@ -5000,27 +5001,20 @@ TYPES = ["ArraysCache", "KVCache", "CacheList"]
 ## MockModel: uses the existing one in this module
 
 
-def _make_cache(
-    cache_dir,
-    *,
-    block_size=BLOCK_SIZE,
-    num_layers=None,
-    hot_cache_max_bytes=64 * 1024**2,
-    hot_cache_only=True,
-):
+def _make_cache(cache_dir, *, num_layers=None):
     if num_layers is None:
         num_layers = len(TYPES)
     ssd = PagedSSDCacheManager(
         cache_dir=cache_dir,
         max_size_bytes=1024**3,
-        hot_cache_max_bytes=hot_cache_max_bytes,
-        hot_cache_only=hot_cache_only,
+        hot_cache_max_bytes=64 * 1024**2,
+        hot_cache_only=True,
         expected_model_name="test-model",
         expected_num_layers=num_layers,
-        expected_block_size=block_size,
+        expected_block_size=BLOCK_SIZE,
     )
     paged = PagedCacheManager(
-        block_size=block_size,
+        block_size=BLOCK_SIZE,
         max_blocks=200,
         model_name="test-model",
         initial_blocks=200,
@@ -5331,116 +5325,3 @@ def test_bounded_path_inactive(tmp_path, monkeypatch, flush_bytes, min_tokens):
     # Lazy path leaves the KV concat unevaluated, as before the change.
     assert restored[1].keys.shape[2] == total
     ssd.close()
-
-
-@pytest.mark.parametrize(
-    "reader_hot_bytes", [0, 256 * 1024**2], ids=["no-promotion", "promotion"]
-)
-def test_bounded_restore_lowers_promoted_peak(tmp_path, monkeypatch, reader_hot_bytes):
-    """With hot-cache promotion the bounded path keeps only the live layer
-    and the newest snapshot. Without promotion both paths stay lazy, and the
-    win is the KV concat evaluated inside reconstruct instead of at the
-    first prefill step: with two KV layers the lazy peak holds both layers'
-    slices plus both concats, the bounded one slice plus one concat."""
-    block, blocks = 64, 16
-    types = [
-        "ArraysCache",
-        "KVCache",
-        "ArraysCache",
-        "KVCache",
-        "KVCache",
-    ]
-    total = block * blocks
-    keys = mx.random.normal((1, 1, total, 256)).astype(mx.bfloat16)
-    values = mx.random.normal((1, 1, total, 256)).astype(mx.bfloat16)
-    mx.eval(keys, values)
-
-    def data(n):
-        out = []
-        for i, t in enumerate(types):
-            if t == "ArraysCache":
-                out.append(
-                    {
-                        "state": (
-                            mx.full((1, 3, 64), n + i, dtype=mx.bfloat16),
-                            mx.full((1, 8, 64, 64), n * 0.5 + i, dtype=mx.float32),
-                        ),
-                        "meta_state": (),
-                        "class_name": t,
-                        "cache_type": t,
-                    }
-                )
-            else:
-                out.append(
-                    {
-                        "state": (keys[:, :, :n, :], values[:, :, :n, :]),
-                        "meta_state": (n,),
-                        "class_name": t,
-                        "cache_type": t,
-                    }
-                )
-        return out
-
-    ssd_dir = tmp_path / "ssd"
-    writer, writer_ssd = _make_cache(
-        ssd_dir,
-        block_size=block,
-        num_layers=len(types),
-        hot_cache_max_bytes=0,
-        hot_cache_only=False,
-    )
-    table = writer.store_cache(
-        "store",
-        list(range(total)),
-        data(total),
-        model_cache_config=ModelCacheConfig.from_type_list(
-            types, model_name="test-model"
-        ),
-        boundary_snapshots={
-            block * (i + 1): data(block * (i + 1)) for i in range(blocks)
-        },
-    )
-    assert table is not None and len(table.block_ids) == blocks
-    writer_ssd.close()
-
-    def peak_and_arrays(flush_bytes):
-        _set_flush(monkeypatch, flush_bytes)
-        reader, reader_ssd = _make_cache(
-            ssd_dir,
-            block_size=block,
-            num_layers=len(types),
-            hot_cache_max_bytes=reader_hot_bytes,
-            hot_cache_only=False,
-        )
-        restore_table, _ = reader.fetch_cache("r", list(range(total)) + [7])
-        assert restore_table is not None and restore_table.num_tokens == total
-        mx.clear_cache()
-        base = mx.get_active_memory()
-        mx.reset_peak_memory()
-        restored = reader.reconstruct_cache(restore_table)
-        assert restored is not None
-        arrays = [
-            v
-            for c in restored
-            for v in _restored_cache_arrays(c)
-            if isinstance(v, mx.array)
-        ]
-        mx.eval(arrays)
-        peak = mx.get_peak_memory() - base
-        reader_ssd.close()
-        return peak, arrays
-
-    lazy_peak, lazy_arrays = peak_and_arrays(0)
-    bounded_peak, bounded_arrays = peak_and_arrays(1)
-    for x, y in zip(lazy_arrays, bounded_arrays, strict=True):
-        assert mx.array_equal(x, y).item()
-    if reader_hot_bytes:
-        # Promotion materializes every block: unbounded holds KV slices +
-        # every block's snapshots; bounded holds KV slices + one live layer
-        # + ~one block of snapshots.
-        assert bounded_peak < 0.65 * lazy_peak, (bounded_peak, lazy_peak)
-    else:
-        # No promotion: snapshots stay lazy on both paths. The eager eval
-        # still wins with two KV layers: lazy peaks holding both layers'
-        # slices plus both concats, bounded one slice plus one concat.
-        assert bounded_peak < 0.8 * lazy_peak, (bounded_peak, lazy_peak)

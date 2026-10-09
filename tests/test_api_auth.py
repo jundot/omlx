@@ -633,8 +633,13 @@ class TestUnauthenticatedInference:
             "/v1/messages/count_tokens",
             "/v1/embeddings",
             "/v1/rerank",
+            "/v1/systemone",
             "/v1/responses",
             "/v1/audio/speech",
+            "/tokenize",
+            "/v1/tokenize",
+            "/detokenize",
+            "/v1/detokenize",
         ],
     )
     def test_http_inference_auth_gate(self, configured_server, path):

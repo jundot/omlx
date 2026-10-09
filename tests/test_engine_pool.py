@@ -994,6 +994,21 @@ class TestApplySettingsOverrides:
         assert pool.get_entry("model-b").model_type == "llm"
         assert pool.get_entry("model-b").engine_type == "batched"
 
+    def test_decision_override_selects_decision_engine(self, small_mock_model_dir):
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        from omlx.model_settings import ModelSettings
+
+        settings_manager = MagicMock()
+        settings_manager.get_settings.return_value = ModelSettings(
+            model_type_override="decision"
+        )
+        pool.apply_settings_overrides(settings_manager)
+
+        assert pool.get_entry("model-a").model_type == "decision"
+        assert pool.get_entry("model-a").engine_type == "decision"
+
     def test_no_override_leaves_entry_unchanged(self, small_mock_model_dir):
         """Test that None override doesn't change entry types."""
         pool = _make_pool(ceiling=10 * 1024**3)
@@ -1835,6 +1850,20 @@ class TestEnginePoolAsync:
         assert sig(off) != sig(on)
         assert sig(on) != sig(other_floor)
 
+    def test_oq_a8_toggle_changes_qwen4_exp_signature(self, pool_with_mock_engines):
+        """Flash-Next reloads on the same toggle, so routed-expert tags never
+        outlive an OFF request (OFF -> ON -> OFF -> ON each get a new engine)."""
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        pool._entries["model-a"].config_model_type = "qwen4_exp"
+        sig = lambda enabled: pool._engine_runtime_signature(  # noqa: E731
+            "model-a", ModelSettings(qwen35_oq_a8_enabled=enabled)
+        )
+        assert sig(False) != sig(True)
+        assert sig(True) == sig(True)
+        assert sig(False) == sig(False)
+
     def test_oq_a8_tuning_is_ignored_while_disabled(self, pool_with_mock_engines):
         """A stale floor on a disabled feature must not split the engine."""
         from omlx.model_settings import ModelSettings
@@ -2000,6 +2029,46 @@ class TestEnginePoolAsync:
 
         assert engine is mock_engine
         MockEmbeddingEngine.assert_called_once_with(
+            model_name=str(model_path),
+            trust_remote_code=False,
+            scheduler_config=pool._scheduler_config,
+        )
+
+    @pytest.mark.asyncio
+    async def test_decision_engine_ignores_saved_dflash_settings(self, tmp_path):
+        """A checkpoint once served as a VLM may keep DFlash settings; a decision
+        load must still build the decision engine."""
+        from omlx.model_settings import ModelSettings
+
+        model_path = tmp_path / "clef"
+        model_path.mkdir()
+        (model_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool._settings_manager = MagicMock()
+        pool._settings_manager.get_settings.return_value = ModelSettings(
+            dflash_enabled=True, dflash_draft_model="draft"
+        )
+        pool._entries["clef"] = EngineEntry(
+            model_id="clef",
+            model_path=str(model_path),
+            model_type="decision",
+            engine_type="decision",
+            estimated_size=1024,
+        )
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+
+        with (
+            patch(
+                "omlx.engine_pool.DecisionEngine", return_value=mock_engine
+            ) as MockDecisionEngine,
+            patch("omlx.engine.dflash.DFlashEngine") as MockDFlashEngine,
+        ):
+            engine = await pool.get_engine("clef")
+
+        assert engine is mock_engine
+        MockDFlashEngine.assert_not_called()
+        MockDecisionEngine.assert_called_once_with(
             model_name=str(model_path),
             trust_remote_code=False,
             scheduler_config=pool._scheduler_config,
@@ -2668,9 +2737,10 @@ class TestEnginePoolPrefillEviction:
 
     @staticmethod
     def _reclaim_scheduler(reclaim_fn) -> MagicMock:
-        """Scheduler stub exposing only the reclaim helper the pool calls."""
+        """Scheduler stub for the helpers the pool calls; no MoE offload."""
         scheduler = MagicMock()
         scheduler._reclaim_prefill_headroom = MagicMock(side_effect=reclaim_fn)
+        scheduler.release_moe_offload_slots = MagicMock(return_value=0)
         return scheduler
 
     @pytest.mark.asyncio
@@ -2988,6 +3058,80 @@ class TestEnginePoolPrefillEviction:
         scheduler._reclaim_prefill_headroom.assert_called_once()
         assert released_on == [target_model]
         pool._unload_engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_prefill_releases_offload_slots_before_hot_cache_and_models(self):
+        """Offload slots go right after the pooled reclaim, on the engine
+        thread, and their bytes leave the admitted size; the hot cache, idle
+        models and ANE banks stay."""
+        gb = 1024**3
+        phys = [52 * gb]
+        pool = [2 * gb]
+        threads = []
+
+        def reclaim():
+            phys[0] -= pool[0]
+            pool[0] = 0
+
+        def release_slots(request_id):
+            threads.append(threading.current_thread())
+            phys[0] = 33 * gb
+            return 16 * gb
+
+        scheduler = self._reclaim_scheduler(reclaim)
+        scheduler.release_moe_offload_slots = MagicMock(side_effect=release_slots)
+        scheduler.requests = {"req-1": object()}
+        scheduler._hot_cache_limit_factor = MagicMock(return_value=0.9)
+        scheduler._prefill_speed_priority = False
+        release_hot_cache = AsyncMock(return_value=4 * gb)
+
+        async def unload(model_id):
+            pool_obj._entries[model_id].engine = None
+        req = PrefillEvictionRequest(
+            request_id="req-1",
+            model_id="target",
+            current_bytes=48 * gb,
+            target_cap_bytes=40 * gb,
+            predicted_transient_bytes=10 * gb,
+            requested_tokens=8192,
+            reason="prefill_preflight",
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            pool_obj = _make_pool(ceiling=0)
+            pool_obj._entries = {
+                "idle-a": self._entry("idle-a", 20 * gb),
+                "target": self._entry(
+                    "target", 25 * gb, scheduler=scheduler, executor=executor
+                ),
+            }
+            # The admitted size counts the slots; without them it is 29GB.
+            pool_obj._current_model_memory = 45 * gb
+            pool_obj._scheduler_config.hot_cache_budget = SimpleNamespace(
+                total_bytes=4 * gb
+            )
+            pool_obj._process_memory_enforcer = SimpleNamespace(
+                release_hot_cache_for_prefill=release_hot_cache
+            )
+            pool_obj._release_ane_prefill_for_headroom = AsyncMock(return_value=0)
+            pool_obj._unload_engine = AsyncMock(side_effect=unload)
+            with (
+                patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+                patch(
+                    "omlx.engine_pool.mx.get_cache_memory", side_effect=lambda: pool[0]
+                ),
+                patch(
+                    "omlx.engine_pool.get_phys_footprint", side_effect=lambda: phys[0]
+                ),
+            ):
+                admitted = await pool_obj._evict_idle_lru_for_prefill("target", req)
+
+        assert admitted is True
+        scheduler._reclaim_prefill_headroom.assert_called_once()
+        scheduler.release_moe_offload_slots.assert_called_once_with("req-1")
+        assert threads and threads[0] is not threading.current_thread()
+        release_hot_cache.assert_not_awaited()
+        pool_obj._unload_engine.assert_not_awaited()
+        pool_obj._release_ane_prefill_for_headroom.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_recurring_headroom_pressure_escalates_to_bank_release(self):

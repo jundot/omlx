@@ -1819,6 +1819,44 @@ class TestAsyncWriteAndTimeoutLoad:
             release_writer.set()
             manager.close()
 
+    def test_staged_write_stays_out_of_hot_cache_bytes(self, tmp_path, mx):
+        """With the hot cache off, queued writes never count as hot bytes."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "staged_bytes",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=0,
+        )
+        release_writer = threading.Event()
+        write_block_file = manager._write_block_file
+
+        def blocked_write(*args, **kwargs):
+            assert release_writer.wait(timeout=5)
+            return write_block_file(*args, **kwargs)
+
+        manager._write_block_file = blocked_write
+        try:
+            for i in range(3):
+                assert manager.save_block(
+                    block_hash=f"staged_bytes_{i}".encode(),
+                    cache_data=[(mx.zeros((1, 4, 16, 32)), mx.ones((1, 4, 16, 32)))],
+                    token_count=16,
+                    model_name="test-model",
+                    layer_cache_types=["KVCache"],
+                )
+            assert manager.get_stats().hot_cache_size_bytes == 0
+
+            release_writer.set()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with manager._pending_write_hashes_lock:
+                    if not manager._pending_write_hashes:
+                        break
+                time.sleep(0.01)
+            assert manager._hot_cache_total_bytes == 0
+        finally:
+            release_writer.set()
+            manager.close()
+
     def test_load_error_returns_none(self, ssd_cache, mx):
         """Verify that a corrupted file returns None and cleans up index."""
         block_hash = b"error_test_hash_1234"

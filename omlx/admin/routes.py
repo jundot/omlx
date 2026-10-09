@@ -198,6 +198,19 @@ print(deleted)
     return deleted, len(node_ids)
 
 
+def _oq_a8_model_supported(config_type: str | None) -> bool:
+    """True for the model families the oQ A8 prefill patch can route.
+
+    Qwen3.5/3.6/3.8 match by prefix. Qwen3.8-Flash-Next (``qwen4_exp``) matches
+    exactly: only that validated checkpoint family has routed-expert A8, so a
+    ``qwen4`` prefix would admit unvalidated models.
+    """
+    config_type = str(config_type or "").lower().replace("-", "_")
+    return config_type == "qwen4_exp" or config_type.startswith(
+        ("qwen3_5", "qwen3_6", "qwen3_8")
+    )
+
+
 def _oq_a8_kernels_available() -> bool:
     """True when the oQ A8 prefill kernels can actually run on this host.
 
@@ -359,7 +372,7 @@ class ModelSettingsRequest(BaseModel):
     qwen35_ane_prefill_cpu_gdn_fraction: float | None = None
     qwen35_ane_prefill_cpu_threads: int | None = None
     qwen35_ane_prefill_cpu_shared_resource: bool | None = None
-    # oQ mixed-bit QxA8 prefill kernels (Qwen3.5/3.6/3.8)
+    # oQ mixed-bit QxA8 prefill kernels (Qwen3.5/3.6/3.8 and Qwen3.8 Flash-Next)
     qwen35_oq_a8_enabled: bool | None = None
     qwen35_oq_a8_min_tokens: int | None = None
     # MoE expert offload (stream non-resident experts from the checkpoint)
@@ -2810,6 +2823,7 @@ async def update_model_settings(
             "audio_stt",
             "audio_tts",
             "audio_sts",
+            "decision",
         }
         # Treat empty string as None (auto-detect)
         override_value = request.model_type_override or None
@@ -2828,6 +2842,7 @@ async def update_model_settings(
             "audio_stt": "audio_stt",
             "audio_tts": "audio_tts",
             "audio_sts": "audio_sts",
+            "decision": "decision",
         }
         if override_value:
             entry.model_type = override_value
@@ -3618,13 +3633,12 @@ def _validate_model_settings(entry, settings):
                 status_code=400, detail="oQ A8 min tokens must be at least 1."
             )
     if settings.get("qwen35_oq_a8_enabled"):
-        config_type = str(getattr(entry, "config_model_type", "") or "")
-        config_type = config_type.lower().replace("-", "_")
-        if not config_type.startswith(("qwen3_5", "qwen3_6", "qwen3_8")):
+        if not _oq_a8_model_supported(getattr(entry, "config_model_type", "")):
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "oQ A8 prefill is available only for Qwen3.5/3.6/3.8 models."
+                    "oQ A8 prefill is available only for Qwen3.5/3.6/3.8 and "
+                    "Qwen3.8-Flash-Next models."
                 ),
             )
         if not _oq_a8_kernels_available():
@@ -3979,9 +3993,11 @@ def _feature_problem(
             return str(error)
         return _ane_prefill_budget_error(snapshot, entry.config_model_type)
     if name == "oq_a8":
-        config_type = str(entry.config_model_type or "").lower().replace("-", "_")
-        if not config_type.startswith(("qwen3_5", "qwen3_6", "qwen3_8")):
-            return "oQ A8 prefill is available only for Qwen3.5/3.6/3.8 models."
+        if not _oq_a8_model_supported(entry.config_model_type):
+            return (
+                "oQ A8 prefill is available only for Qwen3.5/3.6/3.8 and "
+                "Qwen3.8-Flash-Next models."
+            )
         if not _oq_a8_kernels_available():
             return (
                 "oQ A8 prefill needs the native Qwen3.5 prefill kernels and a "

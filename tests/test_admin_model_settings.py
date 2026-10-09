@@ -288,6 +288,95 @@ async def test_oq_a8_alone_is_persisted():
 
 
 @pytest.mark.asyncio
+async def test_oq_a8_is_accepted_for_qwen4_exp_and_keeps_min_tokens():
+    """Qwen3.8-Flash-Next shares the existing A8 setting (routed experts)."""
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen4_exp"
+    settings = ModelSettings()
+
+    with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=True):
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(
+                qwen35_oq_a8_enabled=True, qwen35_oq_a8_min_tokens=512
+            ),
+        )
+
+    assert settings.qwen35_oq_a8_enabled is True
+    assert settings.qwen35_oq_a8_min_tokens == 512
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "config_type", ["qwen4", "qwen4_exp_x", "qwen3", "qwen2", "llama", "gemma4", ""]
+)
+async def test_oq_a8_is_refused_outside_validated_families(config_type):
+    """Only the exact ``qwen4_exp`` family is added, not every ``qwen4*``."""
+    pool, entry = _failed_pool()
+    entry.config_model_type = config_type
+    settings = ModelSettings()
+
+    with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=True):
+        with pytest.raises(admin_routes.HTTPException) as excinfo:
+            await _update_settings(
+                pool,
+                settings,
+                admin_routes.ModelSettingsRequest(qwen35_oq_a8_enabled=True),
+            )
+
+    assert excinfo.value.status_code == 400
+    assert "Flash-Next" in excinfo.value.detail
+    assert settings.qwen35_oq_a8_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_oq_a8_for_qwen4_exp_still_conflicts_with_ane_prefill(tmp_path):
+    from omlx.model_settings import ModelSettingsManager
+
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen4_exp"
+    manager = ModelSettingsManager(tmp_path)
+    manager.set_settings("ling", ModelSettings())
+    before = manager.get_settings("ling").to_dict()
+    with (
+        patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+        patch.object(admin_routes, "_get_settings_manager", return_value=manager),
+        patch.object(admin_routes, "_get_server_state", return_value=MagicMock()),
+        patch.object(admin_routes, "_oq_a8_kernels_available", return_value=True),
+        pytest.raises(admin_routes.HTTPException) as excinfo,
+    ):
+        await admin_routes.update_model_settings(
+            "ling",
+            admin_routes.ModelSettingsRequest(
+                qwen35_oq_a8_enabled=True, qwen35_ane_prefill_enabled=True
+            ),
+            is_admin=True,
+        )
+    assert excinfo.value.status_code == 400
+    assert manager.get_settings("ling").to_dict() == before
+
+
+@pytest.mark.parametrize(
+    "config_type, expected",
+    [
+        ("qwen3_5", True),
+        ("qwen3_5_moe", True),
+        ("Qwen3-6", True),
+        ("qwen3_8", True),
+        ("qwen4_exp", True),
+        ("Qwen4-Exp", True),
+        ("qwen4", False),
+        ("qwen4_exp_x", False),
+        ("llama", False),
+        (None, False),
+    ],
+)
+def test_oq_a8_model_supported(config_type, expected):
+    assert admin_routes._oq_a8_model_supported(config_type) is expected
+
+
+@pytest.mark.asyncio
 async def test_oq_a8_needs_native_int8_kernels():
     """Nothing on this hardware would run faster, so the setting is refused
     rather than accepted and silently ignored at load."""

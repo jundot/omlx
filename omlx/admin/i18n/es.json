@@ -1334,6 +1334,7 @@
   "modal.model_settings.draft_model": "Draft Model",
   "modal.model_settings.draft_model_placeholder": "Select draft model...",
   "modal.model_settings.model_type_audio_sts": "Audio STS",
+  "modal.model_settings.model_type_decision": "Decision",
   "modal.model_settings.model_type_audio_stt": "Audio STT",
   "modal.model_settings.model_type_audio_tts": "Audio TTS",
   "modal.model_settings.model_type_embedding": "Embedding",

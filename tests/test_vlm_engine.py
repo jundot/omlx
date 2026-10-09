@@ -2618,6 +2618,34 @@ class TestPartialModeVLM:
         assert call_kwargs["add_generation_prompt"] is True
         assert "continue_final_message" not in call_kwargs
 
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    async def test_tokenize_chat_returns_generation_path_ids(self, mock_prepare):
+        """tokenize_chat returns the ids the generation render produces."""
+        engine = self._vision_engine()
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[7, 8, 9]]),
+            "pixel_values": None,
+        }
+        executor = ThreadPoolExecutor(max_workers=1)
+        engine._engine = SimpleNamespace(_mlx_executor=executor)
+        try:
+            token_ids = await engine.tokenize_chat(
+                self._plain_messages(), add_generation_prompt=False
+            )
+            with pytest.raises(InvalidRequestError, match="add_special_tokens"):
+                await engine.tokenize_chat(
+                    self._plain_messages(), add_special_tokens=True
+                )
+        finally:
+            executor.shutdown(wait=False)
+
+        assert token_ids == [7, 8, 9]
+        call_kwargs = engine._processor.apply_chat_template.call_args[1]
+        assert call_kwargs["add_generation_prompt"] is False
+        assert "continue_final_message" not in call_kwargs
+
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     @patch("mlx_vlm.utils.prepare_inputs")
     def test_no_chat_template_fallback_drops_continue_final_message(
@@ -3577,4 +3605,3 @@ class TestNativeVideo:
         assert estimate.call_count == 2
         kwargs = engine._preflight_or_raise_with_eviction.call_args.kwargs
         assert kwargs["num_prompt_tokens"] == 1002
-        assert kwargs["text_only"] is False

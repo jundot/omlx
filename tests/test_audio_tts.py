@@ -14,6 +14,7 @@ import struct
 import wave
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import mlx.core as mx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -1081,7 +1082,7 @@ class TestTTSVoiceClonePassthrough:
 
         from omlx.engine.tts import TTSEngine
 
-        def _run(ref_audio_path=None, ref_text=None):
+        def _run(ref_audio_path=None, ref_text=None, annotation=None):
             engine = TTSEngine("test-model")
 
             import inspect
@@ -1109,12 +1110,15 @@ class TestTTSVoiceClonePassthrough:
                 parameters=list(sig_params.values())
             )
             generate_mock.return_value = []
+            if annotation is not None:
+                generate_mock.__annotations__ = {"ref_audio": annotation}
 
             class FakeModel:
                 pass
 
             fake_model = FakeModel()
             fake_model.generate = generate_mock
+            fake_model.sample_rate = 24000
 
             engine._model = fake_model
 
@@ -1153,6 +1157,30 @@ class TestTTSVoiceClonePassthrough:
         kwargs = call.kwargs if call else {}
         assert kwargs.get("ref_audio") == "/tmp/ref.wav"
         assert kwargs.get("ref_text") is None
+
+    @pytest.mark.parametrize(
+        "annotation, decoded",
+        [
+            (mx.array | None, True),
+            (str | mx.array | None, False),
+            (str, False),
+        ],
+    )
+    def test_ref_audio_decoded_only_for_array_only_models(
+        self, _run_synthesize_clone, tmp_path, annotation, decoded
+    ):
+        """Array-only models get the clip at their sample rate; others keep the path."""
+        ref = tmp_path / "ref.wav"
+        ref.write_bytes(_make_wav_bytes(duration_secs=1.0, sample_rate=16000))
+        call = _run_synthesize_clone(
+            ref_audio_path=str(ref), ref_text="hello", annotation=annotation
+        )
+        ref_audio = call.kwargs["ref_audio"]
+        if decoded:
+            assert isinstance(ref_audio, mx.array)
+            assert ref_audio.shape == (24000,)
+        else:
+            assert ref_audio == str(ref)
 
 
 # ---------------------------------------------------------------------------

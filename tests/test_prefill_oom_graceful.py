@@ -1253,12 +1253,10 @@ def test_prefill_reserve_keeps_room_for_a_floor_chunk():
 
 
 @pytest.mark.parametrize(
-    ("monitor", "expected_gathered", "expected_state_route"),
-    [(_qwen4_monitor(), True, True), (_monitor(head_dim=192), False, None)],
+    ("monitor", "expected_gathered"),
+    [(_qwen4_monitor(), True), (_monitor(head_dim=192), False)],
 )
-def test_step_prefill_reclaims_before_first_guard(
-    monitor, expected_gathered, expected_state_route
-):
+def test_step_prefill_reclaims_before_first_guard(monitor, expected_gathered):
     events = []
     request = SimpleNamespace(request_id="req-prefill")
     state = _PrefillState(
@@ -1347,7 +1345,6 @@ def test_step_prefill_reclaims_before_first_guard(
         requested_step=2,
         gathered_core=expected_gathered,
     )
-    assert state.qwen4_gathered_core is expected_state_route
 
 
 # --------------------------------------------------------------------------
@@ -1814,7 +1811,7 @@ def test_prefill_loop_records_pool_release_before_next_chunk(chunked, monkeypatc
     original_adaptive = ns._adaptive_chunk_size
 
     def adaptive(n, **kwargs):
-        charges.append(ns._prefill_transient_tracker.flat_overhead_charge_for(True))
+        charges.append(ns._prefill_transient_tracker.flat_overhead_charge_for(False))
         return original_adaptive(n, **kwargs)
 
     ns._adaptive_chunk_size = adaptive

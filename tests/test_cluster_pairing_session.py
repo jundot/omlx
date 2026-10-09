@@ -300,7 +300,13 @@ def test_redirect_after_delivered_request_keeps_cancellation_proof(tmp_path):
         def log_message(self, *args):
             pass
 
-    server = HTTPServer(("127.0.0.1", 0), RedirectHandler)
+    class LoopbackServer(HTTPServer):
+        def server_bind(self):
+            # Skip HTTPServer's reverse DNS lookup; it can stall CI runners.
+            super(HTTPServer, self).server_bind()
+            self.server_name, self.server_port = self.server_address[:2]
+
+    server = LoopbackServer(("127.0.0.1", 0), RedirectHandler)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     joiner._http_post = _default_http_post

@@ -41,11 +41,12 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[mcp]"
-          python -m pip install pytest pytest-asyncio
+          python -m pip install pytest pytest-asyncio pytest-xdist
 
       - name: Run unit tests
         run: >-
           python -m pytest tests/ -m "not slow and not integration"
+          -n 3 --dist loadgroup
           --durations=50 --junitxml=test-results.xml
 
       - name: Upload test results

@@ -36,7 +36,7 @@ _TAIL_SOURCE = r"""
             u = clamp(u, -limit[0], limit[0]);
         }
         // Match MLX sigmoid arithmetic before the intermediate dtype cast.
-        const float neg_sigmoid = 1.0f / (1.0f + exp(abs(g)));
+        const float neg_sigmoid = 1.0f / (1.0f + metal::precise::exp(abs(g)));
         const float sigmoid = g < 0 ? neg_sigmoid : 1.0f - neg_sigmoid;
         float value = (g * sigmoid) * u;
         if (WEIGHTED) value *= weights[i / D];

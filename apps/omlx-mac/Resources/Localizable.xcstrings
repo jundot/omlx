@@ -13263,6 +13263,30 @@
         }
       }
     },
+    "profile.save.global_drops_model_settings" : {
+      "comment" : "Error shown when saving to a global profile would drop model-specific settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Global profiles keep sampling settings only. Save as a Model profile to keep Lightning MTP, TurboQuant, and other model settings."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Глобальные профили хранят только параметры сэмплирования. Чтобы сохранить Lightning MTP, TurboQuant и другие настройки модели, выберите модельный профиль."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "全局配置文件仅保存采样设置。要保留 Lightning MTP、TurboQuant 等模型设置，请另存为模型配置文件。"
+          }
+        }
+      }
+    },
     "profile.save_as.name.placeholder" : {
       "comment" : "Placeholder text inside the new-profile name field",
       "extractionState" : "manual",
@@ -23166,6 +23190,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "自动检测"
+          }
+        }
+      }
+    },
+    "settings.model_type.decision" : {
+      "comment" : "Model type option label for decision models served by /v1/systemone",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Decision"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Decision"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "决策"
           }
         }
       }

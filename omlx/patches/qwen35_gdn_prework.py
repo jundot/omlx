@@ -90,6 +90,9 @@ _QWEN4_VERIFY_DEFERRED_STATES = (
 )
 _QWEN4_VERIFY_STEP_KERNELS: dict = {}
 _QWEN4_VERIFY_ENGAGED_LOGGED = False
+# The fused verify's norm-gate stage runs step t on simdgroup t of its
+# head_v_dim // 8 = 16 simdgroups, so a window holds at most 16 rows.
+_QWEN4_VERIFY_MAX_ROWS = 16
 _VERIFY_REJECT_DIAG = 0
 
 _SOURCE = """
@@ -121,8 +124,8 @@ _SOURCE = """
             acc += float(xv) * float(conv_w[channel * 4 + tap]);
         }
         const T conv = T(acc);
-        T sy = T(1) / (T(1) + metal::exp(metal::abs(conv)));
-        const T act = conv * ((conv < T(0)) ? sy : T(1) - sy);
+        const auto sy = 1 / (1 + metal::precise::exp(metal::abs(conv)));
+        const T act = conv * T((conv < T(0)) ? sy : 1 - sy);
         activated[i] = act;
         if (L2) {
             const T sqv = T(float(act) * float(act));
@@ -271,8 +274,8 @@ _QWEN4_DECODE_SOURCE = """
         }
         acc += float(qkv[channel]) * float(conv_w[channel * 4 + 3]);
         const T conv = T(acc);
-        T sy = T(1) / (T(1) + metal::exp(metal::abs(conv)));
-        const T act = conv * ((conv < T(0)) ? sy : T(1) - sy);
+        const auto sy = 1 / (1 + metal::precise::exp(metal::abs(conv)));
+        const T act = conv * T((conv < T(0)) ? sy : 1 - sy);
         activated[i] = act;
         const T sqv = T(float(act) * float(act));
         l2acc = T(float(l2acc) + float(sqv));
@@ -312,9 +315,9 @@ _QWEN4_DECODE_SOURCE = """
         }
         if (lane == 0) {
             const T bv = b_in[head];
-            // MLX's Sigmoid takes a precise FP32 exp; a fast bf16 exp rounds some b apart.
-            T by = T(1) / (T(1) + T(metal::precise::exp(metal::abs(float(bv)))));
-            beta_out[head] = (bv < T(0)) ? by : T(1) - by;
+            // MLX's Sigmoid functor, rounded to T once.
+            const auto by = 1 / (1 + metal::precise::exp(metal::abs(bv)));
+            beta_out[head] = T((bv < T(0)) ? by : 1 - by);
 
             // compute_g casts A_log to FP32 but keeps softplus(a+dt_bias)
             // in BF16 before the FP32 multiply and outer exp.
@@ -419,8 +422,8 @@ _QWEN4_DECODE_STEP_SOURCE = """
             }
             acc += float(qkv[channel]) * float(conv_w[channel * 4 + 3]);
             const T conv = T(acc);
-            T sy = T(1) / (T(1) + metal::exp(metal::abs(conv)));
-            const T act = conv * ((conv < T(0)) ? sy : T(1) - sy);
+            const auto sy = 1 / (1 + metal::precise::exp(metal::abs(conv)));
+            const T act = conv * T((conv < T(0)) ? sy : 1 - sy);
             activated[i] = act;
             const T sqv = T(float(act) * float(act));
             l2acc = T(float(l2acc) + float(sqv));
@@ -456,9 +459,9 @@ _QWEN4_DECODE_STEP_SOURCE = """
     } else if (sg == 3 && lane == 0) {
         const uint head = hv;
         const T bv = b_in[head];
-        // MLX's Sigmoid takes a precise FP32 exp; a fast bf16 exp rounds some b apart.
-        T by = T(1) / (T(1) + T(metal::precise::exp(metal::abs(float(bv)))));
-        tg_beta[0] = (bv < T(0)) ? by : T(1) - by;
+        // MLX's Sigmoid functor, rounded to T once.
+        const auto by = 1 / (1 + metal::precise::exp(metal::abs(bv)));
+        tg_beta[0] = T((bv < T(0)) ? by : 1 - by);
 
         const T apd = T(float(a_in[head]) + float(dt_bias[head]));
         const T neg_abs = -metal::abs(apd);
@@ -616,8 +619,8 @@ _QWEN4_VERIFY_STEP_SOURCE = """
             const T x_t = proj[t * P + channel];
             acc += float(x_t) * float(conv_w[channel * 4 + 3]);
             const T conv = T(acc);
-            T sy = T(1) / (T(1) + metal::exp(metal::abs(conv)));
-            const T act = conv * ((conv < T(0)) ? sy : T(1) - sy);
+            const auto sy = 1 / (1 + metal::precise::exp(metal::abs(conv)));
+            const T act = conv * T((conv < T(0)) ? sy : 1 - sy);
             activated[i] = act;
             const T sqv = T(float(act) * float(act));
             l2acc = T(float(l2acc) + float(sqv));
@@ -662,9 +665,9 @@ _QWEN4_VERIFY_STEP_SOURCE = """
         const uint t = lane;
         const uint head = hv;
         const T bv = proj[t * P + b_off + head];
-        // MLX's Sigmoid takes a precise FP32 exp; a fast bf16 exp rounds some b apart.
-        T by = T(1) / (T(1) + T(metal::precise::exp(metal::abs(float(bv)))));
-        tg_beta[t] = (bv < T(0)) ? by : T(1) - by;
+        // MLX's Sigmoid functor, rounded to T once.
+        const auto by = 1 / (1 + metal::precise::exp(metal::abs(bv)));
+        tg_beta[t] = T((bv < T(0)) ? by : 1 - by);
 
         const T apd = T(float(proj[t * P + a_off + head]) + float(dt_bias[head]));
         const T neg_abs = -metal::abs(apd);
@@ -2164,7 +2167,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             and cache is not None
             and cache.is_speculating
             and cache.lengths is None
-            and 1 <= length <= 9
+            and 1 <= length <= _QWEN4_VERIFY_MAX_ROWS
             and (length == 1 or is_row_exact_armed())
             and _qwen4_verify_state_eligible(inputs, cache)
         ):

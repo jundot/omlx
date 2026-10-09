@@ -1873,7 +1873,6 @@ class VLMBatchedEngine(BaseEngine):
         *,
         num_prompt_tokens: int,
         request_id: str | None,
-        text_only: bool = False,
     ) -> None:
         await _run_scheduler_preflight_with_cleanup_retry(
             scheduler,
@@ -1885,7 +1884,6 @@ class VLMBatchedEngine(BaseEngine):
                 "_mlx_executor",
                 None,
             ),
-            text_only=text_only,
         )
 
     @property
@@ -2219,10 +2217,15 @@ class VLMBatchedEngine(BaseEngine):
         # engine. Same sequence as batched.py: wrap on the MLX executor
         # BEFORE materialize so non-resident experts never load.
         moe_offload_wrapped = 0
+        offload_stats = offload_release = offload_restore = None
         if getattr(self._model_settings, "moe_expert_offload_enabled", False):
             from ..patches.moe_expert_offload import (
                 apply_moe_expert_offload,
                 materialize_offload_state,
+                moe_offload_caches,
+                moe_offload_stats,
+                release_moe_offload_slots,
+                restore_moe_offload_slots,
             )
 
             fraction = float(
@@ -2260,6 +2263,10 @@ class VLMBatchedEngine(BaseEngine):
                     materialize_offload_state,
                     self._vlm_model,
                 )
+                caches = moe_offload_caches(self._vlm_model)
+                offload_stats = functools.partial(moe_offload_stats, caches=caches)
+                offload_release = functools.partial(release_moe_offload_slots, caches)
+                offload_restore = functools.partial(restore_moe_offload_slots, caches)
         self._moe_offload_wrapped = moe_offload_wrapped
 
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
@@ -2523,6 +2530,7 @@ class VLMBatchedEngine(BaseEngine):
             if self._scheduler_config
             else SchedulerConfig()
         )
+        scheduler_config.moe_offload_active = bool(moe_offload_wrapped)
         if (
             self._adapter.model_type == "deepseek_v41"
             and self._adapter.config.ced_prefill
@@ -2553,6 +2561,9 @@ class VLMBatchedEngine(BaseEngine):
 
         # TurboQuant KV cache
         scheduler = self._engine.engine.scheduler
+        scheduler.moe_offload_stats = offload_stats
+        scheduler.moe_offload_release = offload_release
+        scheduler.moe_offload_restore = offload_restore
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
             if tq_enabled and self.model_type == "glm5_next":
@@ -4936,6 +4947,7 @@ class VLMBatchedEngine(BaseEngine):
         request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_id=kwargs.pop("_request_id", None),
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
@@ -5205,7 +5217,6 @@ class VLMBatchedEngine(BaseEngine):
             scheduler,
             num_prompt_tokens=num_tokens,
             request_id=request_id,
-            text_only=image_tokens == 0 and video_tokens == 0,
         )
 
     async def preflight_completion(
@@ -5241,7 +5252,6 @@ class VLMBatchedEngine(BaseEngine):
             scheduler,
             num_prompt_tokens=num_tokens,
             request_id=request_id,
-            text_only=True,
         )
 
     async def stream_chat(
@@ -5937,6 +5947,44 @@ class VLMBatchedEngine(BaseEngine):
             is_partial=is_partial,
         )
         return len(self._tokenizer.encode(prompt))
+
+    async def tokenize_chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+        add_generation_prompt: bool | None = None,
+        add_special_tokens: bool | None = None,
+    ) -> list[int]:
+        if not self._loaded:
+            await self.start()
+        if self.is_diffusion_model:
+            raise InvalidRequestError(
+                "Tokenization is not supported for diffusion models.",
+                field="model",
+            )
+        # mlx-vlm prepare_inputs() encodes the rendered prompt without
+        # special tokens, so there is no variant that adds them.
+        if add_special_tokens:
+            raise InvalidRequestError(
+                "add_special_tokens=true is not supported for this model; its "
+                "chat prompt is encoded without extra special tokens.",
+                field="add_special_tokens",
+            )
+        ct_kwargs = dict(chat_template_kwargs or {})
+        if add_generation_prompt is not None:
+            ct_kwargs["add_generation_prompt"] = add_generation_prompt
+        kwargs = {"chat_template_kwargs": ct_kwargs or None, "is_partial": is_partial}
+        loop = asyncio.get_running_loop()
+        token_ids, *_ = await loop.run_in_executor(
+            self._engine._mlx_executor,
+            self._process_chat_messages,
+            messages,
+            tools,
+            kwargs,
+        )
+        return list(token_ids)
 
     def has_active_requests(self) -> bool:
         """Check if the engine has active in-flight requests."""
