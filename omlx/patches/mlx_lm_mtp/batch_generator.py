@@ -4013,6 +4013,26 @@ def _copy_draft_q(copied: List[int], vocab: int) -> SparseDraftQ:
     return SparseDraftQ(ids, mx.zeros(ids.shape, dtype=mx.float32), vocab)
 
 
+def _record_chain_depth(stats: Any, depth: int, drafted: int, accepted: int) -> None:
+    """Count one chain cycle per draft position.
+
+    ``depth`` sizes the per-position lists. Callers pass at least the drafted
+    window: a batch policy can lower ``state.depth`` below the drafts a row
+    already holds (a request that drafted alone joins a batch), and those
+    drafts are still verified this cycle.
+    """
+    if len(stats.depth_drafted) < depth:
+        pad = depth - len(stats.depth_drafted)
+        stats.depth_drafted.extend([0] * pad)
+        stats.depth_accepted.extend([0] * pad)
+    for j in range(drafted):
+        stats.depth_drafted[j] += 1
+        if j < accepted:
+            stats.depth_accepted[j] += 1
+        else:
+            break
+
+
 def _run_verify_cycle_chain(
     gen_batch: Any,
     state: _MtpState,
@@ -4245,16 +4265,7 @@ def _run_verify_cycle_chain(
         state.stats.copy_accepted += m
         state.context_copy.observe(m, k)
     else:
-        if len(state.stats.depth_drafted) < state.depth:
-            pad = state.depth - len(state.stats.depth_drafted)
-            state.stats.depth_drafted.extend([0] * pad)
-            state.stats.depth_accepted.extend([0] * pad)
-        for j in range(k):
-            state.stats.depth_drafted[j] += 1
-            if j < m:
-                state.stats.depth_accepted[j] += 1
-            else:
-                break
+        _record_chain_depth(state.stats, max(state.depth, k), k, m)
         state.stats.accepts += m
     if m < k:
         state.stats.rejects += 1
