@@ -1859,6 +1859,7 @@
   "chat.allow_svg": "Разрешить SVG",
   "chat.allow_svg_warning": "Осторожно: возможно внедрение вредоносного кода.",
   "chat.close_sidebar": "Закрыть боковую панель",
+  "chat.drawer_title": "Настройки модели и профиль",
   "chat.stop_generating_tooltip": "Остановить генерацию",
   "chat.show_settings_tooltip": "Показать настройки",
   "chat.more_actions_tooltip": "Другие действия",

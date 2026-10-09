@@ -1124,7 +1124,7 @@
             <i data-lucide="menu" class="w-5 h-5"></i>
         </button>
 
-        <button @click="rightSidebarOpen = true" class="absolute p-1.5 bg-surface hover:bg-surface-muted rounded-lg border border-line z-[100] shadow-sm"
+        <button @click="openRightDrawer()" class="absolute p-1.5 bg-surface hover:bg-surface-muted rounded-lg border border-line z-[100] shadow-sm"
             style="top: 1rem; right: 1rem; color: var(--text-primary);"
             :title="window.t('chat.show_settings_tooltip')"
             x-show="showRightToggle">
@@ -1891,12 +1891,17 @@
     </div>
 
     <!-- Right Sidebar Overlay (mobile) -->
-    <div class="right-sidebar-overlay" :class="{ 'hidden': !rightSidebarOpen }" @click="rightSidebarOpen = false"
+    <div class="right-sidebar-overlay" :class="{ 'hidden': !rightSidebarOpen }" @click="closeRightDrawer()"
         x-cloak></div>
 
     <!-- Right Sidebar -->
-    <div class="right-sidebar-width h-full bg-surface border-l border-line flex flex-col right-sidebar-transition"
-        :class="{ 'right-sidebar-hidden': !rightSidebarOpen }" x-cloak>
+    <div x-ref="rightDrawer" class="right-sidebar-width h-full bg-surface border-l border-line flex flex-col right-sidebar-transition"
+        :class="{ 'right-sidebar-hidden': !rightSidebarOpen }"
+        :role="drawerOverlay ? 'dialog' : null"
+        :aria-modal="drawerOverlay ? 'true' : null"
+        :tabindex="drawerOverlay ? -1 : null"
+        :aria-label="window.t('chat.drawer_title')"
+        @keydown.tab="drawerOverlay && trapDialogFocus($event)" x-cloak>
 
         <!-- Sidebar Header with tabs -->
         <div class="p-4 border-b border-line flex-shrink-0">
@@ -1927,9 +1932,10 @@
                         <span>{{ t('chat.chat_tab') }}</span>
                     </button>
                 </div>
-                <button @click="rightSidebarOpen = false"
+                <button @click="closeRightDrawer()"
                     class="p-1 hover:bg-surface-alt rounded-lg transition-colors"
-                    title="{{ t('chat.close_settings_tooltip') }}">
+                    title="{{ t('chat.close_settings_tooltip') }}"
+                    aria-label="{{ t('chat.close_settings_tooltip') }}">
                     <i data-lucide="panel-right-close" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
                 </button>
             </div>
@@ -2489,6 +2495,14 @@
     const SYSTEM_PROMPT_STORAGE_KEY = 'omlx_chat_system_prompt';
     const PROMPT_PROFILES_STORAGE_KEY = 'omlx_chat_prompt_profiles';
 
+    // Where focus goes when the right drawer closes. Kept out of the Alpine
+    // state on purpose: a DOM node does not belong in reactive data.
+    let drawerReturnFocus = null;
+
+    // The right-panel toggle hides itself while the panel is open and comes back
+    // this many ms later, so focus cannot land on it any sooner.
+    const RIGHT_TOGGLE_REVEAL_MS = 260;
+
     function resolveChatUntitledLabel() {
         if (typeof window.t === 'function') {
             const translated = window.t(CHAT_UNTITLED_I18N_KEY);
@@ -2636,6 +2650,11 @@
             // Right Sidebar State
             rightSidebarOpen: window.innerWidth >= 1200,
             showRightToggle: window.innerWidth < 1200,
+            // True once the panel floats over the page (see the max-width: 1024px
+            // block in the <style> above). Only then is it a modal dialog: Esc
+            // closes it and Tab stays inside it, because the page behind it is
+            // still reachable.
+            drawerOverlay: window.innerWidth <= 1024,
             modelSettingsDirty: false,
             speculativeEngine: 'none',
             speculativeDraftModel: '',
@@ -3924,7 +3943,9 @@
             if (val) {
                 this.showRightToggle = false;
             } else {
-                this._rightSidebarShowTimer = setTimeout(() => { this.showRightToggle = true; }, 260);
+                this._rightSidebarShowTimer = setTimeout(() => {
+                    this.showRightToggle = true;
+                }, RIGHT_TOGGLE_REVEAL_MS);
             }
         });
 
@@ -3932,6 +3953,10 @@
             clearTimeout(this._timelineResizeTimer);
             this._timelineResizeTimer = setTimeout(() => {
                 this.computeTimelineDots();
+                // The panel is a modal only while the stylesheet floats it over
+                // the page; crossing the breakpoint changes which half of that
+                // is true, so reevaluate it here too.
+                this.drawerOverlay = window.innerWidth <= 1024;
             }, 200);
         });
 
@@ -7364,6 +7389,9 @@
         const mod = e.metaKey || e.ctrlKey;
         if (e.key === 'Escape') {
             if (this.showShortcutsHelp) { this.showShortcutsHelp = false; return; }
+            // Esc reaches the drawer before it reaches the stream: a panel that
+            // floats over the page owns the key while it is open.
+            if (this.rightSidebarOpen && this.drawerOverlay) { this.closeRightDrawer(); return; }
             if (!this._isTypingTarget(e) && this.isCurrentChatStreaming()) {
                 this.stopStreaming();
             }
@@ -7373,6 +7401,46 @@
         if (e.key === '?' && !this._isTypingTarget(e) && !mod) {
             e.preventDefault();
             this.showShortcutsHelp = true;
+        }
+    },
+
+    // ===== Right drawer =====
+
+    openRightDrawer() {
+        drawerReturnFocus = document.activeElement;
+        this.rightSidebarOpen = true;
+        this.$nextTick(() => {
+            const panel = this.$refs.rightDrawer;
+            if (panel) panel.focus();
+        });
+    },
+
+    closeRightDrawer() {
+        this.rightSidebarOpen = false;
+        const previous = drawerReturnFocus;
+        drawerReturnFocus = null;
+        if (previous && typeof previous.focus === 'function') {
+            // The toggle that opened the panel is still hidden here; wait for it
+            // to come back, or the focus() call lands on a display: none button.
+            setTimeout(() => previous.focus(), RIGHT_TOGGLE_REVEAL_MS);
+        }
+    },
+
+    // Keep Tab inside the drawer while it floats over the page: wrap at both
+    // ends, and pull focus back in when it sits on the container itself or has
+    // escaped to the page behind it.
+    trapDialogFocus(event) {
+        const container = event.currentTarget;
+        const controls = Array.from(container.querySelectorAll(
+            'a[href], button, input, select, textarea, [tabindex]'
+        )).filter(el => el.tabIndex >= 0 && !el.matches(':disabled')
+            && el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
+        const index = controls.indexOf(document.activeElement);
+        if (!controls.length || index < 0
+            || (event.shiftKey ? index <= 0 : index === controls.length - 1)) {
+            event.preventDefault();
+            const target = event.shiftKey ? controls.at(-1) : controls[0];
+            (target || container.querySelector('[autofocus]') || container).focus();
         }
     },
 

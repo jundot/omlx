@@ -1859,6 +1859,7 @@
   "chat.allow_svg": "SVGを許可",
   "chat.allow_svg_warning": "悪意のあるコード注入に注意してください。",
   "chat.close_sidebar": "Close sidebar",
+  "chat.drawer_title": "モデル設定とプロファイル",
   "chat.stop_generating_tooltip": "Stop generating",
   "chat.show_settings_tooltip": "Show settings",
   "chat.more_actions_tooltip": "More actions",

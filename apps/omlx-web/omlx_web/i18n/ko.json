@@ -1859,6 +1859,7 @@
   "chat.allow_svg": "SVG 허용",
   "chat.allow_svg_warning": "악성 코드 삽입에 주의하세요.",
   "chat.close_sidebar": "Close sidebar",
+  "chat.drawer_title": "모델 설정 및 프로필",
   "chat.stop_generating_tooltip": "Stop generating",
   "chat.show_settings_tooltip": "Show settings",
   "chat.more_actions_tooltip": "More actions",

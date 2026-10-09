@@ -1859,6 +1859,7 @@
   "chat.allow_svg": "Povolit SVG",
   "chat.allow_svg_warning": "Pozor na injekci škodlivého kódu.",
   "chat.close_sidebar": "Zavřít postranní panel",
+  "chat.drawer_title": "Model settings and profile",
   "chat.stop_generating_tooltip": "Zastavit generování",
   "chat.show_settings_tooltip": "Zobrazit nastavení",
   "chat.more_actions_tooltip": "Více akcí",

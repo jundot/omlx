@@ -1859,6 +1859,7 @@
   "chat.allow_svg": "允許 SVG",
   "chat.allow_svg_warning": "注意：可能注入惡意程式碼。",
   "chat.close_sidebar": "關閉側邊欄",
+  "chat.drawer_title": "模型設定與設定檔",
   "chat.stop_generating_tooltip": "停止生成",
   "chat.show_settings_tooltip": "顯示設定",
   "chat.more_actions_tooltip": "更多操作",

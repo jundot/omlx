@@ -1859,6 +1859,7 @@
   "chat.allow_svg": "Autoriser le SVG",
   "chat.allow_svg_warning": "Attention : risque d'injection de code malveillant.",
   "chat.close_sidebar": "Close sidebar",
+  "chat.drawer_title": "Réglages du modèle et profil",
   "chat.stop_generating_tooltip": "Stop generating",
   "chat.show_settings_tooltip": "Show settings",
   "chat.more_actions_tooltip": "More actions",

@@ -218,3 +218,56 @@ def test_regenerate_with_model_switches_the_chat_model():
     )
 
     assert "if (opts.model) await this.selectModel(opts.model);" in regenerate
+
+
+def _right_panel() -> str:
+    return _section(_template(), "<!-- Right Sidebar -->", "<!-- Tab Content: Scrollable area -->")
+
+
+def test_right_panel_is_a_dialog_only_while_it_floats():
+    panel = _right_panel()
+
+    assert "x-ref=\"rightDrawer\"" in panel
+    assert ':role="drawerOverlay ? \'dialog\' : null"' in panel
+    assert ':aria-modal="drawerOverlay ? \'true\' : null"' in panel
+    assert ':tabindex="drawerOverlay ? -1 : null"' in panel
+    assert ':aria-label="window.t(\'chat.drawer_title\')"' in panel
+    assert '@keydown.tab="drawerOverlay && trapDialogFocus($event)"' in panel
+
+
+def test_right_panel_geometry_breakpoint_matches_the_stylesheet():
+    source = _template()
+
+    # The panel only floats over the page inside the max-width: 1024px block, so
+    # the breakpoint that decides "this is a dialog" has to be the same one.
+    assert "max-width: 1024px" in source
+    assert "drawerOverlay: window.innerWidth <= 1024" in source
+    assert "this.drawerOverlay = window.innerWidth <= 1024" in source
+
+
+def test_every_toggle_of_the_right_panel_goes_through_the_focus_pair():
+    source = _template()
+
+    # Anything that opens or closes the panel directly would skip returning
+    # focus to whoever opened it.
+    assert source.count("@click=\"rightSidebarOpen = true\"") == 0
+    assert source.count("@click=\"rightSidebarOpen = false\"") == 0
+    assert '@click="openRightDrawer()"' in source
+    assert source.count("@click=\"closeRightDrawer()\"") == 2
+
+
+def test_escape_closes_the_right_panel_before_it_stops_the_stream():
+    keydown = _section(_template(), "handleGlobalKeydown(e) {", "onComposerEnter(e)")
+
+    close_drawer = "if (this.rightSidebarOpen && this.drawerOverlay) { this.closeRightDrawer(); return; }"
+    stop_stream = "if (!this._isTypingTarget(e) && this.isCurrentChatStreaming()) {"
+
+    assert close_drawer in keydown
+    assert stop_stream in keydown
+    assert keydown.index(close_drawer) < keydown.index(stop_stream)
+
+
+def test_the_right_panel_labels_itself_from_the_catalogue():
+    en = json.loads((I18N_DIR / "en.json").read_text())
+
+    assert en["chat.drawer_title"]
