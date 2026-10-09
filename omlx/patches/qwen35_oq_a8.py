@@ -95,17 +95,20 @@ def _config_for(module: Any) -> OqA8Config | None:
     return config if _kernels_available() else None
 
 
-def _tag_modules(model: Any, config: OqA8Config) -> int:
-    """Opt every module of one loaded model in. Returns how many were tagged.
+def _tag_modules(model: Any, config: OqA8Config) -> tuple[int, int]:
+    """Opt every module in, returning tagged and eligible counts.
 
     Tags the whole tree rather than just the MLPs: the standalone projections
     the linear backend gets first refusal on (``linear_attn.out_proj``) are
     reached as themselves, not through a parent.
     """
     modules = [module for _, module in model.named_modules()]
+    eligible_projections = sum(
+        _classify_uncached(module) is not None for module in modules
+    )
     for module in modules:
         setattr(module, _CONFIG_ATTR, config)
-    return len(modules)
+    return len(modules), eligible_projections
 
 
 def _kernels_available() -> bool:
@@ -611,8 +614,17 @@ def apply_qwen35_oq_a8_patch(
         floor = int(min_tokens)
     config = OqA8Config(min_tokens=floor)
 
-    tagged = _tag_modules(model, config) if model is not None else 0
+    tagged_modules = 0
+    eligible_projections: int | None = None
     if model is not None:
+        tagged_modules, eligible_projections = _tag_modules(model, config)
+        if eligible_projections == 0:
+            logger.warning(
+                "oQ A8 model has no eligible Q4/Q5 affine projections "
+                "(tagged_modules=%d, eligible_projections=0); prefill will use "
+                "the existing projection paths",
+                tagged_modules,
+            )
         # The routed-expert Gate+Up follows the same per-model opt-in.
         tag_routed_a8_modules(model, floor)
 
@@ -636,12 +648,16 @@ def apply_qwen35_oq_a8_patch(
             logger.debug("oq_a8: GDN backend not registered", exc_info=True)
 
     if _MLP_PATCHED or _GDN_REGISTERED:
+        eligible_text = (
+            str(eligible_projections) if eligible_projections is not None else "unknown"
+        )
         logger.info(
-            "oQ A8 prefill kernels enabled (mlp=%s, gdn=%s, modules=%d, "
-            "min_tokens=%d)",
+            "oQ A8 prefill wrappers installed (mlp=%s, gdn=%s, "
+            "tagged_modules=%d, eligible_projections=%s, min_tokens=%d)",
             _MLP_PATCHED,
             _GDN_REGISTERED,
-            tagged,
+            tagged_modules,
+            eligible_text,
             _min_tokens(config),
         )
     return _MLP_PATCHED or _GDN_REGISTERED

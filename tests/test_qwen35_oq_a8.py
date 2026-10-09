@@ -16,6 +16,8 @@ the classification logic are exercised regardless.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pytest
 
@@ -374,6 +376,93 @@ def _quantized_linear(in_dim, out_dim, bits, group_size=GROUP_SIZE):
     )
     linear.set_dtype(mx.float16)
     return linear
+
+
+def _mock_a8_install(monkeypatch, dispatch):
+    """Keep apply() focused on its status reporting in these tests."""
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    monkeypatch.setattr(fast, "oq_a8_available", lambda: True)
+    monkeypatch.setattr(dispatch, "_kernels_available", lambda: True)
+    monkeypatch.setattr(dispatch, "_MLP_PATCHED", True)
+    monkeypatch.setattr(dispatch, "_GDN_REGISTERED", True)
+
+
+def test_apply_warns_when_tiny_all_q8_model_has_no_eligible_projections(
+    monkeypatch, caplog
+):
+    """An all-Q8 model is tagged but has no Q4/Q5 A8 projection."""
+    import mlx.nn as nn
+
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    _mock_a8_install(monkeypatch, dispatch)
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = _quantized_linear(64, 64, 8)
+
+    model = Model()
+    with caplog.at_level(logging.INFO, logger=dispatch.logger.name):
+        assert dispatch.apply_qwen35_oq_a8_patch(model) is True
+
+    info = caplog.text
+    assert "wrappers installed" in info
+    assert "tagged_modules=2" in info
+    assert "eligible_projections=0" in info
+    assert "no eligible" in info.lower()
+    assert any(
+        record.levelno == logging.WARNING and "no eligible" in record.message.lower()
+        for record in caplog.records
+    )
+    assert all(
+        getattr(module, dispatch._CONFIG_ATTR, None) is not None
+        for _, module in model.named_modules()
+    )
+
+
+def test_apply_counts_mixed_q4_q5_q8_and_tags_whole_tree(monkeypatch, caplog):
+    """Eligibility counts Q4/Q5 only while opt-in still covers every module."""
+    import mlx.nn as nn
+
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    _mock_a8_install(monkeypatch, dispatch)
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q4 = _quantized_linear(64, 64, 4)
+            self.q5 = _quantized_linear(64, 64, 5)
+            self.q8 = _quantized_linear(64, 64, 8)
+
+    model = Model()
+    modules = list(model.named_modules())
+    with caplog.at_level(logging.INFO, logger=dispatch.logger.name):
+        assert dispatch.apply_qwen35_oq_a8_patch(model) is True
+
+    assert f"tagged_modules={len(modules)}" in caplog.text
+    assert "eligible_projections=2" in caplog.text
+    assert all(
+        getattr(module, dispatch._CONFIG_ATTR, None) is not None
+        for _, module in modules
+    )
+    assert all(not hasattr(module, dispatch._PLAN_ATTR) for _, module in modules)
+
+
+def test_apply_without_model_reports_unknown_eligibility(monkeypatch, caplog):
+    """Environment/direct-caller mode cannot claim model coverage."""
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    _mock_a8_install(monkeypatch, dispatch)
+    with caplog.at_level(logging.INFO, logger=dispatch.logger.name):
+        assert dispatch.apply_qwen35_oq_a8_patch() is True
+
+    assert "tagged_modules=0" in caplog.text
+    assert "eligible_projections=unknown" in caplog.text
+    assert "eligible_projections=0" not in caplog.text
+    assert "no eligible" not in caplog.text.lower()
 
 
 @requires_kernels
