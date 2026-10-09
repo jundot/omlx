@@ -30,7 +30,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-import os
 import subprocess
 import time
 from contextlib import suppress
@@ -1724,7 +1723,6 @@ class ProcessMemoryEnforcer:
         if (
             new_level != "ok"
             and not emergency
-            and os.environ.get("OMLX_DISABLE_PRESSURE_RECLAIM") != "1"
             and self._pressure_reclaim_grace_polls
             < self._PRESSURE_RECLAIM_GRACE_POLLS_MAX
         ):
@@ -1756,10 +1754,8 @@ class ProcessMemoryEnforcer:
             # pinned by set_cache_limit(total) (the #300 panic guard), so the
             # freed bytes never leave the process and phys_footprint does not
             # drop — the enforcer then wrongly concludes "no evictable models"
-            # and livelocks until restart. Env gate
-            # OMLX_DISABLE_PRESSURE_RECLAIM=1 restores stock behavior.
-            if os.environ.get("OMLX_DISABLE_PRESSURE_RECLAIM") != "1":
-                self._request_scheduler_cache_reclaim(freed_hot)
+            # and livelocks until restart.
+            self._request_scheduler_cache_reclaim(freed_hot)
             if freed_hot > 0:
                 current = self._current_usage_bytes()
                 emergency = self._is_emergency_pressure(current, emergency_limit)

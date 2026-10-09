@@ -3258,26 +3258,6 @@ class TestPressureReclaimGrace:
         shrink.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_disabled_reclaim_falls_through_to_shrink_and_abort(
-        self, enforcer, monkeypatch
-    ):
-        engine = self._busy_setup(enforcer)
-        scheduler = engine.scheduler
-        monkeypatch.setenv("OMLX_DISABLE_PRESSURE_RECLAIM", "1")
-        with (
-            patch("omlx.process_memory_enforcer.mx") as mock_mx,
-            patch.object(
-                enforcer, "_shrink_hot_cache_for_pressure", return_value=0
-            ) as shrink,
-        ):
-            mock_mx.get_active_memory.return_value = 11 * 1024**3
-            mock_mx.get_cache_memory.return_value = 3 * 1024**3
-            await enforcer._check_and_enforce()
-        scheduler.request_pressure_reclaim.assert_not_called()
-        shrink.assert_called_once()
-        engine.abort_all_requests.assert_awaited_once()
-
-    @pytest.mark.asyncio
     async def test_no_reachable_scheduler_falls_through_to_shrink_and_abort(
         self, enforcer
     ):

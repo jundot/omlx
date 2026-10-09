@@ -10,7 +10,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from omlx.config import OMLXConfig
 from omlx.settings import (
     BURST_DECODE_MODES,
     DEFAULT_BURST_DECODE_MODE,
@@ -1793,39 +1792,6 @@ class TestGlobalSettings:
         gdn_errors = [e for e in errors if "gdn_sidecar_state_dtype" in e]
         assert len(gdn_errors) == 1
         assert "must be one of" in gdn_errors[0]
-
-    def test_legacy_config_gdn_env_and_validation(self):
-        """The legacy config layer exposes the same GDN cache plumbing."""
-        with patch.dict(
-            os.environ,
-            {
-                "OMLX_GDN_SSD_SPLIT_ENABLED": "1",
-                "OMLX_GDN_SSD_PENDING_MAX_SIZE": "768MB",
-                "OMLX_GDN_SIDECAR_STATE_DTYPE": "bf16",
-            },
-            clear=False,
-        ):
-            config = OMLXConfig.from_env()
-        assert config.paged_ssd_cache.gdn_ssd_split_enabled is True
-        assert config.paged_ssd_cache.gdn_ssd_pending_max_size == "768MB"
-        assert config.paged_ssd_cache.gdn_sidecar_state_dtype == "bf16"
-
-        config.paged_ssd_cache.hot_cache_only = True
-        errors = config.validate()
-        assert any("gdn_ssd_split_enabled" in e for e in errors)
-
-    def test_legacy_config_gdn_storage_mode_env(self):
-        with patch.dict(
-            os.environ,
-            {
-                "OMLX_GDN_SNAPSHOT_STORAGE": "embedded",
-                "OMLX_GDN_SSD_SPLIT_ENABLED": "1",
-            },
-            clear=False,
-        ):
-            config = OMLXConfig.from_env()
-        assert config.paged_ssd_cache.gdn_ssd_split_enabled is False
-        assert config.paged_ssd_cache.gdn_snapshot_storage == "embedded"
 
     def test_validate_invalid_initial_cache_blocks(self):
         """Test validation catches invalid initial_cache_blocks."""

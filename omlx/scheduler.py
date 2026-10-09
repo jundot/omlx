@@ -17,7 +17,6 @@ import gc
 import importlib
 import inspect
 import logging
-import os
 import threading
 import time
 from array import array
@@ -283,17 +282,6 @@ def _safe_sync_stream(stream=None):
     except RuntimeError as e:
         if "no Stream" not in str(e):
             raise
-
-
-def _env_int(name: str, default: int = 0) -> int:
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        logger.warning("Ignoring invalid integer env %s=%r", name, value)
-        return default
 
 
 def _collect_mx_arrays(value, out: list[mx.array]) -> None:
@@ -1573,18 +1561,14 @@ def _get_attr_or_key(obj: Any, name: str) -> Any:
 # decode holds ~3x the unthrottled rate while the mixed-batch completion
 # time stays at parity with fairness off; 1.0 buys ~5x decode at ~16%
 # batch-completion cost.
-_DECODE_FAIR_SHARE = float(os.environ.get("OMLX_DECODE_FAIR_SHARE", "0.5"))
+_DECODE_FAIR_SHARE = 0.5
 # Contended chunks are sized in TIME, not tokens: a chunk is the victim's
 # decode stall, and stall tolerance is a human constant while tokens/second
 # is a machine constant. The cap in tokens is derived per engine from the
 # measured prefill throughput; the fixed token value below is only the
 # cold-start fallback before the first chunk has been timed.
-_DECODE_STALL_TARGET_MS = float(
-    os.environ.get("OMLX_DECODE_STALL_TARGET_MS", "500")
-)
-_CONTENDED_PREFILL_CHUNK = int(
-    os.environ.get("OMLX_CONTENDED_PREFILL_CHUNK", "512")
-)
+_DECODE_STALL_TARGET_MS = 500.0
+_CONTENDED_PREFILL_CHUNK = 512
 _CONTENDED_CHUNK_FLOOR = 256  # below this, per-chunk overheads dominate
 # Contended chunks stay on the 64-token grid: the DSv4 native indexer only
 # engages when the chunk length is a multiple of 64 (deepseek_v4_model.py
@@ -1598,16 +1582,6 @@ _PACKED_PREFILL_MAX_ROWS = 4
 
 def _ceil_to_contended_grid(tokens: int) -> int:
     return -(-tokens // _CONTENDED_CHUNK_GRID) * _CONTENDED_CHUNK_GRID
-
-
-# Fraction of the room between current usage and the enforcer's abort
-# watermark that one prefill chunk may plan to consume once the sizing target
-# is already exceeded. Must stay below 1.0: a chunk sized to land exactly on
-# the watermark is a chunk planning to be aborted. OMLX_PREFILL_WATERMARK_SHARE
-# overrides it for A/B measurement.
-def _chunk_snap_enabled() -> bool:
-    """OMLX_CHUNK_SNAP=0 disables chunk quantization (A/B measurement)."""
-    return os.environ.get("OMLX_CHUNK_SNAP", "1") != "0"
 
 
 def _model_declares_llama4(model: Any) -> bool:
@@ -2252,17 +2226,10 @@ class Scheduler:
         # Periodic materialization collapses the chain; enable it for every
         # ArraysCache hybrid, not just MiniMax.
         model_name_lower = (self.config.model_name or "").lower()
-        default_kv_eval_interval = (
+        self._decode_eval_kv_cache_interval: int = (
             256
             if "minimax" in model_name_lower or self._model_has_arrays_cache()
             else 0
-        )
-        self._decode_eval_kv_cache_interval: int = max(
-            0,
-            _env_int(
-                "OMLX_DECODE_EVAL_KV_CACHE_INTERVAL",
-                default_kv_eval_interval,
-            ),
         )
         self._tokens_since_kv_cache_eval: int = 0
         if self._decode_eval_kv_cache_interval > 0:
@@ -4832,7 +4799,7 @@ class Scheduler:
             # Reclaim may have made the original (possibly off-grid) slice
             # fit. Do not shrink it or enlarge a tail to the configured floor.
             return requested
-        step = max(1, self._prefill_min_chunk_tokens) if _chunk_snap_enabled() else 1
+        step = max(1, self._prefill_min_chunk_tokens)
         low = max(1, (min_chunk + step - 1) // step)
         high = requested // step
         best = min(requested, min_chunk)
@@ -4869,8 +4836,6 @@ class Scheduler:
         Chunks at or below the floor keep their size (a short tail before a
         block boundary), and an unthrottled chunk is returned untouched.
         """
-        if not _chunk_snap_enabled():
-            return n
         grid = max(1, self._prefill_min_chunk_tokens)
         if n >= requested or n <= grid:
             return n
@@ -5553,7 +5518,6 @@ class Scheduler:
         target = (
             Scheduler._prefill_peak_target(self)
             if getattr(self, "_prefill_memory_guard", False)
-            and os.environ.get("OMLX_DISABLE_PREFILL_BACKPRESSURE") != "1"
             else 0
         )
         if target <= 0:

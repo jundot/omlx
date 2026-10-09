@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from collections.abc import Callable
 from dataclasses import replace
@@ -20,7 +19,6 @@ from .verification import LinkVerification, read_driver_identity
 from .words import load_word_ops
 
 logger = logging.getLogger(__name__)
-DISABLE_ENV = "OMLX_RDMA_STAGE_LINKS"
 # The owner recorded while the dashboard verifies a link.
 VERIFYING = "a dashboard verification"
 # One owner per link at a time: a second probe would take the worker's service end away.
@@ -138,8 +136,6 @@ def attach_stage_links(
     """The deployment with its verified stage links, and a report of what was decided and why."""
     cleared = replace(deployment, stage_links=())
     release_links(deployment.deployment_id)
-    if os.environ.get(DISABLE_ENV, "").strip().lower() in {"0", "false", "no", "off"}:
-        return cleared, _report(f"disabled by {DISABLE_ENV}")
     if deployment.backend != "ring" or len(deployment.hosts) < 2:
         return cleared, _report(
             "only multi-node TCP-ring deployments have a stage edge to move"

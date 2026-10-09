@@ -520,12 +520,7 @@ async def lifespan(app: FastAPI):
     # Advertise this oMLX instance so another Mac can identify it by hostname
     # and API port without asking the user to type an SSH target. Publication
     # is best-effort: inference remains available if Bonjour is disabled.
-    if (
-        _server_state.global_settings is not None
-        and distributed_inference_enabled()
-        and os.environ.get("OMLX_BONJOUR", "1").strip().lower()
-        not in {"0", "false", "no", "off"}
-    ):
+    if _server_state.global_settings is not None and distributed_inference_enabled():
         bonjour_publisher = BonjourPublisher(
             port=_server_state.global_settings.server.port,
             version=__version__,
@@ -544,13 +539,9 @@ async def lifespan(app: FastAPI):
 
     # Cluster v2: always-on peer discovery (mDNS + IPv6 multicast fallback +
     # manual + Tailscale). Best-effort: discovery failures must never block
-    # serving. OMLX_DISCOVERY=0 disables it for hostile networks.
+    # serving.
     discovery_service = None
-    if (
-        distributed_inference_enabled()
-        and os.environ.get("OMLX_DISCOVERY", "1").strip().lower()
-        not in {"0", "false", "no", "off"}
-    ):
+    if distributed_inference_enabled():
         try:
             from .cluster.discovery import (
                 DiscoveryConfig,

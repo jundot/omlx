@@ -845,13 +845,9 @@ def test_generic_reclaim_that_cannot_fit_still_aborts(gathered_core):
 
 
 @pytest.mark.parametrize("path", ["adaptive", "guard"])
-@pytest.mark.parametrize("snap", ["0", "1"])
 @pytest.mark.parametrize("budget_tokens", [32, 63, 64, 511, 512, 513])
-def test_generic_linear_chunk_sizing_keeps_grid_and_exact_fits(
-    monkeypatch, path, snap, budget_tokens
-):
-    """A linear predictor keeps its previous sizes, including the opt-out."""
-    monkeypatch.setenv("OMLX_CHUNK_SNAP", snap)
+def test_generic_linear_chunk_sizing_keeps_grid_and_exact_fits(path, budget_tokens):
+    """A linear predictor keeps its previous sizes."""
     hard = 20 * _GB
     cap = int(hard * Scheduler._PREFILL_ABORT_MARGIN)
     # A 10-byte observation produces an exactly representable 13-byte
@@ -862,9 +858,7 @@ def test_generic_linear_chunk_sizing_keeps_grid_and_exact_fits(
     call = _call if path == "adaptive" else _guard_call
     chosen = call(ns, 512)
 
-    expected = min(512, budget_tokens)
-    if snap == "1":
-        expected = expected // 32 * 32
+    expected = min(512, budget_tokens) // 32 * 32
     assert chosen == expected
     assert current + ns._admission_transient_bound(chosen, 0) <= cap
 
@@ -1480,11 +1474,6 @@ class TestSnapChunkSize:
         ns = self._ns()
         assert ns._snap_chunk_size(2048, 2048) == 2048
         assert ns._snap_chunk_size(2049, 2048) == 2049
-
-    def test_env_toggle_disables_snapping(self, monkeypatch):
-        monkeypatch.setenv("OMLX_CHUNK_SNAP", "0")
-        ns = self._ns()
-        assert ns._snap_chunk_size(33, 2048) == 33
 
     def test_respects_min_chunk_grid(self):
         ns = self._ns(min_chunk=256)

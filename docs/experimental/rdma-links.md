@@ -87,7 +87,6 @@ would take the worker's end of the mailbox away from the running rank.
 
 | Variable | Effect |
 | --- | --- |
-| `OMLX_RDMA_STAGE_LINKS=0` | Never route stage activations over RDMA |
 | `OMLX_MCDMA_RPCD_SOCKET` | Control socket of the Mac's daemon (default `/tmp/mcdma-rpcd.sock`) |
 | `OMLX_MCDMA_RPC_LIBRARY` | Path to `libmcdma-rpc` |
 
