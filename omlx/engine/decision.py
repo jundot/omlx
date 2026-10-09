@@ -2,7 +2,7 @@
 """
 Decision engine for oMLX.
 
-Serves decision models (Clef, OpenJev) through ``/v1/systemone``. A request
+Serves decision models (Clef, OpenJev, d1) through ``/v1/systemone``. A request
 runs causal prefills and no decoding. The engine steps the model's prefill
 generator one chunk per executor call, so active chat decodes get the GPU
 between chunks.
@@ -21,6 +21,7 @@ import mlx.core as mx
 from ..engine_core import get_mlx_executor
 from ..model_discovery import decision_kind
 from ..models.clef import ClefModel
+from ..models.d1 import D1Model
 from ..models.openjev import OpenJevModel
 from ..scheduler import _CONTENDED_CHUNK_FLOOR, SchedulerConfig
 from .base import BaseNonStreamingEngine
@@ -28,7 +29,7 @@ from .forward_fairness import ForwardFairnessGate
 
 logger = logging.getLogger(__name__)
 
-_MODEL_CLASSES = {"clef": ClefModel, "openjev": OpenJevModel}
+_MODEL_CLASSES = {"clef": ClefModel, "openjev": OpenJevModel, "d1": D1Model}
 
 
 class DecisionEngine(BaseNonStreamingEngine):
@@ -46,7 +47,7 @@ class DecisionEngine(BaseNonStreamingEngine):
         self._prefill_step = max(
             1, int(getattr(scheduler_config, "prefill_step_size", 0) or 2048)
         )
-        self._model: ClefModel | OpenJevModel | None = None
+        self._model: ClefModel | OpenJevModel | D1Model | None = None
         self._kind: str | None = None
         # One request at a time: requests share one GPU executor, so running
         # them interleaved only multiplies the activation memory.
@@ -74,7 +75,7 @@ class DecisionEngine(BaseNonStreamingEngine):
         if kind is None:
             raise ValueError(
                 f"{self._model_name} is not a supported decision model "
-                "(Clef or OpenJev)"
+                "(Clef, OpenJev, or d1)"
             )
         logger.info(f"Starting decision engine ({kind}): {self._model_name}")
         model = _MODEL_CLASSES[kind](
@@ -100,7 +101,7 @@ class DecisionEngine(BaseNonStreamingEngine):
         )
         logger.info(f"Decision engine stopped: {self._model_name}")
 
-    def _require_model(self) -> ClefModel | OpenJevModel:
+    def _require_model(self) -> ClefModel | OpenJevModel | D1Model:
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
         return self._model

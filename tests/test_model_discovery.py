@@ -627,6 +627,26 @@ class TestDetectModelType:
         assert detect_model_type(mlx_copy) == "decision"
         assert detect_model_type(other_family) == "llm"
 
+    def test_detect_d1_by_automap_not_plain_lfm2_vl(self, tmp_path):
+        """d1 is an LFM2-VL decision model. A chat LFM2-VL checkpoint is not."""
+        config = {
+            "model_type": "lfm2_vl",
+            "architectures": ["Lfm2VlForConditionalGeneration"],
+            "vision_config": {"hidden_size": 1152},
+            "auto_map": {"AutoModel": "modeling_d1.D1Model"},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "decision"
+        assert decision_kind(tmp_path) == "d1"
+
+        chat = tmp_path / "lfm2-vl-chat"
+        chat.mkdir()
+        chat_config = dict(config)
+        chat_config.pop("auto_map")
+        (chat / "config.json").write_text(json.dumps(chat_config))
+        assert detect_model_type(chat) == "vlm"
+        assert decision_kind(chat) is None
+
     def test_detect_qwen3_causal_lm_is_llm(self, tmp_path):
         """Qwen3 with CausalLM architecture should be LLM, not embedding."""
         config = {

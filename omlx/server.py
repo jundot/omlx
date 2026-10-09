@@ -1538,7 +1538,7 @@ async def get_engine(
                 raise HTTPException(
                     status_code=400,
                     detail=f"Model '{model_id}' is not a decision model. "
-                    f"Use a decision model such as Clef or OpenJev.",
+                    f"Use a decision model such as Clef, OpenJev, or d1.",
                 )
         elif engine_type == EngineType.LLM:
             # #507: non-LLM engines (STT/TTS/STS/Embedding/Reranker) previously
