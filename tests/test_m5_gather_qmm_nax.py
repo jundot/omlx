@@ -39,12 +39,6 @@ def _on_nax() -> bool:
 needs_nax = pytest.mark.skipif(not _on_nax(), reason="needs an M5 (NAX) GPU")
 
 
-@pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
-    monkeypatch.delenv("OMLX_M5_GATHER_QMM_NAX", raising=False)
-    monkeypatch.delenv("OMLX_M5_GATHER_QMM_NAX_PLAN", raising=False)
-
-
 def _stock():
     fn = mx.gather_qmm
     if getattr(fn, "_omlx_m5_reroute", False):
@@ -163,16 +157,6 @@ def test_supports_gating():
     assert not nax.supports(x, w100, s100, s100, idx, 64, 4, "affine")
 
 
-def test_kill_switch(monkeypatch):
-    monkeypatch.setenv("OMLX_M5_GATHER_QMM_NAX", "0")
-    x = mx.zeros((16, 1, 128), dtype=mx.bfloat16)
-    w = mx.zeros((4, 64, 16), dtype=mx.uint32)
-    s = mx.zeros((4, 64, 2), dtype=mx.bfloat16)
-    idx = mx.zeros((16,), dtype=mx.uint32)
-    assert not nax.enabled()
-    assert nax.sorted_gather_qmm(x, w, s, s, idx, group_size=64, bits=4) is None
-
-
 # ---------------------------------------------------------------------------
 # Exactness on NAX hardware
 # ---------------------------------------------------------------------------
@@ -217,13 +201,9 @@ def _plan_id(plan):
 
 @pytest.fixture(params=_PLANS, ids=_plan_id)
 def forced_plan(request, monkeypatch):
-    """Run a test with every configuration pinned through the env override."""
+    """Run a test with every configuration pinned in place of ``_plan``."""
     plan = request.param
-    sched = "seg" if plan.sched == SEG else "db"
-    monkeypatch.setenv(
-        "OMLX_M5_GATHER_QMM_NAX_PLAN",
-        f"{sched},{plan.bm},{plan.bk},{plan.gx},{plan.pad}",
-    )
+    monkeypatch.setattr(nax, "_plan", lambda *a, **k: plan)
     return plan
 
 
@@ -430,12 +410,11 @@ def test_tile_scan_bounded_on_unsorted_indices():
 
 
 @pytest.fixture
-def installed(monkeypatch):
+def installed():
     """The m5 reroute wrapper on mx.gather_qmm (restored afterwards)."""
     was_installed = getattr(mx.gather_qmm, "_omlx_m5_reroute", False)
     raw = patch_mod._original_gather_qmm if was_installed else mx.gather_qmm
     mx.gather_qmm = raw
-    monkeypatch.delenv("OMLX_M5_GATHER_QMM_FIX", raising=False)
     assert apply_m5_gather_qmm_workaround()
     yield raw
     mx.gather_qmm = raw
@@ -486,24 +465,6 @@ def test_wrapper_routes_sorted_calls_to_nax(installed, monkeypatch):
         rhs_indices=idx, sorted_indices=True,
     )
     assert calls == [True, True]
-
-
-@needs_nax
-def test_wrapper_kill_switch_keeps_stock_path(installed, monkeypatch):
-    monkeypatch.setenv("OMLX_M5_GATHER_QMM_NAX", "0")
-    seen = []
-    monkeypatch.setattr(
-        nax, "_launch", lambda *a, **k: seen.append(1) or None
-    )
-    E, N, K = 8, 128, 128
-    wq, scales, biases, _ = _quantized(E, N, K, "affine", 4, 64, mx.bfloat16)
-    x, idx = _rows((20, 0, 50, 7, 64, 1, 30, 9), K, mx.bfloat16)
-    out = mx.gather_qmm(
-        x, wq, scales, biases, rhs_indices=idx, group_size=64, bits=4, sorted_indices=True
-    )
-    ref = _stock_sorted(x, wq, scales, biases, idx, "affine", 4, 64)
-    assert not seen
-    assert mx.array_equal(out, ref).item()
 
 
 @needs_nax
@@ -758,7 +719,7 @@ def test_reference_activation_matches_the_model_activations():
         )
 
 
-def test_epilogue_unsupported_calls_return_none(monkeypatch):
+def test_epilogue_unsupported_calls_return_none():
     E, K, M = 4, 128, 64
     x = mx.zeros((M, 1, K), dtype=mx.bfloat16)
     idx = mx.zeros((M,), dtype=mx.uint32)
@@ -778,8 +739,6 @@ def test_epilogue_unsupported_calls_return_none(monkeypatch):
     assert call(64, limit=float("inf")) is None
     assert call(64, limit=float("nan")) is None
     assert call(64, x=x.astype(mx.float32)) is None
-    monkeypatch.setenv("OMLX_M5_GATHER_QMM_NAX", "0")
-    assert call(64) is None
 
 
 @needs_nax
@@ -845,7 +804,7 @@ def _dsa_gate_up(mode="affine", gs=64, E=16, n=64, K=128, bias=False):
 
 
 @needs_nax
-def test_fused_gate_up_activation_routing(installed, epilogue_calls, monkeypatch):
+def test_fused_gate_up_activation_routing(installed, epilogue_calls):
     from omlx.patches.glm_moe_dsa.switch_layers import SwiGLU
 
     proj = _dsa_gate_up()
@@ -863,9 +822,6 @@ def test_fused_gate_up_activation_routing(installed, epilogue_calls, monkeypatch
     assert patch_mod.fused_gate_up_activation(proj, few_x, few_idx, act) is None
     biased = _dsa_gate_up(bias=True)
     assert patch_mod.fused_gate_up_activation(biased, x, idx, act) is None
-    monkeypatch.setenv("OMLX_M5_GATHER_QMM_NAX", "0")
-    assert patch_mod.fused_gate_up_activation(proj, x, idx, act) is None
-    monkeypatch.delenv("OMLX_M5_GATHER_QMM_NAX")
     mx.gather_qmm = installed
     assert patch_mod.fused_gate_up_activation(proj, x, idx, act) is None
     assert epilogue_calls == [True]
@@ -954,7 +910,7 @@ def test_sort_routes_matches_mlx_lm_gather_sort():
     assert mx.array_equal(inv, inv_ref).item()
 
 
-def test_row_map_unsupported_calls_return_none(monkeypatch):
+def test_row_map_unsupported_calls_return_none():
     E, K, n, T = 4, 128, 64, 40
     idx = mx.zeros((64,), dtype=mx.uint32)
     x_tok = mx.zeros((T, 1, K), dtype=mx.bfloat16)
@@ -973,8 +929,6 @@ def test_row_map_unsupported_calls_return_none(monkeypatch):
     assert call(rmap, x=x_tok.reshape(T, K)) is None  # token rows [T, 1, K]
     assert not nax.supports(x_tok, w, s, s, idx, 64, 4, "affine")  # no map
     assert nax.supports(x_tok, w, s, s, idx, 64, 4, "affine", rmap)
-    monkeypatch.setenv("OMLX_M5_GATHER_QMM_NAX", "0")
-    assert call(rmap) is None
 
 
 def _dsa_problem(tokens=96, E=16, n=64, K=128, top_k=8):
@@ -1319,7 +1273,6 @@ def qwen_regroup(monkeypatch):
 
     import omlx.patches.qwen35_moe_gate_up as gate_up
 
-    monkeypatch.delenv("OMLX_QWEN35_MOE_GATE_UP", raising=False)
     verifier = Qwen3_5BatchInvariantForward
     monkeypatch.setattr(verifier, "_switch_glu", verifier._switch_glu)
     saved = {cls: cls.__dict__.get("__call__") for cls in (SwitchGLU, VLMSwitchGLU)}

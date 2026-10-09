@@ -1174,6 +1174,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
         is_partial: bool | None = None,
+        add_generation_prompt: bool | None = None,
     ) -> str:
         """Apply chat template to messages.
 
@@ -1187,6 +1188,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 key is cleaned from message dicts but no detection is performed.
                 ``None`` (default) — auto-detect from messages for backward
                 compatibility with direct engine callers.
+            add_generation_prompt: Overrides the partial-derived default.
         """
         if hasattr(self._tokenizer_obj, "apply_chat_template"):
             if is_partial is None:
@@ -1198,7 +1200,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     msg.pop("partial", None)
             template_kwargs = {
                 "tokenize": False,
-                "add_generation_prompt": not is_partial,
+                "add_generation_prompt": (
+                    not is_partial
+                    if add_generation_prompt is None
+                    else add_generation_prompt
+                ),
             }
             if is_partial:
                 template_kwargs["continue_final_message"] = True
@@ -1244,14 +1250,66 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         Returns:
             Number of prompt tokens
         """
+        return len(
+            self._encode_chat_prompt(
+                messages,
+                tools,
+                chat_template_kwargs=chat_template_kwargs,
+                is_partial=is_partial,
+            )
+        )
+
+    async def tokenize_chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+        add_generation_prompt: bool | None = None,
+        add_special_tokens: bool | None = None,
+    ) -> list[int]:
+        if not self._loaded:
+            await self.start()
+        if self._in_fallback_mode:
+            return await self._fallback_engine.tokenize_chat(
+                messages,
+                tools,
+                chat_template_kwargs=chat_template_kwargs,
+                is_partial=is_partial,
+                add_generation_prompt=add_generation_prompt,
+                add_special_tokens=add_special_tokens,
+            )
+        return self._encode_chat_prompt(
+            messages,
+            tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+            add_generation_prompt=add_generation_prompt,
+            add_special_tokens=add_special_tokens,
+        )
+
+    def _encode_chat_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+        add_generation_prompt: bool | None = None,
+        add_special_tokens: bool | None = None,
+    ) -> list[int]:
         template_tools = convert_tools_for_template(tools) if tools else None
         prompt = self._apply_chat_template(
             messages,
             template_tools,
             chat_template_kwargs=chat_template_kwargs,
             is_partial=is_partial,
+            add_generation_prompt=add_generation_prompt,
         )
-        return len(self._tokenizer_obj.encode(prompt))
+        if add_special_tokens is None:
+            return list(self._tokenizer_obj.encode(prompt))
+        return list(
+            self._tokenizer_obj.encode(prompt, add_special_tokens=add_special_tokens)
+        )
 
     async def preflight_chat(
         self,

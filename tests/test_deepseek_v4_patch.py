@@ -2164,7 +2164,6 @@ class TestNaxMoEStockRouting:
         # Pin detection off so the block-kernel tests behave identically on
         # M5-family machines; each test overrides what it needs.
         monkeypatch.setattr(sl, "is_nax_available", lambda: False)
-        monkeypatch.setattr(sl, "_NAX_STOCK_MODE", "")
         yield
 
     def test_prefers_stock_for_prefill_route_counts_only(self, monkeypatch):
@@ -2180,20 +2179,6 @@ class TestNaxMoEStockRouting:
         from omlx.patches.deepseek_v4 import switch_layers as sl
 
         assert not sl._nax_prefers_stock(1 << 20)
-
-    def test_env_kill_switch_keeps_block_kernels(self, monkeypatch):
-        from omlx.patches.deepseek_v4 import switch_layers as sl
-
-        monkeypatch.setattr(sl, "is_nax_available", lambda: True)
-        monkeypatch.setattr(sl, "_NAX_STOCK_MODE", "0")
-        assert not sl._nax_prefers_stock(1 << 20)
-
-    def test_env_force_routes_everything(self, monkeypatch):
-        from omlx.patches.deepseek_v4 import switch_layers as sl
-
-        monkeypatch.setattr(sl, "is_nax_available", lambda: True)
-        monkeypatch.setattr(sl, "_NAX_STOCK_MODE", "1")
-        assert sl._nax_prefers_stock(1)
 
     def test_native_block_kind_short_circuits_on_nax_prefill(self, monkeypatch):
         import mlx.core as mx

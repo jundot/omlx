@@ -35,14 +35,11 @@ kernels, so they are bit-identical to each other.
   without NAX (per-core measured ~1.5x slower on an 80-core M3 Ultra), and
   the fallback when the GPU core count is unknown, a core would get more
   than 128 rows, or the dtype is not 16-bit.
-
-``OMLX_GLM53_KDA_RECURRENCE=blocked`` selects the blocked kernel.
 """
 
 from __future__ import annotations
 
 import functools
-import os
 import re
 import subprocess
 from typing import NamedTuple, Optional, Tuple
@@ -116,7 +113,7 @@ def _reduce_one(rows: int) -> str:
 # Sigmoid functor, rounded like the compiled reference -> bit-identical gate.
 _GATE_EXPR = """{
                 const float x = decay * (static_cast<float>(SRC) + dtb[d]);
-                const float e = 1 / (1 + metal::exp(metal::abs(x)));
+                const float e = 1 / (1 + metal::precise::exp(metal::abs(x)));
                 const float sig = (x < 0) ? e : 1 - e;
                 g_s[r][d] = metal::precise::exp(lb * sig);
             }"""
@@ -382,7 +379,7 @@ def _percore_threadgroups(rows: int, cfg: PerCoreConfig) -> Optional[int]:
 def _pc_gate(src: str, d: str, s: str, dst: str) -> str:
     return f"""{{
                 const float x = decay[{s}] * (static_cast<float>({src}) + dtb[{s}][{d}]);
-                const float e = 1 / (1 + metal::exp(metal::abs(x)));
+                const float e = 1 / (1 + metal::precise::exp(metal::abs(x)));
                 const float sig = (x < 0) ? e : 1 - e;
                 {dst} = metal::precise::exp(lb * sig);
             }}"""
@@ -752,10 +749,7 @@ def kda_recurrence(
     return out
 
 
-_PERCORE_DEFAULT = (
-    os.environ.get("OMLX_GLM53_KDA_RECURRENCE", "percore") != "blocked"
-    and is_nax_available()
-)
+_PERCORE_DEFAULT = is_nax_available()
 if _PERCORE_DEFAULT:
     # Resolve the core count (~20 ms ioreg call) at import, i.e. at model
     # load, rather than inside the first prefill.

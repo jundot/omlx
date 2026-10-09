@@ -116,6 +116,7 @@ class CacheRecoveryManager:
             request.batch_uid = None
             request.prompt_cache = None
             request.cached_tokens = 0
+            request.prefill_resumed_tokens = 0
             request.remaining_tokens = request.prompt_token_ids
 
             # Move to waiting queue (at front for priority)

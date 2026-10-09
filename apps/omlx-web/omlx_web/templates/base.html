@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="{{ current_lang }}">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}{{ t('app.title') }}{% endblock %}</title>
+    <link rel="icon" type="image/svg+xml" href="/admin/static/favicon.svg">
+
+    <!-- Inter Font (self-hosted, Latin) -->
+    <link rel="stylesheet" href="/admin/static/fonts/inter/inter.css">
+
+    <!-- CJK Font (conditional, self-hosted) -->
+    {% if current_lang == 'zh' %}
+    <link rel="stylesheet" href="/admin/static/fonts/noto-sans-sc/noto-sans-sc.css">
+    {% elif current_lang == 'zh-TW' %}
+    <link rel="stylesheet" href="/admin/static/fonts/noto-sans-tc/noto-sans-tc.css">
+    {% elif current_lang == 'ko' %}
+    <link rel="stylesheet" href="/admin/static/fonts/noto-sans-kr/noto-sans-kr.css">
+    {% elif current_lang == 'ja' %}
+    <link rel="stylesheet" href="/admin/static/fonts/noto-sans-jp/noto-sans-jp.css">
+    {% endif %}
+
+    <!-- Color tokens: every color the web UI draws (static/css/theme.css) -->
+    <link rel="stylesheet" href="{{ static('css/theme.css') }}">
+
+    <!-- Tailwind CSS (pre-compiled) -->
+    <link rel="stylesheet" href="{{ static('css/tailwind.css') }}">
+
+    <!-- Alpine.js -->
+    <script defer src="/admin/static/js/alpine.min.js"></script>
+
+    <!-- Lucide Icons -->
+    <script src="/admin/static/js/lucide.min.js"></script>
+
+    <script>
+        // Apply theme immediately to prevent flash of wrong theme
+        (function() {
+            var stored = localStorage.getItem('omlx-chat-theme');
+            var theme = stored || 'auto';
+            if (theme === 'auto') {
+                theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+            }
+            document.documentElement.setAttribute('data-theme', theme);
+        })();
+    </script>
+
+    <script>
+        // Apply Enhanced Readability immediately so non-chat pages (dashboard,
+        // status) honor the saved toggle on first paint. The chat page also
+        // syncs this in Alpine (setEnhancedReadability).
+        (function() {
+            if (localStorage.getItem('omlx-enhanced-readability') === 'on') {
+                document.documentElement.setAttribute('data-enhanced-readability', '');
+            }
+        })();
+    </script>
+
+    <script>
+        // i18n locale strings
+        window._t = {{ locale_json | safe }};
+        window.t = function(key) { return window._t[key] !== undefined ? window._t[key] : key; };
+    </script>
+
+    <style>
+        /* Lucide icon fallback: ensure unprocessed <i data-lucide> elements
+           are inline-block so Tailwind w-*/h-* classes apply even if
+           lucide.min.js fails to load or createIcons() hasn't run yet. */
+        [data-lucide] {
+            display: inline-block;
+        }
+
+        /* Global UI tokens */
+        :root {
+            {% if current_lang == 'ko' %}
+            --font-sans: 'Noto Sans KR', 'Inter', system-ui, sans-serif;
+            {% elif current_lang == 'zh' %}
+            --font-sans: 'PingFang SC', 'SF Pro Text', 'Noto Sans SC', 'Inter', system-ui, sans-serif;
+            {% elif current_lang == 'zh-TW' %}
+            --font-sans: 'PingFang TC', 'SF Pro Text', 'Noto Sans TC', 'Inter', system-ui, sans-serif;
+            {% elif current_lang == 'ja' %}
+            --font-sans: 'Noto Sans JP', 'Inter', system-ui, sans-serif;
+            {% else %}
+            --font-sans: 'Inter', system-ui, sans-serif;
+            {% endif %}
+        }
+
+        body {
+            font-family: var(--font-sans) !important;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        [x-cloak] { display: none !important; }
+
+        /* Subtle grain texture for background */
+        .bg-grain {
+            background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 400 400' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)' opacity='0.03'/%3E%3C/svg%3E");
+        }
+
+        /* Card hover effect */
+        .card-hover {
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+        .card-hover:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 20px 40px -10px rgb(var(--palette-black) / 0.1);
+        }
+
+        /* Input focus ring */
+        input:focus, select:focus, textarea:focus {
+            outline: none;
+            box-shadow: 0 0 0 2px rgb(var(--palette-black) / 0.1);
+        }
+
+        /* Clear keyboard focus indicator (complements the enhanced-readability
+           contrast boost). Visible on :focus-visible only, so mouse users see
+           no extra chrome while keyboard users always see where focus is. */
+        :focus-visible {
+            outline: 2px solid var(--focus-ring-color) !important;
+            outline-offset: 2px;
+        }
+
+        dialog.dashboard-dialog {
+            margin: 0;
+            padding: 0;
+            border: 0;
+            width: 100%;
+            height: 100%;
+            max-width: none;
+            max-height: none;
+            background: transparent;
+            color: inherit;
+        }
+
+        dialog.dashboard-dialog::backdrop {
+            background: transparent;
+        }
+
+        /* Respect "Reduce Motion" (accessibility): collapse CSS transitions
+           and animations so the UI does not animate for users who ask for it. */
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: 0.001ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.001ms !important;
+                scroll-behavior: auto !important;
+            }
+        }
+
+        /* Benchmark tooltip (fixed position, outside overflow containers) */
+        .bench-tip-fixed {
+            position: fixed;
+            z-index: 9999;
+            max-width: 320px;
+            padding: 10px 12px;
+            background: rgb(var(--palette-neutral-900));
+            color: rgb(var(--palette-neutral-200));
+            font-size: 12px;
+            font-weight: 400;
+            line-height: 1.5;
+            border-radius: 8px;
+            white-space: normal;
+            text-align: left;
+            pointer-events: none;
+            box-shadow: 0 4px 12px rgb(var(--palette-black) / 0.15);
+        }
+    </style>
+
+    {% block head %}{% endblock %}
+
+    <!-- Enhanced Readability: global overrides. Loaded AFTER the head block so it
+         wins over theme variable declarations defined inside that block (cascade fix). -->
+    <style>
+        [data-enhanced-readability] {
+            --text-secondary: var(--text-primary) !important;
+            --text-tertiary: var(--text-primary) !important;
+            --text-muted: var(--text-primary) !important;
+            --text-danger: rgb(var(--palette-signal-red-600)) !important;
+        }
+        [data-theme="dark"][data-enhanced-readability] {
+            --text-danger: rgb(var(--palette-signal-red-400)) !important;
+        }
+        /* Gray helper text -> primary (keep red). Selector weight (0,3,0) beats
+           dashboard.css dark-mode !important (0,2,0). */
+        [data-enhanced-readability][data-theme] .text-neutral-100,
+        [data-enhanced-readability][data-theme] .text-neutral-200,
+        [data-enhanced-readability][data-theme] .text-neutral-300,
+        [data-enhanced-readability][data-theme] .text-neutral-400,
+        [data-enhanced-readability][data-theme] .text-neutral-500,
+        [data-enhanced-readability][data-theme] .text-neutral-600,
+        [data-enhanced-readability][data-theme] .text-neutral-700,
+        [data-enhanced-readability][data-theme] .text-neutral-800,
+        [data-enhanced-readability][data-theme] .text-muted,
+        [data-enhanced-readability][data-theme] .text-fg-tertiary,
+        [data-enhanced-readability][data-theme] .text-fg-secondary,
+        [data-enhanced-readability][data-theme] .text-fg-muted {
+            color: var(--text-primary) !important;
+        }
+        [data-enhanced-readability] ::placeholder { color: var(--text-primary) !important; opacity: 1 !important; }
+        /* Font-size floor: lift all <12px text to 12px. KaTeX is intentionally
+           excluded (its font-size stays untouched, preserving 1.21em scaling).
+           Tailwind arbitrary-value classes MUST use the escaped form
+           (.text-\[10px\]) to match the compiled selector. */
+        [data-enhanced-readability] .text-caption,
+        [data-enhanced-readability] .badge,
+        [data-enhanced-readability] .text-\[9px\],
+        [data-enhanced-readability] .text-\[10px\],
+        [data-enhanced-readability] .text-\[11px\],
+        [data-enhanced-readability] .svg-allow-warning,
+        [data-enhanced-readability] .code-copy-btn,
+        [data-enhanced-readability] .svg-render-btn,
+        [data-enhanced-readability] .model-card-content pre code,
+        [data-enhanced-readability] *[style*="font-size: 10px"],
+        [data-enhanced-readability] *[style*="font-size: 11px"],
+        [data-enhanced-readability] *[style*="font-size:10px"],
+        [data-enhanced-readability] *[style*="font-size:11px"] {
+            font-size: 12px !important;
+        }
+        /* Inline gray vars (e.g. style="color: var(--text-tertiary)") -> primary */
+        [data-enhanced-readability] [style*="--text-tertiary"],
+        [data-enhanced-readability] [style*="--text-secondary"],
+        [data-enhanced-readability] [style*="--text-muted"] {
+            color: var(--text-primary) !important;
+        }
+        /* Hardcoded gray hex inline colors -> primary (reds/greens excluded) */
+        [data-enhanced-readability] [style*="color: #3f3f46"],
+        [data-enhanced-readability] [style*="color: #475569"],
+        [data-enhanced-readability] [style*="color: #52525b"],
+        [data-enhanced-readability] [style*="color: #71717a"],
+        [data-enhanced-readability] [style*="color: #a1a1aa"],
+        [data-enhanced-readability] [style*="color: #d4d4d8"],
+        [data-enhanced-readability] [style*="color: #e5e5e5"],
+        [data-enhanced-readability] [style*="color: #efefef"],
+        [data-enhanced-readability] [style*="color: #252529"],
+        [data-enhanced-readability] [style*="color: #18181b"],
+        [data-enhanced-readability] [style*="color: #1d1d20"],
+        [data-enhanced-readability] [style*="color: #2d2d32"] {
+            color: var(--text-primary) !important;
+        }
+    </style>
+
+</head>
+<body class="font-sans bg-white text-neutral-900 antialiased selection:bg-neutral-900 selection:text-white">
+    {% block content %}{% endblock %}
+
+    <script>
+        // Lucide icon processor — bypasses createIcons() which has Safari issues.
+        // Directly creates SVGs from lucide.icons definitions.
+        (function() {
+            if (typeof lucide === 'undefined' || !lucide.icons) return;
+
+            function toPascal(s) {
+                return s.replace(/(^|[-_ ])(\w)/g, function(m, sep, c) { return c.toUpperCase(); });
+            }
+
+            function replaceIcon(el) {
+                var name = el.getAttribute('data-lucide');
+                if (!name) return;
+                var def = lucide.icons[toPascal(name)];
+                if (!def) return;
+                var svg = lucide.createElement(def);
+                Array.from(el.attributes).forEach(function(a) {
+                    if (a.name !== 'data-lucide') svg.setAttribute(a.name, a.value);
+                });
+                svg.classList.add('lucide', 'lucide-' + name);
+                if (el.parentNode) el.parentNode.replaceChild(svg, el);
+            }
+
+            function processAll() {
+                document.querySelectorAll('i[data-lucide]').forEach(replaceIcon);
+            }
+
+            // Initial pass
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', processAll);
+            } else {
+                processAll();
+            }
+
+            // Poll for dynamically added icons (Alpine x-for, x-if, modals).
+            setInterval(function() {
+                if (document.querySelector('i[data-lucide]')) processAll();
+            }, 300);
+        })();
+    </script>
+
+    {% block scripts %}{% endblock %}
+</body>
+</html>

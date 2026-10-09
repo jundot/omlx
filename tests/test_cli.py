@@ -1226,8 +1226,19 @@ class TestServeCommandFunctions:
             if previous_server is not None:
                 sys.modules["omlx.server"] = previous_server
 
-    def test_serve_hands_prebound_socket_to_uvicorn(self, tmp_path, monkeypatch):
+    def test_offline_secondary_bind_address_is_detected(self):
+        from omlx.cli import _is_local_address
+
+        assert _is_local_address("127.0.0.1")
+        assert not _is_local_address("192.0.2.1")
+
+    @pytest.mark.parametrize("headless", [False, True])
+    def test_serve_hands_prebound_socket_to_uvicorn(
+        self, tmp_path, monkeypatch, headless
+    ):
         """Successful serve startup should pass the pre-bound socket into uvicorn."""
+        import os
+
         import omlx
         import uvicorn
 
@@ -1235,8 +1246,9 @@ class TestServeCommandFunctions:
 
         host, port = "127.0.0.1", 0
         settings = self._make_settings(tmp_path, host=host, port=port)
-        args = self._make_serve_args(tmp_path, host=host, port=port)
+        args = self._make_serve_args(tmp_path, host=host, port=port, headless=headless)
         events = []
+        monkeypatch.delenv("OMLX_HEADLESS", raising=False)
 
         fake_server = ModuleType("omlx.server")
 
@@ -1245,6 +1257,8 @@ class TestServeCommandFunctions:
 
         def fake_init_server(**kwargs):
             events.append("init")
+            # omlx.server reads this when it is first imported.
+            events.append(os.environ.get("OMLX_HEADLESS"))
 
         fake_server.app = app
         fake_server.init_server = MagicMock(side_effect=fake_init_server)
@@ -1285,7 +1299,7 @@ class TestServeCommandFunctions:
         serve_command(args)
 
         fake_server.init_server.assert_called_once()
-        assert events == ["bind", "init", "run"]
+        assert events == ["bind", "init", "1" if headless else None, "run"]
         assert captured["socket_count"] == 1
         assert captured["socket_name"][0] == host
         assert captured["socket_name"][1] > 0

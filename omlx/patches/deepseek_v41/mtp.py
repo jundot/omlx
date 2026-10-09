@@ -3,6 +3,8 @@
 
 import mlx.core as mx
 
+from . import growth
+
 
 class AcceptanceDepthController:
     """Choose verification shapes from token acceptance, never wall-clock time.
@@ -117,8 +119,8 @@ class DSparkMixin:
             ]
             ratio = item.compress_ratio
             if ratio:
-                item[2] = item[2][:, : end // ratio]
-                item[3] = item[3][:, : end // ratio]
+                growth.truncate(item, 2, end // ratio)
+                growth.truncate(item, 3, end // ratio)
                 if ratio > 1:
                     kv, gate = state["compressor"]
                     projected_end = before % ratio + count

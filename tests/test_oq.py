@@ -28,6 +28,7 @@ from omlx.oq import (
     OQ_LEVELS,
     OQImatrixCollector,
     OQImatrixEntry,
+    _affine_minmax_params,
     _affine_perturb_group_size,
     _bpw_targets_for_level,
     _build_proxy_for_sensitivity,
@@ -68,9 +69,12 @@ from omlx.oq import (
     _should_quantize_tensor,
     _source_imatrix_signature,
     _source_has_nextn_tensors,
+    _source_weight_files,
     _TrackedTensor,
     _validate_oq_dtype_for_model,
     _uses_minimax_mxfp8_scale_inv_source,
+    _weighted_lsq_refit,
+    _weighted_lsq_refit_metal,
     estimate_bpw_and_size,
     estimate_memory,
     make_predicate,
@@ -2343,6 +2347,56 @@ class TestQuantizeChunked:
         mx.eval(ref_err, weighted_err)
         assert weighted_err.item() < ref_err.item()
 
+    @staticmethod
+    def _stored_weighted_error(grouped, imp, scales, biases, bits, dtype):
+        s = scales.astype(dtype).astype(mx.float32)
+        b = biases.astype(dtype).astype(mx.float32)
+        codes = mx.clip(mx.round((grouped - b) / s), 0, (1 << bits) - 1)
+        return mx.sum(imp * (grouped - (codes * s + b)) ** 2, axis=-1)
+
+    @pytest.mark.parametrize("bits", [2, 3, 4, 8])
+    def test_lsq_refit_never_raises_stored_weighted_error(self, bits):
+        mx.random.seed(0)
+        grouped = mx.random.normal((32, 4, 64)) * mx.exp(mx.random.normal((32, 4, 1)))
+        imp = mx.broadcast_to(mx.exp(mx.random.normal((64,))), grouped.shape)
+
+        scales, biases = _affine_minmax_params(grouped, bits)
+        refit = _weighted_lsq_refit(grouped, imp, scales, biases, bits, mx.bfloat16)
+        args = (grouped, imp)
+        before = self._stored_weighted_error(*args, scales, biases, bits, mx.bfloat16)
+        after = self._stored_weighted_error(*args, *refit, bits, mx.bfloat16)
+
+        assert mx.all(after <= before).item()
+        assert mx.sum(after).item() < mx.sum(before).item()
+
+    @pytest.mark.skipif(
+        not HAS_MLX or not mx.metal.is_available(), reason="Metal not available"
+    )
+    @pytest.mark.parametrize("group_size", [32, 64, 128])
+    @pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+    def test_metal_lsq_refit_matches_reference(self, group_size, dtype):
+        dtype = getattr(mx, dtype)
+        mx.random.seed(1)
+        shape = (64, 512 // group_size, group_size)
+        scale = mx.exp(mx.random.normal((*shape[:2], 1)))
+        grouped = (mx.random.normal(shape) * scale).astype(dtype).astype(mx.float32)
+        imp = mx.broadcast_to(mx.exp(mx.random.normal((group_size,))), shape)
+        scales, biases = _affine_minmax_params(grouped, 3)
+
+        ref = _weighted_lsq_refit(grouped, imp, scales, biases, 3, dtype)
+        out = _weighted_lsq_refit_metal(grouped, imp, scales, biases, 3, dtype)
+        args = (grouped, imp)
+        start = self._stored_weighted_error(*args, scales, biases, 3, dtype)
+        ref_err = self._stored_weighted_error(*args, *ref, 3, dtype)
+        out_err = self._stored_weighted_error(*args, *out, 3, dtype)
+
+        for value in out:
+            assert mx.array_equal(value.astype(dtype).astype(mx.float32), value)
+        assert mx.all(out_err <= start * (1 + 1e-6)).item()
+        same = (out[0] == ref[0]) & (out[1] == ref[1])
+        assert mx.mean(same.astype(mx.float32)).item() > 0.98
+        assert abs(mx.sum(out_err).item() / mx.sum(ref_err).item() - 1) < 1e-4
+
     def test_weighted_3d_expert_importance_chunked(self, monkeypatch):
         monkeypatch.setattr("omlx.oq._QUANTIZE_CHUNK_BYTES", 128)
         w = mx.random.normal((4, 2, 64)).astype(mx.float16)
@@ -4423,6 +4477,65 @@ class TestEstimateBpwHeaderOnly:
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestQuantizeOqStreamingPassthroughDtypes:
+    def test_clef_joint_head_is_copied_beside_an_indexed_backbone(self, tmp_path):
+        """The Clef decision head is not a backbone weight. It must stay out of
+        the quantized shards, and a single-shard output still needs an index
+        so mlx-vlm does not load every *.safetensors file."""
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        hidden = 64
+        np_save(
+            {
+                "model.layers.0.input_layernorm.weight": np.ones(
+                    hidden, dtype=np.float32
+                ),
+                "model.layers.0.self_attn.q_proj.weight": np.ones(
+                    (hidden, hidden), dtype=np.float32
+                ),
+            },
+            str(src / "model.safetensors"),
+        )
+        np_save(
+            {
+                "layers.0.linear1.weight": np.ones((hidden, hidden), dtype=np.float32),
+                "hidden_norm.weight": np.ones(hidden, dtype=np.float32),
+            },
+            str(src / "joint_head.safetensors"),
+        )
+        (src / "joint_head_config.json").write_text('{"hidden_size": 64}')
+        (src / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["TestModelForCausalLM"],
+                    "model_type": "test_passthrough",
+                    "num_hidden_layers": 1,
+                    "hidden_size": hidden,
+                    "vocab_size": 256,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (src / "oq_sensitivity_map.json").write_text(
+            json.dumps({"0": 0.1}), encoding="utf-8"
+        )
+        assert [f.name for f in _source_weight_files(src)] == ["model.safetensors"]
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        index = json.loads((out / "model.safetensors.index.json").read_text())
+        assert set(index["weight_map"]) == {
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.q_proj.scales",
+            "model.layers.0.self_attn.q_proj.biases",
+        }
+        assert set(index["weight_map"].values()) == {"model.safetensors"}
+        for name in ("joint_head.safetensors", "joint_head_config.json"):
+            assert (out / name).read_bytes() == (src / name).read_bytes()
+
     def test_float16_keeps_vision_audio_passthrough_tensors_float32(self, tmp_path):
         """Protected VLM/audio tensors must not be saved as FP16."""
         from safetensors.numpy import save_file as np_save
@@ -7429,21 +7542,18 @@ class TestStreamedCalibration:
         assert mx.isfinite(loaded(tokens).logits).all().item()
 
     @pytest.mark.parametrize(
-        "explicit,env,kind,over_budget,expected",
+        "explicit,kind,over_budget,expected",
         [
-            (None, "", "llama", True, False),
-            (None, "1", "llama", True, False),
-            (None, "", "minimax_m3_vl", True, True),
-            (None, "", "qwen4_exp", False, False),
-            (None, "0", "qwen4_exp", True, False),
-            (False, "1", "qwen4_exp", True, False),
-            (True, "0", "qwen4_exp", False, True),
+            (None, "llama", True, False),
+            (None, "minimax_m3_vl", True, True),
+            (None, "qwen4_exp", False, False),
+            (False, "qwen4_exp", True, False),
+            (True, "qwen4_exp", False, True),
         ],
     )
-    def test_selection(self, monkeypatch, explicit, env, kind, over_budget, expected):
+    def test_selection(self, explicit, kind, over_budget, expected):
         import omlx.oq as oq
 
-        monkeypatch.setenv("OMLX_OQ_STREAM_CALIBRATION", env)
         assert (
             oq._resolve_stream_calibration(
                 explicit, model_exceeds_ram=over_budget, model_type=kind

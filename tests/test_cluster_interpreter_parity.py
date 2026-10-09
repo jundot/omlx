@@ -11,7 +11,6 @@ unexpected behaviour.
 """
 
 import json
-import pathlib
 import platform
 import subprocess
 
@@ -348,21 +347,6 @@ def test_every_probe_branch_returns_the_same_result_keys():
     for key in ("runtime_compatible", "runtime_mismatches", "runtime_warnings"):
         assert key in bootstrap, key
     assert bootstrap["runtime_warnings"] == []
-
-
-def test_dashboard_does_not_render_a_warned_peer_as_an_unqualified_match():
-    wizard = pathlib.Path(
-        "omlx/admin/static/js/cluster_v2.js"
-    ).read_text(encoding="utf-8")
-    template = pathlib.Path(
-        "omlx/admin/templates/dashboard/_cluster_v2.html"
-    ).read_text(encoding="utf-8")
-
-    assert "probe.result?.runtime_warnings" in wizard
-    assert "warnings.length" in wizard
-    assert "? 'warn'" in wizard
-    assert "row.status === 'warn'" in template
-    assert "text-amber-700" in template
 
 
 def test_interpreter_parity_ignores_a_non_string_report():

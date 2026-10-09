@@ -631,14 +631,10 @@ def test_dense_vlm_runtime_return_hidden_uses_language_model_output_contract():
         ("mlx_vlm.models.cache", "BatchQuantizedKVCache"),
     ],
 )
-def test_batch_cache_finalize_refreshes_identity_cached_padding(module_name, cache_name):
+def test_qwen_decode_mask_follows_in_place_finalize_padding(module_name, cache_name):
     import importlib
 
     from mlx_vlm.models.qwen3_5 import language as q35_lang
-
-    from omlx.patches.mlx_vlm_mtp import qwen35_vlm_runtime
-
-    qwen35_vlm_runtime._patch_batch_cache_padding_identity()
 
     cache_class = getattr(importlib.import_module(module_name), cache_name)
     kwargs = {"max_size": 32} if cache_name == "BatchRotatingKVCache" else {}
@@ -654,14 +650,6 @@ def test_batch_cache_finalize_refreshes_identity_cached_padding(module_name, cac
     assert q35_lang._qwen3_5_left_padding_info(cache) == ((2, 3), 3)
     assert q35_lang._create_qwen3_5_attention_mask(mx.zeros((2, 1, 4)), cache)
     assert cache._qwen3_5_decode_left_padding == [2, 3]
-
-    padding = cache.left_padding
-    padding_info = cache._qwen3_5_left_padding_info
-    cache.prepare(lengths=[1, 1], right_padding=[0, 0])
-    cache.finalize()
-    assert cache.left_padding is padding
-    assert q35_lang._qwen3_5_left_padding_info(cache) == ((2, 3), 3)
-    assert cache._qwen3_5_left_padding_info is padding_info
 
 
 def test_dense_vlm_runtime_delegates_foreign_subclasses_unchanged():

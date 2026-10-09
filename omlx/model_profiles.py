@@ -116,6 +116,9 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "deepseek_v41_ced_prefill_enabled",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
+        # Memory residency of an embedding model's audio tower; explicit per model.
+        "embedding_audio_enabled",
+        "embedding_audio_max_seconds",
     }
 )
 

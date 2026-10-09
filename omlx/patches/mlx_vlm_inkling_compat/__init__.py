@@ -113,7 +113,7 @@ def _patch_prompt_utils(prompt_utils: Any) -> None:
         **kwargs,
     ):
         if _is_inkling(model_name):
-            text = "" if prompt is None else str(prompt)
+            text = prompt_utils.extract_text_from_content(prompt)
             content: list[dict[str, Any]] | str
             if role == "user" and not skip_image_token and num_images > 0:
                 content = [{"type": "image"} for _ in range(num_images)]

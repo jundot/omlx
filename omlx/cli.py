@@ -15,8 +15,10 @@ Usage:
 """
 
 import argparse
+import errno
 import faulthandler
 import math
+import socket
 import sys
 
 from ._version import __version__
@@ -156,6 +158,16 @@ def _migrate_saved_network_auth(settings, args) -> None:
             os.replace(temporary, notice)
         finally:
             temporary.unlink(missing_ok=True)
+
+
+def _is_local_address(host: str) -> bool:
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    with socket.socket(family) as probe:
+        try:
+            probe.bind((host, 0))
+        except OSError as exc:
+            return exc.errno != errno.EADDRNOTAVAIL
+    return True
 
 
 def serve_command(args):
@@ -301,6 +313,11 @@ def serve_command(args):
     # normal startup runs ASGI lifespan before binding host/port, which means
     # pinned models can be preloaded before a port conflict is detected.
     bind_hosts = [h.strip() for h in settings.server.host.split(",") if h.strip()]
+    # A secondary address such as a VPN IP can be missing until its link is up.
+    for h in bind_hosts[1:]:
+        if not _is_local_address(h):
+            print(f"Warning: skipping {h}, it is not assigned to any local interface")
+            bind_hosts.remove(h)
     for h in bind_hosts:
         print(f"Binding server at http://{h}:{settings.server.port}")
     # uvicorn does not support "trace" — map to "debug" for its internal logging
@@ -328,6 +345,10 @@ def serve_command(args):
             access_log=show_access_log,
         )
         serve_sockets.append(extra_cfg.bind_socket())
+
+    # Read by omlx.server at import time.
+    if getattr(args, "headless", False):
+        os.environ["OMLX_HEADLESS"] = "1"
 
     try:
         # Import server and config after the port is known to be available.
@@ -1228,7 +1249,7 @@ Example directory structure:
         type=str,
         choices=["off", "safe", "balanced", "aggressive"],
         default=None,
-        help="Memory guard tier, or 'off' to disable the guard. The tier sets how much memory stays free for other apps: safe keeps about 20%% of RAM (6-16 GB), balanced about 8%% (3-8 GB), aggressive 2%% (1.5-4 GB) and may compress other apps' memory. Passing a tier also turns the guard on. (default: balanced)",
+        help="Memory guard tier, or 'off' to disable the guard. The tier sets how much memory stays free for other apps: safe keeps about 20%% of RAM (6-16 GB), balanced about 8%% (3-8 GB) and may compress a quarter of other apps' memory, aggressive 2%% (1.5-4 GB) and may compress half of it. Passing a tier also turns the guard on. (default: balanced)",
     )
     serve_parser.add_argument(
         "--memory-guard-gb",
@@ -1345,6 +1366,12 @@ Example directory structure:
         type=str,
         default=None,
         help="API key for authentication (required for non-loopback binds)",
+    )
+    serve_parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Serve the inference and admin APIs without the web UI. "
+        "Not saved to settings; same as OMLX_HEADLESS=1",
     )
 
     # Launch command

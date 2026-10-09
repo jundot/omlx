@@ -1,4 +1,4 @@
-// Register-resident decoders for the oQ mixed-bit (Q4/Q5, GS64, affine)
+// Register-resident decoders for the oQ mixed-bit (Q4/Q5/Q8, GS64, affine)
 // checkpoint layout, shared by the Stage-A/reference kernels and the NAX
 // INT8 GEMM.
 //
@@ -124,8 +124,9 @@ inline void oq_decode4(
     }
     // Affine codes are unsigned (0..15 for Q4, 0..31 for Q5) and so land in
     // signed INT8 unchanged -- no sign correction is needed before the
-    // INT8 x INT8 tensor op.
-    out[j] = static_cast<int8_t>(v & mask);
+    // INT8 x INT8 tensor op. Q8 codes reach 255, so they are centered to
+    // q - 128 by flipping the top bit.
+    out[j] = static_cast<int8_t>(BITS == 8 ? ((v & mask) ^ 0x80u) : (v & mask));
   }
 }
 

@@ -33,6 +33,7 @@ final class ModelSettingsScreenVM {
         case limitToolResults, toolResultLimitTokens
         case forceSampling, isPinned, isFavorite
         case trustRemoteCode
+        case embeddingAudioEnabled, embeddingAudioMaxSeconds
         case reasoningParser
         case chatTemplateKwargs
         case turboquantKvEnabled, turboquantKvBits
@@ -85,6 +86,9 @@ final class ModelSettingsScreenVM {
             ("audio_sts", String(localized: "settings.model_type.audio_sts",
                                  defaultValue: "Audio STS",
                                  comment: "Model type option label for speech-to-speech models")),
+            ("decision", String(localized: "settings.model_type.decision",
+                                defaultValue: "Decision",
+                                comment: "Model type option label for decision models served by /v1/systemone")),
         ]
     }
 
@@ -269,6 +273,10 @@ final class ModelSettingsScreenVM {
     // Security
     var trustRemoteCode: Bool = false
 
+    // Embedding audio tower. Empty seconds keeps the 30 s processor default.
+    var embeddingAudioEnabled: Bool = false
+    var embeddingAudioMaxSeconds: String = ""
+
     // Reasoning parser (free-form override; empty = auto)
     var reasoningParser: String = ""
 
@@ -378,6 +386,33 @@ final class ModelSettingsScreenVM {
     /// "Working profile" state. Per-model fields (alias / modelType /
     /// ttl / isPinned / trustRemoteCode) auto-save and never set this.
     var profileDirty: Bool = false
+    /// Model-specific profile values at the last load. Global templates drop
+    /// these keys, so edits to them need a model-scope save.
+    private var loadedModelSpecificSettings: [String: AnyCodable] = [:]
+
+    /// True when the working profile changes a setting that a global
+    /// template cannot store.
+    var hasModelSpecificEdits: Bool {
+        profileDirty && modelSpecificSettings() != loadedModelSpecificSettings
+    }
+
+    var defaultSaveAsScope: ProfileScope { hasModelSpecificEdits ? .model : .global }
+
+    private func modelSpecificSettings() -> [String: AnyCodable] {
+        currentSettingsDict().filter { !ProfileSettingsKey.templateKeys.contains($0.key) }
+    }
+
+    /// Record the current values as the clean, loaded state.
+    func resetWorkingBaseline() {
+        loadedModelSpecificSettings = modelSpecificSettings()
+        profileDirty = false
+    }
+
+    private var globalProfileDropsEditsMessage: String {
+        String(localized: "profile.save.global_drops_model_settings",
+               defaultValue: "Global profiles keep sampling settings only. Save as a Model profile to keep Lightning MTP, TurboQuant, and other model settings.",
+               comment: "Error shown when saving to a global profile would drop model-specific settings")
+    }
 
     /// State machine the banner and ProfileDetailCard render against.
     /// Cheap to recompute — pure function of (profileDirty, activeProfileScope,
@@ -440,6 +475,8 @@ final class ModelSettingsScreenVM {
             .replacingOccurrences(of: "-", with: "_") == "qwen4_exp"
     }
 
+    var embeddingAudioSupported: Bool { model?.embeddingAudioSupported == true }
+
     private func isDiffusionUnsupportedField(_ field: Field) -> Bool {
         switch field {
         case .topP, .topK, .minP, .repetitionPenalty, .presencePenalty:
@@ -497,6 +534,8 @@ final class ModelSettingsScreenVM {
         case .alias, .modelType, .contextLength, .maxTokens:
             return false
         case .temperature, .ttl, .isPinned, .isFavorite, .trustRemoteCode:
+            return false
+        case .embeddingAudioEnabled, .embeddingAudioMaxSeconds:
             return false
         case .chatTemplateKwargs:
             return false
@@ -603,6 +642,8 @@ final class ModelSettingsScreenVM {
                 self.isPinned = s?.isPinned ?? false
                 self.isFavorite = s?.isFavorite ?? false
                 self.trustRemoteCode = s?.trustRemoteCode ?? false
+                self.embeddingAudioEnabled = s?.embeddingAudioEnabled ?? false
+                self.embeddingAudioMaxSeconds = s?.embeddingAudioMaxSeconds.map { Self.formatPct($0) } ?? ""
                 self.reasoningParser = s?.reasoningParser ?? ""
                 self.chatTemplateEntries = diffusionCompatibleChatTemplateEntries(
                     ChatTemplateKwargsCodec.decode(
@@ -680,7 +721,7 @@ final class ModelSettingsScreenVM {
                 self.activeProfileName = nil
             }
             // Reload always re-establishes the baseline.
-            self.profileDirty = false
+            resetWorkingBaseline()
             self.lastError = nil
         } catch {
             self.lastError = error.omlxDescription
@@ -759,6 +800,17 @@ final class ModelSettingsScreenVM {
         case .isPinned:                patch.isPinned = isPinned
         case .isFavorite:              patch.isFavorite = isFavorite
         case .trustRemoteCode:         patch.trustRemoteCode = trustRemoteCode
+        case .embeddingAudioEnabled:   patch.embeddingAudioEnabled = embeddingAudioEnabled
+        case .embeddingAudioMaxSeconds:
+            let text = embeddingAudioMaxSeconds.trimmingCharacters(in: .whitespaces)
+            if text.isEmpty {
+                patch.embeddingAudioMaxSeconds = .some(nil)
+            } else if let seconds = Double(text), seconds > 0 {
+                patch.embeddingAudioMaxSeconds = seconds
+            } else {
+                lastError = "Max audio length must be a positive number of seconds."
+                return
+            }
         case .reasoningParser:
             patch.reasoningParser = reasoningParser.isEmpty ? nil : reasoningParser
         case .chatTemplateKwargs:
@@ -1106,6 +1158,9 @@ final class ModelSettingsScreenVM {
     }
 
     var isQwenOqA8Model: Bool {
+        // qwen4_exp (Qwen3.8-Flash-Next) matches exactly: only that validated
+        // family has routed-expert A8, not every qwen4*.
+        if isQwen4Exp { return true }
         let type = (model?.configModelType ?? "").lowercased().replacingOccurrences(of: "-", with: "_")
         return ["qwen3_5", "qwen3_6", "qwen3_8"].contains { type.hasPrefix($0) }
     }
@@ -1550,6 +1605,10 @@ final class ModelSettingsScreenVM {
         let displayName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanName = "p-" + UUID().uuidString.lowercased().prefix(28)
         guard !displayName.isEmpty, scope != .preset else { return }
+        guard scope != .global || !hasModelSpecificEdits else {
+            lastError = globalProfileDropsEditsMessage
+            return
+        }
         guard validateAneWorkingSettings() else { return }
         let settings = currentSettingsDict()
         do {
@@ -1594,6 +1653,10 @@ final class ModelSettingsScreenVM {
     func updateProfileWithWorking(scope: ProfileScope, name: String, client: OMLXClient) async {
         let targetModelID = modelID
         guard scope != .preset else { return }
+        guard scope != .global || !hasModelSpecificEdits else {
+            lastError = globalProfileDropsEditsMessage
+            return
+        }
         guard validateAneWorkingSettings() else { return }
         let settings = currentSettingsDict()
         do {

@@ -23,7 +23,7 @@ replace most of them with the same float operations in the same order:
 
 ``ready`` runs each specialization once on tiny inputs first; a compile or
 launch failure turns the kernels off for the process and callers keep the
-MLX path. Disable with OMLX_QWEN4_ATTN_FUSED=0.
+MLX path.
 """
 
 from __future__ import annotations
@@ -33,12 +33,10 @@ import logging
 
 import mlx.core as mx
 
-from .hc_projection import env_enabled
-
 logger = logging.getLogger(__name__)
 
-_DISABLED = not env_enabled("OMLX_QWEN4_ATTN_FUSED")
-MAX_ROWS = 8
+_DISABLED = False
+MAX_ROWS = 16
 # MLX's vector SDPA: one pass below this many keys on 'd'/'s' GPUs.
 _TWO_PASS_KEYS = 1024
 # MLX's two-pass partition count for 12 query heads per KV head below 16K keys.
@@ -478,6 +476,12 @@ def _gpu_class() -> str:
         return str(mx.device_info().get("architecture", ""))[-1:]
     except Exception:
         return ""
+
+
+def rows_available() -> bool:
+    """Whether the fused decode/verify attention rows can run on this GPU at
+    all (layers still check their own shapes): off after a kernel failure."""
+    return not _DISABLED and _gpu_class() == "d"
 
 
 def row_plan(first_keys: int, last_keys: int) -> int | None:

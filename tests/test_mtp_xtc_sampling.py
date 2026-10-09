@@ -16,7 +16,6 @@ from omlx.utils.sampling import make_sampler
 @pytest.fixture
 def scheduler_probe(monkeypatch):
     mtp.apply()
-    monkeypatch.setenv("OMLX_MTP_ROWWISE_BATCH", "1")
     model = Model(
         ModelArgs(
             model_type="llama",

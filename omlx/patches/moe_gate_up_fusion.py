@@ -23,14 +23,12 @@ forwards split the fused output as ``[gate; up]``). A module is left as is
 when its gate and up differ in format, when it is not quantized, or, for the
 DeepSeek V4 variant, when the format has native gate/up pair kernels (MXFP4,
 affine 2/3-bit), whose tuned paths stay untouched. The engines skip it with
-MoE expert offload and honor ``moe_gate_up_fusion_enabled``;
-``OMLX_MOE_GATE_UP_FUSION=0`` disables it too.
+MoE expert offload and honor ``moe_gate_up_fusion_enabled``.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any
 
 import mlx.core as mx
@@ -54,11 +52,6 @@ _FAMILY_TOKENS = ("mimo_v2", "glm5_next")
 def _is_supported_family(model: Any) -> bool:
     module = type(model).__module__ or ""
     return any(token in module for token in _FAMILY_TOKENS)
-
-
-def _fusion_enabled() -> bool:
-    value = os.environ.get("OMLX_MOE_GATE_UP_FUSION", "1").strip().lower()
-    return value not in ("0", "false", "off", "no")
 
 
 def _switch_family(module: Any) -> str | None:
@@ -125,10 +118,10 @@ def _fuse_one(switch_mlp: Any) -> None:
 def apply_switch_glu_gate_up_fusion(model: Any) -> int:
     """Fuse gate/up of every eligible oMLX ``SwitchGLU`` in a loaded model.
 
-    Returns the number of fused layers (0 when disabled, for model families
-    other than MiMo V2 and GLM-5.3, or when nothing is eligible).
+    Returns the number of fused layers (0 for model families other than
+    MiMo V2 and GLM-5.3, or when nothing is eligible).
     """
-    if not _fusion_enabled() or not _is_supported_family(model):
+    if not _is_supported_family(model):
         return 0
     named_modules = getattr(model, "named_modules", None)
     if named_modules is None:

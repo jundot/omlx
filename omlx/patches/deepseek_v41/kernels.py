@@ -460,6 +460,8 @@ _TOPK = r"""
     const uint query = threadgroup_position_in_grid.y;
     const uint tile = threadgroup_position_in_grid.x;
     const int width = meta[0], base = meta[1];
+    // Runtime counts keep one pipeline as the causal key count grows.
+    const uint K = uint(meta[5]), NT = uint(meta[6]);
     threadgroup float exchange_values[TILE];
     threadgroup int exchange_ids[TILE];
     float values[TILE / THREADS], next_values[TILE / THREADS];
@@ -544,7 +546,7 @@ _TOPK_MERGE = r"""
     const uint pos = thread_position_in_grid.x;
     const uint query = threadgroup_position_in_grid.y;
     const uint group = threadgroup_position_in_grid.z;
-    const uint na = meta[0], nb = meta[1], runs = meta[2];
+    const uint na = meta[0], nb = meta[1], runs = meta[2], K = meta[3];
     const uint groups = GROUPED ? (runs + FANIN - 1) / FANIN : 1;
     if (GROUPED) {
         const uint source = pos / K, own = pos % K;
@@ -628,8 +630,8 @@ def _merge_topk(a, b, count, *, runs=0):
     width = fanin * count if runs else na + nb
     return tuple(
         _topk_merge_kernel()(
-            inputs=[*a, *b, mx.array([na, nb, runs], mx.int32)],
-            template=[("K", count), ("GROUPED", bool(runs)), ("FANIN", fanin)],
+            inputs=[*a, *b, mx.array([na, nb, runs, count], mx.int32)],
+            template=[("GROUPED", bool(runs)), ("FANIN", fanin)],
             grid=((width + 255) // 256 * 256, a[0].shape[1], groups),
             threadgroup=(256, 1, 1),
             output_shapes=[(1, a[0].shape[1], groups * count)] * 2,
@@ -688,12 +690,12 @@ def _tile_topk(
             inputs=[
                 scores,
                 ids if ids is not None else mx.zeros((1,), mx.int32),
-                mx.array([width, offset, score_width, start, ratio], mx.int32),
+                mx.array(
+                    [width, offset, score_width, start, ratio, count, tiles], mx.int32
+                ),
             ],
             template=[
                 ("TILE", tile),
-                ("K", count),
-                ("NT", tiles),
                 ("EXPLICIT", ids is not None),
                 ("BLOCK", block_size),
                 ("FORCE", force_latest),
@@ -711,6 +713,219 @@ def _tile_topk(
         fanin = 4 if count <= 512 else 2
         tiles = (tiles + fanin - 1) // fanin
     return winners
+
+
+_RADIX_HEADER = r"""
+// Order-preserving key: larger scores give larger keys, and -0 equals +0.
+inline uint v41_score_key(float x) {
+    const uint u = as_type<uint>(x == 0.0f ? 0.0f : x);
+    return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
+}
+"""
+
+# Exact top-k of each score row with two reads of the row:
+# - Pass 1 builds a histogram of the top 12 key bits and finds the bin that
+#   holds the K-th largest key.
+# - Pass 2 writes every id above that bin and gathers the bin members, which
+#   are sorted by (key desc, id asc) in threadgroup memory.
+# - A threshold bin larger than CAP falls back to four 8-bit radix passes.
+# The selected set equals a full sort with ties broken by the lower id.
+_RADIX_TOPK = r"""
+    constexpr uint CAP = 2048, BINS = 4096;
+    const uint tid = thread_index_in_threadgroup;
+    const uint row = threadgroup_position_in_grid.x;
+    const uint n = scores_shape[2], K = meta[0];
+    const device float* s = scores + size_t(row) * n;
+    device int* out = ids + size_t(row) * K;
+    threadgroup ulong buf[CAP];
+    threadgroup atomic_uint* hist = (threadgroup atomic_uint*)buf;
+    threadgroup atomic_uint counters[2];
+    threadgroup uint part[256];
+    threadgroup uint threshold_bin, above, need;
+    for (uint b = tid; b < BINS; b += 256)
+        atomic_store_explicit(hist + b, 0, memory_order_relaxed);
+    if (tid < 2) atomic_store_explicit(counters + tid, 0, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < n; i += 256)
+        atomic_fetch_add_explicit(
+            hist + (v41_score_key(s[i]) >> 20), 1, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Thread t owns 16 bins counted down from the top bin.
+    uint local = 0;
+    for (uint j = 0; j < 16; ++j)
+        local += atomic_load_explicit(
+            hist + (BINS - 1 - (tid * 16 + j)), memory_order_relaxed);
+    part[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint acc = 0, t = 0;
+        for (; t < 255; ++t) {
+            if (acc + part[t] >= K) break;
+            acc += part[t];
+        }
+        for (uint j = 0; j < 16; ++j) {
+            const uint bin = BINS - 1 - (t * 16 + j);
+            const uint c = atomic_load_explicit(hist + bin, memory_order_relaxed);
+            if (acc + c >= K || j == 15) {
+                threshold_bin = bin;
+                above = acc;
+                need = K - acc;
+                break;
+            }
+            acc += c;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint bin = threshold_bin;
+    for (uint i = tid; i < n; i += 256) {
+        const uint key = v41_score_key(s[i]), high = key >> 20;
+        if (high > bin) {
+            out[atomic_fetch_add_explicit(counters, 1, memory_order_relaxed)] = int(i);
+        } else if (high == bin) {
+            const uint c = atomic_fetch_add_explicit(counters + 1, 1, memory_order_relaxed);
+            if (c < CAP) buf[c] = (ulong(key) << 32) | ulong(0xFFFFFFFFu - i);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    const uint count = atomic_load_explicit(counters + 1, memory_order_relaxed);
+    if (count <= CAP) {
+        uint size = 1;
+        while (size < count) size <<= 1;
+        for (uint i = count + tid; i < size; i += 256) buf[i] = 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Bitonic sort, descending by key, then ascending by id.
+        for (uint k = 2; k <= size; k <<= 1) {
+            for (uint j = k >> 1; j > 0; j >>= 1) {
+                for (uint i = tid; i < size; i += 256) {
+                    const uint l = i ^ j;
+                    if (l > i) {
+                        const ulong a = buf[i], b = buf[l];
+                        if ((i & k) == 0 ? a < b : a > b) {
+                            buf[i] = b;
+                            buf[l] = a;
+                        }
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+        for (uint r = tid; r < need; r += 256)
+            out[above + r] = int(0xFFFFFFFFu - uint(buf[r] & 0xFFFFFFFFul));
+        return;
+    }
+    threadgroup uint prefix, remaining, greater[256], equal[256];
+    if (tid == 0) {
+        prefix = 0;
+        remaining = K;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        atomic_store_explicit(hist + tid, 0, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < n; i += 256) {
+            const uint key = v41_score_key(s[i]);
+            if (shift == 24 || (key >> (shift + 8)) == prefix)
+                atomic_fetch_add_explicit(
+                    hist + ((key >> shift) & 255u), 1, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            for (int b = 255; b >= 0; --b) {
+                const uint c = atomic_load_explicit(hist + b, memory_order_relaxed);
+                if (remaining > c) {
+                    remaining -= c;
+                } else {
+                    prefix = (prefix << 8) | uint(b);
+                    break;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // prefix is now the K-th largest key. Write greater keys, then equal keys
+    // by ascending id, using per-thread ranges for a stable order.
+    const uint first = (n * tid) / 256, last = (n * (tid + 1)) / 256;
+    uint ng = 0, ne = 0;
+    for (uint i = first; i < last; ++i) {
+        const uint key = v41_score_key(s[i]);
+        ng += key > prefix;
+        ne += key == prefix;
+    }
+    greater[tid] = ng;
+    equal[tid] = ne;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint g = 0, e = 0;
+        for (uint t = 0; t < 256; ++t) {
+            const uint a = greater[t], b = equal[t];
+            greater[t] = g;
+            equal[t] = e;
+            g += a;
+            e += b;
+        }
+        remaining = g;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint g = greater[tid], e = equal[tid];
+    for (uint i = first; i < last; ++i) {
+        const uint key = v41_score_key(s[i]);
+        if (key > prefix) {
+            out[g++] = int(i);
+        } else if (key == prefix) {
+            if (remaining + e < K) out[remaining + e] = int(i);
+            ++e;
+        }
+    }
+"""
+
+# Below this many visible keys the tile sort is as fast.
+_RADIX_MIN_KEYS = 4096
+
+
+@cache
+def _radix_topk_kernel():
+    return mx.fast.metal_kernel(
+        name="deepseek_v41_radix_topk",
+        input_names=["scores", "meta"],
+        output_names=["ids"],
+        source=_RADIX_TOPK,
+        header=_RADIX_HEADER,
+    )
+
+
+def _radix_topk(scores, count):
+    """Unordered ids of each row's top ``count`` scores, ties by lower id."""
+    return _radix_topk_kernel()(
+        inputs=[scores, mx.array([count], mx.uint32)],
+        grid=(256 * scores.shape[0] * scores.shape[1], 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(*scores.shape[:2], count)],
+        output_dtypes=[mx.int32],
+    )[0]
+
+
+def _radix_index_topk(q, keys, weights, start, ratio, count):
+    """Score bounded query groups, then select with the radix kernel."""
+    # At most 64 MiB of FP32 scores per group.
+    group = min(1024, max(1, (64 << 20) // (4 * keys.shape[1])))
+    results, pending = [], None
+    for begin in range(0, q.shape[1], group):
+        end = min(begin + group, q.shape[1])
+        scores = packed_index_scores(
+            q[:, begin:end], keys, weights[:, begin:end], start + begin, ratio
+        )
+        ids = _radix_topk(scores, count)
+        valid = mx.take_along_axis(scores, ids, -1) > -float("inf")
+        ids = mx.sort(mx.where(valid, ids, -1), axis=-1)
+        # Build the next group while this one runs; keep one group in flight.
+        if pending is not None:
+            mx.eval(pending)
+        mx.async_eval(ids)
+        pending = ids
+        results.append(ids)
+    if pending is not None:
+        mx.eval(pending)
+    return mx.concatenate(results, 1)
 
 
 def packed_index_topk(
@@ -754,6 +969,10 @@ def packed_index_topk(
     packed_index_scores(q, keys[:, :0], weights, start, ratio)
     width = keys.shape[1]
     count = min(count, width)
+    visible = min(width, (start + q.shape[1]) // ratio)
+    if q.shape[1] > 8 and not block_count and visible >= max(_RADIX_MIN_KEYS, count):
+        ids = _radix_index_topk(q, keys[:, :visible], weights, start, ratio, count)
+        return ids, mx.zeros((1, q.shape[1], 0), mx.int32)
     if block_count:
         block_count = min(block_count, (width + block_size - 1) // block_size)
         chunk_size = max(block_size, chunk_size // block_size * block_size)

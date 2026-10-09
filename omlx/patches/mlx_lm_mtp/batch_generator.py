@@ -17,7 +17,6 @@ import functools
 import inspect
 import logging
 import math
-import os
 import time
 import weakref
 from collections import deque
@@ -29,6 +28,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 from omlx.prefill_progress import get_prefill_tracker
 
 from . import cache_rollback as _rollback_mod
+from . import context_copy as _context_copy
 from . import prompt_priming as _prompt_priming
 
 logger = logging.getLogger(__name__)
@@ -77,9 +77,6 @@ def _width_stable_verify(gen_batch: Any):
             _set_verify_width_stable(False)
 
 
-_ROW_EXACT_DISABLED = os.environ.get("OMLX_MTP_ROW_EXACT_VERIFY", "1").strip() == "0"
-
-
 def _row_exact_verify(model: Any) -> bool:
     """Whether the target's verify rows must reproduce its one-row decode.
 
@@ -87,10 +84,7 @@ def _row_exact_verify(model: Any) -> bool:
     armed verify forwards then run every multi-row quantized projection,
     DeltaNet prework and attention row with the arithmetic of a serial
     decode step, so greedy MTP output equals MTP-off output byte for byte.
-    ``OMLX_MTP_ROW_EXACT_VERIFY=0`` restores the faster verify kernels.
     """
-    if _ROW_EXACT_DISABLED:
-        return False
     for candidate in (
         model,
         getattr(model, "_language_model", None),
@@ -157,6 +151,7 @@ def apply() -> bool:
         def patched_next(self, *args, **kwargs):
             if _is_mtp_batch_eligible(self):
                 policy = _batch_policy_for_next(self)
+                _batch_park_memory(self.model).tick()
                 if policy is not None and policy.needs_standard():
                     if not _reconcile_mtp_batch_to_standard(self):
                         raise RuntimeError(
@@ -797,6 +792,11 @@ class _MtpStats:
     depth_accepted: List[int] = field(default_factory=list)
     # Cycles the depth controller parked at 0 (plain steps, no speculation).
     zero_cycles: int = 0
+    # Cycles whose drafts were copied from the context instead of the head,
+    # and their drafted / accepted token counts (kept out of depth[...]).
+    copy_cycles: int = 0
+    copy_drafted: int = 0
+    copy_accepted: int = 0
     # Component-level timings. Help diagnose where MTP overhead comes from
     # when accept rate is healthy but wall-clock throughput isn't.
     backbone_ms: float = 0.0  # cumulative time inside the 2-token verify forward
@@ -880,6 +880,14 @@ class _MtpState:
 
     # Boundary tokens need a one-row forward on a private cache.
     boundary_emit_pending: bool = False
+
+    # Context-copy proposer (greedy chain cycles), whether the pending drafts
+    # came from it rather than the MTP head, and whether this cycle rebuilt
+    # its index (a one-off host cost the depth controller must not time as
+    # the window's).
+    context_copy: Optional[Any] = None
+    copy_drafts: bool = False
+    copy_untimed: bool = False
 
     # Accept-rate / throughput counters. Surfaced via logger.info on finish.
     stats: _MtpStats = field(default_factory=_MtpStats)
@@ -1370,11 +1378,28 @@ def _prepare_mtp_batch_state_for_next(gen_batch: Any) -> Optional[_MtpBatchState
     return batch_state
 
 
+# One ParkMemory per live model object (keyed by id: models are dict-like
+# modules; the weak reference keeps a reused id from inheriting verdicts).
+_BATCH_PARK_MEMORY: Dict[int, Tuple[Any, Any]] = {}
+
+
+def _batch_park_memory(model: Any):
+    from .batch_policy import ParkMemory
+
+    entry = _BATCH_PARK_MEMORY.get(id(model))
+    if entry is None or entry[0]() is not model:
+        entry = _BATCH_PARK_MEMORY[id(model)] = (weakref.ref(model), ParkMemory())
+    return entry[1]
+
+
 def _batch_policy_for_next(gen_batch: Any):
     from .batch_policy import BatchPolicy
 
     policy = getattr(gen_batch, "_omlx_mtp_batch_policy", None)
     if policy is None or policy.uids != tuple(gen_batch.uids):
+        memory = _batch_park_memory(gen_batch.model)
+        if policy is not None:
+            memory.retired(policy)
         chain, depth, _ = _resolve_mtp_chain_depth(gen_batch.model)
         policy = BatchPolicy(
             gen_batch.uids,
@@ -1382,6 +1407,7 @@ def _batch_policy_for_next(gen_batch: Any):
             fixed=_drafter_for(gen_batch.model) is not None
             or _mtp_depth_fixed(gen_batch.model),
         )
+        memory.seed(policy)
         gen_batch._omlx_mtp_batch_policy = policy
     return policy
 
@@ -2902,6 +2928,7 @@ def _dspark_next_drafts(
     hidden_rows: Any,
     committed: Any,
     prev_buf: Optional[Any],
+    depth: Optional[int] = None,
 ) -> None:
     """Append committed target taps and sample one DSpark block.
 
@@ -2915,7 +2942,8 @@ def _dspark_next_drafts(
     if host is None:
         raise _MtpStepFallback("embedded DSpark host is unavailable")
 
-    depth = state.controller.cur if state.controller is not None else state.depth
+    if depth is None:
+        depth = state.controller.cur if state.controller is not None else state.depth
     depth = min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
     n = int(committed.shape[0])
     if depth <= 0:
@@ -2978,6 +3006,7 @@ def _chain_next_drafts(
     hidden_rows: Any,
     committed: Any,
     prev_buf: Optional[Any],
+    depth: Optional[int] = None,
 ) -> None:
     """Rebuild committed MTP-head history and draft the next chain.
 
@@ -3008,11 +3037,13 @@ def _chain_next_drafts(
             hidden_rows,
             committed,
             prev_buf,
+            depth,
         )
     sampler = _resolve_draft_sampler(gen_batch, state)
     procs = _proc_list(gen_batch)
 
-    depth = state.controller.cur if state.controller is not None else state.depth
+    if depth is None:
+        depth = state.controller.cur if state.controller is not None else state.depth
     if depth == 0 and not state.mtp_cache:
         # Depth-0 with a stateless head (no cache to keep warm, e.g. the
         # gemma4 assistant): skip the fold entirely — on fast backbones its
@@ -3123,6 +3154,9 @@ def _chain_next_drafts(
         # verifies [next_main] alone, i.e. a plain decode step. The fold
         # above still ran so head-history models stay warm for re-entry.
         state.drafts = mx.zeros((0,), dtype=mx.uint32)
+        # Keep the head-cache fold from piling up lazily across draftless
+        # cycles; its logits are never read, so they are never computed.
+        mx.async_eval(head_hidden)
     state.draft_lps = draft_lps
     if sparse_ids:
         vocab = (
@@ -3349,6 +3383,9 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
         policy = None
     saved = [(state.controller, state.depth) for state in states]
     depths = [int(state.drafts.shape[0]) if state.chain else 1 for state in states]
+    # Copied windows are not draft-depth decisions; the singleton depth
+    # controller skips them too.
+    copied = any(state.copy_drafts for state in states)
     previous = [(state.stats.cycles, state.stats.accepts) for state in states]
     requested = policy.cur if policy is not None else None
     if policy is not None:
@@ -3374,6 +3411,7 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
     )
     if (
         policy is not None
+        and not copied
         and tuple(gen_batch.uids) == policy.uids
         and len(set(depths)) == 1
         and depths[0] > 0
@@ -3401,6 +3439,7 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
                     "Lightning MTP could not restore batch parking state"
                 )
             policy.park()
+            _batch_park_memory(gen_batch.model).parked(policy)
             logger.info(
                 "Lightning MTP batch parked: rows=%d standard_ms=%.3f cooldown=%d",
                 len(states),
@@ -3730,6 +3769,11 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
         depth_str = ""
     if stats.zero_cycles:
         depth_str += f" d0={stats.zero_cycles}"
+    if stats.copy_cycles:
+        depth_str += (
+            f" copy={stats.copy_accepted}/{stats.copy_drafted}"
+            f" in {stats.copy_cycles}"
+        )
     tpc = total_emits / stats.cycles if stats.cycles else 0.0
     logger.info(
         "MTP[%s] finish=%s tokens=%d cycles=%d tok/cycle=%.2f accept=%d/%d (%s)%s "
@@ -3960,6 +4004,44 @@ def _predraft(gen_batch, state, drafter, captured, host_arr, m_arr, anchor) -> b
     return bool(predraft(gen_batch, state, captured, m_arr + 1, anchor))
 
 
+def _context_copy_drafts(
+    gen_batch: Any, state: _MtpState, committed_ids: List[int]
+) -> List[int]:
+    """Draft the next window by copying from the context, if it repeats.
+
+    Singleton chain cycles. Greedy acceptance is exact token equality against
+    the target's own argmax; sampled acceptance treats the copy as a draft
+    distribution with all its mass on the copied token (``_copy_draft_q``),
+    so the Leviathan/Chen rule keeps the sampled distribution exact. Either
+    way any draft source leaves the output distribution unchanged. Returns
+    ``[]`` when the MTP head should draft instead.
+    """
+    if state.context_copy is None:
+        state.context_copy = _context_copy.ContextCopy(
+            wide_window=_row_exact_verify(gen_batch.model)
+        )
+    copier = state.context_copy
+    state.copy_untimed = copier.extend(gen_batch.tokens[0], committed_ids)
+    # The next cycle emits up to len(drafts) + 1 tokens after the queued ones.
+    room = (
+        gen_batch.max_tokens[0] - gen_batch._num_tokens[0] - len(committed_ids) - 1
+    )
+    if _dspark_host(gen_batch.model) is None:
+        return copier.propose(room)
+    # Copies verify in DSpark's window sizes, and only a copy that fills the
+    # block replaces it: DSpark already drafts repeated text accurately.
+    copied = copier.propose(min(room, state.depth))
+    return copied if len(copied) == state.depth else []
+
+
+def _copy_draft_q(copied: List[int], vocab: int) -> SparseDraftQ:
+    """One-hot draft distributions for a copied window."""
+    import mlx.core as mx
+
+    ids = mx.array(copied, dtype=mx.int32)[:, None]
+    return SparseDraftQ(ids, mx.zeros(ids.shape, dtype=mx.float32), vocab)
+
+
 def _run_verify_cycle_chain(
     gen_batch: Any,
     state: _MtpState,
@@ -3994,6 +4076,7 @@ def _run_verify_cycle_chain(
     # Adaptive depth: the chain may have drafted fewer than state.depth
     # tokens this cycle — the verify window follows the actual drafts.
     k = int(state.drafts.shape[0])
+    copy_cycle = state.copy_drafts
     cycle_t0 = time.perf_counter()
 
     inputs = mx.concatenate([state.next_main, state.drafts])  # (k+1,)
@@ -4185,17 +4268,23 @@ def _run_verify_cycle_chain(
 
     # --- stats ---
     state.stats.cycles += 1
-    if len(state.stats.depth_drafted) < state.depth:
-        pad = state.depth - len(state.stats.depth_drafted)
-        state.stats.depth_drafted.extend([0] * pad)
-        state.stats.depth_accepted.extend([0] * pad)
-    for j in range(k):
-        state.stats.depth_drafted[j] += 1
-        if j < m:
-            state.stats.depth_accepted[j] += 1
-        else:
-            break
-    state.stats.accepts += m
+    if copy_cycle:
+        state.stats.copy_cycles += 1
+        state.stats.copy_drafted += k
+        state.stats.copy_accepted += m
+        state.context_copy.observe(m, k)
+    else:
+        if len(state.stats.depth_drafted) < state.depth:
+            pad = state.depth - len(state.stats.depth_drafted)
+            state.stats.depth_drafted.extend([0] * pad)
+            state.stats.depth_accepted.extend([0] * pad)
+        for j in range(k):
+            state.stats.depth_drafted[j] += 1
+            if j < m:
+                state.stats.depth_accepted[j] += 1
+            else:
+                break
+        state.stats.accepts += m
     if m < k:
         state.stats.rejects += 1
     state.stats.sample_ms += (time.perf_counter() - t0) * 1000
@@ -4207,14 +4296,14 @@ def _run_verify_cycle_chain(
         t0 = time.perf_counter()
         if draft_jobs is None and not state.head_clone:
             _mtp_head_trim_to(state.mtp_cache, state.hist_offset)
-        committed = mx.array(
-            [int(d) for d in draft_ids[:m]] + [int(emit_last_id)], dtype=mx.uint32
-        )
+        committed_ids = [int(d) for d in draft_ids[:m]] + [int(emit_last_id)]
+        committed = mx.array(committed_ids, dtype=mx.uint32)
         next_main = committed[-1:]
         hidden_rows = hidden[:, : m + 1]
         prev_buf = None
         if procs is not None:
             prev_buf = gen_batch._token_context[0].tokens
+        state.copy_drafts = False
         if drafter is not None and predrafted and m == m_gpu:
             drafter.adopt_predraft(state, m + 1)
         elif drafter is not None:
@@ -4227,7 +4316,25 @@ def _run_verify_cycle_chain(
             else:
                 draft_jobs.append(job)
         elif draft_jobs is None:
-            _chain_next_drafts(gen_batch, state, hidden_rows, committed, prev_buf)
+            copied = _context_copy_drafts(gen_batch, state, committed_ids)
+            _chain_next_drafts(
+                gen_batch,
+                state,
+                hidden_rows,
+                committed,
+                prev_buf,
+                depth=0 if copied else None,
+            )
+            if copied:
+                state.drafts = mx.array(copied, dtype=mx.uint32)
+                state.draft_lps = []
+                # A copy is a deterministic proposer: q puts all its mass on
+                # the copied token, so acceptance is p(token) and the
+                # residual on rejection is p without it.
+                state.draft_accept_lps = (
+                    [] if is_greedy else _copy_draft_q(copied, combined_lp.shape[-1])
+                )
+                state.copy_drafts = True
         else:
             draft_jobs.append((gen_batch, state, hidden_rows, committed, prev_buf))
         state.next_main = next_main
@@ -4271,7 +4378,8 @@ def _run_verify_cycle_chain(
         if materialize_boundary_emit:
             _materialize_mtp_boundary_emit(gen_batch, state)
             state.boundary_emit_pending = False
-        if state.controller is not None:
+        untimed, state.copy_untimed = state.copy_untimed, False
+        if state.controller is not None and not copy_cycle:
             was_warmup = bool(state.controller._warmup)
             keepalive = bool(getattr(state.mtp_cache, "fold_keepalive", False))
             if keepalive:
@@ -4283,7 +4391,7 @@ def _run_verify_cycle_chain(
                 + (time.perf_counter() - finish_t0) * 1000
                 + verify_ms
                 + shared_commit_ms,
-                time_sample=not keepalive,
+                time_sample=not keepalive and not untimed,
             )
             _maybe_finish_mtp_reentry_probe(
                 gen_batch,
@@ -4334,6 +4442,8 @@ def _materialize_mtp_boundary_emit(gen_batch: Any, state: _MtpState) -> None:
     mx.eval(next_tok)
     state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
 
+    # The drafts below replace any copied window.
+    state.copy_drafts = False
     t0 = time.perf_counter()
     if drafter is not None:
         drafter.draft([(gen_batch, state, captured, next_tok, prev_buf)])

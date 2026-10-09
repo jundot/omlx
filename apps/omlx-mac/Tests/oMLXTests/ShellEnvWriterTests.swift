@@ -136,21 +136,63 @@ final class ShellEnvWriterTests: XCTestCase {
         )
     }
 
-    func testEnsureCLIShimCreatesPublicSymlinkWhenWritable() throws {
+    /// #4341: shared bin dirs such as /opt/homebrew/bin belong to package
+    /// managers, so a writable one on PATH must stay untouched.
+    func testEnsureCLIShimNeverWritesToPublicBin() throws {
         let publicBin = tempHome.appendingPathComponent("public-bin", isDirectory: true)
         try FileManager.default.createDirectory(at: publicBin, withIntermediateDirectories: true)
         ShellEnvWriter.publicBinDirsOverrideForTests = [publicBin]
         setenv("PATH", "\(publicBin.path):/usr/bin", 1)
+
+        let result = try ShellEnvWriter.ensureCLIShim(appBundleURL: try makeFakeAppURL())
+
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: publicBin.path), [])
+        XCTAssertEqual(result, .needsShellPathPrompt(reason: ""))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tempHome.appendingPathComponent(".zshrc").path))
+    }
+
+    /// A Homebrew cask `binary` stanza links the bundle CLI into Homebrew's
+    /// bin. A GUI launch does not see that dir on PATH, but must not prompt.
+    func testEnsureCLIShimAcceptsCaskLinkToBundleCLI() throws {
+        let publicBin = tempHome.appendingPathComponent("public-bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: publicBin, withIntermediateDirectories: true)
+        ShellEnvWriter.publicBinDirsOverrideForTests = [publicBin]
         let appURL = try makeFakeAppURL()
+        let caskLink = publicBin.appendingPathComponent("omlx")
+        try FileManager.default.createSymbolicLink(
+            at: caskLink,
+            withDestinationURL: appURL.appendingPathComponent("Contents/MacOS/omlx-cli")
+        )
 
         let result = try ShellEnvWriter.ensureCLIShim(appBundleURL: appURL)
+        try ShellEnvWriter.removeLegacyPublicLink(atPath: caskLink.path)
 
-        let publicCLI = publicBin.appendingPathComponent("omlx")
-        XCTAssertTrue(FileManager.default.fileExists(atPath: publicCLI.path))
-        let destination = try FileManager.default.destinationOfSymbolicLink(atPath: publicCLI.path)
-        XCTAssertTrue(destination.hasSuffix("/.omlx/bin/omlx"))
-        XCTAssertEqual(result, .publicCommandReady(path: publicCLI.path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: tempHome.appendingPathComponent(".zshrc").path))
+        XCTAssertEqual(result, .publicCommandReady(path: caskLink.path))
+        XCTAssertNotNil(try? FileManager.default.destinationOfSymbolicLink(atPath: caskLink.path))
+    }
+
+    /// Older app versions linked the shim into a shared bin dir. The link is
+    /// reported for a prompt and removed only on request.
+    func testLegacyPublicLinkIsReportedAndRemovedOnRequest() throws {
+        let publicBin = tempHome.appendingPathComponent("public-bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: publicBin, withIntermediateDirectories: true)
+        ShellEnvWriter.publicBinDirsOverrideForTests = [publicBin]
+        let shim = tempHome
+            .appendingPathComponent(".omlx", isDirectory: true)
+            .appendingPathComponent("bin", isDirectory: true)
+            .appendingPathComponent("omlx")
+        let legacyLink = publicBin.appendingPathComponent("omlx")
+        try FileManager.default.createSymbolicLink(at: legacyLink, withDestinationURL: shim)
+
+        let result = try ShellEnvWriter.ensureCLIShim(appBundleURL: try makeFakeAppURL())
+
+        XCTAssertEqual(result, .legacyPublicLink(path: legacyLink.path, shellPathInstalled: false))
+        XCTAssertNotNil(try? FileManager.default.destinationOfSymbolicLink(atPath: legacyLink.path))
+
+        try ShellEnvWriter.removeLegacyPublicLink(atPath: legacyLink.path)
+
+        XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: legacyLink.path))
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: shim.path))
     }
 
     func testEnsureCLIShimDoesNotOverwriteExistingPublicCommand() throws {
@@ -167,7 +209,7 @@ final class ShellEnvWriterTests: XCTestCase {
         let text = try String(contentsOf: existing, encoding: .utf8)
         XCTAssertEqual(text, "#!/bin/sh\n")
         if case .needsShellPathPrompt(let reason) = result {
-            XCTAssertTrue(reason.contains("already exists"))
+            XCTAssertTrue(reason.contains("different omlx install"))
         } else {
             XCTFail("Expected shell PATH prompt when public command conflicts")
         }

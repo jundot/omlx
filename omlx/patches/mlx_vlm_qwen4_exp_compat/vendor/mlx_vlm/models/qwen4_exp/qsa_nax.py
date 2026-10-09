@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import functools
 import logging
-import os
 
 import mlx.core as mx
 
@@ -41,23 +40,15 @@ logger = logging.getLogger(__name__)
 #   "half2" (default): fp16 hi + fp16 lo pieces, |error| <= 2^-24 per probability.
 #   "bf16x3": three bf16 pieces (8+8+8 mantissa bits), fp32-exact for normal P;
 #             slower (three 16x32x16 P V ops per fragment instead of one 16x32x32).
-PV_MODE = os.environ.get("OMLX_QWEN4_QSA_NAX_PV", "half2")
+PV_MODE = "half2"
 _PV_MODES = {
     "half2": (mx.float16, 2),
     "bf16x3": (mx.bfloat16, 3),
 }
-if PV_MODE not in _PV_MODES:
-    logger.warning("Unknown OMLX_QWEN4_QSA_NAX_PV=%r; using half2", PV_MODE)
-    PV_MODE = "half2"
 GQA = 12
 HEAD_DIM = 256
 COMPRESS = 4
 TOPK = 512
-
-
-def enabled() -> bool:
-    """OMLX_QWEN4_QSA_NAX=0 keeps the native direct kernel."""
-    return os.environ.get("OMLX_QWEN4_QSA_NAX", "1") != "0"
 
 
 @functools.lru_cache(maxsize=None)

@@ -70,7 +70,9 @@ template <
     int D,
     int WM,
     typename IndexT,
-    typename AccumType = float>
+    typename AccumType = float,
+    bool DirectQ = false,
+    bool UnpackedKV = false>
 [[kernel, max_total_threads_per_threadgroup(WM * 32)]] void deepseek_v41_packed_attention(
     const device T* Q [[buffer(0)]],
     const device uchar* LocalKV [[buffer(1)]],
@@ -113,7 +115,9 @@ template <
   const int q_pos = int(tid.x);
   const int b = int(tid.y);
 
-  threadgroup T Qs[H * LDQ];
+  // DirectQ loads each Q fragment straight into registers; the staged
+  // variant keeps its threadgroup copy.
+  threadgroup T Qs[DirectQ ? 1 : H * LDQ];
   threadgroup T KVs[(BK * LDV > DC * LDK) ? BK * LDV : DC * LDK];
   threadgroup int selected[BK];
 
@@ -198,11 +202,13 @@ template <
     for (short dchunk = 0; dchunk < D_CHUNKS; ++dchunk) {
       const int dbase = int(dchunk) * DC;
 
-      for (int elem = lane; elem < H * DC; elem += tgp_size) {
-        const int h = elem / DC;
-        const int d = elem - h * DC;
-        Qs[h * LDQ + d] =
-            q_base[size_t(h) * params->Q_strides[1] + dbase + d];
+      if constexpr (!DirectQ) {
+        for (int elem = lane; elem < H * DC; elem += tgp_size) {
+          const int h = elem / DC;
+          const int d = elem - h * DC;
+          Qs[h * LDQ + d] =
+              q_base[size_t(h) * params->Q_strides[1] + dbase + d];
+        }
       }
 
       for (int elem = lane; elem < BK * DC; elem += tgp_size) {
@@ -216,7 +222,11 @@ template <
           const device uchar* row = is_pooled_tile
               ? pooled_base + size_t(source_pos) * params->Pooled_strides[1]
               : local_base + size_t(source_pos) * params->Local_strides[2];
-          value = T(deepseek_v41_packed_value(row, dbase + d, is_pooled_tile));
+          if constexpr (UnpackedKV) {
+            value = reinterpret_cast<const device T*>(row)[dbase + d];
+          } else {
+            value = T(deepseek_v41_packed_value(row, dbase + d, is_pooled_tile));
+          }
         }
         KVs[k + d * LDK] = value;
       }
@@ -226,7 +236,15 @@ template <
       STEEL_PRAGMA_UNROLL
       for (short dd = 0; dd < TDC; ++dd) {
         simdgroup_barrier(mem_flags::mem_none);
-        Qtile.template load<T, 1, 1, LDQ, 1>(&Qs[Qs_offset + dd * kFragSize]);
+        if constexpr (DirectQ) {
+          Qtile.template load<T, 1, 1>(
+              q_base + size_t(tm + sm) * params->Q_strides[1] +
+                  dbase + dd * kFragSize + sn,
+              params->Q_strides[1]);
+        } else {
+          Qtile.template load<T, 1, 1, LDQ, 1>(
+              &Qs[Qs_offset + dd * kFragSize]);
+        }
         Ktile.template load<T, 1, 1, LDK, 1>(
             &KVs[Ks_offset + dd * kFragSize * LDK]);
         simdgroup_barrier(mem_flags::mem_none);
@@ -307,7 +325,11 @@ template <
           const device uchar* row = is_pooled_tile
               ? pooled_base + size_t(source_pos) * params->Pooled_strides[1]
               : local_base + size_t(source_pos) * params->Local_strides[2];
-          value = T(deepseek_v41_packed_value(row, dbase + d, is_pooled_tile));
+          if constexpr (UnpackedKV) {
+            value = reinterpret_cast<const device T*>(row)[dbase + d];
+          } else {
+            value = T(deepseek_v41_packed_value(row, dbase + d, is_pooled_tile));
+          }
         }
         KVs[k * LDV + d] = value;
       }

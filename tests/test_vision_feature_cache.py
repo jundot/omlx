@@ -304,7 +304,6 @@ class TestSSDCache:
     def test_writer_cleanup_unlink_failure(self, ssd_cache, caplog):
         key = _composite_key("model", "image")
         file_path = ssd_cache._file_path_for_key(key)
-        temp_path = file_path.with_name(file_path.stem + "_tmp.safetensors")
 
         def fail_write(path, *args):
             Path(path).write_bytes(b"partial")
@@ -320,7 +319,12 @@ class TestSSDCache:
 
         assert key not in ssd_cache._ssd_index
         assert ssd_cache._ssd_total_size == 0
-        for path in (temp_path, file_path):
+        # Temp names carry a per-writer suffix.
+        leftover_tmps = list(
+            file_path.parent.glob(f"{file_path.stem}_tmp*.safetensors")
+        )
+        assert leftover_tmps, "failed write should leave its temp file behind"
+        for path in (file_path, *leftover_tmps):
             assert path.exists()
             assert any(
                 r.levelno == logging.WARNING

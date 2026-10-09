@@ -28,25 +28,18 @@ simdgroup product per column tile, then a separately rounded
 
 Both fail closed (return None, and stay off after the first failure) and the
 caller keeps the canonical path.
-Disable with OMLX_GLM_HC_PREFILL=0.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from types import SimpleNamespace
 
 import mlx.core as mx
 
 logger = logging.getLogger(__name__)
 
-_DISABLED = os.environ.get("OMLX_GLM_HC_PREFILL", "1").strip().lower() in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
+_DISABLED = False
 # Rows per pre threadgroup (a multiple of 8, at most 32).  Every threadgroup
 # reads the whole [16384, 24] fp32 mix weight, so taller tiles cut that
 # traffic; 16 rows measured fastest on M5 Ultra at 2047-4096-row chunks.

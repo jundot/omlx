@@ -26,7 +26,7 @@ def test_qwen4_sparse_gqa_symbol_is_part_of_extension_abi():
 
 
 def test_qwen4_sparse_gqa_route_forwards_compact_blocks_and_transposes(monkeypatch):
-    monkeypatch.setenv("OMLX_QWEN4_QSA_NATIVE_MAIN_MIN_ROWS", "0")
+    monkeypatch.setattr(qsa_fast, "_NATIVE_MAIN_MIN_ROWS", 0)
     queries = mx.zeros((1, 24, 3, 256), dtype=mx.bfloat16)
     keys = mx.zeros((1, 2, 20, 256), dtype=mx.bfloat16)
     values = mx.zeros_like(keys)
@@ -450,34 +450,26 @@ def test_nax_route_fails_closed(monkeypatch):
     sel = mx.zeros((1, 32, 512), dtype=mx.int32)
     monkeypatch.setattr(qsa_fast, "_NAX_QSA_MAIN_DISABLED", False)
     monkeypatch.setattr(qsa_nax, "nax_available", lambda: True)
-    monkeypatch.setenv("OMLX_QWEN4_QSA_NATIVE_MAIN_MIN_ROWS", "0")
-    qsa_fast._native_main_min_rows.cache_clear()
-    try:
-        # Other geometry or dtype: not handled.
-        assert qsa_fast._nax_sparse_gqa_attention(
-            q.astype(mx.float16), k.astype(mx.float16), k.astype(mx.float16), sel, q_offset=4000
-        ) is None
-        assert qsa_fast._nax_sparse_gqa_attention(
-            q[:, :4], k, k, sel, q_offset=4000
-        ) is None
-        # Disabled by environment.
-        monkeypatch.setenv("OMLX_QWEN4_QSA_NAX", "0")
-        assert qsa_fast._nax_sparse_gqa_attention(q, k, k, sel, q_offset=4000) is None
-        monkeypatch.delenv("OMLX_QWEN4_QSA_NAX")
+    monkeypatch.setattr(qsa_fast, "_NATIVE_MAIN_MIN_ROWS", 0)
+    # Other geometry or dtype: not handled.
+    assert (
+        qsa_fast._nax_sparse_gqa_attention(
+            q.astype(mx.float16),
+            k.astype(mx.float16),
+            k.astype(mx.float16),
+            sel,
+            q_offset=4000,
+        )
+        is None
+    )
+    assert (
+        qsa_fast._nax_sparse_gqa_attention(q[:, :4], k, k, sel, q_offset=4000) is None
+    )
 
-        # A failing kernel disables the route instead of raising.
-        def boom(*args, **kwargs):
-            raise RuntimeError("no pipeline")
+    # A failing kernel disables the route instead of raising.
+    def boom(*args, **kwargs):
+        raise RuntimeError("no pipeline")
 
-        monkeypatch.setattr(qsa_nax, "sparse_gqa_attention", boom)
-        assert qsa_fast._nax_sparse_gqa_attention(q, k, k, sel, q_offset=4000) is None
-        assert qsa_fast._NAX_QSA_MAIN_DISABLED is True
-    finally:
-        qsa_fast._native_main_min_rows.cache_clear()
-
-
-@pytest.fixture(autouse=True)
-def _reset_native_main_gate():
-    qsa_fast._native_main_min_rows.cache_clear()
-    yield
-    qsa_fast._native_main_min_rows.cache_clear()
+    monkeypatch.setattr(qsa_nax, "sparse_gqa_attention", boom)
+    assert qsa_fast._nax_sparse_gqa_attention(q, k, k, sel, q_offset=4000) is None
+    assert qsa_fast._NAX_QSA_MAIN_DISABLED is True

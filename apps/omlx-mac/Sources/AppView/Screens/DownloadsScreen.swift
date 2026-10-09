@@ -12,7 +12,7 @@
 import SwiftUI
 
 /// Active downloader source. Mirrors the HTML admin's `downloaderSource`
-/// state at `omlx/admin/static/js/dashboard.js:266`.
+/// state at `apps/omlx-web/omlx_web/static/js/dashboard.js:266`.
 enum DownloadSource: String, CaseIterable, Hashable, Sendable {
     case hf, ms
 

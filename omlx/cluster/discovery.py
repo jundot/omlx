@@ -1045,9 +1045,7 @@ def _tailscale_executable() -> str | None:
     discovered = shutil.which("tailscale")
     if discovered:
         return discovered
-    candidate = Path(
-        os.environ.get("OMLX_TAILSCALE_CLI", _MACOS_TAILSCALE_CLI)
-    ).expanduser()
+    candidate = Path(_MACOS_TAILSCALE_CLI)
     if (
         sys.platform == "darwin"
         and candidate.is_file()

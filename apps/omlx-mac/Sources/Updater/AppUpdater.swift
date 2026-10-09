@@ -1,11 +1,12 @@
 // In-place auto-updater.
 //
-// Flow: download .dmg → hdiutil attach → copy the inner oMLX.app next to
-// the running bundle as `.oMLX-update.app` → hdiutil detach → on
-// confirmation, register a one-shot launchd worker that waits for our PID
-// to exit, atomically swaps the staged bundle into place, strips the
-// quarantine xattr, and `open`s the new bundle. No EdDSA signature check —
-// Apple's notarization stapled to the DMG is the trust boundary.
+// Flow: download .dmg -> hdiutil attach -> copy the inner oMLX.app next to
+// the running bundle as `.oMLX-update.app` -> check its signature against
+// the release team -> hdiutil detach -> on confirmation, register a one-shot
+// launchd worker that waits for our PID to exit, atomically swaps the staged
+// bundle into place, strips the quarantine xattr, and `open`s the new bundle.
+// The quarantine strip skips Gatekeeper, so the signature check is the trust
+// boundary.
 //
 // Cancellation: `cancel()` is best-effort; an in-flight download exits at
 // the next stream chunk. A staged copy that's already on disk gets
@@ -24,6 +25,7 @@ final class AppUpdater {
         case cleanupFailed(String)
         case appNotFoundInVolume
         case stageFailed(String)
+        case signatureInvalid(String)
         case cancelled
 
         var description: String {
@@ -36,6 +38,8 @@ final class AppUpdater {
             case .cleanupFailed(let m): return "Could not clean up update files: \(m)"
             case .appNotFoundInVolume: return "oMLX.app not found inside the downloaded DMG"
             case .stageFailed(let m): return "Could not stage the update: \(m)"
+            case .signatureInvalid(let m):
+                return "The downloaded update failed signature verification and was discarded: \(m)"
             case .cancelled: return "Update cancelled"
             }
         }
@@ -172,10 +176,11 @@ final class AppUpdater {
         let stagedApp = app.deletingLastPathComponent().appendingPathComponent(Self.stagedAppName)
         do {
             try stageApp(fromMount: mountPoint, to: stagedApp)
-        } catch let err as UpdateError {
-            onError(err); return
+            try verifyAppSignature(at: stagedApp.path)
         } catch {
-            onError(.stageFailed(error.localizedDescription)); return
+            try? FileManager.default.removeItem(at: stagedApp)
+            onError(error as? UpdateError ?? .stageFailed(error.localizedDescription))
+            return
         }
 
         if cancelled { return }
@@ -339,7 +344,7 @@ final class AppUpdater {
     private func mountDMG(at dmg: URL) throws -> URL {
         let result = try runProcess(
             "/usr/bin/hdiutil",
-            args: ["attach", "-nobrowse", "-noverify", "-noautoopen", "-mountrandom", "/tmp", dmg.path]
+            args: ["attach", "-nobrowse", "-noautoopen", "-mountrandom", "/tmp", dmg.path]
         )
         guard result.status == 0 else {
             throw UpdateError.mountFailed(result.stderr.isEmpty ? result.stdout : result.stderr)
@@ -398,6 +403,27 @@ final class AppUpdater {
             return mountPoint.appendingPathComponent(name)
         }
         throw UpdateError.appNotFoundInVolume
+    }
+
+    // MARK: - Signature verification
+
+    /// A plain `--verify` also accepts ad-hoc or foreign signatures, so the
+    /// check pins the Developer ID team that signs releases.
+    static let releaseRequirement =
+        #"=anchor apple generic and identifier "app.omlx" and certificate leaf[subject.OU] = "PSK5Q5T46L""#
+
+    func verifyAppSignature(at appPath: String) throws {
+        let result = try runProcess(
+            "/usr/bin/codesign",
+            args: ["--verify", "--deep", "--strict", "-R", Self.releaseRequirement, appPath]
+        )
+        guard result.status == 0 else {
+            let detail = result.stderr.isEmpty ? result.stdout : result.stderr
+            NSLog("oMLX updater: signature verification failed: %@", detail)
+            throw UpdateError.signatureInvalid(
+                detail.isEmpty ? "codesign exited \(result.status)" : detail
+            )
+        }
     }
 
     // MARK: - Swap + relaunch (called from outside, right before terminate)
