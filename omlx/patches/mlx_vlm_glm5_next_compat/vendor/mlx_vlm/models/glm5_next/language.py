@@ -18,7 +18,6 @@ from ..deepseek_v4.hyper_connection import hc_expand as _hc_expand
 from ..fast_ops import exact_hc_norm
 from ..linear import DECODE_BLOCK_SIZE
 from mlx_lm.models.mla import MultiLinear
-from omlx.custom_kernels.nax import is_nax_available
 from omlx.patches import glm53_kda_prework
 from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as _decode_kernels
 from omlx.patches.deepseek_v4.switch_layers import SwitchGLU, _sort_threshold
@@ -34,6 +33,7 @@ from omlx.patches.glm_moe_dsa.sparse_mla import (
 )
 from omlx.patches.qwen35_verify_qmm import _is_armed as _verify_qmm_armed
 from omlx.patches.qwen35_verify_qmm import is_row_exact_armed as _row_exact_armed
+from omlx.patches.qwen35_verify_qmm import takes_verify_route as _takes_verify_route
 from omlx.patches.glm_moe_dsa.indexer_nax import (
     indexer_scores_nax,
     max_rows_per_call,
@@ -64,11 +64,11 @@ def _cache_parts(cache):
 # Single-sequence decode (L == 1) and short verify blocks (L <= 8, the
 # DECODE_BLOCK_SIZE of the shared HC helpers) run fused kernels that
 # reproduce the reference op graph bit for bit; see decode_kernels.py.
-# They are validated on M5 (NAX) GPUs and used there.
-_DECODE_FUSION = is_nax_available()
+# They run on M3 and newer GPUs (decode_kernels.fused_decode_supported).
+_DECODE_FUSION = _decode_kernels.fused_decode_supported()
 _DECODE_BLOCK = 8
 
-# One-token decode forwards start evaluating every this many layers.
+# Decode and short verification start evaluating every this many layers.
 # A step is ~800 dependent dispatches whose Python graph build takes ~2.7 ms;
 # mlx keeps at most ~10 command buffers in flight and, with its default
 # per-buffer size budget (every expert or projection weight input counts in
@@ -216,54 +216,6 @@ def _decode_hc_pre_deferred(connection, norm, x):
     post, comb, mm = dk.hc_post_mm(connection, mixes, h)
     xn = mx.depends(xn, [post])
     return xn, h, post, comb, mm
-
-
-def _array_slots(tree, slots: list) -> list:
-    """Append ``(container, key)`` for every array held in ``tree``: the items
-    of a module (a dict) and of its nested dicts and lists."""
-    items = tree.items() if isinstance(tree, dict) else enumerate(tree)
-    for key, value in items:
-        if isinstance(value, mx.array):
-            slots.append((tree, key))
-        elif isinstance(value, (dict, list)):
-            _array_slots(value, slots)
-    return slots
-
-
-def compile_ffn_block(layer, method):
-    """``mx.compile(method)`` for a decoder layer's FFN half, with the arrays
-    of the modules it reads traced as inputs rather than as constants.
-
-    MLX 0.32.2 leaks every multi-output primitive that is an intermediate of a
-    compiled trace: rewiring the trace releases the old outputs by assignment,
-    which skips the sibling-cycle break their destructor runs (fixed upstream
-    in ml-explore/mlx#4453), so each such group stays allocated together with
-    everything it references. The one-token FFN is built from such kernels
-    (router logits, the route-selecting gate/up, the HC pre/post), so with the
-    weights as trace constants every compiled MoE layer kept its routed and
-    shared gate/up weights alive after the model was unloaded: ~2.5 GB per
-    layer, 40-80 GB of GLM-5.3's 169 GB. Traced as inputs, the weights are
-    shape-only placeholders in the trace and a leaked group holds no weight
-    memory. Every call passes the same arrays, so the compiled graph and its
-    values are unchanged.
-    """
-    slots = []
-    for module in (layer.ffn_hc, layer.post_attention_layernorm, layer.mlp):
-        _array_slots(module, slots)
-    arrays = [container[key] for container, key in slots]
-
-    def traced(arrays, *args):
-        saved = [container[key] for container, key in slots]
-        for (container, key), value in zip(slots, arrays):
-            container[key] = value
-        try:
-            return method(*args)
-        finally:
-            for (container, key), value in zip(slots, saved):
-                container[key] = value
-
-    compiled = mx.compile(traced)
-    return lambda *args: compiled(arrays, *args)
 
 
 def _mla_head_proj(layer, x: mx.array) -> mx.array:
@@ -1513,31 +1465,37 @@ class Glm5NextSparseAttention(nn.Module):
         return qr, qr_outs[0], outs[1], indexer_projected
 
     def _gathered_attention(self, q, kv_latent, topk_indices):
-        """Latent-space gather for short query blocks; returns pre-o_proj flat."""
+        """Short-block sparse attention, with a gather fallback; pre-o_proj flat."""
         B, H, L, _ = q.shape
-        Kv = kv_latent.shape[2]
         dim = kv_latent.shape[-1]
-        selected = topk_indices[:, 0]
-        topk = selected.shape[-1]
         q_embedded = self.embed_q(q)
-        clamped = mx.clip(selected, 0, Kv - 1)
-        gathered = mx.take_along_axis(
-            mx.broadcast_to(kv_latent[:, 0, None], (B, L, Kv, dim)),
-            mx.broadcast_to(clamped[..., None], (B, L, topk, dim)),
-            axis=2,
+        # NAX reads the selected latent rows in place (the indexer already
+        # excludes future keys); FP32 and batched inputs take the gather path.
+        output = sparse_mla_attention_nax(
+            q_embedded, kv_latent, topk_indices, self.scale
         )
-        q_latent = q_embedded.transpose(0, 2, 1, 3).reshape(B * L, H, 1, dim)
-        gathered = gathered.reshape(B * L, 1, topk, dim)
-        valid = (selected >= 0).reshape(B * L, 1, 1, topk)
-        output = scaled_dot_product_attention(
-            q_latent,
-            gathered,
-            gathered,
-            cache=None,
-            scale=self.scale,
-            mask=valid,
-        )
-        output = output.reshape(B, L, H, dim).transpose(0, 2, 1, 3)
+        if output is None:
+            Kv = kv_latent.shape[2]
+            selected = topk_indices[:, 0]
+            topk = selected.shape[-1]
+            clamped = mx.clip(selected, 0, Kv - 1)
+            gathered = mx.take_along_axis(
+                mx.broadcast_to(kv_latent[:, 0, None], (B, L, Kv, dim)),
+                mx.broadcast_to(clamped[..., None], (B, L, topk, dim)),
+                axis=2,
+            )
+            q_latent = q_embedded.transpose(0, 2, 1, 3).reshape(B * L, H, 1, dim)
+            gathered = gathered.reshape(B * L, 1, topk, dim)
+            valid = (selected >= 0).reshape(B * L, 1, 1, topk)
+            output = scaled_dot_product_attention(
+                q_latent,
+                gathered,
+                gathered,
+                cache=None,
+                scale=self.scale,
+                mask=valid,
+            )
+            output = output.reshape(B, L, H, dim).transpose(0, 2, 1, 3)
         output = self.unembed_out(output).transpose(0, 2, 1, 3).reshape(B, L, -1)
         return output
 
@@ -1609,34 +1567,16 @@ class Glm5NextMoEGate(nn.Module):
         if (
             _DECODE_FUSION
             and x.ndim == 3
-            and x.shape[:2] == (1, 1)
-            and self.n_group == 1
-        ):
-            # One token: the reference logits come from the one-row fp32
-            # gemv, which the fused router reproduces (multi-row calls use
-            # a different matmul and keep the reference path).
-            routed = _decode_kernels.moe_router(
-                x.reshape(1, -1),
-                self.weight,
-                self.e_score_correction_bias,
-                self.top_k,
-                self.routed_scaling_factor,
-                self.norm_topk_prob,
-            )
-            if routed is not None:
-                indices, scores = routed
-                return indices.reshape(1, 1, -1), scores.reshape(1, 1, -1)
-        if (
-            _DECODE_FUSION
-            and x.ndim == 3
             and x.shape[0] == 1
-            and 2 <= x.shape[1] <= _DECODE_BLOCK
+            and 1 <= x.shape[1] <= _DECODE_BLOCK
             and self.n_group == 1
         ):
-            # Verify block: the reference logits come from MLX's NAX split-K
-            # GEMM, which moe_router_rows reproduces op for op.
-            routed = _decode_kernels.moe_router_rows(
-                x.reshape(x.shape[1], -1),
+            # Every row uses the one-token fp32 gemv arithmetic, so verify
+            # rows route like their decode steps. The stock block GEMM uses
+            # TF32 on NAX and can pick other experts.
+            rows = x.shape[1]
+            routed = _decode_kernels.moe_router(
+                x.reshape(rows, -1),
                 self.weight,
                 self.e_score_correction_bias,
                 self.top_k,
@@ -1645,7 +1585,7 @@ class Glm5NextMoEGate(nn.Module):
             )
             if routed is not None:
                 indices, scores = routed
-                return indices.reshape(1, x.shape[1], -1), scores.reshape(1, x.shape[1], -1)
+                return indices.reshape(1, rows, -1), scores.reshape(1, rows, -1)
         logits = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
         return group_expert_select(
             logits,
@@ -1778,7 +1718,12 @@ class Glm5NextMoE(nn.Module):
             y = dk.moe_down_combine(act, routes, weights, sw.down_proj, shared.down_proj)
         else:
             fused = None
-            if shared is not None:
+            # A shared projection on an armed verify route leaves the
+            # multi-row qmv_wide arithmetic, so the expert runs as the module.
+            if shared is not None and not any(
+                _takes_verify_route(p, T, x.dtype)
+                for p in (shared.gate_proj, shared.up_proj, shared.down_proj)
+            ):
                 # One dispatch also computes the shared expert's gate/up with
                 # the multi-row qmv_wide arithmetic its own T > 1 call uses.
                 fused = dk.moe_gate_up_swiglu(
@@ -1833,6 +1778,7 @@ class Glm5NextDecoderLayer(nn.Module):
         self.compile_ffn = True
         self._ffn_c = None
         self._ffn_dc = None
+        self._ffn_eager_shapes = set()
 
     def __call__(
         self,
@@ -1841,11 +1787,6 @@ class Glm5NextDecoderLayer(nn.Module):
         cache: Optional[Any] = None,
         defer: bool = False,
     ) -> mx.array:
-        if _DECODE_FUSION:
-            # Settle (eagerly, once) how MLX's eager fp32 sigmoid evaluates;
-            # the fused router inside the compiled FFN block follows it and
-            # cannot probe while being traced.
-            _decode_kernels.eager_sigmoid_precise(mx.float32)
         # One-token decode can leave this layer's last HC expand to the next
         # layer's fused HC pre (``defer``: returns an _HCDeferred); an
         # _HCDeferred input is always accepted.
@@ -1864,13 +1805,16 @@ class Glm5NextDecoderLayer(nn.Module):
             xn, post, comb = fused
         r = self.self_attn(xn, mask, cache)
         x = _decode_hc_expand(r, residual, post, comb)
-        # Compile the FFN block only for single-stream decode (B=1, S=1) -- the shape it
-        # was validated on and where its win lives. Compiling the 288-expert MoE at a
-        # batched or prefill shape spikes memory (it can OOM alongside the resident
-        # weights), so those shapes take the eager path.
-        if self.compile_ffn and x.shape[0] == 1 and x.shape[1] == 1:
+        # Short verification shares the decode compiler; prefill remains eager.
+        if self.compile_ffn and x.shape[0] == 1 and 1 <= x.shape[1] <= _DECODE_BLOCK:
+            shape = (x.shape, x.dtype)
+            if x.shape[1] > 1 and shape not in self._ffn_eager_shapes:
+                # Prime bitwise kernel checks once per verification shape;
+                # they cannot evaluate their canaries inside a compiled trace.
+                self._ffn_eager_shapes.add(shape)
+                return self._ffn_block(x)
             if self._ffn_c is None:
-                self._ffn_c = compile_ffn_block(self, self._ffn_block)
+                self._ffn_c = mx.compile(self._ffn_block)
             return self._ffn_c(x)
         return self._ffn_block(x)
 
@@ -1906,7 +1850,7 @@ class Glm5NextDecoderLayer(nn.Module):
         r = self.self_attn(xn, mask, cache)
         if self.compile_ffn:
             if self._ffn_dc is None:
-                self._ffn_dc = compile_ffn_block(self, self._ffn_block_deferred)
+                self._ffn_dc = mx.compile(self._ffn_block_deferred)
             return _HCDeferred(*self._ffn_dc(r, h, post, comb, mm))
         return _HCDeferred(*self._ffn_block_deferred(r, h, post, comb, mm))
 
@@ -1968,10 +1912,14 @@ class Glm5NextModel(nn.Module):
             if prefill
             else None
         )
-        # One-token decode: start encoding the step every few layers while the
+        # Decode/verify: start encoding the step every few layers while the
         # rest of the graph is still being built (scheduling only, see
         # _DECODE_EVAL_EVERY).
-        eval_every = _DECODE_EVAL_EVERY if h.shape[1] == 1 else 0
+        eval_every = (
+            _DECODE_EVAL_EVERY
+            if h.shape[0] == 1 and h.shape[1] <= _DECODE_BLOCK
+            else 0
+        )
         n_layers = len(self.layers)
         # One token: each layer's last HC expand runs inside the next layer's
         # first HC pre (see _decode_hc_pre_deferred); the last one here.
@@ -1992,6 +1940,49 @@ class Glm5NextModel(nn.Module):
 
         h = h.mean(axis=2)
         return self.norm(h)
+
+
+def _dequantize_router_gates(weights, hidden_size):
+    """Restore affine router weights before strict loading into a plain gate."""
+    for scales_key in [k for k in weights if k.endswith(".mlp.gate.scales")]:
+        prefix = scales_key[: -len("scales")]
+        weight_key = prefix + "weight"
+        if weight_key not in weights:
+            continue
+        packed = weights[weight_key]
+        scales = weights[scales_key]
+        biases = weights.get(prefix + "biases")
+        if (
+            hidden_size <= 0
+            or packed.ndim != 2
+            or scales.ndim != 2
+            or packed.dtype != mx.uint32
+            or not mx.issubdtype(scales.dtype, mx.floating)
+            or scales.shape[0] != packed.shape[0]
+            or scales.shape[-1] == 0
+            or hidden_size % scales.shape[-1]
+            or (packed.shape[-1] * 32) % hidden_size
+            or (packed.shape[-1] * 32 // hidden_size) not in (2, 3, 4, 5, 6, 8)
+            or (hidden_size // scales.shape[-1]) not in (32, 64, 128)
+            or biases is None
+            or biases.shape != scales.shape
+        ):
+            raise ValueError(
+                f"{weight_key}: cannot infer quantization from shapes "
+                f"{tuple(packed.shape)} / {tuple(scales.shape)}"
+            )
+        # The router has no quantized module, so restore fp32 like stock gates.
+        weights[weight_key] = mx.dequantize(
+            packed,
+            scales,
+            biases,
+            group_size=hidden_size // scales.shape[-1],
+            bits=packed.shape[-1] * 32 // hidden_size,
+            mode="affine",
+        ).astype(mx.float32)
+        weights.pop(scales_key)
+        weights.pop(prefix + "biases", None)
+    return weights
 
 
 class LanguageModel(nn.Module):
@@ -2028,6 +2019,7 @@ class LanguageModel(nn.Module):
 
     def sanitize(self, weights):
         weights = {k: v for k, v in weights.items() if "mtp." not in k}
+        weights = _dequantize_router_gates(weights, self.args.hidden_size)
         weights = DSV32Model.sanitize(self, weights)
 
         remapped = {}

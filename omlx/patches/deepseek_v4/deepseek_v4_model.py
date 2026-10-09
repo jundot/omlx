@@ -2,7 +2,6 @@
 
 import logging
 import math
-import os
 from dataclasses import dataclass, field
 from functools import lru_cache, partial
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -490,9 +489,6 @@ _INDEXER_POOL_TILE = 16384
 # with 64 index heads this is reached at P = ctx/4 ~= 32768, i.e. ctx ~= 128k.
 _INDEXER_MAX_ELEMS = 2**30
 _DEEPSEEK_V4_INDEXER_FALLBACK_WARNED = False
-_DEEPSEEK_V4_M2_MMA_SCORE = os.getenv(
-    "OMLX_DSV4F_M2_MMA_SCORE", "1"
-).strip().lower() in ("1", "true", "on", "yes")
 _DEEPSEEK_V4_M2_MMA_SCORE_LOGGED = False
 
 
@@ -529,13 +525,11 @@ def _dsv4f_m2_exact_pairing(config, compress_ratio: int) -> bool:
 def _dsv4f_m2_mma_score_enabled(config, compress_ratio: int) -> bool:
     """Gate for the v25 from-scratch MMA score kernel (1.37x over Steel).
 
-    Exact-fingerprint pairing, env rollback (OMLX_DSV4F_M2_MMA_SCORE=0),
-    and an extension build exposing the symbol. The kernel serves bf16 /
-    H=64 / D=128 / weights [B, L, H] / non-causal only — all guaranteed by
-    the fingerprint and this call site; N >= 64 is re-checked per call.
+    Exact-fingerprint pairing; the call site also requires an extension
+    build exposing the symbol. The kernel serves bf16 / H=64 / D=128 /
+    weights [B, L, H] / non-causal only - all guaranteed by the fingerprint
+    and this call site; N >= 64 is re-checked per call.
     """
-    if not _DEEPSEEK_V4_M2_MMA_SCORE:
-        return False
     return _dsv4f_m2_exact_pairing(config, compress_ratio)
 
 
@@ -1349,9 +1343,8 @@ class Indexer(nn.Module):
                     # on the exact M2/DSV4F pairing, bit-exact incl. the
                     # fused pooled-ratio mask (validated across aligned and
                     # unaligned M/N and chunked-prefill offsets). Gated by
-                    # fingerprint + OMLX_DSV4F_M2_MMA_SCORE + extension
-                    # symbol; every other configuration keeps the Steel
-                    # path below unchanged.
+                    # fingerprint + extension symbol; every other configuration
+                    # keeps the Steel path below unchanged.
                     _use_mma = (
                         self._m2_mma_score
                         and getattr(glm_fast, "_EXT_MMA_SCORE", False)

@@ -377,7 +377,7 @@ def test_original_affine_expert_reads_repack_only_selected_experts(tmp_path):
         plan.close()
 
 
-def test_engram_and_expert_estimates_compose(tmp_path, monkeypatch):
+def test_engram_and_expert_estimates_compose(tmp_path):
     from test_engine_pool import _make_pool
 
     from omlx.engine_pool import EngineEntry
@@ -423,8 +423,6 @@ def test_engram_and_expert_estimates_compose(tmp_path, monkeypatch):
         )
         == expected
     )
-    monkeypatch.setenv("OMLX_MOE_EXPERT_OFFLOAD", "0")
-    assert pool._entry_runtime_resident_size(entry, settings) == base.mmap_bytes
 
 
 def _synthetic_affine_experts(tmp_path, fraction, seed=412):

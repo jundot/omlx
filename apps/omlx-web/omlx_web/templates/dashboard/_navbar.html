@@ -1,0 +1,502 @@
+    <nav class="w-full py-5 px-6 md:px-12 border-b border-neutral-100 bg-white sticky top-0 z-50">
+        <div class="max-w-7xl mx-auto flex items-center relative">
+            <!-- Logo -->
+            <div class="flex items-center gap-2">
+                <a href="/admin/dashboard" class="flex items-center gap-2">
+                    <img x-show="activeTheme === 'light'" src="/admin/static/navbar-logo-light.svg" alt="oMLX" class="w-9 h-9">
+                    <img x-show="activeTheme === 'dark'" src="/admin/static/navbar-logo-dark.svg" alt="oMLX" class="w-9 h-9" x-cloak>
+                </a>
+                <div class="flex flex-col gap-0">
+                    <a href="/admin/dashboard" class="font-bold tracking-tight text-xl leading-none">oMLX</a>
+                    <a :href="updateAvailable && releaseUrl ? releaseUrl : 'https://github.com/jundot/omlx'" target="_blank"
+                       class="relative text-caption text-neutral-500 dark:text-neutral-400 leading-none hover:text-neutral-700 dark:hover:text-neutral-300"
+                       @mouseenter="versionHover = true" @mouseleave="versionHover = false">
+                        v{{ version }}
+                        <span x-show="updateAvailable" x-cloak
+                              class="inline-block w-1.5 h-1.5 bg-green-500 rounded-full ml-0.5 align-middle"></span>
+                        <span x-show="versionHover" x-cloak
+                              class="absolute left-1/2 -translate-x-1/2 top-full mt-1 px-2 py-1 text-caption text-white bg-neutral-800 rounded whitespace-nowrap z-50"
+                              x-text="updateAvailable && latestVersion
+                                  ? window.t('navbar.update_available').replace('{version}', latestVersion)
+                                  : window.t('navbar.go_to_github')"></span>
+                    </a>
+                </div>
+            </div>
+
+            <!-- Mobile hamburger button -->
+            <button @click="mobileMenuOpen = !mobileMenuOpen"
+                    class="lg:hidden ml-auto p-2 rounded-lg text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 transition-all">
+                <i x-show="!mobileMenuOpen" data-lucide="menu" class="w-5 h-5"></i>
+                <i x-show="mobileMenuOpen" data-lucide="x" class="w-5 h-5" x-cloak></i>
+            </button>
+
+            <!-- Center Navigation -->
+            <div class="hidden lg:flex items-center gap-1 bg-neutral-100 rounded-full p-1 absolute left-1/2 -translate-x-1/2"
+                 role="tablist" aria-label="{{ t('navbar.tablist_label') }}"
+                 @keydown="handleMainTabKeydown($event)">
+                <button
+                    @click="setMainTab('status')"
+                    id="tab-status"
+                    :aria-selected="mainTab === 'status'"
+                    :tabindex="mainTab === 'status' ? 0 : -1"
+                    role="tab"
+                    aria-controls="panel-status"
+                    :class="mainTab === 'status'
+                        ? 'bg-white text-neutral-900 shadow-sm'
+                        : 'text-neutral-600 hover:text-neutral-900'"
+                    class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
+                >
+                    <i data-lucide="bar-chart-3" class="w-4 h-4"></i>
+                    {{ t('navbar.tab.status') }}
+                </button>
+                <button
+                    x-show="globalSettings.server.distributed_inference_active"
+                    x-cloak
+                    @click="setMainTab('cluster')"
+                    role="tab"
+                    id="tab-cluster"
+                    aria-controls="panel-cluster"
+                    :aria-selected="mainTab === 'cluster'"
+                    :tabindex="mainTab === 'cluster' ? 0 : -1"
+                    :class="mainTab === 'cluster'
+                        ? 'bg-white text-neutral-900 shadow-sm'
+                        : 'text-neutral-600 hover:text-neutral-900'"
+                    class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
+                >
+                    <i data-lucide="network" class="w-4 h-4"></i>
+                    {{ t('navbar.tab.cluster') }}
+                </button>
+                <div class="relative" @mouseenter="modelsDropdown = true" @mouseleave="modelsDropdown = false">
+                    <button
+                        @click="setMainTab('models')"
+                        role="tab"
+                        id="tab-models"
+                        aria-controls="panel-models"
+                        :aria-selected="mainTab === 'models'"
+                        :tabindex="mainTab === 'models' ? 0 : -1"
+                        :class="mainTab === 'models'
+                            ? 'bg-white text-neutral-900 shadow-sm'
+                            : 'text-neutral-600 hover:text-neutral-900'"
+                        class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
+                    >
+                        <i data-lucide="hard-drive-download" class="w-4 h-4"></i>
+                        {{ t('navbar.tab.models') }}
+                    </button>
+                    <!-- Download count badge -->
+                    <span x-show="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length > 0"
+                          x-text="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length"
+                          class="absolute -top-1 -right-1 w-4 h-4 bg-blue-500 text-white text-caption font-bold rounded-full flex items-center justify-center pointer-events-none"
+                          x-cloak></span>
+                    <!-- Dropdown menu -->
+                    <div
+                        x-show="modelsDropdown"
+                        x-transition:enter="transition ease-out duration-150"
+                        x-transition:enter-start="opacity-0 translate-y-1"
+                        x-transition:enter-end="opacity-100 translate-y-0"
+                        x-transition:leave="transition ease-in duration-100"
+                        x-transition:leave-start="opacity-100 translate-y-0"
+                        x-transition:leave-end="opacity-0 translate-y-1"
+                        class="absolute left-1/2 -translate-x-1/2 mt-1.5 w-44 bg-white rounded-xl shadow-lg border border-neutral-200 py-1.5 z-[60]"
+                        x-cloak
+                    >
+                        <button
+                            @click="setModelsTab('manager'); modelsDropdown = false;"
+                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            :class="mainTab === 'models' && modelsTab === 'manager'
+                                ? 'text-neutral-900 bg-neutral-100'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
+                        >
+                            <i data-lucide="hard-drive" class="w-3.5 h-3.5"></i>
+                            {{ t('navbar.dropdown.manager') }}
+                        </button>
+                        <button
+                            @click="setModelsTab('downloader'); modelsDropdown = false;"
+                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            :class="mainTab === 'models' && modelsTab === 'downloader'
+                                ? 'text-neutral-900 bg-neutral-100'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
+                        >
+                            <i data-lucide="cloud-download" class="w-3.5 h-3.5"></i>
+                            {{ t('navbar.dropdown.downloader') }}
+                        </button>
+                        <button
+                            @click="setModelsTab('quantizer'); modelsDropdown = false;"
+                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            :class="mainTab === 'models' && modelsTab === 'quantizer'
+                                ? 'text-neutral-900 bg-neutral-100'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
+                        >
+                            <i data-lucide="sparkles" class="w-3.5 h-3.5"></i>
+                            {{ t('navbar.dropdown.quantizer') }}
+                        </button>
+                        <button
+                            @click="setModelsTab('uploader'); modelsDropdown = false;"
+                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            :class="mainTab === 'models' && modelsTab === 'uploader'
+                                ? 'text-neutral-900 bg-neutral-100'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
+                        >
+                            <i data-lucide="cloud-upload" class="w-3.5 h-3.5"></i>
+                            {{ t('navbar.dropdown.uploader') }}
+                        </button>
+                    </div>
+                </div>
+                <div class="relative" @mouseenter="settingsDropdown = true" @mouseleave="settingsDropdown = false">
+                    <button
+                        @click="setMainTab('settings')"
+                        role="tab"
+                        id="tab-settings"
+                        aria-controls="panel-settings"
+                        :aria-selected="mainTab === 'settings'"
+                        :tabindex="mainTab === 'settings' ? 0 : -1"
+                        :class="mainTab === 'settings'
+                            ? 'bg-white text-neutral-900 shadow-sm'
+                            : 'text-neutral-600 hover:text-neutral-900'"
+                        class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
+                    >
+                        <i data-lucide="settings" class="w-4 h-4"></i>
+                        {{ t('navbar.tab.settings') }}
+                        <i data-lucide="chevron-down" class="w-3 h-3 ml-0.5 opacity-50 hidden"></i>
+                    </button>
+                    <div
+                        x-show="settingsDropdown"
+                        x-transition:enter="transition ease-out duration-150"
+                        x-transition:enter-start="opacity-0 translate-y-1"
+                        x-transition:enter-end="opacity-100 translate-y-0"
+                        x-transition:leave="transition ease-in duration-100"
+                        x-transition:leave-start="opacity-100 translate-y-0"
+                        x-transition:leave-end="opacity-0 translate-y-1"
+                        class="absolute left-1/2 -translate-x-1/2 mt-1.5 w-52 bg-white rounded-xl shadow-lg border border-neutral-200 py-1.5 z-[60]"
+                        x-cloak
+                    >
+                        <button
+                            @click="setSettingsTab('global'); settingsDropdown = false"
+                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            :class="mainTab === 'settings' && activeTab === 'global'
+                                ? 'text-neutral-900 bg-neutral-100'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
+                        >
+                            <i data-lucide="globe" class="w-3.5 h-3.5"></i>
+                            {{ t('navbar.dropdown.global_settings') }}
+                        </button>
+                        <button
+                            @click="setSettingsTab('models'); settingsDropdown = false"
+                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            :class="mainTab === 'settings' && activeTab === 'models'
+                                ? 'text-neutral-900 bg-neutral-100'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
+                        >
+                            <i data-lucide="cpu" class="w-3.5 h-3.5"></i>
+                            {{ t('navbar.dropdown.model_settings') }}
+                        </button>
+                        <button
+                            @click="setSettingsTab('integrations'); settingsDropdown = false"
+                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            :class="mainTab === 'settings' && activeTab === 'integrations'
+                                ? 'text-neutral-900 bg-neutral-100'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
+                        >
+                            <i data-lucide="plug" class="w-3.5 h-3.5"></i>
+                            {{ t('navbar.dropdown.integration_settings') }}
+                        </button>
+                    </div>
+                </div>
+                <button
+                    @click="setMainTab('logs')"
+                    role="tab"
+                    id="tab-logs"
+                    aria-controls="panel-logs"
+                    :aria-selected="mainTab === 'logs'"
+                    :tabindex="mainTab === 'logs' ? 0 : -1"
+                    :class="mainTab === 'logs'
+                        ? 'bg-white text-neutral-900 shadow-sm'
+                        : 'text-neutral-600 hover:text-neutral-900'"
+                    class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
+                >
+                    <i data-lucide="scroll-text" class="w-4 h-4"></i>
+                    {{ t('navbar.tab.logs') }}
+                </button>
+                <div class="relative" @mouseenter="benchDropdown = true" @mouseleave="benchDropdown = false">
+                    <button
+                        @click="setMainTab('bench')"
+                        role="tab"
+                        id="tab-bench"
+                        aria-controls="panel-bench"
+                        :aria-selected="mainTab === 'bench'"
+                        :tabindex="mainTab === 'bench' ? 0 : -1"
+                        :class="mainTab === 'bench'
+                            ? 'bg-white text-neutral-900 shadow-sm'
+                            : 'text-neutral-600 hover:text-neutral-900'"
+                        class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5"
+                    >
+                        <i data-lucide="gauge" class="w-4 h-4"></i>
+                        {{ t('navbar.tab.bench') }}
+                    </button>
+                    <div
+                        x-show="benchDropdown"
+                        x-transition:enter="transition ease-out duration-150"
+                        x-transition:enter-start="opacity-0 translate-y-1"
+                        x-transition:enter-end="opacity-100 translate-y-0"
+                        x-transition:leave="transition ease-in duration-100"
+                        x-transition:leave-start="opacity-100 translate-y-0"
+                        x-transition:leave-end="opacity-0 translate-y-1"
+                        class="absolute left-1/2 -translate-x-1/2 mt-1.5 w-44 bg-white rounded-xl shadow-lg border border-neutral-200 py-1.5 z-[60]"
+                        x-cloak
+                    >
+                        <button
+                            @click="setBenchTab('throughput'); benchDropdown = false;"
+                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            :class="mainTab === 'bench' && benchTab === 'throughput'
+                                ? 'text-neutral-900 bg-neutral-100'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
+                        >
+                            <i data-lucide="zap" class="w-3.5 h-3.5"></i>
+                            {{ t('navbar.dropdown.performance') }}
+                        </button>
+                        <button
+                            @click="setBenchTab('accuracy'); benchDropdown = false;"
+                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            :class="mainTab === 'bench' && benchTab === 'accuracy'
+                                ? 'text-neutral-900 bg-neutral-100'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
+                        >
+                            <i data-lucide="target" class="w-3.5 h-3.5"></i>
+                            {{ t('navbar.dropdown.accuracy') }}
+                        </button>
+                        <button
+                            @click="setBenchTab('context'); benchDropdown = false;"
+                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            :class="mainTab === 'bench' && benchTab === 'context'
+                                ? 'text-neutral-900 bg-neutral-100'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
+                        >
+                            <i data-lucide="ruler" class="w-3.5 h-3.5"></i>
+                            {{ t('navbar.dropdown.context') }}
+                        </button>
+                    </div>
+                </div>
+                <a
+                    href="/admin/chat"
+                    class="px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-200 flex items-center gap-1.5 text-neutral-600 hover:text-neutral-900"
+                >
+                    <i data-lucide="message-circle" class="w-4 h-4"></i>
+                    {{ t('navbar.tab.chat') }}
+                </a>
+            </div>
+
+            <!-- Right: Customize Dashboard + Theme Select + Logout -->
+            <div class="hidden lg:flex items-center gap-2 ml-auto">
+                <!-- Customize Dashboard (status tab, view mode only) -->
+                <button type="button"
+                        x-show="mainTab === 'status' && !dashEditing && dashEditAvailable"
+                        x-cloak
+                        @click="startDashboardEdit()"
+                        class="nav-tooltip p-2 rounded-full transition-all duration-200 cursor-pointer"
+                        :class="activeTheme === 'dark'
+                            ? 'text-amber-400 hover:bg-neutral-700'
+                            : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
+                        :data-tooltip="window.t('status.layout.customize')"
+                        :aria-label="window.t('status.layout.customize')">
+                    <i data-lucide="settings-2" class="w-4 h-4"></i>
+                </button>
+                <!-- Theme Select -->
+                <div class="relative"
+                     @mouseenter="themeDropdown = true"
+                     @mouseleave="themeDropdown = false"
+                     @focusin="themeDropdown = true"
+                     @focusout="if (!$el.contains($event.relatedTarget)) themeDropdown = false"
+                     @keydown.escape="themeDropdown = false">
+                    <button type="button"
+                            @click="themeDropdown = true"
+                            aria-haspopup="true"
+                            aria-controls="dashboard-theme-menu"
+                            :aria-expanded="themeDropdown ? 'true' : 'false'"
+                            class="p-2 rounded-full transition-all duration-200 cursor-pointer"
+                            :class="activeTheme === 'dark'
+                                ? 'text-amber-400 hover:bg-neutral-700'
+                                : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
+                            :title="theme === 'auto' ? window.t('navbar.theme.auto') : theme === 'light' ? window.t('navbar.theme.light_mode') : window.t('navbar.theme.dark_mode')">
+                        <i data-lucide="sun-moon" class="w-4 h-4" x-show="theme === 'auto'"></i>
+                        <i data-lucide="sun" class="w-4 h-4" x-show="theme === 'light'"></i>
+                        <i data-lucide="moon" class="w-4 h-4" x-show="theme === 'dark'"></i>
+                    </button>
+                    <div
+                        id="dashboard-theme-menu"
+                        x-show="themeDropdown"
+                        x-transition:enter="transition ease-out duration-150"
+                        x-transition:enter-start="opacity-0 translate-y-1"
+                        x-transition:enter-end="opacity-100 translate-y-0"
+                        x-transition:leave="transition ease-in duration-100"
+                        x-transition:leave-start="opacity-100 translate-y-0"
+                        x-transition:leave-end="opacity-0 translate-y-1"
+                        class="absolute right-0 mt-1.5 w-64 bg-white rounded-xl shadow-lg border border-neutral-200 py-1.5 z-[60]"
+                        x-cloak
+                    >
+                        <button
+                            @click="setTheme('auto'); themeDropdown = false"
+                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            :class="theme === 'auto'
+                                ? 'text-neutral-900 bg-neutral-100'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
+                        >
+                            <i data-lucide="sun-moon" class="w-3.5 h-3.5"></i>
+                            {{ t('navbar.theme.auto') }}
+                        </button>
+                        <button
+                            @click="setTheme('light'); themeDropdown = false"
+                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            :class="theme === 'light'
+                                ? 'text-neutral-900 bg-neutral-100'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
+                        >
+                            <i data-lucide="sun" class="w-3.5 h-3.5"></i>
+                            {{ t('navbar.theme.light_mode') }}
+                        </button>
+                        <button
+                            @click="setTheme('dark'); themeDropdown = false"
+                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            :class="theme === 'dark'
+                                ? 'text-neutral-900 bg-neutral-100'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
+                        >
+                            <i data-lucide="moon" class="w-3.5 h-3.5"></i>
+                            {{ t('navbar.theme.dark_mode') }}
+                        </button>
+                        <div class="border-t border-neutral-100 my-1.5"></div>
+                        <button
+                            type="button"
+                            @click="setEnhancedReadability(!enhancedReadability)"
+                            :aria-pressed="enhancedReadability ? 'true' : 'false'"
+                            :title="window.t('chat.enhanced_readability_desc')"
+                            class="w-full px-4 py-2 text-left text-sm font-medium transition-colors duration-150 flex items-center gap-2 rounded-lg mx-auto"
+                            :class="enhancedReadability
+                                ? 'text-neutral-900 bg-neutral-100'
+                                : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50'"
+                        >
+                            <i data-lucide="eye" class="w-3.5 h-3.5"></i>
+                            <span class="flex-1">{{ t('chat.enhanced_readability') }}</span>
+                            <i data-lucide="check" class="w-3.5 h-3.5" x-show="enhancedReadability" x-cloak></i>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Logout Button -->
+                <button
+                    @click="logout"
+                    class="inline-flex items-center px-4 py-2 text-sm font-medium text-neutral-600
+                           hover:text-neutral-900 hover:bg-neutral-100 rounded-full transition-all duration-200"
+                >
+                    <i data-lucide="log-out" class="w-4 h-4 mr-2"></i>
+                    {{ t('navbar.logout') }}
+                </button>
+            </div>
+        </div>
+
+        <!-- Mobile menu -->
+        <div x-show="mobileMenuOpen" x-cloak
+             x-transition:enter="transition ease-out duration-200"
+             x-transition:enter-start="opacity-0 -translate-y-2"
+             x-transition:enter-end="opacity-100 translate-y-0"
+             x-transition:leave="transition ease-in duration-150"
+             x-transition:leave-start="opacity-100 translate-y-0"
+             x-transition:leave-end="opacity-0 -translate-y-2"
+             class="lg:hidden border-t border-neutral-100 px-4 pt-3 pb-2">
+            <div class="max-w-7xl mx-auto space-y-1">
+                <button @click="setMainTab('status'); mobileMenuOpen = false"
+                        :class="mainTab === 'status' ? 'bg-neutral-100 text-neutral-900' : 'text-neutral-600'"
+                        class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2">
+                    <i data-lucide="bar-chart-3" class="w-4 h-4"></i>
+                    {{ t('navbar.tab.status') }}
+                </button>
+                <button x-show="globalSettings.server.distributed_inference_active"
+                        x-cloak
+                        @click="setMainTab('cluster'); mobileMenuOpen = false"
+                        :class="mainTab === 'cluster' ? 'bg-neutral-100 text-neutral-900' : 'text-neutral-600'"
+                        class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2">
+                    <i data-lucide="network" class="w-4 h-4"></i>
+                    {{ t('navbar.tab.cluster') }}
+                </button>
+                <button @click="setMainTab('models'); mobileMenuOpen = false"
+                        :class="mainTab === 'models' ? 'bg-neutral-100 text-neutral-900' : 'text-neutral-600'"
+                        class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2">
+                    <i data-lucide="hard-drive-download" class="w-4 h-4"></i>
+                    {{ t('navbar.tab.models') }}
+                    <span x-show="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length > 0"
+                          x-text="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length"
+                          class="w-4 h-4 bg-blue-500 text-white text-caption font-bold rounded-full flex items-center justify-center"
+                          x-cloak></span>
+                </button>
+                <button @click="setMainTab('settings'); mobileMenuOpen = false"
+                        :class="mainTab === 'settings' ? 'bg-neutral-100 text-neutral-900' : 'text-neutral-600'"
+                        class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2">
+                    <i data-lucide="settings" class="w-4 h-4"></i>
+                    {{ t('navbar.tab.settings') }}
+                </button>
+                <button @click="setMainTab('logs'); mobileMenuOpen = false"
+                        :class="mainTab === 'logs' ? 'bg-neutral-100 text-neutral-900' : 'text-neutral-600'"
+                        class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2">
+                    <i data-lucide="scroll-text" class="w-4 h-4"></i>
+                    {{ t('navbar.tab.logs') }}
+                </button>
+                <button @click="setMainTab('bench'); mobileMenuOpen = false"
+                        :class="mainTab === 'bench' ? 'bg-neutral-100 text-neutral-900' : 'text-neutral-600'"
+                        class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2">
+                    <i data-lucide="gauge" class="w-4 h-4"></i>
+                    {{ t('navbar.tab.bench') }}
+                </button>
+                <a href="/admin/chat"
+                   class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2 text-neutral-600 hover:text-neutral-900">
+                    <i data-lucide="message-circle" class="w-4 h-4"></i>
+                    {{ t('navbar.tab.chat') }}
+                </a>
+                <button x-show="mainTab === 'status' && !dashEditing && dashEditAvailable"
+                        x-cloak
+                        @click="startDashboardEdit(); mobileMenuOpen = false"
+                        class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2 text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50">
+                    <i data-lucide="settings-2" class="w-4 h-4"></i>
+                    {{ t('status.layout.customize') }}
+                </button>
+                <div class="border-t border-neutral-100 pt-2 mt-2 flex items-center justify-between px-2">
+                    <div class="flex items-center gap-1">
+                        <button @click="setTheme('auto')"
+                                class="p-2 rounded-full transition-all duration-200"
+                                :class="theme === 'auto' ? 'text-amber-400 bg-neutral-100' : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
+                                :title="window.t('navbar.theme.auto')">
+                            <i data-lucide="sun-moon" class="w-4 h-4"></i>
+                        </button>
+                        <button @click="setTheme('light')"
+                                class="p-2 rounded-full transition-all duration-200"
+                                :class="theme === 'light' ? 'text-amber-400 bg-neutral-100' : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
+                                :title="window.t('navbar.theme.light_mode')">
+                            <i data-lucide="sun" class="w-4 h-4"></i>
+                        </button>
+                        <button @click="setTheme('dark')"
+                                class="p-2 rounded-full transition-all duration-200"
+                                :class="theme === 'dark' ? 'text-amber-400 bg-neutral-100' : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
+                                :title="window.t('navbar.theme.dark_mode')">
+                            <i data-lucide="moon" class="w-4 h-4"></i>
+                        </button>
+                    </div>
+                    <button @click="logout"
+                            class="inline-flex items-center px-4 py-2 text-sm font-medium text-neutral-600 hover:text-neutral-900 rounded-full transition-all">
+                        <i data-lucide="log-out" class="w-4 h-4 mr-2"></i>
+                        {{ t('navbar.logout') }}
+                    </button>
+                </div>
+                <button
+                    type="button"
+                    @click="setEnhancedReadability(!enhancedReadability)"
+                    :aria-pressed="enhancedReadability ? 'true' : 'false'"
+                    :title="window.t('chat.enhanced_readability_desc')"
+                    class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2"
+                    :class="enhancedReadability
+                        ? 'bg-neutral-100 text-neutral-900'
+                        : 'text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100'"
+                >
+                    <i data-lucide="eye" class="w-4 h-4"></i>
+                    <span class="flex-1 text-left">{{ t('chat.enhanced_readability') }}</span>
+                    <i data-lucide="check" class="w-4 h-4" x-show="enhancedReadability" x-cloak></i>
+                </button>
+            </div>
+        </div>
+    </nav>

@@ -447,7 +447,7 @@ class TestProfileFieldFiltering:
 class TestTemplatesCRUD:
     def test_list_templates_empty_by_default(self, mgr):
         # Shipped builtins were retired in favor of the client-side preset
-        # bundle (`omlx/admin/static/omlx_preset.json`); the server's
+        # bundle (`omlx_web/static/omlx_preset.json`); the server's
         # /api/profile-templates surface now exposes user templates only.
         assert mgr.list_templates() == []
 
@@ -510,7 +510,7 @@ class TestTemplatesCRUD:
 class TestTemplatesPersistence:
     """The on-disk template file holds only user-created entries. Built-in
     seed templates were retired in favor of the client-side preset bundle
-    (`omlx/admin/static/omlx_preset.json`); /api/profile-templates is now a
+    (`omlx_web/static/omlx_preset.json`); /api/profile-templates is now a
     pure user-store surface."""
 
     def test_no_file_created_when_empty(self, tmp_path):

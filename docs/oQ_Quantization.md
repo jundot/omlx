@@ -1,204 +1,145 @@
-# oQ: oMLX Universal Dynamic Quantization
+# oQ: oMLX Quantization
 
-Quantization should not be exclusive to any particular inference server. oQ produces standard mlx-lm compatible models that work everywhere — oMLX, mlx-lm, and any app that supports MLX safetensors. No custom loader required.
+oQ turns a full-precision Hugging Face model into a smaller MLX model. The result is a standard MLX safetensors model, so it runs in oMLX and also loads in mlx-lm, mlx-vlm and other apps that read MLX models. No custom loader is needed.
 
-**oQ is a data-driven mixed-precision quantization system for Apple Silicon.** Instead of assigning bits by fixed rules or tensor type, oQ measures each layer's actual quantization sensitivity through calibration and allocates bits where the data says they matter most.
+oQ is mixed precision. Before writing anything it measures how much each layer suffers from quantization, then spends extra bits where they help most while keeping the total size close to the level you picked.
 
-### Benchmarks (Qwen3.5-35B-A3B)
+## Quick start
 
-<table>
-<tr>
-<th rowspan="2">Benchmark</th><th rowspan="2">Samples</th>
-<th colspan="2" align="center">2-bit</th>
-<th colspan="2" align="center">3-bit</th>
-<th colspan="2" align="center">4-bit</th>
-</tr>
-<tr>
-<th>mlx-lm</th><th>oQ</th>
-<th>mlx-lm</th><th>oQ</th>
-<th>mlx-lm</th><th>oQ</th>
-</tr>
-<tr><td>MMLU</td><td>300</td><td>14.0%</td><td><b>64.0%</b></td><td>76.3%</td><td><b>85.0%</b></td><td>79.7%</td><td><b>83.3%</b></td></tr>
-<tr><td>TRUTHFULQA</td><td>300</td><td>17.0%</td><td><b>80.0%</b></td><td>81.7%</td><td><b>86.7%</b></td><td>87.7%</td><td><b>88.0%</b></td></tr>
-<tr><td>HUMANEVAL</td><td>164 (full)</td><td>0.0%</td><td><b>78.0%</b></td><td>84.8%</td><td><b>86.6%</b></td><td><b>87.2%</b></td><td>85.4%</td></tr>
-<tr><td>MBPP</td><td>300</td><td>0.3%</td><td><b>63.3%</b></td><td>69.0%</td><td><b>72.0%</b></td><td>71.7%</td><td><b>74.3%</b></td></tr>
-</table>
+1. Open the admin dashboard and go to **Models > oQ Quantization**.
+2. Pick a **Source Model** and an **oQ Level**, and turn on **Enhanced quantization (oQe)**.
+3. Press **Start**. The dashboard shows the estimated size and memory before you start, and the queue shows progress.
 
-## Quantization Levels
+The new model is saved in your model directory with the level in its name, for example `Qwen3.5-9B-oQ4e`, and appears in the model list when it finishes. Quantization runs one model at a time.
 
-| Level | Base Bits | Target bpw | Description |
-|-------|-----------|------------|-------------|
-| oQ2 | 2 | ~2.9 | Extreme compression |
-| oQ2.5 | 2 | ~3.2 | Code-preserving routed down-projection boosts |
-| oQ2.7 | 2 | ~3.3 | Higher-budget code-preserving routed boosts |
-| oQ3 | 3 | ~3.5 | Balanced |
-| oQ3.5 | 3 | ~3.8 | Quality balanced |
-| oQ4 | 4 | ~4.6 | Recommended |
-| oQ5 | 5 | ~5.5 | High quality |
-| oQ6 | 6 | ~6.5 | Near-lossless |
-| oQ8 | 8 | ~8.6 | Near-lossless |
+For most models, **oQ4e** is the place to start.
 
-Base format is affine quantization (group_size=64) for all levels except 8-bit, which uses mxfp8 (group_size=32).
+## Choosing a level
 
-oQ and oQ+ share the same levels. oQ+ adds GPTQ-based weight optimization before quantization.
+| Level | Base bits | Size (bits per weight) | When to use |
+|---|---|---|---|
+| oQ2 | 2 | about 2.8 to 3.0 | Very large MoE models that do not fit otherwise |
+| oQ2.5 | 2 | about 3.1 to 3.3 | Large MoE models, with some expert layers lifted to 3-bit |
+| oQ2.7 | 2 | about 3.25 to 3.35 | Same as oQ2.5 with more 3-bit expert layers |
+| oQ3 | 3 | about 3.5 to 3.7 | When memory is tight |
+| oQ3.5 | 3 | about 3.8 to 4.0 | oQ3 with 4-bit expert down projections |
+| oQ4 | 4 | about 4.6 to 4.7 | Recommended default |
+| oQ5 | 5 | about 5.5 to 5.7 | Higher quality |
+| oQ6 | 6 | about 6.5 to 6.7 | Very close to the original |
+| oQ8 | 8 | about 8.5 | Every quantized tensor at 8-bit |
 
-## Pipeline
+Bits per weight includes the small scale and offset stored with every group of 64 weights. To estimate the file size, multiply the parameter count by bits per weight and divide by 8. A 9B model at oQ4 comes out at about 5.6 GB.
 
-### oQ+ (Enhanced)
+The 2-bit levels are meant for large MoE models, where most weights belong to experts that only a few tokens use at a time. Dense models lose much more quality at 2 bits, so start dense models at oQ3e or higher.
 
-```
-1. Load model (full)
-2. Measure per-layer sensitivity (relative MSE)
-3. Build budget plan (sensitivity-driven bit allocation)
-4. GPTQ weight optimization (all quantizable weights)
-5. Quantize with mixed-precision predicate
-6. Save
-```
+## oQ and oQe
 
-The GPTQ step uses Hessian-based error compensation to optimize rounding decisions for every quantizable weight in the model. For MoE models, this includes all routed expert weights (typically 90%+ of total parameters), which are processed using a batched algorithm that handles all experts in a layer simultaneously.
+Both use the same bit plan and produce models of the same size and speed. The difference is how carefully each tensor is rounded.
 
-### oQ (Streaming)
+**oQ** rounds each group of weights with the standard MLX method, which spreads the available levels evenly between the group's smallest and largest value.
 
-```
-1. Load tensors via mmap
-2. Apply model sanitize
-3. Measure per-layer sensitivity (temporary model load)
-4. Build budget plan
-5. Per-tensor quantize + shard flush
-6. Save config + tokenizer
-```
+**oQe** first runs sample prompts through the model and records which input channels carry the most signal. This is called an importance matrix, or imatrix. When it rounds the weights, it keeps the important channels more accurate:
 
-## Bit Allocation
+- For each group it searches for the scale and offset that give the smallest importance-weighted error.
+- It then refits the scale and offset by weighted least squares, repeating a few times, and keeps the refit only when it lowers the error.
 
-### Mandatory Protection (Always Applied)
+oQe takes longer to make, but the extra work happens only once. On an M3 Ultra, Qwen3.5-9B takes about 2.5 minutes for the first oQe run and about 1 minute after that, and Qwen3.6-35B-A3B about 5 and 2.5 minutes.
 
-| Tensor | Treatment |
-|--------|-----------|
-| lm_head | 8-bit (within budget) |
-| MoE router | 8-bit |
-| shared_expert_gate | 8-bit |
-| Vision encoder | fp16 |
-| SSM state params | fp32 |
+The first oQe run of a model collects the imatrix and saves it in `.oqe_imatrix` inside your model directory. Making another level of the same model, for example oQ3e after oQ4e, reuses it.
 
-### Sensitivity-Driven Allocation (oQ2-oQ6)
+## What oQ does
 
-This is the core differentiator of oQ. Instead of fixed tier systems that assign bits by tensor type, oQ runs actual calibration inference through the model and measures where quantization error hurts the most:
+1. **Reads the model from disk** one tensor at a time instead of loading the whole model.
+2. **Measures layer sensitivity.** It runs built-in calibration prompts through the model and compares each layer's quantized output with the original.
+3. **Plans the bits.** It gives extra bits to the most sensitive tensors until the level's size budget is used.
+4. **Collects the imatrix** (oQe only).
+5. **Quantizes and saves** each tensor, then writes the config, tokenizer and chat template next to the weights.
 
-```
-sensitivity = MSE(float_output, quantized_output) / mean(float_output²)
-```
+### What gets protected
 
-Normalizing by output magnitude prevents later layers from appearing artificially sensitive due to residual accumulation.
+- **Output head and embeddings:** 8-bit when the size budget allows.
+- **MoE routers:** kept at full precision. Shared-expert gates are 8-bit.
+- **Vision and audio encoders:** not quantized.
+- **Norms and recurrent state parameters** (SSM and linear attention): not quantized.
+- **Attention and other sensitive projections:** extra bits where the measurement says so.
+- **Routed experts:** stay at the base bits, because they are most of the model and the most expensive to raise. oQ3.5 gives their down projections one extra bit, and oQ2.5 and oQ2.7 raise whole expert layers to 3-bit.
+- **MTP heads** (with **Preserve MTP weights**): kept, with the small connecting layers at full precision and the rest at 4-bit or more.
 
-The sensitivity score determines the boost tier:
+Every model ends up with its own bit layout, because the plan follows that model's measurements.
 
-| Sensitivity Ratio | Boost | Example (oQ4) |
-|-------------------|-------|---------------|
-| Top (≥50% of max) | base+4 | 4 → 8 bit |
-| High (≥20% of max) | base+2 | 4 → 6 bit |
-| Moderate (<20%) | base+1 | 4 → 5 bit |
+### Calibration data
 
-Boosts apply only to non-expert tensors. Routed experts (93-98% of MoE params) stay at base bits — not by rule, but because their byte cost relative to quality gain makes them poor candidates in the budget optimization.
+Both data sets ship with oMLX, so nothing is downloaded.
 
-The budget plan ensures total bpw stays within the target and hard cap for each level. The result is that every model gets a different bit allocation tailored to its specific layer sensitivities, rather than a one-size-fits-all profile.
+- **Sensitivity:** 600 samples of code, English, Korean, Chinese and Japanese text, tool calling and reasoning. oQ uses 128 sequences of 256 tokens.
+- **oQe imatrix:** about 2,700 samples covering tool calling, chat, reasoning, code and English, Korean, Chinese and Japanese text. oQe uses 128 sequences of 512 tokens. For MoE models it keeps sampling, up to 1,024 sequences, until every expert has seen enough tokens.
 
-### Minimal Protection (oQ8)
+Sample selection uses a fixed seed, so repeated runs on the same model see the same calibration text.
 
-No budget plan. Position-based heuristics only:
+## Options
 
-- lm_head: 6-bit
-- SSM output: 8-bit
-- Embedding: base+2
-- Sensitive layers (first/last 12.5%): base+1
-- Everything else: base
+| Option | What it does |
+|---|---|
+| oQ Level | Size and quality level, see the table above |
+| Enhanced quantization (oQe) | Uses the imatrix when rounding. Recommended |
+| Text Only | Leaves out the vision encoder of a vision-language model and writes a text-only model |
+| Preserve MTP weights | Keeps the MTP heads so Lightning MTP works after quantization. Adds `-mtp` to the name |
+| Combine other model's MTP head | Grafts an MTP head from another checkpoint of the same architecture, or a Gemma 4 assistant model, into the output |
+| Non-quant weight dtype | bfloat16 (default) or float16 for unquantized weights and quantization scales. float16 adds `-fp16` to the name |
+| Sensitivity Model | Measures sensitivity on an already quantized copy of the model to use about 4x less memory |
+| Reuse imatrix cache, Imatrix cache path | Control where the imatrix is stored and whether a compatible one is reused |
+| Calibration samples, Sequence length | How much text oQe runs for the imatrix |
+| Strict imatrix coverage | Stops with an error when a tensor has no imatrix entry, instead of quantizing that tensor with standard oQ |
 
-## GPTQ Weight Optimization
+## Memory and disk
 
-oQ+ uses an optimized implementation of GPTQ (Frantar et al., [arXiv:2210.17323](https://arxiv.org/abs/2210.17323)) to improve quantization quality without changing the output format or inference speed.
+Writing the quantized model needs little memory because tensors are read and written one at a time. Calibration needs the model in memory:
 
-### How It Works
+- If the model does not fit in about 75% of the available memory, oQ makes a temporary 4-bit copy on disk, calibrates on that copy and deletes it afterwards. This needs extra free disk space while it runs.
+- MiniMax M3 and Qwen4-Exp models calibrate one layer at a time instead.
 
-Standard quantization rounds each weight to the nearest quantization grid point. GPTQ takes a smarter approach: it processes weights column by column, and when rounding one column introduces error, it adjusts the remaining columns to compensate. The adjustment direction is guided by the inverse Hessian of the calibration inputs, which captures how each weight column affects the layer's output.
+## Supported models
 
-```
-For each column i:
-    q[i] = round_to_grid(w[i])
-    error = (w[i] - q[i]) / H_inv[i, i]
-    w[i+1:] -= error * H_inv[i, i+1:]    # compensate remaining columns
-```
+oQ works with models that mlx-lm or mlx-vlm can load, including MoE and vision-language models. The source must be the original checkpoint:
 
-The result is the same 4-bit quantized format — identical structure, identical inference speed — but with rounding decisions that minimize actual output error rather than per-element error.
+- BF16 or FP16 weights.
+- FP8 or MXFP8 weights. oQ reads them with their original scales, and keeps a tensor at its source precision when the plan would not lower it.
+- Gemma 4 QAT checkpoints.
 
-### MoE Batched Processing
+Models that are already MLX-quantized cannot be used as a source.
 
-In MoE models, routed experts make up 90%+ of all parameters. Processing them one at a time would take hours. oQ solves this with batched expert GPTQ: all experts in a layer share the same Hessian (since they receive the same input hidden states), so the column-by-column optimization can run on all experts simultaneously as a single batched operation.
+Some models have their own rules:
 
-For Qwen3.5-35B-A3B (256 experts × 40 layers):
-- Per-expert sequential: ~90 minutes
-- Batched: **~6 minutes** (15x speedup, identical results)
+- **DeepSeek V4.1:** oQ3, oQ3e, oQ4 and oQ4e with bfloat16 output, from the original checkpoint. oQ4 keeps the original FP4/FP8 projection precision and quantizes the Engram tables to 4-bit.
+- **DeepSeek V4:** float16 output is not supported.
 
-### Calibration-Aware Bits
+## Benchmarks
 
-The GPTQ optimization uses the actual target bits assigned by the sensitivity budget plan. If a tensor is boosted to 6-bit, the error compensation optimizes for 6-bit quantization boundaries — not the base 4-bit. This eliminates the mismatch between optimization and final quantization.
+All results use greedy decoding with thinking off. Scores are correct answers over all questions, so each question counts once.
 
-### Weight Integrity
+### oQ and oQe compared with uniform 4-bit
 
-Unlike smoothing-based methods that modify normalization weights to redistribute quantization difficulty, oQ's GPTQ implementation only adjusts the rounding of weights that will be quantized. Non-quantized weights (norms, biases) remain untouched, preserving the model's original computation graph.
+Measured when oQe was introduced ([#2057](https://github.com/jundot/omlx/pull/2057)), before the least-squares refit. MMLU 1000, Winogrande 300 and MBPP 300, 1,600 questions in total.
 
-## Streaming Quantization
+| Model | Original | mlx-lm 4-bit | oQ4 | oQ4e |
+|---|---|---|---|---|
+| gemma-4-26B-A4B-it | 82.75 (51.6 GB) | 79.88 (15.4 GB) | 80.06 (15.8 GB) | 81.62 (15.8 GB) |
+| gemma-4-31B-it | 86.44 (62.6 GB) | 85.38 (18.4 GB) | 85.56 (19.0 GB) | 85.50 (19.0 GB) |
+| Qwen3.5-9B | 74.25 (19.3 GB) | 70.12 (6.0 GB) | 70.31 (6.1 GB) | 72.38 (6.1 GB) |
+| Qwen3.6-35B-A3B | 80.44 (71.9 GB) | 81.00 (19.5 GB) | 80.75 (21.1 GB) | 81.00 (21.1 GB) |
+| Qwen3.6-27B | 85.50 (55.6 GB) | 84.25 (16.1 GB) | 84.50 (16.7 GB) | 84.81 (16.7 GB) |
 
-For large models (70B+), the streaming path processes tensors one at a time via safetensors mmap.
+### oQe with the least-squares refit
 
-- No full model instantiation.
-- Shards flushed at 5 GB boundary.
-- Non-quantized float32 weights cast to bfloat16 for inference parity.
-- Calibration uses the smaller of live system memory and the recommended Metal
-  working set. Checkpoints above 75% of that capacity use a temporary uniform
-  4-bit proxy; the remaining 25% is reserved proportionally on 16/32/64 GB
-  systems for model execution and imatrix capture.
-- The proxy is validated against the same live limit before calibration, and
-  oQe micro-batches shrink to one sample when headroom is limited.
+Measured with the refit added in [#4385](https://github.com/jundot/omlx/pull/4385), at batch size 32. MMLU 1000, Winogrande 300, MBPP 300 and GSM8K 300, 1,900 questions in total.
 
-## Calibration Data
+| Model | Original | oQ3e before | oQ3e now | oQ4e before | oQ4e now |
+|---|---|---|---|---|---|
+| Qwen3.5-9B | 76.53 (18 GB) | 72.53 | 73.79 (4.6 GB) | 75.11 | 77.05 (5.6 GB) |
+| Qwen3.6-35B-A3B | 82.68 (67 GB) | 81.58 | 82.68 (16 GB) | 82.79 | 83.05 (20 GB) |
 
-Built-in calibration dataset shipped with oQ. No download required.
-
-600 samples across 7 categories, ~726 KB total:
-
-| Category | Samples | Composition |
-|----------|---------|-------------|
-| code | 200 | Python classes, imports, JS snippets (avg 26 lines) |
-| en | 150 | Wikipedia + C4 web text + OpenOrca conversations |
-| ko | 60 | Wikipedia |
-| zh | 50 | Wikipedia |
-| ja | 60 | Wikipedia |
-| tool_calling | 40 | Function call patterns |
-| reasoning | 40 | GSM8K, chain-of-thought |
-
-Code samples include real-world patterns (class definitions, import chains, multi-language) rather than benchmark-only code. Reasoning category covers mathematical and step-by-step inference, which is absent from typical calibration sets.
-
-## Supported Models
-
-### Enhanced Path (oQ+)
-
-| Architecture | GPTQ Optimization | Notes |
-|-------------|-------------------|-------|
-| Qwen3.5 MoE (hybrid attn) | Full (batched experts) | Validated with benchmarks |
-| Qwen3.5 dense (hybrid attn) | Full | Same hybrid handling |
-| MiniMax-M2.5 MoE | Full | Per-expert dense GPTQ |
-| GLM MoE | Full | Fused expert support |
-| Step-3.5 MoE | Full | `moe.*_proj` fused support |
-| Nemotron-Cascade MoE | Full | Per-expert dense GPTQ |
-| Llama, Mistral, dense models | Full | Standard layer structure |
-| VLM models | Full (text) | Vision weights kept fp16 |
-
-### Streaming Path (oQ)
-
-All models supported by mlx-lm/mlx-vlm. No architecture restrictions.
-Source checkpoints may use BF16/FP16 or reconstructable floating-point block
-formats, including native FP8 and MXFP8. oQ restores FP8/MXFP8 weight semantics
-from the checkpoint scales before applying the selected oQ or oQe format.
+The refit also brings the output distribution closer to the original model's: the KL divergence from the original drops by 12% to 15% on general text for both models at both levels.
 
 ## Acknowledgments
 
-oQ's weight optimization is based on the GPTQ algorithm by Frantar et al. The batched expert processing and MoE-aware Hessian sharing are oQ-specific optimizations. Sensitivity-driven budget allocation was inspired by approaches in [llm-compressor](https://github.com/vllm-project/llm-compressor) and [GGUF K-quants](https://github.com/ggml-org/llama.cpp).
+The importance matrix follows the imatrix approach used by llama.cpp. The least-squares refit was prompted by the 3-bit quantizer in @tacos8me's m5-ultra project.

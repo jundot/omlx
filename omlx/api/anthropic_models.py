@@ -8,9 +8,9 @@ These models define the request and response schemas for:
 - Tool calling in Anthropic format
 """
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, model_validator
 
 from omlx.api.shared_models import IDPrefix, generate_id
 
@@ -84,8 +84,15 @@ class ContentBlockInputAudio(BaseModel):
     input_audio: dict[str, Any]  # {"data": "<base64>", "format": "wav"}
 
 
-# Union type for all content blocks
-ContentBlock = (
+class ContentBlockUnknown(BaseModel):
+    """Content block type this server does not model. Converters skip it."""
+
+    type: str
+    model_config = ConfigDict(extra="allow")
+
+
+# A block without `type` keeps the smart-union inference over the typed models.
+_UntypedContentBlock = (
     ContentBlockText
     | ContentBlockImage
     | ContentBlockToolUse
@@ -94,6 +101,36 @@ ContentBlock = (
     | ContentBlockDocument
     | ContentBlockInputAudio
 )
+_KNOWN_CONTENT_BLOCK_TYPES = frozenset(
+    cls.model_fields["type"].default for cls in get_args(_UntypedContentBlock)
+)
+
+
+def _content_block_tag(value: Any) -> str:
+    if isinstance(value, dict):
+        block_type = value.get("type")
+    else:
+        block_type = getattr(value, "type", None)
+    if not isinstance(block_type, str) or not block_type:
+        return "untyped"
+    if block_type in _KNOWN_CONTENT_BLOCK_TYPES:
+        return block_type
+    return "unknown"
+
+
+# Known types validate strictly. Unknown types are accepted and then ignored.
+ContentBlock = Annotated[
+    Annotated[_UntypedContentBlock, Tag("untyped")]
+    | Annotated[ContentBlockText, Tag("text")]
+    | Annotated[ContentBlockImage, Tag("image")]
+    | Annotated[ContentBlockToolUse, Tag("tool_use")]
+    | Annotated[ContentBlockToolResult, Tag("tool_result")]
+    | Annotated[ContentBlockThinking, Tag("thinking")]
+    | Annotated[ContentBlockDocument, Tag("document")]
+    | Annotated[ContentBlockInputAudio, Tag("input_audio")]
+    | Annotated[ContentBlockUnknown, Tag("unknown")],
+    Discriminator(_content_block_tag),
+]
 
 
 # =============================================================================

@@ -1,10 +1,10 @@
-// Host side of the oQ mixed-bit QxA8 prefill path.
+// Host side of the oQ mixed-bit QxA8 prefill path (Q4, Q5 and Q8, GS64 affine).
 //
 // Three ops:
 //
 //   qwen35_oq_a8_quantize        BF16/FP16 X -> (Qa, Sa, Ra)          [Stage A]
-//   qwen35_oq_a8_qmm_t           (Qa, Sa, Ra) x packed Q4/Q5 -> Y     [GEMM]
-//   qwen35_oq_a8_decode_weights  packed Q4/Q5 -> INT8 codes           [tests]
+//   qwen35_oq_a8_qmm_t           (Qa, Sa, Ra) x packed Q4/Q5/Q8 -> Y  [GEMM]
+//   qwen35_oq_a8_decode_weights  packed Q4/Q5/Q8 -> INT8 codes        [tests]
 //
 // Stage A is separate so Python can share quantized activations between
 // projections of the same input.
@@ -107,7 +107,7 @@ OqA8NaxVariant oq_a8_nax_variant(int variant) {
 }
 
 bool oq_a8_bits_supported(int bits) {
-  return bits == 4 || bits == 5;
+  return bits == 4 || bits == 5 || bits == 8;
 }
 
 // Packed layout check, identical to the one oMLX already applies to affine
@@ -118,6 +118,11 @@ bool oq_a8_packed_shape_matches(int packed_dim, int K, int bits) {
 }
 
 std::atomic<bool> oq_nax_runtime_ok{true};
+
+// Q8 uses the (2,2) tile up to this many rows and (1,2) above.
+constexpr int kQ8WideTileMaxRows = 1024;
+// Both Q8 tiles are this many weight rows wide.
+constexpr int kQ8TileN = 64;
 
 // ---------------------------------------------------------------------------
 // Stage A
@@ -223,7 +228,7 @@ class Qwen35OqA8QmmTPrimitive : public Primitive {
         packed_(packed) {
     if (!oq_a8_bits_supported(bits_)) {
       std::ostringstream msg;
-      msg << "Unsupported oQ A8 bits " << bits_ << " (expected 4 or 5).";
+      msg << "Unsupported oQ A8 bits " << bits_ << " (expected 4, 5 or 8).";
       throw std::invalid_argument(msg.str());
     }
     if (act_mode_ != 0 && act_mode_ != 1) {
@@ -259,11 +264,19 @@ class Qwen35OqA8QmmTPrimitive : public Primitive {
     const int N = weight.shape(0);
     const int M = qa.size() / K;
 
-    const auto cfg = oq_a8_nax_variant(variant_);
     std::string kname;
-    concatenate(kname, "oq_a8_qmm_t_nax_v8_q", bits_, "_am", act_mode_,
-                "_", oq_type_name(out.dtype()), "_wm_", cfg.wm, "_wn_", cfg.wn,
-                packed_ ? "_packed" : "");
+    OqA8NaxVariant cfg;
+    if (bits_ == 8) {
+      cfg = M <= kQ8WideTileMaxRows ? OqA8NaxVariant{64, kQ8TileN, 2, 2}
+                                    : OqA8NaxVariant{32, kQ8TileN, 1, 2};
+      concatenate(kname, "oq_q8_a8_qmm_t_nax_am", act_mode_, "_",
+                  oq_type_name(out.dtype()), "_wm_", cfg.wm, "_wn_", cfg.wn);
+    } else {
+      cfg = oq_a8_nax_variant(variant_);
+      concatenate(kname, "oq_a8_qmm_t_nax_v8_q", bits_, "_am", act_mode_,
+                  "_", oq_type_name(out.dtype()), "_wm_", cfg.wm, "_wn_",
+                  cfg.wn, packed_ ? "_packed" : "");
+    }
 
     auto lib = d.get_library(kOqNaxMetallib, oq_binary_dir());
     auto kernel = d.get_kernel(kname, lib);
@@ -320,7 +333,7 @@ class Qwen35OqA8DecodeWeightsPrimitive : public Primitive {
       : Primitive(stream), bits_(bits), k_(k) {
     if (!oq_a8_bits_supported(bits_)) {
       std::ostringstream msg;
-      msg << "Unsupported oQ A8 bits " << bits_ << " (expected 4 or 5).";
+      msg << "Unsupported oQ A8 bits " << bits_ << " (expected 4, 5 or 8).";
       throw std::invalid_argument(msg.str());
     }
   }
@@ -447,8 +460,12 @@ array qwen35_oq_a8_qmm_t(
   if (!oq_a8_bits_supported(bits)) {
     std::ostringstream msg;
     msg << "[omlx_qwen35_prefill.qwen35_oq_a8_qmm_t] bits " << bits
-        << " unsupported (expected 4 or 5).";
+        << " unsupported (expected 4, 5 or 8).";
     throw std::invalid_argument(msg.str());
+  }
+  if (bits == 8 && packed) {
+    throw std::invalid_argument(
+        "[omlx_qwen35_prefill.qwen35_oq_a8_qmm_t] Q8 has no packed layout.");
   }
   if (qa.dtype() != int8 || sa.dtype() != float32 || ra.dtype() != int16) {
     std::ostringstream msg;
@@ -506,8 +523,9 @@ array qwen35_oq_a8_qmm_t(
         << " bits.";
     throw std::invalid_argument(msg.str());
   }
-  // Metadata is group-major: scales/biases [K/64, N], Ra [K/64, M]. Packed
-  // metadata holds the same N * K/64 values in the PackedLinear tile order.
+  // Ra is [K/64, M].
+  // Q4/Q5 scales/biases are [K/64, N]; Q8 reads the checkpoint's [N, K/64].
+  // Packed metadata holds the same N * K/64 values in the PackedLinear order.
   (void)oq_a8_nax_variant(variant);
   if (packed) {
     if (bits != 4 || out_dtype != bfloat16 || N % kPackedTileN != 0 ||
@@ -523,7 +541,8 @@ array qwen35_oq_a8_qmm_t(
   const size_t sc_size = static_cast<size_t>(N) * static_cast<size_t>(groups);
   const bool sc_ok = packed
       ? scales.size() == sc_size && biases.size() == sc_size
-      : scales.shape(0) == groups && scales.shape(1) == N &&
+      : (bits == 8 ? scales.shape(0) == N && scales.shape(1) == groups
+                   : scales.shape(0) == groups && scales.shape(1) == N) &&
           biases.shape() == scales.shape();
   if (!sc_ok) {
     std::ostringstream msg;
@@ -547,11 +566,11 @@ array qwen35_oq_a8_qmm_t(
 
   // N must tile exactly so the weight decoder can stay bounds-check free; M
   // is the token count and is handled with masked loads and stores.
-  const auto cfg = oq_a8_nax_variant(variant);
-  if (N % cfg.bn != 0) {
+  const int tile_bn = bits == 8 ? kQ8TileN : oq_a8_nax_variant(variant).bn;
+  if (N % tile_bn != 0) {
     std::ostringstream msg;
     msg << "[omlx_qwen35_prefill.qwen35_oq_a8_qmm_t] N=" << N
-        << " is not a multiple of the tile BN=" << cfg.bn << ".";
+        << " is not a multiple of the tile BN=" << tile_bn << ".";
     throw std::invalid_argument(msg.str());
   }
 
@@ -584,7 +603,7 @@ array qwen35_oq_a8_decode_weights(
   if (!oq_a8_bits_supported(bits)) {
     std::ostringstream msg;
     msg << "[omlx_qwen35_prefill.qwen35_oq_a8_decode_weights] bits " << bits
-        << " unsupported (expected 4 or 5).";
+        << " unsupported (expected 4, 5 or 8).";
     throw std::invalid_argument(msg.str());
   }
   if (weight.dtype() != uint32 || weight.ndim() != 2 ||

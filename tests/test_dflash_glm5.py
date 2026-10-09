@@ -193,7 +193,7 @@ class _RecordingLayer:
         self.is_linear = is_linear
         self._calls = calls
 
-    def __call__(self, h, mask=None, cache=None):
+    def __call__(self, h, mask=None, cache=None, defer=False):
         self._calls.append((self.is_linear, int(h.shape[1]), mask is None))
         return h + 1.0
 

@@ -114,6 +114,8 @@ def _glm_linear_forward() -> Any:
 
 def _contract_mhc_hidden(hidden: mx.array) -> mx.array:
     """Contract GLM's ``[B, T, hc_mult, H]`` residual streams for DFlash."""
+    if hasattr(hidden, "materialize"):
+        hidden = hidden.materialize()
     if hidden.ndim == 4:
         return hidden.mean(axis=2)
     if hidden.ndim != 3:
@@ -444,6 +446,15 @@ class Glm5NextTargetOps:
         """One target forward over ``h`` mirroring ``Glm5NextModel.__call__``."""
         from mlx_vlm.models.base import create_attention_mask, create_ssm_mask
 
+        from .mlx_vlm_glm5_next_compat import apply_mlx_vlm_glm5_next_compat_patch
+
+        apply_mlx_vlm_glm5_next_compat_patch()
+        from mlx_vlm.models.glm5_next.language import (
+            _DECODE_BLOCK,
+            _DECODE_EVAL_EVERY,
+            _HCDeferred,
+        )
+
         fa_cache = cache[inner.fa_idx]
         fa_mask = create_attention_mask(
             h,
@@ -475,13 +486,33 @@ class Glm5NextTargetOps:
             if int(h.shape[1]) >= int(self.pipeline_min_tokens)
             else None
         )
+        # Same decode/verify scheduling as Glm5NextModel.__call__. A captured
+        # deferred layer is materialized; the carry stays deferred.
+        defer = h.shape[:2] == (1, 1)
+        eval_every = (
+            _DECODE_EVAL_EVERY
+            if h.shape[0] == 1 and h.shape[1] <= _DECODE_BLOCK
+            else 0
+        )
+        n_layers = len(inner.layers)
         for layer_index, (layer, layer_cache) in enumerate(
             zip(inner.layers, cache, strict=True)
         ):
             mask = ssm_mask if getattr(layer, "is_linear", False) else fa_mask
-            h = layer(h, mask=mask, cache=layer_cache)
+            if defer:
+                h = layer(
+                    h, mask=mask, cache=layer_cache, defer=layer_index + 1 < n_layers
+                )
+            else:
+                h = layer(h, mask=mask, cache=layer_cache)
             if pipeline is not None:
                 pipeline.push(h)
+            elif (
+                eval_every
+                and (layer_index + 1) % eval_every == 0
+                and layer_index + 1 < n_layers
+            ):
+                mx.async_eval(h.arrays() if isinstance(h, _HCDeferred) else h)
             capture_key = layer_index + 1
             if capture_all:
                 captured.append(_contract_mhc_hidden(h))

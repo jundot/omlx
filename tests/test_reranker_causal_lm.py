@@ -212,6 +212,33 @@ class TestCausalLMReranker:
         assert result.indices == [0, 1]
         assert result.total_tokens > 0
 
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @pytest.mark.parametrize(
+        ("instruction", "expected"),
+        [
+            (None, MLXRerankerModel._CAUSAL_LM_DEFAULT_INSTRUCTION),
+            ("", MLXRerankerModel._CAUSAL_LM_DEFAULT_INSTRUCTION),
+            ("Find numeric limits", "Find numeric limits"),
+        ],
+    )
+    def test_rerank_fills_instruct_slot(self, tmp_path, instruction, expected):
+        model = MLXRerankerModel(str(self._make_model_dir(tmp_path)))
+        model._is_causal_lm = True
+        model._loaded = True
+        model._token_true_id = 1
+        model._token_false_id = 0
+        model._prefix_tokens = []
+        model._suffix_tokens = []
+        model.processor = MagicMock(return_value={"input_ids": [[10], [11]]})
+        model.model = MagicMock(return_value=mx.zeros((1, 1, 2)))
+
+        model.rerank("q", ["d1", "d2"], instruction=instruction)
+
+        assert model.processor.call_args.args[0] == [
+            f"<Instruct>: {expected}\n<Query>: q\n<Document>: d1",
+            f"<Instruct>: {expected}\n<Query>: q\n<Document>: d2",
+        ]
+
     def test_rerank_causal_lm_empty_documents(self, tmp_path):
         """Test rerank with empty document list returns empty result."""
         model_dir = self._make_model_dir(tmp_path)

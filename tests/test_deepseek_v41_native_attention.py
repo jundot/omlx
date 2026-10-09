@@ -13,7 +13,16 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize(
-    "start,length,pooled_count", [(0, 7, 0), (0, 7, 3), (131, 3, 40), (4096, 7, 1024)]
+    "start,length,pooled_count",
+    [
+        (0, 7, 0),
+        (0, 7, 3),
+        (131, 3, 40),
+        (4096, 7, 1024),
+        # Prefill kernels: direct Q loads, then KV rows decoded once.
+        (0, 16, 3),
+        (131, 300, 40),
+    ],
 )
 def test_native_packed_attention_causal_window_and_fp32_sinks(
     start, length, pooled_count

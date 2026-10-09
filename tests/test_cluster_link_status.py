@@ -7,6 +7,7 @@ be told to click. These tests pin the distinctions.
 """
 
 import ipaddress
+import shlex
 import subprocess
 
 import pytest
@@ -16,6 +17,8 @@ from omlx.cluster.transport import (
     InterfaceAddress,
     LinkStatus,
     TransportInfo,
+    _rdma_port_state,
+    _run_link_command,
     assess_link,
     classify_link,
     configure_link,
@@ -782,6 +785,32 @@ def test_link_verification_checks_route_and_ping_from_both_macs():
         "/sbin/route",
         "/sbin/ping",
     ]
+
+
+def test_remote_link_probe_reaches_the_peer_shell_intact(monkeypatch):
+    seen = []
+
+    def fake_run(argv, **_kwargs):
+        seen.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr("omlx.cluster.transport.subprocess.run", fake_run)
+    command = ("python3", "-c", "import socket\ns=(1, 2)", "10.0.0.1")
+
+    _run_link_command("Studio.local", command)
+
+    assert seen[0][0] == "ssh"
+    assert shlex.split(seen[0][-1]) == list(command)
+
+
+def test_rdma_port_probe_names_the_link_when_it_times_out(monkeypatch):
+    def fake_run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr("omlx.cluster.transport.subprocess.run", fake_run)
+
+    with pytest.raises(RuntimeError, match="Thunderbolt link is most likely down"):
+        _rdma_port_state("Studio.local", "rdma_en2")
 
 
 def test_link_verification_rejects_a_route_on_the_wrong_interface():

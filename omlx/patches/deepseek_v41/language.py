@@ -17,6 +17,7 @@ from mlx_lm.models.switch_layers import SwitchLinear
 from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 
 from ..deepseek_v4.switch_layers import _block_config, _build_mxfp4_blocks
+from . import growth
 from .activation import quantize_paired_swiglu_activation, quantize_swiglu_activation
 from .cache import DeepseekV41Cache
 from .engram import Engram, NgramHash, build_compressed_token_map
@@ -201,7 +202,7 @@ class Indexer(nn.Module):
                 key = pack_activation(
                     rope(self.k_norm(self.wk(latent)), pos, c, True), bits=4
                 )
-                previous = mx.concatenate([previous, key], 1)
+                previous = growth.append(cache, 3, previous, key, kv_start // ratio)
             shared["index_k"] = cache[3] = previous
         key = shared["index_k"]
         q = self.wq_b(qr).reshape(1, x.shape[1], c.index_n_heads, c.index_head_dim)
@@ -336,7 +337,9 @@ class Attention(nn.Module):
                 compressed = pack_activation(
                     compressed, bits=4, group_size=16, e4m3_scale=True
                 )
-                shared["kv"] = cache[2] = mx.concatenate([shared["kv"], compressed], 1)
+                shared["kv"] = cache[2] = growth.append(
+                    cache, 2, shared["kv"], compressed, kv_start // ratio
+                )
             ci, pooled = shared["idx"], shared["kv"]
         if (
             length > 8

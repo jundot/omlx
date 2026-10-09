@@ -58,7 +58,7 @@ async def blocked_worker():
             loop.call_soon_threadsafe(finished.set)
 
     try:
-        yield SimpleNamespace(call=call, started=started)
+        yield SimpleNamespace(call=call, started=started, release=release)
     finally:
         release.set()
         if started.is_set():
@@ -387,21 +387,22 @@ class TestHFDownloader:
 
     @pytest.mark.asyncio
     async def test_cancel_download(self, downloader, model_dir, blocked_worker):
-        # In-progress shards live under ._____temp and must be removed,
-        # while finalized shards outside it stay for resume on retry.
         target = model_dir / "owner" / "model"
-        target.mkdir(parents=True, exist_ok=True)
+        staging = target / ".cache" / "huggingface" / "download"
+        staging.mkdir(parents=True)
         (target / "model-00001-of-00002.safetensors").write_bytes(b"finalized")
-        temp_dir = target / "._____temp"
-        temp_dir.mkdir()
-        (temp_dir / "model-00002-of-00002.safetensors").write_bytes(b"in-progress")
+        partial = staging / "model-00002-of-00002.safetensors.abc.incomplete"
+        partial.write_bytes(b"in-progress")
 
         with patch(
             "omlx.admin.hf_downloader.HfApi"
         ) as mock_api_cls, patch(
             "omlx.admin.hf_downloader.snapshot_download",
             side_effect=blocked_worker.call,
-        ):
+        ), patch(
+            "omlx.admin.hf_downloader.abort_xet_session",
+            side_effect=blocked_worker.release.set,
+        ), patch("omlx.admin.hf_downloader._REAP_INTERVAL", 0.01):
             mock_api = MagicMock()
             mock_info = MagicMock()
             mock_info.siblings = []
@@ -419,48 +420,10 @@ class TestHFDownloader:
             assert task.status == DownloadStatus.CANCELLED
             await active_task
 
-            assert not temp_dir.exists()
+            assert not partial.exists()
             assert (target / "model-00001-of-00002.safetensors").exists()
-            assert target.exists()
 
             await downloader.shutdown()
-
-    @pytest.mark.asyncio
-    async def test_cancelled_download_cleans_up_temp_dir_only(
-        self, downloader, model_dir
-    ):
-        target = model_dir / "owner" / "model"
-        target.mkdir(parents=True)
-        (target / "model-00001-of-00002.safetensors").write_bytes(b"finalized")
-        temp_dir = target / "._____temp"
-        temp_dir.mkdir()
-        (temp_dir / "model-00002-of-00002.safetensors").write_bytes(b"x")
-
-        task = DownloadTask(task_id="t1", repo_id="owner/model")
-        downloader._tasks[task.task_id] = task
-
-        mock_api = MagicMock()
-        mock_info = MagicMock()
-        mock_info.safetensors = {}
-        mock_api.model_info.return_value = mock_info
-
-        def fake_snapshot_download(**kwargs):
-            if kwargs.get("dry_run"):
-                return []
-            raise asyncio.CancelledError()
-
-        with patch(
-            "omlx.admin.hf_downloader._get_hf_api",
-            return_value=(mock_api, None),
-        ), patch(
-            "omlx.admin.hf_downloader.snapshot_download",
-            side_effect=fake_snapshot_download,
-        ):
-            await downloader._run_download(task.task_id, "")
-
-        assert task.status == DownloadStatus.CANCELLED
-        assert not temp_dir.exists()
-        assert (target / "model-00001-of-00002.safetensors").exists()
 
     @pytest.mark.asyncio
     async def test_cancelled_download_logs_cleanup_failure(self, downloader, caplog):
@@ -526,6 +489,57 @@ class TestHFDownloader:
         assert task.status == DownloadStatus.CANCELLED
         with pytest.raises(asyncio.CancelledError):
             await active
+
+    @pytest.mark.asyncio
+    async def test_cancel_keeps_aborting_until_the_worker_returns(
+        self, downloader, model_dir
+    ):
+        """Cancel keeps aborting until the worker returns, not just once."""
+        task = DownloadTask(task_id="t1", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+
+        mock_api = MagicMock()
+        mock_info = MagicMock()
+        mock_info.safetensors = {}
+        mock_api.model_info.return_value = mock_info
+
+        aborts = []
+        worker_started = threading.Event()
+        worker_returned = threading.Event()
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                return []
+            worker_started.set()
+            # Hub starts the next file on a fresh session after one abort.
+            deadline = time.monotonic() + 2
+            while len(aborts) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            worker_returned.set()
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ), patch(
+            "omlx.admin.hf_downloader.abort_xet_session",
+            side_effect=lambda: aborts.append(1),
+        ), patch("omlx.admin.hf_downloader._REAP_INTERVAL", 0.01):
+            active = asyncio.create_task(
+                downloader._run_download(task.task_id, "")
+            )
+            downloader._active_tasks[task.task_id] = active
+            while not worker_started.is_set():
+                await asyncio.sleep(0.01)
+
+            assert await downloader.cancel_download(task.task_id) is True
+            await asyncio.wait_for(active, timeout=5)
+
+        assert worker_returned.is_set(), "the task returned while its writer ran on"
+        assert len(aborts) >= 2, "the session the worker rebuilt was never aborted"
+        assert task.status == DownloadStatus.CANCELLED
 
     @pytest.mark.asyncio
     async def test_cancel_pending_download_does_not_abort_xet(self, downloader):
@@ -794,32 +808,30 @@ class TestHFDownloader:
     # --- Cleanup ---
 
     @pytest.mark.asyncio
-    async def test_cleanup_partial_removes_temp_dir_only(self, model_dir):
-        """Cleanup deletes the hidden ._____temp dir, finalized shards stay."""
+    async def test_cleanup_partial_removes_hub_partials_only(self, model_dir):
+        """Cleanup deletes hub's .incomplete files; finished files stay for resume."""
         model_dir.mkdir(parents=True, exist_ok=True)
         downloader = HFDownloader(model_dir=str(model_dir))
 
-        org_dir = model_dir / "owner"
-        target = org_dir / "model"
-        target.mkdir(parents=True)
+        target = model_dir / "owner" / "model"
+        staging = target / ".cache" / "huggingface" / "download"
+        staging.mkdir(parents=True)
         (target / "model-00001-of-00002.safetensors").write_bytes(b"finalized")
-        temp_dir = target / "._____temp"
-        temp_dir.mkdir()
-        (temp_dir / "model-00002-of-00002.safetensors").write_bytes(b"in-progress")
+        partial = staging / "model-00002-of-00002.safetensors.abc.incomplete"
+        partial.write_bytes(b"in-progress")
+        metadata = staging / "model-00001-of-00002.safetensors.metadata"
+        metadata.write_text("abc\ndef\n")
 
         task = DownloadTask(task_id="t1", repo_id="owner/model")
         downloader._cleanup_partial(task)
 
-        # In-progress shards gone, finalized shards and dirs preserved
-        # so snapshot_download can resume on retry.
-        assert not temp_dir.exists()
+        assert not partial.exists()
+        assert metadata.exists()
         assert (target / "model-00001-of-00002.safetensors").exists()
-        assert target.exists()
-        assert org_dir.exists()
 
     @pytest.mark.asyncio
     async def test_cleanup_partial_is_noop_when_no_temp_dir(self, model_dir):
-        """With nothing in ._____temp, cleanup leaves the dir untouched."""
+        """With no hub staging dir, cleanup leaves the dir untouched."""
         model_dir.mkdir(parents=True, exist_ok=True)
         downloader = HFDownloader(model_dir=str(model_dir))
 
@@ -1220,6 +1232,94 @@ class TestHFDownloaderRoutes:
             routes_module._get_global_settings = orig_settings
             routes_module._get_engine_pool = orig_pool
             routes_module._get_settings_manager = orig_mgr
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cancel_first", [False, True])
+    async def test_delete_model_cancels_running_download(
+        self, tmp_path, cancel_first
+    ):
+        """Delete waits for the download writer, also right after a cancel."""
+        import omlx.admin.routes as routes_module
+        from omlx.admin.routes import delete_hf_model
+
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        target = model_dir / "owner" / "model"
+        target.mkdir(parents=True)
+        (target / "config.json").write_text(
+            '{"architectures": ["Qwen2ForCausalLM"]}'
+        )
+
+        downloader = HFDownloader(model_dir=str(model_dir))
+
+        mock_settings = MagicMock()
+        mock_settings.model.get_model_dirs.return_value = [model_dir]
+
+        mock_pool = MagicMock()
+        mock_pool.get_loaded_model_ids.return_value = []
+        mock_pool._entries = {}
+        mock_pool.discover_models = MagicMock()
+
+        mock_settings_mgr = MagicMock()
+        mock_settings_mgr.get_pinned_model_ids.return_value = []
+
+        orig_settings = routes_module._get_global_settings
+        orig_pool = routes_module._get_engine_pool
+        orig_mgr = routes_module._get_settings_manager
+        orig_downloader = routes_module._hf_downloader
+
+        routes_module._get_global_settings = lambda: mock_settings
+        routes_module._get_engine_pool = lambda: mock_pool
+        routes_module._get_settings_manager = lambda: mock_settings_mgr
+        routes_module._hf_downloader = downloader
+
+        aborts = []
+        worker_started = threading.Event()
+        worker_returned = threading.Event()
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                return []
+            worker_started.set()
+            deadline = time.monotonic() + 2
+            while len(aborts) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            worker_returned.set()
+
+        try:
+            with patch(
+                "omlx.admin.hf_downloader.HfApi"
+            ) as mock_api_cls, patch(
+                "omlx.admin.hf_downloader.snapshot_download",
+                side_effect=fake_snapshot_download,
+            ), patch(
+                "omlx.admin.hf_downloader.abort_xet_session",
+                side_effect=lambda: aborts.append(1),
+            ), patch("omlx.admin.hf_downloader._REAP_INTERVAL", 0.05):
+                mock_api = MagicMock()
+                mock_info = MagicMock()
+                mock_info.siblings = []
+                mock_api.model_info.return_value = mock_info
+                mock_api_cls.return_value = mock_api
+
+                task = await downloader.start_download("owner/model")
+                while not worker_started.is_set():
+                    await asyncio.sleep(0.01)
+                if cancel_first:
+                    assert await downloader.cancel_download(task.task_id)
+
+                result = await delete_hf_model(model_name="model", is_admin=True)
+
+                assert worker_returned.is_set()
+                assert result["success"] is True
+                assert task.status == DownloadStatus.CANCELLED
+                assert not target.exists()
+        finally:
+            routes_module._get_global_settings = orig_settings
+            routes_module._get_engine_pool = orig_pool
+            routes_module._get_settings_manager = orig_mgr
+            routes_module._hf_downloader = orig_downloader
+            await downloader.shutdown()
 
     @pytest.mark.asyncio
     async def test_delete_model_organized_drops_empty_org_folder(self, tmp_path):

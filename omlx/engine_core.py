@@ -40,6 +40,7 @@ import mlx.core as mx
 from .exceptions import (
     PrefillMemoryAbortedError,
     PrefillMemoryExceededError,
+    RequestAbortedError,
     describe_ceiling_binding,
 )
 from .model_registry import get_registry
@@ -186,6 +187,8 @@ def _raise_request_output_error(output: RequestOutput) -> None:
             ),
             limit_bytes=int(limit_bytes) if limit_bytes is not None else None,
         )
+    if output.error_code == "model_unloading":
+        raise RequestAbortedError(output.error, request_id=output.request_id)
     raise RuntimeError(output.error)
 
 

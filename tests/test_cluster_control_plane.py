@@ -260,8 +260,7 @@ def test_auto_transport_falls_back_before_coordinator_deadline(
     monkeypatch, error_number
 ):
     port = _free_port()
-    monkeypatch.setenv("OMLX_CLUSTER_CONTROL_TRANSPORT", "auto")
-    monkeypatch.setenv("OMLX_CLUSTER_CONTROL_PROXY_PYTHON", sys.executable)
+    monkeypatch.setattr(proxy_module, "_SYSTEM_PYTHON", sys.executable)
     # Exercise the non-loopback macOS policy using a real local coordinator.
     monkeypatch.setattr(proxy_module, "sys", SimpleNamespace(platform="darwin"))
     monkeypatch.setattr(
@@ -324,37 +323,8 @@ def test_auto_transport_falls_back_before_coordinator_deadline(
         assert len(attempts) == 1
 
 
-@pytest.mark.parametrize("mode", ["auto", "", "direct", "system-proxy", "invalid"])
-def test_control_transport_overrides_and_validation(monkeypatch, mode):
-    monkeypatch.setenv("OMLX_CLUSTER_CONTROL_TRANSPORT", mode)
-    monkeypatch.setenv("OMLX_CLUSTER_CONTROL_PROXY_PYTHON", sys.executable)
-    monkeypatch.setattr(proxy_module, "sys", SimpleNamespace(platform="darwin"))
-    control = RankControlPlane(
-        rank=1,
-        world_size=2,
-        host="10.0.0.1",
-        port=12345,
-        token="test",
-    )
-    direct = Mock()
-    proxy = Mock()
-    monkeypatch.setattr(control, "_connect_direct", direct)
-    monkeypatch.setattr(control, "_connect_via_proxy", proxy)
-    if mode == "invalid":
-        with pytest.raises(RuntimeError, match="must be auto"):
-            control._connect_to_coordinator()
-        direct.assert_not_called()
-        proxy.assert_not_called()
-    else:
-        control._connect_to_coordinator()
-        assert direct.call_count == (mode != "system-proxy")
-        assert proxy.call_count == (mode == "system-proxy")
-
-
-@pytest.mark.parametrize("mode", ["auto", "", "direct"])
-def test_transport_fallback_preserves_overall_connection_budget(monkeypatch, mode):
-    monkeypatch.setenv("OMLX_CLUSTER_CONTROL_TRANSPORT", mode)
-    monkeypatch.setenv("OMLX_CLUSTER_CONTROL_PROXY_PYTHON", sys.executable)
+def test_transport_fallback_preserves_overall_connection_budget(monkeypatch):
+    monkeypatch.setattr(proxy_module, "_SYSTEM_PYTHON", sys.executable)
     monkeypatch.setattr(proxy_module, "sys", SimpleNamespace(platform="darwin"))
     now = [100.0]
     monkeypatch.setattr(control_module.time, "monotonic", lambda: now[0])
@@ -369,27 +339,21 @@ def test_transport_fallback_preserves_overall_connection_budget(monkeypatch, mod
 
     def fail_direct(*, deadline, allow_proxy):
         assert deadline == 220.0
-        assert allow_proxy == (mode != "direct")
+        assert allow_proxy
         now[0] = 101.0
         raise TimeoutError("Direct connection timed out")
 
     proxy = Mock()
     monkeypatch.setattr(control, "_connect_direct", fail_direct)
     monkeypatch.setattr(control, "_connect_via_proxy", proxy)
-    if mode == "direct":
-        with pytest.raises(TimeoutError):
-            control._connect_to_coordinator()
-        proxy.assert_not_called()
-    else:
-        control._connect_to_coordinator()
-        proxy.assert_called_once_with(deadline=220.0)
+    control._connect_to_coordinator()
+    proxy.assert_called_once_with(deadline=220.0)
 
 
 def test_auto_transport_does_not_retry_invalid_authentication_via_proxy(monkeypatch):
     monkeypatch.setattr(
         control_module, "should_proxy_control_socket", lambda host: True
     )
-    monkeypatch.setenv("OMLX_CLUSTER_CONTROL_TRANSPORT", "auto")
     control = RankControlPlane(
         rank=1,
         world_size=2,
@@ -413,7 +377,6 @@ def test_auto_transport_does_not_retry_invalid_authentication_via_proxy(monkeypa
 def test_auto_transport_waits_for_late_listener_without_switching_proxy(
     monkeypatch, listener_delay
 ):
-    monkeypatch.setenv("OMLX_CLUSTER_CONTROL_TRANSPORT", "auto")
     monkeypatch.setattr(
         control_module, "should_proxy_control_socket", lambda host: True
     )

@@ -14,6 +14,7 @@ import struct
 import wave
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import mlx.core as mx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -184,6 +185,64 @@ class TestTTSKokoroLangInference:
         await engine.synthesize("hello", voice="aiden")
 
         assert captured["had_lang_code"] is False
+
+
+class TestTTSPresetVoiceRouting:
+    """Qwen3-TTS Base has no preset speakers and raises on any ``voice``."""
+
+    @staticmethod
+    def _engine(captured: list, speakers: list):
+        from types import SimpleNamespace
+
+        import numpy as np
+
+        from omlx.engine.tts import TTSEngine
+
+        class FakeQwenTTS:
+            sample_rate = 24000
+            supported_speakers = speakers
+
+            def generate(
+                self,
+                *,
+                text,
+                verbose=False,
+                voice=None,
+                instruct=None,
+                stream=False,
+                streaming_interval=2.0,
+                **kw,
+            ):
+                if voice is not None and voice not in self.supported_speakers:
+                    raise ValueError(f"Voice '{voice}' is not supported")
+                captured.append(voice)
+                return [SimpleNamespace(audio=np.zeros(100, dtype=np.float32))]
+
+        engine = TTSEngine("qwen3-tts")
+        engine._model = FakeQwenTTS()
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_base_model_ignores_openai_voice(self):
+        captured: list = []
+        engine = self._engine(captured, speakers=[])
+
+        await engine.synthesize("hello", voice="alloy")
+        async for _ in engine.stream_synthesize_pcm("hello", voice="alloy"):
+            pass
+
+        assert captured == [None, None]
+
+    @pytest.mark.asyncio
+    async def test_custom_voice_model_keeps_voice(self):
+        captured: list = []
+        engine = self._engine(captured, speakers=["ryan"])
+
+        await engine.synthesize("hello", voice="ryan")
+        async for _ in engine.stream_synthesize_pcm("hello", voice="ryan"):
+            pass
+
+        assert captured == ["ryan", "ryan"]
 
 
 class TestTTSEndpointBasic:
@@ -1023,7 +1082,7 @@ class TestTTSVoiceClonePassthrough:
 
         from omlx.engine.tts import TTSEngine
 
-        def _run(ref_audio_path=None, ref_text=None):
+        def _run(ref_audio_path=None, ref_text=None, annotation=None):
             engine = TTSEngine("test-model")
 
             import inspect
@@ -1051,12 +1110,15 @@ class TestTTSVoiceClonePassthrough:
                 parameters=list(sig_params.values())
             )
             generate_mock.return_value = []
+            if annotation is not None:
+                generate_mock.__annotations__ = {"ref_audio": annotation}
 
             class FakeModel:
                 pass
 
             fake_model = FakeModel()
             fake_model.generate = generate_mock
+            fake_model.sample_rate = 24000
 
             engine._model = fake_model
 
@@ -1095,6 +1157,30 @@ class TestTTSVoiceClonePassthrough:
         kwargs = call.kwargs if call else {}
         assert kwargs.get("ref_audio") == "/tmp/ref.wav"
         assert kwargs.get("ref_text") is None
+
+    @pytest.mark.parametrize(
+        "annotation, decoded",
+        [
+            (mx.array | None, True),
+            (str | mx.array | None, False),
+            (str, False),
+        ],
+    )
+    def test_ref_audio_decoded_only_for_array_only_models(
+        self, _run_synthesize_clone, tmp_path, annotation, decoded
+    ):
+        """Array-only models get the clip at their sample rate; others keep the path."""
+        ref = tmp_path / "ref.wav"
+        ref.write_bytes(_make_wav_bytes(duration_secs=1.0, sample_rate=16000))
+        call = _run_synthesize_clone(
+            ref_audio_path=str(ref), ref_text="hello", annotation=annotation
+        )
+        ref_audio = call.kwargs["ref_audio"]
+        if decoded:
+            assert isinstance(ref_audio, mx.array)
+            assert ref_audio.shape == (24000,)
+        else:
+            assert ref_audio == str(ref)
 
 
 # ---------------------------------------------------------------------------

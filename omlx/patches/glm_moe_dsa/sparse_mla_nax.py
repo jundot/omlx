@@ -1,4 +1,4 @@
-"""Tensor-unit (NAX) sparse MLA prefill attention for GLM-5.3 on M5 GPUs.
+"""Tensor-unit (NAX) sparse MLA attention for GLM-5.3 on M5 GPUs.
 
 GLM-5.3's DSA layers attend every query over its own top-k latent rows
 (2048 + 3 tail slots, 64 heads, 512-wide NoPE latent; values are the same
@@ -34,14 +34,10 @@ software-pipelined variant nondeterministic on M5.
 
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 from typing import Optional
 
 import mlx.core as mx
-
-_ENV = os.environ.get("OMLX_GLM_SPARSE_MLA_NAX", "1").strip().lower()
-_ENABLED = _ENV not in {"0", "false", "off"}
 
 _D_LATENT = 512
 _HEADS_PER_GROUP = 32
@@ -340,8 +336,6 @@ def _kernel():
 
 @lru_cache(maxsize=1)
 def nax_sparse_mla_available() -> bool:
-    if not _ENABLED:
-        return False
     try:
         from omlx.custom_kernels.nax import is_nax_available
 
@@ -356,7 +350,7 @@ def sparse_mla_attention_nax(
     topk_indices: mx.array,
     scale: float,
 ) -> Optional[mx.array]:
-    """Causal sparse MLA prefill for NoPE latents on the tensor units.
+    """Causal sparse MLA for NoPE latents on the tensor units.
 
     q_latent: [1, H, L, 512], kv_latent: [1, 1, K, 512] (bf16/fp16, the
     last L rows are the queries' own positions), topk_indices:

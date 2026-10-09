@@ -68,7 +68,6 @@ def _make_model(
 def _restore_call(monkeypatch):
     from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
 
-    monkeypatch.delenv("OMLX_QWEN35_MOE_GATE_UP", raising=False)
     orig = getattr(SwitchGLU, "_omlx_gate_up_original_call", SwitchGLU.__call__)
     monkeypatch.setattr(
         Qwen3_5BatchInvariantForward,
@@ -188,13 +187,6 @@ def test_qwen4_exp_family_is_eligible_for_gate_up_fusion():
 
     assert apply_qwen35_moe_gate_up_fusion(model) == 1
     assert hasattr(model.blocks[0], "gate_up_proj")
-
-
-def test_env_kill_switch(monkeypatch):
-    monkeypatch.setenv("OMLX_QWEN35_MOE_GATE_UP", "0")
-    model = _make_model()
-    assert apply_qwen35_moe_gate_up_fusion(model) == 0
-    assert hasattr(model.blocks[0], "gate_proj")
 
 
 def test_unsupported_family_skipped():
@@ -391,10 +383,10 @@ def _assert_decode_plan_matches_per_call(monkeypatch, glu, seed):
     for batch in (1, 3):
         x = (mx.random.normal((batch, 1, 2560)) * 0.5).astype(mx.bfloat16)
         idx = mx.random.randint(0, 16, shape=(batch, 1, 10)).astype(mx.uint32)
-        monkeypatch.setattr(patch_mod, "_DECODE_PLAN_ENABLED", False)
-        ref = glu(x, idx)
-        mx.eval(ref)
-        monkeypatch.setattr(patch_mod, "_DECODE_PLAN_ENABLED", True)
+        with monkeypatch.context() as per_call:
+            per_call.setattr(patch_mod, "cached_per_module", lambda *a: None)
+            ref = glu(x, idx)
+            mx.eval(ref)
         out = glu(x, idx)
         mx.eval(out)
         assert out.shape == ref.shape and out.dtype == ref.dtype == mx.bfloat16

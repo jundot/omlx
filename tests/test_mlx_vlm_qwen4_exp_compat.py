@@ -12,6 +12,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
+from omlx import memory_monitor
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 
 
@@ -491,14 +492,24 @@ def test_qwen4_exp_sanitize_recenters_ones_centered_base_and_mtp(tmp_path, caplo
             )
             for key, value in canonical.items()
         }
+        # A direct gamma below 0.5 with more mantissa bits than its BF16
+        # residual can keep (0.2001953125 - 1 needs nine).
+        fp32_key = "mtp.pre_fc_norm_embedding.weight"
+        shifted[fp32_key] = mx.array(
+            [0.2001953125, 0.25, 0.30078125, 0.3515625], dtype=mx.bfloat16
+        )
 
         with caplog.at_level("INFO"):
             result = Model.sanitize(model, dict(shifted))
 
+        # Every other gamma recentres exactly in BF16 and keeps that dtype.
         for key in target_keys:
-            assert result[key].dtype == mx.float32
+            assert result[key].dtype == (
+                mx.float32 if key == fp32_key else mx.bfloat16
+            )
             assert mx.array_equal(
-                1.0 + result[key], shifted[key].astype(mx.float32)
+                1.0 + result[key].astype(mx.float32),
+                shifted[key].astype(mx.float32),
             ).item()
 
         gated_key = "language_model.model.layers.0.linear_attn.norm.weight"
@@ -665,7 +676,7 @@ def test_qwen4_exp_tiny_text_prefill_and_decode():
 def test_qwen4_gathered_qsa_prefill_matches_official_mask_path(
     monkeypatch, prefix, length, gathered_rows
 ):
-    monkeypatch.setenv("OMLX_QWEN4_GATHERED_MIN_QUERY", "2")
+    monkeypatch.setattr(memory_monitor, "_QWEN4_GATHERED_MIN_QUERY_TOKENS", 2)
     config = _tiny_config()
     import mlx_vlm.models.qwen4_exp.language as language
     from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpAttention

@@ -1,8 +1,8 @@
 // ShellEnvWriter owns the app-managed CLI shim.
 //
-// Default launch behavior must not edit shell rc files. The app first creates
-// `~/.omlx/bin/omlx`, then tries to expose it through a safe public symlink.
-// Shell rc edits are kept behind an explicit user prompt only.
+// The app writes only under `~/.omlx/bin`. It never writes to shared bin dirs
+// such as `/opt/homebrew/bin`, which package managers own. Shell rc edits and
+// removal of a link left by older app versions happen only after a prompt.
 
 import Foundation
 
@@ -16,6 +16,7 @@ enum ShellEnvWriter {
     enum CLISetupResult: Equatable {
         case publicCommandReady(path: String)
         case needsShellPathPrompt(reason: String)
+        case legacyPublicLink(path: String, shellPathInstalled: Bool)
     }
 
     private enum WriterError: LocalizedError {
@@ -31,6 +32,8 @@ enum ShellEnvWriter {
 
     private static let cliShimBeginMarker = "# oMLX: CLI shim path begin"
     private static let cliShimEndMarker = "# oMLX: CLI shim path end"
+    // Read-only. A Homebrew cask `binary` stanza links the bundle CLI here,
+    // and app versions before #4341 linked the shim here.
     private static let publicBinCandidates = [
         "/opt/homebrew/bin",
         "/usr/local/bin",
@@ -40,9 +43,8 @@ enum ShellEnvWriter {
     /// the same terminal command as pip/Homebrew installs.
     @discardableResult
     static func ensureCLIShim(appBundleURL: URL = Bundle.main.bundleURL) throws -> CLISetupResult {
-        let shimDir = home()
-            .appendingPathComponent(".omlx", isDirectory: true)
-            .appendingPathComponent("bin", isDirectory: true)
+        let shimURL = cliShimURL()
+        let shimDir = shimURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(
             at: shimDir,
             withIntermediateDirectories: true
@@ -55,7 +57,6 @@ enum ShellEnvWriter {
         guard FileManager.default.isExecutableFile(atPath: bundleCLI.path) else {
             throw WriterError.cliWrapperNotExecutable(bundleCLI.path)
         }
-        let shimURL = shimDir.appendingPathComponent("omlx")
         try writeLauncherShim(at: shimURL, forwardingTo: bundleCLI)
 
         // Another Mac's coordinator discovers this node by running
@@ -77,33 +78,47 @@ enum ShellEnvWriter {
             )
         }
 
-        if let path = firstCLIPathInCurrentPath() {
-            if isManagedCLI(path: path, shimURL: shimURL) {
-                return .publicCommandReady(path: path.path)
-            }
-        }
-
-        let symlinkResult = ensurePublicSymlink(to: shimURL)
-
-        switch symlinkResult {
-        case .installed(let path):
-            if let first = firstCLIPathInCurrentPath(),
-               !isManagedCLI(path: first, shimURL: shimURL) {
-                return .needsShellPathPrompt(
-                    reason: "\(first.path) appears before the oMLX app-managed command on PATH."
+        for dir in publicBinDirs() {
+            let link = dir.appendingPathComponent("omlx")
+            if isLegacyPublicLink(link) {
+                return .legacyPublicLink(
+                    path: link.path,
+                    shellPathInstalled: shellPathExportAlreadyInstalled()
                 )
             }
-            return .publicCommandReady(path: path.path)
-        case .failed(let reasons):
-            // A GUI launch only sees the launchd PATH, so an rc-based
-            // install is invisible to the PATH scan above. The shim
-            // marker in a shell file is the only signal that "Update
-            // Shell File" already ran.
-            if shellPathExportAlreadyInstalled() {
-                return .publicCommandReady(path: shimURL.path)
-            }
-            return .needsShellPathPrompt(reason: reasons.joined(separator: "\n"))
         }
+
+        let appCLIs = [shimURL, bundleCLI]
+        if let path = firstCLIPathInCurrentPath(), isAppCLI(path, appCLIs: appCLIs) {
+            return .publicCommandReady(path: path.path)
+        }
+
+        // A GUI launch only sees the launchd PATH, so check the shared bin
+        // dirs directly for a cask link.
+        var conflicts: [String] = []
+        for dir in publicBinDirs() {
+            let link = dir.appendingPathComponent("omlx")
+            guard FileManager.default.isExecutableFile(atPath: link.path) else { continue }
+            if isAppCLI(link, appCLIs: appCLIs) {
+                return .publicCommandReady(path: link.path)
+            }
+            conflicts.append("\(link.path) is a different omlx install.")
+        }
+
+        // The shim marker in a shell file is the only signal that "Update
+        // Shell File" already ran.
+        if shellPathExportAlreadyInstalled() {
+            return .publicCommandReady(path: shimURL.path)
+        }
+        return .needsShellPathPrompt(reason: conflicts.joined(separator: "\n"))
+    }
+
+    /// Remove `path` only if it is still a link that an older app version
+    /// created. Any other file is left in place.
+    static func removeLegacyPublicLink(atPath path: String) throws {
+        let link = URL(fileURLWithPath: path)
+        guard isLegacyPublicLink(link) else { return }
+        try FileManager.default.removeItem(at: link)
     }
 
     static func shouldSuppressCLIPathPrompt() -> Bool {
@@ -147,6 +162,13 @@ enum ShellEnvWriter {
         homeOverrideForTests ?? FileManager.default.homeDirectoryForCurrentUser
     }
 
+    private static func cliShimURL() -> URL {
+        home()
+            .appendingPathComponent(".omlx", isDirectory: true)
+            .appendingPathComponent("bin", isDirectory: true)
+            .appendingPathComponent("omlx")
+    }
+
     private static func candidateFiles() -> [URL] {
         let names = [
             ".zshrc", ".zprofile", ".zshenv",
@@ -177,72 +199,24 @@ enum ShellEnvWriter {
 
     // MARK: - File mutation
 
-    private enum PublicSymlinkResult {
-        case installed(URL)
-        case failed([String])
-    }
-
     private struct CLIPathPrefs: Codable {
         var suppressShellPathPrompt: Bool = false
     }
 
-    private static func ensurePublicSymlink(to shimURL: URL) -> PublicSymlinkResult {
-        let fm = FileManager.default
-        var reasons: [String] = []
-
-        for dir in publicBinDirs() {
-            guard fm.fileExists(atPath: dir.path) else {
-                reasons.append("\(dir.path) does not exist.")
-                continue
-            }
-
-            let link = dir.appendingPathComponent("omlx")
-            if fm.fileExists(atPath: link.path) {
-                if isManagedCLI(path: link, shimURL: shimURL) {
-                    return .installed(link)
-                }
-                reasons.append("\(link.path) already exists and is not managed by oMLX.")
-                continue
-            }
-            guard fm.isWritableFile(atPath: dir.path) else {
-                reasons.append("\(dir.path) is not writable.")
-                continue
-            }
-
-            do {
-                try fm.createSymbolicLink(at: link, withDestinationURL: shimURL)
-                return .installed(link)
-            } catch {
-                reasons.append("Failed to create \(link.path): \(error.localizedDescription)")
-            }
-        }
-
-        if reasons.isEmpty {
-            reasons.append("No writable public PATH directory was available.")
-        }
-        return .failed(reasons)
+    private static func publicBinDirs() -> [URL] {
+        publicBinDirsOverrideForTests
+            ?? publicBinCandidates.map { URL(fileURLWithPath: $0, isDirectory: true) }
     }
 
-    private static func publicBinDirs() -> [URL] {
-        if let override = publicBinDirsOverrideForTests {
-            return override
+    /// Older app versions linked `<public bin>/omlx` to the absolute shim
+    /// path. Compare the raw link text so no other link matches.
+    private static func isLegacyPublicLink(_ link: URL) -> Bool {
+        guard let destination = try? FileManager.default
+            .destinationOfSymbolicLink(atPath: link.path)
+        else {
+            return false
         }
-
-        var seen = Set<String>()
-        var dirs: [URL] = []
-        let pathParts = (getenv("PATH").map { String(cString: $0) } ?? "")
-            .split(separator: ":")
-            .map(String.init)
-
-        for path in pathParts where publicBinCandidates.contains(path) {
-            if seen.insert(path).inserted {
-                dirs.append(URL(fileURLWithPath: path, isDirectory: true))
-            }
-        }
-        for path in publicBinCandidates where seen.insert(path).inserted {
-            dirs.append(URL(fileURLWithPath: path, isDirectory: true))
-        }
-        return dirs
+        return destination == cliShimURL().path
     }
 
     private static func firstCLIPathInCurrentPath() -> URL? {
@@ -258,9 +232,11 @@ enum ShellEnvWriter {
         return nil
     }
 
-    private static func isManagedCLI(path: URL, shimURL: URL) -> Bool {
-        path.resolvingSymlinksInPath().standardizedFileURL.path
-            == shimURL.resolvingSymlinksInPath().standardizedFileURL.path
+    private static func isAppCLI(_ path: URL, appCLIs: [URL]) -> Bool {
+        let resolved = path.resolvingSymlinksInPath().standardizedFileURL.path
+        return appCLIs.contains {
+            $0.resolvingSymlinksInPath().standardizedFileURL.path == resolved
+        }
     }
 
     private static func cliPathPrefsURL() -> URL {

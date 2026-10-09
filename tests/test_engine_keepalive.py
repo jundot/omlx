@@ -48,22 +48,18 @@ class TestTryCompileMaskProbe:
     stops representing the real request path.
     """
 
-    def test_mask_branching_model_falls_back_at_load(self, monkeypatch):
+    def test_mask_branching_model_falls_back_at_load(self):
         from omlx.models.embedding import MLXEmbeddingModel
 
-        # An exported OMLX_EMBEDDING_COMPILE=0 would make _try_compile return
-        # False before ever calling mx.compile — a vacuously passing test.
-        monkeypatch.delenv("OMLX_EMBEDDING_COMPILE", raising=False)
         model = MLXEmbeddingModel("test-model")
         model.model = _MaskBranchingModel()
 
         assert model._try_compile() is False
         assert model._compiled_embed is None
 
-    def test_mask_free_model_still_compiles(self, monkeypatch):
+    def test_mask_free_model_still_compiles(self):
         from omlx.models.embedding import MLXEmbeddingModel
 
-        monkeypatch.delenv("OMLX_EMBEDDING_COMPILE", raising=False)
         model = MLXEmbeddingModel("test-model")
         model.model = _MaskFreeModel()
 

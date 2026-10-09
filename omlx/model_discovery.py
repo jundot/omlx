@@ -12,6 +12,7 @@ Supports:
 - Reranker models: Use RerankerEngine for document reranking
 - Audio STT models: Use STTEngine for speech-to-text (Whisper, Qwen3-ASR, ...)
 - Audio TTS models: Use TTSEngine for text-to-speech (Qwen3-TTS, Kokoro, ...)
+- Decision models: Use DecisionEngine for /v1/systemone (Clef, OpenJev)
 """
 
 import contextlib
@@ -25,8 +26,13 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
-EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
+ModelType = Literal[
+    "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "decision"
+]
+EngineType = Literal[
+    "batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "decision"
+]
+DecisionKind = Literal["clef", "openjev"]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -94,6 +100,12 @@ MLX_LM_TEXT_ONLY_MODEL_TYPES = {
 
 _MIMO_VISION_SIDECAR = Path("omnimodal/vision_encoder.safetensors")
 _MIMO_OMNIMODAL_CONFIG = Path("omnimodal/config.json")
+
+# Clef ships its decision head next to the backbone shards. It is not part of
+# the backbone index, so backbone loaders and quantizers must skip it.
+CLEF_HEAD_WEIGHTS = "joint_head.safetensors"
+CLEF_HEAD_CONFIG = "joint_head_config.json"
+_OPENJEV_HELPER = Path("helper/shim.py")
 
 # Speculative-decoding "helper" checkpoints (dFlash / MTP / assistant drafters)
 # are never meant to be served as standalone chat models. Some declare a
@@ -208,6 +220,7 @@ EMBEDDING_ARCHITECTURES = {
     "SiglipModel",
     "SiglipVisionModel",
     "SiglipTextModel",
+    "EmbeddingGemma2Model",  # via mlx-vlm; has vision_config, checked before VLM
 }
 
 # Supported reranker architectures
@@ -450,6 +463,32 @@ def _model_name_hint(model_path: Path) -> str:
     return model_path.name.lower()
 
 
+def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind | None:
+    """Return the decision-model family of a checkpoint, or None.
+
+    Clef is identified by its joint head files. OpenJev is a plain Qwen3.5
+    checkpoint, so it is identified by its helper directory or, for MLX
+    conversions without the helper, by the directory name.
+    """
+    if (model_path / CLEF_HEAD_WEIGHTS).is_file() and (
+        model_path / CLEF_HEAD_CONFIG
+    ).is_file():
+        return "clef"
+    if config is None:
+        try:
+            with open(model_path / "config.json") as f:
+                config = json.load(f)
+        except (OSError, ValueError):
+            return None
+    if config.get("model_type") != "qwen3_5":
+        return None
+    if (model_path / _OPENJEV_HELPER).is_file() or "openjev" in _model_name_hint(
+        model_path
+    ):
+        return "openjev"
+    return None
+
+
 def _is_causal_lm_reranker(model_path: Path) -> bool:
     """
     Heuristic check for CausalLM models fine-tuned as rerankers.
@@ -629,11 +668,15 @@ def detect_model_type(model_path: Path) -> ModelType:
        ``mm_vision_tower`` — see :func:`_has_vision_subconfig`)
     7. Audio model detection (STT/TTS/STS)
 
+    Decision models (see :func:`decision_kind`) are checked first because
+    their backbones look like ordinary VLM checkpoints.
+
     Args:
         model_path: Path to model directory
 
     Returns:
-        Model type: "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", or "audio_sts"
+        Model type: "llm", "vlm", "embedding", "reranker", "audio_stt",
+        "audio_tts", "audio_sts", or "decision"
     """
     config_path = model_path / "config.json"
     if not config_path.exists():
@@ -644,6 +687,9 @@ def detect_model_type(model_path: Path) -> ModelType:
             config = json.load(f)
     except (json.JSONDecodeError, IOError):
         return "llm"
+
+    if decision_kind(model_path, config) is not None:
+        return "decision"
 
     # Check architectures field for reranker first (more specific)
     architectures = config.get("architectures", [])
@@ -1603,6 +1649,8 @@ def _register_model(
             engine_type = "audio_tts"
         elif model_type == "audio_sts":
             engine_type = "audio_sts"
+        elif model_type == "decision":
+            engine_type = "decision"
         else:
             engine_type = "batched"
         estimated_size = estimate_model_size(model_dir)

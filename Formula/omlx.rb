@@ -88,6 +88,18 @@ class Omlx < Formula
     pip_install = [libexec/"bin/pip", "install", *pip_flags, "--no-binary", no_binary]
 
     if build.with?("custom-kernel")
+      # `metal` ships with Xcode, not the Command Line Tools.
+      unless quiet_system("/usr/bin/xcrun", "-f", "metal")
+        odie <<~EOS
+          --with-custom-kernel requires the Metal compiler, but `xcrun -f metal` found none.
+          It ships with full Xcode, and on current Xcode versions is a separate component:
+
+            xcodebuild -downloadComponent MetalToolchain
+
+          Otherwise install omlx without the custom kernels: brew install omlx
+        EOS
+      end
+
       kernel_sources = CUSTOM_KERNELS.map do |kernel|
         buildpath/"omlx/custom_kernels/#{kernel}/csrc"
       end
@@ -248,6 +260,9 @@ class Omlx < Formula
 
   test do
     assert_match version.to_s, shell_output("#{bin}/omlx --version")
+    system libexec/"bin/python", "-c",
+           "import pathlib, omlx_web; " \
+           "assert (pathlib.Path(omlx_web.__file__).parent / 'templates/dashboard.html').is_file()"
     system libexec/"bin/python", "-c",
            "import spacy; spacy.load('en_core_web_sm')"
     verify_custom_kernels(libexec/"bin/python") if build.with?("custom-kernel")

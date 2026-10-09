@@ -1433,21 +1433,24 @@ def test_fused_verify_cycles_under_armed_verify_qmm_routing_are_bitwise_referenc
     verify forward. A KDA layer whose projections do not share one
     quantization (a 5-bit v_proj among 8-bit ones) runs them as separate
     QuantizedLinear calls in the reference body, which the routes take for
-    3+ rows; the fused verify path must give the same values there too."""
+    3+ rows; the fused verify path must give the same values there too.
+    Blocks whose shared-expert projections stay on the stock qmm (2-3 rows
+    here) keep the shared expert in the fused MoE kernel."""
     used = check_verify_matches_reference(
         23, 300, _CYCLES, KDA_BITS["mixed-v/4-bit"], armed=True
     )
-    assert {"kda", "hc_mix"} <= used, used
+    assert {"kda", "hc_mix", "moe_shared_wide"} <= used, used
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
 def test_fused_verify_cycles_are_bitwise_reference_with_nax_tf32():
     """The production default runs fp32 GEMMs on NAX (TF32), where the
-    one-token HC expand and the verify router kernels also engage."""
+    one-token HC expand also engages."""
     here = Path(__file__).resolve().parent
     code = (
         "import sys; sys.path[:0] = [%r, %r]\n"
         "import test_glm5_next_mtp as t\n"
+        "t.dk.moe_router = t._stock_verify_router(t.dk.moe_router)\n"
         "from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk\n"
         "used = []\n"
         "for seed, ctx in ((5, 300), (11, 2101)):\n"
@@ -1471,9 +1474,8 @@ def test_fused_verify_cycles_are_bitwise_reference_with_nax_tf32():
     for families in eval(used):
         assert {"kda", "hc_mix"} <= set(families), families
         if nax_tf32 == "True":
-            # The compiled verify FFN traces the fused router (its first-use
-            # check ran eagerly), and one-token blocks the fused HC expand.
-            assert {"router_rows", "hc_expand"} <= set(families), families
+            # One-token blocks run the fused HC expand.
+            assert "hc_expand" in families, families
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
@@ -1693,3 +1695,21 @@ def test_batched_rollback_rejects_a_fused_capture():
     capture = language.KdaStepCapture(None, mx.zeros((2, 4, 8)), None, None)
     with pytest.raises(ValueError):
         rollback_rows(language, [cache], [capture], [0, 1], 4)
+
+
+def _stock_verify_router(fused):
+    """Leave verify rows to the stock router.
+
+    Fused-vs-reference checks then compare the other kernels on the same
+    expert choices. The verify router has its own tests.
+    """
+
+    def router(x, *args, **kwargs):
+        return None if x.shape[0] > 1 else fused(x, *args, **kwargs)
+
+    return router
+
+
+@pytest.fixture(autouse=True)
+def _pin_verify_router(monkeypatch):
+    monkeypatch.setattr(dk, "moe_router", _stock_verify_router(dk.moe_router))
