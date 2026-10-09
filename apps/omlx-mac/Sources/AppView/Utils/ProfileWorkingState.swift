@@ -137,6 +137,15 @@ enum ProfileSettingsKey {
     static let chatTemplateKwargs = "chat_template_kwargs"
     static let forcedCtKwargs = "forced_ct_kwargs"
 
+    /// Keys a global template keeps (`UNIVERSAL_PROFILE_FIELDS`). The server
+    /// drops every other key from template settings.
+    static let templateKeys: Set<String> = [
+        maxContextWindow, maxTokens, temperature, topP, topK, minP,
+        repetitionPenalty, presencePenalty, enableThinking,
+        thinkingBudgetEnabled, thinkingBudgetTokens, reasoningParser,
+        maxToolResultTokens, forceSampling, chatTemplateKwargs, forcedCtKwargs,
+    ]
+
     // Model-specific
     static let modelTypeOverride = "model_type_override"
     static let trustRemoteCode = "trust_remote_code"

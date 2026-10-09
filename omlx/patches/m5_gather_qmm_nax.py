@@ -2,18 +2,20 @@
 """Tensor-unit (NAX) sorted ``gather_qmm`` for M5 hosts, compiled at runtime.
 
 The MoE prefill path (``SwitchGLU`` with ``sorted_indices=True``) runs every
-routed expert GEMM through ``mx.gather_qmm``. On M5 GPUs mlx 0.32.2 sends
-it to the ``*_gather_qmm_rhs_nax`` row-block kernel: a threadgroup per
-64-row block of the sorted rows, re-running the whole K loop for every
-expert present in the block with only that expert's rows active. At real
-MoE prefill sizes (tens of rows per expert, a third of the blocks spanning
-two experts) a large share of the tensor-unit work is masked, and the
-kernel carries two defects (``K % 64 != 0`` tail and an int16 row offset
-past 32768 rows) that ``m5_gather_qmm`` works around by dropping to the
-slow steel path or splitting the call.
+routed expert GEMM through ``mx.gather_qmm``. On M5 GPUs mlx sends it to
+the ``*_gather_qmm_rhs_nax`` kernels. Through mlx 0.32.2 that was a
+row-block kernel: a threadgroup per 64-row block of the sorted rows,
+re-running the whole K loop for every expert present in the block with
+only that expert's rows active, so at real MoE prefill sizes (tens of rows
+per expert, a third of the blocks spanning two experts) a large share of
+the tensor-unit work was masked. mlx 0.32.3 schedules single-expert tiles
+itself (ml-explore/mlx#4572) but still reads past the expert's K extent
+when ``K % 64 != 0``, which ``m5_gather_qmm`` works around by dropping to
+the slow steel path.
 
-This module runs the same product on the tensor units with segmented tile
-scheduling instead, as ``mx.fast.metal_kernel`` kernels on top of the NAX
+This module runs the same product on the tensor units with its own
+segmented tile scheduling (faster than mlx 0.32.3's on an M5 Max for MoE
+prefill), as ``mx.fast.metal_kernel`` kernels on top of the NAX
 tile primitives of the installed mlx (``steel/gemm/nax.h``, read from the
 package's ``include`` directory):
 
@@ -82,8 +84,8 @@ epilogue additionally needs ``2 * n % 64 == 0``, the row map a uint32
 ``[M]`` map and fewer than 2**32 token-row elements. Anything else returns
 None and the caller keeps the stock path.
 
-The index must hold each expert's rows as one contiguous run. mlx treats
-``sorted_indices`` only as a hint, but the tile pre-pass relies on it: an
+The index must hold each expert's rows as one contiguous run: the tile
+pre-pass relies on it (as mlx 0.32.3's own sorted kernel does), and an
 expert split over two runs leaves rows unwritten. Every caller sorts the
 routes globally first.
 

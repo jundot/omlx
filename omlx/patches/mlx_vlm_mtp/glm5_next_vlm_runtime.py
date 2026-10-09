@@ -374,10 +374,6 @@ def _patch_decoder_layer(g5_lang: Any) -> None:
         # Capture recurrent state only in KDA layers. Both attention families
         # can compile the stateless FFN at the bounded MTP verify shapes.
         residual = x
-        if g5_lang._DECODE_FUSION:
-            # Settle the eager sigmoid probe outside the compiled FFN block,
-            # which cannot run it (as the vendor call does).
-            g5_lang._decode_kernels.eager_sigmoid_precise(mx.float32)
         # Same values as attn_hc + input_layernorm (None: not covered).
         fused = g5_lang._decode_hc_pre(self.attn_hc, self.input_layernorm, x)
         if fused is None:
@@ -398,43 +394,13 @@ def _patch_decoder_layer(g5_lang: Any) -> None:
             and x.shape[0] == 1
             and 1 <= x.shape[1] <= _MAX_CHAIN_DEPTH + 1
         ):
-            _check_verify_router(g5_lang, self, x)
             if self._ffn_c is None:
-                # The vendor's compile keeps the layer's weights out of the
-                # trace's constants (a leaked trace would pin them in memory).
-                self._ffn_c = g5_lang.compile_ffn_block(self, self._ffn_block)
+                self._ffn_c = mx.compile(self._ffn_block)
             return self._ffn_c(x)
         return self._ffn_block(x)
 
     cls.__call__ = __call__
     cls._omlx_mtp_sink_patched = True
-
-
-# Router shapes and block widths whose fused verify router has been checked.
-_ROUTER_CHECKED: set = set()
-
-
-def _check_verify_router(g5_lang: Any, layer: Any, x: mx.array) -> None:
-    """Run the fused verify router's first-use check outside the compiled FFN.
-
-    ``decode_kernels.moe_router_rows`` compares the first call of each
-    configuration with the reference router, which takes an eager
-    evaluation; traced inside ``mx.compile`` it declines, and the compiled
-    FFN block then keeps the reference router at that width for good. One
-    eager router call per block width, on a fixed synthetic block (so it
-    neither waits for this forward nor draws random numbers), settles the
-    check first. The routes are the same either way.
-    """
-    gate = getattr(getattr(layer, "mlp", None), "gate", None)
-    width, dim = x.shape[1], x.shape[-1]
-    if gate is None or not g5_lang._DECODE_FUSION or not 2 <= width <= _MAX_CHAIN_DEPTH + 1:
-        return
-    key = (width, x.dtype, tuple(gate.weight.shape), gate.top_k)
-    if key in _ROUTER_CHECKED:
-        return
-    _ROUTER_CHECKED.add(key)
-    probe = mx.sin(mx.arange(width * dim, dtype=mx.float32) * 0.37) * 2.0
-    gate(probe.astype(x.dtype).reshape(1, width, dim))
 
 
 # ---------------------------------------------------------------------------

@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 import mlx.core as mx
 
 from .engine import BaseEngine, BatchedEngine
+from .engine.decision import DecisionEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine.sts import STSEngine
@@ -261,7 +262,14 @@ class EngineEntry:
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
     model_type: Literal[
-        "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"
+        "llm",
+        "vlm",
+        "embedding",
+        "reranker",
+        "audio_stt",
+        "audio_tts",
+        "audio_sts",
+        "decision",
     ]  # Model type
     engine_type: Literal[
         "batched",
@@ -272,6 +280,7 @@ class EngineEntry:
         "audio_stt",
         "audio_tts",
         "audio_sts",
+        "decision",
     ]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
@@ -297,6 +306,7 @@ class EngineEntry:
         BaseEngine
         | EmbeddingEngine
         | RerankerEngine
+        | DecisionEngine
         | STTEngine
         | STSEngine
         | TTSEngine
@@ -1379,6 +1389,7 @@ class EnginePool:
         "audio_stt": "audio_stt",
         "audio_tts": "audio_tts",
         "audio_sts": "audio_sts",
+        "decision": "decision",
     }
 
     @staticmethod
@@ -2656,6 +2667,8 @@ class EnginePool:
         evicted_any = False
         evicted_count = 0
         reclaim_attempted = False
+        slots_release_attempted = False
+        slots_freed = 0
         ane_release_attempted = False
         hot_cache_attempted = False
         hot_cache_released = False
@@ -2671,6 +2684,8 @@ class EnginePool:
             def _log_decision(outcome: str) -> None:
                 if ane_release_attempted:
                     action = "release_ane"
+                elif slots_freed:
+                    action = "release_offload_slots"
                 elif reclaim_attempted:
                     action = "reclaim_pool"
                 elif evicted_any:
@@ -2705,13 +2720,16 @@ class EnginePool:
                 # excludes the hot cache, as in Scheduler._current_usage_bytes.
                 hot_cache = self._hot_cache_bytes()
                 footprint = max(0, _settled_phys_footprint() - hot_cache)
-                current = max(active, footprint, self._current_model_memory)
+                # Released offload slots are part of the model's admitted size.
+                model_memory = self._current_model_memory - slots_freed
+                current = max(active, footprint, model_memory)
                 if current + predicted <= target:
                     # Use the same sample for admission and its decision log.
                     _log_decision("headroom_available")
                     return (
                         evicted_any
                         or reclaim_attempted
+                        or slots_freed > 0
                         or ane_release_attempted
                         or hot_cache_released
                     )
@@ -2723,6 +2741,16 @@ class EnginePool:
                         exclude_model_id, request_id
                     )
                     continue
+
+                if not slots_release_attempted:
+                    # The requesting model's MoE offload slots return at its next
+                    # decode step, so they go before cached prefixes and models.
+                    slots_release_attempted = True
+                    slots_freed = await self._release_offload_slots_for_headroom(
+                        exclude_model_id, request_id
+                    )
+                    if slots_freed:
+                        continue
 
                 if not hot_cache_attempted:
                     # Cached prefix blocks give way before any model does.
@@ -2942,6 +2970,40 @@ class EnginePool:
                 request_id,
             )
         return freed
+
+    async def _release_offload_slots_for_headroom(
+        self, model_id: str, request_id: str
+    ) -> int:
+        """Release the model's MoE offload slots on its MLX thread; return the bytes."""
+        entry = self._entries.get(model_id)
+        engine = entry.engine if entry is not None else None
+        core = (
+            self._resolve_engine_core_from_engine(engine)
+            if engine is not None
+            else None
+        )
+        scheduler = getattr(core, "scheduler", None)
+        release = getattr(scheduler, "release_moe_offload_slots", None)
+        executor = getattr(core, "_mlx_executor", None)
+        if not callable(release) or executor is None:
+            return 0
+        loop = asyncio.get_running_loop()
+        try:
+            released = await loop.run_in_executor(executor, release, request_id)
+        except Exception as e:
+            logger.warning(
+                "MoE offload slot release failed for prefill request %s: %s",
+                request_id,
+                e,
+            )
+            return 0
+        if released > 0:
+            logger.info(
+                "Released %s of MoE offload slots for prefill request %s",
+                format_size(released),
+                request_id,
+            )
+        return released
 
     async def _release_ane_prefill_for_headroom(
         self, model_id: str, request_id: str
@@ -3487,7 +3549,13 @@ class EnginePool:
             # since DFlash has its own model loading pipeline
             engine = None
             deployment = deployment if effective_type == "batched" else None
-            if deployment is None and model_settings is not None:
+            # Decision models never decode, so speculative decoding settings
+            # saved for the same checkpoint do not apply.
+            if (
+                deployment is None
+                and model_settings is not None
+                and effective_type != "decision"
+            ):
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
                 dflash_draft = getattr(model_settings, "dflash_draft_model", None)
                 if dflash_enabled and not dflash_draft:
@@ -3628,6 +3696,12 @@ class EnginePool:
                     engine = RerankerEngine(
                         model_name=entry.model_path,
                         trust_remote_code=trc,
+                    )
+                elif effective_type == "decision":
+                    engine = DecisionEngine(
+                        model_name=entry.model_path,
+                        trust_remote_code=trc,
+                        scheduler_config=self._scheduler_config,
                     )
                 elif effective_type == "vlm":
                     engine = VLMBatchedEngine(

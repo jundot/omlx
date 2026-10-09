@@ -13,7 +13,7 @@ import gc
 import logging
 import re
 from collections.abc import AsyncIterator
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, get_args, get_type_hints
 
 import mlx.core as mx
 import numpy as np
@@ -55,6 +55,24 @@ def _accepts_preset_voice(model: Any) -> bool:
     """
     speakers = getattr(model, "supported_speakers", None)
     return not (isinstance(speakers, list) and not speakers)
+
+
+def _resolve_ref_audio(model: Any, ref_audio: str) -> Any:
+    """Load ref_audio for models whose generate() accepts only an array.
+
+    Path-accepting models preprocess the file themselves (Confucius4 resamples
+    it to 16 kHz), so they keep the path.
+    """
+    try:
+        hint = get_type_hints(model.generate).get("ref_audio")
+    except Exception:
+        return ref_audio
+    members = get_args(hint) or (hint,)
+    if mx.array not in members or str in members:
+        return ref_audio
+    from mlx_audio.utils import load_audio
+
+    return load_audio(ref_audio, sample_rate=model.sample_rate)
 
 
 class TTSEngine(BaseNonStreamingEngine):
@@ -250,7 +268,7 @@ class TTSEngine(BaseNonStreamingEngine):
             if speed != 1.0:
                 gen_kwargs["speed"] = speed
             if ref_audio is not None and "ref_audio" in gen_params:
-                gen_kwargs["ref_audio"] = ref_audio
+                gen_kwargs["ref_audio"] = _resolve_ref_audio(model, ref_audio)
                 gen_kwargs["ref_text"] = ref_text
             # Generation params (only add non-None values)
             if temperature is not None:
@@ -376,7 +394,7 @@ class TTSEngine(BaseNonStreamingEngine):
             if speed != 1.0:
                 gen_kwargs["speed"] = speed
             if ref_audio is not None and "ref_audio" in gen_params:
-                gen_kwargs["ref_audio"] = ref_audio
+                gen_kwargs["ref_audio"] = _resolve_ref_audio(model, ref_audio)
                 gen_kwargs["ref_text"] = ref_text
             if temperature is not None:
                 gen_kwargs["temperature"] = temperature

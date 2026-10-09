@@ -38,7 +38,7 @@ from .hc_projection import env_enabled
 logger = logging.getLogger(__name__)
 
 _DISABLED = not env_enabled("OMLX_QWEN4_ATTN_FUSED")
-MAX_ROWS = 8
+MAX_ROWS = 16
 # MLX's vector SDPA: one pass below this many keys on 'd'/'s' GPUs.
 _TWO_PASS_KEYS = 1024
 # MLX's two-pass partition count for 12 query heads per KV head below 16K keys.

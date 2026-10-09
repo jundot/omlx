@@ -2818,8 +2818,12 @@ def _quiet_prefill_tracker():
     from omlx.prefill_progress import get_prefill_tracker
 
     get_prefill_tracker().clear()
+    # Batch parking verdicts outlive a cohort (per model object); a model a
+    # fixture reuses must not start a test parked by an earlier one.
+    bg._BATCH_PARK_MEMORY.clear()
     yield
     get_prefill_tracker().clear()
+    bg._BATCH_PARK_MEMORY.clear()
 
 
 class TestLoopTaxHygiene:
@@ -4372,6 +4376,8 @@ def _join_as_batch_row_finishes(model, prompts, joined_prompt, max_tokens=40):
     that singleton with the pending prompt. A one-token prompt splits into
     generation at once, like the scheduler's externally prefilled inserts.
     """
+    # Shared MTP must activate: no parking verdict from an earlier run.
+    bg._BATCH_PARK_MEMORY.clear()
     gen = BatchGenerator(
         model,
         sampler=lambda lp: mx.argmax(lp, -1),
@@ -4587,13 +4593,13 @@ def test_context_copy_drafts_keep_greedy_output(family, monkeypatch):
     """Copied drafts never change greedy output, whichever of them is wrong.
 
     The proposer is replaced by the true continuation with one token flipped
-    at a position that moves every cycle, so the widest (8-row) windows are
+    at a position that moves every cycle, so the widest (16-row) windows are
     verified with accepted lengths from none to all.
     """
     from omlx.patches.mlx_lm_mtp import context_copy
 
     widest = context_copy.MAX_COPY
-    flips = (0, 1, 3, widest - 1, widest)  # ``widest``: nothing flipped
+    flips = (0, 1, 7, widest - 1, widest)  # ``widest``: nothing flipped
     previous = mlx_lm_mtp.is_mtp_active()
     try:
         mlx_lm_mtp.set_mtp_active(True)
@@ -4617,7 +4623,7 @@ def test_context_copy_drafts_keep_greedy_output(family, monkeypatch):
                 copied[wrong] ^= 1
             return copied if len(copied) >= 2 else []
 
-        def observe(self, count):
+        def observe(self, count, drafted):
             accepted.append(count)
 
         monkeypatch.setattr(context_copy.ContextCopy, "propose", propose)
@@ -4627,6 +4633,24 @@ def test_context_copy_drafts_keep_greedy_output(family, monkeypatch):
         assert set(flips) <= set(accepted)
     finally:
         mlx_lm_mtp.set_mtp_active(previous)
+
+
+@pytest.mark.parametrize("wide_window", [False, True])
+def test_context_copy_width_follows_the_targets_verify_window(wide_window):
+    """A verbatim run after a whole accept copies 15 tokens only for a target
+    that verifies 16-row windows; other targets (GLM-5.3 rolls back at most
+    8 rows) keep 7-token copies."""
+    from omlx.patches.mlx_lm_mtp import context_copy
+
+    source = list(range(1000, 1200))
+    history = source + source[:100]  # the tail repeats the source verbatim
+    copier = context_copy.ContextCopy(wide_window=wide_window)
+    copier.extend(history, [])
+    assert copier.propose(64) == source[100:107]
+    copier.observe(7, 7)
+    copier.extend(history + source[100:107], [])
+    expected = 15 if wide_window else 7
+    assert copier.propose(64) == source[107 : 107 + expected]
 
 
 @pytest.mark.parametrize("size", [2, 4])
@@ -5707,3 +5731,73 @@ def test_spec_command_buffers_restore_caps_after_the_step(monkeypatch, raised):
         raise RuntimeError("step failed")
     assert inside == (bg._SPEC_BUFFER_CAPS if raised else (50, 50))
     assert caps[-1] == (50, 50)
+
+
+def test_batch_park_verdict_outlives_its_cohort():
+    """MTP parked at k rows keeps new cohorts of k or more rows parked for what
+    is left of the park, until a cohort where MTP holds up clears it."""
+    from omlx.patches.mlx_lm_mtp.batch_policy import ParkMemory
+
+    memory = ParkMemory()
+    lost = BatchPolicy(range(4), 3)
+    lost.park()
+    memory.parked(lost)
+    for _ in range(28):
+        memory.tick()
+    wider, narrower = BatchPolicy(range(8), 3), BatchPolicy(range(2), 3)
+    memory.seed(wider)
+    memory.seed(narrower)
+    # 128 - 28 steps of the park are left; the next park doubles once.
+    assert wider.remaining == 100 and wider.cooldown == 256
+    assert narrower.remaining == 0
+    fixed = BatchPolicy(range(8), 3, fixed=True)
+    memory.seed(fixed)
+    assert not fixed.needs_standard()
+
+    short = BatchPolicy(range(8), 3)
+    short.decisions = 31
+    memory.retired(short)
+    again = BatchPolicy(range(4), 3)
+    memory.seed(again)
+    assert again.remaining == 100
+    held = BatchPolicy(range(8), 3)
+    held.decisions = 32
+    memory.retired(held)
+    fresh = BatchPolicy(range(8), 3)
+    memory.seed(fresh)
+    assert fresh.remaining == 0
+
+
+def test_batch_park_expires_while_cohorts_come_and_go():
+    """A park ends on the model's step clock, not per cohort: with a cohort
+    change every 50-150 steps and MTP winning once measured again, new
+    cohorts measure MTP after the park and keep running it."""
+    import random
+
+    from omlx.patches.mlx_lm_mtp.batch_policy import ParkMemory
+
+    memory = ParkMemory()
+    lost = BatchPolicy(range(8), 3)
+    lost.park()
+    memory.parked(lost)
+    rng = random.Random(0)
+    steps = mtp_cycles = 0
+    first_mtp = None
+    while steps < 6000:
+        policy = BatchPolicy(range(8), 3)
+        memory.seed(policy)
+        for _ in range(rng.randint(50, 150)):
+            memory.tick()
+            steps += 1
+            if policy.needs_standard():
+                policy.observe_standard(10.0)
+                continue
+            # Every draft accepted at 6 ms a cycle: MTP clearly wins.
+            policy.observe_mtp(policy.cur, [policy.cur] * 8, 6.0, stable=True)
+            mtp_cycles += 1
+            first_mtp = steps if first_mtp is None else first_mtp
+            assert not policy.should_park()
+        memory.retired(policy)
+    # The 128-step park, then one cohort's calibration (2 warmup + 3 samples).
+    assert first_mtp is not None and first_mtp <= 128 + 150 + 5
+    assert mtp_cycles > 0.9 * (6000 - first_mtp) - 5 * 6000 / 50

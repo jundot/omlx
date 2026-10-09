@@ -15,7 +15,11 @@ zero-accept rounds. Differences, measured on Qwen3.8-Flash-Next: copies
 need a 12-token match (TensorFold uses 8; 8-11 token matches in chat and
 long-context replies accepted fewer tokens than the MTP chain they replace);
 only the 32 most recent occurrences are compared, which bounds the host time
-a cycle spends on repetitive text.
+a cycle spends on repetitive text; and a copy proposes 7 tokens, or, on a
+target that verifies 16-row windows, 15 when the tail repeats the source
+verbatim for the whole 64-token match and the previous copy was accepted whole
+(text being copied out, like an edited file, rather than a repeated pattern
+whose details change every few lines).
 """
 
 from __future__ import annotations
@@ -27,10 +31,15 @@ import numpy as np
 
 ENABLED = os.environ.get("OMLX_MTP_CONTEXT_COPY", "1").strip() != "0"
 
-# One verify window carries the pending token plus the drafts. The row-exact
-# verify kernels (MoE routed window, router, row-exact qmv) cover 8 rows, so
-# a copy proposes at most 7 tokens.
-MAX_COPY = 7
+# One verify window carries the pending token plus the drafts. Qwen4-Exp's
+# row-exact verify kernels (MoE routed window, router, row-exact qmv, fused
+# attention, GDN verify, hyper-connections) cover 16 rows, so there a copy
+# proposes at most 15 tokens. An 8-row window costs about 55% of a 16-row one
+# (M5 Ultra), so the wide window is kept for verbatim runs, where it is
+# accepted whole. Other targets keep 8-row windows (GLM-5.3's sparse caches
+# cannot undo a longer verify block), so their copies stay at 7 tokens.
+MAX_COPY = 15
+_NARROW_COPY = 7
 _MAX_MATCH = 64
 _ENTER_MATCH = 12
 _MIN_COPY = 2
@@ -54,13 +63,16 @@ class ContextCopy:
     contiguous ascending run. Tokens appended later go into a dict.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, wide_window: bool = False) -> None:
+        """``wide_window``: the target verifies 16-row windows (MAX_COPY + 1)."""
+        self._wide_window = wide_window
         self._ids: List[int] = []
         self._sorted_keys = np.zeros(0, dtype=np.int64)
         self._sorted_ends = np.zeros(0, dtype=np.int64)
         self._recent: Dict[int, List[int]] = {}
         self._misses = 0
         self._quiet = 0
+        self._wide = False
 
     def _rebuild(self, history: Sequence[int]) -> None:
         self._ids = list(history)
@@ -134,11 +146,15 @@ class ContextCopy:
                     break
         if best_len < _ENTER_MATCH:
             return []
-        copied = ids[best_end + 1 : best_end + 1 + min(limit, MAX_COPY)]
+        verbatim = self._wide_window and self._wide and best_len == _MAX_MATCH
+        take = min(limit, MAX_COPY if verbatim else _NARROW_COPY)
+        copied = ids[best_end + 1 : best_end + 1 + take]
         return copied if len(copied) >= _MIN_COPY else []
 
-    def observe(self, accepted: int) -> None:
-        """Pause copies after several rounds whose first token missed."""
+    def observe(self, accepted: int, drafted: int) -> None:
+        """Allow a wide copy after one accepted whole; pause copies after
+        several rounds whose first token missed."""
+        self._wide = accepted == drafted
         if accepted:
             self._misses = 0
             return

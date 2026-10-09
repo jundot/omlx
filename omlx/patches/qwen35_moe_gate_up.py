@@ -51,6 +51,7 @@ from mlx_vlm.models.switch_layers import (
 from ..scheduler import _sync_and_clear_cache
 from . import moe_verify_gather
 from .m5_gather_qmm import fused_gate_up_activation
+from .m5_gather_qmm_a8 import try_routed_a8
 from .moe_routes import sort_routes
 from .module_cache import cached_per_module
 
@@ -160,6 +161,18 @@ def _make_patched_call(orig_call):
             idx = mx.stop_gradient(idx)
         x_act = None
         if do_sort and not self.training:
+            # Routed A8 (opt-in per model, see m5_gather_qmm_a8): the Gate+Up
+            # on INT8 operands and the A16 Down; None keeps the A16 path.
+            routed = try_routed_a8(
+                self,
+                token_rows,
+                idx,
+                # [B, L, k] routes: the sequence length, not B * L
+                seq_len=int(indices.shape[-2]) if indices.ndim >= 3 else None,
+            )
+            if routed is not None:
+                x = _scatter_unsort(routed, inv_order, indices.shape)
+                return x.squeeze(-2)
             # Sorted prefill on M5: the activation in the [gate; up]
             # matmul's epilogue, token rows read in place (bit-identical;
             # None keeps this path).

@@ -9,6 +9,7 @@ Supported levels: oQ2, oQ2.5, oQ2.7, oQ3, oQ3.5, oQ4, oQ5, oQ6, oQ8
 base bits and add targeted routed-expert protection plus a higher bpw budget.
 """
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -36,6 +37,8 @@ except ImportError:
     HAS_MLX = False
 
 from omlx.model_discovery import (
+    CLEF_HEAD_CONFIG,
+    CLEF_HEAD_WEIGHTS,
     MLX_LM_TEXT_ONLY_MODEL_TYPES,
     VLM_NATIVE_TEXT_MODEL_TYPES,
     _has_vision_subconfig,
@@ -1528,13 +1531,23 @@ def combine_gemma4_assistant_mtp(
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
     """Atomically replace a JSON file (tmp write + rename)."""
-    with tempfile.NamedTemporaryFile(
-        "w", dir=path.parent, prefix=f"{path.name}.tmp.", delete=False
-    ) as tmp:
-        json.dump(payload, tmp, indent=2)
-        tmp.flush()
-        temp_name = tmp.name
-    Path(temp_name).replace(path)
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", dir=path.parent, prefix=f"{path.name}.tmp.", delete=False
+        ) as tmp:
+            # Record the name first so a failed dump still cleans up.
+            temp_name = tmp.name
+            json.dump(payload, tmp, indent=2)
+            tmp.flush()
+            # Make the data durable before the rename.
+            os.fsync(tmp.fileno())
+        Path(temp_name).replace(path)
+        temp_name = None
+    finally:
+        if temp_name is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temp_name)
 
 
 def _write_mtp_shard_and_merge_index(
@@ -3640,7 +3653,9 @@ def _metal_available_memory_bytes() -> int:
 
 def _source_weight_files(model_path: str | Path) -> list[Path]:
     source = Path(model_path)
-    files = sorted(source.glob("*.safetensors"))
+    files = sorted(
+        f for f in source.glob("*.safetensors") if f.name != CLEF_HEAD_WEIGHTS
+    )
     sidecar = source / "mtp" / "model_mtp.safetensors"
     if sidecar.is_file():
         config = json.loads((source / "config.json").read_text())
@@ -4070,7 +4085,7 @@ def _build_model_sanitizer(
 
                 apply_mlx_vlm_qwen4_exp_compat_patch()
         except Exception as patch_err:
-            logger.debug("Qwen4-Exp quantization patch not applied: %s", patch_err)
+            logger.warning("Qwen4-Exp quantization patch not applied: %s", patch_err)
 
     if is_vlm:
         try:
@@ -4113,7 +4128,7 @@ def _build_model_sanitizer(
 
                         glm5_next_vlm_runtime.apply()
             except Exception as patch_err:
-                logger.debug(f"mlx-vlm compatibility patch not applied: {patch_err}")
+                logger.warning(f"mlx-vlm compatibility patch not applied: {patch_err}")
 
             from mlx_vlm.utils import get_model_and_args, sanitize_weights
 
@@ -4129,7 +4144,7 @@ def _build_model_sanitizer(
 
                 apply_mlx_vlm_mtp_patch()
             except Exception as patch_err:
-                logger.debug(f"mlx-vlm MTP patch not applied: {patch_err}")
+                logger.warning(f"mlx-vlm MTP patch not applied: {patch_err}")
 
             # Remap language_model.model.visual.* -> vision_tower.* for
             # Qwen3.6-35B-A3B's nested ViT layout. Wraps whichever
@@ -4142,7 +4157,7 @@ def _build_model_sanitizer(
 
                 apply_qwen3_6_nested_visual_patch()
             except Exception as patch_err:
-                logger.debug(f"qwen3_6 nested-visual patch not applied: {patch_err}")
+                logger.warning(f"qwen3_6 nested-visual patch not applied: {patch_err}")
 
             model_module, _ = get_model_and_args(config)
             model_config_cls = model_module.ModelConfig
@@ -4267,7 +4282,7 @@ def _build_model_sanitizer(
             )
             return _vlm_sanitize
         except Exception as e:
-            logger.debug(f"mlx-vlm sanitizer not available: {e}")
+            logger.warning(f"mlx-vlm sanitizer not available for a VLM config: {e}")
 
     try:
         from mlx_lm.utils import _get_classes
@@ -4278,7 +4293,7 @@ def _build_model_sanitizer(
 
                 apply_glm_moe_dsa_patch()
             except Exception as patch_err:
-                logger.debug(f"glm_moe_dsa patch not applied: {patch_err}")
+                logger.warning(f"glm_moe_dsa patch not applied: {patch_err}")
 
         # DeepSeek-V4 isn't in stock mlx-lm — its model class is injected
         # into ``sys.modules`` by oMLX's base patch. Trigger that here so
@@ -4290,7 +4305,7 @@ def _build_model_sanitizer(
 
                 apply_deepseek_v4_patch()
             except Exception as patch_err:
-                logger.debug(f"deepseek_v4 base patch not applied: {patch_err}")
+                logger.warning(f"deepseek_v4 base patch not applied: {patch_err}")
 
         # Laguna is likewise vendored into ``sys.modules`` by its pre-load
         # patch; register it so sanitizer/proxy builds resolve the class.
@@ -4300,7 +4315,7 @@ def _build_model_sanitizer(
 
                 apply_laguna_patch()
             except Exception as patch_err:
-                logger.debug(f"laguna patch not applied: {patch_err}")
+                logger.warning(f"laguna patch not applied: {patch_err}")
 
         # Hy3 is vendored into ``sys.modules`` like Laguna, but its published
         # Hy-MT2 checkpoints also use the legacy root-level ``rope_theta``
@@ -4315,7 +4330,7 @@ def _build_model_sanitizer(
                 normalize_hy_v3_rope_config(config)
                 apply_hy_v3_patch()
             except Exception as patch_err:
-                logger.debug(f"hy_v3 patch not applied: {patch_err}")
+                logger.warning(f"hy_v3 patch not applied: {patch_err}")
 
         if config.get("model_type") in {"mimo_v2", "mimo_v2_flash"}:
             try:
@@ -4323,7 +4338,7 @@ def _build_model_sanitizer(
 
                 apply_mimo_v2_patch()
             except Exception as patch_err:
-                logger.debug(f"mimo_v2 patch not applied: {patch_err}")
+                logger.warning(f"mimo_v2 patch not applied: {patch_err}")
 
         if config.get("model_type") == "bailing_hybrid":
             try:
@@ -4331,7 +4346,7 @@ def _build_model_sanitizer(
 
                 apply_bailing_hybrid_patch()
             except Exception as patch_err:
-                logger.debug(f"bailing_hybrid patch not applied: {patch_err}")
+                logger.warning(f"bailing_hybrid patch not applied: {patch_err}")
 
         # Apply mlx-lm MTP patch so the patched __init__/sanitize handle
         # mtp.* tensors correctly. Idempotent — apply() is a no-op once
@@ -4346,7 +4361,7 @@ def _build_model_sanitizer(
             apply_mlx_lm_mtp_patch()
             _have_mtp_patch = True
         except Exception as patch_err:
-            logger.debug(f"mlx-lm MTP patch not applied: {patch_err}")
+            logger.warning(f"mlx-lm MTP patch not applied: {patch_err}")
             _have_mtp_patch = False
 
         model_class, model_args_class = _get_classes(config)
@@ -6809,7 +6824,10 @@ def quantize_oq_streaming(
 
     cb("saving", 92.0, "Writing model metadata")
 
-    if total_shards > 1:
+    # Without an index, mlx-vlm loads every *.safetensors file, which would
+    # include the Clef decision head copied next to the shards.
+    has_clef_head = (source / CLEF_HEAD_WEIGHTS).is_file()
+    if total_shards > 1 or has_clef_head:
         total_size = sum(f.stat().st_size for f in output.glob("*.safetensors"))
         index = {
             "metadata": {"total_size": total_size},
@@ -6879,6 +6897,10 @@ def quantize_oq_streaming(
             json.dump(imatrix_report, f, indent=2, ensure_ascii=False)
 
     _copy_model_sidecars(source, output, text_only=text_only)
+    if has_clef_head:
+        for name in (CLEF_HEAD_WEIGHTS, CLEF_HEAD_CONFIG):
+            if (source / name).is_file():
+                shutil.copy2(source / name, output / name)
 
     if mimo_multimodal:
         from .patches.mimo_v2.omnimodal import export_sidecars

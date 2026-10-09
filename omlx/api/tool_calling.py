@@ -2260,6 +2260,15 @@ def parse_qwen_tool_calls(
             )
             if relative_end is not None:
                 function_end = function_start + relative_end
+                if (
+                    paired
+                    and found is not None
+                    and function_end < found[0]
+                    and _QWEN_OPEN_RE.search(text[function_end : found[0]])
+                ):
+                    # The outer close belongs to a later call. Split here so
+                    # the first call is not merged into the second.
+                    found = None
             elif (
                 paired
                 and found
@@ -2283,7 +2292,14 @@ def parse_qwen_tool_calls(
         else:
             end = function_end
             if end is None or (
-                paired and (finish_reason != "stop" or text[end:].strip())
+                paired
+                and (
+                    finish_reason != "stop"
+                    or (
+                        bool(text[end:].strip())
+                        and _QWEN_OPEN_RE.match(text[end:].lstrip()) is None
+                    )
+                )
             ):
                 errors.append("incomplete")
                 pos = len(text)
@@ -2602,6 +2618,35 @@ class ToolCallStreamFilter:
         candidate = self._recovery_candidate
         self._recovery_candidate = ""
         return candidate
+
+    def recovery_candidate_is_payload(self) -> bool:
+        """Whether the withheld tail holds a truncated call, not quoted prose.
+
+        Unsure cases count as calls, so they keep failing instead of leaking
+        call markup. Read it before ``take_recovery_candidate``.
+        """
+        tail = self._recovery_candidate
+        if not tail:
+            return False
+        if self._opens_payload_at(tail, 0):
+            return True
+        start = len(self._opener_at(tail, 0))
+        # A declared tool name is call evidence in any call format.
+        for name in self._registered_tool_names:
+            if re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", tail[start:]):
+                return True
+        # One forward cursor per marker keeps marker-heavy tails linear.
+        cursors = {
+            marker: tail.find(marker, start)
+            for marker, _close in self._marker_pairs
+            if marker
+        }
+        while found := [(i, m) for m, i in cursors.items() if i != -1]:
+            index, marker = min(found)
+            if self._opens_payload_at(tail, index):
+                return True
+            cursors[marker] = tail.find(marker, index + len(marker))
+        return False
 
     def take_completed_envelopes(self) -> List[str]:
         """Return complete suppressed envelopes ready for exact parsing.
@@ -3102,6 +3147,7 @@ class ToolCallStreamFilter:
     def _partial_suffix_len(self, text: str) -> int:
         """Length of trailing suffix that might be an opening-marker prefix."""
         keep = 0
+        cap = 128
         for marker, _close in self._marker_pairs:
             keep = max(keep, self._partial_prefix_len(text, marker))
 
@@ -3111,7 +3157,11 @@ class ToolCallStreamFilter:
             if self._could_be_partial_namespaced_open(
                 candidate
             ) or self._could_be_partial_attr_function_open(candidate):
-                keep = max(keep, len(candidate))
+                # Open tags grow with the tool or namespace name, so widen the
+                # window to keep a long tag whole until it closes.
+                longest = max((len(n) for n in self._registered_tool_names), default=0)
+                cap = max(cap, 512, longest + 64)
+                keep = max(keep, min(len(candidate), cap))
 
         # Partial prefix detection for bracket markers (e.g. "[", "[C",
         # "[Cal" could be start of "[Calling tool:" or "[Tool call:").
@@ -3141,7 +3191,7 @@ class ToolCallStreamFilter:
                 return keep
 
         # Cap retained suffix window to avoid unbounded buffering on malformed text.
-        return min(keep, 128)
+        return min(keep, cap)
 
     def _should_drop_tail_at_finish(self, tail: str) -> bool:
         """Whether unresolved tail should be suppressed under strict mode."""
@@ -3231,6 +3281,30 @@ class ToolCallStreamFilter:
             cursor = close_idx + 1
 
         return "".join(out)
+
+    def _opener_at(self, text: str, index: int) -> str:
+        """Return the longest opening marker at ``index``, or ``""``."""
+        return max(
+            (m for m, _close in self._marker_pairs if m and text.startswith(m, index)),
+            key=len,
+            default="",
+        )
+
+    def _opens_payload_at(self, text: str, index: int) -> bool:
+        """Whether the opener at ``index`` starts a call payload, not prose.
+
+        A model that quotes a control marker in prose fails parsing the same
+        way as a truncated call, so the text after the marker decides.
+        """
+        opener = self._opener_at(text, index)
+        if opener == _XML_FUNCTION_OPEN:
+            return True
+        pos = index + len(opener)
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        if pos >= len(text) or text[pos] in "<{[":
+            return True
+        return text.startswith("call:", pos)
 
     def _unwind_withheld_at_eof(
         self, candidate: str, marker: str, start_marker: str

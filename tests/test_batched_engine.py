@@ -406,6 +406,21 @@ class TestBatchedEngineStreamingCleanup:
 
         assert fake_engine.add_request_kwargs["tools"] == tools
 
+    @pytest.mark.asyncio
+    async def test_stream_generate_uses_caller_request_id(self):
+        from omlx.engine.batched import BatchedEngine
+
+        fake_engine = FakeStreamingCore()
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = fake_engine
+
+        stream = engine.stream_generate("hello", _request_id="req-progress")
+        await stream.__anext__()
+        await stream.aclose()
+
+        assert fake_engine.add_request_kwargs["request_id"] == "req-progress"
+
 
 class TestBatchedEngineApplyChatTemplate:
     """Tests for BatchedEngine._apply_chat_template()."""
@@ -1087,6 +1102,86 @@ class TestBatchedEngineSpecPrefillForwarding:
         await engine.chat(messages, is_partial=True)
         call_kwargs = engine._engine.generate.call_args.kwargs
         assert "generation_prompt_text" not in call_kwargs
+
+
+class _TemplateTokenizer:
+    """Renders a readable prompt and encodes one id per character."""
+
+    bos_token_id = 1
+
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        continue_final_message=False,
+        tools=None,
+        **kwargs,
+    ):
+        text = "|".join(f"{m['role']}:{m['content']}" for m in messages)
+        if tools:
+            text = f"tools={len(tools)}|{text}"
+        if kwargs.get("enable_thinking") is False:
+            text += "|nothink"
+        if add_generation_prompt:
+            text += "|assistant:"
+        return text
+
+    def encode(self, text, add_special_tokens=True):
+        ids = [ord(c) for c in text]
+        return [self.bos_token_id, *ids] if add_special_tokens else ids
+
+
+class TestBatchedEngineTokenizeChat:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_partial", [False, True])
+    async def test_matches_prompt_submitted_by_chat(self, is_partial):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._tokenizer = _TemplateTokenizer()
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(
+                return_value=TestBatchedEngineSpecPrefillForwarding._fake_output()
+            )
+        )
+        tools = [{"type": "function", "function": {"name": "lookup"}}]
+        ct_kwargs = {"enable_thinking": False}
+
+        def messages():
+            return [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "Sure,"},
+            ]
+
+        await engine.chat(
+            messages(),
+            tools=tools,
+            chat_template_kwargs=ct_kwargs,
+            is_partial=is_partial,
+        )
+        submitted = engine._engine.generate.call_args.kwargs["prompt"]
+        token_ids = await engine.tokenize_chat(
+            messages(), tools, chat_template_kwargs=ct_kwargs, is_partial=is_partial
+        )
+
+        assert token_ids == engine._tokenizer.encode(submitted)
+
+    @pytest.mark.asyncio
+    async def test_generation_prompt_and_special_token_overrides(self):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._tokenizer = _TemplateTokenizer()
+        token_ids = await engine.tokenize_chat(
+            [{"role": "user", "content": "hi"}],
+            add_generation_prompt=False,
+            add_special_tokens=False,
+        )
+
+        assert token_ids == [ord(c) for c in "user:hi"]
 
 
 class TestBatchedEngineMoeOffloadWiring:

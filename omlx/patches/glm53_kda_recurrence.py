@@ -116,7 +116,7 @@ def _reduce_one(rows: int) -> str:
 # Sigmoid functor, rounded like the compiled reference -> bit-identical gate.
 _GATE_EXPR = """{
                 const float x = decay * (static_cast<float>(SRC) + dtb[d]);
-                const float e = 1 / (1 + metal::exp(metal::abs(x)));
+                const float e = 1 / (1 + metal::precise::exp(metal::abs(x)));
                 const float sig = (x < 0) ? e : 1 - e;
                 g_s[r][d] = metal::precise::exp(lb * sig);
             }"""
@@ -382,7 +382,7 @@ def _percore_threadgroups(rows: int, cfg: PerCoreConfig) -> Optional[int]:
 def _pc_gate(src: str, d: str, s: str, dst: str) -> str:
     return f"""{{
                 const float x = decay[{s}] * (static_cast<float>({src}) + dtb[{s}][{d}]);
-                const float e = 1 / (1 + metal::exp(metal::abs(x)));
+                const float e = 1 / (1 + metal::precise::exp(metal::abs(x)));
                 const float sig = (x < 0) ? e : 1 - e;
                 {dst} = metal::precise::exp(lb * sig);
             }}"""

@@ -2730,7 +2730,10 @@
 
             isQwenOqA8Model(model) {
                 const type = String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_');
-                return ['qwen3_5', 'qwen3_6', 'qwen3_8'].some(prefix => type.startsWith(prefix));
+                // qwen4_exp (Qwen3.8-Flash-Next) is an exact match: only that
+                // validated family has routed-expert A8, not every qwen4*.
+                return type === 'qwen4_exp'
+                    || ['qwen3_5', 'qwen3_6', 'qwen3_8'].some(prefix => type.startsWith(prefix));
             },
 
             validateQwenOqA8Settings() {

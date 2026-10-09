@@ -3573,6 +3573,7 @@
                     }),
                     stream: true,
                     stream_options: { include_usage: true },
+                    return_progress: true,
                     ...generation,
                     // One-off per-call overrides (e.g. "regenerate creative") without
                     // mutating the session's saved settings.
@@ -3707,6 +3708,16 @@
                 const modelData = this.findModelStatsEntry(data, modelId);
                 const claimed = this.getClaimedRequestStats(stream, modelData);
                 const base = { ...(stream._liveFooterStats || this.emptyStats()) };
+
+                const progress = stream._promptProgress;
+                if (progress && progress.processed < progress.total) {
+                    base.avg_prefill_tps = progress.rate || 0;
+                    base.prompt_tokens = progress.total;
+                    if (stream._statusStart) {
+                        base.total_time = ((Date.now() - stream._statusStart) / 1000).toFixed(1);
+                    }
+                    return base;
+                }
 
                 if (!claimed) {
                     return {
@@ -4215,6 +4226,32 @@
             clearInterval(stream._prefillInterval);
             stream._prefillInterval = null;
         }
+    },
+
+    // llama.cpp-style prompt_progress from this request's own stream.
+    // Unlike the stats poll, it cannot pick up another request's prefill.
+    applyPromptProgress(chatId, progress) {
+        const stream = this.getStreamSession(chatId, false);
+        if (!stream) return;
+        this.stopPrefillPolling(chatId);
+        const prev = stream._promptProgress;
+        const dTokens = prev ? progress.processed - prev.processed : 0;
+        const dMs = prev ? progress.time_ms - prev.time_ms : 0;
+        const rate = dTokens > 0 && dMs > 0 ? dTokens / (dMs / 1000) : (prev?.rate || 0);
+        stream._promptProgress = { ...progress, rate };
+        if (stream.engineStatus?.icon === 'wrench') return; // don't overwrite tool status
+        const uncached = progress.total - progress.cache;
+        if (uncached <= 0 || progress.processed >= progress.total) {
+            stream.engineStatus = { text: window.t('chat.status.generating') };
+            return;
+        }
+        const pct = Math.round((progress.processed - progress.cache) / uncached * 100);
+        const speed = rate > 0 ? ` · ${Math.round(rate)} ${window.t('chat.stats.tokens_per_second_suffix')}` : '';
+        stream.engineStatus = {
+            text: window.t('chat.status.prefilling_percent')
+                .replace('{percent}', pct)
+                .replace('{speed}', speed)
+        };
     },
 
             async _pollPrefill(chatId) {
@@ -4796,7 +4833,7 @@
                 allModels.filter(m => {
                     const gatewayId = this.aliasToGateway[m.id] || m.id;
                     const t = (this.modelTypeMap[gatewayId] || '').toLowerCase();
-                    return t !== 'audio_tts' && t !== 'audio_sts' && t !== 'embedding' && t !== 'reranker';
+                    return t !== 'audio_tts' && t !== 'audio_sts' && t !== 'embedding' && t !== 'reranker' && t !== 'decision';
                 }).map(m => ({
                     id: this.aliasToGateway[m.id] || m.id, // gateway id for API calls
                     name: m.id, // original name (alias or directory name) for display
@@ -6126,6 +6163,7 @@
         const requestBody = this.buildChatCompletionBody(chatSession.messages, context, depth);
         stream._toolRoundContent = '';
         this.setEngineStatus(context.chatId, { text: window.t('chat.status.starting') });
+        stream._promptProgress = null;
         this.startPrefillPolling(context.chatId);
 
         try {
@@ -6167,6 +6205,10 @@
                     if (line.startsWith('data: ')) {
                         try {
                             const data = JSON.parse(line.slice(6));
+                            if (data.prompt_progress) {
+                                this.applyPromptProgress(context.chatId, data.prompt_progress);
+                                continue;
+                            }
                             const choice = data.choices?.[0];
                             const delta = choice?.delta;
                             if (choice?.finish_reason) finishReason = choice.finish_reason;
