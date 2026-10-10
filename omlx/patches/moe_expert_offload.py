@@ -1260,8 +1260,13 @@ def materialize_offload_state(model) -> int:
     return len(caches)
 
 
-def moe_offload_caches(model) -> list:
-    """Every offload cache under ``model``, in no particular order."""
+def moe_offload_caches(model, *, counters: bool = False) -> list:
+    """Every offload cache under ``model``, in no particular order.
+
+    ``counters=True`` also returns DeepSeek V4.1's expert slots, which keep
+    hit/miss counters but are not caches: materialize_offload_state and the
+    slot release must not touch them.
+    """
     caches = []
     stack = [model]
     seen = set()
@@ -1273,6 +1278,10 @@ def moe_offload_caches(model) -> list:
         cache = getattr(obj, "cache", None)
         if getattr(cache, "moe_offload_cache", False):
             caches.append(cache)
+            continue
+        slots = getattr(obj, "slots", None) if counters else None
+        if getattr(slots, "moe_offload_counters", False):
+            caches.append(slots)
             continue
         if isinstance(obj, dict):
             stack.extend(obj.values())
@@ -1296,9 +1305,14 @@ def restore_moe_offload_slots(caches) -> None:
 
 
 def moe_offload_stats(model=None, caches=None) -> dict:
-    """Aggregate hit/miss/byte counters over all offloaded layers."""
+    """Aggregate hit/miss/byte counters over all offloaded layers.
+
+    Without ``caches``, walks ``model`` for every adapter's counters, DeepSeek
+    V4.1's expert slots included. Counts are cumulative since load and
+    include prefill.
+    """
     if caches is None:
-        caches = moe_offload_caches(model)
+        caches = moe_offload_caches(model, counters=True)
     hits = sum(c.hits for c in caches)
     misses = sum(c.misses for c in caches)
     total = hits + misses
