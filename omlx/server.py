@@ -4854,7 +4854,10 @@ async def create_chat_completion(
             # Separate thinking from content
             raw_text = clean_special_tokens(output.text) if output.text else ""
             thinking_content, regular_content = extract_thinking(
-                raw_text, truncated=output.finish_reason == "length"
+                raw_text,
+                truncated=output.finish_reason == "length",
+                prompt_opened=output.finish_reason == "length"
+                and _prompt_opened_thinking(engine, messages, chat_kwargs),
             )
             cleaned_thinking = sanitize_tool_call_markup(
                 thinking_content, engine.tokenizer
@@ -5705,6 +5708,29 @@ def _render_chat_prompt_for_thinking_detection(
         except (TypeError, ValueError):
             return str(prompt), None
     return str(prompt), None
+
+
+def _prompt_opened_thinking(engine: BaseEngine, messages: list, kwargs: dict) -> bool:
+    """Whether the chat template ends the prompt inside an open thinking block.
+
+    Non-streaming counterpart of the detection the streaming paths use to seed
+    ``ThinkingParser``. Detection failure reads as "not opened", which keeps the
+    previous behaviour.
+    """
+    try:
+        tokenizer = getattr(engine, "tokenizer", None)
+        if tokenizer is None:
+            return False
+        prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
+            engine, messages, kwargs
+        )
+        opened, _ = prompt_opens_thinking(
+            tokenizer, prompt, prompt_token_ids=prompt_token_ids
+        )
+        return opened
+    except Exception as exc:
+        logger.debug("Could not detect thinking state for truncation: %s", exc)
+        return False
 
 
 class _ToolCallGenerationError(HTTPException):
@@ -7372,7 +7398,10 @@ async def create_anthropic_message(
             # Separate thinking from content
             raw_text = clean_special_tokens(output.text) if output.text else ""
             thinking_content, regular_content = extract_thinking(
-                raw_text, truncated=output.finish_reason == "length"
+                raw_text,
+                truncated=output.finish_reason == "length",
+                prompt_opened=output.finish_reason == "length"
+                and _prompt_opened_thinking(engine, messages, chat_kwargs),
             )
             cleaned_thinking = sanitize_tool_call_markup(
                 thinking_content, engine.tokenizer
@@ -8132,7 +8161,10 @@ async def create_response(
             # Process output text
             raw_text = clean_special_tokens(output.text) if output.text else ""
             thinking_content, regular_content = extract_thinking(
-                raw_text, truncated=output.finish_reason == "length"
+                raw_text,
+                truncated=output.finish_reason == "length",
+                prompt_opened=output.finish_reason == "length"
+                and _prompt_opened_thinking(engine, messages, chat_kwargs),
             )
 
             # Parse tool calls
