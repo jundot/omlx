@@ -1405,6 +1405,28 @@ def detect_output_parser(
             protocol_marker_texts=_K2_MARKERS,
         )
 
+    from .llmjp4 import is_llmjp4_tokenizer
+
+    if is_llmjp4_tokenizer(tokenizer):
+        # Before the gpt-oss check: these models share the Harmony format,
+        # not openai-harmony's token ids.
+        from .llmjp4 import (
+            LLMJP4_FINAL_HEADER_TEXT,
+            LLMJP4_MARKERS,
+            LLMJP4_STOP_TOKEN_IDS,
+            LLMJP4_THINKING_END_TEXT,
+            Llmjp4OutputParserSession,
+        )
+
+        return OutputParserFactory(
+            kind="llmjp4",
+            create_session=Llmjp4OutputParserSession,
+            stop_token_ids=set(LLMJP4_STOP_TOKEN_IDS),
+            thinking_end_text=LLMJP4_THINKING_END_TEXT,
+            thinking_end_trailing_text=LLMJP4_FINAL_HEADER_TEXT,
+            protocol_marker_texts=LLMJP4_MARKERS,
+        )
+
     if is_harmony_model(model_name, model_config):
         temp_parser = HarmonyStreamingParser(tokenizer)
         return OutputParserFactory(
