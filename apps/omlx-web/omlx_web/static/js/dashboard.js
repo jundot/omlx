@@ -173,6 +173,10 @@
             settingsCopiedAnchor: null,
             _settingsSyncPausedUntil: 0,
             _settingsScrollWatched: false,
+            // Model settings modal section rail
+            modelSettingsActiveSection: 'ms-basic',
+            _modelSettingsSyncPausedUntil: 0,
+            _modelSettingsScrollFrame: 0,
 
             // Mobile menu
             mobileMenuOpen: false,
@@ -1018,20 +1022,22 @@
                 const sections = Array.from(document.querySelectorAll('#panel-settings .settings-section'))
                     .filter((el) => el.getClientRects().length);
                 if (!sections.length) return;
-                // At the bottom of the page the last sections cannot reach the line.
                 const doc = document.documentElement;
-                if (window.scrollY > 0 && window.scrollY + window.innerHeight >= doc.scrollHeight - 2) {
-                    this.settingsActiveSection = sections[sections.length - 1].id;
-                    return;
-                }
+                const atBottom = window.scrollY > 0 && window.scrollY + window.innerHeight >= doc.scrollHeight - 2;
+                this.settingsActiveSection = this._currentSectionId(
+                    sections, atBottom, (el) => parseFloat(getComputedStyle(el).scrollMarginTop) || 0);
+            },
+
+            _currentSectionId(sections, atBottom, lineOf) {
+                // At the bottom the last sections cannot reach the line.
+                if (atBottom) return sections[sections.length - 1].id;
                 // A section is current once its top passes the line it scrolls to.
                 let current = sections[0].id;
                 for (const el of sections) {
-                    const line = parseFloat(getComputedStyle(el).scrollMarginTop) || 0;
-                    if (el.getBoundingClientRect().top > line + 1) break;
+                    if (el.getBoundingClientRect().top > lineOf(el) + 1) break;
                     current = el.id;
                 }
-                this.settingsActiveSection = current;
+                return current;
             },
 
             settingsWatchScroll() {
@@ -1047,6 +1053,40 @@
                 };
                 window.addEventListener('scroll', onScroll, { passive: true });
                 window.addEventListener('resize', onScroll);
+            },
+
+            modelSettingsGoToSection(id) {
+                this.modelSettingsActiveSection = id;
+                // Smooth scrolling passes other sections; keep the clicked one marked.
+                this._modelSettingsSyncPausedUntil = Date.now() + 1000;
+                this.$nextTick(() => {
+                    const body = this.$refs.modelSettingsBody;
+                    const target = document.getElementById(id);
+                    if (!body || !target || !target.getClientRects().length) return;
+                    // scrollIntoView would also scroll the page behind the dialog.
+                    const top = body.scrollTop + target.getBoundingClientRect().top
+                        - body.getBoundingClientRect().top - parseFloat(getComputedStyle(body).paddingTop);
+                    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+                    body.scrollTo({ top, behavior: reduce ? 'auto' : 'smooth' });
+                });
+            },
+
+            modelSettingsSyncActiveSection(body) {
+                if (Date.now() < this._modelSettingsSyncPausedUntil) return;
+                const sections = Array.from(body.querySelectorAll('.model-settings-section'))
+                    .filter((el) => el.getClientRects().length);
+                if (!sections.length) return;
+                const atBottom = body.scrollTop > 0 && body.scrollTop + body.clientHeight >= body.scrollHeight - 2;
+                const line = body.getBoundingClientRect().top + parseFloat(getComputedStyle(body).paddingTop);
+                this.modelSettingsActiveSection = this._currentSectionId(sections, atBottom, () => line);
+            },
+
+            modelSettingsOnScroll(body) {
+                if (this._modelSettingsScrollFrame) return;
+                this._modelSettingsScrollFrame = requestAnimationFrame(() => {
+                    this._modelSettingsScrollFrame = 0;
+                    this.modelSettingsSyncActiveSection(body);
+                });
             },
 
             settingsCopyAnchor(id) {
@@ -2038,6 +2078,8 @@
                     thinking_default: model?.thinking_default ?? null,
                     qwen4_ple_ssd_offload: model?.qwen4_ple_ssd_offload_forced === true
                         || s.qwen4_ple_ssd_offload === true,
+                    qwen4_ple_ssd_offload_requested:
+                        s.qwen4_ple_ssd_offload === true,
                     qwen4_ple_ssd_offload_supported:
                         model?.qwen4_ple_ssd_offload_supported === true,
                     qwen4_ple_ssd_offload_forced:
@@ -2871,6 +2913,10 @@
                 }
                 this._modelSettingsBaseline = JSON.stringify(this.modelSettings);
                 this.showModelSettingsModal = true;
+                // Sync on the next frame: sections have no layout until the dialog opens.
+                this.$nextTick(() => {
+                    if (this.$refs.modelSettingsBody) this.modelSettingsOnScroll(this.$refs.modelSettingsBody);
+                });
             },
 
             async importMtplxSidecar() {
@@ -2895,6 +2941,15 @@
                 } finally {
                     this.importingMtplx = false;
                 }
+            },
+
+            // Qwen4 PLE and DeepSeek V4.1 Engram share one row; a model supports at most one.
+            ssdNgramOffloadKey() {
+                if (this.modelSettings.qwen4_ple_ssd_offload_supported) return 'qwen4_ple_ssd_offload';
+                if (this.modelSettings.deepseek_v41_engram_ssd_offload_supported) {
+                    return 'deepseek_v41_engram_ssd_offload';
+                }
+                return null;
             },
 
             isQwenOqA8Model(model) {
@@ -3066,7 +3121,9 @@
                                     : 0,
                                 enable_thinking: this.selectedModel?.thinking_forced ? null : this.modelSettings.enable_thinking,
                                 qwen4_ple_ssd_offload:
-                                    !!this.modelSettings.qwen4_ple_ssd_offload,
+                                    this.modelSettings.qwen4_ple_ssd_offload_forced
+                                        ? !!this.modelSettings.qwen4_ple_ssd_offload_requested
+                                        : !!this.modelSettings.qwen4_ple_ssd_offload,
                                 deepseek_v41_ced_prefill_enabled:
                                     !!this.modelSettings.deepseek_v41_ced_prefill_enabled,
                                 deepseek_v41_engram_ssd_offload:

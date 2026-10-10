@@ -38,6 +38,10 @@
     [data-theme="dark"] .divide-neutral-100 > :not([hidden]) ~ :not([hidden]) { border-color: var(--border-faint) !important; }
     [data-theme="dark"] .divide-neutral-200 > :not([hidden]) ~ :not([hidden]) { border-color: var(--border-faint) !important; }
 
+    /* Row dividers that skip x-show rows (inline display: none), unlike divide-y. */
+    .settings-rows > :not(template):not([style*="display: none"]) ~ :not(template):not([style*="display: none"]) { border-top: 1px solid rgb(var(--palette-neutral-200)); }
+    [data-theme="dark"] .settings-rows > :not(template):not([style*="display: none"]) ~ :not(template):not([style*="display: none"]) { border-top-color: var(--border-faint); }
+
     /* === Hover states === */
     [data-theme="dark"] .hover\:bg-neutral-100:hover { background-color: var(--bg-tertiary) !important; }
     [data-theme="dark"] .hover\:bg-neutral-50:hover { background-color: var(--bg-secondary) !important; }
@@ -1350,9 +1354,21 @@
         font-weight: 600;
         background-color: var(--bg-tertiary);
     }
+    /* Model settings modal: the rail sticks inside the scrolling modal body. */
+    .model-settings-layout {
+        display: grid;
+        grid-template-columns: 12.5rem minmax(0, 1fr);
+        gap: 1.5rem;
+        align-items: start;
+    }
+    .model-settings-layout > .settings-rail {
+        top: 0;
+        max-height: none;
+    }
     @media (max-width: 900px) {
         .settings-layout { grid-template-columns: minmax(0, 1fr); }
         .settings-rail { display: none; }
+        .model-settings-layout { grid-template-columns: minmax(0, 1fr); }
     }
 
     /* === Log viewer: record table === */
