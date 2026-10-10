@@ -5798,13 +5798,60 @@ def test_spec_command_buffers_restore_caps_after_the_step(monkeypatch, raised):
         caps.append((ops, mb))
         return previous
 
+    target = SimpleNamespace(args=SimpleNamespace(model_type="qwen3_5"))
     monkeypatch.setattr(fast, "set_command_buffer_caps", fake_set)
     monkeypatch.setattr(bg, "_raises_spec_buffer_caps", lambda: raised)
-    with pytest.raises(RuntimeError), bg._spec_command_buffers():
+    with pytest.raises(RuntimeError), bg._spec_command_buffers(target):
         inside = caps[-1]
         raise RuntimeError("step failed")
     assert inside == (bg._SPEC_BUFFER_CAPS if raised else (50, 50))
     assert caps[-1] == (50, 50)
+
+
+@pytest.mark.parametrize(
+    "model_type,draft_type,gpu,enabled,detected",
+    [
+        (kind, "glm5_moe", True, True, True)
+        for kind in (
+            "qwen3_5",
+            "qwen3_5_moe",
+            "qwen3_5_vl",
+            "qwen3_6",
+            "qwen3_6_moe",
+            "qwen4_exp",
+            "qwen4_exp_text",
+        )
+    ]
+    + [
+        ("glm5_moe", "qwen3_5", True, False, False),
+        ("unknown", "qwen3_5", True, False, False),
+        (None, "qwen3_5", True, False, False),
+        ("qwen3_5", None, False, False, True),
+    ],
+)
+def test_spec_caps_target(monkeypatch, model_type, draft_type, gpu, enabled, detected):
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    target = SimpleNamespace(
+        args=SimpleNamespace(model_type=model_type),
+        _omlx_drafter=SimpleNamespace(model_type=draft_type),
+    )
+    calls, detections = [], []
+
+    def fake_set(ops, mb):
+        calls.append((ops, mb))
+        return (50, 50)
+
+    def fake_gpu():
+        detections.append(True)
+        return gpu
+
+    monkeypatch.setattr(bg, "_raises_spec_buffer_caps", fake_gpu)
+    monkeypatch.setattr(fast, "set_command_buffer_caps", fake_set)
+    with bg._spec_command_buffers(target):
+        assert calls == ([bg._SPEC_BUFFER_CAPS] if enabled else [])
+    assert calls == ([bg._SPEC_BUFFER_CAPS, (50, 50)] if enabled else [])
+    assert bool(detections) is detected
 
 
 def test_batch_park_verdict_outlives_its_cohort():

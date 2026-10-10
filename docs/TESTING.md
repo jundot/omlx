@@ -167,6 +167,12 @@ Run `python -m pytest -q apps/omlx-web/tests/test_admin_new_profile_expose_as_mo
 
 Run `python -m pytest tests/test_mtp_xtc_sampling.py -q` for request sampler changes, late-joining mixed batches, row removal, and greedy sampling. These tests use a small MLX model and observe the MTP eligibility boundary; they do not execute a trained MTP head.
 
+### Lightning MTP command-buffer caps
+
+Run `python -m pytest -q tests/test_mlx_lm_mtp_patch.py -k "spec_command_buffers or spec_caps"` for target selection and restoration after a speculative step. These cases mock GPU detection and the native setter; they do not load a model or measure throughput.
+
+The raised caps apply only to supported Qwen target types on M5 and M3-family GPUs. Other targets keep MLX's caps, and drafter metadata does not affect target selection.
+
 ### Batched DFlash drafter
 
 Run `python -m pytest tests/test_dflash_batched.py tests/test_mlx_lm_mtp_patch.py -q -k "dflash_batched or block_drafter"`. `test_dflash_batched.py` builds a tiny DFlash2 drafter with random weights and checks that rows drafted together match the same rows drafted alone across ring wrap-around, ragged context segments and cohort changes, plus the prefill seed window slicing and block-size clamping. The `block_drafter` cases in `test_mlx_lm_mtp_patch.py` drive the Lightning MTP verify path with a table drafter on the CountingModel harness and require token parity with standard decoding, one context entry per committed position (including late joins) and release of finished rows. Real drafter acceptance and throughput need a Qwen3.5-family VLM checkpoint with its `z-lab` DFlash draft and are measured against the standard batched engine.
