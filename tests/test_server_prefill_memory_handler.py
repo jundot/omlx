@@ -475,3 +475,153 @@ class TestStreamingErrorPayload:
 
         body = srv._streaming_error_payload(ValueError("boom"), "chat streaming")
         assert body == {"error": {"message": "boom", "type": "server_error"}}
+
+
+class TestStreamingEndpointsSurfaceGuardRejection:
+    """#3665: a guard rejection after the SSE headers must reach the client.
+
+    The scheduler does not raise. ``_preflight_memory_check`` appends a
+    ``RequestOutput(finished=True, finish_reason="error", ...)`` and
+    ``EngineCore.stream_outputs`` YIELDS that output before
+    ``_raise_request_output_error`` turns it into the typed exception on the
+    NEXT pull. A generator that stops iterating on ``output.finished`` never
+    reaches that raise, so its ``except PrefillMemoryExceededError`` handler
+    is dead code and the stream closes as an ordinary empty turn.
+
+    The mock below reproduces that two-step shape exactly. Collapsing it to a
+    generator that raises on the first pull makes every endpoint pass and
+    tests nothing.
+    """
+
+    GUARD = (
+        "Prefill would require ~4.33 GB peak (current 3.24 GB + KV+SDPA "
+        "1.09 GB) but static ceiling is 3.80 GB. Raise memory_guard_tier "
+        "(safe -> balanced -> aggressive), or reduce context length."
+    )
+
+    def _rejected_then_raise(self):
+        from types import SimpleNamespace
+
+        async def gen(**kwargs):
+            # What BatchedEngine.stream_generate re-yields for the rejection:
+            # a finished, empty output. It carries no error field.
+            yield SimpleNamespace(
+                text="",
+                new_text="",
+                prompt_tokens=22656,
+                completion_tokens=0,
+                finished=True,
+                finish_reason="error",
+                tool_calls=None,
+                cached_tokens=0,
+                generated_at=None,
+                generated_until=None,
+                first_token_at=None,
+            )
+            raise PrefillMemoryExceededError(
+                message=self.GUARD,
+                request_id="req-late",
+                estimated_bytes=4_650_000_000,
+                limit_bytes=4_080_218_931,
+            )
+
+        return gen
+
+    def _wire(self, monkeypatch):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock
+
+        import omlx.server as srv
+        from omlx.model_settings import ModelSettings
+
+        engine = MagicMock()
+        engine.model_type = "llama"
+        engine.is_diffusion_model = False
+        engine.supports_request_scoped_abort = False
+        engine.message_extractor = None
+        engine.tokenizer = MagicMock()
+        engine.tokenizer.encode = lambda text: list(range(22656))
+        engine.start = AsyncMock()
+        # Preflight passes: the estimate fits, the real admission does not.
+        engine.preflight_chat = AsyncMock(return_value=None)
+        engine.preflight_completion = AsyncMock(return_value=None)
+        engine.count_chat_tokens.return_value = 22656
+        engine.stream_chat = self._rejected_then_raise()
+        engine.stream_generate = self._rejected_then_raise()
+
+        pool = MagicMock()
+        pool.preload_pinned_models = AsyncMock()
+        pool.check_ttl_expirations = AsyncMock()
+        pool.shutdown = AsyncMock()
+        pool.get_entry.return_value = SimpleNamespace(
+            config_model_type="llama", preserve_thinking_default=None
+        )
+        monkeypatch.setattr(srv._server_state, "engine_pool", pool)
+        monkeypatch.setattr(srv, "get_engine_for_model", AsyncMock(return_value=engine))
+        monkeypatch.setattr(srv, "resolve_model_id", lambda name: name)
+        monkeypatch.setattr(srv, "validate_context_window", lambda *a, **k: None)
+        monkeypatch.setattr(
+            srv, "get_model_settings_for_request", lambda name: ModelSettings()
+        )
+        monkeypatch.setitem(
+            srv.app.dependency_overrides, srv.verify_api_key, lambda: True
+        )
+        return srv
+
+    @pytest.mark.parametrize(
+        "path, payload",
+        [
+            (
+                "/v1/chat/completions",
+                {
+                    "model": "m",
+                    "messages": [{"role": "user", "content": "x"}],
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                },
+            ),
+            ("/v1/completions", {"model": "m", "prompt": "x", "stream": True}),
+            (
+                "/v1/messages",
+                {
+                    "model": "m",
+                    "max_tokens": 16,
+                    "messages": [{"role": "user", "content": "x"}],
+                    "stream": True,
+                },
+            ),
+            ("/v1/responses", {"model": "m", "input": "x", "stream": True}),
+        ],
+    )
+    def test_guard_message_reaches_the_client(self, monkeypatch, path, payload):
+        srv = self._wire(monkeypatch)
+        with TestClient(srv.app, raise_server_exceptions=False) as client:
+            resp = client.post(path, json=payload)
+        assert resp.status_code == 200, resp.text
+        assert (
+            "memory guard rejected this prompt" in resp.text
+        ), f"{path} closed the stream without surfacing the rejection:\n{resp.text}"
+
+    def test_anthropic_stream_does_not_report_a_rejection_as_end_turn(
+        self, monkeypatch
+    ):
+        """The silent close was worse than a missing error event.
+
+        map_finish_reason_to_stop_reason maps the unknown "error" reason to
+        "end_turn", so the rejected turn was reported as a completed one with
+        zero output tokens — indistinguishable from a model that said nothing.
+        """
+        srv = self._wire(monkeypatch)
+        with TestClient(srv.app, raise_server_exceptions=False) as client:
+            resp = client.post(
+                "/v1/messages",
+                json={
+                    "model": "m",
+                    "max_tokens": 16,
+                    "messages": [{"role": "user", "content": "x"}],
+                    "stream": True,
+                },
+            )
+        assert '"stop_reason": "end_turn"' not in resp.text, resp.text
+        assert "event: error" in resp.text, resp.text
+        assert '"type": "invalid_request_error"' in resp.text, resp.text
