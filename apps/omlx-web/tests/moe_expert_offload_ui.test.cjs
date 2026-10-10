@@ -27,7 +27,7 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx_web/static/js/dashboard.js
         assert.equal(app.modelSettings[fraction], value);
     }
     const html = fs.readFileSync(path.join(root, 'omlx_web/templates/dashboard/_modal_model_settings.html'), 'utf8');
-    const offload = html.split('<!-- MoE Expert Offload -->')[1].split('<!-- IndexCache')[0];
+    const offload = html.split('<!-- MoE Expert Offload -->')[1].split('<!-- TurboQuant KV Cache -->')[0];
     const condition = offload.match(/x-if="([^"]+)"/)[1];
     for (const supported of [true, false, undefined]) {
         assert.equal(vm.runInNewContext(condition, {selectedModel:{moe_expert_offload_supported:supported}}), supported === true);
