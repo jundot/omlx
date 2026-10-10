@@ -177,6 +177,14 @@ final class OMLXClient: ObservableObject {
         try await post(AdminAPI.modelSettingsRecipe(id), body: ApplyRecipeRequest(recipe: recipe))
     }
 
+    /// Normalize an MTPLX MTP sidecar into the model checkpoint so native
+    /// MTP can load it. The server validates the runtime contract before
+    /// changing the local model files.
+    @discardableResult
+    func importMtplxSidecar(id: String) async throws -> SimpleStatusResponse {
+        try await postEmpty(AdminAPI.importMtplx(id))
+    }
+
     func listModelProfiles(id: String) async throws -> ProfileListResponse {
         try await get(AdminAPI.modelProfiles(id))
     }
