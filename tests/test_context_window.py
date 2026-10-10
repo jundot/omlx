@@ -236,6 +236,53 @@ class TestValidateContextWindow:
             assert "100 tokens" in exc_info.value.detail
 
 
+class TestBoundChatOutputToContext:
+    def _state(self, context_window=1000):
+        from omlx.server import SamplingDefaults
+
+        state = MagicMock()
+        state.sampling = SamplingDefaults(max_context_window=context_window)
+        state.settings_manager = None
+        state.engine_pool = None
+        return state
+
+    def test_omitted_budget_is_bounded_to_exact_remainder(self):
+        from omlx.server import bound_chat_output_to_context
+
+        with patch("omlx.server._server_state", self._state()):
+            assert bound_chat_output_to_context(
+                num_prompt_tokens=900,
+                model_id="test-model",
+                requested_max_tokens=None,
+                resolved_max_tokens=32768,
+            ) == 100
+
+    def test_explicit_budget_passes_at_exact_total_boundary(self):
+        from omlx.server import bound_chat_output_to_context
+
+        with patch("omlx.server._server_state", self._state()):
+            assert bound_chat_output_to_context(
+                num_prompt_tokens=12,
+                model_id="test-model",
+                requested_max_tokens=988,
+                resolved_max_tokens=988,
+            ) == 988
+
+    def test_explicit_budget_reports_exact_available_tokens(self):
+        from omlx.server import bound_chat_output_to_context
+
+        with patch("omlx.server._server_state", self._state()):
+            with pytest.raises(HTTPException) as exc_info:
+                bound_chat_output_to_context(
+                    num_prompt_tokens=900,
+                    model_id="test-model",
+                    requested_max_tokens=101,
+                    resolved_max_tokens=101,
+                )
+        assert exc_info.value.status_code == 400
+        assert "available_tokens=100" in exc_info.value.detail
+
+
 class TestCountChatTokens:
     """Tests for BatchedEngine.count_chat_tokens()."""
 
