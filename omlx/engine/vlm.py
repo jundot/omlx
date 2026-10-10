@@ -2109,6 +2109,7 @@ class VLMBatchedEngine(BaseEngine):
                 custom_loaded = maybe_load_custom_quantization(
                     self._model_name,
                     is_vlm=True,
+                    model_settings=self._model_settings,
                 )
                 if custom_loaded is not None:
                     model, processor = custom_loaded

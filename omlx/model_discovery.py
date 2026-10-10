@@ -1036,7 +1036,7 @@ def detect_preserve_thinking(model_path: Path) -> bool | None:
     return True
 
 
-def estimate_model_size(model_path: Path) -> int:
+def estimate_model_size(model_path: Path, *, include_mtp: bool = True) -> int:
     """
     Estimate model memory usage from safetensors/bin file sizes.
 
@@ -1054,6 +1054,41 @@ def estimate_model_size(model_path: Path) -> int:
     safetensors_files = list(model_path.glob("*.safetensors"))
     for f in safetensors_files:
         total_size += f.stat().st_size
+
+    # Use bounded metadata for packed EXL3 admission estimates. Include the
+    # optional draft head conservatively at discovery. Runtime admission can
+    # exclude it when the native loader is configured to drop the head.
+    import struct
+
+    try:
+        config = json.loads((model_path / "config.json").read_text())
+        if (
+            config.get("model_type") == "qwen4_exp"
+            and config.get("expert_quant", {}).get("format") == "exl3"
+        ):
+            resident = 0
+            for shard in safetensors_files:
+                with shard.open("rb") as stream:
+                    header_len = struct.unpack("<Q", stream.read(8))[0]
+                    if not 0 < header_len <= 64 * 1024 * 1024:
+                        raise ValueError("Invalid safetensors header")
+                    header = json.loads(stream.read(header_len))
+                for name, record in header.items():
+                    if name == "__metadata__":
+                        continue
+                    if not include_mtp and name.startswith((
+                        "mtp.", "model.mtp.", "language_model.mtp.",
+                        "model.language_model.mtp.",
+                    )):
+                        continue
+                    start, end = record["data_offsets"]
+                    if not 0 <= start <= end <= shard.stat().st_size - header_len - 8:
+                        raise ValueError("Invalid safetensors offsets")
+                    resident += end - start
+            if resident:
+                total_size = resident
+    except (OSError, ValueError, TypeError, KeyError, struct.error):
+        pass  # Preserve the conservative file-size estimate on malformed metadata.
 
     # Fallback: .bin files (older PyTorch format)
     if total_size == 0:
