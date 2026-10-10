@@ -70,6 +70,24 @@ class EmbeddingOutput:
     dimensions: int = 0
     """Dimension of each embedding vector."""
 
+@dataclass
+class TokenEmbeddingOutput:
+    """Per-token (late-interaction / MaxSim) output for explicit token ids.
+
+    One entry per input sequence: the final hidden state of every token, with
+    padding positions already dropped, so ``len(token_embeddings[i])`` equals
+    ``len(ids_batch[i])`` exactly.
+    """
+
+    token_embeddings: List[List[List[float]]]
+    """Per input sequence, one vector per token id."""
+
+    total_tokens: int
+    """Total number of tokens returned (sum of the sequence lengths)."""
+
+    dimensions: int = 0
+    """Dimension of each token vector."""
+
 
 class _ChatTemplateEmbeddingInputs:
     """Build text, image, and audio embedding inputs with an mlx-vlm processor."""
@@ -1148,6 +1166,83 @@ class MLXEmbeddingModel:
                 embeddings_array = self._extract_embeddings_array(outputs, eager_mask)
 
         return embeddings_array, total_tokens
+
+    def embed_token_ids(
+        self,
+        ids_batch: List[List[int]],
+    ) -> TokenEmbeddingOutput:
+        """Per-token vectors for EXACT token ids (late interaction / MaxSim).
+
+        Unlike :meth:`embed`, the caller owns the token window: the ids are used
+        verbatim, so the returned rows line up one-to-one with the text window
+        the pooled ``sentence_embedding`` was computed over (head truncation and
+        any appended special token are the caller's). This is the tensor the
+        pinned ONNX export exposes as ``token_embeddings`` — the final hidden
+        state, before pooling and before L2 normalization — so a caller that
+        needs the ColBERT/MaxSim convention normalizes the rows itself.
+
+        The batch is right-padded to the longest sequence and each row is sliced
+        back to its own length with the attention mask, so padding never reaches
+        a returned vector (a causal model's real tokens all precede the pads).
+        ``mx.compile`` is deliberately not used here: a compiled primitive
+        returns the pooled array only.
+
+        Args:
+            ids_batch: one list of token ids per input sequence.
+
+        Returns:
+            TokenEmbeddingOutput with ragged per-token vectors.
+        """
+        if not self._loaded:
+            self.load()
+
+        sequences = [list(ids) for ids in ids_batch]
+        if not sequences or any(not ids for ids in sequences):
+            raise ValueError(
+                "token-id embeddings require at least one non-empty sequence"
+            )
+
+        width = max(len(ids) for ids in sequences)
+        # The pad id is irrelevant: real tokens precede the pads, so a causal
+        # forward pass never lets a pad influence their hidden state, and pad
+        # positions are dropped before returning.
+        padded = [ids + [0] * (width - len(ids)) for ids in sequences]
+        masks = [[1] * len(ids) + [0] * (width - len(ids)) for ids in sequences]
+        inputs = self._adapt_model_inputs_for_call(
+            {
+                "input_ids": mx.array(padded, dtype=mx.int32),
+                "attention_mask": mx.array(masks, dtype=mx.int32),
+            }
+        )
+
+        outputs = self.model(**inputs)
+        last_hidden = getattr(outputs, "last_hidden_state", None)
+        if last_hidden is None or last_hidden.ndim != 3:
+            raise ValueError(
+                "Model output does not expose per-token features "
+                "(last_hidden_state with shape (batch, seq_len, hidden)); "
+                f"got {type(last_hidden).__name__}"
+            )
+
+        last_hidden = last_hidden.astype(mx.float32)
+        mx.eval(last_hidden)
+
+        token_embeddings: List[List[List[float]]] = []
+        total_tokens = 0
+        for row, ids in enumerate(sequences):
+            vectors = last_hidden[row, : len(ids), :].tolist()
+            token_embeddings.append(vectors)
+            total_tokens += len(ids)
+
+        dimensions = 0
+        if token_embeddings and token_embeddings[0]:
+            dimensions = len(token_embeddings[0][0])
+
+        return TokenEmbeddingOutput(
+            token_embeddings=token_embeddings,
+            total_tokens=total_tokens,
+            dimensions=dimensions,
+        )
 
     def _count_tokens(
         self, inputs: Union[List[str], List[Dict[str, str]]]
