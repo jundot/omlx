@@ -147,6 +147,8 @@ class Request:
     # pollute the shared cache tiers or trigger the completion-time
     # host memcpy + disk write.
     skip_cache_store: bool = False
+    # Scheduler-owned work with no client. Request fail/retry paths skip it.
+    is_canonical_recovery: bool = False
     # Emit per-chunk timing diagnostics for an internal throughput benchmark.
     # This is never set by ordinary API traffic.
     benchmark_trace: bool = False

@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 
 import mlx.core as mx
 
+from .canonical_recovery import apply_canonical_recovery_settings
 from .engine import BaseEngine, BatchedEngine
 from .engine.decision import DecisionEngine
 from .engine.embedding import EmbeddingEngine
@@ -400,6 +401,7 @@ class EnginePool:
         self._gpu_keep_warm_task: asyncio.Task[None] | None = None
         self._gpu_keep_warm_last_active = 0.0
         self.configure_hot_cache_budget()
+        self.configure_canonical_recovery_budget()
 
     def configure_gpu_keep_warm(self, interval_seconds: float) -> None:
         """Set the idle keep-warm period in seconds (0 or less disables it)."""
@@ -860,6 +862,37 @@ class EnginePool:
         """Current memory used by loaded models in bytes."""
         return self._current_model_memory
 
+    def configure_canonical_recovery_budget(self) -> None:
+        """Give every scheduler in the pool one shared recovery budget.
+
+        Same pattern as configure_hot_cache_budget: an object on the shared config is
+        shared by every engine, a scalar is copied per engine. Created even at 0%, so
+        no scheduler falls back to a private budget.
+        """
+        from .canonical_recovery import DEFAULT_BUDGET_WINDOW_S, CanonicalRecoveryBudget
+
+        pct = float(
+            getattr(self._scheduler_config, "canonical_state_recovery_global_budget_pct", 0.0)
+            or 0.0
+        )
+        window_s = float(
+            getattr(
+                self._scheduler_config,
+                "canonical_state_recovery_budget_window_s",
+                DEFAULT_BUDGET_WINDOW_S,
+            )
+            or DEFAULT_BUDGET_WINDOW_S
+        )
+        current = getattr(self._scheduler_config, "canonical_recovery_budget", None)
+        if isinstance(current, CanonicalRecoveryBudget):
+            # Update in place: a new object would give every engine a fresh window.
+            current.pct = pct
+            current.window_s = window_s if window_s > 0 else DEFAULT_BUDGET_WINDOW_S
+            return
+        self._scheduler_config.canonical_recovery_budget = CanonicalRecoveryBudget(
+            pct=pct, window_s=window_s, shared=True
+        )
+
     def configure_hot_cache_budget(self) -> None:
         """Ensure loaded schedulers share one process-wide hot cache budget."""
         hot_max = int(getattr(self._scheduler_config, "hot_cache_max_size", 0) or 0)
@@ -1181,6 +1214,14 @@ class EnginePool:
             add("specprefill_draft_model", data.get("specprefill_draft_model"))
             add("specprefill_keep_pct", data.get("specprefill_keep_pct", 0.2))
             add("specprefill_threshold", data.get("specprefill_threshold"))
+
+        canonical_recovery_active = bool(data.get("canonical_state_recovery_enabled", False))
+        add("canonical_state_recovery_enabled", canonical_recovery_active)
+        if canonical_recovery_active:
+            add(
+                "canonical_state_recovery_slice_tokens",
+                data.get("canonical_state_recovery_slice_tokens", 0),
+            )
 
         dflash_enabled = bool(data.get("dflash_enabled", False)) and not is_diffusion
         dflash_draft = data.get("dflash_draft_model")
@@ -1798,6 +1839,11 @@ class EnginePool:
         scheduler = self._resolve_scheduler_from_engine(entry.engine)
         if scheduler is None:
             return False
+        # Recovery keeps the scheduler busy; cancel it or the unload never goes ready.
+        cancel_background = getattr(scheduler, "cancel_canonical_recovery_work", None)
+        if callable(cancel_background):
+            with suppress(Exception):
+                cancel_background("unload_pending")
         has_requests = getattr(scheduler, "has_requests", None)
         if callable(has_requests):
             try:
@@ -3547,6 +3593,8 @@ class EnginePool:
             # right values when it builds `SchedulerConfig` internally.
             self._scheduler_config.model_name = model_id
             self._scheduler_config.model_path = entry.model_path
+
+            apply_canonical_recovery_settings(self._scheduler_config, model_settings)
 
             # Native MTP forces LM-only dispatch even for VLM models. Vision
             # encoder weights are ignored because the patched mtp_forward only
