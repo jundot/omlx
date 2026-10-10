@@ -11,8 +11,9 @@ Provides:
 import base64
 import math
 import struct
-from typing import Any, Dict, List, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
+from ..exceptions import InvalidRequestError
 from .embedding_models import EmbeddingInputItem
 
 
@@ -126,19 +127,122 @@ def count_tokens(processor: Any, texts: List[str]) -> int:
     return total
 
 
-def normalize_input(input_data: Union[str, List[str]]) -> List[str]:
+def normalize_input(
+    input_data: Union[str, List[Any]],
+) -> List[Union[str, Dict[str, str]]]:
     """
-    Normalize input to a list of strings.
+    Normalize the request ``input`` field into engine-ready items.
+
+    Supported shapes:
+    - A single string -> one text input.
+    - A list of strings -> a batch of text inputs (OpenAI batch shape).
+    - OpenAI-style multimodal content parts, e.g.
+      ``[{"type": "text", "text": "..."},
+        {"type": "image_url", "image_url": {"url": "data:..."}}]``
+      Any dict inside the list marks the whole list as the content parts of
+      a *single* embedding input — the batch shape is list-of-strings only.
+      Parts collapse into one structured item of the same shape ``items``
+      produces, so content-part clients and ``items`` clients reach the
+      engine through one path.
 
     Args:
-        input_data: Single string or list of strings
+        input_data: Single string, list of strings, or list of content parts
 
     Returns:
-        List of strings
+        List of strings (text batch) or a single structured item dict
+
+    Raises:
+        InvalidRequestError: When content parts are malformed or use
+            unsupported features (e.g. several images in one input).
     """
     if isinstance(input_data, str):
         return [input_data]
-    return list(input_data)
+    items = list(input_data)
+    if all(isinstance(item, str) for item in items):
+        return items
+    if not items:
+        return items
+    return [_item_from_content_parts(items)]
+
+
+def _content_part_url(part: Dict[str, Any], field: str) -> str:
+    """Extract a media reference from a part whose value is a str or {"url": str}."""
+    payload = part.get(field)
+    if isinstance(payload, str) and payload:
+        return payload
+    if isinstance(payload, dict):
+        url = payload.get("url")
+        if isinstance(url, str) and url:
+            return url
+    raise InvalidRequestError(f"Embedding content part '{field}' requires a non-empty url")
+
+
+def _input_audio_part_to_data_uri(part: Dict[str, Any]) -> str:
+    """Fold an OpenAI ``input_audio`` part into the data-URI form engines take."""
+    payload = part.get("input_audio")
+    if isinstance(payload, str) and payload:
+        return payload
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, str) and data:
+            if data.startswith("data:"):
+                return data
+            fmt = payload.get("format") or "wav"
+            return f"data:audio/{fmt};base64,{data}"
+    raise InvalidRequestError("Embedding content part 'input_audio' requires base64 data")
+
+
+def _item_from_content_parts(parts: List[Any]) -> Dict[str, str]:
+    """Collapse a list of OpenAI-style content parts into one structured item."""
+    texts: List[str] = []
+    image: Optional[str] = None
+    audio: Optional[str] = None
+
+    for part in parts:
+        if isinstance(part, str):
+            texts.append(part)
+            continue
+        if not isinstance(part, dict):
+            raise InvalidRequestError(
+                "Embedding input parts must be strings or content-part objects"
+            )
+        part_type = part.get("type")
+        if part_type == "text":
+            texts.append(str(part.get("text", "")))
+        elif part_type in ("image_url", "image", "input_image"):
+            if image is not None:
+                raise InvalidRequestError(
+                    "Embedding input supports at most one image per item"
+                )
+            field = "image_url" if part_type == "image_url" else part_type
+            if part_type == "input_image" and isinstance(part.get("image_url"), str):
+                image = part["image_url"]
+            else:
+                image = _content_part_url(part, field)
+        elif part_type == "input_audio":
+            if audio is not None:
+                raise InvalidRequestError(
+                    "Embedding input supports at most one audio per item"
+                )
+            audio = _input_audio_part_to_data_uri(part)
+        else:
+            raise InvalidRequestError(
+                f"Unsupported embedding content part type: {part_type!r}"
+            )
+
+    item: Dict[str, str] = {}
+    joined = "\n".join(t for t in texts if t)
+    if joined:
+        item["text"] = joined
+    if image is not None:
+        item["image"] = image
+    if audio is not None:
+        item["audio"] = audio
+    if not item:
+        raise InvalidRequestError(
+            "Embedding content parts contain no text, image, or audio"
+        )
+    return item
 
 
 def normalize_embedding_items(

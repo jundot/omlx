@@ -268,6 +268,71 @@ class TestEmbeddingUtils:
         result = normalize_input(["Hello", "World"])
         assert result == ["Hello", "World"]
 
+    def test_normalize_input_image_content_parts(self):
+        """OpenAI image_url content parts fold into one structured item."""
+        parts = [
+            {"type": "text", "text": "a diagram"},
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+        ]
+        assert normalize_input(parts) == [{"text": "a diagram", "image": IMAGE_DATA_URI}]
+
+    def test_normalize_input_image_only_content_parts(self):
+        """Image-only parts produce an item without a text key."""
+        parts = [{"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}}]
+        assert normalize_input(parts) == [{"image": IMAGE_DATA_URI}]
+
+    def test_normalize_input_multiple_text_parts_join(self):
+        """Several text parts join with newlines, like extract_text_from_content."""
+        parts = [
+            {"type": "text", "text": "one"},
+            {"type": "text", "text": "two"},
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+        ]
+        assert normalize_input(parts) == [
+            {"text": "one\ntwo", "image": IMAGE_DATA_URI}
+        ]
+
+    def test_normalize_input_audio_content_part(self):
+        """input_audio parts fold into the data-URI form items take."""
+        parts = [
+            {"type": "text", "text": "speech"},
+            {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+        ]
+        assert normalize_input(parts) == [
+            {"text": "speech", "audio": "data:audio/wav;base64,AAAA"}
+        ]
+
+    def test_normalize_input_rejects_two_images(self):
+        parts = [
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+        ]
+        with pytest.raises(InvalidRequestError, match="at most one image"):
+            normalize_input(parts)
+
+    def test_normalize_input_rejects_unknown_part_type(self):
+        parts = [{"type": "file", "file": {"filename": "x.pdf"}}]
+        with pytest.raises(InvalidRequestError, match="Unsupported embedding content part"):
+            normalize_input(parts)
+
+    def test_normalize_input_rejects_image_part_without_url(self):
+        parts = [{"type": "image_url", "image_url": {}}]
+        with pytest.raises(InvalidRequestError, match="requires a non-empty url"):
+            normalize_input(parts)
+
+    def test_normalize_input_rejects_empty_parts(self):
+        with pytest.raises(InvalidRequestError, match="no text, image, or audio"):
+            normalize_input([{"type": "text", "text": ""}])
+
+    def test_embedding_request_accepts_content_parts(self):
+        """EmbeddingRequest keeps OpenAI content-part input verbatim."""
+        parts = [
+            {"type": "text", "text": "hello"},
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+        ]
+        request = EmbeddingRequest(input=parts, model="test-model")
+        assert request.input == parts
+
     def test_normalize_embedding_items(self):
         """Test structured embedding items normalization."""
         result = normalize_embedding_items(
