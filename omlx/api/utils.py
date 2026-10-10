@@ -92,10 +92,23 @@ def merge_reasoning_effort_chat_template_kwargs(
     chat_template_kwargs: dict[str, Any] | None,
     reasoning_effort: Any | None,
 ) -> dict[str, Any] | None:
-    """Forward an API reasoning effort without overriding explicit template kwargs."""
+    """Forward an API reasoning effort without overriding explicit template kwargs.
+
+    An explicit effort opts the request into thinking — OpenAI/vLLM semantics:
+    sending ``reasoning_effort`` on a reasoning model means "reason". The
+    promotion lands in the request layer, so a model-level default-off
+    (admin toggle) is overridden per request while ``forced_ct_kwargs``
+    locks still win. ``off``/``none`` ask for no thinking and never
+    promote; an explicit ``enable_thinking`` in the request kwargs wins.
+    """
     merged = dict(chat_template_kwargs or {})
     if reasoning_effort is not None:
         merged.setdefault("reasoning_effort", reasoning_effort)
+        effort_off = isinstance(reasoning_effort, str) and (
+            reasoning_effort.strip().lower() in ("off", "none")
+        )
+        if not effort_off:
+            merged.setdefault("enable_thinking", True)
     return merged or None
 
 
