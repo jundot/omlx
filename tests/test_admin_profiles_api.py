@@ -1044,8 +1044,6 @@ def test_a8_profile_roundtrip_supported_architectures(client, monkeypatch, model
         {"dflash_in_memory_cache_max_entries": 1.5},
         {"specprefill_enabled": "not-a-boolean"},
         {"dflash_in_memory_cache": []},
-        {"specprefill_draft_model": "/missing-draft-for-validation"},
-        {"vlm_mtp_draft_model": "./missing-draft-for-validation"},
         {"reasoning_parser": "unknown-parser"},
     ],
 )
@@ -1082,6 +1080,116 @@ def test_invalid_settings_do_not_change_storage(client, monkeypatch, operation, 
     assert {p.name: p.read_bytes() for p in mgr.base_path.glob("*.json")} == before
     assert mgr.get_settings("model-a").temperature == 0.5
     assert len(mgr.list_profiles("model-a")) == 1
+
+
+@pytest.mark.parametrize("feature", ["dflash", "specprefill", "vlm_mtp"])
+def test_parked_draft_does_not_block_saves(client, tmp_path, feature):
+    """A draft parked while its feature is off must not brick unrelated saves.
+
+    Every model-settings save re-sends the whole payload, so a draft directory
+    deleted from disk — or a path imported from another machine — used to reject
+    every PUT, including saves that never enable the feature. #4217 settled this
+    for DFlash only; this covers the shared rule for all three draft fields.
+    """
+    c, mgr = client
+    missing = str(tmp_path / "deleted-draft")
+    mgr.set_settings(
+        "model-a",
+        ModelSettings(**{f"{feature}_draft_model": missing}),
+    )
+    url = "/admin/api/models/model-a"
+
+    payload = mgr.get_settings("model-a").to_dict()
+    payload.update(temperature=0.9, mtp_adaptive_max_depth=6)
+    payload[f"{feature}_enabled"] = False
+    response = c.put(url + "/settings", json=payload)
+    assert response.status_code == 200, response.text
+    stored = mgr.get_settings("model-a")
+    assert stored.temperature == 0.9
+    assert stored.mtp_adaptive_max_depth == 6
+    assert getattr(stored, f"{feature}_draft_model") == missing
+
+    # Turning the feature on with an unusable draft is still rejected, and the
+    # parked value plus the unrelated settings survive untouched. DFlash has its
+    # own compatibility gate ahead of the draft check, hence the 400 there.
+    expected = 400 if feature == "dflash" else 422
+    response = c.put(
+        url + "/settings",
+        json={f"{feature}_enabled": True, f"{feature}_draft_model": missing},
+    )
+    assert response.status_code == expected, response.text
+    stored = mgr.get_settings("model-a")
+    assert getattr(stored, f"{feature}_enabled") is False
+    assert stored.temperature == 0.9
+    assert stored.mtp_adaptive_max_depth == 6
+    assert getattr(stored, f"{feature}_draft_model") == missing
+
+
+def test_dflash_draft_check_survives_shared_loop(client, monkeypatch, tmp_path):
+    """Moving the DFlash check into the shared loop must not weaken it.
+
+    DFlash keeps its pre-#4217 posture: while it is on, an unusable draft is
+    still rejected with 422 and nothing is written. is_dflash_compatible is
+    patched so the assertion below is about the draft check, not about the
+    compatibility gate that answers first for an unavailable model.
+    """
+    c, mgr = client
+    missing = str(tmp_path / "deleted-draft")
+    mgr.set_settings(
+        "model-a",
+        ModelSettings(
+            temperature=0.5,
+            dflash_enabled=True,
+            dflash_draft_model=missing,
+        ),
+    )
+    monkeypatch.setattr(
+        "omlx.engine.dflash.is_dflash_compatible",
+        lambda model_path: (True, ""),
+    )
+    url = "/admin/api/models/model-a"
+    response = c.put(
+        url + "/settings",
+        json={
+            "temperature": 0.9,
+            "dflash_enabled": True,
+            "dflash_draft_model": missing,
+        },
+    )
+    assert response.status_code == 422, response.text
+    stored = mgr.get_settings("model-a")
+    assert stored.temperature == 0.5
+    assert stored.dflash_enabled is True
+    assert stored.dflash_draft_model == missing
+
+
+def test_alias_conflict_only_checked_when_alias_changes(client):
+    """Changing the alias is still checked; a pre-existing duplicate is not.
+
+    The alias is re-sent on every save, so once a duplicate exists — created
+    outside this endpoint, such as by applying a profile — every PUT for this
+    model used to be rejected. Changing the alias to a name another model
+    holds is still rejected with 400 and writes nothing.
+    """
+    c, mgr = client
+    mgr.set_settings("model-a", ModelSettings(model_alias="shared"))
+    mgr.set_settings("model-b", ModelSettings(model_alias="shared"))
+    url = "/admin/api/models/model-a"
+
+    payload = mgr.get_settings("model-a").to_dict()
+    payload["temperature"] = 0.9
+    response = c.put(url + "/settings", json=payload)
+    assert response.status_code == 200, response.text
+    assert mgr.get_settings("model-a").temperature == 0.9
+    assert mgr.get_settings("model-a").model_alias == "shared"
+
+    # Changing the alias to a name another model already holds is still
+    # rejected, and nothing is written.
+    mgr.set_settings("model-b", ModelSettings(model_alias="taken"))
+    response = c.put(url + "/settings", json={"model_alias": "taken"})
+    assert response.status_code == 400, response.text
+    assert mgr.get_settings("model-a").model_alias == "shared"
+    assert mgr.get_settings("model-a").temperature == 0.9
 
 
 @pytest.mark.parametrize("operation", ["settings", "create", "update"])

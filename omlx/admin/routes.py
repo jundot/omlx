@@ -466,8 +466,14 @@ class ModelSettingsRequest(BaseModel):
     def validate_draft_path(cls, value: str | None, info: ValidationInfo) -> str | None:
         if not value:
             return None
-        # A DFlash draft may stay parked while DFlash is off; the route checks it.
-        if info.field_name != "dflash_draft_model" and _draft_path_is_unusable(value):
+        # A draft may stay parked while its feature is off; the route checks the
+        # effective state. Raising here rejects every whole-payload save,
+        # including saves that never touch the draft (#4217).
+        if info.field_name not in (
+            "dflash_draft_model",
+            "specprefill_draft_model",
+            "vlm_mtp_draft_model",
+        ) and _draft_path_is_unusable(value):
             raise ValueError(f"Draft model has no config.json: {value}")
         return value
 
@@ -2690,7 +2696,13 @@ async def update_model_settings(
         alias_value = request.model_alias.strip() if request.model_alias else None
         if alias_value == "":
             alias_value = None
-        if alias_value is not None:
+        # Conflicts are only checked when the alias actually changes: the admin
+        # UI re-sends the stored alias on every save, so a model or directory
+        # that appears later with this name must not brick unrelated saves.
+        # Creating a duplicate is still rejected; resolve_model_id() matches
+        # real model entries before settings aliases, so an alias shadowed by a
+        # directory of the same name stays harmless.
+        if alias_value is not None and alias_value != current_settings.model_alias:
             all_settings = settings_manager.get_all_settings()
             for mid, ms in all_settings.items():
                 if mid != model_id and ms.model_alias == alias_value:
@@ -3111,16 +3123,6 @@ async def update_model_settings(
         )
     if "dflash_verify_mode" in sent:
         current_settings.dflash_verify_mode = request.dflash_verify_mode
-    draft_model = current_settings.dflash_draft_model
-    if (
-        ("dflash_enabled" in sent or "dflash_draft_model" in sent)
-        and current_settings.dflash_enabled
-        and draft_model
-        and _draft_path_is_unusable(draft_model)
-    ):
-        raise HTTPException(
-            status_code=422, detail=f"Draft model has no config.json: {draft_model}"
-        )
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:
@@ -3248,6 +3250,24 @@ async def update_model_settings(
         current_settings.vlm_mtp_draft_model = request.vlm_mtp_draft_model or None
     if "vlm_mtp_draft_block_size" in sent:
         current_settings.vlm_mtp_draft_block_size = request.vlm_mtp_draft_block_size
+
+    # Draft usability is only enforced for a feature that is on: the admin UI
+    # re-sends the whole payload, so a draft directory deleted from disk (or a
+    # path imported from another machine) must not reject saves that never
+    # enable the feature. The parked value is kept verbatim, exactly as #4217
+    # settled for DFlash.
+    for _feature in ("dflash", "specprefill", "vlm_mtp"):
+        _draft = getattr(current_settings, f"{_feature}_draft_model")
+        if (
+            (f"{_feature}_enabled" in sent or f"{_feature}_draft_model" in sent)
+            and getattr(current_settings, f"{_feature}_enabled")
+            and _draft
+            and _draft_path_is_unusable(_draft)
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Draft model has no config.json: {_draft}",
+            )
 
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
