@@ -49,6 +49,34 @@ def _set_verify_qmm_armed(flag: bool, *, row_exact: bool = False) -> None:
         pass
 
 
+def _set_verify_width_stable(flag: bool) -> None:
+    """Arm width-stable verify; a no-op when the kernel module is absent."""
+    try:
+        from ..qwen35_verify_qmm import set_verify_width_stable
+
+        set_verify_width_stable(flag)
+    except Exception:
+        pass
+
+
+@contextlib.contextmanager
+def _width_stable_verify(gen_batch: Any):
+    """Arm width-stable verify for one greedy singleton MTP step.
+
+    The depth controller varies the block width of every multi-row target
+    forward with draft acceptance; greedy output must not vary with it.
+    Sampled steps keep the width-specific kernels.
+    """
+    greedy = hasattr(gen_batch, "samplers") and _is_greedy(gen_batch)
+    if greedy:
+        _set_verify_width_stable(True)
+    try:
+        yield
+    finally:
+        if greedy:
+            _set_verify_width_stable(False)
+
+
 def _row_exact_verify(model: Any) -> bool:
     """Whether the target's verify rows must reproduce its one-row decode.
 
@@ -174,10 +202,11 @@ def apply() -> bool:
                     handed_off = _handoff_mtp_for_late_join(self, self._omlx_mtp_state)
                 if not handed_off:
                     try:
-                        state = _prepare_mtp_state_for_next(self)
-                        if state is not None:
-                            with _spec_command_buffers():
-                                return _mtp_next(self, state)
+                        with _width_stable_verify(self):
+                            state = _prepare_mtp_state_for_next(self)
+                            if state is not None:
+                                with _spec_command_buffers():
+                                    return _mtp_next(self, state)
                     except _MtpStepFallback as exc:
                         logger.debug("MTP next() fallback to standard step: %s", exc)
                         active = getattr(self, "_omlx_mtp_state", None)

@@ -89,6 +89,13 @@ _MIN_ROUTE_N = 16384
 # The mma path wins from much smaller N because stock qmm reads the weights
 # more than once (qmv_wide tiles) or wastes half a 32-row tile at these M.
 _MIN_MMA_ROUTE_N = 4096
+
+# Width-stable verify pads one request's block to this many rows before
+# routing. The depth controller changes the block width from cycle to cycle
+# and each route picks its kernel template from the row count, so without a
+# fixed width the same position gets different logits at different depths and
+# greedy output changes from run to run with draft acceptance.
+_VERIFY_ROWS = 6
 # Draft k/v and conv projections (N 1024..1280) also gain from sg8.
 _MIN_SG8_ROUTE_N = 1024
 _SG8_MIN_ROWS = 4
@@ -113,6 +120,20 @@ def _is_armed() -> bool:
 def is_row_exact_armed() -> bool:
     """True inside a verify forward whose rows must equal serial decode rows."""
     return getattr(_ROUTE_ARMED, "row_exact", False)
+
+
+def set_verify_width_stable(flag: bool) -> None:
+    """Keep a verify row's result independent of the block width.
+
+    Armed around greedy single-request verify cycles, whose output should not
+    depend on how many drafts a cycle carried. Sampled decoding keeps the
+    width-specific kernels.
+    """
+    _ROUTE_ARMED.width_stable = bool(flag)
+
+
+def is_width_stable_armed() -> bool:
+    return getattr(_ROUTE_ARMED, "width_stable", False)
 
 
 # ---------------------------------------------------------------------------
@@ -1019,6 +1040,7 @@ def vk_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> bo
     # M >= 3: at M=2 (depth-1 verify) the dispatch overhead eats the GPU win
     # AND skipping it keeps depth-1 greedy output bit-identical to the
     # unrouted path. Depth >= 2 verifies at M >= 3 where the kernels pay.
+    # Width-stable verify reaches here padded to _VERIFY_ROWS instead.
     return (
         int(bits) in (4, 8)
         and int(group_size) in (32, 64, 128)
@@ -1546,6 +1568,9 @@ def apply_verify_qmm_patch() -> bool:
         ):
             return orig_call(self, x)
         batch, length, K = x.shape
+        if batch == 1 and length < _VERIFY_ROWS and is_width_stable_armed():
+            pad = mx.zeros((1, _VERIFY_ROWS - length, K), dtype=x.dtype)
+            return patched_call(self, mx.concatenate([x, pad], axis=1))[:, :length]
         rows = batch * length
         N = self.scales.shape[0]
         route = _verify_route(rows, K, N, self.bits, self.group_size, x.dtype)
