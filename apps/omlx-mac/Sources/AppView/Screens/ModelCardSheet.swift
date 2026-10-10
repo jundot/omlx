@@ -298,7 +298,7 @@ struct ModelCardSheet: View {
         HStack(spacing: 3) {
             Image(systemName: symbol)
                 .font(.system(size: 10, weight: .medium))
-            Text(Self.compactCount(value))
+            Text(CountFormat.compact(value))
                 .font(.omlxMono(11))
         }
         .foregroundStyle(theme.textSecondary)
@@ -558,24 +558,6 @@ struct ModelCardSheet: View {
             state = .loaded(dto)
         } catch {
             state = .failed(error.omlxDescription)
-        }
-    }
-
-    // MARK: Helpers
-
-    /// Compact-format a count for the metadata counters: 1234 → "1.2K",
-    /// 1_500_000 → "1.5M". Mirrors the HTML admin's display so the same
-    /// repos show the same numbers on both surfaces.
-    private static func compactCount(_ n: Int) -> String {
-        switch n {
-        case 1_000_000_000...:
-            return String(format: "%.1fB", Double(n) / 1_000_000_000)
-        case 1_000_000...:
-            return String(format: "%.1fM", Double(n) / 1_000_000)
-        case 1_000...:
-            return String(format: "%.1fK", Double(n) / 1_000)
-        default:
-            return String(n)
         }
     }
 }
