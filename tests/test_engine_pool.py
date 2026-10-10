@@ -489,6 +489,21 @@ class TestEnginePoolStatus:
         assert model_a_status["pinned"] is True
         assert model_a_status["loaded"] is False
 
+    def test_status_includes_template_reasoning_efforts(self, small_mock_model_dir):
+        template = (
+            "{% set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}"
+            "{% if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}"
+            "{{ raise_exception('Unexpected reasoning effort') }}{% endif %}"
+        )
+        (small_mock_model_dir / "model-a" / "chat_template.jinja").write_text(template)
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        models = {model["id"]: model for model in pool.get_status()["models"]}
+        assert models["model-a"]["reasoning_effort_options"] == ["xhigh", "medium", "low"]
+        assert models["model-a"]["reasoning_effort_default"] == "xhigh"
+        assert models["model-b"]["reasoning_effort_options"] == []
+        assert models["model-b"]["reasoning_effort_default"] is None
+
     def test_get_model_ids(self, small_mock_model_dir):
         """Test get_model_ids returns all model IDs."""
         pool = _make_pool(ceiling=10 * 1024**3)

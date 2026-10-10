@@ -15,12 +15,13 @@ Supports:
 - Decision models: Use DecisionEngine for /v1/systemone (Clef, OpenJev)
 """
 
+import ast
 import contextlib
 import json
 import logging
 import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -399,10 +400,20 @@ class DiscoveredModel:
     engine_type: EngineType  # "batched", "vlm", "embedding", or "reranker"
     estimated_size: int  # Estimated memory usage in bytes
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
-    config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
-    thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
-    preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
-    model_context_length: int | None = None  # Declared context length from config.json (None if unknown)
+    config_model_type: str = (
+        ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
+    )
+    thinking_default: bool | None = (
+        None  # True if model thinks by default, False if not, None if unknown
+    )
+    preserve_thinking_default: bool | None = (
+        None  # True when template supports preserve_thinking (Qwen 3.6+)
+    )
+    model_context_length: int | None = (
+        None  # Declared context length from config.json (None if unknown)
+    )
+    reasoning_effort_options: list[str] = field(default_factory=list)
+    reasoning_effort_default: str | None = None
     source_type: str = "local"  # "local" or "hf_cache"
     source_repo_id: str | None = None  # HuggingFace repo id for cache-backed models
     is_helper: bool = False  # Speculative-decoding drafter (dFlash/Assistant/MTP)
@@ -859,6 +870,52 @@ def detect_model_type(model_path: Path) -> ModelType:
         return "audio_sts"
 
     return "llm"
+
+
+def detect_reasoning_effort(model_path: Path) -> tuple[list[str], str | None]:
+    """Read explicit effort enums from Qwen-style template validation guards.
+
+    Thinking alone does not imply adjustable effort. Only advertise literals
+    from a guard on the variable assigned from ``reasoning_effort|default``;
+    templates without this contract retain the conservative thinking control.
+    """
+    try:
+        template = (model_path / "chat_template.jinja").read_text(encoding="utf-8")
+    except OSError:
+        try:
+            config = json.loads(
+                (model_path / "tokenizer_config.json").read_text(encoding="utf-8")
+            )
+            template = config.get("chat_template") if isinstance(config, dict) else None
+        except (OSError, ValueError):
+            return [], None
+    if not isinstance(template, str):
+        return [], None
+    assignment = re.search(
+        r"set\s+(\w+)\s*=\s*reasoning_effort\s*\|\s*default\(\s*(['\"])(\w+)\2\s*\)",
+        template,
+    )
+    if assignment is None:
+        return [], None
+    variable, _, default = assignment.groups()
+    guard = re.search(
+        rf"if\s+{re.escape(variable)}\s+not\s+in\s+(\([^()]+\))",
+        template,
+    )
+    if guard is None:
+        return [], None
+    try:
+        options = ast.literal_eval(guard.group(1))
+    except (SyntaxError, ValueError):
+        return [], None
+    if (
+        not isinstance(options, tuple)
+        or not options
+        or not all(isinstance(option, str) for option in options)
+        or default not in options
+    ):
+        return [], None
+    return list(dict.fromkeys(options)), default
 
 
 def detect_thinking_default(model_path: Path) -> bool | None:
@@ -1697,6 +1754,9 @@ def _register_model(
         thinking_default = detect_thinking_default(model_dir)
         preserve_thinking_default = detect_preserve_thinking(model_dir)
         model_context_length = _read_model_context_length(model_dir)
+        reasoning_effort_options, reasoning_effort_default = detect_reasoning_effort(
+            model_dir
+        )
 
         models[model_id] = DiscoveredModel(
             model_id=model_id,
@@ -1706,6 +1766,8 @@ def _register_model(
             estimated_size=estimated_size,
             text_only_size=text_only_size,
             config_model_type=config_model_type,
+            reasoning_effort_options=reasoning_effort_options,
+            reasoning_effort_default=reasoning_effort_default,
             thinking_default=thinking_default,
             preserve_thinking_default=preserve_thinking_default,
             model_context_length=model_context_length,
