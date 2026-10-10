@@ -282,6 +282,16 @@ private struct OtherIntegrationsSection: View {
                 command: vm.piCommand
             )
             IntegrationRow(
+                name: String(localized: "integrations.tool.vibe",
+                             defaultValue: "Mistral Vibe",
+                             comment: "Display name for the Mistral Vibe integration"),
+                modelBinding: vm.bind($vm.vibeModel, save: {
+                    Task { await vm.save(.vibeModel, client: client) }
+                }),
+                modelOptions: vm.modelOptions,
+                command: vm.vibeCommand
+            )
+            IntegrationRow(
                 name: String(localized: "integrations.tool.copilot",
                              defaultValue: "Copilot CLI",
                              comment: "Display name for the Copilot CLI integration"),

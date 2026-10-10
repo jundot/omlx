@@ -45,7 +45,7 @@ def ctx(**overrides) -> IntegrationContext:
 class TestIntegrationRegistry:
     def test_list_integrations(self):
         integrations = list_integrations()
-        assert len(integrations) == 9
+        assert len(integrations) == 10
         names = {i.name for i in integrations}
         assert names == {
             "claude",
@@ -56,6 +56,7 @@ class TestIntegrationRegistry:
             "openclaw",
             "hermes",
             "pi",
+            "vibe",
             "dsh",
         }
 
@@ -68,6 +69,7 @@ class TestIntegrationRegistry:
         assert get_integration("openclaw") is not None
         assert get_integration("hermes") is not None
         assert get_integration("pi") is not None
+        assert get_integration("vibe") is not None
         assert get_integration("dsh") is not None
         assert get_integration("nonexistent") is None
 

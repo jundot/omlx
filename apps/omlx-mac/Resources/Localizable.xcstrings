@@ -8087,6 +8087,30 @@
         }
       }
     },
+    "integrations.tool.vibe" : {
+      "comment" : "Display name for the Mistral Vibe integration",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mistral Vibe"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mistral Vibe"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mistral Vibe"
+          }
+        }
+      }
+    },
     "logs.empty" : {
       "comment" : "Empty-state text shown inside the log pane when the server has no log entries",
       "extractionState" : "manual",

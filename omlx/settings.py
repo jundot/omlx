@@ -942,6 +942,7 @@ class IntegrationSettings:
     openclaw_model: str | None = None
     hermes_model: str | None = None
     pi_model: str | None = None
+    vibe_model: str | None = None
     copilot_model: str | None = None
     dsh_model: str | None = None
     openclaw_tools_profile: str = "coding"
@@ -968,6 +969,7 @@ class IntegrationSettings:
             "openclaw_model": self.openclaw_model,
             "hermes_model": self.hermes_model,
             "pi_model": self.pi_model,
+            "vibe_model": self.vibe_model,
             "copilot_model": self.copilot_model,
             "dsh_model": self.dsh_model,
             "openclaw_tools_profile": self.openclaw_tools_profile,
@@ -995,6 +997,7 @@ class IntegrationSettings:
             openclaw_model=data.get("openclaw_model"),
             hermes_model=data.get("hermes_model"),
             pi_model=data.get("pi_model"),
+            vibe_model=data.get("vibe_model"),
             copilot_model=data.get("copilot_model"),
             dsh_model=data.get("dsh_model"),
             openclaw_tools_profile=data.get("openclaw_tools_profile", "coding"),

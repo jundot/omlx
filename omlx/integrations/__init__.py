@@ -10,6 +10,7 @@ from omlx.integrations.hermes import HermesIntegration
 from omlx.integrations.openclaw import OpenClawIntegration
 from omlx.integrations.opencode import OpenCodeIntegration
 from omlx.integrations.pi import PiIntegration
+from omlx.integrations.vibe import VibeIntegration
 
 INTEGRATIONS: dict[str, Integration] = {
     "claude": ClaudeCodeIntegration(),
@@ -19,6 +20,7 @@ INTEGRATIONS: dict[str, Integration] = {
     "openclaw": OpenClawIntegration(),
     "hermes": HermesIntegration(),
     "pi": PiIntegration(),
+    "vibe": VibeIntegration(),
     "copilot": CopilotIntegration(),
     "dsh": DshIntegration(),
 }
