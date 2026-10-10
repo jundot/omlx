@@ -47,6 +47,7 @@ _GPU_SERIAL_TEST_FILES = (
     "test_mlx_lm_mtp_patch.py",
     "test_mlx_vlm_*",
     "test_moe_expert_offload.py",
+    "test_moe_routes.py",
     "test_qwen35_*",
     "test_qwen4_*",
     "test_row_exact_qmv.py",
