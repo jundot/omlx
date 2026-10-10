@@ -475,6 +475,14 @@ def test_profile_api_toggle_i18n_keys_exist_in_every_locale():
             assert catalog["modal.model_settings.profiles.expose_as_model_on"] == "ZAP"
             assert catalog["modal.model_settings.profiles.expose_as_model_off"] == "VYP"
             continue
+        if path.name == "uk.json":
+            assert (
+                catalog["modal.model_settings.profiles.expose_as_model_on"] == "УВІМК."
+            )
+            assert (
+                catalog["modal.model_settings.profiles.expose_as_model_off"] == "ВИМК."
+            )
+            continue
         for key, value in english.items():
             assert (
                 catalog[key] == value

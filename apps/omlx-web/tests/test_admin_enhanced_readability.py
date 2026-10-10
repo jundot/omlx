@@ -14,7 +14,7 @@ the three behaviors the upstream reviewer asked for:
 
 Plus invariants: gray helper text -> primary, red kept, model-card gray text is
 also lifted to primary, no blanket disabled-text override, and the i18n key
-exists in every locale (English fallback, not translated here).
+exists in every locale with either its translation or the English fallback.
 """
 
 import json
@@ -140,14 +140,23 @@ def test_shortcuts_at_top_of_chat_settings():
 
 
 def test_i18n_key_present_in_all_locales():
-    locales = ["en", "zh", "es", "fr", "ja", "ko", "pt-BR", "ru", "zh-TW"]
+    locales = sorted(path.stem for path in I18N.glob("*.json"))
     for loc in locales:
         data = json.loads((I18N / f"{loc}.json").read_text(encoding="utf-8"))
         assert "chat.enhanced_readability" in data, f"{loc} missing key"
         label = data["chat.enhanced_readability"]
         assert label.strip(), f"{loc} empty label"
-        # zh translates the label; every other locale keeps the English fallback
-        # until its own translation lands.
-        if loc != "zh":
-            assert label == "Enhanced Readability", f"{loc} not English fallback"
+        translated_labels = {
+            "cs": "Vylepšená čitelnost",
+            "uk": "Покращена читабельність",
+            "zh": "增强可读性",
+        }
+        assert label == translated_labels.get(loc, "Enhanced Readability")
         assert "chat.enhanced_readability_desc" in data
+
+
+def test_ukrainian_locale_is_selectable():
+    settings = (TEMPLATES / "dashboard/_settings.html").read_text(encoding="utf-8")
+    assert '<option value="uk">{{ t(\'settings.language.uk\') }}</option>' in settings
+    ukrainian = json.loads((I18N / "uk.json").read_text(encoding="utf-8"))
+    assert ukrainian["settings.language.uk"] == "Українська"
