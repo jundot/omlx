@@ -20,11 +20,20 @@ macOS 27 betas broke `brew install omlx` in several ways (issue #2110):
   so a prebuilt wheel could clobber a source-built package, and pip's
   wheel cache could resurrect a dylib built before the strip guards.
 
+The formula used to fetch its own mlx-audio revision to patch the
+`mlx-lm==0.31.1` pin that revision carried. mlx-audio 0.5.x dropped that pin
+and moved the audio stack (misaki, spaCy, librosa, numba, ...) out of its
+"all" extra into omlx's [audio] extra, so the formula now installs that extra
+and the resource only has to track pyproject.toml's mlx-audio pin; a resource
+left behind is what downgraded the keg below mlx-vlm's `mlx-audio>=0.5.2`
+floor (issue #3916).
+
 The formula and workflow use Ruby and shell syntax, so these are text-level
 assertions that the guards stay present.
 """
 
 import re
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -32,12 +41,15 @@ import pytest
 from omlx.custom_kernels import NATIVE_KERNEL_PACKAGES
 
 FORMULA_PATH = Path(__file__).resolve().parents[1] / "Formula" / "omlx.rb"
+PYPROJECT_PATH = Path(__file__).resolve().parents[1] / "pyproject.toml"
 WORKFLOW_PATH = (
     Path(__file__).resolve().parents[1] / ".github" / "workflows" / "update-formula.yml"
 )
 
 MACOS_27_GUARD = 'MacOS.version >= "27"'
 SPACY_MODEL_SHA256 = "1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85"
+MLX_AUDIO_GIT_PREFIX = "git+https://github.com/Blaizzy/mlx-audio@"
+GIT_REVISION = re.compile(r"[0-9a-f]{40}")
 
 
 @pytest.fixture(scope="module")
@@ -46,8 +58,49 @@ def formula() -> str:
 
 
 @pytest.fixture(scope="module")
+def pyproject() -> dict:
+    with PYPROJECT_PATH.open("rb") as handle:
+        return tomllib.load(handle)
+
+
+@pytest.fixture(scope="module")
 def formula_update_workflow() -> str:
     return WORKFLOW_PATH.read_text()
+
+
+def mlx_audio_pins(pyproject: dict) -> dict[str, str]:
+    """The requirements that pin mlx-audio: the base dep and [audio]'s."""
+    return {
+        "base": next(
+            requirement
+            for requirement in pyproject["project"]["dependencies"]
+            if requirement.startswith("mlx-audio @")
+        ),
+        "audio extra": next(
+            requirement
+            for requirement in pyproject["project"]["optional-dependencies"]["audio"]
+            if requirement.startswith("mlx-audio[")
+        ),
+    }
+
+
+def mlx_audio_revision(requirement: str) -> str:
+    assert MLX_AUDIO_GIT_PREFIX in requirement, requirement
+    revision = requirement.split(MLX_AUDIO_GIT_PREFIX, 1)[1].strip()
+
+    assert GIT_REVISION.fullmatch(revision), revision
+
+    return revision
+
+
+def resource_revision(formula: str, name: str) -> str:
+    start = formula.index(f'resource "{name}" do')
+    block = formula[start : formula.index("\n  end", start)]
+    match = re.search(r'revision:\s*"([0-9a-f]{40})"', block)
+
+    assert match is not None, block
+
+    return match.group(1)
 
 
 class TestFormulaReleaseUpdate:
@@ -114,6 +167,46 @@ class TestSharedPipFlags:
         wheel; any new bare `pip install` would bypass the shared flags."""
         assert formula.count('bin/pip", "install"') == 2
         assert 'system libexec/"bin/pip", "install", "--no-deps"' in formula
+
+
+class TestMlxAudioResourcePin:
+    """The mlx-audio resource must track pyproject.toml's mlx-audio pin (#3916).
+
+    The resource's revision decides what the keg ends up with, so leaving it
+    behind pyproject's pin reinstalls an older mlx-audio than omlx resolved
+    (0.4.3 against mlx-vlm's `mlx-audio>=0.5.2` floor) and `pip check` fails.
+    """
+
+    def test_pyproject_mlx_audio_pins_agree(self, pyproject):
+        """The guard compares against one revision, so both pins must match."""
+        revisions = {
+            name: mlx_audio_revision(requirement)
+            for name, requirement in mlx_audio_pins(pyproject).items()
+        }
+
+        assert len(set(revisions.values())) == 1, revisions
+
+    @pytest.mark.parametrize("pin", ["base", "audio extra"])
+    def test_resource_revision_matches_pyproject(self, formula, pyproject, pin):
+        expected = mlx_audio_revision(mlx_audio_pins(pyproject)[pin])
+
+        assert resource_revision(formula, "mlx-audio") == expected
+
+    def test_formula_does_not_patch_mlx_audio_dependencies(self, formula):
+        """Homebrew's inreplace errors out when its pattern is absent, and the
+        pinned mlx-audio dropped the `mlx-lm==0.31.1` pin this used to patch."""
+        assert '"mlx-lm==0.31.1"' not in formula
+
+    def test_formula_installs_omlx_audio_extra(self, formula):
+        """mlx-audio 0.5.x leaves misaki/spaCy/librosa to the [audio] extra,
+        which the formula's spaCy model check and Kokoro TTS depend on."""
+        install_spec = next(
+            line
+            for line in formula.splitlines()
+            if line.strip().startswith("install_spec =")
+        )
+
+        assert "[audio" in install_spec
 
 
 class TestCustomKernelBuild:
