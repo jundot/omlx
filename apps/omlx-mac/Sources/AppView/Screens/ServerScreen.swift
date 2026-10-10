@@ -498,7 +498,7 @@ private struct ServerDefaultProfileEditor: View {
                     sublabel: String(localized: "server.profile.context_window.sub",
                                      defaultValue: "Maximum prompt + completion tokens.",
                                      comment: "Sublabel for the context window field")) {
-                    TextInput(text: $vm.samplingContextText, mono: true, suffix: "tk", width: .controlCompact)
+                    TextInput(text: $vm.samplingContextText, mono: true, suffix: "Tok", width: .controlCompact)
                 }
                 Row(label: String(localized: "server.profile.max_tokens",
                                   defaultValue: "Max Tokens",
@@ -506,7 +506,7 @@ private struct ServerDefaultProfileEditor: View {
                     sublabel: String(localized: "server.profile.max_tokens.sub",
                                      defaultValue: "Server-wide cap on generated tokens.",
                                      comment: "Sublabel for the max tokens field")) {
-                    TextInput(text: $vm.samplingMaxTokensText, mono: true, suffix: "tk", width: .controlCompact)
+                    TextInput(text: $vm.samplingMaxTokensText, mono: true, suffix: "Tok", width: .controlCompact)
                 }
                 Row(label: String(localized: "server.profile.temperature",
                                   defaultValue: "Temperature",

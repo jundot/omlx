@@ -123,6 +123,239 @@ final class LocalizationSmokeTests: XCTestCase {
         }
     }
 
+    /// A count in the Logs screen is an exact quantity substituted as formatted
+    /// text, so the catalogue placeholders are `%@`: the line count reads 8,405
+    /// rather than 8405, and the grouped figure survives the lookup.
+    func testLogCountsSubstituteFormattedText() {
+        let cases: [(String, String)] = [
+            (String(localized: "logs.subtitle.line_count",
+                    defaultValue: "Lines: \(8405.formatted())"), 8405.formatted()),
+            (String(localized: "logs.detail.occurrences",
+                    defaultValue: "Occurrences (\(20000.formatted()))"), 20000.formatted()),
+            (String(localized: "logs.detail.occurrences_more",
+                    defaultValue: "…and \(1234567.formatted()) more"), 1234567.formatted()),
+            (String(localized: "logs.more_lines",
+                    defaultValue: "≡ \(8405.formatted()) more lines"), 8405.formatted()),
+            (String(localized: "logs.detail.lines_more",
+                    defaultValue: "…and \(20000.formatted()) more lines"), 20000.formatted()),
+        ]
+        for (rendered, expected) in cases {
+            XCTAssertTrue(rendered.contains(expected),
+                          "the log count lost its formatted figure: \(rendered)")
+        }
+    }
+
+    /// The app's rule for the token unit: a capital T where the token is a
+    /// **unit** — counted beside a number or a placeholder, or standing on a
+    /// label of its own — and the lowercase common noun inside a sentence.
+    /// "8192 Tok", "3 Tokens (Default)" and "Tokens applied to Context
+    /// Window" carry the capital; "Penalize repeated tokens." and "Limit
+    /// thinking tokens for reasoning models." do not.
+    ///
+    /// A credential is not a token count, and neither is an architecture
+    /// term: the Hugging Face token, its validation subtitle and MTP's
+    /// "multi-token prediction" keep the lowercase spelling upstream uses,
+    /// the same one the console's catalogues kept when #4364 refreshed them.
+    /// API field names (`max_tokens`), the `tokenizer` component and `hf_…`
+    /// placeholders are code, not copy, and keep their spelling: the pattern
+    /// only accepts a token word delimited by non-word characters, so an
+    /// underscore or a trailing letter keeps it out.
+    ///
+    /// Russian transliterates the unit into Cyrillic — "тк", "токенов",
+    /// "ток/с" — which is upstream's translation and not this rule's
+    /// business, so the capital is only asserted on a Latin-script unit.
+    func testTokenWordsInTheCatalogAreCapitalised() {
+        // The build turns the catalogue into `<locale>.lproj/Localizable.strings`
+        // and does not copy the .xcstrings itself into the app bundle, so
+        // Bundle.main has nothing to hand this test. Read the catalogue from
+        // the source tree instead, and fail rather than skip if it is gone.
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()      // oMLXTests
+            .deletingLastPathComponent()      // Tests
+            .deletingLastPathComponent()      // apps/omlx-mac
+            .appendingPathComponent("Resources/Localizable.xcstrings")
+        guard let data = try? Data(contentsOf: url),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let strings = root["strings"] as? [String: Any] else {
+            XCTFail("Localizable.xcstrings is unreadable at \(url.path)")
+            return
+        }
+
+        // The keys whose unit this rule pins: a count beside a number or a
+        // placeholder, or a label that names the unit on its own.
+        let unitKeys: [String] = [
+            "bench.context.result.tokens_label",
+            "profile.detail.acceleration.specprefill.threshold",
+            "profile.detail.behavior.thinking_budget.on",
+            "profile.detail.capacity.tokens",
+            "profile.detail.capacity.tokens.raw",
+            "settings.acceleration.mtp.depth.adaptive",
+            "settings.acceleration.mtp.depth.option",
+            "status.usage.heatmap.cell",
+            "status.usage.row.requests_speed",
+            "status.usage.row.tokens",
+        ]
+        let capital = try! NSRegularExpression(pattern: #"\b(Tok|Token|Tokens)\b"#)
+        let latinUnit = try! NSRegularExpression(
+            pattern: #"(?i)\b(tok/s|t/s|tok|token|tokens|tk)\b"#
+        )
+
+        for key in unitKeys {
+            guard let entry = strings[key] as? [String: Any],
+                  let localizations = entry["localizations"] as? [String: Any] else {
+                XCTFail("the catalogue is missing \(key)")
+                continue
+            }
+            for (locale, raw) in localizations {
+                guard let raw = raw as? [String: Any],
+                      let unit = raw["stringUnit"] as? [String: Any],
+                      let value = unit["value"] as? String else { continue }
+                // A unit spelled in another script is upstream's translation.
+                let latin = NSRange(value.startIndex..., in: value)
+                guard latinUnit.firstMatch(in: value, range: latin) != nil else { continue }
+                let range = NSRange(value.startIndex..., in: value)
+                XCTAssertNotNil(capital.firstMatch(in: value, range: range),
+                                "\(locale) \(key) = \(value) keeps the lowercase unit")
+            }
+        }
+    }
+
+    /// A sentence says "tokens"; only a label says "Tokens". Past a prose
+    /// value's first sentence opener the word is a common noun again, and a
+    /// capital there reads as a typo on a hint people read closely. This is
+    /// the rule the case pass in 7da1a05 was missing.
+    func testEnglishProseKeepsTheCommonNounLowercase() {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()      // oMLXTests
+            .deletingLastPathComponent()      // Tests
+            .deletingLastPathComponent()      // apps/omlx-mac
+            .appendingPathComponent("Resources/Localizable.xcstrings")
+        guard let data = try? Data(contentsOf: url),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let strings = root["strings"] as? [String: Any] else {
+            XCTFail("Localizable.xcstrings is unreadable at \(url.path)")
+            return
+        }
+
+        // A subtitle or a note explains something in sentences.
+        let prose = try! NSRegularExpression(pattern: #"(\.sub|\.note|_note)$"#)
+        let capital = try! NSRegularExpression(pattern: #"(?<![A-Za-z])\b(Tok|Token|Tokens)\b"#)
+        let openers = [" — ", ". "]
+        // These are a credential or an architecture term, and stay lowercase.
+        let lowercaseSpelled: Set<String> = [
+            "quant.upload_modal.token.label",
+            "quant.upload_modal.credentials.subtitle.needs_validate",
+            "quant.advanced.preserve_mtp.sub.available",
+            "settings.apply.choose.group_tg",
+        ]
+
+        var offenders: [String] = []
+        for (key, entry) in strings where lowercaseSpelled[key] == nil {
+            let keyRange = NSRange(key.startIndex..., in: key)
+            guard prose.firstMatch(in: key, range: keyRange) != nil,
+                  let entry = entry as? [String: Any],
+                  let localizations = entry["localizations"] as? [String: Any],
+                  let en = localizations["en"] as? [String: Any],
+                  let unit = en["stringUnit"] as? [String: Any],
+                  let value = unit["value"] as? String else { continue }
+            // Only the text past the first sentence opener is in scope.
+            var cut = value.endIndex
+            for opener in openers {
+                if let r = value.range(of: opener), r.upperBound < cut { cut = r.upperBound }
+            }
+            let tail = String(value[cut...])
+            let range = NSRange(tail.startIndex..., in: tail)
+            if let hit = capital.firstMatch(in: tail, range: range) {
+                offenders.append("\(key): \(value[hit.range]) in \(value)")
+            }
+        }
+        XCTAssertTrue(offenders.isEmpty,
+                      "a prose value capitalises the common noun: \(offenders)")
+    }
+
+    /// The catalogue is what ships, but the `defaultValue:` beside each key is
+    /// what Xcode re-extracts on the next build — a differently-cased unit
+    /// there would overwrite the translation. The sweep cannot see the key a
+    /// literal belongs to, so it does not guess whether the word is a unit or
+    /// a noun. It checks the one thing it can check: where a literal spells
+    /// the same text as a value in the catalogue, it must spell it the same
+    /// way, casing included.
+    func testTheSourceLiteralsAgreeWithTheCatalogue() {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()      // oMLXTests
+            .deletingLastPathComponent()      // Tests
+            .deletingLastPathComponent()      // apps/omlx-mac
+        guard let data = try? Data(contentsOf: root.appendingPathComponent(
+            "Resources/Localizable.xcstrings"
+        )),
+              let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let strings = parsed["strings"] as? [String: Any] else {
+            XCTFail("Localizable.xcstrings is unreadable")
+            return
+        }
+        guard let walker = FileManager.default.enumerator(
+            at: root.appendingPathComponent("Sources"), includingPropertiesForKeys: nil
+        ) else {
+            XCTFail("the app sources are unreadable")
+            return
+        }
+
+        // Every value the catalogue ships, folded to a case-insensitive key so
+        // a literal can be matched against it without knowing its own key.
+        var shipped: [String: Set<String>] = [:]
+        for (_, entry) in strings {
+            guard let entry = entry as? [String: Any],
+                  let localizations = entry["localizations"] as? [String: Any] else { continue }
+            for (_, raw) in localizations {
+                guard let raw = raw as? [String: Any],
+                      let unit = raw["stringUnit"] as? [String: Any],
+                      let value = unit["value"] as? String, !value.isEmpty else { continue }
+                shipped[value.lowercased(), default: []].insert(value)
+            }
+        }
+
+        let literal = try! NSRegularExpression(
+            pattern: #"(?:defaultValue|suffix):\s*"([^"]*)""#
+        )
+        var offenders: [String] = []
+        for case let url as URL in walker where url.pathExtension == "swift" {
+            guard let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
+            let textRange = NSRange(text.startIndex..., in: text)
+            for match in literal.matches(in: text, range: textRange) {
+                guard let valueRange = Range(match.range(at: 1), in: text) else { continue }
+                let value = String(text[valueRange])
+                guard let forms = shipped[value.lowercased()], !forms.contains(value) else {
+                    continue
+                }
+                offenders.append(
+                    "\(url.lastPathComponent): \(value) disagrees with \(forms.sorted())"
+                )
+            }
+        }
+        XCTAssertTrue(offenders.isEmpty,
+                      "a defaultValue:/suffix: spells a shipped value differently: \(offenders)")
+    }
+
+    /// The detector is only worth anything while it bites every spelling the
+    /// rule replaced, and while the deliberate code-only exceptions stay out
+    /// of the pattern.
+    func testTheTokenWordDetectorBites() {
+        let lowercase = try! NSRegularExpression(
+            pattern: #"\b(tok/s|t/s|tok|token|tokens|tk)\b"#
+        )
+        for sample in ["12 tok/s", "8192 tk", "HF token", "50 t/s", "Max tokens"] {
+            let range = NSRange(sample.startIndex..., in: sample)
+            XCTAssertNotNil(lowercase.firstMatch(in: sample, range: range),
+                            "the lower-case detector misses \(sample)")
+        }
+        for sample in ["max_tokens", "hf_token", "tokenizer", "max_output_tokens"] {
+            let range = NSRange(sample.startIndex..., in: sample)
+            XCTAssertNil(lowercase.firstMatch(in: sample, range: range),
+                         "the detector catches code, not copy: \(sample)")
+        }
+    }
+
+
     func testCatalogIsValidJSON() {
         // Direct file-level parse so a catalog corruption (extra trailing
         // comma, bad nesting) shows up here rather than as a missing-string

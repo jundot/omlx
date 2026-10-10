@@ -412,13 +412,13 @@ private struct AverageSpeedTilesRow: View {
                 label: String(localized: "status.speed.prompt_processing.tile",
                               defaultValue: "Prompt Processing (excl. cached)",
                               comment: "Tile label for average prompt-processing speed excluding cached tokens"),
-                value: stats.map { String(format: "%.1f tok/s", $0.avgPrefillTps) } ?? "—"
+                value: stats.map { String(format: "%.1f Tok/s", $0.avgPrefillTps) } ?? "—"
             )
             StatTile(
                 label: String(localized: "status.speed.token_generation",
                               defaultValue: "Token Generation",
                               comment: "Label for average token-generation speed"),
-                value: stats.map { String(format: "%.1f tok/s", $0.avgGenerationTps) } ?? "—"
+                value: stats.map { String(format: "%.1f Tok/s", $0.avgGenerationTps) } ?? "—"
             )
         }
         .padding(.horizontal, 14)

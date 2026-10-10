@@ -4007,7 +4007,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "tokens applied to Context Window"
+            "value" : "Tokens applied to Context Window"
           }
         },
         "zh-Hans" : {
@@ -4355,13 +4355,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp TPS"
+            "value" : "PP TPS"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp TPS"
+            "value" : "PP TPS"
           }
         },
         "zh-Hans" : {
@@ -4403,13 +4403,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "tg TPS"
+            "value" : "TG TPS"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "tg TPS"
+            "value" : "TG TPS"
           }
         },
         "zh-Hans" : {
@@ -5129,13 +5129,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp TPS"
+            "value" : "PP TPS"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp TPS"
+            "value" : "PP TPS"
           }
         },
         "zh-Hans" : {
@@ -5177,13 +5177,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "tg TPS"
+            "value" : "TG TPS"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "tg TPS"
+            "value" : "TG TPS"
           }
         },
         "zh-Hans" : {
@@ -5297,19 +5297,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "pp %1$lld / tg %2$lld"
+            "value" : "PP %1$lld / TG %2$lld"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp %1$lld / tg %2$lld"
+            "value" : "PP %1$lld / TG %2$lld"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp %1$lld / tg %2$lld"
+            "value" : "PP %1$lld / TG %2$lld"
           }
         }
       }
@@ -5465,19 +5465,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "pp %lld"
+            "value" : "PP %lld"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp %lld"
+            "value" : "PP %lld"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp %lld"
+            "value" : "PP %lld"
           }
         }
       }
@@ -11950,7 +11950,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "≥%@ tk"
+            "value" : "≥%@ Tok"
           }
         },
         "ru" : {
@@ -11962,7 +11962,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "≥%@ tk"
+            "value" : "≥%@ Tok"
           }
         }
       }
@@ -12406,7 +12406,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Budget · %@ tk"
+            "value" : "Budget · %@ Tok"
           }
         },
         "ru" : {
@@ -12418,7 +12418,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "预算 · %@ tk"
+            "value" : "预算 · %@ Tok"
           }
         }
       }
@@ -12478,7 +12478,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "%@ tk"
+            "value" : "%@ Tok"
           }
         },
         "ru" : {
@@ -12490,7 +12490,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%@ tk"
+            "value" : "%@ Tok"
           }
         }
       }
@@ -12502,7 +12502,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "%lld tk"
+            "value" : "%lld Tok"
           }
         },
         "ru" : {
@@ -12514,7 +12514,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%lld tk"
+            "value" : "%lld Tok"
           }
         }
       }
@@ -20147,19 +20147,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "3 tokens (Default)"
+            "value" : "3 Tokens (Default)"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "3 tokens (Default)"
+            "value" : "3 Tokens (Default)"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "3 tokens (Default)"
+            "value" : "3 Tokens (Default)"
           }
         }
       }
@@ -20171,19 +20171,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%lld tokens"
+            "value" : "%lld Tokens"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%lld tokens"
+            "value" : "%lld Tokens"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%lld tokens"
+            "value" : "%lld Tokens"
           }
         }
       }
@@ -21989,7 +21989,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "3 tokens (Default)"
+            "value" : "3 Tokens (Default)"
           }
         }
       }
@@ -28000,7 +28000,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "%@ tokens"
+            "value" : "%@ Tokens"
           }
         },
         "ru" : {
@@ -28024,7 +28024,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "%1$lld requests · %2$@ tok/s"
+            "value" : "%1$lld requests · %2$@ Tok/s"
           }
         },
         "ru" : {
@@ -28036,7 +28036,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%1$lld 个请求 · %2$@ tok/s"
+            "value" : "%1$lld 个请求 · %2$@ Tok/s"
           }
         }
       }
@@ -28072,7 +28072,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "%1$@ %2$@:00 · %3$@ tokens"
+            "value" : "%1$@ %2$@:00 · %3$@ Tokens"
           }
         },
         "ru" : {

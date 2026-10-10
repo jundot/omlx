@@ -142,7 +142,7 @@ final class MenubarStatsPoller {
 
                 var detailParts = [modelID]
                 if let tokensPerSecond = progress.speed, tokensPerSecond > 0 {
-                    detailParts.append("\(Int(tokensPerSecond.rounded())) tok/s")
+                    detailParts.append("\(Int(tokensPerSecond.rounded())) Tok/s")
                 }
                 if let etaSeconds = progress.eta, etaSeconds >= 0 {
                     detailParts.append("\(formatDuration(etaSeconds)) left")
@@ -161,13 +161,13 @@ final class MenubarStatsPoller {
                 let tokensPerSecond = max(0, progress.tokensPerSecond ?? 0)
                 let generatedTokens = max(0, progress.generatedTokens ?? 0)
 
-                var detailParts = [modelID, "\(generatedTokens) tok"]
+                var detailParts = [modelID, "\(generatedTokens) Tok"]
                 if let elapsedSeconds = progress.elapsedSeconds {
                     detailParts.append(formatDuration(elapsedSeconds))
                 }
 
                 return LiveActivity(
-                    menuBarTitle: "GEN \(String(format: "%.1f", tokensPerSecond)) tok/s",
+                    menuBarTitle: "GEN \(String(format: "%.1f", tokensPerSecond)) Tok/s",
                     detail: detailParts.joined(separator: " · ")
                 )
             }

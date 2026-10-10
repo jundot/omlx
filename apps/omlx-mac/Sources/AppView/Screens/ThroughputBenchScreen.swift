@@ -21,11 +21,11 @@
 //   Error banner    — red banner if the most recent call failed or the
 //                     server reported a terminal error.
 //
-//   Single Request  — table-style rows: Test, TTFT, TPOT, pp TPS, tg TPS,
+//   Single Request  — table-style rows: Test, TTFT, TPOT, PP TPS, TG TPS,
 //                     E2E, Throughput, Peak Mem. Only when there is at
 //                     least one single-result row.
 //
-//   Batch Results   — Batch, tg TPS, pp TPS, avg TTFT, E2E, Speedup.
+//   Batch Results   — Batch, TG TPS, PP TPS, avg TTFT, E2E, Speedup.
 //                     Adds a synthetic "1×" baseline row derived from the
 //                     first single-request row whose pp == 1024.
 //
@@ -466,10 +466,10 @@ private struct SingleResultsTable: View {
                defaultValue: "TPOT (ms)",
                comment: "Single-request results column header: time-per-output-token in ms"),
         String(localized: "bench.throughput.single.col.pp_tps",
-               defaultValue: "pp TPS",
+               defaultValue: "PP TPS",
                comment: "Single-request results column header: prompt-processing tokens-per-second"),
         String(localized: "bench.throughput.single.col.tg_tps",
-               defaultValue: "tg TPS",
+               defaultValue: "TG TPS",
                comment: "Single-request results column header: token-generation tokens-per-second"),
         String(localized: "bench.throughput.single.col.e2e",
                defaultValue: "E2E (s)",
@@ -534,7 +534,7 @@ private struct SingleResultsTable: View {
         let pp = r.pp ?? 0
         let tg = r.tg ?? 0
         return String(localized: "bench.throughput.single.test_label",
-                      defaultValue: "pp \(pp) / tg \(tg)",
+                      defaultValue: "PP \(pp) / TG \(tg)",
                       comment: "Single-request row identifier showing prompt-processing and token-generation counts; placeholders are pp and tg integer counts")
     }
 }
@@ -552,10 +552,10 @@ private struct BatchResultsTable: View {
                defaultValue: "Batch",
                comment: "Batch results column header: batch size"),
         String(localized: "bench.throughput.batch.col.tg_tps",
-               defaultValue: "tg TPS",
+               defaultValue: "TG TPS",
                comment: "Batch results column header: token-generation tokens-per-second"),
         String(localized: "bench.throughput.batch.col.pp_tps",
-               defaultValue: "pp TPS",
+               defaultValue: "PP TPS",
                comment: "Batch results column header: prompt-processing tokens-per-second"),
         String(localized: "bench.throughput.batch.col.avg_ttft",
                defaultValue: "avg TTFT (ms)",
@@ -812,7 +812,7 @@ private struct UploadRow: View {
     var body: some View {
         HStack(spacing: 10) {
             Text(String(localized: "bench.throughput.upload.row.context_length",
-                        defaultValue: "pp \(result.contextLength)",
+                        defaultValue: "PP \(result.contextLength)",
                         comment: "Per-row label showing prompt-processing context length in the upload list; placeholder is the integer length"))
                 .font(.omlxMono(12))
                 .foregroundStyle(theme.text)

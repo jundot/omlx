@@ -973,7 +973,7 @@ private struct BasicTab: View {
                 sublabel: String(localized: "settings.basic.context_window.sub",
                                  defaultValue: "Maximum tokens per request",
                                  comment: "Sublabel for the context window field")) {
-                TextInput(text: vm.bindProfile($vm.contextLength), mono: true, suffix: "tk", width: .controlCompact)
+                TextInput(text: vm.bindProfile($vm.contextLength), mono: true, suffix: "Tok", width: .controlCompact)
             }
             Row(label: String(localized: "settings.basic.max_tokens.label",
                               defaultValue: "Max Tokens",
@@ -1186,7 +1186,7 @@ private struct AdvancedTab: View {
                     HStack(spacing: 8) {
                         if vm.thinkingBudgetEnabled {
                             TextInput(text: vm.bindProfile($vm.thinkingBudgetTokens),
-                                      mono: true, suffix: "tk", width: .controlCompact)
+                                      mono: true, suffix: "Tok", width: .controlCompact)
                         }
                         RowSwitch(isOn: vm.bindProfile($vm.thinkingBudgetEnabled))
                     }
@@ -1201,7 +1201,7 @@ private struct AdvancedTab: View {
                         if vm.limitToolResults {
                             TextInput(text: vm.bindProfile($vm.toolResultLimitTokens),
                                       placeholder: "4096",
-                                      mono: true, suffix: "tk", width: .controlCompact)
+                                      mono: true, suffix: "Tok", width: .controlCompact)
                         }
                         RowSwitch(isOn: vm.bindProfile($vm.limitToolResults))
                     }
@@ -1665,7 +1665,7 @@ private struct AccelerationSection: View {
                               placeholder: String(localized: "settings.experimental.dflash.max_ctx.placeholder",
                                                   defaultValue: "unlimited",
                                                   comment: "Placeholder shown when DFlash max-context is unset (no cap)"),
-                              mono: true, suffix: "tk", width: .controlCompact)
+                              mono: true, suffix: "Tok", width: .controlCompact)
                 }
                 Row(label: String(localized: "settings.experimental.dflash.verify_mode.label",
                                   defaultValue: "Verify Mode",
@@ -2265,7 +2265,7 @@ private struct ExperimentalSection: View {
                                      comment: "Sublabel for the SpecPrefill threshold field"),
                     isLast: true) {
                     TextInput(text: vm.bindProfile($vm.specprefillThreshold),
-                              placeholder: "8192", mono: true, suffix: "tk", width: .controlCompact)
+                              placeholder: "8192", mono: true, suffix: "Tok", width: .controlCompact)
                 }
             }
         }
@@ -2306,10 +2306,10 @@ private struct ExperimentalSection: View {
             guard let tps = recommendation.processingTps else {
                 return "Winner: GPU only"
             }
-            return String(format: "Winner: GPU only · %.1f prompt tok/s", tps)
+            return String(format: "Winner: GPU only · %.1f prompt Tok/s", tps)
         }
         if recommendation.backend == "k2" {
-            return String(format: "Winner: ANE dense %.0f%% · shared expert %.0f%% · %.1f prompt tok/s",
+            return String(format: "Winner: ANE dense %.0f%% · shared expert %.0f%% · %.1f prompt Tok/s",
                           (recommendation.mlpFraction ?? 0) * 100,
                           (recommendation.sharedFraction ?? 0) * 100, recommendation.processingTps ?? 0)
         }
@@ -2338,7 +2338,7 @@ private struct ExperimentalSection: View {
         guard let tps = recommendation.processingTps else {
             return summary
         }
-        return String(format: "%@ · %.1f prompt tok/s", summary, tps)
+        return String(format: "%@ · %.1f prompt Tok/s", summary, tps)
     }
 }
 
