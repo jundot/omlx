@@ -32,6 +32,32 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx_web/static/js/dashboard.js
     for (const supported of [true, false, undefined]) {
         assert.equal(vm.runInNewContext(condition, {selectedModel:{moe_expert_offload_supported:supported}}), supported === true);
     }
+    // The residency field offers the largest whole-expert residency that fits
+    // the memory ceiling, as reported by /api/models, and applies it on click.
+    const GB = 1024 ** 3;
+    app.selectedModel = {id: 'moe', config_model_type: 'olmoe', moe_expert_offload_supported: true,
+        moe_expert_offload_presets: [{fraction: .125, bytes: 2 * GB, fits: true}, {fraction: .75, bytes: 9 * GB, fits: false}],
+        moe_expert_offload_fit_fraction: .375, moe_expert_offload_fit_bytes: 5 * GB};
+    app.modelSettings = app.buildModelSettingsState(app.selectedModel, {[enabled]:true, [fraction]:0.25});
+    assert.equal(app.moeOffloadFitOption(), true);
+    assert.equal(app.moeOffloadFitLabel(), 'modal.model_settings.moe_expert_offload_fit_label: 37.5% resident \u00b7 ~5.0 GB');
+    assert.equal(app.moeOffloadNoFit(), false);
+    app.applyMoeOffloadFit();
+    assert.equal(app.modelSettings.moe_expert_offload_resident_percent, 37.5);
+    assert.equal(app.modelSettings[fraction], 0.375);
+    await app.saveModelSettings();
+    assert.equal(payload[fraction], 0.375, 'the applied fit is saved as the resident fraction');
+    app.selectedModel.moe_expert_offload_fit_fraction = .25;
+    assert.equal(app.moeOffloadFitOption(), true);
+    assert.equal(app.moeOffloadFitLabel(), 'modal.model_settings.moe_expert_offload_fit_label: 25% resident \u00b7 ~5.0 GB');
+    app.selectedModel.moe_expert_offload_fit_fraction = null;
+    assert.equal(app.moeOffloadFitOption(), false);
+    assert.equal(app.moeOffloadNoFit(), true);
+    app.selectedModel.moe_expert_offload_presets = [];
+    assert.equal(app.moeOffloadNoFit(), false);
+    assert.ok(offload.includes('x-show="moeOffloadFitOption()"'));
+    assert.ok(offload.includes('@click="applyMoeOffloadFit()"'));
+    assert.ok(offload.includes('x-show="moeOffloadNoFit()"'));
     for (const key of ['mtp_enabled', 'vlm_mtp_enabled', 'dflash_enabled']) {
         // The disabled bindings also read selectedModel.
         const scope = {modelSettings: {[enabled]:false, [key]:true}, selectedModel: null};
@@ -74,5 +100,5 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx_web/static/js/dashboard.js
     assert.match(offload, /<input type="number" min="5" max="95" step="any" inputmode="decimal"/);
     assert.ok(offload.includes('@input="onMoeExpertOffloadResidentPercent()"'));
     assert.ok(offload.includes('@blur="onMoeExpertOffloadResidentBlur()"'));
-    console.log('PASS: offload save/reopen, spec toggle exclusion and fractional resident percentage');
+    console.log('PASS: offload save/reopen, residency fit hint, spec toggle exclusion and fractional resident percentage');
 })().catch(error => {console.error(error); process.exitCode = 1});

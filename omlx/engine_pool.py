@@ -58,6 +58,7 @@ from .model_discovery import (
     is_realtime_stt_model,
 )
 from .model_settings import (
+    ModelSettings,
     ane_prefill_backend,
     ane_prefill_fraction,
     validate_ane_prefill,
@@ -505,14 +506,25 @@ class EnginePool:
         *,
         base_size: int | None = None,
         include_ane_reservation: bool = True,
+        ceiling: int | None = None,
+        log_decision: bool = True,
     ) -> int:
-        """Include Engram runtime storage and optional K2 ANE reservations."""
+        """Include Engram runtime storage and optional K2 ANE reservations.
+
+        ``ceiling`` is the memory ceiling the SSD-offload fallbacks (Qwen4
+        PLE, DeepSeek V4.1 Engram) decide against; ``None`` uses the pool's
+        stable ceiling, as admission does. ``log_decision=False`` sizes a
+        hypothetical setting without logging or recording its forced offload.
+        """
 
         base = self._entry_resident_size(entry) if base_size is None else base_size
         if self._distributed_deployment_for_entry(entry) is not None:
             return base
         qwen4_offload, _, qwen4_estimate = self._qwen4_ple_offload_status(
-            entry, runtime_settings
+            entry,
+            runtime_settings,
+            ceiling=ceiling,
+            log_decision=log_decision,
         )
         if qwen4_estimate is not None:
             base = min(
@@ -522,7 +534,10 @@ class EnginePool:
                 else qwen4_estimate.resident_bytes,
             )
         v41_offload, _, v41_estimate = self._deepseek_v41_engram_offload_status(
-            entry, runtime_settings
+            entry,
+            runtime_settings,
+            ceiling=ceiling,
+            log_decision=log_decision,
         )
         if v41_estimate is not None:
             base = (
@@ -665,12 +680,86 @@ class EnginePool:
         if forced:
             logger.warning(message, *args)
 
+    def moe_offload_admission_bytes(
+        self,
+        entry: EngineEntry,
+        settings: object | None,
+        fraction: float,
+        *,
+        ceiling: int | None = None,
+    ) -> int:
+        """Admission-time resident size with expert offload at ``fraction``.
+
+        The same arithmetic admission runs (``_entry_runtime_resident_size``
+        with offload enabled on a copy of ``settings``), so a size shown for
+        an option is the size admission will hold that option to. Probes do
+        not log forced offloads: the admin view sizes several fractions on
+        every poll, and only a load should report its decision.
+        """
+        probe = copy.copy(settings) if settings is not None else ModelSettings()
+        probe.moe_expert_offload_enabled = True
+        probe.moe_expert_offload_resident_fraction = float(fraction)
+        return self._entry_runtime_resident_size(
+            entry, probe, ceiling=ceiling, log_decision=False
+        )
+
+    def _moe_offload_candidate_fractions(
+        self, entry: EngineEntry, settings: object | None
+    ) -> tuple[float, ...]:
+        model_type = (entry.config_model_type or "").replace("-", "_").lower()
+        if model_type == "deepseek_v41":
+            from .patches.deepseek_v41.moe_offload import capacity_fractions
+
+            return capacity_fractions(entry.model_path)
+        from .patches.moe_expert_offload import offload_capacity_fractions
+
+        # Same layout admission sizes: a resident draft head is not offloadable.
+        return offload_capacity_fractions(
+            entry.model_path,
+            mtp_resident=bool(getattr(settings, "mtp_enabled", False)),
+        )
+
+    def fit_moe_offload_fraction(
+        self,
+        entry: EngineEntry,
+        settings: object | None,
+        budget_bytes: int,
+    ) -> float | None:
+        """Largest resident fraction admission would accept under ``budget_bytes``.
+
+        ``1.0`` when the fully resident model fits, ``None`` when even the
+        routing floor does not. Candidates are the whole-expert capacities the
+        checkpoint allows, so the result round-trips through the setting. The
+        budget doubles as the ceiling the SSD fallbacks decide against, which
+        keeps the fitting fractions a prefix of the candidates: a resident
+        Qwen4 PLE table or V4.1 Engram store that stops fitting is forced to
+        SSD, and its mmap size is what the larger fractions are then held to.
+        """
+        candidates = self._moe_offload_candidate_fractions(entry, settings)
+        if not candidates:
+            size = self.moe_offload_admission_bytes(
+                entry, settings, 1.0, ceiling=budget_bytes
+            )
+            return 1.0 if size <= budget_bytes else None
+        lo, hi = 0, len(candidates)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            size = self.moe_offload_admission_bytes(
+                entry, settings, candidates[mid], ceiling=budget_bytes
+            )
+            if size <= budget_bytes:
+                lo = mid + 1
+            else:
+                hi = mid
+        return candidates[lo - 1] if lo else None
+
     def _qwen4_ple_offload_status(
         self,
         entry: EngineEntry,
         settings: object | None,
         *,
         ceiling: int | None = None,
+        log_decision: bool = True,
     ) -> tuple[bool, bool, object | None]:
         """Resolve requested/forced Qwen4 PLE mmap mode for this process."""
 
@@ -723,19 +812,20 @@ class EnginePool:
         forced = estimate.force_ssd_offload(
             ceiling
         ) or self._resident_leaves_no_prompt_room(estimate, ceiling)
-        self._log_offload_decision_once(
-            entry.model_id,
-            "qwen4_ple_ssd_offload",
-            forced,
-            "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB leaves no "
-            "room to serve prompts under the %.1fGB memory ceiling (mmap "
-            "needs %.1fGB). Decode will be roughly 2.5x slower than a "
-            "resident load.",
-            entry.model_id,
-            estimate.resident_bytes / 1e9,
-            ceiling / 1e9,
-            estimate.mmap_bytes / 1e9,
-        )
+        if log_decision:
+            self._log_offload_decision_once(
+                entry.model_id,
+                "qwen4_ple_ssd_offload",
+                forced,
+                "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB leaves no "
+                "room to serve prompts under the %.1fGB memory ceiling (mmap "
+                "needs %.1fGB). Decode will be roughly 2.5x slower than a "
+                "resident load.",
+                entry.model_id,
+                estimate.resident_bytes / 1e9,
+                ceiling / 1e9,
+                estimate.mmap_bytes / 1e9,
+            )
         requested = bool(
             settings is not None and getattr(settings, "qwen4_ple_ssd_offload", False)
         )
@@ -767,6 +857,7 @@ class EnginePool:
         settings: object | None,
         *,
         ceiling: int | None = None,
+        log_decision: bool = True,
     ) -> tuple[bool, bool, object | None]:
         """Resolve requested/forced DeepSeek V4.1 Engram mmap mode for this process."""
 
@@ -813,18 +904,19 @@ class EnginePool:
         forced = estimate.force_ssd_offload(
             ceiling
         ) or self._resident_leaves_no_prompt_room(estimate, ceiling)
-        self._log_offload_decision_once(
-            entry.model_id,
-            "deepseek_v41_engram_ssd_offload",
-            forced,
-            "DeepSeek V4.1 Engram forced to SSD for %s: resident %.1fGB leaves "
-            "no room to serve prompts under the %.1fGB memory ceiling (mmap "
-            "needs %.1fGB).",
-            entry.model_id,
-            estimate.resident_bytes / 1e9,
-            ceiling / 1e9,
-            estimate.mmap_bytes / 1e9,
-        )
+        if log_decision:
+            self._log_offload_decision_once(
+                entry.model_id,
+                "deepseek_v41_engram_ssd_offload",
+                forced,
+                "DeepSeek V4.1 Engram forced to SSD for %s: resident %.1fGB "
+                "leaves no room to serve prompts under the %.1fGB memory "
+                "ceiling (mmap needs %.1fGB).",
+                entry.model_id,
+                estimate.resident_bytes / 1e9,
+                ceiling / 1e9,
+                estimate.mmap_bytes / 1e9,
+            )
         requested = bool(
             settings is not None
             and getattr(settings, "deepseek_v41_engram_ssd_offload", False)
