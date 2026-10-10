@@ -137,16 +137,16 @@
                                                         <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
                                                         <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
                                                     </button>
+                                                <span x-show="managerModelStatus(model.name)" x-cloak
+                                                      class="badge flex-shrink-0 whitespace-nowrap"
+                                                      :class="{loading: 'bg-amber-50 text-amber-600 border-amber-200', loaded: 'bg-green-50 text-green-600 border-green-200', unloaded: 'bg-neutral-100 text-neutral-500 border-neutral-200'}[managerModelStatus(model.name)]"
+                                                      x-text="window.t('models.status.' + managerModelStatus(model.name))"></span>
                                                 </div>
                                                 <!-- Type -->
                                                 <div class="hidden sm:flex w-24 justify-center">
                                                     <span class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 uppercase tracking-wide"
                                                           x-text="model.model_type || 'llm'"></span>
                                                 </div>
-                                                <span x-show="managerModelStatus(model.name)" x-cloak
-                                                      class="badge text-xs"
-                                                      :class="{loading: 'bg-amber-50 text-amber-600 border-amber-200', loaded: 'bg-green-50 text-green-600 border-green-200', unloaded: 'bg-neutral-100 text-neutral-500 border-neutral-200'}[managerModelStatus(model.name)]"
-                                                      x-text="window.t('models.status.' + managerModelStatus(model.name))"></span>
                                                 <!-- Size -->
                                                 <div class="hidden sm:block w-24 text-center text-xs text-neutral-500 tabular-nums" x-text="model.size_formatted"></div>
                                                 <!-- Actions -->
