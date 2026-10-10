@@ -5889,3 +5889,26 @@ def test_chain_depth_stats_cover_drafts_beyond_a_lowered_policy_depth():
     bg._record_chain_depth(stats, 1, 1, 1)
     assert stats.depth_drafted == [2, 1, 1]
     assert stats.depth_accepted == [2, 1, 0]
+
+
+def test_late_join_under_a_lowered_policy_depth_keeps_tokens(monkeypatch):
+    """A late joiner drafts at the model depth alone, then verifies under policy depth 1."""
+    from omlx.patches.mlx_lm_mtp.batch_policy import BatchPolicy
+
+    init = BatchPolicy.__init__
+
+    def shallow(self, *args, **kwargs):
+        init(self, *args, **kwargs)
+        self.cur = 1
+
+    monkeypatch.setattr(BatchPolicy, "__init__", shallow)
+    monkeypatch.setattr(BatchPolicy, "observe_mtp", lambda self, *a, **k: None)
+    monkeypatch.setattr(BatchPolicy, "observe_standard", lambda self, ms: None)
+    monkeypatch.setattr(BatchPolicy, "needs_standard", lambda self: False)
+    model = CountingModel()
+    prompts, limits = [[1, 2], [10, 11, 12]], [24, 16]
+    model._omlx_mtp_decode_enabled = False
+    expected, _ = generate(model, prompts, limits, late_join=True)
+    model._omlx_mtp_decode_enabled = True
+    actual, _ = generate(model, prompts, limits, late_join=True)
+    assert actual == expected
