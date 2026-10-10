@@ -129,7 +129,7 @@ private struct LogPane: View {
                 Text(String(localized: "logs.empty",
                             defaultValue: "No log entries.",
                             comment: "Empty-state text shown inside the log pane when the server has no log entries"))
-                    .font(.omlxText(12))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textTertiary)
                     .frame(maxWidth: .infinity, alignment: .center)
                     .padding(.vertical, 36)

@@ -98,7 +98,7 @@ private struct Header: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
                     Text(model?.displayTitle ?? "—")
-                        .font(.omlxText(17, weight: .semibold))
+                        .font(.omlxText(DesignTokens.FontSize.section, weight: .semibold))
                         .foregroundStyle(theme.text)
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -108,7 +108,7 @@ private struct Header: View {
                 }
                 if let m = model {
                     Text("\(m.id) · \(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))")
-                        .font(.omlxMono(11))
+                        .font(.omlxMono(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textSecondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -163,7 +163,7 @@ private struct SnapshotActions: View {
         .overlay(alignment: .topTrailing) {
             if let hoveredAction {
                 Text(hoveredAction)
-                    .font(.omlxText(12))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.text)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 5)
@@ -219,7 +219,7 @@ private struct SnapshotActions: View {
         } label: {
             Label(title, systemImage: systemImage)
                 .labelStyle(.iconOnly)
-                .font(.omlxText(12))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .frame(width: 20, height: 22)
         }
         .accessibilityLabel(title)
@@ -271,7 +271,7 @@ private struct SettingsApplySheet: View {
     private var errorLine: some View {
         if let error = vm.applyError {
             Text(error)
-                .font(.omlxText(12))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.redDot)
                 .textSelection(.enabled)
         }
@@ -282,19 +282,19 @@ private struct SettingsApplySheet: View {
             Text(String(localized: "settings.apply.recipe.title",
                         defaultValue: "Apply custom recipe",
                         comment: "Title of the paste-a-recipe sheet"))
-                .font(.omlxText(17, weight: .semibold))
+                .font(.omlxText(DesignTokens.FontSize.section, weight: .semibold))
                 .foregroundStyle(theme.text)
             Text(String(localized: "settings.apply.recipe.hint",
                         defaultValue: "Paste a recipe copied from the Recipe row of a benchmark detail page on omlx.ai.",
                         comment: "Hint explaining where a settings recipe can be copied from"))
-                .font(.omlxText(12))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textSecondary)
             linkButton(Self.benchmarksURL,
                        title: String(localized: "settings.apply.result.open_search",
                                      defaultValue: "Open community benchmarks",
                                      comment: "Link button that opens the omlx.ai performance leaderboard"))
             TextEditor(text: $recipeText)
-                .font(.omlxMono(11))
+                .font(.omlxMono(DesignTokens.FontSize.aux))
                 .scrollContentBackground(.hidden)
                 .frame(height: 110)
                 .padding(6)
@@ -310,7 +310,7 @@ private struct SettingsApplySheet: View {
                     Text(String(localized: "settings.apply.recipe.applying",
                                 defaultValue: "Applying the recipe...",
                                 comment: "Progress text while a pasted recipe is being applied"))
-                        .font(.omlxText(12))
+                        .font(.omlxText(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textSecondary)
                 }
                 Spacer()
@@ -337,14 +337,14 @@ private struct SettingsApplySheet: View {
             Text(String(localized: "settings.apply.result.title_optimal",
                         defaultValue: "Optimal settings from omlx.ai",
                         comment: "Title of the optimal-settings sheet"))
-                .font(.omlxText(17, weight: .semibold))
+                .font(.omlxText(DesignTokens.FontSize.section, weight: .semibold))
                 .foregroundStyle(theme.text)
             if let candidates {
                 if candidates.found {
                     Text(String(localized: "settings.apply.choose.hint",
                                 defaultValue: "Pick a benchmark result to apply its settings. Rows are the best matches for this chip and model with the same or less memory, at a 4k prompt.",
                                 comment: "Hint above the benchmark candidate list"))
-                        .font(.omlxText(12))
+                        .font(.omlxText(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textSecondary)
                     ScrollView {
                         VStack(alignment: .leading, spacing: 12) {
@@ -367,7 +367,7 @@ private struct SettingsApplySheet: View {
                 errorLine
             } else if let error = vm.applyError {
                 Text(error)
-                    .font(.omlxText(12))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.redDot)
                     .textSelection(.enabled)
             } else {
@@ -376,7 +376,7 @@ private struct SettingsApplySheet: View {
                     Text(String(localized: "settings.apply.optimal.loading",
                                 defaultValue: "Fetching the best benchmark results from omlx.ai...",
                                 comment: "Progress text while omlx.ai candidates are fetched"))
-                        .font(.omlxText(12))
+                        .font(.omlxText(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textSecondary)
                 }
                 .padding(.vertical, 12)
@@ -387,7 +387,7 @@ private struct SettingsApplySheet: View {
                     Text(String(localized: "settings.apply.optimal.applying",
                                 defaultValue: "Applying the benchmark settings...",
                                 comment: "Progress text while a chosen benchmark snapshot is applied"))
-                        .font(.omlxText(12))
+                        .font(.omlxText(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textSecondary)
                 }
                 Spacer()
@@ -401,7 +401,7 @@ private struct SettingsApplySheet: View {
         if !rows.isEmpty {
             VStack(alignment: .leading, spacing: 6) {
                 Text(label)
-                    .font(.omlxText(11, weight: .semibold))
+                    .font(.omlxText(DesignTokens.FontSize.aux, weight: .semibold))
                     .foregroundStyle(theme.textSecondary)
                 ForEach(rows) { row in
                     HStack(alignment: .center, spacing: 10) {
@@ -410,13 +410,13 @@ private struct SettingsApplySheet: View {
                                 linkButton(url, title: urlText)
                             } else {
                                 Text(row.benchmarkId)
-                                    .font(.omlxMono(11))
+                                    .font(.omlxMono(DesignTokens.FontSize.aux))
                                     .foregroundStyle(theme.text)
                             }
                             Text(ModelSettingsScreenVM.candidateStats(
                                 pp: row.ppTps, tg: row.tgTps, memoryGb: row.memoryGb,
                                 quantization: row.quantization, omlxVersion: row.omlxVersion))
-                                .font(.omlxMono(11))
+                                .font(.omlxMono(DesignTokens.FontSize.aux))
                                 .foregroundStyle(theme.textSecondary)
                         }
                         Spacer()
@@ -446,12 +446,12 @@ private struct SettingsApplySheet: View {
         Text(String(localized: "settings.apply.result.none_title",
                     defaultValue: "No benchmark result matches this device and model.",
                     comment: "Headline when omlx.ai has no benchmark for the current device and model"))
-            .font(.omlxText(13, weight: .medium))
+            .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
             .foregroundStyle(theme.text)
         Text(String(localized: "settings.apply.result.none_body",
                     defaultValue: "Find a similar model on the community benchmarks and apply its recipe with Apply custom recipe.",
                     comment: "Guidance shown when no matching benchmark exists"))
-            .font(.omlxText(12))
+            .font(.omlxText(DesignTokens.FontSize.aux))
             .foregroundStyle(theme.textSecondary)
         linkButton(URL(string: searchUrl ?? "") ?? Self.benchmarksURL,
                    title: String(localized: "settings.apply.result.open_search",
@@ -469,7 +469,7 @@ private struct SettingsApplySheet: View {
                  : String(localized: "settings.apply.result.title_optimal",
                           defaultValue: "Optimal settings from omlx.ai",
                           comment: "Title of the optimal-settings sheet"))
-                .font(.omlxText(17, weight: .semibold))
+                .font(.omlxText(DesignTokens.FontSize.section, weight: .semibold))
                 .foregroundStyle(theme.text)
             Text(result.changed == false
                  ? String(localized: "settings.apply.result.no_change",
@@ -482,14 +482,14 @@ private struct SettingsApplySheet: View {
                     : String(localized: "settings.apply.result.done_optimal",
                              defaultValue: "The settings below were applied from the selected benchmark!",
                              comment: "Result line after a chosen benchmark snapshot was applied")))
-                .font(.omlxText(13, weight: .medium))
+                .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                 .foregroundStyle(theme.text)
             if let urlText = result.benchmarkUrl, let url = URL(string: urlText) {
                 linkButton(url, title: urlText)
                 Text(ModelSettingsScreenVM.candidateStats(
                     pp: result.ppTps, tg: result.tgTps,
                     quantization: result.quantization, omlxVersion: result.omlxVersion))
-                    .font(.omlxMono(11))
+                    .font(.omlxMono(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textSecondary)
             }
             let skipped = ModelSettingsScreenVM.summarizeSkipped(result.skipped)
@@ -498,11 +498,11 @@ private struct SettingsApplySheet: View {
                     Text(String(localized: "settings.apply.result.skipped",
                                 defaultValue: "Skipped on this machine",
                                 comment: "Label above the list of features the server dropped while applying a snapshot"))
-                        .font(.omlxText(12, weight: .semibold))
+                        .font(.omlxText(DesignTokens.FontSize.aux, weight: .semibold))
                         .foregroundStyle(theme.warningText)
                     ForEach(skipped, id: \.self) { line in
                         Text(line)
-                            .font(.omlxText(12))
+                            .font(.omlxText(DesignTokens.FontSize.aux))
                             .foregroundStyle(theme.warningText)
                     }
                 }
@@ -514,11 +514,11 @@ private struct SettingsApplySheet: View {
             Text(String(localized: "settings.apply.result.applied",
                         defaultValue: "Applied settings",
                         comment: "Label above the JSON of the applied settings"))
-                .font(.omlxText(11, weight: .medium))
+                .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                 .foregroundStyle(theme.textSecondary)
             ScrollView {
                 Text(ModelSettingsScreenVM.appliedJSON(result.applied))
-                    .font(.omlxMono(11))
+                    .font(.omlxMono(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.text)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -531,7 +531,7 @@ private struct SettingsApplySheet: View {
                 Text(String(localized: "settings.apply.result.reload_note",
                             defaultValue: "The model will use the new settings after its next load.",
                             comment: "Note shown when applied settings only take effect at model load"))
-                    .font(.omlxText(12))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textSecondary)
             }
             HStack {
@@ -1339,7 +1339,7 @@ private struct ChatTemplateKwargsEditor: View {
                          : String(localized: "settings.advanced.chat_template.count",
                                   defaultValue: "kwargs: \(vm.chatTemplateEntries.count)",
                                   comment: "Count summary in the chat-template editor; placeholder is the entry count"))
-                        .font(.omlxText(12))
+                        .font(.omlxText(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textSecondary)
                     Spacer()
                     addMenu
@@ -1421,7 +1421,7 @@ private struct EntryEditor: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
                 Text(typeLabel)
-                    .font(.omlxText(11, weight: .semibold))
+                    .font(.omlxText(DesignTokens.FontSize.aux, weight: .semibold))
                     .foregroundStyle(theme.textSecondary)
                 Spacer()
                 Button {
@@ -1517,7 +1517,7 @@ private struct EntryEditor: View {
                 defaultValue: "Custom",
                 comment: "Checkbox label that enables a custom reasoning_effort value"
             ))
-            .font(.omlxText(11))
+            .font(.omlxText(DesignTokens.FontSize.aux))
             .foregroundStyle(theme.textSecondary)
         }
         .toggleStyle(.checkbox)
@@ -1549,7 +1549,7 @@ private struct EntryEditor: View {
             Text(String(localized: "settings.advanced.chat_template.force",
                         defaultValue: "Force",
                         comment: "Checkbox label for forcing a chat-template kwarg via forced_ct_kwargs"))
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textSecondary)
         }
         .toggleStyle(.checkbox)
@@ -1974,7 +1974,7 @@ private struct ExperimentalSection: View {
                         if vm.aneTuningIsRunning {
                             if let status = vm.aneTuningStatus {
                                 Text(status.message)
-                                    .font(.omlxText(11))
+                                    .font(.omlxText(DesignTokens.FontSize.aux))
                                     .foregroundStyle(theme.textSecondary)
                                     .fixedSize(horizontal: false, vertical: true)
                                     .multilineTextAlignment(.trailing)
@@ -1995,7 +1995,7 @@ private struct ExperimentalSection: View {
                             .buttonStyle(.omlx(.destructive, size: .small))
                         } else if let recommendation = vm.aneTuningStatus?.recommendation {
                             Text(aneRecommendationText(recommendation))
-                                .font(.omlxText(11))
+                                .font(.omlxText(DesignTokens.FontSize.aux))
                                 .foregroundStyle(theme.textSecondary)
                                 .fixedSize(horizontal: false, vertical: true)
                                 .multilineTextAlignment(.trailing)
@@ -2024,7 +2024,7 @@ private struct ExperimentalSection: View {
                             if let reason = status.terminationReason,
                                !reason.isEmpty {
                                 Text(reason)
-                                    .font(.omlxText(10))
+                                    .font(.omlxText(DesignTokens.FontSize.aux))
                                     .foregroundStyle(
                                         status.status == "error"
                                             ? Color.red

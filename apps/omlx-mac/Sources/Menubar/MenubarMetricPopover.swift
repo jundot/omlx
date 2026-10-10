@@ -34,7 +34,7 @@ struct MetricPopoverView: View {
 
             if let note = statusNote {
                 Text(note)
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textTertiary)
             }
 
@@ -113,7 +113,7 @@ struct MetricPopoverView: View {
 
     private func sectionHeader(_ title: String) -> some View {
         Text(title.uppercased())
-            .font(.omlxText(10, weight: .bold))
+            .font(.omlxText(DesignTokens.FontSize.aux, weight: .bold))
             .kerning(1)
             .foregroundStyle(theme.accent)
             .frame(maxWidth: .infinity, alignment: .center)
@@ -125,18 +125,18 @@ struct MetricPopoverView: View {
                 .fill(tint)
                 .frame(width: 6, height: 6)
             Text(label)
-                .font(.omlxText(12, weight: .medium))
+                .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                 .foregroundStyle(theme.textSecondary)
             Spacer()
             Text(value)
-                .font(.omlxMono(12, weight: .medium))
+                .font(.omlxMono(DesignTokens.FontSize.aux, weight: .medium))
                 .foregroundStyle(theme.text)
         }
     }
 
     private func graphCaption(_ text: String) -> some View {
         Text(text)
-            .font(.omlxMono(9))
+            .font(.omlxMono(DesignTokens.FontSize.aux))
             .foregroundStyle(theme.textTertiary)
     }
 
