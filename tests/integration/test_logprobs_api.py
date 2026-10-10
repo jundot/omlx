@@ -8,7 +8,6 @@ loaded.
 """
 
 import json
-from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -325,10 +324,12 @@ class TestServerCapClamp:
             logprobs=[TokenLogprob(token_id=1, logprob=-0.1)],
         )
         orig = _server_state.global_settings
-        _server_state.global_settings = SimpleNamespace(
-            sampling=SimpleNamespace(top_logprobs_k=1),
-            server=SimpleNamespace(preserve_mid_system_cache=True),
-        )
+        from omlx.settings import GlobalSettings
+
+        settings = GlobalSettings()
+        settings.sampling.top_logprobs_k = 1
+        settings.server.preserve_mid_system_cache = True
+        _server_state.global_settings = settings
         try:
             r = client.post(
                 "/v1/chat/completions", json=_body(logprobs=True, top_logprobs=5)
