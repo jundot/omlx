@@ -386,6 +386,124 @@ class TestThinkingParser:
         assert c == "open but never closed"
 
 
+class TestThinkingLeadingNewline:
+    """The template's opening newline must not start a reasoning delta.
+
+    Chat templates render ``<think>\\n``, so the model's first reasoning
+    character is a newline that belongs to the template rather than to the
+    reasoning. The non-streaming path drops it (``extract_thinking`` strips
+    each ``<think>`` body), while ``ThinkingParser.feed()`` streamed it
+    verbatim as the first ``reasoning_content`` delta — issue #3667.
+
+    Streaming must drop exactly that opening run of newlines. The two plausible
+    shortcuts are wrong and are pinned below: a per-delta ``lstrip()`` would
+    also eat a later delta's leading newline, and ``strip()`` would also eat
+    reasoning-internal indentation. Every case asserts the exact sequence of
+    ``(thinking, content)`` tuples, so a wrong channel or a single dropped or
+    added character fails.
+    """
+
+    _DROPPED = [
+        (
+            "explicit open tag",
+            False,
+            ["<think>\n", "\nThe user is asking"],
+            [("", ""), ("The user is asking", "")],
+        ),
+        (
+            "hy3 open tag",
+            False,
+            ["<think:opensource>\n", "\nreasoning"],
+            [("", ""), ("reasoning", "")],
+        ),
+        (
+            "start_in_thinking",
+            True,
+            ["\n\n", "\nThe user is asking"],
+            [("", ""), ("The user is asking", "")],
+        ),
+        (
+            "open tag split across chunks",
+            False,
+            ["<thi", "nk>\n", "\nreasoning"],
+            [("", ""), ("", ""), ("reasoning", "")],
+        ),
+        (
+            "new block after a closed block",
+            False,
+            ["answer<think>\n", "\nsecond block"],
+            [("", "answer"), ("second block", "")],
+        ),
+    ]
+
+    @pytest.mark.parametrize(
+        "start_in_thinking,chunks,expected",
+        [row[1:] for row in _DROPPED],
+        ids=[row[0] for row in _DROPPED],
+    )
+    def test_opening_newlines_are_not_streamed(
+        self, start_in_thinking, chunks, expected
+    ):
+        parser = ThinkingParser(start_in_thinking=start_in_thinking)
+        assert [parser.feed(chunk) for chunk in chunks] == expected
+
+    _PRESERVED = [
+        (
+            "internal newlines and indentation",
+            False,
+            ["<think>Let me:\n    x = 1\n    y = 2"],
+            [("Let me:\n    x = 1\n    y = 2", "")],
+        ),
+        (
+            "later delta keeps its leading newline (lstrip would break this)",
+            True,
+            ["\nthinking", "\n    second line"],
+            [("thinking", ""), ("\n    second line", "")],
+        ),
+        (
+            "empty and plain first deltas",
+            True,
+            ["", "step 1 "],
+            [("", ""), ("step 1 ", "")],
+        ),
+        (
+            "only \\n is dropped, not spaces (strip would break this)",
+            True,
+            ["\n   indented first line"],
+            [("   indented first line", "")],
+        ),
+    ]
+
+    @pytest.mark.parametrize(
+        "start_in_thinking,chunks,expected",
+        [row[1:] for row in _PRESERVED],
+        ids=[row[0] for row in _PRESERVED],
+    )
+    def test_reasoning_formatting_is_preserved(
+        self, start_in_thinking, chunks, expected
+    ):
+        parser = ThinkingParser(start_in_thinking=start_in_thinking)
+        assert [parser.feed(chunk) for chunk in chunks] == expected
+
+    def test_finish_and_non_streaming_paths_unchanged(self):
+        """Regressions for the paths that were already correct.
+
+        ``finish()``'s recovery flush must not resurrect the dropped newline,
+        and the non-streaming ``extract_thinking`` must still strip.
+        """
+        parser = ThinkingParser(start_in_thinking=True)
+        parser.feed("\nunfinished reasoning")
+        assert parser.finish() == ("", "unfinished reasoning")
+        assert extract_thinking("<think>\nreasoning</think>\n\nanswer") == (
+            "reasoning",
+            "answer",
+        )
+        assert extract_thinking("\nreasoning</think>\nanswer") == (
+            "reasoning",
+            "answer",
+        )
+
+
 class TestCleanSpecialTokens:
     """Tests for clean_special_tokens (preserves think tags)."""
 

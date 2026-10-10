@@ -254,6 +254,24 @@ class ThinkingParser:
         self._close_seen: bool = False
         self._thinking_accumulated: List[str] = []
         self._content_emitted: bool = False
+        # Chat templates open a reasoning block with ``<think>\n`` (or the
+        # scheduler prepends it), so the model's first reasoning character is
+        # a newline that belongs to the template, not to the reasoning. The
+        # non-streaming path drops it because ``extract_thinking`` strips each
+        # ``<think>`` body; streaming must match, otherwise the client renders
+        # an empty first line.
+        #
+        # This needs its own flag rather than reusing ``_thinking_accumulated``:
+        # that list is append-only for the whole response and only ever serves
+        # ``finish()``'s recovery, so it is not a block-start signal and cannot
+        # say whether the *current* block has emitted a reasoning character yet.
+        # The flag is True until the first non-newline character of the current
+        # block goes out, and is reset whenever an open tag starts a new block.
+        #
+        # Whole-block ``strip()`` and per-delta ``lstrip()``/``strip()`` are
+        # both wrong here: they would eat reasoning-internal indentation and the
+        # leading newlines of later deltas, which are reasoning content.
+        self._at_thinking_block_start: bool = True
 
     def feed(self, text: str) -> Tuple[str, str]:
         """Feed a text chunk, return (thinking_delta, content_delta).
@@ -283,11 +301,13 @@ class ThinkingParser:
                 # Try to match <think>
                 if remaining.startswith(_OPEN_TAG):
                     self._in_thinking = True
+                    self._at_thinking_block_start = True
                     i += _OPEN_LEN
                     continue
 
                 if remaining.startswith(_HY3_OPEN_TAG):
                     self._in_thinking = True
+                    self._at_thinking_block_start = True
                     i += len(_HY3_OPEN_TAG)
                     continue
 
@@ -312,12 +332,20 @@ class ThinkingParser:
 
                 # Not a tag, emit the '<' as regular content
                 if self._in_thinking:
+                    self._at_thinking_block_start = False
                     thinking_out.append('<')
                 else:
                     content_out.append('<')
                 i += 1
             else:
                 if self._in_thinking:
+                    # Drop the template's block-opening newline run only.
+                    # Reasoning-internal newlines and their indentation must
+                    # stream through untouched.
+                    if text[i] == "\n" and self._at_thinking_block_start:
+                        i += 1
+                        continue
+                    self._at_thinking_block_start = False
                     thinking_out.append(text[i])
                 else:
                     content_out.append(text[i])
