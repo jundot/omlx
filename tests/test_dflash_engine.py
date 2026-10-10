@@ -1656,6 +1656,8 @@ class TestDFlashCachedTokensWiring:
             min_p,
             repetition_penalty,
             repetition_context_size,
+            prefix_cache_request,
+            prefix_cache_chat_template_kwargs,
         ):
             assert (temperature, top_p, top_k, min_p) == (0.7, 0.9, 0, 0.0)
             assert repetition_penalty == 1.2

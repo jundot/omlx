@@ -358,6 +358,8 @@ class BlockAwarePrefixCache(CacheManager):
         self._tokens_requested_total = 0
         self._last_partial_tokens_skipped = 0
         self._last_tokens_to_next_block = 0
+        self._retained_restore_walkbacks = 0
+        self._placeholder_full_rejects = 0
         self._exact_prefix_hits = 0
         self._exact_prefix_misses = 0
         self._exact_prefix_tokens_restored = 0
@@ -3714,6 +3716,7 @@ class BlockAwarePrefixCache(CacheManager):
                         if bid in self.paged_cache.allocated_blocks
                     )
                     block_table.num_tokens = valid_token_count
+                    self._retained_restore_walkbacks += 1
 
                     # Update meta_states to the truncation-point block
                     if trunc_idx < len(all_block_meta_states):
@@ -3786,6 +3789,7 @@ class BlockAwarePrefixCache(CacheManager):
                             f"CacheList layer {layer_idx}: partial prefix match "
                             f"detected (placeholder). Rejecting cache."
                         )
+                        self._placeholder_full_rejects += 1
                         return None
 
                     # Each sub_state in block_data may be either:
@@ -4604,6 +4608,7 @@ class BlockAwarePrefixCache(CacheManager):
                                 f"block). Rejecting cache to prevent stale "
                                 f"sliding-window state."
                             )
+                            self._placeholder_full_rejects += 1
                             return None
 
                         latest_state = {
@@ -4627,6 +4632,7 @@ class BlockAwarePrefixCache(CacheManager):
                                 f"block). Rejecting cache to prevent stale GDN "
                                 f"state. Request will reprocess from scratch."
                             )
+                            self._placeholder_full_rejects += 1
                             return None
 
                         # Exact match: last block has full state
@@ -5377,6 +5383,8 @@ class BlockAwarePrefixCache(CacheManager):
             last_tokens_to_next_block=self._last_tokens_to_next_block,
             tokens_matched_total=self._tokens_matched_total,
             tokens_requested_total=self._tokens_requested_total,
+            retained_restore_walkbacks=self._retained_restore_walkbacks,
+            placeholder_full_rejects=self._placeholder_full_rejects,
             exact_prefix_hits=self._exact_prefix_hits,
             exact_prefix_misses=self._exact_prefix_misses,
             exact_prefix_tokens_restored=self._exact_prefix_tokens_restored,
@@ -5412,6 +5420,8 @@ class BlockAwarePrefixCache(CacheManager):
             "last_tokens_to_next_block": self._last_tokens_to_next_block,
             "tokens_matched_total": self._tokens_matched_total,
             "tokens_requested_total": self._tokens_requested_total,
+            "retained_restore_walkbacks": self._retained_restore_walkbacks,
+            "placeholder_full_rejects": self._placeholder_full_rejects,
             "exact_prefix_hits": self._exact_prefix_hits,
             "exact_prefix_misses": self._exact_prefix_misses,
             "exact_prefix_tokens_restored": self._exact_prefix_tokens_restored,
@@ -5441,6 +5451,8 @@ class BlockAwarePrefixCache(CacheManager):
         self._tokens_requested_total = 0
         self._last_partial_tokens_skipped = 0
         self._last_tokens_to_next_block = 0
+        self._retained_restore_walkbacks = 0
+        self._placeholder_full_rejects = 0
         self._exact_prefix_hits = 0
         self._exact_prefix_misses = 0
         self._exact_prefix_tokens_restored = 0
