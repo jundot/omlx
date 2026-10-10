@@ -268,6 +268,71 @@ class TestEmbeddingUtils:
         result = normalize_input(["Hello", "World"])
         assert result == ["Hello", "World"]
 
+    def test_normalize_input_image_content_parts(self):
+        """OpenAI image_url content parts fold into one structured item."""
+        parts = [
+            {"type": "text", "text": "a diagram"},
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+        ]
+        assert normalize_input(parts) == [{"text": "a diagram", "image": IMAGE_DATA_URI}]
+
+    def test_normalize_input_image_only_content_parts(self):
+        """Image-only parts produce an item without a text key."""
+        parts = [{"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}}]
+        assert normalize_input(parts) == [{"image": IMAGE_DATA_URI}]
+
+    def test_normalize_input_multiple_text_parts_join(self):
+        """Several text parts join with newlines, like extract_text_from_content."""
+        parts = [
+            {"type": "text", "text": "one"},
+            {"type": "text", "text": "two"},
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+        ]
+        assert normalize_input(parts) == [
+            {"text": "one\ntwo", "image": IMAGE_DATA_URI}
+        ]
+
+    def test_normalize_input_audio_content_part(self):
+        """input_audio parts fold into the data-URI form items take."""
+        parts = [
+            {"type": "text", "text": "speech"},
+            {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+        ]
+        assert normalize_input(parts) == [
+            {"text": "speech", "audio": "data:audio/wav;base64,AAAA"}
+        ]
+
+    def test_normalize_input_rejects_two_images(self):
+        parts = [
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+        ]
+        with pytest.raises(InvalidRequestError, match="at most one image"):
+            normalize_input(parts)
+
+    def test_normalize_input_rejects_unknown_part_type(self):
+        parts = [{"type": "file", "file": {"filename": "x.pdf"}}]
+        with pytest.raises(InvalidRequestError, match="Unsupported embedding content part"):
+            normalize_input(parts)
+
+    def test_normalize_input_rejects_image_part_without_url(self):
+        parts = [{"type": "image_url", "image_url": {}}]
+        with pytest.raises(InvalidRequestError, match="requires a non-empty url"):
+            normalize_input(parts)
+
+    def test_normalize_input_rejects_empty_parts(self):
+        with pytest.raises(InvalidRequestError, match="no text, image, or audio"):
+            normalize_input([{"type": "text", "text": ""}])
+
+    def test_embedding_request_accepts_content_parts(self):
+        """EmbeddingRequest keeps OpenAI content-part input verbatim."""
+        parts = [
+            {"type": "text", "text": "hello"},
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+        ]
+        request = EmbeddingRequest(input=parts, model="test-model")
+        assert request.input == parts
+
     def test_normalize_embedding_items(self):
         """Test structured embedding items normalization."""
         result = normalize_embedding_items(
@@ -2427,3 +2492,84 @@ class TestMlxVlmEmbeddingGemma2:
         model.embed([{"text": "a cat", "image": IMAGE_DATA_URI}])
 
         assert "audio_kwargs" not in processor.apply_chat_template.call_args.kwargs
+
+
+class TestEmbeddingGemma2ImageLayout:
+    """PIL channel-layout guard for mlx-vlm EmbeddingGemma 2 (#2346)."""
+
+    @pytest.fixture(scope="class")
+    def processor(self):
+        pytest.importorskip(
+            "mlx_vlm.models.embedding_gemma2.image_processing_embedding_gemma2"
+        )
+        from omlx.patches.embedding_gemma2_image_layout import (
+            apply_embedding_gemma2_image_layout_patch,
+        )
+
+        apply_embedding_gemma2_image_layout_patch()
+        from mlx_vlm.models.embedding_gemma2.image_processing_embedding_gemma2 import (
+            EmbeddingGemma2ImageProcessor,
+        )
+
+        return EmbeddingGemma2ImageProcessor()
+
+    def test_one_pixel_tall_image_embeds_at_full_patch_width(self, processor):
+        """1-px-tall RGB must not collapse to 256-wide single-channel patches."""
+        from PIL import Image
+
+        out = processor.preprocess([Image.new("RGB", (900, 1), (5, 5, 5))])
+        assert out["pixel_values"].shape[-1] == 768
+
+    def test_nested_pil_batch_is_forced_to_hwc(self, processor):
+        """The HF processor chain hands preprocess a nested [[PIL]] list."""
+        from PIL import Image
+
+        out = processor.preprocess([[Image.new("RGB", (900, 1), (5, 5, 5))]])
+        assert out["pixel_values"].shape[-1] == 768
+
+    def test_landscape_orientation_keeps_width_on_x_axis(self, processor):
+        from PIL import Image
+
+        image = Image.new("RGB", (900, 3))
+        pixels = image.load()
+        for x in range(900):
+            for y in range(3):
+                pixels[x, y] = (x // 4, y * 70, 0)
+        positions = processor.preprocess([image])["image_position_ids"]
+        # Patch grid: 13440/16 wide, 3 stays under one 16-px patch row.
+        assert positions[..., 0].max() > positions[..., 1].max()
+
+    def test_portrait_and_landscape_are_not_interchangeable(self, processor):
+        from PIL import Image
+
+        wide = processor.preprocess([Image.new("RGB", (900, 3))])[
+            "image_position_ids"
+        ]
+        tall = processor.preprocess([Image.new("RGB", (3, 900))])[
+            "image_position_ids"
+        ]
+        assert wide[..., 0].max() == tall[..., 1].max()
+        assert wide[..., 1].max() == tall[..., 0].max()
+
+    def test_explicit_input_format_is_not_overridden(self, processor):
+        """Callers passing input_data_format keep control (e.g. numpy FIRST)."""
+        import numpy as np
+        from PIL import Image
+
+        image = Image.new("RGB", (8, 8), (1, 2, 3))
+        with_channel = processor.preprocess(
+            [image], input_data_format="channels_last"
+        )
+        default = processor.preprocess([image])
+        np.testing.assert_array_equal(
+            np.asarray(with_channel["pixel_values"]),
+            np.asarray(default["pixel_values"]),
+        )
+
+    def test_non_pil_input_still_uses_layout_inference(self, processor):
+        """numpy arrays keep the old behaviour — only PIL gets forced HWC."""
+        import numpy as np
+
+        array_hwc = np.full((8, 8, 3), 7, dtype=np.uint8)
+        out = processor.preprocess([array_hwc])
+        assert out["pixel_values"].shape[-1] == 768
