@@ -4749,6 +4749,11 @@ async def create_chat_completion(
 
         if request.stop:
             chat_kwargs["stop"] = request.stop
+            # Reasoning comes back as reasoning_content, so stop strings
+            # apply to the answer only (#3943).
+            chat_kwargs["stop_skips_reasoning"] = (
+                (merged_ct_kwargs or {}).get("enable_thinking") is not False
+            )
 
         # Pre-flight prefill memory guard. Must run BEFORE either branch wraps
         # the response in a StreamingResponse — starlette emits
@@ -7298,9 +7303,13 @@ async def create_anthropic_message(
         if prepared_prompt is not None:
             chat_kwargs["_prepared_prompt"] = prepared_prompt
 
-        # Add stop sequences
+        # Add stop sequences. Thinking comes back as its own block, so they
+        # apply to the answer only (#3943).
         if request.stop_sequences:
             chat_kwargs["stop"] = request.stop_sequences
+            chat_kwargs["stop_skips_reasoning"] = (
+                (merged_ct_kwargs or {}).get("enable_thinking") is not False
+            )
 
         # Pre-flight prefill memory guard — must precede any StreamingResponse
         # return so PrefillMemoryExceededError can be mapped to HTTP 400.

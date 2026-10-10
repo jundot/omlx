@@ -62,7 +62,13 @@ class OutputParserFinalizeResult:
 
 
 class OutputParserSession(Protocol):
-    """Protocol implemented by per-request output parser sessions."""
+    """Protocol implemented by per-request output parser sessions.
+
+    A session that frames reasoning may also expose ``in_reasoning``: True
+    while the tokens it has seen belong to the reasoning channel. The
+    scheduler then pauses the request's stop strings on that state instead
+    of looking for the markers itself.
+    """
 
     def process_token(self, token_id: int) -> OutputParserTokenResult:
         """Process one generated token."""
@@ -106,6 +112,10 @@ class HarmonyOutputParserSession:
         self._detokenizer = create_streaming_detokenizer(tokenizer, model_path)
         if self._detokenizer is not None:
             self._detokenizer.reset()
+
+    @property
+    def in_reasoning(self) -> bool:
+        return self._parser.current_channel == "analysis"
 
     def process_token(self, token_id: int) -> OutputParserTokenResult:
         control_text, stream_token, visible_token, is_stop = self._parser.process_token(
@@ -1034,6 +1044,10 @@ class InklingOutputParserSession:
                 re.S,
             )
 
+    @property
+    def in_reasoning(self) -> bool:
+        return self._splitter._channel == "thinking"
+
     def _decode_token(self, token_id: int) -> str:
         return _decode_output_token(self._tokenizer, self._detokenizer, token_id)
 
@@ -1294,6 +1308,10 @@ class K2HorizonOutputParserSession:
     def notify_prefilled_thought(self) -> None:
         self._in_reasoning = True
 
+    @property
+    def in_reasoning(self) -> bool:
+        return self._in_reasoning
+
     def _decode_token(self, token_id: int) -> str:
         return _decode_output_token(self._tokenizer, self._detokenizer, token_id)
 
@@ -1414,6 +1432,7 @@ def detect_output_parser(
                 model_path=session_model_path,
             ),
             stop_token_ids=temp_parser.get_stop_token_ids(),
+            thinking_start_text="<|channel|>analysis<|message|>",
             thinking_end_text="<|end|>",
             thinking_end_trailing_text="<|start|>assistant<|channel|>final<|message|>",
         )

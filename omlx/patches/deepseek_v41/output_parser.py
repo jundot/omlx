@@ -24,6 +24,10 @@ class DeepSeekV41OutputParserSession:
     def notify_prefilled_thought(self):
         self._state = "reasoning"
 
+    @property
+    def in_reasoning(self):
+        return self._state == "reasoning"
+
     def _consume(self, final=False):
         output = []
         while self._buffer:
