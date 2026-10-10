@@ -94,14 +94,25 @@ _MIN_SG8_ROUTE_N = 1024
 _SG8_MIN_ROWS = 4
 
 
-def set_verify_qmm_armed(flag: bool) -> None:
-    """Arm/disarm verify-qmm routing (MTP verify forwards only)."""
-    _ROUTE_ARMED.value = bool(flag)
+def set_verify_qmm_armed(flag: bool, *, row_exact: bool = False) -> None:
+    """Arm/disarm verify-qmm routing (MTP verify forwards only).
+
+    ``row_exact`` arms the row-exact mode instead: every multi-row
+    ``nn.QuantizedLinear`` call runs ``row_exact_qmv`` (one-row decode
+    arithmetic per row) and the fast verify kernels below stay disarmed.
+    """
+    _ROUTE_ARMED.value = bool(flag) and not row_exact
+    _ROUTE_ARMED.row_exact = bool(flag) and bool(row_exact)
     _ROUTE_ARMED.layers = 0
 
 
 def _is_armed() -> bool:
     return getattr(_ROUTE_ARMED, "value", False)
+
+
+def is_row_exact_armed() -> bool:
+    """True inside a verify forward whose rows must equal serial decode rows."""
+    return getattr(_ROUTE_ARMED, "row_exact", False)
 
 
 # ---------------------------------------------------------------------------
@@ -1474,6 +1485,32 @@ def _patch_verify_layer_flush() -> None:
     Qwen3_5BatchInvariantForward._model = _model
 
 
+def _verify_route(rows: int, K: int, N: int, bits: int, group_size: int, dtype):
+    """Kernel an armed verify projection runs ("sg8", "mma" or "vk"), or None
+    for the stock qmm."""
+    if sg8_eligible(rows, K, N, bits, group_size, dtype):
+        return "sg8"
+    if mma_eligible(rows, K, N, bits, group_size, dtype):
+        return "mma"
+    if rows <= 6 and vk_eligible(rows, K, N, bits, group_size, dtype):
+        return "vk"
+    return None
+
+
+def takes_verify_route(layer, rows: int, dtype) -> bool:
+    """Whether a ``rows``-row call of ``layer`` (an ``nn.QuantizedLinear``)
+    now leaves the stock qmm: row-exact mode, or an armed verify route."""
+    if rows < 2 or not getattr(type(layer), "_omlx_verify_qmm_patched", False):
+        return False
+    if is_row_exact_armed():
+        return True
+    if not _is_armed() or getattr(layer, "mode", "affine") != "affine":
+        return False
+    K = layer.weight.shape[-1] * 32 // layer.bits
+    N = layer.scales.shape[0]
+    return _verify_route(rows, K, N, layer.bits, layer.group_size, dtype) is not None
+
+
 def apply_verify_qmm_patch() -> bool:
     """Route verify-shaped ``nn.QuantizedLinear`` calls to the vk kernels.
 
@@ -1496,7 +1533,11 @@ def apply_verify_qmm_patch() -> bool:
 
     orig_call = cls.__call__
 
+    from .row_exact_qmv import quantized_linear as row_exact_linear
+
     def patched_call(self, x):
+        if is_row_exact_armed() and x.ndim >= 2 and x.size // x.shape[-1] > 1:
+            return row_exact_linear(self, x)
         if (
             not _is_armed()
             or x.ndim != 3
@@ -1507,13 +1548,7 @@ def apply_verify_qmm_patch() -> bool:
         batch, length, K = x.shape
         rows = batch * length
         N = self.scales.shape[0]
-        route = None
-        if sg8_eligible(rows, K, N, self.bits, self.group_size, x.dtype):
-            route = "sg8"
-        elif mma_eligible(rows, K, N, self.bits, self.group_size, x.dtype):
-            route = "mma"
-        elif rows <= 6 and vk_eligible(rows, K, N, self.bits, self.group_size, x.dtype):
-            route = "vk"
+        route = _verify_route(rows, K, N, self.bits, self.group_size, x.dtype)
         if route is None:
             return orig_call(self, x)
         try:

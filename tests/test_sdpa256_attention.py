@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """SDPA256 bounded routing, numerical fallback, and memory registration tests."""
 
-import logging
 import math
 import sys
 import types
@@ -17,22 +16,15 @@ def _sdpa256_reset():
     from omlx.patches import sdpa256_attention as sdpa256
 
     saved_routes = dict(mm._SDPA_TILED_PREFILL_HEAD_DIMS)
-    saved_force = sdpa256._FORCE_TILED
     saved_logged = set(sdpa256._TILED_ROUTE_LOGGED)
     sdpa256._TILED_ROUTE_LOGGED.clear()
-    sdpa256._FORCE_TILED = None
     try:
         yield sdpa256
     finally:
         mm._SDPA_TILED_PREFILL_HEAD_DIMS.clear()
         mm._SDPA_TILED_PREFILL_HEAD_DIMS.update(saved_routes)
-        sdpa256._FORCE_TILED = saved_force
         sdpa256._TILED_ROUTE_LOGGED.clear()
         sdpa256._TILED_ROUTE_LOGGED.update(saved_logged)
-
-
-def _tiled_log_records(caplog):
-    return [r for r in caplog.records if "memory-bounded path" in r.getMessage()]
 
 
 SCALE_256 = 1.0 / math.sqrt(256)
@@ -79,8 +71,7 @@ def test_flash_sdpa256_chunked_prefill_offset_causal(q_len, k_len):
     assert _max_abs(out, ref) < 2e-2
 
 
-@pytest.mark.parametrize("dtype", [mx.float16, mx.float32])
-def test_flash_sdpa256_memory_is_sub_quadratic(dtype):
+def test_flash_sdpa256_memory_is_sub_quadratic():
     """Peak memory must grow ~O(L), not O(L^2). Over an 8K->32K span (4x in L)
     O(L^2) would grow ~16x; we require < 6x (O(L) is ~4x), a sharp signal."""
     if not hasattr(mx, "reset_peak_memory"):
@@ -90,7 +81,7 @@ def test_flash_sdpa256_memory_is_sub_quadratic(dtype):
     peaks = []
     for seq_len in (8192, 32768):
         baseline = mx.get_active_memory()
-        q, k, v = _qkv(seq_len, seq_len, n_q=6, n_kv=1, dtype=dtype)
+        q, k, v = _qkv(seq_len, seq_len, n_q=6, n_kv=1)
         mx.eval(_flash_sdpa256(q, k, v, SCALE_256, "causal"))
         mx.reset_peak_memory()
         mx.eval(_flash_sdpa256(q, k, v, SCALE_256, "causal"))
@@ -99,7 +90,7 @@ def test_flash_sdpa256_memory_is_sub_quadratic(dtype):
     assert peaks[0] > 0 and peaks[1] < 6 * peaks[0], peaks
 
 
-def test_metal_bounded_path_forces_mlx0322_fused_kernel(monkeypatch):
+def test_metal_bounded_path_forces_the_fused_kernel(monkeypatch):
     from omlx.patches import sdpa256_attention as sdpa256
 
     calls = []
@@ -126,10 +117,8 @@ def test_metal_bounded_path_forces_mlx0322_fused_kernel(monkeypatch):
 
 @pytest.mark.parametrize("case", ["boolean", "additive", "sinks"])
 def test_bounded_path_preserves_array_masks_and_sinks(case):
-    """Array masks route to the bounded portable path on Metal too (native
-    fused array-mask support is unproven and may silently unfuse); causal/
-    no-mask cases exercise the real MLX 0.32.2 fused call when available.
-    All cases stay numerically pinned against the reference SDPA."""
+    """Array masks and sinks take MLX's fused kernel on Metal, like causal and
+    no-mask calls; all cases stay numerically pinned against the reference."""
     from omlx.patches.sdpa256_attention import _flash_sdpa256
 
     q, k, v = _qkv(16, 32, n_q=4, n_kv=2)
@@ -152,26 +141,23 @@ def test_bounded_path_preserves_array_masks_and_sinks(case):
 
 
 @pytest.mark.parametrize("mask_kind", ["boolean", "additive"])
-def test_metal_array_masks_never_reach_native_fused(mask_kind, monkeypatch):
-    """On Metal, an explicit array mask must go straight to the bounded
-    array-tiled kernel — never to mx.fast.scaled_dot_product_attention with
-    force_fused=True, whose array-mask handling could silently unfuse into
-    the O(L^2) fp32 score matrix this patch exists to bound."""
+def test_metal_array_masks_take_the_fused_kernel(mask_kind, monkeypatch):
+    """MLX 0.32.3's fused kernel keeps array-mask calls O(L): on NAX the
+    mask and sinks reach it in one call, never the array-tiled kernel."""
     from omlx.patches import sdpa256_attention as sdpa256
 
     calls = []
 
-    def boom(*args, **kwargs):
-        raise AssertionError("native fused SDPA must not see an array mask")
-
-    def tiled(q, k, v, scale, mask, sinks=None):
-        calls.append((mask, sinks))
+    def fake_sdpa(q, k, v, **kwargs):
+        calls.append(kwargs)
         return q
 
+    def tiled(*args, **kwargs):
+        raise AssertionError("a fused-supported array mask must not tile")
+
     monkeypatch.setattr(sdpa256.mx.metal, "is_available", lambda: True)
-    monkeypatch.setattr(
-        sdpa256.mx.fast, "scaled_dot_product_attention", boom
-    )
+    monkeypatch.setattr(sdpa256, "is_nax_available", lambda: True)
+    monkeypatch.setattr(sdpa256.mx.fast, "scaled_dot_product_attention", fake_sdpa)
     monkeypatch.setattr(sdpa256, "_array_tiled_sdpa256", tiled)
 
     q, k, v = _qkv(16, 32, n_q=4, n_kv=2)
@@ -182,12 +168,88 @@ def test_metal_array_masks_never_reach_native_fused(mask_kind, monkeypatch):
         mask = mx.where(allowed, 0.0, -1e4).astype(mx.float16)
     sinks = mx.array([-0.5, 0.0, 0.5, 1.0], dtype=mx.float16)
 
-    out = sdpa256._flash_sdpa256(q, k, v, SCALE_256, mask, sinks)
-    assert out is q
-    # Mask and sinks forwarded unchanged to the bounded kernel.
+    assert sdpa256._flash_sdpa256(q, k, v, SCALE_256, mask, sinks) is q
     assert len(calls) == 1
-    assert calls[0][0] is mask
-    assert calls[0][1] is sinks
+    assert calls[0]["mask"] is mask and calls[0]["sinks"] is sinks
+    assert calls[0]["force_fused"] is True
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.float32])
+def test_pre_nax_array_mask_runs_in_dispatch_budget_chunks(dtype, monkeypatch):
+    """Pre-NAX GPUs split array-mask (and FP32) calls into query chunks of one
+    dispatch budget (issue #2225); each chunk takes its rows of the mask."""
+    from omlx.patches import sdpa256_attention as sdpa256
+
+    calls = []
+    real = mx.fast.scaled_dot_product_attention
+
+    def counting(q, k, v, **kwargs):
+        calls.append((q.shape[-2], kwargs["mask"].shape))
+        return real(q, k, v, **kwargs)
+
+    monkeypatch.setattr(sdpa256.mx.metal, "is_available", lambda: True)
+    monkeypatch.setattr(sdpa256, "is_nax_available", lambda: False)
+    monkeypatch.setattr(sdpa256, "_DISPATCH_BUDGET", 4 * 48 * 256)
+    monkeypatch.setattr(sdpa256.mx.fast, "scaled_dot_product_attention", counting)
+
+    q, k, v = _qkv(128, 256, n_q=4, n_kv=2, dtype=dtype)
+    cols = mx.arange(256)[None, :]
+    mask = ((cols <= mx.arange(128, 256)[:, None]) & (cols >= 8))[None, None]
+    out = sdpa256._flash_sdpa256(q, k, v, SCALE_256, mask)
+    monkeypatch.undo()
+    ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=SCALE_256, mask=mask)
+    mx.eval(out, ref)
+    assert calls == [
+        (48, (1, 1, 48, 256)),
+        (48, (1, 1, 48, 256)),
+        (32, (1, 1, 32, 256)),
+    ]
+    assert _max_abs(out, ref) < (2e-3 if dtype == mx.float16 else 2e-5)
+
+
+@pytest.mark.parametrize("q_len,k_len", [(128, 128), (96, 320)])
+def test_pre_nax_fp32_causal_chunks_end_keys_at_their_rows(q_len, k_len, monkeypatch):
+    """FP32 causal chunks on pre-NAX GPUs see only the keys up to their own
+    last row: the "causal" mask aligns each call's queries to its key end."""
+    from omlx.patches import sdpa256_attention as sdpa256
+
+    monkeypatch.setattr(sdpa256.mx.metal, "is_available", lambda: True)
+    monkeypatch.setattr(sdpa256, "is_nax_available", lambda: False)
+    monkeypatch.setattr(sdpa256, "_DISPATCH_BUDGET", 4 * 32 * k_len)
+    q, k, v = _qkv(q_len, k_len, n_q=4, n_kv=2, dtype=mx.float32)
+    out = sdpa256._flash_sdpa256(q, k, v, SCALE_256, "causal")
+    ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=SCALE_256, mask="causal")
+    mx.eval(out, ref)
+    assert _max_abs(out, ref) < 2e-5
+
+
+def test_mask_the_fused_kernel_rejects_takes_the_tiled_route(monkeypatch):
+    """An FP32 additive mask on FP16 inputs does not promote to the output
+    dtype; the fused kernel rejects it and the array-tiled route runs."""
+    from omlx.patches import sdpa256_attention as sdpa256
+
+    calls = []
+    tiled = sdpa256._array_tiled_sdpa256
+
+    def recording(*args, **kwargs):
+        calls.append(1)
+        return tiled(*args, **kwargs)
+
+    monkeypatch.setattr(sdpa256, "_array_tiled_sdpa256", recording)
+    q, k, v = _qkv(16, 64, n_q=4, n_kv=2)
+    allowed = mx.arange(64)[None, None, None, :] >= 8
+    mask = mx.where(allowed, 0.0, -1e4).astype(mx.float32)
+    out = sdpa256._flash_sdpa256(q, k, v, SCALE_256, mask)
+    ref = mx.fast.scaled_dot_product_attention(
+        q.astype(mx.float32),
+        k.astype(mx.float32),
+        v.astype(mx.float32),
+        scale=SCALE_256,
+        mask=mask,
+    )
+    mx.eval(out, ref)
+    assert calls == [1]
+    assert _max_abs(out, ref) < 2e-3
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
@@ -461,31 +523,14 @@ def test_unfused_call_bytes_shared_with_guard_estimator():
     )
 
 
-# --- bounded routing overrides -------------------------------------------
+# --- bounded memory route registration -----------------------------------
 
 
-def test_parse_force_tiled_env(monkeypatch):
-    from omlx.patches import sdpa256_attention as sdpa256
-
-    monkeypatch.delenv("OMLX_SDPA256_TILED", raising=False)
-    assert sdpa256._parse_force_tiled_env() is None
-    monkeypatch.setenv("OMLX_SDPA256_TILED", "1")
-    assert sdpa256._parse_force_tiled_env() is True
-    monkeypatch.setenv("OMLX_SDPA256_TILED", "0")
-    assert sdpa256._parse_force_tiled_env() is False
-
-
-def test_force_off_does_not_publish_a_bounded_memory_route(monkeypatch):
-    """The O(L^2) benchmark override must keep conservative admission math."""
+def test_bounded_route_publishes_array_mask_support():
     from omlx import memory_monitor as mm
     from omlx.patches import sdpa256_attention as sdpa256
 
     mm._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
-    monkeypatch.setattr(sdpa256, "_FORCE_TILED", False)
-    assert sdpa256._register_bounded_route(8192) is False
-    assert 256 not in mm._SDPA_TILED_PREFILL_HEAD_DIMS
-
-    monkeypatch.setattr(sdpa256, "_FORCE_TILED", None)
     assert sdpa256._register_bounded_route(8192) is True
     try:
         routes = mm._SDPA_TILED_PREFILL_HEAD_DIMS[256]
@@ -493,20 +538,6 @@ def test_force_off_does_not_publish_a_bounded_memory_route(monkeypatch):
         assert routes[0].supports_array_mask is True
     finally:
         mm._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
-
-
-# --- bounded-route engagement logging (issue #2283) ------------------------
-
-
-def test_tiled_route_logs_forced_env(_sdpa256_reset, caplog, monkeypatch):
-    sdpa256 = _sdpa256_reset
-    monkeypatch.setattr(sdpa256, "_FORCE_TILED", True, raising=False)
-    q, k, _ = _qkv(2048, 16384)
-    with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
-        assert sdpa256._should_route(q, k, None, "causal", None) is True
-    records = _tiled_log_records(caplog)
-    assert len(records) == 1
-    assert "OMLX_SDPA256_TILED=1" in records[0].getMessage()
 
 
 # --- mlx-vlm coverage (issue: VLM engine head-256 prefill unprotected) ----
@@ -620,7 +651,6 @@ def test_production_install_order_covers_vlm_language(
     monkeypatch.setattr(fa256, "_PATCHED", False, raising=False)
     monkeypatch.setattr(fa256, "is_nax_available", lambda: False)
     monkeypatch.setattr(fa256, "_auto_dispatch_budget", lambda *a, **k: 0)
-    monkeypatch.delenv("OMLX_FA256_STEEL", raising=False)
 
     steel_calls = {"n": 0}
 

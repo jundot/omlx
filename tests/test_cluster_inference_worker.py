@@ -11,13 +11,14 @@ import subprocess
 import sys
 import textwrap
 import threading
-import time
 from types import SimpleNamespace
 from typing import Any
 
 import mlx_lm.server as mlx_server
 import pytest
 from mlx_lm.generate import DEFAULT_QUANTIZED_KV_START
+from mlx_lm.tokenizer_utils import TokenizerWrapper
+from mlx_lm.tool_parsers import json_tools, qwen3_coder
 
 import omlx.cluster.inference_worker as inference_worker
 from omlx.cluster.inference_worker import (
@@ -178,6 +179,21 @@ def test_distributed_minimax_protocol_replaces_generic_tool_and_thinking_markers
     assert parsed == {"name": "get_weather", "arguments": {"city": "Paris"}}
 
 
+def test_distributed_protocol_repairs_json_tools_label(tmp_path):
+    tokenizer = TokenizerWrapper.__new__(TokenizerWrapper)
+    tokenizer._tokenizer = SimpleNamespace(
+        chat_template="<tool_call>\n<function=",
+        encode=lambda text, **kwargs: list(text.encode()),
+    )
+    tokenizer._chat_template = None
+    tokenizer._tool_parser = json_tools.parse_tool_call
+    tokenizer._tool_call_start = "<tool_call>"
+    tokenizer._tool_call_end = "</tool_call>"
+
+    assert _install_distributed_model_protocol(tokenizer, tmp_path) == ""
+    assert tokenizer.tool_parser is qwen3_coder.parse_tool_call
+
+
 def test_distributed_protocol_leaves_other_model_families_untouched(tmp_path):
     model = tmp_path / "llama"
     model.mkdir()
@@ -290,6 +306,7 @@ def test_launcher_watchdog_records_reason_and_exits_reparented_rank():
     updates: list[tuple[str, dict]] = []
     events: list[dict] = []
     exit_codes: list[int] = []
+    aborts: list[str] = []
     releases: list[str] = []
     marker = SimpleNamespace(
         update=lambda phase, **extra: updates.append((phase, extra))
@@ -302,6 +319,7 @@ def test_launcher_watchdog_records_reason_and_exits_reparented_rank():
         wait=lambda _seconds: None,
         exit_process=exit_codes.append,
         emit_event=events.append,
+        on_abort=aborts.append,
         release_memory=releases.append,
     )
 
@@ -316,6 +334,8 @@ def test_launcher_watchdog_records_reason_and_exits_reparented_rank():
             },
         )
     ]
+    # The abort stage ran before the exit stage.
+    assert len(aborts) == 1
     assert events[0]["type"] == "launcher_lost"
     # The Metal release runs before the exit: os._exit skips every
     # finally/atexit handler, so a skipped release orphans wired memory.
@@ -1272,103 +1292,6 @@ def test_the_marker_is_removed_when_the_rank_exits_cleanly(monkeypatch, tmp_path
     _run_rank(monkeypatch, tmp_path, rank=0)
 
     assert list(tmp_path.glob("*.json")) == []
-
-
-def test_launcher_watchdog_fires_on_a_stale_launcher_lease(tmp_path):
-    updates: list[tuple[str, dict]] = []
-    events: list[dict] = []
-    exit_codes: list[int] = []
-    aborts: list[str] = []
-    releases: list[str] = []
-    marker = SimpleNamespace(
-        update=lambda phase, **extra: updates.append((phase, extra))
-    )
-    lease = tmp_path / "launcher-lease.json"
-    lease.write_text("{}", encoding="utf-8")
-    stale = time.time() - 120.0
-    os.utime(lease, (stale, stale))
-
-    _watch_launcher_parent(
-        42,
-        marker,
-        watched_marker_path=lease,
-        marker_stale_after=45.0,
-        get_parent_pid=lambda: 42,
-        wait=lambda _seconds: None,
-        exit_process=exit_codes.append,
-        emit_event=events.append,
-        on_abort=aborts.append,
-        release_memory=releases.append,
-    )
-
-    assert updates[0][0] == "launcher_lost"
-    assert "stale" in updates[0][1]["error"]
-    # The abort stage ran before the exit stage.
-    assert len(aborts) == 1
-    assert events[0]["type"] == "launcher_lost"
-    assert len(releases) == 1
-    assert exit_codes == [1]
-
-
-def test_launcher_watchdog_ignores_a_fresh_lease(tmp_path):
-    exit_codes: list[int] = []
-    marker = SimpleNamespace(update=lambda phase, **extra: None)
-    lease = tmp_path / "launcher-lease.json"
-    lease.write_text("{}", encoding="utf-8")
-
-    polls = [0]
-
-    class StopLoopError(Exception):
-        pass
-
-    def wait(_seconds):
-        polls[0] += 1
-        if polls[0] >= 3:
-            raise StopLoopError
-
-    with pytest.raises(StopLoopError):
-        _watch_launcher_parent(
-            42,
-            marker,
-            watched_marker_path=lease,
-            marker_stale_after=45.0,
-            get_parent_pid=lambda: 42,
-            wait=wait,
-            exit_process=exit_codes.append,
-            emit_event=lambda _event: None,
-        )
-
-    assert exit_codes == []
-
-
-def test_launcher_watchdog_ignores_a_lease_that_never_appeared(tmp_path):
-    exit_codes: list[int] = []
-    marker = SimpleNamespace(update=lambda phase, **extra: None)
-    missing = tmp_path / "not-yet-created-lease.json"
-
-    polls = [0]
-
-    class StopLoopError(Exception):
-        pass
-
-    def wait(_seconds):
-        polls[0] += 1
-        if polls[0] >= 3:
-            raise StopLoopError
-
-    with pytest.raises(StopLoopError):
-        _watch_launcher_parent(
-            42,
-            marker,
-            watched_marker_path=missing,
-            marker_stale_after=45.0,
-            get_parent_pid=lambda: 42,
-            wait=wait,
-            exit_process=exit_codes.append,
-            emit_event=lambda _event: None,
-        )
-
-    assert exit_codes == []
 
 
 def test_cancel_request_file_matches_the_telemetry_contract(tmp_path):

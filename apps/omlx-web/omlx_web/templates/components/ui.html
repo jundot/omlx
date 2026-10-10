@@ -1,0 +1,16 @@
+{#- Shared dashboard macros. Import per template:
+      {% import "components/ui.html" as ui %} -#}
+
+{#- Segmented control. `items` is a list of (value, label) pairs, `active` the
+    Alpine expression holding the current value, and `setter` the expression
+    that selects a value ({value} is substituted). -#}
+{% macro segmented(items, active, setter, aria_label=None, attrs='') -%}
+<div class="segmented" role="group"{% if aria_label %} aria-label="{{ aria_label }}"{% endif %} {{ attrs | safe }}>
+    {%- for value, label in items %}
+    <button type="button" class="segmented__item"
+            :class="{{ active }} === '{{ value }}' ? 'segmented__item--active' : ''"
+            :aria-pressed="{{ active }} === '{{ value }}' ? 'true' : 'false'"
+            @click="{{ setter | replace('{value}', value) }}">{{ label }}</button>
+    {%- endfor %}
+</div>
+{%- endmacro %}

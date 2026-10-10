@@ -14,27 +14,25 @@ side into one Metal dispatch:
 
 Both kernels mirror the stock rounding sites so the fused path is
 bit-compatible with the unfused stock path (fp32 L2 sums, a single cast
-back to the activation dtype, bf16-domain conv/SiLU). The forget gate and
-the recurrent delta kernel are untouched; the driver calls the stock
-``gated_delta_update`` on the fused outputs.
+back to the activation dtype, bf16-domain conv/SiLU). The recurrence runs
+on the kernels in ``glm53_kda_recurrence`` (forget gate computed
+in-kernel; same math up to fp32 summation order), falling back to the stock
+``gated_delta_update`` when the gate is not the fp32 safe-gate form.
 
 Eligibility is fail-closed (see ``glm53_kda_prefill_eligible``); anything
-unexpected runs the stock path. Kill switch:
-``OMLX_GLM53_KDA_PREFILL_FUSED=0``.
+unexpected runs the stock path.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 
 import mlx.core as mx
 
+from .glm53_kda_recurrence import kda_recurrence
+
 logger = logging.getLogger(__name__)
 
-_GLM53_KDA_PREFILL_ENABLED = (
-    os.environ.get("OMLX_GLM53_KDA_PREFILL_FUSED", "1") != "0"
-)
 _GLM53_KDA_PREFILL_MIN_ROWS = 64
 
 _PREWORK_SOURCE = """
@@ -57,12 +55,12 @@ _PREWORK_SOURCE = """
             uint input_row = row + tap;
             const T xv = input_row < uint(NKEEP)
                 ? conv_state[input_row * uint(C) + channel]
-                : qkv[(input_row - uint(NKEEP)) * uint(C) + channel];
+                : qkv[(input_row - uint(NKEEP)) * uint(RS) + channel];
             acc += float(xv) * float(conv_w[channel * 4 + tap]);
         }
         const T conv = T(acc);
-        T sy = T(1) / (T(1) + metal::exp(metal::abs(conv)));
-        const T act = conv * ((conv < T(0)) ? sy : T(1) - sy);
+        const auto sy = 1 / (1 + metal::precise::exp(metal::abs(conv)));
+        const T act = conv * T((conv < T(0)) ? sy : 1 - sy);
         activated[i] = act;
         if (is_q || is_k) {
             const float f = float(act);
@@ -110,7 +108,7 @@ _PREWORK_SOURCE = """
     }
     if (row + uint(NKEEP) >= S_rt) {
         uint state_row = row + uint(NKEEP) - S_rt;
-        uint raw_base = row * uint(C) + channel_base + lane * 4;
+        uint raw_base = row * uint(RS) + channel_base + lane * 4;
         uint state_base = state_row * uint(C) + channel_base + lane * 4;
         for (uint i = 0; i < 4; ++i) {
             conv_out[state_base + i] = qkv[raw_base + i];
@@ -173,8 +171,10 @@ def _kernels():
 def kda_prework_fused(mixed, conv_state, conv_w, q_scale, length, heads, dim):
     """Fused conv+SiLU+L2 prework for one prefill chunk.
 
-    mixed [1,S,3*heads*dim] in the activation dtype, conv_state [1,3,C],
-    conv_w [C,1,4]. Returns (q, k, v, next_conv).
+    mixed [1,S,W] in the activation dtype whose first 3*heads*dim columns
+    are q|k|v (W may be wider, e.g. the whole fused input projection, which
+    is read in place), conv_state [1,3,C], conv_w [C,1,4]. Returns
+    (q, k, v, next_conv).
     """
     prework, _ = _kernels()
     c_dim = 3 * heads * dim
@@ -185,6 +185,7 @@ def kda_prework_fused(mixed, conv_state, conv_w, q_scale, length, heads, dim):
             ("H", heads),
             ("D", dim),
             ("C", c_dim),
+            ("RS", int(mixed.shape[-1])),
             ("NKEEP", 3),
         ],
         grid=(32, length, 3 * heads),
@@ -214,8 +215,7 @@ def kda_norm_gate_fused(y, gate, norm_w, eps, heads, dim):
 
 def glm53_kda_prefill_eligible(module, inputs, mask, cache) -> bool:
     if (
-        not _GLM53_KDA_PREFILL_ENABLED
-        or mask is not None
+        mask is not None
         or cache is None
         or not isinstance(inputs, mx.array)
         or inputs.ndim != 3
@@ -262,7 +262,13 @@ def glm53_kda_prefill(module, inputs, cache):
     global _GLM53_KDA_ENGAGED_LOGGED
     length = inputs.shape[1]
     heads, dim = module.num_heads, module.head_dim
-    if module.fuse_in:
+    fused = module._fused_in_proj(inputs, split=False) if module.fuse_in else None
+    if fused is not None:
+        # q|k|v are the fused projection's first columns: the prework reads
+        # them in place instead of a concatenated copy.
+        mixed, split_pts = fused
+        fa_o, ga_o, b_o = mx.split(mixed, split_pts, axis=-1)[3:]
+    elif module.fuse_in:
         q_o, k_o, v_o, fa_o, ga_o, b_o = module._fused_in_proj(inputs)
         mixed = mx.concatenate([q_o, k_o, v_o], axis=-1)
     else:
@@ -291,17 +297,38 @@ def glm53_kda_prefill(module, inputs, cache):
     fg = module.forget_gate
     a = lang.linear_forward(fg.f_b_proj, fa_o).reshape(1, length, heads, dim)
     state = cache[1]
-    out, state = lang.gated_delta_update(
-        q,
-        k,
-        v,
-        a,
-        b_o,
-        fg.A_log.reshape(heads, 1),
-        fg.dt_bias.reshape(heads, dim),
-        state=state,
-        lower_bound=fg.safe_gate_lower_bound,
-    )
+    if (
+        fg.safe_gate_lower_bound is not None
+        and fg.A_log.dtype == mx.float32
+        and fg.dt_bias.dtype == mx.float32
+    ):
+        # Same recurrence as gated_delta_update's kernel with the gate
+        # computed in-kernel; only the fp32 dot summation order differs.
+        if state is None:
+            state = mx.zeros((1, heads, dim, dim), dtype=mx.float32)
+        out, state = kda_recurrence(
+            q,
+            k,
+            v,
+            a,
+            mx.sigmoid(b_o),
+            fg.A_log,
+            fg.dt_bias,
+            fg.safe_gate_lower_bound,
+            state,
+        )
+    else:
+        out, state = lang.gated_delta_update(
+            q,
+            k,
+            v,
+            a,
+            b_o,
+            fg.A_log.reshape(heads, 1),
+            fg.dt_bias.reshape(heads, dim),
+            state=state,
+            lower_bound=fg.safe_gate_lower_bound,
+        )
     cache[1] = state
     cache.advance(length)
 

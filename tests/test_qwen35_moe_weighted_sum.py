@@ -30,8 +30,6 @@ def _fresh_moe_patch(monkeypatch):
     import omlx.patches.qwen35_moe_weighted_sum as patch
 
     monkeypatch.setattr(patch, "_PATCHED", False, raising=False)
-    monkeypatch.delenv("OMLX_QWEN35_MOE_WEIGHTED_SUM", raising=False)
-    monkeypatch.delenv("OMLX_QWEN35_MOE_WEIGHTED_SUM_MIN_TOKENS", raising=False)
 
     originals = []
     try:
@@ -160,8 +158,7 @@ def test_qwen3_moe_patch_matches_stock_and_skips_decode(monkeypatch, top_k):
     if not fast.has_symbol("qwen35_moe_weighted_sum"):
         pytest.skip("qwen35_moe_weighted_sum native kernel unavailable")
 
-    monkeypatch.setenv("OMLX_QWEN35_MOE_WEIGHTED_SUM", "1")
-    monkeypatch.setenv("OMLX_QWEN35_MOE_WEIGHTED_SUM_MIN_TOKENS", "16")
+    monkeypatch.setattr("omlx.patches.qwen35_moe_weighted_sum._MIN_TOKENS", 16)
 
     args = types.SimpleNamespace(
         hidden_size=128,

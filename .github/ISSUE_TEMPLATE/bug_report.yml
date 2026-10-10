@@ -1,0 +1,78 @@
+name: Bug report
+description: Something in oMLX isn't working as expected.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please search existing issues first. Questions go to [Q&A](https://github.com/jundot/omlx/discussions/categories/q-a) and feature requests go to [Ideas](https://github.com/jundot/omlx/discussions/categories/ideas).
+  - type: input
+    id: version
+    attributes:
+      label: oMLX version
+      description: Shown in the app's About window, or run `omlx --version`.
+      placeholder: e.g. 0.7.0
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Install method
+      options:
+        - macOS app (DMG)
+        - Homebrew
+        - pip / from source
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: e.g. 26.4.1
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Mac chip and RAM
+      placeholder: e.g. M3 Max, 128GB
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: Model name and quantization. Write N/A if the problem isn't model-specific.
+      placeholder: e.g. Qwen3.6-35B-A3B-oQ4
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: What went wrong, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The request or client you used, relevant settings, and the steps that trigger the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: |
+        Server logs are in `~/.omlx/logs/server.log`. The macOS app also writes `~/Library/Application Support/oMLX/logs/server.log`.
+        Write N/A if there's nothing relevant, for example when you found the bug by reading the code.
+      render: shell
+    validations:
+      required: true
+  - type: checkboxes
+    id: latest
+    attributes:
+      label: Latest release
+      options:
+        - label: I'm on the latest oMLX release, or I've checked that the problem still happens on it.
+          required: true

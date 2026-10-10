@@ -12,15 +12,20 @@ from __future__ import annotations
 
 import importlib
 import logging
-import os
 from collections.abc import Callable
 from typing import Any
 
 import mlx.core as mx
 
+from .m5_gather_qmm import fused_gate_up_activation
+from .m5_gather_qmm_a8 import try_routed_a8
+from .moe_routes import sort_routes
+
 logger = logging.getLogger(__name__)
 
 _PATCHED = False
+# Shorter prefill chunks keep the stock body.
+_MIN_TOKENS = 1024
 
 
 def _native_weighted_sum():
@@ -42,14 +47,12 @@ def _target_verify_arg(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
 def _should_route(self: Any, x: mx.array, target_verify: bool, min_tokens: int) -> bool:
     # Shape gates first: this runs on every MoE block call of every decode
     # step, so the common (decode) case must exit on the seq-len check
-    # before touching env vars or Metal state (issue #2132).
+    # before touching Metal state (issue #2132).
     if x.ndim != 3 or x.shape[-2] < min_tokens:
         return False
     if target_verify:
         return False
     if x.dtype not in (mx.float16, mx.bfloat16):
-        return False
-    if os.environ.get("OMLX_QWEN35_MOE_WEIGHTED_SUM", "1") == "0":
         return False
     if not mx.metal.is_available():
         return False
@@ -76,21 +79,49 @@ def _native_switch_weighted_sum(
     scores: mx.array,
     weighted_sum: Callable[..., mx.array],
 ) -> mx.array:
-    from mlx_lm.models.switch_layers import _gather_sort
-
-    x_sorted, idx, inv_order = _gather_sort(mx.expand_dims(x, (-2, -3)), inds)
+    # mlx-lm's _gather_sort; the replicated rows stay lazy and are never
+    # computed when the gate/up kernel reads the token rows in place.
+    x_tok, row_map, idx, inv_order = sort_routes(mx.expand_dims(x, (-2, -3)), inds)
+    if not switch_mlp.training:
+        # Routed A8 (opt-in per model, see m5_gather_qmm_a8): the Gate+Up on
+        # INT8 operands and the A16 Down; None keeps the A16 path below.
+        routed = try_routed_a8(
+            switch_mlp, (x_tok, row_map), idx, seq_len=int(x.shape[-2])
+        )
+        if routed is not None:
+            return weighted_sum(
+                mx.contiguous(routed),
+                mx.contiguous(inv_order.astype(mx.uint32)),
+                mx.contiguous(scores.astype(mx.float32)),
+            )
+    x_sorted = x_tok[row_map]
     if switch_mlp.training:
         idx = mx.stop_gradient(idx)
 
     gate_up = getattr(switch_mlp, "gate_up_proj", None)
+    x_act = None
     if gate_up is not None:
-        x_gate_up = gate_up(x_sorted, idx, sorted_indices=True)
-        x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+        if not switch_mlp.training:
+            # M5: the activation in the [gate; up] matmul's epilogue, rows
+            # read through the row map (bit-identical; None keeps the split
+            # + activation below).
+            x_act = fused_gate_up_activation(
+                gate_up,
+                x_sorted,
+                idx,
+                switch_mlp.activation,
+                token_rows=(x_tok, row_map),
+            )
+        if x_act is None:
+            x_gate_up = gate_up(x_sorted, idx, sorted_indices=True)
+            x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
     else:
         x_up = switch_mlp.up_proj(x_sorted, idx, sorted_indices=True)
         x_gate = switch_mlp.gate_proj(x_sorted, idx, sorted_indices=True)
+    if x_act is None:
+        x_act = switch_mlp.activation(x_up, x_gate)
     x_sorted = switch_mlp.down_proj(
-        switch_mlp.activation(x_up, x_gate),
+        x_act,
         idx,
         sorted_indices=True,
     )
@@ -171,15 +202,11 @@ def apply_qwen35_moe_weighted_sum_patch() -> bool:
     global _PATCHED
     if _PATCHED:
         return True
-    if os.environ.get("OMLX_QWEN35_MOE_WEIGHTED_SUM", "1") == "0":
-        return False
     if _native_weighted_sum() is None:
         logger.debug("Qwen MoE weighted-sum native kernel unavailable; patch skipped")
         return False
 
-    min_tokens = int(
-        os.environ.get("OMLX_QWEN35_MOE_WEIGHTED_SUM_MIN_TOKENS", "1024")
-    )
+    min_tokens = _MIN_TOKENS
     patched = False
     patched |= _patch_class(
         "mlx_vlm.models.qwen3_5_moe.language",

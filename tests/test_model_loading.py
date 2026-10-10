@@ -2,6 +2,7 @@
 """Tests for omlx.utils.model_loading.maybe_load_custom_quantization."""
 
 import json
+import logging
 import sys
 import types
 from unittest.mock import MagicMock
@@ -34,12 +35,10 @@ def _write_mtp_index(tmp_path, has_mtp: bool) -> None:
 
 
 class TestRemoteCodePreflight:
-    @pytest.mark.parametrize("supported", [False, True])
     @pytest.mark.parametrize("trusted", [False, True])
     def test_final_tokenizer_load_uses_the_configured_trust_setting(
-        self, monkeypatch, supported, trusted
+        self, monkeypatch, trusted
     ):
-        monkeypatch.setattr(model_loading, "_LM_LOAD_ACCEPTS_TRC", supported)
         monkeypatch.setattr(model_loading, "preflight_text_remote_code", MagicMock())
         loader = MagicMock(return_value=("MODEL", "TOKENIZER"))
         monkeypatch.setitem(sys.modules, "mlx_lm", types.SimpleNamespace(load=loader))
@@ -51,7 +50,7 @@ class TestRemoteCodePreflight:
         assert actual["tokenizer_config"] == {
             "trust_remote_code": trusted, "tool_parser_type": "k2_horizon"
         }
-        assert ("trust_remote_code" in actual) is supported
+        assert actual["trust_remote_code"] is trusted
         assert options["trust_remote_code"] is not trusted
 
     def test_custom_model_file_is_rejected_before_weight_loading(self, tmp_path):
@@ -273,15 +272,10 @@ class TestLlama4PreLoadDispatch:
 
 
 class TestLoadTextModel:
-    def test_forwards_trust_remote_code_when_mlx_lm_supports_it(
-        self, tmp_path, monkeypatch
-    ):
+    def test_forwards_trust_remote_code(self, tmp_path, monkeypatch):
         path = _write_config(tmp_path, '{"model_type": "llama"}')
         maybe_apply = MagicMock()
         monkeypatch.setattr(model_loading, "maybe_apply_pre_load_patches", maybe_apply)
-        # Pin the capability flag so the test is deterministic regardless of the
-        # installed mlx-lm version (lm_load_compat reads this global at call time).
-        monkeypatch.setattr(model_loading, "_LM_LOAD_ACCEPTS_TRC", True)
 
         load_mock = MagicMock(return_value=("MODEL", "TOKENIZER"))
         monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(load=load_mock))
@@ -299,31 +293,6 @@ class TestLoadTextModel:
             path,
             tokenizer_config={"trust_remote_code": True},
             trust_remote_code=True,
-        )
-
-    def test_omits_trust_remote_code_when_mlx_lm_lacks_it(self, tmp_path, monkeypatch):
-        # Some mlx-lm releases dropped ``trust_remote_code`` from ``load``.
-        # lm_load_compat must omit the kwarg there rather than raise TypeError.
-        path = _write_config(tmp_path, '{"model_type": "llama"}')
-        monkeypatch.setattr(
-            model_loading, "maybe_apply_pre_load_patches", MagicMock()
-        )
-        monkeypatch.setattr(model_loading, "_LM_LOAD_ACCEPTS_TRC", False)
-
-        load_mock = MagicMock(return_value=("MODEL", "TOKENIZER"))
-        monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(load=load_mock))
-
-        settings = types.SimpleNamespace(trust_remote_code=True)
-        result = model_loading.load_text_model(
-            path,
-            tokenizer_config={"trust_remote_code": True},
-            model_settings=settings,
-        )
-
-        assert result == ("MODEL", "TOKENIZER")
-        load_mock.assert_called_once_with(
-            path,
-            tokenizer_config={"trust_remote_code": True},
         )
 
 
@@ -696,6 +665,35 @@ class TestVlmMtpPreLoadDispatch:
         assert calls == []
 
 
+class TestSpeculativeBackendLog:
+    @staticmethod
+    def _load(tmp_path, monkeypatch, *, has_mtp: bool) -> None:
+        monkeypatch.setattr(model_loading, "_patch_mlx_lm_load_config", lambda: None)
+        stub = MagicMock(apply_mlx_lm_mtp_patch=MagicMock(return_value=True))
+        monkeypatch.setitem(sys.modules, "omlx.patches.mlx_lm_mtp", stub)
+        path = _write_config(
+            tmp_path, '{"model_type": "qwen3_5", "num_nextn_predict_layers": 1}'
+        )
+        _write_mtp_index(tmp_path, has_mtp=has_mtp)
+        maybe_apply_pre_load_patches(
+            path, model_settings=types.SimpleNamespace(mtp_enabled=True)
+        )
+
+    def test_missing_mtp_weights_logs_inactive(self, tmp_path, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            self._load(tmp_path, monkeypatch, has_mtp=False)
+
+        assert "Lightning MTP is inactive" in caplog.text
+        assert "Speculative backend selected" not in caplog.text
+
+    def test_mtp_weights_present_logs_active(self, tmp_path, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            self._load(tmp_path, monkeypatch, has_mtp=True)
+
+        assert "Speculative backend selected" in caplog.text
+        assert "inactive" not in caplog.text
+
+
 class TestCheckpointHasMtpWeights:
     """``_checkpoint_has_mtp_weights`` decides whether the mlx-vlm runtime
     patch attaches ``MTPModule`` at load time. The scan must:
@@ -944,6 +942,176 @@ class TestExpandPerLayerQuantKeys:
         model_loading.expand_per_layer_quant_keys(cfg)
 
         assert cfg["quantization"][f"inner.{gate}"] == spec
+
+    @pytest.mark.parametrize("config_key", ["quantization", "quantization_config"])
+    @pytest.mark.parametrize(
+        "prefix",
+        ["model.language_model.", "language_model.model.", "model."],
+    )
+    def test_kv_b_proj_spec_covers_split_mla_halves(self, config_key, prefix):
+        spec = {"bits": 8, "group_size": 64, "mode": "affine"}
+        cfg = {config_key: {"bits": 4, prefix + "layers.3.self_attn.kv_b_proj": spec}}
+
+        model_loading.expand_per_layer_quant_keys(cfg)
+
+        runtime = "language_model.model.layers.3.self_attn."
+        for half in ("embed_q", "unembed_out"):
+            assert cfg[config_key][runtime + half] == spec
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_explicit_split_spec_wins_over_kv_b_proj(self, reverse):
+        # Preserve config precedence; this does not requantize an incompatible
+        # raw kv_b_proj tensor to an independently requested split recipe.
+        base = "language_model.model.layers.3.self_attn."
+        entries = [
+            (base + "kv_b_proj", {"bits": 8, "group_size": 64}),
+            (base + "embed_q", {"bits": 5, "group_size": 64}),
+        ]
+        cfg = {"quantization": dict(reversed(entries) if reverse else entries)}
+
+        model_loading.expand_per_layer_quant_keys(cfg)
+
+        assert cfg["quantization"][base + "embed_q"]["bits"] == 5
+        assert cfg["quantization"][base + "unembed_out"]["bits"] == 8
+
+    @pytest.mark.parametrize("config_key", ["quantization", "quantization_config"])
+    @pytest.mark.parametrize(
+        "prefix",
+        ["model.language_model.", "language_model.model.", "model."],
+    )
+    def test_glm5_next_nextn_layer_spec_maps_to_mtp_paths(self, config_key, prefix):
+        eh = {"bits": 5, "group_size": 64, "mode": "affine"}
+        kvb = {"bits": 8, "group_size": 64, "mode": "affine"}
+        cfg = {
+            "model_type": "glm5_next",
+            "text_config": {
+                "model_type": "glm5_next_text",
+                "num_hidden_layers": 45,
+                "num_nextn_predict_layers": 2,
+            },
+            config_key: {"bits": 4, "group_size": 64},
+        }
+        for i in range(2):
+            pre = f"{prefix}layers.{45 + i}."
+            cfg[config_key].update(
+                {
+                    pre + "eh_proj": eh,
+                    pre + "self_attn.kv_b_proj": kvb,
+                    pre + "self_attn.f_a_proj": eh,
+                    pre + "hc_attn_fn": eh,
+                    pre + "shared_head.norm": eh,
+                    pre + "shared_head.head": kvb,
+                    pre + "embed_tokens": kvb,
+                }
+            )
+
+        model_loading.expand_per_layer_quant_keys(cfg)
+
+        q = cfg[config_key]
+        for i in range(2):
+            pre = f"language_model.mtp.{i}."
+            assert q[pre + "eh_proj"] == eh
+            assert q[pre + "norm"] == eh
+            assert q[pre + "block.self_attn.forget_gate.f_a_proj"] == eh
+            assert q[pre + "block.attn_hc.fn"] == eh
+            for tail in ("kv_b_proj", "embed_q", "unembed_out"):
+                assert q[pre + "block.self_attn." + tail] == kvb
+            assert not any(k.startswith(pre + "block.shared_head") for k in q)
+            assert not any(k.startswith(pre + "block.embed_tokens") for k in q)
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_nextn_explicit_split_spec_wins_and_recipes_are_stable(self, reverse):
+        import copy
+
+        pre = "model.language_model.layers.45."
+        entries = [
+            (pre + "self_attn.kv_b_proj", {"bits": 8, "group_size": 64}),
+            (pre + "self_attn.embed_q", {"bits": 5, "group_size": 64}),
+            ("language_model.mtp.0.eh_proj", {"bits": 6, "group_size": 64}),
+            (pre + "eh_proj", {"bits": 5, "group_size": 64}),
+        ]
+        cfg = {
+            "model_type": "glm5_next",
+            "num_hidden_layers": 45,
+            "num_nextn_predict_layers": 1,
+            "quantization": dict(reversed(entries) if reverse else entries),
+        }
+        model_loading.expand_per_layer_quant_keys(cfg)
+        q = cfg["quantization"]
+        assert q["language_model.mtp.0.block.self_attn.embed_q"]["bits"] == 5
+        assert q["language_model.mtp.0.block.self_attn.unembed_out"]["bits"] == 8
+        assert q["language_model.mtp.0.eh_proj"]["bits"] == 6
+        before = copy.deepcopy(cfg)
+        model_loading.expand_per_layer_quant_keys(cfg)
+        assert all(
+            cfg["quantization"][key] == val
+            for key, val in before["quantization"].items()
+        )
+
+    @pytest.mark.parametrize("model_type", ["deepseek_v3", "other_glm5_next_model"])
+    def test_nextn_mapping_skips_other_model_types(self, model_type):
+        cfg = {
+            "model_type": model_type,
+            "num_hidden_layers": 45,
+            "num_nextn_predict_layers": 1,
+            "quantization": {
+                "model.language_model.layers.45.eh_proj": {"bits": 5, "group_size": 64}
+            },
+        }
+        model_loading.expand_per_layer_quant_keys(cfg)
+        assert not any(".mtp." in k for k in cfg["quantization"])
+
+    @pytest.mark.parametrize("config_key", ["quantization", "quantization_config"])
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_nextn_explicit_false_alias_disables_quantization(
+        self, config_key, reverse
+    ):
+        import mlx.nn as nn
+        from mlx_vlm.utils import _quantization_for_module_path
+
+        entries = [
+            ("model.language_model.layers.45.eh_proj", {"bits": 8, "group_size": 64}),
+            ("mtp.0.eh_proj", False),
+        ]
+        cfg = {
+            "model_type": "glm5_next",
+            "num_hidden_layers": 45,
+            "num_nextn_predict_layers": 1,
+            config_key: dict(reversed(entries) if reverse else entries),
+        }
+        model_loading.expand_per_layer_quant_keys(cfg)
+        q = cfg[config_key]
+        assert _quantization_for_module_path(q, "language_model.mtp.0.eh_proj") == {}
+        model = nn.Module()
+        model.language_model = nn.Module()
+        model.language_model.mtp = [nn.Module()]
+        model.language_model.mtp[0].eh_proj = nn.Linear(128, 128, bias=False)
+        nn.quantize(
+            model,
+            group_size=64,
+            bits=4,
+            class_predicate=lambda path, module: (
+                _quantization_for_module_path(q, path)
+                if hasattr(module, "to_quantized")
+                else False
+            ),
+        )
+        assert isinstance(model.language_model.mtp[0].eh_proj, nn.Linear)
+        assert not isinstance(model.language_model.mtp[0].eh_proj, nn.QuantizedLinear)
+
+    @pytest.mark.parametrize("config_key", ["quantization", "quantization_config"])
+    def test_nextn_false_source_recipe_follows_runtime_paths(self, config_key):
+        cfg = {
+            "model_type": "glm5_next",
+            "num_hidden_layers": 45,
+            "num_nextn_predict_layers": 1,
+            config_key: {"model.language_model.layers.45.self_attn.kv_b_proj": False},
+        }
+        model_loading.expand_per_layer_quant_keys(cfg)
+        for half in ("kv_b_proj", "embed_q", "unembed_out"):
+            assert (
+                cfg[config_key]["language_model.mtp.0.block.self_attn." + half] is False
+            )
 
 
 class TestMaterializeLazyState:

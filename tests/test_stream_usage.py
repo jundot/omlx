@@ -13,6 +13,7 @@ from omlx.api.openai_models import (
     StreamOptions,
     Usage,
 )
+from omlx.server import _usage_timing_fields
 
 
 class TestStreamOptions:
@@ -139,33 +140,26 @@ class TestUsageChunkFormat:
         assert data["usage"]["generation_tokens_per_second"] == 36.23
         assert "model_load_duration" not in data["usage"]
 
-    def test_non_streaming_usage_only_total_time(self):
-        """Non-streaming responses know elapsed but not TTFT/decode split.
-
-        Usage should serialize total_time and drop fields that would require
-        per-token instrumentation (TTFT, prompt_eval_duration, generation_duration,
-        prompt_tokens_per_second, generation_tokens_per_second).
-        """
-        usage = Usage(
-            prompt_tokens=18,
-            completion_tokens=6,
-            total_tokens=24,
-            prompt_tokens_details=PromptTokensDetails(cached_tokens=0),
-            total_time=0.43,
+    def test_usage_timing_fields_count_only_uncached_prompt_tokens(self):
+        fields = _usage_timing_fields(
+            165514,
+            100,
+            ttft=0.5,
+            prefill_duration=0.5,
+            generation_duration=2.0,
+            cached_tokens=164623,
         )
-        dumped = json.loads(usage.model_dump_json(exclude_none=True))
-        assert dumped["total_time"] == 0.43
-        assert dumped["prompt_tokens"] == 18
-        assert dumped["completion_tokens"] == 6
-        for absent in (
-            "time_to_first_token",
-            "prompt_eval_duration",
-            "generation_duration",
-            "prompt_tokens_per_second",
-            "generation_tokens_per_second",
-            "model_load_duration",
-        ):
-            assert absent not in dumped, f"{absent} should be excluded when None"
+        assert fields["time_to_first_token"] == 0.5
+        assert fields["prompt_tokens_per_second"] == 1782.0
+        assert fields["generation_tokens_per_second"] == 50.0
+
+    def test_usage_timing_fields_without_first_token(self):
+        fields = _usage_timing_fields(
+            50, 20, ttft=None, prefill_duration=0.0, generation_duration=2.0
+        )
+        assert fields["time_to_first_token"] is None
+        assert fields["prompt_tokens_per_second"] is None
+        assert fields["generation_tokens_per_second"] == 10.0
 
     def test_non_streaming_usage_with_model_load(self):
         """model_load_duration appears only when > 1.0s (matches streaming gate)."""

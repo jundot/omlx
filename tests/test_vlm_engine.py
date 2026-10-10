@@ -13,11 +13,15 @@ Tests cover:
 import base64
 import io
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import numpy as np
 import pytest
 
+from omlx.exceptions import InvalidRequestError
+from omlx.patches.gemma4_audio import apply_gemma4_audio_patch
 from omlx.patches.mlx_vlm_glm5_next_compat import (
     apply_mlx_vlm_glm5_next_compat_patch,
 )
@@ -1558,6 +1562,32 @@ class TestPrepareVisionInputs:
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     @patch("mlx_vlm.utils.prepare_inputs")
     @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_text_only_template_reports_missing_image_tokens(
+        self, mock_vlm_act, mock_prepare
+    ):
+        from PIL import Image
+
+        engine = self._setup_engine_for_vision()
+        engine._processor.image_token = "<|image_pad|>"
+        mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+        messages = [{"role": "user", "content": "Describe"}]
+        images = [Image.new("RGB", (4, 4), "red")]
+
+        with pytest.raises(InvalidRequestError, match="text-only chat template"):
+            engine._prepare_vision_inputs(messages, images)
+        mock_prepare.assert_not_called()
+
+        engine._processor.apply_chat_template.return_value = "<|image_pad|>Describe"
+        engine._prepare_vision_inputs(messages, images)
+        mock_prepare.assert_called_once()
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
     def test_bytesio_audio_survives_missing_resample_export(
         self, mock_vlm_act, mock_prepare, monkeypatch
     ):
@@ -1705,6 +1735,32 @@ class TestPrepareVisionInputs:
         call_kwargs = mock_prepare.call_args[1]
         assert call_kwargs.get("audio") is None
 
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    def test_gemma4_renders_formatted_turns_with_tokenizer(self, mock_prepare):
+        """Gemma4Processor would move the audio marker to the last user turn."""
+        engine = self._setup_engine_for_vision(model_type="gemma4")
+        engine._processor.tokenizer = MagicMock()
+        engine._processor.tokenizer.apply_chat_template.return_value = "<prompt>"
+        mock_prepare.return_value = {"input_ids": mx.array([[1, 2, 3]])}
+        audio_part = {"type": "input_audio", "input_audio": {"data": "x"}}
+        messages = [
+            {"role": "system", "content": "Be brief."},
+            {"role": "user", "content": [audio_part, {"type": "text", "text": "Hi"}]},
+            {"role": "assistant", "content": "Hello."},
+            {"role": "user", "content": "Again"},
+        ]
+
+        engine._prepare_vision_inputs(
+            messages, [], audio=[(np.zeros(16000, np.float32), 16000)]
+        )
+
+        engine._processor.apply_chat_template.assert_not_called()
+        rendered = engine._processor.tokenizer.apply_chat_template.call_args[0][0]
+        assert rendered[0]["content"] == "Be brief."
+        assert {"type": "audio"} in rendered[1]["content"]
+        assert rendered[3]["content"] == "Again"
+
     # --- per-image vision feature cache -------------------------------
 
     def _vision_cache_engine(self, images, entries_by_index):
@@ -1799,6 +1855,49 @@ class TestPrepareVisionInputs:
             call.args and call.args[0] == compute_image_hash(images)
             for call in cache.get.call_args_list
         )
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestGemma4AudioPatch:
+    def test_multi_clip_rows_line_up_with_placeholders(self):
+        from mlx_vlm.models.gemma4.audio import AudioEncoder
+        from mlx_vlm.models.gemma4.audio_feature_extractor import (
+            Gemma4AudioFeatureExtractor,
+        )
+        from mlx_vlm.models.gemma4.config import AudioConfig
+        from mlx_vlm.models.gemma4.processing_gemma4 import Gemma4Processor
+
+        apply_gemma4_audio_patch()
+        mx.random.seed(0)
+        encoder = AudioEncoder(
+            AudioConfig(
+                hidden_size=32,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                subsampling_conv_channels=(8, 4),
+                output_proj_dims=16,
+            )
+        )
+        extractor = Gemma4AudioFeatureExtractor()
+        processor = SimpleNamespace(feature_extractor=extractor, audio_seq_length=750)
+        rng = np.random.default_rng(0)
+        # Both lengths get one placeholder too many from ceil(ms / 40).
+        clips = [rng.standard_normal(n).astype(np.float32) for n in (48001, 76194)]
+
+        def encode(batch):
+            out = extractor(batch, sampling_rate=16000, return_attention_mask=True)
+            features = mx.array(np.stack(out["input_features"]))
+            valid = mx.array(np.stack(out["input_features_mask"]))
+            return encoder(features, ~valid)[0][0]
+
+        rows = encode(clips)
+        counts = [
+            Gemma4Processor._compute_audio_num_tokens(processor, clip, 16000)
+            for clip in clips
+        ]
+        assert Gemma4Processor.supports_multiple_audio
+        assert rows.shape[0] == sum(counts)
+        assert mx.allclose(rows[counts[0] :], encode(clips[1:]), atol=1e-5).item()
 
 
 class TestFormatMessagesForVLMTemplate:
@@ -2517,6 +2616,34 @@ class TestPartialModeVLM:
 
         call_kwargs = engine._processor.apply_chat_template.call_args[1]
         assert call_kwargs["add_generation_prompt"] is True
+        assert "continue_final_message" not in call_kwargs
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    async def test_tokenize_chat_returns_generation_path_ids(self, mock_prepare):
+        """tokenize_chat returns the ids the generation render produces."""
+        engine = self._vision_engine()
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[7, 8, 9]]),
+            "pixel_values": None,
+        }
+        executor = ThreadPoolExecutor(max_workers=1)
+        engine._engine = SimpleNamespace(_mlx_executor=executor)
+        try:
+            token_ids = await engine.tokenize_chat(
+                self._plain_messages(), add_generation_prompt=False
+            )
+            with pytest.raises(InvalidRequestError, match="add_special_tokens"):
+                await engine.tokenize_chat(
+                    self._plain_messages(), add_special_tokens=True
+                )
+        finally:
+            executor.shutdown(wait=False)
+
+        assert token_ids == [7, 8, 9]
+        call_kwargs = engine._processor.apply_chat_template.call_args[1]
+        assert call_kwargs["add_generation_prompt"] is False
         assert "continue_final_message" not in call_kwargs
 
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
@@ -3270,3 +3397,211 @@ def test_deepseek_v4_packed_vision_features_round_trip():
     assert mx.array_equal(restored[1], second)
     with pytest.raises(ValueError, match="image grids"):
         engine._split_vision_features(packed[:4], 2, metadata)
+
+
+# ---------------------------------------------------------------------------
+# Native video (Qwen3.5 / Qwen3.6 / Qwen3.8)
+# ---------------------------------------------------------------------------
+
+_VIDEO_URI = "data:video/mp4;base64,AAAA"
+
+
+def _video_part(url: str = _VIDEO_URI) -> dict:
+    return {"type": "video_url", "video_url": {"url": url}}
+
+
+class _DictVisionCache:
+    def __init__(self):
+        self.entries = {}
+
+    def get(self, key, model_name):
+        return self.entries.get((key, model_name))
+
+    def put(self, key, model_name, features, grid=None):
+        self.entries[(key, model_name)] = features
+
+
+class TestNativeVideo:
+    def _engine(self, native=True):
+        engine = _make_loaded_engine(model_type="qwen3_5")
+        engine._native_video = native
+        return engine
+
+    def test_video_is_rejected_without_native_support(self):
+        from omlx.exceptions import InvalidRequestError
+
+        engine = self._engine(native=False)
+        messages = [{"role": "user", "content": [_video_part()]}]
+
+        with pytest.raises(InvalidRequestError, match="Video input is not supported"):
+            engine._extract_request_media(messages)
+
+    def test_native_video_is_extracted_as_uri(self):
+        engine = self._engine()
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "Describe"}, _video_part()],
+            }
+        ]
+
+        media, text, images, audio, videos = engine._extract_request_media(messages)
+
+        assert media is messages
+        assert text == [{"role": "user", "content": "Describe"}]
+        assert (images, audio, videos) == ([], [], [_VIDEO_URI])
+
+    def test_video_mixed_with_image_is_rejected(self):
+        from omlx.exceptions import InvalidRequestError
+
+        engine = self._engine()
+        messages = [{"role": "user", "content": [_image_part(32, 32), _video_part()]}]
+
+        with pytest.raises(InvalidRequestError, match="cannot be combined"):
+            engine._extract_request_media(messages)
+
+    def test_format_places_video_where_the_user_put_it(self):
+        engine = self._engine()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Before"},
+                    _video_part(),
+                    {"type": "text", "text": "After"},
+                ],
+            },
+            {"role": "assistant", "content": "A crowd."},
+            {"role": "user", "content": "What changes?"},
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=0, num_videos=1
+        )
+
+        assert formatted[0] == {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Before"},
+                {"type": "video"},
+                {"type": "text", "text": "After"},
+            ],
+        }
+        assert all("video" not in str(msg["content"]) for msg in formatted[1:])
+        assert image_ranges == []
+
+    def test_video_cache_identity_covers_content_and_sampling(self):
+        engine = self._engine()
+        video = SimpleNamespace(
+            fps=2.0, min_frames=4, max_frames=64, min_pixels=4096, max_pixels=25165824
+        )
+        engine._processor = SimpleNamespace(video_processor=video)
+
+        identity = engine._video_cache_identity(["a" * 64])
+
+        assert identity == engine._video_cache_identity(["a" * 64])
+        assert identity != engine._video_cache_identity(["b" * 64])
+        video.fps = 1.0
+        assert identity != engine._video_cache_identity(["a" * 64])
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_video_cache_ranges_start_at_each_clip(self):
+        engine = self._engine()
+        engine._vlm_model.config.video_token_id = 7
+        engine._processor = SimpleNamespace(video_processor=None)
+        # text, clip A (two temporal patches), text, clip B (one patch)
+        token_ids = [1, 2, 9, 7, 7, 8, 3, 9, 7, 7, 8, 4, 5, 9, 7, 8, 6]
+        grids = mx.array([[2, 2, 2], [1, 2, 2]])
+
+        ranges = engine._video_cache_key_ranges(token_ids, grids, ["a", "b"])
+
+        assert ranges == [
+            (3, engine._video_cache_identity(["a"])),
+            (14, engine._video_cache_identity(["a", "b"])),
+        ]
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_video_cache_ranges_fall_back_when_tokens_disagree(self):
+        engine = self._engine()
+        engine._vlm_model.config.video_token_id = 7
+        engine._processor = SimpleNamespace(video_processor=None)
+        # The grid declares two temporal patches; the prompt has one run.
+        token_ids = [1, 9, 7, 7, 8, 2]
+        grids = mx.array([[2, 2, 2]])
+
+        assert engine._video_cache_key_ranges(token_ids, grids, ["a"]) == []
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_video_features_are_encoded_once_per_clip(self):
+        engine = self._engine()
+        engine._vlm_model.config.video_token_id = 7
+        engine._vision_cache = _DictVisionCache()
+        engine._vision_cache_enabled = True
+        features = mx.ones((3, 4))
+        engine._compute_vision_features = MagicMock(return_value=features)
+        input_ids = mx.array([[1, 7, 7, 7, 2]])
+        extra = {"pixel_values_videos": mx.zeros((12, 8)), "video_grid_thw": "grid"}
+
+        first = engine._cached_video_features("clip", input_ids, extra)
+        second = engine._cached_video_features("clip", input_ids, extra)
+
+        assert first is features and second is features
+        engine._compute_vision_features.assert_called_once_with(
+            extra["pixel_values_videos"], {"image_grid_thw": "grid"}
+        )
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_video_features_with_wrong_token_count_are_not_used(self):
+        engine = self._engine()
+        engine._vlm_model.config.video_token_id = 7
+        engine._vision_cache = _DictVisionCache()
+        engine._vision_cache_enabled = True
+        engine._compute_vision_features = MagicMock(return_value=mx.ones((2, 4)))
+        input_ids = mx.array([[1, 7, 7, 7, 2]])
+        extra = {"pixel_values_videos": mx.zeros((12, 8)), "video_grid_thw": "grid"}
+
+        assert engine._cached_video_features("clip", input_ids, extra) is None
+        assert engine._vision_cache.entries == {}
+
+    def test_temporary_video_files_are_removed_when_preprocessing_fails(self):
+        engine = self._engine()
+        engine._processor = SimpleNamespace(video_processor=object())
+        written = []
+
+        def fake_prepare(*args, **kwargs):
+            written.extend(kwargs["videos"])
+            raise RuntimeError("vision tower failed")
+
+        engine._prepare_vision_inputs = MagicMock(side_effect=fake_prepare)
+        messages = [{"role": "user", "content": [_video_part()]}]
+
+        with (
+            patch("omlx.engine.vlm.probe_video"),
+            patch("omlx.engine.vlm.native_video_token_count"),
+            pytest.raises(RuntimeError, match="vision tower failed"),
+        ):
+            engine._process_chat_messages(messages, tools=None, kwargs={})
+
+        assert len(written) == 1
+        assert not Path(written[0]).exists()
+
+    @pytest.mark.asyncio
+    async def test_preflight_counts_video_tokens(self):
+        engine = self._engine()
+        engine._apply_chat_template = MagicMock(return_value="prompt")
+        engine._tokenizer = SimpleNamespace(encode=lambda text: [1, 2])
+        engine._processor = SimpleNamespace(
+            image_processor=_QWEN_IP, video_processor=object()
+        )
+        engine._engine = SimpleNamespace(engine=SimpleNamespace(scheduler=object()))
+        engine._preflight_or_raise_with_eviction = AsyncMock()
+        messages = [{"role": "user", "content": [_video_part(), _video_part()]}]
+
+        with patch(
+            "omlx.engine.vlm.estimate_native_video_tokens", return_value=500
+        ) as estimate:
+            await engine.preflight_chat(messages)
+
+        assert estimate.call_count == 2
+        kwargs = engine._preflight_or_raise_with_eviction.call_args.kwargs
+        assert kwargs["num_prompt_tokens"] == 1002

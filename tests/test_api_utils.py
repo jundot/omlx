@@ -53,6 +53,7 @@ from omlx.api.utils import (
     extract_harmony_messages,
     extract_multimodal_content,
     extract_text_content,
+    find_lone_surrogate,
     merge_reasoning_effort_chat_template_kwargs,
     prepare_system_messages_for_template,
     uses_native_reasoning_content,
@@ -3136,10 +3137,12 @@ class TestExtractMultimodalContent:
         assert parts[0]["input_audio"]["format"] == "wav"
 
     @pytest.mark.parametrize("part_type", ["video_url", "input_video"])
-    def test_video_input_is_preserved(self, part_type):
-        parts = _extract_multimodal_content_list(
-            [{"type": part_type, part_type: {"url": "data:video/mp4;base64,AA=="}}]
-        )
+    @pytest.mark.parametrize(
+        "value", [{"url": "data:video/mp4;base64,AA=="}, "data:video/mp4;base64,AA=="]
+    )
+    def test_video_input_is_preserved(self, part_type, value):
+        message = Message(role="user", content=[{"type": part_type, part_type: value}])
+        parts = _extract_multimodal_content_list(message.content)
 
         assert parts == [
             {
@@ -3671,3 +3674,13 @@ class TestCacheReasoningOutput:
             )
             is False
         )
+
+
+class TestFindLoneSurrogate:
+    def test_reports_lone_surrogate_path_and_accepts_paired(self):
+        part = {"type": "text", "text": "hi \U0001f600"}
+        body = {"messages": [{"content": [part]}]}
+        assert find_lone_surrogate(body) is None
+
+        part["text"] = "hi \ud83d"
+        assert find_lone_surrogate(body) == "messages[0].content[0].text"

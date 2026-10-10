@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Any
 
@@ -35,19 +34,6 @@ _REMOTE_CODE_METADATA_PATTERNS = [
     "*.jsonl",
     "*.jinja",
 ]
-
-# mlx_lm.load dropped trust_remote_code in some releases. Check once at
-# import time so call sites can pass it safely across versions.
-def _mlx_lm_load_accepts_trust_remote_code() -> bool:
-    try:
-        import inspect
-        from mlx_lm import load as _lm_load
-        return "trust_remote_code" in inspect.signature(_lm_load).parameters
-    except Exception:
-        return False
-
-_LM_LOAD_ACCEPTS_TRC = _mlx_lm_load_accepts_trust_remote_code()
-
 
 def ensure_model_code_trusted(
     config: dict[str, Any],
@@ -131,9 +117,64 @@ def lm_load_compat(path_or_repo: str, *, trust_remote_code: bool = False, **kwar
         trust_remote_code=trust_remote_code,
     )
     from mlx_lm import load
-    if _LM_LOAD_ACCEPTS_TRC:
-        kwargs["trust_remote_code"] = trust_remote_code
-    return load(path_or_repo, **kwargs)
+    return load(path_or_repo, trust_remote_code=trust_remote_code, **kwargs)
+
+
+def _add_glm5_next_nextn_quant_keys(cfg: dict, quant: dict) -> None:
+    """Mirror the GLM nextn sanitizer's trailing-layer to MTP path mapping."""
+    text = cfg.get("text_config")
+    if not isinstance(text, dict):
+        text = cfg
+    if not any(
+        config.get("model_type") in ("glm5_next", "glm5_next_text")
+        for config in (cfg, text)
+    ):
+        return
+    n_layers = text.get("num_hidden_layers")
+    n_nextn = text.get("num_nextn_predict_layers", 0)
+    if not isinstance(n_layers, int) or not isinstance(n_nextn, int):
+        return
+    extras: dict[str, dict | bool] = {}
+    for key, val in quant.items():
+        if not isinstance(val, dict) and val is not False:
+            continue
+        for i in range(n_nextn):
+            # These are the source prefixes accepted by glm5_next_vlm_runtime.
+            for root in (_CKPT_TEXT_PREFIX, _RUNTIME_TEXT_PREFIX, "model."):
+                prefix = f"{root}layers.{n_layers + i}."
+                if not key.startswith(prefix):
+                    continue
+                tail = key[len(prefix) :]
+                if tail in ("shared_head.head", "embed_tokens") or tail.startswith(
+                    ("shared_head.head.", "embed_tokens.")
+                ):
+                    continue
+                if tail == "shared_head.norm":
+                    mapped = "norm"
+                elif tail in ("eh_proj", "enorm", "hnorm"):
+                    mapped = tail
+                else:
+                    mapped = f"block.{tail}"
+                target = f"{_VLM_TEXT_PREFIX}mtp.{i}.{mapped}"
+                if target not in quant and target not in extras:
+                    extras[target] = val
+    quant.update(extras)
+
+
+def _add_mla_split_quant_keys(quant: dict) -> None:
+    """Inherit kv_b_proj's recipe after explicit split-path aliases exist."""
+    extras: dict[str, dict | bool] = {}
+    for key, val in quant.items():
+        if (not isinstance(val, dict) and val is not False) or not key.endswith(
+            ".self_attn.kv_b_proj"
+        ):
+            continue
+        stem = key[: -len("kv_b_proj")]
+        for half in ("embed_q", "unembed_out"):
+            target = stem + half
+            if target not in quant and target not in extras:
+                extras[target] = val
+    quant.update(extras)
 
 
 def expand_per_layer_quant_keys(cfg: dict) -> dict:
@@ -158,9 +199,9 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
         quant = cfg.get(config_key)
         if not isinstance(quant, dict):
             continue
-        extras: dict[str, dict] = {}
+        extras: dict[str, dict | bool] = {}
         for key, val in quant.items():
-            if not isinstance(val, dict):
+            if not isinstance(val, dict) and val is not False:
                 continue
             if key.startswith(_CKPT_TEXT_PREFIX):
                 # model.language_model.X -> language_model.model.X
@@ -201,6 +242,10 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
                     extras[proj_variant] = val
         if extras:
             quant.update(extras)
+        _add_glm5_next_nextn_quant_keys(cfg, quant)
+        # sanitize splits MLA kv_b_proj using its own recipe. Inherit it only
+        # after explicit split and nextn overrides have their runtime aliases.
+        _add_mla_split_quant_keys(quant)
         if str(cfg.get("model_type", "")).startswith("minimax_m3"):
             # The mlx-lm adapter stores the vendored mlx-vlm tree under
             # ``Model.inner`` and sanitize() re-roots checkpoint weights to
@@ -512,10 +557,7 @@ def maybe_apply_pre_load_patches(
             model_type=_config_model_type(model_name),
         )
 
-    if (
-        getattr(model_settings, "moe_expert_offload_enabled", False)
-        and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
-    ):
+    if getattr(model_settings, "moe_expert_offload_enabled", False):
         from ..patches.moe_offload_compat import moe_offload_compatibility
 
         supported, reason = moe_offload_compatibility(model_name)
@@ -894,13 +936,25 @@ def maybe_apply_pre_load_patches(
                 backend = (
                     "embedded DSpark" if _has_dspark_heads(config) else "Lightning MTP"
                 )
-                logger.info(
-                    "Speculative backend selected for %s: %s "
-                    "(model_type=%s, active)",
-                    model_name,
-                    backend,
-                    model_type,
-                )
+                # DSpark is declared in config only, so only Lightning MTP is probed.
+                if backend == "Lightning MTP" and not _checkpoint_has_mtp_weights(
+                    model_name
+                ):
+                    logger.warning(
+                        "Lightning MTP is inactive for %s (model_type=%s): the "
+                        "config declares MTP heads but the checkpoint has no MTP "
+                        "weights",
+                        model_name,
+                        model_type,
+                    )
+                else:
+                    logger.info(
+                        "Speculative backend selected for %s: %s "
+                        "(model_type=%s, active)",
+                        model_name,
+                        backend,
+                        model_type,
+                    )
             else:
                 logger.debug(
                     "Native MTP patch applied for %s for sanitize correctness "
@@ -1026,6 +1080,18 @@ def maybe_apply_pre_load_patches(
                     "(no MTP heads; switch_mlp load correctness)",
                     model_name,
                 )
+
+    # mlx-vlm Qwen3.5-family GDN layers normalize q/k like the mlx-lm path.
+    if for_vlm and (
+        str(model_type or "").startswith("qwen3_5")
+        or str(text_model_type or "").startswith("qwen3_5")
+    ):
+        try:
+            from ..patches.qwen35_gdn_prework import apply_qwen35_vlm_qk_norm_patch
+        except Exception as e:
+            logger.warning("Qwen3.5 VLM q/k norm patch import failed: %s", e)
+        else:
+            apply_qwen35_vlm_qk_norm_patch()
 
     # qwen3_5_moe covers Qwen3.6 too (HF config sets model_type=qwen3_5_moe).
     # The nested-visual sanitize wrap remaps language_model.model.visual.*
@@ -1283,6 +1349,20 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
     )
 
 
+def mimo_mtp_sidecar_config(model_name: str | Path) -> dict[str, str] | None:
+    """Model-config override that loads ``<model>/mtp/model_mtp.safetensors``.
+
+    MiMo V2 MLX conversions usually drop the next-token-prediction layers;
+    the upstream ``model_mtp.safetensors`` placed under ``mtp/`` restores
+    Lightning MTP decoding (``mimo_v2`` sanitize splits and dequantizes it).
+    """
+    mtp_sidecar = Path(model_name).expanduser() / "mtp" / "model_mtp.safetensors"
+    if not mtp_sidecar.is_file():
+        return None
+    logger.info("Loading MiMo MTP sidecar from %s", mtp_sidecar)
+    return {"omlx_mtp_sidecar": str(mtp_sidecar)}
+
+
 def load_text_model(
     model_name: str,
     tokenizer_config: dict[str, Any] | None = None,
@@ -1296,10 +1376,9 @@ def load_text_model(
         else False
     )
     load_kwargs = {}
-    mtp_sidecar = Path(model_name).expanduser() / "mtp" / "model_mtp.safetensors"
-    if mtp_sidecar.is_file():
-        load_kwargs["model_config"] = {"omlx_mtp_sidecar": str(mtp_sidecar)}
-        logger.info("Loading MiMo MTP sidecar from %s", mtp_sidecar)
+    sidecar_config = mimo_mtp_sidecar_config(model_name)
+    if sidecar_config is not None:
+        load_kwargs["model_config"] = sidecar_config
     return lm_load_compat(
         model_name,
         tokenizer_config=tokenizer_config,

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
+import sys
+
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
@@ -21,6 +24,19 @@ def _require_qmm_kernels(bits):
         if not fast.has_symbol(name):
             pytest.skip(f"{name} native kernel unavailable")
     return fast
+
+
+def _fresh_qwen35_module(monkeypatch):
+    """Execute a private copy of mlx-lm's qwen3_5 with the stock class bodies."""
+    import mlx_lm.models.qwen3_5 as qwen35
+
+    qualname = "mlx_lm.models._omlx_test_qwen35_stock"
+    spec = importlib.util.spec_from_file_location(qualname, qwen35.__file__)
+    module = importlib.util.module_from_spec(spec)
+    module.__package__ = "mlx_lm.models"
+    monkeypatch.setitem(sys.modules, qualname, module)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _quantized_bf16(linear, bits=4):
@@ -70,8 +86,7 @@ def test_qwen35_q4_mlp_patch_routes_prefill_and_skips_decode(monkeypatch):
 
     from omlx.patches.qwen35_q4_mlp import apply_qwen35_q4_mlp_patch
 
-    monkeypatch.setenv("OMLX_QWEN35_Q4_MLP", "1")
-    monkeypatch.setenv("OMLX_QWEN35_Q4_MLP_MIN_TOKENS", "16")
+    monkeypatch.setattr("omlx.patches.qwen35_q4_mlp._MIN_TOKENS", 16)
 
     mlp = qwen35.MLP(256, 512)
     for name in ("gate_proj", "up_proj", "down_proj"):
@@ -107,8 +122,7 @@ def test_qwen35_mixed_bit_mlp_patch_routes_5_bit_down_proj(monkeypatch):
 
     from omlx.patches.qwen35_q4_mlp import apply_qwen35_q4_mlp_patch
 
-    monkeypatch.setenv("OMLX_QWEN35_Q4_MLP", "1")
-    monkeypatch.setenv("OMLX_QWEN35_Q4_MLP_MIN_TOKENS", "16")
+    monkeypatch.setattr("omlx.patches.qwen35_q4_mlp._MIN_TOKENS", 16)
 
     mlp = qwen35.MLP(256, 512)
     mlp.gate_proj = _quantized_bf16(mlp.gate_proj, bits=4)
@@ -215,7 +229,7 @@ def test_post_ane_qmm_or_linear_routes_q8_through_env_threshold(monkeypatch):
     assert q8.called == 1
     assert routed == []
 
-    monkeypatch.setenv("OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS", "2048")
+    monkeypatch.setattr(q4patch, "_Q8_MIN_TOKENS", 2048)
     q8_low = _Stock(bits=8)
     q4patch._post_ane_qmm_or_linear(q8_low, x, 8)
     assert q8_low.called == 0
@@ -238,9 +252,7 @@ def test_qwen35_q8_gdn_backend_has_first_refusal_before_gpu_threshold(
         pass
 
     monkeypatch.setattr(q4patch, "_has_native_qmm", lambda: True)
-    monkeypatch.setenv("OMLX_QWEN35_Q4_LM_LINEAR", "1")
-    monkeypatch.setenv("OMLX_QWEN35_Q4_LINEAR_MIN_TOKENS", "16")
-    monkeypatch.setenv("OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS", "16384")
+    monkeypatch.setattr("omlx.patches.qwen35_q4_mlp._MIN_TOKENS", 16)
 
     class FakeGDN:
         sharding_group = None
@@ -287,8 +299,6 @@ def test_qwen35_q8_gdn_backend_has_first_refusal_before_gpu_threshold(
 
         with pytest.raises(BackendCalledError):
             qwen35.GatedDeltaNet.__call__(gdn, x)
-        monkeypatch.setenv("OMLX_QWEN35_Q4_LM_LINEAR", "0")
-        assert qwen35.GatedDeltaNet.__call__(gdn, x) is x
     finally:
         qwen35.GatedDeltaNet.__call__ = orig_gdn_call
         q4patch._LM_LINEAR_PATCHED = orig_lm_patched
@@ -305,17 +315,14 @@ def test_qwen35_q8_gdn_backend_has_first_refusal_before_gpu_threshold(
         "group_size",
         "nax_available",
         "nax_qmm_kernels_built",
-        "allow_gs128",
         "expected",
     ),
     [
-        (64, True, True, False, True),
-        (128, False, False, False, True),
-        (128, False, True, False, True),
-        (128, True, False, False, False),
-        (128, True, True, False, False),
-        (128, True, False, True, True),
-        (128, True, True, True, True),
+        (64, True, True, True),
+        (128, False, False, True),
+        (128, False, True, True),
+        (128, True, False, False),
+        (128, True, True, False),
     ],
 )
 def test_qwen35_qmm_routing_uses_stock_nax_availability(
@@ -323,7 +330,6 @@ def test_qwen35_qmm_routing_uses_stock_nax_availability(
     group_size,
     nax_available,
     nax_qmm_kernels_built,
-    allow_gs128,
     expected,
 ):
     import omlx.patches.qwen35_q4_mlp as q4patch
@@ -347,11 +353,6 @@ def test_qwen35_qmm_routing_uses_stock_nax_availability(
         "nax_qmm_kernels_built",
         lambda: nax_qmm_kernels_built,
     )
-    if allow_gs128:
-        monkeypatch.setenv("OMLX_QWEN35_Q4_MLP_ALLOW_GS128", "1")
-    else:
-        monkeypatch.delenv("OMLX_QWEN35_Q4_MLP_ALLOW_GS128", raising=False)
-
     assert (
         q4patch._is_supported_affine_linear_shape(
             linear,
@@ -370,8 +371,7 @@ def test_qwen35_q4_mlp_patch_prechecks_down_proj_before_gate_up(monkeypatch):
 
     from omlx.patches.qwen35_q4_mlp import apply_qwen35_q4_mlp_patch
 
-    monkeypatch.setenv("OMLX_QWEN35_Q4_MLP", "1")
-    monkeypatch.setenv("OMLX_QWEN35_Q4_MLP_MIN_TOKENS", "16")
+    monkeypatch.setattr("omlx.patches.qwen35_q4_mlp._MIN_TOKENS", 16)
 
     mlp = qwen35.MLP(256, 512)
     mlp.gate_proj = _quantized_bf16(mlp.gate_proj)
@@ -413,8 +413,7 @@ def test_qwen35_q4_prefill_linear_patch_routes_supported_only(monkeypatch):
 
     from omlx.patches.qwen35_q4_mlp import apply_qwen35_q4_prefill_linear_patch
 
-    monkeypatch.setenv("OMLX_QWEN35_Q4_LINEAR", "1")
-    monkeypatch.setenv("OMLX_QWEN35_Q4_LINEAR_MIN_TOKENS", "16")
+    monkeypatch.setattr("omlx.patches.qwen35_q4_mlp._MIN_TOKENS", 16)
 
     supported = nn.QuantizedLinear(256, 128, bias=False, group_size=64, bits=4)
     unsupported = nn.QuantizedLinear(256, 48, bias=False, group_size=64, bits=4)
@@ -457,8 +456,7 @@ def test_qwen35_q4_prefill_linear_patch_offers_packed_projections(monkeypatch):
     import omlx.patches.qwen35_q4_mlp as q4patch
     from omlx.patches.qwen35_packed_linear import PackedLinear, _pack
 
-    monkeypatch.setenv("OMLX_QWEN35_Q4_LINEAR", "1")
-    monkeypatch.setenv("OMLX_QWEN35_Q4_LINEAR_MIN_TOKENS", "16")
+    monkeypatch.setattr("omlx.patches.qwen35_q4_mlp._MIN_TOKENS", 16)
     source = nn.QuantizedLinear(256, 128, bias=False, group_size=64, bits=4)
     source.set_dtype(mx.bfloat16)
     routed = mx.ones((1, 32, 128), dtype=mx.bfloat16)
@@ -481,6 +479,47 @@ def test_qwen35_q4_prefill_linear_patch_offers_packed_projections(monkeypatch):
     assert seen == [32, 64]
 
 
+def test_qwen35_q8_backend_offered_below_a16_floor(monkeypatch):
+    fast = _require_qmm_kernels([8])
+    import mlx_vlm.models.qwen3_5.language as qwen35_lang
+
+    import omlx.patches.qwen35_q4_mlp as q4patch
+
+    q8 = nn.QuantizedLinear(256, 128, bias=False, group_size=64, bits=8)
+    q4 = nn.QuantizedLinear(256, 128, bias=False, group_size=64, bits=4)
+    for linear in (q8, q4):
+        linear.set_dtype(mx.bfloat16)
+
+    routed = mx.ones((1, 128, 128), dtype=mx.bfloat16)
+    seen = []
+
+    def backend(linear, x):
+        seen.append((linear.bits, x.shape[-2]))
+        return routed if x.shape[-2] == 128 else None
+
+    native = []
+    monkeypatch.setattr(q4patch, "_PREFILL_LINEAR_BACKEND", backend)
+    monkeypatch.setattr(
+        fast,
+        "qwen35_q8_affine_qmm_t",
+        lambda *a, **k: native.append(a[0].shape[-2]),
+    )
+    module = qwen35_lang.Qwen3_5Attention.__new__(qwen35_lang.Qwen3_5Attention)
+    nn.Module.__init__(module)
+    module.q_proj, module.k_proj = q8, q4
+    assert q4patch.apply_qwen35_q4_prefill_linear_patch(module) is True
+
+    assert module.q_proj(mx.zeros((1, 128, 256), mx.bfloat16)) is routed
+    # Declined: stock MLX runs, never the A16 tile below its own floor.
+    out = module.q_proj(mx.zeros((1, 96, 256), mx.bfloat16))
+    assert out.shape == (1, 96, 128) and native == []
+    # Decode and verify rows never reach the backend, and Q4 keeps its floor.
+    module.q_proj(mx.zeros((1, 1, 256), mx.bfloat16))
+    module.q_proj(mx.zeros((1, 8, 256), mx.bfloat16))
+    module.k_proj(mx.zeros((1, 128, 256), mx.bfloat16))
+    assert seen == [(8, 128), (8, 96)]
+
+
 def test_qwen35_q4_lm_attention_uses_sdpa_installed_after_the_patch(monkeypatch):
     """The patch must not freeze the SDPA it saw at install time (issue #2372).
 
@@ -496,8 +535,7 @@ def test_qwen35_q4_lm_attention_uses_sdpa_installed_after_the_patch(monkeypatch)
 
     import omlx.patches.qwen35_q4_mlp as q4patch
 
-    monkeypatch.setenv("OMLX_QWEN35_Q4_LM_LINEAR", "1")
-    monkeypatch.setenv("OMLX_QWEN35_Q4_LINEAR_MIN_TOKENS", "16")
+    monkeypatch.setattr("omlx.patches.qwen35_q4_mlp._MIN_TOKENS", 16)
 
     args = qwen35.TextModelArgs(
         model_type="qwen3_5",
@@ -577,8 +615,7 @@ def test_qwen35_q4_lm_prefill_linear_patch_routes_attention_and_gdn(
 
     import omlx.patches.qwen35_q4_mlp as q4patch
 
-    monkeypatch.setenv("OMLX_QWEN35_Q4_LM_LINEAR", "1")
-    monkeypatch.setenv("OMLX_QWEN35_Q4_LINEAR_MIN_TOKENS", "16")
+    monkeypatch.setattr("omlx.patches.qwen35_q4_mlp._MIN_TOKENS", 16)
 
     args = qwen35.TextModelArgs(
         model_type="qwen3_5",
@@ -712,6 +749,23 @@ def test_qwen35_q4_lm_prefill_linear_patch_routes_attention_and_gdn(
             ).item()
             <= 1.0
         )
+
+        # The wrapper body must normalize q/k like the stock body, which
+        # decode and short chunks still run. Tiny k rows expose the eps.
+        gdn_fp32 = qwen35.GatedDeltaNet(args)
+        k_rows = mx.arange(gdn_fp32.in_proj_qkv.weight.shape[0])
+        k_scale = mx.where(
+            (k_rows >= gdn_fp32.key_dim) & (k_rows < 2 * gdn_fp32.key_dim), 1e-3, 1.0
+        )
+        gdn_fp32.in_proj_qkv.weight = gdn_fp32.in_proj_qkv.weight * k_scale[:, None]
+        x_fp32 = x.astype(mx.float32)
+        backend_calls.clear()
+        y_wrapped = gdn_fp32(x_fp32)
+        assert backend_calls == [(gdn_fp32, x.shape, False)]
+        # Earlier tests can leave a wrapper on the class; use a pristine copy.
+        stock = _fresh_qwen35_module(monkeypatch)
+        y_stock = stock.GatedDeltaNet.__call__(gdn_fp32, x_fp32)
+        assert mx.allclose(y_wrapped, y_stock, atol=1e-5).item()
 
         # The q8 standalone GPU tile is intentionally disabled below 16K,
         # but that threshold must not prevent the independent 2K ANE backend

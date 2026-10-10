@@ -768,10 +768,16 @@ def _supports_pipeline(config: dict[str, Any]) -> bool:
     # that offered pipeline for Qwen3.5/3.6-family VLMs and then failed at load.
     from omlx.model_discovery import _has_vision_subconfig
 
-    if _has_vision_subconfig(config):
+    if _has_vision_subconfig(config) and model_type not in _MLX_LM_TEXT_PIPELINE_TYPES:
         return False
     return _declares_pipeline(model_type)
 
+
+# VLM-shaped checkpoints whose DISTRIBUTED load goes through mlx-lm: the cluster
+# worker never uses mlx-vlm and mlx-lm's ``sanitize`` drops the vision tower, so
+# the vision guard above is a false positive for them (oMLX #3662). Qwen3.5/3.6/3.8
+# dense ships its vision config next to the text weights.
+_MLX_LM_TEXT_PIPELINE_TYPES = frozenset({"qwen3_5"})
 
 # Only about seven of mlx-lm's ~120 architectures can be pipelined, so the
 # answer is nearly always no — worth knowing before staging a hundred
@@ -878,7 +884,23 @@ def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
         return 0
     if kv_heads <= 0 or head_dim <= 0:
         return 0
-    return kv_heads * head_dim * 2 * dtype_size
+    per_layer = kv_heads * head_dim * 2 * dtype_size
+    # Hybrid linear-attention models (Qwen3.5/3.6/3.8 dense: 3 gated-delta-net
+    # layers per full-attention layer) keep a constant-size state in the linear
+    # layers; only the full-attention layers grow a KV cache. ModelLayout stores
+    # one integral average per layer, rounded up to stay conservative.
+    text_config = config.get("text_config")
+    layer_config = text_config if isinstance(text_config, dict) else config
+    layer_types = layer_config.get("layer_types")
+    if (
+        isinstance(layer_types, list)
+        and layer_types
+        and all(isinstance(t, str) for t in layer_types)
+    ):
+        full = sum(t != "linear_attention" for t in layer_types)
+        if 0 < full < len(layer_types):
+            return (per_layer * full + len(layer_types) - 1) // len(layer_types)
+    return per_layer
 
 
 def _attention_head_count(model_path: Path) -> int:

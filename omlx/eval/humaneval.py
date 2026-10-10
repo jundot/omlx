@@ -40,6 +40,22 @@ def _get_imports(prompt: str) -> str:
     return "\n".join(lines)
 
 
+def _body_under(prompt: str, body: str) -> str:
+    """Indent a function-body answer to sit under the prompt's signature.
+
+    The first statement belongs at the docstring's indentation, which chat
+    output loses (the detokenizer and response cleanup trim leading spaces).
+    Later lines keep theirs unless the whole body came unindented.
+    """
+    lines = body.split("\n")
+    last = next((line for line in reversed(prompt.split("\n")) if line.strip()), "")
+    pad = last[: len(last) - len(last.lstrip())] or "    "
+    rest = lines[1:]
+    if all(not line.strip() or line[0] not in " \t" for line in rest):
+        rest = [pad + line if line.strip() else line for line in rest]
+    return "\n".join([pad + lines[0].lstrip(), *rest])
+
+
 def _extract_code(response: str, prompt: str) -> str:
     """Extract the function body from model response.
 
@@ -200,7 +216,7 @@ class HumanEvalBenchmark(BaseBenchmark):
 
         # If no function def found, combine prompt + response body
         if "def " not in code:
-            return item["prompt"] + code
+            return item["prompt"] + _body_under(item["prompt"], code)
 
         return code
 

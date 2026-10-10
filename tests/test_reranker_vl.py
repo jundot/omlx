@@ -175,6 +175,27 @@ class TestVLRerankScoring:
         assert inputs["documents"][0] == {"text": "desc"}
         assert inputs["documents"][1] == {"image": fake_img}
 
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @pytest.mark.parametrize(
+        ("instruction", "expected"),
+        [
+            (None, MLXRerankerModel._CAUSAL_LM_DEFAULT_INSTRUCTION),
+            ("", MLXRerankerModel._CAUSAL_LM_DEFAULT_INSTRUCTION),
+            ("Find diagrams", "Find diagrams"),
+        ],
+    )
+    def test_rerank_forwards_instruction(self, tmp_path, instruction, expected):
+        model = MLXRerankerModel(str(tmp_path))
+        model._is_vl_reranker = True
+        model._loaded = True
+        model.model = MagicMock()
+        model.model.process.return_value = mx.array([0.5])
+        model.processor = MagicMock()
+
+        model.rerank("cat", ["doc"], instruction=instruction)
+
+        assert model.model.process.call_args[0][0]["instruction"] == expected
+
 
 class TestRerankDispatchCoerce:
     """Regression: text-only reranker paths still receive strings even when
@@ -188,7 +209,7 @@ class TestRerankDispatchCoerce:
 
         captured = {}
 
-        def fake_causal_lm(query, docs, max_length):
+        def fake_causal_lm(query, docs, max_length, instruction=None):
             captured["query"] = query
             captured["docs"] = docs
             return RerankOutput(scores=[0.5, 0.5], indices=[0, 1], total_tokens=0)

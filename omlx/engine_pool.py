@@ -18,10 +18,9 @@ import copy
 import gc
 import json
 import logging
-import os
 import time
 from collections import OrderedDict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -34,6 +33,7 @@ if TYPE_CHECKING:
 import mlx.core as mx
 
 from .engine import BaseEngine, BatchedEngine
+from .engine.decision import DecisionEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine.sts import STSEngine
@@ -63,11 +63,31 @@ from .model_settings import (
     validate_ane_prefill,
 )
 from .scheduler import SchedulerConfig
+from .utils.fatal import exit_if_gpu_submissions_ignored
 from .utils.metal_sync import unreleased_graphics_bytes
 from .utils.model_loading import dflash_batched_requested, dflash_batched_supported
 from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
+
+
+def _touch_gpu() -> None:
+    """Run one trivial kernel so the GPU stays out of its idle power state.
+
+    Apple silicon parks the GPU after roughly a second without work, and the
+    first command buffer afterwards stalls for a time that grows with the
+    idle gap and the resident footprint (156 GB model on an M5 Ultra: +1.0 s
+    after 2 s idle, +1.7 s after 6 s — measured on both prefill and decode,
+    the kernels themselves run at full speed once it resumes). A request
+    arriving after a pause pays that on top of its TTFT. One tiny kernel
+    per keep-warm period is enough to prevent it; CPU activity alone is not.
+    """
+    mx.eval(mx.zeros((1,), dtype=mx.float32) + 1)
+
+
+# Stop keep-warm ticks after this long without requests, so an idle laptop
+# with a resident model still lets the GPU reach its idle power state.
+_GPU_KEEP_WARM_IDLE_WINDOW_S = 300.0
 
 _FP16_BYTES = 2
 _MAX_AFFINE_BYTES_PER_WEIGHT = 1.0625  # q8 plus fp16 scale/bias per group
@@ -214,6 +234,27 @@ def _is_metal_out_of_memory(exc: BaseException | None) -> bool:
     return False
 
 
+def _set_concurrency_limits(config: object, value: int) -> None:
+    config.max_num_seqs = value
+    config.completion_batch_size = value
+
+
+def _set_decode_cap(scheduler: object, value: int) -> None:
+    """Set the live decode cap. Must run on the engine's MLX executor.
+
+    The MTP wrapper saves and restores this cap around a generation step, so a
+    write from another thread can be lost.
+    """
+    generator = getattr(scheduler, "batch_generator", None)
+    if generator is None:
+        return
+    try:
+        # Same floor as BatchGenerator.__init__.
+        generator.completion_batch_size = max(value, generator.prefill_batch_size)
+    except Exception:
+        logger.warning("Live decode cap update failed", exc_info=True)
+
+
 @dataclass
 class EngineEntry:
     """Per-model state in the engine pool."""
@@ -221,7 +262,14 @@ class EngineEntry:
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
     model_type: Literal[
-        "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"
+        "llm",
+        "vlm",
+        "embedding",
+        "reranker",
+        "audio_stt",
+        "audio_tts",
+        "audio_sts",
+        "decision",
     ]  # Model type
     engine_type: Literal[
         "batched",
@@ -232,6 +280,7 @@ class EngineEntry:
         "audio_stt",
         "audio_tts",
         "audio_sts",
+        "decision",
     ]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
@@ -257,12 +306,13 @@ class EngineEntry:
         BaseEngine
         | EmbeddingEngine
         | RerankerEngine
+        | DecisionEngine
         | STTEngine
         | STSEngine
         | TTSEngine
         | None
     ) = None  # Loaded engine instance
-    last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
+    last_access: float = 0.0  # Latest load/acquire/release for LRU and TTL
     is_loading: bool = False  # Prevent concurrent loads
     loading_started_at: float | None = None  # Timestamp when current load started
     is_pinned: bool = False  # Never evict if True
@@ -342,7 +392,76 @@ class EnginePool:
         self._failed_load_reclaim_tasks: set[asyncio.Task[None]] = set()
         self._failed_load_reclaim_task: asyncio.Task[None] | None = None
         self._shutting_down = False
+        # Last logged forced-offload state per (model_id, kind).
+        self._offload_warn_state: dict[tuple[str, str], bool] = {}
+        # Idle GPU keep-warm ticker (see _touch_gpu). Configured by the server
+        # from ServerSettings.gpu_keep_warm_interval; started on first load.
+        self._gpu_keep_warm_interval: float = 0.0
+        self._gpu_keep_warm_task: asyncio.Task[None] | None = None
+        self._gpu_keep_warm_last_active = 0.0
         self.configure_hot_cache_budget()
+
+    def configure_gpu_keep_warm(self, interval_seconds: float) -> None:
+        """Set the idle keep-warm period in seconds (0 or less disables it)."""
+        try:
+            interval = float(interval_seconds or 0.0)
+        except (TypeError, ValueError):
+            interval = 0.0
+        self._gpu_keep_warm_interval = max(0.0, interval)
+        if self._gpu_keep_warm_interval <= 0 and self._gpu_keep_warm_task is not None:
+            self._gpu_keep_warm_task.cancel()
+            self._gpu_keep_warm_task = None
+
+    def _ensure_gpu_keep_warm_task(self) -> None:
+        if self._gpu_keep_warm_interval <= 0 or self._shutting_down:
+            return
+        task = self._gpu_keep_warm_task
+        if task is not None and not task.done():
+            return
+        self._gpu_keep_warm_task = asyncio.get_running_loop().create_task(
+            self._gpu_keep_warm_loop(), name="gpu-keep-warm"
+        )
+
+    def _gpu_keep_warm_needed(self) -> bool:
+        """True when a model is resident, idle, and used within the idle window."""
+        now = time.time()
+        last_request = self._gpu_keep_warm_last_active
+        loaded = False
+        for entry in self._entries.values():
+            if entry.engine is None:
+                continue
+            loaded = True
+            if self._entry_has_active_requests(entry):
+                # Generation steps already keep the GPU busy.
+                self._gpu_keep_warm_last_active = now
+                return False
+            # Leases refresh last_access at both request start and completion.
+            last_request = max(last_request, entry.last_access)
+        return loaded and now - last_request < _GPU_KEEP_WARM_IDLE_WINDOW_S
+
+    async def _gpu_keep_warm_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        while not self._shutting_down:
+            interval = self._gpu_keep_warm_interval
+            if interval <= 0:
+                return
+            await asyncio.sleep(interval)
+            if not self._gpu_keep_warm_needed():
+                continue
+            try:
+                await loop.run_in_executor(get_mlx_executor(), _touch_gpu)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("GPU keep-warm tick failed: %s", exc)
+
+    async def _stop_gpu_keep_warm(self) -> None:
+        task = self._gpu_keep_warm_task
+        self._gpu_keep_warm_task = None
+        if task is None:
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     def _distributed_deployment_for_entry(
         self, entry: EngineEntry
@@ -450,10 +569,7 @@ class EnginePool:
 
             fraction = runtime_settings.moe_expert_offload_resident_fraction
             if entry.config_model_type == "deepseek_v41":
-                if (
-                    v41_estimate is None
-                    and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
-                ):
+                if v41_estimate is None:
                     from .patches.deepseek_v41.moe_offload import (
                         estimate_expert_savings,
                     )
@@ -522,6 +638,33 @@ class EnginePool:
         footprint = int(estimate.resident_bytes / 1.05)
         return footprint > line >= estimate.mmap_bytes
 
+    def _log_offload_decision_once(
+        self,
+        model_id: str,
+        kind: str,
+        forced: bool,
+        message: str,
+        *args: object,
+    ) -> None:
+        """Log a forced offload only when its state changes for this model.
+
+        The admin model list and the runtime signature resolve it on every poll
+        and request.
+        """
+
+        state = getattr(self, "_offload_warn_state", None)
+        if state is None:
+            # Pools built via __new__ (tests, single-purpose embedders) never
+            # ran __init__; keep dedup working without requiring it.
+            state = {}
+            self._offload_warn_state = state
+        key = (model_id, kind)
+        if state.get(key) == forced:
+            return
+        state[key] = forced
+        if forced:
+            logger.warning(message, *args)
+
     def _qwen4_ple_offload_status(
         self,
         entry: EngineEntry,
@@ -580,17 +723,19 @@ class EnginePool:
         forced = estimate.force_ssd_offload(
             ceiling
         ) or self._resident_leaves_no_prompt_room(estimate, ceiling)
-        if forced:
-            logger.warning(
-                "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB leaves no "
-                "room to serve prompts under the %.1fGB memory ceiling (mmap "
-                "needs %.1fGB). Decode will be roughly 2.5x slower than a "
-                "resident load.",
-                entry.model_id,
-                estimate.resident_bytes / 1e9,
-                ceiling / 1e9,
-                estimate.mmap_bytes / 1e9,
-            )
+        self._log_offload_decision_once(
+            entry.model_id,
+            "qwen4_ple_ssd_offload",
+            forced,
+            "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB leaves no "
+            "room to serve prompts under the %.1fGB memory ceiling (mmap "
+            "needs %.1fGB). Decode will be roughly 2.5x slower than a "
+            "resident load.",
+            entry.model_id,
+            estimate.resident_bytes / 1e9,
+            ceiling / 1e9,
+            estimate.mmap_bytes / 1e9,
+        )
         requested = bool(
             settings is not None and getattr(settings, "qwen4_ple_ssd_offload", False)
         )
@@ -636,10 +781,7 @@ class EnginePool:
             estimate = deepseek_v41_residency_estimate(entry.model_path)
             if not estimate.supported:
                 return False, False, None
-            if (
-                getattr(settings, "moe_expert_offload_enabled", False)
-                and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
-            ):
+            if getattr(settings, "moe_expert_offload_enabled", False):
                 from .patches.deepseek_v41.moe_offload import estimate_expert_savings
 
                 saved = estimate_expert_savings(
@@ -671,16 +813,18 @@ class EnginePool:
         forced = estimate.force_ssd_offload(
             ceiling
         ) or self._resident_leaves_no_prompt_room(estimate, ceiling)
-        if forced:
-            logger.warning(
-                "DeepSeek V4.1 Engram forced to SSD for %s: resident %.1fGB leaves "
-                "no room to serve prompts under the %.1fGB memory ceiling (mmap "
-                "needs %.1fGB).",
-                entry.model_id,
-                estimate.resident_bytes / 1e9,
-                ceiling / 1e9,
-                estimate.mmap_bytes / 1e9,
-            )
+        self._log_offload_decision_once(
+            entry.model_id,
+            "deepseek_v41_engram_ssd_offload",
+            forced,
+            "DeepSeek V4.1 Engram forced to SSD for %s: resident %.1fGB leaves "
+            "no room to serve prompts under the %.1fGB memory ceiling (mmap "
+            "needs %.1fGB).",
+            entry.model_id,
+            estimate.resident_bytes / 1e9,
+            ceiling / 1e9,
+            estimate.mmap_bytes / 1e9,
+        )
         requested = bool(
             settings is not None
             and getattr(settings, "deepseek_v41_engram_ssd_offload", False)
@@ -909,6 +1053,12 @@ class EnginePool:
         # Security/load gates.
         add("trust_remote_code", bool(data.get("trust_remote_code", False)))
         add("index_cache_freq", normalized_index_cache_freq())
+        # Embedding audio tower residency is decided at load. The audio length
+        # only matters while the tower is loaded.
+        audio_active = bool(data.get("embedding_audio_enabled", False))
+        add("embedding_audio_enabled", audio_active)
+        if audio_active:
+            add("embedding_audio_max_seconds", data.get("embedding_audio_max_seconds"))
 
         # Load-time model variants. Dependent fields only matter when their
         # feature is active; stale draft paths or tuning defaults must not
@@ -1112,6 +1262,44 @@ class EnginePool:
                 if isinstance(engine, EmbeddingEngine):
                     engine._batch_size = batch_size
 
+    async def apply_max_concurrent_requests(self, value: int) -> None:
+        """Apply max concurrent requests to future and currently loaded engines.
+
+        Sets both the admission cap and the decode batch cap. Lowering the value
+        stops new rows only; rows that are decoding finish normally.
+        """
+        value = int(value)
+        if value <= 0:
+            raise ValueError("max concurrent requests must be > 0")
+
+        async with self._lock:
+            _set_concurrency_limits(self._scheduler_config, value)
+            for entry in list(self._entries.values()):
+                engine = entry.engine if entry is not None else None
+                # Cluster ranks build their schedulers from the deployment.
+                if engine is None or getattr(
+                    engine, "_prefill_memory_guard_managed_externally", False
+                ):
+                    continue
+                # DFlash keeps its own config copy for the lazy fallback engine.
+                for host in (engine, getattr(engine, "_fallback_engine", None)):
+                    if host is None:
+                        continue
+                    config = getattr(host, "_scheduler_config", None)
+                    if config is not None:
+                        _set_concurrency_limits(config, value)
+                    core = getattr(getattr(host, "_engine", None), "engine", None)
+                    scheduler = getattr(core, "scheduler", None)
+                    if scheduler is None:
+                        continue
+                    _set_concurrency_limits(scheduler.config, value)
+                    executor = getattr(core, "_mlx_executor", None)
+                    if executor is None:
+                        continue
+                    # A shut-down executor means the engine is stopping.
+                    with suppress(RuntimeError):
+                        executor.submit(_set_decode_cap, scheduler, value)
+
     def discover_models(
         self, model_dirs: str | list[str], pinned_models: list[str] | None = None
     ) -> None:
@@ -1201,6 +1389,7 @@ class EnginePool:
         "audio_stt": "audio_stt",
         "audio_tts": "audio_tts",
         "audio_sts": "audio_sts",
+        "decision": "decision",
     }
 
     @staticmethod
@@ -1392,7 +1581,9 @@ class EnginePool:
         logger.info("Removed cluster-only model registration %s", model_id)
         return True
 
-    async def prepare_cluster_reload(self, model_id: str) -> None:
+    async def prepare_cluster_reload(
+        self, model_id: str, *, local_only: bool = False
+    ) -> None:
         """Make a discovered model ready to adopt its registry deployment.
 
         An engine that was already loaded locally cannot be relabelled as a
@@ -1408,7 +1599,9 @@ class EnginePool:
                 raise ModelNotFoundError(model_id, list(self._entries.keys()))
             if entry.engine is not None:
                 failed_reason = getattr(entry.engine, "runtime_failed_reason", None)
-                if not (isinstance(failed_reason, str) and failed_reason.strip()):
+                if local_only or not (
+                    isinstance(failed_reason, str) and failed_reason.strip()
+                ):
                     self._raise_if_reload_busy(entry, "activate distributed cluster")
             pending_task = self._pending_unload_tasks.pop(model_id, None)
             if pending_task is not None and not pending_task.done():
@@ -1419,7 +1612,9 @@ class EnginePool:
             if entry.engine is None:
                 self._clear_load_failure(entry)
                 return
-            await self._unload_engine(model_id)
+            await self._unload_engine(
+                model_id, **({"local_only": True} if local_only else {})
+            )
             self._clear_load_failure(entry)
 
     def _clear_load_failure(self, entry: EngineEntry) -> None:
@@ -1847,7 +2042,34 @@ class EnginePool:
             return None
         return entry.pending_unload_reason or "request abort"
 
-    def _acquire_loaded_engine(self, model_id, force_lm, lease, runtime_settings):
+    @staticmethod
+    def _runtime_failed_engine(engine: object) -> bool:
+        """True for a distributed engine whose ranks died (it can never serve again)."""
+        reason = getattr(engine, "runtime_failed_reason", None)
+        return isinstance(reason, str) and bool(reason.strip())
+
+    async def _reloadable_failed_engine(self, model_id: str) -> bool:
+        """True when the resident engine is dead AND its deployment can be rebuilt.
+
+        Rebuilding means tearing the old ranks down, and that teardown is
+        verified on every Mac. When a peer is off or off the network (the usual
+        way a rank dies with ``peer_lost``) it cannot succeed, so the engine is
+        left in place and requests keep getting the fast 503 from its health
+        gate instead of each one running a doomed teardown. Called outside the
+        pool lock: the reachability probe is bounded but is network I/O.
+        """
+        entry = self._entries.get(model_id)
+        engine = entry.engine if entry is not None else None
+        if engine is None or not self._runtime_failed_engine(engine):
+            return False
+        reachable = getattr(engine, "peers_reachable", None)
+        if reachable is None:
+            return True
+        return bool(await reachable())
+
+    def _acquire_loaded_engine(
+        self, model_id, force_lm, lease, runtime_settings, reload_failed=False
+    ):
         """Lease a ready engine without waiting for another model's disk drain.
 
         This path has no await: the unload marker and lease update are atomic
@@ -1861,6 +2083,7 @@ class EnginePool:
             or entry.pending_unload_reason
             or model_id in self._unloading_models
             or (force_lm and isinstance(entry.engine, VLMBatchedEngine))
+            or (reload_failed and self._runtime_failed_engine(entry.engine))
         ):
             return None
         expected = self._engine_runtime_signature(model_id, runtime_settings)
@@ -1926,8 +2149,9 @@ class EnginePool:
         if force_lm and entry is not None and not self._has_mlx_lm_path(entry):
             # The VLM engine is the only text engine for these families.
             force_lm = False
+        reload_failed = await self._reloadable_failed_engine(model_id)
         ready = self._acquire_loaded_engine(
-            model_id, force_lm, _lease, runtime_settings
+            model_id, force_lm, _lease, runtime_settings, reload_failed
         )
         if ready is not None:
             return ready
@@ -1952,6 +2176,20 @@ class EnginePool:
                 if candidate > 0:
                     ngram_admission_ceiling = candidate
             unloaded_for_admission = False
+
+            if (
+                reload_failed
+                and entry.engine is not None
+                and self._runtime_failed_engine(entry.engine)
+            ):
+                logger.warning(
+                    "Distributed runtime for %s is no longer serviceable (%s); "
+                    "unloading it so this request reloads the deployment",
+                    model_id,
+                    getattr(entry.engine, "runtime_failed_reason", ""),
+                )
+                await self._unload_engine(model_id)
+                unloaded_for_admission = True
 
             # Already loaded - just update access time
             if entry.engine is not None:
@@ -2235,11 +2473,13 @@ class EnginePool:
         if entry is not None and not entry.pending_unload_reason:
             if entry.in_use > 0:
                 entry.in_use -= 1
+                entry.last_access = time.time()
             return
         async with self._lock:
             e = self._entries.get(model_id)
             if e is not None and e.in_use > 0:
                 e.in_use -= 1
+                e.last_access = time.time()
             await self._unload_pending_if_idle_locked(model_id)
 
     def _finish_lease_release_task(self, task: asyncio.Task[None]) -> None:
@@ -2427,7 +2667,11 @@ class EnginePool:
         evicted_any = False
         evicted_count = 0
         reclaim_attempted = False
+        slots_release_attempted = False
+        slots_freed = 0
         ane_release_attempted = False
+        hot_cache_attempted = False
+        hot_cache_released = False
         reason = str(getattr(eviction_request, "reason", "") or "")
         async with self._lock:
             attempt = self._prefill_headroom_recurring.get(request_id, 0) + 1
@@ -2440,16 +2684,20 @@ class EnginePool:
             def _log_decision(outcome: str) -> None:
                 if ane_release_attempted:
                     action = "release_ane"
+                elif slots_freed:
+                    action = "release_offload_slots"
                 elif reclaim_attempted:
                     action = "reclaim_pool"
                 elif evicted_any:
                     action = "evict_model"
+                elif hot_cache_released:
+                    action = "release_hot_cache"
                 else:
                     action = "already_fit"
                 logger.info(
                     "[prefill-eviction] request=%s retry=%d reason=%s "
                     "action=%s outcome=%s recurring=%s mx_active=%.2fGB "
-                    "phys_footprint=%.2fGB model_memory=%.2fGB "
+                    "phys_footprint=%.2fGB hot_cache=%.2fGB model_memory=%.2fGB "
                     "predicted=%.2fGB target=%.2fGB evicted=%d",
                     request_id,
                     attempt,
@@ -2459,6 +2707,7 @@ class EnginePool:
                     recurring,
                     active / 1024**3,
                     footprint / 1024**3,
+                    hot_cache / 1024**3,
                     self._current_model_memory / 1024**3,
                     predicted / 1024**3,
                     target / 1024**3,
@@ -2467,12 +2716,55 @@ class EnginePool:
 
             while True:
                 active = mx.get_active_memory()
-                footprint = _settled_phys_footprint()
-                current = max(active, footprint, self._current_model_memory)
+                # Targets subtract the hot-cache reservation, so usage
+                # excludes the hot cache, as in Scheduler._current_usage_bytes.
+                hot_cache = self._hot_cache_bytes()
+                footprint = max(0, _settled_phys_footprint() - hot_cache)
+                # Released offload slots are part of the model's admitted size.
+                model_memory = self._current_model_memory - slots_freed
+                current = max(active, footprint, model_memory)
                 if current + predicted <= target:
                     # Use the same sample for admission and its decision log.
                     _log_decision("headroom_available")
-                    return evicted_any or reclaim_attempted or ane_release_attempted
+                    return (
+                        evicted_any
+                        or reclaim_attempted
+                        or slots_freed > 0
+                        or ane_release_attempted
+                        or hot_cache_released
+                    )
+
+                if not recurring and not reclaim_attempted and mx.get_cache_memory():
+                    # Pooled buffers cost nothing to return, so they go first.
+                    reclaim_attempted = True
+                    await self._reclaim_pooled_buffers_for_prefill(
+                        exclude_model_id, request_id
+                    )
+                    continue
+
+                if not slots_release_attempted:
+                    # The requesting model's MoE offload slots return at its next
+                    # decode step, so they go before cached prefixes and models.
+                    slots_release_attempted = True
+                    slots_freed = await self._release_offload_slots_for_headroom(
+                        exclude_model_id, request_id
+                    )
+                    if slots_freed:
+                        continue
+
+                if not hot_cache_attempted:
+                    # Cached prefix blocks give way before any model does.
+                    hot_cache_attempted = True
+                    gain = await self._release_hot_cache_for_prefill(
+                        exclude_model_id,
+                        request_id,
+                        current + predicted - target,
+                        reason,
+                    )
+                    if gain > 0:
+                        hot_cache_released = True
+                        target += gain
+                        continue
 
                 victim = self._find_lru_prefill_eviction_victim(
                     exclude_model_id=exclude_model_id
@@ -2549,6 +2841,55 @@ class EnginePool:
                 await self._unload_engine(victim)
                 evicted_any = True
                 evicted_count += 1
+
+    def _hot_cache_bytes(self) -> int:
+        budget = getattr(self._scheduler_config, "hot_cache_budget", None)
+        if budget is None:
+            return 0
+        return max(0, int(getattr(budget, "total_bytes", 0) or 0))
+
+    async def _release_hot_cache_for_prefill(
+        self, model_id: str, request_id: str, shortfall: int, reason: str
+    ) -> int:
+        """Release hot cache for a prefill; return how far its target rose.
+
+        Skips requests the scheduler does not hold yet: their prefix blocks
+        are not protected (see ``Scheduler._releasable_hot_cache_credit``).
+        """
+        release = getattr(
+            self._process_memory_enforcer, "release_hot_cache_for_prefill", None
+        )
+        entry = self._entries.get(model_id)
+        engine = entry.engine if entry is not None else None
+        scheduler = (
+            self._resolve_scheduler_from_engine(engine) if engine is not None else None
+        )
+        limit_factor = getattr(scheduler, "_hot_cache_limit_factor", None)
+        if (
+            not callable(release)
+            or not callable(limit_factor)
+            or request_id not in getattr(scheduler, "requests", {})
+        ):
+            return 0
+        if (
+            reason == "adaptive_prefill_throttle"
+            and getattr(scheduler, "_prefill_speed_priority", False) is not True
+        ):
+            # The throttle shrinks the chunk instead, so keep the cache.
+            return 0
+        factor = limit_factor()
+        if factor <= 0 or shortfall <= 0:
+            return 0
+        released = await release(int(shortfall / factor) + 1)
+        if released <= 0:
+            return 0
+        logger.info(
+            "Released %s of hot cache for prefill request %s on '%s'",
+            format_size(released),
+            request_id,
+            model_id,
+        )
+        return int(released * factor)
 
     @staticmethod
     def _resolve_engine_core_from_engine(engine: object) -> object | None:
@@ -2629,6 +2970,40 @@ class EnginePool:
                 request_id,
             )
         return freed
+
+    async def _release_offload_slots_for_headroom(
+        self, model_id: str, request_id: str
+    ) -> int:
+        """Release the model's MoE offload slots on its MLX thread; return the bytes."""
+        entry = self._entries.get(model_id)
+        engine = entry.engine if entry is not None else None
+        core = (
+            self._resolve_engine_core_from_engine(engine)
+            if engine is not None
+            else None
+        )
+        scheduler = getattr(core, "scheduler", None)
+        release = getattr(scheduler, "release_moe_offload_slots", None)
+        executor = getattr(core, "_mlx_executor", None)
+        if not callable(release) or executor is None:
+            return 0
+        loop = asyncio.get_running_loop()
+        try:
+            released = await loop.run_in_executor(executor, release, request_id)
+        except Exception as e:
+            logger.warning(
+                "MoE offload slot release failed for prefill request %s: %s",
+                request_id,
+                e,
+            )
+            return 0
+        if released > 0:
+            logger.info(
+                "Released %s of MoE offload slots for prefill request %s",
+                format_size(released),
+                request_id,
+            )
+        return released
 
     async def _release_ane_prefill_for_headroom(
         self, model_id: str, request_id: str
@@ -2755,11 +3130,15 @@ class EnginePool:
                 return True
         return False
 
-    async def _unload_engine(self, model_id: str) -> None:
+    async def _unload_engine(self, model_id: str, *, local_only: bool = False) -> None:
         if model_id in self._unloading_models:
             raise ModelBusyError(model_id, "unload while teardown is in progress")
         self._unloading_models.add(model_id)
-        task = asyncio.create_task(self._stop_and_unload_engine(model_id))
+        task = asyncio.create_task(
+            self._stop_and_unload_engine(
+                model_id, **({"local_only": True} if local_only else {})
+            )
+        )
         cancelled = False
         try:
             while not task.done():
@@ -2773,7 +3152,31 @@ class EnginePool:
         if cancelled:
             raise asyncio.CancelledError
 
-    async def _stop_and_unload_engine(self, model_id: str) -> None:
+    async def _metal_sync_clear_cache(self, model_id: str) -> None:
+        """Synchronize and clear the Metal cache during unload."""
+
+        def sync_clear() -> None:
+            mx.synchronize()
+            mx.clear_cache()
+
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(get_mlx_executor(), sync_clear)
+        except RuntimeError as e:
+            if "Command buffer execution failed" not in str(e):
+                raise
+            exit_if_gpu_submissions_ignored(e)
+            # A failed prefill can leave this error pending. MLX clears it when
+            # it raises, so one retry lets the unload release its accounting.
+            logger.warning(
+                f"Metal command-buffer error while unloading '{model_id}': {e}; "
+                f"retrying synchronize once"
+            )
+            await loop.run_in_executor(get_mlx_executor(), sync_clear)
+
+    async def _stop_and_unload_engine(
+        self, model_id: str, *, local_only: bool = False
+    ) -> None:
         """
         Immediately stop and unload an engine with memory settle barrier.
 
@@ -2800,7 +3203,9 @@ class EnginePool:
         pre_unload_footprint = 0 if distributed else get_phys_footprint()
 
         try:
-            await entry.engine.stop()
+            await entry.engine.stop(
+                **({"local_only": True} if local_only and distributed else {})
+            )
         except Exception as e:
             if distributed:
                 # The supervisor raises (DistributedTeardownError) when the
@@ -2870,10 +3275,7 @@ class EnginePool:
         # Synchronize before clearing to prevent releasing Metal buffers
         # still referenced by in-flight command buffers. See issue #300.
         gc.collect()
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
-        )
+        await self._metal_sync_clear_cache(model_id)
 
         # RAM Engram tables share MLX buffers with CPU views, so their packed
         # bytes are included in both admission and Metal unload settlement.
@@ -2890,6 +3292,8 @@ class EnginePool:
         min_expected_freed = max(0, settle_size - settle_tolerance)
         settled = False
         settle_indeterminate = False
+        settle_stalled = False
+        last_freed: int | None = None
         for _settle_round in range(10):
             active_now = mx.get_active_memory()
             actual_freed = pre_unload_active - active_now
@@ -2926,6 +3330,23 @@ class EnginePool:
                     f"settle wait"
                 )
                 break
+            if (
+                last_freed is not None
+                and actual_freed == last_freed
+                and actual_freed > 0
+                and not footprint_pending
+            ):
+                # A non-zero plateau means gc/clear_cache stopped releasing
+                # memory. A zero plateau still gets the full barrier.
+                settle_stalled = True
+                logger.info(
+                    f"Settle for '{model_id}' stalled at "
+                    f"{format_size(actual_freed)} across two rounds "
+                    f"(need>={format_size(min_expected_freed)}); "
+                    f"skipping further settle rounds"
+                )
+                break
+            last_freed = actual_freed
             logger.debug(
                 f"Settle round {_settle_round + 1} for '{model_id}': "
                 f"freed={format_size(actual_freed)} "
@@ -2934,9 +3355,7 @@ class EnginePool:
             )
             await asyncio.sleep(0.5)
             gc.collect()
-            await loop.run_in_executor(
-                get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
-            )
+            await self._metal_sync_clear_cache(model_id)
 
         # Release memory tracking AFTER barrier
         self._current_model_memory = max(0, self._current_model_memory - resident_size)
@@ -2958,6 +3377,9 @@ class EnginePool:
             # alongside the tracked accumulator (the #1623 max() in
             # get_engine), so any unreleased memory stays visible to both.
             pass
+        elif settle_stalled:
+            # Emergency reclaim repeats the gc/clear_cache work that just stalled.
+            pass
         else:
             # Barrier timed out - try emergency reclaim
             logger.warning(
@@ -2967,10 +3389,7 @@ class EnginePool:
             )
             for _ in range(3):
                 gc.collect()
-                await loop.run_in_executor(
-                    get_mlx_executor(),
-                    lambda: (mx.synchronize(), mx.clear_cache()),
-                )
+                await self._metal_sync_clear_cache(model_id)
                 await asyncio.sleep(1.0)
             active_after = mx.get_active_memory()
             if active_after > self._current_model_memory + 5 * 1024**3:
@@ -3091,6 +3510,10 @@ class EnginePool:
             model_settings = runtime_settings
             if model_settings is None and self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
+            # A status read may have logged a forced offload long before this
+            # load. Log it again next to the load.
+            for kind in ("qwen4_ple_ssd_offload", "deepseek_v41_engram_ssd_offload"):
+                self._offload_warn_state.pop((model_id, kind), None)
             model_settings = self._effective_qwen4_model_settings(entry, model_settings)
             model_settings = self._effective_deepseek_v41_model_settings(
                 entry, model_settings
@@ -3140,7 +3563,13 @@ class EnginePool:
             # since DFlash has its own model loading pipeline
             engine = None
             deployment = deployment if effective_type == "batched" else None
-            if deployment is None and model_settings is not None:
+            # Decision models never decode, so speculative decoding settings
+            # saved for the same checkpoint do not apply.
+            if (
+                deployment is None
+                and model_settings is not None
+                and effective_type != "decision"
+            ):
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
                 dflash_draft = getattr(model_settings, "dflash_draft_model", None)
                 if dflash_enabled and not dflash_draft:
@@ -3180,9 +3609,13 @@ class EnginePool:
                     try:
                         from .engine.dflash import DFlashEngine
 
+                        draft_entry = self._entries.get(dflash_draft)
+                        draft_path = (
+                            draft_entry.model_path if draft_entry else dflash_draft
+                        )
                         engine = DFlashEngine(
                             model_name=entry.model_path,
-                            draft_model_path=dflash_draft,
+                            draft_model_path=draft_path,
                             draft_quant_enabled=getattr(
                                 model_settings, "dflash_draft_quant_enabled", False
                             ),
@@ -3203,7 +3636,7 @@ class EnginePool:
                             ),
                         )
                         logger.info(
-                            f"DFlash enabled for {model_id}, draft={dflash_draft}"
+                            f"DFlash enabled for {model_id}, draft={draft_path}"
                         )
                     except ImportError:
                         logger.warning(
@@ -3215,6 +3648,13 @@ class EnginePool:
                             f"DFlash init failed for {model_id}: {e}. "
                             f"Falling back to default engine."
                         )
+                elif dflash_enabled:
+                    logger.warning(
+                        "DFlash enabled for %s but no draft model is set; "
+                        "loading without DFlash. Set dflash_draft_model to "
+                        "enable it.",
+                        model_id,
+                    )
 
             # Per-model trust_remote_code (security opt-in, issue #926).
             # When unset, defaults to False -- repos with custom modeling_*.py
@@ -3265,11 +3705,23 @@ class EnginePool:
                         model_name=entry.model_path,
                         trust_remote_code=trc,
                         scheduler_config=self._scheduler_config,
+                        audio_enabled=bool(
+                            getattr(model_settings, "embedding_audio_enabled", False)
+                        ),
+                        audio_max_seconds=getattr(
+                            model_settings, "embedding_audio_max_seconds", None
+                        ),
                     )
                 elif effective_type == "reranker":
                     engine = RerankerEngine(
                         model_name=entry.model_path,
                         trust_remote_code=trc,
+                    )
+                elif effective_type == "decision":
+                    engine = DecisionEngine(
+                        model_name=entry.model_path,
+                        trust_remote_code=trc,
+                        scheduler_config=self._scheduler_config,
                     )
                 elif effective_type == "vlm":
                     engine = VLMBatchedEngine(
@@ -3454,6 +3906,7 @@ class EnginePool:
             self._current_model_memory += resident_size
             load_completed = True
             self._clear_load_failure(entry)
+            self._ensure_gpu_keep_warm_task()
 
             # Batched DFlash: load the block drafter and attach it to the
             # Lightning MTP verify path. Fail-soft like the VLM MTP drafter.
@@ -3716,6 +4169,7 @@ class EnginePool:
     async def shutdown(self) -> None:
         """Shutdown all engines gracefully."""
         self._shutting_down = True
+        await self._stop_gpu_keep_warm()
         reclaim_tasks = tuple(self._failed_load_reclaim_tasks)
         for task in reclaim_tasks:
             task.cancel()

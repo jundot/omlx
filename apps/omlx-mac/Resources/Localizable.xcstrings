@@ -7199,54 +7199,6 @@
         }
       }
     },
-    "integrations.claude.context_scaling" : {
-      "comment" : "Row label for the Claude Code context scaling toggle",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Context scaling"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Масштабирование контекста"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "上下文缩放"
-          }
-        }
-      }
-    },
-    "integrations.claude.context_scaling.sub" : {
-      "comment" : "Sublabel for the context scaling toggle",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Stretch context windows for long agentic sessions"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Расширять контекстные окна для долгих агентных сессий"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "为长时间代理会话扩展上下文窗口"
-          }
-        }
-      }
-    },
     "integrations.claude.haiku" : {
       "comment" : "Row label for the Haiku model picker",
       "extractionState" : "manual",
@@ -7415,54 +7367,6 @@
         }
       }
     },
-    "integrations.claude.target_context" : {
-      "comment" : "Row label for the Claude Code target context size field",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Target context size"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Целевой размер контекста"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "目标上下文大小"
-          }
-        }
-      }
-    },
-    "integrations.claude.target_context.sub" : {
-      "comment" : "Sublabel for the target context size field",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Per-request context window Claude Code will scale toward"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Контекстное окно, к которому Claude Code будет масштабировать каждый запрос"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Claude Code 将缩放到的每次请求上下文窗口"
-          }
-        }
-      }
-    },
     "integrations.codex.app" : {
       "comment" : "Label for the Codex desktop app launcher command",
       "extractionState" : "extracted_with_value",
@@ -7531,30 +7435,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "$ 终端"
-          }
-        }
-      }
-    },
-    "integrations.error.target_context_invalid" : {
-      "comment" : "Integrations screen error when the target context size input is invalid",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Target context size must be a positive integer."
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Целевой размер контекста должен быть положительным целым числом."
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "目标上下文大小必须是正整数。"
           }
         }
       }
@@ -8039,30 +7919,6 @@
         }
       }
     },
-    "integrations.target_context.apply" : {
-      "comment" : "Apply button for the Claude Code target context size field",
-      "extractionState" : "extracted_with_value",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "new",
-            "value" : "Apply"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Применить"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "应用"
-          }
-        }
-      }
-    },
     "integrations.tool.codex" : {
       "comment" : "Display name for the Codex integration",
       "extractionState" : "manual",
@@ -8107,6 +7963,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Copilot CLI"
+          }
+        }
+      }
+    },
+    "integrations.tool.dsh" : {
+      "comment" : "Display name for the DeepSeek Harness (dsh) integration",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DeepSeek Harness"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DeepSeek Harness"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DeepSeek Harness"
           }
         }
       }
@@ -13379,6 +13259,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "将当前另存为新配置"
+          }
+        }
+      }
+    },
+    "profile.save.global_drops_model_settings" : {
+      "comment" : "Error shown when saving to a global profile would drop model-specific settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Global profiles keep sampling settings only. Save as a Model profile to keep Lightning MTP, TurboQuant, and other model settings."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Глобальные профили хранят только параметры сэмплирования. Чтобы сохранить Lightning MTP, TurboQuant и другие настройки модели, выберите модельный профиль."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "全局配置文件仅保存采样设置。要保留 Lightning MTP、TurboQuant 等模型设置，请另存为模型配置文件。"
           }
         }
       }
@@ -20692,6 +20596,102 @@
         }
       }
     },
+    "settings.advanced.embedding_audio.label" : {
+      "comment" : "Row label for the embedding audio-input toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Audio Input"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Аудиовход"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "音频输入"
+          }
+        }
+      }
+    },
+    "settings.advanced.embedding_audio.sub" : {
+      "comment" : "Sublabel for the embedding audio-input toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Load the audio encoder so /v1/embeddings accepts audio items. Uses more memory even for text-only requests. Applies after the model reloads."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Загружает аудиокодировщик, чтобы /v1/embeddings принимал аудиоэлементы. Использует больше памяти даже для текстовых запросов. Применяется после перезагрузки модели."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "加载音频编码器，使 /v1/embeddings 接受音频条目。即使只发送文本也会占用更多内存。重新加载模型后生效。"
+          }
+        }
+      }
+    },
+    "settings.advanced.embedding_audio_max_seconds.label" : {
+      "comment" : "Row label for the embedding audio length limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Max Audio Length"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Макс. длина аудио"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最大音频长度"
+          }
+        }
+      }
+    },
+    "settings.advanced.embedding_audio_max_seconds.sub" : {
+      "comment" : "Sublabel for the embedding audio length limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Longer audio is cut at this length (empty = 30 s). The model context caps it at about 5 minutes."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Более длинное аудио обрезается до этой длины (пусто = 30 с). Контекст модели ограничивает её примерно 5 минутами."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "超过此长度的音频会被截断（留空 = 30 秒）。受模型上下文限制，最长约 5 分钟。"
+          }
+        }
+      }
+    },
     "settings.advanced.enable_thinking.label" : {
       "comment" : "Row label for the enable-thinking toggle",
       "extractionState" : "manual",
@@ -23286,6 +23286,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "自动检测"
+          }
+        }
+      }
+    },
+    "settings.model_type.decision" : {
+      "comment" : "Model type option label for decision models served by /v1/systemone",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Decision"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Decision"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "决策"
           }
         }
       }

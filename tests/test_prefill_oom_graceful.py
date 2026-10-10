@@ -32,6 +32,7 @@ from omlx.memory_monitor import (
 from omlx.prefill_transient_tracker import PrefillTransientTracker
 from omlx.request import Request, SamplingParams
 from omlx.scheduler import (
+    PrefillEvictionRequest,
     Scheduler,
     SchedulerConfig,
     _PrefillEvictionNeeded,
@@ -190,7 +191,7 @@ def _throttle_ctx(
     return ns
 
 
-def _call(ns, requested, kv_len=0, *, gathered_core=False):
+def _call(ns, requested, kv_len=0, *, gathered_core=False, probe=False):
     with (
         patch.object(sched_mod.mx, "get_active_memory", return_value=0),
         patch.object(sched_mod, "get_phys_footprint", return_value=ns._fake_current),
@@ -202,7 +203,27 @@ def _call(ns, requested, kv_len=0, *, gathered_core=False):
             loop_label="test",
             kv_len=kv_len,
             gathered_core=gathered_core,
+            probe=probe,
         )
+
+
+def test_adaptive_throttle_probe_neither_pauses_nor_notifies():
+    ns = _throttle_ctx(
+        current=50 * _GB,
+        hard=58 * _GB,
+        samples_bpt=2 * 1024**2,
+    )
+    ns._fake_current = 50 * _GB
+    request = SimpleNamespace(prefill_eviction_retries=0)
+    ns.requests = {"r": request}
+    ns.config = SimpleNamespace(model_name="model-b")
+    ns._raise_prefill_eviction_if_available = (
+        Scheduler._raise_prefill_eviction_if_available.__get__(ns, Scheduler)
+    )
+    # A packed forward only asks whether its rows fit.
+    assert _call(ns, 2048, probe=True) < 2048
+    assert request.prefill_eviction_retries == 0
+    assert ns._throttle_notified_requests == set()
 
 
 def test_adaptive_throttle_requests_eviction_before_shrinking():
@@ -824,13 +845,9 @@ def test_generic_reclaim_that_cannot_fit_still_aborts(gathered_core):
 
 
 @pytest.mark.parametrize("path", ["adaptive", "guard"])
-@pytest.mark.parametrize("snap", ["0", "1"])
 @pytest.mark.parametrize("budget_tokens", [32, 63, 64, 511, 512, 513])
-def test_generic_linear_chunk_sizing_keeps_grid_and_exact_fits(
-    monkeypatch, path, snap, budget_tokens
-):
-    """A linear predictor keeps its previous sizes, including the opt-out."""
-    monkeypatch.setenv("OMLX_CHUNK_SNAP", snap)
+def test_generic_linear_chunk_sizing_keeps_grid_and_exact_fits(path, budget_tokens):
+    """A linear predictor keeps its previous sizes."""
     hard = 20 * _GB
     cap = int(hard * Scheduler._PREFILL_ABORT_MARGIN)
     # A 10-byte observation produces an exactly representable 13-byte
@@ -841,9 +858,7 @@ def test_generic_linear_chunk_sizing_keeps_grid_and_exact_fits(
     call = _call if path == "adaptive" else _guard_call
     chosen = call(ns, 512)
 
-    expected = min(512, budget_tokens)
-    if snap == "1":
-        expected = expected // 32 * 32
+    expected = min(512, budget_tokens) // 32 * 32
     assert chosen == expected
     assert current + ns._admission_transient_bound(chosen, 0) <= cap
 
@@ -1252,12 +1267,10 @@ def test_prefill_reserve_keeps_room_for_a_floor_chunk():
 
 
 @pytest.mark.parametrize(
-    ("monitor", "expected_gathered", "expected_state_route"),
-    [(_qwen4_monitor(), True, True), (_monitor(head_dim=192), False, None)],
+    ("monitor", "expected_gathered"),
+    [(_qwen4_monitor(), True), (_monitor(head_dim=192), False)],
 )
-def test_step_prefill_reclaims_before_first_guard(
-    monitor, expected_gathered, expected_state_route
-):
+def test_step_prefill_reclaims_before_first_guard(monitor, expected_gathered):
     events = []
     request = SimpleNamespace(request_id="req-prefill")
     state = _PrefillState(
@@ -1346,7 +1359,6 @@ def test_step_prefill_reclaims_before_first_guard(
         requested_step=2,
         gathered_core=expected_gathered,
     )
-    assert state.qwen4_gathered_core is expected_state_route
 
 
 # --------------------------------------------------------------------------
@@ -1366,6 +1378,7 @@ def _requeue_ctx():
         _MAX_PREFILL_OOM_RETRIES=2,
         _reclaim_prefill_headroom=lambda: 0,
     )
+    ns._requeue_prefill_retry = Scheduler._requeue_prefill_retry.__get__(ns, Scheduler)
     return ns
 
 
@@ -1461,11 +1474,6 @@ class TestSnapChunkSize:
         ns = self._ns()
         assert ns._snap_chunk_size(2048, 2048) == 2048
         assert ns._snap_chunk_size(2049, 2048) == 2049
-
-    def test_env_toggle_disables_snapping(self, monkeypatch):
-        monkeypatch.setenv("OMLX_CHUNK_SNAP", "0")
-        ns = self._ns()
-        assert ns._snap_chunk_size(33, 2048) == 33
 
     def test_respects_min_chunk_grid(self):
         ns = self._ns(min_chunk=256)
@@ -1813,7 +1821,7 @@ def test_prefill_loop_records_pool_release_before_next_chunk(chunked, monkeypatc
     original_adaptive = ns._adaptive_chunk_size
 
     def adaptive(n, **kwargs):
-        charges.append(ns._prefill_transient_tracker.flat_overhead_charge_for(True))
+        charges.append(ns._prefill_transient_tracker.flat_overhead_charge_for(False))
         return original_adaptive(n, **kwargs)
 
     ns._adaptive_chunk_size = adaptive
@@ -1841,6 +1849,53 @@ def test_prefill_loop_records_pool_release_before_next_chunk(chunked, monkeypatc
     assert len(charges) == 3
     assert charges[0] == 0
     assert all(charge > 0 for charge in charges[1:])
+
+
+def test_resumed_prefill_pausing_before_progress_skips_readmission():
+    """A resumed run can pause for eviction again before its first chunk.
+    It already passed admission, so its next resume must not be re-admitted
+    against the remaining prompt (#4213)."""
+    model = Model(
+        ModelArgs(
+            model_type="llama",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+        )
+    )
+    ns = Scheduler(
+        model,
+        SimpleNamespace(eos_token_id=2, encode=lambda s: [1]),
+        SchedulerConfig(prefill_step_size=64, paged_cache_block_size=0),
+    )
+    eviction = PrefillEvictionRequest(
+        request_id="resumed",
+        model_id="m",
+        current_bytes=0,
+        target_cap_bytes=1,
+        predicted_transient_bytes=1,
+        requested_tokens=64,
+        reason="adaptive_prefill_throttle",
+    )
+
+    def pause(*args, **kwargs):
+        raise _PrefillEvictionNeeded(eviction)
+
+    ns._guard_prefill_chunk = pause
+    prompt = [10] * 129
+    req = Request(request_id="resumed", prompt=prompt, sampling_params=SamplingParams())
+    req.prompt_token_ids = prompt
+    req.num_prompt_tokens = len(prompt)
+    req.prompt_cache = make_prompt_cache(model)
+
+    with pytest.raises(_PrefillEvictionNeeded):
+        ns._do_external_prefill(req, prompt, req.prompt_cache)
+
+    assert req._prefill_resumed is True
 
 
 @pytest.mark.parametrize("route", [False, True])

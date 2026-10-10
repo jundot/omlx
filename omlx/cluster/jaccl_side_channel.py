@@ -26,6 +26,7 @@ _RANK_BYTES = struct.Struct("!I")
 _DEFAULT_BOOTSTRAP_TIMEOUT_SECONDS = 20.0
 _DEFAULT_CONNECT_RETRY_SECONDS = 0.05
 _MAX_METADATA_BYTES = 8 * 1024 * 1024
+_SYSTEM_PYTHON = "/usr/bin/python3"
 
 # The serving interpreter can be denied macOS Local Network access even when
 # Apple's system Python is allowed to use the same direct Thunderbolt IP.  This
@@ -142,34 +143,6 @@ if __name__ == "__main__":
 """
 
 
-def _positive_float(name: str, default: float) -> float:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        return default
-    return value if value > 0 else default
-
-
-def _enabled() -> bool:
-    """Whether to replace JACCL's native metadata side channel.
-
-    This is default-on for oMLX JACCL jobs, with an escape hatch for precise
-    upstream comparison and incident recovery.
-    """
-
-    return os.environ.get(
-        "OMLX_JACCL_PYTHON_SIDE_CHANNEL", "1"
-    ).strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
-
-
 def _coordinator_endpoint() -> tuple[str, int]:
     raw = os.environ.get("MLX_JACCL_COORDINATOR", "").strip()
     host, separator, port_text = raw.rpartition(":")
@@ -225,11 +198,6 @@ def _send_all(sock: socket.socket, payload: bytes) -> None:
         view = view[written:]
 
 
-def _trace(message: str) -> None:
-    if os.environ.get("OMLX_JACCL_SIDE_CHANNEL_TRACE", "0") == "1":
-        print(f"OMLX_JACCL_SIDE_CHANNEL {message}", file=sys.stderr, flush=True)
-
-
 class _SocketAllGather:
     """One rank's persistent, serialized bootstrap TCP connection set."""
 
@@ -238,10 +206,7 @@ class _SocketAllGather:
             raise RuntimeError("JACCL side channel received invalid rank metadata")
         self.rank = rank
         self.size = size
-        self.timeout = _positive_float(
-            "OMLX_JACCL_SIDE_CHANNEL_TIMEOUT_SECONDS",
-            _DEFAULT_BOOTSTRAP_TIMEOUT_SECONDS,
-        )
+        self.timeout = _DEFAULT_BOOTSTRAP_TIMEOUT_SECONDS
         self._lock = threading.Lock()
         self._peers: list[socket.socket] | socket.socket
         host, port = _coordinator_endpoint()
@@ -249,7 +214,6 @@ class _SocketAllGather:
             self._peers = self._accept_peers(host, port)
         else:
             self._peers = self._connect(host, port)
-        _trace(f"ready rank={rank} size={size} coordinator={host}:{port}")
 
     def _accept_peers(self, host: str, port: int) -> list[socket.socket]:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -329,29 +293,17 @@ class _SocketAllGather:
 def _sidecar_python() -> str | None:
     """Return Apple's system Python when it is usable as a network carrier."""
 
-    candidate = Path(
-        os.environ.get("OMLX_JACCL_SIDE_CHANNEL_PYTHON", "/usr/bin/python3")
-    )
+    candidate = Path(_SYSTEM_PYTHON)
     if candidate.is_file() and os.access(candidate, os.X_OK):
         return str(candidate)
     return None
 
 
 def _side_channel_transport() -> str:
-    value = os.environ.get("OMLX_JACCL_SIDE_CHANNEL_TRANSPORT", "auto").strip()
-    selected = value.lower() or "auto"
-    if selected not in {"auto", "direct", "sidecar"}:
-        raise RuntimeError(
-            "OMLX_JACCL_SIDE_CHANNEL_TRANSPORT must be auto, direct, or sidecar"
-        )
-    if selected == "auto":
-        # The helper is off the hot path and prevents a macOS Local Network
-        # entitlement mismatch from making an otherwise verified TB fabric
-        # unusable. Non-macOS hosts retain the direct standard-library path.
-        return "sidecar" if sys.platform == "darwin" and _sidecar_python() else "direct"
-    if selected == "sidecar" and _sidecar_python() is None:
-        raise RuntimeError("JACCL side-channel helper Python is unavailable")
-    return selected
+    # The helper is off the hot path and prevents a macOS Local Network
+    # entitlement mismatch from making an otherwise verified TB fabric
+    # unusable. Non-macOS hosts retain the direct standard-library path.
+    return "sidecar" if sys.platform == "darwin" and _sidecar_python() else "direct"
 
 
 class _SidecarAllGather:
@@ -363,10 +315,7 @@ class _SidecarAllGather:
         host, port = _coordinator_endpoint()
         self.rank = rank
         self.size = size
-        self.timeout = _positive_float(
-            "OMLX_JACCL_SIDE_CHANNEL_TIMEOUT_SECONDS",
-            _DEFAULT_BOOTSTRAP_TIMEOUT_SECONDS,
-        )
+        self.timeout = _DEFAULT_BOOTSTRAP_TIMEOUT_SECONDS
         self._lock = threading.Lock()
         executable = _sidecar_python()
         if executable is None:  # defensive: transport selection already checks
@@ -391,7 +340,6 @@ class _SidecarAllGather:
             stderr=subprocess.PIPE,
             bufsize=0,
         )
-        _trace(f"sidecar started rank={rank} size={size} coordinator={host}:{port}")
 
     def _failure(self) -> RuntimeError:
         status = self._process.poll()
@@ -467,14 +415,12 @@ def init_cluster_group(
     selected = backend
     if selected is None and os.environ.get("MLX_JACCL_COORDINATOR"):
         selected = "jaccl"
-    if selected == "jaccl" and _enabled():
-        if _mlx_supports_all_gather_factory(distributed):
-            return distributed.init(
-                backend="jaccl",
-                strict=strict,
-                all_gather_factory=jaccl_all_gather_factory,
-            )
-        _trace("native MLX has no all_gather_factory; using its default bootstrap")
+    if selected == "jaccl" and _mlx_supports_all_gather_factory(distributed):
+        return distributed.init(
+            backend="jaccl",
+            strict=strict,
+            all_gather_factory=jaccl_all_gather_factory,
+        )
     if selected is None:
         return distributed.init(strict=strict)
     return distributed.init(backend=selected, strict=strict)

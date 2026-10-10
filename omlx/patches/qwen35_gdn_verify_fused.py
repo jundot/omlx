@@ -19,9 +19,8 @@ read. Any other reader of the slot evaluates the lazy replay normally.
 
 The arithmetic follows the stock chain: the per-row reduction order of
 ``gated_delta_update``, the bf16 or fp16 rounding points of ``compute_g`` and
-``sigmoid``, MLX ``rms_norm`` and ``_precise_swiglu``. Compiled MLX graphs use
-precise transcendentals while custom kernels default to fast math, so the
-helpers call ``metal::precise`` explicitly. The result is bit-exact on M3 and
+``sigmoid``, MLX ``rms_norm`` and ``_precise_swiglu``. The decay helpers use
+precise transcendentals, and the SiLU gate follows the installed MLX build. The result is bit-exact on M3 and
 later GPUs. On M1/M2 MLX's own softplus rounds very small values differently,
 so the decay of such rows can differ by one ulp.
 """
@@ -29,6 +28,7 @@ so the decay of such rows can differ by one ulp.
 from __future__ import annotations
 
 import logging
+from functools import cache
 
 import mlx.core as mx
 
@@ -69,16 +69,14 @@ inline float gdn_decay(InT a, InT dt, float neg_a) {
     return metal::precise::exp(neg_a * static_cast<float>(sp));
 }
 
+// MLX's Sigmoid functor, rounded to InT once.
 template <typename InT>
 inline float gdn_beta(InT x) {
-    InT ax = static_cast<InT>(metal::abs(static_cast<float>(x)));
-    InT e = static_cast<InT>(metal::precise::exp(static_cast<float>(ax)));
-    auto y = 1 / (1 + e);
-    InT r = (x < 0) ? y : 1 - y;
-    return static_cast<float>(r);
+    auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
+    return static_cast<float>(static_cast<InT>((x < InT(0)) ? y : 1 - y));
 }
 
-// MLX's half softplus and sigmoid round every half op, which fast math would
+// MLX's half softplus rounds every half op, which fast math would
 // fuse away here, so each step runs in float and rounds to half explicitly.
 inline half gdn_h(float x) {
     return static_cast<half>(x);
@@ -112,14 +110,6 @@ inline float gdn_decay(half a, half dt, float neg_a) {
     return metal::precise::exp(neg_a * static_cast<float>(sp));
 }
 
-inline float gdn_beta(half x) {
-    half ax = metal::abs(x);
-    half e = gdn_h(metal::precise::exp(static_cast<float>(ax)));
-    half d = gdn_h(1.0f + static_cast<float>(e));
-    half y = gdn_h(metal::precise::divide(1.0f, static_cast<float>(d)));
-    half r = (x < half(0)) ? y : gdn_h(1.0f - static_cast<float>(y));
-    return static_cast<float>(r);
-}
 """
 
 _PROLOGUE = """
@@ -219,7 +209,8 @@ _NORM_GATE = """
     for (int i = 0; i < 4; ++i) {
         InT normed = norm_w[lane * 4 + i] * static_cast<InT>(x[i] * inv);
         float g = static_cast<float>(zp[i]);
-        float sy = 1 / (1 + metal::precise::exp(metal::abs(g)));
+        // Match the installed MLX float32 sigmoid arithmetic.
+        float sy = 1 / (1 + SIGMOID_EXP(metal::abs(g)));
         float sig = (g < 0) ? sy : 1 - sy;
         InT o = static_cast<InT>((g * sig) * static_cast<float>(normed));
         op[i] = o;
@@ -261,6 +252,49 @@ def _kernel(main: bool, replay: bool):
     return kernel
 
 
+@cache
+def _sigmoid_exp():
+    """Match served SiLU across all gate encodings before fusing the norm.
+
+    Released and nightly MLX builds differ in their float32 exponential.
+    Probe both expressions once; decline fusion if neither is equivalent.
+    """
+    from mlx_vlm.models.qwen3_5.language import _precise_swiglu
+
+    encodings = mx.arange(65536, dtype=mx.uint32).astype(mx.uint16)
+    gates = mx.concatenate(
+        [
+            encodings.view(dtype).astype(mx.float32)
+            for dtype in (mx.float16, mx.bfloat16)
+        ]
+    )
+    expected = _precise_swiglu(gates, gates, mx.ones_like(gates))
+    for expression in ("metal::exp", "metal::precise::exp"):
+        kernel = mx.fast.metal_kernel(
+            name="omlx_gdn_sigmoid_probe",
+            input_names=["gates"],
+            output_names=["out"],
+            source="""
+                uint i = thread_position_in_grid.x;
+                float g = gates[i];
+                float sy = 1 / (1 + EXP(metal::abs(g)));
+                out[i] = g * (g < 0 ? sy : 1 - sy);
+            """.replace("EXP", expression),
+        )
+        (actual,) = kernel(
+            inputs=[gates],
+            grid=(gates.size, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[gates.shape],
+            output_dtypes=[mx.float32],
+        )
+        same = (actual == expected) | (mx.isnan(actual) & mx.isnan(expected))
+        if mx.all(same).item():
+            return expression
+    logger.warning("GDN fused norm disabled: unsupported MLX sigmoid arithmetic")
+    return None
+
+
 def _norm_gate_kernel(eps: float):
     key = ("norm_gate", float(eps))
     kernel = _KERNELS.get(key)
@@ -269,7 +303,9 @@ def _norm_gate_kernel(eps: float):
             name="omlx_gdn_norm_gate_eps" + f"{eps:.0e}".replace("-", "m"),
             input_names=["y", "z", "norm_w"],
             output_names=["out", "xs"],
-            source=_NORM_GATE.replace("EPS", f"{float(eps)!r}f"),
+            source=_NORM_GATE.replace("EPS", f"{float(eps)!r}f").replace(
+                "SIGMOID_EXP", _sigmoid_exp()
+            ),
         )
         _KERNELS[key] = kernel
     return kernel
@@ -304,6 +340,7 @@ def fused_eligible(layer, q, cache, length) -> bool:
         and layer.norm.weight.dtype == q.dtype
         and (state is None or state.dtype == mx.float32)
         and length <= 32
+        and _sigmoid_exp() is not None
     )
 
 
@@ -438,8 +475,43 @@ def _commit_replay(cache, index, record, lengths):
     cache._omlx_gdn_pending = (state, start, rows, keep)
 
 
+def deferred_states_ready(cache, index, length) -> bool:
+    """Whether ``record_deferred_states`` can record slot ``index`` for one
+    block covering the whole speculative window."""
+    transaction = getattr(cache, "_speculation", None)
+    return (
+        _PATCHED
+        and transaction is not None
+        and transaction["length"] == length
+        and int(index) not in transaction["records"]
+    )
+
+
+def record_deferred_states(cache, index, start, final, length, resolve):
+    """Record a recurrent slot without its per-token states: a commit keeping
+    ``0 < m < length`` tokens assigns ``resolve(m)`` (a lazy recomputation
+    of the state after ``m`` tokens), ``m = length`` keeps ``final`` and
+    ``m = 0`` restores ``start``."""
+    transaction = cache._speculation
+    transaction["records"][int(index)] = ("deferred", start, final, int(length), resolve)
+
+
+def _commit_deferred(cache, index, record, lengths):
+    _, start, final, length, resolve = record
+    if len(set(lengths)) != 1:
+        raise ValueError("Deferred recurrent states commit one shared length.")
+    keep = lengths[0]
+    if keep == 0:
+        cache[index] = start
+    elif keep == length:
+        cache[index] = final
+    else:
+        cache[index] = resolve(keep)
+
+
 def apply_arrays_cache_replay_patch() -> bool:
-    """Teach ArraysCache transactions the ``replay`` and ``window_pair`` kinds."""
+    """Teach ArraysCache transactions the ``replay``, ``window_pair`` and
+    ``deferred`` kinds."""
     global _PATCHED, _NORM_CLASS
     if _PATCHED:
         return True
@@ -451,7 +523,7 @@ def apply_arrays_cache_replay_patch() -> bool:
 
     def _recorded_length(self, index):
         record = self._speculation["records"].get(index)
-        if record is not None and record[0] == "replay":
+        if record is not None and record[0] in ("replay", "deferred"):
             return record[3]
         if record is not None and record[0] == "window_pair":
             return record[2].shape[1]
@@ -464,7 +536,7 @@ def apply_arrays_cache_replay_patch() -> bool:
             custom = {
                 index: record
                 for index, record in transaction["records"].items()
-                if record[0] in ("replay", "window_pair")
+                if record[0] in ("replay", "window_pair", "deferred")
             }
         if not custom:
             return orig_commit(self, lengths, generation)
@@ -477,6 +549,8 @@ def apply_arrays_cache_replay_patch() -> bool:
         for index, record in custom.items():
             if record[0] == "replay":
                 _commit_replay(self, index, record, resolved)
+            elif record[0] == "deferred":
+                _commit_deferred(self, index, record, resolved)
             else:
                 _commit_window(self, index, record, resolved)
 

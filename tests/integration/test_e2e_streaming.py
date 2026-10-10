@@ -4901,6 +4901,238 @@ async def test_qwen_closed_envelope_with_unclosed_parameter_never_emits_call():
     assert events[-1]["error"]["code"] == "invalid_tool_call"
 
 
+# Prose that quotes the control marker. The filter withholds it to EOF, but
+# nothing here is a tool call payload.
+_RECOVERY_PROSE = (
+    "The tag <tool_call> is how qwen calls a tool. This sentence must survive. END"
+)
+_RECOVERY_PROSE_REPEAT = (
+    "The tag <tool_call> is how qwen calls a tool. It is named again in a "
+    "fence:\n```\n<tool_call>\n```\nOnly the name is quoted. END"
+)
+_RECOVERY_MALFORMED_CLOSED = (
+    "<tool_call><function=write><parameter=content>cut</tool_call>"
+)
+_RECOVERY_TRUNCATED_JSON = '<tool_call>{"name":"write","arguments":{"content":"cut'
+
+
+def _recovery_text(events, api):
+    if api == "chat":
+        return "".join(
+            c.get("delta", {}).get("content") or ""
+            for e in events
+            for c in e.get("choices", [])
+        )
+    if api == "anthropic":
+        return "".join(
+            e.get("delta", {}).get("text") or ""
+            for e in events
+            if e.get("type") == "content_block_delta"
+        )
+    return "".join(
+        e.get("delta") or ""
+        for e in events
+        if e.get("type") == "response.output_text.delta"
+    )
+
+
+def _recovery_error_codes(events, api):
+    codes = [e["error"]["code"] for e in events if "error" in e]
+    if api == "responses":
+        codes += [
+            e["response"]["error"]["code"]
+            for e in events
+            if e.get("type") == "response.failed"
+        ]
+    return codes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+@pytest.mark.parametrize("chunk_size", [1, 4096])
+async def test_withheld_prose_after_literal_marker_is_delivered(api, chunk_size):
+    events = await _recovery_stream(_RECOVERY_PROSE, api, chunk_size=chunk_size)
+
+    assert _recovery_error_codes(events, api) == []
+    assert _recovery_text(events, api) == _RECOVERY_PROSE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+@pytest.mark.parametrize(
+    "raw,visible",
+    [
+        (_RECOVERY_TRUNCATED_JSON, ""),
+        ("<function=write><parameter=content>cut", ""),
+        ("<tool_call>", ""),
+        (
+            "The tag <tool_call> is it. Now calling: " + _RECOVERY_TRUNCATED_JSON,
+            "The tag ",
+        ),
+        (_RECOVERY_MALFORMED_CLOSED + " The tag <tool_call> is it. END", " The tag "),
+        ('Saving now. <tool_call>write(content="hel', "Saving now. "),
+    ],
+)
+async def test_withheld_tool_payload_is_not_recovered(api, raw, visible):
+    events = await _recovery_stream(raw, api)
+
+    assert _recovery_error_codes(events, api) == ["incomplete_tool_call"]
+    assert not _recovery_calls(events, api)
+    assert _recovery_text(events, api) == visible
+
+
+@pytest.mark.asyncio
+async def test_withheld_prose_after_delivered_call_is_not_recovered():
+    raw = _RECOVERY_CALL + " then <tool_call> prose that must not be recovered. END"
+    events = await _recovery_stream(raw, "chat")
+
+    assert _recovery_error_codes(events, "chat") == ["incomplete_tool_call"]
+    assert _recovery_text(events, "chat") == " then "
+    assert len(_recovery_calls(events, "chat")) == 1
+
+
+@pytest.mark.asyncio
+async def test_recovered_prose_reaches_responses_final_text():
+    events = await _recovery_stream(_RECOVERY_PROSE, "responses")
+
+    done = [e["text"] for e in events if e.get("type") == "response.output_text.done"]
+    completed = [
+        item["content"][0]["text"]
+        for e in events
+        if e.get("type") == "response.completed"
+        for item in e["response"].get("output", [])
+        if item.get("type") == "message"
+    ]
+    assert done == completed == [_RECOVERY_PROSE]
+
+
+def _nonstream_tool_call_client(monkeypatch, body: str):
+    """Return a client whose model generates ``body`` for non-stream requests."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from fastapi.testclient import TestClient
+    from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+    from omlx.engine.batched import BatchedEngine
+    from omlx.server import _server_state, app
+
+    engine = BatchedEngine("test-model")
+    engine._loaded = True
+    engine._model = SimpleNamespace(args=SimpleNamespace(model_type="qwen3"))
+    engine._tokenizer = MockTokenizer()
+    engine._tokenizer.has_tool_calling = True
+    engine._tokenizer.tool_call_start = "<tool_call>"
+    engine._tokenizer.tool_call_end = "</tool_call>"
+    engine._tokenizer.tool_parser = parse_tool_call
+    engine._engine = SimpleNamespace(engine=SimpleNamespace(scheduler=object()))
+    monkeypatch.setattr(engine, "_preflight_or_raise_with_eviction", AsyncMock())
+
+    output = MockGenerationOutput(
+        text=body,
+        new_text=body,
+        completion_tokens=4,
+        finished=True,
+        finish_reason="stop",
+    )
+    monkeypatch.setattr(engine, "generate", AsyncMock(return_value=output))
+
+    async def generate_stream(*args, **kwargs):
+        yield output
+
+    monkeypatch.setattr(engine, "stream_generate", generate_stream)
+    monkeypatch.setattr(_server_state, "engine_pool", MockEnginePool(engine))
+    monkeypatch.setattr(_server_state, "default_model", "test-model")
+    return TestClient(app)
+
+
+
+
+_NONSTREAM_RECOVERY_REQUESTS = {
+    "/v1/chat/completions": {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Write hello"}],
+        "stream": False,
+        "tools": _RECOVERY_TOOLS,
+    },
+    "/v1/messages": {
+        "model": "test-model",
+        "max_tokens": 128,
+        "messages": [{"role": "user", "content": "Write hello"}],
+        "tools": [
+            {
+                "name": "write",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"content": {"type": "string"}},
+                },
+            }
+        ],
+    },
+    "/v1/responses": {
+        "model": "test-model",
+        "input": "Write hello",
+        "store": False,
+        "tools": [
+            {
+                "type": "function",
+                "name": "write",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"content": {"type": "string"}},
+                },
+            }
+        ],
+    },
+}
+
+
+@pytest.mark.parametrize("path", list(_NONSTREAM_RECOVERY_REQUESTS))
+@pytest.mark.parametrize("raw", [_RECOVERY_PROSE, _RECOVERY_PROSE_REPEAT])
+def test_nonstream_quoted_marker_is_delivered(monkeypatch, path, raw):
+    client = _nonstream_tool_call_client(monkeypatch, raw)
+    response = client.post(path, json=_NONSTREAM_RECOVERY_REQUESTS[path])
+    client.close()
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    if path == "/v1/chat/completions":
+        assert body["choices"][0]["message"]["content"] == raw
+        assert body["choices"][0]["finish_reason"] == "stop"
+    elif path == "/v1/messages":
+        assert body["content"][0]["text"] == raw
+    else:
+        texts = [
+            part["text"]
+            for item in body["output"]
+            if item["type"] == "message"
+            for part in item["content"]
+        ]
+        assert texts == [raw]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        _RECOVERY_TRUNCATED_JSON,
+        "The tag <tool_call> is it. Now calling: " + _RECOVERY_TRUNCATED_JSON,
+        _RECOVERY_MALFORMED_CLOSED + " The tag <tool_call> is it. END",
+        'Saving now. <tool_call>write(content="hel',
+        "<tool_call>\n<|im_start|>function: run>\n<parameter=code>cut",
+    ],
+)
+def test_nonstream_truncated_or_malformed_call_still_fails(monkeypatch, raw):
+    client = _nonstream_tool_call_client(monkeypatch, raw)
+    response = client.post(
+        "/v1/chat/completions",
+        json=_NONSTREAM_RECOVERY_REQUESTS["/v1/chat/completions"],
+    )
+    client.close()
+
+    assert response.status_code == 500, response.text
+    assert response.json()["error"]["code"] == "incomplete_tool_call"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
 @pytest.mark.parametrize("raw", [_RECOVERY_CALL, "<tool_call><function=write>"])
@@ -5354,3 +5586,21 @@ async def test_stream_thinking_length_channels(api, with_tools):
         )
     assert content == ""
     assert reasoning == "unfinished</thi"
+
+
+async def test_responses_stream_reports_resolved_sampling():
+    from omlx.api.responses_models import ResponsesRequest
+    from omlx.server import stream_responses_api
+
+    engine = MockBaseEngine()
+    engine.set_stream_outputs(
+        [MockGenerationOutput(text="Hi", new_text="Hi", finished=True)]
+    )
+    request = ResponsesRequest(model="test-model", input="Hi", temperature=0.9)
+    stream = stream_responses_api(
+        engine, [], request, store_response=False, temperature=0.2, top_p=0.5
+    )
+    events = parse_sse_events("".join([frame async for frame in stream]))
+    for name in ("response.created", "response.completed"):
+        response = next(e["response"] for e in events if e["type"] == name)
+        assert (response["temperature"], response["top_p"]) == (0.2, 0.5)

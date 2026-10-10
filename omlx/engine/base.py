@@ -88,7 +88,6 @@ async def _run_scheduler_preflight_with_cleanup_retry(
     request_id: str | None,
     eviction_callback: Any | None,
     executor: Any | None = None,
-    text_only: bool = False,
 ) -> None:
     """Run route preflight after transient post-request cleanup settles.
 
@@ -109,13 +108,11 @@ async def _run_scheduler_preflight_with_cleanup_retry(
         eviction_request = scheduler.preflight_eviction_request(
             num_prompt_tokens=num_prompt_tokens,
             request_id=request_id,
-            text_only=text_only,
         )
         if eviction_request is None:
             scheduler.preflight_or_raise(
                 num_prompt_tokens=num_prompt_tokens,
                 request_id=request_id,
-                text_only=text_only,
             )
             return
 
@@ -180,10 +177,17 @@ async def _run_scheduler_preflight_with_cleanup_retry(
                 eviction_request.request_id,
             )
             await eviction_callback(eviction_request)
+            # The pool re-measures after eviction/reclaim, but its reading
+            # does not update this scheduler's cached MLX sample. Refresh
+            # even when the callback reports no action: it may already see
+            # enough headroom while this scheduler still charges old bytes.
+            refresh_usage = getattr(scheduler, "refresh_route_preflight_usage", None)
+            if executor is not None and callable(refresh_usage):
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(executor, refresh_usage)
         scheduler.preflight_or_raise(
             num_prompt_tokens=num_prompt_tokens,
             request_id=request_id,
-            text_only=text_only,
         )
         return
 
@@ -545,6 +549,24 @@ class BaseEngine(ABC):
         See :meth:`preflight_chat` for the rationale.
         """
         return None
+
+    async def tokenize_chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+        add_generation_prompt: bool | None = None,
+        add_special_tokens: bool | None = None,
+    ) -> list[int]:
+        """Return the prompt token IDs that ``chat()`` submits for ``messages``.
+
+        ``add_generation_prompt`` overrides the partial-derived default.
+        ``add_special_tokens=None`` keeps the engine's own generation behavior.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support chat tokenization"
+        )
 
 
 class ActivityTrackingMixin:

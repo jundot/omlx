@@ -19,6 +19,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = REPO_ROOT / "omlx" / "admin" / "bench_corpora"
+WEB_ROOT = REPO_ROOT / "apps" / "omlx-web" / "omlx_web"
 KNOTE_COMMIT = "add4f9dd99db7e322018d9993c86aadd8e8f4335"
 KNOTE_TREE_URL = (
     "https://api.github.com/repos/AKS-DHLAB/KNoTE/git/trees/"
@@ -83,8 +84,8 @@ def _mixed_corpus() -> str:
     buckets = [
         sorted((REPO_ROOT / "omlx").rglob("*.py")),
         sorted((REPO_ROOT / "apps" / "omlx-mac" / "Sources").rglob("*.swift")),
-        sorted((REPO_ROOT / "omlx" / "admin" / "static" / "js").rglob("*.js"))
-        + sorted((REPO_ROOT / "omlx" / "admin" / "templates").rglob("*.html")),
+        sorted((WEB_ROOT / "static" / "js").rglob("*.js"))
+        + sorted((WEB_ROOT / "templates").rglob("*.html")),
         sorted((REPO_ROOT / "omlx" / "custom_kernels").rglob("*.cpp"))
         + sorted((REPO_ROOT / "omlx" / "custom_kernels").rglob("*.h"))
         + sorted((REPO_ROOT / "omlx" / "custom_kernels").rglob("*.metal")),

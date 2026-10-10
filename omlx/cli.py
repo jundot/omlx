@@ -15,8 +15,10 @@ Usage:
 """
 
 import argparse
+import errno
 import faulthandler
 import math
+import socket
 import sys
 
 from ._version import __version__
@@ -156,6 +158,16 @@ def _migrate_saved_network_auth(settings, args) -> None:
             os.replace(temporary, notice)
         finally:
             temporary.unlink(missing_ok=True)
+
+
+def _is_local_address(host: str) -> bool:
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    with socket.socket(family) as probe:
+        try:
+            probe.bind((host, 0))
+        except OSError as exc:
+            return exc.errno != errno.EADDRNOTAVAIL
+    return True
 
 
 def serve_command(args):
@@ -301,6 +313,11 @@ def serve_command(args):
     # normal startup runs ASGI lifespan before binding host/port, which means
     # pinned models can be preloaded before a port conflict is detected.
     bind_hosts = [h.strip() for h in settings.server.host.split(",") if h.strip()]
+    # A secondary address such as a VPN IP can be missing until its link is up.
+    for h in bind_hosts[1:]:
+        if not _is_local_address(h):
+            print(f"Warning: skipping {h}, it is not assigned to any local interface")
+            bind_hosts.remove(h)
     for h in bind_hosts:
         print(f"Binding server at http://{h}:{settings.server.port}")
     # uvicorn does not support "trace" — map to "debug" for its internal logging
@@ -328,6 +345,10 @@ def serve_command(args):
             access_log=show_access_log,
         )
         serve_sockets.append(extra_cfg.bind_socket())
+
+    # Read by omlx.server at import time.
+    if getattr(args, "headless", False):
+        os.environ["OMLX_HEADLESS"] = "1"
 
     try:
         # Import server and config after the port is known to be available.
@@ -553,9 +574,17 @@ def launch_command(args, extra_args: list[str] | None = None):
     # Determine model. Explicit CLI tier flags bypass the picker; otherwise always
     # prompt interactively so the user's selection is honoured.
     model = args.model
+    if not model and not integration.requires_model_selection:
+        # The integration registers the server's whole model catalog, so
+        # there is nothing to pick here; the optional per-tool default (or
+        # --model) only seeds the tool's own default model.
+        model = (
+            _optional_str(getattr(settings.integrations, f"{tool_name}_model", None))
+            or ""
+        )
     if not model and (cli_opus_model or cli_sonnet_model or cli_haiku_model):
         model = cli_sonnet_model or cli_opus_model or cli_haiku_model or ""
-    elif not model:
+    elif not model and integration.requires_model_selection:
         # Fetch available models from server
         try:
             resp = requests.get(f"{base_url}/v1/models", headers=headers, timeout=5)
@@ -654,13 +683,17 @@ def launch_command(args, extra_args: list[str] | None = None):
         max_tokens=model_info.get("max_tokens"),
         model_type=model_info.get("model_type"),
         reasoning=model_info.get("enable_thinking"),
+        models_status_map=models_status_map,
         tools_profile=getattr(args, "tools_profile", "coding"),
         extra_args=tuple(extra_args or ()),
         cross_session=getattr(args, "cross_session", False),
     )
 
     # Launch
-    print(f"Launching {integration.display_name} with model {model}...")
+    if model:
+        print(f"Launching {integration.display_name} with model {model}...")
+    else:
+        print(f"Launching {integration.display_name}...")
     integration.launch(ctx)
 
 
@@ -1216,7 +1249,7 @@ Example directory structure:
         type=str,
         choices=["off", "safe", "balanced", "aggressive"],
         default=None,
-        help="Memory guard tier, or 'off' to disable the guard. The tier sets how much memory stays free for other apps: safe keeps about 20%% of RAM (6-16 GB), balanced about 8%% (3-8 GB), aggressive 2%% (1.5-4 GB) and may compress other apps' memory. Passing a tier also turns the guard on. (default: balanced)",
+        help="Memory guard tier, or 'off' to disable the guard. The tier sets how much memory stays free for other apps: safe keeps about 20%% of RAM (6-16 GB), balanced about 8%% (3-8 GB) and may compress a quarter of other apps' memory, aggressive 2%% (1.5-4 GB) and may compress half of it. Passing a tier also turns the guard on. (default: balanced)",
     )
     serve_parser.add_argument(
         "--memory-guard-gb",
@@ -1334,6 +1367,12 @@ Example directory structure:
         default=None,
         help="API key for authentication (required for non-loopback binds)",
     )
+    serve_parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Serve the inference and admin APIs without the web UI. "
+        "Not saved to settings; same as OMLX_HEADLESS=1",
+    )
 
     # Launch command
     launch_parser = subparsers.add_parser(
@@ -1341,8 +1380,8 @@ Example directory structure:
         help="Launch an external tool with oMLX integration",
         description=(
             "Configure and launch external coding tools (Claude Code, Copilot, "
-            "Codex, Codex App, OpenCode, OpenClaw, Hermes Agent, Pi) to use "
-            "the running oMLX server."
+            "Codex, Codex App, OpenCode, OpenClaw, Hermes Agent, Pi, DeepSeek "
+            "Harness) to use the running oMLX server."
         ),
     )
     launch_parser.add_argument(
@@ -1350,7 +1389,7 @@ Example directory structure:
         type=str,
         help=(
             "Tool to launch: claude, copilot, codex, codex_app, opencode, "
-            "openclaw, hermes, pi, or 'list' to show available"
+            "openclaw, hermes, pi, dsh, or 'list' to show available"
         ),
     )
     launch_parser.add_argument(

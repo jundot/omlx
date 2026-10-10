@@ -10,7 +10,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from omlx.config import OMLXConfig
 from omlx.settings import (
     BURST_DECODE_MODES,
     DEFAULT_BURST_DECODE_MODE,
@@ -92,7 +91,9 @@ class TestServerSettings:
             "distributed_inference_enabled": False,
             "max_audio_upload_size": "100MB",
             "max_image_upload_size": "50MB",
+            "max_request_body_size": "512MB",
             "max_image_side_length": 2048,
+            "gpu_keep_warm_interval": 0.5,
         }
 
     def test_qwen4_decode_setting_round_trip(self):
@@ -1792,39 +1793,6 @@ class TestGlobalSettings:
         assert len(gdn_errors) == 1
         assert "must be one of" in gdn_errors[0]
 
-    def test_legacy_config_gdn_env_and_validation(self):
-        """The legacy config layer exposes the same GDN cache plumbing."""
-        with patch.dict(
-            os.environ,
-            {
-                "OMLX_GDN_SSD_SPLIT_ENABLED": "1",
-                "OMLX_GDN_SSD_PENDING_MAX_SIZE": "768MB",
-                "OMLX_GDN_SIDECAR_STATE_DTYPE": "bf16",
-            },
-            clear=False,
-        ):
-            config = OMLXConfig.from_env()
-        assert config.paged_ssd_cache.gdn_ssd_split_enabled is True
-        assert config.paged_ssd_cache.gdn_ssd_pending_max_size == "768MB"
-        assert config.paged_ssd_cache.gdn_sidecar_state_dtype == "bf16"
-
-        config.paged_ssd_cache.hot_cache_only = True
-        errors = config.validate()
-        assert any("gdn_ssd_split_enabled" in e for e in errors)
-
-    def test_legacy_config_gdn_storage_mode_env(self):
-        with patch.dict(
-            os.environ,
-            {
-                "OMLX_GDN_SNAPSHOT_STORAGE": "embedded",
-                "OMLX_GDN_SSD_SPLIT_ENABLED": "1",
-            },
-            clear=False,
-        ):
-            config = OMLXConfig.from_env()
-        assert config.paged_ssd_cache.gdn_ssd_split_enabled is False
-        assert config.paged_ssd_cache.gdn_snapshot_storage == "embedded"
-
     def test_validate_invalid_initial_cache_blocks(self):
         """Test validation catches invalid initial_cache_blocks."""
         settings = GlobalSettings()
@@ -3014,15 +2982,19 @@ class TestClaudeCodeRouteIntegration:
 class TestCORSMiddleware:
     """Test that CORS middleware is correctly applied to the server."""
 
-    def test_cors_preflight(self):
+    def test_cors_preflight(self, monkeypatch):
         """Test that CORS preflight requests get proper response headers."""
         from fastapi.testclient import TestClient
 
-        from omlx.server import app, init_server
+        from omlx.server import _server_state, app, init_server
 
         # Reset middleware stack so add_middleware works even if app was
         # already started by another test in the same process.
         app.middleware_stack = None
+        # init_server points the Responses store into tmpdir; restore it afterwards.
+        monkeypatch.setattr(
+            _server_state, "responses_store", _server_state.responses_store
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = GlobalSettings(base_path=Path(tmpdir))
@@ -3100,6 +3072,7 @@ class TestDashboardLayoutRoute:
                 {"id": "serving_stats", "x": 0, "y": 0, "w": 12},
                 {"id": "active_models", "x": 12, "y": 0, "w": 12},
             ],
+            "serving_stats_tiles": ["generated_tokens", "requests"],
         }
         layout.update(overrides)
         return layout
@@ -3182,6 +3155,40 @@ class TestDashboardLayoutRoute:
         )
         assert [b.id for b in layout.blocks] == ["serving_stats"]
         assert layout.blocks[0].w == 24
+
+    def test_serving_stats_tiles_keep_order_and_drop_unknown(self):
+        from omlx.admin.routes import DashboardLayoutRequest
+
+        layout = DashboardLayoutRequest.model_validate(
+            self._layout(
+                serving_stats_tiles=[
+                    "generated_tokens",
+                    "not_a_tile",
+                    "requests",
+                    "generated_tokens",
+                ]
+            )
+        )
+        assert layout.serving_stats_tiles == ["generated_tokens", "requests"]
+        # Layouts saved before the tile picker existed get the original tiles.
+        legacy = self._layout()
+        del legacy["serving_stats_tiles"]
+        assert DashboardLayoutRequest.model_validate(legacy).serving_stats_tiles == [
+            "requests",
+            "prefill_tokens",
+            "cached_tokens",
+            "cache_efficiency",
+        ]
+
+    def test_more_than_four_serving_stats_tiles_is_rejected(self):
+        import pydantic
+
+        from omlx.admin.routes import DASHBOARD_SERVING_TILE_IDS, DashboardLayoutRequest
+
+        with pytest.raises(pydantic.ValidationError):
+            DashboardLayoutRequest.model_validate(
+                self._layout(serving_stats_tiles=list(DASHBOARD_SERVING_TILE_IDS))
+            )
 
     @pytest.mark.parametrize(
         "block",

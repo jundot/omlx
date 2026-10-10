@@ -1,7 +1,7 @@
 // PR 12 — Quantization screen (oQ universal dynamic quantization).
 //
 // Mirrors the "Quantizer" tab from the HTML admin panel
-// (omlx/admin/templates/dashboard/_models.html:1025-1280 + dashboard.js:3437-
+// (apps/omlx-web/omlx_web/templates/dashboard/_models.html:1025-1280 + dashboard.js:3437-
 // 3680). Wires the /admin/api/oq/* endpoints — list / estimate / start /
 // tasks / cancel / remove — onto a stack of sections:
 //

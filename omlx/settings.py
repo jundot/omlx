@@ -205,8 +205,16 @@ class ServerSettings:
     max_audio_upload_size: str = "100MB"
     # Maximum raw image payload size accepted ("50MB", "100MB").
     max_image_upload_size: str = "50MB"
+    # Cap on any request body. It never drops below the upload limits.
+    max_request_body_size: str = "512MB"
     # Maximum side length in pixels for VLM input images (0 to disable downscaling).
     max_image_side_length: int = 2048
+    # Seconds between trivial GPU kernels submitted while a model is loaded
+    # but idle, so the GPU stays out of its idle power state (the first
+    # command buffer after ~1s+ of GPU idle stalls for up to seconds on
+    # large resident models). Ticks stop after 5 minutes without requests.
+    # 0 disables.
+    gpu_keep_warm_interval: float = 0.5
 
     def max_audio_upload_bytes(self) -> int:
         """Configured audio upload limit in bytes. Non-positive sizes raise ValueError."""
@@ -220,6 +228,13 @@ class ServerSettings:
         size = parse_size(self.max_image_upload_size)
         if size <= 0:
             raise ValueError("max_image_upload_size must be positive")
+        return size
+
+    def max_request_body_bytes(self) -> int:
+        """Configured transport-level request body cap in bytes."""
+        size = parse_size(self.max_request_body_size)
+        if size <= 0:
+            raise ValueError("max_request_body_size must be positive")
         return size
 
     def to_dict(self) -> dict[str, Any]:
@@ -247,7 +262,9 @@ class ServerSettings:
             ),
             max_audio_upload_size=data.get("max_audio_upload_size", "100MB"),
             max_image_upload_size=data.get("max_image_upload_size", "50MB"),
+            max_request_body_size=data.get("max_request_body_size", "512MB"),
             max_image_side_length=data.get("max_image_side_length", 2048),
+            gpu_keep_warm_interval=float(data.get("gpu_keep_warm_interval", 0.5)),
         )
 
 
@@ -926,6 +943,7 @@ class IntegrationSettings:
     hermes_model: str | None = None
     pi_model: str | None = None
     copilot_model: str | None = None
+    dsh_model: str | None = None
     openclaw_tools_profile: str = "coding"
     markitdown_enabled: bool = True
     markitdown_expose_model: bool = False
@@ -951,6 +969,7 @@ class IntegrationSettings:
             "hermes_model": self.hermes_model,
             "pi_model": self.pi_model,
             "copilot_model": self.copilot_model,
+            "dsh_model": self.dsh_model,
             "openclaw_tools_profile": self.openclaw_tools_profile,
             "markitdown_enabled": self.markitdown_enabled,
             "markitdown_expose_model": self.markitdown_expose_model,
@@ -977,6 +996,7 @@ class IntegrationSettings:
             hermes_model=data.get("hermes_model"),
             pi_model=data.get("pi_model"),
             copilot_model=data.get("copilot_model"),
+            dsh_model=data.get("dsh_model"),
             openclaw_tools_profile=data.get("openclaw_tools_profile", "coding"),
             markitdown_enabled=data.get("markitdown_enabled", True),
             markitdown_expose_model=data.get("markitdown_expose_model", False),
@@ -1172,6 +1192,13 @@ class GlobalSettings:
             self.server.preserve_mid_system_cache = (
                 preserve_mid_system_cache.strip().lower() in {"1", "true", "yes", "on"}
             )
+        if gpu_keep_warm := os.getenv("OMLX_GPU_KEEP_WARM_INTERVAL"):
+            try:
+                self.server.gpu_keep_warm_interval = float(gpu_keep_warm)
+            except ValueError:
+                logger.warning(
+                    f"Invalid OMLX_GPU_KEEP_WARM_INTERVAL value: {gpu_keep_warm}"
+                )
         if max_audio_upload_size := os.getenv("OMLX_MAX_AUDIO_UPLOAD_SIZE"):
             self.server.max_audio_upload_size = max_audio_upload_size
         if max_image_upload_size := (
@@ -1671,6 +1698,12 @@ class GlobalSettings:
                 errors.append("max_image_upload_size must be positive")
         except (AttributeError, TypeError, ValueError) as e:
             errors.append(f"Invalid max_image_upload_size: {e}")
+
+        try:
+            if parse_size(self.server.max_request_body_size) <= 0:
+                errors.append("max_request_body_size must be positive")
+        except (AttributeError, TypeError, ValueError) as e:
+            errors.append(f"Invalid max_request_body_size: {e}")
 
         if self.server.max_image_side_length < 0:
             errors.append("max_image_side_length must be non-negative")

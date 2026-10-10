@@ -783,6 +783,11 @@ class PagedCacheManager(CacheManager):
                     self.cached_block_hash_to_block.pop(block.block_hash, block.block_id)
                     self._notify_hash_dropped(block.block_hash)
 
+                # Free-queue blocks carry no hash or token count.
+                block.reset_hash()
+                self.stats.total_tokens_cached -= block.token_count
+                block.token_count = 0
+
                 # Remove from allocated
                 del self.allocated_blocks[block_id]
 
@@ -791,7 +796,6 @@ class PagedCacheManager(CacheManager):
 
                 self.stats.allocated_blocks -= 1
                 self.stats.free_blocks += 1
-                self.stats.total_tokens_cached -= block.token_count
 
                 return True
 
@@ -822,11 +826,15 @@ class PagedCacheManager(CacheManager):
                         self.cached_block_hash_to_block.pop(block.block_hash, block.block_id)
                         self._notify_hash_dropped(block.block_hash)
 
+                    # Free-queue blocks carry no hash or token count.
+                    block.reset_hash()
+                    self.stats.total_tokens_cached -= block.token_count
+                    block.token_count = 0
+
                     del self.allocated_blocks[block.block_id]
                     to_free.append(block)
                     self.stats.allocated_blocks -= 1
                     self.stats.free_blocks += 1
-                    self.stats.total_tokens_cached -= block.token_count
 
             # Add to free queue (back = MRU, evicted last)
             self.free_block_queue.append_n(to_free)
@@ -1665,8 +1673,16 @@ class PagedCacheManager(CacheManager):
                 del self.allocated_blocks[block_id]
                 self.stats.allocated_blocks -= 1
 
-            self.free_block_queue.append(block)
-            self.stats.free_blocks += 1
+            # Only return the block to the free queue if it is not already
+            # in it: get_evictable_blocks() walks the free queue itself, so
+            # most evictees are already linked. Re-appending would corrupt
+            # the chain (num_free_blocks over-counted, two popleft()s can
+            # return the same block, and the relink orphans the middle of
+            # the list). Membership test: append/popleft/remove keep
+            # next_free_block non-None iff linked.
+            if block.next_free_block is None:
+                self.free_block_queue.append(block)
+                self.stats.free_blocks += 1
             self.stats.evictions += 1
 
             logger.debug(f"Permanently evicted block {block_id}")

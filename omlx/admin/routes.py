@@ -29,10 +29,17 @@ from typing import Any, Literal, Optional
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
-from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from fastapi.responses import JSONResponse, RedirectResponse
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
+from .._version import __version__ as _omlx_version
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
 from ..api.utils import _try_parse_json
@@ -64,6 +71,7 @@ from ..utils.hardware import (
     get_total_memory_gb,
     parse_chip_info,
 )
+from ..utils.network import is_loopback_bind
 from ..utils.release_check import normalize_update_channel, select_latest_release
 from ..websearch import (
     DDGS_TEXT_BACKENDS,
@@ -80,6 +88,7 @@ from .auth import (
     validate_api_key,
     verify_api_key,
     verify_session,
+    web_ui_enabled,
 )
 from .benchmark import (
     _UPLOADED_SETTING_FIELDS,
@@ -191,6 +200,19 @@ print(deleted)
     return deleted, len(node_ids)
 
 
+def _oq_a8_model_supported(config_type: str | None) -> bool:
+    """True for the model families the oQ A8 prefill patch can route.
+
+    Qwen3.5/3.6/3.8 match by prefix. Qwen3.8-Flash-Next (``qwen4_exp``) matches
+    exactly: only that validated checkpoint family has routed-expert A8, so a
+    ``qwen4`` prefix would admit unvalidated models.
+    """
+    config_type = str(config_type or "").lower().replace("-", "_")
+    return config_type == "qwen4_exp" or config_type.startswith(
+        ("qwen3_5", "qwen3_6", "qwen3_8")
+    )
+
+
 def _oq_a8_kernels_available() -> bool:
     """True when the oQ A8 prefill kernels can actually run on this host.
 
@@ -287,6 +309,14 @@ class CacheProbeRequest(BaseModel):
     thinking_budget: int | None = None
 
 
+def _draft_path_is_unusable(value: str) -> bool:
+    path = Path(value).expanduser()
+    # Match local references without resolving or downloading HF repo IDs.
+    return (
+        path.is_absolute() or value.startswith(("./", "../")) or path.exists()
+    ) and not (path / "config.json").is_file()
+
+
 class ModelSettingsRequest(BaseModel):
     """Request model for updating per-model settings."""
 
@@ -344,7 +374,7 @@ class ModelSettingsRequest(BaseModel):
     qwen35_ane_prefill_cpu_gdn_fraction: float | None = None
     qwen35_ane_prefill_cpu_threads: int | None = None
     qwen35_ane_prefill_cpu_shared_resource: bool | None = None
-    # oQ mixed-bit QxA8 prefill kernels (Qwen3.5/3.6/3.8)
+    # oQ mixed-bit QxA8 prefill kernels (Qwen3.5/3.6/3.8 and Qwen3.8 Flash-Next)
     qwen35_oq_a8_enabled: bool | None = None
     qwen35_oq_a8_min_tokens: int | None = None
     # MoE expert offload (stream non-resident experts from the checkpoint)
@@ -387,6 +417,8 @@ class ModelSettingsRequest(BaseModel):
     is_favorite: bool | None = None
     # Security: per-model opt-in for trust_remote_code (issue #926)
     trust_remote_code: bool | None = None
+    embedding_audio_enabled: bool | None = None
+    embedding_audio_max_seconds: float | None = Field(default=None, gt=0)
 
     @field_validator("turboquant_kv_bits")
     @classmethod
@@ -431,14 +463,11 @@ class ModelSettingsRequest(BaseModel):
         "specprefill_draft_model", "dflash_draft_model", "vlm_mtp_draft_model"
     )
     @classmethod
-    def validate_draft_path(cls, value: str | None) -> str | None:
+    def validate_draft_path(cls, value: str | None, info: ValidationInfo) -> str | None:
         if not value:
             return None
-        path = Path(value).expanduser()
-        # Match local references without resolving or downloading HF repo IDs.
-        if (
-            path.is_absolute() or value.startswith(("./", "../")) or path.exists()
-        ) and not (path / "config.json").is_file():
+        # A DFlash draft may stay parked while DFlash is off; the route checks it.
+        if info.field_name != "dflash_draft_model" and _draft_path_is_unusable(value):
             raise ValueError(f"Draft model has no config.json: {value}")
         return value
 
@@ -548,6 +577,18 @@ DASHBOARD_BLOCK_IDS = (
     "applications",
     "engine_versions",
 )
+DASHBOARD_SERVING_TILE_IDS = (
+    "requests",
+    "prefill_tokens",
+    "cached_tokens",
+    "cache_efficiency",
+    "generated_tokens",
+)
+DASHBOARD_SERVING_TILE_MAX = 4
+
+
+def _default_serving_tiles() -> list[str]:
+    return list(DASHBOARD_SERVING_TILE_IDS[:DASHBOARD_SERVING_TILE_MAX])
 
 
 class DashboardLayoutBlock(BaseModel):
@@ -571,6 +612,8 @@ class DashboardLayoutRequest(BaseModel):
     version: Literal[1] = 1
     width: Literal["default", "wide", "wider", "full"] = "default"
     blocks: list[DashboardLayoutBlock] = Field(default_factory=list)
+    # Serving Stats tiles in left-to-right order.
+    serving_stats_tiles: list[str] = Field(default_factory=_default_serving_tiles)
 
     @field_validator("blocks")
     @classmethod
@@ -586,6 +629,16 @@ class DashboardLayoutRequest(BaseModel):
             kept.append(block)
         return kept
 
+    @field_validator("serving_stats_tiles")
+    @classmethod
+    def _known_unique_tiles(cls, tiles):
+        kept = list(dict.fromkeys(t for t in tiles if t in DASHBOARD_SERVING_TILE_IDS))
+        if len(kept) > DASHBOARD_SERVING_TILE_MAX:
+            raise ValueError(
+                f"at most {DASHBOARD_SERVING_TILE_MAX} serving stats tiles allowed"
+            )
+        return kept or _default_serving_tiles()
+
 
 class GlobalSettingsRequest(BaseModel):
     """Request model for updating global server settings."""
@@ -599,6 +652,7 @@ class GlobalSettingsRequest(BaseModel):
     auto_start_on_launch: bool | None = None
     burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
     preserve_mid_system_cache: bool | None = None
+    gpu_keep_warm_interval: float | None = None
     qwen4_gdn_decode_wide_proj: bool | None = None
     distributed_inference_enabled: bool | None = None
     max_audio_upload_size: str | None = None
@@ -681,6 +735,7 @@ class GlobalSettingsRequest(BaseModel):
     integrations_openclaw_model: str | None = None
     integrations_hermes_model: str | None = None
     integrations_pi_model: str | None = None
+    integrations_dsh_model: str | None = None
     integrations_openclaw_tools_profile: (
         Literal["minimal", "coding", "messaging", "full"] | None
     ) = None
@@ -1489,80 +1544,10 @@ def _apply_sampling_settings_runtime(
 
 
 # =============================================================================
-# Router and Templates
+# Router
 # =============================================================================
 
 router = APIRouter(prefix="/admin", tags=["admin"])
-templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
-static_dir = Path(__file__).parent / "static"
-
-
-def _static_version(path: str) -> str:
-    """Append file mtime as query string for cache busting."""
-    file_path = static_dir / path
-    if file_path.is_file():
-        mtime = int(file_path.stat().st_mtime)
-        return f"/admin/static/{path}?v={mtime}"
-    return f"/admin/static/{path}"
-
-
-templates.env.globals["static"] = _static_version
-
-from omlx._version import __version__ as _omlx_version
-
-templates.env.globals["version"] = _omlx_version
-
-# i18n defaults (English) — overridden once set_admin_getters is called
-_i18n_dir = Path(__file__).parent / "i18n"
-_en_locale: dict = {}
-try:
-    _en_locale = json.loads((_i18n_dir / "en.json").read_text(encoding="utf-8"))
-except Exception:
-    pass
-templates.env.globals["t"] = lambda key: _en_locale.get(key, key)
-templates.env.globals["locale_json"] = json.dumps(_en_locale, ensure_ascii=False)
-templates.env.globals["current_lang"] = "en"
-
-
-def _load_locale(language: str) -> dict:
-    """Load locale dict and fill missing keys from English."""
-    fallback = dict(_en_locale)
-    path = _i18n_dir / f"{language}.json"
-    if language == "en":
-        return fallback
-    try:
-        locale = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        try:
-            return json.loads((_i18n_dir / "en.json").read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    fallback.update(locale)
-    return fallback
-
-
-def _make_t(locale: dict):
-    """Return a Jinja2-compatible t() function for the given locale dict."""
-
-    def t(key: str) -> str:
-        return locale.get(key, key)
-
-    return t
-
-
-def _refresh_i18n_globals() -> None:
-    """Reload i18n globals from current settings. Called on startup and language change."""
-    lang = "en"
-    try:
-        settings = _get_global_settings() if _get_global_settings else None
-        if settings:
-            lang = settings.ui.language
-    except Exception:
-        pass
-    locale = _load_locale(lang)
-    templates.env.globals["t"] = _make_t(locale)
-    templates.env.globals["locale_json"] = json.dumps(locale, ensure_ascii=False)
-    templates.env.globals["current_lang"] = lang
 
 
 # =============================================================================
@@ -1577,6 +1562,15 @@ _hf_downloader = None
 _ms_downloader = None
 _oq_manager = None
 _hf_uploader = None
+
+# One save at a time: _save_data writes through a pid-named temp file.
+_settings_save_lock = asyncio.Lock()
+
+
+async def _save_global_settings_async(global_settings) -> None:
+    """Persist global settings off the event loop, serialized."""
+    async with _settings_save_lock:
+        await asyncio.to_thread(global_settings.save)
 
 
 def set_admin_getters(
@@ -1602,7 +1596,6 @@ def set_admin_getters(
     _get_engine_pool = pool_getter
     _get_settings_manager = settings_manager_getter
     _get_global_settings = global_settings_getter
-    _refresh_i18n_globals()
 
 
 def set_hf_downloader(downloader):
@@ -1660,6 +1653,36 @@ def _active_bind_host(global_settings) -> str:
         else None
     )
     return active_host or global_settings.server.host
+
+
+def is_admin_request(request: Request) -> bool:
+    """Return whether a browser request can open admin pages without login."""
+    if verify_session(request):
+        return True
+    global_settings = _get_global_settings()
+    # Skip login only when no-auth mode is confined to loopback.
+    return bool(
+        global_settings is not None
+        and global_settings.auth.skip_api_key_verification
+        and is_loopback_bind(_active_bind_host(global_settings))
+    )
+
+
+def configured_api_key() -> str | None:
+    """Return the main API key, or None when none is configured."""
+    global_settings = _get_global_settings()
+    return global_settings.auth.api_key if global_settings else None
+
+
+def configured_ui_language() -> str:
+    """Return the dashboard language, or English when settings are unavailable."""
+    try:
+        settings = _get_global_settings() if _get_global_settings else None
+        if settings:
+            return settings.ui.language
+    except Exception:
+        pass
+    return "en"
 
 
 def format_size(size_bytes: int) -> str:
@@ -1804,99 +1827,6 @@ def get_system_memory_info() -> dict:
 
 
 # =============================================================================
-# HTML Page Routes
-# =============================================================================
-
-
-@router.get("", response_class=HTMLResponse)
-@router.get("/", response_class=HTMLResponse)
-async def login_page(request: Request):
-    """
-    Render the admin login page or setup page.
-
-    If no API key is configured, the page will show the initial setup form.
-    Otherwise, it shows the standard login form.
-
-    Returns:
-        HTML login/setup page.
-    """
-    # Redirect to dashboard if already authenticated
-    from .auth import verify_session
-
-    if verify_session(request):
-        return RedirectResponse(url="/admin/dashboard", status_code=302)
-
-    global_settings = _get_global_settings()
-
-    # Skip login only when no-auth mode is confined to loopback.
-    if global_settings is not None and global_settings.auth.skip_api_key_verification:
-        from ..utils.network import is_loopback_bind
-
-        if is_loopback_bind(_active_bind_host(global_settings)):
-            return RedirectResponse(url="/admin/dashboard", status_code=302)
-
-    api_key_configured = bool(global_settings and global_settings.auth.api_key)
-    return templates.TemplateResponse(
-        request,
-        "login.html",
-        {"api_key_configured": api_key_configured},
-    )
-
-
-@router.get("/dashboard", response_class=HTMLResponse)
-async def dashboard_page(request: Request, is_admin: bool = Depends(require_admin)):
-    """
-    Render the admin dashboard page.
-
-    Requires admin authentication via session cookie.
-
-    Returns:
-        HTML dashboard page with server status and model list.
-    """
-    return templates.TemplateResponse(request, "dashboard.html", {})
-
-
-@router.get("/chat", response_class=HTMLResponse)
-async def chat_page(request: Request, is_admin: bool = Depends(require_admin)):
-    """
-    Render the chat page for interacting with models.
-
-    Requires admin authentication via session cookie.
-    The API key is injected into the template context so that
-    the chat page can auto-set it in localStorage, bypassing
-    the manual API key entry modal.
-
-    Returns:
-        HTML chat page.
-    """
-    global_settings = _get_global_settings()
-    api_key = global_settings.auth.api_key if global_settings else ""
-    return templates.TemplateResponse(request, "chat.html", {"api_key": api_key or ""})
-
-
-@router.get("/static/{path:path}")
-async def admin_static(path: str):
-    """Serve static files for admin panel (CSS, JS, fonts, logos, etc.)."""
-    file_path = static_dir / path
-    if not file_path.is_file() or not file_path.resolve().is_relative_to(
-        static_dir.resolve()
-    ):
-        raise HTTPException(status_code=404, detail="File not found")
-    media_types = {
-        ".svg": "image/svg+xml",
-        ".png": "image/png",
-        ".ico": "image/x-icon",
-        ".css": "text/css",
-        ".js": "application/javascript",
-        ".woff2": "font/woff2",
-        ".woff": "font/woff",
-        ".ttf": "font/ttf",
-    }
-    media_type = media_types.get(file_path.suffix, "application/octet-stream")
-    return FileResponse(file_path, media_type=media_type)
-
-
-# =============================================================================
 # Authentication API Routes
 # =============================================================================
 
@@ -2015,7 +1945,7 @@ async def setup_api_key(
 
     # Persist to file
     try:
-        global_settings.save()
+        await _save_global_settings_async(global_settings)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
 
@@ -2064,6 +1994,8 @@ async def auto_login(key: str = "", redirect: str = "/admin/dashboard"):
     Returns:
         HTTP 302 redirect with session cookie set.
     """
+    if not web_ui_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
     if not redirect.startswith("/admin"):
         raise HTTPException(status_code=400, detail="Invalid redirect path")
 
@@ -2137,7 +2069,7 @@ async def create_sub_key(
     global_settings.auth.sub_keys.append(entry)
 
     try:
-        global_settings.save()
+        await _save_global_settings_async(global_settings)
     except Exception as e:
         # Rollback
         global_settings.auth.sub_keys.pop()
@@ -2171,7 +2103,7 @@ async def delete_sub_key(
         if sk.key and compare_keys(request.key, sk.key):
             removed = global_settings.auth.sub_keys.pop(i)
             try:
-                global_settings.save()
+                await _save_global_settings_async(global_settings)
             except Exception as e:
                 global_settings.auth.sub_keys.insert(i, removed)
                 raise HTTPException(
@@ -2293,6 +2225,7 @@ def _model_options(model_info: dict, settings) -> dict:
         "ane_prefill_default_fraction": ane_prefill_fraction(None, model_type),
         "ane_prefill_mlp_fractions": [1 / 3, 0.5] if ane_backend == "k2" else [],
         "ane_prefill_shared_fractions": [0, 1 / 3, 1] if ane_backend == "k2" else [],
+        "embedding_audio_supported": model_type == "embedding_gemma2",
     }
 
 
@@ -2787,6 +2720,7 @@ async def update_model_settings(
             "audio_stt",
             "audio_tts",
             "audio_sts",
+            "decision",
         }
         # Treat empty string as None (auto-detect)
         override_value = request.model_type_override or None
@@ -2805,6 +2739,7 @@ async def update_model_settings(
             "audio_stt": "audio_stt",
             "audio_tts": "audio_tts",
             "audio_sts": "audio_sts",
+            "decision": "decision",
         }
         if override_value:
             entry.model_type = override_value
@@ -3176,6 +3111,16 @@ async def update_model_settings(
         )
     if "dflash_verify_mode" in sent:
         current_settings.dflash_verify_mode = request.dflash_verify_mode
+    draft_model = current_settings.dflash_draft_model
+    if (
+        ("dflash_enabled" in sent or "dflash_draft_model" in sent)
+        and current_settings.dflash_enabled
+        and draft_model
+        and _draft_path_is_unusable(draft_model)
+    ):
+        raise HTTPException(
+            status_code=422, detail=f"Draft model has no config.json: {draft_model}"
+        )
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:
@@ -3335,6 +3280,14 @@ async def update_model_settings(
         current_settings.is_favorite = request.is_favorite
     if "trust_remote_code" in sent:
         current_settings.trust_remote_code = bool(request.trust_remote_code)
+    if "embedding_audio_enabled" in sent:
+        current_settings.embedding_audio_enabled = bool(
+            request.embedding_audio_enabled
+        )
+    if "embedding_audio_max_seconds" in sent:
+        current_settings.embedding_audio_max_seconds = (
+            request.embedding_audio_max_seconds
+        )
 
     if is_diffusion_model:
         _sanitize_diffusion_model_settings(current_settings)
@@ -3585,13 +3538,12 @@ def _validate_model_settings(entry, settings):
                 status_code=400, detail="oQ A8 min tokens must be at least 1."
             )
     if settings.get("qwen35_oq_a8_enabled"):
-        config_type = str(getattr(entry, "config_model_type", "") or "")
-        config_type = config_type.lower().replace("-", "_")
-        if not config_type.startswith(("qwen3_5", "qwen3_6", "qwen3_8")):
+        if not _oq_a8_model_supported(getattr(entry, "config_model_type", "")):
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "oQ A8 prefill is available only for Qwen3.5/3.6/3.8 models."
+                    "oQ A8 prefill is available only for Qwen3.5/3.6/3.8 and "
+                    "Qwen3.8-Flash-Next models."
                 ),
             )
         if not _oq_a8_kernels_available():
@@ -3946,9 +3898,11 @@ def _feature_problem(
             return str(error)
         return _ane_prefill_budget_error(snapshot, entry.config_model_type)
     if name == "oq_a8":
-        config_type = str(entry.config_model_type or "").lower().replace("-", "_")
-        if not config_type.startswith(("qwen3_5", "qwen3_6", "qwen3_8")):
-            return "oQ A8 prefill is available only for Qwen3.5/3.6/3.8 models."
+        if not _oq_a8_model_supported(entry.config_model_type):
+            return (
+                "oQ A8 prefill is available only for Qwen3.5/3.6/3.8 and "
+                "Qwen3.8-Flash-Next models."
+            )
         if not _oq_a8_kernels_available():
             return (
                 "oQ A8 prefill needs the native Qwen3.5 prefill kernels and a "
@@ -4578,6 +4532,11 @@ def _global_settings_response(global_settings):
                 "preserve_mid_system_cache",
                 True,
             ),
+            "gpu_keep_warm_interval": getattr(
+                global_settings.server,
+                "gpu_keep_warm_interval",
+                0.5,
+            ),
             "distributed_inference_enabled": getattr(
                 global_settings.server,
                 "distributed_inference_enabled",
@@ -4685,6 +4644,7 @@ def _global_settings_response(global_settings):
             "hermes_model": global_settings.integrations.hermes_model,
             "pi_model": global_settings.integrations.pi_model,
             "copilot_model": global_settings.integrations.copilot_model,
+            "dsh_model": global_settings.integrations.dsh_model,
             "openclaw_tools_profile": global_settings.integrations.openclaw_tools_profile,
             "markitdown_enabled": global_settings.integrations.markitdown_enabled,
             "markitdown_expose_model": global_settings.integrations.markitdown_expose_model,
@@ -4812,6 +4772,8 @@ async def update_global_settings(
     runtime_applied: list[str] = []
     pending_embedding_batch_size: int | None = None
     previous_embedding_batch_size: int | None = None
+    pending_max_concurrent_requests: int | None = None
+    previous_max_concurrent_requests: int | None = None
 
     # Apply server settings
     if request.host is not None:
@@ -4888,6 +4850,16 @@ async def update_global_settings(
             request.preserve_mid_system_cache
         )
         runtime_applied.append("preserve_mid_system_cache")
+    if request.gpu_keep_warm_interval is not None:
+        from ..server import _server_state
+
+        interval = max(0.0, float(request.gpu_keep_warm_interval))
+        global_settings.server.gpu_keep_warm_interval = interval
+        keep_warm_pool = _server_state.engine_pool
+        if keep_warm_pool is not None:
+            keep_warm_pool.configure_gpu_keep_warm(interval)
+            keep_warm_pool._ensure_gpu_keep_warm_task()
+        runtime_applied.append("gpu_keep_warm_interval")
     if request.distributed_inference_enabled is not None:
         # Route exposure and Bonjour publication are fixed at process startup,
         # so this intentionally takes effect after the normal settings restart.
@@ -5028,11 +5000,20 @@ async def update_global_settings(
             f"{'enabled' if request.memory_prefill_memory_guard else 'disabled'}"
         )
 
-    # Apply scheduler settings (restart required)
+    # Apply scheduler settings
     if request.max_concurrent_requests is not None:
-        global_settings.scheduler.max_concurrent_requests = (
+        if (
             request.max_concurrent_requests
-        )
+            != global_settings.scheduler.max_concurrent_requests
+        ):
+            # Applied to engines only after validate() and save() succeed.
+            previous_max_concurrent_requests = (
+                global_settings.scheduler.max_concurrent_requests
+            )
+            global_settings.scheduler.max_concurrent_requests = (
+                request.max_concurrent_requests
+            )
+            pending_max_concurrent_requests = request.max_concurrent_requests
 
     # Apply embedding batch size setting (Live for loaded embedding engines)
     if request.embedding_batch_size is not None:
@@ -5547,6 +5528,9 @@ async def update_global_settings(
     if "integrations_pi_model" in request.model_fields_set:
         global_settings.integrations.pi_model = request.integrations_pi_model
         integrations_changed = True
+    if "integrations_dsh_model" in request.model_fields_set:
+        global_settings.integrations.dsh_model = request.integrations_dsh_model
+        integrations_changed = True
     if "integrations_openclaw_tools_profile" in request.model_fields_set:
         global_settings.integrations.openclaw_tools_profile = (
             request.integrations_openclaw_tools_profile
@@ -5702,7 +5686,6 @@ async def update_global_settings(
     if request.ui_language is not None:
         global_settings.ui.language = request.ui_language
         runtime_applied.append("ui_language")
-        _refresh_i18n_globals()
         logger.info(f"UI language changed to: {request.ui_language}")
 
     if "ui_dashboard_layout" in request.model_fields_set:
@@ -5749,17 +5732,36 @@ async def update_global_settings(
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
             )
+        if previous_max_concurrent_requests is not None:
+            global_settings.scheduler.max_concurrent_requests = (
+                previous_max_concurrent_requests
+            )
         raise HTTPException(status_code=400, detail=errors)
 
     # Persist to file
     try:
-        global_settings.save()
+        await _save_global_settings_async(global_settings)
     except Exception as e:
         if previous_embedding_batch_size is not None:
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
             )
+        if previous_max_concurrent_requests is not None:
+            global_settings.scheduler.max_concurrent_requests = (
+                previous_max_concurrent_requests
+            )
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
+
+    if pending_max_concurrent_requests is not None:
+        from ..server import _server_state
+
+        pool = _server_state.engine_pool
+        if pool is not None:
+            await pool.apply_max_concurrent_requests(pending_max_concurrent_requests)
+        runtime_applied.append("max_concurrent_requests")
+        logger.info(
+            f"Max concurrent requests set to {pending_max_concurrent_requests} (live)"
+        )
 
     if pending_embedding_batch_size is not None:
         from ..server import _server_state
@@ -5906,7 +5908,7 @@ async def get_logs(
     log_dir = global_settings.logging.get_log_dir(global_settings.base_path)
 
     # Get available log files
-    available_files = _get_available_log_files(log_dir)
+    available_files = await asyncio.to_thread(_get_available_log_files, log_dir)
 
     # Determine which file to read
     if file:
@@ -5922,7 +5924,7 @@ async def get_logs(
 
     # Read log content
     if log_file.exists():
-        content, total_lines = _tail_file(log_file, lines)
+        content, total_lines = await asyncio.to_thread(_tail_file, log_file, lines)
     else:
         content = ""
         total_lines = 0
@@ -5952,6 +5954,7 @@ def _get_engine_info() -> dict:
 
     engines = {}
     packages = {
+        "mlx": "https://github.com/ml-explore/mlx",
         "mlx-lm": "https://github.com/ml-explore/mlx-lm",
         "mlx-vlm": "https://github.com/Blaizzy/mlx-vlm",
         "mlx-embeddings": "https://github.com/Blaizzy/mlx-embeddings",
@@ -6780,8 +6783,11 @@ def _build_active_models_data() -> dict:
         idle_seconds: float | None = None
         ttl_remaining_seconds: float | None = None
 
-        if is_loaded and last_access is not None and last_access > 0:
-            idle_seconds = max(0.0, time.time() - last_access)
+        if is_loaded:
+            if active_requests or waiting_requests or getattr(entry, "in_use", 0) > 0:
+                idle_seconds = 0.0
+            elif last_access is not None and last_access > 0:
+                idle_seconds = max(0.0, time.time() - last_access)
 
         # Determine effective TTL: per-model ttl_seconds first, then global idle_timeout.
         effective_ttl: int | None = None
@@ -7774,6 +7780,10 @@ async def delete_hf_model(
 
     if not model_path.is_dir():
         raise HTTPException(status_code=400, detail="Not a model directory")
+
+    # A download still writing here would recreate the tree.
+    if _hf_downloader is not None:
+        await _hf_downloader.cancel_download_for_dir(model_path)
 
     # Unload model if loaded
     if engine_pool is not None:

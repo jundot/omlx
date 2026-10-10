@@ -11,7 +11,7 @@ These models define the request and response schemas for:
 """
 
 import json
-from typing import Any, Dict, List, Optional, Union
+from typing import Annotated, Any, Dict, List, Optional, Union
 
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
@@ -71,6 +71,7 @@ class ContentPart(BaseModel):
     text: Optional[str] = None
     image_url: Optional[ImageURL] = None
     video_url: Optional[ImageURL] = None
+    input_video: Optional[Union[ImageURL, str]] = None
     input_audio: Optional[InputAudio] = None
     file: Optional[FileContent] = None
 
@@ -340,6 +341,8 @@ class ChatCompletionRequest(BaseModel):
     )
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
+    # llama.cpp extension: stream prompt_progress chunks during prefill.
+    return_progress: bool = False
     stop: Optional[List[str]] = None
     min_p: float | None = None
     xtc_probability: float | None = None
@@ -476,6 +479,8 @@ class CompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
+    # llama.cpp extension: stream prompt_progress chunks during prefill.
+    return_progress: bool = False
     stop: Optional[List[str]] = None
     min_p: float | None = None
     xtc_probability: float | None = None
@@ -513,6 +518,76 @@ class CompletionResponse(BaseModel):
     model: str
     choices: List[CompletionChoice]
     usage: Usage = Field(default_factory=Usage)
+
+
+# =============================================================================
+# Tokenization (vLLM-compatible /tokenize and /detokenize)
+# =============================================================================
+
+
+class TokenizeCompletionRequest(BaseModel):
+    """Tokenize a raw prompt the way /v1/completions does."""
+
+    model: str | None = None
+    prompt: str
+    add_special_tokens: bool = True
+    return_token_strs: bool = False
+
+
+class TokenizeChatRequest(BaseModel):
+    """Tokenize chat messages the way /v1/chat/completions renders them."""
+
+    model: str | None = None
+    messages: list[Message]
+    tools: list[ToolDefinition] | None = None
+    add_generation_prompt: bool = True
+    continue_final_message: bool = False
+    # None keeps the engine's own encoding, which differs between text and
+    # VLM engines. vLLM defaults to False.
+    add_special_tokens: bool | None = None
+    return_token_strs: bool = False
+    chat_template_kwargs: dict[str, Any] | None = None
+    # Accepted for vLLM schema compatibility; rejected when set.
+    chat_template: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_generation_prompt(cls, data: Any) -> Any:
+        if (
+            isinstance(data, dict)
+            and data.get("continue_final_message")
+            and data.get("add_generation_prompt")
+        ):
+            raise ValueError(
+                "Cannot set both `continue_final_message` and "
+                "`add_generation_prompt` to True."
+            )
+        return data
+
+
+TokenizeRequest = TokenizeChatRequest | TokenizeCompletionRequest
+
+
+class TokenizeResponse(BaseModel):
+    """Response for /tokenize."""
+
+    count: int
+    max_model_len: int | None = None
+    tokens: list[int]
+    token_strs: list[str] | None = None
+
+
+class DetokenizeRequest(BaseModel):
+    """Request for /detokenize."""
+
+    model: str | None = None
+    tokens: list[Annotated[int, Field(ge=0)]]
+
+
+class DetokenizeResponse(BaseModel):
+    """Response for /detokenize."""
+
+    prompt: str
 
 
 # =============================================================================

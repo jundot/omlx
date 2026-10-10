@@ -2,6 +2,7 @@
 # ruff: noqa
 # Copyright © 2026 Apple Inc.
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -10,11 +11,19 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
+from omlx.utils.fast_attention import (
+    blocked_sliding_window_attention,
+    mixed_head_dim_sdpa,
+    window_query_padding,
+)
+
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
+from omlx.patches.glm_moe_dsa.switch_layers import SwitchGLU as _FusedSwitchGLU
+from omlx.patches.mimo_v2 import decode_fast as _decode_fast
 from omlx.patches.mimo_v2.fused_qkv_layout import (
     FUSED_QKV_BLOCK_SIZE,
     detect_fused_qkv_tp,
@@ -22,6 +31,8 @@ from omlx.patches.mimo_v2.fused_qkv_layout import (
     layer_head_geometry,
     split_fused_qkv,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -79,6 +90,7 @@ class Attention(nn.Module):
         super().__init__()
         dim = args.hidden_size
         self.is_sliding_window = is_sliding_window
+        self.sliding_window_size = args.sliding_window_size if is_sliding_window else 0
         if is_sliding_window:
             self.n_heads = args.swa_num_attention_heads
             self.n_kv_heads = args.swa_num_key_value_heads
@@ -126,8 +138,24 @@ class Attention(nn.Module):
     ) -> mx.array:
         B, L, _ = x.shape
 
+        # Blocked window attention runs whole 128-query blocks. Padding the
+        # (hidden-wide) projection input costs a third of padding the
+        # (64 x 192-wide) queries; projection and RoPE are row-wise, so the
+        # real rows are bit-identical and the padded ones are dropped. A wrapped
+        # rope (SpecPrefill) maps positions per query row, so it gets no padding.
+        q_pad = (
+            window_query_padding(L)
+            if self.is_sliding_window
+            and B == 1
+            and not hasattr(cache, "bits")
+            and type(self.rope) is nn.RoPE
+            else 0
+        )
+        q_in = mx.pad(x, [(0, 0), (0, q_pad), (0, 0)]) if q_pad else x
         queries = (
-            self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim).swapaxes(1, 2)
+            self.q_proj(q_in)
+            .reshape(B, L + q_pad, self.n_heads, self.head_dim)
+            .swapaxes(1, 2)
         )
         keys = (
             self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim).swapaxes(1, 2)
@@ -149,15 +177,43 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        output = scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            cache=cache,
-            scale=self.scale,
-            mask=mask,
-            sinks=self.attention_sink_bias,
-        )
+        output = None
+        if L > 8 and not hasattr(cache, "bits"):
+            # Prefill fast paths: MLX's fused SDPA has no sliding-window or
+            # 192/128 (qk/v head dim) prefill kernel, and its fallback scores
+            # the full [L, S] matrix. Both helpers decline unsupported layouts.
+            if self.is_sliding_window:
+                output = blocked_sliding_window_attention(
+                    queries,
+                    keys,
+                    values,
+                    scale=self.scale,
+                    window=self.sliding_window_size,
+                    sinks=self.attention_sink_bias,
+                    mask=mask,
+                    query_len=L,
+                )
+            else:
+                output = mixed_head_dim_sdpa(
+                    queries,
+                    keys,
+                    values,
+                    scale=self.scale,
+                    mask=mask,
+                    sinks=self.attention_sink_bias,
+                )
+        if output is None:
+            if q_pad:
+                queries = queries[:, :, :L]
+            output = scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                cache=cache,
+                scale=self.scale,
+                mask=mask,
+                sinks=self.attention_sink_bias,
+            )
         return self.o_proj(output.swapaxes(1, 2).reshape(B, L, -1))
 
 
@@ -232,7 +288,10 @@ class MoEGate(nn.Module):
 class MoE(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
-        self.switch_mlp = SwitchGLU(
+        # The fused combine kernel handles top-6/top-8 routing (MiMo: top-8).
+        self._fused_combine = config.num_experts_per_tok in (6, 8)
+        switch_cls = _FusedSwitchGLU if self._fused_combine else SwitchGLU
+        self.switch_mlp = switch_cls(
             config.hidden_size,
             config.moe_intermediate_size,
             config.n_routed_experts,
@@ -244,8 +303,16 @@ class MoE(nn.Module):
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
         inds, scores = self.gate(x)
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2).astype(x.dtype)
+        if self._fused_combine:
+            # One kernel unsorts the expert rows and applies the routing
+            # weights (prefill); decode-sized batches return per-expert rows.
+            y = self.switch_mlp(x, inds, scores=scores, weighted_sum=True)
+            if y.ndim == x.ndim + 1:
+                y = (y * scores[..., None]).sum(axis=-2)
+            y = y.astype(x.dtype)
+        else:
+            y = self.switch_mlp(x, inds)
+            y = (y * scores[..., None]).sum(axis=-2).astype(x.dtype)
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)
         return y
@@ -392,6 +459,18 @@ class MiMoV2Model(PipelineMixin, nn.Module):
         pipeline_rank = self.pipeline_rank
         pipeline_size = self.pipeline_size
 
+        # Decode / short verify forwards: same math, fewer dispatches.
+        fast = (
+            _decode_fast.run_layers(self, h, cache, full_mask, swa_mask)
+            if pipeline_size == 1
+            else None
+        )
+        if fast is not None:
+            h, normed = fast
+            if return_hidden:
+                return normed, h
+            return normed
+
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, pipeline_rank + 1)
 
@@ -537,6 +616,23 @@ class Model(nn.Module):
             return None if tensor is None else tensor.shape
 
         TP = detect_fused_qkv_tp(self.args, shape_of)
+        n_mtp = int(self.args.num_nextn_predict_layers or 0)
+        mtp_tp = TP
+        main_fused = any(
+            fused_qkv_keys(i)[1] in weights for i in range(self.args.num_hidden_layers)
+        )
+        sidecar_fused = any(
+            f"model.mtp.layers.{i}.self_attn.qkv_proj.weight_scale_inv" in weights
+            for i in range(n_mtp)
+        )
+        if sidecar_fused and not main_fused:
+            # Sliding-window qkv shapes fit every TP degree, so the split main
+            # layers leave nothing to detect; Xiaomi's releases use TP=4.
+            mtp_tp = 4
+            logger.info(
+                "MiMo MTP sidecar: the main layers are already split; assuming "
+                "the official TP=4 fused qkv layout"
+            )
 
         def dequant_block(weight, scale_inv):
             weight = mx.from_fp8(weight, dtype=bf16)
@@ -570,7 +666,7 @@ class Model(nn.Module):
             weights[f"{prefix}.k_proj.weight"] = k
             weights[f"{prefix}.v_proj.weight"] = v
 
-        for layer_idx in range(int(self.args.num_nextn_predict_layers or 0)):
+        for layer_idx in range(n_mtp):
             prefix = f"model.mtp.layers.{layer_idx}.self_attn"
             qkv_prefix = f"{prefix}.qkv_proj"
             qkv_key = f"{qkv_prefix}.weight"
@@ -579,7 +675,7 @@ class Model(nn.Module):
                 q, k, v = split_fused_qkv(
                     weights.pop(qkv_key),
                     weights.pop(scale_key),
-                    tp=TP,
+                    tp=mtp_tp,
                     n_h=self.args.swa_num_attention_heads,
                     n_kv=self.args.swa_num_key_value_heads,
                     hd=self.args.swa_head_dim,

@@ -307,6 +307,30 @@ class TestHumanEval:
         assert code == "def add(a, b):\n    return a + b"
         assert benchmark.check_answer(code, item) is True
 
+    @pytest.mark.parametrize(
+        "response",
+        [
+            "return a + b",
+            "   return a + b",
+            "```python\n    return a + b\n```",
+            "total = a + b\n    return total",
+            "total = a + b\nreturn total",
+        ],
+    )
+    def test_body_only_answer_lands_in_the_function(self, response):
+        from omlx.eval.humaneval import HumanEvalBenchmark
+
+        benchmark = HumanEvalBenchmark()
+        item = {
+            "prompt": 'def add(a, b):\n    """Add two numbers."""\n',
+            "test": "def check(candidate):\n    assert candidate(1, 2) == 3",
+            "entry_point": "add",
+        }
+
+        code = benchmark.extract_answer(response, item)
+
+        assert benchmark.check_answer(code, item) is True
+
 
 # --- Think Tag Stripping Tests ---
 

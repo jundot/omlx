@@ -111,8 +111,9 @@ omlx/_engine_commits.json
 # Generated build info (build-time artifact)
 omlx/_build_info.py
 
-# Tailwind CSS standalone CLI binary (download on demand via build_css.py)
-omlx/admin/tailwindcss-*
+# Tailwind CSS standalone CLI binary (download on demand via build_css.py).
+# Unanchored so a copy left at the old omlx/admin/ location stays ignored.
+tailwindcss-*
 
 # Git worktrees
 .worktrees/

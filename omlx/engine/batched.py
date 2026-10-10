@@ -44,6 +44,19 @@ except ImportError:
     preprocess_harmony_messages = None  # type: ignore
 
 
+def _mtp_sidecar_load_kwargs(model_name: str) -> dict[str, Any]:
+    """Loader kwargs for a MiMo MTP sidecar next to the checkpoint.
+
+    MLX conversions of MiMo V2 drop the next-token-prediction layers; the
+    upstream ``model_mtp.safetensors`` under ``<model>/mtp/`` restores
+    Lightning MTP decoding (same rule as ``load_text_model``).
+    """
+    from ..utils.model_loading import mimo_mtp_sidecar_config
+
+    sidecar_config = mimo_mtp_sidecar_config(model_name)
+    return {"model_config": sidecar_config} if sidecar_config else {}
+
+
 class BatchedEngine(BaseEngine):
     """
     Batched engine for continuous batching.
@@ -105,7 +118,6 @@ class BatchedEngine(BaseEngine):
                 "_mlx_executor",
                 None,
             ),
-            text_only=True,
         )
 
     @property
@@ -311,6 +323,7 @@ class BatchedEngine(BaseEngine):
                 self._model_name,
                 tokenizer_config=tokenizer_config,
                 trust_remote_code=self._trust_remote_code,
+                **_mtp_sidecar_load_kwargs(self._model_name),
                 # With expert offload the load stays lazy so the wrap below
                 # can drop non-resident expert tensors BEFORE anything
                 # materializes them; materialize_lazy_state then evaluates
@@ -341,10 +354,15 @@ class BatchedEngine(BaseEngine):
         # materializing. Runs on the MLX executor because it allocates the
         # resident slot tensors (#1304).
         moe_offload_wrapped = 0
+        offload_stats = offload_release = offload_restore = None
         if getattr(self._model_settings, "moe_expert_offload_enabled", False):
             from ..patches.moe_expert_offload import (
                 apply_moe_expert_offload,
                 materialize_offload_state,
+                moe_offload_caches,
+                moe_offload_stats,
+                release_moe_offload_slots,
+                restore_moe_offload_slots,
             )
 
             fraction = float(
@@ -378,6 +396,10 @@ class BatchedEngine(BaseEngine):
                 await loop.run_in_executor(
                     get_mlx_executor(), materialize_offload_state, self._model
                 )
+                caches = moe_offload_caches(self._model)
+                offload_stats = functools.partial(moe_offload_stats, caches=caches)
+                offload_release = functools.partial(release_moe_offload_slots, caches)
+                offload_restore = functools.partial(restore_moe_offload_slots, caches)
 
         # Materialize lazy buffers on the loader thread so per-engine
         # inference threads can read them (#1304).
@@ -403,13 +425,11 @@ class BatchedEngine(BaseEngine):
             is not False
         ):
             try:
-                from ..patches.qwen35_moe_gate_up import (
-                    apply_qwen35_moe_gate_up_fusion,
-                )
+                from ..patches.moe_gate_up_fusion import apply_moe_gate_up_fusion
 
                 await loop.run_in_executor(
                     get_mlx_executor(),
-                    apply_qwen35_moe_gate_up_fusion,
+                    apply_moe_gate_up_fusion,
                     self._model,
                 )
             except Exception:
@@ -680,6 +700,7 @@ class BatchedEngine(BaseEngine):
             if self._scheduler_config
             else SchedulerConfig()
         )
+        scheduler_config.moe_offload_active = bool(moe_offload_wrapped)
         signature = getattr(self._model, "_omlx_k2_ane_signature", None)
         if signature:
             scheduler_config.model_name = (
@@ -703,6 +724,9 @@ class BatchedEngine(BaseEngine):
 
         # TurboQuant KV cache: propagate bits to scheduler
         scheduler = self._engine.engine.scheduler
+        scheduler.moe_offload_stats = offload_stats
+        scheduler.moe_offload_release = offload_release
+        scheduler.moe_offload_restore = offload_restore
         if ane_prefill_sequence_length:
             from ..patches.qwen35_ane_prefill import (
                 configure_qwen35_ane_prefill_scheduler,
@@ -932,6 +956,42 @@ class BatchedEngine(BaseEngine):
         Returns:
             Number of prompt tokens
         """
+        _, token_ids = self.prepare_chat_prompt(
+            messages, tools, chat_template_kwargs, is_partial
+        )
+        return len(token_ids)
+
+    async def tokenize_chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+        add_generation_prompt: bool | None = None,
+        add_special_tokens: bool | None = None,
+    ) -> list[int]:
+        if not self._loaded:
+            await self.start()
+        _, token_ids = self.prepare_chat_prompt(
+            messages,
+            tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+            add_generation_prompt=add_generation_prompt,
+            add_special_tokens=add_special_tokens,
+        )
+        return token_ids
+
+    def prepare_chat_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+        add_generation_prompt: bool | None = None,
+        add_special_tokens: bool | None = None,
+    ) -> tuple[str, list[int]]:
+        """Render and tokenize a chat prompt for reuse within one request."""
         messages = self._preprocess_messages(messages)
         template_tools = convert_tools_for_template(tools) if tools else None
         prompt = self._apply_chat_template(
@@ -939,8 +999,13 @@ class BatchedEngine(BaseEngine):
             template_tools,
             chat_template_kwargs=chat_template_kwargs,
             is_partial=is_partial,
+            add_generation_prompt=add_generation_prompt,
         )
-        return len(self._tokenizer.encode(prompt))
+        if add_special_tokens is None:
+            return prompt, list(self._tokenizer.encode(prompt))
+        return prompt, list(
+            self._tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+        )
 
     @staticmethod
     def _pop_specprefill_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -971,6 +1036,7 @@ class BatchedEngine(BaseEngine):
         template_tools: Any,
         ct_kwargs: dict[str, Any] | None,
         kwargs: dict[str, Any],
+        full_prompt_token_count: int | None = None,
     ) -> None:
         """Compute the system-prompt token boundary and add it to ``kwargs``.
 
@@ -996,7 +1062,11 @@ class BatchedEngine(BaseEngine):
                 non_system_prompt = self._apply_chat_template(
                     non_system, template_tools, chat_template_kwargs=ct_kwargs
                 )
-                full_tokens = len(self._tokenizer.encode(prompt))
+                full_tokens = (
+                    full_prompt_token_count
+                    if full_prompt_token_count is not None
+                    else len(self._tokenizer.encode(prompt))
+                )
                 non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
                 system_end = full_tokens - non_system_tokens
                 if system_end > 0:
@@ -1157,6 +1227,7 @@ class BatchedEngine(BaseEngine):
         request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_id=kwargs.pop("_request_id", None),
             tools=tools,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
             preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
@@ -1268,16 +1339,26 @@ class BatchedEngine(BaseEngine):
         # Apply chat template
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
-        prompt = self._apply_chat_template(
-            messages,
-            template_tools,
-            chat_template_kwargs=ct_kwargs,
-            is_partial=partial,
+        prepared = kwargs.pop("_prepared_prompt", None)
+        prompt = (
+            prepared[0]
+            if prepared is not None
+            else self._apply_chat_template(
+                messages,
+                template_tools,
+                chat_template_kwargs=ct_kwargs,
+                is_partial=partial,
+            )
         )
 
         # SpecPrefill: protect the system-prompt region, mirroring stream_chat.
         self._inject_specprefill_system_end(
-            messages, prompt, template_tools, ct_kwargs, kwargs
+            messages,
+            prompt,
+            template_tools,
+            ct_kwargs,
+            kwargs,
+            full_prompt_token_count=len(prepared[1]) if prepared is not None else None,
         )
         generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
         if generation_prompt:
@@ -1285,7 +1366,7 @@ class BatchedEngine(BaseEngine):
             kwargs["generation_prompt_persists"] = persists
 
         return await self.generate(
-            prompt=prompt,
+            prompt=prepared[1] if prepared is not None else prompt,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
@@ -1306,49 +1387,41 @@ class BatchedEngine(BaseEngine):
     ) -> None:
         """Early prefill memory check for chat completions.
 
-        Tokenizes the templated prompt and asks the scheduler whether the
-        request would exceed the configured memory ceiling. Raises
+        Uses prepared tokens or tokenizes the prompt, then asks the scheduler
+        whether the request would exceed the configured memory ceiling. Raises
         ``PrefillMemoryExceededError`` (with the caller's ``request_id``
         attached) if it would. Designed to be called from the FastAPI
         route handler BEFORE the response is wrapped in a
         ``StreamingResponse``, so the exception can be mapped to HTTP
         400 by ``prefill_memory_exceeded_handler``.
-
-        Cheap enough to run as a precondition: tokenization of even a
-        100k-token chat takes tens of milliseconds compared to the many
-        seconds the prefill it gates would consume.
         """
         if not self._loaded:
             await self.start()
-        messages = self._preprocess_messages(messages)
-        template_tools = convert_tools_for_template(tools) if tools else None
-        ct_kwargs = kwargs.get("chat_template_kwargs")
-        partial = kwargs.get("is_partial")
         self._prepare_k2_tool_grammar(tools, kwargs)
-        prompt = self._apply_chat_template(
-            messages,
-            template_tools,
-            chat_template_kwargs=ct_kwargs,
-            is_partial=partial,
-        )
-        # Tokenizer errors (UnicodeDecodeError, HF Rust "Already borrowed",
-        # malformed input) are normally surfaced by the real chat path's
-        # add_request → tokenize call as a 500 — there's no path-specific
-        # 400 handler today. Don't introduce a NEW failure mode here: if
-        # tokenization fails during preflight, log it and skip the memory
-        # check. The actual chat path will hit the same error and raise it
-        # through the existing handler chain so the response shape stays
-        # consistent.
-        try:
-            num_tokens = len(self._tokenizer.encode(prompt))
-        except Exception as e:
-            logger.warning(
-                "BatchedEngine.preflight_chat: tokenizer.encode raised %s; "
-                "skipping prefill memory check, real chat path will surface "
-                "the error",
-                type(e).__name__,
+        prepared = kwargs.get("_prepared_prompt")
+        if prepared is not None:
+            num_tokens = len(prepared[1])
+        else:
+            messages = self._preprocess_messages(messages)
+            template_tools = convert_tools_for_template(tools) if tools else None
+            prompt = self._apply_chat_template(
+                messages,
+                template_tools,
+                chat_template_kwargs=kwargs.get("chat_template_kwargs"),
+                is_partial=kwargs.get("is_partial"),
             )
-            return
+            # Standalone preflight keeps tokenizer failures for the real chat
+            # path to surface through its existing error handler.
+            try:
+                num_tokens = len(self._tokenizer.encode(prompt))
+            except Exception as e:
+                logger.warning(
+                    "BatchedEngine.preflight_chat: tokenizer.encode raised %s; "
+                    "skipping prefill memory check, real chat path will surface "
+                    "the error",
+                    type(e).__name__,
+                )
+                return
         scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_chat")
@@ -1430,16 +1503,26 @@ class BatchedEngine(BaseEngine):
         # Apply chat template
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
-        prompt = self._apply_chat_template(
-            messages,
-            template_tools,
-            chat_template_kwargs=ct_kwargs,
-            is_partial=partial,
+        prepared = kwargs.pop("_prepared_prompt", None)
+        prompt = (
+            prepared[0]
+            if prepared is not None
+            else self._apply_chat_template(
+                messages,
+                template_tools,
+                chat_template_kwargs=ct_kwargs,
+                is_partial=partial,
+            )
         )
 
         # SpecPrefill: protect the system-prompt region from token dropping.
         self._inject_specprefill_system_end(
-            messages, prompt, template_tools, ct_kwargs, kwargs
+            messages,
+            prompt,
+            template_tools,
+            ct_kwargs,
+            kwargs,
+            full_prompt_token_count=len(prepared[1]) if prepared is not None else None,
         )
         generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
         if generation_prompt:
@@ -1447,7 +1530,7 @@ class BatchedEngine(BaseEngine):
             kwargs["generation_prompt_persists"] = persists
 
         async for output in self.stream_generate(
-            prompt=prompt,
+            prompt=prepared[1] if prepared is not None else prompt,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,

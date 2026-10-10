@@ -4,6 +4,8 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+from omlx.patches.deepseek_v41 import activation, hyper_connection, kernels, routing
+from omlx.patches.deepseek_v41.gemv import mxfp8_gemv
 from omlx.patches.deepseek_v41.kernels import (
     packed_index_scores,
     packed_sparse_attention,
@@ -446,3 +448,120 @@ def test_sinkhorn_fused_exact(length, iters, eps):
     np.testing.assert_array_equal(
         sinkhorn(zeros, eps, iters), sinkhorn_reference(zeros, eps, iters)
     )
+
+
+def test_kernel_templates_do_not_depend_on_token_counts(monkeypatch):
+    """Each distinct template compiles a new Metal pipeline. Selection counts,
+    tile counts and row counts change with prompt length and causal key count,
+    so they must reach the kernels as runtime data."""
+    templates = {}
+
+    def record(module, factory):
+        make = getattr(module, factory)
+
+        def wrapped(*args, **kwargs):
+            kernel = make(*args, **kwargs)
+            key = (module.__name__, factory, args, tuple(sorted(kwargs.items())))
+
+            def call(**call_kwargs):
+                templates.setdefault(key, set()).add(tuple(call_kwargs["template"]))
+                return kernel(**call_kwargs)
+
+            return call
+
+        monkeypatch.setattr(module, factory, wrapped)
+
+    record(kernels, "_topk_kernel")
+    record(kernels, "_topk_merge_kernel")
+    record(activation, "_kernel")
+    record(hyper_connection, "_sinkhorn_kernel")
+    record(hyper_connection, "_post_kernel")
+    record(routing, "_kernel")
+
+    mx.random.seed(509)
+    for count in (100, 101, 129):
+        # Two 1024-wide tiles: one tile sort, then one grouped merge.
+        values, ids = kernels._tile_topk(mx.random.normal((1, 2, 1500)), count)
+        assert values.shape == ids.shape == (1, 2, count)
+    for rows in (1, 3, 7):
+        x = mx.random.normal((1, rows, 128)).astype(mx.bfloat16)
+        activation.quantize_fp8_activation(x)
+        activation.quantize_swiglu_activation(x, x, None, mx.bfloat16, 0.0)
+        activation.quantize_paired_swiglu_activation(
+            mx.concatenate([x, x], -1), None, mx.bfloat16, 0.0
+        )
+        comb = mx.softmax(mx.random.normal((1, rows, 4, 4)), -1)
+        hyper_connection.sinkhorn(comb, 1e-6, 20)
+        hyper_connection.fused_hc_post(
+            x,
+            mx.random.normal((1, rows, 4, 128)).astype(mx.bfloat16),
+            mx.ones((1, rows, 4)),
+            comb,
+        )
+        routed = mx.random.normal((6 * rows, 1, 128)).astype(mx.bfloat16)
+        inverse = mx.arange(6 * rows, dtype=mx.uint32)
+        assert routing.combine_sorted_experts(routed, inverse, x) is not None
+
+    assert len(templates) == 8
+    assert {key: len(seen) for key, seen in templates.items() if len(seen) != 1} == {}
+
+
+@pytest.mark.parametrize(
+    "n,k", [(1280, 5120), (512, 5120), (5120, 2304), (4096, 1280), (32768, 1280)]
+)
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_mxfp8_gemv_matches_quantized_matmul(n, k, dtype):
+    mx.random.seed(n + k)
+    weight, scales = mx.quantize(
+        mx.random.normal((n, k)) * 0.02, group_size=32, bits=8, mode="mxfp8"
+    )
+    for rows in (1, 2, 4, 5):
+        x = mx.random.normal((1, rows, k)).astype(dtype)
+        actual = mxfp8_gemv(x, weight, scales)
+        # Wide or short single rows and two-row blocks stay on MLX's kernels.
+        if (rows == 1 and (n > 8192 or k < 4096)) or rows == 2:
+            assert actual is None
+            continue
+        expected = mx.quantized_matmul(
+            x, weight, scales, group_size=32, bits=8, mode="mxfp8"
+        )
+        np.testing.assert_array_equal(
+            actual.astype(mx.float32), expected.astype(mx.float32)
+        )
+    # Rows spread over a batch axis are separate MLX GEMVs.
+    assert mxfp8_gemv(mx.zeros((5, 1, k), dtype), weight, scales) is None
+
+
+@pytest.mark.parametrize("width,distinct", [(4096, 0), (70000, 0), (9000, 3)])
+def test_radix_selection_matches_tile_selection(width, distinct):
+    rng = np.random.default_rng(width)
+    if distinct:
+        # Few distinct scores overflow the gathered threshold bin.
+        data = rng.integers(0, distinct, (1, 3, width)).astype(np.float32)
+    else:
+        data = rng.normal(size=(1, 3, width)).astype(np.float32)
+    data[0, 0, :700] = -np.inf
+    data[0, 1, ::3] = 0.0
+    data[0, 1, 1::3] = -0.0
+    scores = mx.array(data)
+    for count in (1, 512, 2048):
+        _, expected = kernels._tile_topk(scores, count)
+        actual = kernels._radix_topk(scores, count)
+        np.testing.assert_array_equal(
+            np.sort(np.asarray(actual), -1), np.sort(np.asarray(expected), -1)
+        )
+
+
+def test_deep_prefill_index_selection_matches_full_scores():
+    mx.random.seed(4401)
+    start, length, ratio = 16384, 37, 4
+    q = mx.random.normal((1, length, 8, 64)).astype(mx.bfloat16)
+    keys = pack_activation(mx.random.normal((1, 4200, 64)), 4)
+    weights = mx.random.normal((1, length, 8))
+    scores = packed_index_scores(q, keys, weights, start, ratio)
+    order = mx.argsort(-scores, axis=-1)[..., :512].astype(mx.int32)
+    valid = mx.take_along_axis(scores, order, -1) > -float("inf")
+    expected = mx.sort(mx.where(valid, order, -1), axis=-1)
+    actual, blocks = kernels.packed_index_topk(q, keys, weights, start, ratio, 512)
+    np.testing.assert_array_equal(actual, expected)
+    assert blocks.shape == (1, length, 0)

@@ -5,9 +5,13 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 
-from omlx.patches.deepseek_v41.activation import quantize_swiglu_activation
+from omlx.patches.deepseek_v41.activation import (
+    pack_fp8_activation,
+    quantize_swiglu_activation,
+)
 from omlx.patches.deepseek_v41.quantization import (
     _compiled_quantize_activation,
+    _pack_activation,
     quantize_activation,
 )
 
@@ -49,6 +53,32 @@ def test_fp8_activation_midpoints_and_scale_boundaries(dtype):
         quantize_activation(x).astype(mx.float32),
         _compiled_quantize_activation(x).astype(mx.float32),
     )
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_fp8_pack_kernel_matches_graph_bytes(dtype):
+    codes = np.asarray(mx.from_fp8(mx.arange(127, dtype=mx.uint8), dtype=mx.float32))
+    mid = (codes[:-1] + codes[1:]) / 2
+    edges = np.concatenate(
+        [
+            mid,
+            np.nextafter(mid, np.float32(-np.inf)),
+            np.nextafter(mid, np.float32(np.inf)),
+        ]
+    )
+    rows = np.zeros((len(edges) * 2 + 2, 32), np.float32)
+    rows[: 2 * len(edges), 0] = np.concatenate([edges, -edges])
+    rows[: 2 * len(edges), -1] = 448
+    rows[-1] = -0.0
+    exponents = [-10, 0, 6] if dtype == mx.float16 else [-110, -10, 0, 10, 110]
+    cases = [mx.array(rows * np.float32(2.0**e)).astype(dtype) for e in exponents]
+    mx.random.seed(733)
+    for length in (1, 5, 129):
+        cases.append((mx.random.normal((1, length, 512)) * 3).astype(dtype))
+    for x in cases:
+        np.testing.assert_array_equal(
+            pack_fp8_activation(x), _pack_activation(x, 8, 32, False)
+        )
 
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
@@ -138,7 +168,9 @@ def test_normal_scales_are_exact_and_nonzero(device):
         np.testing.assert_array_equal(compiled, expected)
 
 
-@pytest.mark.parametrize("bits,group,e4m3", [(8, 32, False), (4, 32, False), (4, 16, True)])
+@pytest.mark.parametrize(
+    "bits,group,e4m3", [(8, 32, False), (4, 32, False), (4, 16, True)]
+)
 def test_zero_activation_groups_remain_zero(bits, group, e4m3):
     from omlx.patches.deepseek_v41.quantization import (
         _quantize_activation,
@@ -151,7 +183,9 @@ def test_zero_activation_groups_remain_zero(bits, group, e4m3):
         _quantize_activation(x, bits, group, e4m3),
         _compiled_quantize_activation(x, bits, group, e4m3),
         quantize_activation(x, bits, group, e4m3),
-        unpack_activation(pack_activation(x, bits, group, e4m3), bits, group, e4m3, mx.float32),
+        unpack_activation(
+            pack_activation(x, bits, group, e4m3), bits, group, e4m3, mx.float32
+        ),
     ):
         # This rejects NaNs explicitly, including matching NaNs in both paths.
         assert mx.all(mx.isfinite(result)).item()

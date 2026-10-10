@@ -22,6 +22,11 @@ Patch 2 – mx.quantized_matmul
   unchanged.  A dequant+matmul fallback fires only when the native extension
   is unavailable.
 
+Patch 3 - mlx_lm.utils.infer_quant_config
+  mlx-lm infers bits from the packed width of weights that the quantization
+  map does not name. That formula reads a t5 row as 6 bits, so t5 layers are
+  reported as 2-bit affine instead.
+
 Apply once via apply_bonsai_t5_load_patch() before mlx_vlm / mlx_lm load().
 """
 from __future__ import annotations
@@ -30,6 +35,7 @@ import logging
 
 import mlx.core as mx
 import mlx.nn as nn
+import mlx_lm.utils as mlx_lm_utils
 from mlx.utils import tree_flatten, tree_unflatten
 
 from omlx.custom_kernels.bonsai.fast import (
@@ -50,7 +56,10 @@ logger = logging.getLogger(__name__)
 
 _original_load_weights = None
 _original_quantized_matmul = None
+_original_infer_quant_config = None
 _patch_active = False
+
+_T5_GROUP_LAYOUTS = ((13, 64), (26, 128))  # (bytes per group, group_size)
 
 
 def _is_t5_weight_replacement(key: str, curr: mx.array, new: mx.array) -> bool:
@@ -74,7 +83,7 @@ def _is_t5_weight_replacement(key: str, curr: mx.array, new: mx.array) -> bool:
         return False
     if curr.shape[0] != new.shape[0]:
         return False
-    for bpg, group_size in ((13, 64), (26, 128)):
+    for bpg, group_size in _T5_GROUP_LAYOUTS:
         if new.shape[1] % bpg != 0:
             continue
         n_groups = new.shape[1] // bpg
@@ -82,6 +91,24 @@ def _is_t5_weight_replacement(key: str, curr: mx.array, new: mx.array) -> bool:
         if curr.shape[1] == K // 16:
             return True
     return False
+
+
+def _t5_infer_quant_config(path: str, module: nn.Module, weights: dict) -> dict:
+    """infer_quant_config replacement that reports t5 layers as 2-bit affine."""
+    weight = weights.get(f"{path}.weight")
+    scales = weights.get(f"{path}.scales")
+    if (
+        weight is not None
+        and scales is not None
+        and weight.dtype == mx.uint8
+        and scales.dtype != mx.uint8
+    ):
+        n_groups = scales.shape[-1]
+        in_dims = module.weight.shape[-1]
+        for bpg, group_size in _T5_GROUP_LAYOUTS:
+            if weight.shape[-1] == n_groups * bpg and in_dims == n_groups * group_size:
+                return {"group_size": group_size, "bits": 2, "mode": "affine"}
+    return _original_infer_quant_config(path, module, weights)
 
 
 def _patched_load_weights(
@@ -277,15 +304,20 @@ def apply_bonsai_t5_load_patch() -> bool:
     Returns True if newly applied, False if already active.
     """
     global _original_load_weights, _original_quantized_matmul, _patch_active
+    global _original_infer_quant_config
     if _patch_active:
         return False
 
     _original_load_weights = nn.Module.load_weights
     nn.Module.load_weights = _patched_load_weights
 
-    import mlx.core as _mx
-    _original_quantized_matmul = _mx.quantized_matmul
-    _mx.quantized_matmul = _t5_quantized_matmul
+    _original_quantized_matmul = mx.quantized_matmul
+    mx.quantized_matmul = _t5_quantized_matmul
+
+    # Older mlx-lm pins have no infer_quant_config and use the default bits.
+    if hasattr(mlx_lm_utils, "infer_quant_config"):
+        _original_infer_quant_config = mlx_lm_utils.infer_quant_config
+        mlx_lm_utils.infer_quant_config = _t5_infer_quant_config
 
     _patch_active = True
     logger.info(
@@ -297,13 +329,16 @@ def apply_bonsai_t5_load_patch() -> bool:
 
 def remove_bonsai_t5_load_patch() -> None:
     global _original_load_weights, _original_quantized_matmul, _patch_active
+    global _original_infer_quant_config
     if not _patch_active:
         return
     if _original_load_weights is not None:
         nn.Module.load_weights = _original_load_weights
         _original_load_weights = None
     if _original_quantized_matmul is not None:
-        import mlx.core as _mx
-        _mx.quantized_matmul = _original_quantized_matmul
+        mx.quantized_matmul = _original_quantized_matmul
         _original_quantized_matmul = None
+    if _original_infer_quant_config is not None:
+        mlx_lm_utils.infer_quant_config = _original_infer_quant_config
+        _original_infer_quant_config = None
     _patch_active = False

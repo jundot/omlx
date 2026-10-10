@@ -22,8 +22,6 @@ Architecture:
 import logging
 from typing import Any, Dict, List, Optional
 
-import os
-
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_vlm.models.cache import RotatingKVCache
@@ -31,16 +29,23 @@ from mlx_vlm.models.cache import RotatingKVCache
 logger = logging.getLogger(__name__)
 
 
-# OMLX_QWEN4_STEP_TEXT_POSITIONS=0 keeps decode/MTP-verify steps on rank-three
-# mRoPE positions (Qwen4's gathered-QSA arms then stay off those rows).
-_STEP_TEXT_POSITIONS_DISABLED = os.environ.get(
-    "OMLX_QWEN4_STEP_TEXT_POSITIONS", "1"
-).strip().lower() in {"0", "false", "no", "off"}
-# Cached tokens below which decode/verify rows keep rank-three positions (dense
-# path); the M5 Max crossover for the gathered arms is ~12k serial, higher for MTP.
-_STEP_TEXT_POSITIONS_MIN_CONTEXT = int(
-    os.environ.get("OMLX_QWEN4_STEP_TEXT_POSITIONS_MIN_CONTEXT", "32768")
-)
+# Cached tokens below which decode/verify rows keep rank-three positions (the
+# masked QSA path): _GATHERED_STEP_MIN_CONTEXT, the M5 Max crossover for the
+# gathered arms (~12k serial, higher for MTP) -- unless Qwen4's fused attention
+# rows run on this GPU: the masked path is then faster at every context (M5
+# Ultra, 16K-128K) and bit-identical to the unfused MLX ops, so steps never
+# switch.
+_GATHERED_STEP_MIN_CONTEXT = 32768
+
+
+def _step_text_positions_min_context() -> float:
+    """Cached tokens from which a text-proven Qwen4 step takes rank-two
+    positions (the gathered QSA arms); infinite while fused attention rows run."""
+    try:
+        from mlx_vlm.models.qwen4_exp import attn_fused
+    except ImportError:
+        return _GATHERED_STEP_MIN_CONTEXT
+    return float("inf") if attn_fused.rows_available() else _GATHERED_STEP_MIN_CONTEXT
 
 
 class PrefillReadyRotatingKVCache(RotatingKVCache):
@@ -431,9 +436,7 @@ class VLMModelAdapter(nn.Module):
         uids = list(uids) if uids is not None else []
         self._qwen4_text_prefill_positions = False
         self._qwen4_step_text_positions = bool(
-            not _STEP_TEXT_POSITIONS_DISABLED
-            and len(uids) == 1
-            and uids[0] in self._uid_text_positions
+            len(uids) == 1 and uids[0] in self._uid_text_positions
         )
 
     def set_batch_rope_deltas(self, deltas: mx.array) -> None:
@@ -568,6 +571,11 @@ class VLMModelAdapter(nn.Module):
         if hook is not None:
             hook(next_ids, current_ids)
 
+    def ple_gathers_ahead(self) -> bool:
+        """Whether the language model gathers PLE rows one prefill chunk ahead."""
+        probe = getattr(self._language_model, "ple_gathers_ahead", None)
+        return bool(probe()) if probe is not None else False
+
     def _omlx_prefill(self, input_ids, cache=None, **kwargs):
         """Forward the scheduler's cache-only contract to DeepSeek V4.1."""
         if self.model_type == "deepseek_v41":
@@ -644,8 +652,9 @@ class VLMModelAdapter(nn.Module):
                 # scalar offset is the batch-one case the proof is bound to.
                 qwen4_text_prefill_positions = prefill_text_positions or (
                     step_text_positions
+                    and self.model_type == "qwen4_exp"
                     and isinstance(offsets, (int, float))
-                    and offsets >= _STEP_TEXT_POSITIONS_MIN_CONTEXT
+                    and offsets >= _step_text_positions_min_context()
                 )
                 base_offsets = None
                 if isinstance(offsets, mx.array):

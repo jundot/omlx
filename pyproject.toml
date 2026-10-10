@@ -3,13 +3,13 @@ requires = [
     "setuptools>=61.0",
     "wheel",
     "cmake>=3.27",
-    # Pin nanobind to match the ABI version MLX 0.32.2 was built with
-    # (MLX pins nanobind v2.15.0 via FetchContent in its CMakeLists.txt).
+    # Pin nanobind to match the ABI version MLX 0.32.3 was built with
+    # (MLX pins nanobind v3.0.1 via FetchContent in its CMakeLists.txt).
     # A mismatched nanobind isolates the `mlx` NB_DOMAIN, so custom kernel
     # extensions (omlx.custom_kernels.*) reject every mlx.core.array at the
     # type caster with `incompatible function arguments`.
-    "nanobind==2.15.0",
-    "mlx==0.32.2",
+    "nanobind==3.0.1",
+    "mlx==0.32.3",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -31,7 +31,6 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -39,13 +38,14 @@ classifiers = [
 ]
 
 dependencies = [
-    # Vanilla MLX v0.32.2; optional custom kernels live under
+    # Vanilla MLX v0.32.3; optional custom kernels live under
     # omlx.custom_kernels.* when built for release. The bundled kernel
     # binaries are ABI-coupled to this exact mlx version — bumping the pin
     # requires rebuilding them (OMLX_WITH_CUSTOM_KERNEL=1 setup.py build_ext).
-    "mlx==0.32.2",
-    # mlx-lm 0.32.0: full cache state, per-stream stop matchers, and counters.
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@872ae88d1fac77350db23c8c04fe8dd372a9e3e8",
+    "mlx==0.32.3",
+    # mlx-lm main after 0.32.0. setuptools-scm derives the version from the
+    # v0.31.3 tag, so it reports 0.31.4.devN; the 0.32.0 features are present.
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@94cdcae13b266c337bcaca09b97b9c5a9c0e2cde",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
     # mlx-embeddings from latest commit (32981fa)
@@ -110,13 +110,13 @@ dependencies = [
     "openai-harmony",
     # Cohere Command/Cohere2 output parser for reasoning and tool calls
     "cohere_melody>=0.9.0",
-    # mlx-vlm from commit ea79808. oMLX model implementations remain registered
+    # mlx-vlm from commit 4f4634b (v0.7.7). oMLX model implementations remain registered
     # by their pre-load patches.
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@ea79808ce1e9a19fcb915a96b0c70e37ad393a99",
-    # mlx-vlm now requires mlx-audio in the shared runtime.
-    "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@49596ac8b69b9ed377db311a73df838795f38a3d",
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@4f4634bb813c0298cb1467bed2e957526c71d0b4",
+    # mlx-vlm requires mlx-audio>=0.5.2 in the shared runtime.
+    "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@94c7716212b2228f178d2f9c7619a591fd1b0b78",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.10+omlx.7 (c55324c) - jundot fork of bstnxbt 0.1.10 (9ca0028).
+    # dflash-mlx v0.1.10+omlx.9 (71f7c2c) - jundot fork of bstnxbt 0.1.10 (9ca0028).
     # Carries the trimmed-sidecar prefix cache fix (repeat-prompt L1 hits never
     # fired upstream), the single-host-sync decode cycle (one D2H transfer
     # per cycle instead of four syncs plus a hard eval), Gemma 4 unified
@@ -124,10 +124,13 @@ dependencies = [
     # text-only mlx-lm module + MuseGlimmerAssistantModel dispatch), plus
     # FP32 Muse Glimmer query scaling parity with mlx-vlm, DFlash 2 runtime
     # support (sampling params + candidate selector, PR 6), min_p with the
-    # mlx-lm sampler filter order, the sink=0 empty-chunk L2 write fix, and
-    # repetition penalty support across speculative and fallback sampling.
-    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@c55324c86540c369f6818a0f47eae544d405475b",
-    "markitdown[pdf,docx,pptx]==0.1.7",
+    # mlx-lm sampler filter order, the sink=0 empty-chunk L2 write fix,
+    # repetition penalty support across speculative and fallback sampling,
+    # Muse Glimmer target registration and live KV snapshots on mlx-lm 0.32
+    # (PR 11), Muse Glimmer prefix snapshots (PR 5), and GDN verify q/k
+    # normalization that follows mlx-lm normalize_qk.
+    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@71f7c2cae42a968ddc981972a8ad35368dc587a9",
+    "markitdown[pdf,docx,pptx]==0.1.8",
 ]
 
 [project.optional-dependencies]
@@ -137,7 +140,7 @@ grammar = [
     # build. xgrammar 0.2.3 crashes at import with apache-tvm-ffi 0.1.13
     # on macOS arm64, so an open-ended resolver can break Homebrew installs
     # without any oMLX source change (#2428).
-    "xgrammar==0.2.3",
+    "xgrammar==0.2.8",
     "apache-tvm-ffi==0.1.11",
 ]
 mcp = [
@@ -154,8 +157,8 @@ modelscope = [
     "modelscope>=1.10.0",
 ]
 audio = [
-    # mlx-audio from commit (49596ac, v0.4.8) with tts/stt/sts extras
-    "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@49596ac8b69b9ed377db311a73df838795f38a3d",
+    # mlx-audio from commit (94c7716, v0.5.7) with tts/stt/sts extras
+    "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@94c7716212b2228f178d2f9c7619a591fd1b0b78",
     # Keep dependencies for existing audio models removed from upstream extras.
     "espeakng-loader>=0.2.4",
     "librosa==0.11.0",
@@ -200,6 +203,7 @@ bundle = [
     "phonemizer-fork>=3.3.2",
     "espeakng-loader>=0.2.4",
     "webrtcvad>=2.0.10",
+    "zstandard>=0.23.0",
     # [audio] extra on top of pyproject's plain mistral-common>=1.10
     "mistral-common[audio]>=1.10",
     # realtime STT WebSocket endpoint
@@ -217,12 +221,7 @@ dev = [
     # xgrammar / tvm-ffi version bumps. It skips when these aren't
     # importable, which silently hides regressions — install no-deps
     # in the dev environment so the test actually runs.
-    #
-    # Held at 0.2.3: xgrammar 0.2.4/0.2.5 cap transformers at <5,
-    # which conflicts with our transformers>=5.12.1 pin and makes
-    # pip/uv dev installs unresolvable (#2289). Bump again once
-    # upstream lifts the cap.
-    "xgrammar==0.2.3",
+    "xgrammar==0.2.8",
     "apache-tvm-ffi==0.1.11",
 ]
 # PEP 735 dependency groups — consumed by `uv sync --dev`.
@@ -237,7 +236,7 @@ dev = [
     "mypy>=1.0.0",
     "mcp>=2.0.0,<3",
     "venvstacks>=0.7.0",
-    "xgrammar==0.2.3",
+    "xgrammar==0.2.8",
     "apache-tvm-ffi==0.1.11",
 ]
 
@@ -253,35 +252,33 @@ omlx = "omlx.cli:main"
 version = {attr = "omlx._version.__version__"}
 
 [tool.setuptools.packages.find]
-where = ["."]
+# omlx_web ships in the same wheel. Without apps/ the wheel is API-only.
+where = [".", "apps/omlx-web"]
 include = ["omlx*"]
 
 [tool.setuptools.package-data]
 "omlx" = ["oq_calibration_data.json", "oqe_calibration_data.json"]
-"omlx.admin" = [
-    "templates/**/*.html",
-    "static/**/*",
-    "i18n/*.json",
-    "bench_corpora/*",
-]
+"omlx.admin" = ["bench_corpora/*"]
+"omlx_web" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
 "omlx.eval" = ["data/*.jsonl"]
 "omlx.patches.deepseek_v41" = ["LICENSE"]
 "omlx.custom_kernels.glm_moe_dsa" = ["*.metallib", "*.dylib", "*.so"]
 "omlx.custom_kernels.decode_fast" = ["*.metallib", "*.dylib", "*.so"]
 "omlx.custom_kernels.minimax_m3" = ["*.metallib", "*.dylib", "*.so"]
 "omlx.custom_kernels.qwen35_prefill" = ["*.metallib", "*.dylib", "*.so"]
+"omlx.custom_kernels.bonsai" = ["*.metallib", "*.dylib", "*.so"]
 
 [tool.uv]
 # mlx and mlx-lm are git-pinned; override transitive pins
 # so dependency resolution retains the selected runtime versions.
 override-dependencies = [
-    "mlx==0.32.2",
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@872ae88d1fac77350db23c8c04fe8dd372a9e3e8",
+    "mlx==0.32.3",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@94cdcae13b266c337bcaca09b97b9c5a9c0e2cde",
 ]
 
 [tool.black]
 line-length = 88
-target-version = ["py310", "py311", "py312", "py313"]
+target-version = ["py311", "py312", "py313"]
 
 [tool.ruff]
 line-length = 88
@@ -292,7 +289,7 @@ ignore = ["E501", "B905"]
 extend-exclude = ["omlx/patches/*/vendor"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true

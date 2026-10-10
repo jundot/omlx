@@ -204,7 +204,10 @@ def read_remote_marker(
 
     command = " ".join(
         (
-            "python3",
+            # Absolute like the serve marker: the marker script is
+            # stdlib-only, and a bare python3 resolves through the login
+            # shell's PATH.
+            "/usr/bin/python3",
             "-c",
             shlex.quote(_REMOTE_MARKER_SCRIPT),
             shlex.quote(path),

@@ -28,6 +28,7 @@ import stat
 import struct
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -69,6 +70,9 @@ _PENDING_WRITES_HARD_RAM_FRACTION = 0.30
 _PENDING_WRITES_SOFT_FLOOR = 32
 _PENDING_WRITES_CEILING = 256
 _PENDING_WRITE_PUT_TIMEOUT_SECONDS = 1.0
+# Startup keeps unreadable tmp files newer than this; another manager may
+# still be writing them.
+_STALE_TMP_CLEANUP_SECONDS = 600.0
 
 # Conservative defaults for the per-block cost estimator. The actual
 # bytes-per-block depends on the model (KV-cache layers × num_kv_heads ×
@@ -260,6 +264,7 @@ def _cache_compat_signature(
     cachelist_subtypes: dict[str, list[str]] | None = None,
     payload_layout: str | None = None,
     gdn_sidecar_state_dtype: str | None = None,
+    numerics: str | None = None,
 ) -> str:
     """Return a stable compatibility signature for a persisted cache block."""
     payload = {
@@ -287,7 +292,49 @@ def _cache_compat_signature(
         payload["payload_layout"] = payload_layout
     if gdn_sidecar_state_dtype is not None:
         payload["gdn_sidecar_state_dtype"] = gdn_sidecar_state_dtype
+    # Only models whose forward numerics changed carry a revision, so other
+    # signatures stay byte-identical to the previous format.
+    if numerics is not None:
+        payload["numerics"] = numerics
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+# Model modules whose forward numerics changed under a dependency update.
+# Blocks written before the change are unsafe for these models only.
+_NUMERICS_REVISIONS = {
+    # mlx-lm a63e24c scales the GDN q/k l2norm eps by inv_scale**2.
+    "mlx_lm.models.qwen3_5": "gdn-qk-norm-2",
+    "mlx_lm.models.qwen3_next": "gdn-qk-norm-2",
+    "mlx_lm.models.bailing_hybrid": "gdn-qk-norm-2",
+    # omlx.patches.qwen35_gdn_prework applies the same fix to mlx-vlm.
+    "mlx_vlm.models.qwen3_5.language": "gdn-qk-norm-2",
+}
+
+
+def numerics_revision_for_model(model: Any) -> str | None:
+    """Return the numerics revision of a loaded model, or None."""
+    modules = getattr(model, "modules", None)
+    if not callable(modules):
+        return None
+    revisions = {
+        _NUMERICS_REVISIONS[name]
+        for module in modules()
+        if (name := type(module).__module__) in _NUMERICS_REVISIONS
+    }
+    return ",".join(sorted(revisions)) or None
+
+
+def _signature_numerics(cache_signature: str) -> str | None:
+    """Extract ``numerics`` from a stored signature, or None."""
+    if not cache_signature:
+        return None
+    try:
+        payload = json.loads(cache_signature)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload.get("numerics")
 
 
 def cache_signature_for(
@@ -879,6 +926,17 @@ def _fsync_parent_dir(path: str | Path) -> None:
         pass
     finally:
         os.close(dir_fd)
+
+
+def _unique_tmp_path(file_path: Path) -> Path:
+    """Build a per-writer temp path for ``file_path``.
+
+    A shared ``<stem>_tmp`` name lets two writers of one block interleave
+    their bytes in a single file.
+    """
+    return file_path.with_name(
+        f"{file_path.stem}_tmp_{uuid.uuid4().hex[:8]}.safetensors"
+    )
 
 
 def _write_safetensors_no_mx(
@@ -1508,6 +1566,15 @@ class SharedHotCacheBudget:
                     )
         return cleared
 
+    def releasable_bytes(self, protected_hashes: set[bytes]) -> int:
+        """Bytes ``shrink_to`` can free while keeping ``protected_hashes``."""
+        with self._lock:
+            return sum(
+                entry.size_bytes
+                for entry in self._entries.values()
+                if entry.block_hash not in protected_hashes
+            )
+
     def shrink_to(
         self,
         target_bytes: int,
@@ -1715,6 +1782,9 @@ class PagedSSDCacheManager(CacheManager):
         # the layer signature. None disables the check (legacy managers /
         # models without mixed CacheList layers).
         self._expected_cachelist_subtypes: dict[str, list[str]] | None = None
+        # Numerics revision of the live model (see ``_NUMERICS_REVISIONS``).
+        # None accepts every block, like the TurboQuant depth.
+        self._expected_numerics: str | None = None
         # Set once we have swept stale-signature blocks for the current
         # ``_expected_layer_cache_types`` / ``_expected_turboquant_kv_bits``.
         # Re-assigning the signature (e.g., via
@@ -1848,7 +1918,10 @@ class PagedSSDCacheManager(CacheManager):
         Entries from save_block() use 'tensors_raw' (raw bytes).
         Entries from _promote_to_hot_cache() may use 'arrays' (mx.array objects
         loaded from SSD, not from active inference — safe to retain).
+        Staging buffers for queued SSD writes are not hot cache and count as 0.
         """
+        if entry.get("staging"):
+            return 0
         if "arrays" in entry:
             return sum(arr.nbytes for arr in entry["arrays"].values())
         if "tensors_raw" in entry:
@@ -1867,6 +1940,8 @@ class PagedSSDCacheManager(CacheManager):
 
     def _handle_hot_cache_eviction(self, block_hash: bytes, entry: dict) -> None:
         self._stats["hot_cache_evictions"] += 1
+        if entry.get("staging"):
+            return  # Its SSD write is already queued.
         if not entry.get("dirty", True):
             logger.debug(
                 "Evicted clean hot cache block %s; SSD copy already exists",
@@ -2283,6 +2358,8 @@ class PagedSSDCacheManager(CacheManager):
         skipped_incompatible = 0
         skipped_incompatible_bytes = 0
         errors = 0
+        orphaned_tmp_cleaned = 0
+        unreadable_orphans = 0
 
         for subdir in self.SUBDIR_CHARS:
             subdir_path = self._cache_dir / subdir
@@ -2294,6 +2371,22 @@ class PagedSSDCacheManager(CacheManager):
                 try:
                     metadata = self._read_file_metadata(file_path)
                     if metadata is None:
+                        # An unreadable tmp file is a torn write. Skip recent
+                        # ones, which another manager may still be writing.
+                        stem = file_path.stem
+                        try:
+                            tmp_is_stale = (
+                                time.time() - file_path.stat().st_mtime
+                                > _STALE_TMP_CLEANUP_SECONDS
+                            )
+                        except OSError:
+                            tmp_is_stale = False
+                        if ("_tmp_" in stem or stem.endswith("_tmp")) and tmp_is_stale:
+                            with contextlib.suppress(OSError):
+                                file_path.unlink()
+                            orphaned_tmp_cleaned += 1
+                        else:
+                            unreadable_orphans += 1
                         continue
                     if not self._is_compatible_block(metadata):
                         skipped_incompatible += 1
@@ -2328,15 +2421,25 @@ class PagedSSDCacheManager(CacheManager):
             log_msg += f", skipped_gdn_sidecars={sidecars_skipped}"
         if sidecars_bytes > 0:
             log_msg += f", gdn_size={format_bytes(sidecars_bytes)}"
+        if orphaned_tmp_cleaned > 0:
+            log_msg += f", removed_torn_tmp={orphaned_tmp_cleaned}"
+        if unreadable_orphans > 0:
+            log_msg += (
+                f", unreadable_orphans={unreadable_orphans} "
+                f"(left on disk; not indexed or budgeted)"
+            )
         logger.info(log_msg)
 
         # Startup can find a cache directory that already exceeds the shared
         # SSD budget. Converge immediately before serving requests.
         tracked_size = self._tracked_ssd_size()
         if tracked_size > 0 and tracked_size > self._get_effective_max_size():
+            tracked_count = self._tracked_ssd_count()
             self._enforce_size_limit_for_new_block(0, unbounded=True)
-            logger.info(
-                "SSD cache startup cleanup: freed=%s, remaining=%s, limit=%s",
+            logger.warning(
+                "SSD cache startup cleanup: evicted=%d, freed=%s, remaining=%s, "
+                "limit=%s",
+                tracked_count - self._tracked_ssd_count(),
                 format_bytes(tracked_size - self._tracked_ssd_size()),
                 format_bytes(self._tracked_ssd_size()),
                 format_bytes(self._get_effective_max_size()),
@@ -2663,6 +2766,7 @@ class PagedSSDCacheManager(CacheManager):
             return (
                 self._payload_layout == "embedded"
                 and self._signature_bits_match("")
+                and self._signature_numerics_match("")
             )
 
         try:
@@ -2726,7 +2830,16 @@ class PagedSSDCacheManager(CacheManager):
         if not self._signature_bits_match(metadata.cache_signature):
             return False
 
+        if not self._signature_numerics_match(metadata.cache_signature):
+            return False
+
         return True
+
+    def _signature_numerics_match(self, cache_signature: str) -> bool:
+        """True when a block was computed with the live model's numerics."""
+        if self._expected_numerics is None:
+            return True
+        return _signature_numerics(cache_signature) == self._expected_numerics
 
     def _signature_bits_match(self, cache_signature: str) -> bool:
         """True when a block's recorded TurboQuant depth satisfies expectations.
@@ -2774,6 +2887,11 @@ class PagedSSDCacheManager(CacheManager):
             return (
                 "TurboQuant depth: expected "
                 f"{self._expected_turboquant_kv_bits}, got {actual}"
+            )
+        if not self._signature_numerics_match(cache_signature):
+            return (
+                f"numerics: expected {self._expected_numerics}, "
+                f"got {_signature_numerics(cache_signature)}"
             )
 
         expected_subtypes = self._expected_cachelist_subtypes
@@ -2841,6 +2959,7 @@ class PagedSSDCacheManager(CacheManager):
             turboquant_kv_bits=turboquant_kv_bits,
             cachelist_subtypes=cachelist_subtypes,
             payload_layout=self._payload_layout,
+            numerics=self._expected_numerics,
         )
 
     def gdn_cache_signature_for(
@@ -3052,7 +3171,7 @@ class PagedSSDCacheManager(CacheManager):
             temp_path = None
             try:
                 file_path.parent.mkdir(parents=True, exist_ok=True)
-                temp_path = file_path.with_name(file_path.stem + "_tmp.safetensors")
+                temp_path = _unique_tmp_path(file_path)
                 actual_size = _write_safetensors_no_mx(
                     str(temp_path), tensors_raw, metadata
                 )
@@ -3120,6 +3239,17 @@ class PagedSSDCacheManager(CacheManager):
                         if p is not None and isinstance(p, Path) and p.exists():
                             p.unlink()
                 return False
+
+    def wait_for_pending_writes(self, timeout: float) -> bool:
+        """Wait until queued SSD writes finish. Returns False on timeout."""
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._pending_write_hashes_lock:
+                if not self._pending_write_hashes:
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
 
     def _clear_pending_write(
         self, block_hash: bytes, *, remove_hot_cache: bool = False
@@ -3448,6 +3578,7 @@ class PagedSSDCacheManager(CacheManager):
                     cache_data, layer_cache_types, layer_meta_states
                 ),
                 payload_layout=self._payload_layout,
+                numerics=self._expected_numerics,
             )
 
             # Prepare metadata
@@ -3595,6 +3726,7 @@ class PagedSSDCacheManager(CacheManager):
             self._index.add(block_metadata)
 
             # Hot cache disabled: use temporary buffer + immediate SSD write
+            cache_entry["staging"] = True
             with self._hot_cache_lock:
                 self._hot_cache[block_hash] = cache_entry
 
@@ -4372,6 +4504,7 @@ class PagedSSDCacheManager(CacheManager):
         *,
         turboquant_kv_bits: float | None = None,
         cachelist_subtypes: dict[str, list[str]] | None = None,
+        numerics: str | None = None,
     ) -> bool:
         """Set the live layer-cache signature, replacing stale expectations.
 
@@ -4383,6 +4516,9 @@ class PagedSSDCacheManager(CacheManager):
         TurboQuant is inactive). A bit-depth change alone also triggers the
         sweep: blocks written at another depth have a different packed state
         width and would crash batch concatenation if mixed (#2045).
+
+        ``numerics`` is the live model's numerics revision; blocks computed
+        under another revision are swept.
 
         Returns True when the canonical signature changed and a stale-signature
         sweep should run. Returns False for empty input or a canonical no-op.
@@ -4403,10 +4539,12 @@ class PagedSSDCacheManager(CacheManager):
             subtypes_changed = (
                 cachelist_subtypes != self._expected_cachelist_subtypes
             )
+            numerics_changed = numerics != self._expected_numerics
             if (
                 old_canonical == new_canonical
                 and not bits_changed
                 and not subtypes_changed
+                and not numerics_changed
             ):
                 if old_signature != new_signature:
                     self._expected_layer_cache_types = new_signature
@@ -4415,16 +4553,18 @@ class PagedSSDCacheManager(CacheManager):
             self._expected_layer_cache_types = new_signature
             self._expected_turboquant_kv_bits = new_bits
             self._expected_cachelist_subtypes = cachelist_subtypes
+            self._expected_numerics = numerics
             self._signature_sweep_completed = False
 
         logger.info(
             "PagedSSDCacheManager updated layer cache signature "
             "(%d layers, %d unique types, turboquant_kv_bits=%s, "
-            "cachelist_subtypes=%s)",
+            "cachelist_subtypes=%s, numerics=%s)",
             len(new_signature),
             len(set(new_canonical or ())),
             new_bits,
             "yes" if cachelist_subtypes else "no",
+            numerics,
         )
         return True
 
@@ -4486,6 +4626,9 @@ class PagedSSDCacheManager(CacheManager):
                     stale.append(h)
                     continue
                 if not self._signature_bits_match(meta.cache_signature):
+                    stale.append(h)
+                    continue
+                if not self._signature_numerics_match(meta.cache_signature):
                     stale.append(h)
                     continue
                 if self._expected_cachelist_subtypes is not None and (
@@ -4868,9 +5011,12 @@ class PagedSSDCacheManager(CacheManager):
             while self._hot_cache_total_bytes > target_bytes and self._hot_cache:
                 victim_hash = None
                 for block_hash in self._hot_cache:
-                    if block_hash not in protected_hashes:
-                        victim_hash = block_hash
-                        break
+                    if block_hash in protected_hashes:
+                        continue
+                    if self._hot_cache[block_hash].get("staging"):
+                        continue
+                    victim_hash = block_hash
+                    break
                 if victim_hash is None:
                     break
 
