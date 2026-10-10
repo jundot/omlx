@@ -47,6 +47,9 @@ final class AppServices: NSObject {
     let throughputBench = ThroughputBenchScreenVM()
     let accuracyBench   = AccuracyBenchScreenVM()
     let contextBench    = ContextBenchScreenVM()
+    /// The ANE tuner is launched from a transient per-model settings screen,
+    /// but its server run must survive navigation and App View window closes.
+    let aneTuning       = ANETuningSessionVM()
 
     @ObservationIgnored
     private weak var server: ServerProcess?
@@ -65,6 +68,9 @@ final class AppServices: NSObject {
     }
 
     func bind(server: ServerProcess?) {
+        if self.server !== server {
+            aneTuning.reset()
+        }
         // Detach from the previous server (if any) before re-attaching.
         if self.server != nil {
             NotificationCenter.default.removeObserver(
@@ -95,9 +101,18 @@ final class AppServices: NSObject {
         updated.bindAddress = proc.bindAddress
         updated.port = proc.port
         updateConfig(updated)
+        switch proc.state {
+        case .stopped, .failed:
+            aneTuning.reset()
+        case .starting, .running, .stopping, .unresponsive:
+            break
+        }
     }
 
     func updateConfig(_ next: AppConfig) {
+        if config.host != next.host || config.port != next.port {
+            aneTuning.reset()
+        }
         self.config = next
         client.configure(host: next.host, port: next.port, apiKey: next.apiKey)
     }
