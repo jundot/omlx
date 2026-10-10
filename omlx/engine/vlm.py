@@ -2517,6 +2517,10 @@ class VLMBatchedEngine(BaseEngine):
             logger.info(f"VLMBatchedEngine loaded: {self._model_name}")
             return
 
+        from ..patches.m4_dense_mlp_prefill import apply_m4_dense_mlp_prefill
+
+        apply_m4_dense_mlp_prefill(self._vlm_model)
+
         # Create VLM model adapter wrapping language_model.
         # mlx-vlm models now handle per-sequence mx.array offsets natively
         # and batched decode is fixed, so no separate mlx-lm decode model needed.
