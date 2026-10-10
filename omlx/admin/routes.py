@@ -3934,12 +3934,13 @@ async def _apply_settings_snapshot(
     Scoped fields the snapshot does not name fall back to their defaults, so
     the result matches the environment the snapshot came from. Features this
     install cannot run are dropped and reported in ``skipped``. ``reset``
-    applies an empty snapshot over every settings field.
+    applies the model's recommended sampling settings over every settings
+    field, so the model returns to the values it started with.
     """
     mgr = _require_settings_manager()
     skipped: list[dict] = []
     if reset:
-        cleaned: dict = {}
+        cleaned = _get_engine_pool().recommended_sampling_settings(entry)
         scope = set(ALL_FIELDS) & set(ModelSettingsRequest.model_fields)
     else:
         cleaned = clean_snapshot(snapshot)
@@ -4057,7 +4058,7 @@ async def reset_model_settings(
     model_id: str,
     is_admin: bool = Depends(require_admin),
 ):
-    """Return every setting of a model to its default."""
+    """Return every setting of a model to the value it starts with."""
     entry = _require_model(model_id)
     return await _apply_settings_snapshot(entry, model_id, {}, reset=True)
 
@@ -4275,8 +4276,9 @@ async def get_generation_config(
     """
     Read model config files and return recommended defaults.
 
-    Reads generation_config.json for sampling parameters and config.json
-    for max_context_window (max_position_embeddings).
+    Returns the sampling settings a new model starts with (see
+    EnginePool.recommended_sampling_settings) and reads config.json for
+    max_context_window (max_position_embeddings).
 
     Args:
         model_id: The model identifier.
@@ -4298,35 +4300,7 @@ async def get_generation_config(
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
 
     model_path = Path(entry.model_path)
-    result = {}
-
-    # Read generation_config.json for sampling parameters
-    gen_config_path = model_path / "generation_config.json"
-    if gen_config_path.exists():
-        try:
-            with open(gen_config_path, encoding="utf-8") as f:
-                gen_config = json_module.load(f)
-
-            # Temperature: if do_sample is false, effective temperature is 0
-            do_sample = gen_config.get("do_sample", True)
-            if "temperature" in gen_config:
-                result["temperature"] = (
-                    0.0 if not do_sample else gen_config["temperature"]
-                )
-
-            if "top_p" in gen_config:
-                result["top_p"] = gen_config["top_p"]
-
-            if "top_k" in gen_config:
-                result["top_k"] = gen_config["top_k"]
-
-            if "repetition_penalty" in gen_config:
-                result["repetition_penalty"] = gen_config["repetition_penalty"]
-
-        except (json_module.JSONDecodeError, OSError) as e:
-            logger.warning(
-                f"Failed to parse generation_config.json for {model_id}: {e}"
-            )
+    result = engine_pool.recommended_sampling_settings(entry)
 
     # Read config.json for max_position_embeddings → max_context_window
     config_path = model_path / "config.json"
