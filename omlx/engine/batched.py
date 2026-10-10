@@ -1120,6 +1120,14 @@ class BatchedEngine(BaseEngine):
 
         from ..request import SamplingParams
 
+        chat_template_kwargs = kwargs.pop("chat_template_kwargs", None)
+        if (
+            "_enable_thinking" not in kwargs
+            and isinstance(chat_template_kwargs, dict)
+            and "enable_thinking" in chat_template_kwargs
+        ):
+            kwargs["_enable_thinking"] = chat_template_kwargs["enable_thinking"]
+
         self._prepare_k2_tool_grammar(kwargs.get("tools"), kwargs)
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
@@ -1135,6 +1143,7 @@ class BatchedEngine(BaseEngine):
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
             thinking_budget=kwargs.get("thinking_budget", None),
+            enable_thinking=kwargs.pop("_enable_thinking", self._enable_thinking),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
         )
@@ -1200,6 +1209,14 @@ class BatchedEngine(BaseEngine):
 
         from ..request import SamplingParams
 
+        chat_template_kwargs = kwargs.pop("chat_template_kwargs", None)
+        if (
+            "_enable_thinking" not in kwargs
+            and isinstance(chat_template_kwargs, dict)
+            and "enable_thinking" in chat_template_kwargs
+        ):
+            kwargs["_enable_thinking"] = chat_template_kwargs["enable_thinking"]
+
         self._prepare_k2_tool_grammar(kwargs.get("tools"), kwargs)
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
@@ -1215,6 +1232,7 @@ class BatchedEngine(BaseEngine):
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
             thinking_budget=kwargs.get("thinking_budget", None),
+            enable_thinking=kwargs.pop("_enable_thinking", self._enable_thinking),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
         )
@@ -1338,6 +1356,8 @@ class BatchedEngine(BaseEngine):
 
         # Apply chat template
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
+        if isinstance(ct_kwargs, dict) and "enable_thinking" in ct_kwargs:
+            kwargs["_enable_thinking"] = ct_kwargs["enable_thinking"]
         partial = kwargs.pop("is_partial", None)
         prepared = kwargs.pop("_prepared_prompt", None)
         prompt = (
@@ -1502,6 +1522,8 @@ class BatchedEngine(BaseEngine):
 
         # Apply chat template
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
+        if isinstance(ct_kwargs, dict) and "enable_thinking" in ct_kwargs:
+            kwargs["_enable_thinking"] = ct_kwargs["enable_thinking"]
         partial = kwargs.pop("is_partial", None)
         prepared = kwargs.pop("_prepared_prompt", None)
         prompt = (
