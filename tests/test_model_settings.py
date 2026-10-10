@@ -932,3 +932,47 @@ def test_oq_a8_is_a_model_specific_profile_field():
     for name in ("qwen35_oq_a8_enabled", "qwen35_oq_a8_min_tokens"):
         assert name in MODEL_SPECIFIC_PROFILE_FIELDS
         assert name not in UNIVERSAL_FIELDS_SET
+
+
+class TestPrefixedModelIdFallback:
+    """#3071: distributed (org-prefixed) IDs must find bare-name settings."""
+
+    def _manager(self, tmp_path, models):
+        settings_file = tmp_path / "model_settings.json"
+        settings_file.write_text(json.dumps({"version": 1, "models": models}))
+        return ModelSettingsManager(tmp_path)
+
+    def test_prefixed_id_falls_back_to_the_bare_key(self, tmp_path):
+        manager = self._manager(
+            tmp_path,
+            {
+                "Qwen3.8-27B-oQ4e-mtp": {
+                    "thinking_budget_enabled": True,
+                    "thinking_budget_tokens": 4096,
+                }
+            },
+        )
+
+        settings = manager.get_settings("scottlowry/Qwen3.8-27B-oQ4e-mtp")
+
+        assert settings.thinking_budget_enabled is True
+        assert settings.thinking_budget_tokens == 4096
+
+    def test_exact_prefixed_key_wins_over_the_bare_fallback(self, tmp_path):
+        manager = self._manager(
+            tmp_path,
+            {
+                "model-a": {"temperature": 0.1},
+                "org/model-a": {"temperature": 0.9},
+            },
+        )
+
+        assert manager.get_settings("org/model-a").temperature == 0.9
+        assert manager.get_settings("model-a").temperature == 0.1
+
+    def test_unknown_prefix_still_returns_defaults(self, tmp_path):
+        manager = self._manager(tmp_path, {"model-a": {"temperature": 0.1}})
+
+        settings = manager.get_settings("other/model-b")
+
+        assert settings.temperature != 0.1
