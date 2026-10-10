@@ -156,6 +156,12 @@ cluster = [
 modelscope = [
     "modelscope>=1.10.0",
 ]
+menubar = [
+    # macOS menubar sidecar spawned by `omlx serve` (omlx/menubar_sidecar.py):
+    # live PP%/GEN t/s status next to the clock. Pure PyObjC bridge, no heavy
+    # deps; absence simply skips the sidecar (serve runs unchanged).
+    "pyobjc-framework-Cocoa>=10.0",
+]
 audio = [
     # mlx-audio from commit (94c7716, v0.5.7) with tts/stt/sts extras
     "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@94c7716212b2228f178d2f9c7619a591fd1b0b78",
