@@ -347,3 +347,52 @@ extension Font {
         .system(size: size, weight: weight, design: .monospaced)
     }
 }
+
+// MARK: - Type ramp
+
+/// The six steps of the app's type scale, in points.
+///
+/// Every `.omlxText` / `.omlxMono` / `.omlxDisplay` call names one of these
+/// rather than typing a size, so a screen states which step of the scale it
+/// wants and a number cannot drift back into a view. The value of each step
+/// is exactly the point size it replaces: this is a name for the existing
+/// measurements, not a redesign of them.
+///
+/// The table below is the survey the steps were cut from. Step counts were
+/// taken from `Sources/**/*.swift` at the time the ramp was written:
+///
+/// | step       | value | sites | replaces |
+/// |------------|-------|-------|----------|
+/// | `aux`      | 12    | 250   | captions, timestamps, badges, table secondary cells |
+/// | `body`     | 14    | 35    | body copy, form labels, table primary cells |
+/// | `emphasis` | 16    | 5     | group and card titles |
+/// | `section`  | 18    | 8     | section headings, drawer and sheet titles |
+/// | `page`     | 24    | 6     | page titles |
+/// | `kpi`      | 32    | 2     | metric figures |
+///
+/// Nothing renders below `aux`, so the Enhanced Readability switch now only
+/// raises contrast: the floor it used to enforce is the floor of the scale.
+enum DesignTokens {
+    /// The six type levels.
+    enum FontSize {
+        /// Captions, timestamps, table secondary cells, badges.
+        static let aux: CGFloat = 12
+        /// Body copy, form labels, table primary cells.
+        static let body: CGFloat = 14
+        /// Group and card titles.
+        static let emphasis: CGFloat = 16
+        /// Section headings, drawer and sheet titles.
+        static let section: CGFloat = 18
+        /// Page title.
+        static let page: CGFloat = 24
+        /// Metric figures.
+        static let kpi: CGFloat = 32
+
+        /// Smallest size any auxiliary label may use.
+        static let floor: CGFloat = 12
+        /// Smallest size body copy and above may use.
+        static let bodyFloor: CGFloat = 14
+        /// Floor once enhanced readability is on.
+        static let enhancedReadabilityFloor: CGFloat = 12
+    }
+}
