@@ -240,7 +240,11 @@ def _install_controller_key(
     existing = authorized_keys.read_text(encoding="utf-8") if authorized_keys.exists() else ""
     key_parts = public_key.strip().split()
     key_identity = " ".join(key_parts[:2])
-    restricted_line = f'from="{controller_ip}",restrict {public_key.strip()}'
+    # ``restrict`` implies ``no-pty``, but MLX's distributed launcher runs
+    # ``ssh -tt``; without a PTY the rank exits 255 with "PTY allocation
+    # request failed on channel 0". Re-enable only the PTY — port, agent
+    # and X11 forwarding and user rc stay disabled.
+    restricted_line = f'from="{controller_ip}",restrict,pty {public_key.strip()}'
     updated: list[str] = []
     installed = False
     for line in existing.splitlines():
