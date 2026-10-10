@@ -17,7 +17,10 @@ without further changes.
 from __future__ import annotations
 
 import math
-from typing import Callable, List
+import os
+import threading
+from collections import OrderedDict
+from typing import Callable, List, Sequence
 
 import mlx.core as mx
 
@@ -254,4 +257,91 @@ def make_sampler(
     sampler.top_k = top_k
     sampler.min_tokens_to_keep = min_tokens_to_keep
     sampler.xtc_probability = xtc_probability
+    return sampler
+
+
+# mlx-lm's GenerationBatch._step samples a batch in one call only when every
+# row's sampler is the same object; otherwise it runs each row's filter and
+# sampling chain on a one-row slice and concatenates the results. The server
+# builds a sampler per request, so a decode batch of B requests paid B chains
+# (top-k, top-p, categorical over the full vocabulary: about forty graph ops
+# and their GPU launches per row) even when every request asked for the same
+# parameters. The samplers are stateless (their randomness comes from MLX's
+# global RNG, which the per-row loop already advanced row by row), so
+# requests with equal parameters can share one object and mlx-lm samples
+# them together. Each row still draws from its own filtered distribution;
+# only the RNG stream behind the draws changes.
+#
+# XTC is never shared: its coin flip is one draw per call, which a shared
+# call would turn into one flip for the whole batch.
+#
+# OMLX_SHARED_SAMPLERS=0 builds one sampler per request again.
+_SHARED_SAMPLERS_ENABLED = os.environ.get("OMLX_SHARED_SAMPLERS", "1") != "0"
+_SHARED_SAMPLERS_MAX = 256
+_shared_samplers: OrderedDict[tuple, Callable[[mx.array], mx.array]] = OrderedDict()
+_shared_samplers_lock = threading.Lock()
+
+
+def _shared_sampler_key(
+    temp: float,
+    top_p: float,
+    min_p: float,
+    min_tokens_to_keep: int,
+    top_k: int,
+) -> tuple:
+    return (
+        float(temp),
+        float(top_p),
+        float(min_p),
+        int(min_tokens_to_keep),
+        int(top_k or 0),
+    )
+
+
+def make_shared_sampler(
+    temp: float = 0.0,
+    top_p: float = 0.0,
+    min_p: float = 0.0,
+    min_tokens_to_keep: int = 1,
+    top_k: int = 0,
+    xtc_probability: float = 0.0,
+    xtc_threshold: float = 0.0,
+    xtc_special_tokens: Sequence[int] = (),
+) -> Callable[[mx.array], mx.array]:
+    """``make_sampler`` that hands equal parameters the same sampler object.
+
+    Falls back to a fresh ``make_sampler`` for XTC and when
+    ``OMLX_SHARED_SAMPLERS=0``.
+    """
+    if not _SHARED_SAMPLERS_ENABLED or xtc_probability > 0.0:
+        return make_sampler(
+            temp=temp,
+            top_p=top_p,
+            min_p=min_p,
+            min_tokens_to_keep=min_tokens_to_keep,
+            top_k=top_k,
+            xtc_probability=xtc_probability,
+            xtc_threshold=xtc_threshold,
+            xtc_special_tokens=list(xtc_special_tokens or ()),
+        )
+    key = _shared_sampler_key(temp, top_p, min_p, min_tokens_to_keep, top_k)
+    with _shared_samplers_lock:
+        sampler = _shared_samplers.get(key)
+        if sampler is not None:
+            _shared_samplers.move_to_end(key)
+            return sampler
+    sampler = make_sampler(
+        temp=temp,
+        top_p=top_p,
+        min_p=min_p,
+        min_tokens_to_keep=min_tokens_to_keep,
+        top_k=top_k,
+    )
+    with _shared_samplers_lock:
+        # A racing thread may have built the same key; keep the first one so
+        # every row of a batch holds one object.
+        sampler = _shared_samplers.setdefault(key, sampler)
+        _shared_samplers.move_to_end(key)
+        while len(_shared_samplers) > _SHARED_SAMPLERS_MAX:
+            _shared_samplers.popitem(last=False)
     return sampler

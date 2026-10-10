@@ -102,6 +102,7 @@ from .utils.metal_sync import (
 )
 from .utils.proc_memory import get_graphics_footprint, get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
+from .utils.sampling import make_shared_sampler as omlx_make_shared_sampler
 from .utils.tokenizer import create_streaming_detokenizer
 
 
@@ -7388,8 +7389,10 @@ class Scheduler:
     ) -> tuple[Callable[[mx.array], mx.array], list[Callable]]:
         """Build per-request sampler and logits processors."""
         # omlx.utils.sampling.make_sampler carries the fused top-p/top-k and
-        # MTP acceptance metadata that mlx_lm.sample_utils does not.
-        sampler = omlx_make_sampler(
+        # MTP acceptance metadata that mlx_lm.sample_utils does not. Requests
+        # with equal parameters share one sampler object so a decode batch
+        # samples all of them in one call (see make_shared_sampler).
+        sampler = omlx_make_shared_sampler(
             temp=sampling_params.temperature,
             top_p=sampling_params.top_p,
             min_p=sampling_params.min_p,
