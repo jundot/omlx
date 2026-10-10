@@ -126,6 +126,21 @@ class TestResolveBlockExtraKeys:
 
         assert resolve_block_extra_keys(4, extra_key_ranges=ranges) == ("image-1",)
 
+    def test_unsorted_ranges_fall_back_to_whole_request_key(self):
+        """Malformed segmented ranges use the whole-request image key."""
+        assert (
+            resolve_block_extra_keys(
+                12,
+                extra_key_token_start=4,
+                extra_keys=("whole-request-image",),
+                extra_key_ranges=[
+                    (9, ("image-1", "image-2")),
+                    (5, ("image-1",)),
+                ],
+            )
+            == ("whole-request-image",)
+        )
+
 
 class TestCacheBlock:
     """Tests for CacheBlock dataclass."""
