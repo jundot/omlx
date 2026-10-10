@@ -1964,10 +1964,15 @@ class VLMBatchedEngine(BaseEngine):
             return None
         self._grammar_compiler_init_attempted = True
         try:
-            from ..api.grammar import create_grammar_compiler
+            from ..api.grammar import (
+                create_grammar_compiler,
+                grammar_cache_limit_bytes,
+            )
 
             self._grammar_compiler = create_grammar_compiler(
-                self._tokenizer, self._vlm_model
+                self._tokenizer,
+                self._vlm_model,
+                cache_limit_bytes=grammar_cache_limit_bytes(self.model_type),
             )
             logger.info("GrammarCompiler initialized for %s", self._model_name)
         except Exception:
