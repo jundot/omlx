@@ -453,7 +453,6 @@
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.enable_thinking') }}</span>
-                                        <p class="text-xs text-neutral-500 mt-0.5" x-text="selectedModel?.thinking_forced ? window.t('modal.model_settings.k2_thinking_hint') : window.t('modal.model_settings.enable_thinking_hint')"></p>
                                     </div>
                                     <button type="button" :disabled="selectedModel?.thinking_forced" @click="
                                             const effective = modelSettings.enable_thinking != null ? modelSettings.enable_thinking : (modelSettings.thinking_default || false);
@@ -465,6 +464,7 @@
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
+                                <p class="text-xs text-neutral-500 mt-0.5" x-text="selectedModel?.thinking_forced ? window.t('modal.model_settings.k2_thinking_hint') : window.t('modal.model_settings.enable_thinking_hint')"></p>
                                 <p x-show="modelSettings.enable_thinking == null && modelSettings.thinking_default != null"
                                    class="text-xs text-neutral-400" x-text="'{{ t('modal.model_settings.enable_thinking_default')|replace('\\', '\\\\')|replace("'", "\\'") }}'"></p>
                                 <p x-show="modelSettings.enable_thinking != null && modelSettings.thinking_default != null && modelSettings.enable_thinking !== modelSettings.thinking_default"
@@ -479,7 +479,6 @@
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.qwen4_ple_ssd_offload') }}</span>
-                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen4_ple_ssd_offload_hint') }}</p>
                                     </div>
                                     <button type="button"
                                             @click="if (!modelSettings.qwen4_ple_ssd_offload_forced) modelSettings.qwen4_ple_ssd_offload = !modelSettings.qwen4_ple_ssd_offload"
@@ -493,6 +492,7 @@
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
+                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen4_ple_ssd_offload_hint') }}</p>
                                 <p x-show="modelSettings.qwen4_ple_ssd_offload_forced"
                                    class="text-xs text-amber-600">{{ t('modal.model_settings.qwen4_ple_ssd_offload_forced') }}</p>
                             </div>
@@ -503,7 +503,6 @@
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.deepseek_v41_ced_prefill') }}</span>
-                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.deepseek_v41_ced_prefill_hint') }}</p>
                                     </div>
                                     <button type="button" role="switch"
                                             aria-label="{{ t('modal.model_settings.deepseek_v41_ced_prefill') }}"
@@ -515,6 +514,7 @@
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
+                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.deepseek_v41_ced_prefill_hint') }}</p>
                             </div>
 
                             <!-- DeepSeek V4.1 Engram SSD Offload -->
@@ -523,7 +523,6 @@
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.deepseek_v41_engram_ssd_offload') }}</span>
-                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.deepseek_v41_engram_ssd_offload_hint') }}</p>
                                     </div>
                                     <button type="button"
                                             @click="if (!modelSettings.deepseek_v41_engram_ssd_offload_forced) modelSettings.deepseek_v41_engram_ssd_offload = !modelSettings.deepseek_v41_engram_ssd_offload"
@@ -537,6 +536,7 @@
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
+                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.deepseek_v41_engram_ssd_offload_hint') }}</p>
                                 <p x-show="modelSettings.deepseek_v41_engram_ssd_offload_forced"
                                    class="text-xs text-amber-600">{{ t('modal.model_settings.deepseek_v41_engram_ssd_offload_forced') }}</p>
                             </div>
@@ -547,7 +547,6 @@
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.thinking_budget') }}</span>
-                                        <p class="text-xs text-neutral-500 mt-0.5" x-text="window.t('modal.model_settings.thinking_budget_hint')"></p>
                                     </div>
                                     <button type="button" @click="modelSettings.enableThinkingBudget = !modelSettings.enableThinkingBudget; if (!modelSettings.enableThinkingBudget) modelSettings.thinking_budget_tokens = null;"
                                             :class="modelSettings.enableThinkingBudget ? 'bg-black' : 'bg-neutral-200'"
@@ -556,6 +555,7 @@
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
+                                <p class="text-xs text-neutral-500 mt-0.5" x-text="window.t('modal.model_settings.thinking_budget_hint')"></p>
                                 <div x-show="modelSettings.enableThinkingBudget" x-transition class="pt-1">
                                     <input type="number" x-model.number="modelSettings.thinking_budget_tokens" placeholder="{{ t('modal.model_settings.thinking_budget_placeholder') }}" min="1" step="100"
                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
@@ -568,9 +568,6 @@
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.guided_grammar') }}</span>
-                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.guided_grammar_hint') }}</p>
-                                        <p x-show="modelSettings.vlm_mtp_enabled"
-                                           class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.vlm_mtp_processor_locked') }}</p>
                                     </div>
                                     <button type="button" @click="if (!modelSettings.vlm_mtp_enabled) { modelSettings.guided_grammar_enabled = !modelSettings.guided_grammar_enabled; if (!modelSettings.guided_grammar_enabled) modelSettings.guided_grammar = ''; }"
                                             :disabled="modelSettings.vlm_mtp_enabled"
@@ -583,6 +580,9 @@
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
+                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.guided_grammar_hint') }}</p>
+                                <p x-show="modelSettings.vlm_mtp_enabled"
+                                   class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.vlm_mtp_processor_locked') }}</p>
                                 <div x-show="modelSettings.guided_grammar_enabled" x-transition class="pt-1">
                                     <textarea x-model="modelSettings.guided_grammar"
                                               rows="6"
@@ -597,7 +597,6 @@
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.limit_tool_result') }}</span>
-                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.limit_tool_result_hint') }}</p>
                                     </div>
                                     <button type="button" @click="modelSettings.enableToolResultLimit = !modelSettings.enableToolResultLimit; if (!modelSettings.enableToolResultLimit) modelSettings.max_tool_result_tokens = null;"
                                             :class="modelSettings.enableToolResultLimit ? 'bg-black' : 'bg-neutral-200'"
@@ -606,6 +605,7 @@
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
+                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.limit_tool_result_hint') }}</p>
                                 <div x-show="modelSettings.enableToolResultLimit" x-transition class="pt-1">
                                     <input type="number" x-model.number="modelSettings.max_tool_result_tokens" placeholder="{{ t('modal.model_settings.limit_tool_placeholder') }}" min="100" step="100"
                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
@@ -618,7 +618,6 @@
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.force_sampling') }}</span>
-                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.force_sampling_hint') }}</p>
                                     </div>
                                     <button type="button" @click="modelSettings.force_sampling = !modelSettings.force_sampling"
                                             :class="modelSettings.force_sampling ? 'bg-black' : 'bg-neutral-200'"
@@ -627,6 +626,7 @@
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
+                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.force_sampling_hint') }}</p>
                             </div>
 
                             <!-- Trust Remote Code (security-sensitive) -->
@@ -634,7 +634,6 @@
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-red-700">{{ t('modal.model_settings.trust_remote_code') }}</span>
-                                        <p class="text-xs text-red-600 mt-0.5">{{ t('modal.model_settings.trust_remote_code_hint') }}</p>
                                     </div>
                                     <button type="button" @click="modelSettings.trust_remote_code = !modelSettings.trust_remote_code"
                                             :class="modelSettings.trust_remote_code ? 'bg-red-600' : 'bg-neutral-200'"
@@ -643,6 +642,7 @@
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
+                                <p class="text-xs text-red-600 mt-0.5">{{ t('modal.model_settings.trust_remote_code_hint') }}</p>
                             </div>
 
                             <!-- Chat Template Kwargs -->
@@ -767,19 +767,6 @@
                                     <div class="flex items-start justify-between gap-3">
                                         <div class="min-w-0">
                                             <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.lightning_mtp') }}</span>
-                                            <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.lightning_mtp_hint') }}</p>
-                                            <p x-show="!modelSettings.mtp_compatible && modelSettings.mtp_compatibility_reason"
-                                               class="text-xs text-amber-600 mt-1"
-                                               x-text="modelSettings.mtp_compatibility_reason"></p>
-                                            <button type="button"
-                                                    x-show="!modelSettings.mtp_compatible && modelSettings.mtp_compatibility_reason.includes('MTPLX side-car')"
-                                                    @click="importMtplxSidecar()"
-                                                    :disabled="importingMtplx"
-                                                    :class="importingMtplx ? 'opacity-40 cursor-not-allowed' : ''"
-                                                    class="mt-2 px-3 py-1.5 text-xs font-medium rounded-full bg-neutral-900 text-white hover:bg-neutral-700 transition-colors"
-                                                    x-text="importingMtplx ? '{{ t('modal.model_settings.mtplx_importing')|replace('\\', '\\\\')|replace("'", "\\'") }}' : '{{ t('modal.model_settings.mtplx_import')|replace('\\', '\\\\')|replace("'", "\\'") }}'"></button>
-                                            <p x-show="modelSettings.mtp_compatible && modelSettings.dflash_enabled"
-                                               class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.mtp_conflict_dflash') }}</p>
                                         </div>
                                         <button type="button"
                                                 @click="if ((!modelSettings.moe_expert_offload_enabled || modelSettings.moe_offload_allows_mtp) && ((modelSettings.mtp_compatible || modelSettings.mtp_enabled) && !modelSettings.dflash_enabled && !modelSettings.vlm_mtp_enabled)) modelSettings.mtp_enabled = !modelSettings.mtp_enabled"
@@ -800,11 +787,23 @@
                                                   class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                         </button>
                                     </div>
+                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.lightning_mtp_hint') }}</p>
+                                    <p x-show="!modelSettings.mtp_compatible && modelSettings.mtp_compatibility_reason"
+                                       class="text-xs text-amber-600 mt-1"
+                                       x-text="modelSettings.mtp_compatibility_reason"></p>
+                                    <button type="button"
+                                            x-show="!modelSettings.mtp_compatible && modelSettings.mtp_compatibility_reason.includes('MTPLX side-car')"
+                                            @click="importMtplxSidecar()"
+                                            :disabled="importingMtplx"
+                                            :class="importingMtplx ? 'opacity-40 cursor-not-allowed' : ''"
+                                            class="mt-2 px-3 py-1.5 text-xs font-medium rounded-lg bg-neutral-900 text-white hover:bg-neutral-700 transition-colors"
+                                            x-text="importingMtplx ? '{{ t('modal.model_settings.mtplx_importing')|replace('\\', '\\\\')|replace("'", "\\'") }}' : '{{ t('modal.model_settings.mtplx_import')|replace('\\', '\\\\')|replace("'", "\\'") }}'"></button>
+                                    <p x-show="modelSettings.mtp_compatible && modelSettings.dflash_enabled"
+                                       class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.mtp_conflict_dflash') }}</p>
                                     <div x-show="modelSettings.mtp_enabled" x-transition
                                          class="flex items-center justify-between gap-3 pt-1">
                                         <div class="min-w-0">
                                             <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.mtp_depth') }}</span>
-                                            <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.mtp_depth_hint') }}</p>
                                         </div>
                                         <select x-model="modelSettings.mtp_adaptive_max_depth"
                                                 class="w-48 flex-shrink-0 px-3 py-2 border border-neutral-200 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-black">
@@ -814,6 +813,7 @@
                                             {% endfor %}
                                         </select>
                                     </div>
+                                    <p x-show="modelSettings.mtp_enabled" class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.mtp_depth_hint') }}</p>
                                 </div>
 
                                 <!-- DFlash -->
@@ -821,10 +821,6 @@
                                     <div class="flex items-start justify-between gap-3">
                                         <div class="min-w-0">
                                             <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.dflash') }}</span>
-                                            <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.dflash_hint') }}<br>{{ t('modal.model_settings.dflash_mlx_impl') }}(<a href="https://github.com/bstnxbt/dflash-mlx" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">{{ t('modal.model_settings.github') }}</a>)</p>
-                                            <p x-show="!modelSettings.dflash_compatible && modelSettings.dflash_compatibility_reason"
-                                               class="text-xs text-amber-600 mt-1"
-                                               x-text="modelSettings.dflash_compatibility_reason"></p>
                                         </div>
                                         <button type="button"
                                                 @click="if (!modelSettings.moe_expert_offload_enabled && (modelSettings.dflash_compatible && !modelSettings.mtp_enabled && !modelSettings.vlm_mtp_enabled)) modelSettings.dflash_enabled = !modelSettings.dflash_enabled"
@@ -845,6 +841,10 @@
                                                   class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                         </button>
                                     </div>
+                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.dflash_hint') }}<br>{{ t('modal.model_settings.dflash_mlx_impl') }}(<a href="https://github.com/bstnxbt/dflash-mlx" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">{{ t('modal.model_settings.github') }}</a>)</p>
+                                    <p x-show="!modelSettings.dflash_compatible && modelSettings.dflash_compatibility_reason"
+                                       class="text-xs text-amber-600 mt-1"
+                                       x-text="modelSettings.dflash_compatibility_reason"></p>
                                     <div x-show="modelSettings.dflash_enabled" x-transition class="space-y-3 pt-1">
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.draft_model') }}</label>
@@ -861,7 +861,6 @@
                                             <div class="flex items-start justify-between gap-3">
                                                 <div class="min-w-0">
                                                     <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.dflash_quantization') }}</span>
-                                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.dflash_draft_quant_hint') }}</p>
                                                 </div>
                                                 <button type="button" @click="modelSettings.dflash_draft_quant_enabled = !modelSettings.dflash_draft_quant_enabled"
                                                         :class="modelSettings.dflash_draft_quant_enabled ? 'bg-black' : 'bg-neutral-200'"
@@ -870,6 +869,7 @@
                                                           class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                                 </button>
                                             </div>
+                                            <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.dflash_draft_quant_hint') }}</p>
                                         </div>
                                         <div class="grid grid-cols-3 gap-3 pl-4" x-show="modelSettings.dflash_draft_quant_enabled" x-transition>
                                             <div>
@@ -942,7 +942,6 @@
                                         <div class="flex items-start justify-between gap-3 pt-2 border-t border-neutral-200">
                                             <div class="min-w-0">
                                                 <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.dflash_in_memory_cache') }}</span>
-                                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.dflash_in_memory_cache_hint') }}</p>
                                             </div>
                                             <button type="button" @click="modelSettings.dflash_in_memory_cache = !modelSettings.dflash_in_memory_cache; if (!modelSettings.dflash_in_memory_cache) modelSettings.dflash_ssd_cache = false"
                                                     :class="modelSettings.dflash_in_memory_cache ? 'bg-black' : 'bg-neutral-200'"
@@ -951,6 +950,7 @@
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                             </button>
                                         </div>
+                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.dflash_in_memory_cache_hint') }}</p>
                                         <div x-show="modelSettings.dflash_in_memory_cache" x-transition>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash_in_memory_cache_max_entries') }}</label>
                                             <input type="number" x-model.number="modelSettings.dflash_in_memory_cache_max_entries" min="1" max="128" step="1" placeholder="4"
@@ -966,9 +966,6 @@
                                         <div class="flex items-start justify-between gap-3">
                                             <div class="min-w-0">
                                                 <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.dflash_ssd_cache') }}</span>
-                                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.dflash_ssd_cache_hint') }} (<code>dflash_l2/</code>).</p>
-                                                <p x-show="!modelSettings.dflash_ssd_cache_available" class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.dflash_ssd_cache_unavailable') }} (<code>--paged-ssd-cache-dir</code>).</p>
-                                                <p x-show="modelSettings.dflash_ssd_cache_available && !modelSettings.dflash_in_memory_cache" class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.dflash_ssd_cache_requires_l1') }}</p>
                                             </div>
                                             <button type="button"
                                                     @click="if (modelSettings.dflash_ssd_cache_available && modelSettings.dflash_in_memory_cache) modelSettings.dflash_ssd_cache = !modelSettings.dflash_ssd_cache"
@@ -982,6 +979,9 @@
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                             </button>
                                         </div>
+                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.dflash_ssd_cache_hint') }} (<code>dflash_l2/</code>).</p>
+                                        <p x-show="!modelSettings.dflash_ssd_cache_available" class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.dflash_ssd_cache_unavailable') }} (<code>--paged-ssd-cache-dir</code>).</p>
+                                        <p x-show="modelSettings.dflash_ssd_cache_available && !modelSettings.dflash_in_memory_cache" class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.dflash_ssd_cache_requires_l1') }}</p>
                                         <div x-show="modelSettings.dflash_ssd_cache" x-transition>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.dflash_ssd_cache_size') }}</label>
                                             <input type="number" x-model.number="modelSettings.dflash_ssd_cache_max_gib" min="1" max="1024" step="1" placeholder="20"
@@ -996,11 +996,6 @@
                                     <div class="flex items-start justify-between gap-3">
                                         <div class="min-w-0">
                                             <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.vlm_mtp') }}</span>
-                                            <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.vlm_mtp_hint') | safe }}</p>
-                                            <p x-show="modelSettings.dflash_enabled || modelSettings.specprefill_enabled || modelSettings.mtp_enabled || modelSettings.turboquant_kv_enabled"
-                                               class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.vlm_mtp_conflict') }}</p>
-                                            <p x-show="vlmMtpProcessorConflict()"
-                                               class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.vlm_mtp_processor_conflict') }}</p>
                                         </div>
                                         <button type="button"
                                                 @click="if (!modelSettings.moe_expert_offload_enabled && (!modelSettings.is_paroquant && !modelSettings.dflash_enabled && !modelSettings.specprefill_enabled && !modelSettings.mtp_enabled && !modelSettings.turboquant_kv_enabled && !vlmMtpProcessorConflict())) modelSettings.vlm_mtp_enabled = !modelSettings.vlm_mtp_enabled"
@@ -1015,6 +1010,11 @@
                                                   class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                         </button>
                                     </div>
+                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.vlm_mtp_hint') | safe }}</p>
+                                    <p x-show="modelSettings.dflash_enabled || modelSettings.specprefill_enabled || modelSettings.mtp_enabled || modelSettings.turboquant_kv_enabled"
+                                       class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.vlm_mtp_conflict') }}</p>
+                                    <p x-show="vlmMtpProcessorConflict()"
+                                       class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.vlm_mtp_processor_conflict') }}</p>
                                     <div x-show="modelSettings.vlm_mtp_enabled" class="space-y-2">
                                         <label class="block text-xs font-medium text-neutral-600">{{ t('modal.model_settings.vlm_mtp_draft_model') }}</label>
                                         <select x-model="modelSettings.vlm_mtp_draft_model"
@@ -1043,7 +1043,6 @@
                                         <div class="flex items-start justify-between gap-3">
                                             <div class="min-w-0">
                                                 <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.qwen_oq_a8') }}</span>
-                                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_oq_a8_hint') }}</p>
                                             </div>
                                             <button type="button"
                                                     @click="modelSettings.qwen35_oq_a8_enabled = !modelSettings.qwen35_oq_a8_enabled"
@@ -1053,6 +1052,7 @@
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                             </button>
                                         </div>
+                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_oq_a8_hint') }}</p>
 
                                         <div x-show="modelSettings.qwen35_oq_a8_enabled" x-transition class="space-y-4 pt-1">
                                             <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -1074,7 +1074,6 @@
                                         <div class="flex items-start justify-between gap-3">
                                             <div class="min-w-0">
                                                 <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.qwen_ane') }}</span>
-                                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_ane_hint') }}</p>
                                             </div>
                                             <button type="button"
                                                     @click="modelSettings.qwen35_ane_prefill_enabled = !modelSettings.qwen35_ane_prefill_enabled"
@@ -1084,6 +1083,7 @@
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                             </button>
                                         </div>
+                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_ane_hint') }}</p>
 
                                         <div x-show="modelSettings.qwen35_ane_prefill_enabled" x-transition class="space-y-4 pt-1">
                                             <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
@@ -1119,7 +1119,6 @@
                                             <div class="flex items-start justify-between gap-3 pt-3 border-t border-neutral-200">
                                                 <div class="min-w-0">
                                                     <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.qwen_ane_dual') }}</span>
-                                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_ane_dual_hint') }}</p>
                                                 </div>
                                                 <button type="button"
                                                         @click="modelSettings.qwen35_ane_prefill_dual_ane = !modelSettings.qwen35_ane_prefill_dual_ane"
@@ -1129,12 +1128,12 @@
                                                           class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                                 </button>
                                             </div>
+                                            <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_ane_dual_hint') }}</p>
 
                                             <div class="pt-3 border-t border-neutral-200 space-y-3">
                                                 <div class="flex items-start justify-between gap-3">
                                                     <div class="min-w-0">
                                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.qwen_ane_cpu') }}</span>
-                                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_ane_cpu_hint') }}</p>
                                                     </div>
                                                     <button type="button"
                                                             @click="modelSettings.qwen35_ane_prefill_cpu_enabled = !modelSettings.qwen35_ane_prefill_cpu_enabled"
@@ -1144,6 +1143,7 @@
                                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                                     </button>
                                                 </div>
+                                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_ane_cpu_hint') }}</p>
                                                 <div x-show="modelSettings.qwen35_ane_prefill_cpu_enabled" x-transition class="grid grid-cols-1 sm:grid-cols-2 gap-3">
                                                     <div>
                                                         <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.qwen_ane_cpu_fraction') }}</label>
@@ -1177,7 +1177,6 @@
                                                 <div x-show="modelSettings.qwen35_ane_prefill_cpu_enabled" x-transition class="flex items-start justify-between gap-3">
                                                     <div class="min-w-0">
                                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.qwen_ane_cpu_scheduler') }}</span>
-                                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_ane_cpu_scheduler_hint') }}</p>
                                                     </div>
                                                     <button type="button"
                                                             @click="modelSettings.qwen35_ane_prefill_cpu_shared_resource = !modelSettings.qwen35_ane_prefill_cpu_shared_resource"
@@ -1187,12 +1186,12 @@
                                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                                     </button>
                                                 </div>
+                                                <p x-show="modelSettings.qwen35_ane_prefill_cpu_enabled" class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_ane_cpu_scheduler_hint') }}</p>
                                             </div>
 
                                             <div class="flex items-start justify-between gap-3 pt-3 border-t border-neutral-200">
                                                 <div class="min-w-0">
                                                     <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.qwen_ane_gdn') }}</span>
-                                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_ane_gdn_hint') }}</p>
                                                 </div>
                                                 <button type="button"
                                                         @click="modelSettings.qwen35_ane_prefill_gdn = !modelSettings.qwen35_ane_prefill_gdn"
@@ -1202,6 +1201,7 @@
                                                           class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                                 </button>
                                             </div>
+                                            <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_ane_gdn_hint') }}</p>
 
                                             <div x-show="modelSettings.qwen35_ane_prefill_gdn" x-transition class="grid grid-cols-1 sm:grid-cols-2 gap-3">
                                                 <div>
@@ -1368,7 +1368,6 @@
                                     <div class="flex items-start justify-between gap-3">
                                         <div class="min-w-0">
                                             <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.turboquant_kv') }}</span>
-                                            <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.turboquant_kv_hint') }}</p>
                                         </div>
                                         <button type="button"
                                                 @click="if (!modelSettings.is_paroquant && !modelSettings.vlm_mtp_enabled) modelSettings.turboquant_kv_enabled = !modelSettings.turboquant_kv_enabled"
@@ -1383,6 +1382,7 @@
                                                   class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                         </button>
                                     </div>
+                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.turboquant_kv_hint') }}</p>
                                     <div x-show="modelSettings.turboquant_kv_enabled" x-transition class="pt-1">
                                         <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.turboquant_kv_bits_label') }}</label>
                                         <select x-model="modelSettings.turboquant_kv_bits"
@@ -1404,11 +1404,6 @@
                                         <div class="flex items-start justify-between gap-3">
                                             <div class="min-w-0">
                                                 <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.moe_expert_offload') }}</span>
-                                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.moe_expert_offload_hint') }}</p>
-                                                <p class="text-xs text-neutral-500 mt-0.5"
-                                                   x-text="selectedModel?.moe_offload_allows_mtp
-                                                        ? t('modal.model_settings.moe_expert_offload_speculative_hint_v41')
-                                                        : t('modal.model_settings.moe_expert_offload_speculative_hint')"></p>
                                             </div>
                                             <button type="button"
                                                     @click="modelSettings.moe_expert_offload_enabled = !modelSettings.moe_expert_offload_enabled"
@@ -1419,6 +1414,11 @@
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                             </button>
                                         </div>
+                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.moe_expert_offload_hint') }}</p>
+                                        <p class="text-xs text-neutral-500 mt-0.5"
+                                           x-text="selectedModel?.moe_offload_allows_mtp
+                                                ? t('modal.model_settings.moe_expert_offload_speculative_hint_v41')
+                                                : t('modal.model_settings.moe_expert_offload_speculative_hint')"></p>
                                         <div x-show="modelSettings.moe_expert_offload_enabled" x-transition class="pt-1">
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.moe_expert_offload_fraction_label') }}</label>
                                             <div class="flex items-center gap-2">
@@ -1444,7 +1444,6 @@
                                         <div class="flex items-start justify-between gap-3">
                                             <div class="min-w-0">
                                                 <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.index_cache') }}</span>
-                                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.index_cache_hint') }} (<a href="https://github.com/THUDM/IndexCache" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">{{ t('modal.model_settings.github') }}</a>)</p>
                                             </div>
                                             <button type="button"
                                                     @click="if (!modelSettings.is_paroquant) { modelSettings.enableIndexCache = !modelSettings.enableIndexCache; if (!modelSettings.enableIndexCache) modelSettings.index_cache_freq = null; }"
@@ -1459,6 +1458,7 @@
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                             </button>
                                         </div>
+                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.index_cache_hint') }} (<a href="https://github.com/THUDM/IndexCache" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">{{ t('modal.model_settings.github') }}</a>)</p>
                                         <div x-show="modelSettings.enableIndexCache" x-transition class="pt-1">
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.index_cache_freq') }}</label>
                                             <input type="number" x-model.number="modelSettings.index_cache_freq" min="2" max="16" step="1" placeholder="4"
@@ -1472,7 +1472,6 @@
                                     <div class="flex items-start justify-between gap-3">
                                         <div class="min-w-0">
                                             <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.specprefill') }}</span>
-                                            <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.specprefill_hint') }} (<a href="https://arxiv.org/abs/2502.02789" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">{{ t('modal.model_settings.specprefill_paper') }}</a>) (<a href="https://huggingface.co/Thump604/specprefill-paper" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">{{ t('modal.model_settings.huggingface') }}</a>)</p>
                                         </div>
                                         <button type="button"
                                                 @click="if (!modelSettings.is_paroquant && !modelSettings.vlm_mtp_enabled) modelSettings.specprefill_enabled = !modelSettings.specprefill_enabled"
@@ -1487,6 +1486,7 @@
                                                   class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                         </button>
                                     </div>
+                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.specprefill_hint') }} (<a href="https://arxiv.org/abs/2502.02789" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">{{ t('modal.model_settings.specprefill_paper') }}</a>) (<a href="https://huggingface.co/Thump604/specprefill-paper" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">{{ t('modal.model_settings.huggingface') }}</a>)</p>
                                     <div x-show="modelSettings.specprefill_enabled" x-transition class="space-y-3 pt-1">
                                         <div>
                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.draft_model') }}</label>
@@ -1527,7 +1527,6 @@
                             <div class="flex items-start justify-between gap-3">
                                 <div class="min-w-0">
                                     <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.embedding_audio') }}</span>
-                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.embedding_audio_hint') }}</p>
                                 </div>
                                 <button type="button" @click="modelSettings.embedding_audio_enabled = !modelSettings.embedding_audio_enabled"
                                         :class="modelSettings.embedding_audio_enabled ? 'bg-black' : 'bg-neutral-200'"
@@ -1536,6 +1535,7 @@
                                           class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                 </button>
                             </div>
+                            <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.embedding_audio_hint') }}</p>
                             <div x-show="modelSettings.embedding_audio_enabled" x-transition class="pt-1">
                                 <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.embedding_audio_max_seconds') }}</label>
                                 <input type="number" x-model.number="modelSettings.embedding_audio_max_seconds" placeholder="30" min="1" step="1"

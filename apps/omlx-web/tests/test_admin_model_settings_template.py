@@ -853,3 +853,78 @@ assert.equal(tile('generated_tokens').value, app.formatNumber(98765));
         timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _hints_inside_label_columns(html):
+    """Every hint-shaped element that is a descendant of a `min-w-0` label
+    column. Walked as a balanced tree, so a column of any length and a hint
+    behind any number of nested siblings are both seen: a regular expression
+    bounded to a fixed window silently skipped the longest columns."""
+    from html.parser import HTMLParser
+
+    void = {"br", "img", "input", "hr", "meta", "link", "source", "path",
+            "circle", "use", "area", "base", "col", "embed", "track", "wbr"}
+
+    def hint_shaped(tag, cls):
+        if tag in ("p", "small"):
+            return True
+        return tag in ("span", "div") and cls.split()[:1] == ["text-xs"]
+
+    class Scanner(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.open = []
+            self.offenders = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag in void:
+                return
+            cls = dict(attrs).get("class") or ""
+            if any(mark for _, mark in self.open) and hint_shaped(tag, cls):
+                self.offenders.append((self.getpos()[0], tag, cls))
+            self.open.append((tag, tag == "div" and "min-w-0" in cls.split()))
+
+        def handle_endtag(self, tag):
+            for i in range(len(self.open) - 1, -1, -1):
+                if self.open[i][0] == tag:
+                    del self.open[i:]
+                    return
+
+    scanner = Scanner()
+    scanner.feed(html)
+    return scanner.offenders
+
+
+def test_every_hint_sits_under_its_row():
+    """A hint inside the label column wrapped in half the card; it spans the
+    card now. Matched structurally: any min-w-0 column — with or without extra
+    classes — must not hold a hint-shaped element, existing or future."""
+    import re as _re
+    from pathlib import Path as _Path
+
+    html = (_Path(__file__).resolve().parents[1]
+            / "omlx_web/templates/dashboard/_modal_model_settings.html").read_text(encoding="utf-8")
+    assert _re.search(r'<div class="[^"]*\bmin-w-0\b[^"]*">', html), "the label columns are gone"
+    offenders = _hints_inside_label_columns(html)
+    assert not offenders, f"a hint is still inside a label column: {offenders[0]!r}"
+
+
+def test_a_hint_of_a_gated_row_keeps_its_gate():
+    """A hint moved out of the label column stays a sibling of the row it
+    belongs to, so it has to carry the row's own x-show: otherwise it renders
+    while the control it describes is hidden."""
+    import re as _re
+    from pathlib import Path as _Path
+
+    html = (_Path(__file__).resolve().parents[1]
+            / "omlx_web/templates/dashboard/_modal_model_settings.html").read_text(encoding="utf-8")
+    for key, gate in (
+        ("modal.model_settings.mtp_depth_hint", "modelSettings.mtp_enabled"),
+        ("modal.model_settings.qwen_ane_cpu_scheduler_hint",
+         "modelSettings.qwen35_ane_prefill_cpu_enabled"),
+    ):
+        pattern = _re.compile(
+            r'<p\b[^>]*\bx-show="' + _re.escape(gate) + r'"[^>]*>\s*\{\{\s*t\(\''
+            + _re.escape(key) + r'\'\)\s*\}\}\s*</p>')
+        assert pattern.search(html), (
+            f"{key} is no longer gated by {gate}: it would render while its row is hidden")
