@@ -188,15 +188,29 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
     else:
         mx.eval(logits, hidden)
     verify_ms = (time.perf_counter() - started) * 1000 / len(rows)
-    vector_rollback = isinstance(gdn, SpeculativeCacheTransaction) or (
+    # mlx-lm backbones return no rollback state; a model-level per-row
+    # rollback keeps their merged cache in place the same way. Boundary rows
+    # are extracted after the shared rollback, so commit alignment is safe.
+    lm_batch_rollback = getattr(batch.model, "mtp_batch_rollback", None)
+    lm_vector = (
         whole_batch
-        and gdn is not None
-        and not getattr(batch.model, "_omlx_mtp_commit_align", 0)
+        and gdn is None
+        and callable(lm_batch_rollback)
         and all(_supports_batch_rollback(layer) for layer in cache)
-        and any(
-            getattr(host, "_omlx_mtp_batch_rollback", False)
-            for host in (batch.model, getattr(batch.model, "_language_model", None))
-            if host is not None
+    )
+    vector_rollback = (
+        lm_vector
+        or isinstance(gdn, SpeculativeCacheTransaction)
+        or (
+            whole_batch
+            and gdn is not None
+            and not getattr(batch.model, "_omlx_mtp_commit_align", 0)
+            and all(_supports_batch_rollback(layer) for layer in cache)
+            and any(
+                getattr(host, "_omlx_mtp_batch_rollback", False)
+                for host in (batch.model, getattr(batch.model, "_language_model", None))
+                if host is not None
+            )
         )
     )
     deferred = []
@@ -254,9 +268,12 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
         # The model updates KV padding and selects each row's GDN state in
         # place. No extraction or merge is needed for the next target call.
         started = time.perf_counter()
-        batch.model.rollback_speculative_cache(
-            cache, gdn, [accepted for accepted, _ in deferred], depth + 1
-        )
+        accepted_rows = [accepted for accepted, _ in deferred]
+        if lm_vector:
+            if not lm_batch_rollback(cache, accepted_rows, depth):
+                raise bg._MtpStepFallback("batched cache rejects vector rollback")
+        else:
+            batch.model.rollback_speculative_cache(cache, gdn, accepted_rows, depth + 1)
         commit_ms = (time.perf_counter() - started) * 1000 / len(rows)
         for (index, row, _), (_, finish) in zip(rows, deferred):
             bg._set_singleton_mrope_delta(row)
