@@ -7469,6 +7469,12 @@
                 this.startHFDownload();
             },
 
+            isModelDownloaded(repoId) {
+                if (!repoId) return false;
+                const wanted = repoId.toLowerCase();
+                return this.hfModels.some(m => m.repo_id?.toLowerCase() === wanted);
+            },
+
             getMemoryFitStatus(sizeBytes) {
                 const totalBytes = this.globalSettings.system?.total_memory_bytes || 0;
                 if (!totalBytes || !sizeBytes) return 'safe';

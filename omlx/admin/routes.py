@@ -7649,6 +7649,7 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
         model_name: str,
         *,
         source_repo_id: str | None = None,
+        repo_id: str | None = None,
     ) -> None:
         if model_name in seen_names:
             return
@@ -7666,6 +7667,8 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                 ),
                 "size": total_size,
                 "size_formatted": format_size(total_size),
+                # Hub repo the folder came from, when its location reveals it.
+                "repo_id": repo_id or source_repo_id,
             }
         )
 
@@ -7698,7 +7701,9 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                     if not child.is_dir() or child.name.startswith("."):
                         continue
                     if (child / "config.json").exists():
-                        _add_model(child, child.name)
+                        _add_model(
+                            child, child.name, repo_id=f"{subdir.name}/{child.name}"
+                        )
 
     # Sort by the UI display name so organization prefixes group together.
     models.sort(key=lambda m: m["display_name"].lower())

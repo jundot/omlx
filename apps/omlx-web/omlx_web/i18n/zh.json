@@ -284,6 +284,7 @@
   "models.browse.no_results": "未找到任何结果。",
   "models.browse.tight_fit": "内存偏紧",
   "models.browse.high_oom_risk": "OOM 风险高",
+  "models.browse.downloaded": "已下载",
   "models.browse.params_suffix": "参数",
   "models.browse.mlx_only": "仅 MLX",
   "models.queue.section_label": "下载队列",

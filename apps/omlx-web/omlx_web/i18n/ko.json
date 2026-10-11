@@ -284,6 +284,7 @@
   "models.browse.no_results": "검색 결과가 없습니다.",
   "models.browse.tight_fit": "메모리 여유 적음",
   "models.browse.high_oom_risk": "OOM 위험 높음",
+  "models.browse.downloaded": "다운로드됨",
   "models.browse.params_suffix": "파라미터",
   "models.browse.mlx_only": "MLX 전용",
   "models.queue.section_label": "다운로드 대기열",

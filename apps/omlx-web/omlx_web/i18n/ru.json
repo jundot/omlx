@@ -284,6 +284,7 @@
   "models.browse.no_results": "Результаты не найдены.",
   "models.browse.tight_fit": "Тесно по памяти",
   "models.browse.high_oom_risk": "Высокий риск OOM",
+  "models.browse.downloaded": "Загружено",
   "models.browse.params_suffix": "параметров",
   "models.browse.mlx_only": "только MLX",
   "models.queue.section_label": "Очередь загрузок",

@@ -284,6 +284,7 @@
   "models.browse.no_results": "Nebyly nalezeny žádné výsledky.",
   "models.browse.tight_fit": "Těsné na paměť",
   "models.browse.high_oom_risk": "Vysoké riziko OOM",
+  "models.browse.downloaded": "Staženo",
   "models.browse.params_suffix": "parametrů",
   "models.browse.mlx_only": "Pouze MLX",
   "models.queue.section_label": "Fronta stahování",

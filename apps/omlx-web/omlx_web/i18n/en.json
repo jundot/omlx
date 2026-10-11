@@ -284,6 +284,7 @@
   "models.browse.no_results": "No results found.",
   "models.browse.tight_fit": "Tight fit",
   "models.browse.high_oom_risk": "High OOM risk",
+  "models.browse.downloaded": "Downloaded",
   "models.browse.params_suffix": "params",
   "models.browse.mlx_only": "MLX only",
   "models.queue.section_label": "Download Queue",

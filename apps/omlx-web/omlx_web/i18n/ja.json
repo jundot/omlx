@@ -284,6 +284,7 @@
   "models.browse.no_results": "結果が見つかりません。",
   "models.browse.tight_fit": "メモリ余裕少",
   "models.browse.high_oom_risk": "OOMリスク高",
+  "models.browse.downloaded": "ダウンロード済み",
   "models.browse.params_suffix": "パラメータ",
   "models.browse.mlx_only": "MLX のみ",
   "models.queue.section_label": "ダウンロードキュー",

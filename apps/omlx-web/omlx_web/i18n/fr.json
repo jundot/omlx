@@ -284,6 +284,7 @@
   "models.browse.no_results": "Aucun résultat trouvé.",
   "models.browse.tight_fit": "Ajustement serré",
   "models.browse.high_oom_risk": "Risque élevé de saturation mémoire",
+  "models.browse.downloaded": "Téléchargé",
   "models.browse.params_suffix": "params",
   "models.browse.mlx_only": "MLX uniquement",
   "models.queue.section_label": "File de téléchargement",
