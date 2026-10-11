@@ -6,6 +6,7 @@ This module tests the block-based paged KV cache management following vLLM's
 architecture, adapted for MLX on Apple Silicon.
 """
 
+import logging
 from typing import List
 from unittest.mock import MagicMock, patch
 
@@ -1101,3 +1102,97 @@ class TestPagedCacheManager:
 
         assert num_tokens == 0
         assert len(cached_blocks) == 0
+
+    def test_pending_tail_block_registry(self):
+        """Announcements are visible, clearable, and expire once stale."""
+        manager = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model", initial_blocks=100
+        )
+        tail_hash = compute_block_hash(None, [1, 2], model_name="test-model")
+        assert manager.has_pending_tail_block(None) is False
+
+        manager.register_pending_tail_block(None, tail_hash)
+        assert manager.has_pending_tail_block(None) is True
+        assert isinstance(manager._pending_tail_index[None][tail_hash], float)
+
+        manager.clear_pending_tail_block(None, tail_hash)
+        assert manager.has_pending_tail_block(None) is False
+        assert None not in manager._pending_tail_index
+
+        manager.register_pending_tail_block(None, tail_hash)
+        with patch("omlx.cache.paged_cache._PENDING_TAIL_TTL_S", -1.0):
+            assert manager.has_pending_tail_block(None) is False
+        assert None not in manager._pending_tail_index
+
+    def test_match_tail_block_logs_pending_vs_absent(self, caplog):
+        """A tail miss names its parent and flags an in-flight store."""
+        manager = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model", initial_blocks=100
+        )
+        full_hash = self._register_full(manager, None, [1, 2, 3, 4])
+
+        with caplog.at_level(logging.DEBUG, logger="omlx.cache.paged_cache"):
+            _, num_tokens = manager.get_computed_blocks([1, 2, 3, 4, 5, 6])
+        assert num_tokens == 4
+        assert "no tail indexed under parent" in caplog.text
+
+        caplog.clear()
+        pending_hash = compute_block_hash(full_hash, [5, 6], model_name="test-model")
+        manager.register_pending_tail_block(full_hash, pending_hash)
+        with caplog.at_level(logging.DEBUG, logger="omlx.cache.paged_cache"):
+            _, num_tokens = manager.get_computed_blocks([1, 2, 3, 4, 5, 6])
+        assert num_tokens == 4
+        assert "store in flight under parent" in caplog.text
+
+    def test_find_shared_prefix_polls_pending_tail(self):
+        """A lookup landing in the store window picks the tail up shortly after."""
+        manager = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model", initial_blocks=100
+        )
+        full_hash = self._register_full(manager, None, [1, 2, 3, 4])
+        tail_tokens = [5, 6]
+        tail_hash = compute_block_hash(full_hash, tail_tokens, model_name="test-model")
+        manager.register_pending_tail_block(full_hash, tail_hash)
+
+        real_get = manager.get_computed_blocks
+        calls = {"n": 0}
+
+        def publish_tail():
+            block = manager.allocate_block()
+            block.block_hash = tail_hash
+            block.token_count = len(tail_tokens)
+            block.ref_count = 0
+            manager.cached_block_hash_to_block.insert(tail_hash, block)
+            manager.register_tail_block(full_hash, tail_hash, len(tail_tokens))
+
+        def wrapper(*args, **kwargs):
+            blocks, num = real_get(*args, **kwargs)
+            calls["n"] += 1
+            if calls["n"] == 1:
+                publish_tail()
+            return blocks, num
+
+        with (
+            patch.object(manager, "get_computed_blocks", side_effect=wrapper),
+            patch("omlx.cache.paged_cache._PENDING_TAIL_WAIT_S", 1.0),
+            patch("omlx.cache.paged_cache._PENDING_TAIL_POLL_S", 0.01),
+        ):
+            _, block_hashes, remaining = manager.find_shared_prefix(
+                [1, 2, 3, 4, 5, 6, 7, 8]
+            )
+
+        assert calls["n"] >= 2
+        assert block_hashes == [full_hash, tail_hash]
+        assert remaining == [7, 8]
+
+    def test_find_shared_prefix_skips_poll_without_pending(self):
+        """With no pending announcement the lookup returns without polling."""
+        manager = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model", initial_blocks=100
+        )
+        self._register_full(manager, None, [1, 2, 3, 4])
+        with patch.object(
+            manager, "get_computed_blocks", wraps=manager.get_computed_blocks
+        ) as spy:
+            manager.find_shared_prefix([1, 2, 3, 4, 5, 6])
+        assert spy.call_count == 1

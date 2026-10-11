@@ -2047,6 +2047,68 @@ class TestArraysCacheLastBlockOnly:
         # The prefix index covers the full block only.
         assert [entry[0] for entry in cache._prefix_index.values()] == [4]
 
+    def test_store_cache_announces_tail_before_its_write(self, mx):
+        """The tail is pending-visible while its store is mid-write.
+
+        A lookup landing after the full block is saved but before the tail's
+        SSD write returns can tell the tail is still coming instead of missing
+        it silently. The announcement is dropped once the store finishes.
+        """
+        import threading
+
+        from omlx.cache.paged_cache import compute_block_hash
+
+        cache, paged_cache, mock_ssd, config = self._tail_fixture(mx)
+        tokens = list(range(7))
+        snapshots = {
+            4: self._hybrid_state(mx, 4, 4.0),
+            7: self._hybrid_state(mx, 7, 7.0),
+        }
+        entered = threading.Event()
+        release = threading.Event()
+
+        def _save_block(**kwargs):
+            if kwargs.get("tail_terminal"):
+                entered.set()
+                release.wait(timeout=5)
+            return True
+
+        mock_ssd.save_block.side_effect = _save_block
+        result_holder = {}
+
+        def _store():
+            result_holder["result"] = cache.store_cache(
+                "req-window",
+                tokens,
+                self._hybrid_state(mx, 7, 7.0),
+                model_cache_config=config,
+                boundary_snapshots=snapshots,
+                _store_tail_terminal=True,
+            )
+
+        worker = threading.Thread(target=_store)
+        worker.start()
+        try:
+            assert entered.wait(timeout=5), "tail save never started"
+            full_hash = compute_block_hash(None, [0, 1, 2, 3], model_name="test-model")
+            # The full block is indexed; the tail is only announced.
+            assert paged_cache.has_pending_tail_block(full_hash) is True
+            assert full_hash not in paged_cache._tail_index
+            _, num_tokens = paged_cache.get_computed_blocks(tokens)
+            assert num_tokens == 4
+        finally:
+            release.set()
+            worker.join(timeout=5)
+
+        result = result_holder["result"]
+        assert result is not None
+        assert result.num_tokens == 7
+        tail_hash = paged_cache.allocated_blocks[result.block_ids[-1]].block_hash
+        assert paged_cache.has_pending_tail_block(full_hash) is False
+        assert paged_cache._tail_index[full_hash][tail_hash] == 3
+        _, num_tokens = paged_cache.get_computed_blocks(tokens)
+        assert num_tokens == 7
+
     def test_store_cache_pops_fetched_tail_and_extends_on_grid(self, mx):
         """A request that reused a tail stores its own blocks on the grid.
 

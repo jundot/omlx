@@ -1466,6 +1466,13 @@ class BlockAwarePrefixCache(CacheManager):
                                 per_block.append(layer_meta_states[lidx])
                         block_meta = per_block
 
+                    # Announce the tail before its SSD write starts, so a
+                    # lookup landing in that window sees "tail still coming"
+                    # instead of missing it silently.
+                    if is_tail_terminal:
+                        self.paged_cache.register_pending_tail_block(
+                            parent_hash, block.block_hash
+                        )
                     # Save to paged SSD via PagedSSDCacheManager with cache type info
                     if hot_cache_write_back:
                         saved = self.paged_ssd_cache.save_block(
@@ -1562,6 +1569,9 @@ class BlockAwarePrefixCache(CacheManager):
                             self.paged_cache.register_tail_block(
                                 parent_hash, block.block_hash, len(block_tokens)
                             )
+                            self.paged_cache.clear_pending_tail_block(
+                                parent_hash, block.block_hash
+                            )
                             self._tail_hashes.add(block.block_hash)
                             if len(self._tail_hashes) > _TIP_LINEAGE_MAX_ENTRIES:
                                 self._tail_hashes.clear()
@@ -1572,6 +1582,10 @@ class BlockAwarePrefixCache(CacheManager):
                             f"tokens [{global_start}:{global_end}], {len(block_kv_data)} layers"
                         )
                     else:
+                        if is_tail_terminal:
+                            self.paged_cache.clear_pending_tail_block(
+                                parent_hash, block.block_hash
+                            )
                         logger.warning(
                             f"Failed to save block {block.block_id} to tiered cache"
                         )
