@@ -1818,6 +1818,45 @@ class _BoundarySnapshotProvider:
             if snap is not None:
                 yield snap
 
+    def stage_gdn_checkpoint(
+        self,
+        token_count: int,
+        source_block_hash: bytes,
+        *,
+        layer_cache_types: list[str] | None,
+        model_name: str,
+        block_size: int,
+    ) -> str | None:
+        """Stage one recurrent snapshot in memory ahead of its durable commit.
+
+        ``store_cache`` indexes the tail as soon as its KV is resident, so the
+        checkpoint must be resolvable in that same window. Returns the staged
+        signature, or None when nothing was staged.
+        """
+        if self._store is None or self._paged_ssd_manager is None:
+            return None
+        register = getattr(
+            self._paged_ssd_manager, "register_pending_gdn_checkpoint", None
+        )
+        if not callable(register):
+            return None
+        snapshot = self._store.load(self._request_id, token_count)
+        if not snapshot:
+            return None
+        signature_builder = getattr(
+            self._paged_ssd_manager, "gdn_cache_signature_for", None
+        )
+        if not callable(signature_builder):
+            signature_builder = self._paged_ssd_manager.cache_signature_for
+        signature = signature_builder(
+            model_name=model_name,
+            num_layers=len(layer_cache_types or []),
+            block_size=block_size,
+            layer_cache_types=layer_cache_types or [],
+        )
+        register(source_block_hash, signature, snapshot)
+        return signature
+
     def commit_gdn_checkpoint(
         self,
         token_count: int,

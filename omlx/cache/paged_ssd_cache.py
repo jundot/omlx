@@ -1367,10 +1367,13 @@ class GDNCheckpointMetadata:
 class GDNCheckpointLookup:
     """Resolved recurrent sidecar plus the namespace decision that found it."""
 
-    file_path: Path
+    file_path: Path | None
     requested_state_dtype: str
     effective_state_codec: str
     used_legacy_fp32_fallback: bool
+    # Set instead of ``file_path`` when the checkpoint is still staged in
+    # memory (its commit is in flight); the caller restores from it directly.
+    snapshot: list[dict[str, Any]] | None = None
 
 
 class GDNCheckpointIndex:
@@ -1750,6 +1753,10 @@ class PagedSSDCacheManager(CacheManager):
         # promoted into the raw-byte hot cache.  They still consume the same
         # shared SSD budget as the two main block indexes.
         self._gdn_sidecar_index = GDNCheckpointIndex(max_size_bytes)
+        # Recurrent snapshots staged in memory ahead of their durable commit.
+        # A lookup that races that commit resolves the snapshot from here so it
+        # never sees a discoverable tail block without a usable checkpoint.
+        self._pending_gdn_checkpoints: dict[tuple[bytes, str], list[dict[str, Any]]] = {}
         self._hot_cache_only = hot_cache_only
         self._expected_model_name = expected_model_name
         self._expected_num_layers = expected_num_layers
@@ -2503,6 +2510,38 @@ class PagedSSDCacheManager(CacheManager):
                     logger.debug("Skipping GDN sidecar %s: %s", file_path, e)
         return indexed, skipped, total_bytes
 
+    def register_pending_gdn_checkpoint(
+        self,
+        source_block_hash: bytes,
+        cache_signature: str,
+        snapshot: list[dict[str, Any]],
+    ) -> None:
+        """Stage a recurrent snapshot in memory before its durable commit.
+
+        Publishing this ahead of the source block's tail index keeps the two
+        writes atomic from a reader's view: the block never becomes discoverable
+        before its checkpoint is resolvable.
+        """
+        if self._hot_cache_only or self._cache_dir is None:
+            return
+        if not isinstance(source_block_hash, bytes) or not source_block_hash:
+            return
+        if not snapshot:
+            return
+        digest = self._gdn_signature_digest(cache_signature)
+        with self._lock:
+            self._pending_gdn_checkpoints[(source_block_hash, digest)] = snapshot
+
+    def clear_pending_gdn_checkpoint(
+        self, source_block_hash: bytes, cache_signature: str
+    ) -> None:
+        """Drop a staged snapshot once it is durable, or when its store fails."""
+        if not isinstance(source_block_hash, bytes) or not source_block_hash:
+            return
+        digest = self._gdn_signature_digest(cache_signature)
+        with self._lock:
+            self._pending_gdn_checkpoints.pop((source_block_hash, digest), None)
+
     def commit_gdn_checkpoint_file(
         self,
         source_block_hash: bytes,
@@ -2581,6 +2620,10 @@ class PagedSSDCacheManager(CacheManager):
                             last_access=committed_at,
                         )
                     )
+                    # The durable entry now supersedes the staged snapshot.
+                    self._pending_gdn_checkpoints.pop(
+                        (source_block_hash, signature_digest), None
+                    )
                     return final_path
                 except OSError:
                     if old is not None and self._is_safe_gdn_sidecar_file(
@@ -2618,6 +2661,23 @@ class PagedSSDCacheManager(CacheManager):
             return None
 
         with self._lock:
+            requested_state_dtype = self._gdn_state_dtype_from_signature(
+                cache_signature
+            )
+            for candidate in self._gdn_signature_candidates(cache_signature):
+                staged = self._pending_gdn_checkpoints.get(
+                    (source_block_hash, self._gdn_signature_digest(candidate))
+                )
+                if staged is not None:
+                    return GDNCheckpointLookup(
+                        file_path=None,
+                        requested_state_dtype=requested_state_dtype,
+                        effective_state_codec=_GDN_STATE_CODEC_BY_DTYPE[
+                            requested_state_dtype
+                        ],
+                        used_legacy_fp32_fallback=False,
+                        snapshot=staged,
+                    )
             metadata = None
             signature_digest = ""
             selected_candidate_index = -1
@@ -2643,9 +2703,6 @@ class PagedSSDCacheManager(CacheManager):
             if metadata is None:
                 return None
 
-            requested_state_dtype = self._gdn_state_dtype_from_signature(
-                cache_signature
-            )
             used_legacy_fp32_fallback = selected_candidate_index > 0
             effective_state_dtype = (
                 "fp32" if used_legacy_fp32_fallback else requested_state_dtype
@@ -2683,6 +2740,8 @@ class PagedSSDCacheManager(CacheManager):
         with self._lock:
             for candidate in self._gdn_signature_candidates(cache_signature):
                 signature_digest = self._gdn_signature_digest(candidate)
+                if (source_block_hash, signature_digest) in self._pending_gdn_checkpoints:
+                    return True
                 metadata = self._gdn_sidecar_index.get(
                     source_block_hash, signature_digest
                 )
@@ -5308,6 +5367,8 @@ class PagedSSDCacheManager(CacheManager):
         with self._pending_write_hashes_lock:
             self._pending_write_buffers.clear()
             self._pending_write_hashes.clear()
+        with self._lock:
+            self._pending_gdn_checkpoints.clear()
 
         logger.debug("PagedSSDCacheManager closed")
 

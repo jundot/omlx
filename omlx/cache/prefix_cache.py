@@ -519,6 +519,49 @@ class BlockAwarePrefixCache(CacheManager):
             )
             return False
 
+    def _stage_split_gdn_snapshot(
+        self,
+        boundary_snapshots: Any,
+        token_count: int,
+        block_hash: bytes,
+        layer_cache_types: list[str] | tuple[str, ...] | None,
+    ) -> str | None:
+        """Publish the tail's recurrent snapshot in memory before its commit.
+
+        The tail is indexed as soon as its KV is resident, so its checkpoint
+        must be resolvable in that same window. Returns the signature it was
+        staged under, or None when nothing was staged.
+        """
+        stager = getattr(boundary_snapshots, "stage_gdn_checkpoint", None)
+        if not callable(stager):
+            return None
+        try:
+            return stager(
+                token_count,
+                block_hash,
+                layer_cache_types=layer_cache_types,
+                model_name=self.paged_cache.model_name,
+                block_size=self.block_size,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to stage split-GDN checkpoint for block hash %s",
+                block_hash.hex()[:16],
+            )
+            return None
+
+    def _drop_split_gdn_snapshot(
+        self, block_hash: bytes, cache_signature: str | None
+    ) -> None:
+        """Discard a staged snapshot when its commit is rejected."""
+        if cache_signature is None:
+            return
+        clearer = getattr(
+            self.paged_ssd_cache, "clear_pending_gdn_checkpoint", None
+        )
+        if callable(clearer):
+            clearer(block_hash, cache_signature)
+
     def _commit_exact_split_gdn_checkpoint(
         self,
         request_id: str,
@@ -1525,9 +1568,18 @@ class BlockAwarePrefixCache(CacheManager):
                             tail_terminal=is_tail_terminal,
                         )
                     if saved:
-                        # Index the tail now: save_block already staged its KV in
-                        # memory, so waiting for the recurrent-checkpoint commit
-                        # below would leave it readable but undiscoverable.
+                        # Index the tail now that save_block has staged its KV
+                        # in memory; its recurrent snapshot is staged first, so
+                        # the tail is never discoverable without a resolvable
+                        # checkpoint.
+                        staged_gdn_signature = None
+                        if split_gdn_layout and is_tail_terminal:
+                            staged_gdn_signature = self._stage_split_gdn_snapshot(
+                                boundary_snapshots,
+                                block_boundary_tc,
+                                block.block_hash,
+                                layer_cache_types,
+                            )
                         if is_tail_terminal:
                             self._index_tail_block(
                                 parent_hash, block.block_hash, len(block_tokens)
@@ -1596,6 +1648,9 @@ class BlockAwarePrefixCache(CacheManager):
                                         parent_hash, block.block_hash
                                     )
                                     tail_in_table = False
+                                    self._drop_split_gdn_snapshot(
+                                        block.block_hash, staged_gdn_signature
+                                    )
                                 self.paged_cache.free_block(block.block_id)
                                 block_table.block_ids.pop()
                                 block_table.num_tokens -= len(block_tokens)
@@ -3573,6 +3628,7 @@ class BlockAwarePrefixCache(CacheManager):
                     # candidate to be selected before walking back a block.
                     for _attempt in range(2):
                         lookup_diagnostic = None
+                        staged_snapshot = None
                         if callable(sidecar_lookup_getter):
                             lookup = sidecar_lookup_getter(
                                 block.block_hash, cache_signature
@@ -3582,7 +3638,12 @@ class BlockAwarePrefixCache(CacheManager):
                                 if lookup is not None
                                 else None
                             )
-                            if checkpoint_path is not None:
+                            staged_snapshot = (
+                                getattr(lookup, "snapshot", None)
+                                if lookup is not None
+                                else None
+                            )
+                            if checkpoint_path is not None or staged_snapshot is not None:
                                 lookup_diagnostic = {
                                     "requested_state_dtype": getattr(
                                         lookup, "requested_state_dtype", None
@@ -3600,18 +3661,26 @@ class BlockAwarePrefixCache(CacheManager):
                             checkpoint_path = sidecar_getter(
                                 block.block_hash, cache_signature
                             )
-                        if checkpoint_path is None:
+                        if checkpoint_path is None and staged_snapshot is None:
                             break
-                        if self._gdn_checkpoint_loader is None:
-                            logger.warning(
-                                "Split GDN cache enabled without checkpoint loader"
-                            )
-                            return None
-                        load_started = time.perf_counter()
                         dequantizations_before = self._gdn_dequantization_count()
-                        snapshot = self._gdn_checkpoint_loader(checkpoint_path)
+                        if staged_snapshot is not None:
+                            # Commit still in flight: the checkpoint is staged in
+                            # memory, so restore from it instead of failing closed.
+                            snapshot = staged_snapshot
+                            load_latency_ms = 0.0
+                        else:
+                            if self._gdn_checkpoint_loader is None:
+                                logger.warning(
+                                    "Split GDN cache enabled without checkpoint loader"
+                                )
+                                return None
+                            load_started = time.perf_counter()
+                            snapshot = self._gdn_checkpoint_loader(checkpoint_path)
+                            load_latency_ms = (
+                                time.perf_counter() - load_started
+                            ) * 1000.0
                         dequantizations_after = self._gdn_dequantization_count()
-                        load_latency_ms = (time.perf_counter() - load_started) * 1000.0
                         if snapshot is None:
                             forgetter = getattr(
                                 self.paged_ssd_cache,
