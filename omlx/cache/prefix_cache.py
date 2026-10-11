@@ -1467,8 +1467,8 @@ class BlockAwarePrefixCache(CacheManager):
                         block_meta = per_block
 
                     # Announce the tail before its SSD write starts, so a
-                    # lookup landing in that window sees "tail still coming"
-                    # instead of missing it silently.
+                    # lookup landing in that window reports the tail as still
+                    # being written instead of missing it silently.
                     if is_tail_terminal:
                         self.paged_cache.register_pending_tail_block(
                             parent_hash, block.block_hash

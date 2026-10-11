@@ -81,20 +81,10 @@ _TAIL_INDEX_PER_PARENT = 8
 _TAIL_INDEX_MAX_PARENTS = 4096
 
 # A tail block enters the index only once its store has finished the SSD
-# write. A lookup landing in that window otherwise misses silently. These
-# bound a short, targeted poll that bridges it without touching the
-# scheduler's admission timeout; the TTL drops announcements from stores
-# that never published (e.g. a raised exception) so they cannot pin the poll.
-_PENDING_TAIL_WAIT_S = 0.5
-_PENDING_TAIL_POLL_S = 0.05
-_PENDING_TAIL_TTL_S = 3.0
-
-
-def _short_hash(block_hash: Optional[BlockHash]) -> str:
-    """Compact form of a chain hash for log messages."""
-    if block_hash is None:
-        return "<root>"
-    return bytes(block_hash).hex()[:12]
+# write. A lookup landing in that window otherwise misses silently; the
+# announcement makes that miss say "still being written" instead of nothing.
+# The TTL is a backstop for a store that dies without clearing its entry.
+_PENDING_TAIL_TTL_S = 30.0
 
 
 def compute_block_hash(
@@ -1300,20 +1290,21 @@ class PagedCacheManager(CacheManager):
         tails = self._tail_index.get(parent_hash)
         if not tails:
             remaining = len(token_ids) - start
-            if self._pending_tail_index.get(parent_hash):
+            parent_repr = parent_hash.hex()[:12] if parent_hash else "<root>"
+            if self.has_pending_tail_block(parent_hash):
                 logger.debug(
                     "Tail miss at %d (+%d tokens): store in flight under parent "
                     "%s, tail not indexed yet",
                     start,
                     remaining,
-                    _short_hash(parent_hash),
+                    parent_repr,
                 )
             else:
                 logger.debug(
                     "Tail miss at %d (+%d tokens): no tail indexed under parent %s",
                     start,
                     remaining,
-                    _short_hash(parent_hash),
+                    parent_repr,
                 )
             return None
         remaining = len(token_ids) - start
@@ -1426,26 +1417,6 @@ class PagedCacheManager(CacheManager):
             extra_key_token_start=extra_key_token_start,
             extra_key_ranges=extra_key_ranges,
         )
-
-        # A store may still be publishing a tail under the last matched block.
-        # Poll briefly for it so a lookup that lands in the store window can
-        # pick the tail up once its index entry lands, without lengthening the
-        # scheduler's admission timeout.
-        if num_cached_tokens < len(tokens) and self._pending_tail_index:
-            tail_parent = cached_blocks[-1].block_hash if cached_blocks else None
-            if self.has_pending_tail_block(tail_parent):
-                deadline = time.monotonic() + _PENDING_TAIL_WAIT_S
-                while time.monotonic() < deadline:
-                    time.sleep(_PENDING_TAIL_POLL_S)
-                    retry_blocks, retry_tokens = self.get_computed_blocks(
-                        tokens,
-                        extra_keys=extra_keys,
-                        extra_key_token_start=extra_key_token_start,
-                        extra_key_ranges=extra_key_ranges,
-                    )
-                    if retry_tokens > num_cached_tokens:
-                        cached_blocks, num_cached_tokens = retry_blocks, retry_tokens
-                        break
 
         shared_block_ids = [b.block_id for b in cached_blocks]
         shared_block_hashes = [b.block_hash for b in cached_blocks]
