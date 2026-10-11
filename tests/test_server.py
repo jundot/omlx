@@ -1208,6 +1208,9 @@ class TestExposedProfileModels:
         assert profile_model["config_model_type"] == "gemma4"
         assert profile_model["max_context_window"] == 4096
         assert profile_model["max_tokens"] == 1024
+        assert profile_model["enable_thinking"] is True
+        base_model = next(m for m in status["models"] if m["id"] == "qwen-base")
+        assert base_model["enable_thinking"] is None
 
     @pytest.mark.asyncio
     async def test_v1_models_advertises_alias_form_for_exposed_profiles(self, manager):
