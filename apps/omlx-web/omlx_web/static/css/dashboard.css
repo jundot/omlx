@@ -1318,6 +1318,13 @@
         gap: 1.5rem;
         align-items: start;
     }
+    /* The sub-tab row is the mask cards scroll under; extend it to the rail's
+       top so the cards and the rail are cut at the same line. The static layout
+       is unchanged: the added padding comes out of the margin (mb-6). */
+    .page-tabs.page-tabs--settings-rail {
+        padding-bottom: 1.5rem;
+        margin-bottom: 0.75rem;
+    }
     .settings-section {
         scroll-margin-top: calc(var(--dashboard-topbar-height) + var(--dashboard-subtabs-height) + 0.75rem);
     }
