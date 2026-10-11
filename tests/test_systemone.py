@@ -865,3 +865,87 @@ def test_d1_prefix_cache_evicts_by_bytes(tiny_lfm2_backbone):
     model.prefixes.clear()
     _drain(model.run(plans[0], lambda: 64))
     assert len(model.prefixes) == 0
+
+
+def _active_memory() -> int:
+    import gc
+
+    gc.collect()
+    mx.synchronize()
+    mx.clear_cache()
+    return mx.get_active_memory()
+
+
+def test_d1_prefix_cache_holds_only_what_it_counts(tiny_lfm2_backbone):
+    model = _d1_model(tiny_lfm2_backbone)
+    questions = {
+        "a": {"type": "noul", "instructions": "A?"},
+        "b": {"type": "noul", "instructions": "B?"},
+    }
+    _drain(
+        model.run(
+            model.encode({"state": "warm up", "questions": questions}), lambda: 4096
+        )
+    )
+    model.prefixes.clear()
+    base = _active_memory()
+    # One long chunk: each conv state is a slice of a buffer as long as the prefix.
+    request = {"state": "x" * 3000, "questions": questions}
+    _drain(model.run(model.encode(request), lambda: 4096))
+    retained = _active_memory() - base
+    assert model.prefixes.nbytes > 0
+    assert retained <= 1.25 * model.prefixes.nbytes + 64 * 1024
+
+
+class _MergingTokenizer(_D1Tokenizer):
+    """Like the d1 tokenizer, ``\\n\\n`` is one token, so text merges across a split."""
+
+    def encode(self, text, add_special_tokens=False):
+        if text in _D1_WORDS:
+            return [_D1_WORDS[text]]
+        out, i = [], 0
+        while i < len(text):
+            if text.startswith("\n\n", i):
+                out.append(299)
+                i += 2
+            else:
+                out.append(ord(text[i]) % 250 + 1)
+                i += 1
+        return out
+
+
+def test_d1_single_question_keeps_the_whole_prompt_tokens(
+    tiny_lfm2_backbone, monkeypatch
+):
+    model = _d1_model(tiny_lfm2_backbone)
+    model.backbone.tokenizer = _MergingTokenizer()
+    lengths = _prefill_lengths(model, monkeypatch)
+    state = "charged twice"
+    merged = {"type": "noul", "instructions": "\nIs it urgent?"}
+    other = {"type": "noul", "instructions": "Is it urgent?"}
+    _drain(
+        model.run(
+            model.encode({"state": state, "questions": {"m": merged, "o": other}}),
+            lambda: 64,
+        )
+    )
+    assert len(model.prefixes) == 1
+
+    # The prefix ends with a newline, so this question's text merges across the
+    # split; it keeps one pass over the whole prompt instead of the cached prefix.
+    lengths.clear()
+    plan = model.encode({"state": state, "questions": {"m": merged}})
+    whole = model.backbone.tokenize(plan.prefix + plan.items[0].suffix)
+    parts = model.backbone.tokenize(plan.prefix) + model.backbone.tokenize(
+        plan.items[0].suffix
+    )
+    assert whole != parts
+    out = _drain(model.run(plan, lambda: 64))
+    assert lengths == [len(whole)]
+    assert out["input_tokens"] == len(whole) and out["cached_tokens"] == 0
+
+    lengths.clear()
+    out = _drain(
+        model.run(model.encode({"state": state, "questions": {"o": other}}), lambda: 64)
+    )
+    assert out["cached_tokens"] > 0 and max(lengths) < len(whole)

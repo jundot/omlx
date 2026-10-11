@@ -158,7 +158,12 @@ class Lfm2DecisionBackbone(DecisionBackbone):
 
     @staticmethod
     def snapshot_cache(cache: list) -> list:
-        """A compact copy of ``cache`` for keeping: no spare KV capacity."""
+        """A compact copy of ``cache`` for keeping.
+
+        Every array is copied: the KV state is a view of a buffer with spare
+        capacity, and each conv state is a slice of its layer's whole prefill
+        buffer, which a kept slice would hold alive.
+        """
         out = []
         for layer in cache:
             if hasattr(layer, "keys"):  # KVCache
@@ -167,7 +172,9 @@ class Lfm2DecisionBackbone(DecisionBackbone):
                 fresh.state = (mx.contiguous(keys), mx.contiguous(values))
             else:
                 fresh = type(layer)(len(layer.cache))
-                fresh.cache = list(layer.cache)
+                fresh.cache = [
+                    None if a is None else mx.contiguous(a) for a in layer.cache
+                ]
             out.append(fresh)
         mx.eval([c.state for c in out])
         return out
@@ -419,17 +426,26 @@ class D1Model:
         answers = {}
         trunk = self._prefix_ids(plan)
         key = trunk.tobytes()
+        branches = [
+            np.asarray(backbone.tokenize(item.suffix), dtype=np.int32)
+            for item in plan.items
+        ]
         trunk_cache = self.prefixes.get(key)
-        cached_tokens = 0 if trunk_cache is None else len(trunk)
-        if (
-            trunk_cache is None
-            and len(plan.items) == 1
-            and len(trunk) < SPLIT_PREFIX_TOKENS
-        ):
-            item = plan.items[0]
+        one_pass = False
+        if len(plan.items) == 1:
+            # The release reads a single question in one pass over the whole
+            # prompt. Its prefix is only split off when that leaves the token
+            # ids unchanged: text can merge across the boundary (the prefix
+            # ends with a newline).
             ids = np.asarray(
-                backbone.tokenize(plan.prefix + item.suffix), dtype=np.int32
+                backbone.tokenize(plan.prefix + plan.items[0].suffix), dtype=np.int32
             )
+            splits = np.array_equal(ids, np.concatenate([trunk, branches[0]]))
+            one_pass = not splits or (
+                trunk_cache is None and len(trunk) < SPLIT_PREFIX_TOKENS
+            )
+        if one_pass:
+            item = plan.items[0]
             hidden = yield from self._prefill(ids, backbone.make_cache(), chunk_size)
             answers[item.question_id] = self._answer(item, self._probs(item, hidden))
             return {
@@ -438,15 +454,12 @@ class D1Model:
                 "cached_tokens": 0,
             }
 
+        cached_tokens = 0 if trunk_cache is None else len(trunk)
         if trunk_cache is None:
             fresh = backbone.make_cache()
             yield from self._prefill(trunk, fresh, chunk_size)
             trunk_cache = backbone.snapshot_cache(fresh)
             self.prefixes.put(key, trunk_cache)
-        branches = [
-            np.asarray(backbone.tokenize(item.suffix), dtype=np.int32)
-            for item in plan.items
-        ]
         hidden = yield from self._branches(
             trunk_cache, len(trunk), branches, chunk_size
         )
