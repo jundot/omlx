@@ -485,3 +485,157 @@ class TestStatusCacheMemory:
                 "num_files": 640,
             }
         ]
+
+
+class TestStatusKvMemory:
+    """`/api/status` measures the KV in-flight sequences hold right now (#2859).
+
+    ``model_memory_used`` is the settled load footprint and ``cache_memory``
+    is the paged SSD/hot tier, so neither moves while a prefill or a decode
+    grows the live KV — the reporter sampled /api/status through a 40k-token
+    cold prefill and saw a flat line. This block walks the cache tensors the
+    request path is holding at poll time instead of estimating them.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup_server_state(self):
+        state = ServerState()
+        with patch("omlx.server._server_state", state):
+            self._state = state
+            yield
+
+    def _load(self, scheduler):
+        self._state.engine_pool = _pool_with_entries(
+            {"qwen3.5-0.8b-8bit": _entry(_engine_with_scheduler(scheduler))}
+        )
+
+    @pytest.mark.parametrize(
+        ("holder", "expected_bytes"),
+        [
+            # Idle engine: nothing in flight, so the gauge is 0 — not null,
+            # and the model is not dropped from the report.
+            ("idle", 0),
+            ("batch_generator", 4096),
+            ("chunked_prefill", 2048),
+            ("waiting_request", 1024),
+        ],
+    )
+    def test_reports_the_kv_each_holder_is_holding(
+        self, client, holder, expected_bytes
+    ):
+        scheduler = SimpleNamespace(batch_generator=None)
+        if holder == "batch_generator":
+            # mlx-lm's own accessor; absent (None) on generators that never
+            # queued a sequence.
+            scheduler.batch_generator = SimpleNamespace(prompt_cache_nbytes=4096)
+        elif holder == "chunked_prefill":
+            scheduler._prefill_states = {
+                "req-1": SimpleNamespace(cache=[SimpleNamespace(nbytes=2048)])
+            }
+        elif holder == "waiting_request":
+            scheduler.waiting = [
+                SimpleNamespace(prompt_cache=[SimpleNamespace(nbytes=1024)])
+            ]
+        self._load(scheduler)
+
+        data = client.get("/api/status").json()
+
+        assert data["kv_memory"]["models"] == [
+            {"model_id": "qwen3.5-0.8b-8bit", "resident_bytes": expected_bytes}
+        ]
+
+    def test_sums_all_holders_and_counts_an_aliased_cache_once(self, client):
+        # A prefill paused for LRU eviction keeps its cache on the request
+        # while a resumed chunked prefill holds the same list object, so the
+        # same tensors are reachable twice.
+        shared = [SimpleNamespace(nbytes=8192)]
+        scheduler = SimpleNamespace(
+            batch_generator=SimpleNamespace(prompt_cache_nbytes=4096),
+            _prefill_states={"req-1": SimpleNamespace(cache=shared)},
+            _vlm_mtp_active={
+                7: SimpleNamespace(prompt_cache=[SimpleNamespace(nbytes=512)])
+            },
+            waiting=[SimpleNamespace(prompt_cache=shared)],
+            running={},
+        )
+        self._load(scheduler)
+
+        data = client.get("/api/status").json()
+
+        assert data["kv_memory"]["models"] == [
+            {"model_id": "qwen3.5-0.8b-8bit", "resident_bytes": 4096 + 8192 + 512}
+        ]
+
+    def test_a_holder_mutating_mid_poll_is_dropped_not_fatal(self, client):
+        class _RacingBatchGenerator:
+            """BatchGenerator whose queues a step grows while status reads them."""
+
+            @property
+            def prompt_cache_nbytes(self):
+                raise RuntimeError("deque mutated during iteration")
+
+        scheduler = SimpleNamespace(
+            batch_generator=_RacingBatchGenerator(),
+            waiting=[SimpleNamespace(prompt_cache=[SimpleNamespace(nbytes=1024)])],
+        )
+        self._load(scheduler)
+
+        resp = client.get("/api/status")
+
+        assert resp.status_code == 200
+        assert resp.json()["kv_memory"]["models"] == [
+            {"model_id": "qwen3.5-0.8b-8bit", "resident_bytes": 1024}
+        ]
+
+
+class TestStatusTurboQuantConversionEvidence:
+    """`/api/status` shows whether a TurboQuant conversion actually ran (#2859).
+
+    ``active`` only means "armed, with no model-level veto", which is already
+    true before the first request ever arrives, so it cannot tell a user
+    whether a served request's fp16 KV was ever quantized. The evidence is
+    the layer count the conversion itself reports; like ``reason``, the key
+    is omitted while it would say nothing.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup_server_state(self):
+        state = ServerState()
+        with patch("omlx.server._server_state", state):
+            self._state = state
+            yield
+
+    @pytest.mark.parametrize(
+        ("mla", "converted_layers", "expected_layers", "expected_active"),
+        [
+            # Armed and eligible, but no request has converted anything yet.
+            (False, 0, None, True),
+            (False, 24, 24, True),
+            # Vetoed model: arming is not evidence, so there is none to show.
+            (True, 0, None, False),
+        ],
+    )
+    def test_conversion_evidence_tracks_real_conversions(
+        self, client, mla, converted_layers, expected_layers, expected_active
+    ):
+        settings = SimpleNamespace(turboquant_kv_enabled=True, turboquant_kv_bits=8)
+        scheduler = SimpleNamespace(
+            _turboquant_kv_bits=8.0,
+            _turboquant_kv_converted_layers=converted_layers,
+            _model_uses_mla=lambda: mla,
+            _model_uses_attention_sinks=lambda: False,
+        )
+        self._state.engine_pool = _pool_with_entries(
+            {
+                "qwen3.6-35b-a3b-4bit": _entry(
+                    _engine_with_scheduler(scheduler, settings)
+                ),
+            }
+        )
+
+        data = client.get("/api/status").json()
+
+        report = data["turboquant"]["models"][0]
+        assert report["active"] is expected_active
+        assert report.get("converted_layers") == expected_layers
+        assert ("converted_layers" in report) is (expected_layers is not None)

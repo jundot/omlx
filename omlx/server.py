@@ -3252,6 +3252,7 @@ async def server_status(_: bool = Depends(verify_api_key)):
         "ane_prefill": _ane_prefill_status(pool),
         "turboquant": _turboquant_status(pool),
         "cache_memory": _cache_memory_status(pool),
+        "kv_memory": _kv_memory_status(pool),
     }
 
 
@@ -3353,6 +3354,12 @@ def _turboquant_status(pool) -> dict:
     vetoes (composite CacheList layers) stay visible only in the log line,
     because deciding them needs a live prompt cache.
 
+    ``converted_layers`` is the evidence that the fp16 -> TurboQuant
+    conversion ran for a served request: ``active`` turns true at arming,
+    before any request exists, while this key appears only once layers have
+    actually been converted, the same way ``reason`` appears only for a
+    veto.
+
     Best-effort and defensive: a model whose engine cannot be probed is
     skipped rather than failing the endpoint.
     """
@@ -3382,6 +3389,9 @@ def _turboquant_status(pool) -> dict:
                 else "engine did not arm TurboQuant KV for this model"
             )
             bits_value = float(bits) if bits is not None else None
+            converted_layers = int(
+                getattr(scheduler, "_turboquant_kv_converted_layers", 0) or 0
+            )
         except Exception as exc:  # noqa: BLE001 - status must never fail
             logger.warning(
                 "TurboQuant status unavailable for model '%s': %s", model_id, exc
@@ -3395,6 +3405,8 @@ def _turboquant_status(pool) -> dict:
         }
         if reason is not None:
             report["reason"] = reason
+        if converted_layers:
+            report["converted_layers"] = converted_layers
         result["models"].append(report)
         result["requested_models"] += 1
         if reason is None:
@@ -3449,6 +3461,107 @@ def _cache_memory_status(pool) -> dict:
         except Exception as exc:  # noqa: BLE001 - status must never fail
             logger.warning(
                 "Cache memory stats unavailable for model '%s': %s", model_id, exc
+            )
+    return result
+
+
+def _in_flight_cache_lists(scheduler):
+    """Yield the cache lists a scheduler's in-flight sequences hold right now.
+
+    One holder per shipped way a request can be sitting on KV: a chunked
+    prefill accumulating between steps, a vlm_mtp decode that bypasses
+    BatchGenerator, and a waiting/running request whose prompt cache a pause
+    for LRU eviction or an SSD prefix restore left attached.
+    """
+    for state in (getattr(scheduler, "_prefill_states", None) or {}).values():
+        yield getattr(state, "cache", None)
+    for state in (getattr(scheduler, "_vlm_mtp_active", None) or {}).values():
+        yield getattr(state, "prompt_cache", None)
+    requests = list(getattr(scheduler, "waiting", None) or ())
+    requests += list((getattr(scheduler, "running", None) or {}).values())
+    for request in requests:
+        yield getattr(request, "prompt_cache", None)
+
+
+def _in_flight_kv_bytes(scheduler) -> int:
+    """Bytes of KV cache a scheduler is holding for in-flight sequences.
+
+    Measured, not estimated: read at poll time off the cache objects the
+    request path itself is using, so the number moves while a prefill or a
+    decode grows — unlike ``model_memory_used`` (settled load footprint) and
+    ``cache_memory`` (paged SSD/hot tier). ``MemoryMonitor`` is deliberately
+    not consulted: ``estimate_resident_kv_bytes`` is the admission estimator.
+
+    The number is what in-flight sequences hold, not the allocated pool:
+    a freed or trimmed cache stops counting, so the gauge falls back as
+    sequences finish. A cache reachable through two holders is counted once,
+    because a resumed prefill aliases the cache its paused request kept.
+
+    Not covered: a synchronous (non-chunked) prefill keeps its cache in a
+    step-local, so that one is only visible once its request is inserted.
+
+    Best-effort: a holder a step is mutating mid-poll is dropped from the
+    reading rather than failing the endpoint.
+    """
+    from .scheduler import _iter_leaf_caches
+
+    total = 0
+    seen: set[int] = set()
+    try:
+        for caches in _in_flight_cache_lists(scheduler):
+            for leaf in _iter_leaf_caches(caches):
+                if id(leaf) in seen:
+                    continue
+                seen.add(id(leaf))
+                total += int(getattr(leaf, "nbytes", 0) or 0)
+        # Read last: this accessor walks the generator's own queues, so it is
+        # the one that raises when a step grows them mid-poll, and everything
+        # already read should survive that.
+        batch_generator = getattr(scheduler, "batch_generator", None)
+        if batch_generator is not None:
+            total += int(batch_generator.prompt_cache_nbytes)
+    except Exception as exc:  # noqa: BLE001 - a step mutating a queue mid-poll
+        logger.debug("KV gauge: dropping unreadable in-flight caches: %s", exc)
+    return total
+
+
+def _kv_memory_status(pool) -> dict:
+    """KV cache in-flight sequences hold, per loaded model (#2859).
+
+    The reporter polled ``/api/status`` through a 40k-token cold prefill and
+    saw ``model_memory_used`` sit still, because that field settles at load
+    time and the paged-SSD tier behind ``cache_memory`` is not where an
+    in-flight prefill keeps its KV. This block is the gauge for that: bytes
+    held by sequences that are still running, 0 once they all finish. It is
+    a reading, never an estimate — the engine is not asked what KV a request
+    would need, its live caches are measured.
+
+    Models with no scheduler to measure are omitted rather than reported as
+    zeros, so an empty ``models`` list means nothing could be read.
+
+    Best-effort and defensive: a model whose engine cannot be probed is
+    skipped rather than failing the endpoint.
+    """
+    result = {"models": []}
+    if pool is None:
+        return result
+    for model_id, entry in pool._entries.items():
+        engine = getattr(entry, "engine", None)
+        if engine is None:
+            continue
+        try:
+            scheduler = _entry_scheduler(engine)
+            if scheduler is None:
+                continue
+            result["models"].append(
+                {
+                    "model_id": model_id,
+                    "resident_bytes": _in_flight_kv_bytes(scheduler),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - status must never fail
+            logger.warning(
+                "KV memory status unavailable for model '%s': %s", model_id, exc
             )
     return result
 

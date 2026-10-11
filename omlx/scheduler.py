@@ -2000,6 +2000,10 @@ class Scheduler:
 
         # TurboQuant KV cache (set by engine if model_settings has it enabled)
         self._turboquant_kv_bits: float | None = None
+        # Layers converted from fp16 to TurboQuant for served requests.
+        # Arming alone proves nothing before the first request, so this is
+        # what /api/status publishes as evidence that a conversion ran.
+        self._turboquant_kv_converted_layers: int = 0
         self._turboquant_skip_last: bool = True
         # Memoized MLA-architecture detection (see _model_uses_mla / #1613).
         self._mla_model: bool | None = None
@@ -3767,6 +3771,11 @@ class Scheduler:
                         new_caches.append(c)
                 cache_obj.caches = tuple(new_caches)
         if converted > 0:
+            # Created lazily: this helper is also called unbound on
+            # duck-typed schedulers that never ran __init__.
+            self._turboquant_kv_converted_layers = (
+                getattr(self, "_turboquant_kv_converted_layers", 0) + converted
+            )
             skip_msg = ", skipped last KVCache layer" if skip_last else ""
             logger.info(
                 f"TurboQuant: converted {converted}/{len(prompt_cache)} "
