@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,7 @@ def _append_package_path(package: Any, path: Path) -> None:
         return
     path_string = str(path)
     if path_string not in package_path:
-        package_path.append(path_string)
+        package_path.insert(0, path_string)
 
 
 def apply_mlx_vlm_glm5_next_compat_patch() -> bool:
@@ -40,7 +41,24 @@ def apply_mlx_vlm_glm5_next_compat_patch() -> bool:
         apply_pooling_cache_support()
         _append_package_path(mlx_vlm, _VENDOR_MLX_VLM)
         _append_package_path(mlx_vlm.models, _VENDOR_MLX_VLM / "models")
+        # Discovery may import upstream first; reload from the vendor path.
+        for name in [
+            n
+            for n in list(sys.modules)
+            if n == "mlx_vlm.models.glm5_next"
+            or n.startswith("mlx_vlm.models.glm5_next.")
+        ]:
+            del sys.modules[name]
         importlib.import_module("mlx_vlm.models.glm5_next")
+        language = importlib.import_module("mlx_vlm.models.glm5_next.language")
+        if not str(Path(language.__file__).resolve()).startswith(
+            str(_VENDOR_MLX_VLM.resolve())
+        ):
+            logger.error(
+                "GLM-5.3 compat patch did not take effect: language.py resolves to %s",
+                language.__file__,
+            )
+            return False
 
         # mlx-vlm has no glm5_next entry in MODEL_CONFIG, so get_message_json()
         # raises "Unsupported model: glm5_next" on every turn that carries no
@@ -54,7 +72,7 @@ def apply_mlx_vlm_glm5_next_compat_patch() -> bool:
 
         MODEL_CONFIG.setdefault("glm5_next", MessageFormat.LIST_WITH_IMAGE_FIRST)
     except Exception as exc:  # noqa: BLE001
-        logger.debug("GLM-5.3 mlx-vlm registration failed: %s", exc)
+        logger.warning("GLM-5.3 mlx-vlm registration failed: %s", exc)
         return False
 
     _APPLIED = True

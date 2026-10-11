@@ -23,6 +23,7 @@ from omlx.api.anthropic_models import (
     ContentBlockText,
     ContentBlockToolResult,
     ContentBlockToolUse,
+    ContentBlockUnknown,
     ErrorEvent,
     InputJsonDelta,
     MessageDeltaEvent,
@@ -266,6 +267,34 @@ class TestAnthropicMessage:
         # Invalid role
         with pytest.raises(ValidationError):
             AnthropicMessage(role="invalid_role", content="x")
+
+
+class TestContentBlockUnknownType:
+    def test_unknown_type_is_accepted(self):
+        msg = AnthropicMessage(
+            role="user",
+            content=[
+                {
+                    "type": "tool_addition",
+                    "tool": {"type": "tool_reference", "name": "mcp__x__y"},
+                }
+            ],
+        )
+
+        assert isinstance(msg.content[0], ContentBlockUnknown)
+
+    @pytest.mark.parametrize(
+        "block",
+        [{"type": "text"}, {"type": "tool_result", "content": "x"}, {"type": ""}],
+    )
+    def test_malformed_known_type_is_rejected(self, block):
+        with pytest.raises(ValidationError):
+            AnthropicMessage(role="user", content=[block])
+
+    def test_untyped_block_keeps_inferred_type(self):
+        msg = AnthropicMessage(role="user", content=[{"text": "hi"}])
+
+        assert type(msg.content[0]) is ContentBlockText
 
 
 class TestAnthropicTool:

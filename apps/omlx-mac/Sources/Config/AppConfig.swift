@@ -358,6 +358,30 @@ struct AppConfig: Sendable, Equatable, Codable {
         try out.write(to: url, options: [.atomic])
     }
 
+    /// Update only the endpoint while Python is stopped, preserving other settings.
+    static func saveServerEndpoint(
+        basePath: String, host: String? = nil, port: Int? = nil
+    ) throws {
+        let url = settingsURL(basePath: basePath)
+        var json: [String: Any] = [:]
+        if FileManager.default.fileExists(atPath: url.path) {
+            let data = try Data(contentsOf: url)
+            guard let existing = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            json = existing
+        }
+        var server = (json["server"] as? [String: Any]) ?? [:]
+        if let host { server["host"] = host }
+        if let port { server["port"] = port }
+        json["server"] = server
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted])
+        try data.write(to: url, options: [.atomic])
+    }
+
     // MARK: - Internal
 
     /// Subset of `<basePath>/settings.json` we project into AppConfig.
@@ -375,7 +399,7 @@ struct AppConfig: Sendable, Equatable, Codable {
         try readSettings(basePath: basePath)
     }
 
-    private static func readSettings(basePath: String) throws -> ServerSettingsSlice {
+    static func readSettings(basePath: String) throws -> ServerSettingsSlice {
         let url = settingsURL(basePath: basePath)
         guard FileManager.default.fileExists(atPath: url.path) else {
             return ServerSettingsSlice()

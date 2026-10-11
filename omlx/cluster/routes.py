@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import logging
 import re
 import secrets
 import subprocess
@@ -102,6 +103,7 @@ from .planner import (
     synthetic_model_layout,
 )
 from .probe import collect_cluster_status
+from .rdma.link_routes import cluster_rdma_link_verify, cluster_rdma_links
 from .registry import get_cluster_registry, get_device_registry
 from .identity import get_node_identity
 from .replan import (
@@ -142,6 +144,8 @@ from .worker_bundle import (
     worker_source_bundle,
     worker_source_digest,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin/api/cluster", tags=["cluster"])
 join_router = APIRouter(prefix="/cluster/join", tags=["cluster-enrollment"])
@@ -2321,6 +2325,8 @@ async def cluster_complete_worker_join(
         last_seen_at=now,
     )
     try:
+        # Pin first: complete() persists the node and consumes the session,
+        # so a later pin failure would leave an enrolled node with no retry.
         await asyncio.to_thread(
             pin_enrolled_host_key,
             hostname=primary_address,
@@ -3534,10 +3540,13 @@ async def _activate_and_report(
         except BaseException as exc:
             # A deployment is not active merely because it passed planning.
             # Remove the failed engine first, then restore the exact registry
-            # record clients saw before this request.
+            # record clients saw before this request. Rollback errors are only
+            # logged, so the caller still gets the readiness failure.
             try:
                 await pool.prepare_cluster_reload(model_id)
-            finally:
+            except Exception:
+                logger.exception("Could not unload failed cluster model %s", model_id)
+            try:
                 if previous is None:
                     await asyncio.to_thread(
                         registry.remove,
@@ -3552,6 +3561,10 @@ async def _activate_and_report(
                         unregister(model_id)
                 else:
                     await asyncio.to_thread(registry.upsert, previous)
+            except Exception:
+                logger.exception(
+                    "Could not restore the cluster registry for %s", model_id
+                )
             if isinstance(exc, Exception):
                 raise DistributedLaunchError(
                     f"Cluster readiness check failed: {exc}"
@@ -3870,8 +3883,51 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
     }
 
 
+@router.delete("/forget")
+async def forget_cluster(node_id: str | None = None):
+    """Forget one peer, or leave the entire cluster, without remote contact.
+
+    A signed model placement cannot survive losing a rank. Remove affected
+    deployments after verified local teardown; retain all other peer trust.
+    Omitting node_id, or selecting this Mac, leaves the whole local cluster.
+    """
+    from .pairing_routes import PairingError, _manager, _pairing_http_error
+
+    manager = _manager()
+    peers = await asyncio.to_thread(manager.list_paired)
+    deployments = await asyncio.to_thread(get_cluster_registry().list)
+    forget_all = node_id is None or node_id == manager.node_id
+    affected = [
+        deployment
+        for deployment in deployments
+        if forget_all or any(host.node_id == node_id for host in deployment.hosts)
+    ]
+    targets = [
+        peer["node_id"] for peer in peers if forget_all or peer["node_id"] == node_id
+    ]
+    if not forget_all and not targets and not affected:
+        raise HTTPException(status_code=404, detail="cluster member not found")
+    # Do not revoke peer trust if local teardown fails or a request is active.
+    for deployment in affected:
+        await deactivate_cluster_deployment(deployment.deployment_id, local_only=True)
+    results = []
+    try:
+        for target in targets:
+            results.append(await asyncio.to_thread(manager.unpair, target))
+    except PairingError as exc:
+        raise _pairing_http_error(exc) from exc
+    return {
+        "ok": True,
+        "local_only": True,
+        "stopped": False,
+        "forgotten_node_ids": targets,
+        "removed_deployment_ids": [item.deployment_id for item in affected],
+        "revocations": results,
+    }
+
+
 @router.delete("/deployments/{deployment_id}")
-async def deactivate_cluster_deployment(deployment_id: str):
+async def deactivate_cluster_deployment(deployment_id: str, local_only: bool = False):
     """Stop the resident cluster, then disable future distributed loads."""
 
     registry = get_cluster_registry()
@@ -3885,8 +3941,14 @@ async def deactivate_cluster_deployment(deployment_id: str):
         except ModelNotFoundError:
             model_id = None
         if model_id is not None:
-            await pool.prepare_cluster_reload(model_id)
-        await asyncio.to_thread(stop_deployment_processes, deployment)
+            await pool.prepare_cluster_reload(
+                model_id, **({"local_only": True} if local_only else {})
+            )
+        await asyncio.to_thread(
+            stop_deployment_processes,
+            deployment,
+            **({"local_only": True} if local_only else {}),
+        )
         removed = await asyncio.to_thread(registry.remove, deployment_id)
         unregister = getattr(pool, "unregister_cluster_model", None)
         if model_id is not None and callable(unregister):
@@ -3906,7 +3968,8 @@ async def deactivate_cluster_deployment(deployment_id: str):
     return {
         "ok": True,
         "deployment_id": deployment_id,
-        "stopped": True,
+        "stopped": not local_only,
+        "local_only": local_only,
     }
 
 
@@ -3980,8 +4043,9 @@ async def load_cluster_deployment(deployment_id: str):
             )
         entry = pool.get_entry(model_id)
         resident = getattr(entry, "engine", None) if entry is not None else None
-        if resident is not None and getattr(
-            resident, "runtime_failed_reason", None
+        if resident is not None and (
+            getattr(resident, "runtime_failed_reason", None)
+            or getattr(entry, "pending_unload_reason", None)
         ):
             await pool.prepare_cluster_reload(model_id)
         engine = await pool.get_engine(model_id)
@@ -4015,3 +4079,8 @@ async def load_cluster_deployment(deployment_id: str):
         "canary_completion_tokens": canary.completion_tokens,
         "ranks": status.get("ranks", []),
     }
+
+
+# RDMA links over MCDMA: inventory with live evidence, and on-demand verification.
+router.add_api_route("/rdma-links", cluster_rdma_links, methods=["GET"])
+router.add_api_route("/rdma-links/verify", cluster_rdma_link_verify, methods=["POST"])

@@ -2,6 +2,7 @@
 # ruff: noqa
 # Copyright © 2026 Apple Inc.
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -10,11 +11,19 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
+from omlx.utils.fast_attention import (
+    blocked_sliding_window_attention,
+    mixed_head_dim_sdpa,
+    window_query_padding,
+)
+
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
+from omlx.patches.glm_moe_dsa.switch_layers import SwitchGLU as _FusedSwitchGLU
+from omlx.patches.mimo_v2 import decode_fast as _decode_fast
 from omlx.patches.mimo_v2.fused_qkv_layout import (
     FUSED_QKV_BLOCK_SIZE,
     detect_fused_qkv_tp,
@@ -22,6 +31,8 @@ from omlx.patches.mimo_v2.fused_qkv_layout import (
     layer_head_geometry,
     split_fused_qkv,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -54,13 +65,17 @@ class ModelArgs(BaseModelArgs):
     norm_topk_prob: bool
     topk_method: str
     partial_rotary_factor: float
-    attention_bias: bool
     layernorm_epsilon: float
     max_position_embeddings: int
     routed_scaling_factor: Optional[float] = None
     attention_value_scale: Optional[float] = None
     rope_scaling: Optional[Dict[str, Any]] = None
+    attention_bias: bool = False
     tie_word_embeddings: bool = False
+    num_nextn_predict_layers: int = 0
+    omlx_mtp_sidecar: Optional[str] = None
+    n_shared_experts: Optional[int] = None
+    scoring_func: str = "sigmoid"
 
     def __post_init__(self):
         n = self.num_hidden_layers
@@ -75,6 +90,7 @@ class Attention(nn.Module):
         super().__init__()
         dim = args.hidden_size
         self.is_sliding_window = is_sliding_window
+        self.sliding_window_size = args.sliding_window_size if is_sliding_window else 0
         if is_sliding_window:
             self.n_heads = args.swa_num_attention_heads
             self.n_kv_heads = args.swa_num_key_value_heads
@@ -122,8 +138,24 @@ class Attention(nn.Module):
     ) -> mx.array:
         B, L, _ = x.shape
 
+        # Blocked window attention runs whole 128-query blocks. Padding the
+        # (hidden-wide) projection input costs a third of padding the
+        # (64 x 192-wide) queries; projection and RoPE are row-wise, so the
+        # real rows are bit-identical and the padded ones are dropped. A wrapped
+        # rope (SpecPrefill) maps positions per query row, so it gets no padding.
+        q_pad = (
+            window_query_padding(L)
+            if self.is_sliding_window
+            and B == 1
+            and not hasattr(cache, "bits")
+            and type(self.rope) is nn.RoPE
+            else 0
+        )
+        q_in = mx.pad(x, [(0, 0), (0, q_pad), (0, 0)]) if q_pad else x
         queries = (
-            self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim).swapaxes(1, 2)
+            self.q_proj(q_in)
+            .reshape(B, L + q_pad, self.n_heads, self.head_dim)
+            .swapaxes(1, 2)
         )
         keys = (
             self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim).swapaxes(1, 2)
@@ -145,15 +177,43 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        output = scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            cache=cache,
-            scale=self.scale,
-            mask=mask,
-            sinks=self.attention_sink_bias,
-        )
+        output = None
+        if L > 8 and not hasattr(cache, "bits"):
+            # Prefill fast paths: MLX's fused SDPA has no sliding-window or
+            # 192/128 (qk/v head dim) prefill kernel, and its fallback scores
+            # the full [L, S] matrix. Both helpers decline unsupported layouts.
+            if self.is_sliding_window:
+                output = blocked_sliding_window_attention(
+                    queries,
+                    keys,
+                    values,
+                    scale=self.scale,
+                    window=self.sliding_window_size,
+                    sinks=self.attention_sink_bias,
+                    mask=mask,
+                    query_len=L,
+                )
+            else:
+                output = mixed_head_dim_sdpa(
+                    queries,
+                    keys,
+                    values,
+                    scale=self.scale,
+                    mask=mask,
+                    sinks=self.attention_sink_bias,
+                )
+        if output is None:
+            if q_pad:
+                queries = queries[:, :, :L]
+            output = scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                cache=cache,
+                scale=self.scale,
+                mask=mask,
+                sinks=self.attention_sink_bias,
+            )
         return self.o_proj(output.swapaxes(1, 2).reshape(B, L, -1))
 
 
@@ -213,8 +273,9 @@ class MoEGate(nn.Module):
         self.e_score_correction_bias = mx.zeros((config.n_routed_experts,))
 
     def __call__(self, x):
+        # BF16 router logits can collapse distinct expert scores into ties.
         return group_expert_select(
-            x @ self.weight.T,
+            x.astype(mx.float32) @ self.weight.astype(mx.float32).T,
             self.e_score_correction_bias,
             self.top_k,
             self.n_group,
@@ -227,7 +288,10 @@ class MoEGate(nn.Module):
 class MoE(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
-        self.switch_mlp = SwitchGLU(
+        # The fused combine kernel handles top-6/top-8 routing (MiMo: top-8).
+        self._fused_combine = config.num_experts_per_tok in (6, 8)
+        switch_cls = _FusedSwitchGLU if self._fused_combine else SwitchGLU
+        self.switch_mlp = switch_cls(
             config.hidden_size,
             config.moe_intermediate_size,
             config.n_routed_experts,
@@ -239,8 +303,16 @@ class MoE(nn.Module):
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
         inds, scores = self.gate(x)
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2).astype(x.dtype)
+        if self._fused_combine:
+            # One kernel unsorts the expert rows and applies the routing
+            # weights (prefill); decode-sized batches return per-expert rows.
+            y = self.switch_mlp(x, inds, scores=scores, weighted_sum=True)
+            if y.ndim == x.ndim + 1:
+                y = (y * scores[..., None]).sum(axis=-2)
+            y = y.astype(x.dtype)
+        else:
+            y = self.switch_mlp(x, inds)
+            y = (y * scores[..., None]).sum(axis=-2).astype(x.dtype)
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)
         return y
@@ -269,6 +341,70 @@ class DecoderLayer(nn.Module):
         return h + self.mlp(self.post_attention_layernorm(h))
 
 
+class MiMoV2MTPLayer(nn.Module):
+    """One MiMo next-token predictor head."""
+
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        hidden = config.hidden_size
+        self.enorm = nn.RMSNorm(hidden, eps=config.layernorm_epsilon)
+        self.hnorm = nn.RMSNorm(hidden, eps=config.layernorm_epsilon)
+        self.eh_proj = nn.Linear(2 * hidden, hidden, bias=False)
+        self.input_layernorm = nn.RMSNorm(hidden, eps=config.layernorm_epsilon)
+        self.self_attn = Attention(config, is_sliding_window=True)
+        self.pre_mlp_layernorm = nn.RMSNorm(hidden, eps=config.layernorm_epsilon)
+        self.mlp = MLP(config)
+        self.final_layernorm = nn.RMSNorm(hidden, eps=config.layernorm_epsilon)
+        self.sliding_window_size = config.sliding_window_size
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        token_embeddings: mx.array,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        x = self.eh_proj(
+            mx.concatenate(
+                [self.enorm(token_embeddings), self.hnorm(hidden_states)], axis=-1
+            )
+        )
+        mask = create_attention_mask(
+            x,
+            cache,
+            window_size=self.sliding_window_size,
+        )
+        h = x + self.self_attn(self.input_layernorm(x), mask, cache)
+        h = h + self.mlp(self.pre_mlp_layernorm(h))
+        return self.final_layernorm(h)
+
+
+class MiMoV2MultiTokenPredictor(nn.Module):
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.layers = [
+            MiMoV2MTPLayer(config)
+            for _ in range(int(config.num_nextn_predict_layers or 0))
+        ]
+
+    def __call__(self, hidden, tokens, embed, cache):
+        outputs = []
+        for layer, layer_cache in zip(self.layers, cache):
+            if tokens.shape[1] == 0:
+                break
+            hidden = layer(hidden, embed(tokens), layer_cache)
+            outputs.append(hidden)
+            hidden, tokens = hidden[:, :-1], tokens[:, 1:]
+        return outputs
+
+
+class _MiMoMTPCache(list):
+    """Per-head caches plus the current predictor index for one draft cycle."""
+
+    def __init__(self, values=()):
+        super().__init__(values)
+        self.layer_idx = 0
+
+
 class MiMoV2Model(PipelineMixin, nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -291,7 +427,8 @@ class MiMoV2Model(PipelineMixin, nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
-    ) -> mx.array:
+        return_hidden: bool = False,
+    ) -> Any:
         h = (
             input_embeddings
             if input_embeddings is not None
@@ -322,6 +459,18 @@ class MiMoV2Model(PipelineMixin, nn.Module):
         pipeline_rank = self.pipeline_rank
         pipeline_size = self.pipeline_size
 
+        # Decode / short verify forwards: same math, fewer dispatches.
+        fast = (
+            _decode_fast.run_layers(self, h, cache, full_mask, swa_mask)
+            if pipeline_size == 1
+            else None
+        )
+        if fast is not None:
+            h, normed = fast
+            if return_hidden:
+                return normed, h
+            return normed
+
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, pipeline_rank + 1)
 
@@ -337,7 +486,10 @@ class MiMoV2Model(PipelineMixin, nn.Module):
         if pipeline_size > 1:
             h = mx.distributed.all_gather(h)[: h.shape[0]]
 
-        return self.norm(h)
+        normed = self.norm(h)
+        if return_hidden:
+            return normed, h
+        return normed
 
 
 class Model(nn.Module):
@@ -349,24 +501,111 @@ class Model(nn.Module):
         if not config.tie_word_embeddings:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+        from omlx.patches.mlx_lm_mtp import (
+            get_mtp_depth,
+            is_mtp_active,
+            is_mtp_depth_fixed,
+        )
+
+        n_mtp = int(config.num_nextn_predict_layers or 0)
+        self._omlx_mtp_decode_enabled = bool(n_mtp and is_mtp_active())
+        if self._omlx_mtp_decode_enabled:
+            self.model.mtp = MiMoV2MultiTokenPredictor(config)
+            self._omlx_mtp_chain = True
+            self._omlx_mtp_depth = min(int(get_mtp_depth()), n_mtp)
+            self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
+            self._omlx_mtp_head_clone = True
+            self._omlx_mtp_head_prenorm = True
+
+    @property
+    def mtp(self):
+        return self.model.mtp
+
     def __call__(
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        return_hidden: bool = False,
+        n_confirmed: int = 0,
     ):
-        out = self.model(inputs, cache, input_embeddings)
+        del n_confirmed
+        result = self.model(
+            inputs,
+            cache,
+            input_embeddings,
+            return_hidden=return_hidden,
+        )
+        if return_hidden:
+            out, hidden = result
+        else:
+            out = result
         if self.args.tie_word_embeddings:
-            return self.model.embed_tokens.as_linear(out)
-        return self.lm_head(out)
+            logits = self.model.embed_tokens.as_linear(out)
+        else:
+            logits = self.lm_head(out)
+        if return_hidden:
+            return logits, hidden
+        return logits
+
+    def mtp_begin_cycle(self, mtp_cache, depth):
+        del depth
+        if isinstance(mtp_cache, _MiMoMTPCache):
+            mtp_cache.layer_idx = 0
+
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        return_hidden: bool = False,
+        logits_keep: int = 0,
+    ):
+        layer_idx = getattr(mtp_cache, "layer_idx", 0) % len(self.mtp.layers)
+        cache = mtp_cache[layer_idx] if mtp_cache else None
+        token_embeddings = self.model.embed_tokens(next_token_ids)
+        hidden = self.mtp.layers[layer_idx](hidden_states, token_embeddings, cache)
+        if isinstance(mtp_cache, _MiMoMTPCache):
+            mtp_cache.layer_idx = layer_idx + 1
+        logits_source = hidden[:, -logits_keep:] if logits_keep else hidden
+        if self.args.tie_word_embeddings:
+            logits = self.model.embed_tokens.as_linear(logits_source)
+        else:
+            logits = self.lm_head(logits_source)
+        if return_hidden:
+            return logits, hidden
+        return logits
+
+    def make_mtp_cache(self):
+        if not hasattr(self.model, "mtp"):
+            return _MiMoMTPCache()
+        return _MiMoMTPCache(
+            RotatingKVCache(max_size=self.args.sliding_window_size)
+            for _ in self.mtp.layers
+        )
+
+    def mtp_partial_rollback(self, cache, accepted, num_drafts):
+        rejected = num_drafts - accepted
+        if rejected <= 0:
+            return True
+        if not all(c.is_trimmable() for c in cache):
+            return False
+        for c in cache:
+            if c.trim(rejected) != rejected:
+                raise RuntimeError("MiMo MTP cache rollback was incomplete")
+        return True
 
     def sanitize(self, weights):
+        if hasattr(self.model, "mtp") and self.args.omlx_mtp_sidecar:
+            weights = {**weights, **mx.load(self.args.omlx_mtp_sidecar)}
+
         skip_prefixes = (
-            "model.mtp.",
             "visual.",
             "audio_encoder.",
             "speech_embeddings.",
         )
+        if not hasattr(self.model, "mtp"):
+            skip_prefixes += ("model.mtp.",)
         weights = {k: v for k, v in weights.items() if not k.startswith(skip_prefixes)}
 
         BS = FUSED_QKV_BLOCK_SIZE
@@ -377,6 +616,23 @@ class Model(nn.Module):
             return None if tensor is None else tensor.shape
 
         TP = detect_fused_qkv_tp(self.args, shape_of)
+        n_mtp = int(self.args.num_nextn_predict_layers or 0)
+        mtp_tp = TP
+        main_fused = any(
+            fused_qkv_keys(i)[1] in weights for i in range(self.args.num_hidden_layers)
+        )
+        sidecar_fused = any(
+            f"model.mtp.layers.{i}.self_attn.qkv_proj.weight_scale_inv" in weights
+            for i in range(n_mtp)
+        )
+        if sidecar_fused and not main_fused:
+            # Sliding-window qkv shapes fit every TP degree, so the split main
+            # layers leave nothing to detect; Xiaomi's releases use TP=4.
+            mtp_tp = 4
+            logger.info(
+                "MiMo MTP sidecar: the main layers are already split; assuming "
+                "the official TP=4 fused qkv layout"
+            )
 
         def dequant_block(weight, scale_inv):
             weight = mx.from_fp8(weight, dtype=bf16)
@@ -410,6 +666,42 @@ class Model(nn.Module):
             weights[f"{prefix}.k_proj.weight"] = k
             weights[f"{prefix}.v_proj.weight"] = v
 
+        for layer_idx in range(n_mtp):
+            prefix = f"model.mtp.layers.{layer_idx}.self_attn"
+            qkv_prefix = f"{prefix}.qkv_proj"
+            qkv_key = f"{qkv_prefix}.weight"
+            scale_key = f"{qkv_key}_scale_inv"
+            if qkv_key in weights and scale_key in weights:
+                q, k, v = split_fused_qkv(
+                    weights.pop(qkv_key),
+                    weights.pop(scale_key),
+                    tp=mtp_tp,
+                    n_h=self.args.swa_num_attention_heads,
+                    n_kv=self.args.swa_num_key_value_heads,
+                    hd=self.args.swa_head_dim,
+                    vhd=self.args.swa_v_head_dim,
+                )
+                weights[f"{prefix}.q_proj.weight"] = q
+                weights[f"{prefix}.k_proj.weight"] = k
+                weights[f"{prefix}.v_proj.weight"] = v
+                continue
+
+            # Packed MLX weights, scales, and biases share the output-row axis.
+            # Split them at the same Q/K boundaries.
+            if qkv_key not in weights or f"{qkv_prefix}.scales" not in weights:
+                continue
+            q_rows = self.args.swa_num_attention_heads * self.args.swa_head_dim
+            k_rows = self.args.swa_num_key_value_heads * self.args.swa_head_dim
+            boundaries = [q_rows, q_rows + k_rows]
+            for suffix in ("weight", "scales", "biases"):
+                fused_key = f"{qkv_prefix}.{suffix}"
+                if fused_key not in weights:
+                    continue
+                q, k, v = mx.split(weights.pop(fused_key), boundaries, axis=0)
+                weights[f"{prefix}.q_proj.{suffix}"] = q
+                weights[f"{prefix}.k_proj.{suffix}"] = k
+                weights[f"{prefix}.v_proj.{suffix}"] = v
+
         scale_keys = [k for k in weights if k.endswith("weight_scale_inv")]
         for sk in scale_keys:
             wk = sk[: -len("_scale_inv")]
@@ -420,6 +712,27 @@ class Model(nn.Module):
             for proj in ("gate_proj", "down_proj", "up_proj"):
                 expert0 = f"{prefix}.experts.0.{proj}.weight"
                 if expert0 not in weights:
+                    continue
+                scale0 = expert0 + "_scale"
+                if scale0 in weights:
+                    packed, scales = [], []
+                    for e in range(self.args.n_routed_experts):
+                        key = f"{prefix}.experts.{e}.{proj}.weight"
+                        weight = weights.pop(key)
+                        scale = weights.pop(key + "_scale")
+                        if (
+                            weight.dtype != mx.uint8
+                            or scale.dtype != mx.uint8
+                            or scale.shape != (weight.shape[0], weight.shape[1] // 16)
+                        ):
+                            raise ValueError(
+                                f"Invalid MiMo MXFP4 weight/scale pair: {key}"
+                            )
+                        packed.append(weight.view(mx.uint32))
+                        scales.append(scale)
+                    target = f"{prefix}.switch_mlp.{proj}"
+                    weights[f"{target}.weight"] = mx.stack(packed)
+                    weights[f"{target}.scales"] = mx.stack(scales)
                     continue
                 weights[f"{prefix}.switch_mlp.{proj}.weight"] = mx.stack(
                     [

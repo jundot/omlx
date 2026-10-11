@@ -48,6 +48,7 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     var anePrefillDefaultFraction: Double? = nil
     var anePrefillMlpFractions: [Double]? = nil
     var anePrefillSharedFractions: [Double]? = nil
+    var embeddingAudioSupported: Bool? = nil
     /// True when the model is structurally compatible with DFlash (block
     /// diffusion speculative decoding). The toggle stays disabled when false.
     let dflashCompatible: Bool?
@@ -108,6 +109,8 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let activeProfileName: String?
     // Security
     let trustRemoteCode: Bool?
+    var embeddingAudioEnabled: Bool? = nil
+    var embeddingAudioMaxSeconds: Double? = nil
     // Chat-template kwargs (free-form dict + a sibling list of keys the
     // user wants to *force* — those go to `forced_ct_kwargs` server-side
     // and override the request's `chat_template_kwargs`).
@@ -165,6 +168,7 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let dflashVerifyMode: String?
     // Experimental: native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     let mtpEnabled: Bool?
+    let mtpAdaptiveMaxDepth: Int?
     // Experimental: VLM MTP (mlx-vlm assistant-drafter speculative decoding)
     let vlmMtpEnabled: Bool?
     let vlmMtpDraftModel: String?
@@ -196,6 +200,8 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var isFavorite: Bool? = nil
     // Security
     var trustRemoteCode: Bool? = nil
+    var embeddingAudioEnabled: Bool? = nil
+    var embeddingAudioMaxSeconds: Double?? = nil // .some(nil) sends JSON null (30 s default).
     var reasoningParser: String? = nil
     // Chat-template kwargs
     var chatTemplateKwargs: [String: AnyCodable]? = nil
@@ -250,10 +256,74 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var dflashVerifyMode: String? = nil
     // Experimental: native MTP
     var mtpEnabled: Bool? = nil
+    var mtpAdaptiveMaxDepth: Int? = nil
+    var mtpFixedDepth: Int?? = nil // .some(nil) sends JSON null (adaptive).
     // Experimental: VLM MTP
     var vlmMtpEnabled: Bool? = nil
     var vlmMtpDraftModel: String? = nil
     var vlmMtpDraftBlockSize: Int? = nil
+}
+
+/// Body for POST /admin/api/models/{id}/settings/recipe.
+struct ApplyRecipeRequest: Encodable, Sendable {
+    let recipe: String
+}
+
+/// Body for POST /admin/api/models/{id}/settings/optimal.
+struct ApplyOptimalRequest: Encodable, Sendable {
+    let benchmarkId: String
+}
+
+struct SkippedFeatureDTO: Codable, Equatable, Sendable {
+    let feature: String
+    let reason: String
+}
+
+/// One omlx.ai benchmark row offered by GET /settings/optimal.
+struct OptimalCandidateDTO: Decodable, Identifiable, Sendable {
+    let benchmarkId: String
+    let benchmarkUrl: String?
+    let ppTps: Double?
+    let tgTps: Double?
+    let quantization: String?
+    let omlxVersion: String?
+    let createdAt: String?
+    let contextProfile: String?
+    let memoryGb: Int?
+
+    var id: String { benchmarkId }
+}
+
+/// Response of GET /admin/api/models/{id}/settings/optimal: best rows by
+/// prompt processing and by token generation for this device and model.
+struct OptimalCandidatesDTO: Decodable, Sendable {
+    let found: Bool
+    let modelName: String?
+    let contextLength: Int?
+    let byPp: [OptimalCandidateDTO]
+    let byTg: [OptimalCandidateDTO]
+    let searchUrl: String?
+}
+
+/// Response of the settings snapshot endpoints (reset / recipe / optimal
+/// apply). Carries the persisted `settings` plus the scoped `applied` values
+/// and the features `skipped` on this machine; the optimal apply adds the
+/// benchmark summary.
+struct SettingsApplyResultDTO: Decodable, Sendable {
+    let success: Bool?
+    let benchmarkId: String?
+    let benchmarkUrl: String?
+    let ppTps: Double?
+    let tgTps: Double?
+    let quantization: String?
+    let omlxVersion: String?
+    let requiresReload: Bool?
+    let autoUnloaded: Bool?
+    let autoReloaded: Bool?
+    let changed: Bool?
+    let applied: [String: AnyCodable]?
+    let skipped: [SkippedFeatureDTO]?
+    let settings: ModelSettingsDTO?
 }
 
 /// Generic acknowledgment shape returned by non-streaming admin endpoints

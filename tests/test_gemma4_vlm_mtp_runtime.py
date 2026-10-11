@@ -160,6 +160,12 @@ def test_attach_and_chain_flags_when_active():
     )
 
 
+def test_attach_leaves_drafter_unbound():
+    # A bind here would pin the float embed_tokens that nn.quantize() replaces.
+    lm = _language_model(_text_config({"mtp_assistant_config": TINY_ASSISTANT_CONFIG}))
+    assert lm.mtp._input_embed is None
+
+
 def _stubbed_mtp_lm(cache_entries):
     """LanguageModel with an attached stub drafter and fake cache stash."""
     lm_mtp.set_mtp_active(True)
@@ -219,9 +225,6 @@ def test_mtp_forward_uses_plain_int_offset_and_batch_idx():
 
 
 def test_mtp_forward_rebinds_stale_input_embed():
-    # nn.quantize() swaps the backbone embed_tokens module after the
-    # __init__-time bind; mtp_forward must re-bind so the drafter never
-    # embeds through a stale (random-init) module.
     lm, drafter = _stubbed_mtp_lm([SimpleNamespace(offset=3)])
     lm._omlx_mtp_shared_kv = {
         "full_attention": (mx.zeros((1, 1, 3, 8)), mx.zeros((1, 1, 3, 8)))

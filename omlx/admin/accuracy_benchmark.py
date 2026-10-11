@@ -303,7 +303,7 @@ async def _continue_queue(engine_pool: Any, chain_id: int) -> None:
     _current_run_id = run.bench_id
     # Queue-continued runs execute inside this chain's own task; record it
     # so cancel_queue can hard-cancel them instead of waiting for the next
-    # on_progress checkpoint (up to a full generation batch away).
+    # on_progress checkpoint (up to one answered question away).
     run.task = asyncio.current_task()
 
     logger.info(
@@ -368,7 +368,7 @@ async def run_accuracy_benchmark(
     """Execute accuracy benchmark run.
 
     Phases:
-    1. Unload all models
+    1. Unload all models (a reusable resident target stays loaded)
     2. Load target model
     3. For each selected benchmark: load data, evaluate, report
     4. Unload model
@@ -383,6 +383,7 @@ async def run_accuracy_benchmark(
         engine_pool._suppress_ttl = True
     start_time = time.time()
     client: Optional[ExternalAPIClient] = None
+    leased_model_id: Optional[str] = None
 
     try:
         run.phase = "loading"
@@ -406,8 +407,14 @@ async def run_accuracy_benchmark(
             await engine.preflight()
             sampling_kwargs = {}
         else:
-            # Phase 1: Unload all models
-            loaded_ids = engine_pool.get_loaded_model_ids()
+            # Phase 1: Unload all models except a resident target that the
+            # LM load below would reuse as-is.
+            loaded_ids = [
+                model_id
+                for model_id in engine_pool.get_loaded_model_ids()
+                if model_id != request.model_id
+                or engine_pool._force_lm_replaces_engine(model_id)
+            ]
             if loaded_ids:
                 await _send_event(run, {
                     "type": "progress",
@@ -437,7 +444,12 @@ async def run_accuracy_benchmark(
 
             # Force LM engine for accuracy benchmarks — text-only tasks
             # don't need VLM and the VLM adapter can produce empty responses.
-            engine = await engine_pool.get_engine(request.model_id, force_lm=True)
+            # The lease keeps settings saves and eviction from unloading the
+            # engine between eval batches.
+            engine = await engine_pool.get_engine(
+                request.model_id, force_lm=True, _lease=True
+            )
+            leased_model_id = request.model_id
 
             # Load model sampling settings. Under the default "deterministic"
             # profile sampling params are not read — the benchmark runs greedy
@@ -585,6 +597,12 @@ async def run_accuracy_benchmark(
                         "completion_tokens": qr.completion_tokens,
                         "error_message": qr.error_message,
                     })
+                else:
+                    question_data.update({
+                        "finish_reason": qr.finish_reason,
+                        "prompt_tokens": qr.prompt_tokens,
+                        "completion_tokens": qr.completion_tokens,
+                    })
                 question_results.append(question_data)
 
             result_data = {
@@ -639,6 +657,27 @@ async def run_accuracy_benchmark(
                         )
                     ),
                 })
+            else:
+                # Answers that hit the token limit (max_tokens) are scored on
+                # incomplete output; count them so the headline is not read as
+                # clean (#3772). "Finished" means a normal stop, so errored or
+                # aborted answers count as neither. Accuracy on finished answers
+                # describes only those (None when there are none); it is not a
+                # corrected score.
+                questions = result.question_results
+                truncated = [qr for qr in questions if qr.finish_reason == "length"]
+                finished = [
+                    qr for qr in questions if qr.finish_reason in ("stop", "tool_calls")
+                ]
+                result_data.update({
+                    "truncated_count": len(truncated),
+                    "truncated_correct_count": sum(qr.correct for qr in truncated),
+                    "finished_count": len(finished),
+                    "finished_accuracy": (
+                        round(sum(qr.correct for qr in finished) / len(finished), 4)
+                        if finished else None
+                    ),
+                })
             if result.category_scores:
                 result_data["category_scores"] = {
                     k: round(v, 4) for k, v in result.category_scores.items()
@@ -680,6 +719,9 @@ async def run_accuracy_benchmark(
         # user "still running" while we clean up reads as a bug).
         run.phase = "unloading"
         if request.external is None:
+            if leased_model_id is not None:
+                await engine_pool.release_engine(leased_model_id)
+                leased_model_id = None
             try:
                 await engine_pool._unload_engine(request.model_id)
             except Exception:
@@ -716,6 +758,8 @@ async def run_accuracy_benchmark(
             "message": str(e),
         })
     finally:
+        if leased_model_id is not None:
+            await engine_pool.release_engine(leased_model_id)
         # Re-enable TTL auto-unload
         engine_pool._suppress_ttl = False
         if client is not None:

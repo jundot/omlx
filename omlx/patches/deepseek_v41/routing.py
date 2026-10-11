@@ -7,7 +7,7 @@ import mlx.core as mx
 
 _SOURCE = r"""
     const uint i = thread_position_in_grid.x;
-    if (i >= ROWS * D) return;
+    if (i >= shared_shape[0] * shared_shape[1] * D) return;
     const uint row = i / D, d = i % D;
     float sum = 0.0f;
     for (uint j = 0; j < K; j++) {
@@ -42,10 +42,9 @@ def combine_sorted_experts(routed, inverse, shared):
     ):
         return None
     width = shared.shape[-1]
-    rows = shared.size // width
     return _kernel()(
         inputs=[routed, inverse, shared],
-        template=[("T", shared.dtype), ("ROWS", rows), ("D", width), ("K", 6)],
+        template=[("T", shared.dtype), ("D", width), ("K", 6)],
         grid=(shared.size, 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[shared.shape],

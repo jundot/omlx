@@ -20,14 +20,17 @@ class EmbeddingInputItem(BaseModel):
     # Image values are request-facing and must be inline data URIs. Remote URLs
     # and filesystem paths are rejected before processor-specific preparation.
     image: Optional[str] = None
+    # Audio values follow the chat input_audio rule: a base64 data URI or bare
+    # base64, never a URL or filesystem path.
+    audio: Optional[str] = None
 
     model_config = {"extra": "forbid"}
 
     @model_validator(mode="after")
     def validate_fields(self) -> "EmbeddingInputItem":
         """Require at least one supported field."""
-        if self.text is None and self.image is None:
-            raise ValueError("Embedding input item must include text or image")
+        if self.text is None and self.image is None and self.audio is None:
+            raise ValueError("Embedding input item must include text, image, or audio")
         return self
 
 

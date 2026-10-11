@@ -55,11 +55,11 @@ def test_nemotron_compatibility_has_an_explicit_assignment_contract(tmp_path):
         assert pipeline_assignment_is_honored(model)
 
 
-def test_a_custom_unmarked_pipeline_remains_fail_closed(tmp_path):
+def test_deepseek_v32_inherits_the_pipeline_contract(tmp_path):
     model = _model_config(tmp_path, "deepseek_v32")
 
     with install_pipeline_compatibility(_assignment()):
-        assert not pipeline_assignment_is_honored(model)
+        assert pipeline_assignment_is_honored(model)
 
 
 def test_minimax_declares_its_wrapped_assigned_stage_contract(tmp_path):

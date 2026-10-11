@@ -30,8 +30,6 @@ def _fresh_moe_patch(monkeypatch):
     import omlx.patches.qwen35_moe_weighted_sum as patch
 
     monkeypatch.setattr(patch, "_PATCHED", False, raising=False)
-    monkeypatch.delenv("OMLX_QWEN35_MOE_WEIGHTED_SUM", raising=False)
-    monkeypatch.delenv("OMLX_QWEN35_MOE_WEIGHTED_SUM_MIN_TOKENS", raising=False)
 
     originals = []
     try:
@@ -148,7 +146,8 @@ def test_external_prefill_evaluates_native_weighted_sum_on_engine_stream():
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="Metal is required")
-def test_qwen3_moe_patch_matches_stock_and_skips_decode(monkeypatch):
+@pytest.mark.parametrize("top_k", [8, 10])
+def test_qwen3_moe_patch_matches_stock_and_skips_decode(monkeypatch, top_k):
     from mlx_lm.models import qwen3_moe
 
     from omlx.custom_kernels.qwen35_prefill import fast
@@ -159,17 +158,18 @@ def test_qwen3_moe_patch_matches_stock_and_skips_decode(monkeypatch):
     if not fast.has_symbol("qwen35_moe_weighted_sum"):
         pytest.skip("qwen35_moe_weighted_sum native kernel unavailable")
 
-    monkeypatch.setenv("OMLX_QWEN35_MOE_WEIGHTED_SUM", "1")
-    monkeypatch.setenv("OMLX_QWEN35_MOE_WEIGHTED_SUM_MIN_TOKENS", "16")
+    monkeypatch.setattr("omlx.patches.qwen35_moe_weighted_sum._MIN_TOKENS", 16)
 
     args = types.SimpleNamespace(
         hidden_size=128,
         moe_intermediate_size=64,
         num_experts=16,
-        num_experts_per_tok=8,
+        num_experts_per_tok=top_k,
         norm_topk_prob=True,
     )
     block = qwen3_moe.Qwen3MoeSparseMoeBlock(args)
+    # The native kernel accepts only half-precision expert outputs.
+    block.set_dtype(mx.bfloat16)
     x = mx.random.normal((1, 32, 128)).astype(mx.bfloat16)
     orig_call = qwen3_moe.Qwen3MoeSparseMoeBlock.__call__
     y_ref = orig_call(block, x)
@@ -179,8 +179,10 @@ def test_qwen3_moe_patch_matches_stock_and_skips_decode(monkeypatch):
     orig_weighted_sum = fast.qwen35_moe_weighted_sum
 
     def spy(*args, **kwargs):
+        # Count only native results; a rejected shape falls back to stock.
+        out = orig_weighted_sum(*args, **kwargs)
         calls["count"] += 1
-        return orig_weighted_sum(*args, **kwargs)
+        return out
 
     monkeypatch.setattr(fast, "qwen35_moe_weighted_sum", spy)
     assert apply_qwen35_moe_weighted_sum_patch() is True

@@ -488,3 +488,22 @@ class TestRealDflashIntegration:
                 )
                 is True
             )
+
+
+def test_snapshot_serializes_valid_kv_without_capacity_tail():
+    import mlx.core as mx
+    from mlx_lm.models.cache import KVCache
+    from dflash_mlx.cache import codecs
+    from omlx.patches.dflash_lifecycle import _install_cache_serializer
+
+    cache = KVCache()
+    keys = mx.ones((1, 2, 7, 16))
+    cache.update_and_fetch(keys, keys * 2)
+    assert cache.keys.shape[2] > cache.offset
+    _install_cache_serializer()
+    fa, recurrent = codecs.serialize_target_cache([cache])
+    assert fa[0][0].shape[2] == fa[0][2] == 7
+    assert mx.array_equal(fa[0][1], keys * 2)
+    assert recurrent == (None,)
+    cache.update_and_fetch(keys, keys)
+    assert fa[0][0].shape[2] == 7

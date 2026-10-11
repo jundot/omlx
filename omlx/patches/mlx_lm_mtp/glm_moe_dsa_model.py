@@ -352,10 +352,11 @@ def _patch_model(glm: Any) -> None:
         if mtp_decode_enabled:
             n_main = config.num_hidden_layers
             self.mtp = [glm.GlmMTPBlock(config, n_main + i) for i in range(n_mtp)]
-            from . import get_mtp_depth
+            from . import get_mtp_depth, is_mtp_depth_fixed
 
             self._omlx_mtp_chain = True
             self._omlx_mtp_depth = get_mtp_depth()
+            self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
             self._omlx_mtp_head_clone = False
             # Marginal cost prior for the adaptive depth controller: with
             # 8-of-256 routing each extra verify row pulls an almost

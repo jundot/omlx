@@ -24,6 +24,15 @@ except ImportError:
     HAS_MLX = False
 
 
+def _wait_until(predicate, timeout=5.0, interval=0.01):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+    return True
+
+
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestHotCacheDisabled:
     """Verify that hot_cache_max_bytes=0 preserves existing behaviour."""
@@ -328,8 +337,9 @@ class TestHotCachePromotion:
             model_name="test",
             layer_cache_types=["KVCache"] * 4,
         )
-        # Wait for background SSD write to complete
-        time.sleep(0.5)
+        metadata = mgr_cold._index.get(block_hash)
+        assert metadata is not None
+        assert _wait_until(lambda: metadata.file_path.exists())
         mgr_cold.close()
 
         # Now open with hot cache enabled — block is on SSD only
@@ -448,8 +458,9 @@ class TestHotCachePromotion:
                 layer_cache_types=["KVCache"] * 4,
             )
 
-            # Wait for background write
-            time.sleep(0.5)
+            metadata = mgr._index.get(block_hash)
+            assert metadata is not None
+            assert _wait_until(lambda: metadata.file_path.exists())
 
             # Clear the temporary buffer (simulates what happens after write completes)
             mgr._hot_cache_remove(block_hash)
@@ -902,8 +913,7 @@ class TestHotCacheWriteBack:
             # Block should be in hot cache
             assert mgr._hot_cache_get(block_hash) is not None
 
-            # No SSD file should exist yet
-            time.sleep(0.3)
+            # Write-back mode does not enqueue an SSD write before eviction.
             ssd_files = list((tmp_path / "wb_test").rglob("*.safetensors"))
             assert len(ssd_files) == 0, f"Unexpected SSD files: {ssd_files}"
         finally:
@@ -933,8 +943,7 @@ class TestHotCacheWriteBack:
                     layer_cache_types=["KVCache"] * 2,
                 )
 
-            # No SSD files yet
-            time.sleep(0.3)
+            # Write-back mode does not enqueue an SSD write before eviction.
             ssd_files = list((tmp_path / "wb_evict_test").rglob("*.safetensors"))
             assert len(ssd_files) == 0
 
@@ -948,10 +957,10 @@ class TestHotCacheWriteBack:
                 layer_cache_types=["KVCache"] * 2,
             )
 
-            # Wait for background writer to process the evicted block
-            time.sleep(0.5)
-            ssd_files = list((tmp_path / "wb_evict_test").rglob("*.safetensors"))
-            assert len(ssd_files) >= 1, "Evicted block should be written to SSD"
+            assert _wait_until(
+                lambda: len(list((tmp_path / "wb_evict_test").rglob("*.safetensors")))
+                >= 1
+            ), "Evicted block should be written to SSD"
         finally:
             mgr.close()
 
@@ -976,8 +985,7 @@ class TestHotCacheWriteBack:
                 layer_cache_types=["KVCache"] * 2,
             )
 
-        # No SSD files before close
-        time.sleep(0.3)
+        # Write-back mode does not enqueue an SSD write before close.
         ssd_files = list((tmp_path / "wb_flush_test").rglob("*.safetensors"))
         assert len(ssd_files) == 0
 
@@ -1018,8 +1026,7 @@ class TestHotCacheWriteBack:
                 layer_cache_types=["KVCache"] * 2,
             )
 
-        # All blocks in hot cache, no SSD files yet
-        time.sleep(0.3)
+        # All blocks remain in hot cache until close, so no SSD write is queued.
         ssd_files = list((tmp_path / "wb_queue_full_test").rglob("*.safetensors"))
         assert len(ssd_files) == 0
 
@@ -1106,13 +1113,14 @@ class TestPendingWriteBuffer:
             with mgr._pending_write_hashes_lock:
                 assert b"cleanup_test_blk0" in mgr._pending_write_buffers
 
-            # Wait for writer to finish
-            time.sleep(1.0)
+            def pending_block_exists():
+                with mgr._pending_write_hashes_lock:
+                    return (
+                        b"cleanup_test_blk0" in mgr._pending_write_buffers
+                        or b"cleanup_test_blk0" in mgr._pending_write_hashes
+                    )
 
-            # Buffer should be empty after writer cleanup
-            with mgr._pending_write_hashes_lock:
-                assert b"cleanup_test_blk0" not in mgr._pending_write_buffers
-                assert b"cleanup_test_blk0" not in mgr._pending_write_hashes
+            assert _wait_until(lambda: not pending_block_exists())
         finally:
             mgr.close()
 
@@ -1256,12 +1264,11 @@ class TestPendingWriteBuffer:
             assert loaded is not None, "Should load from pending buffer"
             assert mgr._stats["hot_cache_hits"] >= 1
 
-            # Phase 2: wait for writer to complete
-            time.sleep(1.0)
+            def pending_block_exists():
+                with mgr._pending_write_hashes_lock:
+                    return b"lifecycle_blk_00" in mgr._pending_write_buffers
 
-            # Buffer should be empty
-            with mgr._pending_write_hashes_lock:
-                assert b"lifecycle_blk_00" not in mgr._pending_write_buffers
+            assert _wait_until(lambda: not pending_block_exists())
 
             # Phase 3: SSD hit (block now on disk)
             loaded_ssd = mgr.load_block(b"lifecycle_blk_00")
@@ -1567,15 +1574,6 @@ class TestHotCacheWriteThrough:
             layer_cache_types=["KVCache"] * num_layers,
         )
 
-    @staticmethod
-    def _wait_for(predicate, timeout=5.0):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if predicate():
-                return True
-            time.sleep(0.05)
-        return False
-
     def test_write_through_retains_and_persists_immediately(self, tmp_path):
         """Save lands in the hot cache AND gets an SSD index entry + file
         without eviction or shutdown."""
@@ -1591,10 +1589,10 @@ class TestHotCacheWriteThrough:
 
             # The background writer commits the file with no eviction/close
             meta = mgr._index.get(block_hash)
-            assert self._wait_for(lambda: Path(meta.file_path).exists())
+            assert _wait_until(lambda: Path(meta.file_path).exists())
 
             # The retained entry is marked clean once its write commits
-            assert self._wait_for(
+            assert _wait_until(
                 lambda: not mgr._hot_cache[block_hash].get("dirty", True)
             )
         finally:
@@ -1607,7 +1605,7 @@ class TestHotCacheWriteThrough:
         block_hash = b"wt_restart_test_1"
         assert self._save_block(mgr, block_hash) is True
         meta = mgr._index.get(block_hash)
-        assert self._wait_for(lambda: Path(meta.file_path).exists())
+        assert _wait_until(lambda: Path(meta.file_path).exists())
         mgr.close()
 
         mgr2 = PagedSSDCacheManager(
@@ -1644,8 +1642,8 @@ class TestHotCacheWriteThrough:
             block_hash = b"wt_clean_evict_test"
             assert self._save_block(mgr, block_hash) is True
             meta = mgr._index.get(block_hash)
-            assert self._wait_for(lambda: Path(meta.file_path).exists())
-            assert self._wait_for(
+            assert _wait_until(lambda: Path(meta.file_path).exists())
+            assert _wait_until(
                 lambda: not mgr._hot_cache[block_hash].get("dirty", True)
             )
 
@@ -1689,7 +1687,7 @@ class TestHotCacheWriteThrough:
             # Dirty entry was flushed instead of dropped
             assert mgr._index.contains(block_hash)
             meta = mgr._index.get(block_hash)
-            assert self._wait_for(lambda: Path(meta.file_path).exists())
+            assert _wait_until(lambda: Path(meta.file_path).exists())
             assert mgr.load_block(block_hash) is not None
         finally:
             mgr.close()

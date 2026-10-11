@@ -23,6 +23,19 @@ import mlx.nn as nn
 import numpy as np
 
 RESIDENT_READ_BYTES = 8 * 1024 * 1024
+# safetensors dtype tag -> numpy transport dtype (bf16 travels as raw uint16).
+SAFETENSORS_NUMPY_DTYPES = {
+    "BF16": "<u2",
+    "F16": "<f2",
+    "F32": "<f4",
+    "U32": "<u4",
+    "U8": "u1",
+    "I8": "i1",
+    "F8_E4M3": "u1",
+    "F8_E8M0": "u1",
+    "F8_E4M3FN": "u1",
+    "F8_E8M0FNU": "u1",
+}
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 PAGE_PREFETCH_MIN_ROWS = 128
 PAGE_IO_WORKERS = 48
@@ -81,21 +94,9 @@ class TensorFile:
                 raise RuntimeError("Engram tensor file is closed")
             entry = self.header[key]
             dtype = entry["dtype"]
-            formats = {
-                "BF16": "<u2",
-                "F16": "<f2",
-                "F32": "<f4",
-                "U32": "<u4",
-                "U8": "u1",
-                "I8": "i1",
-                "F8_E4M3": "u1",
-                "F8_E8M0": "u1",
-                "F8_E4M3FN": "u1",
-                "F8_E8M0FNU": "u1",
-            }
-            if dtype not in formats:
+            if dtype not in SAFETENSORS_NUMPY_DTYPES:
                 raise ValueError(f"Unsupported source tensor dtype: {dtype}")
-            dt = np.dtype(formats[dtype])
+            dt = np.dtype(SAFETENSORS_NUMPY_DTYPES[dtype])
             start, end = entry["data_offsets"]
             if end - start != math.prod(entry["shape"]) * dt.itemsize:
                 raise ValueError(f"Invalid tensor byte length: {key}")

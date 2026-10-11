@@ -1,14 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MiMo V2.5 text-model support for the pinned mlx-lm dependency.
+"""Register the MiMo V2 text, multimodal, and Lightning MTP implementation.
 
-This ports ml-explore/mlx-lm#1219 into oMLX without modifying the installed
-mlx-lm package. The upstream PR adds ``mlx_lm.models.mimo_v2`` for the text
-backbone shared by MiMo V2.5 and MiMo V2.5 Pro. The model intentionally drops
-vision, audio, speech, and MTP weights during sanitize.
-
-MLX-LM resolves model architectures with a dynamic import under its own
-namespace. Until upstream ships the module, register the vendored file under
-that name so the normal loader path remains unchanged.
+The vendored model extends mlx-lm PR 1219. Both model aliases must resolve to it because the upstream modules lack oMLX's embedding and MTP contracts.
 """
 
 from __future__ import annotations
@@ -25,64 +18,71 @@ PR_HEAD_SHA = "96dd6fc2e0d2a1c43fcbd5b3c4be7dee640ad304"
 PR_URL = "https://github.com/ml-explore/mlx-lm/pull/1219"
 
 _MODULE_NAME = "mlx_lm.models.mimo_v2"
+_FLASH_MODULE_NAME = "mlx_lm.models.mimo_v2_flash"
 _APPLIED = False
 
 
 def _register_module() -> None:
-    if _MODULE_NAME in sys.modules:
-        return
-
     file_path = Path(__file__).parent / "mimo_v2_model.py"
     spec = importlib.util.spec_from_file_location(_MODULE_NAME, str(file_path))
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not create spec for {_MODULE_NAME} from {file_path}")
 
+    previous = {
+        name: sys.modules.get(name) for name in (_MODULE_NAME, _FLASH_MODULE_NAME)
+    }
     module = importlib.util.module_from_spec(spec)
     module.__package__ = "mlx_lm.models"
     sys.modules[_MODULE_NAME] = module
+    sys.modules[_FLASH_MODULE_NAME] = module
     try:
         spec.loader.exec_module(module)
         models_pkg = importlib.import_module("mlx_lm.models")
         models_pkg.mimo_v2 = module
+        models_pkg.mimo_v2_flash = module
     except BaseException:
-        if sys.modules.get(_MODULE_NAME) is module:
-            sys.modules.pop(_MODULE_NAME)
+        for name, old_module in previous.items():
+            if sys.modules.get(name) is not module:
+                continue
+            if old_module is None:
+                sys.modules.pop(name)
+            else:
+                sys.modules[name] = old_module
         raise
 
     logger.info("Registered %s from %s", _MODULE_NAME, file_path.name)
 
 
 def apply_mimo_v2_patch() -> bool:
-    """Register ``mlx_lm.models.mimo_v2`` when upstream lacks it."""
+    """Register oMLX's extended ``mlx_lm.models.mimo_v2`` implementation."""
     global _APPLIED
-    if _APPLIED:
+    file_path = (Path(__file__).parent / "mimo_v2_model.py").resolve()
+    current = sys.modules.get(_MODULE_NAME)
+    flash_current = sys.modules.get(_FLASH_MODULE_NAME)
+    current_path = getattr(current, "__file__", None)
+    if (
+        _APPLIED
+        and current is flash_current
+        and current_path
+        and Path(current_path).resolve() == file_path
+    ):
         return False
 
     try:
-        module = importlib.import_module(_MODULE_NAME)
+        importlib.import_module("mlx_lm.models")
     except ModuleNotFoundError as error:
         if error.name == "mlx_lm":
             logger.debug("mlx_lm not importable - MiMo V2.5 patch skipped")
             return False
-        if error.name != _MODULE_NAME:
-            raise
-        _register_module()
-        applied = True
-    else:
-        models_pkg = importlib.import_module("mlx_lm.models")
-        models_pkg.mimo_v2 = module
-        applied = False
+        raise
 
+    _register_module()
     _APPLIED = True
-    if applied:
-        logger.info(
-            "MiMo V2.5 mlx-lm patch applied (PR 1219 head %s)",
-            PR_HEAD_SHA[:8],
-        )
-        return True
-
-    logger.debug("mlx_lm.models.mimo_v2 already available upstream")
-    return False
+    logger.info(
+        "MiMo V2.5 mlx-lm patch applied (PR 1219 head %s)",
+        PR_HEAD_SHA[:8],
+    )
+    return True
 
 
 def is_applied() -> bool:

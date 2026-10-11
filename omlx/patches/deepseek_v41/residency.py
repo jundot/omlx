@@ -24,7 +24,8 @@ class EngramResidencyEstimate:
 
 
 @lru_cache(maxsize=128)
-def _header(filename, size, mtime_ns):
+def header_with_offset(filename, size, mtime_ns):
+    """A shard's safetensors header and the file offset of its tensor data."""
     with open(filename, "rb") as file:
         raw = file.read(8)
         if len(raw) != 8:
@@ -32,20 +33,29 @@ def _header(filename, size, mtime_ns):
         length = struct.unpack("<Q", raw)[0]
         if length > size - 8:
             raise ValueError("Invalid safetensors header length")
-        return json.loads(file.read(length))
+        return json.loads(file.read(length)), 8 + length
 
 
-def deepseek_v41_residency_estimate(model_path):
+def _header(filename, size, mtime_ns):
+    return header_with_offset(filename, size, mtime_ns)[0]
+
+
+def checkpoint_signature(model_path):
+    """Sizes and mtimes of every file a residency estimate depends on."""
     path = Path(model_path).expanduser().resolve()
     files = [path / "config.json", path / "model.safetensors.index.json"]
     files.extend(path.glob("*.safetensors"))
     files.extend((path / "engram").glob("*.safetensors"))
-    signature = tuple(
+    return tuple(
         (str(f), st.st_size, st.st_mtime_ns)
         for f in sorted(files)
         for st in (f.stat(),)
     )
-    return _estimate(str(path), signature)
+
+
+def deepseek_v41_residency_estimate(model_path):
+    path = Path(model_path).expanduser().resolve()
+    return _estimate(str(path), checkpoint_signature(path))
 
 
 @lru_cache(maxsize=128)

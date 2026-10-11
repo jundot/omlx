@@ -60,11 +60,11 @@ def is_applied() -> bool:
 def _install_vendor_namespace() -> None:
     import mlx_vlm
     import mlx_vlm.models
-    import mlx_vlm.tool_parsers
+    import mlx_vlm.tools.parsers
 
     _append_package_path(mlx_vlm, _VENDOR_MLX_VLM)
     _append_package_path(mlx_vlm.models, _VENDOR_MLX_VLM / "models")
-    _append_package_path(mlx_vlm.tool_parsers, _VENDOR_MLX_VLM / "tool_parsers")
+    _append_package_path(mlx_vlm.tools.parsers, _VENDOR_MLX_VLM / "tool_parsers")
 
 
 def _append_package_path(package: Any, path: Path) -> None:
@@ -73,7 +73,7 @@ def _append_package_path(package: Any, path: Path) -> None:
         return
     path_str = str(path)
     if path_str not in package_path:
-        package_path.append(path_str)
+        package_path.insert(0, path_str)
 
 
 def _import_vendor_modules() -> None:
@@ -83,7 +83,7 @@ def _import_vendor_modules() -> None:
         "mlx_vlm.models.minimax_m3_vl.processing_minimax_m3_vl",
         "mlx_vlm.models.minimax_m3_vl",
         "mlx_vlm.models.minimax_m3",
-        "mlx_vlm.tool_parsers.minimax_m3",
+        "mlx_vlm.tools.parsers.minimax_m3",
     ):
         importlib.import_module(module_name)
 
@@ -114,12 +114,12 @@ def _patch_get_model_and_args(vlm_utils: Any) -> None:
     if original is None or getattr(original, "_omlx_minimax_m3_compat", False):
         return
 
-    def patched_get_model_and_args(config: dict):
+    def patched_get_model_and_args(config: dict, model_path=None):
         raw_model_type = (
             config.get("model_type") if isinstance(config, dict) else None
         )
         if raw_model_type == "minimax_m3_vl":
-            module, model_type = original(config)
+            module, model_type = original(config, model_path=model_path)
             if model_type != "minimax_m3_vl":
                 module = importlib.import_module("mlx_vlm.models.minimax_m3_vl")
                 return module, "minimax_m3_vl"
@@ -132,8 +132,8 @@ def _patch_get_model_and_args(vlm_utils: Any) -> None:
         ):
             patched_config = dict(config)
             patched_config["model_type"] = "minimax_m3"
-            return original(patched_config)
-        return original(config)
+            return original(patched_config, model_path=model_path)
+        return original(config, model_path=model_path)
 
     patched_get_model_and_args._omlx_minimax_m3_compat = True
     patched_get_model_and_args._omlx_original = original
@@ -212,17 +212,17 @@ def _patch_process_inputs(vlm_utils: Any) -> None:
 
 
 def _patch_stopping_criteria(vlm_utils: Any) -> None:
-    original_cls = getattr(vlm_utils, "StoppingCriteria", None)
-    if original_cls is None or getattr(original_cls, "_omlx_minimax_m3_compat", False):
+    original_cls = vlm_utils.StoppingCriteria
+    if getattr(original_cls, "_omlx_minimax_m3_compat", False):
         return
 
     class PatchedStoppingCriteria(original_cls):
-        def __init__(self, eos_token_ids, tokenizer=None):
+        def __init__(
+            self, eos_token_ids, tokenizer=None, additional_eos_token_ids=None
+        ):
+            super().__init__(eos_token_ids, tokenizer, additional_eos_token_ids)
             if eos_token_ids is None:
-                self.eos_token_ids = []
-                self.tokenizer = tokenizer
-                return
-            super().__init__(eos_token_ids, tokenizer)
+                self.eos_token_ids = list(self.additional_eos_token_ids)
 
     PatchedStoppingCriteria.__name__ = original_cls.__name__
     PatchedStoppingCriteria.__qualname__ = original_cls.__qualname__

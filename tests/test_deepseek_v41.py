@@ -8,14 +8,19 @@ import sys
 import zlib
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 import numpy as np
 import pytest
 
+from omlx.api.utils import extract_text_content, uses_native_reasoning_content
+from omlx.cache.deepseek_v41_delta import compact_state
 from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
 from omlx.patches.deepseek_v41.config import ModelConfig
+from omlx.patches.deepseek_v41.encoding import IMAGE_PLACEHOLDER, encode_messages
 from omlx.patches.deepseek_v41.language import LanguageModel
+from omlx.patches.deepseek_v41.processing import Processor
 
 
 def tiny(**kwargs):
@@ -138,6 +143,47 @@ def test_official_prefill_decode(expected, length):
         )
 
 
+def test_in_place_cache_growth_matches_concatenation(monkeypatch):
+    from omlx.patches.deepseek_v41 import growth
+
+    model = LanguageModel(tiny())
+    load_reference_weights(model)
+    ids = mx.array(np.random.default_rng(17).integers(3, 60, (1, 40), dtype=np.int32))
+
+    def run():
+        cache = model.make_cache()
+        logits = [model(ids[:, :9], cache=cache)]
+        for position in range(9, 40):
+            if position == 24:
+                # Extracting a single row keeps its storage.
+                cache = [layer.extract(0) for layer in cache]
+            logits.append(model(ids[:, position : position + 1], cache=cache))
+        return logits, cache
+
+    actual_logits, actual_cache = run()
+    assert any(
+        layer._ds41_buffers[2]["idle"] is not None
+        for layer in actual_cache
+        if getattr(layer, "_ds41_buffers", None) and 2 in layer._ds41_buffers
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            growth,
+            "append",
+            lambda cache, slot, previous, values, start: mx.concatenate(
+                [previous[:, :start], values], 1
+            ),
+        )
+        expected_logits, expected_cache = run()
+    for actual, expected in zip(actual_logits, expected_logits):
+        np.testing.assert_array_equal(actual, expected)
+    for actual, expected in zip(actual_cache, expected_cache):
+        for a, b in zip(actual.cache, expected.cache):
+            assert (a is None) == (b is None)
+            if a is not None:
+                np.testing.assert_array_equal(a, b)
+
+
 def test_chunk_boundaries_and_late_join():
     mx.random.seed(32)
     model = LanguageModel(tiny())
@@ -166,6 +212,91 @@ def test_chunk_boundaries_and_late_join():
     np.testing.assert_allclose(
         result, model(mx.array([[12, 13, 14, 16, 17]]))[:, -1:], atol=1e-5
     )
+
+
+def test_extract_trims_batch_padding_to_row_offset():
+    model = LanguageModel(tiny(window_size=8))
+    a = mx.array([[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]])
+    b = mx.array([[12, 13, 14, 15]])
+    ca, cb = model.make_cache(), model.make_cache()
+    model(a, cache=ca)
+    model(b, cache=cb)
+    merged = [DeepseekV41Cache.merge([x, y]) for x, y in zip(ca, cb)]
+    next_ids = mx.array([[16], [17]])
+    model(next_ids, cache=merged)
+    for row, offset in ((0, 12), (1, 5)):
+        for layer in merged:
+            ratio = layer.compress_ratio
+            extracted = layer.extract(row)
+            assert int(extracted.offset.item()) == offset
+            assert extracted[1].shape[1] == min(offset, 8)
+            assert (
+                extracted[2].shape[1]
+                == extracted[3].shape[1]
+                == (offset // ratio if ratio else 0)
+            )
+            assert (
+                extracted[4].shape[1]
+                == extracted[5].shape[1]
+                == (offset % ratio if ratio > 1 else 0)
+            )
+            if ratio:
+                compact_state(tuple(extracted.cache), extracted.meta_state, 0, offset)
+        solo = model.make_cache()
+        prompt = mx.concatenate([a if row == 0 else b, next_ids[row : row + 1]], 1)
+        model(prompt, cache=solo)
+        rows = [layer.extract(row) for layer in merged]
+        np.testing.assert_allclose(
+            model(mx.array([[18]]), cache=rows),
+            model(mx.array([[18]]), cache=solo),
+            atol=1e-5,
+        )
+
+
+def test_echoed_reasoning_renders_one_think_block():
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "write_file", "parameters": {"type": "object"}},
+        }
+    ]
+    messages = [
+        SimpleNamespace(role="user", content="Fix the bug."),
+        SimpleNamespace(
+            role="assistant", content="", reasoning_content="Let me write."
+        ),
+        SimpleNamespace(role="user", content="Continue."),
+    ]
+    native = uses_native_reasoning_content(config_model_type="deepseek_v41")
+    processor = Processor(SimpleNamespace(), SimpleNamespace(image_token_id=129264))
+    prompt = processor.apply_chat_template(
+        extract_text_content(messages, native_reasoning_content=native), tools=tools
+    )
+    turn = prompt[prompt.index("<｜Assistant｜>") : prompt.index("<｜User｜>Continue.")]
+    assert turn.startswith("<｜Assistant｜><think>Let me write.</think>")
+    assert turn.count("<think>") == 1
+
+
+def test_literal_image_placeholder_in_text_is_replaced():
+    literal = f"log {IMAGE_PLACEHOLDER}"
+    messages = [
+        {"role": "user", "content": literal},
+        {"role": "assistant", "content": "ok", "reasoning_content": literal},
+        {"role": "tool", "content": [{"type": "text", "text": literal}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": literal},
+                {"type": "image_url", "image_url": {"url": "data:x"}},
+            ],
+        },
+    ]
+    prompt, media = encode_messages(
+        messages, thinking_mode="chat", return_multi_modal_data=True
+    )
+    # Only the real image block may render the placeholder token.
+    assert prompt.count(IMAGE_PLACEHOLDER) == len(media["images"]) == 1
+    assert prompt.count("log [image]") == 3
 
 
 def test_left_padding():
@@ -317,7 +448,7 @@ def write_checkpoint(tmp_path, vision=True, **config_overrides):
 
     from omlx.patches.deepseek_v41.model import Model
 
-    c = tiny(
+    vision_defaults = dict(
         vision_n_layers=1 if vision else 0,
         vision_dim=32,
         vision_n_heads=4,
@@ -326,8 +457,9 @@ def write_checkpoint(tmp_path, vision=True, **config_overrides):
         vision_min_pixels=64,
         vision_max_n_token=32,
         image_token_id=63,
-        **config_overrides,
     )
+    vision_defaults.update(config_overrides)
+    c = tiny(**vision_defaults)
     model = Model(c)
     source = tmp_path / "source"
     source.mkdir()
@@ -350,13 +482,13 @@ def write_checkpoint(tmp_path, vision=True, **config_overrides):
     }
     if vision:
         config["vision_config"] = {
-            "num_hidden_layers": 1,
-            "hidden_size": 32,
-            "num_attention_heads": 4,
-            "intermediate_size": 32,
-            "patch_size": 2,
-            "max_image_tokens": 32,
-            "min_pixels": 64,
+            "num_hidden_layers": vision_defaults["vision_n_layers"],
+            "hidden_size": vision_defaults["vision_dim"],
+            "num_attention_heads": vision_defaults["vision_n_heads"],
+            "intermediate_size": vision_defaults["vision_inter_dim"],
+            "patch_size": vision_defaults["vision_patch_size"],
+            "max_image_tokens": vision_defaults["vision_max_n_token"],
+            "min_pixels": vision_defaults["vision_min_pixels"],
         }
     (source / "config.json").write_text(json.dumps(config))
     (source / "model.safetensors.index.json").write_text(
@@ -391,6 +523,72 @@ def write_checkpoint(tmp_path, vision=True, **config_overrides):
         additional_special_tokens=special[6:] + [vocabulary[-1]],
     )
     tokenizer.save_pretrained(source)
+    return source, model
+
+
+def write_affine_checkpoint(
+    tmp_path,
+    vision=False,
+    bits=2,
+    group_size=64,
+    index_order="sorted",
+    **config_overrides,
+):
+    """Write mixed dense/affine weights with mlx_lm quantization metadata."""
+    import json
+
+    source, model = write_checkpoint(
+        tmp_path,
+        vision=vision,
+        dim=64,
+        moe_inter_dim=64,
+        vision_dim=64,
+        vision_inter_dim=64,
+        **config_overrides,
+    )
+    originals = dict(mx.load(str(source / "model.safetensors")))
+    tensors, quantized = {}, {}
+    for name, value in originals.items():
+        base = name.removesuffix(".weight") if name.endswith(".weight") else ""
+        # Keep the router dense and preserve linear biases beside packed weights.
+        if (
+            base
+            and not base.endswith("ffn.gate")
+            and value.ndim == 2
+            and value.shape[-1] % group_size == 0
+            and value.shape[-1] >= group_size
+        ):
+            weight, scales, biases = mx.quantize(
+                value.astype(mx.bfloat16),
+                group_size=group_size,
+                bits=bits,
+                mode="affine",
+            )
+            base = name.removesuffix(".weight")
+            tensors[base + ".weight"] = weight
+            tensors[base + ".scales"] = scales
+            tensors[base + ".biases"] = biases
+            quantized[base] = {"bits": bits, "group_size": group_size, "mode": "affine"}
+        else:
+            tensors[name] = value
+            if name.endswith(".weight"):
+                quantized[name.removesuffix(".weight")] = False
+    # Materialize lazy reads before overwriting their source file.
+    mx.eval(list(tensors.values()))
+    mx.save_safetensors(str(source / "model.safetensors"), tensors)
+    # Match mlx_lm's sorted index by default, with biases before weights.
+    keys = sorted(tensors) if index_order == "sorted" else list(tensors)
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {k: "model.safetensors" for k in keys}})
+    )
+    config = json.loads((source / "config.json").read_text())
+    config["quantization"] = config["quantization_config"] = {
+        "bits": bits,
+        "group_size": group_size,
+        "mode": "affine",
+        **quantized,
+    }
+    (source / "config.json").write_text(json.dumps(config))
     return source, model
 
 
@@ -743,15 +941,26 @@ def test_quantized_conversion_and_loaded_projection(tmp_path):
     model.close()
 
 
-@pytest.mark.parametrize("direct", [False, True])
-def test_real_vlm_engine_text_and_images(tmp_path, direct):
+def test_real_vlm_engine_text_and_images(tmp_path):
     import subprocess
 
-    script = (
-        "import asyncio,sys; from pathlib import Path; "
-        "sys.path.insert(0,sys.argv[1]); import test_deepseek_v41 as t; "
-        "asyncio.run(t._run_vlm_engine(Path(sys.argv[2]), sys.argv[3] == '1'))"
-    )
+    script = """
+import asyncio
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+import test_deepseek_v41 as t
+
+async def main():
+    for direct in (False, True):
+        root = Path(sys.argv[2]) / ("direct" if direct else "converted")
+        root.mkdir()
+        print(f"Testing {root.name} checkpoint", flush=True)
+        await asyncio.wait_for(t._run_vlm_engine(root, direct), timeout=60)
+
+asyncio.run(main())
+"""
     # Engine startup installs process-wide Metal routes. Keep those real hooks
     # in a subprocess so unrelated estimator unit tests retain their fixtures.
     result = subprocess.run(
@@ -761,11 +970,10 @@ def test_real_vlm_engine_text_and_images(tmp_path, direct):
             script,
             str(Path(__file__).parent),
             str(tmp_path),
-            "1" if direct else "0",
         ],
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -911,3 +1119,101 @@ def test_load_preserves_bf16_head_without_changing_prefill_logits(tmp_path):
             np.testing.assert_array_equal(actual, reference)
         finally:
             model.close()
+
+
+# ---------------------------------------------------------------------------
+# CED prefill: the decoder half forwards only the trailing window tokens.
+# ---------------------------------------------------------------------------
+
+
+def tiny_ced(**kwargs):
+    values = dict(
+        n_layers=6,
+        compress_ratios=(0, 2, 2, 1, 1, 1),
+        kv_source_layers=(1, 3),
+        index_source_layers=(1, 3, 4, 5),
+        candidate_source_layer=3,
+        window_size=4,
+        ced_prefill=True,
+    )
+    values.update(kwargs)
+    return tiny(**values)
+
+
+def ced_pair():
+    off, on = LanguageModel(tiny_ced(ced_prefill=False)), LanguageModel(tiny_ced())
+    load_reference_weights(off)
+    load_reference_weights(on)
+    return off, on
+
+
+def test_ced_layout_supported():
+    assert tiny_ced(ced_prefill=False).ced_layout_supported()
+    assert not tiny_ced(n_layers=5).ced_layout_supported()
+    assert not tiny_ced(window_size=0).ced_layout_supported()
+    assert not tiny_ced(kv_source_layers=(1, 3, 5)).ced_layout_supported()
+    assert not tiny_ced(compress_ratios=(0, 2, 2, 1, 1, 2)).ced_layout_supported()
+    assert not tiny_ced(engram_layer_ids=(4,)).ced_layout_supported()
+    with pytest.raises(ValueError, match="CED"):
+        tiny_ced(kv_source_layers=(1, 3, 5), ced_prefill=True).validate()
+
+
+def test_ced_preserves_encoder_and_global_kv_bitwise():
+    off, on = ced_pair()
+    ids = mx.array([[5, 9, 3, 12, 20, 7, 33, 41, 2, 18]])
+    co, cn = off.make_cache(), on.make_cache()
+    off(ids, cache=co)
+    ln = np.asarray(on._omlx_prefill(ids, cache=cn)[:, -1])
+    # Determinism: two CED runs are bit-identical.
+    ln2 = np.asarray(on._omlx_prefill(ids, cache=on.make_cache())[:, -1])
+    np.testing.assert_array_equal(ln, ln2)
+    # Encoder caches are untouched by CED.
+    for i in range(3):
+        np.testing.assert_array_equal(np.asarray(co[i][1]), np.asarray(cn[i][1]))
+    # The midpoint CSA2 layer sees the identical encoder-final hidden
+    # states, so its global KV and index K are bit-identical.
+    np.testing.assert_array_equal(np.asarray(co[3][2]), np.asarray(cn[3][2]))
+    np.testing.assert_array_equal(np.asarray(co[3][3]), np.asarray(cn[3][3]))
+    np.testing.assert_array_equal(np.asarray(co[3][1]), np.asarray(cn[3][1]))
+    assert co[3].size() == cn[3].size() == ids.shape[1]
+    # Decoder window KV may legitimately differ (bounded replay), but the
+    # stored window still covers exactly the last window_size positions.
+    for i in (4, 5):
+        assert cn[i][1].shape[1] == min(ids.shape[1], 4)
+
+
+def test_ced_inactive_within_window_is_bitwise_full_compute():
+    off, on = ced_pair()
+    ids = mx.array([[5, 9, 3, 12, 20, 7]])
+    ln = np.asarray(on._omlx_prefill(ids, cache=on.make_cache()))
+    # Cache-only prefill returns computed tail logits, not fabricated zeros.
+    assert ln.shape == (1, 4, 64)
+    assert np.isfinite(ln).all()
+    lo = np.asarray(off(ids, cache=off.make_cache()))
+    assert not np.allclose(lo[:, -1], ln[:, -1])
+    # A sequence within the window stays on the full-compute path bitwise.
+    short = mx.array([[5, 9, 3, 12]])
+    np.testing.assert_array_equal(
+        np.asarray(off(short, cache=off.make_cache())),
+        np.asarray(on._omlx_prefill(short, cache=on.make_cache())),
+    )
+
+
+def test_ced_chunked_continuity_and_decode_seam():
+    _, on = ced_pair()
+    full = mx.array([[5, 9, 3, 12, 20, 7, 33, 41, 2, 18]])
+    ca = on.make_cache()
+    first = np.asarray(on._omlx_prefill(full[:, :6], cache=ca))
+    second = np.asarray(on._omlx_prefill(full[:, 6:], cache=ca))
+    assert first.shape[1] == second.shape[1] == 4
+    decoded = np.asarray(on(mx.array([[11]]), cache=ca))[:, -1]
+    assert np.isfinite(decoded).all()
+    for i in (3, 4, 5):
+        assert ca[i].size() == 11
+        assert ca[i][1].shape[1] == 4
+    # A short suffix extends the contiguous replay window normally.
+    cb = on.make_cache()
+    on._omlx_prefill(full[:, :6], cache=cb)
+    on(full[:, 6:], cache=cb)
+    solo = np.asarray(on(mx.array([[11]]), cache=cb))[:, -1]
+    np.testing.assert_array_equal(decoded, solo)

@@ -45,7 +45,7 @@ def test_qwen4_qsa_symbol_is_part_of_the_extension_abi():
 
 
 def test_qwen4_qsa_production_geometry_routes_to_native_abi(monkeypatch):
-    monkeypatch.setenv("OMLX_QWEN4_QSA_NATIVE_SCORE_MIN_ROWS", "0")
+    monkeypatch.setattr(qsa_fast, "_NATIVE_SCORE_MIN_ROWS", 0)
     q = mx.zeros((1, 7, 4, 128), dtype=mx.bfloat16)
     k = mx.zeros((1, 19, 128), dtype=mx.bfloat16)
     seen = []
@@ -79,7 +79,7 @@ def test_qwen4_qsa_production_geometry_routes_to_native_abi(monkeypatch):
 
 
 def test_qwen4_native_dispatch_rejection_latches_to_portable(monkeypatch):
-    monkeypatch.setenv("OMLX_QWEN4_QSA_NATIVE_SCORE_MIN_ROWS", "0")
+    monkeypatch.setattr(qsa_fast, "_NATIVE_SCORE_MIN_ROWS", 0)
     q = mx.zeros((1, 3, 4, 128), dtype=mx.bfloat16)
     k = mx.zeros((1, 16, 128), dtype=mx.bfloat16)
     calls = 0
@@ -245,10 +245,7 @@ def fake_native_scores(monkeypatch):
     monkeypatch.setattr(fast, "qwen4_qsa_indexer_scores", scores)
     monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_SCORE_DISABLED", False)
     monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_SCORE_PROVEN", True)
-    monkeypatch.delenv("OMLX_QWEN4_QSA_NATIVE_SCORE_MIN_ROWS", raising=False)
-    qsa_fast._native_score_min_rows.cache_clear()
-    yield seen
-    qsa_fast._native_score_min_rows.cache_clear()
+    return seen
 
 
 def _score_rows(rows):
@@ -262,43 +259,16 @@ def _score_rows(rows):
 
 
 @pytest.mark.parametrize("rows", [1, 4, 16])
-def test_native_indexer_scores_yield_to_mlx_for_decode_rows_on_nax(monkeypatch, fake_native_scores, rows):
-    monkeypatch.setattr(qsa_fast, "_nax_gpu", lambda: True)
+def test_native_indexer_scores_yield_to_mlx_for_decode_rows(fake_native_scores, rows):
     assert _score_rows(rows) is None
     assert fake_native_scores == []
     assert qsa_fast._NATIVE_QSA_SCORE_DISABLED is False
 
 
 @pytest.mark.parametrize("rows", [32, 64, 2048])
-def test_native_indexer_scores_keep_native_for_prefill_rows_on_nax(monkeypatch, fake_native_scores, rows):
-    monkeypatch.setattr(qsa_fast, "_nax_gpu", lambda: True)
+def test_native_indexer_scores_keep_native_for_prefill_rows(fake_native_scores, rows):
     assert _score_rows(rows) is not None
     assert fake_native_scores == [(1, 4, rows, 128)]
-
-
-def test_native_indexer_scores_stay_native_for_decode_rows_off_nax(monkeypatch, fake_native_scores):
-    monkeypatch.setattr(qsa_fast, "_nax_gpu", lambda: False)
-    assert _score_rows(1) is not None
-    assert fake_native_scores == [(1, 4, 1, 128)]
-
-
-def test_native_indexer_scores_min_rows_env_override(monkeypatch, fake_native_scores):
-    monkeypatch.setattr(qsa_fast, "_nax_gpu", lambda: True)
-    monkeypatch.setenv("OMLX_QWEN4_QSA_NATIVE_SCORE_MIN_ROWS", "0")
-    qsa_fast._native_score_min_rows.cache_clear()
-    assert _score_rows(1) is not None
-    monkeypatch.setattr(qsa_fast, "_nax_gpu", lambda: False)
-    monkeypatch.setenv("OMLX_QWEN4_QSA_NATIVE_SCORE_MIN_ROWS", "4096")
-    qsa_fast._native_score_min_rows.cache_clear()
-    assert _score_rows(2048) is None
-    assert fake_native_scores == [(1, 4, 1, 128)]
-
-
-@pytest.fixture(autouse=True)
-def _reset_native_score_gate():
-    qsa_fast._native_score_min_rows.cache_clear()
-    yield
-    qsa_fast._native_score_min_rows.cache_clear()
 
 
 @pytest.fixture
@@ -314,10 +284,7 @@ def fake_native_topk(monkeypatch):
     monkeypatch.setattr(fast, "qwen4_qsa_topk_indices", topk)
     monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_TOPK_DISABLED", False)
     monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_TOPK_PROVEN", True)
-    monkeypatch.delenv("OMLX_QWEN4_QSA_NATIVE_TOPK_MIN_ROWS", raising=False)
-    qsa_fast._native_topk_min_rows.cache_clear()
-    yield seen
-    qsa_fast._native_topk_min_rows.cache_clear()
+    return seen
 
 
 def _topk_rows(rows):
@@ -325,32 +292,16 @@ def _topk_rows(rows):
 
 
 @pytest.mark.parametrize("rows", [1, 4])
-def test_native_topk_yields_to_argpartition_for_decode_rows_on_nax(monkeypatch, fake_native_topk, rows):
-    monkeypatch.setattr(qsa_fast, "_nax_gpu", lambda: True)
+def test_native_topk_yields_to_argpartition_for_decode_rows(fake_native_topk, rows):
     assert _topk_rows(rows) is None
     assert fake_native_topk == []
     assert qsa_fast._NATIVE_QSA_TOPK_DISABLED is False
 
 
 @pytest.mark.parametrize("rows", [8, 64, 2048])
-def test_native_topk_keeps_native_from_eight_rows_on_nax(monkeypatch, fake_native_topk, rows):
-    monkeypatch.setattr(qsa_fast, "_nax_gpu", lambda: True)
+def test_native_topk_keeps_native_from_eight_rows(fake_native_topk, rows):
     assert _topk_rows(rows) is not None
     assert fake_native_topk == [(1, rows, 4096)]
-
-
-def test_native_topk_stays_native_for_decode_rows_off_nax(monkeypatch, fake_native_topk):
-    monkeypatch.setattr(qsa_fast, "_nax_gpu", lambda: False)
-    assert _topk_rows(1) is not None
-    assert fake_native_topk == [(1, 1, 4096)]
-
-
-def test_native_topk_min_rows_env_override(monkeypatch, fake_native_topk):
-    monkeypatch.setattr(qsa_fast, "_nax_gpu", lambda: True)
-    monkeypatch.setenv("OMLX_QWEN4_QSA_NATIVE_TOPK_MIN_ROWS", "0")
-    qsa_fast._native_topk_min_rows.cache_clear()
-    assert _topk_rows(1) is not None
-    assert fake_native_topk == [(1, 1, 4096)]
 
 
 @pytest.fixture
@@ -366,10 +317,7 @@ def fake_native_sparse_attention(monkeypatch):
     monkeypatch.setattr(fast, "qwen4_qsa_sparse_gqa_attention", attention)
     monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_MAIN_DISABLED", False)
     monkeypatch.setattr(qsa_fast, "_NATIVE_QSA_MAIN_PROVEN", True)
-    monkeypatch.delenv("OMLX_QWEN4_QSA_NATIVE_MAIN_MIN_ROWS", raising=False)
-    qsa_fast._native_main_min_rows.cache_clear()
-    yield seen
-    qsa_fast._native_main_min_rows.cache_clear()
+    return seen
 
 
 def _attention_rows(rows):
@@ -384,29 +332,13 @@ def _attention_rows(rows):
 
 
 @pytest.mark.parametrize("rows", [4, 8, 16])
-def test_native_sparse_attention_yields_to_gathered_sdpa_for_verify_rows_on_nax(monkeypatch, fake_native_sparse_attention, rows):
-    monkeypatch.setattr(qsa_fast, "_nax_gpu", lambda: True)
+def test_native_sparse_attention_yields_to_gathered_sdpa_for_verify_rows(fake_native_sparse_attention, rows):
     assert _attention_rows(rows) is None
     assert fake_native_sparse_attention == []
     assert qsa_fast._NATIVE_QSA_MAIN_DISABLED is False
 
 
 @pytest.mark.parametrize("rows", [24, 64, 2048])
-def test_native_sparse_attention_keeps_native_for_prefill_rows_on_nax(monkeypatch, fake_native_sparse_attention, rows):
-    monkeypatch.setattr(qsa_fast, "_nax_gpu", lambda: True)
+def test_native_sparse_attention_keeps_native_for_prefill_rows(fake_native_sparse_attention, rows):
     assert _attention_rows(rows) is not None
     assert fake_native_sparse_attention == [(1, 24, rows, 256)]
-
-
-def test_native_sparse_attention_stays_native_for_verify_rows_off_nax(monkeypatch, fake_native_sparse_attention):
-    monkeypatch.setattr(qsa_fast, "_nax_gpu", lambda: False)
-    assert _attention_rows(4) is not None
-    assert fake_native_sparse_attention == [(1, 24, 4, 256)]
-
-
-def test_native_sparse_attention_min_rows_env_override(monkeypatch, fake_native_sparse_attention):
-    monkeypatch.setattr(qsa_fast, "_nax_gpu", lambda: True)
-    monkeypatch.setenv("OMLX_QWEN4_QSA_NATIVE_MAIN_MIN_ROWS", "0")
-    qsa_fast._native_main_min_rows.cache_clear()
-    assert _attention_rows(4) is not None
-    assert fake_native_sparse_attention == [(1, 24, 4, 256)]
