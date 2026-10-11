@@ -16,7 +16,12 @@ from ..exceptions import (
     ModelNotFoundError,
     ModelTooLargeError,
 )
-from .markitdown import MarkItDownFile, MarkItDownRequestError, quiet_pdf_parser_loggers
+from .markitdown import (
+    MarkItDownFile,
+    MarkItDownRequestError,
+    convert_pdf_file_to_markdown,
+    quiet_pdf_parser_loggers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +31,7 @@ def resolve_pdf_ocr_model(
     *,
     engine_pool: Any | None,
     settings_manager: Any | None,
-) -> str:
+) -> str | None:
     if engine_pool is None:
         raise MarkItDownRequestError(
             "PDF OCR processing requires an initialized engine pool.",
@@ -36,10 +41,10 @@ def resolve_pdf_ocr_model(
     resolved = engine_pool.resolve_model_id(model_id, settings_manager)
     entry = engine_pool.get_entry(resolved)
     if entry is None:
-        raise MarkItDownRequestError(
-            f"MarkItDown PDF OCR model not found: {model_id}",
-            status_code=400,
+        logger.warning(
+            "PDF OCR model not found: %s; using MarkItDown instead", model_id
         )
+        return None
 
     config_model_type = str(getattr(entry, "config_model_type", "") or "").lower()
     if "ocr" not in config_model_type:
@@ -124,6 +129,10 @@ async def stream_pdf_with_ocr_engine(
         engine_pool=engine_pool,
         settings_manager=settings_manager,
     )
+    if model_id is None:
+        yield await asyncio.to_thread(convert_pdf_file_to_markdown, file)
+        return
+
     data_uris = await asyncio.to_thread(render_pdf_pages_to_image_data_uris, file)
     if not data_uris:
         raise MarkItDownRequestError(

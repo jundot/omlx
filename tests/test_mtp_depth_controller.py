@@ -415,9 +415,10 @@ def test_exit_margin_arg_overrides_prior_with_clamp():
     assert _DepthController(3, exit_margin=0.5).EXIT_MARGIN == 1.0
 
 
-def test_std_tax_probe_measures_and_smooths():
+def test_std_tax_probe_measures_and_smooths(monkeypatch):
     from types import SimpleNamespace
 
+    from omlx.patches.mlx_lm_mtp import batch_generator
     from omlx.patches.mlx_lm_mtp.batch_generator import (
         _STD_TAX_SAMPLES,
         _STD_TAX_SKIP,
@@ -425,6 +426,8 @@ def test_std_tax_probe_measures_and_smooths():
         _record_std_tax_sample,
     )
 
+    # The process-wide prefill tracker may hold another test's prefill.
+    monkeypatch.setattr(batch_generator, "_prefill_activity_recent", lambda: False)
     model = SimpleNamespace()
     gb = SimpleNamespace(model=model)
     _arm_std_tax_probe(gb, 12.0)
@@ -443,3 +446,44 @@ def test_std_tax_probe_measures_and_smooths():
     for _ in range(_STD_TAX_SAMPLES):
         _record_std_tax_sample(gb, 11.0)
     assert 1.0 < model._omlx_mtp_loop_tax < 1.2
+
+
+def test_unreached_position_borrows_previous_estimate():
+    c = _DepthController(3)
+    c._warmup = []
+    c.p = [0.9, None, None]
+    assert c._p_eff(2) == 0.9
+    # First reach of position 2 starts its EMA from position 1's estimate.
+    c.observe(2, 2, 10.0)
+    assert c.p[1] > 0.9
+    assert c.p[2] is None
+
+
+def test_seed_revalidates_costs_before_selecting_depth():
+    prev = _simulate(_DepthController(2), 20, [0.9, 0.9], {0: 8.0, 1: 10.0, 2: 12.0})
+    prev.t = {0: 1.0, 1: 40.0, 2: 3.0}
+    c = _DepthController(3, seed=prev)
+    assert c.p[:2] == prev.p and c.p[2] is None
+    assert c.t == prev.t
+    for depth, cost in [(3, 14.0), (2, 12.0), (1, 10.0), (0, 9.0), (0, 8.0), (0, 9.0)]:
+        assert c.cur == depth
+        c.observe(depth, depth, cost)
+    assert c.t == {0: 8.0, 1: 10.0, 2: 12.0, 3: 14.0}
+    assert c._warmup == []
+    assert c.cur > 0
+    assert not c.should_exit()
+    assert prev.t == {0: 1.0, 1: 40.0, 2: 3.0}
+
+
+def test_seed_revalidation_waits_for_a_valid_timing_sample():
+    prev = _DepthController(2)
+    prev.t = {0: 1.0, 1: 2.0, 2: 3.0}
+    c = _DepthController(2, seed=prev)
+    c.observe(2, 2, 100.0, time_sample=False)
+    assert c.cur == 2
+    assert c.t[2] == 3.0
+    assert math.isinf(c.t_age[2])
+    c.observe(2, 2, 15.0)
+    assert c.t[2] == 15.0
+    assert c.t_age[2] == 0.0
+    assert c.cur == 1

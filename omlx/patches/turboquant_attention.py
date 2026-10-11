@@ -460,7 +460,7 @@ def _patch_vlm_target_verify_attention() -> None:
         return
     if getattr(q35_lang, "_omlx_tq_target_verify_patched", False):
         return
-    original = getattr(q35_lang, "_target_verify_left_padded_attention", None)
+    original = getattr(q35_lang, "_qwen3_5_left_padded_attention", None)
     if original is None:
         return
 
@@ -508,7 +508,7 @@ def _patch_vlm_target_verify_attention() -> None:
             axis=2,
         )
 
-    q35_lang._target_verify_left_padded_attention = patched
+    q35_lang._qwen3_5_left_padded_attention = patched
     q35_lang._omlx_tq_target_verify_original = original
     q35_lang._omlx_tq_target_verify_patched = True
 

@@ -12,8 +12,9 @@ Two surgical changes from PR 1192 are applied:
    spec via ``deepseek_v4.make_quantization_config``.
 
 The rest of ``load_model``'s body is identical to the v0.31.3 (``ed1fca4``)
-upstream — copied verbatim from PR 1192 head ``5c10538``. mlx-lm is pinned
-to a commit, so the body is stable.
+upstream — copied verbatim from PR 1192 head ``5c10538``. Other model types
+go to the original ``load_model``, so the process-wide replacement does not
+freeze the upstream loader for them.
 
 When mlx-lm merges PR 1192 upstream this patch should be removed.
 """
@@ -50,9 +51,13 @@ def _native_ratio128_attention_enabled(config: dict[str, Any]) -> bool:
     quantizations = [config.get("quantization"), config.get("quantization_config")]
     text_config = config.get("text_config")
     if isinstance(text_config, dict):
-        quantizations.append(text_config.get("quantization_config"))
+        quantizations.extend(
+            [text_config.get("quantization"), text_config.get("quantization_config")]
+        )
 
-    for quantization in quantizations:
+    # Per-layer overrides can be nested below a four-bit default.
+    while quantizations:
+        quantization = quantizations.pop()
         bits = quantization.get("bits") if isinstance(quantization, dict) else None
         if (
             isinstance(bits, (int, float))
@@ -60,6 +65,10 @@ def _native_ratio128_attention_enabled(config: dict[str, Any]) -> bool:
             and float(bits) < 4
         ):
             return False
+        if isinstance(quantization, dict):
+            quantizations.extend(quantization.values())
+        elif isinstance(quantization, list):
+            quantizations.extend(quantization)
     return True
 
 
@@ -123,6 +132,7 @@ def _build_patched_load_model() -> Callable:
     they pick up any other patches applied to ``mlx_lm.utils``.
     """
     default_get_classes = _utils._get_classes
+    original_load_model = _utils.load_model
 
     def patched_load_model(
         model_path: Path,
@@ -144,6 +154,16 @@ def _build_patched_load_model() -> Callable:
                 f"The model at {model_path} requires executing custom model "
                 f"code ({model_file!r}). Pass trust_remote_code=True if you "
                 "trust this model."
+            )
+
+        if not str(config.get("model_type", "")).startswith("deepseek_v4"):
+            return original_load_model(
+                model_path,
+                lazy=lazy,
+                strict=strict,
+                model_config=model_config,
+                get_model_classes=get_model_classes,
+                trust_remote_code=trust_remote_code,
             )
 
         weight_files = glob.glob(str(model_path / "model*.safetensors"))
@@ -171,10 +191,9 @@ def _build_patched_load_model() -> Callable:
             if "quantization_config" in text_config:
                 config["quantization_config"] = text_config["quantization_config"]
 
-        if str(config.get("model_type", "")).startswith("deepseek_v4"):
-            config["use_native_ratio128_attention"] = bool(
-                config.get("use_native_ratio128_attention", True)
-            ) and _native_ratio128_attention_enabled(config)
+        config["use_native_ratio128_attention"] = bool(
+            config.get("use_native_ratio128_attention", True)
+        ) and _native_ratio128_attention_enabled(config)
 
         model_args = model_args_class.from_dict(config)
         model = model_class(model_args)
@@ -223,9 +242,7 @@ def _build_patched_load_model() -> Callable:
                 config["quantization"] = quantization
                 config["quantization_config"] = quantization
                 _quantize(quantization)
-            elif quant_method == "fp8" and str(config.get("model_type", "")).startswith(
-                "deepseek_v4"
-            ):  # PR 1192 new branch
+            elif quant_method == "fp8":  # PR 1192 new branch
                 from mlx_lm.models.deepseek_v4 import make_quantization_config
 
                 quantization = make_quantization_config(model)

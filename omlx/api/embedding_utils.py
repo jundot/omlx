@@ -165,12 +165,15 @@ def normalize_embedding_items(
 
         text = payload.get("text")
         image = payload.get("image")
+        audio = payload.get("audio")
 
         normalized_item: Dict[str, str] = {}
         if text is not None:
             normalized_item["text"] = text
         if image is not None:
             normalized_item["image"] = image
+        if audio is not None:
+            normalized_item["audio"] = audio
 
         normalized.append(normalized_item)
 

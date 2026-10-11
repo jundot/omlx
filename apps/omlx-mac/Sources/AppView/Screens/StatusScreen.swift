@@ -2,9 +2,9 @@
 //   • ServerHeroCard (the same card the Server screen mounts; defined in
 //     ServerScreen.swift)
 //   • Serving Stats — prefill/cache tiles + average speed from /admin/api/stats
+//   • Active Now — active_models slice from /api/stats
 //   • System — slice of /admin/api/global-settings + uptime from /api/stats
 //   • Updates — release check status + auto-check/auto-notify prefs
-//   • Active Now — active_models slice from /api/stats
 //
 // Polling is on-screen-only: a 5s timer ticks while the view is visible.
 
@@ -62,12 +62,12 @@ struct StatusScreen: View {
                                   comment: "Header label above average serving speed metrics"))
             AverageSpeedTilesRow(stats: vm.stats)
 
-            UsageHistoryView()
-
             SectionHeader(String(localized: "status.section.active_now",
                                   defaultValue: "Active Now",
                                   comment: "Section header for the currently active models list"))
             ActiveNowList(models: vm.stats?.activeModels.models ?? [])
+
+            UsageHistoryView()
 
             SectionHeader(String(localized: "status.section.system",
                                   defaultValue: "System",
@@ -315,7 +315,7 @@ private struct RuntimeCacheSection: View {
 }
 
 /// Bytes → human-readable string. Mirrors `formatByteCount` in
-/// `omlx/admin/static/js/dashboard.js` — 1024-scaled, one decimal place.
+/// `apps/omlx-web/omlx_web/static/js/dashboard.js` — 1024-scaled, one decimal place.
 private func formatByteCount(_ bytes: Int64) -> String {
     let b = Double(max(0, bytes))
     if b >= 1024 * 1024 * 1024 { return String(format: "%.1f GB", b / (1024 * 1024 * 1024)) }
@@ -489,8 +489,8 @@ private struct SystemRamTrailing: View {
         guard let used = metrics.ramUsedBytes,
               let total = metrics.ramTotalBytes
         else { return "—" }
-        let u = SystemMetricsPoller.formatBytesAsGB(used)
-        let t = SystemMetricsPoller.formatBytesAsGB(total)
+        let u = SystemMetricsPoller.formatBytesAsGiB(used)
+        let t = SystemMetricsPoller.formatBytesAsGiB(total)
         return "\(u) / \(t) GB"
     }
 }

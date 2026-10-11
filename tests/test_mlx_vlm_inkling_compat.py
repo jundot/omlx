@@ -89,6 +89,14 @@ def test_prompt_formatting_image_first(applied):
     assistant = get_message_json("inkling", "hello", role="assistant")
     assert assistant["content"] == "hello"
 
+    # apply_chat_template passes OpenAI list content through unchanged.
+    parts = [
+        {"type": "text", "text": "describe this"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+    ]
+    message = get_message_json("inkling", parts, role="user", num_images=1)
+    assert message["content"][-1] == {"type": "text", "text": "describe this"}
+
 
 def test_other_models_untouched(applied):
     from mlx_vlm.prompt_utils import get_message_json
@@ -121,40 +129,8 @@ def test_load_config_translates_nvfp4(applied, tmp_path):
     assert "quantization" not in config
 
 
-def test_raw_inkling_layout_detection_uses_weight_index(applied, tmp_path):
-    from omlx.patches.mlx_vlm_inkling_compat import _has_raw_inkling_weights
-
-    (tmp_path / "config.json").write_text(
-        json.dumps({"model_type": "inkling_mm_model"})
-    )
-    index_path = tmp_path / "model.safetensors.index.json"
-    index_path.write_text(
-        json.dumps(
-            {
-                "weight_map": {
-                    "model.llm.layers.0.attn.wq_du.weight": "model-1.safetensors"
-                }
-            }
-        )
-    )
-    assert _has_raw_inkling_weights(tmp_path)
-
-    index_path.write_text(
-        json.dumps(
-            {
-                "weight_map": {
-                    "language_model.model.layers.0.self_attn.qkvr_proj.weight": (
-                        "model-1.safetensors"
-                    )
-                }
-            }
-        )
-    )
-    assert not _has_raw_inkling_weights(tmp_path)
-
-
-@pytest.mark.parametrize(("raw_layout", "sanitize_calls"), [(True, 1), (False, 0)])
-def test_load_model_forces_sanitize_only_for_raw_inkling(
+@pytest.mark.parametrize(("raw_layout", "sanitize_calls"), [(True, 1), (False, 1)])
+def test_load_model_sanitizes_raw_and_converted_inkling(
     applied, tmp_path, monkeypatch, raw_layout, sanitize_calls
 ):
     from types import SimpleNamespace
@@ -204,7 +180,9 @@ def test_load_model_forces_sanitize_only_for_raw_inkling(
 
     arch = SimpleNamespace(ModelConfig=FakeModelConfig, Model=FakeModel)
     monkeypatch.setattr(
-        vlm_utils, "get_model_and_args", lambda config: (arch, "inkling")
+        vlm_utils,
+        "get_model_and_args",
+        lambda config, model_path=None: (arch, "inkling"),
     )
     monkeypatch.setattr(
         vlm_utils,
@@ -353,7 +331,7 @@ def test_tiny_model_single_forward(applied):
     assert step.logits.shape == (1, 1, 128)
     kv_state = cache[0][0].state
     assert kv_state[0].shape[2] == 6
-    conv_slots = list(cache[0][1].state)
+    conv_slots = list(cache[0][1].cache)
     assert len(conv_slots) == 4
     assert all(s is not None for s in conv_slots)
 
@@ -811,29 +789,23 @@ def test_cache_snapshot_restores_empty_composite_cache(applied):
     assert all(cache[0][1][slot] is None for slot in range(4))
 
 
-def test_sliding_window_slice_parity(applied, monkeypatch):
-    """Slicing sliding-layer K/V to the window must match full-sequence
-    SDPA (masked keys contribute exactly zero after softmax)."""
-    import importlib
-
-    language = importlib.import_module("mlx_vlm.models.inkling.language")
+def test_sliding_window_slice_parity(applied):
+    """Decode steps slice sliding-layer K/V to the window; that must match
+    full-sequence SDPA (masked keys contribute exactly zero after softmax).
+    One forward over the whole sequence never slices, so it is the reference."""
     model = _tiny_language_model()
     # window (sliding_window_size=8) well exceeded by prompt + decode.
     tokens = [(i * 37 + 11) % 128 for i in range(24)]
+    steps = [1, 2, 3, 4]
 
-    def run():
-        cache = model.make_cache()
-        logits = [model(mx.array([tokens]), cache=cache).logits[:, -1]]
-        for step in range(4):
-            logits.append(model(mx.array([[step + 1]]), cache=cache).logits[:, -1])
-        out = mx.concatenate(logits, axis=0)
-        mx.eval(out)
-        return out
-
-    monkeypatch.setattr(language, "_SLIDING_WINDOW_SLICE", False)
-    reference = run()
-    monkeypatch.setattr(language, "_SLIDING_WINDOW_SLICE", True)
-    sliced = run()
+    cache = model.make_cache()
+    logits = [model(mx.array([tokens]), cache=cache).logits[:, -1]]
+    for step in steps:
+        logits.append(model(mx.array([[step]]), cache=cache).logits[:, -1])
+    sliced = mx.concatenate(logits, axis=0)
+    reference = model(mx.array([tokens + steps]), cache=model.make_cache()).logits
+    reference = reference[0, len(tokens) - 1 :]
+    mx.eval(sliced, reference)
 
     diff = mx.max(mx.abs(reference - sliced)).item()
     assert diff < 2e-5, f"sliding-window slice diverged: {diff}"

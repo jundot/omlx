@@ -57,6 +57,13 @@ struct ProfileDTO: Codable, Equatable, Sendable, Identifiable {
 
     var id: String { name }
 
+    func matchingTemplate(in templates: [ProfileDTO]) -> ProfileDTO? {
+        guard let sourceTemplate else { return nil }
+        return templates.first {
+            $0.name == sourceTemplate && ($0.settings ?? [:]) == (settings ?? [:])
+        }
+    }
+
     /// Splits a template list into preset/global by `isBuiltin`. Defaults
     /// to Global for legacy server responses where the field is missing —
     /// the server is the source of truth for builtin status, so an absent

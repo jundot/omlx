@@ -135,6 +135,10 @@ class Model(nn.Module):
                 nk = "vision_model." + nk[len("model.visual.") :]
             elif nk.startswith("visual."):
                 nk = "vision_model." + nk[len("visual.") :]
+            # Community GLM-5.3 exports (e.g. Vontra oQ checkpoints) ship the
+            # vision tower under the raw HF ``vision_tower.*`` names.
+            elif nk.startswith("vision_tower."):
+                nk = "vision_model." + nk[len("vision_tower.") :]
             elif nk.startswith("model.language_model."):
                 nk = "language_model.model." + nk[len("model.language_model.") :]
             elif nk.startswith("lm_head."):

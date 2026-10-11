@@ -113,6 +113,7 @@ async def test_k2_unload_checks_weights_not_ane_admission_reserve(
     with (
         patch("omlx.engine_pool.BatchedEngine", return_value=engine),
         patch("omlx.engine_pool.mx") as mlx,
+        patch("omlx.engine_pool.gc"),
         patch("omlx.engine_pool.get_phys_footprint", side_effect=lambda: active),
         patch("omlx.engine_pool.get_mlx_executor", return_value=None),
         patch("asyncio.sleep", new_callable=AsyncMock) as sleep,

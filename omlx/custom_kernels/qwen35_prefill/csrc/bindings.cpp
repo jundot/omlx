@@ -1,4 +1,5 @@
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/tuple.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/shared_ptr.h>
@@ -28,6 +29,12 @@ NB_MODULE(_ext, m) {
   m.def(
       "is_nax_available",
       &omlx::qwen35_prefill_kernels::is_nax_available);
+
+  m.def(
+      "set_command_buffer_caps",
+      &omlx::qwen35_prefill_kernels::set_command_buffer_caps,
+      "ops"_a,
+      "mb"_a);
   m.def(
       "nax_qmm_kernels_built",
       &omlx::qwen35_prefill_kernels::nax_qmm_kernels_built);
@@ -443,6 +450,36 @@ NB_MODULE(_ext, m) {
       "use_nax"_a = false,
       "nax_variant"_a = 0,
       "group_size"_a = 64,
+      "stream"_a = nb::none());
+  m.def(
+      "oq_a8_kernels_available",
+      &omlx::qwen35_prefill_kernels::oq_a8_kernels_available);
+  m.def(
+      "qwen35_oq_a8_quantize",
+      &omlx::qwen35_prefill_kernels::qwen35_oq_a8_quantize,
+      "x"_a,
+      "act_mode"_a = 0,
+      "stream"_a = nb::none());
+  m.def(
+      "qwen35_oq_a8_qmm_t",
+      &omlx::qwen35_prefill_kernels::qwen35_oq_a8_qmm_t,
+      "qa"_a,
+      "sa"_a,
+      "ra"_a,
+      "weight"_a,
+      "scales"_a,
+      "biases"_a,
+      "bits"_a,
+      "act_mode"_a = 0,
+      "variant"_a = 800,
+      "packed"_a = false,
+      "stream"_a = nb::none());
+  m.def(
+      "qwen35_oq_a8_decode_weights",
+      &omlx::qwen35_prefill_kernels::qwen35_oq_a8_decode_weights,
+      "weight"_a,
+      "bits"_a,
+      "group_count"_a,
       "stream"_a = nb::none());
   m.def(
       "qwen35_moe_weighted_sum",

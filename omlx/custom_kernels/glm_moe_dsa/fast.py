@@ -110,6 +110,8 @@ NATIVE_SYMBOLS = (
     "glm_dsa_sparse_mla_attention",
     "glm_dsa_exact_block_attention",
     "deepseek_v4_sparse_attention",
+    "deepseek_v41_packed_attention",
+    "deepseek_v41_grouped_expert",
     "dspark_ring_gemm",
     "dspark_rowwise_gemm",
     "glm_dsa_q8_vup_flat",
@@ -576,6 +578,35 @@ def deepseek_v4_sparse_attention(
     raise RuntimeError("deepseek_v4_sparse_attention native kernel is unavailable")
 
 
+def deepseek_v41_packed_attention(
+    q: mx.array,
+    local_kv: mx.array,
+    pooled: mx.array,
+    topk_indices: mx.array,
+    sinks: mx.array,
+    scale: float,
+    q_offset: int,
+    compress_ratio: int,
+    local_window: int,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is not None and hasattr(_ext, "deepseek_v41_packed_attention"):
+        return _ext.deepseek_v41_packed_attention(
+            q,
+            local_kv,
+            pooled,
+            topk_indices,
+            sinks,
+            scale,
+            q_offset,
+            compress_ratio,
+            local_window,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError("deepseek_v41_packed_attention native kernel is unavailable")
+
+
 def glm_dsa_q8_vup_flat(
     x: mx.array,
     weight: mx.array,
@@ -808,3 +839,10 @@ def __dir__() -> list[str]:
     if _ext is not None:
         names.update(dir(_ext))
     return sorted(names)
+
+
+def deepseek_v41_grouped_expert(gate, up, activation, down):
+    """Submit one routed expert pipeline using its existing MLX primitives."""
+    if _ext is not None and hasattr(_ext, "deepseek_v41_grouped_expert"):
+        return _ext.deepseek_v41_grouped_expert(gate, up, activation, down)
+    raise RuntimeError("DeepSeek V4.1 grouped expert native kernel is unavailable")

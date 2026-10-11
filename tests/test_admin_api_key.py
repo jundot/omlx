@@ -133,6 +133,63 @@ class TestListModelsSettings:
         assert model["qwen4_ple_resident_bytes"] == 1000
         assert model["qwen4_ple_mmap_bytes"] == 400
 
+    def test_list_models_reports_forced_deepseek_v41_engram_offload(self, tmp_path):
+        from omlx.patches.deepseek_v41.residency import (
+            EngramResidencyEstimate,
+        )
+
+        model_path = tmp_path / "v41"
+        model_path.mkdir()
+        estimate = EngramResidencyEstimate(
+            supported=True,
+            engram_bytes=550,
+            resident_bytes=1000,
+            mmap_bytes=400,
+        )
+        pool = MagicMock()
+        pool.get_status.return_value = {
+            "models": [
+                {
+                    "id": "v41",
+                    "model_path": str(model_path),
+                    "config_model_type": "deepseek_v41",
+                    "estimated_size": 1000,
+                }
+            ]
+        }
+        pool._fallback_admission_ceiling.return_value = 500
+        manager = MagicMock()
+        manager.get_all_settings.return_value = {}
+        state = MagicMock(default_model=None)
+
+        with (
+            patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+            patch.object(admin_routes, "_get_settings_manager", return_value=manager),
+            patch.object(admin_routes, "_get_server_state", return_value=state),
+            patch.object(admin_routes, "_get_global_settings", return_value=None),
+            patch.object(
+                admin_routes, "_dflash_compat_for_model", return_value=(False, "")
+            ),
+            patch.object(
+                admin_routes, "_mtp_compat_for_model", return_value=(False, "")
+            ),
+            patch.object(
+                admin_routes, "_paroquant_compat_for_model", return_value=(False, "")
+            ),
+            patch(
+                "omlx.patches.deepseek_v41.residency."
+                "deepseek_v41_residency_estimate",
+                return_value=estimate,
+            ),
+        ):
+            result = asyncio.run(admin_routes.list_models(is_admin=True))
+
+        model = result["models"][0]
+        assert model["deepseek_v41_engram_ssd_offload_supported"] is True
+        assert model["deepseek_v41_engram_ssd_offload_forced"] is True
+        assert model["deepseek_v41_engram_resident_bytes"] == 1000
+        assert model["deepseek_v41_engram_mmap_bytes"] == 400
+
     def test_list_models_adds_display_name_without_changing_id(self, tmp_path):
         """Ensure nested model paths only affect UI display names."""
         model_root = tmp_path / "models"
@@ -326,26 +383,31 @@ class TestVerifyAnyApiKey:
 
     def test_matches_main_key(self):
         from omlx.settings import SubKeyEntry
+
         sub_keys = [SubKeyEntry(key="sub1"), SubKeyEntry(key="sub2")]
         assert verify_any_api_key("main-key", "main-key", sub_keys) is True
 
     def test_matches_sub_key(self):
         from omlx.settings import SubKeyEntry
+
         sub_keys = [SubKeyEntry(key="sub1"), SubKeyEntry(key="sub2")]
         assert verify_any_api_key("sub2", "main-key", sub_keys) is True
 
     def test_no_match(self):
         from omlx.settings import SubKeyEntry
+
         sub_keys = [SubKeyEntry(key="sub1")]
         assert verify_any_api_key("wrong", "main-key", sub_keys) is False
 
     def test_empty_api_key(self):
         from omlx.settings import SubKeyEntry
+
         sub_keys = [SubKeyEntry(key="sub1")]
         assert verify_any_api_key("", "main-key", sub_keys) is False
 
     def test_no_main_key_matches_sub(self):
         from omlx.settings import SubKeyEntry
+
         sub_keys = [SubKeyEntry(key="sub1")]
         assert verify_any_api_key("sub1", "", sub_keys) is True
 
@@ -360,6 +422,7 @@ class TestVerifyAnyApiKey:
 
     def test_none_main_key_matches_sub(self):
         from omlx.settings import SubKeyEntry
+
         sub_keys = [SubKeyEntry(key="sub1")]
         assert verify_any_api_key("sub1", None, sub_keys) is True
 
@@ -555,7 +618,14 @@ def _mock_global_settings(api_key=None):
     """Create a mock GlobalSettings with the given API key."""
     mock = MagicMock()
     mock.auth.api_key = api_key
+    mock.auth.skip_api_key_verification = False
+    mock.server.host = "127.0.0.1"
     return mock
+
+
+def _loopback_http_request():
+    """Create the request state accepted by the loopback-only setup endpoint."""
+    return SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
 
 
 def _patch_getter(mock_settings):
@@ -573,6 +643,26 @@ def _restore_getter(original):
 class TestSetupApiKeyEndpoint:
     """Tests for POST /admin/api/setup-api-key endpoint logic."""
 
+    def test_setup_returns_503_when_settings_are_unavailable(self):
+        from fastapi import HTTPException
+
+        original = _patch_getter(None)
+        try:
+            request = admin_routes.SetupApiKeyRequest(
+                api_key="validkey123", api_key_confirm="validkey123"
+            )
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
+
+            assert exc_info.value.status_code == 503
+            assert "not initialized" in exc_info.value.detail
+        finally:
+            _restore_getter(original)
+
     def test_setup_rejects_when_key_already_set(self):
         """Setup should fail if API key is already configured."""
         from fastapi import HTTPException
@@ -584,7 +674,11 @@ class TestSetupApiKeyEndpoint:
                 api_key="newkey", api_key_confirm="newkey"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
             assert exc_info.value.status_code == 400
             assert "already configured" in exc_info.value.detail
         finally:
@@ -601,7 +695,11 @@ class TestSetupApiKeyEndpoint:
                 api_key="key1", api_key_confirm="key2"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
             assert exc_info.value.status_code == 400
             assert "do not match" in exc_info.value.detail
         finally:
@@ -618,7 +716,11 @@ class TestSetupApiKeyEndpoint:
                 api_key="abc", api_key_confirm="abc"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
             assert exc_info.value.status_code == 400
             assert "at least 4" in exc_info.value.detail
         finally:
@@ -635,9 +737,59 @@ class TestSetupApiKeyEndpoint:
                 api_key="ab cd", api_key_confirm="ab cd"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
             assert exc_info.value.status_code == 400
             assert "whitespace" in exc_info.value.detail
+        finally:
+            _restore_getter(original)
+
+    def test_setup_rejects_non_loopback_configured_bind(self):
+        """Initial setup is unavailable once the server is network-facing."""
+        from fastapi import HTTPException
+
+        mock_settings = _mock_global_settings(api_key=None)
+        mock_settings.server.host = "0.0.0.0"
+        original = _patch_getter(mock_settings)
+        try:
+            request = admin_routes.SetupApiKeyRequest(
+                api_key="validkey123", api_key_confirm="validkey123"
+            )
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.setup_api_key(
+                        request, MagicMock(), _loopback_http_request()
+                    )
+                )
+
+            assert exc_info.value.status_code == 403
+            assert "only available over loopback" in exc_info.value.detail
+            mock_settings.save.assert_not_called()
+        finally:
+            _restore_getter(original)
+
+    def test_setup_rejects_non_loopback_client(self):
+        """A remote peer cannot claim the first key on a loopback setup."""
+        from fastapi import HTTPException
+
+        mock_settings = _mock_global_settings(api_key=None)
+        remote_request = SimpleNamespace(client=SimpleNamespace(host="192.168.1.50"))
+        original = _patch_getter(mock_settings)
+        try:
+            request = admin_routes.SetupApiKeyRequest(
+                api_key="validkey123", api_key_confirm="validkey123"
+            )
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.setup_api_key(request, MagicMock(), remote_request)
+                )
+
+            assert exc_info.value.status_code == 403
+            assert "only available over loopback" in exc_info.value.detail
+            mock_settings.save.assert_not_called()
         finally:
             _restore_getter(original)
 
@@ -657,7 +809,9 @@ class TestSetupApiKeyEndpoint:
                     api_key="validkey123", api_key_confirm="validkey123"
                 )
                 result = asyncio.run(
-                    admin_routes.setup_api_key(request, mock_response)
+                    admin_routes.setup_api_key(
+                        request, mock_response, _loopback_http_request()
+                    )
                 )
 
                 assert result["success"] is True
@@ -860,6 +1014,7 @@ class TestRuntimeCacheObservability:
         mock_settings = MagicMock()
         mock_settings.base_path = Path("/tmp/omlx-base")
         mock_settings.cache.get_ssd_cache_dir.return_value = cache_dir
+        mock_settings.cache.ssd_cache_max_size = "auto"
         mock_settings.cache.get_ssd_cache_max_size_bytes.return_value = 0
 
         shared_ssd_stats = {
@@ -934,6 +1089,7 @@ class TestRuntimeCacheObservability:
         with patch.object(admin_routes, "_get_engine_pool", return_value=engine_pool):
             payload = admin_routes._build_runtime_cache_observability(mock_settings)
 
+        mock_settings.cache.get_ssd_cache_max_size_bytes.assert_not_called()
         assert payload["total_num_files"] == 10
         assert payload["total_size_bytes"] == 12288
         assert payload["effective_block_sizes"] == [1024, 2048]
@@ -1199,3 +1355,66 @@ class TestGlobalSettingsValidation:
         )
         assert req.sampling_max_context_window_policy is None
         assert "sampling_max_context_window_policy" in req.model_fields_set
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_kv", [False, True])
+async def test_offline_ssd_sidecar_usage_and_clear(tmp_path, monkeypatch, include_kv):
+    cache_dir = tmp_path / "cache"
+    sidecar = cache_dir / "_gdn_sidecars" / ("a" * 64) / "abcd.safetensors"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_bytes(b"sidecar")
+    if include_kv:
+        block = cache_dir / "b" / "abcd.safetensors"
+        block.parent.mkdir()
+        block.write_bytes(b"kv")
+    settings = SimpleNamespace(
+        base_path=tmp_path,
+        cache=SimpleNamespace(
+            ssd_cache_max_size="1GB",
+            get_ssd_cache_dir=lambda _: cache_dir,
+            get_ssd_cache_max_size_bytes=lambda _: 10**9,
+        ),
+    )
+    monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+    monkeypatch.setattr(
+        admin_routes,
+        "_get_engine_pool",
+        lambda: SimpleNamespace(get_status=lambda: {"models": []}, _entries={}),
+    )
+    monkeypatch.setattr(
+        admin_routes, "_clear_cold_remote_cluster_cache_roots", lambda _: (0, 0)
+    )
+    before = admin_routes._build_runtime_cache_observability(settings)
+    assert before["total_num_files"] == 1 + include_kv
+    assert before["total_size_bytes"] == 7 + 2 * include_kv
+    result = await admin_routes.clear_ssd_cache(is_admin=True)
+    assert result["total_deleted"] == 1 + include_kv
+    assert not list(cache_dir.rglob("*.safetensors"))
+    after = admin_routes._build_runtime_cache_observability(settings)
+    assert after["total_num_files"] == 0
+    assert after["total_size_bytes"] == 0
+
+
+@pytest.mark.parametrize("link_level", ["root", "signature", "file"])
+def test_offline_gdn_scan_preserves_symlink_targets(tmp_path, link_level):
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "state.safetensors"
+    target.write_bytes(b"keep")
+    root = cache_dir / "_gdn_sidecars"
+    if link_level == "root":
+        root.symlink_to(outside, target_is_directory=True)
+    else:
+        root.mkdir()
+        signature = root / ("a" * 64)
+        if link_level == "signature":
+            signature.symlink_to(outside, target_is_directory=True)
+        else:
+            signature.mkdir()
+            (signature / "state.safetensors").symlink_to(target)
+    assert admin_routes._scan_offline_gdn_sidecars(cache_dir) == (0, 0)
+    assert admin_routes._scan_offline_gdn_sidecars(cache_dir, clear=True) == (0, 0)
+    assert target.read_bytes() == b"keep"

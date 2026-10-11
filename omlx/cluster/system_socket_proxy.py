@@ -10,6 +10,7 @@ normal socket API and no model data crosses this helper.
 from __future__ import annotations
 
 import ipaddress
+import logging
 import os
 import select
 import socket
@@ -19,6 +20,8 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT_SECONDS = 20.0
 _PROXY_PROGRAM = r"""
@@ -67,13 +70,13 @@ def main():
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
         print("PORT %d" % listener.getsockname()[1], flush=True)
-        remote = connect(host, port, timeout)
-        print("READY", flush=True)
         local, _ = listener.accept()
     finally:
         listener.close()
+    remote = connect(host, port, timeout)
     thread = threading.Thread(target=copy, args=(remote, local), daemon=True)
     thread.start()
+    print("READY", flush=True)
     copy(local, remote)
     thread.join(timeout=1.0)
     local.close()
@@ -88,10 +91,11 @@ if __name__ == "__main__":
 """
 
 
+_SYSTEM_PYTHON = "/usr/bin/python3"
+
+
 def _system_python() -> str | None:
-    candidate = Path(
-        os.environ.get("OMLX_CLUSTER_CONTROL_PROXY_PYTHON", "/usr/bin/python3")
-    )
+    candidate = Path(_SYSTEM_PYTHON)
     if candidate.is_file() and os.access(candidate, os.X_OK):
         return str(candidate)
     return None
@@ -100,22 +104,15 @@ def _system_python() -> str | None:
 def should_proxy_control_socket(host: str) -> bool:
     """Whether a non-loopback control socket should use the macOS carrier."""
 
-    mode = os.environ.get("OMLX_CLUSTER_CONTROL_TRANSPORT", "auto").strip().lower()
-    if mode not in {"", "auto", "direct", "system-proxy"}:
-        raise RuntimeError(
-            "OMLX_CLUSTER_CONTROL_TRANSPORT must be auto, direct, or system-proxy"
-        )
-    if mode == "direct":
-        return False
-    if mode == "system-proxy":
-        if _system_python() is None:
-            raise RuntimeError("system Python control proxy is unavailable")
-        return True
     try:
         loopback = ipaddress.ip_address(host).is_loopback
     except ValueError:
         loopback = host.strip().lower() in {"localhost", "localhost.local"}
-    return sys.platform == "darwin" and not loopback and _system_python() is not None
+    use_proxy = (
+        sys.platform == "darwin" and not loopback and _system_python() is not None
+    )
+    logger.debug("control transport: system proxy fallback available=%s", use_proxy)
+    return use_proxy
 
 
 @dataclass
@@ -180,8 +177,9 @@ def open_system_tcp_proxy(
     executable = _system_python()
     if executable is None:
         raise RuntimeError("system Python control proxy is unavailable")
+    # -I: ignore the bundled app's PYTHONHOME, which system Python cannot use.
     process = subprocess.Popen(
-        [executable, "-u", "-c", _PROXY_PROGRAM, host, str(port), str(timeout)],
+        [executable, "-I", "-u", "-c", _PROXY_PROGRAM, host, str(port), str(timeout)],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

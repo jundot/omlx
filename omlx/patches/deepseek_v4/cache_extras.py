@@ -16,6 +16,11 @@ import mlx.core as mx
 
 from mlx_lm.models.cache import _BaseCache
 
+# Widest single update whose pooling remainder can still be rolled back
+# through the undo log. Depth-k MTP chains verify at most 8 tokens; the
+# GLM-5.3 DFlash lane verifies up to a 16-token draft block per cycle.
+POOLING_UNDO_MAX_TOKENS = 16
+
 
 class PoolingCache(_BaseCache):
     """Cache for pooled (compressed) KV tokens with a remainder buffer.
@@ -24,6 +29,8 @@ class PoolingCache(_BaseCache):
       1. A growing pool of compressed tokens (step-allocated).
       2. A small remainder buffer of tokens not yet forming a full window.
     """
+
+    _omlx_mtp_batched_head_cache = True
 
     def __init__(self, ratio: int):
         self.ratio = ratio
@@ -91,7 +98,7 @@ class PoolingCache(_BaseCache):
     def offset(self):
         return self._pool_len
 
-    def _grow_pool(self, needed: int) -> None:
+    def _grow_pool(self, needed: int, *, exact: bool = False) -> None:
         """Ensure backing capacity for ``needed`` rows (geometric growth).
 
         Copies only the logical region; rows outside it were never visible
@@ -99,10 +106,37 @@ class PoolingCache(_BaseCache):
         buffer, whose committed bytes stay valid.
         """
         old = self._pool_buf
-        capacity = max(needed, 2 * old.shape[1])
+        capacity = needed if exact else max(needed, 2 * old.shape[1])
         new = mx.zeros((old.shape[0], capacity, old.shape[2]), dtype=old.dtype)
         new[:, : self._pool_len] = old[:, : self._pool_len]
         self._pool_buf = new
+
+    def prefill_capacity_bytes(self, tokens: int) -> int:
+        """Bytes ``reserve_prefill_capacity(tokens)`` would add."""
+        if self._pool_buf is None:
+            return 0
+        rows = int(tokens) // self.ratio - self._pool_buf.shape[1]
+        if rows <= 0:
+            return 0
+        return rows * (self._pool_buf.nbytes // max(1, self._pool_buf.shape[1]))
+
+    def prefill_spare_bytes(self) -> int:
+        """Bytes of pool capacity beyond the rows written so far."""
+        if self._pool_buf is None:
+            return 0
+        rows = self._pool_buf.shape[1] - self._pool_len
+        return rows * (self._pool_buf.nbytes // max(1, self._pool_buf.shape[1]))
+
+    def reserve_prefill_capacity(self, tokens: int) -> list:
+        """Size the pool for a known prompt length in one allocation.
+
+        Each geometric regrowth leaves the old buffer in the MLX pool at a
+        size no later request matches. Returns the arrays to evaluate.
+        """
+        if not self.prefill_capacity_bytes(tokens):
+            return []
+        self._grow_pool(int(tokens) // self.ratio, exact=True)
+        return [self._pool_buf]
 
     def accumulate_windows(self, kv: mx.array, gate: mx.array, offset):
         B, L, D1 = kv.shape
@@ -114,12 +148,13 @@ class PoolingCache(_BaseCache):
 
         # One-update undo log for MTP draft rejection: trim() needs the
         # pre-update state plus this update's raw inputs to undo the last
-        # token when it completed a pool window. Only decode / MTP-verify
-        # sized updates (L <= 8 covers depth-k chain verify windows) are
-        # ever trimmed; skipping the stash for prompt chunks avoids pinning
-        # large prefill projections. Buffer slices are taken before any
-        # mutation, so they reference the pre-update array node.
-        if L <= 8:
+        # token when it completed a pool window. Only decode / MTP-verify /
+        # DFlash-verify sized updates (POOLING_UNDO_MAX_TOKENS covers depth-k
+        # chain verify windows and a 16-token DFlash block) are ever trimmed;
+        # skipping the stash for prompt chunks avoids pinning large prefill
+        # projections. Buffer slices are taken before any mutation, so they
+        # reference the pre-update array node.
+        if L <= POOLING_UNDO_MAX_TOKENS:
             try:
                 from omlx.patches.mlx_lm_mtp import cache_rollback
 
@@ -396,6 +431,8 @@ class PoolingCache(_BaseCache):
 class BatchPoolingCache(_BaseCache):
     """Batched pooling cache with per-element variable-length tracking."""
 
+    _omlx_mtp_batch_rollback_cache = True
+
     def __init__(self, ratio: int, left_padding: List[int]):
         self.ratio = ratio
 
@@ -423,7 +460,7 @@ class BatchPoolingCache(_BaseCache):
         self._processed = [0] * batch_size
         self._undo = None
         self._undo_chain = False
-        self._mtp_cross_boundary_rollback = batch_size == 1
+        self._mtp_cross_boundary_rollback = True
 
         # Previous completed window's raw KV/gate per batch row, for overlap
         # (ratio==4) compressors — see PoolingCache.prev_win_kv docstring.
@@ -754,50 +791,7 @@ class BatchPoolingCache(_BaseCache):
             prev_valid,
         ) = self._undo
         if self._mtp_cross_boundary_rollback:
-            self._undo = None
-            self._undo_chain = False
-            k = kv.shape[1] - n
-            prefix_kv = mx.concatenate(
-                [buf_kv[:, : remainder[0]], kv[:, :k]],
-                axis=1,
-            )
-            prefix_gate = mx.concatenate(
-                [buf_gate[:, : remainder[0]], gate[:, :k]],
-                axis=1,
-            )
-            completed = prefix_kv.shape[1] // self.ratio
-            next_pool_length = pool_lengths[0] + completed
-            # Old code rebound ``self.pooled = pooled_after[:, :N]``; the
-            # buffer's first N columns are exactly that slice (appends only
-            # wrote at [pool_lengths[0], ...)).
-            if next_pool_length:
-                self._pool_extent = next_pool_length
-            else:
-                self._pool_buf = None
-                self._pool_extent = 0
-            self._pool_lengths = [next_pool_length]
-            self._processed = [processed[0] + k]
-
-            used = completed * self.ratio
-            remainder_kv = prefix_kv[:, used:]
-            remainder_gate = prefix_gate[:, used:]
-            self.remainder = [remainder_kv.shape[1]]
-            self.buf_kv = buf_kv
-            self.buf_gate = buf_gate
-            if self.remainder[0]:
-                self.buf_kv[:, : self.remainder[0]] = remainder_kv
-                self.buf_gate[:, : self.remainder[0]] = remainder_gate
-
-            if completed:
-                start = used - self.ratio
-                self.prev_win_kv = prefix_kv[:, start:used, :][:, None]
-                self.prev_win_gate = prefix_gate[:, start:used, :][:, None]
-                self._prev_valid = [True]
-            else:
-                self.prev_win_kv = prev_kv
-                self.prev_win_gate = prev_gate
-                self._prev_valid = list(prev_valid)
-            self._last_usable = [used]
+            self._trim_rows_from_undo([n] * len(self.remainder))
             return n
 
         self._undo = None
@@ -829,6 +823,108 @@ class BatchPoolingCache(_BaseCache):
             self._undo = None
             self._undo_chain = False
         return n
+
+    def _can_trim_rows(self, trims):
+        if not trims or len(trims) != len(self.remainder) or min(trims) < 0:
+            return False
+        if max(trims) <= min(self.remainder):
+            return True
+        return bool(
+            self._mtp_cross_boundary_rollback
+            and self._undo is not None
+            and max(trims) <= self._undo[5].shape[1]
+        )
+
+    def trim_rows(self, trims):
+        """Restore each row's accepted prefix from the same verify update."""
+        if not self._can_trim_rows(trims):
+            raise ValueError("Pooling cache cannot restore every accepted row")
+        if max(trims) <= min(self.remainder):
+            self.remainder = [r - n for r, n in zip(self.remainder, trims)]
+            self._processed = [p - n for p, n in zip(self._processed, trims)]
+            self._truncate_pooled_tail()
+            self._undo = None
+            self._undo_chain = False
+            return
+        self._trim_rows_from_undo(trims)
+
+    def _trim_rows_from_undo(self, trims):
+        (
+            buf_kv,
+            buf_gate,
+            remainder,
+            pool_lengths,
+            processed,
+            kv,
+            gate,
+            prev_kv,
+            prev_gate,
+            prev_valid,
+        ) = self._undo
+        kept = [kv.shape[1] - n for n in trims]
+        next_buf_kv, next_buf_gate = mx.zeros_like(buf_kv), mx.zeros_like(buf_gate)
+        rows, ratio = len(trims), self.ratio
+        next_prev_kv = mx.zeros((rows, 1, ratio, kv.shape[-1]), dtype=kv.dtype)
+        next_prev_gate = mx.zeros((rows, 1, ratio, gate.shape[-1]), dtype=gate.dtype)
+        next_lengths, next_remainder, next_valid, usable = [], [], [], []
+        simple_limit = min(self.remainder)
+        for row, (rem, keep) in enumerate(zip(remainder, kept)):
+            # Preserve the existing scalar trim's no-replay branch, including
+            # overlap carry metadata for rows whose suffix remains buffered.
+            if trims[row] <= simple_limit:
+                tail = self.remainder[row] - trims[row]
+                next_lengths.append(self._pool_lengths[row])
+                next_remainder.append(tail)
+                usable.append(self._last_usable[row])
+                if tail:
+                    next_buf_kv[row : row + 1, :tail] = self.buf_kv[
+                        row : row + 1, :tail
+                    ]
+                    next_buf_gate[row : row + 1, :tail] = self.buf_gate[
+                        row : row + 1, :tail
+                    ]
+                valid = self._prev_valid[row]
+                if valid:
+                    next_prev_kv[row : row + 1] = self.prev_win_kv[row : row + 1]
+                    next_prev_gate[row : row + 1] = self.prev_win_gate[row : row + 1]
+                next_valid.append(valid)
+                continue
+            prefix_kv = mx.concatenate(
+                [buf_kv[row : row + 1, :rem], kv[row : row + 1, :keep]], axis=1
+            )
+            prefix_gate = mx.concatenate(
+                [buf_gate[row : row + 1, :rem], gate[row : row + 1, :keep]], axis=1
+            )
+            completed, tail = divmod(rem + keep, ratio)
+            used = completed * ratio
+            next_lengths.append(pool_lengths[row] + completed)
+            next_remainder.append(tail)
+            usable.append(used)
+            if tail:
+                next_buf_kv[row : row + 1, :tail] = prefix_kv[:, used:]
+                next_buf_gate[row : row + 1, :tail] = prefix_gate[:, used:]
+            if completed:
+                next_prev_kv[row : row + 1] = prefix_kv[:, used - ratio : used][:, None]
+                next_prev_gate[row : row + 1] = prefix_gate[:, used - ratio : used][
+                    :, None
+                ]
+            elif prev_valid[row]:
+                next_prev_kv[row : row + 1] = prev_kv[row : row + 1]
+                next_prev_gate[row : row + 1] = prev_gate[row : row + 1]
+            next_valid.append(bool(completed or prev_valid[row]))
+        self._pool_lengths = next_lengths
+        self._pool_extent = max(next_lengths, default=0)
+        if self._pool_extent == 0:
+            self._pool_buf = None
+        self._processed = [p + keep for p, keep in zip(processed, kept)]
+        self.remainder = next_remainder
+        self.buf_kv, self.buf_gate = next_buf_kv, next_buf_gate
+        self.prev_win_kv = next_prev_kv if any(next_valid) else None
+        self.prev_win_gate = next_prev_gate if any(next_valid) else None
+        self._prev_valid = next_valid
+        self._last_usable = usable
+        self._undo = None
+        self._undo_chain = False
 
     def _truncate_pooled_tail(self):
         """Drop pooled rows written by a rejected speculative suffix."""

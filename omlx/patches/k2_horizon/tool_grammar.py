@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Request-owned K2 tool names, compiled by oMLX's existing grammar backend."""
 
+from ...api.grammar import mark_grammar_thinking_phase
 from ...exceptions import InvalidRequestError
 
 
@@ -76,7 +77,7 @@ def compile_tool_grammar(compiler, tools, existing=None):
         ),
         "end": _token("</ifm|tool_calls>"),
     }
-    return compiler.compile_structural_tag(
+    compiled = compiler.compile_structural_tag(
         {
             "type": "structural_tag",
             "format": {
@@ -86,3 +87,5 @@ def compile_tool_grammar(compiler, tools, existing=None):
             },
         }
     )
+    # Tool-name constraints leave preceding reasoning unconstrained.
+    return mark_grammar_thinking_phase(compiled, enabled=True)

@@ -43,6 +43,10 @@ VALID_PROMPT_LENGTHS = [1024, 4096, 8192, 16384, 32768, 65536, 131072, 200000]
 # Valid batch sizes for continuous batching tests
 VALID_BATCH_SIZES = [2, 4, 8]
 
+# Below this, the decode span is mostly back-to-back emission bursts (e.g. the
+# first two queued MTP tokens), so tokens / span is not a decode rate.
+_MIN_TG_TOKENS = 16
+
 
 class BenchmarkContextProfile(StrEnum):
     """Stable identifiers for the bundled throughput-benchmark corpora."""
@@ -344,6 +348,10 @@ _UPLOADED_SETTING_FIELDS = (
     "turboquant_kv_enabled",
     "turboquant_kv_bits",
     "turboquant_skip_last",
+    "qwen35_oq_a8_enabled",
+    "qwen35_oq_a8_min_tokens",
+    "moe_expert_offload_enabled",
+    "moe_expert_offload_resident_fraction",
     "specprefill_enabled",
     "specprefill_draft_model",
     "specprefill_keep_pct",
@@ -357,13 +365,16 @@ _UPLOADED_SETTING_FIELDS = (
     "dflash_max_ctx",
     "dflash_in_memory_cache",
     "dflash_in_memory_cache_max_entries",
+    "dflash_in_memory_cache_max_bytes",
     "dflash_ssd_cache",
+    "dflash_ssd_cache_max_bytes",
     "dflash_draft_window_size",
     "dflash_draft_sink_size",
     "dflash_block_size",
     "dflash_verify_mode",
     "mtp_enabled",
-    "mtp_num_draft_tokens",
+    "mtp_adaptive_max_depth",
+    "mtp_fixed_depth",
     "vlm_mtp_enabled",
     "vlm_mtp_draft_model",
     "vlm_mtp_draft_block_size",
@@ -394,7 +405,9 @@ _PATH_VALUED_SETTING_FIELDS = frozenset(
     }
 )
 
-_MAX_UPLOADED_SETTINGS_BYTES = 4096
+# omlx.ai accepts up to 8192 bytes; the margin leaves room for the
+# benchmark_context label that is prepended at upload time.
+_MAX_UPLOADED_SETTINGS_BYTES = 6144
 
 
 def _filter_uploaded_settings(model_settings: Any) -> Optional[dict]:
@@ -612,12 +625,12 @@ def _compute_single_metrics(
     e2e_duration = end_time - start_time
 
     ttft_ms: float | None = ttft_s * 1000
-    if generation_measured and completion_tokens > 1 and gen_duration > 0:
+    if generation_measured and completion_tokens >= _MIN_TG_TOKENS and gen_duration > 0:
         tpot_ms: float | None = (gen_duration / (completion_tokens - 1)) * 1000
         gen_tps: float | None = completion_tokens / gen_duration
     else:
         # Generation timing could not be measured (e.g. all content arrived
-        # in a single burst with no measurable inter-token span) — report
+        # in a single burst, or an early stop left too few tokens) - report
         # unmeasured rather than a misleading 0.0.
         tpot_ms = None
         gen_tps = None
@@ -831,6 +844,13 @@ async def _run_single_test(
 
     if generation_duration_s is None:
         generation_duration_s = producer_generation_duration_s
+
+    if metric_completion_tokens < min(max_tokens, _MIN_TG_TOKENS):
+        logger.warning(
+            f"Benchmark test pp{pp_len} stopped after "
+            f"{metric_completion_tokens}/{max_tokens} tokens; "
+            f"tg is not reported."
+        )
 
     generation_measured = generation_duration_s is not None
     trace_prefill_duration_s = prefill_duration_s
@@ -1263,6 +1283,7 @@ async def _run_external_batch_test(
 
 
 OMLX_AI_API_URL = "https://omlx.ai/api/benchmarks"
+OMLX_AI_BEST_URL = f"{OMLX_AI_API_URL}/best"
 
 # The leaderboard accepts model_name up to 150 characters.
 _MAX_MODEL_NAME_LEN = 150
@@ -1929,6 +1950,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             getattr(effective_scheduler, "prefill_speed_priority", None),
             getattr(effective_scheduler, "max_num_batched_tokens", None),
         )
+        del runtime_scheduler
 
         for pp_len in single_prompt_lengths:
             current_test += 1

@@ -200,22 +200,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handleCLISetupResult(_ result: ShellEnvWriter.CLISetupResult) {
-        guard case .needsShellPathPrompt(let reason) = result else { return }
         guard !ShellEnvWriter.shouldSuppressCLIPathPrompt() else { return }
-        promptForShellPathExport(reason: reason)
+        switch result {
+        case .publicCommandReady:
+            break
+        case .needsShellPathPrompt(let reason):
+            var message = """
+            oMLX installed the `omlx` command at ~/.omlx/bin/omlx, but that folder is not on your PATH.
+
+            To make `omlx` available in new Terminal sessions, oMLX can add a small PATH block to your shell init file. This only happens if you choose Update Shell File.
+            """
+            if !reason.isEmpty {
+                message += "\n\n\(reason)"
+            }
+            promptForCLIPathChange(
+                title: "Enable `omlx` in Terminal?",
+                message: message,
+                confirmTitle: "Update Shell File"
+            ) {
+                try ShellEnvWriter.ensureShellPathExport()
+            }
+        case .legacyPublicLink(let path, let shellPathInstalled):
+            let folder = (path as NSString).deletingLastPathComponent
+            let next = shellPathInstalled
+                ? "The `omlx` command already works through ~/.omlx/bin, so this link is no longer needed."
+                : "oMLX can remove this link and add ~/.omlx/bin to PATH in your shell init file instead. The `omlx` command keeps working in new Terminal sessions."
+            promptForCLIPathChange(
+                title: "Move the `omlx` command out of \(folder)?",
+                message: """
+                An earlier version of oMLX created \(path). oMLX no longer puts files in shared folders like Homebrew's bin directory.
+
+                \(next)
+                """,
+                confirmTitle: shellPathInstalled ? "Remove Link" : "Remove Link and Update Shell File"
+            ) {
+                // Add the PATH block first so a failed rc write keeps the old link working.
+                try ShellEnvWriter.ensureShellPathExport()
+                try ShellEnvWriter.removeLegacyPublicLink(atPath: path)
+            }
+        }
     }
 
-    private func promptForShellPathExport(reason: String) {
+    private func promptForCLIPathChange(
+        title: String,
+        message: String,
+        confirmTitle: String,
+        onConfirm: () throws -> Void
+    ) {
         let alert = NSAlert()
-        alert.messageText = "Enable `omlx` in Terminal?"
-        alert.informativeText = """
-        oMLX could not create a public `omlx` command in /opt/homebrew/bin or /usr/local/bin.
-
-        To make `omlx` available in new Terminal sessions, oMLX can add a small PATH block to your shell init file. This only happens if you choose Update Shell File.
-
-        \(reason)
-        """
-        alert.addButton(withTitle: "Update Shell File")
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: confirmTitle)
         alert.addButton(withTitle: "Dismiss Now")
         alert.addButton(withTitle: "Don't Ask Again")
         alert.window.level = .floating
@@ -223,9 +258,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch alert.runModal() {
         case .alertFirstButtonReturn:
             do {
-                try ShellEnvWriter.ensureShellPathExport()
+                try onConfirm()
             } catch {
-                NSLog("oMLX: CLI shell path setup failed — \(error)")
+                NSLog("oMLX: CLI path setup failed: \(error)")
             }
         case .alertThirdButtonReturn:
             ShellEnvWriter.suppressCLIPathPromptForever()

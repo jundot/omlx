@@ -9,12 +9,16 @@ suppression) and exposes a uniform token-by-token interface.
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Protocol
+
+from mlx_lm import tokenizer_utils
 
 from ..utils.tokenizer import (
     create_streaming_detokenizer,
@@ -345,6 +349,46 @@ class BailingHybridOutputParserSession:
         )
 
 
+def repair_tool_parser(tokenizer: Any) -> str | None:
+    """Replace a ``json_tools`` label that the chat template contradicts.
+
+    MLX-LM trusts ``tool_parser_type`` from tokenizer_config.json. Some
+    conversions store a stale ``json_tools`` label for XML grammars, so the
+    JSON parser drops every call. Only the in-memory wrapper is changed.
+    """
+    if not isinstance(tokenizer, tokenizer_utils.TokenizerWrapper):
+        return None
+    parser_module = getattr(tokenizer.tool_parser, "__module__", None)
+    if parser_module != "mlx_lm.tool_parsers.json_tools":
+        return None
+    template = tokenizer.chat_template
+    # A chat_template_type renderer does not use the Jinja template.
+    if tokenizer._chat_template is not None or not isinstance(template, str):
+        return None
+    # Resolve at call time because patches (hy_v3) rebind this function.
+    # An empty vocab keeps the choice based on the template only.
+    inferred = tokenizer_utils._infer_tool_parser(
+        SimpleNamespace(chat_template=template, get_vocab=dict)
+    )
+    if inferred in (None, "json_tools"):
+        return None
+    module = importlib.import_module(f"mlx_lm.tool_parsers.{inferred}")
+    tokenizer._tool_parser = module.parse_tool_call
+    tokenizer._tool_call_start = module.tool_call_start
+    tokenizer._tool_call_end = module.tool_call_end
+    tokenizer._tool_call_start_tokens = tuple(
+        tokenizer.encode(module.tool_call_start, add_special_tokens=False)
+    )
+    tokenizer._tool_call_end_tokens = tuple(
+        tokenizer.encode(module.tool_call_end, add_special_tokens=False)
+    )
+    logger.warning(
+        "Tool parser json_tools conflicts with the chat template; using %s",
+        inferred,
+    )
+    return inferred
+
+
 def install_minimax_m3_tokenizer_protocol(
     tokenizer: Any,
     model_name: str,
@@ -371,7 +415,7 @@ def install_minimax_m3_tokenizer_protocol(
     )
 
     apply_mlx_vlm_minimax_m3_compat_patch()
-    from mlx_vlm.tool_parsers.minimax_m3 import (
+    from mlx_vlm.tools.parsers.minimax_m3 import (
         parse_tool_call as parse_native_tool_call,
     )
 
@@ -513,6 +557,12 @@ class DeepSeekV4OutputParserSession:
 
     def __init__(self, tokenizer: Any, model_path: str | None = None):
         self._tokenizer = tokenizer
+        self._tool_start = (
+            getattr(tokenizer, "tool_call_start", None) or _DEEPSEEK_V4_TOOL_CALL_START
+        )
+        self._tool_end = (
+            getattr(tokenizer, "tool_call_end", None) or _DEEPSEEK_V4_TOOL_CALL_END
+        )
         self._raw_text = ""
         self._stopped = False
         self._detokenizer = create_streaming_detokenizer(tokenizer, model_path)
@@ -545,13 +595,13 @@ class DeepSeekV4OutputParserSession:
         return tool_filter.finish()
 
     def _trim_at_first_tool_block_end(self, text: str) -> tuple[str, bool]:
-        start_idx = text.find(_DEEPSEEK_V4_TOOL_CALL_START)
+        start_idx = text.find(self._tool_start)
         if start_idx < 0:
             return text, False
-        end_idx = text.find(_DEEPSEEK_V4_TOOL_CALL_END, start_idx)
+        end_idx = text.find(self._tool_end, start_idx)
         if end_idx < 0:
             return text, False
-        cutoff = end_idx + len(_DEEPSEEK_V4_TOOL_CALL_END)
+        cutoff = end_idx + len(self._tool_end)
         return text[:cutoff], True
 
     def process_token(self, token_id: int) -> OutputParserTokenResult:
@@ -720,7 +770,7 @@ class MiniMaxM3OutputParserSession:
 
                 apply_mlx_vlm_minimax_m3_compat_patch()
 
-                from mlx_vlm.tool_parsers.minimax_m3 import parse_tool_call
+                from mlx_vlm.tools.parsers.minimax_m3 import parse_tool_call
 
                 parsed = parse_tool_call(self._raw_text)
                 parsed_calls = parsed if isinstance(parsed, list) else [parsed]
@@ -1306,6 +1356,7 @@ def detect_output_parser(
     filesystem path is available so parser sessions can locate
     tokenizer.json for their streaming detokenizers.
     """
+    repair_tool_parser(tokenizer)
     session_model_path = model_path or model_name
 
     model_type = model_config.get("model_type") if model_config else None
@@ -1394,6 +1445,18 @@ def detect_output_parser(
                 _TOOL_RESPONSE_OPEN,
                 _TOOL_RESPONSE_CLOSE,
             ),
+        )
+
+    if getattr(tokenizer, "tool_call_start", None) == "<｜DSML｜ calls>":
+        from ..patches.deepseek_v41.output_parser import DeepSeekV41OutputParserSession
+
+        return OutputParserFactory(
+            kind="deepseek_v41",
+            create_session=lambda session_tokenizer: DeepSeekV41OutputParserSession(
+                session_tokenizer, model_path=session_model_path
+            ),
+            stop_token_ids=set(),
+            protocol_marker_texts=("<｜DSML｜ calls>", "</｜DSML｜ calls>"),
         )
 
     if _is_deepseek_v4_model(model_name, tokenizer, model_config):

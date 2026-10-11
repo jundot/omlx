@@ -32,25 +32,21 @@ SOFTWARE.
 from __future__ import annotations
 
 import logging
-import os
 
 import mlx.core as mx
 import mlx.nn as nn
 
 logger = logging.getLogger(__name__)
 
+
 _HC_COUNT = 4
 _HIDDEN_SIZE = 2560
 _STREAM_WIDTH = _HC_COUNT * _HIDDEN_SIZE
 _LOW_RANK = 320
-_GROUP_SIZE = 64
+# MLX's qmv traversal is the same for every group size; only the scale/bias
+# pointers move with it (lane / (GS / VPT), then BLOCK / GS per block).
+_GROUP_SIZES = (32, 64)
 _SUPPORTED_BITS = (4, 5, 6, 8)
-_DISABLED = os.environ.get("OMLX_QWEN4_HC_HYBRID", "1").strip().lower() in {
-    "0",
-    "false",
-    "off",
-    "no",
-}
 _KERNEL = None
 _RUNTIME_FAILED = False
 _FAILURE_LOGGED = False
@@ -221,14 +217,14 @@ _SOURCE = r"""
     const uint lane = thread_index_in_simdgroup;
     constexpr int PF = hc_pack_factor<BITS>();
     constexpr int BP = hc_bytes_per_pack<BITS>();
-    constexpr int GROUPS = K / 64;
+    constexpr int GROUPS = K / GS;
     constexpr int ROW_BYTES = K * BP / PF;
 
     if (tg < 40) {
         constexpr int PPT = 2;
         constexpr int VPT = PF * PPT;
         constexpr int BLOCK = VPT * 32;
-        constexpr int SCALE_STEP = 64 / VPT;
+        constexpr int SCALE_STEP = GS / VPT;
         const int out_row = int(tg) * 8 + int(sg) * 4;
         const device uint8_t* wp = (const device uint8_t*)down_w
             + out_row * ROW_BYTES + int(lane) * PPT * BP;
@@ -250,8 +246,8 @@ _SOURCE = r"""
                     sum);
             }
             wp += BLOCK * BP / PF;
-            sp += BLOCK / 64;
-            bp += BLOCK / 64;
+            sp += BLOCK / GS;
+            bp += BLOCK / GS;
             xp += BLOCK;
         }
         for (int row = 0; row < 4; ++row) {
@@ -265,7 +261,7 @@ _SOURCE = r"""
     constexpr int PPT = 1;
     constexpr int VPT = PF;
     constexpr int BLOCK = VPT * 32;
-    constexpr int SCALE_STEP = 64 / VPT;
+    constexpr int SCALE_STEP = GS / VPT;
     const device uint8_t* wp = (const device uint8_t*)inject_w
         + int(lane) * BP;
     const device T* sp = inject_s + int(lane) / SCALE_STEP;
@@ -285,8 +281,8 @@ _SOURCE = r"""
                 sum);
         }
         wp += BLOCK * BP / PF;
-        sp += BLOCK / 64;
-        bp += BLOCK / 64;
+        sp += BLOCK / GS;
+        bp += BLOCK / GS;
         xp += BLOCK;
     }
     float sum = hc_load_vector<T, VPT, BITS>(xp, xv);
@@ -327,14 +323,12 @@ def _kernel():
 
 def compatible_projections(down, injection) -> bool:
     """Whether two raw Qwen4 projection banks match the native contract."""
-    if _DISABLED:
-        return False
     if not (
         type(down) is nn.QuantizedLinear
         and type(injection) is nn.QuantizedLinear
         and getattr(down, "group_size", None)
         == getattr(injection, "group_size", None)
-        == _GROUP_SIZE
+        in _GROUP_SIZES
         and getattr(down, "bits", None) == getattr(injection, "bits", None)
         and getattr(down, "bits", None) in _SUPPORTED_BITS
         and getattr(down, "mode", None)
@@ -352,13 +346,13 @@ def compatible_projections(down, injection) -> bool:
     if not all(isinstance(value, mx.array) for value in tensors):
         return False
     packed_width = _STREAM_WIDTH * down.bits // 32
+    groups = _STREAM_WIDTH // down.group_size
     return bool(
         down.weight.shape == (_LOW_RANK, packed_width)
         and injection.weight.shape == (_HC_COUNT, packed_width)
         and down.weight.dtype == injection.weight.dtype == mx.uint32
-        and down.scales.shape == (_LOW_RANK, _STREAM_WIDTH // _GROUP_SIZE)
-        and injection.scales.shape
-        == (_HC_COUNT, _STREAM_WIDTH // _GROUP_SIZE)
+        and down.scales.shape == (_LOW_RANK, groups)
+        and injection.scales.shape == (_HC_COUNT, groups)
         and down.biases.shape == down.scales.shape
         and injection.biases.shape == injection.scales.shape
         and down.scales.dtype == down.biases.dtype == mx.bfloat16
@@ -399,6 +393,7 @@ def hybrid_projection(
                 ("T", x.dtype),
                 ("BITS", down.bits),
                 ("K", _STREAM_WIDTH),
+                ("GS", down.group_size),
             ],
             grid=(32, 82, 1),
             threadgroup=(32, 2, 1),
