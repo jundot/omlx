@@ -1,0 +1,54 @@
+name: Stale issues
+
+on:
+  schedule:
+    - cron: "0 20 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Close issues waiting on the reporter
+        uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93 # v11.0.0
+        with:
+          debug-only: ${{ vars.TRIAGE_LIVE != 'true' }}
+          only-issue-labels: needs-info
+          days-before-issue-stale: 7
+          days-before-issue-close: 7
+          stale-issue-label: stale
+          stale-issue-message: >-
+            This issue is still waiting for the information requested above.
+            It will be closed in 7 days if there's no reply.
+          close-issue-message: >-
+            Closing this because the requested information didn't come in.
+            If you can share it later, please open a new issue with the details and link this one.
+          close-issue-reason: not_planned
+          days-before-pr-stale: -1
+          days-before-pr-close: -1
+
+      - name: Close inactive issues
+        uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93 # v11.0.0
+        with:
+          debug-only: ${{ vars.TRIAGE_LIVE != 'true' }}
+          exempt-issue-labels: bug,planned,has-pr,needs-info
+          days-before-issue-stale: 60
+          days-before-issue-close: 14
+          stale-issue-label: stale
+          stale-issue-message: >-
+            This issue has had no activity for 60 days.
+            It will be closed in 14 days unless there's a new comment.
+            If it still happens on the latest release, a short comment with your oMLX version keeps it open.
+            See #4256 for the policy.
+          close-issue-message: >-
+            Closing this after 14 more days without activity.
+            If it still happens on the latest release, please open a new issue and link this one.
+          close-issue-reason: not_planned
+          days-before-pr-stale: -1
+          days-before-pr-close: -1
+          operations-per-run: 100

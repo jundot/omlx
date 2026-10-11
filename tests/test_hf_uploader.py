@@ -21,6 +21,18 @@ from omlx.admin.hf_uploader import (
 )
 
 
+async def _wait_for_upload_status(
+    task: UploadTask, expected: UploadStatus, timeout: float = 5.0
+) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while task.status != expected:
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(
+                f"upload task did not reach {expected.value}: {task.status.value}"
+            )
+        await asyncio.sleep(0.01)
+
+
 # =============================================================================
 # Helper Tests
 # =============================================================================
@@ -366,12 +378,12 @@ class TestHFUploaderTaskLifecycle:
                 token="hf_token",
             )
 
+            await _wait_for_upload_status(task, UploadStatus.COMPLETED)
+
         assert task.model_name == "Llama-3B-oQ4"
         assert task.repo_id == "user/Llama-3B-oQ4"
         assert task.total_size > 0
 
-        # Wait for async task to complete
-        await asyncio.sleep(0.5)
         tasks = uploader.get_tasks()
         assert len(tasks) == 1
 
@@ -440,8 +452,7 @@ class TestHFUploaderTaskLifecycle:
                 repo_id="user/Llama-3B-oQ4",
                 token="hf_token",
             )
-            # Wait for completion
-            await asyncio.sleep(0.5)
+            await _wait_for_upload_status(task, UploadStatus.COMPLETED)
             assert uploader.remove_task(task.task_id) is True
             assert uploader.get_tasks() == []
 
@@ -475,18 +486,18 @@ class TestHFUploaderTaskLifecycle:
             mock_api.create_repo.return_value = None
             mock_api.upload_folder.return_value = None
 
-            await uploader.start_upload(
+            first_task = await uploader.start_upload(
                 model_path=oq_path1,
                 repo_id="user/Llama-3B-oQ4",
                 token="hf_token",
             )
-            await asyncio.sleep(0.01)
-            await uploader.start_upload(
+            second_task = await uploader.start_upload(
                 model_path=oq_path2,
                 repo_id="user/Qwen-7B-oQ3",
                 token="hf_token",
             )
-            await asyncio.sleep(0.5)
+            await _wait_for_upload_status(first_task, UploadStatus.COMPLETED)
+            await _wait_for_upload_status(second_task, UploadStatus.COMPLETED)
             tasks = uploader.get_tasks()
             assert len(tasks) == 2
             assert tasks[0]["model_name"] == "Llama-3B-oQ4"
@@ -514,13 +525,13 @@ class TestHFUploaderReadme:
 
             mock_api.upload_folder.side_effect = fake_upload
 
-            await uploader.start_upload(
+            task = await uploader.start_upload(
                 model_path=str(oq_path),
                 repo_id="user/Llama-3B-oQ4",
                 token="hf_token",
                 auto_readme=True,
             )
-            await asyncio.sleep(0.5)
+            await _wait_for_upload_status(task, UploadStatus.COMPLETED)
 
             # README should have been present during upload
             assert "README.md" in uploaded_files
@@ -547,13 +558,13 @@ class TestHFUploaderReadme:
 
             mock_api.upload_folder.side_effect = fake_upload
 
-            await uploader.start_upload(
+            task = await uploader.start_upload(
                 model_path=str(oq_path),
                 repo_id="user/Llama-3B-oQ4",
                 token="hf_token",
                 readme_source_path=source_path,
             )
-            await asyncio.sleep(0.5)
+            await _wait_for_upload_status(task, UploadStatus.COMPLETED)
 
             assert len(readme_contents) == 1
             assert "Llama 3B Instruct" in readme_contents[0]
@@ -583,13 +594,13 @@ class TestHFUploaderReadme:
 
             mock_api.upload_folder.side_effect = fake_upload
 
-            await uploader.start_upload(
+            task = await uploader.start_upload(
                 model_path=str(oq_path),
                 repo_id="user/Llama-3B-oQ4",
                 token="hf_token",
                 auto_readme=True,
             )
-            await asyncio.sleep(0.5)
+            await _wait_for_upload_status(task, UploadStatus.COMPLETED)
 
             assert len(readme_contents) == 1
             # Should contain auto-generated content, not the stub

@@ -179,6 +179,11 @@ def quantize_engram(
     """Write three safetensors arrays in bounded row chunks, never a full table."""
     if bits not in (2, 3, 4, 6, 8):
         raise ValueError("Unsupported Engram affine bit width")
+    if table.get("bias_key"):
+        # This path reads published FP8 bytes, not packed affine tables.
+        raise ValueError(
+            "Engram table is already quantized: requantization is unsupported"
+        )
     if rows_per_chunk <= 0:
         raise ValueError("Engram chunk size must be positive")
     reader = TensorFile(source / table["weight_file"])
@@ -204,7 +209,11 @@ def quantize_engram(
         offset += length
     names = {key: f"{module_name}.{key}" if module_name else key for key in shapes}
     encoded = json.dumps(
-        {names[key]: value for key, value in header.items()}, separators=(",", ":")
+        {
+            **{names[key]: value for key, value in header.items()},
+            "__metadata__": {"format": "mlx"},
+        },
+        separators=(",", ":"),
     ).encode()
     encoded += b" " * (-len(encoded) % 8)
     data_start = 8 + len(encoded)
@@ -290,10 +299,10 @@ def quantize(
         _emit_progress,
         _get_predicate_bits,
         _lookup_imatrix_importance,
+        _validate_v41_oq_settings,
     )
 
-    if oq_level not in (3, 4) or dtype != "bfloat16" or group_size != 64:
-        raise ValueError("V4.1 supports oQ3/oQ4 BF16 export with group size 64")
+    _validate_v41_oq_settings(oq_level, dtype, group_size)
     if oq_level == 4 and (sensitivity_model_path or sensitivity_map_override):
         raise ValueError(
             "V4.1 original-precision oQ4 does not use sensitivity overrides"
@@ -385,7 +394,7 @@ def quantize(
         budget["tensor_bytes"] / 1024**3,
     )
     writer = ShardWriter(destination)
-    tables = source_engram_tables(mapping)
+    tables = source_engram_tables(mapping, config)
     exported_tables = {}
     engram_start, engram_span = (20, 20) if oq_level == 3 else (0, 30)
     projection_start = engram_start + engram_span

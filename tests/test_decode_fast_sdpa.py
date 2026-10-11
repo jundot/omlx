@@ -11,22 +11,27 @@ fast = pytest.importorskip("omlx.custom_kernels.decode_fast.fast")
 )
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16, mx.float16])
 @pytest.mark.parametrize(
-    "B,H,Hkv,qL,kL,D",
+    "B,H,Hkv,qL,kL,D,V",
     [
-        (1, 8, 1, 1, 512, 128),
-        (1, 8, 1, 1, 4096, 128),
-        (1, 8, 1, 4, 2048, 128),  # causal, gqa*qL = 32 (limit)
-        (1, 4, 4, 1, 1024, 64),   # MHA
-        (2, 8, 2, 1, 1500, 96),   # odd kL, head 96
-        (1, 8, 1, 1, 777, 128),   # odd kL 1-pass
-        (1, 16, 2, 1, 16384, 128),
+        (1, 8, 1, 1, 512, 128, 128),
+        (1, 8, 1, 1, 4096, 128, 128),
+        (1, 8, 1, 4, 2048, 128, 128),  # causal, gqa*qL = 32 (limit)
+        (1, 4, 4, 1, 1024, 64, 64),  # MHA
+        (2, 8, 2, 1, 1500, 96, 96),  # odd kL, head 96
+        (1, 8, 1, 1, 777, 128, 128),  # odd kL 1-pass
+        (1, 16, 2, 1, 16384, 128, 128),
+        # Large heads need the full 1024-thread pipeline in both passes.
+        (1, 8, 1, 1, 512, 192, 128),
+        (1, 8, 1, 4, 2048, 192, 128),
+        (1, 8, 1, 1, 512, 256, 256),
+        (1, 8, 1, 4, 2048, 256, 256),
     ],
 )
-def test_matches_mx_fast(dtype, B, H, Hkv, qL, kL, D):
+def test_matches_mx_fast(dtype, B, H, Hkv, qL, kL, D, V):
     mx.random.seed(0)
     q = mx.random.normal((B, H, qL, D)).astype(dtype)
     k = mx.random.normal((B, Hkv, kL, D)).astype(dtype)
-    v = mx.random.normal((B, Hkv, kL, D)).astype(dtype)
+    v = mx.random.normal((B, Hkv, kL, V)).astype(dtype)
     scale = 1.0 / (D ** 0.5)
     causal = qL > 1
     assert fast._ext.sdpa_decode_supported(q, k, v)

@@ -7,6 +7,7 @@ Provides multiple engine implementations:
 - VLMBatchedEngine: Vision-language model engine with image support
 - EmbeddingEngine: Batch embedding generation using mlx-embeddings
 - RerankerEngine: Document reranking using SequenceClassification models
+- DecisionEngine: Typed decisions for /v1/systemone (Clef, OpenJev)
 
 Also re-exports core engine components for backwards compatibility.
 """
@@ -15,6 +16,7 @@ Also re-exports core engine components for backwards compatibility.
 from ..engine_core import AsyncEngineCore, EngineConfig, EngineCore
 from .base import BaseEngine, BaseNonStreamingEngine, GenerationOutput
 from .batched import BatchedEngine
+from .decision import DecisionEngine
 from .embedding import EmbeddingEngine
 
 from .dflash import DFlashEngine
@@ -33,6 +35,7 @@ __all__ = [
     "VLMBatchedEngine",
     "EmbeddingEngine",
     "RerankerEngine",
+    "DecisionEngine",
     "STTEngine",
     "STSEngine",
     "TTSEngine",

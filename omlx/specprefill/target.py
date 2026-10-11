@@ -122,7 +122,12 @@ def run_specprefill_target_prefill(
                 promote_to_hot_cache=promote_static_prefix_to_hot_cache,
             )
             if restored_cache is not None:
-                prompt_cache = restored_cache
+                restore_cache = getattr(target_model, "restore_cache", None)
+                prompt_cache = (
+                    restore_cache(restored_cache)
+                    if callable(restore_cache)
+                    else restored_cache
+                )
                 static_prefix_cached_tokens = len(full_static_prefix_tokens)
                 report_system_progress(system_token_count, system_token_count)
                 log.info(

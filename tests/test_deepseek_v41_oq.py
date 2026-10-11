@@ -2,6 +2,7 @@
 
 import json
 import math
+import struct
 
 import mlx.core as mx
 import numpy as np
@@ -51,6 +52,57 @@ def test_shard_writer_keeps_oversized_projection_intact(tmp_path):
     mapping = writer.finish()
     assert mapping["big.weight"] == mapping["big.scales"]
     assert mapping["big.weight"] != mapping["small.weight"]
+
+
+def _declared_format(path):
+    with open(path, "rb") as handle:
+        length = struct.unpack("<Q", handle.read(8))[0]
+        return json.loads(handle.read(length)).get("__metadata__")
+
+
+def test_exported_shards_declare_mlx_format(tmp_path):
+    from omlx.patches.deepseek_v41.sharding import ShardWriter
+
+    writer = ShardWriter(tmp_path, max_shard_bytes=16)
+    writer.add({"a.weight": mx.ones((16,), mx.bfloat16)})
+    writer.add({"b.weight": mx.ones((1,), mx.bfloat16)})
+    mapping = writer.finish()
+    shards = sorted(set(mapping.values()))
+    assert len(shards) == 2
+    assert not list(tmp_path.glob(".model-shard-*"))
+    for name in shards:
+        assert _declared_format(tmp_path / name) == {"format": "mlx"}
+
+    mx.random.seed(7)
+    weight = mx.random.normal((9, 128)).astype(mx.bfloat16)
+    mx.save_safetensors(str(tmp_path / "source.safetensors"), {"embed.weight": weight})
+    spec = quantize_engram(
+        tmp_path,
+        tmp_path / "engram.safetensors",
+        {"weight_file": "source.safetensors", "weight_key": "embed.weight"},
+        rows_per_chunk=4,
+        bits=4,
+        module_name="language_model.embed_tokens",
+    )
+    assert _declared_format(tmp_path / spec["weight_file"]) == {"format": "mlx"}
+
+    embed = DiskEngramEmbedding(
+        tmp_path / spec["weight_file"],
+        spec["weight_key"],
+        spec["scale_key"],
+        bias_key=spec["bias_key"],
+        bits=4,
+        group_size=32,
+    )
+    try:
+        expected = mx.quantize(weight, bits=4, group_size=32)
+        ids = mx.array([[0, 4, 8]])
+        np.testing.assert_array_equal(
+            embed(ids).astype(mx.float32),
+            mx.dequantize(*expected, bits=4, group_size=32)[ids].astype(mx.float32),
+        )
+    finally:
+        embed.close()
 
 
 @pytest.mark.parametrize("switched", [False, True])

@@ -18,7 +18,7 @@ the qwen35_model chain contract to the Nemotron-H hybrid trunk:
   bit-identical to the original forward for those positions (same stock
   ssm path, same single-chunk math).
 - Stamps ``_omlx_mtp_chain`` / ``_omlx_mtp_depth`` (from ``get_mtp_depth()``,
-  i.e. the ``mtp_num_draft_tokens`` model setting; nemotron_h defaults to a
+  i.e. the ``mtp_adaptive_max_depth`` model setting; nemotron_h defaults to a
   fixed depth-1 cycle — the stock head is depth-1 trained) on MTP-bearing
   instances, plus ``_omlx_mtp_head_hidden_normed`` — nemotron's
   ``return_hidden`` hidden is already post-``norm_f``, so
@@ -391,10 +391,11 @@ def _patch_init_markers(nh):
     def __init__(self, args):
         orig_init(self, args)
         if hasattr(self, "mtp"):
-            from . import get_mtp_depth
+            from . import get_mtp_depth, is_mtp_depth_fixed
 
             self._omlx_mtp_chain = True
             self._omlx_mtp_depth = get_mtp_depth()
+            self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
             # return_hidden hidden is post-norm_f already: the chain's
             # trunk-norm hook must be identity for this model.
             self._omlx_mtp_head_hidden_normed = True

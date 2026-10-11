@@ -29,6 +29,10 @@ _VM_STATS_MIN_COUNT = 4
 # against `vm_stat` output on Apple Silicon.
 _VM_SPECULATIVE_INDEX = 23
 _VM_COMPRESSOR_INDEX = 32
+_VM_EXTERNAL_INDEX = 34
+# HOST_VM_INFO64 revision 2 fits older SDKs and includes compressor counters.
+_HOST_INFO64_INITIAL_COUNT = 40
+_MIG_ARRAY_TOO_LARGE = -307
 _VM_PAGE_SIZE = 16384
 _SYSCTL = "/usr/sbin/sysctl"
 _VM_STAT = "/usr/bin/vm_stat"
@@ -103,20 +107,25 @@ def get_total_memory() -> int:
 def get_macos_vm_stats() -> dict[str, int] | None:
     """Return macOS vm_statistics64 page counters in bytes.
 
-    The first four counters are stable across SDK versions. The oversized
-    host_info64_t buffer avoids binding oMLX to an SDK-specific struct tail.
-    "speculative" and "compressed" sit further into the struct and are only
-    reported when the kernel filled that far, so callers must treat them as
-    optional.
+    The buffer reserves space for newer layouts.
+    Tail counters are optional when the kernel returns an older revision.
     """
     if _libc is None or _MACH_HOST is None:
         return None
     try:
         stats = (ctypes.c_int * _HOST_INFO64_MAX_COUNT)()
-        count = ctypes.c_uint(_HOST_INFO64_MAX_COUNT)
+        count = ctypes.c_uint(_HOST_INFO64_INITIAL_COUNT)
         rc = _libc.host_statistics64(
             _MACH_HOST, _HOST_VM_INFO64, stats, ctypes.byref(count)
         )
+        if rc == _MIG_ARRAY_TOO_LARGE:
+            required_count = int(count.value)
+            if not (_VM_STATS_MIN_COUNT <= required_count <= _HOST_INFO64_MAX_COUNT):
+                return None
+            count = ctypes.c_uint(required_count)
+            rc = _libc.host_statistics64(
+                _MACH_HOST, _HOST_VM_INFO64, stats, ctypes.byref(count)
+            )
         if rc != 0 or count.value < _VM_STATS_MIN_COUNT:
             return None
         ps = _VM_PAGE_SIZE
@@ -130,6 +139,8 @@ def get_macos_vm_stats() -> dict[str, int] | None:
             result["speculative"] = int(stats[_VM_SPECULATIVE_INDEX]) * ps
         if count.value > _VM_COMPRESSOR_INDEX:
             result["compressed"] = int(stats[_VM_COMPRESSOR_INDEX]) * ps
+        if count.value > _VM_EXTERNAL_INDEX:
+            result["external"] = int(stats[_VM_EXTERNAL_INDEX]) * ps
         return result
     except Exception:  # noqa: BLE001
         return None

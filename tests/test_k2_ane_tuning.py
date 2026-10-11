@@ -205,6 +205,7 @@ async def test_long_prefill_measurement_requires_native_execution(
     monkeypatch.setattr(
         fast, "qwen35_ane_profile_snapshot", lambda: {"mlp": {"operations": operations}}
     )
+    monkeypatch.setattr(ane_tuning, "_runs", {})
     run = ane_tuning.create_run(
         ane_tuning.ANETuningRequest(
             model_id="model", backend="k2", sequence_length=1024

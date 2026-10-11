@@ -12,7 +12,9 @@ This file guards the oMLX-side integration surfaces:
   wrapper (issue #2317) — the muse drafter does its own root-key
   normalization and must keep working with the wrapper installed,
 - drafter discovery classification (config_model_type payload the
-  dashboard's DFlash drafter set keys on).
+  dashboard's DFlash drafter set keys on),
+- target registration against the pinned mlx-lm (issue #4009): the
+  module the DFlash loader resolves must be usable by the target ops.
 """
 
 from __future__ import annotations
@@ -121,6 +123,20 @@ class TestCrossImplementationParity:
         vendor_logits = vendor_lm(ids, cache=vendor_lm.make_cache()).logits
         mx.eval(logits, vendor_logits)
         assert bool(mx.allclose(logits, vendor_logits, atol=1e-5))
+
+
+class TestTargetRegistration:
+    def test_loader_resolves_usable_target_module(self):
+        import importlib
+
+        from dflash_mlx.engine.target_muse_glimmer import MuseGlimmerTargetOps
+        from dflash_mlx.runtime.loading import _register_bundled_target_modules
+
+        _register_bundled_target_modules()
+        module = importlib.import_module("mlx_lm.models.muse_glimmer")
+        assert hasattr(module.Model, "logits_tail")
+        model = module.Model(module.ModelArgs(**_TINY_TEXT_KWARGS))
+        assert MuseGlimmerTargetOps().supports_model(model)
 
 
 class TestDraftConfig:

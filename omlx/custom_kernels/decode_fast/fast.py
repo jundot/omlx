@@ -88,7 +88,7 @@ def sdpa_decode(
         k,
         v,
         scale=scale,
-        mask=mask,
+        mask="causal" if causal and mask is None else mask,
         sinks=sinks,
     )
 

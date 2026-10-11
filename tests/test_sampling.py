@@ -102,6 +102,34 @@ def test_apply_top_p_masks_tail_tokens():
     assert np.isinf(out_np[0, 0]) and out_np[0, 0] < 0
 
 
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_apply_top_p_keeps_the_top_token_at_tiny_thresholds(dtype):
+    """A low-precision cumulative sum used to mask every token (mlx-lm #1912)."""
+    mx.random.seed(0)
+    logits = mx.random.normal((2, 4096)) * 3
+    logprobs = (logits - mx.logsumexp(logits, axis=-1, keepdims=True)).astype(dtype)
+    for top_p in (1e-8, 1e-4, 1e-3):
+        filtered = apply_top_p(logprobs, top_p)
+        assert ((filtered > -float("inf")).sum(axis=-1) > 0).all().item()
+        assert filtered.max(axis=-1).tolist() == logprobs.max(axis=-1).tolist()
+
+
+def test_apply_xtc_threshold_is_per_row():
+    """A batch row must not take its cutoff from another row's probabilities."""
+    logits = mx.log(mx.array([[0.5, 0.3, 0.2], [0.05, 0.15, 0.8]]))
+    out = apply_xtc(
+        logits, xtc_probability=1.0, xtc_threshold=0.1, xtc_special_tokens=[]
+    )
+    # Each row keeps only its own lowest above-threshold token and below.
+    assert (out > -float("inf")).tolist() == [[False, False, True], [True, True, False]]
+
+
+def test_apply_min_p_keeps_min_tokens():
+    logprobs = mx.log(mx.array([[0.9, 0.0, 0.0, 0.1]]))
+    out = apply_min_p(logprobs, 0.5, min_tokens_to_keep=2)
+    assert (out > -float("inf")).tolist() == [[True, False, False, True]]
+
+
 def test_apply_top_k_keeps_only_k_tokens():
     """apply_top_k should mask all but the top-k highest logits."""
     logits = mx.array([[1.0, 2.0, 3.0, 4.0, 5.0]])
@@ -173,3 +201,119 @@ def test_make_sampler_runs_with_various_top_p(top_p):
     mx.eval(out)
     token = out.item()
     assert 0 <= token < 1000
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"temp": 1.0},
+        {"temp": 0.6, "top_p": 0.95, "top_k": 20},
+        {"temp": 1.0, "top_p": 0.95, "top_k": 20},
+        {"temp": 0.8, "min_p": 0.1},
+    ],
+)
+def test_shared_draft_filter_preserves_draw_density_and_rng(dtype, params):
+    from omlx.patches.mlx_lm_mtp.batch_generator import (
+        _accept_lp_for,
+        _sample_draft_with_logprobs,
+    )
+
+    mx.random.seed(731)
+    logits = (mx.random.normal((4, 257)) * 3).astype(dtype)
+    lp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    mx.eval(lp)
+    sampler = make_sampler(**params)
+    for seed in range(5):
+        mx.random.seed(seed)
+        token = sampler(lp)
+        density = _accept_lp_for(sampler, lp)
+        mx.eval(token, density)
+        rng = _capture_rng()
+        mx.random.seed(seed)
+        shared_token, shared_density = _sample_draft_with_logprobs(sampler, lp)
+        mx.eval(shared_token, shared_density)
+        assert mx.array_equal(token, shared_token).item()
+        assert mx.array_equal(density, shared_density).item()
+        assert _capture_rng() == rng
+
+
+def test_shared_draft_filter_keeps_custom_and_greedy_sampler_contract():
+    from omlx.patches.mlx_lm_mtp.batch_generator import _sample_draft_with_logprobs
+
+    lp = mx.array([[-2.0, -1.0, -3.0]])
+    calls = []
+
+    def custom(values):
+        calls.append(values)
+        return mx.array([2])
+
+    token, density = _sample_draft_with_logprobs(custom, lp)
+    assert token.item() == 2
+    assert len(calls) == 1
+    assert density is lp
+    greedy = make_sampler(temp=0)
+    token, density = _sample_draft_with_logprobs(greedy, lp)
+    assert token.item() == 1
+    assert density is lp
+    assert not hasattr(make_sampler(temp=1, xtc_probability=0.5), "sample_with_logprobs")
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("depth", [1, 2, 4])
+@pytest.mark.parametrize("temp", [0.6, 1.0])
+def test_shared_verify_filter_preserves_packet_and_rng(dtype, depth, temp):
+    from omlx.patches.mlx_lm_mtp.batch_generator import (
+        _accept_lp_for,
+        _stochastic_verify_tokens,
+    )
+
+    mx.random.seed(719)
+    lp = (mx.random.normal((depth + 1, 257)) * 3).astype(dtype)
+    lp = lp - mx.logsumexp(lp, axis=-1, keepdims=True)
+    sampler = make_sampler(temp=temp, top_p=0.95, top_k=20)
+    draft_lp = lp[:depth] + mx.random.normal((depth, 257)).astype(dtype)
+    draft_lp = draft_lp - mx.logsumexp(draft_lp, axis=-1, keepdims=True)
+    q = _accept_lp_for(sampler, draft_lp)
+    drafts = mx.argmax(q, axis=-1)
+    qs = [q[index] for index in range(depth)]
+    mx.eval(lp, q, drafts)
+    callback = sampler._mtp_sampling_logits
+    for seed in range(3):
+        del sampler._mtp_sampling_logits
+        mx.random.seed(seed)
+        expected = _stochastic_verify_tokens(sampler, lp, drafts, qs)
+        mx.eval(expected)
+        rng = _capture_rng()
+        sampler._mtp_sampling_logits = callback
+        mx.random.seed(seed)
+        actual = _stochastic_verify_tokens(sampler, lp, drafts, qs)
+        mx.eval(actual)
+        assert mx.array_equal(expected, actual).item()
+        assert _capture_rng() == rng
+
+
+@pytest.mark.parametrize("scale", [1.0, 3.0, 8.0])
+@pytest.mark.parametrize("top_p, top_k", [(0.9, 20), (0.5, 50), (0.99, 5)])
+def test_top_p_top_k_matches_sequential_filters(scale, top_p, top_k):
+    from omlx.utils.sampling import apply_top_p_top_k
+
+    mx.random.seed(11)
+    logits = mx.random.normal((6, 512)) * scale
+    lp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    expected = apply_top_k(apply_top_p(lp, top_p), top_k)
+    actual = apply_top_p_top_k(lp, top_p, top_k)
+    kept = ~mx.isinf(expected)
+    assert mx.array_equal(kept, ~mx.isinf(actual)).item()
+    assert mx.array_equal(mx.where(kept, expected, 0), mx.where(kept, actual, 0)).item()
+
+
+@pytest.mark.parametrize("vocab, top_k", [(16384, 20), (16384, 64), (1000, 20)])
+def test_top_k_indices_matches_full_sort(vocab, top_k):
+    from omlx.utils.sampling import top_k_indices
+
+    mx.random.seed(5)
+    values = mx.random.normal((3, vocab)) * 4
+    expected = mx.sort(mx.argsort(-values, axis=-1)[:, :top_k], axis=-1)
+    actual = mx.sort(top_k_indices(values, top_k), axis=-1)
+    assert mx.array_equal(expected, actual).item()
