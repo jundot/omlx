@@ -1122,6 +1122,45 @@ def test_turboquant_convert_preserves_skip_last_after_partial_tq_restore():
     assert isinstance(cache[2], KVCache)
 
 
+def test_turboquant_convert_records_how_many_layers_it_converted():
+    """The conversion leaves evidence for /api/status, not just an armed flag.
+
+    ``active`` in /api/status is true from arming onwards, before any request
+    has been served, so the published layer count is what shows the
+    fp16 -> TurboQuant conversion of a real prompt cache actually ran.
+    """
+    from types import SimpleNamespace
+
+    from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+    from omlx.scheduler import Scheduler
+
+    first = KVCache()
+    first.update_and_fetch(
+        mx.random.normal((1, 2, 4, 32)),
+        mx.random.normal((1, 2, 4, 32)),
+    )
+    rotating = RotatingKVCache(max_size=32)
+    rotating.update_and_fetch(
+        mx.random.normal((1, 2, 4, 32)),
+        mx.random.normal((1, 2, 4, 32)),
+    )
+    last = KVCache()
+    last.update_and_fetch(
+        mx.random.normal((1, 2, 4, 32)),
+        mx.random.normal((1, 2, 4, 32)),
+    )
+    mx.eval(first.state, rotating.state, last.state)
+
+    ns = SimpleNamespace(_turboquant_kv_bits=4.0, _turboquant_skip_last=True)
+
+    Scheduler._apply_turboquant_kv_convert(ns, [first, rotating, last])
+
+    # Only ``first`` is a dense KVCache that converts: the rotating layer is
+    # pass-through and ``skip_last`` leaves the final layer in fp16.
+    assert ns._turboquant_kv_converted_layers == 1
+
+
 def test_from_cache_merge_builds_working_batch():
     """Mirror the scheduler path: fp16 prefill -> from_cache (post-prefill
     quantize) -> _merge_caches builds a BatchTurboQuantKVCache that decodes.
