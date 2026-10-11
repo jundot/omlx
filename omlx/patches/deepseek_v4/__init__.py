@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DeepSeek V4 monkey-patch for mlx-lm v0.31.3.
+"""DeepSeek V4 runtime support for the pinned mlx-lm.
 
 Brings PR 1192 (https://github.com/ml-explore/mlx-lm/pull/1192) into omlx
 without modifying the pinned mlx-lm. The patch:
@@ -14,14 +14,12 @@ without modifying the pinned mlx-lm. The patch:
    encode the MTP variant in ``model_type``.
 3. Replaces ``mlx_lm.utils.load_model`` with a copy that handles
    ``F8_E8M0`` dtype fallback and the DeepSeek V4 ``fp8`` quant_method.
-4. Replaces ``mlx_lm.generate._make_cache`` with a copy aware of
-   ``PoolingCache`` → ``BatchPoolingCache`` conversion.
-5. Wraps ``mlx_lm.tokenizer_utils.AutoTokenizer`` with a fallback that
+4. Wraps ``mlx_lm.tokenizer_utils.AutoTokenizer`` with a fallback that
    retries with an empty ``PreTrainedConfig()`` when transformers does
    not yet recognize the ``deepseek_v4`` model_type (PR 45643 was
    merged 2026-05-02 but is missing from transformers <=5.7.0). This
    adopts PR 1189's tokenizer-fallback strategy.
-6. Registers omlx-side cache handlers for the two new cache classes so
+5. Registers omlx-side cache handlers for the two new cache classes so
    prefix-cache / SSD-cache state extraction does not silently fall
    through to ``DefaultCacheHandler``.
 
@@ -175,9 +173,6 @@ def apply_pooling_cache_support() -> bool:
 
     _inject_cache_extras()
 
-    from .generate_patch import apply_generate_patch
-
-    apply_generate_patch()
     _register_cache_handlers()
     _POOLING_APPLIED = True
     return True

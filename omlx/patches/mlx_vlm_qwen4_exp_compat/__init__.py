@@ -22,7 +22,7 @@ def _append_package_path(package: Any, path: Path) -> None:
         return
     path_string = str(path)
     if path_string not in package_path:
-        package_path.append(path_string)
+        package_path.insert(0, path_string)
 
 
 def apply_mlx_vlm_qwen4_exp_compat_patch() -> bool:
@@ -38,8 +38,19 @@ def apply_mlx_vlm_qwen4_exp_compat_patch() -> bool:
         _append_package_path(mlx_vlm, _VENDOR_MLX_VLM)
         _append_package_path(mlx_vlm.models, _VENDOR_MLX_VLM / "models")
         importlib.import_module("mlx_vlm.models.qwen4_exp")
+        from mlx_vlm.models.qwen3_5 import language as qwen35_language
+
+        from ..mlx_vlm_mtp import (
+            qwen35_verify_attention,
+            qwen35_verify_linear,
+        )
+
+        # Reuse the shared primitives without replacing Qwen4's HC trunk.
+        qwen35_verify_linear.apply()
+        qwen35_verify_attention.apply(qwen35_language)
         _patch_prompt_utils()
         _patch_prompt_loop()
+        _patch_model_file_bypass()
     except Exception as exc:  # noqa: BLE001
         logger.debug("Qwen4-Exp mlx-vlm registration failed: %s", exc)
         return False
@@ -47,6 +58,35 @@ def apply_mlx_vlm_qwen4_exp_compat_patch() -> bool:
     _APPLIED = True
     logger.info("Qwen4-Exp mlx-vlm compatibility patch applied")
     return True
+
+
+def _patch_model_file_bypass() -> None:
+    """Route qwen4_exp checkpoints to the exposed built-in module.
+
+    mlx-vlm >=0.7.1 gives ``config.model_file`` top priority: it imports the
+    bundled architecture file as ``custom_model`` and ``load_model`` then
+    requires ``custom_model.ModelConfig``. Published qwen4_exp checkpoints ship
+    ``model_file=qwen4_exp.py`` exporting only ``ModelArgs``-style classes, so
+    the load dies with ``module 'custom_model' has no attribute
+    'ModelConfig'``. This patch's whole purpose is exposing
+    ``mlx_vlm.models.qwen4_exp``, so for that model type drop ``model_file``
+    and keep the registry resolution mlx-vlm 0.6.x used.
+    """
+    import mlx_vlm.utils as utils
+
+    if getattr(utils.get_model_and_args, "_omlx_qwen4_exp_bypass", False):
+        return
+
+    original = utils.get_model_and_args
+
+    def get_model_and_args(config, model_path=None):
+        if str(config.get("model_type", "")).lower() == "qwen4_exp":
+            config = {k: v for k, v in config.items() if k != "model_file"}
+            return original(config, model_path=None)
+        return original(config, model_path=model_path)
+
+    get_model_and_args._omlx_qwen4_exp_bypass = True
+    utils.get_model_and_args = get_model_and_args
 
 
 def _patch_prompt_utils() -> None:

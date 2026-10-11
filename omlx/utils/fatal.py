@@ -25,3 +25,9 @@ def fatal_exit(reason: str, exit_code: int = FATAL_EXIT_CODE) -> NoReturn:
     except Exception:
         logger.exception("Failed to dump thread tracebacks before fatal exit")
     os._exit(exit_code)
+
+
+def exit_if_gpu_submissions_ignored(error: Exception) -> None:
+    """Exit when Metal rejects further GPU submissions from this process."""
+    if "kIOGPUCommandBufferCallbackErrorSubmissionsIgnored" in str(error):
+        fatal_exit(f"Metal GPU submissions disabled: {error}")

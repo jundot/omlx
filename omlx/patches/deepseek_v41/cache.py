@@ -13,6 +13,13 @@ class DeepseekV41Cache(ArraysCache):
         super().__init__(7)
         self.compress_ratio = compress_ratio
 
+    @classmethod
+    def from_state(cls, state, meta_state):
+        obj = cls()
+        obj.cache = list(state)
+        obj.meta_state = meta_state
+        return obj
+
     @property
     def offset(self):
         return self.cache[0] if self.cache[0] is not None else 0
@@ -49,7 +56,35 @@ class DeepseekV41Cache(ArraysCache):
 
     def extract(self, idx):
         result = type(self)(self.compress_ratio)
-        result.cache = [x[idx : idx + 1] if x is not None else None for x in self.cache]
+        if self.batch_size == 1 and idx in (0, -1):
+            # Forward passes run on extracted rows. Share the arrays and the
+            # growth registry so appends keep extending the same storage.
+            if getattr(self, "_ds41_buffers", None) is None:
+                self._ds41_buffers = {}
+            result.cache = list(self.cache)
+            result._ds41_buffers = self._ds41_buffers
+        else:
+            result.cache = [
+                x[idx : idx + 1] if x is not None else None for x in self.cache
+            ]
+        ratio = self.compress_ratio
+        if result.cache[0] is None or ratio is None:
+            return result
+        # extend() pads every slot to the widest row; a padded row fails the
+        # cumulative-state checks in the prefix cache, so trim to this row's
+        # own offset. The window keeps min(offset, width) rows.
+        offset = int(result.cache[0].item())
+        limits = {
+            1: offset,
+            2: offset // ratio if ratio else 0,
+            3: offset // ratio if ratio else 0,
+            4: offset % ratio if ratio > 1 else 0,
+            5: offset % ratio if ratio > 1 else 0,
+        }
+        for slot, limit in limits.items():
+            value = result.cache[slot]
+            if value is not None and value.ndim > 1 and value.shape[1] > limit:
+                result.cache[slot] = value[:, :limit]
         return result
 
     @classmethod

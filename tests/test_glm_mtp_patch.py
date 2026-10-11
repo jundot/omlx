@@ -6,6 +6,7 @@ import sys
 import mlx.core as mx
 import mlx.utils as mu
 import pytest
+from test_glm_moe_dsa_patch import _glm_generate_patch_installed
 
 from omlx.patches.glm_moe_dsa import apply_glm_moe_dsa_patch
 from omlx.patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch, set_mtp_active
@@ -13,7 +14,8 @@ from omlx.patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch, set_mtp_active
 
 @pytest.fixture(scope="module")
 def glm():
-    apply_glm_moe_dsa_patch()
+    with _glm_generate_patch_installed():
+        apply_glm_moe_dsa_patch()
     apply_mlx_lm_mtp_patch()
     return sys.modules["mlx_lm.models.glm_moe_dsa"]
 

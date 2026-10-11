@@ -321,16 +321,23 @@ def test_block_dequant_refuses_padded_fused_qkv(tmp_path):
         _block_dequant_fp8(codes, mx.array(scale), "F8_E4M3", "F32")
 
 
-def test_streaming_plan_matches_eager_sanitize(tmp_path):
+@pytest.mark.parametrize("model_type", ["mimo_v2", "mimo_v2_flash"])
+@pytest.mark.parametrize("mtp_heads", [0, 1])
+def test_streaming_plan_matches_eager_sanitize(tmp_path, model_type, mtp_heads):
     """Discovery must yield exactly the keys eager sanitize would produce."""
     shard, sources = _build_checkpoint(tmp_path)
-    config = _config()
-    sanitize_fn = _build_model_sanitizer(config)
+    config = _config(model_type=model_type, num_nextn_predict_layers=mtp_heads)
+    sanitize_fn = _build_model_sanitizer(config, preserve_mtp=bool(mtp_heads))
     assert sanitize_fn is not None
 
     eager_inputs = {}
     for layer_idx, (codes, scale) in sources.items():
         key = f"model.layers.{layer_idx}.self_attn.qkv_proj.weight"
+        eager_inputs[key] = codes
+        eager_inputs[f"{key}_scale_inv"] = mx.array(scale)
+    if mtp_heads:
+        codes, scale = _fused_tensors(99, SWA)
+        key = "model.mtp.layers.0.self_attn.qkv_proj.weight"
         eager_inputs[key] = codes
         eager_inputs[f"{key}_scale_inv"] = mx.array(scale)
     eager = sanitize_fn(dict(eager_inputs))
@@ -348,6 +355,12 @@ def test_streaming_plan_matches_eager_sanitize(tmp_path):
         expected = _oracle(*sources[layer_idx], geom)
         for part_idx, part in enumerate(PARTS):
             key = f"model.layers.{layer_idx}.self_attn.{part}.weight"
+            got = np.array(planned.pop(key).astype(mx.float32))
+            assert np.array_equal(got, expected[part_idx]), key
+    if mtp_heads:
+        expected = _oracle(*_fused_tensors(99, SWA), SWA)
+        for part_idx, part in enumerate(PARTS):
+            key = f"model.mtp.layers.0.self_attn.{part}.weight"
             got = np.array(planned.pop(key).astype(mx.float32))
             assert np.array_equal(got, expected[part_idx]), key
 

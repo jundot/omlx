@@ -3,6 +3,8 @@
 
 import mlx.core as mx
 
+from . import growth
+
 
 class AcceptanceDepthController:
     """Choose verification shapes from token acceptance, never wall-clock time.
@@ -30,6 +32,8 @@ class AcceptanceDepthController:
 
 
 class DSparkMixin:
+    _omlx_mtp_multi_request = True
+
     def _omlx_prefill(self, input_ids, cache=None, **kwargs):
         """Scheduler cache-only entry; normal forward retains full logits."""
         return self(input_ids, cache=cache, _ced_prefill=True, **kwargs)
@@ -46,6 +50,7 @@ class DSparkMixin:
         self._omlx_mtp_chain = True
         self._omlx_mtp_head_clone = False
         self._omlx_mtp_rowwise_unsupported = True
+        self._omlx_mtp_independent_verify = True
         self._omlx_mtp_depth = max(1, min(depth, self._config.dspark_block_size))
 
     def make_mtp_depth_controller(self, depth):
@@ -114,8 +119,8 @@ class DSparkMixin:
             ]
             ratio = item.compress_ratio
             if ratio:
-                item[2] = item[2][:, : end // ratio]
-                item[3] = item[3][:, : end // ratio]
+                growth.truncate(item, 2, end // ratio)
+                growth.truncate(item, 3, end // ratio)
                 if ratio > 1:
                     kv, gate = state["compressor"]
                     projected_end = before % ratio + count

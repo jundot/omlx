@@ -10,7 +10,6 @@ from __future__ import annotations
 import gc
 import importlib
 import logging
-import os
 import threading
 import time
 import weakref
@@ -36,6 +35,9 @@ _GDN_MODULES: weakref.WeakValueDictionary[int, Any] = weakref.WeakValueDictionar
 # all slices into one multi-procedure program per ANE instance and bypass this
 # fallback-only budget.
 _ANE_RESIDENT_PROGRAM_LIMIT = 120
+# Shared shape limits for compilation validation and scheduler guidance.
+_ANE_MIN_SEQUENCE_LENGTH = 1024
+_ANE_SEQUENCE_LENGTH_ALIGNMENT = 64
 # First retry cap for split procedure banks after a monolithic bank fails to
 # load. Program-create maps a bank's whole weight blob into the owning ANE's
 # ~4 GiB device address window, so single-die chips reject two monolithic
@@ -191,9 +193,10 @@ def _target_verify(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
 
 
 def _eligible_affine_linear(
-    linear: Any, dtype: mx.Dtype, *, bits: int, group_size: int
+    linear: Any, dtype: mx.Dtype | None, *, bits: int, group_size: int
 ) -> bool:
-    if not isinstance(linear, nn.QuantizedLinear):
+    # dtype is None when the sibling it came from has no stock scales.
+    if dtype is None or not isinstance(linear, nn.QuantizedLinear):
         return False
     weight = getattr(linear, "weight", None)
     scales = getattr(linear, "scales", None)
@@ -219,7 +222,7 @@ def _eligible_affine_linear(
 
 def _affine_spec(
     linear: Any,
-    dtype: mx.Dtype,
+    dtype: mx.Dtype | None,
     *,
     allowed_bits: tuple[int, ...] = (4, 5, 6, 8),
 ) -> tuple[int, int] | None:
@@ -300,17 +303,14 @@ def _tail_qmm_or_linear(linear: Any, x: mx.array, variant: int) -> mx.array:
     # min-tokens boundary (2048 default, 16384 for q8); shorter tails use
     # stock MLX.
     from omlx.patches.qwen35_q4_mlp import (
+        _MIN_TOKENS,
         _Q8_MIN_TOKENS,
         _linear_qmm,
         _route_min_tokens_for_bits,
     )
 
     bits = getattr(linear, "bits", None)
-    min_tokens = int(os.environ.get("OMLX_QWEN35_Q4_LINEAR_MIN_TOKENS", "2048"))
-    q8_min_tokens = int(
-        os.environ.get("OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS", str(_Q8_MIN_TOKENS))
-    )
-    if x.shape[-2] < _route_min_tokens_for_bits(bits, min_tokens, q8_min_tokens):
+    if x.shape[-2] < _route_min_tokens_for_bits(bits, _MIN_TOKENS, _Q8_MIN_TOKENS):
         return linear(x)
     return _linear_qmm(linear, x, variant)
 
@@ -320,9 +320,13 @@ def configure_qwen35_ane_prefill_scheduler(
     sequence_length: int,
 ) -> bool:
     """Keep normal wide prompt chunks; projection backends tile internally."""
-    if sequence_length < 1024 or sequence_length % 64:
+    if (
+        sequence_length < _ANE_MIN_SEQUENCE_LENGTH
+        or sequence_length % _ANE_SEQUENCE_LENGTH_ALIGNMENT
+    ):
         raise ValueError(
-            "ANE prefill sequence_length must be a multiple of 64 >= 1024"
+            "ANE prefill sequence_length must be a multiple of "
+            f"{_ANE_SEQUENCE_LENGTH_ALIGNMENT} >= {_ANE_MIN_SEQUENCE_LENGTH}"
         )
     config = getattr(scheduler, "config", None)
     if config is None:
@@ -337,15 +341,36 @@ def configure_qwen35_ane_prefill_scheduler(
         # configured step or the qwen35 floor.
         delivered_cap = min(delivered_cap, block_size) if delivered_cap else block_size
     if delivered_cap and sequence_length > delivered_cap:
-        logger.warning(
-            "Qwen ANE prefill sequence_length=%d exceeds the delivered prefill "
-            "chunk width (~%d tokens). Chunks narrower than the compiled shape "
-            "cannot tile onto it, so the ANE will compile but never execute. "
-            "Set sequence_length=%d or smaller.",
-            sequence_length,
-            delivered_cap,
-            delivered_cap,
-        )
+        # Round down so the recommended shape passes alignment validation.
+        usable = (
+            delivered_cap // _ANE_SEQUENCE_LENGTH_ALIGNMENT
+        ) * _ANE_SEQUENCE_LENGTH_ALIGNMENT
+        if usable < _ANE_MIN_SEQUENCE_LENGTH:
+            usable = 0
+        if usable:
+            logger.warning(
+                "Qwen ANE prefill sequence_length=%d exceeds the delivered "
+                "prefill chunk width (~%d tokens). Chunks narrower than the "
+                "compiled shape require eligible tail padding to execute on "
+                "ANE. Set sequence_length=%d or a smaller valid shape to "
+                "use unpadded tiles.",
+                sequence_length,
+                delivered_cap,
+                usable,
+            )
+        else:
+            logger.warning(
+                "Qwen ANE prefill chunk width (~%d tokens) is below the "
+                "minimum ANE sequence length (%d). These chunks require "
+                "eligible tail padding to execute on ANE; changing "
+                "sequence_length alone cannot provide an unpadded tile. "
+                "For unpadded tiles, raise the effective prefill chunk width "
+                "to at least %d (capped by the paged cache block size with "
+                "block-aware caching).",
+                delivered_cap,
+                _ANE_MIN_SEQUENCE_LENGTH,
+                _ANE_MIN_SEQUENCE_LENGTH,
+            )
     logger.info(
         "Qwen ANE prefill preserving scheduler chunks; projection tile=%d "
         "(step=%d, floor=%d)",
@@ -905,7 +930,6 @@ def _post_ane_linear(
     x: mx.array,
     variant: int,
     *,
-    q8_threshold_env: str,
     cpu_state: _CpuLinearState | None = None,
     cpu_threads: int = 8,
     cpu_shared_resource: bool = True,
@@ -933,11 +957,10 @@ def _post_ane_linear(
             cpu_shared_resource,
         )
 
-    from omlx.patches.qwen35_q4_mlp import _linear_qmm
+    from omlx.patches.qwen35_q4_mlp import _Q8_MIN_TOKENS, _linear_qmm
 
     if getattr(linear, "bits", None) == 8:
-        q8_min_tokens = int(os.environ.get(q8_threshold_env, "16384"))
-        if x.ndim >= 3 and int(x.shape[-2]) < q8_min_tokens:
+        if x.ndim >= 3 and int(x.shape[-2]) < _Q8_MIN_TOKENS:
             return linear(x)
     return _linear_qmm(linear, x, variant)
 
@@ -954,7 +977,6 @@ def _post_ane_down(
             linear,
             x,
             config.variant,
-            q8_threshold_env="OMLX_QWEN35_Q8_MLP_MIN_TOKENS",
             cpu_state=fallback,
             cpu_threads=config.cpu_threads,
             cpu_shared_resource=config.cpu_shared_resource,
@@ -2074,45 +2096,19 @@ def _wrap_class(cls: type) -> None:
 
 
 def _install_dispatch() -> bool:
-    global _VLM_GDN_HOOK_INSTALLED, _VLM_HOOK_INSTALLED
+    from omlx.patches.qwen35_q4_mlp import (
+        apply_qwen35_vlm_gdn_projection_hook,
+        register_qwen35_lm_gdn_prefill_backend,
+    )
+
+    register_qwen35_lm_gdn_prefill_backend(_gdn_backend)
     installed = False
     try:
         vlm = importlib.import_module("mlx_vlm.models.qwen3_5.language")
-        register = getattr(vlm, "register_qwen3_5_mlp_prefill_backend", None)
-        register_gdn = getattr(vlm, "register_qwen3_5_gdn_prefill_backend", None)
-        cls = getattr(vlm, "Qwen3_5MLP", None)
-        if cls is not None and getattr(cls, "_omlx_q4_mlp_patched", False):
-            # The exact q4 MLP patch replaces __call__ and therefore bypasses
-            # mlx-vlm's inner registration hook. Wrap that dispatcher so ANE
-            # gets first refusal and the q4 implementation remains fallback.
-            _wrap_class(cls)
-            installed = True
-        elif callable(register):
-            if not _VLM_HOOK_INSTALLED:
-                register(_backend)
-                _VLM_HOOK_INSTALLED = True
-            installed = True
-        else:
-            if cls is not None:
-                _wrap_class(cls)
-                installed = True
-        if callable(register_gdn) and not _VLM_GDN_HOOK_INSTALLED:
-            register_gdn(_gdn_backend)
-            _VLM_GDN_HOOK_INSTALLED = True
-        elif not _VLM_GDN_HOOK_INSTALLED:
-            target_linears = getattr(vlm, "_target_verify_linears", None)
-            if callable(target_linears):
-
-                def ane_target_linears(linears, x, target_verify=False):
-                    gdn = _GDN_MODULES.get(id(linears[0])) if linears else None
-                    if gdn is not None:
-                        output = _gdn_backend(gdn, x, target_verify)
-                        if output is not None:
-                            return output
-                    return target_linears(linears, x, target_verify)
-
-                vlm._target_verify_linears = ane_target_linears
-                _VLM_GDN_HOOK_INSTALLED = True
+        if vlm.Qwen3_5MLP is not None:
+            _wrap_class(vlm.Qwen3_5MLP)
+        apply_qwen35_vlm_gdn_projection_hook()
+        installed = True
     except Exception:
         logger.debug("mlx-vlm Qwen ANE dispatch hook unavailable", exc_info=True)
 
@@ -2121,21 +2117,22 @@ def _install_dispatch() -> bool:
         cls = getattr(lm, "MLP", None)
         if cls is not None:
             _wrap_class(cls)
-            installed = True
-        from omlx.patches.qwen35_q4_mlp import (
-            register_qwen35_lm_gdn_prefill_backend,
-        )
-
-        # The mlx-lm GDN implementation does not use mlx-vlm's
-        # _target_verify_linears helper.  Its q4 compatibility wrapper owns
-        # the projection call site, so register there on every install.  The
-        # assignment is deliberately idempotent and avoids stale process-wide
-        # hook state across VLM -> LLM fallback and model reloads.
-        register_qwen35_lm_gdn_prefill_backend(_gdn_backend)
         installed = True
     except Exception:
         logger.debug("mlx-lm Qwen ANE dispatch hook unavailable", exc_info=True)
     return installed
+
+
+def install_qwen35_ane_prefill_dispatch() -> bool:
+    """Install the class hooks that route prefill to the compiled slices."""
+    if _install_dispatch():
+        return True
+    logger.warning(
+        "Qwen ANE prefill: dispatch hook could not be installed "
+        "(mlx-vlm/mlx-lm Qwen backend not registered); ANE prefill inactive, "
+        "running prefill on GPU"
+    )
+    return False
 
 
 def _bank_chunk_spans(
@@ -2177,19 +2174,10 @@ def _bank_split_ladder(
     returns ``(models0, models1)``. Returns ``(models0, models1,
     resident_program_count)``, or ``None`` when every attempt failed and the
     caller should use the per-layer fallback.
-    ``OMLX_QWEN35_ANE_BANK_MAX_BYTES`` forces an initial per-bank byte cap.
-    The cap counts the packed source weights handed to the bank compiler,
-    which run about four times the compiled INT8 program size.
+    The per-bank byte cap counts the packed source weights handed to the bank
+    compiler, which run about four times the compiled INT8 program size.
     """
     cap = 0
-    raw = os.environ.get("OMLX_QWEN35_ANE_BANK_MAX_BYTES", "").strip()
-    if raw:
-        try:
-            cap = max(int(raw), 0)
-        except ValueError:
-            logger.warning(
-                "Ignoring non-integer OMLX_QWEN35_ANE_BANK_MAX_BYTES=%r", raw
-            )
     total_bytes = sum(source_bytes)
     largest_bytes = max(source_bytes, default=0)
 
@@ -2305,14 +2293,6 @@ def _compile_single_banks(
     from omlx.custom_kernels.qwen35_prefill import fast
 
     cap = 0
-    raw = os.environ.get("OMLX_QWEN35_ANE_BANK_MAX_BYTES", "").strip()
-    if raw:
-        try:
-            cap = max(int(raw), 0)
-        except ValueError:
-            logger.warning(
-                "Ignoring non-integer OMLX_QWEN35_ANE_BANK_MAX_BYTES=%r", raw
-            )
     total_bytes = sum(weight.nbytes for weight in weights)
     largest_bytes = max((weight.nbytes for weight in weights), default=0)
 
@@ -2575,41 +2555,18 @@ def _enable_dual_procedure_banks(
                     _stage(dense0, dense1)
                     prepared_gdns.append((module, state))
 
-        try:
-            down_layer_stride = max(
-                1,
-                int(os.environ.get("OMLX_QWEN35_ANE_DOWN_LAYER_STRIDE", "1")),
-            )
-        except ValueError:
-            down_layer_stride = 1
         down_entries = [
             (index, state.down_ane)
             for index, (_, state) in enumerate(prepared_mlps)
-            if state.down_ane is not None and index % down_layer_stride == 0
+            if state.down_ane is not None
         ]
-        combine_down = bool(
-            down_entries
-            and os.environ.get(
-                "OMLX_QWEN35_ANE_DOWN_COMBINED_BANK", ""
-            ).strip().lower()
-            in ("1", "true", "on")
-        )
         procedure_entries: list[tuple[str, int]] = [
             *(("mlp", index) for index in range(len(prepared_mlps))),
             *(("gdn", index) for index in range(len(prepared_gdns))),
         ]
-        if combine_down:
-            for index, down_state in down_entries:
-                _stage(down_state.compile_weight0, down_state.compile_weight1)
-                procedure_entries.append(("down", index))
-        separate_down_entries = [] if combine_down else down_entries
-        down_weights0 = [
-            state.compile_weight0 for _, state in separate_down_entries
-        ]
-        down_weights1 = [
-            state.compile_weight1 for _, state in separate_down_entries
-        ]
-        procedure_count = len(procedure_entries) + len(separate_down_entries)
+        down_weights0 = [state.compile_weight0 for _, state in down_entries]
+        down_weights1 = [state.compile_weight1 for _, state in down_entries]
+        procedure_count = len(procedure_entries) + len(down_entries)
         if not procedure_count:
             return (0, 0, 0, 0)
         if procedure_count > 256:
@@ -2639,7 +2596,7 @@ def _enable_dual_procedure_banks(
         models0, models1, resident_program_count = banked_models
         down_models0: list[Any] = []
         down_models1: list[Any] = []
-        if separate_down_entries:
+        if down_entries:
             down_banks = _compile_dual_banks(
                 down_weights0,
                 down_weights1,
@@ -2651,7 +2608,6 @@ def _enable_dual_procedure_banks(
                     "continuing with the established gate/GDN bank"
                 )
                 down_entries = []
-                separate_down_entries = []
             else:
                 down_models0, down_models1, down_programs = down_banks
                 resident_program_count += down_programs
@@ -2682,21 +2638,6 @@ def _enable_dual_procedure_banks(
                     model=models0[procedure],
                     model1=models1[procedure],
                 )
-            elif kind == "down":
-                state = assigned_mlp_states[index]
-                down_state = state.down_ane
-                if down_state is None:
-                    raise RuntimeError("Missing prepared ANE down state")
-                assigned_mlp_states[index] = replace(
-                    state,
-                    down_ane=replace(
-                        down_state,
-                        model=models0[procedure],
-                        model1=models1[procedure],
-                        compile_weight0=None,
-                        compile_weight1=None,
-                    ),
-                )
             else:
                 assigned_gdn_states[index] = replace(
                     assigned_gdn_states[index],
@@ -2704,7 +2645,7 @@ def _enable_dual_procedure_banks(
                     model1=models1[procedure],
                 )
 
-        for procedure, (index, down_state) in enumerate(separate_down_entries):
+        for procedure, (index, down_state) in enumerate(down_entries):
             state = assigned_mlp_states[index]
             down_state = replace(
                 down_state,
@@ -2771,7 +2712,7 @@ def _enable_dual_procedure_banks(
                     "GDN" if kind == "gdn" else "MLP",
                     exc_info=True,
                 )
-        for procedure, (index, _) in enumerate(separate_down_entries):
+        for procedure, (index, _) in enumerate(down_entries):
             module = prepared_mlps[index][0]
             try:
                 for warm_model in (
@@ -3127,14 +3068,24 @@ def enable_qwen35_ane_prefill(
     cpu_threads: int = 8,
     cpu_shared_resource: bool = True,
     tail_padding_min_tokens: int = 0,
+    install_dispatch: bool = True,
 ) -> int:
     """Enable the private ANE backend on eligible MLPs in ``model``.
 
     Returns the number of marked dense Qwen MLP modules. A return value of zero
     is a safe no-op for other model families and unsupported runtimes.
+
+    With ``install_dispatch=False`` only the slices are compiled. The caller
+    must then call ``install_qwen35_ane_prefill_dispatch`` before serving.
     """
-    if sequence_length < 1024 or sequence_length % 64:
-        raise ValueError("ANE prefill sequence_length must be a multiple of 64 >= 1024")
+    if (
+        sequence_length < _ANE_MIN_SEQUENCE_LENGTH
+        or sequence_length % _ANE_SEQUENCE_LENGTH_ALIGNMENT
+    ):
+        raise ValueError(
+            "ANE prefill sequence_length must be a multiple of "
+            f"{_ANE_SEQUENCE_LENGTH_ALIGNMENT} >= {_ANE_MIN_SEQUENCE_LENGTH}"
+        )
     if not 0.05 <= fraction <= 0.90:
         raise ValueError("ANE prefill fraction must be between 0.05 and 0.90")
     if max_layers < 1:
@@ -3165,10 +3116,6 @@ def enable_qwen35_ane_prefill(
             "ANE tail padding threshold must be zero or less than sequence_length"
         )
 
-    env = os.environ.get("OMLX_QWEN35_ANE_PREFILL", "").strip().lower()
-    if env in ("0", "false", "off"):
-        logger.info("Qwen ANE prefill disabled by OMLX_QWEN35_ANE_PREFILL")
-        return 0
     try:
         from omlx.custom_kernels.qwen35_prefill import fast
 
@@ -3178,12 +3125,7 @@ def enable_qwen35_ane_prefill(
     except Exception:
         logger.warning("ANE native extension unavailable; Qwen ANE prefill skipped")
         return 0
-    if not _install_dispatch():
-        logger.warning(
-            "Qwen ANE prefill: dispatch hook could not be installed "
-            "(mlx-vlm/mlx-lm Qwen backend not registered); ANE prefill inactive, "
-            "running prefill on GPU"
-        )
+    if install_dispatch and not install_qwen35_ane_prefill_dispatch():
         return 0
 
     config = _AnePrefillConfig(

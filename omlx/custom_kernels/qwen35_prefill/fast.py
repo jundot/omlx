@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import platform
 import re
 from pathlib import Path
@@ -72,6 +71,17 @@ def _verify_abi(ext, import_error):
 _ext, _IMPORT_ERROR = _verify_abi(_ext, _IMPORT_ERROR)
 
 
+def set_command_buffer_caps(ops: int, mb: int) -> tuple[int, int] | None:
+    """Set MLX's per-command-buffer caps and return the previous pair.
+
+    Returns None when the native extension is unavailable; MLX keeps its caps.
+    """
+    setter = getattr(_ext, "set_command_buffer_caps", None)
+    if setter is None:
+        return None
+    return tuple(setter(int(ops), int(mb)))
+
+
 NATIVE_SYMBOLS = (
     "qwen35_fa256_attention",
     "qwen35_q2_affine_qmm_t",
@@ -104,6 +114,7 @@ NATIVE_SYMBOLS = (
     "qwen35_oq_a8_qmm_t",
     "qwen35_oq_a8_decode_weights",
     "qwen35_oq_a8_stage_a_v8",
+    "qwen35_oq_a8_stage_a_natural",
 )
 
 
@@ -833,30 +844,7 @@ _qmm_nax_cache: bool | None = None
 #   0: 64x64x64 wm2 wn2 (stock MLX tile, default)   1: bm 32   2: bm 128
 #   3: bn 128   4: bk 32   5: wm4 wn1
 NAX_QMM_VARIANTS = range(6)
-_qmm_nax_variant_warned = False
-
-
-def _resolve_qmm_nax_variant() -> int:
-    global _qmm_nax_variant_warned
-    raw = os.environ.get("OMLX_QWEN35_QMM_NAX_VARIANT", "0").strip()
-    try:
-        variant = int(raw)
-    except ValueError:
-        variant = -1
-    if variant in NAX_QMM_VARIANTS:
-        return variant
-    if not _qmm_nax_variant_warned:
-        _qmm_nax_variant_warned = True
-        logger.warning(
-            "OMLX_QWEN35_QMM_NAX_VARIANT=%r is not a bundled NAX tile "
-            "(valid: 0-%d); using variant 0",
-            raw,
-            NAX_QMM_VARIANTS[-1],
-        )
-    return 0
-
-
-QMM_NAX_VARIANT = _resolve_qmm_nax_variant()
+QMM_NAX_VARIANT = 0
 
 
 def _nax_available_fallback(
@@ -925,16 +913,9 @@ def is_nax_available() -> bool:
     """True when stock MLX will dispatch to the M5 tensor-unit (NAX) kernels.
 
     Requires both NAX hardware (mirroring mlx metal::is_nax_available) and an
-    mlx install whose metallib actually ships the NAX kernels. OMLX_NAX=0/1
-    overrides detection (testing only; the native op still refuses NAX
-    pipelines on hardware without tensor units).
+    mlx install whose metallib actually ships the NAX kernels.
     """
     global _nax_available_cache
-    env = os.environ.get("OMLX_NAX", "").strip().lower()
-    if env in ("0", "false", "off"):
-        return False
-    if env in ("1", "true", "on"):
-        return True
     if _nax_available_cache is None:
         if _EXT_HAS_NAX:
             hardware = bool(_ext.is_nax_available())
@@ -953,18 +934,11 @@ def nax_qmm_kernels_built() -> bool:
 def _qmm_use_nax() -> bool:
     global _qmm_nax_cache
     if _qmm_nax_cache is None:
-        if os.environ.get("OMLX_QWEN35_QMM_NAX", "").strip().lower() in (
-            "0",
-            "false",
-            "off",
-        ):
-            _qmm_nax_cache = False
-        else:
-            _qmm_nax_cache = (
-                _EXT_HAS_NAX
-                and bool(_ext.is_nax_available())
-                and bool(_ext.nax_qmm_kernels_built())
-            )
+        _qmm_nax_cache = (
+            _EXT_HAS_NAX
+            and bool(_ext.is_nax_available())
+            and bool(_ext.nax_qmm_kernels_built())
+        )
         if _qmm_nax_cache:
             logger.info(
                 "Qwen qmm NAX dispatch enabled (nax_variant=%d)",
@@ -973,8 +947,13 @@ def _qmm_use_nax() -> bool:
     return _qmm_nax_cache
 
 
-def _qmm_nax_kwargs() -> dict[str, object]:
-    if not _EXT_HAS_NAX:
+def _qmm_nax_kwargs(bits: int) -> dict[str, object]:
+    # The NAX metal kernel only defines bits 4/5/6/8 (qwen35_qmm_nax.metal).
+    # Routing a q2 call through NAX anyway hits a kernel-lookup failure that
+    # latches `nax_qmm_runtime_ok=false` process-wide, permanently demoting
+    # every q4/q5/q6/q8 layer to the classic kernel for the rest of the
+    # process. Never request NAX for bits==2.
+    if bits == 2 or not _EXT_HAS_NAX:
         return {}
     return {"use_nax": _qmm_use_nax(), "nax_variant": QMM_NAX_VARIANT}
 
@@ -1070,7 +1049,7 @@ def qwen35_q2_affine_qmm_t(
             scales,
             biases,
             variant,
-            **_qmm_nax_kwargs(),
+            **_qmm_nax_kwargs(2),
             **_qmm_group_size_kwargs(group_size),
             **_native_stream_kwargs(stream),
         )
@@ -1094,7 +1073,7 @@ def qwen35_q4_affine_qmm_t(
             scales,
             biases,
             variant,
-            **_qmm_nax_kwargs(),
+            **_qmm_nax_kwargs(4),
             **_qmm_group_size_kwargs(group_size),
             **_native_stream_kwargs(stream),
         )
@@ -1118,7 +1097,7 @@ def qwen35_q5_affine_qmm_t(
             scales,
             biases,
             variant,
-            **_qmm_nax_kwargs(),
+            **_qmm_nax_kwargs(5),
             **_qmm_group_size_kwargs(group_size),
             **_native_stream_kwargs(stream),
         )
@@ -1142,7 +1121,7 @@ def qwen35_q6_affine_qmm_t(
             scales,
             biases,
             variant,
-            **_qmm_nax_kwargs(),
+            **_qmm_nax_kwargs(6),
             **_qmm_group_size_kwargs(group_size),
             **_native_stream_kwargs(stream),
         )
@@ -1166,7 +1145,7 @@ def qwen35_q8_affine_qmm_t(
             scales,
             biases,
             variant,
-            **_qmm_nax_kwargs(),
+            **_qmm_nax_kwargs(8),
             **_qmm_group_size_kwargs(group_size),
             **_native_stream_kwargs(stream),
         )
@@ -1197,10 +1176,7 @@ def qwen35_moe_weighted_sum(
     raise RuntimeError("qwen35_moe_weighted_sum native kernel is unavailable")
 
 
-# --- oQ mixed-bit QxA8 (Q4/Q5, GS64, affine) on the M5 tensor units ---------
-
-OQ_A8_VARIANT = int(os.environ.get("OMLX_OQ_A8_VARIANT", "0"))
-OQ_A8_ACT_MODE = int(os.environ.get("OMLX_OQ_A8_ACT_MODE", "0"))
+# --- oQ mixed-bit QxA8 (Q4/Q5/Q8, GS64, affine) on the M5 tensor units ------
 
 
 def oq_a8_available() -> bool:
@@ -1249,6 +1225,7 @@ def qwen35_oq_a8_qmm_t(
     act_mode: int = 0,
     variant: int = 800,
     *,
+    packed: bool = False,
     stream=None,
 ) -> mx.array:
     if _ext is None or not hasattr(_ext, "qwen35_oq_a8_qmm_t"):
@@ -1263,6 +1240,7 @@ def qwen35_oq_a8_qmm_t(
         bits,
         act_mode,
         variant,
+        packed=packed,
         **_native_stream_kwargs(stream),
     )
 
@@ -1279,14 +1257,18 @@ def qwen35_oq_a8_linear(
     stream=None,
 ) -> mx.array:
     """Convenience Stage-A + GEMM for a projection with no shared activation."""
-    qa, sa, ra = qwen35_oq_a8_stage_a_v8(x, act_mode, stream=stream)
+    if bits == 8:
+        qa, sa, ra = qwen35_oq_a8_stage_a_natural(x, act_mode, stream=stream)
+    else:
+        qa, sa, ra = qwen35_oq_a8_stage_a_v8(x, act_mode, stream=stream)
+        scales, biases = mx.contiguous(scales.T), mx.contiguous(biases.T)
     return qwen35_oq_a8_qmm_t(
         qa,
         sa,
         ra,
         weight,
-        mx.contiguous(scales.T),
-        mx.contiguous(biases.T),
+        scales,
+        biases,
         bits,
         act_mode,
         variant,
@@ -1327,6 +1309,24 @@ def qwen35_oq_a8_stage_a_v8(
     return qa, sa, ra
 
 
+def qwen35_oq_a8_stage_a_natural(
+    x: mx.array,
+    act_mode: int = 0,
+    *,
+    stream=None,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Stage A for the Q8 kernel: activations stay in checkpoint K order.
+
+    Q4/Q5 use :func:`qwen35_oq_a8_stage_a_v8`. Only the group metadata is
+    transposed here, so there is no INT8 activation copy.
+    """
+    qa, sa, ra = qwen35_oq_a8_quantize(x, act_mode, stream=stream)
+    ra = mx.contiguous(ra.reshape(qa.size // qa.shape[-1], -1).T)
+    if act_mode != 0:
+        sa = mx.contiguous(sa.reshape(qa.size // qa.shape[-1], -1).T)
+    return qa, sa, ra
+
+
 def qwen35_oq_a8_decode_weights(
     weight: mx.array,
     bits: int,
@@ -1334,7 +1334,7 @@ def qwen35_oq_a8_decode_weights(
     *,
     stream=None,
 ) -> mx.array:
-    """Unpack Q4/Q5 codes to INT8.
+    """Unpack Q4/Q5/Q8 codes to INT8 (Q8 centered to q - 128).
 
     Test helper only: the production path never materializes unpacked weights
     in device memory.

@@ -688,7 +688,7 @@ def test_bonsai_local_build_probe_is_healthy():
 def _make_t5_layer(N: int = 64, K: int = 256, group_size: int = 128,
                    quants: np.ndarray | None = None) -> nn.QuantizedLinear:
     """QuantizedLinear with t5-format weights (uint8, base-3)."""
-    from tools.repack_ternary_t5 import pack_t5
+    from scripts.repack_ternary_t5 import pack_t5
 
     if quants is None:
         rng = np.random.default_rng(42)
@@ -709,10 +709,10 @@ def _make_t5_layer(N: int = 64, K: int = 256, group_size: int = 128,
 
 
 class TestT5Repack:
-    """Tests for tools/repack_ternary_t5.py."""
+    """Tests for scripts/repack_ternary_t5.py."""
 
     def test_pack_unpack_roundtrip_gs128(self):
-        from tools.repack_ternary_t5 import pack_t5, unpack_t5
+        from scripts.repack_ternary_t5 import pack_t5, unpack_t5
         rng = np.random.default_rng(0)
         q = rng.integers(0, 3, size=(8, 128), dtype=np.uint8)
         t5w = pack_t5(q, group_size=128)
@@ -721,7 +721,7 @@ class TestT5Repack:
         np.testing.assert_array_equal(q, q_rt)
 
     def test_pack_unpack_roundtrip_gs64(self):
-        from tools.repack_ternary_t5 import pack_t5, unpack_t5
+        from scripts.repack_ternary_t5 import pack_t5, unpack_t5
         rng = np.random.default_rng(1)
         q = rng.integers(0, 3, size=(8, 64), dtype=np.uint8)
         t5w = pack_t5(q, group_size=64)
@@ -730,7 +730,7 @@ class TestT5Repack:
         np.testing.assert_array_equal(q, q_rt)
 
     def test_pack_unpack_larger_K(self):
-        from tools.repack_ternary_t5 import pack_t5, unpack_t5
+        from scripts.repack_ternary_t5 import pack_t5, unpack_t5
         rng = np.random.default_rng(2)
         K, gs = 7168, 128
         q = rng.integers(0, 3, size=(4, K), dtype=np.uint8)
@@ -742,7 +742,7 @@ class TestT5Repack:
 
     def test_padding_trit_is_neutral(self):
         """Padding trits (q=1) must contribute zero to the dot product."""
-        from tools.repack_ternary_t5 import pack_t5
+        from scripts.repack_ternary_t5 import pack_t5
         # Single group of 128, last 2 positions zero-padded with q=1
         q = np.ones((1, 128), dtype=np.uint8)  # all t=0 (q=1 → dq=0 for scale*(q-1))
         t5w = pack_t5(q, group_size=128)
@@ -752,7 +752,7 @@ class TestT5Repack:
 
     def test_dequant_matches_2bit_reference(self):
         """t5 and 2-bit dequantize to the same float values."""
-        from tools.repack_ternary_t5 import pack_t5, unpack_t5, unpack_mlx_2bit
+        from scripts.repack_ternary_t5 import pack_t5, unpack_t5, unpack_mlx_2bit
         rng = np.random.default_rng(3)
         N, K, gs = 16, 256, 128
         # Generate ternary quants ∈ {0,1,2}
@@ -824,3 +824,55 @@ class TestT5FormatDetection:
         object.__setattr__(layer, "weight", mx.zeros((16, 3), dtype=mx.uint8))
         second = _is_t5_format(layer)
         assert first == second
+
+
+def test_vlm_one_bit_modules_keep_bonsai_paths(monkeypatch):
+    from mlx_vlm.quantization.one_bit import OneBitEmbedding, OneBitLinear
+
+    from omlx.models.vlm import restore_bonsai_quantized_modules
+    from omlx.patches import bonsai_qmv
+
+    model = nn.Module()
+    model.linear = OneBitLinear(128, 32, bias=False)
+    model.embedding = OneBitEmbedding(32, 128)
+    for module in (model.linear, model.embedding):
+        module.weight = mx.full((32, 4), 0x55555555, dtype=mx.uint32)
+        module.scales = mx.ones((32, 2), dtype=mx.float16)
+        module.biases = mx.full((32, 2), -0.5, dtype=mx.float16)
+    weights = model.linear.weight, model.embedding.weight
+    calls = []
+
+    def native(x, weight, scales, biases):
+        calls.append(tuple(x.shape))
+        return x @ bonsai_fast._dequant_1bit(weight, scales, biases, x.dtype).T
+
+    monkeypatch.setattr(bonsai_qmv, "has_native", lambda: True)
+    monkeypatch.setattr(bonsai_qmv, "bonsai_q1_affine_qmv_sym", native)
+    assert restore_bonsai_quantized_modules(model) == 2
+    assert type(model.linear) is nn.QuantizedLinear
+    assert type(model.embedding) is nn.QuantizedEmbedding
+    assert model.linear.weight is weights[0]
+    assert model.embedding.weight is weights[1]
+    assert not model.linear.trainable_parameters()
+    assert not model.embedding.trainable_parameters()
+    assert restore_bonsai_quantized_modules(model) == 0
+    for batch in (1, 2):
+        x = mx.ones((batch, 128), dtype=mx.float16)
+        actual = model.linear(x)
+        expected = (
+            x
+            @ bonsai_fast._dequant_1bit(
+                weights[0], model.linear.scales, model.linear.biases, x.dtype
+            ).T
+        )
+        mx.eval(actual, expected)
+        np.testing.assert_array_equal(np.array(actual), np.array(expected))
+    assert calls == [(1, 128), (2, 128)]
+    ids = mx.array([0, 7])
+    expected = bonsai_fast._dequant_1bit(
+        model.embedding.weight,
+        model.embedding.scales,
+        model.embedding.biases,
+        mx.float16,
+    )[ids]
+    np.testing.assert_array_equal(np.array(model.embedding(ids)), np.array(expected))

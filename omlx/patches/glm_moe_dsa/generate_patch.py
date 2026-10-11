@@ -191,10 +191,12 @@ def apply_glm_moe_dsa_generate_patch() -> bool:
         prompt_responses = []
 
         if len(self._generation_batch) > 0:
+            decode_start = time.perf_counter()
             generation_responses = self._generation_batch.next()
-            self._gen_tokens_counter += len(generation_responses)
-            self._steps_counter += 1
-            if self._steps_counter % 512 == 0:
+            self._counters.decode_time += time.perf_counter() - decode_start
+            self._counters.generation_tokens += len(generation_responses)
+            self._counters.generation_steps += 1
+            if self._counters.generation_steps % 512 == 0:
                 # GenerationBatch.next() submits the decode step with
                 # mx.async_eval, so the periodic clear has to drain that work
                 # first. self._stream is the stream it rode: BatchGenerator
@@ -261,11 +263,11 @@ def apply_glm_moe_dsa_generate_patch() -> bool:
             response.progress = (seq[1], seq[2])
             prompt_responses.append(response)
 
-        self._prompt_tokens_counter += sum(len(prompt) for prompt in prompts)
+        self._counters.prompt_tokens += sum(len(prompt) for prompt in prompts)
         tic = time.perf_counter()
         self._prompt_batch.prompt(prompts)
         toc = time.perf_counter()
-        self._prompt_time_counter += toc - tic
+        self._counters.prompt_time += toc - tic
 
         return prompt_responses, generation_responses
 

@@ -7,7 +7,9 @@ import mlx.core as mx
 
 _SOURCE = r"""
     const uint row = thread_position_in_grid.x;
-    if (row >= ROWS) return;
+    uint rows = 1;
+    for (int dim = 0; dim + 2 < x_ndim; ++dim) rows *= x_shape[dim];
+    if (row >= rows) return;
     float values[16];
     for (int i = 0; i < 16; ++i) values[i] = x[row * 16 + i];
     for (int iteration = 0; iteration < ITERS; ++iteration) {
@@ -29,14 +31,41 @@ _SOURCE = r"""
     for (int i = 0; i < 16; ++i) y[row * 16 + i] = values[i];
 """
 
+_LANE_SOURCE = r"""
+    // One lane per matrix entry, 16 lanes per row. Each lane repeats the
+    // serial per-row and per-column sum order, so results match exactly.
+    const uint lane = thread_index_in_simdgroup;
+    const uint first = lane & ~15u;
+    const uint row = thread_position_in_grid.x / 16;
+    const uint entry = lane % 16, r = entry / 4, c = entry % 4;
+    uint rows = 1;
+    for (int dim = 0; dim + 2 < x_ndim; ++dim) rows *= x_shape[dim];
+    float value = x[(row < rows ? row : 0) * 16 + entry];
+    for (int iteration = 0; iteration < ITERS; ++iteration) {
+        if (iteration > 0) {
+            float total = 0.0f;
+            for (uint i = 0; i < 4; ++i)
+                total = simd_shuffle(value, first + r * 4 + i) + total;
+            total = total + eps[0];
+            value /= total;
+        }
+        float total = 0.0f;
+        for (uint i = 0; i < 4; ++i)
+            total = simd_shuffle(value, first + i * 4 + c) + total;
+        total = total + eps[0];
+        value /= total;
+    }
+    if (row < rows) y[row * 16 + entry] = value;
+"""
+
 
 @cache
-def _sinkhorn_kernel():
+def _sinkhorn_kernel(lanes=False):
     return mx.fast.metal_kernel(
-        name="deepseek_v41_sinkhorn",
+        name="deepseek_v41_sinkhorn_lanes" if lanes else "deepseek_v41_sinkhorn",
         input_names=["x", "eps"],
         output_names=["y"],
-        source=_SOURCE,
+        source=_LANE_SOURCE if lanes else _SOURCE,
         header=("#pragma clang fp reassociate(off)\n#pragma clang fp contract(off)\n"),
     )
 
@@ -59,10 +88,13 @@ def sinkhorn(comb, eps, iters):
     ):
         return sinkhorn_reference(comb, eps, iters)
     rows = comb.size // 16
-    return _sinkhorn_kernel()(
+    # Decode and verify rows are latency bound; long prefill chunks have
+    # enough rows to fill the GPU with one thread per row.
+    lanes = rows <= 64
+    return _sinkhorn_kernel(lanes)(
         inputs=[comb, mx.array([eps], mx.float32)],
-        template=[("ROWS", rows), ("ITERS", max(1, iters))],
-        grid=(rows, 1, 1),
+        template=[("ITERS", max(1, iters))],
+        grid=((rows + 1) // 2 * 32 if lanes else rows, 1, 1),
         threadgroup=(32, 1, 1),
         output_shapes=[comb.shape],
         output_dtypes=[mx.float32],
@@ -71,7 +103,9 @@ def sinkhorn(comb, eps, iters):
 
 _POST_SOURCE = r"""
     const uint z = thread_position_in_grid.x;
-    if (z >= ROWS * D) return;
+    uint size = D;
+    for (int dim = 0; dim + 1 < x_ndim; ++dim) size *= x_shape[dim];
+    if (z >= size) return;
     const uint row = z / D, d = z % D;
     float values[4];
     for (uint i = 0; i < 4; ++i)
@@ -101,7 +135,7 @@ def fused_hc_post(x, residual, post, comb):
     """Mix four residual streams without expanding the residual to FP32."""
     return _post_kernel()(
         inputs=[x, residual, post, comb],
-        template=[("T", x.dtype), ("ROWS", x.size // x.shape[-1]), ("D", x.shape[-1])],
+        template=[("T", x.dtype), ("D", x.shape[-1])],
         grid=(x.size, 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[residual.shape],
