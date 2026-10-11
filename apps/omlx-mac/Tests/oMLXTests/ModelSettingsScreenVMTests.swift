@@ -56,6 +56,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
                 "audio_stt",
                 "audio_tts",
                 "audio_sts",
+                "decision",
             ]
         )
     }
@@ -70,6 +71,46 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         let settings = vm.currentSettingsDict()
         XCTAssertEqual(settings["mtp_enabled"]?.value as? Bool, true)
         XCTAssertEqual(settings["turboquant_kv_enabled"]?.value as? Bool, true)
+    }
+
+    func testLightningMtpAdaptiveMaxDepthInWorkingProfile() {
+        let vm = ModelSettingsScreenVM()
+        vm.mtpEnabled = true
+        XCTAssertEqual(vm.currentSettingsDict()[ProfileSettingsKey.mtpAdaptiveMaxDepth]?.value as? Int, 3)
+        XCTAssertEqual(ModelSettingsScreenVM.mtpDepthOptions.map(\.0), ["3", "4", "5", "6"])
+
+        for depth in 3...6 {
+            vm.mtpAdaptiveMaxDepth = String(depth)
+            let settings = vm.currentSettingsDict()
+            XCTAssertEqual(settings[ProfileSettingsKey.mtpAdaptiveMaxDepth]?.value as? Int, depth)
+            XCTAssertNil(settings["mtp_fixed_depth"])
+        }
+
+        vm.mtpEnabled = false
+        XCTAssertNil(vm.currentSettingsDict()[ProfileSettingsKey.mtpAdaptiveMaxDepth])
+    }
+
+    func testLightningMtpEditIsNotSavedToGlobalProfile() async {
+        let vm = ModelSettingsScreenVM()
+        vm.resetWorkingBaseline()
+        vm.temperature = "0.7"
+        vm.markProfileDirty()
+        XCTAssertFalse(vm.hasModelSpecificEdits)
+        XCTAssertEqual(vm.defaultSaveAsScope, .global)
+
+        vm.mtpEnabled = true
+        XCTAssertTrue(vm.hasModelSpecificEdits)
+        XCTAssertEqual(vm.defaultSaveAsScope, .model)
+
+        // Global templates keep only universal keys, so both writes must stop
+        // before any request instead of dropping mtp_enabled.
+        let client = OMLXClient(host: "127.0.0.1", port: 9)
+        await vm.saveWorkingAs(scope: .global, name: "mtp", client: client)
+        XCTAssertTrue(vm.lastError?.contains("Model profile") == true)
+        vm.lastError = nil
+        await vm.updateProfileWithWorking(scope: .global, name: "mtp", client: client)
+        XCTAssertTrue(vm.lastError?.contains("Model profile") == true)
+        XCTAssertTrue(vm.profileDirty)
     }
 
     func testVlmMtpDraftModelOptionsIncludeQwenMtpConfigType() {
@@ -319,6 +360,20 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertNil(vm.currentSettingsDict()["enable_thinking"])
         vm.model?.anePrefillBackend = nil
         XCTAssertFalse(vm.isQwen35AnePrefillModel)
+    }
+
+    func testQwenOqA8ModelGateCoversQwen4ExpOnly() {
+        let vm = ModelSettingsScreenVM()
+        for type in ["qwen3_5", "qwen3_5_moe", "qwen3_6", "qwen3_8", "qwen4_exp", "Qwen4-Exp"] {
+            vm.model = makeModel(id: "m", configModelType: type)
+            XCTAssertTrue(vm.isQwenOqA8Model, type)
+        }
+        for type in ["qwen4", "qwen4_exp_x", "qwen3", "llama", "k2_horizon"] {
+            vm.model = makeModel(id: "m", configModelType: type)
+            XCTAssertFalse(vm.isQwenOqA8Model, type)
+        }
+        vm.model = makeModel(id: "m", configModelType: nil)
+        XCTAssertFalse(vm.isQwenOqA8Model)
     }
 
     func testQwen4SsdOffloadWireKeysAndCompatibility() throws {

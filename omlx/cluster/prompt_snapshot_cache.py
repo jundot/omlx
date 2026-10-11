@@ -60,6 +60,10 @@ logger = logging.getLogger(__name__)
 # reusable boundaries exist across all prompts; the byte bound is the backstop.
 _MAX_ENTRIES_DEFAULT = 512
 
+# Bump when stored states stop matching a fresh prefill; older manifests then
+# reset on load. 2: mlx-lm 94cdcae changed the Qwen3.5 GDN q/k norm eps.
+_MANIFEST_VERSION = 2
+
 
 def _wire_state(entry: Any) -> tuple[Any, Any]:
     from mlx_lm.models.cache import CacheList, QuantizedKVCache
@@ -553,7 +557,10 @@ class SSDPromptSnapshotStore:
             return
         try:
             payload = json.loads(manifest.read_text(encoding="utf-8"))
-            if payload.get("version") != 1 or int(payload.get("step")) != self.step:
+            if (
+                payload.get("version") != _MANIFEST_VERSION
+                or int(payload.get("step")) != self.step
+            ):
                 raise ValueError("snapshot manifest contract changed")
             rows = payload.get("entries")
             if not isinstance(rows, list):
@@ -597,7 +604,7 @@ class SSDPromptSnapshotStore:
         if not self.persistent:
             return
         payload = {
-            "version": 1,
+            "version": _MANIFEST_VERSION,
             "step": self.step,
             "entries": [
                 {

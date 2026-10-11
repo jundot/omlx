@@ -528,6 +528,19 @@ class TestPagedCacheManager:
         assert manager.free_blocks == initial_free + 1
         assert block_id not in manager.allocated_blocks
 
+    def test_free_block_clears_hash_and_token_count(self):
+        """Free-queue blocks must carry no stale hash or token_count."""
+        manager = PagedCacheManager(block_size=64, max_blocks=100, initial_blocks=100)
+
+        block = manager.allocate_block()
+        block.block_hash = compute_block_hash(None, [1, 2, 3])
+        block.token_count = 3
+
+        assert manager.free_block(block.block_id) is True
+        assert block.block_hash is None
+        assert block.token_count == 0
+        assert manager.cold_block_count == 0
+
     def test_free_block_shared(self):
         """Test freeing a shared block only decrements ref_count."""
         manager = PagedCacheManager(block_size=64, max_blocks=100, initial_blocks=100)
@@ -541,6 +554,50 @@ class TestPagedCacheManager:
         assert result is False  # Not actually freed
         assert block.ref_count == 1
         assert manager.free_blocks == initial_free  # No change
+
+    def test_evict_block_permanently_no_double_enqueue(self):
+        """Evicting a block already in the free queue must not re-link it.
+
+        get_evictable_blocks() walks the free queue, so most evictees are
+        already linked; a second append corrupts the chain — num_free_blocks
+        over-counts and two popleft()s can hand out the same block.
+        """
+        manager = PagedCacheManager(block_size=64, max_blocks=100, initial_blocks=100)
+
+        block = manager.allocate_block()
+        manager.register_block_hash(block, [1, 2, 3])
+        block_id = block.block_id
+        queue_before = manager.free_block_queue.num_free_blocks
+
+        # Free puts it in the queue; evict walks the same queue.
+        assert manager.free_block(block_id) is True
+        assert manager.evict_block_permanently(block_id) is True
+
+        assert manager.free_block_queue.num_free_blocks == queue_before + 1
+        assert block.block_hash is None
+
+        # The queue must still hand out distinct blocks: drain everything
+        # and check for duplicates.
+        seen = set()
+        while manager.free_block_queue.num_free_blocks > 0:
+            drained = manager.free_block_queue.popleft()
+            assert drained.block_id not in seen
+            seen.add(drained.block_id)
+
+    def test_evict_block_permanently_enqueues_unqueued_block(self):
+        """An allocated block with ref 0 (not in the queue) gets enqueued."""
+        manager = PagedCacheManager(block_size=64, max_blocks=100, initial_blocks=100)
+
+        block = manager.allocate_block()
+        block_id = block.block_id
+        # Simulate a ref-0 allocated block outside the free queue.
+        manager.allocated_blocks[block_id] = block
+        block.ref_count = 0
+        queue_before = manager.free_block_queue.num_free_blocks
+
+        assert manager.evict_block_permanently(block_id) is True
+        assert manager.free_block_queue.num_free_blocks == queue_before + 1
+        assert block.next_free_block is not None
 
     def test_increment_ref(self):
         """Test incrementing reference count."""
@@ -933,6 +990,101 @@ class TestPagedCacheManager:
         assert num_tokens == 8
         assert manager.stats.allocated_blocks == initial_allocated + 2
         assert manager.stats.free_blocks == initial_free - 2
+
+    @staticmethod
+    def _register_full(manager, parent_hash, tokens):
+        block = manager.allocate_block()
+        manager.register_block_hash(block, tokens, parent_hash)
+        block.token_count = len(tokens)
+        block.ref_count = 0
+        return block.block_hash
+
+    @staticmethod
+    def _register_tail(manager, parent_hash, tokens, hot=True):
+        tail_hash = compute_block_hash(parent_hash, tokens, model_name="test-model")
+        if hot:
+            block = manager.allocate_block()
+            block.block_hash = tail_hash
+            block.token_count = len(tokens)
+            block.ref_count = 0
+            manager.cached_block_hash_to_block.insert(tail_hash, block)
+        manager.register_tail_block(parent_hash, tail_hash, len(tokens))
+        return tail_hash
+
+    def test_get_computed_blocks_matches_tail_after_full_chain(self):
+        """A tail under the last matched block extends the hit past the grid."""
+        manager = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model", initial_blocks=100
+        )
+        full_hash = self._register_full(manager, None, [1, 2, 3, 4])
+        tail_hash = self._register_tail(manager, full_hash, [5, 6])
+
+        # The next full block misses, but the tail still covers its prefix.
+        blocks, num_tokens = manager.get_computed_blocks([1, 2, 3, 4, 5, 6, 7, 8])
+        assert num_tokens == 6
+        assert [b.block_hash for b in blocks] == [full_hash, tail_hash]
+        assert blocks[-1].token_count == 2
+
+        # Exact end on the tail.
+        _, num_tokens = manager.get_computed_blocks([1, 2, 3, 4, 5, 6])
+        assert num_tokens == 6
+        # Token mismatch inside the tail.
+        _, num_tokens = manager.get_computed_blocks([1, 2, 3, 4, 5, 9, 7, 8])
+        assert num_tokens == 4
+        # Tail longer than the remaining prompt.
+        _, num_tokens = manager.get_computed_blocks([1, 2, 3, 4, 5])
+        assert num_tokens == 4
+
+    def test_get_computed_blocks_root_tail_prefers_longest(self):
+        """Prompts shorter than a block match a chain-root tail, longest first."""
+        manager = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model", initial_blocks=100
+        )
+        short_hash = self._register_tail(manager, None, [1, 2])
+        long_hash = self._register_tail(manager, None, [1, 2, 3])
+
+        blocks, num_tokens = manager.get_computed_blocks([1, 2, 3])
+        assert num_tokens == 3
+        assert blocks[0].block_hash == long_hash
+        blocks, num_tokens = manager.get_computed_blocks([1, 2, 9])
+        assert num_tokens == 2
+        assert blocks[0].block_hash == short_hash
+        # A full-block prompt with no matching full block still finds the tail.
+        _, num_tokens = manager.get_computed_blocks([1, 2, 3, 9, 9])
+        assert num_tokens == 3
+        # The per-parent index stays bounded as tails accumulate.
+        from omlx.cache.paged_cache import _TAIL_INDEX_PER_PARENT
+
+        for i in range(_TAIL_INDEX_PER_PARENT + 2):
+            manager.register_tail_block(None, bytes([i]) * 4, i + 4)
+        assert len(manager._tail_index[None]) == _TAIL_INDEX_PER_PARENT
+
+    def test_get_computed_blocks_tail_cold_registration_and_stale_pruning(self):
+        """Indexed tails are verified against the tiers on every lookup."""
+        manager = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model", initial_blocks=100
+        )
+        full_hash = self._register_full(manager, None, [1, 2, 3, 4])
+        cold_hash = self._register_tail(manager, full_hash, [5, 6, 7], hot=False)
+        stale_hash = self._register_tail(manager, full_hash, [5, 6], hot=False)
+
+        mock_ssd = MagicMock(spec=[])
+        mock_ssd.has_block = MagicMock(side_effect=lambda h: h == cold_hash)
+        manager._paged_ssd_cache_manager = mock_ssd
+
+        blocks, num_tokens = manager.get_computed_blocks([1, 2, 3, 4, 5, 6, 7, 8])
+        assert num_tokens == 7
+        assert blocks[-1].block_hash == cold_hash
+        assert blocks[-1].token_count == 3
+        assert manager.cached_block_hash_to_block.get_block(cold_hash) is blocks[-1]
+
+        # The shorter tail was tried after the cold one missed the prompt
+        # length check below, so it is still indexed; a lookup that reaches
+        # it prunes the entry once no tier holds it.
+        assert stale_hash in manager._tail_index[full_hash]
+        _, num_tokens = manager.get_computed_blocks([1, 2, 3, 4, 5, 6])
+        assert num_tokens == 4
+        assert stale_hash not in manager._tail_index[full_hash]
 
     def test_get_computed_blocks_no_ssd_no_regression(self):
         """Test that without SSD cache manager, behavior is unchanged."""

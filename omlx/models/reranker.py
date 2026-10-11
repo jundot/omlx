@@ -21,6 +21,7 @@ from typing import Any, Dict, Tuple
 import mlx.core as mx
 
 from ..model_discovery import (
+    _TOKENIZER_MAX_LENGTH_SENTINEL,
     CAUSAL_LM_RERANKER_ARCHITECTURES,
     MULTIMODAL_RERANKER_ARCHITECTURES,
     SUPPORTED_RERANKER_ARCHITECTURES,
@@ -29,7 +30,9 @@ from ..model_discovery import (
 from ..patches.modernbert_attention import patch_modernbert_attention
 from ..patches.qwen3_sliding_window import apply_qwen3_sliding_window_patch
 from ..utils.image import load_image
+from .base_model import ENCODER_BATCH_TOKEN_BUDGET, token_budget_batches
 from .mlx_embeddings_compat import (
+    patch_qwen3_vl_position_ids_recompute,
     patch_qwen3_vl_processor_for_torch_free_image_loading,
 )
 
@@ -240,6 +243,7 @@ class MLXRerankerModel:
         embedder is decided by the input dict shape at inference time.
         """
         patch_qwen3_vl_processor_for_torch_free_image_loading()
+        patch_qwen3_vl_position_ids_recompute()
         from mlx_embeddings import load as mlx_emb_load
 
         return mlx_emb_load(
@@ -279,13 +283,14 @@ class MLXRerankerModel:
         query: "str | dict[str, Any]",
         documents: "list[str] | list[dict[str, Any]]",
         max_length: int,
+        instruction: str | None = None,
     ) -> RerankOutput:
         """Rerank using mlx-embeddings' multimodal model.process() API."""
         query_item = self._build_vl_item(query)
         doc_items = [self._build_vl_item(d) for d in documents]
 
         inputs = {
-            "instruction": self._CAUSAL_LM_DEFAULT_INSTRUCTION,
+            "instruction": instruction or self._CAUSAL_LM_DEFAULT_INSTRUCTION,
             "query": query_item,
             "documents": doc_items,
         }
@@ -826,6 +831,7 @@ class MLXRerankerModel:
             else:
                 # Use mlx-embeddings for other architectures (ModernBert, etc.)
                 patch_qwen3_vl_processor_for_torch_free_image_loading()
+                patch_qwen3_vl_position_ids_recompute()
                 from mlx_embeddings import load
 
                 self.model, self.processor = load(
@@ -950,7 +956,8 @@ class MLXRerankerModel:
         mx.clear_cache()
         gc.collect()
 
-    # Default max_length per model type
+    # Default max_length per model type. Encoders use the tokenizer's limit
+    # and fall back to 512 only when the tokenizer declares none.
     _DEFAULT_MAX_LENGTH_SEQ_CLASSIFICATION = 512
     _DEFAULT_MAX_LENGTH_CAUSAL_LM = 8192
 
@@ -959,6 +966,7 @@ class MLXRerankerModel:
         query: "str | dict",
         documents: "list[str] | list[dict]",
         max_length: int | None = None,
+        instruction: str | None = None,
     ) -> RerankOutput:
         """
         Rerank documents by relevance to the query.
@@ -969,8 +977,11 @@ class MLXRerankerModel:
             documents: List of documents to rerank. Each item can be a string
                 or a dict with 'text' and/or 'image' keys.
             max_length: Maximum token length for each query-document pair.
-                If None, uses model-appropriate default (512 for encoder,
-                8192 for CausalLM).
+                If None, uses model-appropriate default (the tokenizer limit
+                for encoders, 8192 for CausalLM). Encoder values are capped
+                at the tokenizer limit.
+            instruction: Task instruction for the Qwen3 reranker `<Instruct>:`
+                slot. None or empty uses the default. Other rerankers ignore it.
 
         Returns:
             RerankOutput with scores, sorted indices, and token count
@@ -987,7 +998,9 @@ class MLXRerankerModel:
                 if max_length is not None
                 else self._DEFAULT_MAX_LENGTH_CAUSAL_LM
             )
-            return self._rerank_vl(query, documents, effective_max_length)
+            return self._rerank_vl(
+                query, documents, effective_max_length, instruction=instruction
+            )
 
         # Text-only paths: coerce dict inputs down to text so existing
         # _rerank_* methods keep their str-only contract.
@@ -1007,12 +1020,15 @@ class MLXRerankerModel:
                 if max_length is not None
                 else self._DEFAULT_MAX_LENGTH_CAUSAL_LM
             )
-            return self._rerank_causal_lm(query_str, docs_str, effective_max_length)
+            return self._rerank_causal_lm(
+                query_str, docs_str, effective_max_length, instruction=instruction
+            )
         else:
+            # Absolute position tables read out of range without an error, so
+            # never exceed the tokenizer's declared limit.
+            limit = self._seq_classification_max_length()
             effective_max_length = (
-                max_length
-                if max_length is not None
-                else self._DEFAULT_MAX_LENGTH_SEQ_CLASSIFICATION
+                min(max_length, limit) if max_length is not None else limit
             )
             return self._rerank_seq_classification(
                 query_str, docs_str, effective_max_length
@@ -1023,6 +1039,7 @@ class MLXRerankerModel:
         query: str,
         documents: list[str],
         max_length: int = 8192,
+        instruction: str | None = None,
     ) -> RerankOutput:
         """
         Rerank using CausalLM yes/no logit scoring (e.g., Qwen3-Reranker).
@@ -1045,6 +1062,8 @@ class MLXRerankerModel:
         if not callable(self.model):
             raise ValueError("CausalLM reranker model is not initialized.")
 
+        effective_instruction = instruction or self._CAUSAL_LM_DEFAULT_INSTRUCTION
+
         # Compute max tokens available for the instruction content
         max_content_tokens = max_length - len(prefix_tokens) - len(suffix_tokens)
 
@@ -1052,7 +1071,7 @@ class MLXRerankerModel:
         pairs_text = []
         for doc in documents:
             content = (
-                f"<Instruct>: {self._CAUSAL_LM_DEFAULT_INSTRUCTION}\n"
+                f"<Instruct>: {effective_instruction}\n"
                 f"<Query>: {query}\n"
                 f"<Document>: {doc}"
             )
@@ -1317,51 +1336,34 @@ class MLXRerankerModel:
             total_tokens=total_tokens,
         )
 
-    def _rerank_seq_classification(
-        self,
-        query: str,
-        documents: list[str],
-        max_length: int = 512,
-    ) -> RerankOutput:
-        """Rerank using SequenceClassification models (encoder-based)."""
-        import mlx.core as mx
-
-        # Get the underlying tokenizer from TokenizerWrapper (mlx-embeddings only)
-        # Don't unwrap transformers tokenizers which also have _tokenizer attribute
+    def _seq_classification_tokenizer(self) -> Any:
+        """Return the tokenizer behind the SequenceClassification processor."""
+        # Unwrap only mlx-embeddings' TokenizerWrapper. transformers
+        # tokenizers also have a _tokenizer attribute.
         processor = self.processor
-        processor_class = type(processor).__name__
-        if processor_class == "TokenizerWrapper" and hasattr(processor, "_tokenizer"):
-            processor = processor._tokenizer
-        if not callable(processor):
-            raise ValueError("SequenceClassification processor is not initialized.")
+        if type(processor).__name__ == "TokenizerWrapper" and hasattr(
+            processor, "_tokenizer"
+        ):
+            return processor._tokenizer
+        return processor
 
-        # Tokenize query-document pairs
-        # SequenceClassification models expect pairs as (query, document)
-        pairs = [(query, doc) for doc in documents]
+    def _seq_classification_max_length(self) -> int:
+        """Return the tokenizer's declared input limit for encoder rerankers."""
+        limit = getattr(self._seq_classification_tokenizer(), "model_max_length", None)
+        # transformers uses int(1e30) when the tokenizer declares no limit.
+        if isinstance(limit, int) and 0 < limit < _TOKENIZER_MAX_LENGTH_SENTINEL:
+            return limit
+        return self._DEFAULT_MAX_LENGTH_SEQ_CLASSIFICATION
 
-        # Batch encode all pairs
-        inputs = processor(
-            [p[0] for p in pairs],
-            [p[1] for p in pairs],
-            max_length=max_length,
-            padding=True,
-            truncation=True,
-            return_tensors="np",
-        )
-
-        # Convert to MLX arrays
-        input_ids = mx.array(inputs["input_ids"])
-        attention_mask = mx.array(inputs["attention_mask"])
-
-        # Forward pass (compiled primitive logits path when available)
-        logits = None
+    def _seq_classification_logits(
+        self, input_ids: mx.array, attention_mask: mx.array
+    ) -> mx.array:
+        """Run one padded batch and return its classification logits."""
         if self._is_compiled and self._compiled_seq_logits is not None:
             try:
-                model_inputs = {
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask,
-                }
-                logits = self._compiled_seq_logits(model_inputs)
+                return self._compiled_seq_logits(
+                    {"input_ids": input_ids, "attention_mask": attention_mask}
+                )
             except Exception as e:
                 logger.warning(
                     f"compiled reranker path failed for {self.model_name}: {e}; "
@@ -1370,36 +1372,58 @@ class MLXRerankerModel:
                 self._is_compiled = False
                 self._compiled_seq_logits = None
 
-        if logits is None:
-            if not callable(self.model):
-                raise ValueError("SequenceClassification model is not initialized.")
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
+        if not callable(self.model):
+            raise ValueError("SequenceClassification model is not initialized.")
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        # pooler_output shape: (batch_size, num_labels)
+        if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+            return outputs.pooler_output
+        raise ValueError(
+            "Model output does not contain pooler_output. "
+            "Ensure the model is a SequenceClassification model."
+        )
+
+    def _rerank_seq_classification(
+        self,
+        query: str,
+        documents: list[str],
+        max_length: int = 512,
+    ) -> RerankOutput:
+        """Rerank using SequenceClassification models (encoder-based)."""
+        processor = self._seq_classification_tokenizer()
+        if not callable(processor):
+            raise ValueError("SequenceClassification processor is not initialized.")
+
+        # SequenceClassification models expect (query, document) pairs.
+        # Tokenize once, then pad each length-sorted batch separately.
+        input_ids = processor(
+            [query] * len(documents),
+            documents,
+            max_length=max_length,
+            truncation=True,
+        )["input_ids"]
+
+        scores = [0.0] * len(documents)
+        for batch in token_budget_batches(
+            [len(ids) for ids in input_ids], ENCODER_BATCH_TOKEN_BUDGET
+        ):
+            padded = processor.pad(
+                {"input_ids": [input_ids[i] for i in batch]}, return_tensors="np"
             )
+            logits = self._seq_classification_logits(
+                mx.array(padded["input_ids"]), mx.array(padded["attention_mask"])
+            )
+            # Evaluate per batch so peak memory stays at one batch.
+            mx.eval(logits)
 
-            # Extract scores from pooler_output
-            # pooler_output shape: (batch_size, num_labels)
-            if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
-                logits = outputs.pooler_output
+            # Binary heads already apply sigmoid. Multi-class heads use the
+            # last column (typically the "relevant" class).
+            if logits.shape[-1] == 1:
+                batch_scores = logits.squeeze(-1).tolist()
             else:
-                raise ValueError(
-                    "Model output does not contain pooler_output. "
-                    "Ensure the model is a SequenceClassification model."
-                )
-
-        # Ensure computation is done
-        mx.eval(logits)
-
-        # Extract relevance scores
-        # For binary classification (num_labels=1), score is already sigmoid applied
-        # For multi-class, take the positive class probability
-        if logits.shape[-1] == 1:
-            # Binary classification: sigmoid already applied by model
-            scores = logits.squeeze(-1).tolist()
-        else:
-            # Multi-class: take last column (typically "relevant" class)
-            scores = logits[:, -1].tolist()
+                batch_scores = logits[:, -1].tolist()
+            for index, score in zip(batch, batch_scores):
+                scores[index] = score
 
         # Sort indices by score (descending)
         indexed_scores = list(enumerate(scores))

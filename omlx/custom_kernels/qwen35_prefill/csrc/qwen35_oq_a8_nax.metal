@@ -46,6 +46,12 @@ constant constexpr int kElemsPerFrag = 8;
 constant constexpr int kDestElems = 2 * kElemsPerFrag;
 constant constexpr int kStepsPerGroup = kGroupSize / kFragK; // 4
 
+// PackedLinear (omlx/patches/qwen35_packed_linear.py) tile width. Its layout
+// is codes [N / 128][group][128][words] and scales/biases
+// [N / 128][group / 4][128][4]. BN divides 128, so a threadgroup's columns sit
+// in one tile.
+constant constexpr int kPackedTileN = 128;
+
 using frag_i8 = BaseNAXFrag::dtype_frag_t<int8_t>;
 
 // One 5-bit code out of a lane's normalized 96-bit Q5 window.
@@ -66,7 +72,7 @@ inline int8_t oq_q5_window_code(uint3 w) {
   return static_cast<int8_t>(((lo >> sh) | (hi << (32 - sh))) & 0x1fu);
 }
 
-template <typename T, int BITS, int ACT_MODE, int WM, int WN>
+template <typename T, int BITS, int ACT_MODE, int WM, int WN, bool PACKED>
 [[kernel]] void oq_a8_qmm_t_nax_v8(
     const device int8_t* qa [[buffer(0)]],
     const device float* sa [[buffer(1)]],
@@ -152,10 +158,20 @@ template <typename T, int BITS, int ACT_MODE, int WM, int WN>
   // One base pointer and two strides rather than four row pointers: on a
   // 64-bit address that is four registers instead of eight, and registers are
   // what this loop is short of.
-  const device uint32_t* wbase =
-      w + size_t(col_base + int(coord.y)) * size_t(groups) * words;
-  const int w_stride8 = 8 * groups * words;
-  const int w_stride16 = kFragM * groups * words;
+  const int n_lane = col_base + int(coord.y);
+  const device uint32_t* wbase = PACKED
+      ? w + (size_t(n_lane / kPackedTileN) * size_t(groups) * kPackedTileN +
+             size_t(n_lane % kPackedTileN)) * words
+      : w + size_t(n_lane) * size_t(groups) * words;
+  const int w_row = PACKED ? words : groups * words;
+  const int w_stride8 = 8 * w_row;
+  const int w_stride16 = kFragM * w_row;
+  const int w_group = PACKED ? kPackedTileN * words : words;
+  // Packed metadata offset of this lane's first column, group 0.
+  const int s_lane = PACKED
+      ? (n_run0 / kPackedTileN) * (groups / 4) * (kPackedTileN * 4) +
+          (n_run0 % kPackedTileN) * 4
+      : 0;
 
   const int m0_base = row_base + int(coord.y);
   // Fragment column group: 0..3. Under the step-transposed schedule this is
@@ -189,7 +205,7 @@ template <typename T, int BITS, int ACT_MODE, int WM, int WN>
     STEEL_PRAGMA_UNROLL
     for (int q = 0; q < 4; ++q) {
       const device uint32_t* wr = wbase + (q & 1) * w_stride8 +
-          (q >> 1) * w_stride16 + size_t(g) * words;
+          (q >> 1) * w_stride16 + size_t(g) * w_group;
       if (BITS == 4) {
         wg[q] = reinterpret_cast<const device uint2*>(wr)[cx];
       } else {
@@ -304,11 +320,24 @@ template <typename T, int BITS, int ACT_MODE, int WM, int WN>
     // compile-time constant so the widening is free of address arithmetic.
     vec<T, 4> sv[2];
     vec<T, 4> bv[2];
-    STEEL_PRAGMA_UNROLL
-    for (int h = 0; h < 2; ++h) {
-      const int n0 = n_run0 + h * kFragM;
-      sv[h] = *reinterpret_cast<const device vec<T, 4>*>(srow + n0);
-      bv[h] = *reinterpret_cast<const device vec<T, 4>*>(brow + n0);
+    if (PACKED) {
+      // Adjacent columns are 4 elements apart; the 16-column run is 64.
+      const int s_g = s_lane + (g >> 2) * (kPackedTileN * 4) + (g & 3);
+      STEEL_PRAGMA_UNROLL
+      for (int h = 0; h < 2; ++h) {
+        const int i = s_g + h * kFragM * 4;
+        sv[h] = vec<T, 4>(
+            scales[i], scales[i + 4], scales[i + 8], scales[i + 12]);
+        bv[h] = vec<T, 4>(
+            biases[i], biases[i + 4], biases[i + 8], biases[i + 12]);
+      }
+    } else {
+      STEEL_PRAGMA_UNROLL
+      for (int h = 0; h < 2; ++h) {
+        const int n0 = n_run0 + h * kFragM;
+        sv[h] = *reinterpret_cast<const device vec<T, 4>*>(srow + n0);
+        bv[h] = *reinterpret_cast<const device vec<T, 4>*>(brow + n0);
+      }
     }
 
     float r_g[TM][2];
@@ -390,7 +419,20 @@ template <typename T, int BITS, int ACT_MODE, int WM, int WN>
       bits,                                                                   \
       act_mode,                                                               \
       wm,                                                                     \
-      wn)
+      wn,                                                                     \
+      false)
+
+#define instantiate_oq_a8_qmm_t_nax_v8_packed(act_mode, wm, wn)               \
+  instantiate_kernel(                                                         \
+      "oq_a8_qmm_t_nax_v8_q4_am" #act_mode "_bfloat16_t_wm_" #wm "_wn_" #wn   \
+      "_packed",                                                              \
+      oq_a8_qmm_t_nax_v8,                                                     \
+      bfloat16_t,                                                             \
+      4,                                                                      \
+      act_mode,                                                               \
+      wm,                                                                     \
+      wn,                                                                     \
+      true)
 
 // Tile variants must stay in sync with oq_a8_nax_variant() in qwen35_oq_a8.cpp
 // and with _VARIANT_TILES in omlx/patches/qwen35_oq_a8.py, which index the
@@ -414,5 +456,18 @@ template <typename T, int BITS, int ACT_MODE, int WM, int WN>
 
 instantiate_oq_a8_qmm_t_nax_v8_bits(4);
 instantiate_oq_a8_qmm_t_nax_v8_bits(5);
+
+// PackedLinear holds only Q4 GS64 with bfloat16 metadata.
+#define instantiate_oq_a8_qmm_t_nax_v8_packed_tiles(act_mode)                 \
+  instantiate_oq_a8_qmm_t_nax_v8_packed(act_mode, 2, 2);                      \
+  instantiate_oq_a8_qmm_t_nax_v8_packed(act_mode, 4, 2);                      \
+  instantiate_oq_a8_qmm_t_nax_v8_packed(act_mode, 2, 4);                      \
+  instantiate_oq_a8_qmm_t_nax_v8_packed(act_mode, 4, 4);                      \
+  instantiate_oq_a8_qmm_t_nax_v8_packed(act_mode, 1, 4);                      \
+  instantiate_oq_a8_qmm_t_nax_v8_packed(act_mode, 8, 2);                      \
+  instantiate_oq_a8_qmm_t_nax_v8_packed(act_mode, 1, 2)
+
+instantiate_oq_a8_qmm_t_nax_v8_packed_tiles(0);
+instantiate_oq_a8_qmm_t_nax_v8_packed_tiles(1);
 
 #endif // __has_include(<MetalPerformancePrimitives/MetalPerformancePrimitives.h>)

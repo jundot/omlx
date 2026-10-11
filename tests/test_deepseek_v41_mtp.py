@@ -25,6 +25,33 @@ def mtp_config(**kwargs):
     )
 
 
+# Packed cache slots as (bits, group_size): window KV, compressed KV, index keys.
+_PACKED_SLOTS = {1: (8, 32), 2: (4, 16), 3: (4, 32)}
+
+
+def _assert_packed_close(a, b, bits, group_size):
+    """Packed KV of the verify block and of the shorter replay: equal scale
+    bytes, and value codes equal or one step apart on at most 1% of the codes
+    (the fp32 test weights round differently in GEMM and GEMV). Returns the
+    number of codes that differ."""
+    a, b = np.asarray(a), np.asarray(b)
+    assert a.shape == b.shape and a.dtype == b.dtype == np.uint8
+    per_group = group_size * bits // 8
+    nbytes = a.shape[-1] // (per_group + 1) * per_group
+    np.testing.assert_array_equal(a[..., nbytes:], b[..., nbytes:])
+    va, vb = a[..., :nbytes], b[..., :nbytes]
+    if bits == 4:
+        va = np.stack([va & 15, va >> 4], -1)
+        vb = np.stack([vb & 15, vb >> 4], -1)
+    sign = 0x80 if bits == 8 else 0x8
+    np.testing.assert_array_equal(va & sign, vb & sign)
+    step = np.abs((va & (sign - 1)).astype(np.int16) - (vb & (sign - 1)))
+    assert step.max(initial=0) <= 1
+    flips = int((step > 0).sum())
+    assert flips <= max(1, va.size // 100)
+    return flips
+
+
 @pytest.mark.parametrize("ratio", [2, 4, 8])
 @pytest.mark.parametrize("prefix", [1, 3, 4, 5, 7, 8])
 @pytest.mark.parametrize("accepted", [0, 1, 2, 3])
@@ -48,15 +75,20 @@ def test_verify_rollback_restores_all_csa2_slots(prefix, accepted, ratio, monkey
         assert model.mtp_partial_rollback(cache, accepted, 3)
     assert cache[0]._mtp_draft_stash is None
     model(block[:, : accepted + 1], cache=expected, return_hidden=True)
+    flips = 0
     for actual, wanted in zip(cache, expected):
         assert actual.size() == wanted.size() == prefix + accepted + 1
         np.testing.assert_array_equal(actual.left_padding, wanted.left_padding)
-        for a, b in zip(actual.cache, wanted.cache):
-            np.testing.assert_allclose(a, b, atol=1e-6, rtol=1e-5)
+        for slot, (a, b) in enumerate(zip(actual.cache, wanted.cache)):
+            if slot in _PACKED_SLOTS:
+                flips += _assert_packed_close(a, b, *_PACKED_SLOTS[slot])
+            else:
+                np.testing.assert_allclose(a, b, atol=1e-6, rtol=1e-5)
     following = mx.array([[25]])
     a = model(following, cache=cache)
     b = model(following, cache=expected)
-    np.testing.assert_allclose(a, b, atol=1e-6, rtol=1e-5)
+    # One code step in the packed KV moves these logits by up to ~4e-2.
+    np.testing.assert_allclose(a, b, atol=1e-6 if flips == 0 else 1e-1, rtol=1e-5)
 
 
 def test_rollback_restores_engram_history():
@@ -234,3 +266,63 @@ def test_second_request_prefix_preparation_preserves_dspark_owner(
     primed = prompt_priming.take_primed(adapter, second_cache, mx.array([22]))
     assert primed is not None
     assert primed[1] == cached_tokens + 2
+
+
+def test_interleaved_prefills_keep_their_dspark_contexts():
+    from types import SimpleNamespace
+
+    from omlx.models.vlm import VLMModelAdapter
+    from omlx.patches.mlx_lm_mtp import prompt_priming
+
+    model = LanguageModel(mtp_config())
+    load_reference_weights(model)
+    model.configure_mtp(True, 3)
+    adapter = VLMModelAdapter(
+        SimpleNamespace(
+            config=SimpleNamespace(model_type="deepseek_v41"), language_model=model
+        )
+    )
+    caches = {name: model.make_cache() for name in "abc"}
+
+    def insert(name, uid, tokens):
+        # After insertion the first decode step feeds the final prompt token;
+        # a prompt inserted whole is prefilled by the generator.
+        prompt_priming.bind_uid(adapter, name, uid)
+        cache = caches[name]
+        scope = (
+            prompt_priming.decode_scope(adapter, [uid])
+            if len(tokens) == 1
+            else prompt_priming.prefill_scope(adapter, [uid], [tokens], cache)
+        )
+        with scope:
+            model(mx.array([tokens]), cache=cache)
+
+    def activate(name, uid, token):
+        cache = caches[name]
+        model(mx.array([[token]]), cache=cache, return_hidden=True)
+        primed = prompt_priming.take_primed(adapter, cache, mx.array([token]), uid=uid)
+        return None if primed is None else primed[1]
+
+    for name in "abc":
+        prompt_priming.prepare_prefix_context(
+            adapter,
+            request_id=name,
+            prompt_tokens=[1, 2, 3, 4],
+            cached_tokens=0,
+            prefix_cache=None,
+        )
+    # Scheduler chunks activate their request; insertion and activation of one
+    # request happen after the other request has prefilled.
+    for name, chunk in (("a", [3, 4]), ("b", [7, 8, 9]), ("a", [5])):
+        prompt_priming.activate_request(adapter, name)
+        model(mx.array([chunk]), cache=caches[name])
+    insert("a", 0, [6])
+    insert("b", 1, [10])
+    # A short prompt is prefilled by the generator alone.
+    insert("c", 2, [3, 4])
+    assert [activate("a", 0, 11), activate("b", 1, 12), activate("c", 2, 5)] == [
+        4,
+        4,
+        2,
+    ]
+

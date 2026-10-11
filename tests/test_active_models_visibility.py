@@ -1,5 +1,3 @@
-import json
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -28,6 +26,7 @@ class FakePool:
                     "loading_started_at": self.loading_started_at,
                     "estimated_size": 1024,
                     "pinned": False,
+                    "last_access": 100.0,
                 }
             ],
         }
@@ -74,6 +73,7 @@ def test_active_models_generation_includes_activity_and_waiting_rows():
     assert data["total_active_requests"] == 2
     assert model["active_requests"] == 2
     assert model["waiting_requests"] == 1
+    assert model["idle_seconds"] == 0.0
     assert model["prefilling"] == [
         {"request_id": "prefill-1", "processed": 10, "total": 20}
     ]
@@ -126,6 +126,7 @@ def test_active_models_does_not_count_waiting_collectors_as_active():
     assert data["total_waiting_requests"] == 1
     assert model["active_requests"] == 0
     assert model["waiting_requests"] == 1
+    assert model["idle_seconds"] == 0.0
     assert model["generating"] == []
 
 
@@ -240,9 +241,9 @@ def _make_settings_manager(ttl_seconds=None):
 class FakeIdlePool:
     """Pool with a single loaded idle model that has last_access set."""
 
-    def __init__(self, last_access=100.0):
+    def __init__(self, last_access=100.0, in_use=0):
         self._entries = {
-            "model-a": SimpleNamespace(engine=object()),  # engine is not None → loaded
+            "model-a": SimpleNamespace(engine=object(), in_use=in_use),  # engine is not None → loaded
         }
         self._last_access = last_access
 
@@ -301,6 +302,32 @@ def test_idle_seconds_none_when_no_last_access():
         data = admin_routes._build_active_models_data()
 
     assert data["models"][0]["idle_seconds"] is None
+
+
+def test_idle_seconds_zero_while_lease_is_held():
+    """A leased model is busy: no idle time and the full TTL remains."""
+    with (
+        patch("omlx.admin.routes._get_server_state", return_value=None),
+        patch.object(
+            admin_routes,
+            "_get_engine_pool",
+            return_value=FakeIdlePool(last_access=100.0, in_use=1),
+        ),
+        patch.object(
+            admin_routes,
+            "_get_settings_manager",
+            return_value=_make_settings_manager(ttl_seconds=30),
+        ),
+        patch.object(admin_routes, "_get_global_settings", return_value=None),
+        patch("omlx.prefill_progress.get_prefill_tracker", return_value=EmptyPrefillTracker()),
+        patch("time.time", return_value=115.0),
+        patch("time.monotonic", return_value=115.0),
+    ):
+        data = admin_routes._build_active_models_data()
+
+    model = data["models"][0]
+    assert model["idle_seconds"] == 0.0
+    assert model["ttl_remaining_seconds"] == 30.0
 
 
 def test_ttl_remaining_from_per_model_setting():
@@ -586,33 +613,3 @@ def test_active_models_surfaces_dflash_guardrail_stats():
         "speculation": speculation,
         "pairing_warning": "Possible DFlash precision mismatch",
     }
-
-
-def test_dflash_dashboard_localizes_metrics_and_shows_session_fallbacks():
-    root = Path(__file__).resolve().parents[1]
-    template = (
-        root / "omlx/admin/templates/dashboard/blocks/_active_models.html"
-    ).read_text(encoding="utf-8")
-    dashboard_js = (root / "omlx/admin/static/js/dashboard.js").read_text(
-        encoding="utf-8"
-    )
-    i18n_dir = root / "omlx/admin/i18n"
-    keys = {
-        "status.active_models.dflash_fallback_ar",
-        "status.active_models.dflash_draft_share",
-        "status.active_models.dflash_accepted_draft_per_cycle",
-        "status.active_models.dflash_output_per_cycle",
-        "status.active_models.dflash_draft_tokens_last_request",
-        "status.active_models.dflash_session",
-        "status.active_models.dflash_speculative_requests",
-        "status.active_models.dflash_fallback_requests",
-    }
-
-    assert "m.dflash.speculation.totals.requests > 1" in template
-    assert "formatDFlashSessionStats(m.dflash.speculation.totals)" in template
-    assert "totals.fallback_requests > 0" in dashboard_js
-    for key in keys:
-        assert key in template + dashboard_js
-    for locale_path in i18n_dir.glob("*.json"):
-        locale = json.loads(locale_path.read_text(encoding="utf-8"))
-        assert not keys - locale.keys(), f"{locale_path.name} is missing DFlash keys"

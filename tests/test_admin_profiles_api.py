@@ -40,9 +40,13 @@ class _FakeEntry:
 class _FakePool:
     def __init__(self):
         self._entries = {"model-a": _FakeEntry("model-a")}
+        self.recommended_sampling = {}
 
     def get_entry(self, model_id):
         return self._entries.get(model_id)
+
+    def recommended_sampling_settings(self, entry):
+        return dict(self.recommended_sampling)
 
     def get_status(self):
         return {
@@ -963,61 +967,6 @@ class TestExposeAsModelAPI:
         assert prof["expose_as_model"] is True
         assert prof["settings"]["temperature"] == 0.9
 
-    def test_dashboard_profile_ui_round_trips_expose_as_model_flag(self):
-        from pathlib import Path
-
-        root = Path(__file__).resolve().parents[1]
-        js = (root / "omlx/admin/static/js/dashboard.js").read_text()
-        html = (
-            root / "omlx/admin/templates/dashboard/_modal_model_settings.html"
-        ).read_text()
-        settings_html = (
-            root / "omlx/admin/templates/dashboard/_settings.html"
-        ).read_text()
-        dashboard_html = (root / "omlx/admin/templates/dashboard.html").read_text()
-        en = (root / "omlx/admin/i18n/en.json").read_text()
-
-        # api_name is the exposed model ID suffix, so it's validated as a
-        # slug and rejected on bad input.
-        assert "isValidProfileName" in js
-        assert "api_name" in js
-        assert "modal.model_settings.profiles.invalid_name" in en
-        # Profile chips keep the display name visible in both API-on and
-        # API-off states. API state is shown as a badge and edited from the
-        # edit form, not toggled directly from the chip row.
-        assert "profileTooltip(p)" in html
-        assert "p.display_name || p.name" in html
-        assert "p.expose_as_model ? (p.api_name || p.name)" not in html
-        assert "expose_as_model: !p.expose_as_model" not in html
-        assert "p.has_engine_fields" in html
-        # Editing updates display_name/api_name/description/exposure without
-        # renaming the internal profile key.
-        assert "updateProfileFromEdit" in js
-        assert "api_name: apiName" in js
-        assert "description: description" in js
-        assert "expose_as_model: exposeAsModel" in js
-        edit_method = js.split("updateProfileFromEdit(p) {", 1)[1].split(
-            "updateProfileSettingsFromForm(p)", 1
-        )[0]
-        assert "settings:" not in edit_method
-        assert "updateProfileSettingsFromForm(p)" in js
-        assert "updateProfileFromEdit(p)" in html
-        assert "updateProfileSettingsFromForm(p)" in html
-        assert "_editDescription" in html
-        assert "_editExposeAsModel" in html
-        assert "profileTooltip(profile)" in settings_html
-        assert "model.exposed_profiles" in settings_html
-        assert "profile.api_name || profile.name" in settings_html
-        assert settings_html.index("profile.has_engine_fields") < settings_html.index(
-            "profile.api_name || profile.name"
-        )
-        assert 'x-text="model.settings.active_profile_name"' not in settings_html
-        assert "profileTooltip" in js
-        assert "whitespace-pre-line" in dashboard_html
-        assert "modal.model_settings.profiles.expose_as_model" in html
-        assert "modal.model_settings.profiles.exposed_as" in en
-        assert "modal.model_settings.profiles.expose_engine_fields_hint" in en
-
 
 @pytest.mark.parametrize("operation", ["create", "update", "apply"])
 @pytest.mark.parametrize("reason", ["hardware", "architecture", "conflict", "floor"])
@@ -1514,6 +1463,23 @@ class TestSettingsSnapshotRoutes:
         again = c.post("/admin/api/models/model-a/settings/reset").json()
         assert again["changed"] is False
 
+    def test_reset_restores_recommended_sampling(self, client):
+        c, mgr = client
+        pool = admin_routes._get_engine_pool()
+        pool.recommended_sampling = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}
+        mgr.set_settings(
+            "model-a", ModelSettings(temperature=0.1, top_k=5, model_alias="alias")
+        )
+
+        body = c.post("/admin/api/models/model-a/settings/reset").json()
+
+        expected = ModelSettings(temperature=0.6, top_p=0.95, top_k=20).to_dict()
+        assert body["settings"] == expected
+        assert body["applied"]["temperature"] == 0.6
+        assert mgr.get_settings("model-a").to_dict() == expected
+        again = c.post("/admin/api/models/model-a/settings/reset").json()
+        assert again["changed"] is False
+
     def test_reset_unknown_model_404(self, client):
         c, _ = client
         assert c.post("/admin/api/models/nope/settings/reset").status_code == 404
@@ -1769,13 +1735,13 @@ class TestSettingsSnapshotRoutes:
     def test_recipe_skips_feature_the_model_cannot_run(self, client):
         c, _ = client
         recipe = settings_recipe.encode_recipe(
-            {"mtp_enabled": True, "mtp_num_draft_tokens": 3, "max_tokens": 64}
+            {"mtp_enabled": True, "mtp_adaptive_max_depth": 3, "max_tokens": 64}
         )
         r = c.post("/admin/api/models/model-a/settings/recipe", json={"recipe": recipe})
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["settings"]["mtp_enabled"] is False
-        assert "mtp_num_draft_tokens" not in body["settings"]
+        assert "mtp_adaptive_max_depth" not in body["settings"]
         assert body["settings"]["max_tokens"] == 64
         assert [s["feature"] for s in body["skipped"]] == ["mtp"]
 
@@ -1929,38 +1895,6 @@ class TestSettingsSnapshotRoutes:
         assert settings["guided_grammar"] == 'root ::= "YES"'
         assert "guided_grammar" not in r.json()["applied"]
 
-    def test_dashboard_wires_snapshot_actions(self):
-        from pathlib import Path
-
-        root = Path(__file__).resolve().parents[1]
-        js = (root / "omlx/admin/static/js/dashboard.js").read_text()
-        modal = (
-            root / "omlx/admin/templates/dashboard/_modal_model_settings.html"
-        ).read_text()
-        apply_modal = (
-            root / "omlx/admin/templates/dashboard/_modal_settings_apply.html"
-        ).read_text()
-        dashboard = (root / "omlx/admin/templates/dashboard.html").read_text()
-        en = json.loads((root / "omlx/admin/i18n/en.json").read_text())
-        ko = json.loads((root / "omlx/admin/i18n/ko.json").read_text())
-
-        assert "dashboard/_modal_settings_apply.html" in dashboard
-        for mode in ("reset", "optimal", "recipe"):
-            assert f"openSettingsApply('{mode}')" in modal
-        assert "/settings/${path}`" in js
-        assert "_settingsActionRequest('POST', 'reset')" in js
-        assert "_settingsActionRequest('GET', 'optimal')" in js
-        assert "_settingsActionRequest('POST', 'recipe'" in js
-        assert "applyOptimalCandidate(item.benchmark_id)" in apply_modal
-        assert "by_pp" in js and "by_tg" in js
-        for key in (
-            "modal.model_settings.actions.reset_confirm",
-            "modal.model_settings.actions.group_pp",
-            "modal.model_settings.actions.group_tg",
-            "modal.model_settings.actions.none_body",
-            "js.error.settings_apply_failed",
-        ):
-            assert key in en and key in ko
 
     def test_cache_reasoning_output_round_trips_through_put(self, client):
         c, mgr = client

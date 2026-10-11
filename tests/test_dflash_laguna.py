@@ -474,9 +474,9 @@ def test_target_ops_logits_last_only_slices_before_lm_head():
     The DFlash target path slices the post-norm hidden states to the last
     position BEFORE the vocabulary head (Swift lagunaLastTokenHidden), so the
     prefill lm_head never computes the dead [L-1, vocab] slab. A [1,1,H] head
-    matmul is ULP-divergent from the [B,L,H] full matmul (frame divergence,
-    see docs/laguna-mlxfast-port-correctness.md C2); asserted at the repo
-    tolerance, matching the DFlash reference layer's frame-divergence tolerance.
+    matmul is ULP-divergent from the [B,L,H] full matmul (frame divergence);
+    asserted at the repo tolerance, matching the DFlash reference layer's
+    frame-divergence tolerance.
     """
     from omlx.patches.dflash_laguna import LagunaTargetOps
 

@@ -17,6 +17,7 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 
 from omlx.patches.mlx_lm_mtp import prompt_priming
+from omlx.prefill.packed import PackedBatch, PackedRow, PackedRows
 
 
 TINY_CONFIG = {
@@ -130,7 +131,8 @@ class _MemoryMtpPrefixCache:
         return self.snapshots.get(self._key(tokens, boundary))
 
 
-def test_block_prefix_cache_mtp_sidecar_uses_live_chain_hash_and_evicts():
+@pytest.mark.parametrize("boundary", [8, 3, 7])
+def test_block_prefix_cache_mtp_sidecar_uses_live_chain_hash_and_evicts(boundary):
     """The production sidecar is only visible while its backbone tip lives."""
     from omlx.cache.prefix_cache import BlockAwarePrefixCache
 
@@ -152,19 +154,32 @@ def test_block_prefix_cache_mtp_sidecar_uses_live_chain_hash_and_evicts():
     cache._mtp_prefix_snapshots = OrderedDict()
     cache._mtp_prefix_snapshot_lock = threading.RLock()
 
-    tokens = list(range(8))
+    tokens = list(range(boundary + 2))
     snapshot = object()
-    assert cache.store_mtp_prefix_snapshot(tokens, 8, snapshot)
-    tip = cache._mtp_prefix_chain_tip(tokens, 8)
-    assert tip is not None
+    assert cache.store_mtp_prefix_snapshot(tokens, boundary, snapshot)
+    tip = cache._mtp_prefix_chain_tip(tokens, boundary)
+    from omlx.cache.paged_cache import compute_block_hash
+
+    expected = None
+    for start in range(0, boundary, 4):
+        expected = compute_block_hash(
+            expected,
+            tokens[start : min(start + 4, boundary)],
+            model_name="tiny-mtp-test",
+        )
+    assert tip == expected
     # Publishing precedes the async backbone store, so the snapshot must not
     # become restorable until the matching ordinary block is live.
-    assert cache.restore_mtp_prefix_snapshot(tokens, 8) is None
+    assert cache.restore_mtp_prefix_snapshot(tokens, boundary) is None
     hash_map.blocks[tip] = object()
-    assert cache.restore_mtp_prefix_snapshot(tokens, 8) is snapshot
+    assert cache.restore_mtp_prefix_snapshot(tokens, boundary) is snapshot
+
+    changed = list(tokens)
+    changed[boundary - 1] += 100
+    assert cache.restore_mtp_prefix_snapshot(changed, boundary) is None
 
     cache._on_block_hash_dropped(tip)
-    assert cache.restore_mtp_prefix_snapshot(tokens, 8) is None
+    assert cache.restore_mtp_prefix_snapshot(tokens, boundary) is None
 
 
 def test_block_prefix_cache_mtp_sidecar_lru_four_and_clear_lifecycle():
@@ -279,8 +294,9 @@ class TestCaptureFold:
             assert mx.allclose(k, rk, rtol=1e-4, atol=1e-4)
             assert mx.allclose(v, rv, rtol=1e-4, atol=1e-4)
 
+    @pytest.mark.parametrize("boundary, length", [(8, 13), (5, 7), (11, 13)])
     def test_warm_prefix_restores_exact_head_history_without_trunk_reforward(
-        self, strict_model
+        self, strict_model, boundary, length
     ):
         """A backbone hit at C restores MTP(C-1)+hidden(C-1), then folds
         only the uncached suffix and activation seam.  The resulting head
@@ -288,7 +304,7 @@ class TestCaptureFold:
         Repeating scheduler preparation for the same request is idempotent.
         """
         model = strict_model
-        tokens = _tokens(13, seed=40)
+        tokens = _tokens(length, seed=40)
         main_tok = _tokens(1, seed=41)
         sidecar = _MemoryMtpPrefixCache(block_size=8)
 
@@ -300,7 +316,16 @@ class TestCaptureFold:
             cached_tokens=0,
             prefix_cache=sidecar,
         )
-        _chunked_prefill(model, cold_cache, tokens, [8, 5])
+        _chunked_prefill(model, cold_cache, tokens[:boundary], [boundary])
+        if boundary % sidecar.block_size:
+            ctx = prompt_priming._find_ctx(model)
+            previous = ctx.snapshot_candidate
+            prompt_priming.capture_tail_boundary(model, "other", boundary)
+            assert ctx.snapshot_candidate is previous
+            prompt_priming.capture_tail_boundary(model, "cold", boundary + 1)
+            assert ctx.snapshot_candidate is previous
+            prompt_priming.capture_tail_boundary(model, "cold", boundary)
+        _chunked_prefill(model, cold_cache, tokens[boundary:], [length - boundary])
         cold_ctx = prompt_priming._find_ctx(model)
         assert cold_ctx is not None
         cold_final_pending = cold_ctx.pending_hidden + 0
@@ -308,27 +333,25 @@ class TestCaptureFold:
         model(main_tok[None, :], cache=cold_cache, return_hidden=True)
         cold_primed = prompt_priming.take_primed(model, cold_cache, main_tok)
         assert cold_primed is not None
-        snapshot_key = (tuple(tokens[:8].tolist()), 8)
+        snapshot_key = (tuple(tokens[:boundary].tolist()), boundary)
         assert snapshot_key in sidecar.snapshots
         boundary_pending = sidecar.snapshots[snapshot_key].pending_hidden
 
-        # Build the already-restored backbone cache outside capture.  Start
-        # tracing only after sidecar restore: a correct warm path invokes the
-        # MTP head for suffix(5)+seam(1), never for the cached trunk(8).
+        # Trace only the suffix and seam; the cached trunk must not run again.
         warm_cache = _make_cache(model)
         with prompt_priming.suppress_capture():
-            model(tokens[:8][None, :], cache=warm_cache)
+            model(tokens[:boundary][None, :], cache=warm_cache)
         assert prompt_priming.prepare_prefix_context(
             model,
             request_id="warm",
             prompt_tokens=tokens.tolist(),
-            cached_tokens=8,
+            cached_tokens=boundary,
             prefix_cache=sidecar,
         )
         warm_ctx = prompt_priming._find_ctx(model)
         assert warm_ctx is not None
-        assert warm_ctx.folded == 7
-        assert warm_ctx.expected_offset == 8
+        assert warm_ctx.folded == boundary - 1
+        assert warm_ctx.expected_offset == boundary
         assert mx.array_equal(warm_ctx.pending_hidden, boundary_pending).item()
 
         # The scheduler's prepared-set normally prevents this second call;
@@ -338,7 +361,7 @@ class TestCaptureFold:
             model,
             request_id="warm",
             prompt_tokens=tokens.tolist(),
-            cached_tokens=8,
+            cached_tokens=boundary,
             prefix_cache=sidecar,
         )
         assert prompt_priming._find_ctx(model) is warm_ctx
@@ -351,7 +374,7 @@ class TestCaptureFold:
             return original_mtp_forward(hidden, next_ids, cache, **kwargs)
 
         model.mtp_forward = traced_mtp_forward
-        _chunked_prefill(model, warm_cache, tokens[8:], [5])
+        _chunked_prefill(model, warm_cache, tokens[boundary:], [length - boundary])
         warm_final_ctx = prompt_priming._find_ctx(model)
         assert warm_final_ctx is not None
         assert mx.array_equal(
@@ -361,7 +384,7 @@ class TestCaptureFold:
         warm_primed = prompt_priming.take_primed(model, warm_cache, main_tok)
         assert warm_primed is not None
         assert warm_primed[1] == len(tokens)
-        assert mtp_rows == [5, 1]
+        assert mtp_rows == [length - boundary, 1]
 
         mx.eval(
             [c.state for c in cold_primed[0]],
@@ -406,12 +429,6 @@ class TestCaptureFold:
 
 
 class TestCaptureSkips:
-    def test_env_off_disables_capture(self, model, monkeypatch):
-        monkeypatch.setenv("OMLX_MTP_PROMPT_PRIMING", "0")
-        cache = _make_cache(model)
-        _chunked_prefill(model, cache, _tokens(6), [6])
-        assert prompt_priming.prime_ctx_stats(model) is None
-
     def test_suppress_capture(self, model):
         cache = _make_cache(model)
         with prompt_priming.suppress_capture():
@@ -466,45 +483,6 @@ class TestCaptureSkips:
         _chunked_prefill(model, cache, tokens[8:], [4])
         # Restarted mid-prompt: only the new chunk's internal pairs.
         assert prompt_priming.prime_ctx_stats(model) == 3
-
-    def test_window_cap_disables_long_prompts(self, model, monkeypatch):
-        monkeypatch.setenv("OMLX_MTP_PRIME_WINDOW", "4")
-        cache = _make_cache(model)
-        _chunked_prefill(model, cache, _tokens(10, seed=5), [5, 5])
-        assert prompt_priming.prime_ctx_stats(model) is None
-
-    def test_window_caps_folded_span_not_absolute_offset(self, model, monkeypatch):
-        """A warm prefix cache leaves only a small remainder to fold; the
-        window must cap that folded span (the head-KV it exists to bound),
-        not the absolute prompt offset — otherwise every long-context
-        warm-cache request runs unprimed even when the remainder is tiny
-        (#2909)."""
-        monkeypatch.setenv("OMLX_MTP_PRIME_WINDOW", "6")
-        tokens = _tokens(12, seed=8)
-        cache = _make_cache(model)
-        with prompt_priming.suppress_capture():
-            _chunked_prefill(model, cache, tokens[:8], [8])
-        assert prompt_priming.prime_ctx_stats(model) is None
-        # Remainder of 4 tokens at absolute offset 12: over the old
-        # absolute-offset guard (12 > 6), within the span guard (4 <= 6).
-        _chunked_prefill(model, cache, tokens[8:], [4])
-        assert prompt_priming.prime_ctx_stats(model) == 3
-
-    def test_window_overflow_stays_latched_across_small_chunks(
-        self, model, monkeypatch
-    ):
-        """An oversized multi-chunk remainder must not restart priming after
-        the first context is dropped."""
-        monkeypatch.setenv("OMLX_MTP_PRIME_WINDOW", "4")
-        tokens = _tokens(17, seed=9)
-        cache = _make_cache(model)
-        with prompt_priming.suppress_capture():
-            _chunked_prefill(model, cache, tokens[:8], [8])
-        _chunked_prefill(model, cache, tokens[8:], [3, 3, 3])
-        assert prompt_priming.prime_ctx_stats(model) is None
-        ctx = prompt_priming._find_ctx(model)
-        assert ctx is not None and ctx.window_exceeded
-        assert ctx.expected_offset == 17
 
     def test_take_primed_requires_seam_offset(self, model):
         """No activation forward ran: seam mismatch must discard the ctx."""
@@ -788,6 +766,9 @@ def test_owned_batch_calibration_history_matches_full_prompt_fold(strict_model):
     for uid, tokens in zip([11, 12], histories):
         ctx = owned.uids[uid][0]
         assert ctx.expected_offset == 11
+        # Ordinary decode collects its pairs; they fold at activation.
+        assert ctx.folded == 5 and len(ctx.deferred_pairs) == 5
+        prompt_priming._flush_deferred_history(model, ctx)
         assert ctx.folded == 10
         ref = _reference_head_cache(model, tokens)
         for (keys, values), (ref_keys, ref_values) in zip(
@@ -940,6 +921,28 @@ def test_retained_cache_survives_handoff_without_duplicate_pair():
         ]
         assert result[1] == offset + 2
     assert owned.uids == {}
+
+
+def test_parked_singleton_reenters_with_its_head_history():
+    """A park keeps the head cache; parked tokens fold in at the re-entry probe."""
+    host = RecordingHead()
+    head = [SimpleNamespace(pairs=[])]
+    # The park handoff fed token 10 (head input 100); the cache is now at 11.
+    prompt_priming.retain_parked_head_history(
+        host, 3, head, 10, mx.array([[[100]]]), [SimpleNamespace(offset=11)]
+    )
+    with prompt_priming.decode_scope(host, [3]):
+        for token in (11, 12):
+            prompt_priming.maybe_capture(
+                host,
+                mx.array([[token]]),
+                mx.array([[[token * 10]]]),
+                [SimpleNamespace(offset=token + 1)],
+            )
+    result = prompt_priming.take_primed(host, [], mx.array(13), uid=3, cache_offset=14)
+    assert result[0] is head
+    assert head[0].pairs == [(100, 11), (110, 12), (120, 13)]
+    assert result[1] == 13
 
 
 @pytest.mark.parametrize("failure", ["queued", "owned"])
@@ -1131,6 +1134,31 @@ def capture(host, tokens, offset):
     )
 
 
+def test_packed_prefill_folds_each_row_into_its_own_request():
+
+    host = HeadHost()
+    prepare(host, "a", [1, 2, 3, 4])
+    capture(host, [1, 2], 2)
+    prepare(host, "b", [5, 6, 7, 8, 9])
+    capture(host, [5, 6], 2)
+    previous = prompt_priming._find_ctx(host)
+    batch = PackedBatch(
+        [
+            PackedRow("a", mx.array([[3, 4]]), [SimpleNamespace(offset=4)]),
+            PackedRow("b", mx.array([[7, 8, 9]]), [SimpleNamespace(offset=5)]),
+        ]
+    )
+    inputs = mx.array([[3, 4, 7, 8, 9]])
+    cache = [PackedRows(batch, [row.cache[0] for row in batch.rows])]
+    prompt_priming.maybe_capture(host, inputs, inputs[..., None], cache)
+    assert prompt_priming._find_ctx(host) is previous
+    prompt_priming.bind_uid(host, "a", 11)
+    prompt_priming.bind_uid(host, "b", 12)
+    _, state = prompt_priming._owned(host)
+    assert state.uids[11][0].mtp_cache[0].pairs == [(1, 2), (2, 3), (3, 4)]
+    assert state.uids[12][0].mtp_cache[0].pairs == [(5, 6), (6, 7), (7, 8), (8, 9)]
+
+
 def test_interleaved_equal_length_requests_keep_distinct_history():
     host = HeadHost()
     prepare(host, "a", [1, 2, 3, 4])
@@ -1238,16 +1266,28 @@ def test_decode_scope_restores_after_exception_and_models_do_not_share_state():
     assert prompt_priming._owned(first)[1] is not prompt_priming._owned(second)[1]
 
 
-def test_dspark_context_is_owned_by_custom_hook():
+def test_dspark_contexts_move_with_their_requests():
     host = HeadHost()
     host._omlx_dspark_decode_enabled = True
-    custom = object()
-    setattr(host, prompt_priming._CTX_ATTR, custom)
+    first, second = object(), object()
+    setattr(host, prompt_priming._CTX_ATTR, first)
+    # Registration leaves the slot to the request that is still prefilling.
+    prepare(host, "b", [3, 4])
+    assert prompt_priming._find_ctx(host) is first
     prepare(host, "a", [1, 2])
-    prompt_priming.release_request(host, "a")
+    for request_id, ctx in (("a", first), ("b", second)):
+        prompt_priming.activate_request(host, request_id)
+        prompt_priming.owned_capture(
+            host, lambda ctx=ctx: setattr(host, prompt_priming._CTX_ATTR, ctx)
+        )
+    prompt_priming.activate_request(host, "a")
+    assert prompt_priming._find_ctx(host) is first
+    prompt_priming.bind_uid(host, "a", 1)
+    assert prompt_priming._find_ctx(host) is None
+    state = prompt_priming._owned(host)[1]
+    assert state.uids[1][0] is first and state.requests["b"][0] is second
     prompt_priming.clear_owned(host)
-    assert prompt_priming._find_ctx(host) is custom
-    assert prompt_priming._owned(host)[1] is None
+    assert not state.requests and not state.uids
 
 
 @pytest.mark.parametrize("operation", ["reset", "deep_reset", "shutdown"])

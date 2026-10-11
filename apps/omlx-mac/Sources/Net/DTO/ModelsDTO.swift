@@ -48,6 +48,7 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     var anePrefillDefaultFraction: Double? = nil
     var anePrefillMlpFractions: [Double]? = nil
     var anePrefillSharedFractions: [Double]? = nil
+    var embeddingAudioSupported: Bool? = nil
     /// True when the model is structurally compatible with DFlash (block
     /// diffusion speculative decoding). The toggle stays disabled when false.
     let dflashCompatible: Bool?
@@ -108,6 +109,8 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let activeProfileName: String?
     // Security
     let trustRemoteCode: Bool?
+    var embeddingAudioEnabled: Bool? = nil
+    var embeddingAudioMaxSeconds: Double? = nil
     // Chat-template kwargs (free-form dict + a sibling list of keys the
     // user wants to *force* — those go to `forced_ct_kwargs` server-side
     // and override the request's `chat_template_kwargs`).
@@ -165,6 +168,7 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let dflashVerifyMode: String?
     // Experimental: native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     let mtpEnabled: Bool?
+    let mtpAdaptiveMaxDepth: Int?
     // Experimental: VLM MTP (mlx-vlm assistant-drafter speculative decoding)
     let vlmMtpEnabled: Bool?
     let vlmMtpDraftModel: String?
@@ -196,6 +200,8 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var isFavorite: Bool? = nil
     // Security
     var trustRemoteCode: Bool? = nil
+    var embeddingAudioEnabled: Bool? = nil
+    var embeddingAudioMaxSeconds: Double?? = nil // .some(nil) sends JSON null (30 s default).
     var reasoningParser: String? = nil
     // Chat-template kwargs
     var chatTemplateKwargs: [String: AnyCodable]? = nil
@@ -250,6 +256,8 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var dflashVerifyMode: String? = nil
     // Experimental: native MTP
     var mtpEnabled: Bool? = nil
+    var mtpAdaptiveMaxDepth: Int? = nil
+    var mtpFixedDepth: Int?? = nil // .some(nil) sends JSON null (adaptive).
     // Experimental: VLM MTP
     var vlmMtpEnabled: Bool? = nil
     var vlmMtpDraftModel: String? = nil

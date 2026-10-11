@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # Separate router for the realtime WebSocket: the main audio router is
-# mounted with an HTTP-only verify_api_key dependency that cannot resolve
+# mounted with an HTTP-only auth dependency that cannot resolve
 # in a websocket scope (and browsers cannot set an Authorization header on
 # WebSocket connections anyway). Auth happens in-band via the first
 # {"type": "start"} message instead.
@@ -618,13 +618,15 @@ async def create_transcription(
 
 
 def _verify_ws_api_key(api_key: Optional[str]) -> bool:
-    """Verify an in-band API key with the same rules as verify_api_key.
+    """Verify an in-band API key, including the manual inference opt-in.
 
     WebSocket connections from browsers cannot carry an Authorization
     header, so the key arrives inside the {"type": "start"} message.
     """
-    from omlx.server import _server_state
+    from omlx.server import _server_state, allows_unauthenticated_inference
 
+    if allows_unauthenticated_inference():
+        return True
     if _server_state.api_key is None:
         return True
     gs = _server_state.global_settings

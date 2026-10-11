@@ -130,6 +130,30 @@ def get_ssd_capacity(path: str | Path) -> int:
         return 500 * 1024**3
 
 
+def get_auto_ssd_cache_size(cache_dir: Path) -> int:
+    """Estimate the automatic budget before the runtime cache index is loaded."""
+    check_path = cache_dir
+    while not check_path.exists() and check_path.parent != check_path:
+        check_path = check_path.parent
+    free_bytes = shutil.disk_usage(check_path).free
+    cache_bytes = 0
+    roots = [cache_dir / prefix for prefix in "0123456789abcdef"]
+    roots.append(cache_dir / "_gdn_sidecars")
+    for root in roots:
+        if root.is_symlink():
+            continue
+        for directory, _, names in os.walk(root, followlinks=False):
+            for name in names:
+                path = Path(directory) / name
+                if path.suffix != ".safetensors" or path.is_symlink():
+                    continue
+                try:
+                    cache_bytes += path.stat().st_size
+                except FileNotFoundError:
+                    pass  # A runtime writer can evict files during the scan.
+    return (free_bytes + cache_bytes) // 2
+
+
 # Burst Decode UI modes -> (decode_burst_max_steps, decode_burst_budget_single_s).
 # These mirror the OMLX_DECODE_BURST_* env vars read by EngineConfig
 # (engine_core.py). "off" fully disables bursting via max_steps=1; the on-levels
@@ -175,13 +199,22 @@ class ServerSettings:
     auto_start_on_launch: bool = True
     burst_decode_mode: str = DEFAULT_BURST_DECODE_MODE
     preserve_mid_system_cache: bool = True
+    qwen4_gdn_decode_wide_proj: bool = False
     distributed_inference_enabled: bool = False
     # Human-readable size, same grammar as cache limits ("100MB", "1GB").
     max_audio_upload_size: str = "100MB"
     # Maximum raw image payload size accepted ("50MB", "100MB").
     max_image_upload_size: str = "50MB"
+    # Cap on any request body. It never drops below the upload limits.
+    max_request_body_size: str = "512MB"
     # Maximum side length in pixels for VLM input images (0 to disable downscaling).
     max_image_side_length: int = 2048
+    # Seconds between trivial GPU kernels submitted while a model is loaded
+    # but idle, so the GPU stays out of its idle power state (the first
+    # command buffer after ~1s+ of GPU idle stalls for up to seconds on
+    # large resident models). Ticks stop after 5 minutes without requests.
+    # 0 disables.
+    gpu_keep_warm_interval: float = 0.5
 
     def max_audio_upload_bytes(self) -> int:
         """Configured audio upload limit in bytes. Non-positive sizes raise ValueError."""
@@ -195,6 +228,13 @@ class ServerSettings:
         size = parse_size(self.max_image_upload_size)
         if size <= 0:
             raise ValueError("max_image_upload_size must be positive")
+        return size
+
+    def max_request_body_bytes(self) -> int:
+        """Configured transport-level request body cap in bytes."""
+        size = parse_size(self.max_request_body_size)
+        if size <= 0:
+            raise ValueError("max_request_body_size must be positive")
         return size
 
     def to_dict(self) -> dict[str, Any]:
@@ -215,13 +255,16 @@ class ServerSettings:
             auto_start_on_launch=data.get("auto_start_on_launch", True),
             burst_decode_mode=data.get("burst_decode_mode", DEFAULT_BURST_DECODE_MODE),
             preserve_mid_system_cache=data.get("preserve_mid_system_cache", True),
+            qwen4_gdn_decode_wide_proj=data.get("qwen4_gdn_decode_wide_proj", False),
             distributed_inference_enabled=data.get(
                 "distributed_inference_enabled",
                 False,
             ),
             max_audio_upload_size=data.get("max_audio_upload_size", "100MB"),
             max_image_upload_size=data.get("max_image_upload_size", "50MB"),
+            max_request_body_size=data.get("max_request_body_size", "512MB"),
             max_image_side_length=data.get("max_image_side_length", 2048),
+            gpu_keep_warm_interval=float(data.get("gpu_keep_warm_interval", 0.5)),
         )
 
 
@@ -344,7 +387,7 @@ class CacheSettings:
     enabled: bool = True
     hot_cache_only: bool = False
     ssd_cache_dir: str | None = None  # None means ~/.omlx/cache
-    ssd_cache_max_size: str = "auto"  # "auto" means 10% of SSD capacity
+    ssd_cache_max_size: str = "auto"  # "auto" reserves half of available cache space
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
     # When True (and the hot cache is enabled), every saved block is kept in
     # RAM AND persisted to SSD immediately — RAM-speed resume for recent
@@ -419,11 +462,11 @@ class CacheSettings:
             base_path: Base oMLX directory.
 
         Returns:
-            Max SSD cache size in bytes (10% of SSD if "auto").
+            Max SSD cache size in bytes (half of free space plus existing cache for "auto").
         """
         if self.ssd_cache_max_size.lower() == "auto":
             cache_dir = self.get_ssd_cache_dir(base_path)
-            return int(get_ssd_capacity(cache_dir) * 0.1)
+            return get_auto_ssd_cache_size(cache_dir)
         return parse_size(self.ssd_cache_max_size)
 
     def get_hot_cache_max_size_bytes(self) -> int:
@@ -516,14 +559,15 @@ class MemorySettings:
     prefill_memory_guard: bool = (
         True  # Memory guard: prefill estimation + generation scheduling defer
     )
-    # Tier selects the active-memory reclaim ratio (safe/balanced/aggressive)
-    # or, for "custom", lets the user pin the dynamic ceiling to a fixed
-    # GB number. See ProcessMemoryEnforcer._get_dynamic_ceiling for the math.
+    # Tier selects how much memory stays free for other apps (safe / balanced
+    # / aggressive) or, for "custom", pins the ceiling to a fixed GB number.
+    # See process_memory_enforcer.tier_reserve_bytes for the reserves.
     memory_guard_tier: MemoryGuardTier = "balanced"
     # Only consulted when memory_guard_tier == "custom". GB. 0 = unset.
     memory_guard_custom_ceiling_gb: float = 0.0
     # Two-stage watermark on the ceiling. soft triggers admission pause + LRU eviction,
-    # hard triggers in-flight abort. Gap >= 10% absorbs macOS compressed-memory oscillation.
+    # hard triggers in-flight abort. The saved 0.85 / 0.95 defaults select the
+    # tier's own watermarks; any other value overrides them for every tier.
     soft_threshold: float = 0.85
     hard_threshold: float = 0.95
     # Adaptive prefill throttle. When current memory >= hard_cap * safe_zone_ratio
@@ -615,6 +659,7 @@ class AuthSettings:
     api_key: str | None = None
     secret_key: str | None = None
     skip_api_key_verification: bool = False
+    allow_unauthenticated_inference: bool = False
     sub_keys: list[SubKeyEntry] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -623,6 +668,7 @@ class AuthSettings:
             "api_key": self.api_key,
             "secret_key": self.secret_key,
             "skip_api_key_verification": self.skip_api_key_verification,
+            "allow_unauthenticated_inference": self.allow_unauthenticated_inference,
             "sub_keys": [sk.to_dict() for sk in self.sub_keys],
         }
 
@@ -633,6 +679,9 @@ class AuthSettings:
             api_key=data.get("api_key"),
             secret_key=data.get("secret_key"),
             skip_api_key_verification=data.get("skip_api_key_verification", False),
+            allow_unauthenticated_inference=data.get(
+                "allow_unauthenticated_inference", False
+            ),
             sub_keys=[SubKeyEntry.from_dict(sk) for sk in data.get("sub_keys", [])],
         )
 
@@ -894,6 +943,7 @@ class IntegrationSettings:
     hermes_model: str | None = None
     pi_model: str | None = None
     copilot_model: str | None = None
+    dsh_model: str | None = None
     openclaw_tools_profile: str = "coding"
     markitdown_enabled: bool = True
     markitdown_expose_model: bool = False
@@ -919,6 +969,7 @@ class IntegrationSettings:
             "hermes_model": self.hermes_model,
             "pi_model": self.pi_model,
             "copilot_model": self.copilot_model,
+            "dsh_model": self.dsh_model,
             "openclaw_tools_profile": self.openclaw_tools_profile,
             "markitdown_enabled": self.markitdown_enabled,
             "markitdown_expose_model": self.markitdown_expose_model,
@@ -945,6 +996,7 @@ class IntegrationSettings:
             hermes_model=data.get("hermes_model"),
             pi_model=data.get("pi_model"),
             copilot_model=data.get("copilot_model"),
+            dsh_model=data.get("dsh_model"),
             openclaw_tools_profile=data.get("openclaw_tools_profile", "coding"),
             markitdown_enabled=data.get("markitdown_enabled", True),
             markitdown_expose_model=data.get("markitdown_expose_model", False),
@@ -1140,6 +1192,13 @@ class GlobalSettings:
             self.server.preserve_mid_system_cache = (
                 preserve_mid_system_cache.strip().lower() in {"1", "true", "yes", "on"}
             )
+        if gpu_keep_warm := os.getenv("OMLX_GPU_KEEP_WARM_INTERVAL"):
+            try:
+                self.server.gpu_keep_warm_interval = float(gpu_keep_warm)
+            except ValueError:
+                logger.warning(
+                    f"Invalid OMLX_GPU_KEEP_WARM_INTERVAL value: {gpu_keep_warm}"
+                )
         if max_audio_upload_size := os.getenv("OMLX_MAX_AUDIO_UPLOAD_SIZE"):
             self.server.max_audio_upload_size = max_audio_upload_size
         if max_image_upload_size := (
@@ -1451,7 +1510,6 @@ class GlobalSettings:
         """Save current settings to the settings file."""
         self.ensure_directories()
 
-        settings_file = self.base_path / "settings.json"
         data = {
             "version": SETTINGS_VERSION,
             "server": self.server.to_dict(),
@@ -1473,6 +1531,21 @@ class GlobalSettings:
             "idle_timeout": self.idle_timeout.to_dict(),
         }
 
+        self._save_data(data)
+
+    def ensure_inference_auth_setting(self) -> None:
+        """Add the manual opt-in default without persisting runtime overrides."""
+        path = self.base_path / "settings.json"
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        auth = data.setdefault("auth", {})
+        if "allow_unauthenticated_inference" in auth:
+            return
+        auth["allow_unauthenticated_inference"] = False
+        self.base_path.mkdir(parents=True, exist_ok=True)
+        self._save_data(data)
+
+    def _save_data(self, data: dict[str, Any]) -> None:
+        settings_file = self.base_path / "settings.json"
         # Write to a temp file and rename so a crash or a concurrent
         # writer can never leave a torn settings.json (same pattern as
         # ModelSettingsManager._save). The rename also carries the temp
@@ -1560,6 +1633,9 @@ class GlobalSettings:
         """
         errors = []
 
+        if type(self.auth.allow_unauthenticated_inference) is not bool:
+            errors.append("auth.allow_unauthenticated_inference must be a boolean")
+
         # Server validation
         if not 1 <= self.server.port <= 65535:
             errors.append(f"Invalid port: {self.server.port} (must be 1-65535)")
@@ -1622,6 +1698,12 @@ class GlobalSettings:
                 errors.append("max_image_upload_size must be positive")
         except (AttributeError, TypeError, ValueError) as e:
             errors.append(f"Invalid max_image_upload_size: {e}")
+
+        try:
+            if parse_size(self.server.max_request_body_size) <= 0:
+                errors.append("max_request_body_size must be positive")
+        except (AttributeError, TypeError, ValueError) as e:
+            errors.append(f"Invalid max_request_body_size: {e}")
 
         if self.server.max_image_side_length < 0:
             errors.append("max_image_side_length must be non-negative")
@@ -1823,6 +1905,7 @@ class GlobalSettings:
         )
 
         return SchedulerConfig(
+            qwen4_gdn_decode_wide_proj=self.server.qwen4_gdn_decode_wide_proj,
             max_num_seqs=self.scheduler.max_concurrent_requests,
             completion_batch_size=self.scheduler.max_concurrent_requests,
             embedding_batch_size=self.scheduler.embedding_batch_size,
@@ -1835,6 +1918,7 @@ class GlobalSettings:
             paged_ssd_cache_max_size=self.cache.get_ssd_cache_max_size_bytes(
                 self.base_path
             ),
+            paged_ssd_cache_auto_size=self.cache.ssd_cache_max_size.lower() == "auto",
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
             hot_cache_write_through=self.cache.hot_cache_write_through,
             gdn_ssd_split_enabled=self.cache.get_gdn_ssd_split_enabled(),

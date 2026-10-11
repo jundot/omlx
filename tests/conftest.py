@@ -1,5 +1,8 @@
+import fnmatch
 import os
 import subprocess
+import sys
+import zlib
 
 # MLX 0.32.2 runs fp32 GPU matmuls at TF32 precision on M5-class tensor units;
 # the fp32 parity tests assert 2e-5, which TF32 cannot hold. Test session only.
@@ -34,6 +37,73 @@ apply_m5_gather_qmm_workaround()
 
 from omlx.request import Request, SamplingParams
 
+# Model and kernel numerics tests keep the GPU busy. Under --dist loadgroup
+# they share one worker so concurrent command buffers do not trip the Metal
+# GPU timeout. Every other test file stays on a single worker.
+_GPU_SERIAL_TEST_FILES = (
+    "test_deepseek_v4*",
+    "test_glm5_*",
+    "test_glm_moe_*",
+    "test_mlx_lm_mtp_patch.py",
+    "test_mlx_vlm_*",
+    "test_moe_expert_offload.py",
+    "test_qwen35_*",
+    "test_qwen4_*",
+    "test_row_exact_qmv.py",
+    "test_scheduler_chunked_prefill.py",
+    "test_sdpa*",
+)
+
+
+@pytest.hookimpl(tryfirst=True)  # Before xdist reads the xdist_group markers.
+def pytest_collection_modifyitems(config, items):
+    if not config.pluginmanager.hasplugin("xdist"):
+        return
+    for item in items:
+        name = item.path.name
+        if any(fnmatch.fnmatch(name, pattern) for pattern in _GPU_SERIAL_TEST_FILES):
+            group = "gpu"
+        else:
+            group = item.nodeid.split("::", 1)[0]
+        item.add_marker(pytest.mark.xdist_group(group))
+
+
+@pytest.fixture
+def glm5_fused_decode():
+    """GLM-5.3's fused decode/verify kernels, which run (and replay the
+    reference bit for bit) on M3 and newer GPUs."""
+    from omlx.patches.mlx_vlm_glm5_next_compat import (
+        apply_mlx_vlm_glm5_next_compat_patch,
+    )
+
+    apply_mlx_vlm_glm5_next_compat_patch()
+    from mlx_vlm.models.glm5_next import language
+
+    if not language._DECODE_FUSION:
+        pytest.skip("the fused GLM-5.3 decode kernels run on M3 and newer GPUs")
+    return language
+
+
+@pytest.fixture(autouse=True)
+def cluster_home(tmp_path, monkeypatch):
+    from omlx.cluster import ssh_keys, worker_shim
+
+    home = tmp_path / "cluster-home"
+    publish = worker_shim.ensure_cluster_python_shim
+
+    def publish_shim(**kwargs):
+        if kwargs.get("home") is None:
+            kwargs["home"] = home
+        return publish(**kwargs)
+
+    monkeypatch.setattr(worker_shim, "ensure_cluster_python_shim", publish_shim)
+    # SSH paths are resolved at import time, before test fixtures run.
+    ssh_dir = home / ".ssh"
+    monkeypatch.setattr(ssh_keys, "_SSH_DIR", ssh_dir)
+    monkeypatch.setattr(ssh_keys, "_SSH_KEY_PATH", ssh_dir / "omlx_cluster")
+    monkeypatch.setattr(ssh_keys, "_SSH_PUBKEY_PATH", ssh_dir / "omlx_cluster.pub")
+    return home
+
 
 class MockTokenizer:
     """Mock tokenizer for testing without loading real models."""
@@ -52,8 +122,8 @@ class MockTokenizer:
             tokens.append(self.bos_token_id)
         # Simulate tokenization by splitting on spaces
         for i, word in enumerate(text.split()):
-            # Use hash to get a consistent token id for each word
-            token_id = (hash(word) % (self.vocab_size - 10)) + 10
+            # crc32, unlike hash(), is stable across processes.
+            token_id = (zlib.crc32(word.encode()) % (self.vocab_size - 10)) + 10
             tokens.append(token_id)
         return tokens
 
@@ -231,3 +301,29 @@ def _reset_decode_activity_registry():
     get_decode_activity().clear()
     yield
     get_decode_activity().clear()
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_metal_release_accounting(monkeypatch):
+    """Keep the graphics footprint and its release-lag history test-local.
+
+    Tests feed synthetic phys_footprint values. The test process's real
+    graphics ledger and earlier tests' samples would otherwise split or
+    discount them unpredictably. Tests of the split patch these explicitly.
+    """
+    for name in (
+        "omlx.scheduler",
+        "omlx.process_memory_enforcer",
+        "omlx.utils.metal_sync",
+    ):
+        module = sys.modules.get(name)
+        if module is not None and hasattr(module, "get_graphics_footprint"):
+            monkeypatch.setattr(module, "get_graphics_footprint", lambda: 0)
+    metal_sync = sys.modules.get("omlx.utils.metal_sync")
+    if metal_sync is not None:
+        metal_sync._residuals.clear()
+        metal_sync._last_unreleased = (0.0, 0)
+    yield
+    if metal_sync is not None:
+        metal_sync._residuals.clear()
+        metal_sync._last_unreleased = (0.0, 0)

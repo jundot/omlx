@@ -135,3 +135,8 @@ class TestCustomKernelBuild:
     def test_kernel_verification_not_shadowed_by_buildpath(self, formula):
         """Import check must run outside buildpath's raw omlx/ source tree."""
         assert "Dir.chdir(libexec)" in formula
+
+    def test_metal_toolchain_checked_before_kernel_build(self, formula):
+        block = formula.index('if build.with?("custom-kernel")')
+        guard = formula.index('quiet_system("/usr/bin/xcrun", "-f", "metal")', block)
+        assert guard < formula.index('ENV["OMLX_WITH_CUSTOM_KERNEL"]', block)

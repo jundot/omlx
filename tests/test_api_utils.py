@@ -53,6 +53,7 @@ from omlx.api.utils import (
     extract_harmony_messages,
     extract_multimodal_content,
     extract_text_content,
+    find_lone_surrogate,
     merge_reasoning_effort_chat_template_kwargs,
     prepare_system_messages_for_template,
     uses_native_reasoning_content,
@@ -665,6 +666,20 @@ class TestUsesNativeReasoningContent:
 
     def test_plain_model_is_not_native(self):
         assert not uses_native_reasoning_content("llama-3")
+
+    def test_detects_deepseek_v4_family(self):
+        assert uses_native_reasoning_content(
+            "any-name",
+            config_model_type="deepseek_v41",
+        )
+        assert uses_native_reasoning_content(
+            "any-name",
+            engine_model_type="deepseek_v4",
+        )
+        assert not uses_native_reasoning_content(
+            "any-name",
+            config_model_type="deepseek_v3",
+        )
 
 
 class TestConvertAnthropicToInternal:
@@ -3122,11 +3137,19 @@ class TestExtractMultimodalContent:
         assert parts[0]["input_audio"]["format"] == "wav"
 
     @pytest.mark.parametrize("part_type", ["video_url", "input_video"])
-    def test_video_input_is_rejected(self, part_type):
-        with pytest.raises(InvalidRequestError, match="Video input is not supported"):
-            _extract_multimodal_content_list(
-                [{"type": part_type, part_type: {"url": "data:video/mp4;base64,AA=="}}]
-            )
+    @pytest.mark.parametrize(
+        "value", [{"url": "data:video/mp4;base64,AA=="}, "data:video/mp4;base64,AA=="]
+    )
+    def test_video_input_is_preserved(self, part_type, value):
+        message = Message(role="user", content=[{"type": part_type, part_type: value}])
+        parts = _extract_multimodal_content_list(message.content)
+
+        assert parts == [
+            {
+                "type": "video_url",
+                "video_url": {"url": "data:video/mp4;base64,AA=="},
+            }
+        ]
 
 
 # =============================================================================
@@ -3651,3 +3674,13 @@ class TestCacheReasoningOutput:
             )
             is False
         )
+
+
+class TestFindLoneSurrogate:
+    def test_reports_lone_surrogate_path_and_accepts_paired(self):
+        part = {"type": "text", "text": "hi \U0001f600"}
+        body = {"messages": [{"content": [part]}]}
+        assert find_lone_surrogate(body) is None
+
+        part["text"] = "hi \ud83d"
+        assert find_lone_surrogate(body) == "messages[0].content[0].text"

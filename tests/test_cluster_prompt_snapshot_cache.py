@@ -3,6 +3,8 @@
 one linear chain of slabs, and stay consistent across ranks that see the same
 requests."""
 
+import json
+
 import mlx.core as mx
 from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
 
@@ -351,6 +353,24 @@ def test_invalid_persistent_manifest_fails_closed(tmp_path):
     assert len(store) == 0
     assert not (tmp_path / "deadbeef.safetensors").exists()
     assert (tmp_path / "index.json").is_file()
+
+
+def test_older_manifest_version_resets_the_store(tmp_path):
+    """States saved before a numerics change must not survive an upgrade."""
+    tokens = list(range(8))
+    first = SSDPromptSnapshotStore(tmp_path, step=4, persistent=True)
+    kv = KVCache()
+    _feed(kv, 4)
+    assert first.put(MODEL, tokens[:4], [kv])
+    manifest = tmp_path / "index.json"
+    payload = json.loads(manifest.read_text())
+    payload["version"] = 1
+    manifest.write_text(json.dumps(payload))
+
+    second = SSDPromptSnapshotStore(tmp_path, step=4, persistent=True)
+
+    assert len(second) == 0
+    assert second.present_boundaries(MODEL, tokens) == ()
 
 
 def test_an_unaligned_prompt_is_rejected(tmp_path):

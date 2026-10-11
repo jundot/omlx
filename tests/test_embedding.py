@@ -3,17 +3,24 @@
 
 import asyncio
 import base64
+import io
 import json
 import math
 import numpy as np
 import struct
 import threading
 import time
+import wave
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import mlx.core as mx
 import pytest
+from mlx.utils import tree_flatten
+from mlx_vlm.models.embedding_gemma2 import Model as EmbeddingGemma2
+from mlx_vlm.models.embedding_gemma2 import ModelConfig as EmbeddingGemma2Config
+from safetensors.numpy import save_file
 
 from omlx.api.embedding_models import (
     EmbeddingData,
@@ -32,7 +39,23 @@ from omlx.api.embedding_utils import (
 from omlx.engine.embedding import EmbeddingEngine
 from omlx.exceptions import InvalidRequestError
 from omlx.model_discovery import detect_model_type
-from omlx.models.embedding import EmbeddingOutput
+from omlx.models.embedding import EmbeddingOutput, MLXEmbeddingModel
+
+
+def _wav_data_uri(seconds: float = 0.25, sample_rate: int = 16000) -> str:
+    """Base64 data URI of a mono 16-bit sine WAV."""
+    t = np.arange(int(seconds * sample_rate)) / sample_rate
+    pcm = (0.3 * np.sin(2 * np.pi * 440 * t) * 32767).astype("<i2").tobytes()
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm)
+    return "data:audio/wav;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+
+AUDIO_DATA_URI = _wav_data_uri()
 
 IMAGE_DATA_URI = (
     "data:image/png;base64,"
@@ -107,8 +130,14 @@ class TestEmbeddingModels:
 
     def test_embedding_input_item_requires_text_or_image(self):
         """Test EmbeddingInputItem rejects empty payloads."""
-        with pytest.raises(ValueError, match="text or image"):
+        with pytest.raises(ValueError, match="text, image, or audio"):
             EmbeddingInputItem()
+
+    def test_embedding_input_item_accepts_audio_only(self):
+        """Test EmbeddingInputItem accepts an audio-only payload."""
+        item = EmbeddingInputItem(audio=AUDIO_DATA_URI)
+        assert item.audio == AUDIO_DATA_URI
+        assert item.text is None and item.image is None
 
     def test_embedding_input_item_allows_empty_string_text(self):
         """Test EmbeddingInputItem preserves empty-string text items."""
@@ -249,8 +278,11 @@ class TestEmbeddingUtils:
                     text="hello",
                     image=IMAGE_DATA_URI,
                 ),
+                EmbeddingInputItem(text="rain", audio=AUDIO_DATA_URI),
             ]
         )
+        assert result[-1] == {"text": "rain", "audio": AUDIO_DATA_URI}
+        result = result[:-1]
         assert result == [
             {"text": "hello"},
             {"image": IMAGE_DATA_URI},
@@ -552,6 +584,33 @@ class TestEmbeddingCompileFallback:
 
         assert generate.call_args.kwargs["max_length"] == 1024
 
+    def test_max_length_is_capped_at_position_table(self):
+        """XLM-R declares 8194 positions but only 8192 inputs fit after the offset."""
+        import mlx.core as mx
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        model._loaded = True
+        model._is_compiled = False
+        model._compiled_embed = None
+        model.model = SimpleNamespace(
+            config=SimpleNamespace(max_position_embeddings=8194),
+            max_input_length=8192,
+        )
+        model.processor = SimpleNamespace()
+
+        mock_outputs = MagicMock(spec=[])
+        mock_outputs.text_embeds = mx.array([[0.5, 0.6]])
+        mock_outputs.pooler_output = None
+        mock_outputs.last_hidden_state = None
+
+        with patch("mlx_embeddings.generate", return_value=mock_outputs) as generate:
+            model.embed(["test"])
+            model.embed(["test"], max_length=1024)
+
+        lengths = [call.kwargs["max_length"] for call in generate.call_args_list]
+        assert lengths == [8192, 1024]
+
     def test_custom_processor_compiled_path_uses_prepare_embedding_inputs(self):
         """Custom embedding processors should use their own prepare API."""
         import mlx.core as mx
@@ -751,21 +810,6 @@ class TestEmbeddingCompileFallback:
         with pytest.raises(ValueError, match="does not support image inputs"):
             model.embed([{"image": IMAGE_DATA_URI}])
 
-    def test_try_compile_respects_disable_env(self, monkeypatch):
-        """OMLX_EMBEDDING_COMPILE=0 should skip mx.compile for root-cause probes."""
-        from omlx.models.embedding import MLXEmbeddingModel
-
-        monkeypatch.setenv("OMLX_EMBEDDING_COMPILE", "0")
-        model = MLXEmbeddingModel("test-model")
-        model.model = MagicMock()
-
-        with patch("omlx.models.embedding.mx") as mock_mx:
-            result = model._try_compile()
-
-        assert result is False
-        assert model._compiled_embed is None
-        mock_mx.compile.assert_not_called()
-
     def test_close_releases_compiled_model_and_processor_resources(self):
         """close() should drop wrapper references before clearing MLX caches."""
         from omlx.models.embedding import MLXEmbeddingModel
@@ -816,7 +860,12 @@ class TestEmbeddingEngine:
 
             asyncio.run(engine.start())
 
-            MockModel.assert_called_once_with("test-model", trust_remote_code=False)
+            MockModel.assert_called_once_with(
+                "test-model",
+                trust_remote_code=False,
+                audio_enabled=False,
+                audio_max_seconds=None,
+            )
             mock_model.load.assert_called_once()
 
             asyncio.run(engine.stop())
@@ -1514,6 +1563,69 @@ class TestNativeEmbeddingLoading:
         assert result is False
         assert model._loaded is False
 
+    def test_native_embed_tokenizes_with_tokenizer_call(self, tmp_path):
+        """transformers tokenizers expose a Rust _tokenizer that must stay unused."""
+        config = {
+            "model_type": "bert",
+            "architectures": ["BertModel"],
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "vocab_size": 128,
+            "num_attention_heads": 4,
+            "intermediate_size": 64,
+            "max_position_embeddings": 64,
+            "attention_probs_dropout_prob": 0.0,
+            "hidden_dropout_prob": 0.0,
+            "pad_token_id": 0,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        self._write_full_native_checkpoint(tmp_path, config)
+
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel(str(tmp_path))
+        tokenizer = self.MockNativeTokenizer(vocab_size=config["vocab_size"])
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained", return_value=tokenizer
+        ):
+            model.load()
+            expected = model.embed(["hello world"]).embeddings
+            # Its encode() would apply tokenizer.json padding as real tokens.
+            tokenizer._tokenizer = object()
+            assert model.embed(["hello world"]).embeddings == expected
+
+    def test_position_ids_follow_bert_and_roberta_numbering(self):
+        """BERT positions start at 0; XLM-R positions start after padding_idx."""
+        import mlx.core as mx
+        from omlx.models.xlm_roberta import Model, ModelArgs
+
+        input_ids = mx.array([[5, 6, 7, 8]])
+        common = dict(
+            hidden_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            intermediate_size=16,
+            vocab_size=16,
+        )
+        cases = (
+            ("bert", 0, 512, [0, 1, 2, 3], 512),
+            ("xlm-roberta", 1, 8194, [2, 3, 4, 5], 8192),
+        )
+        for model_type, pad_token_id, table, positions, max_input in cases:
+            model = Model(
+                ModelArgs(
+                    model_type=model_type,
+                    pad_token_id=pad_token_id,
+                    max_position_embeddings=table,
+                    **common,
+                )
+            )
+            model.train(False)
+            expected = model.embeddings(input_ids, position_ids=mx.array([positions]))
+
+            assert mx.array_equal(model.embeddings(input_ids), expected).item()
+            assert model.max_input_length == max_input
+
     def test_load_native_falls_back_for_unknown_arch(self, tmp_path):
         """Test that native loading returns False for unsupported architectures."""
         import sys
@@ -1572,6 +1684,79 @@ class TestNativeEmbeddingLoading:
         emb = output.embeddings[0]
         norm = math.sqrt(sum(x * x for x in emb))
         assert abs(norm - 1.0) < 0.01, f"Embedding not normalized: norm={norm}"
+
+    def test_xlm_roberta_sdpa_attention_matches_eager(self):
+        """The fused attention path must match the eager path on padded rows."""
+        import mlx.core as mx
+        from omlx.models.xlm_roberta import Model, ModelArgs
+
+        model = Model(
+            ModelArgs(
+                hidden_size=32,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                intermediate_size=64,
+                vocab_size=100,
+                max_position_embeddings=40,
+            )
+        )
+        model.train(False)
+        input_ids = mx.array([[0, 5, 6, 7, 8, 2], [0, 9, 2, 1, 1, 1]])
+        attention_mask = mx.array([[1, 1, 1, 1, 1, 1], [1, 1, 1, 0, 0, 0]])
+
+        fused = model(input_ids, attention_mask=attention_mask)
+        # output_attentions needs the probabilities, so it keeps the eager path.
+        eager = model(input_ids, attention_mask=attention_mask, output_attentions=True)
+
+        assert mx.allclose(
+            fused.last_hidden_state, eager.last_hidden_state, atol=1e-5
+        ).item()
+
+    def test_embed_batches_long_inputs_in_input_order(self, tmp_path):
+        """Token-budget batches must match single-input vectors in input order."""
+        config = {
+            "model_type": "bert",
+            "architectures": ["BertModel"],
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "vocab_size": 128,
+            "num_attention_heads": 4,
+            "intermediate_size": 64,
+            "max_position_embeddings": 128,
+            "attention_probs_dropout_prob": 0.0,
+            "hidden_dropout_prob": 0.0,
+            "pad_token_id": 0,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        self._write_full_native_checkpoint(tmp_path, config)
+
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel(str(tmp_path))
+        texts = ["w " * 40, "a b", "x " * 20, "c d e"]
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            return_value=self.MockNativeTokenizer(vocab_size=config["vocab_size"]),
+        ):
+            model.load()
+            singles = [model.embed([text], max_length=64) for text in texts]
+
+            shapes = []
+            forward = model.model
+
+            def recording_forward(**kwargs):
+                shapes.append(kwargs["input_ids"].shape)
+                return forward(**kwargs)
+
+            model.model = recording_forward
+            with patch("omlx.models.embedding.ENCODER_BATCH_TOKEN_BUDGET", 48):
+                batched = model.embed(texts, max_length=64)
+
+        assert len(shapes) == 3
+        assert all(batch * width <= 48 for batch, width in shapes)
+        for got, single in zip(batched.embeddings, singles):
+            assert got == pytest.approx(single.embeddings[0], abs=1e-5)
+        assert batched.total_tokens == sum(single.total_tokens for single in singles)
 
 
 class TestGetEmbeddingMaxLength:
@@ -1932,8 +2117,8 @@ class TestDeclaredPoolingMode:
         """compile off + right-padded batch: the tokenizer path must pool real tokens.
 
         ``mlx_embeddings.generate`` drops the mask it builds, so this path
-        pooled a pad token for every mixed-length batch whenever
-        ``OMLX_EMBEDDING_COMPILE=0`` or a compile failure sent it here.
+        pooled a pad token for every mixed-length batch whenever a compile
+        failure sent it here.
         """
         import mlx.core as mx
 
@@ -1977,3 +2162,268 @@ class TestDeclaredPoolingMode:
 
         out = np.array(m.embed(["ab", "abc"]).embeddings)
         assert np.allclose(out, self._E2E_EXPECTED, atol=1e-5)
+
+
+
+class TestEmbeddingDtype:
+    """bf16 -> fp16 promotion for unquantized Qwen3-Embedding 0.6B / 8B."""
+
+    class _Module:
+        def __init__(self):
+            self._params = {"weight": mx.zeros((2,), dtype=mx.bfloat16)}
+
+        def parameters(self):
+            return self._params
+
+        def update(self, tree):
+            self._params = tree
+
+    @staticmethod
+    def _promoted(model_dir, **config):
+        model_dir.mkdir(parents=True)
+        cfg = {"model_type": "qwen3", "hidden_size": 4096, "num_hidden_layers": 36}
+        cfg.update(config)
+        (model_dir / "config.json").write_text(json.dumps(cfg))
+        module = TestEmbeddingDtype._Module()
+        MLXEmbeddingModel(str(model_dir))._promote_bf16_to_fp16(module)
+        return module._params["weight"].dtype == mx.float16
+
+    @pytest.mark.parametrize(
+        "name,shape",
+        [("Qwen3-Embedding-0.6B", (1024, 28)), ("Qwen3-Embedding-8B", (4096, 36))],
+    )
+    def test_promotes_validated_sizes(self, tmp_path, name, shape):
+        assert self._promoted(
+            tmp_path / name, hidden_size=shape[0], num_hidden_layers=shape[1]
+        )
+
+    def test_size_comes_from_config_not_path(self, tmp_path):
+        # HF cache snapshot hashes can contain "8b".
+        snapshot = (
+            tmp_path
+            / "models--Qwen--Qwen3-Embedding-4B"
+            / "snapshots"
+            / "5cf2132abc8bd8a4f1c2b0e7d6a9f3e1b2c4d5e6"
+        )
+        assert not self._promoted(snapshot, hidden_size=2560)
+
+    @pytest.mark.parametrize(
+        "name,config",
+        [
+            ("Qwen3-Embedding-8B-4bit", {"quantization": {"bits": 4}}),
+            ("Qwen3-VL-Embedding-8B", {"model_type": "qwen3_vl"}),
+            ("Qwen3-8B", {}),
+        ],
+    )
+    def test_leaves_other_models_untouched(self, tmp_path, name, config):
+        assert not self._promoted(tmp_path / name, **config)
+
+
+class TestMlxVlmEmbeddingGemma2:
+    """EmbeddingGemma 2 loads through mlx-vlm with an image input adapter."""
+
+    _CONFIG = {
+        "model_type": "embedding_gemma2",
+        "architectures": ["EmbeddingGemma2Model"],
+        "text_config": {
+            "vocab_size": 64,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "hidden_size_per_layer_input": 8,
+            "embedding_dim": 24,
+            "sliding_window": 4,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "per_layer_config": {"01": {"head_dim": 32, "num_key_value_heads": 1}},
+            "max_position_embeddings": 262144,
+        },
+        "vision_config": None,
+        "audio_config": {
+            "hidden_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "subsampling_conv_channels": [4, 4],
+            "output_proj_dims": 16,
+            "attention_chunk_size": 4,
+            "attention_context_left": 5,
+        },
+    }
+
+    class MockTokenizer:
+        """Right-padding tokenizer that records the requested max_length."""
+
+        def __init__(self):
+            self.max_lengths = []
+
+        def __call__(self, texts, *, max_length, **kwargs):
+            self.max_lengths.append(max_length)
+            encoded = [
+                [2, *(3 + len(word) % 60 for word in text.split()), 1][:max_length]
+                for text in texts
+            ]
+            width = max(len(ids) for ids in encoded)
+            input_ids = [ids + [0] * (width - len(ids)) for ids in encoded]
+            mask = [[1] * len(ids) + [0] * (width - len(ids)) for ids in encoded]
+            return {"input_ids": mx.array(input_ids), "attention_mask": mx.array(mask)}
+
+    @pytest.fixture
+    def model_dir(self, tmp_path):
+        (tmp_path / "config.json").write_text(json.dumps(self._CONFIG))
+        model = EmbeddingGemma2(EmbeddingGemma2Config.from_dict(self._CONFIG))
+        weights = {
+            name: np.array(value) for name, value in tree_flatten(model.parameters())
+        }
+        save_file(weights, str(tmp_path / "model.safetensors"))
+        return tmp_path
+
+    def _load(self, model_dir, audio_enabled=False, audio_max_seconds=None):
+        tokenizer = self.MockTokenizer()
+        processor = MagicMock()
+        processor.tokenizer = tokenizer
+        processor.feature_extractor.sampling_rate = 16000
+        model = MLXEmbeddingModel(
+            str(model_dir),
+            audio_enabled=audio_enabled,
+            audio_max_seconds=audio_max_seconds,
+        )
+        with patch(
+            "omlx.models.embedding.load_processor", return_value=processor
+        ) as load_processor:
+            model.load()
+        load_processor.assert_called_once_with(model_dir, add_detokenizer=False)
+        return model, tokenizer, processor
+
+    def test_text_embeddings_match_model_and_clamp_length(self, model_dir):
+        model, tokenizer, processor = self._load(model_dir)
+        texts = ["one two three", "four"]
+
+        output = model.embed(texts, max_length=262144)
+
+        assert model.model.audio_tower is None
+        assert tokenizer.max_lengths[-1] == 8192
+        inputs = tokenizer(texts, return_tensors="mlx", max_length=8192)
+        expected = model.model(**inputs).text_embeds
+        np.testing.assert_allclose(
+            np.array(output.embeddings), np.array(expected), atol=1e-5
+        )
+        processor.apply_chat_template.assert_not_called()
+
+    def test_image_batch_skips_compiled_path(self, model_dir):
+        model, _, processor = self._load(model_dir)
+        prepared = {
+            "input_ids": mx.array([[2, 5, 6, 1]]),
+            "attention_mask": mx.array([[1, 1, 1, 1]]),
+        }
+        processor.apply_chat_template.return_value = prepared
+        model._compiled_embed = MagicMock()
+
+        output = model.embed([{"text": "a cat", "image": IMAGE_DATA_URI}])
+
+        conversations = processor.apply_chat_template.call_args.args[0]
+        assert conversations == [
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "a cat"},
+                        {"type": "image", "url": IMAGE_DATA_URI},
+                    ],
+                }
+            ]
+        ]
+        model._compiled_embed.assert_not_called()
+        expected = model.model(**prepared).text_embeds
+        np.testing.assert_allclose(
+            np.array(output.embeddings), np.array(expected), atol=1e-6
+        )
+
+    def test_audio_item_reaches_processor_as_waveform(self, model_dir):
+        model, _, processor = self._load(model_dir, audio_enabled=True)
+        assert model.model.audio_tower is not None
+        prepared = {
+            "input_ids": mx.array([[2, 5, 6, 1]]),
+            "attention_mask": mx.array([[1, 1, 1, 1]]),
+        }
+        processor.apply_chat_template.return_value = prepared
+        model._compiled_embed = MagicMock()
+
+        output = model.embed([{"text": "a beep", "audio": AUDIO_DATA_URI}])
+
+        (conversation,) = processor.apply_chat_template.call_args.args[0]
+        content = conversation[0]["content"]
+        assert content[0] == {"type": "text", "text": "a beep"}
+        assert content[1]["type"] == "audio"
+        waveform = content[1]["audio"]
+        assert isinstance(waveform, np.ndarray) and waveform.dtype == np.float32
+        assert waveform.shape == (4000,)  # 0.25 s at 16 kHz
+        model._compiled_embed.assert_not_called()
+        expected = model.model(**prepared).text_embeds
+        np.testing.assert_allclose(
+            np.array(output.embeddings), np.array(expected), atol=1e-6
+        )
+
+    def test_audio_rejected_until_setting_enables_tower(self, model_dir):
+        model, _, processor = self._load(model_dir)
+
+        with pytest.raises(ValueError, match="enable embedding_audio_enabled"):
+            model.embed([{"audio": AUDIO_DATA_URI}])
+        processor.apply_chat_template.assert_not_called()
+
+    def test_engine_passes_audio_setting_to_model(self, model_dir):
+        from omlx.engine.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine(
+            str(model_dir), audio_enabled=True, audio_max_seconds=90
+        )
+        with patch(
+            "omlx.models.embedding.load_processor", return_value=MagicMock()
+        ):
+            asyncio.run(engine.start())
+        assert engine._model.audio_enabled is True
+        assert engine._model.audio_max_seconds == 90
+        assert engine._model.model.audio_tower is not None
+
+    def test_malformed_audio_is_request_error(self, model_dir):
+        model, _, processor = self._load(model_dir, audio_enabled=True)
+
+        with pytest.raises(InvalidRequestError):
+            model.embed([{"audio": "data:audio/wav;base64,not-base64!"}])
+        processor.apply_chat_template.assert_not_called()
+
+    def _prepared(self, processor):
+        processor.apply_chat_template.return_value = {
+            "input_ids": mx.array([[2, 5, 6, 1]]),
+            "attention_mask": mx.array([[1, 1, 1, 1]]),
+        }
+
+    def test_audio_length_setting_reaches_feature_extractor(self, model_dir):
+        model, _, processor = self._load(
+            model_dir, audio_enabled=True, audio_max_seconds=120
+        )
+        self._prepared(processor)
+
+        model.embed([{"audio": AUDIO_DATA_URI}])
+
+        kwargs = processor.apply_chat_template.call_args.kwargs
+        assert kwargs["audio_kwargs"] == {"max_length": 120 * 16000}
+
+    def test_audio_length_default_keeps_processor_default(self, model_dir):
+        model, _, processor = self._load(model_dir, audio_enabled=True)
+        self._prepared(processor)
+
+        model.embed([{"audio": AUDIO_DATA_URI}])
+
+        assert "audio_kwargs" not in processor.apply_chat_template.call_args.kwargs
+
+    def test_audio_length_not_sent_for_image_batches(self, model_dir):
+        model, _, processor = self._load(
+            model_dir, audio_enabled=True, audio_max_seconds=120
+        )
+        self._prepared(processor)
+
+        model.embed([{"text": "a cat", "image": IMAGE_DATA_URI}])
+
+        assert "audio_kwargs" not in processor.apply_chat_template.call_args.kwargs

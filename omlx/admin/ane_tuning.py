@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import statistics
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -129,6 +130,16 @@ class ANETuningRun:
     task: asyncio.Task | None = None
     created_at: float = field(default_factory=time.time)
     deadline: float | None = None
+    _cancel_calibration: threading.Event = field(default_factory=threading.Event, repr=False)
+
+
+class _CalibrationCancelled(Exception):
+    pass
+
+
+def _check_calibration_cancelled(run: ANETuningRun) -> None:
+    if run._cancel_calibration.is_set():
+        raise _CalibrationCancelled
 
 
 class _K2BudgetExpired(Exception):
@@ -331,6 +342,7 @@ def _tail_padding_min_tokens(
 
 
 def _set_phase_running(run: ANETuningRun, slot: int, message: str) -> None:
+    _check_calibration_cancelled(run)
     run.phase = "calibrating"
     run.message = message
     run.results[slot]["state"] = "running"
@@ -345,6 +357,7 @@ def _preview_phase(
     **values: Any,
 ) -> None:
     """Publish a provisional calibration leader without completing its row."""
+    _check_calibration_cancelled(run)
     run.results[slot].update(
         {
             "detail": detail,
@@ -371,6 +384,7 @@ def _complete_phase(
     fused_down: bool = False,
     cpu_threads: int | None = None,
 ) -> None:
+    _check_calibration_cancelled(run)
     result = run.results[slot]
     result.update(
         {
@@ -553,6 +567,16 @@ def _ane_execution_observed(
     )
 
 
+def _observed_operations(traces: list[dict[str, Any] | None]) -> dict[str, int]:
+    totals = {"mlp": 0, "gdn": 0}
+    for trace in traces:
+        categories = (trace or {}).get("categories") or {}
+        for category in totals:
+            values = categories.get(category) or {}
+            totals[category] += int(values.get("operations", 0) or 0)
+    return totals
+
+
 def _ane_is_active(engine: Any) -> bool:
     model = getattr(engine, "_model", None)
     if model is None:
@@ -696,24 +720,40 @@ async def _measure_candidate(
     # Reject only a positive observation that compiled programs remained idle.
     # If profiling was unavailable, the result is unknown and stays eligible.
     if candidate.enabled and any(o is False for o in observations) and not any(observations):
+        operations = _observed_operations(traces)
         step = _prefill_step_size(engine)
-        hint = (
-            f"the scheduler is configured for {step}-token prefill chunks, "
-            f"so set sequence_length={step} or smaller (wider chunks tile "
-            "onto the compiled shape, narrower ones cannot)"
-            if step
-            else "sequence_length must not exceed the scheduler's prefill "
-            "chunk width"
-        )
+        if any(operations.values()):
+            # Another branch ran on the same chunks, so the width matched.
+            cause = (
+                "The other ANE branch ran on the same chunks, so the idle "
+                "branch was dropped at load or dispatch; check the serve log "
+                "for ANE compile, program budget, warmup, or runtime failure "
+                "warnings."
+            )
+        elif step is None:
+            cause = (
+                "sequence_length must not exceed the scheduler's prefill "
+                "chunk width."
+            )
+        elif run.request.sequence_length > step:
+            cause = (
+                f"The scheduler is configured for {step}-token prefill chunks, "
+                f"so set sequence_length={step} or smaller (wider chunks tile "
+                "onto the compiled shape, narrower ones cannot)."
+            )
+        else:
+            cause = (
+                f"The configured {step}-token prefill step fits this shape; "
+                "check chunk_tokens in the serve log, since delivered chunks "
+                "can shrink below the step, and check for ANE warmup or "
+                "runtime failure warnings."
+            )
         raise RuntimeError(
-            "The ANE compiled but never executed for "
-            f"sequence_length={run.request.sequence_length}: no ANE operation "
-            "was observed during measurement, so this candidate would report "
-            "GPU-only throughput as an ANE result. The most common cause is a "
-            f"prefill chunk size mismatch ({hint}; confirm against "
-            "chunk_tokens in the serve log, since delivered chunks can shrink "
-            "below the configured step). A runtime dispatch failure can also "
-            "disable the path; check the serve log for 'Disabling ANE' warnings."
+            "A required ANE branch never executed for "
+            f"sequence_length={run.request.sequence_length} (observed ANE "
+            f"operations: mlp={operations['mlp']}, gdn={operations['gdn']}), "
+            "so this candidate would report GPU-only throughput as an ANE "
+            f"result. {cause}"
         )
 
     result = {
@@ -1653,13 +1693,36 @@ async def _calibrate_components(
     from omlx.engine_core import get_mlx_executor
 
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
+    future = loop.run_in_executor(
         get_mlx_executor(),
         _calibrate_components_sync,
         run,
         engine,
         base_settings,
     )
+    cancelled = False
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError:
+            cancelled = True
+            run._cancel_calibration.set()
+            run.phase = "cleaning_up"
+            run.message = "Waiting for ANE calibration to stop..."
+        except Exception:
+            if not cancelled:
+                raise
+            break
+    if cancelled:
+        # Await the worker before unload can clear its temporary module state.
+        try:
+            future.result()
+        except _CalibrationCancelled:
+            pass
+        except Exception:
+            logger.debug("ANE calibration failed while cancelling", exc_info=True)
+        raise asyncio.CancelledError
+    return future.result()
 
 
 def _calibrate_components_sync(
@@ -2206,9 +2269,23 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
             )
         if refinement_changed:
             active_slot = _REFINE_SLOT
-            await _measure_result_slot(
-                run, _REFINE_SLOT, engine_pool, base_settings, refined
-            )
+            try:
+                await _measure_result_slot(
+                    run, _REFINE_SLOT, engine_pool, base_settings, refined
+                )
+            except Exception as exc:
+                # The verified prediction stays a valid answer; only this
+                # follow-up candidate is dropped.
+                logger.warning(
+                    "ANE tuning skipped %s for %s",
+                    refined.label,
+                    run.request.model_id,
+                    exc_info=True,
+                )
+                run.termination_reason = (
+                    f"Skipped {refined.label} after it failed: "
+                    f"{_exception_reason(exc)}"
+                )
         else:
             _complete_phase(
                 run,
@@ -2344,11 +2421,17 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
             }
     finally:
         _restore_speed_priority(engine_pool, previous_speed_priority)
+        terminal = run.status, run.phase, run.message
+        run.status = "running"
+        run.phase = "cleaning_up"
+        run.message = "Unloading the test model..."
         try:
             if run.request.model_id in engine_pool.get_loaded_model_ids():
                 await engine_pool._unload_engine(run.request.model_id)
         except Exception:
             logger.warning("Failed to unload model after ANE tuning", exc_info=True)
+        finally:
+            run.status, run.phase, run.message = terminal
 
 
 def _validate_k2_tuning_model(model: Any) -> None:

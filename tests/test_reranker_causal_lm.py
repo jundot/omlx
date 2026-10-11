@@ -58,6 +58,70 @@ class TestXLMRobertaReranker:
 
         assert loaded_model.training is False
 
+    def test_max_length_defaults_to_tokenizer_limit_and_is_capped(self, tmp_path):
+        """Encoder rerankers default to the tokenizer limit and never exceed it."""
+        model = MLXRerankerModel(str(tmp_path))
+        model._loaded = True
+        model.processor = MagicMock(model_max_length=8192)
+        result = RerankOutput(scores=[0.9], indices=[0], total_tokens=10)
+
+        with patch.object(
+            model, "_rerank_seq_classification", return_value=result
+        ) as mock_method:
+            model.rerank("query", ["doc"])
+            model.rerank("query", ["doc"], max_length=1024)
+            model.rerank("query", ["doc"], max_length=8194)
+            # transformers' "no limit" sentinel keeps the legacy 512 default.
+            model.processor = MagicMock(model_max_length=int(1e30))
+            model.rerank("query", ["doc"])
+
+        lengths = [call.args[2] for call in mock_method.call_args_list]
+        assert lengths == [8192, 1024, 8192, 512]
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_seq_classification_batches_keep_document_order(self, tmp_path):
+        """Length-sorted batches must fit the token budget and keep input order."""
+
+        class PairTokenizer:
+            def __call__(self, queries, documents, max_length, truncation):
+                return {"input_ids": [[5] * len(doc.split()) for doc in documents]}
+
+            def pad(self, encoded, return_tensors):
+                rows = encoded["input_ids"]
+                width = max(len(row) for row in rows)
+                return {
+                    "input_ids": np.array(
+                        [row + [0] * (width - len(row)) for row in rows]
+                    ),
+                    "attention_mask": np.array(
+                        [[1] * len(row) + [0] * (width - len(row)) for row in rows]
+                    ),
+                }
+
+        shapes = []
+
+        def fake_model(input_ids, attention_mask):
+            shapes.append(input_ids.shape)
+            outputs = MagicMock(spec=[])
+            # Score each row by its unpadded length to identify the document.
+            outputs.pooler_output = attention_mask.sum(axis=1, keepdims=True).astype(
+                mx.float32
+            )
+            return outputs
+
+        model = MLXRerankerModel(str(tmp_path))
+        model.processor = PairTokenizer()
+        model.model = fake_model
+        docs = ["a b c d e f g", "a b c", "a b c d e", "a b c"]
+
+        with patch("omlx.models.reranker.ENCODER_BATCH_TOKEN_BUDGET", 12):
+            result = model._rerank_seq_classification("query", docs, max_length=64)
+
+        assert result.scores == [7.0, 3.0, 5.0, 3.0]
+        assert result.indices[0] == 0
+        assert len(shapes) == 3
+        assert all(batch * width <= 12 for batch, width in shapes)
+
 
 class TestCausalLMReranker:
     """Tests for CausalLM reranker (e.g., Qwen3-Reranker) functionality."""
@@ -147,6 +211,33 @@ class TestCausalLMReranker:
         # Sorted indices: doc 0 first
         assert result.indices == [0, 1]
         assert result.total_tokens > 0
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @pytest.mark.parametrize(
+        ("instruction", "expected"),
+        [
+            (None, MLXRerankerModel._CAUSAL_LM_DEFAULT_INSTRUCTION),
+            ("", MLXRerankerModel._CAUSAL_LM_DEFAULT_INSTRUCTION),
+            ("Find numeric limits", "Find numeric limits"),
+        ],
+    )
+    def test_rerank_fills_instruct_slot(self, tmp_path, instruction, expected):
+        model = MLXRerankerModel(str(self._make_model_dir(tmp_path)))
+        model._is_causal_lm = True
+        model._loaded = True
+        model._token_true_id = 1
+        model._token_false_id = 0
+        model._prefix_tokens = []
+        model._suffix_tokens = []
+        model.processor = MagicMock(return_value={"input_ids": [[10], [11]]})
+        model.model = MagicMock(return_value=mx.zeros((1, 1, 2)))
+
+        model.rerank("q", ["d1", "d2"], instruction=instruction)
+
+        assert model.processor.call_args.args[0] == [
+            f"<Instruct>: {expected}\n<Query>: q\n<Document>: d1",
+            f"<Instruct>: {expected}\n<Query>: q\n<Document>: d2",
+        ]
 
     def test_rerank_causal_lm_empty_documents(self, tmp_path):
         """Test rerank with empty document list returns empty result."""
@@ -1084,6 +1175,10 @@ class TestRerankerCompileFallback:
             "input_ids": [[1, 2, 3, 4]],
             "attention_mask": [[1, 1, 1, 1]],
         }
+        mock_processor.pad.return_value = {
+            "input_ids": np.array([[1, 2, 3, 4]]),
+            "attention_mask": np.array([[1, 1, 1, 1]]),
+        }
         model.processor = mock_processor
 
         # Mock model to return pooler_output
@@ -1111,6 +1206,10 @@ class TestRerankerCompileFallback:
         mock_processor.return_value = {
             "input_ids": [[1, 2, 3]],
             "attention_mask": [[1, 1, 1]],
+        }
+        mock_processor.pad.return_value = {
+            "input_ids": np.array([[1, 2, 3]]),
+            "attention_mask": np.array([[1, 1, 1]]),
         }
         model.processor = mock_processor
 

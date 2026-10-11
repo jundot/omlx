@@ -679,6 +679,23 @@ async def test_measure_rejects_candidate_whose_ane_never_executed(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_idle_gdn_branch_is_not_blamed_on_chunk_size(monkeypatch):
+    """MLP ran on the same chunks, so the chunk width cannot be the cause."""
+    pool = _measure_env(monkeypatch, trace=_trace(mlp_ops=126, gdn_ops=0))
+    run = ane_tuning.create_run(
+        ane_tuning.ANETuningRequest(model_id="qwen", sequence_length=2048, repeats=1)
+    )
+    candidate = ane_tuning._Candidate("MLP 50%", True, 0.5, True, 0.5)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await ane_tuning._measure_candidate(run, pool, ModelSettings(), candidate)
+
+    message = str(excinfo.value)
+    assert "mlp=378, gdn=0" in message
+    assert "set sequence_length" not in message
+
+
+@pytest.mark.asyncio
 async def test_measure_accepts_candidate_whose_ane_executed(monkeypatch):
     pool = _measure_env(monkeypatch, trace=_trace(mlp_ops=126))
     run = ane_tuning.create_run(
@@ -817,6 +834,74 @@ async def test_tuner_preserves_partial_matrix_and_failure_reason(monkeypatch):
         "sequence_length": run.request.sequence_length,
         "tail_padding_min_tokens": 0,
     }
+
+
+@pytest.mark.asyncio
+async def test_failed_refinement_keeps_the_verified_prediction(monkeypatch):
+    monkeypatch.setattr(
+        ane_tuning, "_fraction_grid", lambda: [0.4, 0.45, 0.5, 0.53, 0.6]
+    )
+    operations = 192
+
+    async def measure(run, pool, settings, candidate):
+        if candidate.label == "Profile-refined optimum":
+            raise RuntimeError("A required ANE branch never executed")
+        tps = 125.0 if candidate.enabled else 100.0
+        return {
+            **ane_tuning._empty_result(candidate),
+            "processing_tps": tps,
+            "samples": [tps],
+            # Rebalances the 0.5 prediction to 0.35, so the refine slot runs.
+            "_profile": {
+                "mlp": {
+                    "operations": operations,
+                    "ane0_eval_ns": 19.0e6 * operations,
+                    "ane1_eval_ns": 19.0e6 * operations,
+                    "gpu_completion_ns": 10.0e6 * operations,
+                }
+            },
+        }
+
+    async def calibrate(run, engine, settings):
+        return ane_tuning._CalibrationChoice(
+            mlp_fraction=0.5,
+            cpu_fraction=0.0,
+            cpu_down_fraction=0.0,
+            gdn_enabled=False,
+            gdn_fraction=None,
+            cpu_enabled=False,
+            cpu_threads=8,
+            cpu_shared_resource=False,
+        )
+
+    monkeypatch.setattr(ane_tuning, "_measure_candidate", measure)
+    monkeypatch.setattr(ane_tuning, "_calibrate_components", calibrate)
+
+    async def get_engine(*args, **kwargs):
+        return object()
+
+    pool = SimpleNamespace(
+        _settings_manager=SimpleNamespace(
+            get_settings=lambda model_id: ModelSettings()
+        ),
+        get_loaded_model_ids=lambda: [],
+        get_engine=get_engine,
+    )
+    run = ane_tuning.create_run(
+        ane_tuning.ANETuningRequest(model_id="qwen", repeats=1)
+    )
+
+    await ane_tuning.run_tuning(run, pool)
+    snapshot = ane_tuning.run_snapshot(run)
+
+    assert run.status == "completed"
+    assert snapshot["results"][ane_tuning._REFINE_SLOT]["state"] == "failed"
+    assert snapshot["recommendation"]["enabled"] is True
+    assert snapshot["recommendation"]["mlp_fraction"] == 0.5
+    assert snapshot["recommendation"]["processing_tps"] == 125.0
+    assert snapshot["termination_reason"].startswith(
+        "Skipped Profile-refined optimum after it failed: RuntimeError"
+    )
 
 
 @pytest.mark.parametrize(
@@ -983,3 +1068,97 @@ def test_bank_compiler_available_matches_serving_probe(monkeypatch):
     assert fast.qwen35_ane_bank_compiler_available() is False
     with pytest.raises(RuntimeError, match="procedure-bank compiler"):
         fast.qwen35_ane_compile_linear_bank([], 2048, 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("worker_fails", [False, True])
+async def test_calibration_cancellation_drains_worker(monkeypatch, worker_fails):
+    import asyncio
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    entered = asyncio.Event()
+    finish = threading.Event()
+    drained = threading.Event()
+    loop = asyncio.get_running_loop()
+    run = ane_tuning.create_run(ane_tuning.ANETuningRequest(model_id="qwen"))
+
+    def calibrate(run, engine, settings):
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            assert finish.wait(5)
+            if worker_fails:
+                raise RuntimeError("native dispatch failed")
+            ane_tuning._set_phase_running(run, 1, "Next candidate")
+        finally:
+            drained.set()
+
+    monkeypatch.setattr(ane_tuning, "_calibrate_components_sync", calibrate)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr("omlx.engine_core.get_mlx_executor", lambda: executor)
+        task = asyncio.create_task(
+            ane_tuning._calibrate_components(run, object(), ModelSettings())
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert run.phase == "cleaning_up"
+            assert not task.done()
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            finish.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 5)
+            assert drained.is_set()
+            assert run.results[1]["state"] == "pending"
+        finally:
+            finish.set()
+            if not task.done():
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+
+@pytest.mark.asyncio
+async def test_cancelled_tuning_stays_active_until_unload_finishes(monkeypatch):
+    import asyncio
+
+    unloading = asyncio.Event()
+    finish = asyncio.Event()
+    loaded = False
+
+    async def get_engine(*args, **kwargs):
+        nonlocal loaded
+        loaded = True
+        return object()
+
+    async def calibrate(*args):
+        raise asyncio.CancelledError
+
+    async def measure(run, pool, settings, candidate):
+        return {**ane_tuning._empty_result(candidate), "processing_tps": 100.0}
+
+    async def unload(model_id):
+        unloading.set()
+        await finish.wait()
+
+    monkeypatch.setattr(ane_tuning, "_calibrate_components", calibrate)
+    monkeypatch.setattr(ane_tuning, "_measure_candidate", measure)
+    pool = SimpleNamespace(
+        _settings_manager=SimpleNamespace(get_settings=lambda _: ModelSettings()),
+        get_engine=get_engine,
+        get_loaded_model_ids=lambda: ["qwen"] if loaded else [],
+        _unload_engine=unload,
+    )
+    run = ane_tuning.create_run(ane_tuning.ANETuningRequest(model_id="qwen"))
+    run.task = asyncio.create_task(ane_tuning.run_tuning(run, pool))
+    try:
+        await asyncio.wait_for(unloading.wait(), 5)
+        assert ane_tuning.get_active_run() is run
+        assert run.phase == "cleaning_up"
+    finally:
+        finish.set()
+        await asyncio.wait_for(run.task, 5)
+    assert run.status == "cancelled"
+    assert ane_tuning.get_active_run() is None

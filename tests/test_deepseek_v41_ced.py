@@ -138,6 +138,7 @@ async def test_clear_ssd_removes_both_modes_when_model_is_unloaded(
     settings = SimpleNamespace(
         base_path=tmp_path,
         cache=SimpleNamespace(
+            ssd_cache_max_size="1KB",
             get_ssd_cache_dir=lambda _: tmp_path,
             get_ssd_cache_max_size_bytes=lambda _: 1024,
         ),
