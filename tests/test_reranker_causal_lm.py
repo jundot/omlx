@@ -1292,3 +1292,87 @@ class TestRerankerClose:
         mock_mx.synchronize.assert_called_once()
         mock_mx.clear_cache.assert_called_once()
         assert collect.call_count == 2
+
+
+class TestCausalLMRerankerScorePrecision:
+    """The relevance score must not be computed in the logits' dtype.
+
+    Model logits are bfloat16, which carries ~8 bits of precision -- near 1.0
+    its spacing is 1/128. A softmax left in that dtype saturates to exactly 1.0
+    once the logit gap reaches 6 (a true probability of 0.9975, i.e. ordinary
+    confidence), so every document the model is confident about collapses onto
+    the same handful of values and ties. The ranking is present in the logits;
+    the readout is where it is lost.
+    """
+
+    def _model_scoring(self, tmp_path, gaps):
+        """A CausalLM reranker whose forward pass returns the given yes/no gaps.
+
+        Logits are bfloat16, as a real model's are -- that dtype is the whole
+        point of these tests.
+        """
+        model_dir = tmp_path / "Qwen3-Reranker-0.6B"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps({"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"]})
+        )
+        model = MLXRerankerModel(str(model_dir))
+        model._is_causal_lm = True
+        model._loaded = True
+        model._token_true_id = 9693
+        model._token_false_id = 2152
+        model._prefix_tokens = [1, 2]
+        model._suffix_tokens = [3]
+
+        model.processor = MagicMock(
+            side_effect=lambda pairs, **kw: {"input_ids": [[10, 11] for _ in pairs]}
+        )
+
+        remaining = list(gaps)
+
+        def forward(input_ids):
+            gap = remaining.pop(0)
+            vocab = 10000
+            arr = np.zeros((1, input_ids.shape[1], vocab), dtype=np.float32)
+            arr[0, -1, 9693] = gap
+            arr[0, -1, 2152] = 0.0
+            return mx.array(arr).astype(mx.bfloat16)
+
+        model.model = MagicMock(side_effect=forward)
+        return model
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_ordinary_confidence_does_not_saturate(self, tmp_path):
+        """A gap of 6 is p=0.9975, not 1.0. bf16 softmax rounds it to 1.0."""
+        model = self._model_scoring(tmp_path, [6.0])
+        score = model._rerank_causal_lm("q", ["d"]).scores[0]
+        assert score < 1.0
+        assert score == pytest.approx(0.99752742, abs=1e-6)
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_distinct_gaps_give_distinct_scores(self, tmp_path):
+        """Confident documents must stay orderable rather than collapsing."""
+        gaps = [6.0, 7.0, 8.0, 10.0, 15.0]
+        model = self._model_scoring(tmp_path, gaps)
+        scores = model._rerank_causal_lm("q", ["a", "b", "c", "d", "e"]).scores
+        assert len(set(scores)) == len(gaps)
+        # and strictly increasing with the gap, so the ranking is recoverable
+        assert scores == sorted(scores)
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_matches_an_fp32_softmax(self, tmp_path):
+        """The sigmoid form must agree with the softmax it replaces."""
+        gaps = [0.5, 3.0, 6.0, 9.0]
+        model = self._model_scoring(tmp_path, gaps)
+        scores = model._rerank_causal_lm("q", ["a", "b", "c", "d"]).scores
+        for score, gap in zip(scores, gaps):
+            pair = mx.array([0.0, gap], dtype=mx.bfloat16).astype(mx.float32)
+            expected = mx.softmax(pair)
+            mx.eval(expected)
+            assert score == pytest.approx(expected[1].item(), rel=1e-6)
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_unchanged_where_bfloat16_was_already_exact(self, tmp_path):
+        """A gap of 0 is 0.5 in any dtype -- no behaviour change to hide here."""
+        model = self._model_scoring(tmp_path, [0.0])
+        assert model._rerank_causal_lm("q", ["d"]).scores[0] == pytest.approx(0.5)
