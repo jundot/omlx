@@ -41,7 +41,7 @@ import mlx.nn as nn
 
 from .. import glm53_kda_prework
 from ..mlx_lm_mtp import prompt_priming
-from .glm5_next_batch_rollback import rollback_rows
+from .glm5_next_batch_rollback import rollback_rows, supports_rollback_rows
 
 logger = logging.getLogger(__name__)
 
@@ -894,6 +894,7 @@ def _patch_language_model(g5_lang: Any) -> None:
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache
     cls.mtp_clamp_accept = mtp_clamp_accept
+    cls.mtp_supports_batch_rollback = supports_rollback_rows
     cls.rollback_speculative_cache = rollback_speculative_cache
     cls.sanitize = sanitize
     cls._omlx_mtp_runtime_patched = True

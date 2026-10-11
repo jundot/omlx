@@ -54,6 +54,19 @@ def _independent_verify(model):
     return False
 
 
+def _can_rollback_batch(model, cache, captures, block_size, batch_size):
+    """Ask the rollback owner before deferring any row's commit."""
+    for host in (model, getattr(model, "_language_model", None)):
+        if host is None:
+            continue
+        supports = getattr(host, "mtp_supports_batch_rollback", None)
+        if callable(supports):
+            return supports(cache, captures, block_size, batch_size)
+    # Boundary alignment may shorten an otherwise fully accepted block.
+    # Models without a capability hook retain the existing scalar path.
+    return not getattr(model, "_omlx_mtp_commit_align", 0)
+
+
 def advance(batch, batch_state):
     """Advance empty row queues, sharing equal-depth target verification.
 
@@ -191,13 +204,13 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
     vector_rollback = isinstance(gdn, SpeculativeCacheTransaction) or (
         whole_batch
         and gdn is not None
-        and not getattr(batch.model, "_omlx_mtp_commit_align", 0)
         and all(_supports_batch_rollback(layer) for layer in cache)
         and any(
             getattr(host, "_omlx_mtp_batch_rollback", False)
             for host in (batch.model, getattr(batch.model, "_language_model", None))
             if host is not None
         )
+        and _can_rollback_batch(batch.model, cache, gdn, depth + 1, len(rows))
     )
     deferred = []
     committed = {depth: cache}

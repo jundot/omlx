@@ -7,10 +7,7 @@ from mlx_vlm.models.cache import ArraysCache, BatchKVCache, CacheList
 from ..deepseek_v4.cache_extras import BatchPoolingCache
 
 
-def rollback_rows(language, caches, captures, accepted, block_size):
-    """Restore KDA and sparse caches with per-row accepted lengths."""
-
-    accepted = [int(a) for a in accepted]
+def _validate_rollback_rows(caches, captures, accepted, block_size):
     if len(accepted) < 2 or any(a < 0 or a >= block_size for a in accepted):
         raise ValueError("Invalid GLM accepted-length vector")
     kept = [a + 1 for a in accepted]
@@ -43,7 +40,26 @@ def rollback_rows(language, caches, captures, accepted, block_size):
             raise ValueError("Pooling cache cannot restore every accepted row")
         if cache[0]._idx < block_size or cache[0].keys.shape[0] != len(accepted):
             raise ValueError("GLM KV rollback shape mismatch")
+    return recurrent
 
+
+def supports_rollback_rows(_model, caches, captures, block_size, batch_size):
+    """Whether every acceptance count can be restored after this verify block."""
+    try:
+        # Zero acceptance needs the longest rewind. Pooling's row-trim
+        # capability is monotonic in that length, including boundary clamps.
+        _validate_rollback_rows(caches, captures, [0] * batch_size, block_size)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def rollback_rows(language, caches, captures, accepted, block_size):
+    """Restore KDA and sparse caches with per-row accepted lengths."""
+    accepted = [int(a) for a in accepted]
+    recurrent = _validate_rollback_rows(caches, captures, accepted, block_size)
+    kept = [a + 1 for a in accepted]
+    trims = [block_size - k for k in kept]
     rewind = mx.array(trims, dtype=mx.int32)
     ends = mx.array(kept, dtype=mx.int32)
     max_end = max(kept)
