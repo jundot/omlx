@@ -220,6 +220,27 @@ def extract_thinking(text: str, *, truncated: bool = False) -> Tuple[str, str]:
     return ("", text)
 
 
+def unclosed_thinking(text: str, *, prompt_opened: bool = False) -> str:
+    """Return the reasoning of an output that never closed its thinking block.
+
+    Mirrors the streaming recovery in ``ThinkingParser.finish()``: when the
+    model stops inside its thinking block, the text is still surfaced as the
+    answer, but it is also reported as reasoning so a client can tell the
+    two apart. Returns ``""`` when the thinking block was closed or never
+    opened.
+    """
+    if not text:
+        return ""
+    text = text.replace(_MINIMAX_OPEN_TAG, _OPEN_TAG).replace(
+        _HY3_OPEN_TAG, _OPEN_TAG
+    )
+    if any(tag in text for tag in (_CLOSE_TAG, _MINIMAX_CLOSE_TAG, _HY3_CLOSE_TAG)):
+        return ""
+    if _OPEN_TAG in text:
+        return text.split(_OPEN_TAG, 1)[1].strip()
+    return text.strip() if prompt_opened else ""
+
+
 class ThinkingParser:
     """Stateful streaming parser for separating <think>...</think> from content.
 
