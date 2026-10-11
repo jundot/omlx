@@ -7980,6 +7980,8 @@ class OQImatrixCollector:
     def __init__(self):
         self.entries: dict[str, OQImatrixEntry] = {}
         self._original_modules: dict[str, Any] = {}
+        # Same modules keyed by entry name (with name_prefix) for hook lookups.
+        self._prefixed_modules: dict[str, Any] = {}
         self._saved_attributes: list[tuple[Any, str, Any]] = []
         self.capture_module_classes: dict[str, int] = {}
         self.switch_capture_modules = 0
@@ -8038,6 +8040,7 @@ class OQImatrixCollector:
             if _is_oqe_switch_module(module):
                 self.switch_capture_modules += 1
             self._original_modules[name] = module
+            self._prefixed_modules[f"{name_prefix}{name}"] = module
             replacements.append(
                 (name, _ImatrixCaptureWrapper(module, f"{name_prefix}{name}", self))
             )
@@ -8052,6 +8055,7 @@ class OQImatrixCollector:
                 strict=False,
             )
             self._original_modules.clear()
+        self._prefixed_modules.clear()
         for module, attribute, value in self._saved_attributes:
             setattr(module, attribute, value)
         self._saved_attributes.clear()
@@ -8124,7 +8128,7 @@ class OQImatrixCollector:
         forcing calibration past the production indexer's short-prefix bypass.
         """
         embed_name = q_b_name[: -len("q_b_proj")] + "embed_q"
-        module = self._original_modules.get(embed_name)
+        module = self._prefixed_modules.get(embed_name)
         if module is None or type(module).__name__ not in _OQE_MULTI_LINEAR_CLASSES:
             return
         try:
@@ -8241,6 +8245,15 @@ def _collect_glm5_next_lm_head_imatrix(model, hidden, collector) -> bool:
     )
 
 
+def _run_glm5_next_mtp_blocks(blocks, hidden, embed, input_ids) -> None:
+    """Run GLM-5.3 MTP blocks on the hc-collapsed trunk hidden, without lm_head."""
+    h = hidden.mean(axis=2)[:, :-1, :]
+    mask = create_attention_mask(h, None, return_array=True)
+    for block in blocks:
+        h = block(h, embed, input_ids, mask, None)
+    mx.eval(h)
+
+
 def _collect_k2_horizon_lm_head_imatrix(model, hidden, collector) -> bool:
     if str(getattr(model, "model_type", "")) != "k2_horizon":
         return False
@@ -8296,6 +8309,11 @@ def _collect_mtp_head_imatrix(
                 mx.eval(*out)
             else:
                 mx.eval(out)
+            return True
+        if str(getattr(model, "model_type", "")) == "glm5_next":
+            _run_glm5_next_mtp_blocks(
+                mtp, hidden, inner.model.embed_tokens, batch[:, 1:]
+            )
             return True
         if isinstance(mtp, (list, tuple)):
             # DeepSeek-V4 style: MTPBlock stack consuming the raw (4D)
@@ -8672,7 +8690,9 @@ _STREAM_EMBED_KEY = "language_model.model.embed_tokens.weight"
 # keeps the RAM-safe proxy calibration path: the auto rule never streams them,
 # and an explicit stream_calibration request for one fails fast (see
 # _resolve_stream_calibration). Keep this in lockstep with the sourcer above.
-_STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES = frozenset({"minimax_m3_vl", "qwen4_exp"})
+_STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES = frozenset(
+    {"minimax_m3_vl", "qwen4_exp", "glm5_next"}
+)
 
 
 def _stream_calibration_supported(model_type: str | None) -> bool:
@@ -8693,6 +8713,11 @@ def _streamed_text_args(model_path, config, *, trust_remote_code: bool = False):
         from mlx_vlm.models.qwen4_exp.language import Qwen4ExpDecoderLayer
 
         layer_cls = Qwen4ExpDecoderLayer
+    elif _stream_source_model_type(config) == "glm5_next":
+        from mlx_vlm.models.glm5_next.config import TextConfig
+        from mlx_vlm.models.glm5_next.language import Glm5NextDecoderLayer
+
+        layer_cls = Glm5NextDecoderLayer
     else:
         from mlx_vlm.models.minimax_m3_vl.config import TextConfig
         from mlx_vlm.models.minimax_m3_vl.language import MiniMaxDecoderLayer
@@ -9004,6 +9029,20 @@ class _StreamingNoModel:
     """
 
 
+def _streamed_glm5_next_state(config: dict, embedded):
+    """Streamed counterpart of the glm5_next branch of _prepare_layer_inputs."""
+    text_config = config.get("text_config") or {}
+    hc_mult = int(text_config.get("hc_mult") or config.get("hc_mult") or 0)
+    if hc_mult <= 0:
+        raise RuntimeError("glm5_next streaming requires a positive hc_mult")
+    attention_mask = create_attention_mask(embedded, None, return_array=True)
+    hidden = mx.broadcast_to(
+        embedded[:, :, None, :],
+        (embedded.shape[0], embedded.shape[1], hc_mult, embedded.shape[2]),
+    )
+    return mx.contiguous(hidden), attention_mask
+
+
 def _streamed_sensitivity_state(
     tokenizer,
     embed_weight,
@@ -9036,6 +9075,17 @@ def _streamed_sensitivity_state(
     if calib_data is None:
         return None
     inputs = embed_weight[calib_data]
+    if _stream_source_model_type(config) == "glm5_next":
+        inputs, attention_mask = _streamed_glm5_next_state(config, inputs)
+        mx.eval(inputs)
+        return {
+            "inputs": inputs,
+            "mask": attention_mask,
+            "layer_masks": None,
+            "block_driven_attention_mask": True,
+            "position_ids": {"kind": _GLM5_NEXT_LAYER_STATE_KIND},
+            "scores": {},
+        }
     if _stream_source_model_type(config) == "qwen4_exp":
         inputs, layer_masks, position_ids = _streamed_qwen4_exp_state(
             config, calib_data, inputs
@@ -9077,7 +9127,12 @@ def _streamed_sensitivity_layer(
     bug, and a silently missing score would skew the bit allocation.
     """
     layer_masks = state.get("layer_masks")
-    layer_mask = layer_masks[layer_idx] if layer_masks is not None else state["mask"]
+    if state.get("block_driven_attention_mask"):
+        layer_mask = None if bool(getattr(block, "is_linear", False)) else state["mask"]
+    elif layer_masks is not None:
+        layer_mask = layer_masks[layer_idx]
+    else:
+        layer_mask = state["mask"]
     out_float, _ = _forward_layer_result(
         block, state["inputs"], layer_mask, state["position_ids"], layer_idx=layer_idx
     )
@@ -9147,6 +9202,69 @@ def _collect_streamed_qwen4_mtp(source, config, collector, calib_data, working, 
     return installed
 
 
+def _collect_streamed_glm5_next_lm_head(source, config, collector, working) -> int:
+    """Streamed counterpart of _collect_untied_lm_head_imatrix."""
+    plan = _streamed_source_plan(source, config)
+    norm_key = "language_model.model.norm.weight"
+    head_key = "language_model.lm_head.weight"
+    if head_key not in plan or norm_key not in plan:
+        return 0
+    head_weight = plan.pop(head_key)
+    norm_weight = plan.pop(norm_key)
+    text_config = config.get("text_config") or {}
+    hidden_size = int(head_weight.shape[1])
+    norm = nn.RMSNorm(hidden_size, eps=float(text_config.get("rms_norm_eps") or 1e-6))
+    norm.weight = norm_weight
+    head = nn.Linear(hidden_size, int(head_weight.shape[0]), bias=False)
+    head.weight = head_weight
+    norm.eval()
+    head.eval()
+    mx.eval(norm.parameters(), head.parameters())
+    before = len(collector.entries)
+    for hidden in working:
+        h = hidden.mean(axis=2) if getattr(hidden, "ndim", 0) == 4 else hidden
+        collector.collect_dense("language_model.lm_head", head, norm(h))
+    del norm, head, head_weight, norm_weight
+    mx.clear_cache()
+    return 1 if len(collector.entries) > before else 0
+
+
+def _collect_streamed_glm5_next_mtp(
+    source, config, collector, calib_data, working, ranges
+) -> int:
+    """Streamed counterpart of the glm5_next branch of _collect_mtp_head_imatrix."""
+    from mlx_vlm.models.glm5_next import language as g5_lang
+    from mlx_vlm.models.glm5_next.config import TextConfig
+
+    from omlx.patches.mlx_vlm_mtp import glm5_next_vlm_runtime
+
+    glm5_next_vlm_runtime.apply()
+    prefix = "language_model.mtp.0."
+    plan = _streamed_source_plan(source, config, preserve_mtp=True)
+    head = g5_lang.Glm5NextMTPBlock(TextConfig.from_dict(config["text_config"]))
+    head.eval()
+    head.load_weights(
+        [
+            (key[len(prefix) :], plan.pop(key))
+            for key in list(plan)
+            if key.startswith(prefix)
+        ],
+        strict=True,
+    )
+    embed_weight = plan.pop(_STREAM_EMBED_KEY)
+    embed = nn.Embedding(*embed_weight.shape)
+    embed.weight = embed_weight
+    del embed_weight
+    mx.eval(head.parameters(), embed.parameters())
+    installed = collector.install(head, name_prefix=prefix)
+    try:
+        for hidden, (lo, hi) in zip(working, ranges):
+            _run_glm5_next_mtp_blocks([head], hidden, embed, calib_data[lo:hi, 1:])
+    finally:
+        collector.restore(head)
+    return installed
+
+
 def _collect_imatrix_streaming(
     source,
     tokenizer,
@@ -9204,9 +9322,10 @@ def _collect_imatrix_streaming(
     from omlx.utils.model_loading import _checkpoint_has_mtp_weights, _has_mtp_heads
 
     source = Path(source)
+    is_glm5_next = _stream_source_model_type(config) == "glm5_next"
     collect_mtp = (
         require_mtp_entries
-        and _stream_source_model_type(config) == "qwen4_exp"
+        and _stream_source_model_type(config) in ("qwen4_exp", "glm5_next")
         and _has_mtp_heads(config)
         and _checkpoint_has_mtp_weights(source)
     )
@@ -9286,6 +9405,11 @@ def _collect_imatrix_streaming(
         mx.eval(embedded)
         mask = None
         position_ids = None
+    elif is_glm5_next:
+        embedded, glm5_attention_mask = _streamed_glm5_next_state(config, embedded)
+        mx.eval(embedded)
+        mask = glm5_attention_mask
+        position_ids = {"kind": _GLM5_NEXT_LAYER_STATE_KIND}
     else:
         # One causal mask and one position-id row serve every layer and every
         # micro-batch: both depend only on seq_length and the activation dtype.
@@ -9359,7 +9483,12 @@ def _collect_imatrix_streaming(
                         "layout does not match the capture predicate. Refusing "
                         f"to sweep all {total_layers} layers for an empty imatrix"
                     )
-            layer_mask = q4_layer_masks[layer_idx] if is_qwen4_exp else mask
+            if is_qwen4_exp:
+                layer_mask = q4_layer_masks[layer_idx]
+            elif is_glm5_next:
+                layer_mask = None if bool(getattr(block, "is_linear", False)) else mask
+            else:
+                layer_mask = mask
             try:
                 for slot in range(len(working)):
                     out, _ = _forward_layer_result(
@@ -9439,9 +9568,22 @@ def _collect_imatrix_streaming(
                 },
             )
 
+        if is_glm5_next:
+            head_entries = _collect_streamed_glm5_next_lm_head(
+                source, config, collector, working
+            )
+            if round_index == 0:
+                installed += head_entries
+
         if collect_mtp:
-            head_installed = _collect_streamed_qwen4_mtp(
-                source, config, collector, calib_data, working, ranges
+            head_installed = (
+                _collect_streamed_glm5_next_mtp(
+                    source, config, collector, calib_data, working, ranges
+                )
+                if is_glm5_next
+                else _collect_streamed_qwen4_mtp(
+                    source, config, collector, calib_data, working, ranges
+                )
             )
             if round_index == 0:
                 installed += head_installed
