@@ -102,17 +102,38 @@ class TestGetMaxContextWindow:
         state.engine_pool = mock_pool
         return state
 
-    def test_policy_unset_native_wins_unchanged(self):
-        """With ``max_context_window_policy`` unset, the model's
-        native context length is returned verbatim — existing
-        installs see no behavior change after this PR."""
+    def test_policy_unset_native_wins_when_ram_cap_unknown(self):
+        """With ``max_context_window_policy`` unset and no RAM reading,
+        the model's native context length is returned verbatim."""
         from omlx.server import get_max_context_window
 
         state = self._mount_native_and_policy(
             native_ctx=262_144, policy_cap=None
         )
-        with patch("omlx.server._server_state", state):
+        with (
+            patch("omlx.server._server_state", state),
+            patch("omlx.server.ram_context_cap_tokens", return_value=None),
+        ):
             assert get_max_context_window("big-model") == 262_144
+
+    def test_ram_cap_clamps_native_on_64gb_machines(self):
+        """A 64 GB Mac Mini cannot hold a 256k KV cache for a 27B-4bit
+        model. Advertising 256k makes agent clients skip compaction."""
+        from omlx.server import get_max_context_window, ram_context_cap_tokens
+
+        assert ram_context_cap_tokens(64 * 1024**3) == 65_536
+        assert ram_context_cap_tokens(32 * 1024**3) == 32_768
+        assert ram_context_cap_tokens(128 * 1024**3) == 131_072
+        assert ram_context_cap_tokens(192 * 1024**3) is None
+
+        state = self._mount_native_and_policy(
+            native_ctx=262_144, policy_cap=None
+        )
+        with (
+            patch("omlx.server._server_state", state),
+            patch("omlx.server.ram_context_cap_tokens", return_value=65_536),
+        ):
+            assert get_max_context_window("big-model") == 65_536
 
     def test_policy_set_clamps_native(self):
         """With ``max_context_window_policy=128_000`` and a model that
