@@ -452,3 +452,12 @@ def test_truncated_stream_flushes_partial_tag_only_as_thinking(prompt_opened):
     assert parser.feed(prefix + "unfinished</thi") == ("unfinished", "")
     assert parser.finish(truncated=True) == ("</thi", "")
     assert parser.finish(truncated=True) == ("", "")
+
+
+@pytest.mark.parametrize("prompt_opened", [False, True])
+def test_truncated_logprob_stream_preserves_thinking_channel(prompt_opened):
+    parser = ThinkingParser(start_in_thinking=prompt_opened)
+    text = "reasoning</thi" if prompt_opened else "<think>reasoning</thi"
+    parser.feed_with_logprob(text, None)
+    assert parser.finish_with_logprob(truncated=True) == ("</thi", "", [])
+    assert parser.finish_with_logprob(truncated=True) == ("", "", [])
