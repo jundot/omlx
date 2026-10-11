@@ -519,6 +519,45 @@ class BlockAwarePrefixCache(CacheManager):
             )
             return False
 
+    def _stage_split_gdn_snapshot(
+        self,
+        boundary_snapshots: Any,
+        token_count: int,
+        block_hash: bytes,
+        layer_cache_types: list[str] | tuple[str, ...] | None,
+    ) -> str | None:
+        """Publish the tail's recurrent snapshot in memory before its commit.
+
+        Returns the staged signature, or None when nothing was staged.
+        """
+        stager = getattr(boundary_snapshots, "stage_gdn_checkpoint", None)
+        if not callable(stager):
+            return None
+        try:
+            return stager(
+                token_count,
+                block_hash,
+                layer_cache_types=layer_cache_types,
+                model_name=self.paged_cache.model_name,
+                block_size=self.block_size,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to stage split-GDN checkpoint for block hash %s",
+                block_hash.hex()[:16],
+            )
+            return None
+
+    def _drop_split_gdn_snapshot(
+        self, block_hash: bytes, cache_signature: str | None
+    ) -> None:
+        """Discard a staged snapshot when its commit is rejected."""
+        if cache_signature is None:
+            return
+        clearer = getattr(self.paged_ssd_cache, "clear_pending_gdn_checkpoint", None)
+        if callable(clearer):
+            clearer(block_hash, cache_signature)
+
     def _commit_exact_split_gdn_checkpoint(
         self,
         request_id: str,
@@ -569,6 +608,30 @@ class BlockAwarePrefixCache(CacheManager):
                 block_hash.hex()[:16],
             )
             return False
+
+    def _index_tail_block(
+        self,
+        parent_hash: bytes | None,
+        block_hash: bytes,
+        token_count: int,
+    ) -> None:
+        """Make a tail discoverable the moment its KV is resident in memory.
+
+        ``save_block`` stages the payload in RAM before returning, so a lookup
+        landing in the gap before the checkpoint commit reads it from memory.
+        """
+        self.paged_cache.register_tail_block(parent_hash, block_hash, token_count)
+        self.paged_cache.clear_pending_tail_block(parent_hash, block_hash)
+        self._tail_hashes.add(block_hash)
+        if len(self._tail_hashes) > _TIP_LINEAGE_MAX_ENTRIES:
+            self._tail_hashes.clear()
+        self._tail_blocks_stored += 1
+
+    def _unindex_tail_block(self, parent_hash: bytes | None, block_hash: bytes) -> None:
+        """Undo ``_index_tail_block`` for a store rejected before its commit."""
+        self.paged_cache.unregister_tail_block(parent_hash, block_hash)
+        self._tail_hashes.discard(block_hash)
+        self._tail_blocks_stored -= 1
 
     def _get_model_num_layers(self, model: Any) -> int:
         """
@@ -1466,6 +1529,12 @@ class BlockAwarePrefixCache(CacheManager):
                                 per_block.append(layer_meta_states[lidx])
                         block_meta = per_block
 
+                    # Announce the tail so a lookup racing the SSD write sees it as
+                    # still being written rather than absent.
+                    if is_tail_terminal:
+                        self.paged_cache.register_pending_tail_block(
+                            parent_hash, block.block_hash
+                        )
                     # Save to paged SSD via PagedSSDCacheManager with cache type info
                     if hot_cache_write_back:
                         saved = self.paged_ssd_cache.save_block(
@@ -1493,6 +1562,21 @@ class BlockAwarePrefixCache(CacheManager):
                             tail_terminal=is_tail_terminal,
                         )
                     if saved:
+                        # The KV is staged in memory now; its snapshot is staged first,
+                        # so the tail is never discoverable without a checkpoint.
+                        staged_gdn_signature = None
+                        if split_gdn_layout and is_tail_terminal:
+                            staged_gdn_signature = self._stage_split_gdn_snapshot(
+                                boundary_snapshots,
+                                block_boundary_tc,
+                                block.block_hash,
+                                layer_cache_types,
+                            )
+                        if is_tail_terminal:
+                            self._index_tail_block(
+                                parent_hash, block.block_hash, len(block_tokens)
+                            )
+                            tail_in_table = True
                         if split_gdn_layout:
                             if is_exact_split_block:
                                 checkpoint_committed = (
@@ -1551,6 +1635,14 @@ class BlockAwarePrefixCache(CacheManager):
                                                 "block %s",
                                                 block.block_id,
                                             )
+                                if is_tail_terminal:
+                                    self._unindex_tail_block(
+                                        parent_hash, block.block_hash
+                                    )
+                                    tail_in_table = False
+                                    self._drop_split_gdn_snapshot(
+                                        block.block_hash, staged_gdn_signature
+                                    )
                                 self.paged_cache.free_block(block.block_id)
                                 block_table.block_ids.pop()
                                 block_table.num_tokens -= len(block_tokens)
@@ -1558,20 +1650,15 @@ class BlockAwarePrefixCache(CacheManager):
                         blocks_saved_to_ssd += 1
                         if is_last_block:
                             tip_block_saved = True
-                        if is_tail_terminal:
-                            self.paged_cache.register_tail_block(
-                                parent_hash, block.block_hash, len(block_tokens)
-                            )
-                            self._tail_hashes.add(block.block_hash)
-                            if len(self._tail_hashes) > _TIP_LINEAGE_MAX_ENTRIES:
-                                self._tail_hashes.clear()
-                            self._tail_blocks_stored += 1
-                            tail_in_table = True
                         logger.debug(
                             f"Saved block {block.block_id} to tiered cache: "
                             f"tokens [{global_start}:{global_end}], {len(block_kv_data)} layers"
                         )
                     else:
+                        if is_tail_terminal:
+                            self.paged_cache.clear_pending_tail_block(
+                                parent_hash, block.block_hash
+                            )
                         logger.warning(
                             f"Failed to save block {block.block_id} to tiered cache"
                         )
@@ -3533,6 +3620,7 @@ class BlockAwarePrefixCache(CacheManager):
                     # candidate to be selected before walking back a block.
                     for _attempt in range(2):
                         lookup_diagnostic = None
+                        staged_snapshot = None
                         if callable(sidecar_lookup_getter):
                             lookup = sidecar_lookup_getter(
                                 block.block_hash, cache_signature
@@ -3542,7 +3630,15 @@ class BlockAwarePrefixCache(CacheManager):
                                 if lookup is not None
                                 else None
                             )
-                            if checkpoint_path is not None:
+                            staged_snapshot = (
+                                getattr(lookup, "snapshot", None)
+                                if lookup is not None
+                                else None
+                            )
+                            if (
+                                checkpoint_path is not None
+                                or staged_snapshot is not None
+                            ):
                                 lookup_diagnostic = {
                                     "requested_state_dtype": getattr(
                                         lookup, "requested_state_dtype", None
@@ -3560,18 +3656,25 @@ class BlockAwarePrefixCache(CacheManager):
                             checkpoint_path = sidecar_getter(
                                 block.block_hash, cache_signature
                             )
-                        if checkpoint_path is None:
+                        if checkpoint_path is None and staged_snapshot is None:
                             break
-                        if self._gdn_checkpoint_loader is None:
-                            logger.warning(
-                                "Split GDN cache enabled without checkpoint loader"
-                            )
-                            return None
-                        load_started = time.perf_counter()
                         dequantizations_before = self._gdn_dequantization_count()
-                        snapshot = self._gdn_checkpoint_loader(checkpoint_path)
+                        if staged_snapshot is not None:
+                            # Commit in flight: restore from the staged snapshot.
+                            snapshot = staged_snapshot
+                            load_latency_ms = 0.0
+                        else:
+                            if self._gdn_checkpoint_loader is None:
+                                logger.warning(
+                                    "Split GDN cache enabled without checkpoint loader"
+                                )
+                                return None
+                            load_started = time.perf_counter()
+                            snapshot = self._gdn_checkpoint_loader(checkpoint_path)
+                            load_latency_ms = (
+                                time.perf_counter() - load_started
+                            ) * 1000.0
                         dequantizations_after = self._gdn_dequantization_count()
-                        load_latency_ms = (time.perf_counter() - load_started) * 1000.0
                         if snapshot is None:
                             forgetter = getattr(
                                 self.paged_ssd_cache,

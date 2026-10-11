@@ -56,6 +56,234 @@ def _block_hashes(prefix_cache, table):
     ]
 
 
+def _split_stack(tmp_path, *, state_dtype: str = "rht_int8"):
+    cache_dir = tmp_path / "cache"
+    paged = PagedCacheManager(
+        block_size=BLOCK_SIZE,
+        max_blocks=100,
+        model_name="hybrid-model",
+        initial_blocks=100,
+    )
+    ssd = PagedSSDCacheManager(
+        cache_dir=cache_dir,
+        max_size_bytes=100 * 1024**2,
+        expected_model_name="hybrid-model",
+        expected_num_layers=2,
+        expected_block_size=BLOCK_SIZE,
+        expected_layer_cache_types=LAYER_TYPES,
+        gdn_ssd_split_enabled=True,
+        gdn_sidecar_state_dtype=state_dtype,
+    )
+    boundary = BoundarySnapshotSSDStore(
+        cache_dir,
+        pending_max_bytes=1024**2,
+        gdn_sidecar_state_dtype=state_dtype,
+    )
+    prefix = BlockAwarePrefixCache(
+        model=_HybridModel(),
+        paged_cache_manager=paged,
+        paged_ssd_cache_manager=ssd,
+        gdn_ssd_split_enabled=True,
+    )
+    prefix.set_gdn_checkpoint_loader(boundary.load_file)
+    return ssd, boundary, prefix
+
+
+def _tail_signature(ssd):
+    return ssd.gdn_cache_signature_for(
+        model_name="hybrid-model",
+        num_layers=2,
+        block_size=BLOCK_SIZE,
+        layer_cache_types=LAYER_TYPES,
+    )
+
+
+def test_pending_gdn_checkpoint_resolves_before_commit(tmp_path):
+    ssd, boundary, _prefix = _split_stack(tmp_path)
+    try:
+        block_hash = b"\x11" * 32
+        signature = _tail_signature(ssd)
+        snapshot = _hybrid_extracted(BLOCK_SIZE, 4.0)
+        assert not ssd.has_gdn_checkpoint(block_hash, signature)
+
+        ssd.register_pending_gdn_checkpoint(block_hash, signature, snapshot)
+        assert ssd.has_gdn_checkpoint(block_hash, signature)
+        lookup = ssd.get_gdn_checkpoint_file_with_diagnostic(block_hash, signature)
+        assert lookup is not None
+        assert lookup.file_path is None
+        assert lookup.snapshot is snapshot
+        assert lookup.requested_state_dtype == "rht_int8"
+        assert lookup.used_legacy_fp32_fallback is False
+        # A staged checkpoint has no durable path to hand back.
+        assert ssd.get_gdn_checkpoint_file(block_hash, signature) is None
+
+        ssd.clear_pending_gdn_checkpoint(block_hash, signature)
+        assert not ssd.has_gdn_checkpoint(block_hash, signature)
+        assert (
+            ssd.get_gdn_checkpoint_file_with_diagnostic(block_hash, signature) is None
+        )
+    finally:
+        boundary.shutdown()
+        ssd.close()
+
+
+def test_pending_gdn_checkpoint_superseded_by_durable_commit(tmp_path):
+    ssd, boundary, _prefix = _split_stack(tmp_path)
+    try:
+        request_id = "supersede"
+        snapshot = _hybrid_extracted(BLOCK_SIZE, 4.0)
+        assert boundary.save(
+            request_id,
+            BLOCK_SIZE,
+            [MagicMock()],
+            lambda _snapshot: (snapshot, None),
+        )
+        staged_path = boundary.take_staged_file(request_id, BLOCK_SIZE)
+        assert staged_path is not None
+        block_hash = b"\x33" * 32
+        signature = _tail_signature(ssd)
+        ssd.register_pending_gdn_checkpoint(block_hash, signature, snapshot)
+
+        assert (
+            ssd.commit_gdn_checkpoint_file(
+                block_hash,
+                staged_path,
+                token_count=BLOCK_SIZE,
+                model_name="hybrid-model",
+                cache_signature=signature,
+                block_size=BLOCK_SIZE,
+            )
+            is not None
+        )
+
+        assert ssd._pending_gdn_checkpoints == {}
+        lookup = ssd.get_gdn_checkpoint_file_with_diagnostic(block_hash, signature)
+        assert lookup is not None
+        assert lookup.file_path is not None
+        assert lookup.snapshot is None
+    finally:
+        boundary.shutdown()
+        ssd.close()
+
+
+def test_close_drops_pending_gdn_checkpoints(tmp_path):
+    ssd, boundary, _prefix = _split_stack(tmp_path)
+    try:
+        ssd.register_pending_gdn_checkpoint(
+            b"\x44" * 32, _tail_signature(ssd), _hybrid_extracted(BLOCK_SIZE, 1.0)
+        )
+        assert ssd._pending_gdn_checkpoints
+    finally:
+        boundary.shutdown()
+        ssd.close()
+    assert ssd._pending_gdn_checkpoints == {}
+
+
+def test_split_tail_stages_sidecar_in_commit_window_and_rolls_back(tmp_path):
+    ssd, boundary, prefix = _split_stack(tmp_path)
+    try:
+        request_id = "tail-commit-window"
+        for token_count in (4, 8, 11):
+            extracted = _hybrid_extracted(token_count, float(token_count))
+            assert boundary.save(
+                request_id,
+                token_count,
+                [MagicMock()],
+                lambda _snapshot, extracted=extracted: (extracted, None),
+            )
+        provider = _BoundarySnapshotProvider(
+            boundary,
+            request_id,
+            [4, 8],
+            {},
+            paged_ssd_manager=ssd,
+            tail_terminal_token_count=11,
+        )
+        real_commit = provider.commit_gdn_checkpoint
+        staged_seen = {}
+
+        def commit_rejecting_tail(token_count, block_hash, **kwargs):
+            if token_count == 11:
+                staged_seen.update(ssd._pending_gdn_checkpoints)
+                return False
+            return real_commit(token_count, block_hash, **kwargs)
+
+        provider.commit_gdn_checkpoint = commit_rejecting_tail
+
+        stored = prefix.store_cache(
+            request_id,
+            list(range(11)),
+            _hybrid_extracted(11, 11.0),
+            boundary_snapshots=provider,
+            _store_tail_terminal=True,
+        )
+
+        # The tail's snapshot was resolvable from memory while its durable
+        # commit was still pending, and the rejected commit left nothing behind.
+        assert len(staged_seen) == 1
+        assert ssd._pending_gdn_checkpoints == {}
+        assert stored is not None
+        assert stored.num_tokens == 8
+    finally:
+        boundary.shutdown()
+        ssd.close()
+
+
+def test_split_restore_prefers_staged_snapshot_over_durable_sidecar(tmp_path):
+    ssd, boundary, prefix = _split_stack(tmp_path)
+    try:
+        request_id = "tail-staged-restore"
+        for token_count in (4, 8, 11):
+            extracted = _hybrid_extracted(token_count, float(token_count))
+            assert boundary.save(
+                request_id,
+                token_count,
+                [MagicMock()],
+                lambda _snapshot, extracted=extracted: (extracted, None),
+            )
+        provider = _BoundarySnapshotProvider(
+            boundary,
+            request_id,
+            [4, 8],
+            {},
+            paged_ssd_manager=ssd,
+            tail_terminal_token_count=11,
+        )
+        tokens = list(range(11))
+        stored = prefix.store_cache(
+            request_id,
+            tokens,
+            _hybrid_extracted(11, 11.0),
+            boundary_snapshots=provider,
+            _store_tail_terminal=True,
+        )
+        assert stored is not None and stored.num_tokens == 11
+        tail_hash = _block_hashes(prefix, stored)[-1]
+        signature = _tail_signature(ssd)
+        assert ssd.get_gdn_checkpoint_file(tail_hash, signature) is not None
+
+        # A lookup racing the commit resolves the staged snapshot; it wins over
+        # the durable sidecar without ever touching the checkpoint loader.
+        ssd.register_pending_gdn_checkpoint(
+            tail_hash, signature, _hybrid_extracted(11, 99.0)
+        )
+        prefix.paged_cache.release_for_eviction(stored.block_ids)
+
+        hit_table, remaining = prefix.fetch_cache("restore-staged", tokens + [99, 100])
+        assert hit_table is not None
+        assert hit_table.num_tokens == 11 and remaining == [99, 100]
+        restored = prefix.reconstruct_cache(hit_table)
+        assert restored is not None
+        assert float(restored[1].cache[0][0, 0, 0]) == pytest.approx(99.0)
+        assert (
+            prefix.get_stats_dict()["gdn_last_restore"]["checkpoint_load_latency_ms"]
+            == 0.0
+        )
+    finally:
+        boundary.shutdown()
+        ssd.close()
+
+
 def test_unsupported_gdn_layout_logs_embedded_fallback_once(tmp_path, caplog):
     paged = PagedCacheManager(
         block_size=BLOCK_SIZE,

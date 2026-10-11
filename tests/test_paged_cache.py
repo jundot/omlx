@@ -6,6 +6,7 @@ This module tests the block-based paged KV cache management following vLLM's
 architecture, adapted for MLX on Apple Silicon.
 """
 
+import logging
 from typing import List
 from unittest.mock import MagicMock, patch
 
@@ -1101,3 +1102,61 @@ class TestPagedCacheManager:
 
         assert num_tokens == 0
         assert len(cached_blocks) == 0
+
+    def test_pending_tail_block_registry(self):
+        """Announcements are visible, clearable, and expire once stale."""
+        manager = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model", initial_blocks=100
+        )
+        tail_hash = compute_block_hash(None, [1, 2], model_name="test-model")
+        assert manager.has_pending_tail_block(None) is False
+
+        manager.register_pending_tail_block(None, tail_hash)
+        assert manager.has_pending_tail_block(None) is True
+        assert isinstance(manager._pending_tail_index[None][tail_hash], float)
+
+        manager.clear_pending_tail_block(None, tail_hash)
+        assert manager.has_pending_tail_block(None) is False
+        assert None not in manager._pending_tail_index
+
+        manager.register_pending_tail_block(None, tail_hash)
+        with patch("omlx.cache.paged_cache._PENDING_TAIL_TTL_S", -1.0):
+            assert manager.has_pending_tail_block(None) is False
+        assert None not in manager._pending_tail_index
+
+    def test_unregister_tail_block_drops_entry(self):
+        """A tail indexed before its commit must be removable if rejected."""
+        manager = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model", initial_blocks=100
+        )
+        parent = compute_block_hash(None, [1, 2, 3, 4], model_name="test-model")
+        tail_hash = compute_block_hash(parent, [5, 6], model_name="test-model")
+
+        manager.register_tail_block(parent, tail_hash, 2)
+        assert manager._tail_index[parent][tail_hash] == 2
+
+        manager.unregister_tail_block(parent, tail_hash)
+        assert parent not in manager._tail_index
+
+        # Removing an already-gone entry is a no-op, not an error.
+        manager.unregister_tail_block(parent, tail_hash)
+
+    def test_match_tail_block_logs_pending_vs_absent(self, caplog):
+        """A tail miss names its parent and flags an in-flight store."""
+        manager = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model", initial_blocks=100
+        )
+        full_hash = self._register_full(manager, None, [1, 2, 3, 4])
+
+        with caplog.at_level(logging.DEBUG, logger="omlx.cache.paged_cache"):
+            _, num_tokens = manager.get_computed_blocks([1, 2, 3, 4, 5, 6])
+        assert num_tokens == 4
+        assert "no tail indexed under parent" in caplog.text
+
+        caplog.clear()
+        pending_hash = compute_block_hash(full_hash, [5, 6], model_name="test-model")
+        manager.register_pending_tail_block(full_hash, pending_hash)
+        with caplog.at_level(logging.DEBUG, logger="omlx.cache.paged_cache"):
+            _, num_tokens = manager.get_computed_blocks([1, 2, 3, 4, 5, 6])
+        assert num_tokens == 4
+        assert "store in flight under parent" in caplog.text

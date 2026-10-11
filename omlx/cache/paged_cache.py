@@ -80,6 +80,9 @@ def resolve_block_extra_keys(
 _TAIL_INDEX_PER_PARENT = 8
 _TAIL_INDEX_MAX_PARENTS = 4096
 
+# Backstop for a pending tail whose store died before clearing its entry.
+_PENDING_TAIL_TTL_S = 30.0
+
 
 def compute_block_hash(
     parent_hash: Optional[BlockHash],
@@ -579,6 +582,12 @@ class PagedCacheManager(CacheManager):
         # Tail blocks by chain parent (None for a root). A tail is shorter
         # than a block, so the grid walk cannot derive its hash.
         self._tail_index: Dict[Optional[BlockHash], "OrderedDict[BlockHash, int]"] = {}
+
+        # Tails an in-flight store has announced but not yet published; values
+        # are registration times, pruned by _PENDING_TAIL_TTL_S.
+        self._pending_tail_index: Dict[
+            Optional[BlockHash], "OrderedDict[BlockHash, float]"
+        ] = {}
 
         logger.info(
             f"PagedCacheManager initialized: block_size={block_size}, "
@@ -1204,6 +1213,20 @@ class PagedCacheManager(CacheManager):
             while len(tails) > _TAIL_INDEX_PER_PARENT:
                 tails.popitem(last=False)
 
+    def unregister_tail_block(
+        self,
+        parent_hash: Optional[BlockHash],
+        tail_hash: BlockHash,
+    ) -> None:
+        """Undo ``register_tail_block`` for a tail whose commit was rejected."""
+        with self._lock:
+            tails = self._tail_index.get(parent_hash)
+            if not tails:
+                return
+            tails.pop(tail_hash, None)
+            if not tails:
+                self._tail_index.pop(parent_hash, None)
+
     def seed_tail_blocks(
         self, entries: Iterable[Tuple[Optional[BlockHash], BlockHash, int]]
     ) -> int:
@@ -1213,6 +1236,47 @@ class PagedCacheManager(CacheManager):
             self.register_tail_block(parent_hash, tail_hash, token_count)
             seeded += 1
         return seeded
+
+    def register_pending_tail_block(
+        self,
+        parent_hash: Optional[BlockHash],
+        tail_hash: BlockHash,
+    ) -> None:
+        """Announce a tail whose SSD write is still in flight."""
+        with self._lock:
+            tails = self._pending_tail_index.setdefault(parent_hash, OrderedDict())
+            tails.pop(tail_hash, None)
+            tails[tail_hash] = time.monotonic()
+            while len(tails) > _TAIL_INDEX_PER_PARENT:
+                tails.popitem(last=False)
+
+    def clear_pending_tail_block(
+        self,
+        parent_hash: Optional[BlockHash],
+        tail_hash: BlockHash,
+    ) -> None:
+        """Drop an announcement once its store published or abandoned the tail."""
+        with self._lock:
+            tails = self._pending_tail_index.get(parent_hash)
+            if not tails:
+                return
+            tails.pop(tail_hash, None)
+            if not tails:
+                self._pending_tail_index.pop(parent_hash, None)
+
+    def has_pending_tail_block(self, parent_hash: Optional[BlockHash]) -> bool:
+        """Whether an in-flight store still owes a tail under ``parent_hash``."""
+        with self._lock:
+            tails = self._pending_tail_index.get(parent_hash)
+            if not tails:
+                return False
+            cutoff = time.monotonic() - _PENDING_TAIL_TTL_S
+            for stale in [h for h, ts in tails.items() if ts < cutoff]:
+                tails.pop(stale, None)
+            if not tails:
+                self._pending_tail_index.pop(parent_hash, None)
+                return False
+            return True
 
     def _match_tail_block(
         self,
@@ -1229,6 +1293,23 @@ class PagedCacheManager(CacheManager):
         """
         tails = self._tail_index.get(parent_hash)
         if not tails:
+            remaining = len(token_ids) - start
+            parent_repr = parent_hash.hex()[:12] if parent_hash else "<root>"
+            if self.has_pending_tail_block(parent_hash):
+                logger.debug(
+                    "Tail miss at %d (+%d tokens): store in flight under parent "
+                    "%s, tail not indexed yet",
+                    start,
+                    remaining,
+                    parent_repr,
+                )
+            else:
+                logger.debug(
+                    "Tail miss at %d (+%d tokens): no tail indexed under parent %s",
+                    start,
+                    remaining,
+                    parent_repr,
+                )
             return None
         remaining = len(token_ids) - start
         for tail_hash, length in sorted(tails.items(), key=lambda kv: -kv[1]):
@@ -1515,6 +1596,7 @@ class PagedCacheManager(CacheManager):
 
             self.cached_block_hash_to_block.clear()
             self._tail_index.clear()
+            self._pending_tail_index.clear()
             if self.on_hash_map_cleared is not None:
                 self.on_hash_map_cleared()
             self.request_tables.clear()

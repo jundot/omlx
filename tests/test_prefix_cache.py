@@ -1457,6 +1457,12 @@ class TestValidateBlockCacheData:
         assert result is False
 
 
+class _CommitSnapshots(dict):
+    """Boundary snapshots that advertise the split-GDN sidecar commit."""
+
+    commit_gdn_checkpoint = staticmethod(lambda *_a, **_k: True)
+
+
 class TestArraysCacheLastBlockOnly:
     """Tests for ArraysCache last-block-only storage and partial match rejection."""
 
@@ -2046,6 +2052,159 @@ class TestArraysCacheLastBlockOnly:
         assert stats.last_partial_tokens_skipped == 0
         # The prefix index covers the full block only.
         assert [entry[0] for entry in cache._prefix_index.values()] == [4]
+
+    def test_store_cache_announces_tail_before_its_write(self, mx):
+        """The tail is pending-visible while its store is mid-write.
+
+        A lookup landing in that window sees it as still coming, not absent.
+        """
+        import threading
+
+        from omlx.cache.paged_cache import compute_block_hash
+
+        cache, paged_cache, mock_ssd, config = self._tail_fixture(mx)
+        tokens = list(range(7))
+        snapshots = {
+            4: self._hybrid_state(mx, 4, 4.0),
+            7: self._hybrid_state(mx, 7, 7.0),
+        }
+        entered = threading.Event()
+        release = threading.Event()
+
+        def _save_block(**kwargs):
+            if kwargs.get("tail_terminal"):
+                entered.set()
+                release.wait(timeout=5)
+            return True
+
+        mock_ssd.save_block.side_effect = _save_block
+        result_holder = {}
+
+        def _store():
+            result_holder["result"] = cache.store_cache(
+                "req-window",
+                tokens,
+                self._hybrid_state(mx, 7, 7.0),
+                model_cache_config=config,
+                boundary_snapshots=snapshots,
+                _store_tail_terminal=True,
+            )
+
+        worker = threading.Thread(target=_store)
+        worker.start()
+        try:
+            assert entered.wait(timeout=5), "tail save never started"
+            full_hash = compute_block_hash(None, [0, 1, 2, 3], model_name="test-model")
+            # The full block is indexed; the tail is only announced.
+            assert paged_cache.has_pending_tail_block(full_hash) is True
+            assert full_hash not in paged_cache._tail_index
+            _, num_tokens = paged_cache.get_computed_blocks(tokens)
+            assert num_tokens == 4
+        finally:
+            release.set()
+            worker.join(timeout=5)
+
+        result = result_holder["result"]
+        assert result is not None
+        assert result.num_tokens == 7
+        tail_hash = paged_cache.allocated_blocks[result.block_ids[-1]].block_hash
+        assert paged_cache.has_pending_tail_block(full_hash) is False
+        assert paged_cache._tail_index[full_hash][tail_hash] == 3
+        _, num_tokens = paged_cache.get_computed_blocks(tokens)
+        assert num_tokens == 7
+
+    def test_tail_indexed_while_recurrent_checkpoint_commits(self, mx):
+        """The tail is discoverable during the split-GDN commit that follows it.
+
+        save_block stages the tail's KV in memory before returning, so a
+        lookup landing in that gap reads it from memory.
+        """
+        import threading
+
+        from omlx.cache.paged_cache import compute_block_hash
+
+        cache, paged_cache, mock_ssd, config = self._tail_fixture(mx)
+        mock_ssd.has_block.return_value = True
+        tokens = list(range(7))
+        snapshots = _CommitSnapshots(
+            {
+                4: self._hybrid_state(mx, 4, 4.0),
+                7: self._hybrid_state(mx, 7, 7.0),
+            }
+        )
+        entered = threading.Event()
+        release = threading.Event()
+
+        cache._gdn_split_layout_supported = lambda *_: True
+
+        def _commit(_snapshots, boundary_tc, *_args, **_kwargs):
+            # Only the tail's commit (boundary 7) is held; the full block's
+            # commit at boundary 4 runs straight through.
+            if boundary_tc == 7:
+                entered.set()
+                release.wait(timeout=5)
+            return True
+
+        cache._commit_split_gdn_checkpoint = _commit
+        result_holder = {}
+
+        def _store():
+            result_holder["result"] = cache.store_cache(
+                "req-gap",
+                tokens,
+                self._hybrid_state(mx, 7, 7.0),
+                model_cache_config=config,
+                boundary_snapshots=snapshots,
+                _store_tail_terminal=True,
+            )
+
+        worker = threading.Thread(target=_store)
+        worker.start()
+        try:
+            assert entered.wait(timeout=5), "checkpoint commit never started"
+            full_hash = compute_block_hash(None, [0, 1, 2, 3], model_name="test-model")
+            tail_hash = compute_block_hash(
+                full_hash, [4, 5, 6], model_name="test-model"
+            )
+            # Indexed even though the commit is still in flight.
+            assert paged_cache._tail_index[full_hash][tail_hash] == 3
+            assert paged_cache.has_pending_tail_block(full_hash) is False
+            _, num_tokens = paged_cache.get_computed_blocks(tokens)
+            assert num_tokens == 7
+        finally:
+            release.set()
+            worker.join(timeout=5)
+
+        assert result_holder["result"].num_tokens == 7
+
+    def test_rejected_tail_is_unindexed(self, mx):
+        """A tail whose recurrent checkpoint is rejected must not stay indexed."""
+        from omlx.cache.paged_cache import compute_block_hash
+
+        cache, paged_cache, _, config = self._tail_fixture(mx)
+        tokens = list(range(7))
+        snapshots = _CommitSnapshots(
+            {
+                4: self._hybrid_state(mx, 4, 4.0),
+                7: self._hybrid_state(mx, 7, 7.0),
+            }
+        )
+
+        cache._gdn_split_layout_supported = lambda *_: True
+        cache._commit_split_gdn_checkpoint = lambda *_a, **_k: False
+
+        cache.store_cache(
+            "req-reject",
+            tokens,
+            self._hybrid_state(mx, 7, 7.0),
+            model_cache_config=config,
+            boundary_snapshots=snapshots,
+            _store_tail_terminal=True,
+        )
+
+        full_hash = compute_block_hash(None, [0, 1, 2, 3], model_name="test-model")
+        assert full_hash not in paged_cache._tail_index
+        assert cache.get_stats().tail_blocks_stored == 0
 
     def test_store_cache_pops_fetched_tail_and_extends_on_grid(self, mx):
         """A request that reused a tail stores its own blocks on the grid.
