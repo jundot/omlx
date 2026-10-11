@@ -1176,6 +1176,12 @@ class TestHFDownloaderRoutes:
             )
             assert display_names["model-a"] == "model-a"
 
+            repo_ids = {m["name"]: m["repo_id"] for m in models}
+            assert repo_ids["Qwen3.6-27B-MLX-oQ5-FP16"] == (
+                "deepsweet/Qwen3.6-27B-MLX-oQ5-FP16"
+            )
+            assert repo_ids["model-a"] is None
+
             for m in models:
                 assert "size" in m
                 assert "size_formatted" in m

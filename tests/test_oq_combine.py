@@ -128,6 +128,32 @@ def test_validate_rejects_non_gemma4_base():
         validate_gemma4_assistant_pair(base, ASSISTANT_CONFIG)
 
 
+def test_combine_routes_unified_assistant_to_assistant_merge(tmp_path):
+    out = _write_base_output(tmp_path)
+    base = dict(BASE_CONFIG, model_type="gemma4_unified")
+    (out / "config.json").write_text(json.dumps(base))
+    asst_config = dict(ASSISTANT_CONFIG, model_type="gemma4_unified_assistant")
+    asst = _write_assistant(tmp_path, config=asst_config)
+
+    combine_mtp_into_output(out, asst)
+
+    merged = mx.load(str(out / GEMMA4_ASSISTANT_MTP_SHARD))
+    assert GEMMA4_ASSISTANT_MTP_PREFIX + "pre_projection.weight" in merged
+    config = json.loads((out / "config.json").read_text())
+    assert config["text_config"]["mtp_assistant_config"] == asst_config
+
+
+@pytest.mark.parametrize(
+    ("base_type", "assistant_type"),
+    [("gemma4", "gemma4_unified_assistant"), ("gemma4_unified", "gemma4_assistant")],
+)
+def test_validate_rejects_assistant_for_other_gemma4_variant(base_type, assistant_type):
+    base = dict(BASE_CONFIG, model_type=base_type)
+    asst = dict(ASSISTANT_CONFIG, model_type=assistant_type)
+    with pytest.raises(ValueError, match="must have model_type"):
+        validate_gemma4_assistant_pair(base, asst)
+
+
 def test_validate_rejects_headless_assistant():
     headless = dict(ASSISTANT_CONFIG)
     headless["text_config"] = {"model_type": "gemma4_text"}

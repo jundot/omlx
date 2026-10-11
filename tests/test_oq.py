@@ -7225,6 +7225,50 @@ class TestGlm5NextLayerWalk:
             collector.restore(model)
         assert linear_attention.fuse_in
 
+    def test_mtp_head_imatrix_hooks_execute(self):
+        from omlx.oq import _collect_mtp_head_imatrix, _run_glm5_next_mtp_blocks
+        from omlx.patches import mlx_vlm_glm5_next_compat
+        from omlx.patches.mlx_vlm_mtp import glm5_next_vlm_runtime
+        from tests.test_mlx_vlm_glm5_next_compat import _tiny_config
+
+        mlx_vlm_glm5_next_compat.apply_mlx_vlm_glm5_next_compat_patch()
+        assert glm5_next_vlm_runtime.apply()
+        from mlx_vlm.models.glm5_next import Model
+
+        config = _tiny_config()
+        config.text_config.index_topk = 2048
+        config.text_config.num_nextn_predict_layers = 1
+        model = Model(config)
+        language_model = model.language_model
+        # Past 8 rows, attention reads embed_q only through q_b_proj's hook.
+        tokens = mx.arange(1, 13, dtype=mx.int32)[None]
+        layers = language_model.model.layers
+        inputs = language_model.model.embed_tokens(tokens)
+        inputs, masks, state = _prepare_layer_inputs(model, layers, tokens, inputs)
+
+        collector = OQImatrixCollector()
+        collector.install(model)
+        try:
+            for layer_idx, layer in enumerate(layers):
+                inputs, _ = _forward_layer_result(
+                    layer, inputs, masks[layer_idx], state, layer_idx=layer_idx
+                )
+            assert _collect_mtp_head_imatrix(model, tokens, inputs)
+        finally:
+            collector.restore(model)
+        assert "language_model.mtp.0.eh_proj" in collector.entries
+
+        # The streamed collector installs the head alone under its entry prefix.
+        head = language_model.mtp[0]
+        collector = OQImatrixCollector()
+        collector.install(head, name_prefix="language_model.mtp.0.")
+        try:
+            embed = language_model.model.embed_tokens
+            _run_glm5_next_mtp_blocks([head], inputs, embed, tokens[:, 1:])
+        finally:
+            collector.restore(head)
+        assert "language_model.mtp.0.block.self_attn.embed_q" in collector.entries
+
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestInklingLayerWalk:
@@ -7546,6 +7590,7 @@ class TestStreamedCalibration:
         [
             (None, "llama", True, False),
             (None, "minimax_m3_vl", True, True),
+            (None, "glm5_next", True, True),
             (None, "qwen4_exp", False, False),
             (False, "qwen4_exp", True, False),
             (True, "qwen4_exp", False, True),

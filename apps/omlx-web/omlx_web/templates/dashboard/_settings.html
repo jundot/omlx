@@ -1,6 +1,6 @@
 {% import "components/ui.html" as ui %}
             <div x-show="mainTab === 'settings'" x-cloak role="tabpanel" id="panel-settings" aria-labelledby="tab-settings">
-            <div class="page-tabs mb-6 animate-fade-in-up">
+            <div class="page-tabs mb-6 animate-fade-in-up" :class="activeTab === 'global' ? 'page-tabs--settings-rail' : ''">
                 {{ ui.segmented([('global', t('settings.tab.global')), ('models', t('settings.tab.models')), ('integrations', t('settings.tab.integrations'))],
                                 'activeTab', "setSettingsTab('{value}')", aria_label=t('navbar.tab.settings')) }}
             </div>

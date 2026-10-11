@@ -39,7 +39,7 @@ from .engine.reranker import RerankerEngine
 from .engine.sts import STSEngine
 from .engine.stt import STTEngine
 from .engine.tts import TTSEngine
-from .engine.vlm import VLMBatchedEngine
+from .engine.vlm import OCR_MODEL_GENERATION_DEFAULTS, VLMBatchedEngine
 from .engine_core import get_mlx_executor, shutdown_mlx_executor
 from .exceptions import (
     DEFAULT_CEILING_ADVICE,
@@ -64,6 +64,7 @@ from .model_settings import (
 )
 from .scheduler import SchedulerConfig
 from .utils.fatal import exit_if_gpu_submissions_ignored
+from .utils.generation_config import SAMPLING_SETTING_KEYS, load_sampling_defaults
 from .utils.metal_sync import unreleased_graphics_bytes
 from .utils.model_loading import dflash_batched_requested, dflash_batched_supported
 from .utils.proc_memory import get_phys_footprint
@@ -1400,7 +1401,11 @@ class EnginePool:
     def apply_settings_overrides(
         self, settings_manager: ModelSettingsManager
     ) -> None:
-        """Apply model_type_override from persisted settings to discovered entries."""
+        """Apply persisted settings to discovered entries.
+
+        Applies model_type_override, then saves the recommended sampling
+        settings of generation models that have no saved settings yet.
+        """
         for model_id, entry in self._entries.items():
             settings = settings_manager.get_settings(model_id)
             if settings.model_type_override:
@@ -1412,6 +1417,46 @@ class EnginePool:
                     f"Applied model_type override for {model_id}: "
                     f"type={entry.model_type}, engine={entry.engine_type}"
                 )
+
+        initial = {}
+        for model_id, entry in self._entries.items():
+            if settings_manager.has_settings(model_id):
+                continue
+            values = self.recommended_sampling_settings(entry)
+            if values:
+                initial[model_id] = values
+        try:
+            added = settings_manager.add_initial_settings(initial)
+        except OSError as e:
+            logger.warning(f"Could not save recommended sampling settings: {e}")
+            return
+        for model_id in added:
+            logger.info(
+                f"Applied recommended sampling settings for {model_id}: "
+                f"{initial[model_id]}"
+            )
+
+    @classmethod
+    def recommended_sampling_settings(cls, entry: EngineEntry) -> dict:
+        """Return the sampling settings a model starts with and resets to.
+
+        Values come from generation_config.json and family defaults. OCR
+        defaults replace them, so OCR models keep their request-time values.
+        Temporary cluster entries get none.
+        """
+        if (
+            entry.is_helper
+            or entry.source_type == "cluster"
+            or entry.model_type not in ("llm", "vlm")
+        ):
+            return {}
+        values = load_sampling_defaults(entry.model_path, entry.config_model_type)
+        if cls._entry_is_diffusion_model(entry):
+            # The diffusion lane ignores every sampling knob except temperature.
+            return {k: v for k, v in values.items() if k == "temperature"}
+        ocr = OCR_MODEL_GENERATION_DEFAULTS.get(entry.config_model_type, {})
+        values.update({k: v for k, v in ocr.items() if k in SAMPLING_SETTING_KEYS})
+        return values
 
     def get_model_ids(self) -> list[str]:
         """Get list of all discovered model IDs."""

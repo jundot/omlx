@@ -26,7 +26,7 @@ from omlx.exceptions import (
     ModelTooLargeError,
     ModelUnavailableError,
 )
-from omlx.model_settings import ModelSettings
+from omlx.model_settings import ModelSettings, ModelSettingsManager
 from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
     Qwen4ExpResidencyEstimate,
 )
@@ -1023,6 +1023,71 @@ class TestApplySettingsOverrides:
 
         assert pool.get_entry("model-a").model_type == "llm"
         assert pool.get_entry("model-a").engine_type == "batched"
+
+    def test_new_models_get_recommended_sampling(self, tmp_path):
+        models = tmp_path / "models"
+        for name, model_type, generation in (
+            (
+                "plain",
+                "llama",
+                {"do_sample": False, "temperature": 0.6, "top_p": 0.9, "top_k": -1},
+            ),
+            ("family", "qwen3", None),
+            ("custom", "llama", {"temperature": 0.3}),
+            ("bare", "llama", None),
+        ):
+            path = models / name
+            path.mkdir(parents=True)
+            (path / "config.json").write_text(json.dumps({"model_type": model_type}))
+            (path / "model.safetensors").write_bytes(b"0" * 1024)
+            if generation is not None:
+                (path / "generation_config.json").write_text(json.dumps(generation))
+        manager = ModelSettingsManager(tmp_path / "settings")
+        manager.set_settings("custom", ModelSettings(model_alias="mine"))
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(models))
+
+        pool.apply_settings_overrides(manager)
+
+        # do_sample is ignored and top_k -1 means disabled.
+        assert manager.get_settings("plain").to_dict() == (
+            ModelSettings(temperature=0.6, top_p=0.9, top_k=0).to_dict()
+        )
+        assert manager.get_settings("family").to_dict() == (
+            ModelSettings(top_k=20, top_p=0.95).to_dict()
+        )
+        assert manager.get_settings("custom").temperature is None
+        assert not manager.has_settings("bare")
+
+        # A value the user clears stays cleared on the next discovery.
+        manager.set_settings("plain", ModelSettings())
+        pool.apply_settings_overrides(manager)
+        assert manager.get_settings("plain").temperature is None
+        reloaded = ModelSettingsManager(tmp_path / "settings")
+        assert reloaded.get_settings("family").top_k == 20
+
+    def test_recommended_sampling_keeps_ocr_defaults(self, tmp_path):
+        (tmp_path / "generation_config.json").write_text(
+            json.dumps({"temperature": 0.7, "top_p": 0.8})
+        )
+        entry = EngineEntry(
+            model_id="ocr",
+            model_path=str(tmp_path),
+            model_type="vlm",
+            engine_type="vlm",
+            estimated_size=0,
+            config_model_type="glm_ocr",
+        )
+
+        assert EnginePool.recommended_sampling_settings(entry) == {
+            "temperature": 0.0,
+            "top_p": 0.8,
+            "repetition_penalty": 1.1,
+        }
+        entry.config_model_type = "diffusion_gemma"
+        assert EnginePool.recommended_sampling_settings(entry) == {"temperature": 0.7}
+        entry.model_type = "embedding"
+        assert EnginePool.recommended_sampling_settings(entry) == {}
 
 
 class TestVLMFallback:

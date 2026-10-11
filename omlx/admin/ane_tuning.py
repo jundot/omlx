@@ -567,6 +567,16 @@ def _ane_execution_observed(
     )
 
 
+def _observed_operations(traces: list[dict[str, Any] | None]) -> dict[str, int]:
+    totals = {"mlp": 0, "gdn": 0}
+    for trace in traces:
+        categories = (trace or {}).get("categories") or {}
+        for category in totals:
+            values = categories.get(category) or {}
+            totals[category] += int(values.get("operations", 0) or 0)
+    return totals
+
+
 def _ane_is_active(engine: Any) -> bool:
     model = getattr(engine, "_model", None)
     if model is None:
@@ -710,24 +720,40 @@ async def _measure_candidate(
     # Reject only a positive observation that compiled programs remained idle.
     # If profiling was unavailable, the result is unknown and stays eligible.
     if candidate.enabled and any(o is False for o in observations) and not any(observations):
+        operations = _observed_operations(traces)
         step = _prefill_step_size(engine)
-        hint = (
-            f"the scheduler is configured for {step}-token prefill chunks, "
-            f"so set sequence_length={step} or smaller (wider chunks tile "
-            "onto the compiled shape, narrower ones cannot)"
-            if step
-            else "sequence_length must not exceed the scheduler's prefill "
-            "chunk width"
-        )
+        if any(operations.values()):
+            # Another branch ran on the same chunks, so the width matched.
+            cause = (
+                "The other ANE branch ran on the same chunks, so the idle "
+                "branch was dropped at load or dispatch; check the serve log "
+                "for ANE compile, program budget, warmup, or runtime failure "
+                "warnings."
+            )
+        elif step is None:
+            cause = (
+                "sequence_length must not exceed the scheduler's prefill "
+                "chunk width."
+            )
+        elif run.request.sequence_length > step:
+            cause = (
+                f"The scheduler is configured for {step}-token prefill chunks, "
+                f"so set sequence_length={step} or smaller (wider chunks tile "
+                "onto the compiled shape, narrower ones cannot)."
+            )
+        else:
+            cause = (
+                f"The configured {step}-token prefill step fits this shape; "
+                "check chunk_tokens in the serve log, since delivered chunks "
+                "can shrink below the step, and check for ANE warmup or "
+                "runtime failure warnings."
+            )
         raise RuntimeError(
-            "The ANE compiled but never executed for "
-            f"sequence_length={run.request.sequence_length}: no ANE operation "
-            "was observed during measurement, so this candidate would report "
-            "GPU-only throughput as an ANE result. The most common cause is a "
-            f"prefill chunk size mismatch ({hint}; confirm against "
-            "chunk_tokens in the serve log, since delivered chunks can shrink "
-            "below the configured step). A runtime dispatch failure can also "
-            "disable the path; check the serve log for 'Disabling ANE' warnings."
+            "A required ANE branch never executed for "
+            f"sequence_length={run.request.sequence_length} (observed ANE "
+            f"operations: mlp={operations['mlp']}, gdn={operations['gdn']}), "
+            "so this candidate would report GPU-only throughput as an ANE "
+            f"result. {cause}"
         )
 
     result = {
@@ -2243,9 +2269,23 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
             )
         if refinement_changed:
             active_slot = _REFINE_SLOT
-            await _measure_result_slot(
-                run, _REFINE_SLOT, engine_pool, base_settings, refined
-            )
+            try:
+                await _measure_result_slot(
+                    run, _REFINE_SLOT, engine_pool, base_settings, refined
+                )
+            except Exception as exc:
+                # The verified prediction stays a valid answer; only this
+                # follow-up candidate is dropped.
+                logger.warning(
+                    "ANE tuning skipped %s for %s",
+                    refined.label,
+                    run.request.model_id,
+                    exc_info=True,
+                )
+                run.termination_reason = (
+                    f"Skipped {refined.label} after it failed: "
+                    f"{_exception_reason(exc)}"
+                )
         else:
             _complete_phase(
                 run,

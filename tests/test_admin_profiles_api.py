@@ -40,9 +40,13 @@ class _FakeEntry:
 class _FakePool:
     def __init__(self):
         self._entries = {"model-a": _FakeEntry("model-a")}
+        self.recommended_sampling = {}
 
     def get_entry(self, model_id):
         return self._entries.get(model_id)
+
+    def recommended_sampling_settings(self, entry):
+        return dict(self.recommended_sampling)
 
     def get_status(self):
         return {
@@ -1456,6 +1460,23 @@ class TestSettingsSnapshotRoutes:
         assert state.default_model is None
         assert pool.get_entry("model-a").is_pinned is False
 
+        again = c.post("/admin/api/models/model-a/settings/reset").json()
+        assert again["changed"] is False
+
+    def test_reset_restores_recommended_sampling(self, client):
+        c, mgr = client
+        pool = admin_routes._get_engine_pool()
+        pool.recommended_sampling = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}
+        mgr.set_settings(
+            "model-a", ModelSettings(temperature=0.1, top_k=5, model_alias="alias")
+        )
+
+        body = c.post("/admin/api/models/model-a/settings/reset").json()
+
+        expected = ModelSettings(temperature=0.6, top_p=0.95, top_k=20).to_dict()
+        assert body["settings"] == expected
+        assert body["applied"]["temperature"] == 0.6
+        assert mgr.get_settings("model-a").to_dict() == expected
         again = c.post("/admin/api/models/model-a/settings/reset").json()
         assert again["changed"] is False
 

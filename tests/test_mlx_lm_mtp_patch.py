@@ -23,7 +23,7 @@ from mlx_lm.models.cache import KVCache
 from omlx.model_settings import ModelSettings
 from omlx.patches import mlx_lm_mtp
 from omlx.patches.mlx_lm_mtp import batch_generator as bg
-from omlx.patches.mlx_lm_mtp import batched_head, cache_rollback
+from omlx.patches.mlx_lm_mtp import batched_head, cache_rollback, fused_batch
 from omlx.patches.mlx_lm_mtp.batch_policy import BatchPolicy
 from omlx.patches.mlx_vlm_mtp import qwen35_verify_linear
 from omlx.utils.model_loading import (
@@ -5875,3 +5875,25 @@ def test_batch_park_expires_while_cohorts_come_and_go():
     # The 128-step park, then one cohort's calibration (2 warmup + 3 samples).
     assert first_mtp is not None and first_mtp <= 128 + 150 + 5
     assert mtp_cycles > 0.9 * (6000 - first_mtp) - 5 * 6000 / 50
+
+
+def test_rows_rebuilt_under_a_lowered_policy_depth_keep_tokens(monkeypatch):
+    """A fallback rebuilds rows that draft deeper than the lowered policy depth."""
+    advance = fused_batch.advance
+    fired = []
+
+    def fall_back_once(batch, batch_state):
+        if not fired and batch._omlx_mtp_batch_policy.cur < 2:
+            fired.append(True)
+            raise bg._MtpStepFallback("test")
+        return advance(batch, batch_state)
+
+    monkeypatch.setattr(fused_batch, "advance", fall_back_once)
+    model = CountingModel()
+    prompts, limits = [[1, 2], [10, 11, 12]], [60, 60]
+    model._omlx_mtp_decode_enabled = False
+    expected, _ = generate(model, prompts, limits)
+    model._omlx_mtp_decode_enabled = True
+    actual, _ = generate(model, prompts, limits)
+    assert fired
+    assert actual == expected

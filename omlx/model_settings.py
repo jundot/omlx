@@ -822,7 +822,11 @@ class ModelSettingsManager:
                 for model_id, settings in self._settings.items()
             },
         }
+        self._write_settings_file(data)
+        logger.debug(f"Saved settings for {len(self._settings)} models")
 
+    def _write_settings_file(self, data: dict) -> None:
+        """Replace the settings file with ``data`` atomically."""
         # Write to temp file first, then rename for atomicity. The pid in
         # the temp name keeps concurrent processes from sharing a temp path
         # and renaming each other's partial writes into place.
@@ -836,7 +840,6 @@ class ModelSettingsManager:
                 os.fsync(f.fileno())
 
             temp_file.replace(self.settings_file)
-            logger.debug(f"Saved settings for {len(self._settings)} models")
 
         except Exception as e:
             logger.error(f"Failed to save settings file: {e}")
@@ -859,6 +862,47 @@ class ModelSettingsManager:
                 return ModelSettings.from_dict(settings.to_dict())
 
             return ModelSettings()
+
+    def has_settings(self, model_id: str) -> bool:
+        """Return True when settings for the model are saved."""
+        with self._lock:
+            return model_id in self._settings
+
+    def add_initial_settings(self, initial: dict[str, dict[str, Any]]) -> list[str]:
+        """Save settings for models that have none yet.
+
+        Only the new records are added to the file. Records already on disk
+        keep their content, including fields or records this build cannot
+        load. Nothing is written when the file cannot be read. Returns the
+        IDs of the models that were added.
+        """
+        with self._lock:
+            pending = [mid for mid in initial if mid not in self._settings]
+            if not pending:
+                return []
+            data: Any = {"version": SETTINGS_VERSION, "models": {}}
+            if self.settings_file.exists():
+                try:
+                    data = json.loads(self.settings_file.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as e:
+                    logger.warning(f"Initial model settings not saved: {e}")
+                    return []
+            models = data.setdefault("models", {}) if isinstance(data, dict) else None
+            if not isinstance(models, dict):
+                logger.warning("Initial model settings not saved: invalid file")
+                return []
+            added = {
+                mid: ModelSettings.from_dict(initial[mid])
+                for mid in pending
+                if mid not in models
+            }
+            if not added:
+                return []
+            for mid, settings in added.items():
+                models[mid] = settings.to_dict()
+            self._write_settings_file(data)
+            self._settings.update(added)
+            return list(added)
 
     def get_settings_for_request(
         self,

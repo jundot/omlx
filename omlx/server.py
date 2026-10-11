@@ -1782,26 +1782,18 @@ async def acquire_reranker_engine(model: str):
             await get_engine_pool().release_engine(leased[0])
 
 
-async def get_decision_engine(model: str) -> DecisionEngine:
-    """Get the decision engine for ``model`` (see get_engine for errors)."""
-    return await get_engine(model, EngineType.DECISION)
+async def get_decision_engine(model: str, lease: _LLMEngineLease) -> DecisionEngine:
+    """Get the decision engine for ``model`` and hold it under ``lease``.
 
-
-@asynccontextmanager
-async def acquire_decision_engine(model: str):
-    """Acquire a decision engine with an atomic, eviction-proof in-use lease.
-
-    See acquire_embedding_engine for the lease/release contract.
+    See get_engine for errors.
     """
-    leased: list = []
+    leased: list[str] = []
     engine = await get_engine(
         model, EngineType.DECISION, _lease=True, _leased_out=leased
     )
-    try:
-        yield engine
-    finally:
-        if leased:
-            await get_engine_pool().release_engine(leased[0])
+    if leased:
+        lease.model_id = leased[0]
+    return engine
 
 
 def get_sampling_params(
@@ -4062,43 +4054,48 @@ async def create_systemone(
 
     # Tokenize and preprocess images before the keepalive response starts, so
     # request errors keep their real status codes.
-    engine = await get_decision_engine(request.model)
+    # The lease keeps the model loaded from encode() to the response.
+    lease = _LLMEngineLease()
     try:
-        plan = await engine.encode(request.model_dump(), truncate=request.truncate)
-    except DecisionContextLengthError as e:
-        raise HTTPException(status_code=413, detail=str(e)) from e
-    except DecisionRequestError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
+        engine = await get_decision_engine(request.model, lease)
+        try:
+            plan = await engine.encode(request.model_dump(), truncate=request.truncate)
+        except DecisionContextLengthError as e:
+            raise HTTPException(status_code=413, detail=str(e)) from e
+        except DecisionRequestError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
-    async def _decide():
-        start_time = time.perf_counter()
-        async with acquire_decision_engine(request.model) as leased_engine:
-            result = await leased_engine.systemone(plan)
-        elapsed = time.perf_counter() - start_time
-        resolved_model = resolve_model_id(request.model) or request.model
-        input_tokens = result["input_tokens"]
-        logger.info(
-            f"SystemOne: model={resolved_model}, {len(request.questions)} "
-            f"questions, {input_tokens} tokens in {elapsed:.3f}s"
-        )
-        get_server_metrics().record_request_complete(
-            prompt_tokens=input_tokens,
-            completion_tokens=0,
-            cached_tokens=0,
-            prefill_duration=elapsed,
-            model_id=resolved_model,
-            request_duration=elapsed,
-        )
-        return json.dumps(
-            {
-                "model": request.model,
-                "answers": result["answers"],
-                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
-            },
-            ensure_ascii=False,
-        )
+        async def _decide():
+            start_time = time.perf_counter()
+            result = await engine.systemone(plan)
+            elapsed = time.perf_counter() - start_time
+            resolved_model = resolve_model_id(request.model) or request.model
+            input_tokens = result["input_tokens"]
+            logger.info(
+                f"SystemOne: model={resolved_model}, {len(request.questions)} "
+                f"questions, {input_tokens} tokens in {elapsed:.3f}s"
+            )
+            get_server_metrics().record_request_complete(
+                prompt_tokens=input_tokens,
+                completion_tokens=0,
+                cached_tokens=0,
+                prefill_duration=elapsed,
+                model_id=resolved_model,
+                request_duration=elapsed,
+            )
+            return json.dumps(
+                {
+                    "model": request.model,
+                    "answers": result["answers"],
+                    "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+                },
+                ensure_ascii=False,
+            )
 
-    return await _json_response_or_keepalive(http_request, _decide())
+        return await _json_response_or_keepalive(http_request, _decide(), lease=lease)
+    except BaseException:
+        await lease.release()
+        raise
 
 
 # =============================================================================

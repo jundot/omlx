@@ -4245,8 +4245,10 @@ def _run_verify_cycle_chain(
         state.stats.copy_accepted += m
         state.context_copy.observe(m, k)
     else:
-        if len(state.stats.depth_drafted) < state.depth:
-            pad = state.depth - len(state.stats.depth_drafted)
+        # A batch policy can lower state.depth below the drafts a row holds.
+        depth = max(state.depth, k)
+        if len(state.stats.depth_drafted) < depth:
+            pad = depth - len(state.stats.depth_drafted)
             state.stats.depth_drafted.extend([0] * pad)
             state.stats.depth_accepted.extend([0] * pad)
         for j in range(k):
