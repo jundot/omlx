@@ -360,22 +360,46 @@ def _patch_model(glm: Any) -> None:
             self._omlx_mtp_head_clone = False
             # Marginal cost prior for the adaptive depth controller.
             #
-            # The 35 ms figure was measured on GLM-5.2 (8-of-256 routing,
-            # bf16): each extra verify row pulled a nearly disjoint expert
-            # set, ~55% of step bytes. GLM-5.3 Flash quantized to oQ4e
-            # (8-of-288, 45 layers) behaves differently: on an M3 Ultra
-            # 512GB the measured backbone cost per cycle *drops* as the
-            # controller drafts deeper (52 ms at tok/cycle<1.8 vs 26 ms at
-            # >=2.3 over ~250 MTP sessions), because accepted drafts reuse
-            # the same KV pages and expert routing overlaps across chained
-            # rows. With the 35 ms prior the controller parks at depth<=3;
-            # with the dense-backbone default it probes deeper and holds
-            # higher tok/cycle under sustained load.
+            # Scope note: this __init__ serves the GLM-5.2 family
+            # (mlx_lm glm_moe_dsa). The 35 ms prior was measured on
+            # GLM-5.2 itself (8-of-256 routing, bf16) and stays correct
+            # for unquantized 5.2 loads.
             #
-            # A principled follow-up would key this prior on quantization
-            # config + expert count; for now prefer the measured-slope
-            # fallback (dense default) over a stale bf16 measurement.
-            self._omlx_mtp_marginal_ms = 7.0
+            # Quantized loads pay far less per extra verify row (oQ4e packs
+            # expert weights to ~1/4 the bytes, and on GLM-5.3 Flash oQ4e
+            # the measured backbone cost per cycle *drops* as drafting
+            # deepens: 52 ms at tok/cycle<1.8 vs 26 ms at >=2.3 over ~250
+            # MTP sessions on an M3 Ultra 512GB). mlx_lm quantizes after
+            # ModelArgs is built, so the quantization signal is not on
+            # `config` here — detect it lazily from the loaded module tree
+            # on first controller use instead of a load-time constant.
+            self._omlx_mtp_marginal_ms = 35.0
+
+    def _default_marginal_ms(self) -> float:
+        """Quantization-aware fallback when the measured slope is absent.
+
+        mlx_lm applies nn.quantize after ModelArgs construction, so this
+        cannot be decided in __init__; inspect the live module tree once.
+        """
+        cached = getattr(self, "_omlx_mtp_marginal_resolved", None)
+        if cached is not None:
+            return cached
+        quantized = False
+        try:
+            for layer in getattr(getattr(self, "model", self), "layers", []) or []:
+                mlp = getattr(layer, "mlp", None)
+                if mlp is None:
+                    continue
+                # Quantized mlx modules carry `scales`/`bits` parameters;
+                # a single hit anywhere in the first MoE block is decisive.
+                if any("scales" in k for k, _ in mlp.items()):
+                    quantized = True
+                    break
+        except Exception:
+            quantized = False
+        resolved = 7.0 if quantized else 35.0
+        self._omlx_mtp_marginal_resolved = resolved
+        return resolved
 
     def __call__(
         self,

@@ -3238,9 +3238,20 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
             if factory is not None:
                 state.controller = factory(depth)
             else:
+                _marginal_attr = getattr(
+                    gen_batch.model, "_omlx_mtp_marginal_ms", None
+                )
+                _resolver = getattr(
+                    gen_batch.model, "_default_marginal_ms", None
+                )
+                # A callable prior means "decide from the live module tree"
+                # (quantization is applied after ModelArgs, so load-time
+                # constants can't see it); resolve once here.
+                if callable(_marginal_attr):
+                    _marginal_attr = _marginal_attr()
                 state.controller = _DepthController(
                     depth,
-                    marginal_ms=getattr(gen_batch.model, "_omlx_mtp_marginal_ms", None),
+                    marginal_ms=_marginal_attr,
                     exit_margin=_effective_loop_tax(gen_batch.model),
                     seed=getattr(gen_batch.model, "_omlx_mtp_depth_seed", None),
                 )
