@@ -4078,7 +4078,7 @@ async def create_systemone(
             get_server_metrics().record_request_complete(
                 prompt_tokens=input_tokens,
                 completion_tokens=0,
-                cached_tokens=0,
+                cached_tokens=result.get("cached_tokens", 0),
                 prefill_duration=elapsed,
                 model_id=resolved_model,
                 request_duration=elapsed,

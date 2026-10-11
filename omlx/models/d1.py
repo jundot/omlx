@@ -16,16 +16,25 @@ release packs its branches without padding under a tree mask; padding after a
 row's last token cannot reach that token, so each row reads what it would
 alone. A single question is one plain pass over the whole prompt, as the
 runner does.
+
+Prefix caches are kept between requests, so later requests on the same state
+run only their questions. A single question on an uncached prefix keeps the
+one plain pass unless the prefix is long enough to be worth keeping. The same
+question can therefore read slightly differently with and without a cached
+prefix (different batch shapes round differently in bfloat16), as the
+release's single and multi-question passes do.
 """
 
 import json
 import math
+from collections import OrderedDict
 from collections.abc import Generator
 from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
 import numpy as np
+from mlx.utils import tree_flatten
 
 from .decision import (
     ChunkSize,
@@ -38,6 +47,13 @@ from .decision import (
 # Prefix tokens repeated across one batch of questions: each row of a batch
 # holds its own copy of the prefix's attention cache while it runs.
 BRANCH_PREFIX_TOKENS = 32768
+# Bytes of prefix caches kept between requests. The engine pool's memory
+# estimate for the model does not include them.
+PREFIX_CACHE_BYTES = 512 * 1024**2
+# A single question on an uncached prefix splits it off, and keeps it, only from
+# this many prefix tokens. The split costs one extra short pass (about 11 ms
+# on d1-3B 4-bit, M5 Max) and a cache hit then saves the whole prefix pass.
+SPLIT_PREFIX_TOKENS = 512
 
 IM_START = "<|im_start|>"
 IM_END = "<|im_end|>"
@@ -140,6 +156,66 @@ class Lfm2DecisionBackbone(DecisionBackbone):
         mx.eval(last)
         return last
 
+    @staticmethod
+    def snapshot_cache(cache: list) -> list:
+        """A compact copy of ``cache`` for keeping: no spare KV capacity."""
+        out = []
+        for layer in cache:
+            if hasattr(layer, "keys"):  # KVCache
+                fresh = type(layer)()
+                keys, values = layer.state
+                fresh.state = (mx.contiguous(keys), mx.contiguous(values))
+            else:
+                fresh = type(layer)(len(layer.cache))
+                fresh.cache = list(layer.cache)
+            out.append(fresh)
+        mx.eval([c.state for c in out])
+        return out
+
+
+def cache_nbytes(cache: list) -> int:
+    return sum(a.nbytes for layer in cache for _, a in tree_flatten(layer.state))
+
+
+class PrefixCache:
+    """Least recently used prefix caches, keyed by the prefix token ids.
+
+    Entries are only read: questions continue from fresh caches built over
+    them (``Lfm2DecisionBackbone.branch_caches``).
+    """
+
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max_bytes
+        self.nbytes = 0
+        self._entries: OrderedDict[bytes, tuple[list, int]] = OrderedDict()
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def get(self, key: bytes) -> list | None:
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        self._entries.move_to_end(key)
+        return entry[0]
+
+    def put(self, key: bytes, cache: list) -> None:
+        size = cache_nbytes(cache)
+        if size > self.max_bytes:
+            return
+        old = self._entries.pop(key, None)
+        if old is not None:
+            self.nbytes -= old[1]
+        self._entries[key] = (cache, size)
+        self.nbytes += size
+        while self.nbytes > self.max_bytes:
+            _, (_, evicted) = self._entries.popitem(last=False)
+            self.nbytes -= evicted
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self.nbytes = 0
+
 
 def option_codes(labels: list[str]) -> list[str]:
     """Native letters when the labels already are letters, else A..Z, else 00.."""
@@ -189,14 +265,17 @@ class D1Model:
         self.backbone = Lfm2DecisionBackbone(model_path, trust_remote_code)
         self._bos = ""
         self._aliases: dict[tuple[str, ...], list[tuple[str, int]]] = {}
+        self.prefixes = PrefixCache(PREFIX_CACHE_BYTES)
 
     def load(self) -> None:
         self.backbone.load()
         bos = getattr(self.backbone.tokenizer, "bos_token", None)
         self._bos = bos if isinstance(bos, str) else ""
         self._aliases = {}
+        self.prefixes.clear()
 
     def close(self) -> None:
+        self.prefixes.clear()
         self.backbone.close()
 
     # ------------------------------------------------------------- tokens
@@ -331,21 +410,39 @@ class D1Model:
     # ---------------------------------------------------------------- run
 
     def run(self, plan: D1Plan, chunk_size: ChunkSize) -> Generator[int, None, dict]:
-        """Answer every question, yielding per prefill chunk."""
+        """Answer every question, yielding per prefill chunk.
+
+        ``cached_tokens`` counts the prefix tokens read from the prefix cache;
+        ``input_tokens`` counts them too, as the release does.
+        """
         backbone = self.backbone
         answers = {}
-        if len(plan.items) == 1:
+        trunk = self._prefix_ids(plan)
+        key = trunk.tobytes()
+        trunk_cache = self.prefixes.get(key)
+        cached_tokens = 0 if trunk_cache is None else len(trunk)
+        if (
+            trunk_cache is None
+            and len(plan.items) == 1
+            and len(trunk) < SPLIT_PREFIX_TOKENS
+        ):
             item = plan.items[0]
             ids = np.asarray(
                 backbone.tokenize(plan.prefix + item.suffix), dtype=np.int32
             )
             hidden = yield from self._prefill(ids, backbone.make_cache(), chunk_size)
             answers[item.question_id] = self._answer(item, self._probs(item, hidden))
-            return {"answers": answers, "input_tokens": int(len(ids))}
+            return {
+                "answers": answers,
+                "input_tokens": int(len(ids)),
+                "cached_tokens": 0,
+            }
 
-        trunk = np.asarray(backbone.tokenize(plan.prefix), dtype=np.int32)
-        trunk_cache = backbone.make_cache()
-        yield from self._prefill(trunk, trunk_cache, chunk_size)
+        if trunk_cache is None:
+            fresh = backbone.make_cache()
+            yield from self._prefill(trunk, fresh, chunk_size)
+            trunk_cache = backbone.snapshot_cache(fresh)
+            self.prefixes.put(key, trunk_cache)
         branches = [
             np.asarray(backbone.tokenize(item.suffix), dtype=np.int32)
             for item in plan.items
@@ -356,7 +453,18 @@ class D1Model:
         for item, h in zip(plan.items, hidden, strict=True):
             answers[item.question_id] = self._answer(item, self._probs(item, h))
         input_tokens = len(trunk) + sum(len(b) for b in branches)
-        return {"answers": answers, "input_tokens": int(input_tokens)}
+        return {
+            "answers": answers,
+            "input_tokens": int(input_tokens),
+            "cached_tokens": int(cached_tokens),
+        }
+
+    def _prefix_ids(self, plan: D1Plan) -> np.ndarray:
+        return np.asarray(self.backbone.tokenize(plan.prefix), dtype=np.int32)
+
+    def prefix_key(self, plan: D1Plan) -> bytes:
+        """The prefix cache key of ``plan``: its prefix token ids."""
+        return self._prefix_ids(plan).tobytes()
 
     def _branches(
         self,

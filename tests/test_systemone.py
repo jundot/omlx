@@ -730,6 +730,7 @@ def test_d1_shared_prefix_matches_each_question_alone(tiny_lfm2_backbone):
     tokens += sum(len(model.backbone.tokenize(item.suffix)) for item in plan.items)
     assert shared["input_tokens"] == tokens
     for key, question in questions.items():
+        model.prefixes.clear()  # alone: one plain pass over the whole prompt
         alone = _drain(
             model.run(
                 model.encode({"state": state, "questions": {key: question}}), lambda: 16
@@ -782,3 +783,85 @@ def test_d1_batched_branches_match_one_at_a_time(tiny_lfm2_backbone):
         assert np.allclose(np.array(h), np.array(e), atol=1e-5)
     after = _cache_arrays(trunk_cache)
     assert all(np.array_equal(x, y) for x, y in zip(before, after, strict=True))
+
+
+def _prefill_lengths(model, monkeypatch) -> list[int]:
+    lengths = []
+    prefill = model._prefill
+
+    def recording(ids, cache, chunk_size):
+        lengths.append(len(ids))
+        return (yield from prefill(ids, cache, chunk_size))
+
+    monkeypatch.setattr(model, "_prefill", recording)
+    return lengths
+
+
+def test_d1_prefix_cache_serves_later_requests(tiny_lfm2_backbone, monkeypatch):
+    model = _d1_model(tiny_lfm2_backbone)
+    lengths = _prefill_lengths(model, monkeypatch)
+    state = {"ticket": "charged twice, nobody replied"}
+    angry = {"type": "noul", "instructions": "Is the customer angry?"}
+    urgency = {"type": "score", "instructions": "How urgent?", "criteria": ["a", "b"]}
+    both = {"state": state, "questions": {"angry": angry, "urgency": urgency}}
+    plan = model.encode(both)
+    prefix_len = len(model.backbone.tokenize(plan.prefix))
+
+    first = _drain(model.run(plan, lambda: 64))
+    assert first["cached_tokens"] == 0
+    assert len(model.prefixes) == 1
+    stored = _cache_arrays(model.prefixes.get(model.prefix_key(plan)))
+
+    # A later single question on the same state runs only its own tokens.
+    lengths.clear()
+    single = {"state": state, "questions": {"angry": angry}}
+    again = _drain(model.run(model.encode(single), lambda: 64))
+    assert prefix_len not in lengths and max(lengths) < prefix_len
+    assert again["cached_tokens"] == prefix_len
+    assert again["answers"]["angry"]["noul"] == pytest.approx(
+        first["answers"]["angry"]["noul"], abs=2e-4
+    )
+    after = _cache_arrays(model.prefixes.get(model.prefix_key(plan)))
+    assert all(np.array_equal(x, y) for x, y in zip(stored, after, strict=True))
+
+    # A single question on a new short prefix keeps the one plain pass.
+    lengths.clear()
+    other = {"state": "another ticket", "questions": {"angry": angry}}
+    out = _drain(model.run(model.encode(other), lambda: 64))
+    assert len(lengths) == 1 and out["input_tokens"] == lengths[0]
+    assert len(model.prefixes) == 1
+
+    # From SPLIT_PREFIX_TOKENS a single question splits off its prefix and keeps it.
+    monkeypatch.setattr(d1, "SPLIT_PREFIX_TOKENS", 4)
+    out = _drain(model.run(model.encode(other), lambda: 64))
+    assert len(model.prefixes) == 2 and out["cached_tokens"] == 0
+
+    # The backbone is shared by the module's tests; only the model closes.
+    monkeypatch.setattr(model.backbone, "close", lambda: None)
+    model.close()
+    assert len(model.prefixes) == 0 and model.prefixes.nbytes == 0
+
+
+def test_d1_prefix_cache_evicts_by_bytes(tiny_lfm2_backbone):
+    model = _d1_model(tiny_lfm2_backbone)
+    questions = {
+        "a": {"type": "noul", "instructions": "A?"},
+        "b": {"type": "noul", "instructions": "B?"},
+    }
+    plans = [
+        model.encode({"state": f"ticket {i}", "questions": questions}) for i in range(3)
+    ]
+    _drain(model.run(plans[0], lambda: 64))
+    one = model.prefixes.nbytes
+    model.prefixes.max_bytes = 2 * one + one // 2
+    _drain(model.run(plans[1], lambda: 64))
+    model.prefixes.get(model.prefix_key(plans[0]))  # most recently used
+    _drain(model.run(plans[2], lambda: 64))
+    assert model.prefixes.get(model.prefix_key(plans[1])) is None
+    assert model.prefixes.get(model.prefix_key(plans[0])) is not None
+    assert model.prefixes.nbytes <= model.prefixes.max_bytes
+
+    model.prefixes.max_bytes = one - 1
+    model.prefixes.clear()
+    _drain(model.run(plans[0], lambda: 64))
+    assert len(model.prefixes) == 0
