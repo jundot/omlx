@@ -80,10 +80,7 @@ def resolve_block_extra_keys(
 _TAIL_INDEX_PER_PARENT = 8
 _TAIL_INDEX_MAX_PARENTS = 4096
 
-# A tail block enters the index only once its store has finished the SSD
-# write. A lookup landing in that window otherwise misses silently; the
-# announcement makes that miss say "still being written" instead of nothing.
-# The TTL is a backstop for a store that dies without clearing its entry.
+# Backstop for a pending tail whose store died before clearing its entry.
 _PENDING_TAIL_TTL_S = 30.0
 
 
@@ -586,10 +583,8 @@ class PagedCacheManager(CacheManager):
         # than a block, so the grid walk cannot derive its hash.
         self._tail_index: Dict[Optional[BlockHash], "OrderedDict[BlockHash, int]"] = {}
 
-        # Tails an in-flight store has announced but not yet published. Same
-        # shape as _tail_index; values are registration times, pruned by TTL.
-        # An entry is dropped once the real index entry lands (or the store
-        # aborts), so it only marks the store window.
+        # Tails an in-flight store has announced but not yet published; values
+        # are registration times, pruned by _PENDING_TAIL_TTL_S.
         self._pending_tail_index: Dict[
             Optional[BlockHash], "OrderedDict[BlockHash, float]"
         ] = {}
@@ -1223,12 +1218,7 @@ class PagedCacheManager(CacheManager):
         parent_hash: Optional[BlockHash],
         tail_hash: BlockHash,
     ) -> None:
-        """Undo ``register_tail_block`` for a tail that was rejected before commit.
-
-        A tail is indexed the moment its KV is resident in memory, which is
-        before the recurrent checkpoint commits. If that commit then fails the
-        block is deleted, so the index entry must not survive it.
-        """
+        """Undo ``register_tail_block`` for a tail whose commit was rejected."""
         with self._lock:
             tails = self._tail_index.get(parent_hash)
             if not tails:
@@ -1252,12 +1242,7 @@ class PagedCacheManager(CacheManager):
         parent_hash: Optional[BlockHash],
         tail_hash: BlockHash,
     ) -> None:
-        """Announce a tail block whose SSD write is still in flight.
-
-        Registered just before the store reaches its SSD write, so a lookup
-        that lands inside the store window can tell "tail still being written"
-        apart from "no tail was ever written" instead of missing silently.
-        """
+        """Announce a tail whose SSD write is still in flight."""
         with self._lock:
             tails = self._pending_tail_index.setdefault(parent_hash, OrderedDict())
             tails.pop(tail_hash, None)

@@ -1371,8 +1371,7 @@ class GDNCheckpointLookup:
     requested_state_dtype: str
     effective_state_codec: str
     used_legacy_fp32_fallback: bool
-    # Set instead of ``file_path`` when the checkpoint is still staged in
-    # memory (its commit is in flight); the caller restores from it directly.
+    # Set instead of ``file_path`` while the checkpoint's commit is in flight.
     snapshot: list[dict[str, Any]] | None = None
 
 
@@ -1753,10 +1752,11 @@ class PagedSSDCacheManager(CacheManager):
         # promoted into the raw-byte hot cache.  They still consume the same
         # shared SSD budget as the two main block indexes.
         self._gdn_sidecar_index = GDNCheckpointIndex(max_size_bytes)
-        # Recurrent snapshots staged in memory ahead of their durable commit.
-        # A lookup that races that commit resolves the snapshot from here so it
-        # never sees a discoverable tail block without a usable checkpoint.
-        self._pending_gdn_checkpoints: dict[tuple[bytes, str], list[dict[str, Any]]] = {}
+        # Recurrent snapshots staged ahead of their durable commit, so a lookup
+        # racing the commit never sees a tail block without a usable checkpoint.
+        self._pending_gdn_checkpoints: dict[tuple[bytes, str], list[dict[str, Any]]] = (
+            {}
+        )
         self._hot_cache_only = hot_cache_only
         self._expected_model_name = expected_model_name
         self._expected_num_layers = expected_num_layers
@@ -2516,12 +2516,7 @@ class PagedSSDCacheManager(CacheManager):
         cache_signature: str,
         snapshot: list[dict[str, Any]],
     ) -> None:
-        """Stage a recurrent snapshot in memory before its durable commit.
-
-        Publishing this ahead of the source block's tail index keeps the two
-        writes atomic from a reader's view: the block never becomes discoverable
-        before its checkpoint is resolvable.
-        """
+        """Stage a recurrent snapshot in memory before its durable commit."""
         if self._hot_cache_only or self._cache_dir is None:
             return
         if not isinstance(source_block_hash, bytes) or not source_block_hash:
@@ -2740,7 +2735,10 @@ class PagedSSDCacheManager(CacheManager):
         with self._lock:
             for candidate in self._gdn_signature_candidates(cache_signature):
                 signature_digest = self._gdn_signature_digest(candidate)
-                if (source_block_hash, signature_digest) in self._pending_gdn_checkpoints:
+                if (
+                    source_block_hash,
+                    signature_digest,
+                ) in self._pending_gdn_checkpoints:
                     return True
                 metadata = self._gdn_sidecar_index.get(
                     source_block_hash, signature_digest

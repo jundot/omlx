@@ -119,7 +119,9 @@ def test_pending_gdn_checkpoint_resolves_before_commit(tmp_path):
 
         ssd.clear_pending_gdn_checkpoint(block_hash, signature)
         assert not ssd.has_gdn_checkpoint(block_hash, signature)
-        assert ssd.get_gdn_checkpoint_file_with_diagnostic(block_hash, signature) is None
+        assert (
+            ssd.get_gdn_checkpoint_file_with_diagnostic(block_hash, signature) is None
+        )
     finally:
         boundary.shutdown()
         ssd.close()

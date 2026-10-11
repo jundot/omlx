@@ -2056,9 +2056,7 @@ class TestArraysCacheLastBlockOnly:
     def test_store_cache_announces_tail_before_its_write(self, mx):
         """The tail is pending-visible while its store is mid-write.
 
-        A lookup landing after the full block is saved but before the tail's
-        SSD write returns can tell the tail is still coming instead of missing
-        it silently. The announcement is dropped once the store finishes.
+        A lookup landing in that window sees it as still coming, not absent.
         """
         import threading
 
@@ -2118,9 +2116,8 @@ class TestArraysCacheLastBlockOnly:
     def test_tail_indexed_while_recurrent_checkpoint_commits(self, mx):
         """The tail is discoverable during the split-GDN commit that follows it.
 
-        save_block stages the tail's KV in memory before returning, so it is
-        indexed ahead of the recurrent-checkpoint commit. A lookup landing in
-        that gap reads the tail from memory instead of missing it.
+        save_block stages the tail's KV in memory before returning, so a
+        lookup landing in that gap reads it from memory.
         """
         import threading
 

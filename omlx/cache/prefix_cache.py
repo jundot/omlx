@@ -528,9 +528,7 @@ class BlockAwarePrefixCache(CacheManager):
     ) -> str | None:
         """Publish the tail's recurrent snapshot in memory before its commit.
 
-        The tail is indexed as soon as its KV is resident, so its checkpoint
-        must be resolvable in that same window. Returns the signature it was
-        staged under, or None when nothing was staged.
+        Returns the staged signature, or None when nothing was staged.
         """
         stager = getattr(boundary_snapshots, "stage_gdn_checkpoint", None)
         if not callable(stager):
@@ -556,9 +554,7 @@ class BlockAwarePrefixCache(CacheManager):
         """Discard a staged snapshot when its commit is rejected."""
         if cache_signature is None:
             return
-        clearer = getattr(
-            self.paged_ssd_cache, "clear_pending_gdn_checkpoint", None
-        )
+        clearer = getattr(self.paged_ssd_cache, "clear_pending_gdn_checkpoint", None)
         if callable(clearer):
             clearer(block_hash, cache_signature)
 
@@ -621,9 +617,8 @@ class BlockAwarePrefixCache(CacheManager):
     ) -> None:
         """Make a tail discoverable the moment its KV is resident in memory.
 
-        ``save_block`` stages the payload in RAM before returning, so indexing
-        here -- ahead of the recurrent-checkpoint commit -- lets a lookup that
-        lands in that gap read the tail from memory instead of missing it.
+        ``save_block`` stages the payload in RAM before returning, so a lookup
+        landing in the gap before the checkpoint commit reads it from memory.
         """
         self.paged_cache.register_tail_block(parent_hash, block_hash, token_count)
         self.paged_cache.clear_pending_tail_block(parent_hash, block_hash)
@@ -1534,9 +1529,8 @@ class BlockAwarePrefixCache(CacheManager):
                                 per_block.append(layer_meta_states[lidx])
                         block_meta = per_block
 
-                    # Announce the tail before its SSD write starts, so a
-                    # lookup landing in that window reports the tail as still
-                    # being written instead of missing it silently.
+                    # Announce the tail so a lookup racing the SSD write sees it as
+                    # still being written rather than absent.
                     if is_tail_terminal:
                         self.paged_cache.register_pending_tail_block(
                             parent_hash, block.block_hash
@@ -1568,10 +1562,8 @@ class BlockAwarePrefixCache(CacheManager):
                             tail_terminal=is_tail_terminal,
                         )
                     if saved:
-                        # Index the tail now that save_block has staged its KV
-                        # in memory; its recurrent snapshot is staged first, so
-                        # the tail is never discoverable without a resolvable
-                        # checkpoint.
+                        # The KV is staged in memory now; its snapshot is staged first,
+                        # so the tail is never discoverable without a checkpoint.
                         staged_gdn_signature = None
                         if split_gdn_layout and is_tail_terminal:
                             staged_gdn_signature = self._stage_split_gdn_snapshot(
@@ -3643,7 +3635,10 @@ class BlockAwarePrefixCache(CacheManager):
                                 if lookup is not None
                                 else None
                             )
-                            if checkpoint_path is not None or staged_snapshot is not None:
+                            if (
+                                checkpoint_path is not None
+                                or staged_snapshot is not None
+                            ):
                                 lookup_diagnostic = {
                                     "requested_state_dtype": getattr(
                                         lookup, "requested_state_dtype", None
@@ -3665,8 +3660,7 @@ class BlockAwarePrefixCache(CacheManager):
                             break
                         dequantizations_before = self._gdn_dequantization_count()
                         if staged_snapshot is not None:
-                            # Commit still in flight: the checkpoint is staged in
-                            # memory, so restore from it instead of failing closed.
+                            # Commit in flight: restore from the staged snapshot.
                             snapshot = staged_snapshot
                             load_latency_ms = 0.0
                         else:

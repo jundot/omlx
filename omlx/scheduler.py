@@ -1829,9 +1829,7 @@ class _BoundarySnapshotProvider:
     ) -> str | None:
         """Stage one recurrent snapshot in memory ahead of its durable commit.
 
-        ``store_cache`` indexes the tail as soon as its KV is resident, so the
-        checkpoint must be resolvable in that same window. Returns the staged
-        signature, or None when nothing was staged.
+        Returns the staged signature, or None when nothing was staged.
         """
         if self._store is None or self._paged_ssd_manager is None:
             return None
