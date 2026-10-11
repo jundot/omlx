@@ -3,7 +3,7 @@
 Pydantic models for the TypeSafe System One API.
 
 These models define the request schema for:
-- /v1/systemone endpoint (decision models such as Clef and OpenJev)
+- /v1/systemone endpoint (decision models such as Clef, OpenJev and d1)
 
 Each decision model applies its own rules to ``instructions`` and
 ``criteria``; this schema only checks the shared shape.

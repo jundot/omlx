@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the decision models behind /v1/systemone (Clef and OpenJev)."""
+"""Tests for the decision models behind /v1/systemone (Clef, OpenJev and d1)."""
 
 import copy
 import json
@@ -14,7 +14,7 @@ mx = pytest.importorskip("mlx.core")
 import mlx.nn as nn  # noqa: E402
 from mlx.utils import tree_flatten  # noqa: E402
 
-from omlx.models import clef, openjev  # noqa: E402
+from omlx.models import clef, d1, openjev  # noqa: E402
 from omlx.models.decision import (  # noqa: E402
     DecisionBackbone,
     DecisionContextLengthError,
@@ -489,3 +489,259 @@ def test_lm_head_rows_are_dequantized():
     expected = linear.weight[mx.array([3, 7])]
     assert rows.shape == (2, 64)
     assert np.allclose(np.array(rows), np.array(expected), atol=2e-2)
+
+
+# --------------------------------------------------------------------------
+# d1 prompt, readout and shared prefix
+
+_D1_WORDS = {"yes": 300, "Yes": 301, "no": 302, "No": 303, " A": 304, " B": 305}
+
+
+class _D1Tokenizer:
+    """Characters, plus a few words that are one token as in the d1 vocabulary."""
+
+    bos_token = "<|startoftext|>"
+
+    def encode(self, text, add_special_tokens=False):
+        if text in _D1_WORDS:
+            return [_D1_WORDS[text]]
+        return [ord(c) % 250 + 1 for c in text]
+
+
+def _d1_model(backbone=None) -> d1.D1Model:
+    model = d1.D1Model("unused")
+    if backbone is not None:
+        model.backbone = backbone
+    model.backbone.tokenizer = _D1Tokenizer()
+    model._bos = _D1Tokenizer.bos_token
+    return model
+
+
+def _d1_text(model, request) -> list[str]:
+    plan = model.encode(request)
+    return [plan.prefix + item.suffix for item in plan.items]
+
+
+def test_d1_prompt_layout_matches_release():
+    # Expected texts are the release prompt.py renderings used for the d1 study.
+    model = _d1_model()
+    state = {
+        "message": "My package arrived with a broken screen. Please send a replacement.",
+        "order_status": "delivered",
+        "warranty": "active",
+    }
+    choice = {
+        "type": "choice",
+        "instructions": "Route this support request.",
+        "criteria": {
+            "refund": "return the customer's payment",
+            "replacement": "send a replacement device",
+            "technical support": "help troubleshoot the device",
+        },
+    }
+    assert _d1_text(model, {"state": state, "questions": {"q": choice}}) == [
+        "<|startoftext|><|im_start|>user\n{\n"
+        '  "message": "My package arrived with a broken screen. Please send a '
+        'replacement.",\n  "order_status": "delivered",\n  "warranty": "active"\n'
+        "}\n\n\nQUESTION:\nRoute this support request.\n\nOptions:\n"
+        "A return the customer's payment\nB send a replacement device\n"
+        "C help troubleshoot the device\n\nReply with the option code only."
+        "<|im_end|>\n<|im_start|>assistant\n"
+    ]
+    noul = {
+        "type": "noul",
+        "instructions": "Does this task require disclosure of private customer data?",
+    }
+    assert _d1_text(model, {"state": "plain text", "questions": {"q": noul}}) == [
+        "<|startoftext|><|im_start|>user\nplain text\n\n\nQUESTION:\n"
+        "Does this task require disclosure of private customer data?\n\n"
+        "Reply with yes or no only.<|im_end|>\n<|im_start|>assistant\n"
+    ]
+    score = {
+        "type": "score",
+        "instructions": "Rate the urgency.",
+        "criteria": ["low", "high", 3],
+    }
+    noul_criteria = {**noul, "criteria": {"true": "it does", "false": None}}
+    texts = _d1_text(
+        model, {"state": [1, 2], "questions": {"s": score, "n": noul_criteria}}
+    )
+    prefix = "<|startoftext|><|im_start|>user\n[\n  1,\n  2\n]\n\n\nQUESTION:\n"
+    assert texts == [
+        prefix + "Rate the urgency.\n\n0 low\n1 high\n2 3\n\n"
+        "Reply with a single digit 0-2 only.<|im_end|>\n<|im_start|>assistant\n",
+        prefix + "Does this task require disclosure of private customer data?\n"
+        "Yes: it does\nNo: None\n\nReply with yes or no only."
+        "<|im_end|>\n<|im_start|>assistant\n",
+    ]
+
+
+def test_d1_option_tokens_and_codes():
+    model = _d1_model()
+    choice = {
+        "type": "choice",
+        "instructions": "Pick.",
+        "criteria": {"x_y": None, "z": None},
+    }
+    item = model.encode({"state": "s", "questions": {"q": choice}}).items[0]
+    assert "A x y\nB z" in item.suffix
+    # Each option scores its bare code and its spaced code when that is one token.
+    assert item.groups == [[ord("A") % 250 + 1, 304], [ord("B") % 250 + 1, 305]]
+    noul = model.encode(
+        {"state": "s", "questions": {"q": {"type": "noul", "instructions": "?"}}}
+    ).items[0]
+    assert noul.groups == [[300, 301], [302, 303]]
+
+    assert d1.option_codes(["b", "a"]) == ["b", "a"]
+    assert d1.option_codes(["one", "two"]) == ["A", "B"]
+    assert d1.option_codes([str(i) for i in range(30)])[:2] == ["00", "01"]
+    # Two-character codes are not one token here, so the fallback pool fills in.
+    many = {
+        "type": "choice",
+        "instructions": "Pick.",
+        "criteria": {f"o{i}": None for i in range(30)},
+    }
+    item = model.encode({"state": "s", "questions": {"q": many}}).items[0]
+    firsts = [group[0] for group in item.groups]
+    assert len(set(firsts)) == 30
+    assert item.suffix.split("Options:\n")[1].startswith("A o0\nB o1\n")
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        {"type": "noul"},
+        {"type": "choice", "instructions": "x", "criteria": ["a", "b"]},
+        {"type": "score", "instructions": "x", "criteria": ["only"]},
+        {"type": "noul", "instructions": "x", "criteria": ["a"]},
+    ],
+)
+def test_d1_rejects_malformed_questions(question):
+    with pytest.raises(DecisionRequestError):
+        _d1_model().encode({"state": "s", "questions": {"q": question}})
+
+
+def test_d1_rejects_images_and_long_prompts():
+    model = _d1_model()
+    question = {"q": {"type": "noul", "instructions": "x"}}
+    with pytest.raises(DecisionRequestError):
+        model.encode({"state": "s", "questions": question, "images": ["data:"]})
+    model.backbone.config = {"text_config": {"max_position_embeddings": 64}}
+    with pytest.raises(DecisionContextLengthError):
+        model.encode({"state": "s" * 80, "questions": question})
+
+
+def test_d1_readout_and_answer_format():
+    model = _d1_model()
+    item = d1._Question("q", "choice", ["a", "b", "c"], [], "", [[0, 1], [2], [3]])
+    rows = mx.eye(4, 2)
+    model.backbone.output_rows = lambda ids: rows[ids]
+    # Logits per token: [1, 0, 0, 0] @ hidden; option a takes its best token.
+    probs = model._probs(item, mx.array([2.0, 5.0]))
+    expected = np.exp([5.0, 0.0, 0.0]) / np.exp([5.0, 0.0, 0.0]).sum()
+    assert np.allclose(probs, expected)
+    answer = model._answer(item, probs)
+    assert answer["choice"] == "a"
+    assert answer["confidence"] == round(expected[0], 4)
+    assert list(answer["probabilities"]) == ["a", "b", "c"]
+
+    score = d1._Question("s", "score", ["0", "1"], ["low", "high"], "", [[0], [1]])
+    assert model._answer(score, [0.25, 0.75]) == {
+        "type": "score",
+        "score": 0.75,
+        "confidence": 0.75,
+        "probabilities": {"0": 0.25, "1": 0.75},
+        "legend": {"0": "low", "1": "high"},
+    }
+    noul = d1._Question("n", "noul", ["yes", "no"], [], "", [[0], [1]])
+    assert model._answer(noul, [0.3, 0.7]) == {"type": "noul", "noul": 0.3}
+
+
+_LFM2_CONFIG = {
+    "model_type": "lfm2",
+    "hidden_size": 64,
+    "num_hidden_layers": 4,
+    "intermediate_size": 128,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "num_heads": 4,
+    "vocab_size": 320,
+    "max_position_embeddings": 4096,
+    "block_dim": 64,
+    "block_auto_adjust_ff_dim": False,
+    "conv_dim": 64,
+    "conv_dim_out": 64,
+    "layer_types": ["conv", "full_attention", "conv", "full_attention"],
+}
+
+
+@pytest.fixture(scope="module")
+def tiny_lfm2_backbone():
+    from mlx_vlm.models.lfm2_vl.config import TextConfig
+    from mlx_vlm.models.lfm2_vl.language import LanguageModel
+
+    mx.random.seed(4)
+    language_model = LanguageModel(TextConfig.from_dict(_LFM2_CONFIG))
+    mx.eval(language_model.parameters())
+    backbone = d1.Lfm2DecisionBackbone("tiny-lfm2")
+    backbone.model = SimpleNamespace(language_model=language_model)
+    backbone.config = {"text_config": _LFM2_CONFIG}
+    backbone._text_model = language_model.model
+    backbone._lm_head = language_model.model.embed_tokens
+    return backbone
+
+
+def test_d1_backbone_matches_lfm2_logits(tiny_lfm2_backbone):
+    backbone = tiny_lfm2_backbone
+    ids = np.arange(5, 25, dtype=np.int32)
+    embeds, positions = backbone.embed(ids)
+    hidden = _drain(
+        backbone.prefill(
+            ids, embeds, positions, backbone.make_cache(), lambda: 7, keep_all=False
+        )
+    )
+    expected = backbone.model.language_model(mx.array(ids)[None]).logits[0, -1]
+    assert np.allclose(np.array(backbone.logits(hidden)), np.array(expected), atol=1e-4)
+
+
+def test_d1_shared_prefix_matches_each_question_alone(tiny_lfm2_backbone):
+    model = _d1_model(tiny_lfm2_backbone)
+    questions = {
+        "team": {
+            "type": "choice",
+            "instructions": "Which team?",
+            "criteria": {
+                "billing": "charges and refunds",
+                "support": None,
+                "sales": None,
+            },
+        },
+        "angry": {"type": "noul", "instructions": "Is the customer angry?"},
+        "urgency": {
+            "type": "score",
+            "instructions": "How urgent?",
+            "criteria": ["later", "today", "now"],
+        },
+    }
+    state = {"ticket": "charged twice, nobody replied"}
+    plan = model.encode({"state": state, "questions": questions})
+    shared = _drain(model.run(plan, lambda: 16))
+    tokens = len(model.backbone.tokenize(plan.prefix))
+    tokens += sum(len(model.backbone.tokenize(item.suffix)) for item in plan.items)
+    assert shared["input_tokens"] == tokens
+    for key, question in questions.items():
+        alone = _drain(
+            model.run(
+                model.encode({"state": state, "questions": {key: question}}), lambda: 16
+            )
+        )["answers"][key]
+        if key == "angry":
+            assert shared["answers"][key]["noul"] == pytest.approx(
+                alone["noul"], abs=2e-4
+            )
+        else:
+            a = shared["answers"][key]["probabilities"]
+            b = alone["probabilities"]
+            assert list(a) == list(b)
+            assert np.allclose(list(a.values()), list(b.values()), atol=2e-4)
+    json.dumps(shared)

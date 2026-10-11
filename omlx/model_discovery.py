@@ -12,7 +12,7 @@ Supports:
 - Reranker models: Use RerankerEngine for document reranking
 - Audio STT models: Use STTEngine for speech-to-text (Whisper, Qwen3-ASR, ...)
 - Audio TTS models: Use TTSEngine for text-to-speech (Qwen3-TTS, Kokoro, ...)
-- Decision models: Use DecisionEngine for /v1/systemone (Clef, OpenJev)
+- Decision models: Use DecisionEngine for /v1/systemone (Clef, OpenJev, d1)
 """
 
 import contextlib
@@ -32,7 +32,7 @@ ModelType = Literal[
 EngineType = Literal[
     "batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "decision"
 ]
-DecisionKind = Literal["clef", "openjev"]
+DecisionKind = Literal["clef", "openjev", "d1"]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -468,7 +468,9 @@ def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind 
 
     Clef is identified by its joint head files. OpenJev is a plain Qwen3.5
     checkpoint, so it is identified by its helper directory or, for MLX
-    conversions without the helper, by the directory name.
+    conversions without the helper, by the directory name. d1 is an LFM2-VL
+    checkpoint whose ``auto_map`` names the release's ``modeling_d1`` class,
+    or, for conversions that dropped it, a ``d1`` directory name.
     """
     if (model_path / CLEF_HEAD_WEIGHTS).is_file() and (
         model_path / CLEF_HEAD_CONFIG
@@ -480,6 +482,13 @@ def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind 
                 config = json.load(f)
         except (OSError, ValueError):
             return None
+    if config.get("model_type") == "lfm2_vl":
+        auto_map = config.get("auto_map") or {}
+        if any(str(v).startswith("modeling_d1.") for v in auto_map.values()):
+            return "d1"
+        if re.search(r"(^|[-_.])d1([-_.]|$)", _model_name_hint(model_path)):
+            return "d1"
+        return None
     if config.get("model_type") != "qwen3_5":
         return None
     if (model_path / _OPENJEV_HELPER).is_file() or "openjev" in _model_name_hint(
