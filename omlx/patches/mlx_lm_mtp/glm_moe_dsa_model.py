@@ -358,11 +358,24 @@ def _patch_model(glm: Any) -> None:
             self._omlx_mtp_depth = get_mtp_depth()
             self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
             self._omlx_mtp_head_clone = False
-            # Marginal cost prior for the adaptive depth controller: with
-            # 8-of-256 routing each extra verify row pulls an almost
-            # disjoint expert set (~55% of step bytes), measured ~35 ms
-            # per row on GLM-5.2 vs the dense-backbone 7 ms default.
-            self._omlx_mtp_marginal_ms = 35.0
+            # Marginal cost prior for the adaptive depth controller.
+            #
+            # The 35 ms figure was measured on GLM-5.2 (8-of-256 routing,
+            # bf16): each extra verify row pulled a nearly disjoint expert
+            # set, ~55% of step bytes. GLM-5.3 Flash quantized to oQ4e
+            # (8-of-288, 45 layers) behaves differently: on an M3 Ultra
+            # 512GB the measured backbone cost per cycle *drops* as the
+            # controller drafts deeper (52 ms at tok/cycle<1.8 vs 26 ms at
+            # >=2.3 over ~250 MTP sessions), because accepted drafts reuse
+            # the same KV pages and expert routing overlaps across chained
+            # rows. With the 35 ms prior the controller parks at depth<=3;
+            # with the dense-backbone default it probes deeper and holds
+            # higher tok/cycle under sustained load.
+            #
+            # A principled follow-up would key this prior on quantization
+            # config + expert count; for now prefer the measured-slope
+            # fallback (dense default) over a stale bf16 measurement.
+            self._omlx_mtp_marginal_ms = 7.0
 
     def __call__(
         self,
