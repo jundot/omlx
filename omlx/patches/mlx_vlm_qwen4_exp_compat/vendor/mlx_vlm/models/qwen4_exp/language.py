@@ -1144,6 +1144,9 @@ class BatchQSAKVCache:
         cache = QSAKVCache()
         base = self.kv_cache.extract(idx)
         cache.keys, cache.values, cache.offset = base.keys, base.values, base.offset
+        # Caller-sized copy, as in QSAKVCache.extract: its first append rounds
+        # to one step instead of doubling the row.
+        cache._geometric_capacity_managed = False
         if self.index_keys is not None:
             padding = int(self.left_padding[idx].item())
             cache.index_keys = mx.contiguous(

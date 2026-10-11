@@ -91,6 +91,14 @@ class _ExactIndexer:
             )
 
 
+def test_batch_extract_rounds_first_append_to_one_step():
+    length = 5000  # 2 * length > one 8192 step, so doubling would show
+    batch = BatchQSAKVCache.merge([_row(length, 1), _row(length - 3, 11)])
+    row = batch.extract(0)
+    row.update_and_fetch(_rnd((1, H, 1, D), 21), _rnd((1, H, 1, D), 22))
+    assert row.keys.shape[2] <= 8192  # was max(8192, 2 * 5000)
+
+
 @pytest.mark.parametrize("mrope", [False, True])
 def test_indexer_capacity_matches_concatenate_bit_for_bit(mrope):
     rng = random.Random(7)
