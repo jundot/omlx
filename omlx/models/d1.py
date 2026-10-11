@@ -9,13 +9,15 @@ assistant header), and the answer is a softmax over each option's best token
 logit at the answer slot. d1 ships no calibration, so the probabilities are
 returned as read.
 
-Several questions over one state share the prefix: it is prefilled once and
-each question continues from a copy of that cache, which is the release
-runner's trunk-and-branches pass, one branch at a time. A single question is
-one plain pass over the whole prompt, as the runner does.
+Several questions over one state share the prefix, as in the release runner's
+trunk-and-branches pass: the prefix is prefilled once, then the questions run
+together as one right-padded batch that continues from the prefix cache. The
+release packs its branches without padding under a tree mask; padding after a
+row's last token cannot reach that token, so each row reads what it would
+alone. A single question is one plain pass over the whole prompt, as the
+runner does.
 """
 
-import copy
 import json
 import math
 from collections.abc import Generator
@@ -32,6 +34,10 @@ from .decision import (
     DecisionRequestError,
     round4,
 )
+
+# Prefix tokens repeated across one batch of questions: each row of a batch
+# holds its own copy of the prefix's attention cache while it runs.
+BRANCH_PREFIX_TOKENS = 32768
 
 IM_START = "<|im_start|>"
 IM_END = "<|im_end|>"
@@ -88,6 +94,51 @@ class Lfm2DecisionBackbone(DecisionBackbone):
         cache: list,
     ) -> mx.array:
         return self._text_model(tokens, cache=cache, input_embeddings=embeds)
+
+    @staticmethod
+    def branch_caches(cache: list, rows: int) -> list:
+        """Fresh caches that continue ``cache`` for ``rows`` rows.
+
+        The prefix arrays are broadcast, not copied; the layers write new
+        arrays into the new caches, so ``cache`` itself is never changed.
+        """
+        out = []
+        for layer in cache:
+            if hasattr(layer, "keys"):  # KVCache
+                fresh = type(layer)()
+                keys, values = layer.state
+                fresh.state = (
+                    mx.broadcast_to(keys, (rows, *keys.shape[1:])),
+                    mx.broadcast_to(values, (rows, *values.shape[1:])),
+                )
+            else:  # ArraysCache: the conv layers' recent inputs
+                fresh = type(layer)(len(layer.cache))
+                fresh.cache = [
+                    None if a is None else mx.broadcast_to(a, (rows, *a.shape[1:]))
+                    for a in layer.cache
+                ]
+            out.append(fresh)
+        return out
+
+    def prefill_branches(self, cache: list, rows: list[np.ndarray]) -> mx.array:
+        """Run ``rows`` as one right-padded batch after ``cache``.
+
+        Returns each row's hidden state at its last token, ``[len(rows), D]``.
+        """
+        width = max(len(r) for r in rows)
+        tokens = np.zeros((len(rows), width), dtype=np.int32)
+        for i, r in enumerate(rows):
+            tokens[i, : len(r)] = r
+        tokens = mx.array(tokens)
+        hidden = self._forward(
+            tokens,
+            self._text_model.embed_tokens(tokens),
+            None,
+            self.branch_caches(cache, len(rows)),
+        )
+        last = hidden[mx.arange(len(rows)), mx.array([len(r) - 1 for r in rows])]
+        mx.eval(last)
+        return last
 
 
 def option_codes(labels: list[str]) -> list[str]:
@@ -295,16 +346,61 @@ class D1Model:
         trunk = np.asarray(backbone.tokenize(plan.prefix), dtype=np.int32)
         trunk_cache = backbone.make_cache()
         yield from self._prefill(trunk, trunk_cache, chunk_size)
-        input_tokens = len(trunk)
-        for item in plan.items:
-            branch = np.asarray(backbone.tokenize(item.suffix), dtype=np.int32)
-            # Caches update in place; each question continues from its own copy.
-            hidden = yield from self._prefill(
-                branch, copy.deepcopy(trunk_cache), chunk_size
-            )
-            answers[item.question_id] = self._answer(item, self._probs(item, hidden))
-            input_tokens += len(branch)
+        branches = [
+            np.asarray(backbone.tokenize(item.suffix), dtype=np.int32)
+            for item in plan.items
+        ]
+        hidden = yield from self._branches(
+            trunk_cache, len(trunk), branches, chunk_size
+        )
+        for item, h in zip(plan.items, hidden, strict=True):
+            answers[item.question_id] = self._answer(item, self._probs(item, h))
+        input_tokens = len(trunk) + sum(len(b) for b in branches)
         return {"answers": answers, "input_tokens": int(input_tokens)}
+
+    def _branches(
+        self,
+        trunk_cache: list,
+        trunk_len: int,
+        branches: list[np.ndarray],
+        chunk_size: ChunkSize,
+    ) -> Generator[int, None, list[mx.array]]:
+        """Each branch's last hidden state after the prefix, in request order.
+
+        Branches are grouped shortest first, so a batch pads little, and a
+        batch stays within one prefill chunk and ``BRANCH_PREFIX_TOKENS``. A
+        branch that fills a chunk alone is prefilled chunk by chunk.
+        """
+        order = sorted(range(len(branches)), key=lambda i: len(branches[i]))
+        hidden: list[mx.array | None] = [None] * len(branches)
+        start = 0
+        while start < len(order):
+            limit = max(1, chunk_size())
+            group = [order[start]]
+            for i in order[start + 1 :]:
+                rows = len(group) + 1
+                if (
+                    rows * len(branches[i]) > limit
+                    or rows * trunk_len > BRANCH_PREFIX_TOKENS
+                ):
+                    break
+                group.append(i)
+            if len(group) == 1:
+                i = group[0]
+                hidden[i] = yield from self._prefill(
+                    branches[i],
+                    self.backbone.branch_caches(trunk_cache, 1),
+                    chunk_size,
+                )
+            else:
+                out = self.backbone.prefill_branches(
+                    trunk_cache, [branches[i] for i in group]
+                )
+                for row, i in enumerate(group):
+                    hidden[i] = out[row]
+                yield sum(len(branches[i]) for i in group)
+            start += len(group)
+        return hidden
 
     def _prefill(
         self, ids: np.ndarray, cache: list, chunk_size: ChunkSize

@@ -745,3 +745,40 @@ def test_d1_shared_prefix_matches_each_question_alone(tiny_lfm2_backbone):
             assert list(a) == list(b)
             assert np.allclose(list(a.values()), list(b.values()), atol=2e-4)
     json.dumps(shared)
+
+
+def _cache_arrays(cache) -> list[np.ndarray]:
+    return [np.array(a) for c in cache for _, a in tree_flatten(c.state)]
+
+
+def test_d1_batched_branches_match_one_at_a_time(tiny_lfm2_backbone):
+    backbone = tiny_lfm2_backbone
+    model = _d1_model(backbone)
+    trunk = np.arange(5, 40, dtype=np.int32)
+    trunk_cache = backbone.make_cache()
+    _drain(model._prefill(trunk, trunk_cache, lambda: 16))
+    before = _cache_arrays(trunk_cache)
+    branches = [np.arange(50, 50 + n, dtype=np.int32) for n in (9, 3, 6, 6, 1)]
+
+    expected = []
+    for b in branches:
+        expected.append(
+            _drain(model._prefill(b, copy.deepcopy(trunk_cache), lambda: 16))
+        )
+    sizes = []
+
+    def chunk():
+        return 12  # groups: [1, 3], [6, 6], [9]
+
+    steps = model._branches(trunk_cache, len(trunk), branches, chunk)
+    while True:
+        try:
+            sizes.append(next(steps))
+        except StopIteration as stop:
+            hidden = stop.value
+            break
+    assert sizes == [4, 12, 9]
+    for h, e in zip(hidden, expected, strict=True):
+        assert np.allclose(np.array(h), np.array(e), atol=1e-5)
+    after = _cache_arrays(trunk_cache)
+    assert all(np.array_equal(x, y) for x, y in zip(before, after, strict=True))
