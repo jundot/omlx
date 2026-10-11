@@ -1124,6 +1124,23 @@ class TestPagedCacheManager:
             assert manager.has_pending_tail_block(None) is False
         assert None not in manager._pending_tail_index
 
+    def test_unregister_tail_block_drops_entry(self):
+        """A tail indexed before its commit must be removable if rejected."""
+        manager = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model", initial_blocks=100
+        )
+        parent = compute_block_hash(None, [1, 2, 3, 4], model_name="test-model")
+        tail_hash = compute_block_hash(parent, [5, 6], model_name="test-model")
+
+        manager.register_tail_block(parent, tail_hash, 2)
+        assert manager._tail_index[parent][tail_hash] == 2
+
+        manager.unregister_tail_block(parent, tail_hash)
+        assert parent not in manager._tail_index
+
+        # Removing an already-gone entry is a no-op, not an error.
+        manager.unregister_tail_block(parent, tail_hash)
+
     def test_match_tail_block_logs_pending_vs_absent(self, caplog):
         """A tail miss names its parent and flags an in-flight store."""
         manager = PagedCacheManager(

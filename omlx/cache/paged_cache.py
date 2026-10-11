@@ -1218,6 +1218,25 @@ class PagedCacheManager(CacheManager):
             while len(tails) > _TAIL_INDEX_PER_PARENT:
                 tails.popitem(last=False)
 
+    def unregister_tail_block(
+        self,
+        parent_hash: Optional[BlockHash],
+        tail_hash: BlockHash,
+    ) -> None:
+        """Undo ``register_tail_block`` for a tail that was rejected before commit.
+
+        A tail is indexed the moment its KV is resident in memory, which is
+        before the recurrent checkpoint commits. If that commit then fails the
+        block is deleted, so the index entry must not survive it.
+        """
+        with self._lock:
+            tails = self._tail_index.get(parent_hash)
+            if not tails:
+                return
+            tails.pop(tail_hash, None)
+            if not tails:
+                self._tail_index.pop(parent_hash, None)
+
     def seed_tail_blocks(
         self, entries: Iterable[Tuple[Optional[BlockHash], BlockHash, int]]
     ) -> int:

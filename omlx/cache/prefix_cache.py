@@ -570,6 +570,31 @@ class BlockAwarePrefixCache(CacheManager):
             )
             return False
 
+    def _index_tail_block(
+        self,
+        parent_hash: bytes | None,
+        block_hash: bytes,
+        token_count: int,
+    ) -> None:
+        """Make a tail discoverable the moment its KV is resident in memory.
+
+        ``save_block`` stages the payload in RAM before returning, so indexing
+        here -- ahead of the recurrent-checkpoint commit -- lets a lookup that
+        lands in that gap read the tail from memory instead of missing it.
+        """
+        self.paged_cache.register_tail_block(parent_hash, block_hash, token_count)
+        self.paged_cache.clear_pending_tail_block(parent_hash, block_hash)
+        self._tail_hashes.add(block_hash)
+        if len(self._tail_hashes) > _TIP_LINEAGE_MAX_ENTRIES:
+            self._tail_hashes.clear()
+        self._tail_blocks_stored += 1
+
+    def _unindex_tail_block(self, parent_hash: bytes | None, block_hash: bytes) -> None:
+        """Undo ``_index_tail_block`` for a store rejected before its commit."""
+        self.paged_cache.unregister_tail_block(parent_hash, block_hash)
+        self._tail_hashes.discard(block_hash)
+        self._tail_blocks_stored -= 1
+
     def _get_model_num_layers(self, model: Any) -> int:
         """
         Get the expected number of *cache layers* for validation.
@@ -1500,6 +1525,14 @@ class BlockAwarePrefixCache(CacheManager):
                             tail_terminal=is_tail_terminal,
                         )
                     if saved:
+                        # Index the tail now: save_block already staged its KV in
+                        # memory, so waiting for the recurrent-checkpoint commit
+                        # below would leave it readable but undiscoverable.
+                        if is_tail_terminal:
+                            self._index_tail_block(
+                                parent_hash, block.block_hash, len(block_tokens)
+                            )
+                            tail_in_table = True
                         if split_gdn_layout:
                             if is_exact_split_block:
                                 checkpoint_committed = (
@@ -1558,6 +1591,11 @@ class BlockAwarePrefixCache(CacheManager):
                                                 "block %s",
                                                 block.block_id,
                                             )
+                                if is_tail_terminal:
+                                    self._unindex_tail_block(
+                                        parent_hash, block.block_hash
+                                    )
+                                    tail_in_table = False
                                 self.paged_cache.free_block(block.block_id)
                                 block_table.block_ids.pop()
                                 block_table.num_tokens -= len(block_tokens)
@@ -1565,18 +1603,6 @@ class BlockAwarePrefixCache(CacheManager):
                         blocks_saved_to_ssd += 1
                         if is_last_block:
                             tip_block_saved = True
-                        if is_tail_terminal:
-                            self.paged_cache.register_tail_block(
-                                parent_hash, block.block_hash, len(block_tokens)
-                            )
-                            self.paged_cache.clear_pending_tail_block(
-                                parent_hash, block.block_hash
-                            )
-                            self._tail_hashes.add(block.block_hash)
-                            if len(self._tail_hashes) > _TIP_LINEAGE_MAX_ENTRIES:
-                                self._tail_hashes.clear()
-                            self._tail_blocks_stored += 1
-                            tail_in_table = True
                         logger.debug(
                             f"Saved block {block.block_id} to tiered cache: "
                             f"tokens [{global_start}:{global_end}], {len(block_kv_data)} layers"
