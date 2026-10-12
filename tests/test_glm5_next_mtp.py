@@ -1417,10 +1417,12 @@ def test_fused_verify_cycles_are_bitwise_reference(seed, kda):
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
-def test_fused_verify_cycles_with_sparse_selection_are_bitwise_reference():
+def test_fused_verify_cycles_with_sparse_selection_are_bitwise_reference(monkeypatch):
     """Past index_topk the sparse layers select (indexer + pooling undo)."""
     if not _native_indexer_available():
         pytest.skip("GLM DSA native indexer extension is not built")
+    # Preserve the original scorer's bitwise-reference contract.
+    monkeypatch.setattr(language, "_SMALL_QUERY_INDEXER", False)
     used = check_verify_matches_reference(
         29, 2101, _CYCLES[:10], KDA_BITS["8-bit/5-bit"]
     )

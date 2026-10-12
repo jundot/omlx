@@ -2952,6 +2952,8 @@ def test_nax_sparse_mla_short_verify_avoids_gather(monkeypatch, length, bits):
     from mlx_lm.models.cache import KVCache, PoolingCache
     from mlx_vlm.models.glm5_next import language
 
+    # This checks the existing NAX attention route independently of small scoring.
+    monkeypatch.setattr(language, "_SMALL_QUERY_INDEXER", False)
     attn = _make_sparse_attention(head_dim=32)
     if bits is not None:
         nn.quantize(attn, group_size=32, bits=bits)
@@ -3940,9 +3942,11 @@ _CORE_FUSED = {"hc_mix", "kda", "moe_gate_up", "moe_down"}
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
-def test_small_model_decode_and_verify_logits_are_bitwise_reference():
+def test_small_model_decode_and_verify_logits_are_bitwise_reference(monkeypatch):
     if not _native_indexer_available():
         pytest.skip("GLM DSA native indexer extension is not built")
+    # Retain bitwise assertions for the original scorer and attention kernels.
+    monkeypatch.setattr(_language(), "_SMALL_QUERY_INDEXER", False)
     used = _check_small_model()
     assert _CORE_FUSED | {"dsa_gather"} <= used, used
 
