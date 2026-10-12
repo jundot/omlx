@@ -50,6 +50,11 @@ from .small_indexer import (
     expand_windows,
     native_topk_required,
 )
+from .sparse_mla_decode import (
+    sparse_mla_decode,
+    sparse_mla_decode_batched,
+    supports_sparse_mla_mask,
+)
 
 logger = logging.getLogger(__name__)
 _NATIVE_INDEXER_WARNED = False
@@ -78,6 +83,7 @@ _DECODE_BLOCK = DECODE_BLOCK_SIZE
 # the prefill scorer and existing attention dispatch.
 _SMALL_QUERY_VERIFY_ROWS = _DECODE_BLOCK
 _SMALL_QUERY_INDEXER = True
+_DSA_DECODE_FUSED = True
 # Native prefill scoring uses a 64-query/key matrix tile.
 _NATIVE_INDEXER_MATRIX_TILE_ROWS = 64
 # The native radix selector handles exactly this many pooled windows.
@@ -1447,6 +1453,66 @@ class Glm5NextSparseAttention(nn.Module):
             and nax_sparse_mla_available()
         )
 
+    def _decode_fused(
+        self, q, kv_latent, cache, windows, before, n_pool, q_latent=None, mask=None
+    ):
+        """Decode/verify attention over top-k windows in two kernels."""
+        batch_size, heads, query_rows, _ = q.shape
+        if q_latent is None:
+            q_latent = self.embed_q(q)
+        out = sparse_mla_decode(
+            q_latent.astype(kv_latent.dtype),
+            kv_latent,
+            windows,
+            before,
+            n_pool,
+            self.scale,
+            mask=mask,
+        )
+        if cache[1].pooled is not None:
+            deps = tuple(v for v in cache[1].state if isinstance(v, mx.array))
+            if deps:
+                cache[0].keys = mx.depends(cache[0].keys, deps)
+        out = self.unembed_out(out)
+        return self._finish(
+            out.transpose(0, 2, 1, 3).reshape(batch_size, query_rows, -1), None
+        )
+
+    def _decode_fused_batched(
+        self, q, kv_latent, cache, windows, rows, q_latent=None, mask=None
+    ):
+        """Batched decode/verify attention over each row's top-k windows."""
+        batch_size, heads, query_rows, _ = q.shape
+        if q_latent is None:
+            q_latent = self.embed_q(q)
+        kv_length = kv_latent.shape[2]
+        kv_buf = cache[0].keys
+        if not (
+            kv_buf.ndim == 4
+            and kv_buf.shape[:2] == (batch_size, 1)
+            and kv_buf.shape[2] >= kv_length
+            and kv_buf.shape[3] == kv_latent.shape[3]
+            and kv_buf.dtype == kv_latent.dtype
+        ):
+            kv_buf = kv_latent
+        out = sparse_mla_decode_batched(
+            q_latent.astype(kv_latent.dtype),
+            kv_buf,
+            kv_length,
+            windows,
+            rows,
+            self.scale,
+            mask=mask,
+        )
+        if cache[1].pooled is not None:
+            deps = tuple(v for v in cache[1].state if isinstance(v, mx.array))
+            if deps:
+                cache[0].keys = mx.depends(cache[0].keys, deps)
+        out = self.unembed_out(out)
+        return self._finish(
+            out.transpose(0, 2, 1, 3).reshape(batch_size, query_rows, -1), None
+        )
+
     def _finish(self, flat, out_dense):
         if out_dense is not None:
             flat = mx.concatenate([out_dense, flat], axis=1)
@@ -1510,6 +1576,11 @@ class Glm5NextSparseAttention(nn.Module):
         else:
             cache = [None] * 2
 
+        split_k_inputs_ok = (
+            _DSA_DECODE_FUSED
+            and kv_latent.dtype in (mx.float16, mx.bfloat16)
+            and supports_sparse_mla_mask(mask, B, L, kv_latent.shape[2])
+        )
         scalar_small = self._decode_fused_ok(B, L, dense_rows, cache, q)
         batch_small = not scalar_small and self._batched_fused_ok(
             B, L, dense_rows, cache, q
@@ -1551,6 +1622,17 @@ class Glm5NextSparseAttention(nn.Module):
             )
             if picked is not None:
                 windows, before, plen = picked
+                if split_k_inputs_ok:
+                    return self._decode_fused(
+                        q,
+                        kv_latent,
+                        cache,
+                        windows,
+                        before,
+                        plen,
+                        q_latent=q_latent_early,
+                        mask=mask,
+                    )
                 topk_indices = expand_windows(self.indexer, windows[None], before, plen)
             else:
                 # The pool advanced; None is dense bypass, never indexer retry.
@@ -1562,6 +1644,16 @@ class Glm5NextSparseAttention(nn.Module):
             )
             if picked is not None:
                 windows, rows = picked
+                if split_k_inputs_ok:
+                    return self._decode_fused_batched(
+                        q,
+                        kv_latent,
+                        cache,
+                        windows,
+                        rows,
+                        q_latent=q_latent_early,
+                        mask=mask,
+                    )
                 # Host metadata was validated before dispatch; avoid a device sync.
                 plen = self.indexer._pool_lengths(cache[1])
                 topk_indices = expand_windows(

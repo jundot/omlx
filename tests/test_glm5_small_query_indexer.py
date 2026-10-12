@@ -79,6 +79,8 @@ def _fake_scores_batched(q, keys, weights, before, plen, ratio, pool_cache=None)
 
 @pytest.fixture
 def cpu_paths(monkeypatch, language, small):
+    # Exercise indexer + gathered attention independently of split-K.
+    monkeypatch.setattr(language, "_DSA_DECODE_FUSED", False)
     monkeypatch.setattr(language, "_SMALL_QUERY_INDEXER", True)
     monkeypatch.setattr(language, "_DECODE_FUSION", False)
     monkeypatch.setattr(language, "nax_sparse_mla_available", lambda: True)
