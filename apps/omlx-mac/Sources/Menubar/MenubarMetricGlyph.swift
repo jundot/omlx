@@ -1,6 +1,6 @@
 // Compact menubar readout for a metric status item: a vertical three-letter
-// tag (LIV / AVG / ALL) followed by two aligned rows, "P: <prompt tok/s>"
-// stacked over "T: <generation tok/s>". The readout is rasterized into an
+// tag (LIV / AVG / ALL) followed by two aligned rows, "P: <prompt Tok/s>"
+// stacked over "T: <generation Tok/s>". The readout is rasterized into an
 // NSImage because a status-item button only renders bitmap content reliably,
 // and every image assignment forces the menubar to re-composite the item —
 // so callers gate assignments with `signature`, which captures the only
@@ -14,7 +14,7 @@ enum MenubarMetricGlyph {
 
     /// Worst-case value string that reserves the value column, keeping the
     /// status item at a constant width while readings fluctuate.
-    static let valueTemplate = "9999tk/s"
+    static let valueTemplate = "9999Tok/s"
 
     private static let rowLabels = ("P:", "T:")
 
@@ -27,9 +27,9 @@ enum MenubarMetricGlyph {
         }
         let clamped = max(0, value)
         if clamped >= 10_000 {
-            return String(format: "%.1fktk/s", clamped / 1_000)
+            return String(format: "%.1fkTok/s", clamped / 1_000)
         }
-        return "\(Int(clamped.rounded()))tk/s"
+        return "\(Int(clamped.rounded()))Tok/s"
     }
 
     /// Cheap pixel-change detector: same signature ⇒ identical glyph, so the
