@@ -9,13 +9,24 @@ import asyncio
 import enum
 import json
 import logging
+import math
 import shutil
+import struct
 import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Optional
+
+from ..model_discovery import CLEF_HEAD_WEIGHTS
+from ..oq import (
+    _is_audio_tensor,
+    _is_mtp_tensor,
+    _is_qwen4_exp_ngram_embedding_tensor,
+    _is_vision_tensor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,47 +77,229 @@ def _is_oq_model(name: str) -> bool:
     return "oQ" in name
 
 
+_DTYPE_LABELS = {
+    "BF16": "BF16",
+    "F16": "FP16",
+    "F32": "FP32",
+    "F8_E4M3": "FP8 (E4M3)",
+    "F8_E5M2": "FP8 (E5M2)",
+}
+# MX formats fix their group size, so a config may record only bits and mode.
+_MX_GROUP_SIZES = {"mxfp4": 32, "mxfp8": 32, "nvfp4": 16}
+# Row-lookup tables that oMLX can serve from SSD. The card also reports the
+# average without them, because they do not count toward resident memory.
+_LOOKUP_TABLES = {
+    "N-gram embedding": "the N-gram embedding table",
+    "Engram tables": "the Engram tables",
+}
+_COMPONENT_ORDER = (
+    "Language model",
+    "N-gram embedding",
+    "Engram tables",
+    "Vision",
+    "Audio",
+    "MTP head",
+    "Joint schema head",
+)
+_REDOWNLOAD_NOTICE = (
+    "> [!NOTE]\n"
+    "> **Updated {date}:** Re-quantized with oMLX v{version}. "
+    "Please re-download if you have an earlier copy."
+)
+
+
+def _read_safetensors_header(path: Path) -> dict:
+    with open(path, "rb") as f:
+        size = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(size))
+    header.pop("__metadata__", None)
+    return header
+
+
+def _quantization_specs(config: dict) -> tuple[dict, dict]:
+    """Return the default and per-module quantization specs of an oQ output."""
+    v41 = config.get("omlx_deepseek_v41")
+    if isinstance(v41, dict):
+        modules = dict(v41.get("quantized_modules") or {})
+        for table in (v41.get("engram_tables") or {}).values():
+            modules[table["weight_key"].rsplit(".", 1)[0]] = {
+                "bits": table.get("bits"),
+                "group_size": table.get("group_size"),
+                "mode": table.get("mode", "affine"),
+            }
+        return {}, modules
+    quant = config.get("quantization") or config.get("quantization_config") or {}
+    default = {k: quant[k] for k in ("bits", "group_size", "mode") if k in quant}
+    return default, {k: v for k, v in quant.items() if isinstance(v, dict)}
+
+
+def _storage_format(
+    spec: dict, weight: dict, scales: dict, has_biases: bool
+) -> tuple[str, int]:
+    """Return the table label and bit width of one quantized module."""
+    mode = spec.get("mode") or ("affine" if has_biases else None)
+    group = spec.get("group_size") or _MX_GROUP_SIZES.get(mode or "")
+    group = group or (64 if has_biases else 32)
+    # Each uint32 word packs 32 / bits weights, and each scale covers a group.
+    bits = spec.get("bits") or round(
+        weight["shape"][-1] * 32 / (scales["shape"][-1] * group)
+    )
+    mode = mode or f"mxfp{bits}"
+    if mode == "affine":
+        return f"Affine {bits}-bit, group {group}", bits
+    return f"{mode.upper()}, group {group}", bits
+
+
+def _card_component(key: str, shard: str, config: dict) -> str:
+    if shard == CLEF_HEAD_WEIGHTS:
+        return "Joint schema head"
+    if _is_qwen4_exp_ngram_embedding_tensor(key, config):
+        return "N-gram embedding"
+    if config.get("model_type") == "deepseek_v41" and ".engram.embed" in key:
+        return "Engram tables"
+    if _is_mtp_tensor(key):
+        return "MTP head"
+    # V4.1 names its vision encoder and aligner without a vision_ marker.
+    v41_vision = config.get("model_type") == "deepseek_v41" and key.startswith(
+        ("vision.", "aligner.", "image_")
+    )
+    if v41_vision or _is_vision_tensor(key):
+        return "Vision"
+    if _is_audio_tensor(key):
+        return "Audio"
+    return "Language model"
+
+
+def _storage_summary(model_path: Path, config: dict) -> tuple[dict, dict]:
+    """Sum logical weights and stored bytes by storage format and component.
+
+    Only safetensors headers are read, so this stays cheap for any model size.
+    """
+    tensors = {}
+    for shard in sorted(model_path.glob("*.safetensors")):
+        for key, info in _read_safetensors_header(shard).items():
+            start, end = info["data_offsets"]
+            tensors[key] = {**info, "bytes": end - start, "shard": shard.name}
+    default, modules = _quantization_specs(config)
+    formats: dict[str, list] = {}  # label -> [weights, bytes, bits]
+    components: dict[str, list] = {}  # component -> [weights, bytes]
+    for key, info in tensors.items():
+        module = key.rsplit(".", 1)[0]
+        if key.endswith((".scales", ".biases")) and module + ".weight" in tensors:
+            continue
+        component = _card_component(key, info["shard"], config)
+        scales = tensors.get(module + ".scales")
+        if key.endswith(".weight") and scales is not None:
+            biases = tensors.get(module + ".biases")
+            label, bits = _storage_format(
+                {**default, **modules.get(module, {})}, info, scales, biases is not None
+            )
+            weights = math.prod(info["shape"]) * 32 // bits
+            stored = info["bytes"] + scales["bytes"] + (biases or {}).get("bytes", 0)
+            if component in _LOOKUP_TABLES:
+                label = f"{component.split()[0]} {label[0].lower()}{label[1:]}"
+        else:
+            weights = math.prod(info["shape"])
+            stored = info["bytes"]
+            label = _DTYPE_LABELS.get(info["dtype"], info["dtype"])
+            bits = 8 * stored // max(weights, 1)
+        row = formats.setdefault(label, [0, 0, bits])
+        row[0] += weights
+        row[1] += stored
+        part = components.setdefault(component, [0, 0])
+        part[0] += weights
+        part[1] += stored
+    return formats, components
+
+
 def _generate_model_card(
-    model_name: str, config: dict, redownload_notice: bool = False,
+    model_name: str,
+    model_path: Path,
+    config: dict,
+    redownload_notice: bool = False,
 ) -> str:
-    """Generate a minimal HuggingFace model card for an oQ model."""
+    """Generate a HuggingFace model card with the oQ bit distribution."""
     from omlx._version import __version__
 
-    model_type = config.get("model_type", "unknown")
-    quant = config.get("quantization", {})
-    bits = quant.get("bits", "?")
-    group_size = quant.get("group_size", "?")
+    formats, components = _storage_summary(model_path, config)
+    total_w = max(sum(row[0] for row in formats.values()), 1)
+    total_b = sum(row[1] for row in formats.values())
+    gib = 1024**3
 
-    notice = ""
+    tags = ["mlx", "oq", "quantized"] + (["mtp"] if "MTP head" in components else [])
+    lines = ["---", "library_name: mlx", "tags:", *(f"- {tag}" for tag in tags)]
+    lines += ["---", "", f"# {model_name}", ""]
     if redownload_notice:
-        from datetime import date
+        today = date.today().isoformat()
+        lines += [_REDOWNLOAD_NOTICE.format(date=today, version=__version__), ""]
+    lines += [
+        "This model was quantized using [oQ](https://github.com/jundot/omlx) "
+        f"(oMLX v{__version__}) mixed-precision quantization.",
+        "",
+    ]
 
-        today = date.today().strftime("%Y-%m-%d")
-        notice = f"""> [!IMPORTANT]
-> This quantization was uploaded on **{today}** and replaces a previous version.
-> If you downloaded this model before this date, please re-download for the updated weights.
+    average = f"{8 * total_b / total_w:.3f} bits/weight"
+    tables = [name for name in _LOOKUP_TABLES if name in components]
+    if tables:
+        table_w = sum(components[name][0] for name in tables)
+        table_b = sum(components[name][1] for name in tables)
+        excluded = " and ".join(_LOOKUP_TABLES[name] for name in tables)
+        lines.append(
+            "The effective average is "
+            f"{8 * (total_b - table_b) / max(total_w - table_w, 1):.3f} "
+            f"bits/weight excluding {excluded}, or {average} for the complete "
+            "checkpoint."
+        )
+    else:
+        lines.append(f"The effective average is {average} for the complete checkpoint.")
 
-"""
+    lines += [
+        "",
+        "## Quantization and Bit Distribution",
+        "",
+        "| Storage format | Logical weights | Share of total | Tensor storage "
+        "| Effective bits/weight |",
+        "|---|---|---|---|---|",
+    ]
+    table_prefixes = tuple(name.split()[0] + " " for name in tables)
+    order = sorted(
+        formats,
+        key=lambda label: (
+            bool(table_prefixes) and label.startswith(table_prefixes),
+            formats[label][2],
+            label,
+        ),
+    )
+    for label in order:
+        weights, stored, _ = formats[label]
+        lines.append(
+            f"| {label} | {weights / 1e9:.3f}B | {100 * weights / total_w:.3f}% | "
+            f"{stored / gib:.3f} GiB | {8 * stored / max(weights, 1):.2f} |"
+        )
+    lines.append(
+        f"| **Total** | **{total_w / 1e9:.3f}B** | **100%** | "
+        f"**{total_b / gib:.3f} GiB** | **{8 * total_b / total_w:.3f}** |"
+    )
 
-    return f"""---
-library_name: mlx
-tags:
-- mlx
-- oq
-- quantized
----
-
-{notice}# {model_name}
-
-This model was quantized using [oQ](https://github.com/jundot/omlx) (oMLX v{__version__}) mixed-precision quantization.
-
-## Quantization details
-
-- **Model type**: {model_type}
-- **Bits**: {bits}
-- **Group size**: {group_size}
-- **Format**: MLX safetensors
-"""
+    lines += [
+        "",
+        "## Storage Breakdown",
+        "",
+        "| Component | Logical weights | Storage |",
+        "|---|---|---|",
+    ]
+    for name in _COMPONENT_ORDER:
+        if name in components:
+            weights, stored = components[name]
+            lines.append(
+                f"| {name} | {weights / 1e9:.3f}B | "
+                f"{stored / 1e9:.3f} GB / {stored / gib:.3f} GiB |"
+            )
+    lines.append(
+        f"| **Total** | **{total_w / 1e9:.3f}B** | "
+        f"**{total_b / 1e9:.3f} GB / {total_b / gib:.3f} GiB** |"
+    )
+    return "\n".join(lines) + "\n"
 
 
 class UploadStatus(str, enum.Enum):
@@ -492,7 +685,9 @@ class HFUploader:
                     except Exception:
                         config = {}
                     readme_content = _generate_model_card(
-                        task.model_name, config,
+                        task.model_name,
+                        model_path,
+                        config,
                         redownload_notice=redownload_notice,
                     )
                     readme_in_model.write_text(readme_content, encoding="utf-8")
