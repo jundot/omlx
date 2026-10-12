@@ -48,7 +48,7 @@ private struct QuietButtonStyle: ButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(.omlxText(size == .small ? 11.5 : 13, weight: .medium))
+            .font(.omlxText(size == .small ? DesignTokens.FontSize.aux : DesignTokens.FontSize.body, weight: .medium))
             .padding(.horizontal, size == .small ? 10 : 12)
             .padding(.vertical, size == .small ? 4 : 6)
             .foregroundStyle(theme.text)

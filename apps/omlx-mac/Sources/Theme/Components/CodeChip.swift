@@ -15,7 +15,7 @@ struct CodeChip: View {
         Button(action: copy) {
             HStack(spacing: 6) {
                 Text(value)
-                    .font(.omlxMono(11.5, weight: .medium))
+                    .font(.omlxMono(DesignTokens.FontSize.aux, weight: .medium))
                     .foregroundStyle(theme.text)
                     .lineLimit(1)
                     .truncationMode(.middle)

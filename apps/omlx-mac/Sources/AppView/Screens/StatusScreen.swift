@@ -93,7 +93,7 @@ struct StatusScreen: View {
                                      comment: "Sublabel for GPU utilization row")
                 ) {
                     Text(vm.gpuUtilizationText)
-                        .font(.omlxMono(12))
+                        .font(.omlxMono(DesignTokens.FontSize.aux))
                 }
                 Row(label: String(localized: "status.row.thermal_state",
                                   defaultValue: "Thermal State",
@@ -104,14 +104,14 @@ struct StatusScreen: View {
                                   defaultValue: "Server Uptime",
                                   comment: "Row label for server uptime")) {
                     Text(vm.uptimeText)
-                        .font(.omlxMono(12))
+                        .font(.omlxMono(DesignTokens.FontSize.aux))
                 }
                 Row(label: String(localized: "status.row.version",
                                   defaultValue: "oMLX Version",
                                   comment: "Row label for the running oMLX version"),
                     isLast: true) {
                     Text(vm.versionText)
-                        .font(.omlxMono(12))
+                        .font(.omlxMono(DesignTokens.FontSize.aux))
                         .foregroundStyle(.secondary)
                 }
             }
@@ -222,33 +222,33 @@ private struct RuntimeCacheSection: View {
                                   defaultValue: "Memory Cache",
                                   comment: "Row label for the in-memory (hot) KV cache size gauge")) {
                     Text(memoryGaugeText)
-                        .font(.omlxMono(12))
+                        .font(.omlxMono(DesignTokens.FontSize.aux))
                 }
                 Row(label: String(localized: "status.runtime_cache.memory_entries",
                                   defaultValue: "Memory Entries",
                                   comment: "Row label for the number of in-memory KV cache entries")) {
                     Text(memoryEntriesText)
-                        .font(.omlxMono(12))
+                        .font(.omlxMono(DesignTokens.FontSize.aux))
                 }
             }
             Row(label: String(localized: "status.runtime_cache.files",
                               defaultValue: "Cache Files",
                               comment: "Row label for cache file count")) {
                 Text(fileCountText)
-                    .font(.omlxMono(12))
+                    .font(.omlxMono(DesignTokens.FontSize.aux))
             }
             Row(label: String(localized: "status.runtime_cache.size",
                               defaultValue: "Total Size",
                               comment: "Row label for total cache size on disk")) {
                 Text(sizeText)
-                    .font(.omlxMono(12))
+                    .font(.omlxMono(DesignTokens.FontSize.aux))
             }
             if let dir = cache?.ssdCacheDir, !dir.isEmpty {
                 Row(label: String(localized: "status.runtime_cache.location",
                                   defaultValue: "Location",
                                   comment: "Row label for the SSD cache directory path")) {
                     Text(dir)
-                        .font(.omlxMono(11))
+                        .font(.omlxMono(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textSecondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -368,20 +368,20 @@ private struct StatTile: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(label)
-                .font(.omlxText(11, weight: .medium))
+                .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                 .foregroundStyle(theme.textSecondary)
                 .textCase(.uppercase)
                 .kerning(0.6)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: .infinity)
             Text(value)
-                .font(.omlxText(22, weight: .semibold))
+                .font(.omlxText(DesignTokens.FontSize.page, weight: .semibold))
                 .kerning(-0.5)
                 .foregroundStyle(accentColor)
                 .frame(maxWidth: .infinity)
             if let sub {
                 Text(sub)
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textTertiary)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: .infinity)
@@ -439,7 +439,7 @@ private struct GpuMemoryTrailing: View {
             ProgressBar(progress: progress, tint: theme.blueDot)
                 .frame(width: 140)
             Text(labelText(used: used, max: max))
-                .font(.omlxMono(11))
+                .font(.omlxMono(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textSecondary)
                 .frame(minWidth: 110, alignment: .trailing)
         }
@@ -471,7 +471,7 @@ private struct SystemRamTrailing: View {
             ProgressBar(progress: progress, tint: theme.text.opacity(0.7))
                 .frame(width: 140)
             Text(labelText)
-                .font(.omlxMono(11))
+                .font(.omlxMono(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textSecondary)
                 .frame(minWidth: 110, alignment: .trailing)
         }
@@ -506,7 +506,7 @@ private struct ThermalTrailing: View {
                 .fill(color(for: severity))
                 .frame(width: 8, height: 8)
             Text(SystemMetricsPoller.label(for: severity))
-                .font(.omlxText(12))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.text)
         }
     }
@@ -533,7 +533,7 @@ private struct ActiveNowList: View {
                     Text(String(localized: "status.active_now.empty",
                                 defaultValue: "Server idle — no models loaded",
                                 comment: "Empty-state text shown when the Active Now list has no entries"))
-                        .font(.omlxText(12))
+                        .font(.omlxText(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textTertiary)
                         .frame(maxWidth: .infinity, alignment: .center)
                         .padding(.vertical, 12)
@@ -544,7 +544,7 @@ private struct ActiveNowList: View {
                         HStack(spacing: 12) {
                             modelStateBadge(for: model)
                             Text(model.estimatedSizeFormatted ?? "—")
-                                .font(.omlxMono(11))
+                                .font(.omlxMono(DesignTokens.FontSize.aux))
                                 .foregroundStyle(theme.textSecondary)
                                 .frame(minWidth: 60, alignment: .trailing)
                         }
@@ -657,19 +657,19 @@ private struct UpdatesSection: View {
             Text(String(localized: "status.updates.checking_primary",
                         defaultValue: "Checking for updates…",
                         comment: "Primary update status line while a check is in progress"))
-                .font(.omlxText(13, weight: .medium))
+                .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                 .foregroundStyle(theme.text)
         case .available(let upd), .ready(let upd):
             Text(String(localized: "status.updates.available_primary",
                         defaultValue: "oMLX \(upd.version) is available",
                         comment: "Primary update status line when a new version is available; placeholder is the version string"))
-                .font(.omlxText(13, weight: .medium))
+                .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                 .foregroundStyle(theme.text)
         case .downloading:
             Text(String(localized: "status.updates.downloading_primary",
                         defaultValue: "Downloading update…",
                         comment: "Primary update status line while the new build is downloading"))
-                .font(.omlxText(13, weight: .medium))
+                .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                 .foregroundStyle(theme.text)
         case .idle:
             Text(updates.lastError == nil
@@ -679,7 +679,7 @@ private struct UpdatesSection: View {
                  : String(localized: "status.updates.error_primary",
                           defaultValue: "Update check failed",
                           comment: "Primary update status line when checking for updates failed"))
-                .font(.omlxText(13, weight: .medium))
+                .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                 .foregroundStyle(theme.text)
         }
     }
@@ -691,29 +691,29 @@ private struct UpdatesSection: View {
             Text(String(localized: "status.updates.checking_secondary",
                         defaultValue: "Checking GitHub releases…",
                         comment: "Secondary update status line while a check is in progress"))
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textSecondary)
         case .available(let upd):
             Text(String(localized: "status.updates.available_secondary",
                         defaultValue: "Ready to download · \(upd.sizeText ?? "—")",
                         comment: "Secondary update status line when a new version is available; placeholder is the download size or em dash"))
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textSecondary)
         case .downloading(let pct):
             Text(String(localized: "status.updates.downloading_secondary",
                         defaultValue: "Downloading · \(pct)%",
                         comment: "Secondary update status line during download; placeholder is the percent complete"))
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textSecondary)
         case .ready(let upd):
             Text(String(localized: "status.updates.ready_secondary",
                         defaultValue: "\(upd.version) is ready to install",
                         comment: "Secondary update status line once the staged bundle is ready; placeholder is the version"))
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textSecondary)
         case .idle(let lastChecked):
             Text(updates.lastError ?? lastCheckedText(lastChecked))
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textSecondary)
         }
     }

@@ -157,11 +157,11 @@ struct MemoryStatsPanel: View {
             ))
             HStack {
                 Text("\(SystemMetricsPoller.formatBytesAsGiB(memory.usedBytes)) / \(StatsFormat.wholeGiB(memory.totalBytes)) GB")
-                    .font(.omlxMono(12, weight: .semibold))
+                    .font(.omlxMono(DesignTokens.FontSize.aux, weight: .semibold))
                     .foregroundStyle(theme.text)
                 Spacer()
                 Text(StatsFormat.percent(memory.usedFraction))
-                    .font(.omlxMono(12))
+                    .font(.omlxMono(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textSecondary)
             }
             SegmentedUsageBar(
@@ -204,11 +204,11 @@ struct MemoryStatsPanel: View {
                 .fill(color)
                 .frame(width: 8, height: 8)
             Text(label)
-                .font(.omlxText(11.5))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textSecondary)
             Spacer()
             Text(SystemMetricsPoller.formatBytesAsGiB(bytes) + " GB")
-                .font(.omlxMono(11.5))
+                .font(.omlxMono(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.text)
         }
     }
@@ -279,7 +279,7 @@ private struct StatsPanelHeader: View {
 
     var body: some View {
         Text(title.uppercased())
-            .font(.omlxText(10, weight: .bold))
+            .font(.omlxText(DesignTokens.FontSize.aux, weight: .bold))
             .kerning(1)
             .foregroundStyle(theme.accent)
             .frame(maxWidth: .infinity, alignment: .center)
@@ -293,7 +293,7 @@ private struct StatsPanelCaption: View {
 
     var body: some View {
         Text(window.isEmpty ? text : "\(text) · \(window)")
-            .font(.omlxText(9.5))
+            .font(.omlxText(DesignTokens.FontSize.aux))
             .foregroundStyle(theme.textTertiary)
     }
 }
@@ -309,11 +309,11 @@ private struct UsageBarRow: View {
         VStack(alignment: .leading, spacing: 3) {
             HStack {
                 Text(label)
-                    .font(.omlxText(12, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                     .foregroundStyle(theme.text)
                 Spacer()
                 Text(value)
-                    .font(.omlxMono(12))
+                    .font(.omlxMono(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.text)
             }
             GeometryReader { geo in
@@ -341,11 +341,11 @@ private struct StatsValueRow: View {
     var body: some View {
         HStack {
             Text(label)
-                .font(.omlxText(12))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textSecondary)
             Spacer()
             Text(value)
-                .font(.omlxMono(12))
+                .font(.omlxMono(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.text)
         }
     }
