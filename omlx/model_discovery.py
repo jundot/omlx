@@ -402,6 +402,7 @@ class DiscoveredModel:
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
+    reasoning_efforts: list[str] | None = None  # Template effort levels (None = no effort)
     model_context_length: int | None = None  # Declared context length from config.json (None if unknown)
     source_type: str = "local"  # "local" or "hf_cache"
     source_repo_id: str | None = None  # HuggingFace repo id for cache-backed models
@@ -861,7 +862,28 @@ def detect_model_type(model_path: Path) -> ModelType:
     return "llm"
 
 
-def detect_thinking_default(model_path: Path) -> bool | None:
+def _read_chat_template_text(model_path: Path) -> str | None:
+    """Return the chat template from chat_template.jinja or tokenizer_config.json."""
+    jinja_path = model_path / "chat_template.jinja"
+    if jinja_path.exists():
+        with contextlib.suppress(OSError):
+            return jinja_path.read_text(encoding="utf-8")
+
+    tc_path = model_path / "tokenizer_config.json"
+    if tc_path.exists():
+        try:
+            with open(tc_path) as f:
+                template = json.load(f).get("chat_template")
+        except Exception:
+            return None
+        if isinstance(template, str):
+            return template
+    return None
+
+
+def detect_thinking_default(
+    model_path: Path, template_text: str | None = None
+) -> bool | None:
     """Detect a model's effective thinking default from local metadata.
 
     Inspects the Jinja chat template for ``enable_thinking`` references and
@@ -877,22 +899,8 @@ def detect_thinking_default(model_path: Path) -> bool | None:
     * **None** — template does not reference ``enable_thinking`` (model has
       no thinking toggle).
     """
-    # Try standalone Jinja file first, then tokenizer_config.json
-    template_text = None
-    jinja_path = model_path / "chat_template.jinja"
-    if jinja_path.exists():
-        with contextlib.suppress(OSError):
-            template_text = jinja_path.read_text(encoding="utf-8")
-
     if template_text is None:
-        tc_path = model_path / "tokenizer_config.json"
-        if tc_path.exists():
-            try:
-                with open(tc_path) as f:
-                    tc = json.load(f)
-                template_text = tc.get("chat_template")
-            except Exception:
-                pass
+        template_text = _read_chat_template_text(model_path)
 
     if not template_text or "enable_thinking" not in template_text:
         return None
@@ -1002,7 +1010,9 @@ def _read_model_context_length(model_path: Path) -> int | None:
     return None
 
 
-def detect_preserve_thinking(model_path: Path) -> bool | None:
+def detect_preserve_thinking(
+    model_path: Path, template_text: str | None = None
+) -> bool | None:
     """Detect whether a model's chat template supports ``preserve_thinking``.
 
     Qwen 3.6+ templates strip ``<think>`` blocks from historical assistant
@@ -1014,26 +1024,40 @@ def detect_preserve_thinking(model_path: Path) -> bool | None:
         True if the template references ``preserve_thinking`` (should be
         enabled), None otherwise (template has no such flag).
     """
-    template_text = None
-    jinja_path = model_path / "chat_template.jinja"
-    if jinja_path.exists():
-        with contextlib.suppress(OSError):
-            template_text = jinja_path.read_text(encoding="utf-8")
-
     if template_text is None:
-        tc_path = model_path / "tokenizer_config.json"
-        if tc_path.exists():
-            try:
-                with open(tc_path) as f:
-                    tc = json.load(f)
-                template_text = tc.get("chat_template")
-            except Exception:
-                pass
+        template_text = _read_chat_template_text(model_path)
 
     if not template_text or "preserve_thinking" not in template_text:
         return None
 
     return True
+
+
+REASONING_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+# `reasoning_effort == 'low'` or `reasoning_effort (not) in ['low', 'high']`.
+_EFFORT_CHECK = re.compile(
+    r"reasoning_effort\s*(?:==|(?:not\s+)?in)\s*"
+    r"([\[(][^\])]*[\])]|'[^']*'|\"[^\"]*\")"
+)
+_QUOTED = re.compile(r"['\"]([^'\"]+)['\"]")
+
+
+def detect_reasoning_effort(
+    model_path: Path, template_text: str | None = None
+) -> list[str] | None:
+    """Return the effort levels the chat template accepts.
+
+    None means the template does not read ``reasoning_effort``. An empty list
+    means it reads the value but names none of the standard levels.
+    """
+    if template_text is None:
+        template_text = _read_chat_template_text(model_path)
+    if not template_text or "reasoning_effort" not in template_text:
+        return None
+    named = set()
+    for match in _EFFORT_CHECK.finditer(template_text):
+        named.update(_QUOTED.findall(match.group(1)))
+    return [level for level in REASONING_EFFORT_LEVELS if level in named]
 
 
 def estimate_model_size(model_path: Path) -> int:
@@ -1694,8 +1718,10 @@ def _register_model(
                 model_id,
             )
 
-        thinking_default = detect_thinking_default(model_dir)
-        preserve_thinking_default = detect_preserve_thinking(model_dir)
+        template_text = _read_chat_template_text(model_dir)
+        thinking_default = detect_thinking_default(model_dir, template_text)
+        preserve_thinking_default = detect_preserve_thinking(model_dir, template_text)
+        reasoning_efforts = detect_reasoning_effort(model_dir, template_text)
         model_context_length = _read_model_context_length(model_dir)
 
         models[model_id] = DiscoveredModel(
@@ -1708,6 +1734,7 @@ def _register_model(
             config_model_type=config_model_type,
             thinking_default=thinking_default,
             preserve_thinking_default=preserve_thinking_default,
+            reasoning_efforts=reasoning_efforts,
             model_context_length=model_context_length,
             source_type=source_type,
             source_repo_id=source_repo_id,

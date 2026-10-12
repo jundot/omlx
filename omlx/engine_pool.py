@@ -297,6 +297,9 @@ class EngineEntry:
     preserve_thinking_default: bool | None = (
         None  # True when template supports preserve_thinking (Qwen 3.6+)
     )
+    reasoning_efforts: list[str] | None = (
+        None  # Effort levels the template accepts (None = no effort)
+    )
     model_context_length: int | None = (
         None  # Declared context length from config.json (None if unknown)
     )
@@ -1351,6 +1354,7 @@ class EnginePool:
                     preserve_thinking_default=getattr(
                         info, "preserve_thinking_default", None
                     ),
+                    reasoning_efforts=getattr(info, "reasoning_efforts", None),
                     model_context_length=getattr(info, "model_context_length", None),
                     source_type=getattr(info, "source_type", "local"),
                     source_repo_id=getattr(info, "source_repo_id", None),
@@ -4275,6 +4279,7 @@ class EnginePool:
                     "is_helper": e.is_helper,
                     "thinking_default": e.thinking_default,
                     "preserve_thinking_default": e.preserve_thinking_default,
+                    "reasoning_efforts": e.reasoning_efforts,
                     "source_type": e.source_type,
                     "source_repo_id": e.source_repo_id,
                     "last_access": e.last_access if e.last_access > 0 else None,

@@ -43,6 +43,7 @@ from .._version import __version__ as _omlx_version
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
 from ..api.utils import _try_parse_json
+from ..model_discovery import REASONING_EFFORT_LEVELS
 from ..model_discovery import model_display_name as _model_display_name
 from ..model_profiles import (
     EXCLUDED_FROM_PROFILES,
@@ -61,6 +62,9 @@ from ..model_settings import (
     MOE_OFFLOAD_MTP_MODEL_TYPES,
     merge_chat_template_kwargs,
 )
+from ..patches.deepseek_v4.chat_template_v4 import REASONING_EFFORT_PROMPTS
+from ..patches.deepseek_v41.encoding import REASONING_EFFORT_MAPPINGS
+from ..patches.k2_horizon import REASONING_EFFORTS
 from ..patches.moe_offload_compat import moe_offload_compatibility
 from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
 from ..utils.hardware import (
@@ -2202,10 +2206,39 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
 # =============================================================================
 
 
+# Families whose thinking switch is rendered by oMLX code instead of the
+# checkpoint chat template (prefix match on model_type).
+_OMLX_THINKING_TOGGLE_TYPES = ("deepseek_v4", "minimax_m3")
+
+
+def _reasoning_levels(model_info: dict, model_type: str, forced: bool) -> list[str]:
+    """Return the chat reasoning slider stops, or [] when the model has none."""
+    toggle = model_info.get("thinking_default") is not None or model_type.startswith(
+        _OMLX_THINKING_TOGGLE_TYPES
+    )
+    if model_type == "k2_horizon":
+        efforts = list(REASONING_EFFORTS)
+    elif model_type.startswith("deepseek_v41"):
+        efforts = list(REASONING_EFFORT_MAPPINGS)
+    elif model_type.startswith("deepseek_v4"):
+        efforts = list(REASONING_EFFORT_PROMPTS)
+    elif model_type == "gpt_oss":
+        # Harmony folds every level above "high" into "high".
+        efforts = ["low", "medium", "high"]
+    else:
+        efforts = model_info.get("reasoning_efforts")
+        if efforts is not None and not efforts:
+            efforts = list(REASONING_EFFORT_LEVELS)
+    levels = ["off"] if toggle and not forced else []
+    if efforts:
+        levels += efforts
+    elif toggle:
+        levels.append("on")
+    return levels
+
+
 def _model_options(model_info: dict, settings) -> dict:
     """Describe model controls once for the web and native settings clients."""
-    from ..patches.k2_horizon import REASONING_EFFORTS
-
     model_type = (model_info.get("config_model_type") or "").lower().replace("-", "_")
     is_k2 = model_type == "k2_horizon"
     thinking_modes = ["auto", "on_limit"] if is_k2 else [
@@ -2217,11 +2250,12 @@ def _model_options(model_info: dict, settings) -> dict:
     return {
         "thinking_forced": is_k2,
         "thinking_modes": thinking_modes,
-        "reasoning_effort_options": list(REASONING_EFFORTS) if is_k2 else [
-            "low", "medium", "high", "xhigh", "max"
-        ],
+        "reasoning_effort_options": list(
+            REASONING_EFFORTS if is_k2 else REASONING_EFFORT_LEVELS
+        ),
         "reasoning_effort_default": "high" if is_k2 else "low",
         "reasoning_effort_custom": not is_k2,
+        "reasoning_levels": _reasoning_levels(model_info, model_type, is_k2),
         "ane_prefill_backend": ane_backend,
         "ane_prefill_default_fraction": ane_prefill_fraction(None, model_type),
         "ane_prefill_mlp_fractions": [1 / 3, 0.5] if ane_backend == "k2" else [],
@@ -2427,6 +2461,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "model_context_length": model_info.get("model_context_length"),
             "thinking_default": model_info.get("thinking_default"),
             "preserve_thinking_default": model_info.get("preserve_thinking_default"),
+            "reasoning_efforts": model_info.get("reasoning_efforts"),
             "source_type": model_info.get("source_type", "local"),
             "source_repo_id": model_info.get("source_repo_id"),
             "distributed": model_info.get("distributed", False),
