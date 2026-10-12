@@ -4355,13 +4355,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp TPS"
+            "value" : "PP TPS"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp TPS"
+            "value" : "PP TPS"
           }
         },
         "zh-Hans" : {
@@ -4403,13 +4403,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "tg TPS"
+            "value" : "TG TPS"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "tg TPS"
+            "value" : "TG TPS"
           }
         },
         "zh-Hans" : {
@@ -5129,13 +5129,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp TPS"
+            "value" : "PP TPS"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp TPS"
+            "value" : "PP TPS"
           }
         },
         "zh-Hans" : {
@@ -5177,13 +5177,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "tg TPS"
+            "value" : "TG TPS"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "tg TPS"
+            "value" : "TG TPS"
           }
         },
         "zh-Hans" : {
@@ -5297,19 +5297,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "pp %1$lld / tg %2$lld"
+            "value" : "PP %1$lld / TG %2$lld"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp %1$lld / tg %2$lld"
+            "value" : "PP %1$lld / TG %2$lld"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp %1$lld / tg %2$lld"
+            "value" : "PP %1$lld / TG %2$lld"
           }
         }
       }
@@ -5465,19 +5465,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "pp %lld"
+            "value" : "PP %lld"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp %lld"
+            "value" : "PP %lld"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "pp %lld"
+            "value" : "PP %lld"
           }
         }
       }
