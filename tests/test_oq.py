@@ -1359,8 +1359,8 @@ class TestStreamingHelpers:
 
         assert report["missing"] == [f"{base}.weights_proj"]
 
-    def test_qwen4_ngram_group32_is_priced_into_budget_plan(self):
-        from omlx.oq import _structural_quant_overrides
+    def test_qwen4_ngram_table_stays_outside_budget_plan(self):
+        from omlx.oq import _budgeted_shapes, _get_predicate_bits
 
         ple = (
             "language_model.model.layers.1.ple.ple_embedding."
@@ -1382,32 +1382,21 @@ class TestStreamingHelpers:
             "_oq_sensitivity_map": {"0": 1.0, "1": 0.5},
         }
 
-        unpriced = _build_quant_plan(
-            named_shapes,
-            config,
-            4,
-            target_bpw=4.6,
-            hard_cap_bpw=4.7,
-        )
-        fixed = _structural_quant_overrides(named_shapes, config, 4)
         plan = _build_quant_plan(
-            named_shapes,
+            _budgeted_shapes(named_shapes, config),
             config,
-            4,
-            target_bpw=4.6,
-            hard_cap_bpw=4.7,
-            fixed_overrides=fixed,
+            2.5,
+            target_bpw=3.1,
+            hard_cap_bpw=3.3,
         )
 
-        assert unpriced.effective_bpw > 5.5
-        assert fixed[ple] == {
-            "bits": 4,
-            "group_size": 32,
-            "mode": "affine",
-        }
-        assert plan.effective_bpw <= 4.7
         assert ple not in plan.boost_map
+        assert plan.effective_bpw <= 3.3
         assert plan.boost_map["language_model.lm_head"]["bits"] == 8
+        # The table keeps its own group-32 policy and never drops below 4 bits.
+        weight = f"{ple}.weight"
+        assert _get_predicate_bits(weight, config, 2.5, 64) == (4, 32, "affine")
+        assert _get_predicate_bits(weight, config, 6, 64) == (6, 32, "affine")
 
     def test_build_quant_plan_respects_hard_cap(self):
         named_shapes = {

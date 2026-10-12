@@ -1424,7 +1424,7 @@
   "models.oq.about_table_oqe_use": "Lepší udržení kvality při nízkém počtu bitů, zejména u MoE a vrstev se zkreslenými aktivacemi",
   "models.oq.about_table_path": "Cesta",
   "models.oq.about_universal_heading": "oQ: univerzální dynamická kvantizace oMLX",
-  "models.oq.v41_policy_hint": "DeepSeek V4.1 podporuje oQ3/oQ3e a oQ4/oQ4e s BF16 výstupem. oQ4 zachovává původní přesnost projekcí FP4/FP8 a kvantizuje Engram tabulky na 4 bity. Kodek vidění je zachován.",
+  "models.oq.v41_policy_hint": "DeepSeek V4.1 podporuje oQ2, oQ2.5, oQ2.7, oQ3 a oQ4, s e i bez něj, s BF16 výstupem. oQ4 zachovává původní přesnost projekcí FP4/FP8 a všechny úrovně kvantizují Engram tabulky na 4 bity. Kodek vidění je zachován.",
   "models.oq.full_precision_only": "(pouze plná přesnost)",
   "models.oq.quantization_started": "Kvantizace zahájena: {name} → {model}",
   "models.oq.sensitivity_model": "Model citlivosti",

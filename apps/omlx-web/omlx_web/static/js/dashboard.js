@@ -7195,7 +7195,7 @@
 
             oqAvailableLevels() {
                 return this.oqSelectedModelType() === 'deepseek_v41'
-                    ? [3, 4] : [2, 2.5, 2.7, 3, 3.5, 4, 5, 6, 8];
+                    ? [2, 2.5, 2.7, 3, 4] : [2, 2.5, 2.7, 3, 3.5, 4, 5, 6, 8];
             },
 
             oqApplyModelPolicy() {

@@ -77,7 +77,7 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx_web/static/js/dashboard.js
     app.oqSelectedModelPath = 'v41';
     vm.runInNewContext(`with (app) { ${effect} }`, {app});
     assert.equal(estimatedLevel, 4);
-    assert.deepEqual(Array.from(app.oqAvailableLevels()), [3, 4]);
+    assert.deepEqual(Array.from(app.oqAvailableLevels()), [2, 2.5, 2.7, 3, 4]);
     assert.equal(app.oqLevel, 4);
     assert.equal(app.oqDtype, 'bfloat16');
     assert.equal(app.oqTextOnly, false);

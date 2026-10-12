@@ -1424,7 +1424,7 @@
   "models.oq.about_table_oqe_use": "更好的低位保留，特别是对于 MoE 和激活偏斜层",
   "models.oq.about_table_path": "路径",
   "models.oq.about_universal_heading": "oQ：oMLX 通用动态量化",
-  "models.oq.v41_policy_hint": "DeepSeek V4.1 supports oQ3/oQ3e and oQ4/oQ4e with BF16 output. oQ4 preserves the original FP4/FP8 projection precision and quantizes Engram tables to 4 bits. The vision encoder is retained.",
+  "models.oq.v41_policy_hint": "DeepSeek V4.1 supports oQ2, oQ2.5, oQ2.7, oQ3 and oQ4, with or without e, with BF16 output. oQ4 preserves the original FP4/FP8 projection precision, and every level quantizes Engram tables to 4 bits. The vision encoder is retained.",
   "models.oq.full_precision_only": "（仅全精度）",
   "models.oq.quantization_started": "量化已开始：{name} → {model}",
   "models.oq.sensitivity_model": "敏感度模型",

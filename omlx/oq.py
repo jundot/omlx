@@ -172,12 +172,16 @@ def _validate_oq_dtype_for_model(config: dict, dtype: str) -> None:
         )
 
 
+_V41_OQ_LEVELS = (2, 2.5, 2.7, 3, 4)
+
+
 def _validate_v41_oq_settings(oq_level, dtype="bfloat16", group_size=64):
-    if oq_level not in (3, 4):
+    if oq_level not in _V41_OQ_LEVELS:
         raise ValueError(
             f"DeepSeek V4.1 does not support oQ{oq_level:g}/oQ{oq_level:g}e. "
-            "Choose oQ3/oQ3e or oQ4/oQ4e. oQ4 preserves the original "
-            "FP4/FP8 projection precision and quantizes Engram tables to 4 bits."
+            "Choose oQ2, oQ2.5, oQ2.7, oQ3 or oQ4, with or without e. oQ4 "
+            "preserves the original FP4/FP8 projection precision, and every "
+            "level quantizes Engram tables to 4 bits."
         )
     if dtype != "bfloat16" or group_size != 64:
         raise ValueError(
@@ -836,26 +840,27 @@ def _estimate_effective_bpw(
     return total_bits / max(total_params, 1)
 
 
-def _structural_quant_overrides(
-    named_shapes: dict[str, tuple], config: dict, oq_level: int
-) -> dict[str, dict]:
-    """Layouts fixed by a model invariant rather than the bit allocator.
+# Qwen4-Exp N-gram and DeepSeek V4.1 Engram rows are gathered by id and can
+# stay on SSD, so these tables never drop below 4 bits and stay outside the
+# bit budget of the resident weights.
+_OFFLOAD_TABLE_MIN_BITS = 4
 
-    Qwen4-Exp PLE rows are 160 elements wide.  The writer always uses group
-    size 32 for them, but pricing them at the default group size 64 makes the
-    planner classify the table as an unquantizable 16-bpw tensor.  Since PLE
-    is about 51B parameters, that false cost can exhaust the entire budget and
-    suppress every protection boost even though the writer emits Q4/group32.
+
+def _offload_table_bits(oq_level) -> int:
+    return max(_base_bits_for_level(oq_level), _OFFLOAD_TABLE_MIN_BITS)
+
+
+def _budgeted_shapes(named_shapes: dict[str, tuple], config: dict) -> dict[str, tuple]:
+    """Return the shapes that compete for the level's bit budget.
+
+    The Qwen4-Exp N-gram table is about 51B parameters. Pricing it would make
+    a 4-bit table consume most of a sub-4-bit budget, so it is quantized by its
+    own table policy instead.
     """
-    base_bits = _base_bits_for_level(oq_level)
     return {
-        path: {
-            "bits": base_bits,
-            "group_size": _QWEN4_EXP_NGRAM_GROUP_SIZE,
-            "mode": "affine",
-        }
-        for path in named_shapes
-        if _is_qwen4_exp_ngram_embedding_tensor(path, config)
+        path: shape
+        for path, shape in named_shapes.items()
+        if not _is_qwen4_exp_ngram_embedding_tensor(path, config)
     }
 
 
@@ -3362,15 +3367,19 @@ def estimate_bpw_and_size(
             "weight_map"
         ]
         budget = source_budget(
-            source, config, mapping, preserve_mtp=preserve_mtp, engram_bits=oq_level
+            source,
+            config,
+            mapping,
+            preserve_mtp=preserve_mtp,
+            engram_bits=_offload_table_bits(oq_level),
         )
         remaining = budget["remaining_weights"]
-        # The oQ3 allocation is not known until calibration. Quote its budget
-        # ceiling rather than assuming original FP4 expert bytes pass through.
+        # Allocations below oQ4 are not known until calibration. Quote their
+        # budget ceiling rather than assuming original FP4 expert bytes pass.
         remaining_bytes = remaining["tensor_bytes"]
-        if oq_level == 3:
+        if oq_level < 4:
             remaining_bytes = math.ceil(
-                remaining["logical_parameters"] * _OQ_BPW_TARGETS[3][1] / 8
+                remaining["logical_parameters"] * _OQ_BPW_TARGETS[oq_level][1] / 8
             )
         total = remaining_bytes + budget["engram"]["tensor_bytes"]
         parameters = (
@@ -3384,7 +3393,7 @@ def estimate_bpw_and_size(
             "output_size_bytes": total,
             "output_size_formatted": _format_size(total),
             "estimate_basis": (
-                "calibration_budget_ceiling" if oq_level == 3 else "source_precision"
+                "calibration_budget_ceiling" if oq_level < 4 else "source_precision"
             ),
             "engram_size_bytes": budget["engram"]["tensor_bytes"],
             "remaining_size_bytes": remaining_bytes,
@@ -3492,17 +3501,13 @@ def estimate_bpw_and_size(
                 pos_sens[str(i)] = 0.01
         config["_oq_sensitivity_map"] = pos_sens
 
-        plan_fixed_overrides = {
-            **fixed_overrides,
-            **_structural_quant_overrides(named_shapes, config, oq_level),
-        }
         plan = _build_quant_plan(
-            named_shapes,
+            _budgeted_shapes(named_shapes, config),
             config,
             oq_level,
             target_bpw=_level_targets[0],
             hard_cap_bpw=_level_targets[1],
-            fixed_overrides=plan_fixed_overrides,
+            fixed_overrides=fixed_overrides,
         )
         config["_oq_boost_map"] = plan.boost_map
     else:
@@ -4574,14 +4579,14 @@ def _get_predicate_bits(
     base_bits = _base_bits_for_level(oq_level)
 
     # Qwen4-Exp's PLE rows are 160 elements wide, so the default group size
-    # 64 leaves the 100 GB N-gram table unquantized. Keep the table uniform at
-    # the selected oQ level and use the group-32 layout published by existing
-    # Qwen4-Exp quantizations. Embeddings have no input-channel imatrix entry;
-    # the streaming loop deliberately applies ordinary affine quantization.
+    # 64 leaves the 100 GB N-gram table unquantized. Keep the table uniform
+    # and use the group-32 layout published by existing Qwen4-Exp
+    # quantizations. Embeddings have no input-channel imatrix entry; the
+    # streaming loop deliberately applies ordinary affine quantization.
     if _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config) or (
         config.get("model_type") == "deepseek_v41" and ".engram.embed" in tensor_name
     ):
-        return base_bits, _QWEN4_EXP_NGRAM_GROUP_SIZE, "affine"
+        return _offload_table_bits(oq_level), _QWEN4_EXP_NGRAM_GROUP_SIZE, "affine"
 
     result = universal_quant_predicate(tensor_name, None, config, oq_level)
     if result is False:
@@ -6760,17 +6765,13 @@ def quantize_oq_streaming(
     if _level_targets is not None:
         _t = target_bpw if target_bpw is not None else _level_targets[0]
         _c = hard_cap_bpw if hard_cap_bpw is not None else _level_targets[1]
-        plan_fixed_overrides = {
-            **fixed_overrides,
-            **_structural_quant_overrides(named_shapes, config, oq_level),
-        }
         plan = _build_quant_plan(
-            named_shapes,
+            _budgeted_shapes(named_shapes, config),
             config,
             oq_level,
             target_bpw=_t,
             hard_cap_bpw=_c,
-            fixed_overrides=plan_fixed_overrides,
+            fixed_overrides=fixed_overrides,
         )
         config["_oq_boost_map"] = plan.boost_map
         logger.info(

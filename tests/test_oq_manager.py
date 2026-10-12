@@ -848,7 +848,7 @@ async def test_v41_source_metadata_and_converted_filter(tmp_path, layer_key):
 @pytest.mark.parametrize(
     "settings, message",
     [
-        ({"oq_level": 8, "enhanced": True}, "Choose oQ3/oQ3e or oQ4/oQ4e"),
+        ({"oq_level": 8, "enhanced": True}, "Choose oQ2, oQ2.5, oQ2.7, oQ3 or oQ4"),
         ({"oq_level": 4, "dtype": "float16"}, "requires dtype='bfloat16'"),
         ({"oq_level": 3, "group_size": 32}, "group_size=64"),
     ],

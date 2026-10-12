@@ -1424,7 +1424,7 @@
   "models.oq.about_table_oqe_use": "Better low-bit retention, especially for MoE and activation-skewed layers",
   "models.oq.about_table_path": "Path",
   "models.oq.about_universal_heading": "oQ: oMLX Universal Dynamic Quantization",
-  "models.oq.v41_policy_hint": "DeepSeek V4.1은 BF16 출력으로 oQ3/oQ3e와 oQ4/oQ4e를 지원합니다. oQ4는 원본 FP4/FP8 프로젝션 정밀도를 보존하고 Engram 테이블을 4비트로 양자화합니다. 비전 인코더도 유지됩니다.",
+  "models.oq.v41_policy_hint": "DeepSeek V4.1은 BF16 출력으로 oQ2, oQ2.5, oQ2.7, oQ3, oQ4와 각 e 버전을 지원합니다. oQ4는 원본 FP4/FP8 프로젝션 정밀도를 보존하며, 모든 레벨에서 Engram 테이블을 4비트로 양자화합니다. 비전 인코더도 유지됩니다.",
   "models.oq.full_precision_only": "(full precision only)",
   "models.oq.quantization_started": "Quantization started: {name} → {model}",
   "models.oq.sensitivity_model": "Sensitivity Model",
