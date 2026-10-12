@@ -422,6 +422,9 @@ class OQManager:
                     f"{'e' if enhanced else ''} "
                     f"({dtype}) is already in progress"
                 )
+            # A failed job removes its output directory.
+            if task.output_path == str(output_path) and task.status in _ACTIVE_STATUSES:
+                raise ValueError(f"Another quantization is writing to {output_path}")
 
         if enhanced:
             if imatrix_num_samples < 1:

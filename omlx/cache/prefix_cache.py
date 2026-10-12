@@ -1219,6 +1219,19 @@ class BlockAwarePrefixCache(CacheManager):
                     extra_keys=block_extra_keys,
                 )
                 if existing_block:
+                    # The lookup takes no reference. The inference thread can
+                    # free and reuse the block before this worker pins it, so
+                    # pin it against the locally computed chain hash.
+                    existing_block = self.paged_cache.acquire_cached_block(
+                        existing_block.block_id,
+                        compute_block_hash(
+                            parent_hash,
+                            block_tokens,
+                            extra_keys=block_extra_keys,
+                            model_name=self.paged_cache.model_name,
+                        ),
+                    )
+                if existing_block:
                     if split_gdn_layout and not self._has_split_gdn_checkpoint(
                         existing_block.block_hash, layer_cache_types
                     ):
@@ -1236,6 +1249,9 @@ class BlockAwarePrefixCache(CacheManager):
                                 "checkpoint",
                                 request_id,
                                 global_start,
+                            )
+                            self.paged_cache.release_for_eviction(
+                                [existing_block.block_id]
                             )
                             break
                     # Dedup'd blocks are never rewritten, so a block first
@@ -1271,8 +1287,6 @@ class BlockAwarePrefixCache(CacheManager):
                                 > _BACKFILL_CHECKED_MAX_ENTRIES
                             ):
                                 self._backfill_checked_hashes.clear()
-                    # Reuse existing block
-                    self.paged_cache.increment_ref(existing_block.block_id)
                     block_table.block_ids.append(existing_block.block_id)
                     block_table.num_tokens += len(block_tokens)
                     if is_tail_terminal:

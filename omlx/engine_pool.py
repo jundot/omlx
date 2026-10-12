@@ -4340,7 +4340,9 @@ class EnginePool:
         expired: list[str] = []
 
         async with self._lock:
-            for model_id, entry in self._entries.items():
+            # _unload_engine awaits, and cluster registration mutates _entries
+            # without this lock.
+            for model_id, entry in list(self._entries.items()):
                 if entry.engine is None or entry.is_loading or entry.is_pinned:
                     continue
 
