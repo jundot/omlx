@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 @MainActor
@@ -8,6 +9,7 @@ final class IntegrationsScreenVM {
         case codexModel, opencodeModel, openclawModel, piModel, openclawToolsProfile
         case hermesModel, copilotModel, dshModel, vibeModel
         case mcpConfig
+        case splashPath, splashLimits, splashKvFormat, splashAnePrefill
     }
 
     // Claude Code
@@ -26,6 +28,19 @@ final class IntegrationsScreenVM {
     var hermesModel: String = ""
     var copilotModel: String = ""
     var dshModel: String = ""
+
+    // External engines: Splash
+    private(set) var splash: GlobalSettingsDTO.SplashStatus?
+    /// Path saved in settings; empty when the server detects the launcher.
+    private(set) var splashPathSetting: String = ""
+    var splashPathDraft: String = ""
+    var editingSplashPath = false
+    var splashKvFormat: String = "int8"
+    var splashAnePrefill = true
+    /// Whole GB as text; empty means automatic.
+    var splashMaxMemoryGb: String = ""
+    var splashSsdCacheGb: String = ""
+    private var splashLimitsLoaded = ("", "")
 
     // MCP
     var mcpConfigPath: String = ""
@@ -115,6 +130,37 @@ final class IntegrationsScreenVM {
         mcpConfigPath.trimmingCharacters(in: .whitespaces) != mcpConfigLoaded
     }
 
+    /// Show the path field when no launcher was found or the user edits it.
+    var showsSplashPathField: Bool {
+        editingSplashPath || splash?.available != true
+    }
+
+    var hasPendingSplashLimits: Bool {
+        (Self.trimmed(splashMaxMemoryGb), Self.trimmed(splashSsdCacheGb)) != splashLimitsLoaded
+    }
+
+    func beginEditingSplashPath() {
+        splashPathDraft = splashPathSetting.isEmpty ? (splash?.path ?? "") : splashPathSetting
+        editingSplashPath = true
+    }
+
+    func chooseSplashLauncher() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.treatsFilePackagesAsDirectories = true
+        panel.prompt = String(localized: "integrations.splash.browse.prompt",
+                              defaultValue: "Select",
+                              comment: "NSOpenPanel button label for choosing the Splash launcher")
+        panel.message = String(localized: "integrations.splash.browse.message",
+                               defaultValue: "Choose the splash or splash-m1 launcher.",
+                               comment: "NSOpenPanel message for choosing the Splash launcher")
+        if panel.runModal() == .OK, let url = panel.url {
+            splashPathDraft = url.path
+        }
+    }
+
     func bind<T: Equatable>(
         _ binding: Binding<T>,
         save: @escaping () -> Void
@@ -149,7 +195,14 @@ final class IntegrationsScreenVM {
                 self.hermesModel          = it.hermesModel ?? ""
                 self.copilotModel         = it.copilotModel ?? ""
                 self.dshModel             = it.dshModel ?? ""
+                self.splashPathSetting    = it.splashPath ?? ""
+                self.splashKvFormat       = it.splashKvFormat ?? "int8"
+                self.splashAnePrefill     = it.splashAnePrefill ?? true
+                self.splashMaxMemoryGb    = Self.gigabytesText(it.splashMaxMemoryGb)
+                self.splashSsdCacheGb     = Self.gigabytesText(it.splashSsdCacheGb)
+                self.splashLimitsLoaded   = (self.splashMaxMemoryGb, self.splashSsdCacheGb)
             }
+            self.splash = settings.externalEngines?.splash
             if let mcp = settings.mcp {
                 let path = mcp.configPath ?? ""
                 self.mcpConfigPath = path
@@ -195,6 +248,20 @@ final class IntegrationsScreenVM {
         case .dshModel:             patch.integrationsDshModel = dshModel
         case .mcpConfig:
             patch.mcpConfig = mcpConfigPath.trimmingCharacters(in: .whitespaces)
+        case .splashPath:
+            patch.splashPath = Self.trimmed(splashPathDraft)
+        case .splashKvFormat:       patch.splashKvFormat = splashKvFormat
+        case .splashAnePrefill:     patch.splashAnePrefill = splashAnePrefill
+        case .splashLimits:
+            guard let memory = Self.gigabytesPatch(splashMaxMemoryGb, minimum: 1),
+                  let ssd = Self.gigabytesPatch(splashSsdCacheGb, minimum: 0) else {
+                self.lastError = String(localized: "integrations.splash.limits.invalid",
+                                        defaultValue: "Enter whole gigabytes, or leave the field empty for automatic.",
+                                        comment: "Error when a Splash memory or SSD cache size is not a whole number")
+                return
+            }
+            patch.splashMaxMemoryGb = memory
+            patch.splashSsdCacheGb = ssd
         }
         do {
             _ = try await client.updateGlobalSettings(patch)
@@ -202,12 +269,35 @@ final class IntegrationsScreenVM {
             switch field {
             case .mcpConfig:
                 self.mcpConfigLoaded = mcpConfigPath.trimmingCharacters(in: .whitespaces)
+            case .splashPath:
+                self.editingSplashPath = false
+                // Reload for the launcher status the server resolved.
+                await load(client: client)
+            case .splashLimits:
+                self.splashLimitsLoaded = (Self.trimmed(splashMaxMemoryGb), Self.trimmed(splashSsdCacheGb))
             default:
                 break
             }
         } catch {
             self.lastError = error.omlxDescription
         }
+    }
+
+    private static func trimmed(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespaces)
+    }
+
+    private static func gigabytesText(_ value: Double?) -> String {
+        guard let value else { return "" }
+        return String(Int(value))
+    }
+
+    /// `.null` for an empty field, the value for whole GB, nil when invalid.
+    private static func gigabytesPatch(_ text: String, minimum: Int) -> PatchOptionalInt? {
+        let value = trimmed(text)
+        if value.isEmpty { return .null }
+        guard let gigabytes = Int(value), gigabytes >= minimum else { return nil }
+        return .value(gigabytes)
     }
 
     // MARK: - Shell helpers

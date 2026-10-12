@@ -7727,6 +7727,30 @@
         }
       }
     },
+    "integrations.section.external_engines" : {
+      "comment" : "Section header for engines that serve models from their own process",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "External Engines"
+          }
+        }
+      }
+    },
+    "integrations.section.external_engines.sub" : {
+      "comment" : "Subtitle for the External Engines section",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Serve a model with another inference engine in its own process. Choose the engine per model in Model Settings → Advanced."
+          }
+        }
+      }
+    },
     "integrations.section.mcp" : {
       "comment" : "Section header for the MCP config path row",
       "extractionState" : "manual",
@@ -7915,6 +7939,270 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "将真正的 `claude` 二进制文件指向你的本地 oMLX 服务器。"
+          }
+        }
+      }
+    },
+    "integrations.splash.ane_prefill" : {
+      "comment" : "Row label for Splash Neural Engine prefill",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Neural Engine Prefill"
+          }
+        }
+      }
+    },
+    "integrations.splash.ane_prefill.sub" : {
+      "comment" : "Sublabel for Splash Neural Engine prefill",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Let Splash run part of long prompts on the Neural Engine when that is faster."
+          }
+        }
+      }
+    },
+    "integrations.splash.apply" : {
+      "comment" : "Apply button for the Splash launcher path",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apply"
+          }
+        }
+      }
+    },
+    "integrations.splash.auto" : {
+      "comment" : "Placeholder for an automatic Splash size",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auto"
+          }
+        }
+      }
+    },
+    "integrations.splash.binary" : {
+      "comment" : "Row label for the Splash launcher",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Splash"
+          }
+        }
+      }
+    },
+    "integrations.splash.binary.sub" : {
+      "comment" : "Sublabel for the Splash launcher path field",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Path to the splash or splash-m1 launcher."
+          }
+        }
+      }
+    },
+    "integrations.splash.browse.help" : {
+      "comment" : "Tooltip for choosing the Splash launcher",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Choose launcher"
+          }
+        }
+      }
+    },
+    "integrations.splash.browse.message" : {
+      "comment" : "NSOpenPanel message for choosing the Splash launcher",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Choose the splash or splash-m1 launcher."
+          }
+        }
+      }
+    },
+    "integrations.splash.browse.prompt" : {
+      "comment" : "NSOpenPanel button label for choosing the Splash launcher",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Select"
+          }
+        }
+      }
+    },
+    "integrations.splash.cancel" : {
+      "comment" : "Cancel editing the Splash launcher path",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cancel"
+          }
+        }
+      }
+    },
+    "integrations.splash.change" : {
+      "comment" : "Button to edit the detected Splash launcher path",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Change"
+          }
+        }
+      }
+    },
+    "integrations.splash.configured" : {
+      "comment" : "Tooltip when the Splash launcher path was set by the user",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Set by path"
+          }
+        }
+      }
+    },
+    "integrations.splash.detected" : {
+      "comment" : "Tooltip when the Splash launcher was detected",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Found automatically"
+          }
+        }
+      }
+    },
+    "integrations.splash.kv_format" : {
+      "comment" : "Row label for the Splash KV cache format",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "KV Cache Precision"
+          }
+        }
+      }
+    },
+    "integrations.splash.kv_format.sub" : {
+      "comment" : "Sublabel for the Splash KV cache format",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "int8 holds about twice the context of bf16 in the same memory."
+          }
+        }
+      }
+    },
+    "integrations.splash.limits.apply" : {
+      "comment" : "Apply button for the Splash memory and SSD cache sizes",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apply"
+          }
+        }
+      }
+    },
+    "integrations.splash.limits.invalid" : {
+      "comment" : "Error when a Splash memory or SSD cache size is not a whole number",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enter whole gigabytes, or leave the field empty for automatic."
+          }
+        }
+      }
+    },
+    "integrations.splash.max_memory" : {
+      "comment" : "Row label for the Splash memory limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Memory Limit"
+          }
+        }
+      }
+    },
+    "integrations.splash.max_memory.sub" : {
+      "comment" : "Sublabel for the Splash memory limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Empty gives Splash enough for the full context window; a larger limit gives its prefix cache more room."
+          }
+        }
+      }
+    },
+    "integrations.splash.ssd_cache" : {
+      "comment" : "Row label for the Splash SSD cache size",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SSD Cache"
+          }
+        }
+      }
+    },
+    "integrations.splash.ssd_cache.sub" : {
+      "comment" : "Sublabel for the Splash SSD cache size",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Splash's prefix cache in the oMLX SSD cache folder. Empty uses the oMLX SSD cache size; 0 turns it off."
+          }
+        }
+      }
+    },
+    "integrations.splash.use_auto" : {
+      "comment" : "Button that clears the Splash path so the server detects the launcher",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Detect Automatically"
           }
         }
       }
@@ -20862,6 +21150,42 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "推测性解码、KV 缓存量化及其他研究功能。"
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.label" : {
+      "comment" : "Row label for serving a model with an external engine",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Use External Engine"
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.section_note" : {
+      "comment" : "Note above MLX-only settings while an external engine serves the model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "These settings do not apply while an external engine serves this model."
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.sub" : {
+      "comment" : "Sublabel for the external engine toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Serve this model with another inference engine in its own process instead of oMLX's MLX engines."
           }
         }
       }

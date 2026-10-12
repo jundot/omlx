@@ -67,6 +67,9 @@ class _FakePool:
     def _engine_runtime_signature(self, model_id, runtime_settings=None):
         return ()
 
+    def splash_target(self, model_id, model_settings):
+        return None, ""
+
     @staticmethod
     def _clear_load_failure(entry):
         entry.load_failed = False

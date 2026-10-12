@@ -32,7 +32,7 @@ final class ModelSettingsScreenVM {
         case thinkingBudgetEnabled, thinkingBudgetTokens
         case limitToolResults, toolResultLimitTokens
         case forceSampling, isPinned, isFavorite
-        case trustRemoteCode
+        case trustRemoteCode, externalEngine
         case embeddingAudioEnabled, embeddingAudioMaxSeconds
         case reasoningParser
         case chatTemplateKwargs
@@ -272,6 +272,9 @@ final class ModelSettingsScreenVM {
 
     // Security
     var trustRemoteCode: Bool = false
+
+    /// External engine serving the model; empty runs it in-process.
+    var externalEngine: String = ""
 
     // Embedding audio tower. Empty seconds keeps the 30 s processor default.
     var embeddingAudioEnabled: Bool = false
@@ -535,6 +538,8 @@ final class ModelSettingsScreenVM {
             return false
         case .temperature, .ttl, .isPinned, .isFavorite, .trustRemoteCode:
             return false
+        case .externalEngine:
+            return true
         case .embeddingAudioEnabled, .embeddingAudioMaxSeconds:
             return false
         case .chatTemplateKwargs:
@@ -642,6 +647,7 @@ final class ModelSettingsScreenVM {
                 self.isPinned = s?.isPinned ?? false
                 self.isFavorite = s?.isFavorite ?? false
                 self.trustRemoteCode = s?.trustRemoteCode ?? false
+                self.externalEngine = s?.externalEngine ?? ""
                 self.embeddingAudioEnabled = s?.embeddingAudioEnabled ?? false
                 self.embeddingAudioMaxSeconds = s?.embeddingAudioMaxSeconds.map { Self.formatPct($0) } ?? ""
                 self.reasoningParser = s?.reasoningParser ?? ""
@@ -800,6 +806,8 @@ final class ModelSettingsScreenVM {
         case .isPinned:                patch.isPinned = isPinned
         case .isFavorite:              patch.isFavorite = isFavorite
         case .trustRemoteCode:         patch.trustRemoteCode = trustRemoteCode
+        case .externalEngine:
+            patch.externalEngine = .some(externalEngine.isEmpty ? nil : externalEngine)
         case .embeddingAudioEnabled:   patch.embeddingAudioEnabled = embeddingAudioEnabled
         case .embeddingAudioMaxSeconds:
             let text = embeddingAudioMaxSeconds.trimmingCharacters(in: .whitespaces)

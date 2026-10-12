@@ -499,7 +499,8 @@
                 <!-- Acceleration -->
                 <section id="ms-acceleration" class="model-settings-section mt-8" x-show="{{ ms_llm_non_diffusion }}" x-cloak>
                     <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.acceleration_label') }}</h3>
-                    <div class="{{ ms_rows }}">
+                    <p x-show="modelSettings.external_engine" x-cloak class="text-xs text-amber-600 mb-3">{{ t('modal.model_settings.external_engine_section_note') }}</p>
+                    <div class="{{ ms_rows }}" :class="modelSettings.external_engine ? 'opacity-40 pointer-events-none' : ''">
                         <!-- Lightning MTP (built-in MTP head speculative decoding) -->
                         <div class="px-4 py-3.5 space-y-3">
                             <div class="flex items-start justify-between gap-3">
@@ -828,7 +829,8 @@
                 <!-- Memory Saving -->
                 <section id="ms-memory" class="model-settings-section mt-8" x-show="{{ ms_llm_non_diffusion }}" x-cloak>
                     <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.memory_label') }}</h3>
-                    <div class="{{ ms_rows }}">
+                    <p x-show="modelSettings.external_engine" x-cloak class="text-xs text-amber-600 mb-3">{{ t('modal.model_settings.external_engine_section_note') }}</p>
+                    <div class="{{ ms_rows }}" :class="modelSettings.external_engine ? 'opacity-40 pointer-events-none' : ''">
                         <!-- SSD N-gram Offload (Qwen4 PLE or DeepSeek V4.1 Engram) -->
                         <div class="px-4 py-3.5 space-y-2"
                              x-show="ssdNgramOffloadKey()" x-cloak>
@@ -937,8 +939,44 @@
                          x-show="{{ ms_llm }} || selectedModel?.embedding_audio_supported">
                     <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.advanced_label') }}</h3>
                     <div class="{{ ms_rows }}" x-show="{{ ms_llm }}">
+                        <!-- External engine: serve the model from another engine's process -->
+                        <div class="px-4 py-3.5 space-y-3"
+                             x-show="!modelSettings.is_diffusion_model && modelSettings.external_engines.length" x-cloak>
+                            <div class="flex items-start justify-between gap-3">
+                                <div class="min-w-0">
+                                    <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.external_engine') }}</span>
+                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.external_engine_hint') }}</p>
+                                    <p x-show="externalEngineReason()" class="text-xs text-amber-600 mt-1 break-words" x-text="externalEngineReason()"></p>
+                                </div>
+                                <button type="button"
+                                        @click="modelSettings.external_engine = modelSettings.external_engine ? '' : firstUsableExternalEngine()"
+                                        :disabled="!modelSettings.external_engine && !firstUsableExternalEngine()"
+                                        :class="[
+                                            modelSettings.external_engine ? 'bg-black' : 'bg-neutral-200',
+                                            (!modelSettings.external_engine && !firstUsableExternalEngine()) ? 'opacity-40 cursor-not-allowed' : ''
+                                        ]"
+                                        class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                    <span :class="modelSettings.external_engine ? 'translate-x-5' : 'translate-x-0'"
+                                          class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                </button>
+                            </div>
+                            <div x-show="modelSettings.external_engine" x-transition>
+                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.external_engine_select') }}</label>
+                                <select x-model="modelSettings.external_engine"
+                                        class="w-full px-3 py-2 border border-neutral-200 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-black">
+                                    <template x-for="engine in modelSettings.external_engines" :key="engine.id">
+                                        <option :value="engine.id" x-text="engine.label"
+                                                :disabled="!engine.compatible"
+                                                :selected="modelSettings.external_engine === engine.id"></option>
+                                    </template>
+                                </select>
+                                <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.external_engine_select_hint') }}</p>
+                            </div>
+                        </div>
+
                         <!-- Trust Remote Code (security-sensitive) -->
-                        <div class="px-4 py-3.5 bg-red-50 rounded-t-xl">
+                        <div class="px-4 py-3.5 bg-red-50"
+                             :class="!modelSettings.is_diffusion_model && modelSettings.external_engines.length ? '' : 'rounded-t-xl'">
                             <div class="flex items-start justify-between gap-3">
                                 <div class="min-w-0">
                                     <span class="text-sm font-medium text-red-700">{{ t('modal.model_settings.trust_remote_code') }}</span>
@@ -1181,7 +1219,8 @@
                 <!-- Experimental Features -->
                 <section id="ms-experimental" class="model-settings-section mt-8" x-show="{{ ms_llm_non_diffusion }}" x-cloak>
                     <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.experimental_label') }}</h3>
-                    <div class="{{ ms_rows }}">
+                    <p x-show="modelSettings.external_engine" x-cloak class="text-xs text-amber-600 mb-3">{{ t('modal.model_settings.external_engine_section_note') }}</p>
+                    <div class="{{ ms_rows }}" :class="modelSettings.external_engine ? 'opacity-40 pointer-events-none' : ''">
                         <!-- Qwen 3.5/3.6/3.8 private ANE/GPU prompt processing -->
                         <template x-if="selectedModel?.ane_prefill_backend === 'qwen'">
                             <div class="px-4 py-3.5 space-y-4">

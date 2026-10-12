@@ -226,6 +226,14 @@
                     web_search_content_mode: 'snippet',
                     web_search_content_truncate: true,
                     web_search_content_max_chars: 20000,
+                    splash_path: null,
+                    splash_kv_format: 'int8',
+                    splash_max_memory_gb: null,
+                    splash_ssd_cache_gb: null,
+                    splash_ane_prefill: true,
+                },
+                external_engines: {
+                    splash: { available: false, path: null, auto_detected: null, version: null, label: null, reason: '', install_hint: '', models: [] },
                 },
                 ui: { language: 'en', dashboard_layout: null },
                 idle_timeout: { idle_timeout_seconds: null },
@@ -234,6 +242,9 @@
 
             // Web search "Test search" button state
             webSearchTest: { running: false, ok: null, message: '' },
+            // Splash launcher path row: manual entry when not detected or changed
+            splashPath: { editing: false, draft: '', error: '', saving: false },
+            splashOptionsError: '',
             // Engines selectable for the DDGS Custom provider (ddgs 9.14.1 text registry)
             ddgsBackendList: ['brave', 'duckduckgo', 'grokipedia', 'mojeek', 'wikipedia', 'yahoo', 'yandex'],
 
@@ -316,6 +327,8 @@
                 moe_expert_offload_resident_fraction: 0.25,
                 qwen35_oq_a8_enabled: false,
                 qwen35_oq_a8_min_tokens: 128,
+                external_engine: '',
+                external_engines: [],
                 trust_remote_code: false,
                 embedding_audio_enabled: false,
                 embedding_audio_max_seconds: null,
@@ -1228,6 +1241,7 @@
                             auth: { ...this.globalSettings.auth, ...data.auth },
                             claude_code: { ...this.globalSettings.claude_code, ...data.claude_code },
                             integrations: { ...this.globalSettings.integrations, ...data.integrations },
+                            external_engines: { ...this.globalSettings.external_engines, ...data.external_engines },
                             idle_timeout: { ...this.globalSettings.idle_timeout, ...data.idle_timeout },
                             system: { ...this.globalSettings.system, ...data.system },
                         };
@@ -2172,6 +2186,8 @@
                     vlm_mtp_draft_block_size: s.vlm_mtp_draft_block_size ?? null,
                     ctKwargEntries,
                     is_diffusion_model: isDiffusion,
+                    external_engine: s.external_engine || '',
+                    external_engines: model?.external_engines || [],
                     trust_remote_code: s.trust_remote_code || false,
                     embedding_audio_enabled: s.embedding_audio_enabled || false,
                     embedding_audio_max_seconds: s.embedding_audio_max_seconds ?? null,
@@ -3254,6 +3270,7 @@
                                     ? parseInt(this.modelSettings.vlm_mtp_draft_block_size)
                                     : null,
                                 trust_remote_code: this.modelSettings.trust_remote_code,
+                                external_engine: this.modelSettings.external_engine || null,
                             };
                             if (isDiffusion) {
                                 Object.assign(payload, {
@@ -3292,6 +3309,7 @@
                                     specprefill_draft_model: null,
                                     specprefill_keep_pct: null,
                                     specprefill_threshold: null,
+                                    external_engine: null,
                                     dflash_enabled: false,
                                     dflash_draft_model: null,
                                     dflash_draft_quant_enabled: false,
@@ -4202,14 +4220,84 @@
                             web_search_content_mode: this.globalSettings.integrations.web_search_content_mode,
                             web_search_content_truncate: this.globalSettings.integrations.web_search_content_truncate,
                             web_search_content_max_chars: this.globalSettings.integrations.web_search_content_max_chars,
+                            splash_path: this.globalSettings.integrations.splash_path,
+                            splash_kv_format: this.globalSettings.integrations.splash_kv_format,
+                            splash_max_memory_gb: this.globalSettings.integrations.splash_max_memory_gb,
+                            splash_ssd_cache_gb: this.globalSettings.integrations.splash_ssd_cache_gb,
+                            splash_ane_prefill: this.globalSettings.integrations.splash_ane_prefill,
                         }),
                     });
                     if (!response.ok) {
+                        const data = await response.json().catch(() => ({}));
                         console.error('Failed to save integration settings');
+                        return data.detail || window.t('settings.integrations.save_failed');
                     }
                 } catch (err) {
                     console.error('Failed to save integration settings:', err);
+                    return String(err);
                 }
+                return '';
+            },
+
+            // Number inputs where an empty field means "automatic".
+            optionalNumber(value) {
+                return value === '' || value === null || value === undefined ? null : Number(value);
+            },
+
+            // The first external engine that can serve the model, or ''.
+            firstUsableExternalEngine() {
+                const usable = (this.modelSettings.external_engines || []).find(e => e.compatible);
+                return usable ? usable.id : '';
+            },
+
+            externalEngineReason() {
+                const engines = this.modelSettings.external_engines || [];
+                const selected = engines.find(e => e.id === this.modelSettings.external_engine);
+                if (selected) return selected.compatible ? '' : selected.reason;
+                return engines.some(e => e.compatible) ? '' : (engines[0]?.reason || '');
+            },
+
+            // Saves a Splash size in GB; empty means automatic. A value the
+            // server would reject is put back so later saves keep working.
+            async saveSplashSize(field, input, minimum) {
+                const previous = this.globalSettings.integrations[field];
+                const value = this.optionalNumber(input.value);
+                let error = '';
+                if (value !== null && !(value >= minimum)) {
+                    error = window.t('settings.integrations.splash.invalid_size');
+                } else {
+                    this.globalSettings.integrations[field] = value;
+                    error = await this.saveIntegrationSettings();
+                }
+                if (error) {
+                    this.globalSettings.integrations[field] = previous;
+                    input.value = previous ?? '';
+                }
+                this.splashOptionsError = error;
+            },
+
+            editSplashPath() {
+                const splash = this.globalSettings.external_engines.splash;
+                this.splashPath.draft = this.globalSettings.integrations.splash_path || splash.path || '';
+                this.splashPath.error = '';
+                this.splashPath.editing = true;
+            },
+
+            async applySplashPath(path) {
+                this.splashPath.saving = true;
+                this.splashPath.error = '';
+                const previous = this.globalSettings.integrations.splash_path;
+                this.globalSettings.integrations.splash_path = (path || '').trim() || null;
+                const error = await this.saveIntegrationSettings();
+                if (error) {
+                    this.globalSettings.integrations.splash_path = previous;
+                    this.splashPath.error = error;
+                } else {
+                    this.splashPath.editing = false;
+                    await this.loadGlobalSettings();
+                    this.loadModels();
+                }
+                this.splashPath.saving = false;
             },
 
             ddgsBackendChecked(name) {

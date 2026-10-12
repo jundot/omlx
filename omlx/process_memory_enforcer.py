@@ -701,7 +701,9 @@ class ProcessMemoryEnforcer:
         omlx_usage = get_phys_footprint()
         reserve = self._tier_reserve_bytes()
         terms = {
-            "omlx": omlx_usage,
+            # Splash's wired memory is neither free nor reclaimable, so it
+            # counts as oMLX's own: unloading the model frees it.
+            "omlx": omlx_usage + self._external_process_bytes(),
             "free": 0,
             "inactive": 0,
             "other_apps": 0,
@@ -734,7 +736,7 @@ class ProcessMemoryEnforcer:
         reclaimable = terms["free"] + terms["inactive"] + terms["other_apps"]
         # Other apps may already hold the reserve. Stay at 1 byte rather than
         # 0, which callers read as "guard disabled".
-        terms["dynamic"] = max(1, omlx_usage + reclaimable - reserve)
+        terms["dynamic"] = max(1, terms["omlx"] + reclaimable - reserve)
         return terms
 
     def _get_hard_limit_bytes(self) -> int:
@@ -942,6 +944,9 @@ class ProcessMemoryEnforcer:
 
         When no request is active we keep the legacy direct MLX telemetry path
         so idle/status accounting remains as precise as before.
+
+        Models served from their own processes (Splash) are added, since
+        evicting them frees that memory too.
         """
         phys = get_phys_footprint()
         if self._has_active_requests():
@@ -951,7 +956,20 @@ class ProcessMemoryEnforcer:
             active = mx.get_active_memory()
             mlx_bytes = active + mx.get_cache_memory()
             fresh = True
-        return max(active, phys - unreleased_graphics_bytes(mlx_bytes, fresh=fresh))
+        own = max(active, phys - unreleased_graphics_bytes(mlx_bytes, fresh=fresh))
+        return own + self._external_process_bytes()
+
+    def _external_process_bytes(self) -> int:
+        """Memory of models served from their own processes (Splash)."""
+        reader = getattr(self._engine_pool, "external_process_memory_bytes", None)
+        if not callable(reader):
+            return 0
+        try:
+            value = reader()
+        except Exception:  # noqa: BLE001
+            logger.debug("external process memory read failed", exc_info=True)
+            return 0
+        return value if isinstance(value, int) else 0
 
     def _is_emergency_pressure(self, current: int, ceiling: int) -> bool:
         """Return True only for pressure beyond the configured ceiling.

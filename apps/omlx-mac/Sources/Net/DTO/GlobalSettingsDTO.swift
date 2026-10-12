@@ -49,6 +49,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     let network: NetworkDTO?
     let claudeCode: ClaudeCodeSettings?
     let integrations: IntegrationsSettings?
+    let externalEngines: ExternalEnginesStatus?
     let mcp: MCPSettings?
     let usage: UsageSettings?
 
@@ -183,6 +184,35 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let hermesModel: String?
         let copilotModel: String?
         let dshModel: String?
+        /// Splash launcher path; nil means the server detects it.
+        let splashPath: String?
+        let splashKvFormat: String?
+        let splashMaxMemoryGb: Double?
+        let splashSsdCacheGb: Double?
+        let splashAnePrefill: Bool?
+    }
+
+    /// Read-only `external_engines` block: the launcher each external engine
+    /// would run on this Mac, and the models it serves now.
+    struct ExternalEnginesStatus: Codable, Equatable, Sendable {
+        let splash: SplashStatus?
+    }
+
+    struct SplashStatus: Codable, Equatable, Sendable {
+        let available: Bool
+        let path: String?
+        let autoDetected: Bool?
+        let version: String?
+        let label: String?
+        let reason: String?
+        let models: [SplashModel]?
+
+        struct SplashModel: Codable, Equatable, Sendable {
+            let id: String
+            let memoryBytes: Int?
+            let memoryBudgetBytes: Int?
+            let logPath: String?
+        }
     }
 
     /// Mirrors `omlx.settings.MCPSettings`. The server stores a single path to
@@ -256,6 +286,14 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var integrationsHermesModel: String? = nil
     var integrationsCopilotModel: String? = nil
     var integrationsDshModel: String? = nil
+
+    // External engines: Splash. An empty path returns to automatic
+    // detection; `.null` sizes return to automatic sizing.
+    var splashPath: String? = nil
+    var splashKvFormat: String? = nil
+    var splashMaxMemoryGb: PatchOptionalInt? = nil
+    var splashSsdCacheGb: PatchOptionalInt? = nil
+    var splashAnePrefill: Bool? = nil
 
     /// Path to an MCP server config file. Empty string clears the field on
     /// the server (`global_settings.mcp.config_path = None`). Shared across
