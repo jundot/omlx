@@ -178,6 +178,8 @@ def quantize_engram(
     bits=4,
 ):
     """Write three safetensors arrays in bounded row chunks, never a full table."""
+    if isinstance(bits, float):
+        bits = int(bits)
     if bits not in (2, 3, 4, 6, 8):
         raise ValueError("Unsupported Engram affine bit width")
     if table.get("bias_key"):

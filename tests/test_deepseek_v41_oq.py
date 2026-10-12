@@ -638,3 +638,21 @@ def test_unobserved_expert_uses_affine_three_bits_without_importance():
         for suffix, expected in zip(("weight", "scales", "biases"), observed):
             assert mx.array_equal(result["p." + suffix][0], expected).item()
         assert spec["bits"] == 3 and spec["mode"] == "affine"
+
+def test_quantize_engram_accepts_float_bits(tmp_path):
+    mx.random.seed(341)
+    weight = mx.random.normal((17, 256)).astype(mx.bfloat16)
+    mx.save_safetensors(str(tmp_path / "source.safetensors"), {"embed.weight": weight})
+
+
+    result = quantize_engram(
+        tmp_path,
+        tmp_path / "engram.safetensors",
+        {"weight_file": "source.safetensors", "weight_key": "embed.weight"},
+        rows_per_chunk=3,
+        bits=4.0,
+    )
+    # Loads the exported safetensors file back into mmory
+    exported = mx.load(str(tmp_path / result["weight_file"]))
+    # checking that the weight tensor was written and can be found
+    assert result["weight_key"] in exported
