@@ -5289,7 +5289,7 @@
                     lines.push('');
                     lines.push(window.t('bench.results.single.section_label'));
                     lines.push('-'.repeat(80));
-                    const hdr = [rpad(window.t('bench.results.single.test'), 32), pad('TTFT(ms)', 10), pad('TPOT(ms)', 10), pad('pp TPS', 12), pad('tg TPS', 12), pad('E2E(s)', 10), pad(window.t('bench.results.single.throughput'), 12), pad(window.t('bench.results.single.peak_mem'), 10)];
+                    const hdr = [rpad(window.t('bench.results.single.test'), 32), pad('TTFT(ms)', 10), pad('TPOT(ms)', 10), pad('PP TPS', 12), pad('TG TPS', 12), pad('E2E(s)', 10), pad(window.t('bench.results.single.throughput'), 12), pad(window.t('bench.results.single.peak_mem'), 10)];
                     lines.push(hdr.join('  '));
                     for (const r of this.benchSingleResults) {
                         const row = [
@@ -5314,7 +5314,7 @@
                     lines.push(`${title}`);
                     lines.push(subtitle);
                     lines.push('-'.repeat(80));
-                    const hdr = [rpad(window.t('bench.results.text_export.batch'), 8), pad('tg TPS', 12), pad(window.t('bench.results.batch.speedup'), 8), pad('pp TPS', 12), pad('pp TPS/req', 12), pad('TTFT(ms)', 10), pad('E2E(s)', 10)];
+                    const hdr = [rpad(window.t('bench.results.text_export.batch'), 8), pad('TG TPS', 12), pad(window.t('bench.results.batch.speedup'), 8), pad('PP TPS', 12), pad('PP TPS/req', 12), pad('TTFT(ms)', 10), pad('E2E(s)', 10)];
                     lines.push(hdr.join('  '));
                     if (baseline) {
                         const row = [
