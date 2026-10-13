@@ -17,6 +17,7 @@ import functools
 import inspect
 import logging
 import math
+import os
 import threading
 import time
 import weakref
@@ -1767,6 +1768,11 @@ _COARSE_MIN_VOCAB = 65536
 _COARSE_HEADS: Dict[int, Any] = {}
 
 
+def _greedy_coarse_enabled() -> bool:
+    """Greedy chains draft through the coarse head only when OMLX_MTP_GREEDY_COARSE=1."""
+    return os.environ.get("OMLX_MTP_GREEDY_COARSE") == "1"
+
+
 class _CoarseDraftHead:
     """MTP chain head that rescores a few coarse candidates per step."""
 
@@ -1783,12 +1789,8 @@ class _CoarseDraftHead:
         out = self.mtp(hidden_states, tokens, self.lang.model.embed_tokens, cache)
         return out if isinstance(out, tuple) else (out, out)
 
-    def candidates(self, h):
-        """Vocab ids ``(1, M)`` and their log-probabilities for hidden ``h``.
-
-        The candidates normalize among themselves: the coarse logits are too
-        narrow to estimate the vocabulary's normalizer.
-        """
+    def rescored(self, h):
+        """Coarse top-``_COARSE_CANDIDATES`` ids ``(1, M)`` and their exact logits (float32)."""
         import mlx.core as mx
 
         from omlx.utils.sampling import top_k_indices
@@ -1803,8 +1805,25 @@ class _CoarseDraftHead:
             group_size=head.group_size,
             bits=head.bits,
         )
-        exact = exact.astype(mx.float32)
+        return ids, exact.astype(mx.float32)
+
+    def candidates(self, h):
+        """Vocab ids ``(1, M)`` and their log-probabilities for hidden ``h``.
+
+        The candidates normalize among themselves: the coarse logits are too
+        narrow to estimate the vocabulary's normalizer.
+        """
+        import mlx.core as mx
+
+        ids, exact = self.rescored(h)
         return ids, exact - mx.logsumexp(exact, axis=-1, keepdims=True)
+
+    def greedy_token(self, h):
+        """The best exactly-rescored coarse candidate, shape ``(1,)`` int."""
+        import mlx.core as mx
+
+        ids, exact = self.rescored(h)
+        return mx.take(ids.reshape(-1), mx.argmax(exact, axis=-1))
 
 
 def _head_rows(head, rows):
@@ -1963,11 +1982,13 @@ def _quantize_mtp_fc(mtp) -> None:
     mx.eval(mtp.fc.parameters())
 
 
-def _coarse_draft_head(model) -> Optional[_CoarseDraftHead]:
+def _coarse_draft_head(
+    model, *, quantize_fc: bool = True
+) -> Optional[_CoarseDraftHead]:
     """The coarse chain head for Qwen3.5/Qwen4 MTP with a quantized lm_head.
 
-    The first call per head builds the coarse copy and stores the MTP ``fc``
-    at 4 bits.
+    The first call per head builds the coarse copy. Unless ``quantize_fc`` is
+    false, the MTP ``fc`` is stored at 4 bits.
     """
     import mlx.core as mx
     import mlx.nn as nn
@@ -1986,9 +2007,11 @@ def _coarse_draft_head(model) -> Optional[_CoarseDraftHead]:
         or _head_vocab(head) < _COARSE_MIN_VOCAB
     ):
         return None
+    if quantize_fc:
+        _quantize_mtp_fc(mtp)
     coarse = _COARSE_HEADS.get(id(head))
     if coarse is None:
-        _quantize_mtp_fc(mtp)
+        t_build = time.perf_counter()
         rows = _head_vocab(head)
         parts = []
         for start in range(0, rows, 16384):
@@ -2017,6 +2040,12 @@ def _coarse_draft_head(model) -> Optional[_CoarseDraftHead]:
         _COARSE_HEADS[id(head)] = coarse
         # The copy lives as long as its model.
         weakref.finalize(head, _COARSE_HEADS.pop, id(head), None)
+        logger.info(
+            "MTP coarse draft head built in %.2fs (%.0f MiB)",
+            time.perf_counter() - t_build,
+            sum(a.nbytes for a in (coarse.weight, coarse.scales, coarse.biases))
+            / 2**20,
+        )
     return _CoarseDraftHead(lang, mtp, coarse)
 
 
@@ -3082,7 +3111,22 @@ def _chain_next_drafts(
         begin(state.mtp_cache, depth)
 
     sparse_k = _sparse_top_k(sampler) if procs is None else 0
-    coarse = _coarse_draft_head(model) if 0 < sparse_k <= 32 else None
+    # Opt-in: greedy chains draft the best exactly-rescored coarse candidate.
+    # Logits processors keep the full head: they reshape the whole vocabulary.
+    # The greedy path does not quantize ``fc``; a sampled request in the same
+    # process still does, and the head then keeps that precision.
+    greedy = (
+        procs is None
+        and sparse_k == 0
+        and _greedy_coarse_enabled()
+        and _is_greedy(gen_batch)
+    )
+    coarse = (
+        _coarse_draft_head(model, quantize_fc=not greedy)
+        if 0 < sparse_k <= 32 or greedy
+        else None
+    )
+    greedy_coarse = greedy and coarse is not None
     n = committed.shape[0]
     if coarse is None:
         logits, head_hidden = model.mtp_forward(
@@ -3116,7 +3160,9 @@ def _chain_next_drafts(
 
     sparse_ids: List[Any] = []
     for j in range(depth):
-        if coarse is not None:
+        if greedy_coarse:
+            tok = coarse.greedy_token(source)
+        elif coarse is not None:
             # Emitted drafts then report the target's own log-probabilities.
             cand_ids, cand_lp = coarse.candidates(source)
             tok, ids, accept_lp = _sample_candidates_fused(sampler, cand_lp, sparse_k)
@@ -3139,7 +3185,8 @@ def _chain_next_drafts(
             draft_lps.append(lp_2d.squeeze(0))
         tok = _ensure_uint32(tok)
         draft_toks.append(tok)
-        draft_accept_lps.append(accept_lp.squeeze(0))
+        if not greedy_coarse:
+            draft_accept_lps.append(accept_lp.squeeze(0))
         if j + 1 == depth:
             break
         # Start this step on the GPU while the host encodes the next one.
