@@ -154,10 +154,25 @@ def test_active_models_copy_buttons_render_their_icons():
         assert "copyToClipboard(m.id)" in click
 
 
-def test_queue_copy_tooltip_key_exists_in_every_locale():
+def test_usage_history_copy_button_renders_its_icon():
+    html = _render("dashboard/_usage.html")
+    buttons = _copy_buttons(html, "usage.copy_model_name_tooltip")
+    # One button per usage table row template.
+    assert len(buttons) == 1
+    _assert_icon_pair(buttons[0])
+    click = next(
+        value
+        for name, value in buttons[0]["attrs"].items()
+        if name.startswith("@click") or name.startswith("x-on:click")
+    )
+    assert "copyToClipboard(row.model_id)" in click
+
+
+def test_copy_tooltip_keys_exist_in_every_locale():
     for key in (
         "models.queue.copy_model_name_tooltip",
         "status.active_models.copy_model_name_tooltip",
+        "usage.copy_model_name_tooltip",
     ):
         for locale_path in sorted(I18N.glob("*.json")):
             translations = json.loads(locale_path.read_text())

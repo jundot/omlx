@@ -2209,6 +2209,7 @@
   "usage.90d": "90 dní",
   "usage.month": "Tento měsíc",
   "usage.model": "Model",
+  "usage.copy_model_name_tooltip": "Kopírovat název modelu",
   "usage.all_models": "Všechny modely",
   "usage.note": "Lokální agregace · místní čas serveru · aktualizace každých 15 sekund · uchování 400 dní",
   "usage.requests": "Požadavky",

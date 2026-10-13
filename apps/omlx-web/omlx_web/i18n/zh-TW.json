@@ -2209,6 +2209,7 @@
   "usage.90d": "90 天",
   "usage.month": "本月",
   "usage.model": "模型",
+  "usage.copy_model_name_tooltip": "複製模型名稱",
   "usage.all_models": "所有模型",
   "usage.note": "本機彙總 · 伺服器本地時間 · 每 15 秒更新 · 保留 400 天",
   "usage.requests": "請求",

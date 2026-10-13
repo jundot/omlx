@@ -2209,6 +2209,7 @@
   "usage.90d": "90일",
   "usage.month": "이번 달",
   "usage.model": "모델",
+  "usage.copy_model_name_tooltip": "모델 이름 복사",
   "usage.all_models": "모든 모델",
   "usage.note": "로컬 집계 · 서버 로컬 시간 · 15초마다 갱신 · 400일 보관",
   "usage.requests": "요청",

@@ -2209,6 +2209,7 @@
   "usage.90d": "90 天",
   "usage.month": "本月",
   "usage.model": "模型",
+  "usage.copy_model_name_tooltip": "复制模型名称",
   "usage.all_models": "所有模型",
   "usage.note": "本地聚合 · 服务器本地时间 · 每 15 秒更新 · 保留 400 天",
   "usage.requests": "请求",

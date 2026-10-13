@@ -2209,6 +2209,7 @@
   "usage.90d": "90日間",
   "usage.month": "今月",
   "usage.model": "モデル",
+  "usage.copy_model_name_tooltip": "モデル名をコピー",
   "usage.all_models": "すべてのモデル",
   "usage.note": "ローカル集計 · サーバーのローカル時刻 · 15秒ごとに更新 · 400日間保持",
   "usage.requests": "リクエスト",

@@ -2209,6 +2209,7 @@
   "usage.90d": "90 jours",
   "usage.month": "Ce mois-ci",
   "usage.model": "Modèle",
+  "usage.copy_model_name_tooltip": "Copier le nom du modèle",
   "usage.all_models": "Tous les modèles",
   "usage.note": "Agrégats locaux · heure locale du serveur · mis à jour toutes les 15 secondes · conservation 400 jours",
   "usage.requests": "Requêtes",

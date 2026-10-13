@@ -2209,6 +2209,7 @@
   "usage.90d": "90 Days",
   "usage.month": "This Month",
   "usage.model": "Model",
+  "usage.copy_model_name_tooltip": "Copy model name",
   "usage.all_models": "All Models",
   "usage.note": "Local aggregates · server local time · updated every 15 seconds · 400-day retention",
   "usage.requests": "Requests",
