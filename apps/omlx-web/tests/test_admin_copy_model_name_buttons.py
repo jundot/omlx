@@ -9,9 +9,12 @@ carry both state icons (copy and check) as direct children.
 """
 
 import json
+import shutil
+import subprocess
 from html.parser import HTMLParser
 from pathlib import Path
 
+import pytest
 from jinja2 import Environment, FileSystemLoader
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -118,7 +121,7 @@ def test_download_queue_copy_buttons_render_their_icons():
         _assert_icon_pair(button)
 
 
-def test_download_queue_copy_buttons_copy_the_repo_id_when_completed():
+def test_download_queue_copy_buttons_copy_the_canonical_id_when_completed():
     html = _render("dashboard/_models.html")
     buttons = _copy_buttons(html, "models.queue.copy_model_name_tooltip")
     assert len(buttons) == 2
@@ -129,7 +132,10 @@ def test_download_queue_copy_buttons_copy_the_repo_id_when_completed():
             for name, value in attrs.items()
             if name.startswith("@click") or name.startswith("x-on:click")
         )
-        assert "copyToClipboard(task.repo_id)" in click
+        # The queue must copy the same canonical id the model manager and
+        # the API use, resolved through the shared helper, not the raw
+        # HuggingFace repo id.
+        assert "copyToClipboard(queueModelName(task.repo_id))" in click
         assert "task.status === 'completed'" in attrs.get("x-show", "")
 
 
@@ -138,3 +144,17 @@ def test_queue_copy_tooltip_key_exists_in_every_locale():
     for locale_path in sorted(I18N.glob("*.json")):
         translations = json.loads(locale_path.read_text())
         assert key in translations, f"{locale_path.name} is missing {key!r}"
+
+
+def test_queue_model_name_helper_matches_the_manager_resolution():
+    """The queue copy helper resolves ids through the real dashboard.js."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for dashboard behavior tests")
+    result = subprocess.run(
+        [node, str(ROOT / "tests/queue_copy_model_name_ui.test.cjs")],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

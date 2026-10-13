@@ -4758,6 +4758,19 @@
                 }
             },
 
+            // Canonical id a queue row should copy, matching the model
+            // manager: the alias or folder id the API keys on, not the
+            // HuggingFace repo id. Falls back to the folder name (the last
+            // repo segment) when the model is not in the loaded list yet.
+            queueModelName(repoId) {
+                if (!repoId) return '';
+                const model = this.models.find(
+                    (m) => m.id === repoId || m.display_name === repoId
+                );
+                if (model) return model.settings?.model_alias || model.id;
+                return repoId.includes('/') ? repoId.split('/').pop() : repoId;
+            },
+
             _copyFallback(text) {
                 const textarea = document.createElement('textarea');
                 textarea.value = text;
