@@ -397,6 +397,7 @@
   "models.queue.downloading": "Stahování…",
   "models.queue.cancel_tooltip": "Zrušit stahování",
   "models.queue.remove_tooltip": "Odebrat ze seznamu",
+  "models.queue.copy_model_name_tooltip": "Kopírovat název modelu",
   "models.oq.section_label": "Kvantizace",
   "models.oq.heading": "Kvantizace oQ",
   "models.oq.description": "Kvantizujte modely strategií oQ se smíšenou přesností pro lepší kvalitu při nízkém počtu bitů.",

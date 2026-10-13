@@ -397,6 +397,7 @@
   "models.queue.downloading": "Загрузка...",
   "models.queue.cancel_tooltip": "Отменить загрузку",
   "models.queue.remove_tooltip": "Убрать из списка",
+  "models.queue.copy_model_name_tooltip": "Скопировать название модели",
   "models.oq.section_label": "Квантование",
   "models.oq.heading": "oQ квантование",
   "models.oq.description": "Квантуйте модели с помощью стратегии смешанной точности oQ, чтобы получить лучшее качество на низкой битности.",

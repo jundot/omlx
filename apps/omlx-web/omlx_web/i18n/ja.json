@@ -397,6 +397,7 @@
   "models.queue.downloading": "ダウンロード中...",
   "models.queue.cancel_tooltip": "ダウンロードをキャンセル",
   "models.queue.remove_tooltip": "リストから削除",
+  "models.queue.copy_model_name_tooltip": "モデル名をコピー",
   "models.oq.section_label": "量子化",
   "models.oq.heading": "oQ量子化",
   "models.oq.description": "oQ混合精度戦略でモデルを量子化し、低ビットで高品質を実現します。",

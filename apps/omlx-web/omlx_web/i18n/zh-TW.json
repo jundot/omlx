@@ -397,6 +397,7 @@
   "models.queue.downloading": "下載中...",
   "models.queue.cancel_tooltip": "取消下載",
   "models.queue.remove_tooltip": "從列表移除",
+  "models.queue.copy_model_name_tooltip": "複製模型名稱",
   "models.oq.section_label": "量化",
   "models.oq.heading": "oQ量化",
   "models.oq.description": "使用oQ混合精度策略量化模型，在低位元下實現更高品質。",
