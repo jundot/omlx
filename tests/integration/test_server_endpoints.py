@@ -1959,7 +1959,10 @@ class TestSystemOneEndpoint:
     }
 
     def test_systemone_response_shape(self, client, mock_decision_engine):
-        response = client.post("/v1/systemone", json={**self._BODY, "truncate": False})
+        video = "data:video/mp4;base64,AAAA"
+        response = client.post(
+            "/v1/systemone", json={**self._BODY, "truncate": False, "videos": [video]}
+        )
 
         assert response.status_code == 200
         assert response.json() == {
@@ -1972,6 +1975,7 @@ class TestSystemOneEndpoint:
         }
         (call,) = mock_decision_engine.encoded
         assert call["truncate"] is False
+        assert call["request"]["videos"] == [video]
         assert call["request"]["questions"]["team"]["criteria"] == {
             "billing": None,
             "tech": None,

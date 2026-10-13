@@ -1303,6 +1303,13 @@
         background-color: var(--bg-primary);
         color: var(--text-primary);
     }
+    /* Half-filled smarts dot on the Recommended downloader tab. */
+    .rec-dot-half {
+        background: linear-gradient(90deg, rgb(var(--palette-neutral-500)) 50%, rgb(var(--palette-neutral-200)) 50%);
+    }
+    [data-theme="dark"] .rec-dot-half {
+        background: linear-gradient(90deg, rgb(var(--palette-neutral-500)) 50%, var(--bg-tertiary) 50%);
+    }
     /* Compact size for choices inside a card or a table row. */
     .segmented--sm { padding: 0.125rem; }
     .segmented--sm .segmented__item {

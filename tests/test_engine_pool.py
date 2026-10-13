@@ -1066,6 +1066,36 @@ class TestApplySettingsOverrides:
         reloaded = ModelSettingsManager(tmp_path / "settings")
         assert reloaded.get_settings("family").top_k == 20
 
+    def test_new_lightning_mtp_checkpoints_start_with_mtp_on(self, tmp_path):
+        models = tmp_path / "models"
+        config = {"model_type": "qwen3_5", "text_config": {"mtp_num_hidden_layers": 1}}
+        builds = (("mtp", True), ("stripped", False), ("saved", True))
+        for name, has_mtp_weights in builds:
+            path = models / name
+            path.mkdir(parents=True)
+            (path / "config.json").write_text(json.dumps(config))
+            (path / "model.safetensors").write_bytes(b"0" * 1024)
+            weight_map = {
+                "language_model.model.embed_tokens.weight": "model.safetensors"
+            }
+            if has_mtp_weights:
+                weight_map["language_model.mtp.fc.weight"] = "model.safetensors"
+            (path / "model.safetensors.index.json").write_text(
+                json.dumps({"metadata": {}, "weight_map": weight_map})
+            )
+        manager = ModelSettingsManager(tmp_path / "settings")
+        manager.set_settings("saved", ModelSettings(model_alias="mine"))
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(models))
+
+        pool.apply_settings_overrides(manager)
+
+        assert manager.get_settings("mtp").mtp_enabled is True
+        # Config heads without MTP tensors cannot run Lightning MTP.
+        assert not manager.get_settings("stripped").mtp_enabled
+        # Saved settings are the user's; discovery does not touch them.
+        assert not manager.get_settings("saved").mtp_enabled
+
     def test_recommended_sampling_keeps_ocr_defaults(self, tmp_path):
         (tmp_path / "generation_config.json").write_text(
             json.dumps({"temperature": 0.7, "top_p": 0.8})

@@ -4456,6 +4456,16 @@ class TestNumericsSignature:
         assert mgr._index.get(b"23" * 10) is not None
         assert "numerics" not in json.loads(mgr._expected_cache_signature())
 
+    def test_yarn_scaled_rotary_tags_the_revision(self):
+        language = pytest.importorskip("mlx_vlm.models.qwen3_5.language")
+        rotary = language.Qwen3_5RotaryEmbedding(8, mrope_section=[2, 1, 1])
+
+        base = numerics_revision_for_model(rotary)
+        rotary.attention_scaling = 1.25
+
+        # Toggling YaRN changes the revision, so the other blocks are swept.
+        assert numerics_revision_for_model(rotary) == f"{base},yarn-1.25"
+
 
 class TestTurboquantBitsSignature:
     """#2045: the cache signature must key the TurboQuant bit depth.

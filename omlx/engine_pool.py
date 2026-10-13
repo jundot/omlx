@@ -36,6 +36,16 @@ from .engine import BaseEngine, BatchedEngine
 from .engine.decision import DecisionEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
+from .engine.splash import (
+    EXTERNAL_ENGINES,
+    SplashEngine,
+    SplashOptions,
+    SplashTarget,
+    find_splash_binary,
+    resolve_splash_target,
+    splash_memory_estimate,
+    splash_repo_id,
+)
 from .engine.sts import STSEngine
 from .engine.stt import STTEngine
 from .engine.tts import TTSEngine
@@ -62,11 +72,17 @@ from .model_settings import (
     ane_prefill_fraction,
     validate_ane_prefill,
 )
+from .patches.qwen35_yarn import yarn_factor
 from .scheduler import SchedulerConfig
+from .settings import get_settings as get_global_settings
 from .utils.fatal import exit_if_gpu_submissions_ignored
 from .utils.generation_config import SAMPLING_SETTING_KEYS, load_sampling_defaults
 from .utils.metal_sync import unreleased_graphics_bytes
-from .utils.model_loading import dflash_batched_requested, dflash_batched_supported
+from .utils.model_loading import (
+    dflash_batched_requested,
+    dflash_batched_supported,
+    lightning_mtp_supported,
+)
 from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
@@ -297,6 +313,9 @@ class EngineEntry:
     preserve_thinking_default: bool | None = (
         None  # True when template supports preserve_thinking (Qwen 3.6+)
     )
+    reasoning_efforts: list[str] | None = (
+        None  # Effort levels the template accepts (None = no effort)
+    )
     model_context_length: int | None = (
         None  # Declared context length from config.json (None if unknown)
     )
@@ -366,6 +385,9 @@ class EnginePool:
         self._entries: dict[str, EngineEntry] = {}
         self._lock = asyncio.Lock()
         self._current_model_memory = 0
+        # Splash engines between launch and load completion, which the memory
+        # guard must count before entry.engine is set.
+        self._starting_external: dict[str, SplashEngine] = {}
         # Scanned model roots, kept for org-qualified display/upload names.
         self._model_dirs: list[Path] = []
         self._scheduler_config = scheduler_config or SchedulerConfig()
@@ -512,6 +534,13 @@ class EnginePool:
         base = self._entry_resident_size(entry) if base_size is None else base_size
         if self._distributed_deployment_for_entry(entry) is not None:
             return base
+        if getattr(runtime_settings, "external_engine", None):
+            # Splash plans its own budget; none of the MLX reservations apply.
+            target, _ = self.splash_target(entry.model_id, runtime_settings)
+            if target is not None:
+                wanted = self._splash_wanted_bytes(entry, runtime_settings, target)
+                limit = self._splash_admission_target()
+                return min(wanted, limit) if limit > 0 else wanted
         qwen4_offload, _, qwen4_estimate = self._qwen4_ple_offload_status(
             entry, runtime_settings
         )
@@ -1053,6 +1082,7 @@ class EnginePool:
 
         # Security/load gates.
         add("trust_remote_code", bool(data.get("trust_remote_code", False)))
+        add("external_engine", data.get("external_engine") or None)
         add("index_cache_freq", normalized_index_cache_freq())
         # Embedding audio tower residency is decided at load. The audio length
         # only matters while the tower is loaded.
@@ -1083,6 +1113,13 @@ class EnginePool:
                 "deepseek_v41_ced_prefill_enabled",
                 getattr(settings, "deepseek_v41_ced_prefill_enabled", False),
             )
+            factor = yarn_factor(
+                entry.config_model_type,
+                entry.model_context_length,
+                data.get("max_context_window"),
+            )
+            if factor is not None:
+                add("yarn_factor", factor)
 
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)
@@ -1351,6 +1388,7 @@ class EnginePool:
                     preserve_thinking_default=getattr(
                         info, "preserve_thinking_default", None
                     ),
+                    reasoning_efforts=getattr(info, "reasoning_efforts", None),
                     model_context_length=getattr(info, "model_context_length", None),
                     source_type=getattr(info, "source_type", "local"),
                     source_repo_id=getattr(info, "source_repo_id", None),
@@ -1404,7 +1442,8 @@ class EnginePool:
         """Apply persisted settings to discovered entries.
 
         Applies model_type_override, then saves the recommended sampling
-        settings of generation models that have no saved settings yet.
+        settings of generation models that have no saved settings yet. A
+        new checkpoint with Lightning MTP weights also starts with MTP on.
         """
         for model_id, entry in self._entries.items():
             settings = settings_manager.get_settings(model_id)
@@ -1423,18 +1462,28 @@ class EnginePool:
             if settings_manager.has_settings(model_id):
                 continue
             values = self.recommended_sampling_settings(entry)
+            if self._starts_with_lightning_mtp(entry):
+                values["mtp_enabled"] = True
             if values:
                 initial[model_id] = values
         try:
             added = settings_manager.add_initial_settings(initial)
         except OSError as e:
-            logger.warning(f"Could not save recommended sampling settings: {e}")
+            logger.warning(f"Could not save initial model settings: {e}")
             return
         for model_id in added:
-            logger.info(
-                f"Applied recommended sampling settings for {model_id}: "
-                f"{initial[model_id]}"
-            )
+            logger.info(f"Applied initial settings for {model_id}: {initial[model_id]}")
+
+    @classmethod
+    def _starts_with_lightning_mtp(cls, entry: EngineEntry) -> bool:
+        if (
+            entry.is_helper
+            or entry.source_type == "cluster"
+            or entry.model_type not in ("llm", "vlm")
+            or cls._entry_is_diffusion_model(entry)
+        ):
+            return False
+        return lightning_mtp_supported(entry.model_path)
 
     @classmethod
     def recommended_sampling_settings(cls, entry: EngineEntry) -> dict:
@@ -1875,6 +1924,192 @@ class EnginePool:
         tokenizer = getattr(engine, "tokenizer", None)
         return tokenizer is not None and callable(getattr(tokenizer, "encode", None))
 
+    def _splash_draft_candidates(self, model_settings: object | None) -> list[str]:
+        """Helper model paths to look for a DFlash2 draft in, configured one first."""
+        candidates = []
+        draft_id = getattr(model_settings, "dflash_draft_model", None)
+        if draft_id:
+            draft_entry = self._entries.get(draft_id)
+            candidates.append(draft_entry.model_path if draft_entry else draft_id)
+        candidates += [e.model_path for e in self._entries.values() if e.is_helper]
+        return candidates
+
+    def splash_target(
+        self, model_id: str, model_settings: object | None
+    ) -> tuple[SplashTarget | None, str]:
+        """Whether Splash can serve ``model_id``, and with what; else why not."""
+        entry = self._entries.get(model_id)
+        if entry is None:
+            return None, f"Model '{model_id}' not found"
+        if entry.engine_type not in ("batched", "vlm"):
+            return None, "Splash serves language models only"
+        return resolve_splash_target(
+            entry.model_path,
+            get_global_settings().integrations.splash_path,
+            self._splash_draft_candidates(model_settings),
+        )
+
+    def _splash_sizing_context(
+        self, entry: EngineEntry, model_settings: object | None
+    ) -> int | None:
+        # The context the server would accept (get_max_context_window).
+        configured = getattr(model_settings, "max_context_window", None)
+        if configured:
+            return int(configured)
+        native = entry.model_context_length
+        policy = get_global_settings().sampling.max_context_window_policy
+        if native and policy:
+            return min(native, policy)
+        return native
+
+    def _splash_wanted_bytes(
+        self, entry: EngineEntry, model_settings: object | None, target: SplashTarget
+    ) -> int:
+        """The configured Splash memory limit, or enough for the context window."""
+        settings = get_global_settings().integrations
+        wanted = int((settings.splash_max_memory_gb or 0) * 1024**3)
+        if wanted > 0:
+            return wanted
+        return splash_memory_estimate(
+            entry.model_path,
+            target.draft_path,
+            self._splash_sizing_context(entry, model_settings),
+            settings.splash_kv_format,
+        )
+
+    def _splash_admission_target(self) -> int:
+        """Total the pool fills models up to (as admission does); 0 for no limit.
+
+        Splash grows into its whole budget, so the budget stays under the soft
+        watermark where the memory guard starts evicting.
+        """
+        ceiling = self._current_ceiling() or self._fallback_admission_ceiling()
+        if ceiling <= 0:
+            return 0
+        soft = self._admission_soft_target()
+        return min(soft, ceiling) if soft > 0 else ceiling
+
+    def _splash_memory_budget(
+        self, entry: EngineEntry, model_settings: object | None, target: SplashTarget
+    ) -> int:
+        """Bytes Splash may plan: what it wants, within what the target leaves.
+
+        The pool then counts the budget Splash planned as the model's size, so
+        admission and the memory guard see Splash's share.
+        """
+        wanted = self._splash_wanted_bytes(entry, model_settings, target)
+        limit = self._splash_admission_target()
+        if limit <= 0:
+            return wanted
+        room = limit - self._current_model_memory
+        if room <= 0:
+            raise ModelLoadingError(
+                entry.model_id,
+                f"Splash cannot serve '{entry.model_id}': the oMLX memory limit "
+                "leaves no memory for it",
+            )
+        return min(room, wanted)
+
+    async def _check_splash_launcher(
+        self, model_id: str, runtime_settings: object | None
+    ) -> None:
+        """Run the launcher check off the event loop when a model uses Splash.
+
+        The first look at a launcher runs it to read its version.
+        """
+        settings = runtime_settings
+        if settings is None and self._settings_manager is not None:
+            get_settings = getattr(self._settings_manager, "get_settings", None)
+            if callable(get_settings):
+                settings = get_settings(model_id)
+        if getattr(settings, "external_engine", None):
+            await asyncio.to_thread(
+                find_splash_binary, get_global_settings().integrations.splash_path
+            )
+
+    def _external_engine_for(
+        self,
+        entry: EngineEntry,
+        model_settings: object | None,
+        effective_type: str,
+    ) -> SplashEngine | None:
+        """The external engine the model's settings select, else None.
+
+        A model that cannot run on its selected engine fails to load with the
+        reason instead of falling back to MLX, since the user asked for it.
+        """
+        engine_id = getattr(model_settings, "external_engine", None)
+        if not engine_id:
+            return None
+        if engine_id not in EXTERNAL_ENGINES:
+            raise ModelLoadingError(
+                entry.model_id, f"Unknown external engine '{engine_id}'"
+            )
+        if effective_type not in ("batched", "vlm"):
+            raise ModelLoadingError(
+                entry.model_id, "Splash serves language models only"
+            )
+        target, reason = self.splash_target(entry.model_id, model_settings)
+        if target is None:
+            raise ModelLoadingError(
+                entry.model_id, f"Splash cannot serve '{entry.model_id}': {reason}"
+            )
+        logger.info(
+            "Serving %s through %s %s (%s)",
+            entry.model_id,
+            target.binary.label,
+            target.binary.version,
+            target.binary.path,
+        )
+        settings = get_global_settings()
+        integrations = settings.integrations
+        cfg = self._scheduler_config
+        cache_disk_bytes = 0
+        cache_dir = None
+        if getattr(cfg, "paged_ssd_cache_dir", None) and not getattr(
+            cfg, "hot_cache_only", False
+        ):
+            if integrations.splash_ssd_cache_gb is None:
+                cache_disk_bytes = int(cfg.paged_ssd_cache_max_size)
+            else:
+                cache_disk_bytes = int(integrations.splash_ssd_cache_gb * 1024**3)
+            slug = splash_repo_id(entry.model_id).split("/", 1)[1]
+            cache_dir = Path(cfg.paged_ssd_cache_dir) / "splash" / slug
+        # Only an explicit limit goes to Splash; otherwise Splash fits the
+        # context to its budget and the server adopts what it planned.
+        requested_context = getattr(model_settings, "max_context_window", None)
+        return SplashEngine(
+            model_name=entry.model_path,
+            model_id=entry.model_id,
+            target=target,
+            hub_dir=settings.base_path / "splash" / "hub",
+            log_dir=settings.logging.get_log_dir(settings.base_path) / "splash",
+            options=SplashOptions(
+                max_context=requested_context,
+                max_memory_bytes=self._splash_memory_budget(
+                    entry, model_settings, target
+                ),
+                kv_format=integrations.splash_kv_format,
+                ane_prefill=integrations.splash_ane_prefill,
+                cache_disk_bytes=cache_disk_bytes,
+                cache_dir=cache_dir,
+            ),
+        )
+
+    def external_process_memory_bytes(self) -> int:
+        """Memory held by models that run in their own processes (Splash)."""
+        engines = [entry.engine for entry in list(self._entries.values())]
+        engines += list(self._starting_external.values())
+        total = 0
+        for engine in engines:
+            if not isinstance(engine, SplashEngine):
+                continue
+            try:
+                total += engine.process_memory_bytes()
+            except Exception:  # noqa: BLE001
+                logger.debug("external process memory read failed", exc_info=True)
+        return total
+
     def _validate_llm_engine_ready(self, model_id: str, engine: object | None) -> None:
         if engine is None:
             raise ModelLoadingError(
@@ -2195,6 +2430,7 @@ class EnginePool:
             # The VLM engine is the only text engine for these families.
             force_lm = False
         reload_failed = await self._reloadable_failed_engine(model_id)
+        await self._check_splash_launcher(model_id, runtime_settings)
         ready = self._acquire_loaded_engine(
             model_id, force_lm, _lease, runtime_settings, reload_failed
         )
@@ -3238,14 +3474,16 @@ class EnginePool:
 
         logger.info(f"Unloading model: {model_id} (immediate abort)")
         distributed = self._distributed_deployment_for_entry(entry) is not None
+        # Splash, like cluster ranks, holds its memory in its own process.
+        external = distributed or isinstance(entry.engine, SplashEngine)
         resident_size = self._entry_resident_size(entry)
         settle_size = (
             entry.runtime_settle_size
             if entry.runtime_settle_size is not None
             else resident_size
         )
-        pre_unload_active = 0 if distributed else mx.get_active_memory()
-        pre_unload_footprint = 0 if distributed else get_phys_footprint()
+        pre_unload_active = 0 if external else mx.get_active_memory()
+        pre_unload_footprint = 0 if external else get_phys_footprint()
 
         try:
             await entry.engine.stop(
@@ -3296,19 +3534,20 @@ class EnginePool:
         entry.runtime_estimated_size = None
         entry.runtime_settle_size = None
 
-        if distributed:
-            # Cluster weights live in supervised rank processes, not this
-            # process's Metal allocator. Successful supervisor teardown is
-            # the memory barrier; polling mx.get_active_memory() here would
-            # wait against an unrelated gauge and then run emergency reclaim.
+        if external:
+            # Cluster weights live in supervised rank processes and Splash's
+            # in its server process, not this process's Metal allocator.
+            # Successful process teardown is the memory barrier; polling
+            # mx.get_active_memory() here would wait against an unrelated
+            # gauge and then run emergency reclaim.
             gc.collect()
             self._current_model_memory = max(
                 0,
                 self._current_model_memory - resident_size,
             )
+            kind = "distributed" if distributed else "Splash"
             logger.info(
-                f"Unloaded distributed model: {model_id}, "
-                f"released local shard process "
+                f"Unloaded {kind} model: {model_id}, released its process "
                 f"({format_size(resident_size)} planned)"
             )
             self._wake_process_memory_enforcer()
@@ -3533,6 +3772,7 @@ class EnginePool:
         entry = self._entries[model_id]
         if entry.is_loading:
             raise ModelLoadingError(model_id)
+        await self._check_splash_launcher(model_id, runtime_settings)
 
         entry.is_loading = True
         entry.loading_started_at = time.monotonic()
@@ -3604,14 +3844,16 @@ class EnginePool:
             # model families; let VLMBatchedEngine handle MTP-enabled VLMs.
             pass
 
-            # Check if DFlash is enabled -- takes priority over engine type
-            # since DFlash has its own model loading pipeline
-            engine = None
+            # An external engine replaces every in-process engine. Otherwise
+            # DFlash takes priority over the engine type, since it has its
+            # own model loading pipeline.
+            engine = self._external_engine_for(entry, model_settings, effective_type)
             deployment = deployment if effective_type == "batched" else None
             # Decision models never decode, so speculative decoding settings
             # saved for the same checkpoint do not apply.
             if (
-                deployment is None
+                engine is None
+                and deployment is None
                 and model_settings is not None
                 and effective_type != "decision"
             ):
@@ -3800,9 +4042,15 @@ class EnginePool:
             if _is_dflash_engine:
                 await self._unload_other_dflash_engines(model_id)
 
+            if isinstance(engine, SplashEngine):
+                self._starting_external[model_id] = engine
             try:
                 await engine.start()
             except Exception as start_error:
+                if isinstance(engine, SplashEngine):
+                    # start() already stopped Splash; its error carries the
+                    # tail of the Splash log. There is no MLX fallback.
+                    raise
                 if _is_dflash_engine:
                     # DFlash engine failed to start -- fall back to the
                     # model's natural engine type (VLM or Batched)
@@ -3926,6 +4174,8 @@ class EnginePool:
                     )
                 else:
                     raise
+            finally:
+                self._starting_external.pop(model_id, None)
 
             # Check if memory enforcer requested abort during loading
             if entry.abort_loading:
@@ -3946,6 +4196,12 @@ class EnginePool:
                 )
 
             self._validate_llm_engine_ready(model_id, engine)
+            if isinstance(engine, SplashEngine) and engine.reserved_bytes() > 0:
+                # Splash may grow into the whole budget it planned, so the
+                # pool counts that instead of the weights estimate.
+                resident_size = engine.reserved_bytes()
+                entry.runtime_estimated_size = resident_size
+                entry.runtime_settle_size = resident_size
             entry.engine = engine
             entry.last_access = time.time()
             self._current_model_memory += resident_size
@@ -4081,6 +4337,9 @@ class EnginePool:
 
             post_load_memory = max(mx.get_active_memory(), get_phys_footprint())
             observed_delta = max(0, post_load_memory - pre_load_memory)
+            if isinstance(engine, SplashEngine):
+                # The weights live in the Splash process, not this one.
+                observed_delta = 0
             entry.actual_size = observed_delta or resident_size
 
             # Registry consistency check: a lockless mutator (a
@@ -4248,6 +4507,12 @@ class EnginePool:
         models = []
         for mid, e in sorted(self._entries.items()):
             deployment = self._distributed_deployment_for_entry(e)
+            actual_size = e.actual_size
+            external_engine = None
+            if isinstance(e.engine, SplashEngine):
+                # Report the live footprint of the Splash process group.
+                external_engine = "splash"
+                actual_size = e.engine.process_memory_bytes() or actual_size
             models.append(
                 {
                     "id": mid,
@@ -4263,7 +4528,8 @@ class EnginePool:
                         if deployment is not None
                         else None
                     ),
-                    "actual_size": e.actual_size,
+                    "actual_size": actual_size,
+                    "external_engine": external_engine,
                     "pinned": e.is_pinned,
                     "engine_type": e.engine_type,
                     "model_type": e.model_type,
@@ -4275,6 +4541,7 @@ class EnginePool:
                     "is_helper": e.is_helper,
                     "thinking_default": e.thinking_default,
                     "preserve_thinking_default": e.preserve_thinking_default,
+                    "reasoning_efforts": e.reasoning_efforts,
                     "source_type": e.source_type,
                     "source_repo_id": e.source_repo_id,
                     "last_access": e.last_access if e.last_access > 0 else None,
@@ -4340,7 +4607,9 @@ class EnginePool:
         expired: list[str] = []
 
         async with self._lock:
-            for model_id, entry in self._entries.items():
+            # _unload_engine awaits, and cluster registration mutates _entries
+            # without this lock.
+            for model_id, entry in list(self._entries.items()):
                 if entry.engine is None or entry.is_loading or entry.is_pinned:
                     continue
 

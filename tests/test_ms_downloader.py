@@ -178,10 +178,11 @@ class TestMSDownloader:
                 await downloader.start_download("no-slash")
 
     @pytest.mark.asyncio
-    async def test_start_download_invalid_model_id_too_many_parts(self, downloader):
+    @pytest.mark.parametrize("model_id", ["a/b/c", "../..", "a/..", "/etc"])
+    async def test_start_download_invalid_model_id_parts(self, downloader, model_id):
         with patch("omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True):
             with pytest.raises(ValueError, match="Invalid model ID"):
-                await downloader.start_download("a/b/c")
+                await downloader.start_download(model_id)
 
     @pytest.mark.asyncio
     async def test_start_download_strips_whitespace(self, downloader):

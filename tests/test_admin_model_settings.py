@@ -754,6 +754,33 @@ def test_runtime_signature_gates_mtp_depth_on_lightning_mtp():
     ) == pool._engine_runtime_signature("m", depth_8_off)
 
 
+def test_runtime_signature_reloads_qwen35_family_for_a_yarn_window():
+    pool = EnginePool()
+    pool._entries["q"] = EngineEntry(
+        model_id="q",
+        model_path="/tmp/q",
+        model_type="vlm",
+        engine_type="vlm",
+        estimated_size=1,
+        config_model_type="qwen4_exp",
+        model_context_length=262144,
+    )
+
+    def signature(window):
+        return dict(
+            pool._engine_runtime_signature(
+                "q", ModelSettings(max_context_window=window)
+            )
+        )
+
+    assert "yarn_factor" not in signature(None)
+    assert "yarn_factor" not in signature(262144)
+    assert signature(524288)["yarn_factor"] != signature(1048576)["yarn_factor"]
+
+    pool._entries["q"].config_model_type = "llama"
+    assert "yarn_factor" not in signature(1048576)
+
+
 @pytest.mark.asyncio
 async def test_parked_dflash_draft_path_does_not_block_saves(tmp_path):
     pool, _ = _failed_pool()

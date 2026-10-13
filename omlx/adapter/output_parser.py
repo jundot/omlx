@@ -1414,6 +1414,7 @@ def detect_output_parser(
                 model_path=session_model_path,
             ),
             stop_token_ids=temp_parser.get_stop_token_ids(),
+            thinking_start_text="<|channel|>analysis<|message|>",
             thinking_end_text="<|end|>",
             thinking_end_trailing_text="<|start|>assistant<|channel|>final<|message|>",
         )

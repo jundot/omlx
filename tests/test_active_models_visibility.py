@@ -538,6 +538,62 @@ def test_active_models_dflash_primary_counts_activity():
     assert model["activities"][0]["detail"] == "generating"
 
 
+class FakeLivePool:
+    """Fake EnginePool whose engine reports its own live request rows."""
+
+    def __init__(self, engine):
+        self._entries = {"live-model": SimpleNamespace(engine=engine)}
+
+    def get_status(self):
+        return {
+            "current_model_memory": 1024,
+            "final_ceiling": 2048,
+            "models": [
+                {
+                    "id": "live-model",
+                    "loaded": True,
+                    "is_loading": False,
+                    "estimated_size": 1024,
+                    "pinned": False,
+                }
+            ],
+        }
+
+
+def test_active_models_includes_engine_live_request_rows():
+    """Engines without an oMLX scheduler (Splash) supply their own rows."""
+    prefill_row = {
+        "request_id": "req-pp-1",
+        "processed": 50,
+        "total": 100,
+        "speed": 100.0,
+        "eta": 0.5,
+        "elapsed": 1.2,
+        "detail": None,
+    }
+    generating_row = {
+        "request_id": "req-gen-1",
+        "elapsed_seconds": 2.5,
+        "generated_tokens": 30,
+        "tokens_per_second": 12.0,
+        "last_activity_age_seconds": 0.1,
+        "prompt_tokens": 100,
+        "max_tokens": 256,
+    }
+
+    class Engine:
+        def get_live_requests(self):
+            return {"prefilling": [prefill_row], "generating": [generating_row]}
+
+    data = _build_with_pool(FakeLivePool(Engine()))
+
+    model = data["models"][0]
+    assert data["total_active_requests"] == 2
+    assert model["active_requests"] == 2
+    assert model["prefilling"] == [prefill_row]
+    assert model["generating"] == [generating_row]
+
+
 def test_active_models_resolves_scheduler_property_without_async_core():
     """Fallback mode: the engine exposes a scheduler property instead of an
     AsyncEngineCore, and the snapshot path must still be taken."""

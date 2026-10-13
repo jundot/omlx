@@ -231,6 +231,48 @@ def test_dedup_placeholder_rotating_block_backfilled(tmp_path):
     assert cache.reconstruct_cache(partial) is not None
 
 
+def test_dedup_block_reused_before_acquire_is_not_written(tmp_path):
+    cache, ssd = _make_cache(tmp_path)
+    paged = cache.paged_cache
+
+    # Prefix X lives on SSD only, with a placeholder rotating payload.
+    tx = cache.store_cache("x", list(range(90, 98)), _hybrid_cache_data(8))
+    x_hash = _block_hash(cache, tx, 0)
+    paged.release_for_eviction(tx.block_ids)
+    for block_id in tx.block_ids:
+        assert paged.evict_block_permanently(block_id)
+
+    tokens = list(range(2 * BLOCK_SIZE))
+    ta = cache.store_cache("a", tokens, _hybrid_cache_data(len(tokens)))
+    reused = paged.allocated_blocks[ta.block_ids[0]]
+    a_hash = reused.block_hash
+    paged.release_for_eviction(ta.block_ids)
+
+    real_find = paged.find_cached_block
+
+    def find_then_reuse(*args, **kwargs):
+        found = real_find(*args, **kwargs)
+        if found is reused and reused.block_hash == a_hash:
+            # Before the store worker takes a reference, the inference thread
+            # frees the block and a lazy SSD restore registers X in it.
+            assert paged.evict_block_permanently(reused.block_id)
+            paged.free_block_queue.remove(reused)
+            reused.block_hash = x_hash
+            reused.token_count = BLOCK_SIZE
+            paged.allocated_blocks[reused.block_id] = reused
+            paged.cached_block_hash_to_block.insert(x_hash, reused)
+        return found
+
+    paged.find_cached_block = find_then_reuse
+    snapshots = {tc: _hybrid_snapshot(tc) for tc in (BLOCK_SIZE, 2 * BLOCK_SIZE)}
+    tb = cache.store_cache(
+        "b", tokens, _hybrid_cache_data(len(tokens)), boundary_snapshots=snapshots
+    )
+
+    assert _block_hash(cache, tb, 0) == a_hash
+    assert _rotating_layer_shape(ssd, x_hash) == PLACEHOLDER_SHAPE
+
+
 def test_partial_match_walks_back_to_backfilled_block(tmp_path):
     cache, ssd = _make_cache(tmp_path)
     tokens = list(range(3 * BLOCK_SIZE))

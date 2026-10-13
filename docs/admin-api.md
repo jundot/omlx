@@ -66,6 +66,7 @@ curl -H "Authorization: Bearer $OMLX_API_KEY" http://127.0.0.1:8000/admin/api/st
 | Endpoint | Description |
 |---|---|
 | `GET /admin/api/hf/search?q=`, `GET /admin/api/hf/model-info?repo_id=` | Search Hugging Face and read a model card |
+| `GET /admin/api/hf/recommendations` | oQ builds that fit this Mac's memory guard and Metal limit, grouped as best match, bigger, more bits, faster, and builds that need a higher limit |
 | `POST /admin/api/hf/download` | Start a download, `{"repo_id": "mlx-community/..."}` |
 | `GET /admin/api/hf/tasks` | Download progress |
 | `POST /admin/api/hf/cancel/{task_id}`, `POST .../retry/{task_id}`, `DELETE .../task/{task_id}` | Cancel, retry, or remove a task |

@@ -192,19 +192,26 @@
 
                         <!-- Source Switcher (HF / MS) -->
                         <div class="segmented segmented--sm mb-6 w-fit">
-                            <button @click="downloaderSource = 'hf'"
+                            <button @click="setDownloaderSource('hf')"
                                     :class="downloaderSource === 'hf'
                                         ? 'segmented__item--active'
                                         : ''"
                                     class="segmented__item">
                                 {{ t('models.downloader.source.hf') }}
                             </button>
-                            <button @click="downloaderSource = 'ms'; initMsDownloader()"
+                            <button @click="setDownloaderSource('ms')"
                                     :class="downloaderSource === 'ms'
                                         ? 'segmented__item--active'
                                         : ''"
                                     class="segmented__item">
                                 {{ t('models.downloader.source.ms') }}
+                            </button>
+                            <button @click="setDownloaderSource('recommended')"
+                                    :class="downloaderSource === 'recommended'
+                                        ? 'segmented__item--active'
+                                        : ''"
+                                    class="segmented__item inline-flex items-center gap-1">
+                                <i data-lucide="sparkles" class="w-3.5 h-3.5"></i>{{ t('models.downloader.source.recommended') }}
                             </button>
                         </div>
 
@@ -1303,6 +1310,8 @@
                                 </div>
                             </template>
                         </div><!-- end ModelScope Source -->
+
+                        {% include 'dashboard/_recommendations.html' %}
 
                     </div>
 

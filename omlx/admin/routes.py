@@ -43,6 +43,14 @@ from .._version import __version__ as _omlx_version
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
 from ..api.utils import _try_parse_json
+from ..engine.splash import (
+    EXTERNAL_ENGINES,
+    SPLASH_INSTALL_HINT,
+    SplashEngine,
+    find_splash_binary,
+    inspect_splash_binary,
+)
+from ..model_discovery import REASONING_EFFORT_LEVELS
 from ..model_discovery import model_display_name as _model_display_name
 from ..model_profiles import (
     EXCLUDED_FROM_PROFILES,
@@ -61,8 +69,16 @@ from ..model_settings import (
     MOE_OFFLOAD_MTP_MODEL_TYPES,
     merge_chat_template_kwargs,
 )
+from ..patches.deepseek_v4.chat_template_v4 import REASONING_EFFORT_PROMPTS
+from ..patches.deepseek_v41.encoding import REASONING_EFFORT_MAPPINGS
+from ..patches.k2_horizon import REASONING_EFFORTS
 from ..patches.moe_offload_compat import moe_offload_compatibility
-from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
+from ..settings import (
+    BURST_DECODE_MODES,
+    SPLASH_KV_FORMATS,
+    SubKeyEntry,
+    burst_decode_env,
+)
 from ..utils.hardware import (
     compute_owner_hash,
     get_chip_name,
@@ -79,6 +95,7 @@ from ..websearch import (
     run_web_search_test,
 )
 from ..websearch import SUPPORTED_PROVIDERS as SUPPORTED_WEB_SEARCH_PROVIDERS
+from . import model_recommender
 from .auth import (
     REMEMBER_ME_MAX_AGE,
     SESSION_MAX_AGE,
@@ -385,6 +402,8 @@ class ModelSettingsRequest(BaseModel):
     specprefill_draft_model: str | None = None
     specprefill_keep_pct: float | None = None
     specprefill_threshold: int | None = None
+    # External engine (omlx/engine/splash.py); null runs the model in-process
+    external_engine: str | None = None
     # DFlash (block diffusion speculative decoding)
     dflash_enabled: bool | None = None
     dflash_draft_model: str | None = None
@@ -735,6 +754,7 @@ class GlobalSettingsRequest(BaseModel):
     integrations_openclaw_model: str | None = None
     integrations_hermes_model: str | None = None
     integrations_pi_model: str | None = None
+    integrations_vibe_model: str | None = None
     integrations_dsh_model: str | None = None
     integrations_openclaw_tools_profile: (
         Literal["minimal", "coding", "messaging", "full"] | None
@@ -752,6 +772,12 @@ class GlobalSettingsRequest(BaseModel):
     web_search_content_mode: str | None = None
     web_search_content_truncate: bool | None = None
     web_search_content_max_chars: int | None = None
+    # External engines: Splash. An empty path means automatic detection.
+    splash_path: str | None = None
+    splash_kv_format: str | None = None
+    splash_max_memory_gb: float | None = None
+    splash_ssd_cache_gb: float | None = None
+    splash_ane_prefill: bool | None = None
 
     # UI settings
     ui_language: str | None = None
@@ -927,6 +953,24 @@ def _dflash_compat_for_model(model_info: dict) -> tuple[bool, str]:
     return is_dflash_compatible(model_path)
 
 
+def _external_engines_for_model(engine_pool, model_info: dict, settings) -> list[dict]:
+    """Each external engine and whether it can serve this model."""
+    if model_info.get("engine_type") not in ("batched", "vlm"):
+        return []
+    if model_info.get("is_helper"):
+        return []
+    target, reason = engine_pool.splash_target(model_info["id"], settings)
+    return [
+        {
+            "id": engine_id,
+            "label": label,
+            "compatible": target is not None,
+            "reason": reason,
+        }
+        for engine_id, label in EXTERNAL_ENGINES.items()
+    ]
+
+
 def _entry_is_diffusion_model(entry) -> bool:
     model_type = (getattr(entry, "config_model_type", None) or "").lower()
     return model_type.replace("-", "_") == "diffusion_gemma"
@@ -979,6 +1023,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["moe_expert_offload_enabled"] = False
     settings["moe_expert_offload_resident_fraction"] = 0.25
     settings["specprefill_enabled"] = False
+    settings["external_engine"] = None
     settings["dflash_enabled"] = False
     settings["dflash_in_memory_cache"] = True
     settings["dflash_in_memory_cache_max_entries"] = 4
@@ -2201,10 +2246,39 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
 # =============================================================================
 
 
+# Families whose thinking switch is rendered by oMLX code instead of the
+# checkpoint chat template (prefix match on model_type).
+_OMLX_THINKING_TOGGLE_TYPES = ("deepseek_v4", "minimax_m3")
+
+
+def _reasoning_levels(model_info: dict, model_type: str, forced: bool) -> list[str]:
+    """Return the chat reasoning slider stops, or [] when the model has none."""
+    toggle = model_info.get("thinking_default") is not None or model_type.startswith(
+        _OMLX_THINKING_TOGGLE_TYPES
+    )
+    if model_type == "k2_horizon":
+        efforts = list(REASONING_EFFORTS)
+    elif model_type.startswith("deepseek_v41"):
+        efforts = list(REASONING_EFFORT_MAPPINGS)
+    elif model_type.startswith("deepseek_v4"):
+        efforts = list(REASONING_EFFORT_PROMPTS)
+    elif model_type == "gpt_oss":
+        # Harmony folds every level above "high" into "high".
+        efforts = ["low", "medium", "high"]
+    else:
+        efforts = model_info.get("reasoning_efforts")
+        if efforts is not None and not efforts:
+            efforts = list(REASONING_EFFORT_LEVELS)
+    levels = ["off"] if toggle and not forced else []
+    if efforts:
+        levels += efforts
+    elif toggle:
+        levels.append("on")
+    return levels
+
+
 def _model_options(model_info: dict, settings) -> dict:
     """Describe model controls once for the web and native settings clients."""
-    from ..patches.k2_horizon import REASONING_EFFORTS
-
     model_type = (model_info.get("config_model_type") or "").lower().replace("-", "_")
     is_k2 = model_type == "k2_horizon"
     thinking_modes = ["auto", "on_limit"] if is_k2 else [
@@ -2216,11 +2290,12 @@ def _model_options(model_info: dict, settings) -> dict:
     return {
         "thinking_forced": is_k2,
         "thinking_modes": thinking_modes,
-        "reasoning_effort_options": list(REASONING_EFFORTS) if is_k2 else [
-            "low", "medium", "high", "xhigh", "max"
-        ],
+        "reasoning_effort_options": list(
+            REASONING_EFFORTS if is_k2 else REASONING_EFFORT_LEVELS
+        ),
         "reasoning_effort_default": "high" if is_k2 else "low",
         "reasoning_effort_custom": not is_k2,
+        "reasoning_levels": _reasoning_levels(model_info, model_type, is_k2),
         "ane_prefill_backend": ane_backend,
         "ane_prefill_default_fraction": ane_prefill_fraction(None, model_type),
         "ane_prefill_mlp_fractions": [1 / 3, 0.5] if ane_backend == "k2" else [],
@@ -2261,6 +2336,12 @@ async def list_models(is_admin: bool = Depends(require_admin)):
 
     if engine_pool is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
+
+    if global_settings is not None:
+        # The first look at a launcher runs it once; keep that off the loop.
+        await asyncio.to_thread(
+            find_splash_binary, global_settings.integrations.splash_path
+        )
 
     # Get engine pool status
     status = engine_pool.get_status()
@@ -2308,6 +2389,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
         mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
+        external_engines = _external_engines_for_model(
+            engine_pool, model_info, settings
+        )
         from ..patches.moe_offload_compat import moe_offload_compatibility
 
         moe_offload_supported, _ = moe_offload_compatibility(
@@ -2426,11 +2510,13 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "model_context_length": model_info.get("model_context_length"),
             "thinking_default": model_info.get("thinking_default"),
             "preserve_thinking_default": model_info.get("preserve_thinking_default"),
+            "reasoning_efforts": model_info.get("reasoning_efforts"),
             "source_type": model_info.get("source_type", "local"),
             "source_repo_id": model_info.get("source_repo_id"),
             "distributed": model_info.get("distributed", False),
             "cluster": model_info.get("cluster"),
             "last_access": model_info.get("last_access"),
+            "external_engines": external_engines,
             "dflash_compatible": compat_ok,
             "dflash_compatibility_reason": compat_reason,
             "dflash_ssd_cache_available": dflash_ssd_cache_available,
@@ -2491,6 +2577,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "source_type": "builtin",
                 "source_repo_id": None,
                 "last_access": None,
+                "external_engines": [],
                 "dflash_compatible": False,
                 "dflash_compatibility_reason": "",
                 "dflash_ssd_cache_available": False,
@@ -3003,6 +3090,21 @@ async def update_model_settings(
         current_settings.specprefill_keep_pct = request.specprefill_keep_pct or None
     if "specprefill_threshold" in sent:
         current_settings.specprefill_threshold = request.specprefill_threshold or None
+    if "external_engine" in sent:
+        engine_id = None if is_diffusion_model else request.external_engine or None
+        # Check only a change: the web modal resends the field on every save,
+        # and a launcher or draft removed later must not block other fields.
+        if engine_id is not None and engine_id != current_settings.external_engine:
+            if engine_id not in EXTERNAL_ENGINES:
+                raise HTTPException(
+                    status_code=400, detail=f"Unknown external engine: {engine_id}"
+                )
+            target, reason = await asyncio.to_thread(
+                engine_pool.splash_target, model_id, current_settings
+            )
+            if target is None:
+                raise HTTPException(status_code=400, detail=reason)
+        current_settings.external_engine = engine_id
     # DFlash settings
     if "dflash_enabled" in sent:
         new_dflash_enabled = (
@@ -4460,6 +4562,10 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
+    # The first look at a launcher runs it once; keep that off the loop.
+    await asyncio.to_thread(
+        find_splash_binary, global_settings.integrations.splash_path
+    )
     return _global_settings_response(global_settings)
 
 
@@ -4475,6 +4581,40 @@ async def get_global_settings_defaults(is_admin: bool = Depends(require_admin)):
     response = _global_settings_response(defaults)
     response["cache"]["ssd_cache_max_size"] = defaults.cache.ssd_cache_max_size
     return response
+
+
+def _splash_status(global_settings) -> dict:
+    """The Splash launcher oMLX would run, and the models it serves now."""
+    binary, reason = find_splash_binary(global_settings.integrations.splash_path)
+    models = []
+    try:
+        engine_pool = _get_engine_pool() if _get_engine_pool is not None else None
+    except HTTPException:  # the server has not created the pool yet
+        engine_pool = None
+    entries = getattr(engine_pool, "_entries", None) or {}
+    for model_id, entry in list(entries.items()):
+        engine = getattr(entry, "engine", None)
+        if not isinstance(engine, SplashEngine):
+            continue
+        stats = engine.get_stats()
+        models.append(
+            {
+                "id": model_id,
+                "memory_bytes": stats["process_memory_bytes"],
+                "memory_budget_bytes": stats["memory_budget_bytes"],
+                "log_path": stats["log_path"],
+            }
+        )
+    return {
+        "available": binary is not None,
+        "path": str(binary.path) if binary else None,
+        "auto_detected": binary.auto_detected if binary else None,
+        "version": binary.version if binary else None,
+        "label": binary.label if binary else None,
+        "reason": reason,
+        "install_hint": SPLASH_INSTALL_HINT,
+        "models": models,
+    }
 
 
 def _global_settings_response(global_settings):
@@ -4617,6 +4757,7 @@ def _global_settings_response(global_settings):
             "openclaw_model": global_settings.integrations.openclaw_model,
             "hermes_model": global_settings.integrations.hermes_model,
             "pi_model": global_settings.integrations.pi_model,
+            "vibe_model": global_settings.integrations.vibe_model,
             "copilot_model": global_settings.integrations.copilot_model,
             "dsh_model": global_settings.integrations.dsh_model,
             "openclaw_tools_profile": global_settings.integrations.openclaw_tools_profile,
@@ -4633,7 +4774,13 @@ def _global_settings_response(global_settings):
             "web_search_content_mode": global_settings.integrations.web_search_content_mode,
             "web_search_content_truncate": global_settings.integrations.web_search_content_truncate,
             "web_search_content_max_chars": global_settings.integrations.web_search_content_max_chars,
+            "splash_path": global_settings.integrations.splash_path,
+            "splash_kv_format": global_settings.integrations.splash_kv_format,
+            "splash_max_memory_gb": global_settings.integrations.splash_max_memory_gb,
+            "splash_ssd_cache_gb": global_settings.integrations.splash_ssd_cache_gb,
+            "splash_ane_prefill": global_settings.integrations.splash_ane_prefill,
         },
+        "external_engines": {"splash": _splash_status(global_settings)},
         "system": {
             "total_memory_bytes": memory_info["total_bytes"],
             "total_memory": memory_info["total_formatted"],
@@ -5502,12 +5649,58 @@ async def update_global_settings(
     if "integrations_pi_model" in request.model_fields_set:
         global_settings.integrations.pi_model = request.integrations_pi_model
         integrations_changed = True
+    if "integrations_vibe_model" in request.model_fields_set:
+        global_settings.integrations.vibe_model = request.integrations_vibe_model
+        integrations_changed = True
     if "integrations_dsh_model" in request.model_fields_set:
         global_settings.integrations.dsh_model = request.integrations_dsh_model
         integrations_changed = True
     if "integrations_openclaw_tools_profile" in request.model_fields_set:
         global_settings.integrations.openclaw_tools_profile = (
             request.integrations_openclaw_tools_profile
+        )
+        integrations_changed = True
+    if "splash_path" in request.model_fields_set:
+        splash_path = (request.splash_path or "").strip() or None
+        # Check only a new path: the web UI resends every integration field,
+        # and a launcher removed later must not block unrelated saves.
+        if splash_path and splash_path != global_settings.integrations.splash_path:
+            binary, reason = await asyncio.to_thread(
+                inspect_splash_binary,
+                Path(splash_path).expanduser(),
+                auto_detected=False,
+            )
+            if binary is None:
+                raise HTTPException(status_code=400, detail=reason)
+        global_settings.integrations.splash_path = splash_path
+        integrations_changed = True
+    if "splash_kv_format" in request.model_fields_set:
+        if request.splash_kv_format not in SPLASH_KV_FORMATS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"splash_kv_format must be one of {sorted(SPLASH_KV_FORMATS)}",
+            )
+        global_settings.integrations.splash_kv_format = request.splash_kv_format
+        integrations_changed = True
+    if "splash_max_memory_gb" in request.model_fields_set:
+        memory = request.splash_max_memory_gb
+        if memory is not None and memory <= 0:
+            raise HTTPException(
+                status_code=400, detail="splash_max_memory_gb must be > 0"
+            )
+        global_settings.integrations.splash_max_memory_gb = memory
+        integrations_changed = True
+    if "splash_ssd_cache_gb" in request.model_fields_set:
+        ssd = request.splash_ssd_cache_gb
+        if ssd is not None and ssd < 0:
+            raise HTTPException(
+                status_code=400, detail="splash_ssd_cache_gb must be >= 0"
+            )
+        global_settings.integrations.splash_ssd_cache_gb = ssd
+        integrations_changed = True
+    if "splash_ane_prefill" in request.model_fields_set:
+        global_settings.integrations.splash_ane_prefill = bool(
+            request.splash_ane_prefill
         )
         integrations_changed = True
     if "markitdown_enabled" in request.model_fields_set:
@@ -6393,6 +6586,11 @@ def _build_runtime_cache_observability(
             model_payload["cache_tier"] = "rank-prompt-snapshot"
             model_payload["rank_prompt_cache"] = rank_prompt_cache
 
+        splash_cache = runtime_stats.get("splash_cache")
+        if isinstance(splash_cache, dict):
+            model_payload["cache_tier"] = "splash"
+            model_payload["splash_cache"] = splash_cache
+
         payload["models"].append(model_payload)
         payload["total_num_files"] += model_payload["num_files"]
         payload["total_size_bytes"] += model_payload["total_size_bytes"]
@@ -6689,6 +6887,20 @@ def _build_active_models_data() -> dict:
                     "max_tokens": getattr(req, "max_tokens", None) if req else None,
                 }
             )
+
+        # Engines that run requests outside an oMLX scheduler (Splash) report
+        # the same prefill/generate rows themselves.
+        get_live_requests = (
+            getattr(entry.engine, "get_live_requests", None) if entry else None
+        )
+        if callable(get_live_requests):
+            try:
+                live = get_live_requests()
+                prefilling.extend(live["prefilling"])
+                generating.extend(live["generating"])
+                active_requests += len(live["prefilling"]) + len(live["generating"])
+            except Exception:  # noqa: BLE001
+                logger.debug("live request rows failed", exc_info=True)
 
         if cluster_metrics is not None:
             # Synthesize scheduler-shaped prefill/generate rows from rank
@@ -7542,6 +7754,46 @@ async def get_recommended_models(
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+def _free_disk_bytes(path: str | Path) -> int:
+    """Free bytes on the volume holding `path` (or its nearest existing parent)."""
+    try:
+        check_path = Path(path).expanduser().resolve()
+        while not check_path.exists() and check_path.parent != check_path:
+            check_path = check_path.parent
+        return shutil.disk_usage(check_path).free
+    except OSError:
+        return 0
+
+
+@router.get("/api/hf/recommendations")
+async def get_model_recommendations(
+    is_admin: bool = Depends(require_admin),
+):
+    """oQ models that fit this Mac, grouped for the downloader's Recommended tab."""
+    if _hf_downloader is None:
+        raise HTTPException(status_code=503, detail="Downloader not initialized")
+
+    global_settings = _get_global_settings() if _get_global_settings else None
+    try:
+        result = await model_recommender.recommendations(
+            getattr(global_settings, "memory", None)
+        )
+    except TimeoutError as e:
+        raise HTTPException(
+            status_code=504,
+            detail="HuggingFace API request timed out. The service may be temporarily unavailable.",
+        ) from e
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+    model_dir = _hf_downloader.model_dir
+    result["disk"] = {
+        "model_dir": str(model_dir),
+        "free_bytes": await asyncio.to_thread(_free_disk_bytes, model_dir),
+    }
+    return result
 
 
 @router.get("/api/hf/search")

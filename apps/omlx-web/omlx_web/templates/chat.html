@@ -735,6 +735,261 @@
         color: var(--text-muted);
     }
 
+    /* Composer toolbar */
+    .composer-icon-btn {
+        width: 2.25rem;
+        height: 2.25rem;
+        flex-shrink: 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 9999px;
+        color: var(--text-secondary);
+        transition: background-color 0.15s, color 0.15s;
+    }
+
+    .composer-pill {
+        height: 2.25rem;
+        min-width: 0;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.375rem;
+        padding: 0 0.75rem;
+        border-radius: 9999px;
+        font-size: 0.75rem;
+        font-weight: 500;
+        color: var(--text-secondary);
+        transition: background-color 0.15s, color 0.15s;
+    }
+
+    .composer-icon-btn:hover:not(:disabled),
+    .composer-icon-btn.is-open,
+    .composer-pill:hover,
+    .composer-pill.is-open {
+        background-color: var(--bg-tertiary);
+        color: var(--text-primary);
+    }
+
+    .composer-icon-btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+    }
+
+    .composer-pill--active,
+    .composer-pill--active:hover {
+        color: var(--timeline-accent);
+    }
+
+    .composer-toolbar,
+    .composer-menu {
+        position: relative;
+    }
+
+    @media (max-width: 640px) {
+        .composer-menu {
+            position: static;
+        }
+
+        .composer-toolbar .composer-popover {
+            left: 0.5rem;
+            right: 0.5rem;
+            width: auto;
+        }
+    }
+
+    .composer-popover {
+        position: absolute;
+        bottom: calc(100% + 0.5rem);
+        z-index: 40;
+        width: min(var(--popover-w, 18rem), calc(100vw - 2rem));
+        border: 1px solid var(--border-normal);
+        border-radius: 1rem;
+        background-color: var(--bg-primary);
+        box-shadow: 0 12px 32px rgb(0 0 0 / 0.14);
+    }
+
+    .composer-menu-item {
+        width: 100%;
+        display: flex;
+        align-items: center;
+        gap: 0.625rem;
+        padding: 0.5rem 0.625rem;
+        border-radius: 0.5rem;
+        font-size: 0.8125rem;
+        text-align: left;
+        color: var(--text-primary);
+    }
+
+    .composer-menu-item:hover:not(:disabled) {
+        background-color: var(--bg-tertiary);
+    }
+
+    .composer-menu-item:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+    }
+
+    .sampling-readonly {
+        padding: 0.5rem 0.75rem;
+        border: 1px dashed var(--border-normal);
+        border-radius: 0.5rem;
+        font-size: 0.75rem;
+        line-height: 1rem;
+        color: var(--text-primary);
+    }
+
+    .sampling-readonly.is-inherited {
+        color: var(--text-tertiary);
+    }
+
+    .composer-switch {
+        position: relative;
+        width: 1.75rem;
+        height: 1rem;
+        flex-shrink: 0;
+        border-radius: 9999px;
+        background-color: var(--border-normal);
+        transition: background-color 0.15s;
+    }
+
+    .composer-switch::after {
+        content: '';
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 0.75rem;
+        height: 0.75rem;
+        border-radius: 9999px;
+        background-color: #fff;
+        transition: transform 0.15s;
+    }
+
+    .composer-switch.is-on {
+        background-color: var(--timeline-accent);
+    }
+
+    .composer-switch.is-on::after {
+        transform: translateX(0.75rem);
+    }
+
+    /* Reasoning level slider. --t thumb size, --p inset, --n last stop index,
+       --i selected stop. Dot k sits at the thumb center for value k. */
+    .reasoning-slider,
+    .reasoning-slider-labels {
+        --t: 1.875rem;
+        --p: 3px;
+    }
+
+    .reasoning-slider {
+        position: relative;
+        height: calc(var(--t) + 2 * var(--p));
+        border-radius: 9999px;
+        background-color: var(--bg-tertiary);
+    }
+
+    .reasoning-slider-fill {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        left: 0;
+        width: calc(2 * var(--p) + var(--t) + (100% - 2 * var(--p) - var(--t)) * var(--i) / var(--n));
+        border-radius: 9999px;
+        background-color: var(--timeline-accent);
+        transition: width 0.15s ease;
+    }
+
+    .reasoning-slider-dot {
+        position: absolute;
+        top: 50%;
+        left: calc(var(--p) + var(--t) / 2 + (100% - 2 * var(--p) - var(--t)) * var(--k) / var(--n));
+        width: 5px;
+        height: 5px;
+        margin: -2.5px 0 0 -2.5px;
+        border-radius: 9999px;
+        background-color: var(--text-tertiary);
+        pointer-events: none;
+    }
+
+    .reasoning-slider-dot.is-filled {
+        background-color: rgb(255 255 255 / 0.7);
+    }
+
+    .reasoning-slider input[type="range"] {
+        position: absolute;
+        inset: var(--p);
+        width: calc(100% - 2 * var(--p));
+        height: var(--t);
+        margin: 0;
+        background: transparent;
+        cursor: pointer;
+        -webkit-appearance: none;
+        appearance: none;
+    }
+
+    .reasoning-slider input[type="range"]:focus {
+        outline: none;
+    }
+
+    .reasoning-slider input[type="range"]::-webkit-slider-runnable-track {
+        height: var(--t);
+        background: transparent;
+    }
+
+    .reasoning-slider input[type="range"]::-moz-range-track {
+        height: var(--t);
+        background: transparent;
+    }
+
+    .reasoning-slider input[type="range"]::-webkit-slider-thumb {
+        width: var(--t);
+        height: var(--t);
+        border-radius: 9999px;
+        background-color: #fff;
+        box-shadow: 0 1px 4px rgb(0 0 0 / 0.3);
+        transition: opacity 0.15s;
+        -webkit-appearance: none;
+        appearance: none;
+    }
+
+    .reasoning-slider input[type="range"]::-moz-range-thumb {
+        width: var(--t);
+        height: var(--t);
+        border: none;
+        border-radius: 9999px;
+        background-color: #fff;
+        box-shadow: 0 1px 4px rgb(0 0 0 / 0.3);
+    }
+
+    .reasoning-slider input[type="range"]:focus-visible::-webkit-slider-thumb {
+        box-shadow: 0 0 0 3px rgb(255 255 255 / 0.5), 0 0 0 5px var(--timeline-accent);
+    }
+
+    /* Auto is the model default, not a level; keep its fill neutral. */
+    .reasoning-slider.is-auto .reasoning-slider-fill {
+        background-color: var(--border-normal);
+    }
+
+    .reasoning-slider-labels {
+        position: relative;
+        height: 1rem;
+    }
+
+    .reasoning-slider-label {
+        position: absolute;
+        top: 0;
+        left: calc(var(--p) + var(--t) / 2 + (100% - 2 * var(--p) - var(--t)) * var(--k) / var(--n));
+        transform: translateX(-50%);
+        white-space: nowrap;
+        font-size: 10px;
+        line-height: 1rem;
+        color: var(--text-tertiary);
+    }
+
+    .reasoning-slider-label.is-current {
+        font-weight: 600;
+        color: var(--text-primary);
+    }
+
     /* API Key Modal */
     .api-key-modal.hidden {
         display: none;
@@ -1133,40 +1388,6 @@
 
         <!-- Messages area with rail -->
         <div class="flex-1 min-h-0 relative">
-            <!-- Floating model selector capsule (top-center; mirrors the sidebar model picker) -->
-            <div x-show="currentModel && availableModels.length > 0" x-cloak
-                class="absolute top-3 left-1/2 -translate-x-1/2 z-20"
-                x-data="{ modelMenuOpen: false }" @click.outside="modelMenuOpen = false"
-                @keydown.escape="modelMenuOpen = false">
-                <button @click="modelMenuOpen = !modelMenuOpen" :title="window.t('chat.switch_model')"
-                    class="flex items-center gap-2 px-3 py-1.5 rounded-full border border-line bg-surface shadow-md text-xs font-medium hover:bg-surface-muted transition-colors"
-                    style="color: var(--text-primary); max-width: 18rem;">
-                    <i data-lucide="box" class="w-3.5 h-3.5 flex-shrink-0" style="color: var(--text-tertiary);"></i>
-                    <span class="truncate min-w-0" x-text="(availableModels.find(m => m.id === currentModel)?.name) || currentModel"></span>
-                    <i data-lucide="chevron-down" class="w-3.5 h-3.5 flex-shrink-0 transition-transform"
-                        :style="modelMenuOpen ? 'color: var(--text-tertiary);' : 'color: var(--text-tertiary); transform: rotate(180deg);'"></i>
-                </button>
-                <!-- Static centered anchor: transform lives here (never animated), so the
-                     dropdown's own x-transition can't fight the -translate-x-1/2 centering. -->
-                <div class="absolute top-full left-1/2 mt-1.5" style="transform: translateX(-50%); z-index: 30;">
-                <div x-show="modelMenuOpen" x-transition.opacity x-cloak
-                    class="overflow-y-auto rounded-xl border border-line bg-surface shadow-lg py-1"
-                    style="min-width: 15rem; max-height: 18rem;">
-                    <template x-for="model in availableModels" :key="model.id">
-                        <button @click="selectModel(model.id); modelMenuOpen = false"
-                            class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left hover:bg-surface-muted transition-colors"
-                            :class="model.id === currentModel ? 'font-semibold' : ''"
-                            style="color: var(--text-primary);">
-                            <i data-lucide="check" class="w-3 h-3 flex-shrink-0"
-                                :style="'color: var(--timeline-accent); visibility:' + (model.id === currentModel ? 'visible' : 'hidden')"></i>
-                            <span class="flex-1 min-w-0 truncate" x-text="model.name"></span>
-                            <i data-lucide="star" class="w-3 h-3 flex-shrink-0" x-show="model.is_favorite"
-                                style="color: var(--timeline-accent);"></i>
-                        </button>
-                    </template>
-                </div>
-                </div>
-            </div>
             <!-- Messages Container -->
             <div class="absolute inset-0 overflow-y-auto overflow-x-hidden custom-scrollbar" id="messagesContainer">
             <!-- Welcome Screen -->
@@ -1179,7 +1400,7 @@
                             class="w-[60px] h-[60px]" x-cloak>
                         <h1 class="text-2xl font-bold">{{ t('chat.welcome_heading') }}</h1>
                     </div>
-                    <p class="text-fg-tertiary mb-6">{{ t('chat.welcome_description') }}</p>
+                    <p class="text-fg-tertiary mb-6 whitespace-pre-line">{{ t('chat.welcome_description') }}</p>
                     <div class="p-4 bg-surface-alt rounded-xl text-sm text-fg-secondary">
                         <i data-lucide="shield-check" class="w-4 h-4 inline mr-1"></i>
                         {{ t('chat.welcome_privacy') }}
@@ -1774,86 +1995,280 @@
                         </div>
                     </div>
 
-                    <div class="flex items-end">
-                        <!-- Image upload button (only for VLM models) -->
-                        <button x-show="hasVisionSupport()" @click="$refs.imageInput.click()"
-                            :disabled="!apiKeySet || !currentModel || isCurrentChatStreaming() || imageLimitReached()"
-                            class="w-10 h-10 m-1 shrink-0 bg-surface-muted hover:bg-surface rounded-full border border-line transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
-                            :title="window.t('chat.upload_image')">
-                            <i data-lucide="image" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
-                        </button>
-                        <button x-show="hasDocumentSupport() && !hasAsrSupport()" @click="$refs.documentInput.click()"
-                            :disabled="!apiKeySet || !currentModel || isCurrentChatStreaming() || uploadDocuments.length >= markitdownSettings.max_files_per_request"
-                            class="w-10 h-10 m-1 shrink-0 bg-surface-muted hover:bg-surface rounded-full border border-line transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
-                            :title="window.t('chat.upload_document')">
-                            <i data-lucide="file-text" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
-                        </button>
-                        <!-- Audio attach button (only for ASR models) -->
-                        <button x-show="hasAsrSupport()" @click="$refs.audioInput.click()"
-                            :disabled="!apiKeySet || !currentModel || isCurrentChatStreaming() || micActive() || uploadAudio"
-                            class="w-10 h-10 m-1 shrink-0 bg-surface-muted hover:bg-surface rounded-full border border-line transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
-                            :title="window.t('chat.upload_audio')">
-                            <i data-lucide="audio-lines" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
-                        </button>
-                        <!-- Realtime microphone (only for realtime-capable ASR models) -->
-                        <button x-show="hasAsrSupport() && isRealtimeSttModel()" @click="toggleMicTranscription()"
-                            :disabled="!apiKeySet || !currentModel || (isCurrentChatStreaming() && !micActive()) || uploadAudio"
-                            class="w-10 h-10 m-1 shrink-0 rounded-full border transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
-                            :class="micActive() ? 'bg-surface border-accent' : 'bg-surface-muted hover:bg-surface border-line'"
-                            :title="window.t(micActive() ? 'chat.stop_recording' : 'chat.record_audio')">
-                            <i x-show="!micActive()" data-lucide="mic" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
-                            <div x-show="micActive()" class="w-3 h-3 rounded-[2px]" style="background-color: var(--text-danger);"></div>
-                        </button>
-                        <span x-show="micActive()" x-cloak class="self-center text-xs font-mono px-1"
-                            style="color: var(--text-danger);" x-text="formatRecordingTime(micSeconds)"></span>
-                        <!-- Web search toggle -->
-                        <button x-show="!hasAsrSupport()" @click="chatSettings.webSearchEnabled = !chatSettings.webSearchEnabled; saveChatSettings()"
-                            :disabled="!apiKeySet || !currentModel"
-                            class="w-10 h-10 m-1 shrink-0 rounded-full border transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
-                            :class="chatSettings.webSearchEnabled ? 'bg-surface border-accent' : 'bg-surface-muted hover:bg-surface border-line'"
-                            :title="window.t(chatSettings.webSearchEnabled ? 'chat.web_search_on' : 'chat.web_search_off')">
-                            <i data-lucide="globe" class="w-4 h-4"
-                               :style="chatSettings.webSearchEnabled ? 'color: var(--btn-primary);' : 'color: var(--text-tertiary);'"></i>
+                    <textarea x-ref="messageInput" x-model="inputMessage"
+                        autocomplete="off" autocorrect="off"
+                        @keydown.enter="onComposerEnter($event)"
+                        @input="autoResize($event.target)" @paste="handlePaste($event)"
+                        :placeholder="hasAsrSupport() ? window.t('chat.input_placeholder_asr') : (isMobile ? window.t('chat.input_placeholder_mobile') : window.t('chat.input_placeholder'))"
+                        :disabled="!apiKeySet || !currentModel || isCurrentChatStreaming() || hasAsrSupport()" rows="1"
+                        class="block w-full px-4 pt-3.5 pb-1 bg-transparent resize-none outline-none text-sm max-h-32"
+                        style="color: var(--text-primary);"></textarea>
+
+                    <!-- Composer toolbar -->
+                    <div class="composer-toolbar flex items-center gap-1 px-2 pb-2 pt-1">
+                        <!-- Attach / tools menu -->
+                        <div class="composer-menu flex-shrink-0" x-data="{ open: false }"
+                            @click.outside="open = false"
+                            @keydown.escape="if (open) { open = false; $event.stopPropagation(); }">
+                            <button @click="open = !open" class="composer-icon-btn" :class="{ 'is-open': open }"
+                                :disabled="!apiKeySet || !currentModel"
+                                :title="window.t('chat.composer.attach')" :aria-label="window.t('chat.composer.attach')"
+                                :aria-expanded="open">
+                                <i data-lucide="plus" class="w-5 h-5"></i>
+                            </button>
+                            <div x-show="open" x-transition.opacity x-cloak class="composer-popover left-0 p-1.5"
+                                style="--popover-w: 15rem;">
+                                <button x-show="hasVisionSupport()" class="composer-menu-item"
+                                    @click="open = false; $refs.imageInput.click()"
+                                    :disabled="isCurrentChatStreaming() || imageLimitReached()">
+                                    <i data-lucide="image" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
+                                    <span>{{ t('chat.upload_image') }}</span>
+                                </button>
+                                <button x-show="hasDocumentSupport() && !hasAsrSupport()" class="composer-menu-item"
+                                    @click="open = false; $refs.documentInput.click()"
+                                    :disabled="isCurrentChatStreaming() || uploadDocuments.length >= markitdownSettings.max_files_per_request">
+                                    <i data-lucide="file-text" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
+                                    <span>{{ t('chat.upload_document') }}</span>
+                                </button>
+                                <button x-show="hasAsrSupport()" class="composer-menu-item"
+                                    @click="open = false; $refs.audioInput.click()"
+                                    :disabled="isCurrentChatStreaming() || micActive() || uploadAudio">
+                                    <i data-lucide="audio-lines" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
+                                    <span>{{ t('chat.upload_audio') }}</span>
+                                </button>
+                                <div x-show="!hasAsrSupport() && (hasVisionSupport() || hasDocumentSupport())"
+                                    class="my-1 border-t border-line"></div>
+                                <button x-show="!hasAsrSupport()" class="composer-menu-item" @click="toggleWebSearch()"
+                                    :title="window.t(chatSettings.webSearchEnabled ? 'chat.web_search_on' : 'chat.web_search_off')">
+                                    <i data-lucide="globe" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
+                                    <span class="flex-1">{{ t('chat.composer.web_search') }}</span>
+                                    <span class="composer-switch" :class="{ 'is-on': chatSettings.webSearchEnabled }"></span>
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Web search chip (visible while enabled) -->
+                        <button x-show="chatSettings.webSearchEnabled && !hasAsrSupport()" x-cloak
+                            @click="toggleWebSearch()" class="composer-pill composer-pill--active"
+                            :title="window.t('chat.web_search_on')">
+                            <i data-lucide="globe" class="w-3.5 h-3.5"></i>
+                            <span>{{ t('chat.composer.search_chip') }}</span>
+                            <i data-lucide="x" class="w-3 h-3"></i>
                         </button>
 
-                        <textarea x-ref="messageInput" x-model="inputMessage"
-                            autocomplete="off" autocorrect="off"
-                            @keydown.enter="onComposerEnter($event)"
-                            @input="autoResize($event.target)" @paste="handlePaste($event)"
-                            :placeholder="hasAsrSupport() ? window.t('chat.input_placeholder_asr') : (isMobile ? window.t('chat.input_placeholder_mobile') : window.t('chat.input_placeholder'))"
-                            :disabled="!apiKeySet || !currentModel || isCurrentChatStreaming() || hasAsrSupport()" rows="1"
-                            class="flex-1 px-4 py-3 bg-transparent resize-none outline-none text-sm max-h-32"
-                            style="color: var(--text-primary);"></textarea>
+                        <!-- Sampling / profile settings -->
+                        <div class="composer-menu flex-shrink-0" x-data="{ open: false }"
+                            @click.outside="open = false"
+                            @keydown.escape="if (open) { open = false; $event.stopPropagation(); }">
+                            <button @click="open = !open" class="composer-icon-btn" :class="{ 'is-open': open }"
+                                :disabled="!apiKeySet || !currentModel"
+                                :title="window.t('chat.composer.settings')" :aria-label="window.t('chat.composer.settings')"
+                                :aria-expanded="open">
+                                <i data-lucide="sliders-horizontal" class="w-4 h-4"></i>
+                            </button>
+                            <div x-show="open" x-transition.opacity x-cloak class="composer-popover left-0 p-3 space-y-3"
+                                style="--popover-w: 20rem;">
+                                <!-- Active profile -->
+                                <div class="space-y-1">
+                                    <div class="flex items-center justify-between">
+                                        <label class="text-caption font-bold uppercase tracking-wider"
+                                            style="color: var(--text-secondary);">{{ t('chat.active_profile') }}</label>
+                                        <button @click="open = false; rightSidebarTab = 'profile'; openRightDrawer()"
+                                            class="text-caption hover:underline" style="color: var(--text-tertiary);">
+                                            {{ t('chat.composer.edit_profile') }}
+                                        </button>
+                                    </div>
+                                    <div class="relative">
+                                        <select @change="selectProfileOption($event.target.value)"
+                                            class="select-chevron-custom w-full px-3 py-2 text-xs border border-line rounded-lg font-medium cursor-pointer appearance-none focus:outline-none focus:border-line-strong transition-colors bg-surface-muted hover:bg-surface-alt"
+                                            style="color: var(--text-primary);">
+                                            <template x-for="p in promptProfiles" :key="p.name">
+                                                <option :value="p.name" :selected="p.name === activePromptProfile"
+                                                    x-text="profileLabel(p.name)"></option>
+                                            </template>
+                                            <option value="__custom__" :selected="!activePromptProfile">{{ t('chat.profile_custom') }}</option>
+                                        </select>
+                                        <i data-lucide="chevron-down"
+                                            class="w-4 h-4 absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none"
+                                            style="color: var(--text-tertiary);"></i>
+                                    </div>
+                                </div>
+
+                                <!-- Sampling: editable for Custom Parameters, read-only otherwise -->
+                                <div class="grid grid-cols-2 gap-2">
+                                    <template x-for="f in samplingFields()" :key="f.key">
+                                        <div class="space-y-1">
+                                            <label class="text-caption font-bold uppercase tracking-wider block"
+                                                style="color: var(--text-secondary);" x-text="f.label"></label>
+                                            <input x-show="samplingMode() === 'custom'" type="number"
+                                                x-model.number="modelSettings[f.key]" @input="onModelSettingsChange()"
+                                                :step="f.step" :min="f.min" :max="f.max" :placeholder="samplingPlaceholder(f.key)"
+                                                class="w-full px-3 py-2 text-xs border border-line rounded-lg focus:outline-none focus:border-line-strong bg-surface-muted"
+                                                style="color: var(--text-primary);">
+                                            <div x-show="samplingMode() !== 'custom'" class="sampling-readonly"
+                                                :class="{ 'is-inherited': samplingDisplay(f.key).inherited }"
+                                                x-text="samplingDisplay(f.key).text"></div>
+                                        </div>
+                                    </template>
+                                </div>
+                                <p x-show="samplingMode() !== 'custom'" class="text-caption" style="color: var(--text-tertiary);"
+                                    x-text="window.t(samplingMode() === 'model' ? 'chat.sampling.model_hint' : 'chat.sampling.readonly_hint')"></p>
+
+                                <div class="flex items-center justify-end pt-2 border-t border-line">
+                                    <button @click="open = false; rightSidebarTab = 'chat'; openRightDrawer()"
+                                        class="flex items-center gap-1 text-xs hover:underline" style="color: var(--text-secondary);">
+                                        <span>{{ t('chat.composer.all_settings') }}</span>
+                                        <i data-lucide="chevron-right" class="w-3.5 h-3.5"></i>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="flex-1 min-w-0"></div>
+
+                        <!-- Model picker -->
+                        <div x-show="currentModel && availableModels.length > 0" x-cloak
+                            class="composer-menu min-w-0" x-data="{ open: false }"
+                            @click.outside="open = false"
+                            @keydown.escape="if (open) { open = false; $event.stopPropagation(); }">
+                            <button @click="open = !open" class="composer-pill" :class="{ 'is-open': open }"
+                                :title="window.t('chat.switch_model')" :aria-expanded="open" style="max-width: 15rem;">
+                                <i data-lucide="box" class="w-3.5 h-3.5 flex-shrink-0" style="color: var(--text-tertiary);"></i>
+                                <span class="truncate min-w-0" x-text="(availableModels.find(m => m.id === currentModel)?.name) || currentModel"></span>
+                                <i data-lucide="chevron-down" class="w-3.5 h-3.5 flex-shrink-0" style="color: var(--text-tertiary);"></i>
+                            </button>
+                            <div x-show="open" x-transition.opacity x-cloak
+                                class="composer-popover right-0 p-1.5 overflow-y-auto"
+                                style="--popover-w: 17rem; max-height: 20rem;">
+                                <template x-for="model in availableModels" :key="model.id">
+                                    <button @click="selectModel(model.id); open = false"
+                                        class="composer-menu-item" :class="model.id === currentModel ? 'font-semibold' : ''">
+                                        <span class="w-3.5 h-3.5 flex-shrink-0 flex items-center justify-center"
+                                            :style="'color: var(--timeline-accent); visibility:' + (model.id === currentModel ? 'visible' : 'hidden')">
+                                            <i data-lucide="check" class="w-3.5 h-3.5"></i>
+                                        </span>
+                                        <span class="flex-1 min-w-0 truncate text-xs" x-text="model.name"></span>
+                                        <span x-show="model.is_favorite" class="flex-shrink-0" style="color: var(--timeline-accent);">
+                                            <i data-lucide="star" class="w-3 h-3"></i>
+                                        </span>
+                                    </button>
+                                </template>
+                            </div>
+                        </div>
+
+                        <!-- Reasoning level -->
+                        <div x-show="currentModel && reasoningStops().length > 0" x-cloak
+                            class="composer-menu flex-shrink-0" x-data="{ open: false, advanced: false }"
+                            @click.outside="open = false"
+                            @keydown.escape="if (open) { open = false; $event.stopPropagation(); }">
+                            <button @click="open = !open" class="composer-pill" :class="{ 'is-open': open }"
+                                :title="window.t('chat.reasoning.label')" :aria-expanded="open">
+                                <i data-lucide="brain" class="w-3.5 h-3.5 flex-shrink-0" style="color: var(--text-tertiary);"></i>
+                                <span x-text="reasoningPillLabel()"></span>
+                                <i data-lucide="chevron-down" class="w-3.5 h-3.5 flex-shrink-0" style="color: var(--text-tertiary);"></i>
+                            </button>
+                            <div x-show="open" x-transition.opacity x-cloak class="composer-popover right-0 px-4 pt-3 pb-4"
+                                style="--popover-w: 19rem;">
+                                <button @click="advanced = !advanced"
+                                    class="w-full flex items-center justify-center gap-1 py-1 text-sm font-medium"
+                                    style="color: var(--text-primary);" :aria-expanded="advanced">
+                                    <span x-text="reasoningLevelLabel(reasoningLevel())"></span>
+                                    <span class="inline-flex transition-transform"
+                                        :style="advanced ? 'color: var(--text-tertiary); transform: rotate(90deg);' : 'color: var(--text-tertiary);'">
+                                        <i data-lucide="chevron-right" class="w-3.5 h-3.5"></i>
+                                    </span>
+                                </button>
+                                <div class="reasoning-slider mt-2" :class="{ 'is-auto': reasoningLevel() === 'auto' }"
+                                    :style="reasoningSliderStyle()">
+                                    <div class="reasoning-slider-fill"></div>
+                                    <template x-for="(stop, k) in reasoningStops()" :key="stop">
+                                        <span class="reasoning-slider-dot" :class="{ 'is-filled': k <= reasoningSliderIndex() }"
+                                            :style="'--k: ' + k"></span>
+                                    </template>
+                                    <input type="range" min="0" step="1"
+                                        :max="reasoningStops().length - 1"
+                                        :value="reasoningSliderIndex()"
+                                        @input="setReasoningLevel(reasoningStops()[$event.target.valueAsNumber])"
+                                        :aria-label="window.t('chat.reasoning.label')"
+                                        :aria-valuetext="reasoningLevelLabel(reasoningLevel())">
+                                </div>
+                                <div class="reasoning-slider-labels mt-1.5" :style="reasoningSliderStyle()">
+                                    <template x-for="(stop, k) in reasoningStops()" :key="stop">
+                                        <span class="reasoning-slider-label" :style="'--k: ' + k"
+                                            :class="{ 'is-current': k === reasoningSliderIndex() }"
+                                            x-show="reasoningStops().length <= 4 || stop === 'auto' || k === 0 || k === reasoningStops().length - 1 || k === reasoningSliderIndex()"
+                                            x-text="reasoningLevelLabel(stop)"></span>
+                                    </template>
+                                </div>
+                                <p x-show="reasoningLevel() === 'auto'" class="mt-2 text-caption text-center"
+                                    style="color: var(--text-tertiary);">{{ t('chat.reasoning.model_default') }}</p>
+
+                                <!-- Advanced: thinking budget -->
+                                <div x-show="advanced" x-cloak class="mt-3 pt-3 border-t border-line space-y-2">
+                                    <button class="w-full flex items-center justify-between text-xs disabled:opacity-50 disabled:cursor-not-allowed"
+                                        :disabled="!thinkingModes().includes('on_limit') || reasoningLevel() === 'off'"
+                                        @click="setThinkingBudgetEnabled(thinkingModeValue() !== 'on_limit')"
+                                        style="color: var(--text-primary);">
+                                        <span>{{ t('chat.reasoning.budget') }}</span>
+                                        <span class="composer-switch" :class="{ 'is-on': thinkingModeValue() === 'on_limit' }"></span>
+                                    </button>
+                                    <div x-show="thinkingModeValue() === 'on_limit'" class="flex items-center gap-2">
+                                        <input type="number"
+                                            :value="modelSettings.thinking_budget_tokens ?? ''"
+                                            @keydown.arrow-up.prevent="stepThinkingBudgetTokens(1)"
+                                            @keydown.arrow-down.prevent="stepThinkingBudgetTokens(-1)"
+                                            @input="onThinkingBudgetTokensInput($event)"
+                                            @change="clampThinkingBudgetTokens()"
+                                            placeholder="4096" min="0" step="1024"
+                                            class="flex-1 px-3 py-1.5 text-xs border border-line rounded-lg bg-surface-muted thinking-budget-input"
+                                            style="color: var(--text-primary);">
+                                        <span class="text-caption" style="color: var(--text-tertiary);">{{ t('chat.thinking_tokens') }}</span>
+                                    </div>
+                                    <p x-show="currentModelInfo()?.thinking_forced" class="text-caption" style="color: var(--text-tertiary);">{{ t('modal.model_settings.k2_thinking_hint') }}</p>
+                                </div>
+
+                                <p x-show="messages.some(m => m.role === 'assistant')"
+                                    class="mt-3 flex items-start gap-1.5 text-caption" style="color: var(--text-tertiary);">
+                                    <span class="flex-shrink-0 mt-px"><i data-lucide="info" class="w-3 h-3"></i></span>
+                                    <span>{{ t('chat.reasoning.cache_hint') }}</span>
+                                </p>
+                            </div>
+                        </div>
+
+                        <!-- Realtime microphone (only for realtime-capable ASR models) -->
+                        <span x-show="micActive()" x-cloak class="self-center text-xs font-mono px-1"
+                            style="color: var(--text-danger);" x-text="formatRecordingTime(micSeconds)"></span>
+                        <button x-show="hasAsrSupport() && isRealtimeSttModel()" @click="toggleMicTranscription()"
+                            :disabled="!apiKeySet || !currentModel || (isCurrentChatStreaming() && !micActive()) || uploadAudio"
+                            class="composer-icon-btn" :class="{ 'is-open': micActive() }"
+                            :title="window.t(micActive() ? 'chat.stop_recording' : 'chat.record_audio')">
+                            <i x-show="!micActive()" data-lucide="mic" class="w-4 h-4"></i>
+                            <div x-show="micActive()" class="w-3 h-3 rounded-[2px]" style="background-color: var(--text-danger);"></div>
+                        </button>
+
                         <div class="relative flex-shrink-0">
                             <button x-show="!isCurrentChatStreaming()" @click="sendMessage()"
                                 :disabled="(hasAsrSupport() ? (!uploadAudio || micActive()) : (!inputMessage.trim() && uploadImages.length === 0 && uploadDocuments.length === 0)) || hasPendingUploads() || !apiKeySet || !currentModel"
-                                class="w-10 h-10 m-1 bg-accent hover:bg-accent-hover disabled:bg-surface-muted rounded-full transition-colors flex items-center justify-center">
+                                class="w-9 h-9 ml-1 bg-accent hover:bg-accent-hover disabled:bg-surface-muted rounded-full transition-colors flex items-center justify-center">
                                 <i data-lucide="arrow-up" class="w-4 h-4 text-accent-fg"></i>
                             </button>
                             <button x-show="isCurrentChatStreaming()" @click="stopStreaming()"
-                                class="w-10 h-10 m-1 bg-surface-muted hover:bg-surface rounded-full border border-line transition-colors flex items-center justify-center">
+                                class="w-9 h-9 ml-1 bg-surface-muted hover:bg-surface rounded-full border border-line transition-colors flex items-center justify-center">
                                 <div class="w-3 h-3 rounded-[2px]" style="background-color: var(--text-danger);"></div>
                             </button>
                             <!-- Image count badge -->
                             <div x-show="uploadImages.length > 0"
-                                class="absolute -top-0.5 -right-0.5 w-4.5 h-4.5 bg-accent text-accent-fg text-caption flex items-center justify-center rounded-full pointer-events-none"
+                                class="absolute -top-1 -right-1 w-4.5 h-4.5 bg-accent text-accent-fg text-caption flex items-center justify-center rounded-full pointer-events-none"
                                 x-text="uploadImages.length"></div>
                             <div x-show="uploadDocuments.length > 0 && uploadImages.length === 0"
-                                class="absolute -top-0.5 -right-0.5 w-4.5 h-4.5 bg-accent text-accent-fg text-caption flex items-center justify-center rounded-full pointer-events-none"
+                                class="absolute -top-1 -right-1 w-4.5 h-4.5 bg-accent text-accent-fg text-caption flex items-center justify-center rounded-full pointer-events-none"
                                 x-text="uploadDocuments.length"></div>
                         </div>
                     </div>
                 </div>
-                <!-- Context usage: status line — active model on the left, a capsule holding
-                     tokens · % + a ring on the right. Hover the capsule for the exact count. -->
+                <!-- Context usage capsule: tokens · % + a ring. Hover for the exact count. -->
                 <div x-show="currentModel && contextTokensUsed() > 0" x-cloak
-                    class="flex items-center justify-between gap-3 mt-1.5 px-1">
-                    <!-- Active model -->
-                    <span class="flex items-center gap-1.5 min-w-0" style="font-size: 11px; color: var(--text-secondary);">
-                        <span class="w-1.5 h-1.5 rounded-full flex-shrink-0"
-                            style="background-color: rgb(var(--palette-emerald-400)); box-shadow: 0 0 0 3px rgb(var(--palette-emerald-400) / 0.22);"></span>
-                        <span class="truncate" x-text="(availableModels.find(m => m.id === currentModel)?.name) || currentModel"></span>
-                    </span>
+                    class="flex items-center justify-end gap-3 mt-1.5 px-1">
                     <!-- Context capsule -->
                     <div class="relative flex-shrink-0" x-data="{ ctxHover: false }"
                         @mouseenter="ctxHover = true" @mouseleave="ctxHover = false">
@@ -1907,14 +2322,6 @@
         <div class="p-4 border-b border-line flex-shrink-0">
             <div class="flex items-center gap-1">
                 <div class="flex flex-1 items-center gap-1">
-                    <button @click="rightSidebarTab = 'settings'"
-                        class="flex-1 flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg text-caption font-bold uppercase tracking-wider transition-colors"
-                        :class="rightSidebarTab === 'settings'
-                            ? 'bg-neutral-200 dark:bg-neutral-700 text-neutral-900 dark:text-neutral-100'
-                            : 'text-neutral-500 hover:bg-neutral-100 dark:hover:bg-neutral-800'">
-                        <i data-lucide="settings" class="w-3 h-3"></i>
-                        <span>{{ t('chat.model_tab') }}</span>
-                    </button>
                     <button @click="rightSidebarTab = 'profile'"
                         class="flex-1 flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg text-caption font-bold uppercase tracking-wider transition-colors"
                         :class="rightSidebarTab === 'profile'
@@ -1959,7 +2366,7 @@
                                     <span class="w-2 h-2 rounded-full flex-shrink-0"
                                         :class="activePromptProfile === p.name ? 'bg-blue-500' : 'border border-line'"></span>
                                     <span class="flex-1 text-xs font-medium truncate"
-                                        style="color: var(--text-primary);" x-text="p.name"></span>
+                                        style="color: var(--text-primary);" x-text="profileLabel(p.name)"></span>
                                     <div class="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
                                         :class="{'!opacity-100': activePromptProfile === p.name}">
                                         <button x-show="p.name !== 'System Default'" @click.stop="startRenamingPromptProfile()"
@@ -2011,6 +2418,14 @@
                         </div>
                     </template>
                 </div>
+                <!-- Custom Parameters: per-chat values with no saved profile -->
+                <div @click="selectProfileOption('__custom__')"
+                    class="flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer transition-colors"
+                    :class="!activePromptProfile ? 'bg-surface-muted' : 'hover:bg-surface-muted'">
+                    <span class="w-2 h-2 rounded-full flex-shrink-0"
+                        :class="!activePromptProfile ? 'bg-blue-500' : 'border border-line'"></span>
+                    <span class="flex-1 text-xs font-medium truncate" style="color: var(--text-primary);">{{ t('chat.profile_custom') }}</span>
+                </div>
                 <!-- Add Profile button -->
                 <button @click="addNewPromptProfile()"
                     class="w-full flex items-center gap-2 px-3 py-2 mt-2 rounded-lg text-xs transition-colors hover:bg-surface-muted"
@@ -2024,10 +2439,38 @@
                     <label class="text-caption font-bold uppercase tracking-wider block"
                         style="color: var(--text-secondary);">{{ t('chat.prompt_content_label') }}</label>
                     <textarea x-model="systemPrompt" rows="5"
-                        @input="promptDirty = (activePromptProfile && systemPrompt !== promptProfiles.find(p => p.name === activePromptProfile)?.content); const s = getChatSession(currentChatId, true); if (s) s.systemPrompt = systemPrompt;"
+                        @input="updateProfileDirty(); const s = getChatSession(currentChatId, true); if (s) s.systemPrompt = systemPrompt;"
                         placeholder="{{ t('chat.prompt_content_placeholder') }}"
                         class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong transition-all resize-y bg-surface-muted"
                         style="color: var(--text-primary);"></textarea>
+                </div>
+
+                <!-- Sampling -->
+                <div class="space-y-2">
+                    <label class="text-caption font-bold uppercase tracking-wider block"
+                        style="color: var(--text-secondary);">{{ t('chat.sampling.title') }}</label>
+                    <div class="grid grid-cols-2 gap-2">
+                        <template x-for="f in samplingFields()" :key="f.key">
+                            <div class="space-y-1">
+                                <label class="text-caption font-bold uppercase tracking-wider block"
+                                    style="color: var(--text-secondary);" x-text="f.label"></label>
+                                <input x-show="samplingMode() === 'custom'" type="number"
+                                    x-model.number="modelSettings[f.key]" @input="onModelSettingsChange()"
+                                    :step="f.step" :min="f.min" :max="f.max" :placeholder="samplingPlaceholder(f.key)"
+                                    class="w-full px-3 py-2 text-xs border border-line rounded-lg focus:outline-none focus:border-line-strong bg-surface-muted"
+                                    style="color: var(--text-primary);">
+                                <input x-show="samplingMode() === 'profile'" type="number"
+                                    x-model.number="profileParamsDraft[f.key]" @input="updateProfileDirty()"
+                                    :step="f.step" :min="f.min" :max="f.max" :placeholder="samplingPlaceholder(f.key)"
+                                    class="w-full px-3 py-2 text-xs border border-line rounded-lg focus:outline-none focus:border-line-strong bg-surface-muted"
+                                    style="color: var(--text-primary);">
+                                <div x-show="samplingMode() === 'model'" class="sampling-readonly"
+                                    x-text="samplingDisplay(f.key).text"></div>
+                            </div>
+                        </template>
+                    </div>
+                    <p class="text-caption" style="color: var(--text-tertiary);"
+                        x-text="window.t('chat.sampling.' + samplingMode() + '_hint')"></p>
                 </div>
 
                 <!-- Save -->
@@ -2042,155 +2485,6 @@
                         <span>{{ t('chat.save_settings') }}</span>
                     </button>
                 </div>
-            </div>
-
-            <!-- ==================== MODEL TAB ==================== -->
-            <div x-show="rightSidebarTab === 'settings'" class="px-4 py-3 space-y-3">
-
-                <!-- Active Profile selector (shared with PROFILE tab) -->
-                <div class="space-y-1">
-                    <div class="flex items-center gap-1.5 mb-1">
-                        <i data-lucide="user" class="w-3 h-3" style="color: var(--text-secondary);"></i>
-                        <label class="text-caption font-bold uppercase tracking-wider"
-                            style="color: var(--text-secondary);">{{ t('chat.active_profile') }}</label>
-                    </div>
-                    <div class="relative">
-                        <select
-                            :value="activePromptProfile || ''"
-                            @change="selectPromptProfile($event.target.value || null)"
-                            class="w-full px-3 py-2 text-xs border border-line rounded-xl font-medium cursor-pointer appearance-none focus:outline-none focus:border-line-strong transition-colors bg-surface-muted hover:bg-surface-alt"
-                            style="color: var(--text-primary);">
-                            <template x-for="p in promptProfiles" :key="p.name">
-                                <option :value="p.name" x-text="p.name"></option>
-                            </template>
-                        </select>
-                        <i data-lucide="chevron-down"
-                            class="w-4 h-4 absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none"
-                            style="color: var(--text-tertiary);"></i>
-                    </div>
-                </div>
-
-                <!-- Active Model Selector -->
-                <div class="space-y-1">
-                    <label class="text-caption font-bold uppercase tracking-wider block"
-                        style="color: var(--text-secondary);">{{ t('chat.active_model') }}</label>
-                    <div class="relative">
-                        <select x-model="currentModel"
-                            @change="selectModel($event.target.value)"
-                            class="w-full px-3 py-2 text-xs border border-line rounded-xl font-medium cursor-pointer appearance-none focus:outline-none focus:border-line-strong transition-colors bg-surface-muted hover:bg-surface-alt"
-                            style="color: var(--text-primary);">
-                            <template x-for="model in availableModels" :key="model.id">
-                                <option :value="model.id" x-text="model.name"></option>
-                            </template>
-                        </select>
-                        <i data-lucide="chevron-down"
-                            class="w-4 h-4 absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none"
-                            style="color: var(--text-tertiary);"></i>
-                    </div>
-                    <div x-show="availableModels.length === 0">
-                        {{ t('chat.no_models') }}
-                    </div>
-                </div>
-
-                <!-- Temperature & Max Tokens -->
-                <div class="grid grid-cols-2 gap-3">
-                    <div class="space-y-1">
-                        <label class="text-caption font-bold uppercase tracking-wider"
-                            style="color: var(--text-secondary);">{{ t('modal.model_settings.temperature') }}</label>
-                        <input type="number" x-model.number="modelSettings.temperature" @input="onModelSettingsChange()"
-                            step="0.1" min="0" max="2" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
-                            class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
-                            style="color: var(--text-primary);">
-                    </div>
-                    <div class="space-y-1">
-                        <label class="text-caption font-bold uppercase tracking-wider"
-                            style="color: var(--text-secondary);">{{ t('modal.model_settings.max_tokens') }}</label>
-                        <input type="number" x-model.number="modelSettings.max_tokens" @input="onModelSettingsChange()"
-                            min="1" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
-                            class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
-                            style="color: var(--text-primary);">
-                    </div>
-                </div>
-
-                <!-- Sampling Advanced parameters: Top P, Top K, Min P -->
-                <div class="grid grid-cols-3 gap-2">
-                    <div class="space-y-1">
-                        <label class="text-caption font-bold uppercase tracking-wider"
-                            style="color: var(--text-secondary);">{{ t('modal.model_settings.top_p') }}</label>
-                        <input type="number" x-model.number="modelSettings.top_p" @input="onModelSettingsChange()"
-                            step="0.05" min="0" max="1" placeholder="—"
-                            class="w-full px-2 py-2 text-xs border border-line rounded-xl text-center focus:outline-none focus:border-line-strong bg-surface-muted"
-                            style="color: var(--text-primary);">
-                    </div>
-                    <div class="space-y-1">
-                        <label class="text-caption font-bold uppercase tracking-wider"
-                            style="color: var(--text-secondary);">{{ t('modal.model_settings.top_k') }}</label>
-                        <input type="number" x-model.number="modelSettings.top_k" @input="onModelSettingsChange()" min="0"
-                            placeholder="—"
-                            class="w-full px-2 py-2 text-xs border border-line rounded-xl text-center focus:outline-none focus:border-line-strong bg-surface-muted"
-                            style="color: var(--text-primary);">
-                    </div>
-                    <div class="space-y-1">
-                        <label class="text-caption font-bold uppercase tracking-wider"
-                            style="color: var(--text-secondary);">{{ t('modal.model_settings.min_p') }}</label>
-                        <input type="number" x-model.number="modelSettings.min_p" @input="onModelSettingsChange()"
-                            step="0.01" min="0" max="1" placeholder="—"
-                            class="w-full px-2 py-2 text-xs border border-line rounded-xl text-center focus:outline-none focus:border-line-strong bg-surface-muted"
-                            style="color: var(--text-primary);">
-                    </div>
-                </div>
-
-                <!-- Repetition Penalty & Presence Penalty -->
-                <div class="grid grid-cols-2 gap-3">
-                    <div class="space-y-1">
-                        <label class="text-caption font-bold uppercase tracking-wider"
-                            style="color: var(--text-secondary);">{{ t('modal.model_settings.repetition_penalty_short') }}</label>
-                        <input type="number" x-model.number="modelSettings.repetition_penalty"
-                            @input="onModelSettingsChange()" step="0.05" min="0" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
-                            class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
-                            style="color: var(--text-primary);">
-                    </div>
-                    <div class="space-y-1">
-                        <label class="text-caption font-bold uppercase tracking-wider"
-                            style="color: var(--text-secondary);">{{ t('modal.model_settings.presence_penalty') }}</label>
-                        <input type="number" x-model.number="modelSettings.presence_penalty"
-                            @input="onModelSettingsChange()" step="0.05" min="-2" max="2" placeholder="{{ t('modal.model_settings.placeholder_default') }}"
-                            class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
-                            style="color: var(--text-primary);">
-                    </div>
-                </div>
-
-                <!-- Thinking: Auto / On (Unlimit) / On (Limit) / Off -->
-                <div class="p-3 bg-surface-muted rounded-xl border border-line space-y-2">
-                    <label class="text-caption font-bold uppercase tracking-wider block"
-                        style="color: var(--text-secondary);">{{ t('chat.thinking_label') }}</label>
-                    <select :value="thinkingModeValue()" @change="setThinkingMode($event.target.value)"
-                        class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
-                        style="color: var(--text-primary);">
-                        <option value="auto" :disabled="!thinkingModes().includes('auto')">{{ t('chat.thinking_mode.auto') }}</option>
-                        <option value="on_unlimit" :disabled="!thinkingModes().includes('on_unlimit')">{{ t('chat.thinking_mode.on_unlimited') }}</option>
-                        <option value="on_limit" :disabled="!thinkingModes().includes('on_limit')">{{ t('chat.thinking_mode.on_limited') }}</option>
-                        <option value="off" :disabled="!thinkingModes().includes('off')">{{ t('chat.thinking_mode.off') }}</option>
-                    </select>
-                    <p x-show="currentModelInfo()?.thinking_forced" class="text-caption" style="color: var(--text-tertiary);">{{ t('modal.model_settings.k2_thinking_hint') }}</p>
-                    <div x-show="thinkingModeValue() === 'on_limit'" x-collapse class="space-y-1">
-                        <label class="text-caption font-bold uppercase tracking-wider block"
-                            style="color: var(--text-secondary);">{{ t('chat.thinking_tokens') }}</label>
-                        <input type="number"
-                            :value="modelSettings.thinking_budget_tokens ?? ''"
-                            @keydown.arrow-up.prevent="stepThinkingBudgetTokens(1)"
-                            @keydown.arrow-down.prevent="stepThinkingBudgetTokens(-1)"
-                            @input="onThinkingBudgetTokensInput($event)"
-                            @change="clampThinkingBudgetTokens()"
-                            placeholder="4096" min="0" step="1024"
-                            class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface thinking-budget-input"
-                            style="color: var(--text-primary);">
-                    </div>
-                    <p class="text-caption" style="color: var(--text-tertiary);">
-                        {{ t('chat.model_settings_advanced_hint') }}
-                    </p>
-                </div>
-
             </div>
 
             <!-- ==================== SETTINGS TAB ==================== -->
@@ -2379,7 +2673,7 @@
                     <label class="block text-xs font-bold uppercase tracking-wider text-fg-tertiary mb-2">{{ t('chat.theme_label') }}</label>
                     <select @change="setTheme($event.target.value)" x-model="theme"
                         class="w-full px-3 py-2 border border-line rounded-xl text-sm focus:outline-none focus:border-line-strong"
-                        style="background: var(--bg-primary); color: var(--text-primary);">
+                        style="background-color: var(--bg-primary); color: var(--text-primary);">
                         <option value="auto">{{ t('navbar.theme.auto') }}</option>
                         <option value="light">{{ t('navbar.theme.light_mode') }}</option>
                         <option value="dark">{{ t('navbar.theme.dark_mode') }}</option>
@@ -2494,6 +2788,7 @@
     const ENHANCED_READABILITY_KEY = 'omlx-enhanced-readability';
     const SYSTEM_PROMPT_STORAGE_KEY = 'omlx_chat_system_prompt';
     const PROMPT_PROFILES_STORAGE_KEY = 'omlx_chat_prompt_profiles';
+    const CUSTOM_PROFILE_OPTION = '__custom__';
 
     // Opener of the right drawer. A DOM node, so kept out of reactive Alpine state.
     let drawerReturnFocus = null;
@@ -2623,10 +2918,12 @@
             systemPrompt: '',
 
             // Right Sidebar Tab
-            rightSidebarTab: 'settings',
+            rightSidebarTab: 'profile',
 
             // PROFILE Section State
             promptProfiles: [],
+            profileParamsDraft: {},       // Active profile's sampling values until Save
+            _draftProfile: null,          // Profile object the draft belongs to
             activePromptProfile: null,
             promptDirty: false,
             editingPromptProfileName: false,
@@ -2643,8 +2940,8 @@
             BUILTIN_WEB_TOOL_ROUTES: { web_search: '/v1/web/search', fetch_url: '/v1/web/fetch' },
 
             // Right Sidebar State
-            rightSidebarOpen: window.innerWidth >= 1200,
-            showRightToggle: window.innerWidth < 1200,
+            rightSidebarOpen: false,
+            showRightToggle: true,
             // Same breakpoint as the max-width: 1024px block that floats the panel.
             drawerOverlay: window.innerWidth <= 1024,
             modelSettingsDirty: false,
@@ -2681,6 +2978,7 @@
                 repetition_penalty: null,
                 presence_penalty: null,
                 enable_thinking: null,
+                reasoning_effort: null,
                 thinking_budget_enabled: false,
                 thinking_budget_tokens: null,
             },
@@ -2695,6 +2993,7 @@
                     repetition_penalty: null,
                     presence_penalty: null,
                     enable_thinking: null,
+                    reasoning_effort: null,
                     thinking_budget_enabled: false,
                     thinking_budget_tokens: null,
                 };
@@ -2764,12 +3063,87 @@
                 );
             },
 
-            setThinkingMode(mode) {
-                if (!this.thinkingModes().includes(mode)) return;
-                this.modelSettings.enable_thinking = mode === 'auto' ? null : mode !== 'off';
-                this.modelSettings.thinking_budget_enabled = mode === 'on_limit';
-                this.modelSettings.thinking_budget_tokens = mode === 'on_limit'
-                    ? this.normalizeThinkingBudgetTokens(this.modelSettings.thinking_budget_tokens) : null;
+            // Slider stops from the server: 'off', 'on', and effort levels.
+            reasoningLevels() {
+                return this.currentModelInfo()?.reasoning_levels || [];
+            },
+
+            // Off, Auto (model default), then On or the effort levels.
+            reasoningStops() {
+                const levels = this.reasoningLevels();
+                if (!levels.length) return [];
+                const off = levels.includes('off') ? ['off'] : [];
+                return [...off, 'auto', ...levels.filter(level => level !== 'off')];
+            },
+
+            reasoningLevel() {
+                const s = this.modelSettings;
+                const levels = this.reasoningLevels();
+                if (s.enable_thinking === false && levels.includes('off')) return 'off';
+                if (s.reasoning_effort && levels.includes(s.reasoning_effort)) return s.reasoning_effort;
+                if (s.enable_thinking === true && levels.includes('on')) return 'on';
+                return 'auto';
+            },
+
+            reasoningLevelLabel(level) {
+                return level ? window.t('chat.reasoning.level.' + level) : '';
+            },
+
+            reasoningPillLabel() {
+                const level = this.reasoningLevel();
+                return level === 'auto' ? window.t('chat.reasoning.label') : this.reasoningLevelLabel(level);
+            },
+
+            reasoningSliderIndex() {
+                return Math.max(0, this.reasoningStops().indexOf(this.reasoningLevel()));
+            },
+
+            reasoningSliderStyle() {
+                const n = Math.max(1, this.reasoningStops().length - 1);
+                return `--n: ${n}; --i: ${this.reasoningSliderIndex()};`;
+            },
+
+            setReasoningLevel(level) {
+                const s = this.modelSettings;
+                const levels = this.reasoningLevels();
+                if (level === 'off' && levels.includes('off')) {
+                    s.enable_thinking = false;
+                    s.reasoning_effort = null;
+                    s.thinking_budget_enabled = false;
+                    s.thinking_budget_tokens = null;
+                } else if (level === 'on' && levels.includes('on')) {
+                    s.enable_thinking = true;
+                    s.reasoning_effort = null;
+                } else if (level && level !== 'auto' && levels.includes(level)) {
+                    s.reasoning_effort = level;
+                    // An 'off' stop means the template has a thinking switch the request may set.
+                    s.enable_thinking = levels.includes('off') ? true : null;
+                } else {
+                    s.enable_thinking = null;
+                    s.reasoning_effort = null;
+                    // Forced-thinking models keep the budget: it is their only limit.
+                    if (!this.currentModelInfo()?.thinking_forced) {
+                        s.thinking_budget_enabled = false;
+                        s.thinking_budget_tokens = null;
+                    }
+                }
+                this.onModelSettingsChange();
+            },
+
+            setThinkingBudgetEnabled(enabled) {
+                const s = this.modelSettings;
+                const forced = this.currentModelInfo()?.thinking_forced;
+                if (enabled) {
+                    // A budget only applies while thinking is on (see thinkingModeValue).
+                    if (!forced) s.enable_thinking = true;
+                    s.thinking_budget_enabled = true;
+                    s.thinking_budget_tokens = this.normalizeThinkingBudgetTokens(s.thinking_budget_tokens);
+                } else {
+                    // Turning the budget off returns an Auto level to the model default.
+                    if (!forced && this.reasoningLevel() === 'auto') s.enable_thinking = null;
+                    s.thinking_budget_enabled = false;
+                    s.thinking_budget_tokens = null;
+                }
                 this.onModelSettingsChange();
             },
 
@@ -3141,6 +3515,9 @@
                 if (msg.role !== 'assistant') return true;
                 const userIdx = this.findUserIndexForMessage(this.messages, index);
                 if (userIdx < 0) return true;
+                if (this.isReplacingVariantsAt(userIdx)) {
+                    return msg.id === this.currentStream().targetMessageId;
+                }
                 const active = this.getActiveVariantForUser(this.messages, userIdx);
                 return active ? msg.id === active.id : true;
             },
@@ -3159,9 +3536,15 @@
                 return true;
             },
 
+            // A regeneration hides the turn's earlier variants until the new one lands.
+            isReplacingVariantsAt(userIndex) {
+                const stream = this.currentStream();
+                return Boolean(stream?.isStreaming && stream.replacingVariantsAt === userIndex);
+            },
+
             isActiveVariantForUser(userIndex, variantId) {
                 const user = this.messages[userIndex];
-                if (!user) return false;
+                if (!user || this.isReplacingVariantsAt(userIndex)) return false;
                 const activeId = user._activeVariantId;
                 const variants = this.getTurnVariantsForUser(userIndex);
                 if (!variants.length) return false;
@@ -3201,6 +3584,8 @@
             async selectVariant(userIndex, variantId) {
                 const session = this.getChatSession(this.currentChatId, true);
                 if (!session?.messages[userIndex] || session.messages[userIndex].role !== 'user') return;
+                // Picking an earlier variant mid-regeneration shows it again.
+                if (this.isReplacingVariantsAt(userIndex)) this.currentStream().replacingVariantsAt = null;
                 session.messages[userIndex]._activeVariantId = variantId;
                 this.messages = session.messages;
                 const variant = session.messages.find(m => m.id === variantId);
@@ -3232,6 +3617,9 @@
                     s.enable_thinking = false;
                 } else if (generation.thinking_budget != null) {
                     s.enable_thinking = true;
+                }
+                if (typeof generation.reasoning_effort === 'string') {
+                    s.reasoning_effort = generation.reasoning_effort;
                 }
                 const budget = generation.thinking_budget ?? generation.thinking_budget_tokens;
                 if (budget != null) {
@@ -3277,12 +3665,16 @@
                         await this.loadAdminModelDefaults(gatewayId);
                     }
                 }
-                if (meta.profileName) {
-                    const name = this.normalizeProfileName(meta.profileName);
-                    if (name && this.promptProfiles.some(p => p.name === name)) {
-                        this.activePromptProfile = name;
-                        session.activeProfile = name;
-                    }
+                const name = this.normalizeProfileName(meta.profileName);
+                if (name && this.promptProfiles.some(p => p.name === name)) {
+                    this.activePromptProfile = name;
+                    session.activeProfile = name;
+                } else if (meta.generation) {
+                    // Model Default sends no sampling values, so any value means the
+                    // reply used Custom Parameters, now restored into modelSettings.
+                    const custom = this.samplingFields().some(({ key }) => meta.generation[key] != null);
+                    this.activePromptProfile = custom ? null : 'System Default';
+                    session.activeProfile = this.activePromptProfile;
                 }
                 if (meta.systemPrompt != null && String(meta.systemPrompt).trim()) {
                     this.systemPrompt = String(meta.systemPrompt).trim();
@@ -3355,6 +3747,16 @@
                 return msg;
             },
 
+            // Custom Parameters (no profile) sends the chat's own values, a profile
+            // sends its saved values, and System Default sends none so the
+            // model settings apply.
+            samplingSource() {
+                const name = this.activePromptProfile;
+                if (!name) return this.modelSettings;
+                if (name === 'System Default') return {};
+                return (this.promptProfiles || []).find(p => p.name === name)?.params || {};
+            },
+
             snapshotGenerationSettings() {
                 const gen = {};
                 const s = this.modelSettings;
@@ -3362,15 +3764,24 @@
                     'temperature', 'max_tokens', 'top_p', 'top_k', 'min_p',
                     'repetition_penalty', 'presence_penalty'
                 ];
+                const source = this.samplingSource();
                 for (const key of scalarKeys) {
-                    if (s[key] != null) gen[key] = s[key];
+                    if (source[key] != null) gen[key] = source[key];
                 }
-                const mode = this.thinkingModeValue();
-                if (mode !== 'auto' && !this.currentModelInfo()?.thinking_forced) {
+                // A model without a reasoning control sends no saved thinking state.
+                const forced = this.currentModelInfo()?.thinking_forced;
+                const levels = this.reasoningLevels();
+                let mode = forced || levels.length ? this.thinkingModeValue() : 'auto';
+                // A saved Off has no meaning once the model shows no Off stop.
+                if (mode === 'off' && !levels.includes('off')) mode = 'auto';
+                if (mode !== 'auto' && !forced) {
                     gen.chat_template_kwargs = { enable_thinking: mode !== 'off' };
                 }
                 if (mode === 'on_limit') {
                     gen.thinking_budget = this.normalizeThinkingBudgetTokens(s.thinking_budget_tokens);
+                }
+                if (s.reasoning_effort && levels.includes(s.reasoning_effort)) {
+                    gen.reasoning_effort = s.reasoning_effort;
                 }
                 return Object.keys(gen).length ? gen : null;
             },
@@ -3405,13 +3816,7 @@
                         if (sp != null && String(sp).trim()) return String(sp).trim();
                         return '';
                     }
-                    for (let i = variantUserIndex - 1; i >= 0; i--) {
-                        if (messages[i].role !== 'user') continue;
-                        const variant = this.getActiveVariantForUser(messages, i);
-                        const sp = variant?.meta?.systemPrompt;
-                        if (sp != null && String(sp).trim()) return String(sp).trim();
-                        break;
-                    }
+                    // A new turn follows the panel; picking a variant restores the panel.
                     return fallback?.trim() ? fallback.trim() : '';
                 }
                 for (let i = messages.length - 1; i >= 0; i--) {
@@ -3427,20 +3832,8 @@
 
             resolveApiModel(messages, fallbackModel, variantUserIndex = null) {
                 const fallback = this.resolveGatewayModelId(fallbackModel);
-                if (variantUserIndex != null) {
-                    if (this.getTurnVariantsAt(messages, variantUserIndex).length > 0) {
-                        return fallback;
-                    }
-                    for (let i = variantUserIndex - 1; i >= 0; i--) {
-                        if (messages[i].role !== 'user') continue;
-                        const variant = this.getActiveVariantForUser(messages, i);
-                        if (variant?.meta?.modelId) {
-                            return this.resolveGatewayModelId(variant.meta.modelId);
-                        }
-                        break;
-                    }
-                    return fallback;
-                }
+                // Regenerations and new turns both follow the panel.
+                if (variantUserIndex != null) return fallback;
                 for (let i = messages.length - 1; i >= 0; i--) {
                     if (messages[i].role !== 'user') continue;
                     if (!this.getTurnVariantsAt(messages, i).length) continue;
@@ -3458,16 +3851,8 @@
                     const gen = variant?.meta?.generation;
                     return gen && typeof gen === 'object' ? { ...gen } : {};
                 };
+                // Regenerations and new turns both follow the panel.
                 if (variantUserIndex != null) {
-                    if (this.getTurnVariantsAt(messages, variantUserIndex).length > 0) {
-                        return { ...(this.snapshotGenerationSettings() || {}) };
-                    }
-                    for (let i = variantUserIndex - 1; i >= 0; i--) {
-                        if (messages[i].role !== 'user') continue;
-                        const variant = this.getActiveVariantForUser(messages, i);
-                        if (variant) return fromMeta(variant);
-                        break;
-                    }
                     return { ...(this.snapshotGenerationSettings() || {}) };
                 }
                 for (let i = messages.length - 1; i >= 0; i--) {
@@ -3589,6 +3974,7 @@
                     _toolTimers: {},
                     _prefillInterval: null,
                     targetMessageId: null,
+                    replacingVariantsAt: null,
                     _statsRequestId: null,
                     _liveFooterStats: null,
                 };
@@ -3869,6 +4255,7 @@
                 }
                 stream._toolTimers = {};
                 stream.targetMessageId = null;
+                stream.replacingVariantsAt = null;
                 stream._statsRequestId = null;
                 stream._liveFooterStats = null;
                 if (stream._domUpdateRaf) {
@@ -3887,6 +4274,8 @@
             async init() {
 
         this.loadPromptProfiles();
+        this.resetProfileParamsDraft();
+        this.$watch('activePromptProfile', () => this.resetProfileParamsDraft());
 
                 const serverApiKey = {{ api_key | tojson }};
 
@@ -4926,6 +5315,11 @@
         this.schedulePersistModelSettings();
     },
 
+    toggleWebSearch() {
+        this.chatSettings.webSearchEnabled = !this.chatSettings.webSearchEnabled;
+        this.saveChatSettings();
+    },
+
     cancelPersistModelSettingsTimer() {
         clearTimeout(this._persistModelSettingsTimer);
         this._persistModelSettingsTimer = null;
@@ -5007,6 +5401,79 @@
 
     // ===== PROFILE Section (Prompt Profiles) =====
 
+    samplingFields() {
+        return [
+            { key: 'temperature', label: window.t('modal.model_settings.temperature'), step: 0.1, min: 0, max: 2 },
+            { key: 'max_tokens', label: window.t('modal.model_settings.max_tokens'), step: 1, min: 1 },
+            { key: 'top_p', label: window.t('modal.model_settings.top_p'), step: 0.05, min: 0, max: 1 },
+            { key: 'top_k', label: window.t('modal.model_settings.top_k'), step: 1, min: 0 },
+            { key: 'min_p', label: window.t('modal.model_settings.min_p'), step: 0.01, min: 0, max: 1 },
+            { key: 'repetition_penalty', label: window.t('modal.model_settings.repetition_penalty_short'), step: 0.05, min: 0 },
+            { key: 'presence_penalty', label: window.t('modal.model_settings.presence_penalty'), step: 0.05, min: -2, max: 2 },
+        ];
+    },
+
+    samplingMode() {
+        const name = this.activePromptProfile;
+        if (!name) return 'custom';
+        return name === 'System Default' ? 'model' : 'profile';
+    },
+
+    profileLabel(name) {
+        return name === 'System Default' ? window.t('chat.profile_model_default') : name;
+    },
+
+    samplingPlaceholder(key) {
+        return this.currentModelInfo()?.settings?.[key] ?? window.t('modal.model_settings.placeholder_default');
+    },
+
+    // Read-only value; a blank profile field shows the model value it falls back to.
+    samplingDisplay(key) {
+        const own = this.samplingSource()[key];
+        if (own != null) return { text: String(own), inherited: false };
+        return { text: String(this.samplingPlaceholder(key)), inherited: this.samplingMode() === 'profile' };
+    },
+
+    selectProfileOption(value) {
+        if (value !== CUSTOM_PROFILE_OPTION) {
+            this.selectPromptProfile(value);
+            return;
+        }
+        if (!this.activePromptProfile) return;
+        // Custom Parameters starts from the values the previous profile showed.
+        const source = this.samplingSource();
+        const model = this.currentModelInfo()?.settings || {};
+        for (const { key } of this.samplingFields()) {
+            this.modelSettings[key] = source[key] ?? model[key] ?? null;
+        }
+        this.selectPromptProfile(null);
+        this.onModelSettingsChange();
+    },
+
+    resetProfileParamsDraft() {
+        const profile = this.promptProfiles.find(p => p.name === this.activePromptProfile) || null;
+        // A rename keeps the same profile object, so unsaved edits stay.
+        if (profile && profile === this._draftProfile) return;
+        this._draftProfile = profile;
+        const params = profile?.params || {};
+        this.profileParamsDraft = Object.fromEntries(
+            this.samplingFields().map(({ key }) => [key, params[key] ?? null])
+        );
+        this.updateProfileDirty();
+    },
+
+    updateProfileDirty() {
+        const profile = this.promptProfiles.find(p => p.name === this.activePromptProfile);
+        if (!profile) {
+            this.promptDirty = false;
+            return;
+        }
+        const params = profile.params || {};
+        this.promptDirty = this.systemPrompt !== profile.content
+            || this.samplingFields().some(({ key }) =>
+                (this.profileParamsDraft[key] ?? null) !== (params[key] ?? null));
+    },
+
     loadPromptProfiles() {
         try {
             const raw = localStorage.getItem(PROMPT_PROFILES_STORAGE_KEY);
@@ -5070,6 +5537,11 @@
         const profile = this.promptProfiles.find(p => p.name === this.activePromptProfile);
         if (profile) {
             profile.content = this.systemPrompt;
+            if (profile.name !== 'System Default') {
+                profile.params = Object.fromEntries(
+                    Object.entries(this.profileParamsDraft).filter(([, v]) => v != null)
+                );
+            }
             this._persistPromptProfiles();
             this.promptDirty = false;
             // Sync to session
@@ -5133,7 +5605,7 @@
             name = `${baseName} (${counter})`;
             counter++;
         }
-        this.promptProfiles.push({ name, content: '' });
+        this.promptProfiles.push({ name, content: '', params: {} });
         this._persistPromptProfiles();
         this.activePromptProfile = name;
         this.systemPrompt = '';
@@ -6113,6 +6585,11 @@
             stream.sourceModel = requestModel;
             stream.sourceSystemPrompt = context.systemPrompt;
             stream.sourceProfile = context._profile;
+            // Hide the turn's replies only when the new one streams right below them.
+            const regenAt = context._excludeVariantsAtUserIndex;
+            stream.replacingVariantsAt = regenAt != null
+                && !chatSession.messages.slice(regenAt + 1).some(m => m.role === 'user')
+                ? regenAt : null;
             if (context._variantUserIndex == null) {
                 for (let i = chatSession.messages.length - 1; i >= 0; i--) {
                     if (chatSession.messages[i].role === 'user') {
@@ -6610,6 +7087,7 @@
                             parts.push(`think=${ctk.enable_thinking ? 'on' : 'off'}`);
                         }
                         if (gen.thinking_budget != null) parts.push(`think_budget=${gen.thinking_budget}`);
+                        if (gen.reasoning_effort) parts.push(`effort=${gen.reasoning_effort}`);
                         const modelLabel = meta.modelDisplay
                             || this.availableModels.find(m => m.id === (stream.sourceModel || requestModel))?.name
                             || stream.sourceModel
@@ -6684,7 +7162,8 @@
         // The creative temperature applies to this call only.
         let generationOverride = null;
         if (opts.creative) {
-            const base = Number(this.modelSettings?.temperature);
+            const base = Number(this.samplingSource().temperature
+                ?? this.currentModelInfo()?.settings?.temperature);
             const temp = Number.isFinite(base) && base > 0 ? Math.min(2, base + 0.4) : 1.2;
             generationOverride = { temperature: temp };
         }

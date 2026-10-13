@@ -10,6 +10,71 @@
 ] %}
             <div x-show="mainTab === 'status'" x-cloak role="tabpanel" id="panel-status" aria-labelledby="tab-status">
                 <div class="animate-fade-in-up">
+                    <!-- First-run guide: only when the first model list was empty. -->
+                    <template x-if="onboardingState === 'first'">
+                        <div class="mx-3 mb-4 rounded-2xl border border-neutral-200 bg-neutral-50 px-5 py-4 flex flex-wrap items-center justify-between gap-4">
+                            <div class="flex items-center gap-3 min-w-0">
+                                <span class="w-9 h-9 shrink-0 rounded-xl bg-white border border-neutral-200 text-neutral-500 grid place-items-center">
+                                    <i data-lucide="download" class="w-5 h-5"></i>
+                                </span>
+                                <div class="min-w-0">
+                                    <div class="text-sm font-semibold text-neutral-900">{{ t('status.onboarding.first.title') }}</div>
+                                    <div class="text-sm text-neutral-600">{{ t('status.onboarding.first.body') }}</div>
+                                </div>
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <button type="button" @click="openRecommendations()"
+                                        class="px-4 py-2 text-sm font-medium rounded-full bg-neutral-900 text-white hover:bg-neutral-800 transition-colors">
+                                    {{ t('status.onboarding.first.cta') }}
+                                </button>
+                                <button type="button" @click="onboardingDismissed = true"
+                                        class="px-3 py-2 text-sm font-medium rounded-full text-neutral-600 hover:bg-neutral-100 transition-colors">
+                                    {{ t('status.onboarding.first.dismiss') }}
+                                </button>
+                            </div>
+                        </div>
+                    </template>
+                    <template x-if="onboardingState === 'downloading'">
+                        <div class="mx-3 mb-4 rounded-2xl border border-neutral-200 bg-neutral-50 px-5 py-4 flex flex-wrap items-center justify-between gap-4">
+                            <div class="flex-1 min-w-[16rem]">
+                                <div class="text-sm font-semibold text-neutral-900"
+                                     x-text="window.t('status.onboarding.downloading.title').replace('{name}', onboardingTask.repo_id.split('/').pop()).replace('{percent}', Math.round(onboardingTask.progress || 0))"></div>
+                                <div class="mt-2 h-1.5 rounded-full bg-white overflow-hidden">
+                                    <div class="h-full bg-neutral-500 transition-all" :style="'width: ' + (onboardingTask.progress || 0) + '%'"></div>
+                                </div>
+                                <div class="text-xs text-neutral-600 mt-1.5">{{ t('status.onboarding.downloading.body') }}</div>
+                            </div>
+                            <button type="button" @click="openRecommendations()"
+                                    class="px-4 py-2 text-sm font-medium rounded-full border border-neutral-200 bg-white text-neutral-700 hover:bg-neutral-100 transition-colors">
+                                {{ t('status.onboarding.downloading.cta') }}
+                            </button>
+                        </div>
+                    </template>
+                    <template x-if="onboardingState === 'ready'">
+                        <div class="mx-3 mb-4 rounded-2xl border border-green-200 bg-green-50 px-5 py-4 flex flex-wrap items-center justify-between gap-4">
+                            <div class="flex items-center gap-3 min-w-0">
+                                <span class="w-9 h-9 shrink-0 rounded-xl bg-white border border-green-200 text-green-700 grid place-items-center">
+                                    <i data-lucide="check" class="w-5 h-5"></i>
+                                </span>
+                                <div class="min-w-0">
+                                    <div class="text-sm font-semibold text-neutral-900"
+                                         x-text="window.t('status.onboarding.ready.title').replace('{name}', onboardingReadyName)"></div>
+                                    <div class="text-sm text-neutral-600">{{ t('status.onboarding.ready.body') }}</div>
+                                </div>
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <a href="/admin/chat"
+                                   class="px-4 py-2 text-sm font-medium rounded-full bg-neutral-900 text-white hover:bg-neutral-800 transition-colors">
+                                    {{ t('status.onboarding.ready.cta') }}
+                                </a>
+                                <button type="button" @click="onboardingReadyDismissed = true"
+                                        class="px-3 py-2 text-sm font-medium rounded-full text-green-700 hover:bg-green-50 transition-colors">
+                                    {{ t('status.onboarding.ready.dismiss') }}
+                                </button>
+                            </div>
+                        </div>
+                    </template>
+
                     <!-- Server status header: identity, uptime and the two lifecycle actions.
                          mx-3 matches the 12px GridStack item margin of the blocks below. -->
                     <div class="bg-white rounded-2xl border border-neutral-200 mb-6 mx-3">

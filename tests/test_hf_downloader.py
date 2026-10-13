@@ -206,9 +206,10 @@ class TestHFDownloader:
             await downloader.start_download("no-slash")
 
     @pytest.mark.asyncio
-    async def test_start_download_invalid_repo_id_too_many_parts(self, downloader):
+    @pytest.mark.parametrize("repo_id", ["a/b/c", "../..", "a/..", "/etc"])
+    async def test_start_download_invalid_repo_id_parts(self, downloader, repo_id):
         with pytest.raises(ValueError, match="Invalid repository ID"):
-            await downloader.start_download("a/b/c")
+            await downloader.start_download(repo_id)
 
     @pytest.mark.asyncio
     async def test_start_download_strips_whitespace(self, downloader):
@@ -1129,6 +1130,36 @@ class TestHFDownloaderRoutes:
         (model_dir / ".hidden" / "config.json").write_text("{}")
 
         return model_dir
+
+    @pytest.mark.asyncio
+    async def test_recommendations_report_free_space_of_the_model_folder(
+        self, tmp_path
+    ):
+        import omlx.admin.routes as routes_module
+        from fastapi import HTTPException
+
+        downloader = MagicMock()
+        # A fresh install has no model folder yet; its parent volume counts.
+        downloader.model_dir = tmp_path / "models"
+        orig_downloader = routes_module._hf_downloader
+        try:
+            routes_module._hf_downloader = None
+            with pytest.raises(HTTPException) as exc:
+                await routes_module.get_model_recommendations(is_admin=True)
+            assert exc.value.status_code == 503
+
+            routes_module._hf_downloader = downloader
+            with patch.object(
+                routes_module.model_recommender,
+                "recommendations",
+                AsyncMock(return_value={"sections": {}}),
+            ):
+                result = await routes_module.get_model_recommendations(is_admin=True)
+        finally:
+            routes_module._hf_downloader = orig_downloader
+
+        assert result["disk"]["model_dir"] == str(tmp_path / "models")
+        assert result["disk"]["free_bytes"] > 0
 
     @pytest.mark.asyncio
     async def test_list_models(self, model_dir_with_models):

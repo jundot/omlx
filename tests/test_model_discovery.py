@@ -605,6 +605,29 @@ class TestDetectModelType:
         assert detect_model_type(tmp_path) == "decision"
         assert decision_kind(tmp_path) == "clef"
 
+    def test_detect_d3_by_readout_and_decision_config(self, tmp_path):
+        """Decision 3.0 is a Qwen3.5 base checkpoint plus its code readout."""
+        config = {
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5Model"],
+            "vision_config": {"depth": 12, "hidden_size": 768},
+        }
+        # A directory name with "openjev" must not win over the d3 files.
+        model_dir = tmp_path / "openjev-d3"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps(config))
+        (model_dir / "readout.safetensors").write_bytes(b"")
+        (model_dir / "decision_config.json").write_text(
+            json.dumps({"format_id": "something-else"})
+        )
+        assert decision_kind(model_dir) == "openjev"
+
+        (model_dir / "decision_config.json").write_text(
+            json.dumps({"format_id": "d3-code-readout-v1"})
+        )
+        assert detect_model_type(model_dir) == "decision"
+        assert decision_kind(model_dir) == "d3"
+
     def test_detect_openjev_by_helper_or_directory_name(self, tmp_path):
         config = {
             "model_type": "qwen3_5",

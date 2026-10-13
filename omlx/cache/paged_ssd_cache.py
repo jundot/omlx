@@ -311,16 +311,40 @@ _NUMERICS_REVISIONS = {
 }
 
 
+# mlx-lm Qwen3.5-family modules whose ``YarnRoPE`` comes from a context window
+# past the native one (see ``omlx.patches.qwen35_yarn``).
+_QWEN35_LM_MODULES = frozenset({"mlx_lm.models.qwen3_5", "mlx_lm.models.qwen3_next"})
+
+
+def _yarn_revision(modules: list[Any]) -> str | None:
+    """Tag the YaRN attention scaling of a Qwen3.5-family model, or None."""
+    qwen35_lm = any(type(m).__module__ in _QWEN35_LM_MODULES for m in modules)
+    for module in modules:
+        name = type(module).__name__
+        if name == "Qwen3_5RotaryEmbedding":
+            scale = module.attention_scaling
+        elif name == "YarnRoPE" and qwen35_lm:
+            scale = module.mscale
+        else:
+            continue
+        if scale != 1.0:
+            return f"yarn-{float(scale)!r}"
+    return None
+
+
 def numerics_revision_for_model(model: Any) -> str | None:
     """Return the numerics revision of a loaded model, or None."""
     modules = getattr(model, "modules", None)
     if not callable(modules):
         return None
+    modules = list(modules())
     revisions = {
         _NUMERICS_REVISIONS[name]
-        for module in modules()
+        for module in modules
         if (name := type(module).__module__) in _NUMERICS_REVISIONS
     }
+    if yarn := _yarn_revision(modules):
+        revisions.add(yarn)
     return ",".join(sorted(revisions)) or None
 
 

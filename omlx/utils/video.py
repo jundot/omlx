@@ -68,9 +68,11 @@ def _video_url(part: Any) -> str | None:
     return None
 
 
-def _decode_video_data_uri(value: str) -> tuple[bytes, str]:
+def _decode_video_data_uri(
+    value: str, field: str = "messages", subject: str = "video_url"
+) -> tuple[bytes, str]:
     if not isinstance(value, str) or not value.strip().startswith("data:"):
-        raise InvalidRequestError(_VIDEO_INPUT_ERROR, field="messages")
+        raise InvalidRequestError(_VIDEO_INPUT_ERROR, field=field)
 
     prefix, separator, encoded = value.strip().partition(",")
     prefix_lower = prefix.lower()
@@ -80,23 +82,23 @@ def _decode_video_data_uri(value: str) -> tuple[bytes, str]:
         or ";base64" not in prefix_lower
     ):
         raise InvalidRequestError(
-            "video_url must use a base64 video data URI.", field="messages"
+            f"{subject} must use a base64 video data URI.", field=field
         )
 
     estimated_size = len(encoded) * 3 // 4
     if estimated_size > DEFAULT_MAX_VIDEO_BYTES:
         raise InvalidRequestError(
             f"Video payload exceeds {DEFAULT_MAX_VIDEO_BYTES} bytes.",
-            field="messages",
+            field=field,
         )
     try:
         payload = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise InvalidRequestError(
-            "video_url contains invalid base64 data.", field="messages"
+            f"{subject} contains invalid base64 data.", field=field
         ) from exc
     if not payload:
-        raise InvalidRequestError("Video payload is empty.", field="messages")
+        raise InvalidRequestError("Video payload is empty.", field=field)
 
     media_type = prefix.split(";", 1)[0].split("/", 1)[-1].lower()
     suffix = {"quicktime": ".mov", "x-matroska": ".mkv"}.get(
@@ -146,9 +148,7 @@ def _decode_video_frames(value: str, max_frames: int) -> list[Image.Image]:
             capture.set(cv2.CAP_PROP_POS_FRAMES, index)
             ok, frame = capture.read()
             if ok:
-                frames.append(
-                    Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                )
+                frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
         if not frames:
             raise InvalidRequestError(
                 "Video contains no decodable frames.", field="messages"
@@ -206,26 +206,28 @@ def expand_video_parts(
     return expanded
 
 
-def require_opencv():
+def require_opencv(field: str = "messages"):
     """Import OpenCV for frame decoding, or reject the request clearly."""
     try:
         import cv2
     except ImportError as exc:
         raise InvalidRequestError(
             "Video input requires OpenCV (opencv-python-headless).",
-            field="messages",
+            field=field,
         ) from exc
     return cv2
 
 
-def write_video_data_uri(value: str) -> tuple[Path, str]:
+def write_video_data_uri(
+    value: str, field: str = "messages", subject: str = "video_url"
+) -> tuple[Path, str]:
     """Write an inline video to a temporary file for the native video path.
 
     Applies the same validation and size limit as MiMo's frame sampler. Returns
     the file path and the SHA-256 of the payload, which identifies the clip in
     the prefix cache. The caller deletes the file once preprocessing is done.
     """
-    payload, suffix = _decode_video_data_uri(value)
+    payload, suffix = _decode_video_data_uri(value, field, subject)
     digest = hashlib.sha256(payload).hexdigest()
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
         handle.write(payload)

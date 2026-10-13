@@ -12,6 +12,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 
+from ..patches.qwen35_yarn import apply_qwen35_yarn_patch, set_context_window
+
 logger = logging.getLogger(__name__)
 
 _VLM_TEXT_PREFIX = "language_model."
@@ -589,6 +591,11 @@ def maybe_apply_pre_load_patches(
 
     apply_arrays_cache_extract_guard()
 
+    # Model-independent: honors yarn rope entries on every Qwen3.5-family
+    # attention, whatever model loaded first.
+    apply_qwen35_yarn_patch()
+    set_context_window(model_name, getattr(model_settings, "max_context_window", None))
+
     config_path = Path(model_name) / "config.json"
     if not config_path.exists():
         return
@@ -640,6 +647,18 @@ def maybe_apply_pre_load_patches(
                 )
 
     model_type = config.get("model_type")
+    if for_vlm and model_type == "qwen3_5":
+        from ..patches.mlx_vlm_qwen35_base_compat import (
+            apply_mlx_vlm_qwen35_base_compat_patch,
+            needs_base_compat,
+        )
+
+        if needs_base_compat(config) and apply_mlx_vlm_qwen35_base_compat_patch():
+            logger.info(
+                "Qwen3.5 base-checkpoint mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+
     if for_vlm and model_type in {"moondream1", "moondream2"}:
         from ..patches.moondream2_compat import apply_moondream2_compat_patch
 
@@ -1347,6 +1366,30 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type in ("inkling", "inkling_mm_model")
         or model_type == "step3p7"
     )
+
+
+def lightning_mtp_supported(model_path: str | Path) -> bool:
+    """Whether the Lightning MTP toggle accepts this checkpoint.
+
+    Same gates as the admin toggle: not paroquant, MTP heads on a supported
+    model type (Qwen4-Exp uses its own runtime), and MTP tensors in the weights.
+    """
+    try:
+        config = json.loads((Path(model_path) / "config.json").read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(config, dict):
+        return False
+    quantization = config.get("quantization_config") or {}
+    if str(quantization.get("quant_method") or "").lower() == "paroquant":
+        return False
+    model_type = config.get("model_type")
+    if model_type == "qwen4_exp":
+        if not _has_mtp_heads(config):
+            return False
+    elif not _is_mtp_compatible(config, model_type):
+        return False
+    return _checkpoint_has_mtp_weights(model_path)
 
 
 def mimo_mtp_sidecar_config(model_name: str | Path) -> dict[str, str] | None:

@@ -23,6 +23,7 @@ from omlx.utils.sampling import (
     apply_xtc,
     categorical_sampling,
     make_sampler,
+    make_shared_sampler,
 )
 
 
@@ -317,3 +318,25 @@ def test_top_k_indices_matches_full_sort(vocab, top_k):
     expected = mx.sort(mx.argsort(-values, axis=-1)[:, :top_k], axis=-1)
     actual = mx.sort(top_k_indices(values, top_k), axis=-1)
     assert mx.array_equal(expected, actual).item()
+
+
+def test_make_shared_sampler_reuses_one_object_per_parameter_set():
+    sampler = make_shared_sampler(temp=0.7, top_p=0.95, top_k=20)
+    assert make_shared_sampler(temp=0.7, top_p=0.95, top_k=20) is sampler
+    assert make_shared_sampler(temp=0.7, top_p=0.95, top_k=40) is not sampler
+    xtc = dict(temp=1.0, xtc_probability=0.5, xtc_threshold=0.1)
+    assert make_shared_sampler(**xtc) is not make_shared_sampler(**xtc)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [dict(temp=0.7, top_p=0.95, top_k=20), dict(temp=0.7, min_p=0.05, top_k=50)],
+)
+def test_shared_sampler_filters_a_batch_like_one_row_calls(kwargs):
+    sampler = make_shared_sampler(**kwargs)
+    logits = mx.random.normal((8, 128 * 80), key=mx.random.key(0)) * 4.0
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    rows = mx.concatenate(
+        [sampler._mtp_sampling_logits(logprobs[e : e + 1]) for e in range(8)], axis=0
+    )
+    assert mx.array_equal(sampler._mtp_sampling_logits(logprobs), rows).item()

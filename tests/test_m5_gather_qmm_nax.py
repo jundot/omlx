@@ -895,16 +895,17 @@ def test_row_map_of_routed_tokens(mode, gs, limit, tokens, top_k, E):
     _assert_bitwise(got, ref)
 
 
-def test_sort_routes_matches_mlx_lm_gather_sort():
+@pytest.mark.parametrize("tokens", [50, 400])  # 600 and 4800 routes
+def test_sort_routes_matches_mlx_lm_gather_sort(tokens):
     from mlx_lm.models.switch_layers import _gather_sort
 
-    h = mx.random.normal((2, 50, 1, 1, 32)).astype(mx.bfloat16)
+    h = mx.random.normal((2, tokens, 1, 1, 32)).astype(mx.bfloat16)
     inds = mx.argpartition(
-        -mx.random.uniform(shape=(2, 50, 16)), kth=5, axis=-1
+        -mx.random.uniform(shape=(2, tokens, 16)), kth=5, axis=-1
     )[..., :6]
     x_tok, row_map, idx, inv = sort_routes(h, inds)
     x_ref, idx_ref, inv_ref = _gather_sort(h, inds)
-    assert x_tok.shape == (100, 1, 32) and row_map.dtype == mx.uint32
+    assert x_tok.shape == (2 * tokens, 1, 32) and row_map.dtype == mx.uint32
     _assert_bitwise(x_tok[row_map], x_ref)
     assert mx.array_equal(idx, idx_ref).item()
     assert mx.array_equal(inv, inv_ref).item()

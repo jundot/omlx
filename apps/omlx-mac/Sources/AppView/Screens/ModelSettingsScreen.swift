@@ -1139,9 +1139,13 @@ private struct AdvancedTab: View {
                              comment: "Section header above the Advanced tab fields"))
 
         // Profile-eligible toggles use `bindProfile` — flipping them flips
-        // the working-dirty flag. `isPinned` and `trustRemoteCode` stay
-        // per-model (server excludes them from profiles) and auto-save.
+        // the working-dirty flag. `isPinned`, `trustRemoteCode` and
+        // `externalEngine` stay per-model (server excludes them from
+        // profiles) and auto-save.
         ListGroup {
+            if !vm.isDiffusionModel, let engines = vm.model?.externalEngines, !engines.isEmpty {
+                ExternalEngineRow(vm: vm, client: client, engines: engines)
+            }
             if !vm.isDiffusionModel {
                 Row(label: String(localized: "settings.advanced.enable_thinking.label",
                                   defaultValue: "Enable Thinking",
@@ -1305,7 +1309,11 @@ private struct AdvancedTab: View {
                                  defaultValue: "Decoding speedups for models that support them.",
                                  comment: "Subtitle for the Acceleration settings section")
             )
+            if !vm.externalEngine.isEmpty {
+                HintLine(text: Self.externalEngineNote, icon: "exclamationmark.triangle")
+            }
             AccelerationSection(vm: vm, client: client)
+                .disabled(!vm.externalEngine.isEmpty)
 
             SectionHeader(
                 String(localized: "settings.advanced.experimental.section",
@@ -1315,8 +1323,71 @@ private struct AdvancedTab: View {
                                  defaultValue: "Speculative decoding, KV-cache quantization, and other research features.",
                                  comment: "Subtitle for the Experimental settings section")
             )
+            if !vm.externalEngine.isEmpty {
+                HintLine(text: Self.externalEngineNote, icon: "exclamationmark.triangle")
+            }
             ExperimentalSection(vm: vm, client: client)
+                .disabled(!vm.externalEngine.isEmpty)
         }
+    }
+
+    private static let externalEngineNote = String(
+        localized: "settings.advanced.external_engine.section_note",
+        defaultValue: "These settings do not apply while an external engine serves this model.",
+        comment: "Note above MLX-only settings while an external engine serves the model")
+}
+
+/// "Use External Engine" toggle plus the engine to use. Engines that cannot
+/// serve the model stay out of the menu; the first that can is the default.
+private struct ExternalEngineRow: View {
+    @Bindable var vm: ModelSettingsScreenVM
+    let client: OMLXClient
+    let engines: [ExternalEngineOption]
+
+    private var usableEngine: String? {
+        engines.first(where: { $0.compatible })?.id
+    }
+
+    private var sublabel: String {
+        let selected = engines.first(where: { $0.id == vm.externalEngine })
+        if let selected, !selected.compatible, let reason = selected.reason, !reason.isEmpty {
+            return reason
+        }
+        if usableEngine == nil, let reason = engines.first?.reason, !reason.isEmpty {
+            return reason
+        }
+        return String(localized: "settings.advanced.external_engine.sub",
+                      defaultValue: "Serve this model with another inference engine in its own process instead of oMLX's MLX engines.",
+                      comment: "Sublabel for the external engine toggle")
+    }
+
+    var body: some View {
+        Row(label: String(localized: "settings.advanced.external_engine.label",
+                          defaultValue: "Use External Engine",
+                          comment: "Row label for serving a model with an external engine"),
+            sublabel: sublabel) {
+            HStack(spacing: 7) {
+                if !vm.externalEngine.isEmpty {
+                    Popup(selection: vm.bind($vm.externalEngine, save: save),
+                          width: .controlCompact,
+                          options: engines
+                              .filter { $0.compatible || $0.id == vm.externalEngine }
+                              .map { ($0.id, $0.label) })
+                }
+                RowSwitch(isOn: Binding(
+                    get: { !vm.externalEngine.isEmpty },
+                    set: { on in
+                        vm.externalEngine = on ? (usableEngine ?? "") : ""
+                        save()
+                    }
+                ))
+                .disabled(vm.externalEngine.isEmpty && usableEngine == nil)
+            }
+        }
+    }
+
+    private func save() {
+        Task { await vm.save(.externalEngine, client: client) }
     }
 }
 

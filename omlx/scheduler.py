@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
 import mlx.core as mx
+from mlx.utils import tree_flatten
 from mlx_lm.generate import (
     BatchGenerator,
     GenerationBatch,
@@ -102,6 +103,7 @@ from .utils.metal_sync import (
 )
 from .utils.proc_memory import get_graphics_footprint, get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
+from .utils.sampling import make_shared_sampler as omlx_make_shared_sampler
 from .utils.tokenizer import create_streaming_detokenizer
 
 
@@ -260,12 +262,105 @@ class _VLMMTPResponse:
     error: str | None = None
 
 
+class _ThinkTracker:
+    """Follows the leading think block of a generated token stream (#3943).
+
+    Only the block the prompt opened, or one that opens the output, is
+    reasoning. After it closes, or when the output starts with anything
+    else, later think markers are answer text.
+    """
+
+    def __init__(self, start: tuple[int, ...], end: tuple[int, ...], in_thinking: bool):
+        self.start = start
+        self.end = end
+        self.in_thinking = in_thinking
+        self.done = False
+        self._recent: list[int] = []
+
+    def __copy__(self) -> "_ThinkTracker":
+        clone = _ThinkTracker(self.start, self.end, self.in_thinking)
+        clone.done = self.done
+        clone._recent = list(self._recent)
+        return clone
+
+    def advance(self, token: int) -> bool:
+        """Consume one token. Returns True on the token that closes the block."""
+        if self.done:
+            return False
+        recent = self._recent
+        recent.append(int(token))
+        if self.in_thinking:
+            del recent[: -len(self.end)]
+            if tuple(recent) == self.end:
+                self.in_thinking = False
+                self.done = True
+                return True
+        elif tuple(recent) != self.start[: len(recent)]:
+            self.done = True
+        elif len(recent) == len(self.start):
+            self.in_thinking = True
+            recent.clear()
+        return False
+
+
+class _ReasoningAwareStopSequences(StopSequences):
+    """StopSequences whose stop strings skip the leading think block (#3943).
+
+    EOS and ``stop_token_ids`` always match. Each matcher follows the block
+    over its own tokens, so MTP draft copies stay exact.
+    """
+
+    def __init__(
+        self, always: list[list[int]], strings: list[list[int]], think: _ThinkTracker
+    ):
+        super().__init__(always)
+        self._strings = StopSequences(strings)
+        self._think = think
+
+    def matcher(self) -> "_ReasoningAwareMatcher":
+        return _ReasoningAwareMatcher(self)
+
+
+class _ReasoningAwareMatcher:
+    """One row's position in a ``_ReasoningAwareStopSequences``."""
+
+    def __init__(self, owner: _ReasoningAwareStopSequences):
+        self._owner = owner
+        self._always = StopSequences.Matcher(owner._root)
+        self._strings = owner._strings.matcher()
+        self._think = copy.copy(owner._think)
+
+    def __copy__(self) -> "_ReasoningAwareMatcher":
+        clone = object.__new__(_ReasoningAwareMatcher)
+        clone._owner = self._owner
+        clone._always = copy.copy(self._always)
+        clone._strings = copy.copy(self._strings)
+        clone._think = copy.copy(self._think)
+        return clone
+
+    def advance(self, token: int) -> bool:
+        hit = self._always.advance(token)
+        if self._think.advance(token):
+            # A prefix matched before the block does not continue after it.
+            self._strings = self._owner._strings.matcher()
+            return hit
+        if self._think.in_thinking:
+            return hit
+        return self._strings.advance(token) or hit
+
+
 @dataclass
 class _StopOutputState:
     """Request-local output held while it can still match a stop string."""
 
     strings: dict[tuple[int, ...], str]
     pending: deque[tuple[int, RequestOutput]] = field(default_factory=deque)
+    # Set when the stop strings skip the leading think block (#3943). When
+    # it closes, the answer start is recorded in each text the matcher reads.
+    think: _ThinkTracker | None = None
+    search_start: int = 0  # Streaming detokenizer text.
+    visible_start: int = 0  # Parser visible text.
+    answer_token_start: int = 0  # Output token ids.
 
 
 def _safe_sync_stream(stream=None):
@@ -1395,6 +1490,54 @@ def _grow_kv_capacity(cache_obj: Any, capacity: int) -> list[mx.array]:
         setattr(cache_obj, name, new)
         grown.append(new)
     return grown
+
+
+# Holds the restored TurboQuant cache on the dense layer that replaces it
+# during a long suffix prefill.
+_RESTORED_TQ_PREFIX_ATTR = "_omlx_restored_turboquant_prefix"
+
+
+def _dense_kv_template(prompt_cache: list[Any], model: Any) -> tuple[type, Any]:
+    """Return the KVCache class and dtype a cold prefill uses (dtype may be None)."""
+    for c in _iter_leaf_caches(prompt_cache):
+        if type(c) in _STEP_GROWN_KV_CACHE_TYPES and c.keys is not None:
+            return type(c), c.keys.dtype
+    dtype = getattr(model, "dtype", None)
+    if not isinstance(dtype, mx.Dtype):
+        embed_tokens = getattr(getattr(model, "model", None), "embed_tokens", None)
+        # A quantized embedding packs its weight as uint32 and outputs its
+        # scales dtype.
+        source = getattr(embed_tokens, "scales", None)
+        if source is None:
+            source = getattr(embed_tokens, "weight", None)
+        dtype = getattr(source, "dtype", None)
+    if not isinstance(dtype, mx.Dtype) or not mx.issubdtype(dtype, mx.floating):
+        return _MLXKVCache, None
+    return _MLXKVCache, dtype
+
+
+def _turboquant_dense_bytes_per_token(cache_obj: Any, dtype: Any) -> int:
+    """Bytes per token of a TurboQuant layer once dequantized to ``dtype``."""
+    keys_state, _ = cache_obj.state
+    shaped = [a for _, a in tree_flatten(keys_state) if a.ndim >= 3]
+    if not shaped:
+        return 0
+    rows = int(shaped[0].shape[0]) * int(shaped[0].shape[1])
+    width = int(cache_obj.key_codec.dim) + int(cache_obj.value_codec.dim)
+    return rows * width * int(dtype.size)
+
+
+def _requantize_onto_restored_prefix(prefix: Any, dense: Any) -> Any:
+    """Quantize only the suffix onto the TurboQuant cache the dense layer replaced."""
+    start, end = int(prefix.offset), int(dense.offset)
+    if end < start:
+        prefix.trim(start - end)
+    elif end > start:
+        prefix.update_and_fetch(
+            dense.keys[..., start:end, :], dense.values[..., start:end, :]
+        )
+    delattr(dense, _RESTORED_TQ_PREFIX_ATTR)
+    return prefix
 
 
 def _collect_cache_storage_arrays(cache_obj: Any) -> list[mx.array]:
@@ -3746,6 +3889,13 @@ class Scheduler:
         bits = float(self._turboquant_kv_bits)
         for i, cache_obj in enumerate(prompt_cache):
             if isinstance(cache_obj, (KVCache, _vlm_cache.KVCache)):
+                restored_prefix = getattr(cache_obj, _RESTORED_TQ_PREFIX_ATTR, None)
+                if restored_prefix is not None:
+                    prompt_cache[i] = _requantize_onto_restored_prefix(
+                        restored_prefix, cache_obj
+                    )
+                    converted += 1
+                    continue
                 if i == last_kv_idx:
                     continue
                 prompt_cache[i] = TurboQuantKVCache.from_cache(cache_obj, bits=bits)
@@ -3765,6 +3915,91 @@ class Scheduler:
                 f"TurboQuant: converted {converted}/{len(prompt_cache)} "
                 f"cache layers to {bits}-bit{skip_msg}"
             )
+
+    def _dequantize_restored_turboquant_prefix(
+        self,
+        prompt_cache: list[Any],
+        prefill_tokens: int,
+        request_id: str | None = None,
+    ) -> int:
+        """Prefill a long suffix over a dense copy of a restored TQ prefix.
+
+        Prefilling over restored TurboQuant layers runs every chunk through
+        the slower tiled quantized attention. A suffix longer than one chunk
+        dequantizes each layer once instead, if the dense copy fits under the
+        prefill peak target. Returns the number of layers converted.
+        """
+        if getattr(self, "_turboquant_kv_bits", None) is None or not prompt_cache:
+            return 0
+        restored = [
+            (i, c)
+            for i, c in enumerate(prompt_cache)
+            if type(c).__name__ == "TurboQuantKVCache"
+            and c.keys is not None
+            and c.offset > 0
+        ]
+        if not restored:
+            return 0
+        prefill_tokens = int(prefill_tokens)
+        if prefill_tokens <= self._prefill_step_size_for_progress(0, prefill_tokens):
+            return 0
+        # The end-of-prefill conversion must run, or the layers stay dense.
+        if not self._turboquant_eligible(prompt_cache):
+            return 0
+        dense_type, dtype = _dense_kv_template(prompt_cache, self.model)
+        if dtype is None:
+            return 0
+
+        horizon = _cache_base_sizes(prompt_cache) + prefill_tokens + 1
+        dense_bytes = horizon * sum(
+            _turboquant_dense_bytes_per_token(c, dtype) for _, c in restored
+        )
+        target = Scheduler._prefill_peak_target(self)
+        if target > 0:
+            current = self._current_usage_bytes()
+            floor = 0
+            if Scheduler._prefill_shares_memory(self, request_id):
+                floor = self._admission_transient_bound(
+                    Scheduler._admission_charge_tokens(self, horizon), horizon
+                )
+            if current + dense_bytes + floor > target:
+                logger.info(
+                    "Kept restored TurboQuant prefix quantized for a %d-token "
+                    "suffix: %.2fGB + dense %.2fGB + floor chunk %.2fGB exceeds "
+                    "prefill peak target %.2fGB",
+                    prefill_tokens,
+                    current / 1024**3,
+                    dense_bytes / 1024**3,
+                    floor / 1024**3,
+                    target / 1024**3,
+                )
+                return 0
+
+        started = time.perf_counter()
+        with mx.stream(self._stream):
+            for i, cache_obj in restored:
+                keys, values = cache_obj.dequantize()
+                dense = dense_type()
+                dense.keys = keys.astype(dtype)
+                dense.values = values.astype(dtype)
+                dense.offset = int(cache_obj.offset)
+                mx.eval(dense.keys, dense.values)
+                setattr(dense, _RESTORED_TQ_PREFIX_ATTR, cache_obj)
+                prompt_cache[i] = dense
+                # Return this layer's float32 dequantize buffers before the
+                # next layer allocates its own.
+                _sync_and_clear_cache(self._stream)
+        logger.info(
+            "TurboQuant: dequantized %d restored TurboQuant layers "
+            "(%d tokens) for a %d-token suffix prefill in %.2fs (+%.2fGB "
+            "for the prompt)",
+            len(restored),
+            int(max(c.offset for _, c in restored)),
+            prefill_tokens,
+            time.perf_counter() - started,
+            dense_bytes / 1024**3,
+        )
+        return len(restored)
 
     def _qwen4_prefill_accounting_enabled(self) -> bool:
         monitor = getattr(self, "memory_monitor", None)
@@ -3905,10 +4140,13 @@ class Scheduler:
             prompt_cache = make_prompt_cache(self.model)
 
         # Fresh TurboQuant requests run fp16 during the cold prefill loop and
-        # are quantized once at the end. Restored TurboQuant prefix caches stay
-        # quantized while pre-filling the uncached suffix, then keep using TQ for
-        # decode. Rotating/sliding-window layers remain native pass-through
-        # caches; only full-attention KVCache layers are converted.
+        # are quantized once at the end. A restored TurboQuant prefix runs a
+        # long suffix over a dense copy. Rotating/sliding-window layers remain
+        # native pass-through caches; only full-attention KVCache layers are
+        # converted.
+        Scheduler._dequantize_restored_turboquant_prefix(
+            self, prompt_cache, n_tokens - 1, request.request_id
+        )
 
         # Clear stale mRoPE position state for text-only requests.
         if vlm_embeds is None and hasattr(self.model, "clear_vlm_position_state"):
@@ -5160,7 +5398,14 @@ class Scheduler:
         # A prefix restored from the SSD cache may still be lazy. Load it
         # before measuring, so this check and the chunk guard see it.
         with mx.stream(self._stream):
-            mx.eval([a for c, cap in plans if cap for a in (c.keys, c.values)])
+            mx.eval(
+                [
+                    a
+                    for c, _ in plans
+                    for a in (getattr(c, "keys", None), getattr(c, "values", None))
+                    if isinstance(a, mx.array)
+                ]
+            )
         target = Scheduler._prefill_peak_target(self)
         if target > 0:
             current = self._current_usage_bytes()
@@ -6094,6 +6339,9 @@ class Scheduler:
             existing_cache
             if existing_cache is not None
             else make_prompt_cache(self.model)
+        )
+        Scheduler._dequantize_restored_turboquant_prefix(
+            self, prompt_cache, len(tokens) - 1, request.request_id
         )
 
         block_size = self.config.paged_cache_block_size
@@ -7108,6 +7356,7 @@ class Scheduler:
 
         sequences = [[t] for t in stop_tokens_set]
         stop_sequence_strings: dict[tuple[int, ...], str] = {}
+        string_sequences: list[list[int]] = []
 
         # Tokenize stop strings into token sequences. mlx-lm's
         # StopSequences uses Aho-Corasick, so per-token match
@@ -7122,16 +7371,53 @@ class Scheduler:
                 seq = self.tokenizer.encode(stop_str)
             if seq:
                 token_sequence = tuple(int(token) for token in seq)
-                sequences.append(list(token_sequence))
+                string_sequences.append(list(token_sequence))
                 stop_sequence_strings[token_sequence] = stop_str
+
+        # Stop strings skip the leading think block (#3943) on APIs that
+        # return reasoning separately. Other requests match as before.
+        think = None
+        if string_sequences and request.sampling_params.stop_skips_reasoning:
+            think = self._stop_think_tracker(request)
 
         # Response-side buffering is request-local so normal completion,
         # retry, and cleanup paths do not need any new scheduler lifecycle.
         request._stop_output_state = _StopOutputState(  # type: ignore[attr-defined]
-            strings=stop_sequence_strings
+            strings=stop_sequence_strings,
+            think=copy.copy(think) if think is not None else None,
         )
 
-        return StopSequences(sequences)
+        if think is not None:
+            return _ReasoningAwareStopSequences(sequences, string_sequences, think)
+        return StopSequences(sequences + string_sequences)
+
+    def _stop_think_tracker(self, request: "Request") -> _ThinkTracker | None:
+        """Return a tracker for the request's leading think block, if any."""
+        opened = bool(getattr(request, "needs_think_prefix", False))
+        start = tuple(self._resolve_think_start_token_ids() or ())
+        if not (opened or start):
+            return None
+        end_id = getattr(request, "think_end_token_id", None)
+        if end_id is not None:
+            end = (int(end_id),)
+        else:
+            end = tuple(self._resolve_think_end_token_ids() or ())
+        if not end:
+            return None
+        return _ThinkTracker(start, end, opened)
+
+    def _resolve_think_start_token_ids(self) -> list[int] | None:
+        """Resolve token ID(s) for the open-think tag, parser marker first."""
+        parser_think_start = self._get_output_parser_thinking_start_text()
+        if parser_think_start is not None:
+            return self._encode_thinking_marker(parser_think_start)
+        tokens = self._get_think_token_id("think_start_tokens")
+        if tokens:
+            return [int(token) for token in tokens]
+        think_start_id = self._get_think_token_id("think_start_id")
+        if think_start_id is not None:
+            return [think_start_id]
+        return None
 
     def _buffer_stop_sequence_output(
         self,
@@ -7152,6 +7438,13 @@ class Scheduler:
             return [output]
 
         pending = state.pending
+        if state.think is not None and state.think.in_thinking:
+            # Reasoning streams as it comes: nothing in it can match a stop
+            # string, so no prefix is held back and a held one is released.
+            ready = [pending_output for _, pending_output in pending]
+            pending.clear()
+            ready.append(output)
+            return ready
         if stop_prefix_chars is not None:
             # The text matcher already clipped this chunk and the final text.
             # Remove only the matched characters from earlier pending chunks.
@@ -7389,7 +7682,7 @@ class Scheduler:
         """Build per-request sampler and logits processors."""
         # omlx.utils.sampling.make_sampler carries the fused top-p/top-k and
         # MTP acceptance metadata that mlx_lm.sample_utils does not.
-        sampler = omlx_make_sampler(
+        sampler = omlx_make_shared_sampler(
             temp=sampling_params.temperature,
             top_p=sampling_params.top_p,
             min_p=sampling_params.min_p,
@@ -12817,7 +13110,21 @@ class Scheduler:
             # Pending chunks retain prefixes even when contextual BPE tokens
             # differ from the standalone stop encoding.
             stop_strs = request.sampling_params.stop or []
-            if stop_strs and (not is_stop or new_text):
+            stop_state = getattr(request, "_stop_output_state", None)
+            think = stop_state.think if stop_state is not None else None
+            # Stop strings skip the leading think block, including the token
+            # that closes it (#3943).
+            in_reasoning = False
+            if think is not None:
+                if not is_stop and think.advance(response.token):
+                    in_reasoning = True
+                    stop_state.answer_token_start = len(request.output_token_ids)
+                    stop_state.visible_start = len(request.output_text)
+                    if parser_session is None and detokenizer is not None:
+                        stop_state.search_start = len(detokenizer.text)
+                else:
+                    in_reasoning = think.in_thinking
+            if stop_strs and not in_reasoning and (not is_stop or new_text):
                 if parser_session is not None:
                     state = getattr(request, "_stop_output_state", None)
                     pending_text = (
@@ -12826,13 +13133,15 @@ class Scheduler:
                         else ""
                     )
                     full_text = pending_text + new_text
+                    floor = 0
                 else:
                     full_text = (
                         detokenizer.text if detokenizer is not None else new_text
                     )
+                    floor = stop_state.search_start if stop_state is not None else 0
                 prev_len = len(full_text) - len(new_text)
                 matches = [
-                    full_text.find(ss, max(0, prev_len - len(ss) + 1))
+                    full_text.find(ss, max(floor, prev_len - len(ss) + 1))
                     for ss in stop_strs
                     if ss
                 ]
@@ -12881,7 +13190,8 @@ class Scheduler:
                 request_id=request_id,
                 new_token_ids=[response.token] if not is_stop else [],
                 new_text=new_text,
-                output_token_ids=list(request.output_token_ids),
+                # Only the terminal chunk's cumulative ids are read.
+                output_token_ids=list(request.output_token_ids) if is_finished else [],
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
                 generated_at=output_generated_at,
@@ -12936,6 +13246,10 @@ class Scheduler:
                         request.output_text = (
                             final_result.output_text_prefix + request.output_text
                         )
+                        if stop_state is not None:
+                            stop_state.visible_start += len(
+                                final_result.output_text_prefix
+                            )
                     if final_result.tool_calls:
                         output.tool_calls = final_result.tool_calls
                     if final_result.finish_reason:
@@ -12956,8 +13270,13 @@ class Scheduler:
                     request.output_text = output.output_text
 
                 # Finalization may release a parser marker or incomplete UTF-8
-                # text. Apply the same stop boundary before flushing that text.
-                if stop_strs and stop_prefix_chars is None:
+                # text. Apply the same stop boundary before flushing that text,
+                # unless the output ended inside its think block.
+                if (
+                    stop_strs
+                    and stop_prefix_chars is None
+                    and not (think is not None and think.in_thinking)
+                ):
                     state = getattr(request, "_stop_output_state", None)
                     pending_text = (
                         "".join(chunk.new_text for _, chunk in state.pending)
@@ -12978,10 +13297,25 @@ class Scheduler:
                         output.new_token_ids = []
                         output.tool_calls = []
 
-                # Both parser and ordinary text omit the first matched stop.
+                # Both parser and ordinary text omit the first matched stop,
+                # searched from where the answer starts on a reasoning request.
                 if is_stop:
+                    answer_start = 0
+                    if think is not None:
+                        if think.in_thinking:
+                            answer_start = len(output.output_text)
+                        elif parser_session is not None:
+                            answer_start = stop_state.visible_start
+                        elif stop_state.answer_token_start:
+                            answer_start = len(
+                                self.tokenizer.decode(
+                                    request.output_token_ids[
+                                        : stop_state.answer_token_start
+                                    ]
+                                )
+                            )
                     matches = [
-                        output.output_text.find(ss)
+                        output.output_text.find(ss, answer_start)
                         for ss in request.sampling_params.stop or []
                         if ss
                     ]

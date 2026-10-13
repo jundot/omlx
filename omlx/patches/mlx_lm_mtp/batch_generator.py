@@ -121,6 +121,7 @@ def apply() -> bool:
                     logger.debug("MTP path not active: %s", reason)
 
         def patched_next(self, *args, **kwargs):
+            model = getattr(self, "model", None)
             if _is_mtp_batch_eligible(self):
                 policy = _batch_policy_for_next(self)
                 _batch_park_memory(self.model).tick()
@@ -149,7 +150,7 @@ def apply() -> bool:
                 try:
                     batch_state = _prepare_mtp_batch_state_for_next(self)
                     if batch_state is not None:
-                        with _spec_command_buffers():
+                        with _spec_command_buffers(model):
                             return _mtp_batch_next(self, batch_state)
                 except _MtpStepFallback as exc:
                     logger.debug("MTP batch next() fallback to standard step: %s", exc)
@@ -176,7 +177,7 @@ def apply() -> bool:
                     try:
                         state = _prepare_mtp_state_for_next(self)
                         if state is not None:
-                            with _spec_command_buffers():
+                            with _spec_command_buffers(model):
                                 return _mtp_next(self, state)
                     except _MtpStepFallback as exc:
                         logger.debug("MTP next() fallback to standard step: %s", exc)
@@ -370,6 +371,24 @@ def _model_has_mtp_module(model: Any) -> bool:
 # raise its peak memory.
 _SPEC_BUFFER_CAPS = (200, 512)
 
+# Target model types supported by the Qwen Lightning MTP/DFlash paths.
+_SPEC_CAPS_TARGET_TYPES = frozenset(
+    {
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen3_5_vl",
+        "qwen3_6",
+        "qwen3_6_moe",
+        "qwen4_exp",
+        "qwen4_exp_text",
+    }
+)
+
+
+def _spec_caps_target(model: Any) -> bool:
+    """Whether the loaded target belongs to the selected Qwen family."""
+    return getattr(model, "model_type", None) in _SPEC_CAPS_TARGET_TYPES
+
 
 @functools.lru_cache(maxsize=1)
 def _raises_spec_buffer_caps() -> bool:
@@ -388,11 +407,12 @@ def _raises_spec_buffer_caps() -> bool:
 
 
 @contextlib.contextmanager
-def _spec_command_buffers():
-    """Raise MLX's command-buffer caps for one speculative decode step.
+def _spec_command_buffers(model: Any = None):
+    """Raise caps for supported Qwen targets and GPUs, then restore them."""
+    if not _spec_caps_target(model):
+        yield
+        return
 
-    Measured on M5 and M3 Ultra, so other GPUs keep MLX's caps.
-    """
     from omlx.custom_kernels.qwen35_prefill.fast import set_command_buffer_caps
 
     previous = None

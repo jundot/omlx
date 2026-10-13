@@ -1,6 +1,7 @@
 """Tests for the integrations module."""
 
 import json
+import os
 import plistlib
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -29,6 +30,7 @@ from omlx.integrations.hermes import HermesIntegration
 from omlx.integrations.openclaw import OpenClawIntegration
 from omlx.integrations.opencode import OpenCodeIntegration
 from omlx.integrations.pi import PiIntegration, _get_agent_dir
+from omlx.integrations.vibe import VibeIntegration
 
 
 def ctx(**overrides) -> IntegrationContext:
@@ -45,7 +47,7 @@ def ctx(**overrides) -> IntegrationContext:
 class TestIntegrationRegistry:
     def test_list_integrations(self):
         integrations = list_integrations()
-        assert len(integrations) == 9
+        assert len(integrations) == 10
         names = {i.name for i in integrations}
         assert names == {
             "claude",
@@ -56,6 +58,7 @@ class TestIntegrationRegistry:
             "openclaw",
             "hermes",
             "pi",
+            "vibe",
             "dsh",
         }
 
@@ -68,6 +71,7 @@ class TestIntegrationRegistry:
         assert get_integration("openclaw") is not None
         assert get_integration("hermes") is not None
         assert get_integration("pi") is not None
+        assert get_integration("vibe") is not None
         assert get_integration("dsh") is not None
         assert get_integration("nonexistent") is None
 
@@ -1327,6 +1331,68 @@ class TestPiIntegration:
         assert pi.display_name == "Pi"
 
 
+class TestVibeIntegration:
+    @staticmethod
+    def _launch(context: IntegrationContext) -> tuple[list[str], dict[str, str]]:
+        with patch("omlx.integrations.vibe.os.execvpe") as execute:
+            VibeIntegration().launch(context)
+        _, argv, env = execute.call_args.args
+        return argv, env
+
+    def test_get_command_quotes_model(self):
+        cmd = VibeIntegration().get_command(ctx(model="local model"))
+        assert cmd.endswith("launch vibe --model 'local model'")
+
+    def test_launch_scopes_config_to_process(self, tmp_path, monkeypatch):
+        config = tmp_path / "config.toml"
+        original = 'active_model = "cloud"\n'
+        config.write_text(original)
+        monkeypatch.setenv("VIBE_HOME", str(tmp_path))
+        monkeypatch.setenv("VIBE_ACTIVE_MODEL", "cloud")
+        monkeypatch.setenv("PYTHONHOME", "/bundle/python")
+
+        argv, env = self._launch(
+            ctx(
+                api_key="local-secret",
+                model="qwen3.5",
+                context_window=32768,
+                model_type="vlm",
+                extra_args=("--resume", "session-id"),
+            )
+        )
+
+        assert argv == ["vibe", "--resume", "session-id"]
+        assert env["OMLX_API_KEY"] == "local-secret"
+        assert "PYTHONHOME" not in env
+        provider = json.loads(env["VIBE_PROVIDERS"])[0]
+        assert provider["api_base"] == "http://127.0.0.1:8000/v1"
+        assert provider["api_key_env_var"] == "OMLX_API_KEY"
+        model = json.loads(env["VIBE_MODELS"])[0]
+        assert model["alias"] == env["VIBE_ACTIVE_MODEL"]
+        assert model["name"] == "qwen3.5"
+        assert model["provider"] == provider["name"]
+        assert model["max_context_length"] == 32768
+        assert model["supports_images"] is True
+        assert config.read_text() == original
+        assert os.environ["VIBE_ACTIVE_MODEL"] == "cloud"
+
+    def test_launch_without_key_or_context_window(self):
+        _, env = self._launch(ctx(model="qwen3.5"))
+        assert env["OMLX_API_KEY"] == "omlx"
+        model = json.loads(env["VIBE_MODELS"])[0]
+        assert "max_context_length" not in model
+        assert model["supports_images"] is False
+
+    def test_alias_is_stable_per_server_and_model(self):
+        aliases = [
+            self._launch(ctx(port=port, model=model))[1]["VIBE_ACTIVE_MODEL"]
+            for port, model in ((8000, "a"), (8000, "a"), (8000, "b"), (8001, "a"))
+        ]
+        # Saved Vibe sessions resume by alias.
+        assert aliases[0] == aliases[1]
+        assert len(set(aliases)) == 3
+
+
 class TestClaudeCodeIntegration:
     def test_get_command(self):
         cc = ClaudeCodeIntegration()
@@ -2062,19 +2128,23 @@ class TestIntegrationSettings:
         assert settings.openclaw_model is None
         assert settings.hermes_model is None
         assert settings.pi_model is None
+        assert settings.vibe_model is None
         assert settings.dsh_model is None
         assert settings.openclaw_tools_profile == "coding"
 
     def test_to_dict(self):
         from omlx.settings import IntegrationSettings
 
-        settings = IntegrationSettings(codex_model="qwen3.5", dsh_model="Qwen3.8")
+        settings = IntegrationSettings(
+            codex_model="qwen3.5", vibe_model="local", dsh_model="Qwen3.8"
+        )
         d = settings.to_dict()
         assert d["copilot_model"] is None
         assert d["codex_model"] == "qwen3.5"
         assert d["opencode_model"] is None
         assert d["hermes_model"] is None
         assert d["pi_model"] is None
+        assert d["vibe_model"] == "local"
         assert d["dsh_model"] == "Qwen3.8"
         assert d["openclaw_tools_profile"] == "coding"
 
@@ -2087,6 +2157,7 @@ class TestIntegrationSettings:
                 "codex_model": "llama",
                 "opencode_model": "qwen",
                 "hermes_model": "hermes-qwen",
+                "vibe_model": "local",
                 "dsh_model": "Qwen3.8",
             }
         )
@@ -2096,6 +2167,7 @@ class TestIntegrationSettings:
         assert settings.openclaw_model is None
         assert settings.hermes_model == "hermes-qwen"
         assert settings.pi_model is None
+        assert settings.vibe_model == "local"
         assert settings.dsh_model == "Qwen3.8"
 
     def test_from_dict_empty(self):

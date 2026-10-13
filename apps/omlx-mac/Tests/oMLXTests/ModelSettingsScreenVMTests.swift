@@ -399,6 +399,31 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(object?["qwen4_ple_ssd_offload"] as? Bool, true)
     }
 
+    func testExternalEngineWireKeys() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let dto = try decoder.decode(
+            ModelSettingsDTO.self,
+            from: Data(#"{"trust_remote_code":false,"external_engine":"splash"}"#.utf8)
+        )
+        XCTAssertEqual(dto.externalEngine, "splash")
+        let option = try decoder.decode(
+            ExternalEngineOption.self,
+            from: Data(#"{"id":"splash","label":"Splash","compatible":false,"reason":"no draft"}"#.utf8)
+        )
+        XCTAssertEqual(option.reason, "no draft")
+
+        // Turning the engine off must send JSON null, not omit the key.
+        var patch = ModelSettingsPatch()
+        patch.externalEngine = .some(nil)
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let object = try JSONSerialization.jsonObject(
+            with: encoder.encode(patch)
+        ) as? [String: Any]
+        XCTAssertTrue(object?["external_engine"] is NSNull)
+    }
+
     func testQwenAneSettingsDecodeFromServerAndEncodeForPatch() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase

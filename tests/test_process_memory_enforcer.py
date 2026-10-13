@@ -574,6 +574,21 @@ class TestCurrentUsageTelemetry:
             assert enforcer._current_usage_bytes() == 5 * 1024**3
         mock_mx.get_active_memory.assert_called_once()
 
+    def test_usage_includes_models_served_out_of_process(self, enforcer):
+        """Splash memory counts: evicting the model frees it too."""
+        enforcer._engine_pool.external_process_memory_bytes = MagicMock(
+            return_value=6 * 1024**3
+        )
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch(
+                "omlx.process_memory_enforcer.get_phys_footprint",
+                return_value=3 * 1024**3,
+            ),
+        ):
+            mock_mx.get_active_memory.return_value = 5 * 1024**3
+            assert enforcer._current_usage_bytes() == 11 * 1024**3
+
     def test_active_usage_uses_cached_executor_sample_without_mlx(self, enforcer):
         """Active decode ticks must not call MLX from the enforcer thread."""
         scheduler = MagicMock()
@@ -1247,6 +1262,39 @@ class TestHardLimitCalculation:
             assert enforcer._get_hard_limit_bytes() == (
                 8 * 1024**3 + int(3 * 1024**3 * 0.25) - reserve
             )
+
+    def test_dynamic_ceiling_counts_out_of_process_models_as_own(
+        self, mock_engine_pool
+    ):
+        """Splash's wired memory is not free, but unloading it frees it."""
+        mock_engine_pool.external_process_memory_bytes = MagicMock(
+            return_value=2 * 1024**3
+        )
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier="balanced"
+        )
+        with (
+            patch("omlx.settings.get_system_memory", return_value=48 * 1024**3),
+            patch(
+                "omlx.process_memory_enforcer.get_phys_footprint",
+                return_value=1 * 1024**3,
+            ),
+            patch(
+                "omlx.process_memory_enforcer.get_macos_vm_stats",
+                return_value={
+                    "free": 5 * 1024**3,
+                    "inactive": 2 * 1024**3,
+                    "active": 4 * 1024**3,
+                    "wired": 3 * 1024**3,
+                },
+            ),
+        ):
+            terms = enforcer._dynamic_ceiling_terms()
+        reserve = tier_reserve_bytes("balanced", 48 * 1024**3)
+        assert terms["omlx"] == 3 * 1024**3
+        assert terms["dynamic"] == (
+            3 * 1024**3 + 7 * 1024**3 + int(3 * 1024**3 * 0.25) - reserve
+        )
 
 
 class TestAbortLimitCalculation:

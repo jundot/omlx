@@ -5798,13 +5798,45 @@ def test_spec_command_buffers_restore_caps_after_the_step(monkeypatch, raised):
         caps.append((ops, mb))
         return previous
 
+    target = SimpleNamespace(model_type="qwen3_5")
     monkeypatch.setattr(fast, "set_command_buffer_caps", fake_set)
     monkeypatch.setattr(bg, "_raises_spec_buffer_caps", lambda: raised)
-    with pytest.raises(RuntimeError), bg._spec_command_buffers():
+    with pytest.raises(RuntimeError), bg._spec_command_buffers(target):
         inside = caps[-1]
         raise RuntimeError("step failed")
     assert inside == (bg._SPEC_BUFFER_CAPS if raised else (50, 50))
     assert caps[-1] == (50, 50)
+
+
+@pytest.mark.parametrize(
+    "model_type,gpu,enabled,detected",
+    [
+        ("qwen3_5_moe", True, True, True),
+        ("glm5_next", True, False, False),
+        (None, True, False, False),
+        ("qwen3_5", False, False, True),
+    ],
+)
+def test_spec_caps_target(monkeypatch, model_type, gpu, enabled, detected):
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    target = SimpleNamespace(model_type=model_type)
+    calls, detections = [], []
+
+    def fake_set(ops, mb):
+        calls.append((ops, mb))
+        return (50, 50)
+
+    def fake_gpu():
+        detections.append(True)
+        return gpu
+
+    monkeypatch.setattr(bg, "_raises_spec_buffer_caps", fake_gpu)
+    monkeypatch.setattr(fast, "set_command_buffer_caps", fake_set)
+    with bg._spec_command_buffers(target):
+        assert calls == ([bg._SPEC_BUFFER_CAPS] if enabled else [])
+    assert calls == ([bg._SPEC_BUFFER_CAPS, (50, 50)] if enabled else [])
+    assert bool(detections) is detected
 
 
 def test_batch_park_verdict_outlives_its_cohort():

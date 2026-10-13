@@ -22,6 +22,9 @@ from mlx.utils import tree_flatten, tree_map
 from mlx_vlm.embedding_loader import load_embedding_model
 from mlx_vlm.utils import load_audio, load_config, load_processor
 
+from ..patches.embedding_gemma2_image_layout import (
+    apply_embedding_gemma2_image_layout_patch,
+)
 from ..patches.modernbert_attention import patch_modernbert_attention
 from ..utils.image import _decode_input_audio_data, validate_image_data_uri
 from .base_model import (
@@ -436,6 +439,9 @@ class MLXEmbeddingModel:
             return False
 
         logger.info(f"Loading embedding model via mlx-vlm: {self.model_name}")
+        # Class-level patch; safe before the processor is instantiated and
+        # applies to instances loaded earlier in this process too.
+        apply_embedding_gemma2_image_layout_patch()
         config = load_config(model_path)
         # The audio tower is resident even for text-only requests, so it loads
         # only when the model's embedding_audio_enabled setting asks for it.

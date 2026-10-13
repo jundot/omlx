@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Budget-checked oQ3/oQ4 export of the mixed-precision V4.1 release.
+"""Budget-checked oQ2-oQ4 export of the mixed-precision V4.1 release.
 
-Engram follows Qwen4-Exp's uniform affine group-32 embedding policy and is
-excluded from the remaining weights' bit budget. If all other source weights
-fit their independent budget at original precision, that allocation dominates
-every lossy alternative: neither sensitivity ranking nor an imatrix can improve
-it. oQ3 measures layer sensitivity and projection input statistics, then uses
-the official mixed-bit allocator and weighted affine arithmetic for oQ3e.
+Engram follows Qwen4-Exp's uniform affine group-32 embedding policy, stays at
+4 bits and is excluded from the remaining weights' bit budget. If all other
+source weights fit their independent budget at original precision, that
+allocation dominates every lossy alternative: neither sensitivity ranking nor
+an imatrix can improve it. Levels below oQ4 measure layer sensitivity and
+projection input statistics, then use the official mixed-bit allocator and
+weighted affine arithmetic for the e variants.
 """
 
 import json
@@ -299,10 +300,12 @@ def quantize(
         _emit_progress,
         _get_predicate_bits,
         _lookup_imatrix_importance,
+        _offload_table_bits,
         _validate_v41_oq_settings,
     )
 
     _validate_v41_oq_settings(oq_level, dtype, group_size)
+    engram_bits = _offload_table_bits(oq_level)
     if oq_level == 4 and (sensitivity_model_path or sensitivity_map_override):
         raise ValueError(
             "V4.1 original-precision oQ4 does not use sensitivity overrides"
@@ -326,7 +329,7 @@ def quantize(
         mapping,
         preserve_mtp=preserve_mtp,
         text_only=text_only,
-        engram_bits=oq_level,
+        engram_bits=engram_bits,
     )
     default_target, default_cap = _OQ_BPW_TARGETS[oq_level]
     target = default_target if target_bpw is None else target_bpw
@@ -336,16 +339,17 @@ def quantize(
     if oq_level == 4 and budget["remaining_weights"]["effective_bpw"] > target:
         raise ValueError(
             "Original-precision allocation exceeds the requested oQ4 budget; "
-            "V4.1 calibrated affine allocation is currently supported for oQ3"
+            "V4.1 calibrated affine allocation is supported below oQ4"
         )
     allocation, imatrix, preparation = {}, None, {}
-    if oq_level == 3:
+    if oq_level < 4:
         allocation, imatrix, preparation = prepare_affine_conversion(
             source,
             destination,
             config,
             mapping,
             budget,
+            oq_level=oq_level,
             target=target,
             cap=cap,
             preserve_mtp=preserve_mtp,
@@ -396,11 +400,11 @@ def quantize(
     writer = ShardWriter(destination)
     tables = source_engram_tables(mapping, config)
     exported_tables = {}
-    engram_start, engram_span = (20, 20) if oq_level == 3 else (0, 30)
+    engram_start, engram_span = (20, 20) if oq_level < 4 else (0, 30)
     projection_start = engram_start + engram_span
     for i, (name, table) in enumerate(tables.items()):
         if _get_predicate_bits(name + ".weight", config, oq_level, 64) != (
-            oq_level,
+            engram_bits,
             32,
             "affine",
         ):
@@ -427,7 +431,7 @@ def quantize(
             table,
             progress=progress,
             module_name=name,
-            bits=oq_level,
+            bits=engram_bits,
         )
         writer.add_file(
             filename, [spec[key] for key in ("weight_key", "scale_key", "bias_key")]
@@ -556,6 +560,7 @@ def prepare_affine_conversion(
     mapping,
     budget,
     *,
+    oq_level,
     target,
     cap,
     preserve_mtp,
@@ -570,6 +575,7 @@ def prepare_affine_conversion(
 ):
     from ...oq import (
         _OQE_CALIB_DATASET,
+        _base_bits_for_level,
         _emit_progress,
         _load_or_collect_imatrix,
         _normalize_sensitivity_map_override,
@@ -648,7 +654,10 @@ def prepare_affine_conversion(
                 )
 
             sensitivity = measure_sensitivity(
-                model, processor.tokenizer, bits=3, progress=progress
+                model,
+                processor.tokenizer,
+                bits=_base_bits_for_level(oq_level),
+                progress=progress,
             )
         finally:
             model.close()
@@ -662,6 +671,7 @@ def prepare_affine_conversion(
         config,
         imatrix,
         sensitivity,
+        oq_level=oq_level,
         target=target,
         cap=cap,
     )

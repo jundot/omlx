@@ -114,6 +114,8 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "deepseek_v41_engram_ssd_offload",
         # Architecture-level prefill strategy; explicit per model.
         "deepseek_v41_ced_prefill_enabled",
+        # Which engine serves the model depends on what this Mac has installed.
+        "external_engine",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
         # Memory residency of an embedding model's audio tower; explicit per model.
