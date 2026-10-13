@@ -1096,11 +1096,13 @@ def test_d1_rejects_malformed_questions(question):
         _d1_model().encode({"state": "s", "questions": {"q": question}})
 
 
-def test_d1_rejects_images_and_long_prompts():
+def test_d1_rejects_media_and_long_prompts():
     model = _d1_model()
     question = {"q": {"type": "noul", "instructions": "x"}}
     with pytest.raises(DecisionRequestError):
         model.encode({"state": "s", "questions": question, "images": ["data:"]})
+    with pytest.raises(DecisionRequestError, match="videos"):
+        model.encode({"state": "s", "questions": question, "videos": ["data:"]})
     model.backbone.config = {"text_config": {"max_position_embeddings": 64}}
     with pytest.raises(DecisionContextLengthError):
         model.encode({"state": "s" * 80, "questions": question})

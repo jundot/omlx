@@ -394,6 +394,8 @@ class D1Model:
         """
         if request.get("images"):
             raise DecisionRequestError("d1 images are not supported yet")
+        if request.get("videos"):
+            raise DecisionRequestError("this model does not take videos")
         items = [
             self._question(str(qid), question)
             for qid, question in request["questions"].items()
