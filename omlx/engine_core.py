@@ -700,6 +700,8 @@ class EngineCore:
         if sampling_params is None:
             sampling_params = SamplingParams()
 
+        from .cache_namespace import current_cache_namespace
+
         request = Request(
             request_id=request_id,
             prompt=prompt,
@@ -716,6 +718,7 @@ class EngineCore:
             preserve_reasoning=preserve_reasoning,
             benchmark_trace=benchmark_trace,
             benchmark_ane_sequence_length=benchmark_ane_sequence_length,
+            cache_namespace=current_cache_namespace.get(),
         )
 
         # SpecPrefill: resolve per-request settings.
@@ -1184,6 +1187,8 @@ class EngineCore:
             sampling_params = SamplingParams()
 
         # Add all requests to scheduler
+        from .cache_namespace import current_cache_namespace
+
         request_ids = []
         for prompt in prompts:
             request_id = str(uuid_module.uuid4())
@@ -1191,6 +1196,7 @@ class EngineCore:
                 request_id=request_id,
                 prompt=prompt,
                 sampling_params=sampling_params,
+                cache_namespace=current_cache_namespace.get(),
             )
             self.scheduler.add_request(request)
             request_ids.append(request_id)

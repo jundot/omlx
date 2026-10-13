@@ -347,9 +347,25 @@ async def verify_api_key(
     Also accepts the x-api-key header as a fallback (Anthropic SDK compatibility).
     """
     from .admin.auth import fingerprint_key, verify_any_api_key
+    from .cache_namespace import current_cache_namespace, namespace_for_api_key
     from .utils.network import is_loopback_bind
 
     global_settings = _server_state.global_settings
+    current_cache_namespace.set(None)
+    isolate_cache = (
+        global_settings is not None
+        and global_settings.auth.cache_isolation == "api_key"
+    )
+    if isolate_cache and (
+        not _server_state.api_key
+        or global_settings.auth.skip_api_key_verification
+        or global_settings.auth.allow_unauthenticated_inference
+        or _server_state.distributed_inference_enabled
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="API-key cache isolation requires authenticated local inference",
+        )
     configured_host = getattr(
         getattr(global_settings, "server", None), "host", None
     )
@@ -392,6 +408,8 @@ async def verify_api_key(
         logger.warning("Rejected API key (fp=%s)", fingerprint_key(api_key_value))
         raise HTTPException(status_code=401, detail="Invalid API key")
 
+    if isolate_cache:
+        current_cache_namespace.set(namespace_for_api_key(api_key_value))
     return True
 
 
@@ -408,7 +426,15 @@ async def verify_inference_api_key(
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> bool:
     """Allow the manual inference opt-in without changing management auth."""
+    if (
+        _server_state.global_settings is not None
+        and _server_state.global_settings.auth.cache_isolation == "api_key"
+    ):
+        return await verify_api_key(request, credentials)
     if allows_unauthenticated_inference():
+        from .cache_namespace import current_cache_namespace
+
+        current_cache_namespace.set(None)
         return True
     return await verify_api_key(request, credentials)
 
@@ -1484,7 +1510,12 @@ async def get_engine(
                 )
                 if _lease and _leased_out is not None:
                     _leased_out.append(_server_state.default_model)
+                _require_cache_namespace_support(fb_engine)
                 return fb_engine
+            except HTTPException:
+                if _lease and _leased_out:
+                    await pool.release_engine(_leased_out.pop())
+                raise
             except Exception:
                 pass  # Fall through to original 404
 
@@ -1541,6 +1572,7 @@ async def get_engine(
                     f"Use a decision model such as Clef, OpenJev or Decision 3.0.",
                 )
         elif engine_type == EngineType.LLM:
+            _require_cache_namespace_support(engine)
             # #507: non-LLM engines (STT/TTS/STS/Embedding/Reranker) previously
             # fell through and crashed on `engine.model_type` with an unhandled
             # 500. Reject with a clear 400 pointing the caller at the right
@@ -1560,6 +1592,18 @@ async def get_engine(
         raise
 
     return engine
+
+
+def _require_cache_namespace_support(engine: object) -> None:
+    from .cache_namespace import current_cache_namespace
+
+    if current_cache_namespace.get() is not None and (
+        getattr(engine, "supports_cache_namespace", False) is not True
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="This engine does not support authenticated KV cache isolation",
+        )
 
 
 def _suggest_endpoint_for_engine(engine: object) -> str:

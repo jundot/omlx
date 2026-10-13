@@ -13,6 +13,7 @@ import mlx.core as mx
 from mlx_lm.models.cache import make_prompt_cache
 
 from ..request import Request
+from ..cache_namespace import namespace_keys
 from .planning import SpecPrefillTargetPlan
 
 
@@ -34,6 +35,7 @@ class ExactPrefixCache(Protocol):
         tokens: list[int],
         *,
         promote_to_hot_cache: bool,
+        extra_keys: tuple | None = None,
     ) -> list[Any] | None: ...
 
     def store_exact_prefix(
@@ -42,6 +44,8 @@ class ExactPrefixCache(Protocol):
         tokens: list[int],
         cache_data: list[dict[str, Any]],
         model_cache_config: Any = ...,
+        *,
+        extra_keys: tuple | None = None,
     ) -> Any: ...
 
 
@@ -114,12 +118,18 @@ def run_specprefill_target_prefill(
         # ``draft_prefix_cache.fetch_cache``/``reconstruct_cache`` to reuse the
         # draft-model prefix instead of re-scoring from scratch.
         static_prefix_cached_tokens = 0
+        namespace_kwargs = (
+            {"extra_keys": namespace_keys(request.cache_namespace)}
+            if getattr(request, "cache_namespace", None) is not None
+            else {}
+        )
         if exact_prefix_cache is not None and static_prefix_tokens:
             full_static_prefix_tokens = list(static_prefix_tokens)
             restored_cache = exact_prefix_cache.restore_exact_prefix(
                 f"{request.request_id}:specprefill-static-restore",
                 full_static_prefix_tokens,
                 promote_to_hot_cache=promote_static_prefix_to_hot_cache,
+                **namespace_kwargs,
             )
             if restored_cache is not None:
                 restore_cache = getattr(target_model, "restore_cache", None)
@@ -186,6 +196,7 @@ def run_specprefill_target_prefill(
                             list(static_prefix_tokens),
                             extracted_states,
                             model_cache_config=model_cache_config,
+                            **namespace_kwargs,
                         )
                 except Exception as error:
                     log.debug(

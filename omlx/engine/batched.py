@@ -65,6 +65,10 @@ class BatchedEngine(BaseEngine):
     concurrent users by batching requests together.
     """
 
+    @property
+    def supports_cache_namespace(self) -> bool:
+        return True
+
     def __init__(
         self,
         model_name: str,

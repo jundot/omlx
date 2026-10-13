@@ -1,0 +1,24 @@
+{
+  "source_repository": "mlx2",
+  "source_revision": "de836806961e561f2fd7fd848590d7b2e3a44f44",
+  "source_paths": [
+    "src/mlx2/tenant_auth.py",
+    "src/mlx2/server.py",
+    "src/mlx2/serving.py"
+  ],
+  "license": "Apache-2.0",
+  "license_basis": "mlx2 LICENSE; explicit Apache notice for shared suffix storage",
+  "upstream_base_repository": "https://github.com/jundot/omlx",
+  "upstream_base_revision": "64bf5d1ba6336b45955c00f7fe0e46acd5c85095",
+  "modifications": "Adapted the verified-principal/cache-scope contract to oMLX API keys and existing block extra_keys; no APCv2 implementation copied.",
+  "validation": {
+    "device": "MLX CPU",
+    "checks": [
+      "Concurrent HTTP authentication and EngineCore request capture across worker handoff",
+      "Normal hot/cold, exact static-prefix, split-GDN and MTP-sidecar scope isolation",
+      "SpecPrefill draft and target key propagation",
+      "Default shared keys retained; incompatible auth and engines fail closed"
+    ],
+    "qualification": "Local prototype validation only; no GPU, real checkpoint or performance qualification"
+  }
+}

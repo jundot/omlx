@@ -695,6 +695,7 @@ class TestAuthSettings:
             "secret_key": None,
             "skip_api_key_verification": False,
             "allow_unauthenticated_inference": False,
+            "cache_isolation": "shared",
             "sub_keys": [],
         }
 
