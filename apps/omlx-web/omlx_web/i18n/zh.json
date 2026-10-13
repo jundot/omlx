@@ -191,6 +191,7 @@
   "status.active_models.cached_tokens": "已缓存（{count} Token）",
   "status.active_models.est_prefix": "预计 ",
   "status.active_models.waiting_prompt_tokens": "提示词：{count} tok",
+  "status.active_models.copy_model_name_tooltip": "复制模型名称",
   "status.header.running": "运行中",
   "status.header.restarting": "正在重启",
   "status.header.uptime": "运行时长",

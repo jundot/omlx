@@ -191,6 +191,7 @@
   "status.active_models.cached_tokens": "cached ({count} tokens)",
   "status.active_models.est_prefix": "est. ",
   "status.active_models.waiting_prompt_tokens": "prompt: {count} tok",
+  "status.active_models.copy_model_name_tooltip": "複製模型名稱",
   "status.header.running": "執行中",
   "status.header.restarting": "正在重新啟動",
   "status.header.uptime": "執行時間",

@@ -139,11 +139,29 @@ def test_download_queue_copy_buttons_copy_the_canonical_id_when_completed():
         assert "task.status === 'completed'" in attrs.get("x-show", "")
 
 
+def test_active_models_copy_buttons_render_their_icons():
+    html = _render("dashboard/blocks/_active_models.html")
+    buttons = _copy_buttons(html, "status.active_models.copy_model_name_tooltip")
+    # One button per layout: mobile and desktop rows.
+    assert len(buttons) == 2
+    for button in buttons:
+        _assert_icon_pair(button)
+        click = next(
+            value
+            for name, value in button["attrs"].items()
+            if name.startswith("@click") or name.startswith("x-on:click")
+        )
+        assert "copyToClipboard(m.id)" in click
+
+
 def test_queue_copy_tooltip_key_exists_in_every_locale():
-    key = "models.queue.copy_model_name_tooltip"
-    for locale_path in sorted(I18N.glob("*.json")):
-        translations = json.loads(locale_path.read_text())
-        assert key in translations, f"{locale_path.name} is missing {key!r}"
+    for key in (
+        "models.queue.copy_model_name_tooltip",
+        "status.active_models.copy_model_name_tooltip",
+    ):
+        for locale_path in sorted(I18N.glob("*.json")):
+            translations = json.loads(locale_path.read_text())
+            assert key in translations, f"{locale_path.name} is missing {key!r}"
 
 
 def test_queue_model_name_helper_matches_the_manager_resolution():

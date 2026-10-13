@@ -191,6 +191,7 @@
   "status.active_models.cached_tokens": "cached ({count} tokens)",
   "status.active_models.est_prefix": "est. ",
   "status.active_models.waiting_prompt_tokens": "prompt: {count} tok",
+  "status.active_models.copy_model_name_tooltip": "모델 이름 복사",
   "status.header.running": "실행 중",
   "status.header.restarting": "재시작 중",
   "status.header.uptime": "가동 시간",
