@@ -84,3 +84,57 @@ class TestLifetimeMaxPhysFootprintFallback:
     def test_returns_zero_when_libproc_unavailable(self, monkeypatch):
         monkeypatch.setattr("omlx.utils.proc_memory._proc_pid_rusage", None)
         assert get_lifetime_max_phys_footprint() == 0
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin-only API")
+class TestGraphicsFootprintDarwin:
+    def test_kernel_fills_the_graphics_ledger(self):
+        """The kernel fills only whole revisions that fit the caller's count."""
+        from omlx.utils import proc_memory as pm
+
+        info = pm._TaskVMInfo()
+        count = ctypes.c_uint(pm._TASK_VM_INFO_COUNT)
+        rc = pm._task_info(
+            pm._mach_task_self.value,
+            pm._TASK_VM_INFO,
+            ctypes.byref(info),
+            ctypes.byref(count),
+        )
+        assert rc == 0
+        assert count.value >= pm._TASK_VM_INFO_GRAPHICS_COUNT
+        assert info.phys_footprint == pytest.approx(get_phys_footprint(), rel=0.5)
+
+
+class TestMetalReleaseLag:
+    GB = 1024**3
+
+    def test_lag_is_graphics_above_the_settled_residual(self, monkeypatch):
+        from omlx.utils import metal_sync
+
+        graphics = [16.1 * self.GB]
+        monkeypatch.setattr(
+            metal_sync, "get_graphics_footprint", lambda: int(graphics[0])
+        )
+        # 0.1 GB of Metal memory outside MLX is the settled level.
+        assert metal_sync.unreleased_graphics_bytes(16 * self.GB) == 0
+        # MLX dropped a 3 GB pool; the ledger still charges it.
+        assert metal_sync.unreleased_graphics_bytes(13 * self.GB) == pytest.approx(
+            3 * self.GB, abs=1
+        )
+        # The driver finished releasing it.
+        graphics[0] = 13.1 * self.GB
+        assert metal_sync.unreleased_graphics_bytes(13 * self.GB) == 0
+
+    def test_settled_level_follows_the_recent_window(self, monkeypatch):
+        from omlx.utils import metal_sync
+
+        now = [100.0]
+        monkeypatch.setattr(metal_sync.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(metal_sync, "get_graphics_footprint", lambda: 20 * self.GB)
+        metal_sync.unreleased_graphics_bytes(19 * self.GB)
+        # New Metal memory outside MLX reads as pending release until the
+        # window settles it.
+        now[0] += 1.0
+        assert metal_sync.unreleased_graphics_bytes(18 * self.GB) == 1 * self.GB
+        now[0] += metal_sync._RESIDUAL_WINDOW_S
+        assert metal_sync.unreleased_graphics_bytes(18 * self.GB) == 0

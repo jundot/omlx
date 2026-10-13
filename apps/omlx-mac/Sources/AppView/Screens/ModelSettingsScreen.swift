@@ -615,7 +615,7 @@ private struct ProfilesTab: View {
                         }
                     }
                 },
-                onSaveAsNew: { openSaveAs(scope: .global) },
+                onSaveAsNew: { openSaveAs(scope: vm.defaultSaveAsScope) },
                 onRevert: {
                     Task { await vm.revertWorking(client: client) }
                 }
@@ -1096,7 +1096,7 @@ private struct BasicEditBanner: View {
                         }
                     },
                     onSaveAsNew: {
-                        saveAsScope = .global
+                        saveAsScope = vm.defaultSaveAsScope
                         saveAsName = vm.suggestSaveAsName()
                         saveAsOpen = true
                     },
@@ -1139,9 +1139,13 @@ private struct AdvancedTab: View {
                              comment: "Section header above the Advanced tab fields"))
 
         // Profile-eligible toggles use `bindProfile` — flipping them flips
-        // the working-dirty flag. `isPinned` and `trustRemoteCode` stay
-        // per-model (server excludes them from profiles) and auto-save.
+        // the working-dirty flag. `isPinned`, `trustRemoteCode` and
+        // `externalEngine` stay per-model (server excludes them from
+        // profiles) and auto-save.
         ListGroup {
+            if !vm.isDiffusionModel, let engines = vm.model?.externalEngines, !engines.isEmpty {
+                ExternalEngineRow(vm: vm, client: client, engines: engines)
+            }
             if !vm.isDiffusionModel {
                 Row(label: String(localized: "settings.advanced.enable_thinking.label",
                                   defaultValue: "Enable Thinking",
@@ -1244,6 +1248,30 @@ private struct AdvancedTab: View {
                     Task { await vm.save(.isFavorite, client: client) }
                 }))
             }
+            if vm.embeddingAudioSupported {
+                Row(label: String(localized: "settings.advanced.embedding_audio.label",
+                                  defaultValue: "Audio Input",
+                                  comment: "Row label for the embedding audio-input toggle"),
+                    sublabel: String(localized: "settings.advanced.embedding_audio.sub",
+                                     defaultValue: "Load the audio encoder so /v1/embeddings accepts audio items. Uses more memory even for text-only requests. Applies after the model reloads.",
+                                     comment: "Sublabel for the embedding audio-input toggle")) {
+                    RowSwitch(isOn: vm.bind($vm.embeddingAudioEnabled, save: {
+                        Task { await vm.save(.embeddingAudioEnabled, client: client) }
+                    }))
+                }
+                if vm.embeddingAudioEnabled {
+                    Row(label: String(localized: "settings.advanced.embedding_audio_max_seconds.label",
+                                      defaultValue: "Max Audio Length",
+                                      comment: "Row label for the embedding audio length limit"),
+                        sublabel: String(localized: "settings.advanced.embedding_audio_max_seconds.sub",
+                                         defaultValue: "Longer audio is cut at this length (empty = 30 s). The model context caps it at about 5 minutes.",
+                                         comment: "Sublabel for the embedding audio length limit")) {
+                        TextInput(text: $vm.embeddingAudioMaxSeconds,
+                                  placeholder: "30", mono: true, suffix: "s", width: .controlCompact)
+                            .onSubmit { Task { await vm.save(.embeddingAudioMaxSeconds, client: client) } }
+                    }
+                }
+            }
             // Security-sensitive row — flagged red to match the HTML
             // editor's visual treatment. HF custom-code execution gives
             // the model author the ability to run arbitrary Python in
@@ -1281,7 +1309,11 @@ private struct AdvancedTab: View {
                                  defaultValue: "Decoding speedups for models that support them.",
                                  comment: "Subtitle for the Acceleration settings section")
             )
+            if !vm.externalEngine.isEmpty {
+                HintLine(text: Self.externalEngineNote, icon: "exclamationmark.triangle")
+            }
             AccelerationSection(vm: vm, client: client)
+                .disabled(!vm.externalEngine.isEmpty)
 
             SectionHeader(
                 String(localized: "settings.advanced.experimental.section",
@@ -1291,8 +1323,71 @@ private struct AdvancedTab: View {
                                  defaultValue: "Speculative decoding, KV-cache quantization, and other research features.",
                                  comment: "Subtitle for the Experimental settings section")
             )
+            if !vm.externalEngine.isEmpty {
+                HintLine(text: Self.externalEngineNote, icon: "exclamationmark.triangle")
+            }
             ExperimentalSection(vm: vm, client: client)
+                .disabled(!vm.externalEngine.isEmpty)
         }
+    }
+
+    private static let externalEngineNote = String(
+        localized: "settings.advanced.external_engine.section_note",
+        defaultValue: "These settings do not apply while an external engine serves this model.",
+        comment: "Note above MLX-only settings while an external engine serves the model")
+}
+
+/// "Use External Engine" toggle plus the engine to use. Engines that cannot
+/// serve the model stay out of the menu; the first that can is the default.
+private struct ExternalEngineRow: View {
+    @Bindable var vm: ModelSettingsScreenVM
+    let client: OMLXClient
+    let engines: [ExternalEngineOption]
+
+    private var usableEngine: String? {
+        engines.first(where: { $0.compatible })?.id
+    }
+
+    private var sublabel: String {
+        let selected = engines.first(where: { $0.id == vm.externalEngine })
+        if let selected, !selected.compatible, let reason = selected.reason, !reason.isEmpty {
+            return reason
+        }
+        if usableEngine == nil, let reason = engines.first?.reason, !reason.isEmpty {
+            return reason
+        }
+        return String(localized: "settings.advanced.external_engine.sub",
+                      defaultValue: "Serve this model with another inference engine in its own process instead of oMLX's MLX engines.",
+                      comment: "Sublabel for the external engine toggle")
+    }
+
+    var body: some View {
+        Row(label: String(localized: "settings.advanced.external_engine.label",
+                          defaultValue: "Use External Engine",
+                          comment: "Row label for serving a model with an external engine"),
+            sublabel: sublabel) {
+            HStack(spacing: 7) {
+                if !vm.externalEngine.isEmpty {
+                    Popup(selection: vm.bind($vm.externalEngine, save: save),
+                          width: .controlCompact,
+                          options: engines
+                              .filter { $0.compatible || $0.id == vm.externalEngine }
+                              .map { ($0.id, $0.label) })
+                }
+                RowSwitch(isOn: Binding(
+                    get: { !vm.externalEngine.isEmpty },
+                    set: { on in
+                        vm.externalEngine = on ? (usableEngine ?? "") : ""
+                        save()
+                    }
+                ))
+                .disabled(vm.externalEngine.isEmpty && usableEngine == nil)
+            }
+        }
+    }
+
+    private func save() {
+        Task { await vm.save(.externalEngine, client: client) }
     }
 }
 
@@ -1537,6 +1632,12 @@ private struct EntryEditor: View {
 
 // MARK: - Acceleration section
 
+private var vlmMtpOwnsSpeculativePathReason: String {
+    String(localized: "settings.speculative.conflict.vlm_mtp",
+           defaultValue: "Disable VLM MTP before enabling this feature.",
+           comment: "Tooltip / sublabel shown when another speculative feature can't be enabled because VLM MTP is on")
+}
+
 private struct AccelerationSection: View {
     @Bindable var vm: ModelSettingsScreenVM
     let client: OMLXClient
@@ -1549,11 +1650,212 @@ private struct AccelerationSection: View {
             Row(label: String(localized: "settings.acceleration.mtp.label",
                               defaultValue: "Lightning MTP",
                               comment: "Row label for the Lightning MTP toggle"),
-                sublabel: mtpSublabel,
-                isLast: true) {
+                sublabel: mtpSublabel) {
                 RowSwitch(isOn: vm.bindProfile($vm.mtpEnabled))
                     .disabled(mtpToggleDisabled)
                     .help(vm.mtpConflictReason ?? vm.model?.mtpCompatibilityReason ?? "")
+            }
+            if vm.mtpEnabled {
+                Row(label: String(localized: "settings.acceleration.mtp.depth.label",
+                                  defaultValue: "Adaptive max depth",
+                                  comment: "Row label for the Lightning MTP draft depth picker"),
+                    sublabel: String(localized: "settings.acceleration.mtp.depth.sub",
+                                     defaultValue: "Automatically adjusts the draft depth up to the selected maximum.",
+                                     comment: "Sublabel for the Lightning MTP draft depth picker")) {
+                    Popup(
+                        selection: vm.bindProfile($vm.mtpAdaptiveMaxDepth),
+                        width: .controlWide,
+                        options: ModelSettingsScreenVM.mtpDepthOptions
+                    )
+                }
+            }
+
+            // DFlash
+            Row(label: String(localized: "settings.experimental.dflash.label",
+                              defaultValue: "DFlash",
+                              comment: "Row label for the DFlash toggle"),
+                sublabel: dflashSublabel) {
+                RowSwitch(isOn: vm.bindProfile($vm.dflashEnabled))
+                    .disabled(dflashToggleDisabled)
+                    .help(dflashHelp)
+            }
+            if vm.dflashEnabled {
+                Row(label: String(localized: "settings.experimental.dflash.draft.label",
+                                  defaultValue: "DFlash Draft Model",
+                                  comment: "Row label for the DFlash draft-model picker")) {
+                    Popup(
+                        selection: vm.bindProfile($vm.dflashDraftModel),
+                        width: .controlWide,
+                        options: vm.draftModelOptions()
+                    )
+                }
+                Row(label: String(localized: "settings.experimental.dflash.draft_quant.label",
+                                  defaultValue: "Draft Quantization",
+                                  comment: "Row label for the DFlash draft quantization toggle"),
+                    sublabel: String(localized: "settings.experimental.dflash.draft_quant.sub",
+                                     defaultValue: "Enable quantization for the draft model (weight, activation bits & group size).",
+                                     comment: "Sublabel for the DFlash draft quantization toggle")) {
+                    RowSwitch(isOn: vm.bindProfile($vm.dflashDraftQuantEnabled))
+                }
+                if vm.dflashDraftQuantEnabled {
+                    Row(label: String(localized: "settings.experimental.dflash.draft_quant_weight.label",
+                                      defaultValue: "Weight Bits",
+                                      comment: "Row label for the DFlash draft quantization weight bits picker")) {
+                        Popup(
+                            selection: vm.bindProfile($vm.dflashDraftQuantWeightBits),
+                            width: .controlCompact,
+                            options: ModelSettingsScreenVM.dflashDraftQuantWeightBitsOptions
+                        )
+                    }
+                    Row(label: String(localized: "settings.experimental.dflash.draft_quant_activation.label",
+                                      defaultValue: "Activation Bits",
+                                      comment: "Row label for the DFlash draft quantization activation bits picker")) {
+                        Popup(
+                            selection: vm.bindProfile($vm.dflashDraftQuantActivationBits),
+                            width: .controlCompact,
+                            options: ModelSettingsScreenVM.dflashDraftQuantActivationBitsOptions
+                        )
+                    }
+                    Row(label: String(localized: "settings.experimental.dflash.draft_quant_group.label",
+                                      defaultValue: "Group Size",
+                                      comment: "Row label for the DFlash draft quantization group size picker")) {
+                        Popup(
+                            selection: vm.bindProfile($vm.dflashDraftQuantGroupSize),
+                            width: .controlCompact,
+                            options: ModelSettingsScreenVM.dflashDraftQuantGroupSizeOptions
+                        )
+                    }
+                }
+                Row(label: String(localized: "settings.experimental.dflash.max_ctx.label",
+                                  defaultValue: "Max Context (fallback)",
+                                  comment: "Row label for the DFlash max-context fallback field"),
+                    sublabel: String(localized: "settings.experimental.dflash.max_ctx.sub",
+                                     defaultValue: "Prompts at or above this token count switch to BatchedEngine. Empty = unlimited.",
+                                     comment: "Sublabel describing the DFlash max-context fallback")) {
+                    TextInput(text: vm.bindProfile($vm.dflashMaxCtx),
+                              placeholder: String(localized: "settings.experimental.dflash.max_ctx.placeholder",
+                                                  defaultValue: "unlimited",
+                                                  comment: "Placeholder shown when DFlash max-context is unset (no cap)"),
+                              mono: true, suffix: "tk", width: .controlCompact)
+                }
+                Row(label: String(localized: "settings.experimental.dflash.verify_mode.label",
+                                  defaultValue: "Verify Mode",
+                                  comment: "Row label for the DFlash verifier algorithm picker"),
+                    sublabel: String(localized: "settings.experimental.dflash.verify_mode.sub",
+                                     defaultValue: "Verifier algorithm. \"adaptive\" shrinks block size when acceptance drops; \"off\" disables speculative verify.",
+                                     comment: "Sublabel for the DFlash verify mode picker")) {
+                    Popup(
+                        selection: vm.bindProfile($vm.dflashVerifyMode),
+                        width: .controlMedium,
+                        options: ModelSettingsScreenVM.dflashVerifyModeOptions
+                    )
+                }
+                Row(label: String(localized: "settings.experimental.dflash.window_size.label",
+                                  defaultValue: "Draft Window Size",
+                                  comment: "Row label for the DFlash draft sliding-attention window size field"),
+                    sublabel: String(localized: "settings.experimental.dflash.window_size.sub",
+                                     defaultValue: "Draft model sliding-attention window. Empty = dflash default (2048).",
+                                     comment: "Sublabel for the DFlash draft window size field")) {
+                    TextInput(text: vm.bindProfile($vm.dflashDraftWindowSize),
+                              placeholder: "2048", mono: true, width: .controlCompact)
+                }
+                Row(label: String(localized: "settings.experimental.dflash.sink_size.label",
+                                  defaultValue: "Draft Sink Size",
+                                  comment: "Row label for the DFlash attention-sink tokens field"),
+                    sublabel: String(localized: "settings.experimental.dflash.sink_size.sub",
+                                     defaultValue: "Attention-sink tokens always kept in the window. Empty = dflash default (0).",
+                                     comment: "Sublabel for the DFlash draft sink size field")) {
+                    TextInput(text: vm.bindProfile($vm.dflashDraftSinkSize),
+                              placeholder: "0", mono: true, width: .controlCompact)
+                }
+                Row(label: String(localized: "settings.experimental.dflash.block_size.label",
+                                  defaultValue: "Runtime Block Size",
+                                  comment: "Row label for the DFlash runtime block size field"),
+                    sublabel: String(localized: "settings.experimental.dflash.block_size.sub",
+                                     defaultValue: "Maximum draft and verify tokens per cycle. Empty = checkpoint default.",
+                                     comment: "Sublabel for the DFlash runtime block size field")) {
+                    TextInput(text: vm.bindProfile($vm.dflashBlockSize),
+                              placeholder: "checkpoint", mono: true, width: .controlCompact)
+                }
+                Row(label: String(localized: "settings.experimental.dflash.mem_cache.label",
+                                  defaultValue: "DFlash in-memory cache",
+                                  comment: "Row label for the DFlash L1 in-memory cache toggle"),
+                    sublabel: String(localized: "settings.experimental.dflash.mem_cache.sub",
+                                     defaultValue: "DFlash L1 prefix snapshot cache in RAM.",
+                                     comment: "Sublabel for the DFlash L1 in-memory cache toggle")) {
+                    HStack(spacing: 8) {
+                        if vm.dflashInMemoryCache {
+                            TextInput(text: vm.bindProfile($vm.dflashInMemoryCacheGib),
+                                      placeholder: "8", mono: true, suffix: "GiB", width: .controlCompact)
+                        }
+                        RowSwitch(isOn: vm.bindProfile($vm.dflashInMemoryCache))
+                    }
+                }
+                if vm.dflashInMemoryCache {
+                    Row(label: String(localized: "settings.experimental.dflash.mem_cache_entries.label",
+                                      defaultValue: "Cache Entries",
+                                      comment: "Row label for the DFlash L1 in-memory cache max entries field"),
+                        sublabel: String(localized: "settings.experimental.dflash.mem_cache_entries.sub",
+                                         defaultValue: "Maximum prefix snapshots kept in RAM. Each entry stores KV + draft GDN state.",
+                                         comment: "Sublabel for the DFlash L1 cache max entries field")) {
+                        TextInput(text: vm.bindProfile($vm.dflashInMemoryCacheMaxEntries),
+                                  placeholder: "4", mono: true, width: .controlCompact)
+                    }
+                }
+                Row(label: String(localized: "settings.experimental.dflash.ssd_cache.label",
+                                  defaultValue: "DFlash SSD cache",
+                                  comment: "Row label for the DFlash L2 SSD cache toggle"),
+                    sublabel: dflashSsdSublabel) {
+                    RowSwitch(isOn: vm.bindProfile($vm.dflashSsdCache))
+                        .disabled(!(vm.model?.dflashSsdCacheAvailable ?? false) || !vm.dflashInMemoryCache)
+                }
+                if vm.dflashSsdCache && (vm.model?.dflashSsdCacheAvailable ?? false) {
+                    Row(label: String(localized: "settings.experimental.dflash.ssd_cache_size.label",
+                                      defaultValue: "SSD Cache Size",
+                                      comment: "Row label for the DFlash L2 SSD cache disk budget field"),
+                        sublabel: String(localized: "settings.experimental.dflash.ssd_cache_size.sub",
+                                         defaultValue: "Disk budget for L2 spill; oldest entries are evicted when exceeded.",
+                                         comment: "Sublabel for the DFlash SSD cache size field")) {
+                        TextInput(text: vm.bindProfile($vm.dflashSsdCacheGib),
+                                  placeholder: "20", mono: true, suffix: "GiB", width: .controlCompact)
+                    }
+                }
+            }
+
+            // VLM MTP - last row of the acceleration group. Reveals the
+            // draft-model picker and block-size field when enabled.
+            Row(label: String(localized: "settings.experimental.vlm_mtp.label",
+                              defaultValue: "VLM MTP",
+                              comment: "Row label for the VLM MTP toggle"),
+                sublabel: vlmMtpSublabel,
+                isLast: !vm.vlmMtpEnabled) {
+                RowSwitch(isOn: vm.bindProfile($vm.vlmMtpEnabled))
+                    .disabled(vlmMtpToggleDisabled)
+                    .help(vm.vlmMtpConflictReason ?? "")
+            }
+            if vm.vlmMtpEnabled {
+                Row(label: String(localized: "settings.experimental.vlm_mtp.draft.label",
+                                  defaultValue: "VLM Draft Model",
+                                  comment: "Row label for the VLM MTP draft-model picker"),
+                    sublabel: String(localized: "settings.experimental.vlm_mtp.draft.sub",
+                                     defaultValue: "Assistant drafter sharing the target's tokenizer.",
+                                     comment: "Sublabel for the VLM MTP draft-model picker")) {
+                    Popup(
+                        selection: vm.bindProfile($vm.vlmMtpDraftModel),
+                        width: .controlWide,
+                        options: vm.vlmMtpDraftModelOptions()
+                    )
+                }
+                Row(label: String(localized: "settings.experimental.vlm_mtp.block_size.label",
+                                  defaultValue: "Draft Block Size",
+                                  comment: "Row label for the VLM MTP draft block-size field"),
+                    sublabel: String(localized: "settings.experimental.vlm_mtp.block_size.sub",
+                                     defaultValue: "Tokens drafted per round. Empty uses the mlx-vlm default.",
+                                     comment: "Sublabel for the VLM MTP draft block-size field"),
+                    isLast: true) {
+                    TextInput(text: vm.bindProfile($vm.vlmMtpDraftBlockSize),
+                              placeholder: "4", mono: true, width: .controlNarrow)
+                }
             }
         }
     }
@@ -1574,6 +1876,56 @@ private struct AccelerationSection: View {
         return String(localized: "settings.acceleration.mtp.sub",
                       defaultValue: "Drafts several tokens per step with the model's built-in MTP head. Up to ~1.5x faster decoding for supported models.",
                       comment: "Default sublabel for the Lightning MTP toggle")
+    }
+
+    private var dflashToggleDisabled: Bool {
+        !(vm.model?.dflashCompatible ?? true) || vm.vlmMtpEnabled
+    }
+
+    private var dflashHelp: String {
+        if let reason = vm.model?.dflashCompatibilityReason,
+           !(vm.model?.dflashCompatible ?? true) {
+            return reason
+        }
+        return vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : ""
+    }
+
+    private var dflashSublabel: String {
+        if let reason = vm.model?.dflashCompatibilityReason,
+           !(vm.model?.dflashCompatible ?? true) {
+            return reason
+        }
+        if vm.vlmMtpEnabled { return vlmMtpOwnsSpeculativePathReason }
+        return String(localized: "settings.experimental.dflash.sub",
+                      defaultValue: "Block-diffusion speculative decoding.",
+                      comment: "Default sublabel for the DFlash toggle (used when the model is compatible)")
+    }
+
+    private var dflashSsdSublabel: String {
+        if !(vm.model?.dflashSsdCacheAvailable ?? false) {
+            return String(localized: "settings.experimental.dflash.ssd_cache.sub.unavailable",
+                          defaultValue: "Enable the global paged SSD cache directory first.",
+                          comment: "Sublabel for the DFlash SSD cache row when the global SSD cache directory isn't configured")
+        }
+        if !vm.dflashInMemoryCache {
+            return String(localized: "settings.experimental.dflash.ssd_cache.sub.needs_l1",
+                          defaultValue: "Requires the in-memory cache to be enabled.",
+                          comment: "Sublabel for the DFlash SSD cache row when the L1 in-memory cache is off")
+        }
+        return String(localized: "settings.experimental.dflash.ssd_cache.sub",
+                      defaultValue: "L2 spill of evicted L1 entries to disk.",
+                      comment: "Default sublabel for the DFlash SSD cache toggle")
+    }
+
+    private var vlmMtpToggleDisabled: Bool {
+        vm.vlmMtpConflictReason != nil
+    }
+
+    private var vlmMtpSublabel: String {
+        if let reason = vm.vlmMtpConflictReason { return reason }
+        return String(localized: "settings.experimental.vlm_mtp.sub",
+                      defaultValue: "External drafter (Gemma 4 assistant or Qwen MTP) speeds up single requests.",
+                      comment: "Default sublabel for the VLM MTP toggle")
     }
 }
 
@@ -1611,28 +1963,34 @@ private struct ExperimentalSection: View {
                         }
                     }
                 }
+            }
+            // The oQ A8 rows do not depend on an ANE backend: Qwen3.8
+            // Flash-Next has none, but still supports oQ A8.
+            if vm.isQwenOqA8Model {
+                Row(label: String(localized: "settings.experimental.qwen_oq_a8.label",
+                                  defaultValue: "Qwen INT8 Activation Prefill",
+                                  comment: "Row label for the oQ INT8-activation prefill kernels"),
+                    sublabel: qwenOqA8Sublabel) {
+                    RowSwitch(isOn: vm.bindProfile($vm.qwen35OqA8Enabled))
+                        .disabled(vm.qwen35OqA8ConflictReason != nil)
+                        .help(vm.qwen35OqA8ConflictReason ?? "")
+                }
+                if vm.qwen35OqA8Enabled {
+                    Row(label: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.label",
+                                      defaultValue: "Minimum Prompt Tokens",
+                                      comment: "Row label for the oQ A8 minimum prompt length"),
+                        sublabel: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.sub",
+                                         defaultValue: "Shorter prompts stay on the existing path, where the activation-quantization pass costs more than the faster matmul saves.",
+                                         comment: "Sublabel explaining the oQ A8 minimum prompt length")) {
+                        TextInput(text: vm.bindProfile($vm.qwen35OqA8MinTokens),
+                                  placeholder: "128", mono: true,
+                                  isNumeric: true, range: 1...262_144,
+                                  step: 64, width: .controlCompact)
+                    }
+                }
+            }
+            if vm.model?.anePrefillBackend != nil {
                 if vm.isQwenOqA8Model {
-                    Row(label: String(localized: "settings.experimental.qwen_oq_a8.label",
-                                      defaultValue: "Qwen INT8 Activation Prefill",
-                                      comment: "Row label for the oQ INT8-activation prefill kernels"),
-                        sublabel: qwenOqA8Sublabel) {
-                        RowSwitch(isOn: vm.bindProfile($vm.qwen35OqA8Enabled))
-                            .disabled(vm.qwen35OqA8ConflictReason != nil)
-                            .help(vm.qwen35OqA8ConflictReason ?? "")
-                    }
-                    if vm.qwen35OqA8Enabled {
-                        Row(label: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.label",
-                                          defaultValue: "Minimum Prompt Tokens",
-                                          comment: "Row label for the oQ A8 minimum prompt length"),
-                            sublabel: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.sub",
-                                             defaultValue: "Shorter prompts stay on the existing path, where the activation-quantization pass costs more than the faster matmul saves.",
-                                             comment: "Sublabel explaining the oQ A8 minimum prompt length")) {
-                            TextInput(text: vm.bindProfile($vm.qwen35OqA8MinTokens),
-                                      placeholder: "128", mono: true,
-                                      isNumeric: true, range: 1...262_144,
-                                      step: 64, width: .controlCompact)
-                        }
-                    }
                     Row(label: String(localized: "settings.experimental.qwen_ane.label",
                                       defaultValue: "Qwen ANE Prefill",
                                       comment: "Row label for private Qwen ANE/GPU prefill acceleration"),
@@ -1942,7 +2300,8 @@ private struct ExperimentalSection: View {
             Row(label: String(localized: "settings.experimental.specprefill.label",
                               defaultValue: "SpecPrefill",
                               comment: "Row label for the SpecPrefill toggle"),
-                sublabel: specprefillSublabel) {
+                sublabel: specprefillSublabel,
+                isLast: !vm.specprefillEnabled) {
                 RowSwitch(isOn: vm.bindProfile($vm.specprefillEnabled))
                     .disabled(vm.vlmMtpEnabled)
                     .help(vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : "")
@@ -1974,206 +2333,13 @@ private struct ExperimentalSection: View {
                                   comment: "Row label for the SpecPrefill threshold field"),
                     sublabel: String(localized: "settings.experimental.specprefill.threshold.sub",
                                      defaultValue: "Min prompt tokens to trigger (shorter prompts use full prefill).",
-                                     comment: "Sublabel for the SpecPrefill threshold field")) {
+                                     comment: "Sublabel for the SpecPrefill threshold field"),
+                    isLast: true) {
                     TextInput(text: vm.bindProfile($vm.specprefillThreshold),
                               placeholder: "8192", mono: true, suffix: "tk", width: .controlCompact)
                 }
             }
-
-            // DFlash
-            Row(label: String(localized: "settings.experimental.dflash.label",
-                              defaultValue: "DFlash",
-                              comment: "Row label for the DFlash toggle"),
-                sublabel: dflashSublabel) {
-                RowSwitch(isOn: vm.bindProfile($vm.dflashEnabled))
-                    .disabled(dflashToggleDisabled)
-                    .help(dflashHelp)
-            }
-            if vm.dflashEnabled {
-                Row(label: String(localized: "settings.experimental.dflash.draft.label",
-                                  defaultValue: "DFlash Draft Model",
-                                  comment: "Row label for the DFlash draft-model picker")) {
-                    Popup(
-                        selection: vm.bindProfile($vm.dflashDraftModel),
-                        width: .controlWide,
-                        options: vm.draftModelOptions()
-                    )
-                }
-                Row(label: String(localized: "settings.experimental.dflash.draft_quant.label",
-                                  defaultValue: "Draft Quantization",
-                                  comment: "Row label for the DFlash draft quantization toggle"),
-                    sublabel: String(localized: "settings.experimental.dflash.draft_quant.sub",
-                                     defaultValue: "Enable quantization for the draft model (weight, activation bits & group size).",
-                                     comment: "Sublabel for the DFlash draft quantization toggle")) {
-                    RowSwitch(isOn: vm.bindProfile($vm.dflashDraftQuantEnabled))
-                }
-                if vm.dflashDraftQuantEnabled {
-                    Row(label: String(localized: "settings.experimental.dflash.draft_quant_weight.label",
-                                      defaultValue: "Weight Bits",
-                                      comment: "Row label for the DFlash draft quantization weight bits picker")) {
-                        Popup(
-                            selection: vm.bindProfile($vm.dflashDraftQuantWeightBits),
-                            width: .controlCompact,
-                            options: ModelSettingsScreenVM.dflashDraftQuantWeightBitsOptions
-                        )
-                    }
-                    Row(label: String(localized: "settings.experimental.dflash.draft_quant_activation.label",
-                                      defaultValue: "Activation Bits",
-                                      comment: "Row label for the DFlash draft quantization activation bits picker")) {
-                        Popup(
-                            selection: vm.bindProfile($vm.dflashDraftQuantActivationBits),
-                            width: .controlCompact,
-                            options: ModelSettingsScreenVM.dflashDraftQuantActivationBitsOptions
-                        )
-                    }
-                    Row(label: String(localized: "settings.experimental.dflash.draft_quant_group.label",
-                                      defaultValue: "Group Size",
-                                      comment: "Row label for the DFlash draft quantization group size picker")) {
-                        Popup(
-                            selection: vm.bindProfile($vm.dflashDraftQuantGroupSize),
-                            width: .controlCompact,
-                            options: ModelSettingsScreenVM.dflashDraftQuantGroupSizeOptions
-                        )
-                    }
-                }
-                Row(label: String(localized: "settings.experimental.dflash.max_ctx.label",
-                                  defaultValue: "Max Context (fallback)",
-                                  comment: "Row label for the DFlash max-context fallback field"),
-                    sublabel: String(localized: "settings.experimental.dflash.max_ctx.sub",
-                                     defaultValue: "Prompts at or above this token count switch to BatchedEngine. Empty = unlimited.",
-                                     comment: "Sublabel describing the DFlash max-context fallback")) {
-                    TextInput(text: vm.bindProfile($vm.dflashMaxCtx),
-                              placeholder: String(localized: "settings.experimental.dflash.max_ctx.placeholder",
-                                                  defaultValue: "unlimited",
-                                                  comment: "Placeholder shown when DFlash max-context is unset (no cap)"),
-                              mono: true, suffix: "tk", width: .controlCompact)
-                }
-                Row(label: String(localized: "settings.experimental.dflash.verify_mode.label",
-                                  defaultValue: "Verify Mode",
-                                  comment: "Row label for the DFlash verifier algorithm picker"),
-                    sublabel: String(localized: "settings.experimental.dflash.verify_mode.sub",
-                                     defaultValue: "Verifier algorithm. \"adaptive\" shrinks block size when acceptance drops; \"off\" disables speculative verify.",
-                                     comment: "Sublabel for the DFlash verify mode picker")) {
-                    Popup(
-                        selection: vm.bindProfile($vm.dflashVerifyMode),
-                        width: .controlMedium,
-                        options: ModelSettingsScreenVM.dflashVerifyModeOptions
-                    )
-                }
-                Row(label: String(localized: "settings.experimental.dflash.window_size.label",
-                                  defaultValue: "Draft Window Size",
-                                  comment: "Row label for the DFlash draft sliding-attention window size field"),
-                    sublabel: String(localized: "settings.experimental.dflash.window_size.sub",
-                                     defaultValue: "Draft model sliding-attention window. Empty = dflash default (2048).",
-                                     comment: "Sublabel for the DFlash draft window size field")) {
-                    TextInput(text: vm.bindProfile($vm.dflashDraftWindowSize),
-                              placeholder: "2048", mono: true, width: .controlCompact)
-                }
-                Row(label: String(localized: "settings.experimental.dflash.sink_size.label",
-                                  defaultValue: "Draft Sink Size",
-                                  comment: "Row label for the DFlash attention-sink tokens field"),
-                    sublabel: String(localized: "settings.experimental.dflash.sink_size.sub",
-                                     defaultValue: "Attention-sink tokens always kept in the window. Empty = dflash default (0).",
-                                     comment: "Sublabel for the DFlash draft sink size field")) {
-                    TextInput(text: vm.bindProfile($vm.dflashDraftSinkSize),
-                              placeholder: "0", mono: true, width: .controlCompact)
-                }
-                Row(label: String(localized: "settings.experimental.dflash.block_size.label",
-                                  defaultValue: "Runtime Block Size",
-                                  comment: "Row label for the DFlash runtime block size field"),
-                    sublabel: String(localized: "settings.experimental.dflash.block_size.sub",
-                                     defaultValue: "Maximum draft and verify tokens per cycle. Empty = checkpoint default.",
-                                     comment: "Sublabel for the DFlash runtime block size field")) {
-                    TextInput(text: vm.bindProfile($vm.dflashBlockSize),
-                              placeholder: "checkpoint", mono: true, width: .controlCompact)
-                }
-                Row(label: String(localized: "settings.experimental.dflash.mem_cache.label",
-                                  defaultValue: "DFlash in-memory cache",
-                                  comment: "Row label for the DFlash L1 in-memory cache toggle"),
-                    sublabel: String(localized: "settings.experimental.dflash.mem_cache.sub",
-                                     defaultValue: "DFlash L1 prefix snapshot cache in RAM.",
-                                     comment: "Sublabel for the DFlash L1 in-memory cache toggle")) {
-                    HStack(spacing: 8) {
-                        if vm.dflashInMemoryCache {
-                            TextInput(text: vm.bindProfile($vm.dflashInMemoryCacheGib),
-                                      placeholder: "8", mono: true, suffix: "GiB", width: .controlCompact)
-                        }
-                        RowSwitch(isOn: vm.bindProfile($vm.dflashInMemoryCache))
-                    }
-                }
-                if vm.dflashInMemoryCache {
-                    Row(label: String(localized: "settings.experimental.dflash.mem_cache_entries.label",
-                                      defaultValue: "Cache Entries",
-                                      comment: "Row label for the DFlash L1 in-memory cache max entries field"),
-                        sublabel: String(localized: "settings.experimental.dflash.mem_cache_entries.sub",
-                                         defaultValue: "Maximum prefix snapshots kept in RAM. Each entry stores KV + draft GDN state.",
-                                         comment: "Sublabel for the DFlash L1 cache max entries field")) {
-                        TextInput(text: vm.bindProfile($vm.dflashInMemoryCacheMaxEntries),
-                                  placeholder: "4", mono: true, width: .controlCompact)
-                    }
-                }
-                Row(label: String(localized: "settings.experimental.dflash.ssd_cache.label",
-                                  defaultValue: "DFlash SSD cache",
-                                  comment: "Row label for the DFlash L2 SSD cache toggle"),
-                    sublabel: dflashSsdSublabel) {
-                    RowSwitch(isOn: vm.bindProfile($vm.dflashSsdCache))
-                        .disabled(!(vm.model?.dflashSsdCacheAvailable ?? false) || !vm.dflashInMemoryCache)
-                }
-                if vm.dflashSsdCache && (vm.model?.dflashSsdCacheAvailable ?? false) {
-                    Row(label: String(localized: "settings.experimental.dflash.ssd_cache_size.label",
-                                      defaultValue: "SSD Cache Size",
-                                      comment: "Row label for the DFlash L2 SSD cache disk budget field"),
-                        sublabel: String(localized: "settings.experimental.dflash.ssd_cache_size.sub",
-                                         defaultValue: "Disk budget for L2 spill; oldest entries are evicted when exceeded.",
-                                         comment: "Sublabel for the DFlash SSD cache size field")) {
-                        TextInput(text: vm.bindProfile($vm.dflashSsdCacheGib),
-                                  placeholder: "20", mono: true, suffix: "GiB", width: .controlCompact)
-                    }
-                }
-            }
-
-            // VLM MTP — last row of the experimental group. Reveals the
-            // draft-model picker and block-size field when enabled.
-            Row(label: String(localized: "settings.experimental.vlm_mtp.label",
-                              defaultValue: "VLM MTP",
-                              comment: "Row label for the VLM MTP toggle"),
-                sublabel: vlmMtpSublabel,
-                isLast: !vm.vlmMtpEnabled) {
-                RowSwitch(isOn: vm.bindProfile($vm.vlmMtpEnabled))
-                    .disabled(vlmMtpToggleDisabled)
-                    .help(vm.vlmMtpConflictReason ?? "")
-            }
-            if vm.vlmMtpEnabled {
-                Row(label: String(localized: "settings.experimental.vlm_mtp.draft.label",
-                                  defaultValue: "VLM Draft Model",
-                                  comment: "Row label for the VLM MTP draft-model picker"),
-                    sublabel: String(localized: "settings.experimental.vlm_mtp.draft.sub",
-                                     defaultValue: "Assistant drafter sharing the target's tokenizer.",
-                                     comment: "Sublabel for the VLM MTP draft-model picker")) {
-                    Popup(
-                        selection: vm.bindProfile($vm.vlmMtpDraftModel),
-                        width: .controlWide,
-                        options: vm.vlmMtpDraftModelOptions()
-                    )
-                }
-                Row(label: String(localized: "settings.experimental.vlm_mtp.block_size.label",
-                                  defaultValue: "Draft Block Size",
-                                  comment: "Row label for the VLM MTP draft block-size field"),
-                    sublabel: String(localized: "settings.experimental.vlm_mtp.block_size.sub",
-                                     defaultValue: "Tokens drafted per round. Empty uses the mlx-vlm default.",
-                                     comment: "Sublabel for the VLM MTP draft block-size field"),
-                    isLast: true) {
-                    TextInput(text: vm.bindProfile($vm.vlmMtpDraftBlockSize),
-                              placeholder: "4", mono: true, width: .controlNarrow)
-                }
-            }
         }
-    }
-
-    private var vlmMtpOwnsSpeculativePathReason: String {
-        String(localized: "settings.speculative.conflict.vlm_mtp",
-               defaultValue: "Disable VLM MTP before enabling this feature.",
-               comment: "Tooltip / sublabel shown when another speculative feature can't be enabled because VLM MTP is on")
     }
 
     private var turboquantSublabel: String {
@@ -2190,49 +2356,10 @@ private struct ExperimentalSection: View {
                       comment: "Sublabel describing SpecPrefill")
     }
 
-    private var dflashToggleDisabled: Bool {
-        !(vm.model?.dflashCompatible ?? true) || vm.vlmMtpEnabled
-    }
-
-    private var dflashHelp: String {
-        if let reason = vm.model?.dflashCompatibilityReason,
-           !(vm.model?.dflashCompatible ?? true) {
-            return reason
-        }
-        return vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : ""
-    }
-
-    private var dflashSublabel: String {
-        if let reason = vm.model?.dflashCompatibilityReason,
-           !(vm.model?.dflashCompatible ?? true) {
-            return reason
-        }
-        if vm.vlmMtpEnabled { return vlmMtpOwnsSpeculativePathReason }
-        return String(localized: "settings.experimental.dflash.sub",
-                      defaultValue: "Block-diffusion speculative decoding. Single-stream only (requests run one at a time).",
-                      comment: "Default sublabel for the DFlash toggle (used when the model is compatible)")
-    }
-
-    private var dflashSsdSublabel: String {
-        if !(vm.model?.dflashSsdCacheAvailable ?? false) {
-            return String(localized: "settings.experimental.dflash.ssd_cache.sub.unavailable",
-                          defaultValue: "Enable the global paged SSD cache directory first.",
-                          comment: "Sublabel for the DFlash SSD cache row when the global SSD cache directory isn't configured")
-        }
-        if !vm.dflashInMemoryCache {
-            return String(localized: "settings.experimental.dflash.ssd_cache.sub.needs_l1",
-                          defaultValue: "Requires the in-memory cache to be enabled.",
-                          comment: "Sublabel for the DFlash SSD cache row when the L1 in-memory cache is off")
-        }
-        return String(localized: "settings.experimental.dflash.ssd_cache.sub",
-                      defaultValue: "L2 spill of evicted L1 entries to disk.",
-                      comment: "Default sublabel for the DFlash SSD cache toggle")
-    }
-
     private var qwenOqA8Sublabel: String {
         if let reason = vm.qwen35OqA8ConflictReason { return reason }
         return String(localized: "settings.experimental.qwen_oq_a8.sub",
-                      defaultValue: "Experimental GPU INT8 activation quantization for supported Q4/Q5 prefill operations. Requires M5-series or newer and the native kernels. Outputs and model quality may change; some quantization formats receive no acceleration. Cannot be combined with ANE prefill. Applies after the model reloads.",
+                      defaultValue: "Experimental GPU INT8 activation quantization for supported Q4/Q5/Q8 prefill operations on Qwen3.5/3.6/3.8, and routed expert gate/up projections on Qwen3.8 Flash-Next. Requires M5-series or newer and the native kernels. Outputs and model quality may change; some quantization formats receive no acceleration. Cannot be combined with ANE prefill. Applies after the model reloads.",
                       comment: "Sublabel describing the oQ INT8-activation prefill kernels")
     }
 
@@ -2241,17 +2368,6 @@ private struct ExperimentalSection: View {
         return String(localized: "settings.experimental.qwen_ane.sub",
                       defaultValue: "Split fixed-shape Qwen 3.5/3.6/3.8 prompt processing across both ANEs and the GPU. Experimental private API; takes effect after the model reloads.",
                       comment: "Sublabel describing Qwen ANE/GPU prefill acceleration")
-    }
-
-    private var vlmMtpToggleDisabled: Bool {
-        vm.vlmMtpConflictReason != nil
-    }
-
-    private var vlmMtpSublabel: String {
-        if let reason = vm.vlmMtpConflictReason { return reason }
-        return String(localized: "settings.experimental.vlm_mtp.sub",
-                      defaultValue: "Multi-token prediction for vision-language models via an assistant drafter.",
-                      comment: "Default sublabel for the VLM MTP toggle")
     }
 
     private func aneRecommendationText(

@@ -2,8 +2,10 @@
 """Tests for Qwen4-Exp PLE resident/mmap size accounting."""
 
 import json
+import logging
 import struct
 
+from omlx.engine_pool import EngineEntry, EnginePool
 from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
     qwen4_exp_residency_estimate,
 )
@@ -21,6 +23,34 @@ def _write_safetensors(path, tensors: dict[str, int]) -> None:
         offset += size
     encoded = json.dumps(header).encode()
     path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + bytes(offset))
+
+
+def _qwen4_pool(tmp_path):
+    model = tmp_path / "qwen4"
+    model.mkdir()
+    ple_key = "model.language_model.ngram_embedding.shard_0.weight"
+    _write_safetensors(model / "model.safetensors", {ple_key: 100})
+    (model / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {ple_key: "model.safetensors"}})
+    )
+    estimate = qwen4_exp_residency_estimate(model)
+
+    pool = EnginePool.__new__(EnginePool)
+    pool._get_admission_ceiling = None
+    pool._get_admission_soft_target = None
+    pool._get_final_ceiling = None
+    entry = EngineEntry.__new__(EngineEntry)
+    entry.model_id = "qwen4"
+    entry.model_path = str(model)
+    entry.config_model_type = "qwen4_exp"
+    return pool, entry, estimate
+
+
+def _forced_warnings(caplog) -> int:
+    return sum(
+        "Qwen4-Exp PLE forced to SSD" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_estimate_subtracts_only_mmap_backed_ngram_tensors(tmp_path):
@@ -77,25 +107,7 @@ def test_residency_uses_the_stable_ceiling_not_the_instantaneous_one(tmp_path):
     the table is forced to SSD for the rest of that engine's life. Measured
     cost of that mistake on this machine: 35.3 -> 14.1 tok/s.
     """
-    from omlx.engine_pool import EngineEntry, EnginePool
-
-    model = tmp_path / "qwen4"
-    model.mkdir()
-    ple_key = "model.language_model.ngram_embedding.shard_0.weight"
-    _write_safetensors(model / "model.safetensors", {ple_key: 100})
-    (model / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {ple_key: "model.safetensors"}})
-    )
-    estimate = qwen4_exp_residency_estimate(model)
-
-    pool = EnginePool.__new__(EnginePool)
-    pool._get_admission_ceiling = None
-    pool._get_admission_soft_target = None
-    pool._get_final_ceiling = None
-    entry = EngineEntry.__new__(EngineEntry)
-    entry.model_id = "qwen4"
-    entry.model_path = str(model)
-    entry.config_model_type = "qwen4_exp"
+    pool, entry, estimate = _qwen4_pool(tmp_path)
 
     # The instantaneous ceiling has dipped between the two modes — exactly the
     # window right after a swap. The stable ceiling still clears resident.
@@ -111,3 +123,31 @@ def test_residency_uses_the_stable_ceiling_not_the_instantaneous_one(tmp_path):
     pool._get_residency_ceiling = None
     _, forced_sem_cb, _ = pool._qwen4_ple_offload_status(entry, None)
     assert forced_sem_cb is True
+
+
+def test_polled_forced_status_logs_once(tmp_path, caplog):
+    pool, entry, estimate = _qwen4_pool(tmp_path)
+    between_modes = (estimate.resident_bytes + estimate.mmap_bytes) // 2
+    pool._get_residency_ceiling = lambda: between_modes
+
+    with caplog.at_level(logging.WARNING, logger="omlx.engine_pool"):
+        results = [pool._qwen4_ple_offload_status(entry, None) for _ in range(5)]
+
+    assert all(forced is True for _, forced, _ in results)
+    assert _forced_warnings(caplog) == 1
+
+
+def test_forced_status_logs_again_after_a_transition(tmp_path, caplog):
+    pool, entry, estimate = _qwen4_pool(tmp_path)
+    between_modes = (estimate.resident_bytes + estimate.mmap_bytes) // 2
+    ceiling = [between_modes]
+    pool._get_residency_ceiling = lambda: ceiling[0]
+
+    with caplog.at_level(logging.WARNING, logger="omlx.engine_pool"):
+        pool._qwen4_ple_offload_status(entry, None)
+        ceiling[0] = estimate.resident_bytes
+        pool._qwen4_ple_offload_status(entry, None)
+        ceiling[0] = between_modes
+        pool._qwen4_ple_offload_status(entry, None)
+
+    assert _forced_warnings(caplog) == 2

@@ -652,25 +652,34 @@ private struct APIEndpointsList: View {
             Row(label: String(localized: "server.endpoint.openai",
                               defaultValue: "OpenAI-compatible",
                               comment: "API endpoint row label for the OpenAI-compatible base URL")) {
-                CodeChip(value: "http://\(host):\(port)/v1")
+                CodeChip(value: endpoint(path: "/v1"))
             }
             Row(label: String(localized: "server.endpoint.anthropic",
                               defaultValue: "Anthropic / Claude Code",
                               comment: "API endpoint row label for the Anthropic/Claude Code base URL")) {
-                CodeChip(value: "http://\(host):\(port)")
+                CodeChip(value: endpoint(path: ""))
             }
             Row(label: String(localized: "server.endpoint.health",
                               defaultValue: "Health probe",
                               comment: "API endpoint row label for the health probe URL")) {
-                CodeChip(value: "http://\(host):\(port)/health")
+                CodeChip(value: endpoint(path: "/health"))
             }
             Row(label: String(localized: "server.endpoint.metrics",
                               defaultValue: "Metrics (Prometheus)",
                               comment: "API endpoint row label for the Prometheus metrics URL"),
                 isLast: true) {
-                CodeChip(value: "http://\(host):\(port)/metrics")
+                CodeChip(value: endpoint(path: "/metrics"))
             }
         }
+    }
+
+    /// Build via `AppConfig.httpURL` so an IPv6 literal host is bracketed
+    /// (`http://[::1]:8000/v1`) instead of the malformed `http://::1:8000/v1`
+    /// raw interpolation would produce. Fall back to interpolation only if the
+    /// URL is somehow unconstructable.
+    private func endpoint(path: String) -> String {
+        AppConfig.httpURL(host: host, port: port, path: path)?.absoluteString
+            ?? "http://\(host):\(port)\(path)"
     }
 }
 

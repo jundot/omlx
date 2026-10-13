@@ -67,6 +67,7 @@ private struct APIKeyEditorRow: View {
     @FocusState private var focused: Bool
 
     @Environment(\.omlxTheme) private var theme
+    @Environment(AppServices.self) private var services
 
     private var loaded: String { vm.apiKey ?? "" }
     private var isDirty: Bool { draft != loaded }
@@ -180,6 +181,10 @@ private struct APIKeyEditorRow: View {
         let next = trimmed
         let ok = await vm.applyApiKey(next, client: client)
         if ok {
+            // Server state changes reapply `services.config` to the client.
+            var updated = services.config
+            updated.apiKey = next
+            services.updateConfig(updated)
             // Drop focus so the next `.task(id:)` mirror picks up the fresh
             // loaded value without fighting an in-progress edit.
             focused = false

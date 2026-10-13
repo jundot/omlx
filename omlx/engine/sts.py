@@ -201,10 +201,13 @@ def _process_lfm2(model_and_processor, audio_path: str, **kwargs) -> bytes:
     chat_state.end_turn()
     chat_state.new_turn("assistant")
 
-    # Generation parameters
+    # Generation parameters. mlx-audio leaves top-k unset (no filtering)
+    # unless it is passed explicitly.
     max_new_tokens = kwargs.get("max_new_tokens", 512)
     temperature = kwargs.get("temperature", 0.7)
+    top_k = kwargs.get("top_k", 50)
     audio_temperature = kwargs.get("audio_temperature", 0.8)
+    audio_top_k = kwargs.get("audio_top_k", 4)
 
     # Collect audio output frames (each is shape (num_codebooks,) or (1, num_codebooks))
     audio_frames = []
@@ -212,7 +215,9 @@ def _process_lfm2(model_and_processor, audio_path: str, **kwargs) -> bytes:
         chat_state,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
+        top_k=top_k,
         audio_temperature=audio_temperature,
+        audio_top_k=audio_top_k,
     ):
         if modality == LFMModality.AUDIO_OUT:
             audio_frames.append(token)
@@ -348,7 +353,9 @@ class STSEngine(BaseNonStreamingEngine):
                   (default: ["speech"])
                 - max_new_tokens (int): Max tokens for LFM2 (default: 512)
                 - temperature (float): Sampling temperature for LFM2
+                - top_k (int): Text top-k for LFM2 (default: 50)
                 - audio_temperature (float): Audio sampling temp for LFM2
+                - audio_top_k (int): Audio top-k for LFM2 (default: 4)
 
         Returns:
             WAV-encoded bytes (RIFF header + 16-bit mono PCM) of processed audio

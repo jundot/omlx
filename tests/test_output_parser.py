@@ -8,6 +8,10 @@ import sys
 import types
 from types import SimpleNamespace
 
+import pytest
+from mlx_lm.tokenizer_utils import TokenizerWrapper
+from mlx_lm.tool_parsers import json_tools, qwen3_coder
+
 from omlx.adapter.gemma4 import Gemma4OutputParserSession
 from omlx.adapter.harmony import load_harmony_gpt_oss_encoding
 from omlx.adapter.output_parser import detect_output_parser
@@ -1083,6 +1087,56 @@ class TestOutputParserFactory:
         thinking, content = extract_thinking(output_text)
         assert thinking == "Let me think about this"
         assert content == "Four"
+
+    @staticmethod
+    def _labeled_json_tools(template, parser=json_tools.parse_tool_call):
+        tokenizer = TokenizerWrapper.__new__(TokenizerWrapper)
+        tokenizer._tokenizer = SimpleNamespace(
+            chat_template=template,
+            encode=lambda text, **kwargs: list(text.encode()),
+        )
+        tokenizer._chat_template = None
+        tokenizer._tool_parser = parser
+        tokenizer._tool_call_start = "<tool_call>"
+        tokenizer._tool_call_end = "</tool_call>"
+        tokenizer._tool_call_start_tokens = (1,)
+        tokenizer._tool_call_end_tokens = (2,)
+        return tokenizer
+
+    @pytest.mark.parametrize(
+        "template, expected",
+        [
+            ("<tool_call>\n<function=", "qwen3_coder"),
+            ("<arg_key>", "glm47"),
+            ("[TOOL_CALLS]", "mistral"),  # Empty end marker.
+        ],
+    )
+    def test_json_tools_label_follows_template_grammar(self, template, expected):
+        tokenizer = self._labeled_json_tools(template)
+        detect_output_parser("model", tokenizer)
+
+        assert tokenizer.tool_parser.__module__ == f"mlx_lm.tool_parsers.{expected}"
+        start, end = tokenizer.tool_call_start, tokenizer.tool_call_end
+        assert tokenizer.tool_call_start_tokens == tuple(start.encode())
+        assert tokenizer.tool_call_end_tokens == tuple(end.encode())
+
+    @pytest.mark.parametrize(
+        "template, parser, renderer",
+        [
+            ("<tool_call>tool_call.name", json_tools.parse_tool_call, None),
+            ("<arg_key>", qwen3_coder.parse_tool_call, None),
+            ("<arg_key>", json_tools.parse_tool_call, lambda *args: ""),
+        ],
+        ids=["json-template", "specific-label", "custom-renderer"],
+    )
+    def test_tool_parser_kept_without_template_conflict(
+        self, template, parser, renderer
+    ):
+        tokenizer = self._labeled_json_tools(template, parser)
+        tokenizer._chat_template = renderer
+        detect_output_parser("model", tokenizer)
+
+        assert tokenizer.tool_parser is parser
 
 
 class InklingTokenizer:

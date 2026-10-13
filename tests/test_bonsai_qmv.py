@@ -688,7 +688,7 @@ def test_bonsai_local_build_probe_is_healthy():
 def _make_t5_layer(N: int = 64, K: int = 256, group_size: int = 128,
                    quants: np.ndarray | None = None) -> nn.QuantizedLinear:
     """QuantizedLinear with t5-format weights (uint8, base-3)."""
-    from tools.repack_ternary_t5 import pack_t5
+    from scripts.repack_ternary_t5 import pack_t5
 
     if quants is None:
         rng = np.random.default_rng(42)
@@ -709,10 +709,10 @@ def _make_t5_layer(N: int = 64, K: int = 256, group_size: int = 128,
 
 
 class TestT5Repack:
-    """Tests for tools/repack_ternary_t5.py."""
+    """Tests for scripts/repack_ternary_t5.py."""
 
     def test_pack_unpack_roundtrip_gs128(self):
-        from tools.repack_ternary_t5 import pack_t5, unpack_t5
+        from scripts.repack_ternary_t5 import pack_t5, unpack_t5
         rng = np.random.default_rng(0)
         q = rng.integers(0, 3, size=(8, 128), dtype=np.uint8)
         t5w = pack_t5(q, group_size=128)
@@ -721,7 +721,7 @@ class TestT5Repack:
         np.testing.assert_array_equal(q, q_rt)
 
     def test_pack_unpack_roundtrip_gs64(self):
-        from tools.repack_ternary_t5 import pack_t5, unpack_t5
+        from scripts.repack_ternary_t5 import pack_t5, unpack_t5
         rng = np.random.default_rng(1)
         q = rng.integers(0, 3, size=(8, 64), dtype=np.uint8)
         t5w = pack_t5(q, group_size=64)
@@ -730,7 +730,7 @@ class TestT5Repack:
         np.testing.assert_array_equal(q, q_rt)
 
     def test_pack_unpack_larger_K(self):
-        from tools.repack_ternary_t5 import pack_t5, unpack_t5
+        from scripts.repack_ternary_t5 import pack_t5, unpack_t5
         rng = np.random.default_rng(2)
         K, gs = 7168, 128
         q = rng.integers(0, 3, size=(4, K), dtype=np.uint8)
@@ -742,7 +742,7 @@ class TestT5Repack:
 
     def test_padding_trit_is_neutral(self):
         """Padding trits (q=1) must contribute zero to the dot product."""
-        from tools.repack_ternary_t5 import pack_t5
+        from scripts.repack_ternary_t5 import pack_t5
         # Single group of 128, last 2 positions zero-padded with q=1
         q = np.ones((1, 128), dtype=np.uint8)  # all t=0 (q=1 → dq=0 for scale*(q-1))
         t5w = pack_t5(q, group_size=128)
@@ -752,7 +752,7 @@ class TestT5Repack:
 
     def test_dequant_matches_2bit_reference(self):
         """t5 and 2-bit dequantize to the same float values."""
-        from tools.repack_ternary_t5 import pack_t5, unpack_t5, unpack_mlx_2bit
+        from scripts.repack_ternary_t5 import pack_t5, unpack_t5, unpack_mlx_2bit
         rng = np.random.default_rng(3)
         N, K, gs = 16, 256, 128
         # Generate ternary quants ∈ {0,1,2}

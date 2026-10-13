@@ -17,6 +17,7 @@ from mlx_lm.models.switch_layers import SwitchLinear
 from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 
 from ..deepseek_v4.switch_layers import _block_config, _build_mxfp4_blocks
+from . import growth
 from .activation import quantize_paired_swiglu_activation, quantize_swiglu_activation
 from .cache import DeepseekV41Cache
 from .engram import Engram, NgramHash, build_compressed_token_map
@@ -201,7 +202,7 @@ class Indexer(nn.Module):
                 key = pack_activation(
                     rope(self.k_norm(self.wk(latent)), pos, c, True), bits=4
                 )
-                previous = mx.concatenate([previous, key], 1)
+                previous = growth.append(cache, 3, previous, key, kv_start // ratio)
             shared["index_k"] = cache[3] = previous
         key = shared["index_k"]
         q = self.wq_b(qr).reshape(1, x.shape[1], c.index_n_heads, c.index_head_dim)
@@ -336,7 +337,9 @@ class Attention(nn.Module):
                 compressed = pack_activation(
                     compressed, bits=4, group_size=16, e4m3_scale=True
                 )
-                shared["kv"] = cache[2] = mx.concatenate([shared["kv"], compressed], 1)
+                shared["kv"] = cache[2] = growth.append(
+                    cache, 2, shared["kv"], compressed, kv_start // ratio
+                )
             ci, pooled = shared["idx"], shared["kv"]
         if (
             length > 8
@@ -848,9 +851,10 @@ class LanguageModel(DSparkMixin, nn.Module):
 
             self.mtp = make_stages(config)
         self._hasher = None
-        from ..mlx_lm_mtp import get_mtp_depth, is_mtp_active
+        from ..mlx_lm_mtp import get_mtp_depth, is_mtp_active, is_mtp_depth_fixed
 
         self.configure_mtp(config.preserve_mtp and is_mtp_active(), get_mtp_depth())
+        self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
 
     def make_dspark_cache(self):
         from .dspark import make_cache
@@ -960,6 +964,18 @@ class LanguageModel(DSparkMixin, nn.Module):
             )
             ced_mid = c.n_layers // 2
             prefetch = getattr(self, "_engram_prefetch", None)
+            # The CPU enqueues a whole prefill chunk in ~1s while the GPU runs
+            # ~15x longer; with the layer loop fully lazy every intermediate
+            # (fp32 hyper-connection streams across hc_mult, gathered sparse
+            # attention loads, MoE routes) stays pinned until the final logits
+            # eval and the Metal pool hoards every freed size class as
+            # IOAccelerator footprint (measured +14.5GB per 2048-token chunk).
+            # Eval the running stream at each layer boundary during prefill so
+            # intermediates retire as the GPU progresses, and clear the pool at
+            # the same points (per-layer widths vary across the ratio switch,
+            # CED tail and 2047/2048 chunk widths, so size classes never
+            # reuse). Decode/verify widths stay lazy for latency.
+            prefill_backpressure = end - begin >= 256
             with prefetch.forward() if prefetch is not None else nullcontext():
                 if prefetch is not None and c.engram_layer_ids:
                     first = self.layers[c.engram_layer_ids[0]].engram.embed
@@ -992,6 +1008,9 @@ class LanguageModel(DSparkMixin, nn.Module):
                     )
                     if prefetch is not None and "engram" in layer:
                         mx.async_eval(h, pre)
+                    if prefill_backpressure:
+                        mx.eval(h, pre)
+                        mx.clear_cache()
                     rc[i][0] = mx.array([start + end - begin], mx.int32)
                     if history is not None and i == 0:
                         rc[i][6] = mx.array(history, mx.int64)

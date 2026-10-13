@@ -91,10 +91,11 @@ if __name__ == "__main__":
 """
 
 
+_SYSTEM_PYTHON = "/usr/bin/python3"
+
+
 def _system_python() -> str | None:
-    candidate = Path(
-        os.environ.get("OMLX_CLUSTER_CONTROL_PROXY_PYTHON", "/usr/bin/python3")
-    )
+    candidate = Path(_SYSTEM_PYTHON)
     if candidate.is_file() and os.access(candidate, os.X_OK):
         return str(candidate)
     return None
@@ -103,19 +104,6 @@ def _system_python() -> str | None:
 def should_proxy_control_socket(host: str) -> bool:
     """Whether a non-loopback control socket should use the macOS carrier."""
 
-    mode = os.environ.get("OMLX_CLUSTER_CONTROL_TRANSPORT", "auto").strip().lower()
-    if mode not in {"", "auto", "direct", "system-proxy"}:
-        raise RuntimeError(
-            "OMLX_CLUSTER_CONTROL_TRANSPORT must be auto, direct, or system-proxy"
-        )
-    if mode == "direct":
-        logger.info("control transport: direct (forced by env)")
-        return False
-    if mode == "system-proxy":
-        if _system_python() is None:
-            raise RuntimeError("system Python control proxy is unavailable")
-        logger.info("control transport: system-proxy (forced by env)")
-        return True
     try:
         loopback = ipaddress.ip_address(host).is_loopback
     except ValueError:
@@ -189,8 +177,9 @@ def open_system_tcp_proxy(
     executable = _system_python()
     if executable is None:
         raise RuntimeError("system Python control proxy is unavailable")
+    # -I: ignore the bundled app's PYTHONHOME, which system Python cannot use.
     process = subprocess.Popen(
-        [executable, "-u", "-c", _PROXY_PROGRAM, host, str(port), str(timeout)],
+        [executable, "-I", "-u", "-c", _PROXY_PROGRAM, host, str(port), str(timeout)],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

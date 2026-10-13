@@ -16,7 +16,7 @@ import time
 from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext, suppress
 from datetime import UTC, datetime
-from functools import wraps
+from functools import partial, wraps
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -25,6 +25,7 @@ from .control_plane import RankControlPlane
 from .deployment import (
     decode_worker_contract,
     decode_worker_path_map,
+    decode_worker_stage_links,
 )
 from .jaccl_lease import acquire_jaccl_communicator_lease
 from .liveness import PeerWatchdog
@@ -43,10 +44,13 @@ from .pipeline_compat import (
 from .planner import PipelineAssignment
 from .prefill_guard import build_guard
 from .progressive_loading import install_progressive_loader
+from .rdma.stage_transport import install_stage_links
 from .runtime_optimizations import install_runtime_optimizations
 from .telemetry import install_server_telemetry
 
 _EVENT_PREFIX = "OMLX_CLUSTER_EVENT:"
+# Bound for the Metal release in the SIGTERM/SIGINT handler before hard exit.
+_SIGNAL_CLEAR_TIMEOUT_SECONDS = 10
 
 logger = logging.getLogger(__name__)
 
@@ -467,6 +471,11 @@ def _server_arguments(
         prompt_cache_size=args.prompt_cache_size,
         prompt_cache_bytes=args.prompt_cache_bytes,
         max_kv_size=args.max_kv_size,
+        # MLX-LM CLI defaults. kv_bits=None keeps KV quantization off and
+        # the generator batchable.
+        kv_bits=None,
+        kv_group_size=64,
+        quantized_kv_start=5000,
     )
 
 
@@ -487,8 +496,10 @@ def _install_distributed_model_protocol(tokenizer: Any, model_path: str | Path) 
     model_type = _distributed_model_type(model_path)
     from omlx.adapter.output_parser import (
         install_minimax_m3_tokenizer_protocol,
+        repair_tool_parser,
     )
 
+    repair_tool_parser(tokenizer)
     installed = install_minimax_m3_tokenizer_protocol(
         tokenizer,
         str(model_path),
@@ -584,9 +595,7 @@ def _install_signal_handlers() -> None:
         # KeyboardInterrupt path is unchanged for a rank that answers promptly.
         try:
             signal.signal(signal.SIGALRM, hard_exit)
-            signal.alarm(
-                int(os.environ.get("OMLX_CLUSTER_SIGNAL_CLEAR_TIMEOUT", "10") or "10")
-            )
+            signal.alarm(_SIGNAL_CLEAR_TIMEOUT_SECONDS)
         except Exception:
             pass
         _release_metal_memory(f"rank received {name}")
@@ -652,8 +661,6 @@ def _watch_launcher_parent(
     marker: RuntimeMarker,
     *,
     poll_interval: float = 0.2,
-    watched_marker_path: Any = None,
-    marker_stale_after: float = 45.0,
     get_parent_pid: Any = os.getppid,
     wait: Any = time.sleep,
     exit_process: Any = os._exit,
@@ -668,42 +675,22 @@ def _watch_launcher_parent(
     of every rank, so a reparented worker cannot make useful collective
     progress and must not remain resident on a node.
 
-    Two conditions are watched: the parent pid changing (the original check),
-    and — when ``watched_marker_path`` is configured — a launcher- or
-    coordinator-maintained lease file going stale for ``marker_stale_after``
-    seconds, which catches a launcher that is alive but wedged (its ranks
-    would otherwise wait in a collective forever). ``os._exit`` stays the
-    last resort: ``on_abort`` fires first so in-flight requests can be
-    cancelled at a step boundary, and ``release_memory`` unwires the rank's
-    Metal allocations before the process disappears — ``os._exit`` skips
-    every finally/atexit handler, and a skipped release strands wired memory
-    until the Mac is rebooted.
+    ``os._exit`` stays the last resort: ``on_abort`` fires first so in-flight
+    requests can be cancelled at a step boundary, and ``release_memory``
+    unwires the rank's Metal allocations before the process disappears -
+    ``os._exit`` skips every finally/atexit handler, and a skipped release
+    strands wired memory until the Mac is rebooted.
     """
 
-    watched = Path(watched_marker_path) if watched_marker_path else None
     while True:
         wait(poll_interval)
-        reason = None
-        if get_parent_pid() != parent_pid:
-            current_parent = get_parent_pid()
-            reason = (
-                f"rank launcher parent changed from {parent_pid} to "
-                f"{current_parent}; the rank cannot safely continue"
-            )
-        elif watched is not None and marker_stale_after > 0:
-            try:
-                age = time.time() - watched.stat().st_mtime
-            except OSError:
-                age = None
-            # A lease that never appeared yet is not stale; the launcher may
-            # still be starting. Once it exists, it must stay fresh.
-            if age is not None and age > marker_stale_after:
-                reason = (
-                    f"launcher lease {watched} is stale ({age:.1f}s > "
-                    f"{marker_stale_after:.1f}s); the launcher is wedged"
-                )
-        if reason is None:
+        if get_parent_pid() == parent_pid:
             continue
+        current_parent = get_parent_pid()
+        reason = (
+            f"rank launcher parent changed from {parent_pid} to "
+            f"{current_parent}; the rank cannot safely continue"
+        )
         # Keep the marker as bounded crash evidence. The next activation
         # overwrites the deterministic path, and liveness already ignores a
         # marker whose owner is dead. Removing it here reduced this exact
@@ -721,6 +708,32 @@ def _watch_launcher_parent(
             logger.warning("Launcher watchdog Metal release failed", exc_info=True)
         exit_process(1)
         return
+
+
+def _exit_on_generation_failure(
+    marker: RuntimeMarker,
+    rank: int,
+    error: str,
+    *,
+    emit_event: Any = _emit_event,
+    release_memory: Any = _release_metal_memory,
+    exit_process: Any = os._exit,
+) -> None:
+    """End a rank whose MLX-LM generation thread died.
+
+    The rank cannot generate again. Exiting through the same path as the
+    watchdogs lets the launcher report the failure and lets unload proceed,
+    instead of leaving a rank that still counts the dead request as active.
+    """
+
+    reason = f"rank {rank} generation thread died: {error}"[:1000]
+    with suppress(Exception):
+        marker.update("failed", error=reason)
+    with suppress(Exception):
+        emit_event({"type": "generation_failed", "reason": reason})
+    with suppress(Exception):
+        release_memory(f"generation failure exit: {reason}")
+    exit_process(1)
 
 
 def _peer_hosts_by_rank(
@@ -807,14 +820,12 @@ def _start_peer_watchdog(
             plan_hash=marker.payload.get("plan_hash"),
         )
 
-    abort_grace = float(os.environ.get("OMLX_CLUSTER_PEER_ABORT_GRACE", "5.0") or 0.0)
     watchdog = PeerWatchdog(
         hosts_by_rank,
         deployment_id=deployment_id,
         state_dir=state_dir,
         on_lost=on_lost,
         on_abort=on_abort,
-        abort_grace=abort_grace,
     )
     thread = threading.Thread(
         target=watchdog.run, name="omlx-cluster-peer-watchdog", daemon=True
@@ -829,11 +840,6 @@ def _start_launcher_watchdog(
     *,
     state_dir: str | None = None,
 ) -> None:
-    # Optional coordinator/launcher lease file: when configured (and once
-    # it exists), the watchdog also fires if it goes stale — covering a
-    # launcher that is alive but wedged, which the parent-pid check alone
-    # cannot see. Off by default, preserving the original PPID-only watch.
-    lease = os.environ.get("OMLX_CLUSTER_LAUNCHER_LEASE", "").strip()
     deployment_id = str(marker.payload.get("deployment_id") or "")
 
     def on_abort(reason: str) -> None:
@@ -848,10 +854,7 @@ def _start_launcher_watchdog(
     thread = threading.Thread(
         target=_watch_launcher_parent,
         args=(parent_pid, marker),
-        kwargs={
-            "watched_marker_path": lease or None,
-            "on_abort": on_abort,
-        },
+        kwargs={"on_abort": on_abort},
         name="omlx-cluster-launcher-watchdog",
         daemon=True,
     )
@@ -1406,13 +1409,22 @@ def run_worker(args: argparse.Namespace) -> int:
             # Doing it here as well would shard every projection twice.
             measured_weight_bytes = _measured_weight_bytes(provider.model)
             _validate_measured_weight_bytes(measured_weight_bytes, assignment)
-            with install_runtime_optimizations(
-                provider.model,
-                group,
-                execution,
-                batchable=provider.is_batchable,
-                pipeline_parallel=tensor_parallel_size == 1,
-            ) as optimizations:
+            # Installed first so the runtime optimizations wrap the RDMA-aware send.
+            with (
+                install_stage_links(
+                    mx,
+                    group,
+                    decode_worker_stage_links(args.plan),
+                    rank=rank,
+                ) as stage_links,
+                install_runtime_optimizations(
+                    provider.model,
+                    group,
+                    execution,
+                    batchable=provider.is_batchable,
+                    pipeline_parallel=tensor_parallel_size == 1,
+                ) as optimizations,
+            ):
                 marker.update(
                     "ready",
                     load_stage="ready",
@@ -1430,6 +1442,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         profile.to_dict() for profile in performance_profiles
                     ],
                     optimizations=optimizations,
+                    stage_links=stage_links,
                     output_protocol=protocol or None,
                 )
                 _emit_event(
@@ -1448,6 +1461,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         "capacity_bytes": assignment.capacity_bytes,
                         "reserve_bytes": assignment.reserve_bytes,
                         "headroom_bytes": assignment.headroom_bytes,
+                        "stage_links": stage_links,
                     }
                 )
                 if rank == 0:
@@ -1504,6 +1518,9 @@ def run_worker(args: argparse.Namespace) -> int:
                             prefill_step_size=args.prefill_step_size,
                         ),
                         control_plane=control_plane,
+                        on_generation_failed=partial(
+                            _exit_on_generation_failure, marker, rank
+                        ),
                     ),
                     _bind_generation_thread_stream(
                         ResponseGenerator,

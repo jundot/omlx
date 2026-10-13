@@ -7,12 +7,15 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from omlx.cluster import launch
+from omlx.cluster import launch, memory_guard
 from omlx.cluster.deployment import ClusterDeployment, ClusterHost
 from omlx.cluster.launch import (
     CudaFabricProbeHost,
@@ -321,6 +324,31 @@ def test_supervisor_preserves_structured_peer_loss_reason():
     assert "generic launcher noise" not in supervisor._exit_detail(1)
 
 
+def test_rank_exit_detail_waits_for_rank_stderr_forwarded_after_the_exit_line():
+    supervisor = launch.DistributedJobSupervisor(_deployment(), preflight=False)
+    supervisor.process = SimpleNamespace(poll=lambda: None)
+
+    # mlx.launch prints the exit line before it forwards the rank's own stderr.
+    def launcher_stderr():
+        yield "[WARN] Node with rank 0 exited with code 1\n"
+        time.sleep(0.2)
+        yield "RuntimeError: JACCL side-channel helper stopped (status=1)\n"
+
+    reader = threading.Thread(
+        target=supervisor._drain,
+        args=(launcher_stderr(), supervisor._stderr, False),
+        daemon=True,
+    )
+    supervisor._readers.append(reader)
+    reader.start()
+
+    with pytest.raises(
+        launch.DistributedLaunchError,
+        match=r"(?s)rank 0 exited with code 1.*side-channel helper stopped",
+    ):
+        supervisor._wait_for_ready()
+
+
 def test_supervisor_prefers_rank_marker_over_mlx_cleanup_traceback(monkeypatch):
     supervisor = launch.DistributedJobSupervisor(_deployment(), preflight=False)
     supervisor._stderr.append(
@@ -516,9 +544,13 @@ def test_supervisor_stop_handles_reused_group_permission_error(
     assert supervisor.status().phase == "stopped"
 
 
-def test_remote_preflight_uses_prompt_free_noninteractive_ssh():
+def test_remote_preflight_uses_prompt_free_noninteractive_ssh(monkeypatch):
     calls = []
     versions = _local_runtime_versions()
+    # The local rank measures live memory, which other test workers consume.
+    monkeypatch.setattr(
+        memory_guard, "ceiling_breakdown", lambda tier: {"hard_limit": 1024**4}
+    )
 
     def runner(argv, **kwargs):
         calls.append((argv, kwargs))
@@ -2394,3 +2426,65 @@ def test_reap_orphaned_launches_leaves_an_active_job_alone(tmp_path, monkeypatch
     assert report["reaped"] == []
     assert kills == []
     assert launch._launch_manifest_path(tmp_path, "cluster-test").exists()
+
+
+def test_peer_probe_stops_immediately_on_ssh_auth_failure():
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv, 255, stdout="", stderr="Permission denied (publickey)."
+        )
+
+    with pytest.raises(DistributedLaunchError, match="Permission denied"):
+        probe_remote_host("worker@example.invalid", runner=runner)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("local_failure", [False, True])
+def test_local_only_teardown_never_contacts_remote_peer(
+    tmp_path, monkeypatch, local_failure
+):
+    calls = []
+
+    def sweep(deployment_id, hosts, **kwargs):
+        calls.append(hosts)
+        return ["local worker survived"] if local_failure else []
+
+    def no_ssh(*args, **kwargs):
+        pytest.fail("local-only removal must not contact a remote Mac")
+
+    monkeypatch.setattr(launch, "_sweep_rank_processes", sweep)
+    if local_failure:
+        with pytest.raises(
+            launch.DistributedTeardownError, match="local worker survived"
+        ):
+            launch.stop_deployment_processes(
+                _deployment(), state_dir=tmp_path, runner=no_ssh, local_only=True
+            )
+    else:
+        result = launch.stop_deployment_processes(
+            _deployment(), state_dir=tmp_path, runner=no_ssh, local_only=True
+        )
+        assert result["ranks_checked"] == 1
+    assert calls == [[{"rank": 0, "node_id": "local", "ssh": "127.0.0.1"}]]
+
+
+
+def test_supervisor_local_stop_skips_remote_reaping(tmp_path, monkeypatch):
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(), preflight=False, state_dir=str(tmp_path)
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_reap_remote_ranks",
+        lambda: pytest.fail("remote reaping attempted"),
+    )
+    monkeypatch.setattr(
+        launch,
+        "_run_cluster_ssh",
+        lambda *_a, **_k: pytest.fail("remote serve gate cleared over SSH"),
+    )
+    supervisor.stop(local_only=True)
+    assert supervisor.process is None

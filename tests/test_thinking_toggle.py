@@ -2,7 +2,13 @@
 
 import json
 
-from omlx.model_discovery import detect_preserve_thinking, detect_thinking_default
+import pytest
+
+from omlx.model_discovery import (
+    detect_preserve_thinking,
+    detect_reasoning_effort,
+    detect_thinking_default,
+)
 from omlx.model_settings import ModelSettings
 
 # ---------------------------------------------------------------------------
@@ -209,3 +215,31 @@ class TestModelSettingsPreserveThinking:
     def test_set_to_false(self):
         ms = ModelSettings(preserve_thinking=False)
         assert ms.preserve_thinking is False
+
+
+@pytest.mark.parametrize(
+    "template, levels",
+    [
+        ("{{ messages }}", None),
+        ("Reasoning: {{ reasoning_effort | default('medium') }}", []),
+        # Qwen3.8 raises on anything outside its three levels.
+        (
+            "{%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}"
+            "{%- elif resolved_reasoning_effort == 'low' %}",
+            ["low", "medium", "xhigh"],
+        ),
+        # GLM-5.3 maps every other value to max; Hunyuan adds no_think.
+        (
+            "{%- set e = reasoning_effort if reasoning_effort in ['low', 'high'] %}",
+            ["low", "high"],
+        ),
+        (
+            "{%- if reasoning_effort not in ['high', 'low', 'no_think'] %}",
+            ["low", "high"],
+        ),
+    ],
+)
+def test_detect_reasoning_effort_reads_the_accepted_levels(tmp_path, template, levels):
+    tc = {"chat_template": template}
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps(tc))
+    assert detect_reasoning_effort(tmp_path) == levels

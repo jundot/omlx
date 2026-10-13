@@ -19,7 +19,13 @@ def rollback_rows(language, caches, captures, accepted, block_size):
     if len(recurrent) != len(captures):
         raise ValueError("GLM recurrent capture count mismatch")
     for cache, entry in zip(recurrent, captures):
-        if len(entry) < 11 or entry[0].shape[:2] != (len(accepted), block_size):
+        # The fused one-sequence capture (KdaStepCapture) never reaches a
+        # batch; only the reference body's tuple carries per-row inputs.
+        if (
+            not isinstance(entry, (tuple, list))
+            or len(entry) < 11
+            or entry[0].shape[:2] != (len(accepted), block_size)
+        ):
             raise ValueError("GLM recurrent capture shape mismatch")
         if cache[0] is None or cache[1] is None:
             raise ValueError("Missing GLM recurrent state")

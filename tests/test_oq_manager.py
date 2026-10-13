@@ -2,6 +2,7 @@
 """Tests for the OQManager admin component."""
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -631,6 +632,23 @@ class TestOQManagerEnhanced:
         assert task.imatrix_cache_path.endswith("-s8-l128.npz")
 
 
+@pytest.mark.asyncio
+async def test_start_rejects_output_dir_of_active_task(fp_model_dir, monkeypatch):
+    manager = OQManager(model_dirs=[str(fp_model_dir)])
+
+    async def _noop_run(task_id):
+        return None
+
+    monkeypatch.setattr(manager, "_run_quantization", _noop_run)
+    # Both names resolve to Llama-3B-oQ4.
+    twin = fp_model_dir / "Llama-3B-bf16"
+    shutil.copytree(fp_model_dir / "Llama-3B", twin)
+
+    await manager.start_quantization(str(fp_model_dir / "Llama-3B"), 4)
+    with pytest.raises(ValueError, match="Another quantization is writing"):
+        await manager.start_quantization(str(twin), 4)
+
+
 class TestOQManagerHfCacheDiscovery:
     """HF cache models (non-MLX) should appear as quantization sources."""
 
@@ -824,3 +842,25 @@ async def test_v41_source_metadata_and_converted_filter(tmp_path, layer_key):
         "original": False,
         "converted": True,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "settings, message",
+    [
+        ({"oq_level": 8, "enhanced": True}, "Choose oQ2, oQ2.5, oQ2.7, oQ3 or oQ4"),
+        ({"oq_level": 4, "dtype": "float16"}, "requires dtype='bfloat16'"),
+        ({"oq_level": 3, "group_size": 32}, "group_size=64"),
+    ],
+)
+async def test_v41_rejects_unsupported_settings_before_queueing(
+    tmp_path, settings, message
+):
+    source = tmp_path / "DeepSeek-V4.1"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "deepseek_v41"}))
+    manager = OQManager(model_dirs=[str(tmp_path)])
+    with pytest.raises(ValueError, match=message):
+        await manager.start_quantization(str(source), **settings)
+    assert not manager._active_tasks
+    assert list(tmp_path.iterdir()) == [source]

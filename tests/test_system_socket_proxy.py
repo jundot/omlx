@@ -15,7 +15,9 @@ from omlx.cluster.system_socket_proxy import (
 )
 
 
-def test_system_proxy_bridges_a_loopback_stream():
+def test_system_proxy_bridges_a_loopback_stream(monkeypatch, tmp_path):
+    # oMLX.app exports PYTHONHOME for its bundled interpreter.
+    monkeypatch.setenv("PYTHONHOME", str(tmp_path))
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", 0))
@@ -32,7 +34,8 @@ def test_system_proxy_bridges_a_loopback_stream():
             stream.close()
             listener.close()
 
-    thread = threading.Thread(target=server)
+    # Daemon: a helper that fails to start must fail the test, not hang it.
+    thread = threading.Thread(target=server, daemon=True)
     thread.start()
     proxy = open_system_tcp_proxy("127.0.0.1", port, timeout=3)
     try:
@@ -46,15 +49,9 @@ def test_system_proxy_bridges_a_loopback_stream():
     assert result == {"request": b"ping"}
 
 
-def test_control_proxy_auto_skips_loopback(monkeypatch):
-    monkeypatch.delenv("OMLX_CLUSTER_CONTROL_TRANSPORT", raising=False)
+def test_control_proxy_auto_skips_loopback():
     assert should_proxy_control_socket("127.0.0.1") is False
     assert should_proxy_control_socket("localhost") is False
-
-
-def test_control_proxy_direct_override(monkeypatch):
-    monkeypatch.setenv("OMLX_CLUSTER_CONTROL_TRANSPORT", "direct")
-    assert should_proxy_control_socket("10.0.0.1") is False
 
 
 def test_system_proxy_reaches_ipv6_loopback():
@@ -88,19 +85,9 @@ def test_system_proxy_reaches_ipv6_loopback():
     assert not thread.is_alive()
 
 
-@pytest.mark.parametrize("override", [None, "/custom/python", "/missing/python"])
-def test_proxy_python_preserves_system_default_and_explicit_override(
-    monkeypatch, override
-):
-    if override is None:
-        monkeypatch.delenv("OMLX_CLUSTER_CONTROL_PROXY_PYTHON", raising=False)
-    else:
-        monkeypatch.setenv("OMLX_CLUSTER_CONTROL_PROXY_PYTHON", override)
-    monkeypatch.setattr(
-        proxy_module.Path, "is_file", lambda path: str(path) != "/missing/python"
-    )
+@pytest.mark.parametrize("present", [True, False])
+def test_proxy_python_is_the_system_interpreter(monkeypatch, present):
+    monkeypatch.setattr(proxy_module.Path, "is_file", lambda path: present)
     monkeypatch.setattr(proxy_module.os, "access", lambda path, mode: True)
-    expected = "/usr/bin/python3" if override is None else override
-    if override == "/missing/python":
-        expected = None
+    expected = "/usr/bin/python3" if present else None
     assert proxy_module._system_python() == expected

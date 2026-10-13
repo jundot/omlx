@@ -859,15 +859,12 @@ class TestDeepSeekV4PrefillMemoryProfile:
     def _set_wsdpa_route(
         monkeypatch,
         *,
-        enabled: bool = True,
         broken: bool = False,
         dense: bool = True,
         topk: bool = True,
     ):
         from omlx.patches.deepseek_v4 import wsdpa_attention as wsdpa
 
-        monkeypatch.setattr(wsdpa, "_ENABLED", enabled)
-        monkeypatch.setattr(wsdpa, "_TOPK_ENABLED", True)
         monkeypatch.setattr(wsdpa, "_broken", broken)
         monkeypatch.setattr(wsdpa, "_ready", dense)
         monkeypatch.setattr(wsdpa, "_topk_ready", topk)
@@ -906,12 +903,10 @@ class TestDeepSeekV4PrefillMemoryProfile:
         assert active == self._wsdpa_bytes(query_tokens, local_tokens)
         assert active < fallback
 
-        for enabled, broken in ((False, False), (True, True)):
-            self._set_wsdpa_route(monkeypatch, enabled=enabled, broken=broken)
-            assert (
-                supported.estimate_chunk_transient_bytes(query_tokens, kv_len)
-                == fallback
-            )
+        self._set_wsdpa_route(monkeypatch, broken=True)
+        assert (
+            supported.estimate_chunk_transient_bytes(query_tokens, kv_len) == fallback
+        )
 
         self._set_wsdpa_route(monkeypatch)
         unsupported = self._monitor(ratios=[0], wsdpa_dtype_supported=False)

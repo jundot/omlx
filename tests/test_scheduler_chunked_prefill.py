@@ -14,13 +14,33 @@ from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import pytest
+from mlx_lm.models import qwen3_5_moe
+from mlx_lm.models.cache import make_prompt_cache
+from mlx_vlm.models.qwen3_5 import config as qwen3_5_config
+from mlx_vlm.models.qwen3_5 import language as qwen3_5_language
 
+import omlx.scheduler as scheduler_module
 from omlx.exceptions import PrefillMemoryExceededError
+from omlx.models.vlm import VLMModelAdapter
+from omlx.patches import mlx_vlm_qwen4_exp_compat
+from omlx.patches.hy_v3 import apply_hy_v3_patch
+from omlx.patches.mlx_vlm_glm5_next_compat import (
+    apply_mlx_vlm_glm5_next_compat_patch,
+)
+from omlx.prefill.packed import (
+    PackedBatch,
+    PackedRow,
+    PackedRows,
+    install_packed_prefill,
+    packed_min_row_tokens,
+    run_packed_prefill,
+)
 from omlx.request import Request, RequestStatus, SamplingParams
 from omlx.scheduler import (
     PrefillEvictionRequest,
     Scheduler,
     SchedulerConfig,
+    _bind_text_prefill_rope_delta,
     _default_generation_stream,
     _PrefillAbortedError,
     _PrefillEvictionNeeded,
@@ -1596,3 +1616,896 @@ def test_external_prefill_announces_the_next_chunk_to_the_model():
         scheduler._do_external_prefill(request, tokens, cache)
     assert model.chunk_lengths == [4, 4, 2]
     assert model.seen == [([10, 11, 12, 13], []), ([14, 15, 16, 17], [10, 11, 12, 13]), ([18, 19], [14, 15, 16, 17])]
+
+
+# ---------------------------------------------------------------------------
+# Packed prefill
+# ---------------------------------------------------------------------------
+
+
+def _tiny_qwen3_5():
+    text = qwen3_5_config.TextConfig(
+        model_type="qwen3_5_text",
+        hidden_size=32,
+        intermediate_size=64,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_conv_kernel_dim=4,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        rms_norm_eps=1e-6,
+        vocab_size=64,
+        num_key_value_heads=2,
+        max_position_embeddings=512,
+        head_dim=8,
+        rope_parameters={
+            "type": "default",
+            "mrope_section": [2, 1, 1],
+            "rope_theta": 10000,
+            "partial_rotary_factor": 1.0,
+        },
+    )
+    return qwen3_5_language.LanguageModel(text), SimpleNamespace(
+        model_type="qwen3_5", text_config=text
+    )
+
+
+def _tiny_qwen4_exp():
+    mlx_vlm_qwen4_exp_compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models import qwen4_exp
+
+    text = qwen4_exp.TextConfig(
+        model_type="qwen4_exp_text",
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_conv_kernel_dim=3,
+        num_experts=4,
+        num_experts_per_tok=2,
+        shared_expert_intermediate_size=16,
+        moe_intermediate_size=16,
+        rms_norm_eps=1e-6,
+        vocab_size=64,
+        num_key_value_heads=2,
+        max_position_embeddings=128,
+        hc_count=2,
+        hc_lowrank=8,
+        head_dim=8,
+        layer_types=["linear_attention", "full_attention"],
+        ple_layer_ids=[1],
+        ple_embed_dim=32,
+        ple_conv_kernel_size=3,
+        ngram_size=3,
+        heads_per_ngram=2,
+        ngram_vocab_size_base=17,
+        make_ngram_vocab_size_divisible_by=4,
+        split_ngram_parts=4,
+        indexer_n_heads=2,
+        indexer_kv_heads=1,
+        indexer_head_dim=8,
+        indexer_budget=8,
+        indexer_compress_ratio=2,
+        eos_token_id=1,
+        rope_parameters={
+            "rope_type": "default",
+            "mrope_section": [2, 1, 1],
+            "rope_theta": 10_000,
+            "partial_rotary_factor": 1.0,
+        },
+    )
+    vision = qwen4_exp.VisionConfig(
+        model_type="qwen4_exp",
+        depth=1,
+        hidden_size=32,
+        intermediate_size=64,
+        out_hidden_size=32,
+        num_heads=4,
+        patch_size=14,
+        in_channels=3,
+        spatial_merge_size=2,
+        temporal_patch_size=2,
+        num_position_embeddings=16,
+        deepstack_visual_indexes=[],
+    )
+    config = qwen4_exp.ModelConfig(
+        text_config=text,
+        vision_config=vision,
+        model_type="qwen4_exp",
+        image_token_id=60,
+        video_token_id=61,
+        vision_start_token_id=58,
+        vision_end_token_id=59,
+        vocab_size=64,
+    )
+    return qwen4_exp.Model(config).language_model, config
+
+
+def _tiny_glm5_next():
+    apply_mlx_vlm_glm5_next_compat_patch()
+    from mlx_vlm.models import glm5_next
+    from mlx_vlm.models.glm5_next import language
+
+    text = glm5_next.TextConfig(
+        model_type="glm5_next_text",
+        vocab_size=64,
+        hidden_size=64,
+        intermediate_size=128,
+        moe_intermediate_size=32,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        n_shared_experts=1,
+        n_routed_experts=4,
+        routed_scaling_factor=2.5,
+        kv_lora_rank=32,
+        q_lora_rank=32,
+        qk_rope_head_dim=0,
+        v_head_dim=16,
+        qk_nope_head_dim=16,
+        num_experts_per_tok=2,
+        first_k_dense_replace=1,
+        max_position_embeddings=512,
+        rms_norm_eps=1e-5,
+        # Small enough that the 7- and 21-token prefixes take the sparse path.
+        index_topk=8,
+        index_head_dim=16,
+        index_n_heads=2,
+        layer_types=[
+            "linear_attention",
+            "deepseek_sparse_attention",
+            "linear_attention",
+            "deepseek_sparse_attention",
+        ],
+        mlp_layer_types=["dense", "sparse", "sparse", "sparse"],
+        linear_attn_config={
+            "num_heads": 2,
+            "head_dim": 16,
+            "short_conv_kernel_size": 4,
+            "gate_lower_bound": -5.0,
+        },
+        index_kpool=2,
+        hc_mult=2,
+        hc_sinkhorn_iters=5,
+    )
+    return language.LanguageModel(text), SimpleNamespace(
+        model_type="glm5_next", text_config=text
+    )
+
+
+def _tiny_mlx_lm_qwen3_5_moe():
+
+    mx.random.seed(7)
+    model = qwen3_5_moe.Model(
+        qwen3_5_moe.ModelArgs.from_dict(
+            {
+                "model_type": "qwen3_5_moe",
+                "hidden_size": 32,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 8,
+                "linear_num_value_heads": 4,
+                "linear_num_key_heads": 2,
+                "linear_key_head_dim": 8,
+                "linear_value_head_dim": 8,
+                "linear_conv_kernel_dim": 4,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "shared_expert_intermediate_size": 16,
+                "moe_intermediate_size": 16,
+                "vocab_size": 64,
+                "max_position_embeddings": 512,
+                "rope_parameters": {
+                    "type": "default",
+                    "mrope_section": [2, 1, 1],
+                    "rope_theta": 10000,
+                    "partial_rotary_factor": 1.0,
+                },
+            }
+        )
+    )
+    mx.eval(model.parameters())
+    return model
+
+
+def _tiny_hy_v3():
+    apply_hy_v3_patch()
+    from mlx_lm.models import hy_v3
+
+    mx.random.seed(7)
+    model = hy_v3.Model(
+        hy_v3.ModelArgs(
+            model_type="hy_v3",
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            num_experts=4,
+            num_experts_per_tok=2,
+            num_shared_experts=1,
+            expert_hidden_dim=16,
+            first_k_dense_replace=1,
+            rms_norm_eps=1e-6,
+            rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+        )
+    )
+    mx.eval(model.parameters())
+    return model
+
+
+def _tiny_vlm_adapter(builder):
+
+    mx.random.seed(7)
+    language_model, config = builder()
+    mx.eval(language_model.parameters())
+    return VLMModelAdapter(
+        SimpleNamespace(language_model=language_model, config=config)
+    )
+
+
+def _single_chunk(model, cache, tokens):
+
+    _bind_text_prefill_rope_delta(model, 0.0)
+    kwargs = (
+        {"skip_lm_head": True} if getattr(model, "supports_skip_lm_head", False) else {}
+    )
+    model(mx.array(tokens, dtype=mx.int32)[None], cache=cache, **kwargs)
+    mx.eval([c.state for c in cache])
+
+
+def _cache_with_prefix(model, tokens):
+
+    cache = make_prompt_cache(model)
+    if tokens:
+        _single_chunk(model, cache, tokens)
+    return cache
+
+
+def _cache_leaves(cache):
+    def flatten(value):
+        if isinstance(value, mx.array):
+            return [value]
+        if isinstance(value, (list, tuple)):
+            return [leaf for item in value for leaf in flatten(item)]
+        return []
+
+    return flatten([c.state for c in cache])
+
+
+def _assert_same_cache(actual, expected):
+    actual, expected = _cache_leaves(actual), _cache_leaves(expected)
+    assert len(actual) == len(expected)
+    for a, b in zip(actual, expected):
+        assert a.shape == b.shape
+        assert mx.array_equal(a, b).item()
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: _tiny_vlm_adapter(_tiny_qwen3_5),
+        lambda: _tiny_vlm_adapter(_tiny_qwen4_exp),
+        lambda: _tiny_vlm_adapter(_tiny_glm5_next),
+        _tiny_mlx_lm_qwen3_5_moe,
+        _tiny_hy_v3,
+    ],
+    ids=[
+        "qwen3_5",
+        "qwen4_exp",
+        "glm5_next",
+        "mlx_lm_qwen3_5_moe",
+        "hy_v3",
+    ],
+)
+def test_packed_prefill_matches_single_request_chunks(build):
+    """Rows at different offsets and lengths match their own single forwards."""
+
+    model = build()
+    assert install_packed_prefill(model)
+    sequences = [list(range(3, 30)), list(range(5, 40)), list(range(1, 50))]
+    rows, expected = [], []
+    for index, (sequence, prefix, length) in enumerate(
+        zip(sequences, (0, 7, 21), (5, 11, 3))
+    ):
+        chunk = sequence[prefix : prefix + length]
+        reference = _cache_with_prefix(model, sequence[:prefix])
+        _single_chunk(model, reference, chunk)
+        expected.append(reference)
+        rows.append(
+            PackedRow(
+                request_id=f"row-{index}",
+                tokens=mx.array(chunk, dtype=mx.int32)[None],
+                cache=_cache_with_prefix(model, sequence[:prefix]),
+            )
+        )
+    run_packed_prefill(model, rows)
+    for row, reference in zip(rows, expected):
+        _assert_same_cache(row.cache, reference)
+
+
+def _glm5_next_router():
+    from mlx_vlm.models.glm5_next import language
+
+    return _tiny_vlm_adapter(_tiny_glm5_next), language.Glm5NextMoEGate
+
+
+def _hy_v3_row_op(name):
+    def build():
+        model = _tiny_hy_v3()
+        from mlx_lm.models import hy_v3
+
+        return model, getattr(hy_v3, name)
+
+    return build
+
+
+@pytest.mark.parametrize(
+    "build",
+    [_glm5_next_router, _hy_v3_row_op("MoEGate"), _hy_v3_row_op("MLP")],
+    ids=["glm5_next_router", "hy_v3_router", "hy_v3_shared_mlp"],
+)
+def test_packed_row_ops_run_once_per_row(monkeypatch, build):
+    """Ops that pick kernels by row count see each row alone."""
+
+    model, op = build()
+    call = op.__call__
+    seen = []
+
+    def record(self, x):
+        seen.append(x.shape[1])
+        return call(self, x)
+
+    monkeypatch.setattr(op, "__call__", record)
+    assert install_packed_prefill(model)
+    rows = [
+        PackedRow(f"row-{n}", mx.array([list(range(3, 3 + n))], dtype=mx.int32), cache)
+        for n, cache in (
+            (5, _cache_with_prefix(model, [])),
+            (9, _cache_with_prefix(model, [])),
+        )
+    ]
+    run_packed_prefill(model, rows)
+    assert seen and set(seen) == {5, 9}
+
+
+def test_packed_min_row_tokens_keeps_exact_moe_rows_on_the_sorted_expert_gather():
+
+    def adapter(model_type, **args):
+        language_model = SimpleNamespace(args=SimpleNamespace(**args))
+        return SimpleNamespace(
+            model_type=model_type, _language_model=language_model, _vlm_model=None
+        )
+
+    # mlx's segmented gather needs 4 rows per expert: 4 * 288 / 8 routes.
+    glm = adapter("glm5_next", n_routed_experts=288, num_experts_per_tok=8)
+    assert packed_min_row_tokens(glm) == 144
+    # Qwen MoE rows differ from single chunks at any length; they keep the gain.
+    qwen = adapter("qwen4_exp", num_experts=512, num_experts_per_tok=10)
+    assert packed_min_row_tokens(qwen) == 64
+    assert packed_min_row_tokens(adapter("qwen3_5")) == 64
+    # mlx-lm models keep their config on ``args``.
+    hy = SimpleNamespace(
+        args=SimpleNamespace(model_type="hy_v3", num_experts=192, num_experts_per_tok=8)
+    )
+    assert packed_min_row_tokens(hy) == 96
+
+
+def test_packed_rows_reject_unregistered_cache_access():
+
+    batch = PackedBatch([PackedRow("a", mx.zeros((1, 2), dtype=mx.int32), [None])])
+    rows = PackedRows(batch, [None])
+    with pytest.raises(AttributeError, match="update_and_fetch"):
+        _ = rows.update_and_fetch
+    assert rows.offset == 0 and rows.left_padding is None
+
+
+def _make_packed_scheduler(step_size: int = 16):
+    model = _tiny_vlm_adapter(_tiny_qwen3_5)
+    tokenizer = MagicMock()
+    tokenizer.eos_token_id = 2
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=tokenizer,
+        config=SchedulerConfig(
+            max_num_seqs=8,
+            prefill_step_size=step_size,
+            chunked_prefill=True,
+            paged_cache_block_size=0,
+        ),
+    )
+    scheduler._qwen35_prefill_floor = 0
+    # Tiny rows stand in for full-size chunks.
+    scheduler._packed_min_row_tokens = 1
+    mock_bg = MagicMock()
+    mock_bg.insert.return_value = [42]
+    scheduler.batch_generator = mock_bg
+    scheduler._current_sampler_params = ()
+    return scheduler
+
+
+def _stage_prefill(scheduler, request_id: str, n_tokens: int, request=None):
+    request = request or _make_request(request_id, n_tokens=n_tokens)
+    request.prompt_token_ids = list(range(3, 3 + n_tokens))
+    request.remaining_tokens = list(request.prompt_token_ids)
+    scheduler.requests[request_id] = request
+    state = scheduler._begin_prefill(request, request.prompt_token_ids, None)
+    state.sampler = MagicMock()
+    state.sm = MagicMock()
+    state.per_row_lps = []
+    scheduler.prefilling.append(request)
+    scheduler._prefill_states[request_id] = state
+    return request, state
+
+
+def _record_packed_forwards(monkeypatch):
+
+    forwards = []
+    run = scheduler_module.run_packed_prefill
+
+    def record(model, rows):
+        forwards.append([(row.request_id, int(row.tokens.shape[1])) for row in rows])
+        return run(model, rows)
+
+    monkeypatch.setattr(scheduler_module, "run_packed_prefill", record)
+    return forwards
+
+
+def _record_inserted_caches(monkeypatch, scheduler):
+    inserted = {}
+    insert = scheduler._insert_prefilled_request
+
+    def record(request, state, scheduled):
+        inserted[request.request_id] = state.cache
+        return insert(request, state, scheduled)
+
+    monkeypatch.setattr(scheduler, "_insert_prefilled_request", record)
+    return inserted
+
+
+def _advance(scheduler):
+    scheduled, rejected = [], []
+    with patch("omlx.scheduler._sync_and_clear_cache"):
+        scheduler._advance_chunked_prefills(scheduled, rejected)
+    return [r.request_id for r in scheduled], rejected
+
+
+def test_packed_prefill_keeps_the_head_chunk_and_fills_the_forward(monkeypatch):
+    scheduler = _make_packed_scheduler()
+    forwards = _record_packed_forwards(monkeypatch)
+    inserted = _record_inserted_caches(monkeypatch, scheduler)
+    for request_id, n_tokens in (("a", 5), ("b", 7), ("c", 7)):
+        _stage_prefill(scheduler, request_id, n_tokens)
+    scheduled, rejected = _advance(scheduler)
+    # Rows keep the chunks they would run alone inside the head's 16 tokens.
+    assert forwards == [[("a", 4), ("b", 6), ("c", 6)]]
+    assert scheduled == ["a", "b", "c"] and rejected == []
+    model = scheduler.model
+    for request_id, n_tokens in (("a", 5), ("b", 7), ("c", 7)):
+        expected = _cache_with_prefix(model, list(range(3, 2 + n_tokens)))
+        _assert_same_cache(inserted[request_id], expected)
+    assert scheduler.get_stats()["packed_prefill"]["rows"] == 3
+
+
+def test_packed_forwards_leave_the_single_chunk_rate_alone(monkeypatch):
+    """The contended cap prices single-row chunks, which run slower per token."""
+
+    monkeypatch.setattr(scheduler_module, "_CONTENDED_CHUNK_FLOOR", 1)
+    scheduler = _make_packed_scheduler()
+    forwards = _record_packed_forwards(monkeypatch)
+    _stage_prefill(scheduler, "a", 5)
+    _stage_prefill(scheduler, "b", 7)
+    _advance(scheduler)
+    assert forwards == [[("a", 4), ("b", 6)]]
+    assert scheduler._prefill_tps_best is None
+    _stage_prefill(scheduler, "c", 7)
+    _advance(scheduler)
+    assert scheduler._prefill_tps_best is not None
+
+
+def test_packed_prefill_never_cuts_a_companion_chunk(monkeypatch):
+    scheduler = _make_packed_scheduler()
+    forwards = _record_packed_forwards(monkeypatch)
+    _stage_prefill(scheduler, "a", 9)
+    _stage_prefill(scheduler, "b", 31)
+    _stage_prefill(scheduler, "c", 6)
+    _advance(scheduler)
+    # b's 16-token chunk does not fit the 8 tokens left; c's whole chunk does.
+    assert forwards == [[("a", 8), ("c", 5)]]
+
+
+def test_contended_packed_prefill_finishes_the_shortest_rows_first(monkeypatch):
+    scheduler = _make_packed_scheduler(step_size=512)
+    forwards = _record_packed_forwards(monkeypatch)
+    monkeypatch.setattr(Scheduler, "_contended_prefill_cap", lambda self: 192)
+    for request_id, n_tokens in (("a", 201), ("b", 41), ("c", 81), ("d", 301)):
+        _stage_prefill(scheduler, request_id, n_tokens)
+    scheduled, _ = _advance(scheduler)
+    # Decode waits: b and c finish inside one 192-token chunk, the head keeps
+    # a grid step, and the longest row waits.
+    assert forwards == [[("a", 64), ("b", 40), ("c", 80)]]
+    assert scheduled == ["b", "c"]
+
+
+@pytest.mark.parametrize(
+    "head_tokens, head_chunk",
+    [
+        # The head would not finish: it keeps its grid step only.
+        (301, 64),
+        # The head would finish, but its rest is longer than b.
+        (151, 64),
+        # The head's rest is shorter than b, so both finish together.
+        (101, 100),
+    ],
+)
+def test_contended_rows_that_finish_do_not_wait_for_a_longer_head_chunk(
+    monkeypatch, head_tokens, head_chunk
+):
+    scheduler = _make_packed_scheduler(step_size=512)
+    forwards = _record_packed_forwards(monkeypatch)
+    monkeypatch.setattr(Scheduler, "_contended_prefill_cap", lambda self: 192)
+    _stage_prefill(scheduler, "a", head_tokens)
+    _stage_prefill(scheduler, "b", 41)
+    _advance(scheduler)
+    assert forwards == [[("a", head_chunk), ("b", 40)]]
+
+
+def test_packed_prefill_keeps_short_chunks_out_of_the_pack(monkeypatch):
+    scheduler = _make_packed_scheduler()
+    scheduler._packed_min_row_tokens = 6
+    forwards = _record_packed_forwards(monkeypatch)
+    for request_id, n_tokens in (("a", 9), ("b", 5), ("c", 8)):
+        _stage_prefill(scheduler, request_id, n_tokens)
+    # b's 4-token chunk would take small-row kernels in a pack: it runs alone,
+    # first, so it does not wait behind a. a and c then share one forward.
+    assert _advance(scheduler) == (["b", "a", "c"], [])
+    assert forwards == [[("a", 8), ("c", 7)]]
+
+
+def test_contended_packed_rows_get_at_least_the_packable_minimum(monkeypatch):
+    scheduler = _make_packed_scheduler(step_size=512)
+    scheduler._packed_min_row_tokens = 70
+    forwards = _record_packed_forwards(monkeypatch)
+    monkeypatch.setattr(Scheduler, "_contended_prefill_cap", lambda self: 256)
+    for request_id, n_tokens in (("a", 201), ("b", 41), ("c", 81), ("d", 301)):
+        _stage_prefill(scheduler, request_id, n_tokens)
+    # b's 40 tokens are too short to pack, so b runs alone first.
+    assert _advance(scheduler) == (["b"], [])
+    _advance(scheduler)
+    # The head keeps two grid steps (>= 70), and only c fits the 128 left.
+    assert forwards == [[("a", 128), ("c", 80)]]
+
+
+def test_late_request_joins_the_next_packed_forward(monkeypatch):
+    scheduler = _make_packed_scheduler()
+    # No decode step runs here, so fairness would hold prefills after "a".
+    scheduler._decode_fairness = False
+    forwards = _record_packed_forwards(monkeypatch)
+    _stage_prefill(scheduler, "c", 40)
+    _advance(scheduler)
+    _advance(scheduler)
+    # d arrives while c is mid-prefill and rides in c's last chunk.
+    _, d_state = _stage_prefill(scheduler, "d", 4)
+    _advance(scheduler)
+    # c ran two full 16-token chunks alone before d arrived.
+    assert forwards == [[("c", 7), ("d", 3)]]
+    assert "d" in scheduler.running
+    _assert_same_cache(
+        d_state.cache, _cache_with_prefix(scheduler.model, list(range(3, 6)))
+    )
+
+
+def test_failed_packed_forward_requeues_rows_and_disables_packing(monkeypatch):
+
+    scheduler = _make_packed_scheduler()
+
+    def fail(model, rows):
+        raise ValueError("unsupported cache access")
+
+    monkeypatch.setattr(scheduler_module, "run_packed_prefill", fail)
+    for request_id, n_tokens in (("a", 5), ("b", 7)):
+        _stage_prefill(scheduler, request_id, n_tokens)
+    assert _advance(scheduler) == ([], [])
+    assert not scheduler.prefilling and not scheduler._prefill_states
+    assert [r.request_id for r in scheduler.waiting] == ["a", "b"]
+    assert all(r.prefill_oom_retries == 0 for r in scheduler.waiting)
+    assert scheduler._packed_prefill_disabled is not None
+    assert not Scheduler._packed_prefill_ready(scheduler)
+
+
+def test_rows_of_a_pack_that_ran_out_of_memory_retry_alone(monkeypatch):
+
+    scheduler = _make_packed_scheduler()
+    run = scheduler_module.run_packed_prefill
+    packs = []
+
+    def fail_first_pack(model, rows):
+        packs.append([row.request_id for row in rows])
+        if len(packs) == 1:
+            raise MemoryError("pack does not fit")
+        return run(model, rows)
+
+    monkeypatch.setattr(scheduler_module, "run_packed_prefill", fail_first_pack)
+    sizes = {"a": 5, "b": 7}
+    requests = [_stage_prefill(scheduler, rid, n)[0] for rid, n in sizes.items()]
+    assert _advance(scheduler) == ([], [])
+    assert list(scheduler.waiting) == requests
+    # A memory failure keeps packing for other requests.
+    assert Scheduler._packed_prefill_ready(scheduler)
+    scheduler.waiting.clear()
+    states = [
+        _stage_prefill(scheduler, r.request_id, sizes[r.request_id], request=r)[1]
+        for r in requests
+    ]
+    assert _advance(scheduler) == (["a", "b"], [])
+    assert packs == [["a", "b"]]
+    assert [state.tokens_processed for state in states] == [4, 6]
+
+
+def test_rows_of_a_pack_out_of_memory_retries_fail_cleanly(monkeypatch):
+    scheduler = _make_packed_scheduler()
+
+    def fail(model, rows):
+        raise MemoryError("pack does not fit")
+
+    monkeypatch.setattr(scheduler_module, "run_packed_prefill", fail)
+    for request_id, n_tokens in (("a", 5), ("b", 7)):
+        request, _ = _stage_prefill(scheduler, request_id, n_tokens)
+        request.prefill_oom_retries = scheduler._MAX_PREFILL_OOM_RETRIES
+    scheduled, rejected = _advance(scheduler)
+    assert scheduled == [] and not scheduler.waiting
+    assert sorted(output.request_id for output in rejected) == ["a", "b"]
+    assert {output.finish_reason for output in rejected} == {"error"}
+
+
+@pytest.mark.parametrize(
+    "routes, priced_gathered", [((True, True), True), ((True, False), False)]
+)
+def test_packed_forward_with_a_dense_row_is_priced_dense(
+    monkeypatch, routes, priced_gathered
+):
+    scheduler = _make_packed_scheduler()
+    plans = []
+    for request_id, gathered in zip(("a", "b"), routes):
+        _, state = _stage_prefill(scheduler, request_id, 9)
+        plan = scheduler._plan_prefill_chunk(state, guarded=False)
+        plan.gathered_core = gathered
+        plans.append(plan)
+    priced = []
+
+    def bound(self, n_tokens, kv_len, *, gathered_core=False):
+        priced.append(gathered_core)
+        return 0
+
+    monkeypatch.setattr(Scheduler, "_adaptive_chunk_size", lambda self, n, **_: n)
+    monkeypatch.setattr(
+        Scheduler, "_prefill_abort_description", lambda self: (None, 1 << 40, None)
+    )
+    monkeypatch.setattr(Scheduler, "_current_usage_bytes", lambda self: 0)
+    monkeypatch.setattr(Scheduler, "_admission_transient_bound", bound)
+    assert scheduler._packed_prefill_fits(plans)
+    assert priced == [priced_gathered]
+
+
+def test_a_companion_that_fails_to_plan_leaves_the_head_alone(monkeypatch):
+    scheduler = _make_packed_scheduler()
+    forwards = _record_packed_forwards(monkeypatch)
+    reserve = Scheduler._reserve_prefill_capacity
+
+    def fail_for_b(self, cache, tokens, request_id):
+        if request_id == "b":
+            raise RuntimeError("cannot reserve b")
+        return reserve(self, cache, tokens, request_id)
+
+    monkeypatch.setattr(Scheduler, "_reserve_prefill_capacity", fail_for_b)
+    _stage_prefill(scheduler, "a", 9)
+    _stage_prefill(scheduler, "b", 7)
+    scheduled, rejected = _advance(scheduler)
+    # b's error surfaces on its own turn; a still prefills.
+    assert scheduled == ["a"]
+    assert [output.request_id for output in rejected] == ["b"]
+    assert forwards == []
+
+
+def test_contended_head_keeps_its_chunk_when_its_companions_drop_out(monkeypatch):
+    scheduler = _make_packed_scheduler(step_size=512)
+    forwards = _record_packed_forwards(monkeypatch)
+    monkeypatch.setattr(Scheduler, "_contended_prefill_cap", lambda self: 192)
+    monkeypatch.setattr(Scheduler, "_packed_prefill_fits", lambda self, plans: False)
+    _, a_state = _stage_prefill(scheduler, "a", 301)
+    _stage_prefill(scheduler, "b", 41)
+    _advance(scheduler)
+    assert forwards == []
+    assert a_state.tokens_processed == 192
+
+
+def test_ane_prefill_on_the_wrapped_vlm_model_disables_packing():
+    scheduler = _make_packed_scheduler()
+    assert Scheduler._packed_prefill_ready(scheduler)
+    scheduler.model._vlm_model._omlx_ane_mlp_prefill_count = 1
+    assert not Scheduler._packed_prefill_ready(scheduler)
+
+
+def test_insert_rollback_releases_drafter_rows(monkeypatch):
+    scheduler = _make_packed_scheduler()
+    drafter = MagicMock()
+    monkeypatch.setattr(scheduler_module, "_block_drafter_for", lambda model: drafter)
+    monkeypatch.setattr(
+        scheduler_module,
+        "_mark_text_positions",
+        MagicMock(side_effect=RuntimeError("positions")),
+    )
+    request, state = _stage_prefill(scheduler, "a", 5)
+    state.tokens_remaining = state.tokens_remaining[:, :0]
+    with pytest.raises(RuntimeError, match="positions"):
+        scheduler._insert_prefilled_request(request, state, [])
+    drafter.release.assert_called_once_with([42])
+
+
+def test_packed_prefill_drops_rows_that_do_not_fit(monkeypatch):
+    scheduler = _make_packed_scheduler()
+    forwards = _record_packed_forwards(monkeypatch)
+    monkeypatch.setattr(Scheduler, "_packed_prefill_fits", lambda self, plans: False)
+    _stage_prefill(scheduler, "a", 5)
+    _stage_prefill(scheduler, "b", 7)
+    # Neither runs packed. "a" ran uncontended, so b follows in the same step,
+    # as unpacked prefills do.
+    assert _advance(scheduler) == (["a", "b"], [])
+    assert forwards == []
+
+
+@pytest.mark.parametrize(
+    "a_tokens, scheduled",
+    [
+        # a's 16-token chunk fills the step.
+        (41, []),
+        # a finishes and then decodes, but its forward ran uncontended.
+        (9, ["a"]),
+    ],
+)
+def test_lone_heads_without_contention_let_later_prefills_advance(
+    monkeypatch, a_tokens, scheduled
+):
+    scheduler = _make_packed_scheduler()
+    forwards = _record_packed_forwards(monkeypatch)
+    _stage_prefill(scheduler, "a", a_tokens)
+    _, b_state = _stage_prefill(scheduler, "b", 31)
+    assert _advance(scheduler) == (scheduled, [])
+    # b's 16-token chunk does not fit next to a's, yet b still advances.
+    assert b_state.tokens_processed == 16
+    assert forwards == []
+
+
+def test_chunks_too_short_to_pack_do_not_wait_behind_a_long_head(monkeypatch):
+    scheduler = _make_packed_scheduler()
+    scheduler._packed_min_row_tokens = 6
+    forwards = _record_packed_forwards(monkeypatch)
+    order = []
+    run = Scheduler._run_prefill_chunks
+
+    def record(self, plans):
+        order.append([plan.state.request.request_id for plan in plans])
+        return run(self, plans)
+
+    monkeypatch.setattr(Scheduler, "_run_prefill_chunks", record)
+    _stage_prefill(scheduler, "a", 41)
+    _stage_prefill(scheduler, "b", 5)
+    assert _advance(scheduler) == (["b"], [])
+    assert order == [["b"], ["a"]] and forwards == []
+
+
+def test_packing_steps_aside_when_a_contended_chunk_holds_one_row(monkeypatch):
+    scheduler = _make_packed_scheduler(step_size=512)
+    scheduler._packed_min_row_tokens = 100
+    forwards = _record_packed_forwards(monkeypatch)
+    monkeypatch.setattr(Scheduler, "_contended_prefill_cap", lambda self: 192)
+    _, a_state = _stage_prefill(scheduler, "a", 301)
+    _stage_prefill(scheduler, "b", 121)
+    # A 128-token head floor and a 100-token row exceed the 192-token cap, so
+    # both prefills take one unpacked chunk each, as without packing.
+    assert _advance(scheduler) == (["b"], [])
+    assert forwards == []
+    assert a_state.tokens_processed == 192
+
+
+def test_packed_rows_emit_their_own_boundary_snapshots(monkeypatch):
+    scheduler = _make_packed_scheduler()
+    forwards = _record_packed_forwards(monkeypatch)
+    emitted = []
+    monkeypatch.setattr(
+        scheduler,
+        "_emit_prefill_boundary_snapshot",
+        lambda request, cache, total: emitted.append(
+            (request.request_id, total, cache)
+        ),
+    )
+    states = {}
+    for request_id, n_tokens in (("a", 6), ("b", 7), ("c", 31)):
+        _, state = _stage_prefill(scheduler, request_id, n_tokens)
+        state.boundary_enabled = True
+        state.block_size = 4
+        states[request_id] = state
+    _advance(scheduler)
+    assert forwards == [[("a", 4), ("b", 4), ("c", 4)]]
+    assert [(rid, total) for rid, total, _ in emitted] == [("a", 4), ("b", 4), ("c", 4)]
+    assert all(cache is states[rid].cache for rid, _, cache in emitted)
+
+
+@pytest.mark.parametrize(
+    "chunked, contended, min_row, cap_fits, excluded, packed",
+    [
+        (True, False, 1, True, False, True),
+        # Decode fairness chunks prompts under contention even when chunked
+        # prefill is off, so those prompts pack too.
+        (False, True, 1, True, False, True),
+        (False, False, 1, True, False, False),
+        (True, False, 64, True, False, False),
+        # The resumable path holds the last token back: 2 tokens < 3.
+        (True, False, 3, True, False, False),
+        (True, False, 1, False, False, False),
+        # A retry after a failed pack runs alone.
+        (True, False, 1, True, True, False),
+    ],
+)
+def test_schedule_waiting_admits_text_prompts_for_packed_prefill(
+    monkeypatch, chunked, contended, min_row, cap_fits, excluded, packed
+):
+    sched = _make_scheduler(chunked_prefill=chunked, step_size=4)
+    sched._packed_min_row_tokens = min_row
+    monkeypatch.setattr(Scheduler, "_packed_prefill_ready", lambda self: True)
+    monkeypatch.setattr(Scheduler, "_decode_contention", lambda self: contended)
+    monkeypatch.setattr(Scheduler, "_packing_fits_contended_cap", lambda self: cap_fits)
+    req = _make_request("short", n_tokens=3)
+    req.packed_prefill_excluded = excluded
+    sched.add_request(req)
+    state = _make_prefill_state(sched, req, 2)
+    aborted = _PrefillAbortedError([], 0)
+    with (
+        patch.object(sched, "_begin_prefill", return_value=state),
+        patch.object(sched, "_step_prefill_chunk") as step,
+        patch.object(sched, "_do_external_prefill", side_effect=aborted) as external,
+    ):
+        sched._schedule_waiting()
+    step.assert_not_called()
+    # Otherwise the prompt takes the regular path.
+    assert (req in sched.prefilling) is packed
+    assert (req.request_id in sched._prefill_states) is packed
+    assert external.called is not packed
+
+
+def test_packed_rows_activate_their_own_priming_slot_for_tail_snapshots(monkeypatch):
+
+    scheduler = _make_packed_scheduler()
+    _record_packed_forwards(monkeypatch)
+    events = []
+    monkeypatch.setattr(
+        scheduler_module._mtp_priming,
+        "activate_request",
+        lambda model, request_id: events.append(("activate", request_id)),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_emit_prefill_tail_snapshot",
+        lambda request, cache, total: events.append(("tail", request.request_id)),
+    )
+    for request_id, n_tokens in (("a", 9), ("b", 9)):
+        _, state = _stage_prefill(scheduler, request_id, n_tokens)
+        state.boundary_enabled = True
+        state.block_size = 64
+        state.tail_at = 5
+    _advance(scheduler)
+    for request_id in ("a", "b"):
+        # The prefill end (8 tokens) is off the 64-token grid: an end tail.
+        scheduler._prefill_states[request_id].end_tail = True
+    _advance(scheduler)
+    tails = [i for i, event in enumerate(events) if event[0] == "tail"]
+    assert [events[i][1] for i in tails] == ["a", "b", "a", "b"]
+    assert all(events[i - 1] == ("activate", events[i][1]) for i in tails)

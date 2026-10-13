@@ -182,3 +182,23 @@ def apply_mlx_vlm_mtp_runtime_patch(model_type: str | None = None) -> bool:
             logger.debug("%s MTP runtime patch did not apply", name)
 
     return applied
+
+
+def apply_external_mtp_runtime_patch() -> None:
+    """Commit external MTP cache state on the verifier stream."""
+    from functools import wraps
+
+    import mlx.core as mx
+    from mlx_vlm.speculative import mtp
+
+    original = mtp._MTPVerifyResult.commit
+    if getattr(original, "_omlx_generation_stream", False):
+        return
+
+    @wraps(original)
+    def commit(*args, **kwargs):
+        with mx.stream(mtp.generation_stream):
+            return original(*args, **kwargs)
+
+    commit._omlx_generation_stream = True
+    mtp._MTPVerifyResult.commit = commit

@@ -23,11 +23,14 @@ class _CaptureBlock:
     def __getattr__(self, name):
         return getattr(self.block, name)
 
-    def __call__(self, h, pre, cache, shared, start, image_mask):
+    def __call__(self, h, pre, cache, shared, start, image_mask, ced_tail=None):
         # Cache writes replace arrays; separate containers preserve the input
         # snapshot while the ordinary forward updates its own cache and KV map.
-        self.samples.append((h, pre, cache.extract(0), dict(shared), start, image_mask))
-        return self.block(h, pre, cache, shared, start, image_mask)
+        # ced_tail is replayed with the sample so CED tail layers keep their shape.
+        self.samples.append(
+            (h, pre, cache.extract(0), dict(shared), start, image_mask, ced_tail)
+        )
+        return self.block(h, pre, cache, shared, start, image_mask, ced_tail=ced_tail)
 
 
 @contextmanager
@@ -116,8 +119,10 @@ def measure_sensitivity(
             raise RuntimeError(f"Missing full-forward samples for V4.1 layer {index}")
 
         def forward(row, block=block):
-            h, pre, cache, shared, start, mask = row
-            return block(h, pre, cache.extract(0), dict(shared), start, mask)
+            h, pre, cache, shared, start, mask, ced_tail = row
+            return block(
+                h, pre, cache.extract(0), dict(shared), start, mask, ced_tail=ced_tail
+            )
 
         baseline = [forward(row) for row in rows]
         mx.eval(baseline)

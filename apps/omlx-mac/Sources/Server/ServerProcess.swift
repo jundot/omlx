@@ -26,6 +26,7 @@
 // PR 6) the AppView shell can react without owning the lifecycle.
 
 import Foundation
+import AppKit
 import Darwin
 
 struct AutoRestartBudget {
@@ -152,6 +153,7 @@ final class ServerProcess: @unchecked Sendable {
 
     private(set) var state: State = .stopped
     private var process: Process?
+    private(set) var startupNoticeURL: URL?
     private var logHandle: FileHandle?
     private var healthTask: Task<Void, Never>?
     private var consecutiveFailures = 0
@@ -340,7 +342,11 @@ final class ServerProcess: @unchecked Sendable {
         let proc = Process()
         proc.executableURL = runtime.executable
         proc.arguments = makeArguments()
-        proc.environment = runtime.makeEnvironment()
+        // A per-launch notice keeps Python migration and the native alert in sync.
+        var environment = runtime.makeEnvironment()
+        let noticeURL = prepareStartupNotice()
+        environment["OMLX_STARTUP_NOTICE_PATH"] = noticeURL.path
+        proc.environment = environment
         proc.standardOutput = handle
         proc.standardError  = handle
         proc.terminationHandler = { [weak self] term in
@@ -366,6 +372,7 @@ final class ServerProcess: @unchecked Sendable {
         expectingExit = false
         process = nil
         closeLog()
+        Task { @MainActor [weak self] in self?.presentStartupNotice() }
 
         if wasExpectingExit {
             update(.stopped)
@@ -419,6 +426,41 @@ final class ServerProcess: @unchecked Sendable {
 
     // MARK: - Internal — health check
 
+    func prepareStartupNotice() -> URL {
+        if let previous = startupNoticeURL {
+            try? FileManager.default.removeItem(at: previous)
+        }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omlx-startup-\(UUID().uuidString).txt")
+        startupNoticeURL = url
+        return url
+    }
+
+    @MainActor
+    func consumeStartupNotice() -> String? {
+        guard let url = startupNoticeURL,
+              let message = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        try? FileManager.default.removeItem(at: url)
+        startupNoticeURL = nil
+        bindAddress = "127.0.0.1"
+        resolver = PortConflictResolver(host: host, port: port)
+        NotificationCenter.default.post(name: Self.stateDidChangeNotification, object: self)
+        return message
+    }
+
+    @MainActor
+    private func presentStartupNotice() {
+        guard let message = consumeStartupNotice() else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Server access is now limited to this Mac"
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        alert.window.level = .floating
+        alert.runModal()
+    }
+
     private func startHealthCheckLoop() {
         cancelHealthLoop()
         healthTask = Task { @MainActor [weak self] in
@@ -444,6 +486,7 @@ final class ServerProcess: @unchecked Sendable {
             return
         }
 
+        presentStartupNotice()
         let probe = await resolver.probeHealth()
         let now = Date()
         switch state {

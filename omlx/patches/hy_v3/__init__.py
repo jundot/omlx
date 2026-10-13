@@ -81,14 +81,16 @@ def _patch_infer_tool_parser() -> None:
     if getattr(original, "_omlx_hy_v3", False):
         return
 
-    def _infer_tool_parser_with_hy_v3(chat_template):
+    def _infer_tool_parser_with_hy_v3(tokenizer):
+        # mlx-lm passes the tokenizer since #1626, not the template string.
+        chat_template = getattr(tokenizer, "chat_template", None)
         if isinstance(chat_template, str) and (
             "<tool_sep" in chat_template and "<arg_key" in chat_template
         ):
             return (
                 "hy_v3_opensource" if ":opensource" in chat_template else "hy_v3"
             )
-        return original(chat_template)
+        return original(tokenizer)
 
     _infer_tool_parser_with_hy_v3._omlx_hy_v3 = True
     tu._infer_tool_parser = _infer_tool_parser_with_hy_v3

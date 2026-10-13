@@ -76,29 +76,34 @@ def test_apply_is_idempotent():
     assert first in (True, False)
 
 
-def test_apply_prefers_upstream_module(monkeypatch):
+def test_apply_replaces_upstream_ling26_module(monkeypatch):
+    """Upstream mlx-lm's bailing_hybrid is Ling 2.6, not the vendored Ling 3.0."""
+    import mlx_lm.models as models_pkg
+
     from omlx.patches import bailing_hybrid
 
-    upstream = SimpleNamespace(_omlx_swiglu_clamp_native=True)
-    models_pkg = SimpleNamespace()
-
-    def fake_import(name):
-        if name == "mlx_lm.models.bailing_hybrid":
-            return upstream
-        if name == "mlx_lm.models":
-            return models_pkg
-        raise AssertionError(f"unexpected import: {name}")
-
-    monkeypatch.setattr(bailing_hybrid, "_APPLIED", False)
-    monkeypatch.setattr(bailing_hybrid.importlib, "import_module", fake_import)
-    monkeypatch.setattr(
-        bailing_hybrid,
-        "_register_module",
-        lambda: (_ for _ in ()).throw(AssertionError("vendored module used")),
+    upstream = SimpleNamespace(
+        __file__="/site-packages/mlx_lm/models/bailing_hybrid.py"
     )
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.bailing_hybrid", upstream)
+    monkeypatch.setattr(models_pkg, "bailing_hybrid", upstream, raising=False)
+    monkeypatch.setattr(bailing_hybrid, "_APPLIED", False)
 
-    assert bailing_hybrid.apply_bailing_hybrid_patch() is False
-    assert models_pkg.bailing_hybrid is upstream
+    assert bailing_hybrid.apply_bailing_hybrid_patch() is True
+
+    module = sys.modules["mlx_lm.models.bailing_hybrid"]
+    assert module is not upstream
+    assert module.__file__.endswith("bailing_hybrid_model.py")
+    assert models_pkg.bailing_hybrid is module
+
+
+def test_cluster_planner_judges_the_vendored_module():
+    """Upstream's Ling 2.6 module declares pipelining; Ling 3.0 does not."""
+    from omlx.cluster import planner
+
+    _load_patch_module()
+
+    assert planner._supports_pipeline(_minimal_config()) is False
 
 
 def test_apply_propagates_clamp_install_failure(monkeypatch):

@@ -38,6 +38,7 @@ from .paged_ssd_cache import (
     _fsync_parent_dir,
     _has_zero_dim,
     _restore_tensor_from_bytes,
+    _unique_tmp_path,
     _write_safetensors_no_mx,
 )
 from .pooling_delta import compact_pooling_cache_snapshot
@@ -287,7 +288,7 @@ class BoundarySnapshotSSDStore:
             # allowed to exceed the configured cap when the queue is empty;
             # this guarantees forward progress for unusually wide recurrent
             # states without allowing a second checkpoint to accumulate.
-            temp_path = file_path.with_name(file_path.stem + "_tmp.safetensors")
+            temp_path = _unique_tmp_path(file_path)
             if not self._is_safe_snapshot_path(file_path) or temp_path.is_symlink():
                 raise ValueError("unsafe boundary snapshot staging path")
             inline_write = False
@@ -944,7 +945,7 @@ class BoundarySnapshotSSDStore:
         """Write one staging file synchronously without retaining a fallback."""
         tensors_raw = pending["tensors_raw"]
         metadata = pending["metadata"]
-        temp_path = file_path.with_name(file_path.stem + "_tmp.safetensors")
+        temp_path = _unique_tmp_path(file_path)
         owns_pending = False
         wrote_file = False
         try:
@@ -1121,7 +1122,7 @@ class BoundarySnapshotSSDStore:
                 )
                 return
             file_path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path = file_path.with_name(file_path.stem + "_tmp.safetensors")
+            temp_path = _unique_tmp_path(file_path)
             if (
                 not self._is_safe_snapshot_path(file_path)
                 or temp_path.is_symlink()

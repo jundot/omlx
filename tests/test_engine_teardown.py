@@ -305,7 +305,7 @@ async def test_cancelled_wrapper_finishes_close_and_clears_references(wrapper_cl
         entered.set()
         assert release.wait(3)
 
-    wrapper = wrapper_class.__new__(wrapper_class)
+    wrapper = wrapper_class(model_name="test")
     wrapper._engine = SimpleNamespace(
         stop=AsyncMock(), engine=SimpleNamespace(close=close)
     )

@@ -304,7 +304,6 @@ class TestSSDCache:
     def test_writer_cleanup_unlink_failure(self, ssd_cache, caplog):
         key = _composite_key("model", "image")
         file_path = ssd_cache._file_path_for_key(key)
-        temp_path = file_path.with_name(file_path.stem + "_tmp.safetensors")
 
         def fail_write(path, *args):
             Path(path).write_bytes(b"partial")
@@ -320,7 +319,12 @@ class TestSSDCache:
 
         assert key not in ssd_cache._ssd_index
         assert ssd_cache._ssd_total_size == 0
-        for path in (temp_path, file_path):
+        # Temp names carry a per-writer suffix.
+        leftover_tmps = list(
+            file_path.parent.glob(f"{file_path.stem}_tmp*.safetensors")
+        )
+        assert leftover_tmps, "failed write should leave its temp file behind"
+        for path in (file_path, *leftover_tmps):
             assert path.exists()
             assert any(
                 r.levelno == logging.WARNING
@@ -632,3 +636,45 @@ class TestVLMEngineIntegration:
             "mm_token_type_ids": mm_token_type_ids,
             "token_type_ids": token_type_ids,
         }
+
+
+class TestMemoryByteLRU:
+    """Byte-budgeted memory LRU (sessions with 20+ screenshots must not
+    evict their own hot set every turn)."""
+
+    def test_evicts_by_bytes(self):
+        # 32-byte entries (16 bf16), budget for exactly 3.
+        cache = VisionFeatureSSDCache(
+            cache_dir=None,
+            max_memory_entries=1000,
+            max_memory_bytes=3 * 32,
+        )
+        try:
+            for i, h in enumerate(["h0", "h1", "h2", "h3"]):
+                cache.put(h, "m", mx.zeros((16,), dtype=mx.bfloat16))
+            assert cache.get("h0", "m") is None
+            assert cache.get("h1", "m") is not None
+            assert cache.get("h3", "m") is not None
+            assert cache._memory_bytes == 3 * 32
+        finally:
+            cache.close()
+
+    def test_overwrite_reaccounts_bytes(self):
+        cache = VisionFeatureSSDCache(
+            cache_dir=None,
+            max_memory_entries=1000,
+            max_memory_bytes=2 * 32,
+        )
+        try:
+            cache.put("h0", "m", mx.zeros((16,), dtype=mx.bfloat16))
+            # Growing the same entry past budget must not double-count.
+            cache.put("h0", "m", mx.zeros((32,), dtype=mx.bfloat16))
+            assert cache._memory_bytes == 64
+            assert cache.get("h0", "m") is not None
+            cache.put("h1", "m", mx.zeros((16,), dtype=mx.bfloat16))
+            # Budget 64: h0(64)+h1(32) overflows -> oldest (h0) evicted.
+            assert cache._memory_bytes == 32
+            assert cache.get("h0", "m") is None
+            assert cache.get("h1", "m") is not None
+        finally:
+            cache.close()

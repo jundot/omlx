@@ -295,6 +295,18 @@ class TestApplyProfile:
         mgr.apply_profile("m", "p")
         assert mgr.get_settings("m").turboquant_kv_enabled is True
 
+    def test_apply_with_mtp_toggle_owns_the_fixed_depth(self, mgr):
+        mgr.set_settings("m", ModelSettings(mtp_enabled=True, mtp_fixed_depth=4))
+        mgr.save_profile("m", "chip", "Chip", None, {"temperature": 0.5})
+        mgr.apply_profile("m", "chip")
+        assert mgr.get_settings("m").mtp_fixed_depth == 4
+
+        mgr.save_profile("m", "adaptive", "Adaptive", None, {"mtp_enabled": True})
+        mgr.apply_profile("m", "adaptive")
+        s = mgr.get_settings("m")
+        assert s.mtp_enabled is True
+        assert s.mtp_fixed_depth is None
+
     def test_apply_resolves_vlm_mtp_processor_conflict(self, tmp_path):
         manager = ModelSettingsManager(tmp_path)
         manager.set_settings(
@@ -435,7 +447,7 @@ class TestProfileFieldFiltering:
 class TestTemplatesCRUD:
     def test_list_templates_empty_by_default(self, mgr):
         # Shipped builtins were retired in favor of the client-side preset
-        # bundle (`omlx/admin/static/omlx_preset.json`); the server's
+        # bundle (`omlx_web/static/omlx_preset.json`); the server's
         # /api/profile-templates surface now exposes user templates only.
         assert mgr.list_templates() == []
 
@@ -498,7 +510,7 @@ class TestTemplatesCRUD:
 class TestTemplatesPersistence:
     """The on-disk template file holds only user-created entries. Built-in
     seed templates were retired in favor of the client-side preset bundle
-    (`omlx/admin/static/omlx_preset.json`); /api/profile-templates is now a
+    (`omlx_web/static/omlx_preset.json`); /api/profile-templates is now a
     pure user-store surface."""
 
     def test_no_file_created_when_empty(self, tmp_path):

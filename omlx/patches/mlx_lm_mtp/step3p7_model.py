@@ -452,17 +452,9 @@ def _patch_step3p5_model(step3p5: Any) -> None:
                 and "norm" in key
             ):
                 return weight
-            if is_raw_hf:
-                return weight + 1.0
-            if weight.__class__.__name__ == "_TrackedTensor" and hasattr(
-                weight, "_clone"
-            ):
-                return weight._clone(transform="add_if_mean_lt_0_5")
-            try:
-                mean = float(mx.mean(weight.astype(mx.float32)).item())
-            except Exception:
-                return weight
-            return weight + 1.0 if mean < 0.5 else weight
+            # Raw-HF shifts every zero-centered gamma by +1; an MLX-format
+            # checkpoint is loaded as stored (see #3742).
+            return weight + 1.0 if is_raw_hf else weight
 
         for k, v in mtp_weights.items():
             v = normalize_mtp_norm(k, v)

@@ -48,6 +48,10 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     var anePrefillDefaultFraction: Double? = nil
     var anePrefillMlpFractions: [Double]? = nil
     var anePrefillSharedFractions: [Double]? = nil
+    var embeddingAudioSupported: Bool? = nil
+    /// External engines that could serve this model, with why not when they
+    /// cannot. Empty for models only oMLX's own engines run.
+    var externalEngines: [ExternalEngineOption]? = nil
     /// True when the model is structurally compatible with DFlash (block
     /// diffusion speculative decoding). The toggle stays disabled when false.
     let dflashCompatible: Bool?
@@ -82,6 +86,14 @@ extension ModelDTO {
     }
 }
 
+/// One entry of `external_engines` in GET /admin/api/models.
+struct ExternalEngineOption: Codable, Equatable, Sendable, Identifiable {
+    let id: String
+    let label: String
+    let compatible: Bool
+    let reason: String?
+}
+
 struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let modelAlias: String?
     let modelTypeOverride: String?
@@ -108,6 +120,10 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let activeProfileName: String?
     // Security
     let trustRemoteCode: Bool?
+    /// External engine serving the model ("splash"); nil runs it in-process.
+    var externalEngine: String? = nil
+    var embeddingAudioEnabled: Bool? = nil
+    var embeddingAudioMaxSeconds: Double? = nil
     // Chat-template kwargs (free-form dict + a sibling list of keys the
     // user wants to *force* — those go to `forced_ct_kwargs` server-side
     // and override the request's `chat_template_kwargs`).
@@ -165,6 +181,7 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let dflashVerifyMode: String?
     // Experimental: native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     let mtpEnabled: Bool?
+    let mtpAdaptiveMaxDepth: Int?
     // Experimental: VLM MTP (mlx-vlm assistant-drafter speculative decoding)
     let vlmMtpEnabled: Bool?
     let vlmMtpDraftModel: String?
@@ -196,6 +213,9 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var isFavorite: Bool? = nil
     // Security
     var trustRemoteCode: Bool? = nil
+    var externalEngine: String?? = nil // .some(nil) sends JSON null (in-process).
+    var embeddingAudioEnabled: Bool? = nil
+    var embeddingAudioMaxSeconds: Double?? = nil // .some(nil) sends JSON null (30 s default).
     var reasoningParser: String? = nil
     // Chat-template kwargs
     var chatTemplateKwargs: [String: AnyCodable]? = nil
@@ -250,6 +270,8 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var dflashVerifyMode: String? = nil
     // Experimental: native MTP
     var mtpEnabled: Bool? = nil
+    var mtpAdaptiveMaxDepth: Int? = nil
+    var mtpFixedDepth: Int?? = nil // .some(nil) sends JSON null (adaptive).
     // Experimental: VLM MTP
     var vlmMtpEnabled: Bool? = nil
     var vlmMtpDraftModel: String? = nil

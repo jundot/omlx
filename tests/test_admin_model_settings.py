@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for load-failure invalidation in admin model settings."""
 
+import asyncio
 import copy
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 
 import omlx.server  # noqa: F401 - ensure server module is imported first
 from omlx.admin import routes as admin_routes
@@ -93,6 +95,61 @@ async def test_load_time_setting_change_clears_cached_failure():
 
 
 @pytest.mark.asyncio
+async def test_embedding_audio_setting_is_load_time():
+    pool, entry = _failed_pool()
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(embedding_audio_enabled=True),
+    )
+
+    assert settings.embedding_audio_enabled is True
+    assert entry.load_failed is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audio_enabled", [True, False])
+async def test_embedding_audio_length_is_load_time_only_with_audio(audio_enabled):
+    pool, entry = _failed_pool()
+    settings = ModelSettings(embedding_audio_enabled=audio_enabled)
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(embedding_audio_max_seconds=120),
+    )
+
+    assert settings.embedding_audio_max_seconds == 120
+    assert entry.load_failed is not audio_enabled
+
+
+@pytest.mark.asyncio
+async def test_resent_embedding_audio_settings_keep_loaded_engine():
+    pool, entry = _failed_pool()
+    entry.engine = _idle_engine()
+    entry.load_failed = False
+    pool._unload_engine = AsyncMock()
+
+    result = await _update_settings(
+        pool,
+        ModelSettings(embedding_audio_enabled=True, embedding_audio_max_seconds=120.0),
+        admin_routes.ModelSettingsRequest(
+            embedding_audio_enabled=True, embedding_audio_max_seconds=120.0
+        ),
+    )
+
+    assert result["requires_reload"] is False
+    pool._unload_engine.assert_not_awaited()
+
+
+def test_embedding_audio_length_must_be_positive():
+    with pytest.raises(ValueError):
+        admin_routes.ModelSettingsRequest(embedding_audio_max_seconds=0)
+
+
+@pytest.mark.asyncio
 async def test_unchanged_load_time_setting_keeps_cached_failure():
     pool, entry = _failed_pool()
     settings = ModelSettings(trust_remote_code=False)
@@ -159,11 +216,19 @@ async def test_qwen_ane_prefill_settings_are_persisted():
     assert result["requires_reload"] is False
 
 
+def _idle_engine() -> MagicMock:
+    engine = MagicMock()
+    engine.has_active_requests.return_value = False
+    engine.scheduler = None
+    engine._engine = None
+    return engine
+
+
 @pytest.mark.asyncio
 async def test_qwen_ane_prefill_change_unloads_a_loaded_engine():
     pool, entry = _failed_pool()
     entry.config_model_type = "qwen3_5"
-    entry.engine = MagicMock()
+    entry.engine = _idle_engine()
     entry.load_failed = False
     pool._unload_engine = AsyncMock()
 
@@ -175,7 +240,39 @@ async def test_qwen_ane_prefill_change_unloads_a_loaded_engine():
 
     assert result["requires_reload"] is True
     assert result["auto_unloaded"] is True
+    assert result["reload_deferred"] is False
     pool._unload_engine.assert_awaited_once_with("ling")
+
+
+@pytest.mark.asyncio
+async def test_reload_setting_on_busy_engine_defers_unload():
+    """A save during a benchmark run must not abort it (#3961)."""
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5"
+    entry.engine = _idle_engine()
+    entry.engine.abort_all_requests = AsyncMock()
+    entry.load_failed = False
+    entry.in_use = 1
+    pool._unload_engine = AsyncMock()
+
+    result = await _update_settings(
+        pool,
+        ModelSettings(),
+        admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
+    )
+
+    assert result["requires_reload"] is True
+    assert result["auto_unloaded"] is False
+    assert result["reload_deferred"] is True
+    assert entry.pending_unload_reason == "settings changed"
+    assert entry.abort_requested is False
+    entry.engine.abort_all_requests.assert_not_awaited()
+    pool._unload_engine.assert_not_awaited()
+
+    pending = pool._pending_unload_tasks["ling"]
+    await pool.release_engine("ling")
+    pool._unload_engine.assert_awaited_once_with("ling")
+    await asyncio.wait_for(pending, timeout=1)
 
 
 @pytest.mark.asyncio
@@ -243,6 +340,95 @@ async def test_oq_a8_alone_is_persisted():
 
     assert settings.qwen35_oq_a8_enabled is True
     assert settings.qwen35_oq_a8_min_tokens == 256
+
+
+@pytest.mark.asyncio
+async def test_oq_a8_is_accepted_for_qwen4_exp_and_keeps_min_tokens():
+    """Qwen3.8-Flash-Next shares the existing A8 setting (routed experts)."""
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen4_exp"
+    settings = ModelSettings()
+
+    with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=True):
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(
+                qwen35_oq_a8_enabled=True, qwen35_oq_a8_min_tokens=512
+            ),
+        )
+
+    assert settings.qwen35_oq_a8_enabled is True
+    assert settings.qwen35_oq_a8_min_tokens == 512
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "config_type", ["qwen4", "qwen4_exp_x", "qwen3", "qwen2", "llama", "gemma4", ""]
+)
+async def test_oq_a8_is_refused_outside_validated_families(config_type):
+    """Only the exact ``qwen4_exp`` family is added, not every ``qwen4*``."""
+    pool, entry = _failed_pool()
+    entry.config_model_type = config_type
+    settings = ModelSettings()
+
+    with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=True):
+        with pytest.raises(admin_routes.HTTPException) as excinfo:
+            await _update_settings(
+                pool,
+                settings,
+                admin_routes.ModelSettingsRequest(qwen35_oq_a8_enabled=True),
+            )
+
+    assert excinfo.value.status_code == 400
+    assert "Flash-Next" in excinfo.value.detail
+    assert settings.qwen35_oq_a8_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_oq_a8_for_qwen4_exp_still_conflicts_with_ane_prefill(tmp_path):
+    from omlx.model_settings import ModelSettingsManager
+
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen4_exp"
+    manager = ModelSettingsManager(tmp_path)
+    manager.set_settings("ling", ModelSettings())
+    before = manager.get_settings("ling").to_dict()
+    with (
+        patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+        patch.object(admin_routes, "_get_settings_manager", return_value=manager),
+        patch.object(admin_routes, "_get_server_state", return_value=MagicMock()),
+        patch.object(admin_routes, "_oq_a8_kernels_available", return_value=True),
+        pytest.raises(admin_routes.HTTPException) as excinfo,
+    ):
+        await admin_routes.update_model_settings(
+            "ling",
+            admin_routes.ModelSettingsRequest(
+                qwen35_oq_a8_enabled=True, qwen35_ane_prefill_enabled=True
+            ),
+            is_admin=True,
+        )
+    assert excinfo.value.status_code == 400
+    assert manager.get_settings("ling").to_dict() == before
+
+
+@pytest.mark.parametrize(
+    "config_type, expected",
+    [
+        ("qwen3_5", True),
+        ("qwen3_5_moe", True),
+        ("Qwen3-6", True),
+        ("qwen3_8", True),
+        ("qwen4_exp", True),
+        ("Qwen4-Exp", True),
+        ("qwen4", False),
+        ("qwen4_exp_x", False),
+        ("llama", False),
+        (None, False),
+    ],
+)
+def test_oq_a8_model_supported(config_type, expected):
+    assert admin_routes._oq_a8_model_supported(config_type) is expected
 
 
 @pytest.mark.asyncio
@@ -439,19 +625,24 @@ async def test_qwen_ane_prefill_rejects_other_model_families():
 
 
 @pytest.mark.asyncio
-async def test_mtp_draft_tokens_is_persisted_not_dropped():
-    """#2823: mtp_num_draft_tokens used to be silently discarded by PUT."""
+@pytest.mark.parametrize("depth", [3, 4, 5, 6, 8])
+async def test_mtp_draft_tokens_is_persisted_not_dropped(depth):
+    """#2823: mtp_adaptive_max_depth used to be silently discarded by PUT."""
     pool, _ = _failed_pool()
-    settings = ModelSettings(mtp_num_draft_tokens=None)
+    settings = ModelSettings(mtp_adaptive_max_depth=None, mtp_fixed_depth=2)
 
     result = await _update_settings(
         pool,
         settings,
-        admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=8),
+        admin_routes.ModelSettingsRequest(
+            mtp_adaptive_max_depth=depth, mtp_fixed_depth=None
+        ),
     )
 
-    assert settings.mtp_num_draft_tokens == 8
-    assert result["settings"]["mtp_num_draft_tokens"] == 8
+    assert settings.mtp_adaptive_max_depth == depth
+    assert result["settings"]["mtp_adaptive_max_depth"] == depth
+
+    assert settings.mtp_fixed_depth is None
 
 
 @pytest.mark.asyncio
@@ -479,15 +670,33 @@ async def test_preserve_thinking_and_turboquant_skip_last_are_persisted():
 
 
 @pytest.mark.asyncio
+async def test_mtp_fixed_depth_is_persisted_and_cleared():
+    pool, _ = _failed_pool()
+    settings = ModelSettings()
+
+    result = await _update_settings(
+        pool, settings, admin_routes.ModelSettingsRequest(mtp_fixed_depth=4)
+    )
+    assert settings.mtp_fixed_depth == 4
+    assert result["settings"]["mtp_fixed_depth"] == 4
+
+    await _update_settings(
+        pool, settings, admin_routes.ModelSettingsRequest(mtp_fixed_depth=None)
+    )
+    assert settings.mtp_fixed_depth is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["mtp_adaptive_max_depth", "mtp_fixed_depth"])
 @pytest.mark.parametrize("value", [0, 9])
-async def test_mtp_draft_tokens_rejects_out_of_range_values(value):
+async def test_mtp_depth_rejects_out_of_range_values(field, value):
     pool, _ = _failed_pool()
 
     with pytest.raises(admin_routes.HTTPException, match="must be between 1 and 8"):
         await _update_settings(
             pool,
             ModelSettings(),
-            admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=value),
+            admin_routes.ModelSettingsRequest(**{field: value}),
         )
 
 
@@ -497,7 +706,7 @@ def test_unknown_settings_fields_are_rejected_loudly():
 
     with pytest.raises(pydantic.ValidationError, match="bogus_field"):
         # Simulate a client sending a field that has no admin-PUT support.
-        admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=8, bogus_field=1)
+        admin_routes.ModelSettingsRequest(mtp_adaptive_max_depth=8, bogus_field=1)
 
 
 @pytest.mark.asyncio
@@ -518,22 +727,22 @@ async def test_turboquant_skip_last_null_preserves_default_true():
 
 
 def test_runtime_signature_gates_mtp_depth_on_lightning_mtp():
-    """mtp_num_draft_tokens must be part of the engine runtime signature only
+    """mtp_adaptive_max_depth must be part of the engine runtime signature only
     while Lightning MTP (mtp_enabled) is active (review feedback), so a depth
     change reloads a loaded engine, but a stale value never forces one."""
     from omlx.engine_pool import EnginePool
 
     pool = EnginePool()
 
-    depth_3_on = ModelSettings(mtp_enabled=True, mtp_num_draft_tokens=3)
-    depth_8_on = ModelSettings(mtp_enabled=True, mtp_num_draft_tokens=8)
-    depth_3_off = ModelSettings(mtp_enabled=False, mtp_num_draft_tokens=3)
-    depth_8_off = ModelSettings(mtp_enabled=False, mtp_num_draft_tokens=8)
+    depth_3_on = ModelSettings(mtp_enabled=True, mtp_adaptive_max_depth=3)
+    depth_8_on = ModelSettings(mtp_enabled=True, mtp_adaptive_max_depth=8)
+    depth_3_off = ModelSettings(mtp_enabled=False, mtp_adaptive_max_depth=3)
+    depth_8_off = ModelSettings(mtp_enabled=False, mtp_adaptive_max_depth=8)
 
     on_keys = {k for k, _ in pool._engine_runtime_signature("m", depth_3_on)}
-    assert "mtp_num_draft_tokens" in on_keys
+    assert "mtp_adaptive_max_depth" in on_keys
     off_keys = {k for k, _ in pool._engine_runtime_signature("m", depth_3_off)}
-    assert "mtp_num_draft_tokens" not in off_keys
+    assert "mtp_adaptive_max_depth" not in off_keys
 
     # Active MTP: different depths produce different signatures (reload).
     assert pool._engine_runtime_signature(
@@ -543,3 +752,78 @@ def test_runtime_signature_gates_mtp_depth_on_lightning_mtp():
     assert pool._engine_runtime_signature(
         "m", depth_3_off
     ) == pool._engine_runtime_signature("m", depth_8_off)
+
+
+def test_runtime_signature_reloads_qwen35_family_for_a_yarn_window():
+    pool = EnginePool()
+    pool._entries["q"] = EngineEntry(
+        model_id="q",
+        model_path="/tmp/q",
+        model_type="vlm",
+        engine_type="vlm",
+        estimated_size=1,
+        config_model_type="qwen4_exp",
+        model_context_length=262144,
+    )
+
+    def signature(window):
+        return dict(
+            pool._engine_runtime_signature(
+                "q", ModelSettings(max_context_window=window)
+            )
+        )
+
+    assert "yarn_factor" not in signature(None)
+    assert "yarn_factor" not in signature(262144)
+    assert signature(524288)["yarn_factor"] != signature(1048576)["yarn_factor"]
+
+    pool._entries["q"].config_model_type = "llama"
+    assert "yarn_factor" not in signature(1048576)
+
+
+@pytest.mark.asyncio
+async def test_parked_dflash_draft_path_does_not_block_saves(tmp_path):
+    pool, _ = _failed_pool()
+    deleted = str(tmp_path / "deleted-draft")
+    settings = ModelSettings(dflash_enabled=True, dflash_draft_model=deleted)
+
+    await _update_settings(
+        pool, settings, admin_routes.ModelSettingsRequest(temperature=0.3)
+    )
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(
+            dflash_enabled=False, dflash_draft_model=deleted
+        ),
+    )
+
+    assert settings.dflash_enabled is False
+    assert settings.dflash_draft_model == deleted
+
+
+@pytest.mark.asyncio
+async def test_enabling_dflash_over_a_deleted_draft_path_is_rejected(tmp_path):
+    pool, _ = _failed_pool()
+    deleted = str(tmp_path / "deleted-draft")
+    manager = MagicMock()
+    manager.get_settings.side_effect = lambda _: ModelSettings(
+        dflash_draft_model=deleted
+    )
+
+    with (
+        patch("omlx.admin.routes._get_engine_pool", return_value=pool),
+        patch("omlx.admin.routes._get_settings_manager", return_value=manager),
+        patch("omlx.admin.routes._get_server_state", return_value=MagicMock()),
+        patch("omlx.engine.dflash.is_dflash_compatible", return_value=(True, "")),
+    ):
+        for payload in (
+            {"dflash_enabled": True},
+            {"dflash_enabled": True, "dflash_draft_model": deleted},
+        ):
+            request = admin_routes.ModelSettingsRequest(**payload)
+            with pytest.raises(HTTPException) as exc:
+                await admin_routes.update_model_settings("ling", request, is_admin=True)
+            assert exc.value.status_code == 422
+
+    manager.set_settings.assert_not_called()

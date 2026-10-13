@@ -222,7 +222,10 @@ final class MenubarStatsPoller {
     }
 
     private let baseURL: URL
-    private let apiKey: String?
+    private var apiKey: String?
+    /// The key can be set or changed after launch (Security screen, web
+    /// dashboard), so a 401 rechecks settings.json through this loader.
+    private let apiKeyLoader: () -> String?
     private let idleInterval: TimeInterval
     private let session: URLSession
     private var task: Task<Void, Never>?
@@ -249,10 +252,12 @@ final class MenubarStatsPoller {
         baseURL: URL,
         apiKey: String?,
         interval: TimeInterval = 2.0,
-        sessionConfiguration: URLSessionConfiguration? = nil
+        sessionConfiguration: URLSessionConfiguration? = nil,
+        apiKeyLoader: @escaping () -> String? = { AppConfig.load().apiKey }
     ) {
         self.baseURL = baseURL
         self.apiKey = apiKey
+        self.apiKeyLoader = apiKeyLoader
         self.idleInterval = interval
 
         let cfg = sessionConfiguration ?? URLSessionConfiguration.default
@@ -379,15 +384,36 @@ final class MenubarStatsPoller {
     }
 
     private func fetchPublicStatus() async throws -> Stats {
-        let url = try makeURL(path: "/api/status")
-        var req = URLRequest(url: url)
+        let (data, response) = try await session.data(for: publicStatusRequest())
+
+        if let http = response as? HTTPURLResponse, http.statusCode == 401,
+           reloadAPIKey() {
+            let (authenticatedData, authenticatedResponse) = try await session.data(
+                for: publicStatusRequest()
+            )
+            try validateOK(authenticatedResponse)
+            return try JSONDecoder().decode(Stats.self, from: authenticatedData)
+        }
+        try validateOK(response)
+        return try JSONDecoder().decode(Stats.self, from: data)
+    }
+
+    private func publicStatusRequest() throws -> URLRequest {
+        var req = URLRequest(url: try makeURL(path: "/api/status"))
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         if let key = apiKey, !key.isEmpty {
             req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         }
-        let (data, response) = try await session.data(for: req)
-        try validateOK(response)
-        return try JSONDecoder().decode(Stats.self, from: data)
+        return req
+    }
+
+    /// Returns true when the configured key differs from the one in use.
+    private func reloadAPIKey() -> Bool {
+        guard let latest = apiKeyLoader(), !latest.isEmpty, latest != apiKey else {
+            return false
+        }
+        apiKey = latest
+        return true
     }
 
     private func fetchAdminStats(scope: String) async throws -> Stats {

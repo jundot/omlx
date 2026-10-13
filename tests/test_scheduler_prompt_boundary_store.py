@@ -165,6 +165,30 @@ def test_prompt_boundary_store_skips_missing_snapshot_for_snapshot_models():
     scheduler._extract_live_request_cache_for_store.assert_not_called()
 
 
+def test_prompt_boundary_store_keeps_sub_block_tail_snapshot():
+    scheduler = _scheduler()
+    prompt_tokens = list(range(3))
+    tail_tokens = prompt_tokens[:2]
+    tail_cache = [
+        {
+            "state": ("arrays-at-tail",),
+            "class_name": "ArraysCache",
+            "cache_type": "ArraysCache",
+        }
+    ]
+    scheduler._get_boundary_store_override = MagicMock(
+        return_value=(tail_tokens, tail_cache, "tail-config", {})
+    )
+
+    result = scheduler._prepare_prompt_boundary_cache_store(
+        "req-parser-stop",
+        _request(prompt_tokens),
+        uid=7,
+    )
+
+    assert result == (tail_tokens, tail_cache, "tail-config", {})
+
+
 def test_prompt_boundary_store_uses_live_cache_for_sliceable_models():
     scheduler = _scheduler()
     prompt_tokens = list(range(10))
