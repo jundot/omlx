@@ -1287,13 +1287,15 @@ class TestBatchedEnginePreparedPrompt:
     ):
         engine = self._engine()
         engine._model_settings = SimpleNamespace(specprefill_enabled=True)
-        engine._apply_chat_template = MagicMock(return_value="USER_ONLY")
-        engine._tokenizer.encode.return_value = [1, 2, 3, 4]
+        engine._apply_chat_template = MagicMock(
+            side_effect=lambda msgs, *a, **k: "|".join(m["content"] for m in msgs)
+        )
+        engine._tokenizer.encode.side_effect = lambda text: [ord(c) for c in text]
         messages = [
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "hi"},
         ]
-        prepared = ("FULL_PROMPT", list(range(10)))
+        prepared = ("FULL_PROMPT", [ord(c) for c in "sys|hi"])
 
         if streaming:
             _ = [
@@ -1308,10 +1310,10 @@ class TestBatchedEnginePreparedPrompt:
             generation = engine._engine.generate.call_args.kwargs
 
         assert generation["prompt"] == prepared[1]
-        assert generation["specprefill_system_end"] == 6
-        engine._apply_chat_template.assert_called_once()
-        assert engine._apply_chat_template.call_args.args[0] == messages[1:]
-        engine._tokenizer.encode.assert_called_once_with("USER_ONLY")
+        # probes diverge right after "sys|"
+        assert generation["specprefill_system_end"] == 4
+        for call in engine._tokenizer.encode.call_args_list:
+            assert call.args[0] != "FULL_PROMPT"
 
 class TestBatchedEngineMoeOffloadWiring:
     """The text engine's offload call must carry the Lightning MTP residency flag.
