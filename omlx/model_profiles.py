@@ -83,6 +83,7 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "dflash_draft_sink_size",
     "dflash_block_size",
     "dflash_verify_mode",
+    "dflash_fallback_cooldown_secs",
     "mtp_enabled",
     "mtp_adaptive_max_depth",
     "mtp_fixed_depth",
