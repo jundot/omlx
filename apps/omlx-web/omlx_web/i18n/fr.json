@@ -397,6 +397,7 @@
   "models.queue.downloading": "Téléchargement en cours...",
   "models.queue.cancel_tooltip": "Annuler le téléchargement",
   "models.queue.remove_tooltip": "Supprimer de la liste",
+  "models.queue.copy_model_name_tooltip": "Copier le nom du modèle",
   "models.oq.section_label": "Quantification",
   "models.oq.heading": "Quantification oQ",
   "models.oq.description": "Quantifiez les modèles en utilisant la stratégie de précision mixte oQ pour une meilleure qualité à bas bits.",

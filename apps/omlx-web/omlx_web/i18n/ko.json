@@ -397,6 +397,7 @@
   "models.queue.downloading": "다운로드 중...",
   "models.queue.cancel_tooltip": "다운로드 취소",
   "models.queue.remove_tooltip": "목록에서 제거",
+  "models.queue.copy_model_name_tooltip": "모델 이름 복사",
   "models.oq.section_label": "양자화",
   "models.oq.heading": "oQ 양자화",
   "models.oq.description": "oQ 혼합 정밀도 전략으로 모델을 양자화하여 낮은 비트에서 더 높은 품질을 달성합니다.",
