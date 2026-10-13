@@ -231,6 +231,64 @@ def _target_precision_tag(
     return _canonical_precision_tag(Path(str(target_name).rstrip("/")).name)
 
 
+def _draft_dir_with_model_shards(draft_path: str) -> str:
+    """Return a directory whose weights mlx-lm's loader can find.
+
+    dflash-mlx loads the draft through ``mlx_lm.utils.load_model``, which
+    only globs ``model*.safetensors``. Drafts shipped inside a target's
+    repository (e.g. nativ-community's ``<model>/dflash``) keep their weights
+    under another name such as ``dflash_draft_model.safetensors`` next to a
+    ``model.safetensors.index.json``. Mirror such a directory with symlinks
+    under the cache dir, adding ``model*.safetensors`` links for the files
+    the index maps, and load from there. Hub ids and conforming directories
+    are returned unchanged.
+    """
+    src = Path(str(draft_path)).expanduser()
+    if not src.is_dir() or any(src.glob("model*.safetensors")):
+        return str(draft_path)
+    index = src / "model.safetensors.index.json"
+    shards: list[Path] = []
+    if index.is_file():
+        try:
+            weight_map = json.loads(index.read_text()).get("weight_map") or {}
+            shards = sorted({src / name for name in weight_map.values()})
+        except (OSError, ValueError, AttributeError):
+            shards = []
+    if not shards:
+        shards = sorted(src.glob("*.safetensors"))
+    shards = [s for s in shards if s.is_file()]
+    if not shards:
+        return str(draft_path)
+    from ..settings import get_settings
+
+    mirror = (
+        Path(get_settings().base_path)
+        / "cache"
+        / "dflash_drafts"
+        / (src.parent.name + "__" + src.name)
+    )
+    mirror.mkdir(parents=True, exist_ok=True)
+    for item in src.iterdir():
+        link = mirror / item.name
+        if not link.exists() and not link.is_symlink():
+            link.symlink_to(item)
+    for i, shard in enumerate(shards):
+        name = (
+            "model.safetensors"
+            if len(shards) == 1
+            else f"model-{i + 1:05d}-of-{len(shards):05d}.safetensors"
+        )
+        link = mirror / name
+        if not link.exists() and not link.is_symlink():
+            link.symlink_to(shard)
+    logger.info(
+        "DFlash draft %s has no model*.safetensors; loading via mirror %s",
+        src,
+        mirror,
+    )
+    return str(mirror)
+
+
 def check_draft_target_precision_pairing(
     target_name: str,
     target_config: dict | None,
@@ -822,7 +880,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         exc_info=True,
                     )
             draft, draft_meta = load_draft_bundle(
-                self._draft_model_path,
+                _draft_dir_with_model_shards(self._draft_model_path),
                 draft_quant=(
                     self._build_quant_spec(
                         self._draft_quant_weight_bits,
