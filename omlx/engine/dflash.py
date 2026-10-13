@@ -21,6 +21,7 @@ import threading
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import mlx.core as mx
@@ -1495,6 +1496,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         min_p: float = 0.0,
         repetition_penalty: float = 1.0,
         repetition_context_size: int = 20,
+        prefix_cache_request: Any | None = None,
+        prefix_cache_chat_template_kwargs: dict[str, Any] | None = None,
     ):
         """Build the dflash event iterator with prefix cache plumbed in."""
         from dflash_mlx.runtime import stream_dflash_generate
@@ -1508,20 +1511,22 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         # ``model_key`` is consumed as a tuple where index 0 = target id and
         # index 2 = draft id; the middle slot is unused on the dflash side.
         # ``tokenizer`` and ``cli_args`` are required since dflash-mlx 1ba6713 —
-        # build_prefix_key hashes the chat template / policy. cli_args=None
-        # makes chat_template_args fall back to {}.
+        # build_prefix_key hashes the chat template / policy.
         class _ModelProviderShim:
             model_key = (self._model_name, None, self._draft_model_path)
             model = self._target_model
             target_ops = self._target_ops
             tokenizer = self._executor_tokenizer
-            cli_args = None
+            cli_args = SimpleNamespace(
+                chat_template_args=prefix_cache_chat_template_kwargs or {}
+            )
 
         prefix_flow = PrefixCacheFlow.for_request(
             model_provider=_ModelProviderShim(),
             draft_model=self._draft_model,
             tokenizer=self._executor_tokenizer,
             prompt=prompt_tokens,
+            request=prefix_cache_request,
             max_new_tokens=max_tokens,
             runtime_context=self._runtime_context,
         )
@@ -1606,6 +1611,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         queue: asyncio.Queue,
         loop: asyncio.AbstractEventLoop,
         stop_event: threading.Event,
+        prefix_cache_request: Any | None = None,
+        prefix_cache_chat_template_kwargs: dict[str, Any] | None = None,
     ) -> None:
         """Run dflash generation with streaming on MLX executor thread.
 
@@ -1633,6 +1640,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 min_p=min_p,
                 repetition_penalty=repetition_penalty,
                 repetition_context_size=repetition_context_size,
+                prefix_cache_request=prefix_cache_request,
+                prefix_cache_chat_template_kwargs=prefix_cache_chat_template_kwargs,
             )
             cache_manager = self._begin_runtime_cache_request()
             self._record_prefill_guard_active_memory()
@@ -1789,6 +1798,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         if not self._loaded:
             await self.start()
 
+        prefix_cache_request = kwargs.pop("prefix_cache_request", None)
+        prefix_cache_chat_template_kwargs = kwargs.pop(
+            "prefix_cache_chat_template_kwargs", None
+        )
         prompt_tokens = self._tokenize_prompt(prompt)
 
         # Fallback: evict dflash models, start LLM/VLM engine
@@ -1866,6 +1879,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     min_p=min_p,
                     repetition_penalty=repetition_penalty,
                     repetition_context_size=int(repetition_context_size),
+                    prefix_cache_request=prefix_cache_request,
+                    prefix_cache_chat_template_kwargs=prefix_cache_chat_template_kwargs,
                 )
                 cache_manager = self._begin_runtime_cache_request()
                 self._record_prefill_guard_active_memory()
@@ -2028,6 +2043,10 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         if not self._loaded:
             await self.start()
 
+        prefix_cache_request = kwargs.pop("prefix_cache_request", None)
+        prefix_cache_chat_template_kwargs = kwargs.pop(
+            "prefix_cache_chat_template_kwargs", None
+        )
         prompt_tokens = self._tokenize_prompt(prompt)
 
         # Fallback: evict dflash models, start LLM/VLM engine
@@ -2118,6 +2137,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 queue,
                 loop,
                 stop_event,
+                prefix_cache_request,
+                prefix_cache_chat_template_kwargs,
             )
         except Exception:
             self._unregister_stop_event(stop_event)
@@ -2262,6 +2283,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             is_partial=is_partial,
         )
 
+        prefix_cache_request = SimpleNamespace(request_type="chat", messages=messages)
         return await self.generate(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -2272,6 +2294,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
             tools=tools,
+            prefix_cache_request=prefix_cache_request,
+            prefix_cache_chat_template_kwargs=ct_kwargs,
             **kwargs,
         )
 
@@ -2342,6 +2366,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             is_partial=is_partial,
         )
 
+        prefix_cache_request = SimpleNamespace(request_type="chat", messages=messages)
         async for output in self.stream_generate(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -2352,6 +2377,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
             tools=tools,
+            prefix_cache_request=prefix_cache_request,
+            prefix_cache_chat_template_kwargs=ct_kwargs,
             **kwargs,
         ):
             yield output
