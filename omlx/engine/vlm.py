@@ -74,6 +74,8 @@ from .base import (
     _close_engine_core,
     _run_scheduler_preflight_with_cleanup_retry,
     _warn_scheduler_unreachable_once,
+    log_effective_prefill_step_size,
+    resolve_prefill_step_size,
 )
 
 logger = logging.getLogger(__name__)
@@ -2528,6 +2530,9 @@ class VLMBatchedEngine(BaseEngine):
             if self._scheduler_config
             else SchedulerConfig()
         )
+        resolve_prefill_step_size(
+            scheduler_config, self._model_settings, self._model_name
+        )
         scheduler_config.moe_offload_active = bool(moe_offload_wrapped)
         if (
             self._adapter.model_type == "deepseek_v41"
@@ -2559,6 +2564,7 @@ class VLMBatchedEngine(BaseEngine):
 
         # TurboQuant KV cache
         scheduler = self._engine.engine.scheduler
+        log_effective_prefill_step_size(scheduler, self._model_name)
         scheduler.moe_offload_stats = offload_stats
         scheduler.moe_offload_release = offload_release
         scheduler.moe_offload_restore = offload_restore

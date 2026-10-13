@@ -1545,6 +1545,28 @@
                             </div>
                         </template>
 
+                        <!-- Prefill chunk size -->
+                        <div class="px-4 py-3.5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 sm:gap-6">
+                            <div class="min-w-0">
+                                <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.prefill_step_size') }}</span>
+                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.prefill_step_size_hint') }}</p>
+                            </div>
+                            <select x-model="modelSettings.prefill_step_size" class="{{ ms_field_short }}">
+                                <option :value="null">{{ t('modal.model_settings.prefill_step_size_auto') }}</option>
+                                <option value="256">256</option>
+                                <option value="512">512</option>
+                                <option value="1024">1024</option>
+                                <!-- On glm_moe_dsa / minimax_m3* an explicit 2048 and Automatic are
+                                     provably the same thing: both leave config.prefill_step_size at
+                                     2048, both satisfy the != 2048 adaptive-widening gate, so both
+                                     run the widened 8192 / 4096. Offering it would only add a
+                                     guaranteed-false label (#3381). -->
+                                <template x-if="!PREFILL_WIDENING_MODEL_TYPES.has(selectedModel?.config_model_type || '')">
+                                    <option value="2048">2048</option>
+                                </template>
+                            </select>
+                        </div>
+
                         <!-- SpecPrefill -->
                         <div class="px-4 py-3.5 space-y-3">
                             <div class="flex items-start justify-between gap-3">
