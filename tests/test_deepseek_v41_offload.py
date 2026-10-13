@@ -414,6 +414,109 @@ def test_source_iterator_releases_mappings_before_yield(converted, monkeypatch):
         stream.close()
 
 
+def source_plan(converted):
+    """The source checkpoint and its index, for the read-ahead tests."""
+    source = converted.parent / "source"
+    config = json.loads((source / "config.json").read_text())
+    mapping = json.loads((source / "model.safetensors.index.json").read_text())[
+        "weight_map"
+    ]
+    return source, config, mapping
+
+
+def drain_source(source, config, mapping):
+    """Every tensor iter_source_weights yields, materialised for comparison."""
+    from omlx.patches.deepseek_v41 import convert as converter
+
+    drained = []
+    stream = converter.iter_source_weights(source, config, mapping)
+    try:
+        for values, specs in stream:
+            mx.eval(values)
+            drained.append(
+                ({name: np.asarray(value) for name, value in values.items()}, specs)
+            )
+    finally:
+        stream.close()
+    return drained
+
+
+def test_source_iterator_read_ahead_matches_serial_tensors(converted, monkeypatch):
+    from omlx.patches.deepseek_v41 import convert as converter
+
+    source, config, mapping = source_plan(converted)
+    monkeypatch.setattr(converter, "LOAD_IO_WORKERS", 1)
+    serial = drain_source(source, config, mapping)
+    monkeypatch.setattr(converter, "LOAD_IO_WORKERS", 4)
+    parallel = drain_source(source, config, mapping)
+
+    assert len(serial) == len(parallel) > 1
+    for (expected, expected_specs), (actual, actual_specs) in zip(serial, parallel):
+        assert expected_specs == actual_specs
+        assert list(expected) == list(actual)
+        for name, value in expected.items():
+            np.testing.assert_array_equal(value, actual[name])
+
+
+def test_source_iterator_read_ahead_releases_mappings_before_yield(
+    converted, monkeypatch
+):
+    from omlx.patches.deepseek_v41 import convert as converter
+
+    source, config, mapping = source_plan(converted)
+    readers, threads = [], []
+    original = converter.TensorFile
+
+    def open_reader(path):
+        reader = original(path)
+        readers.append(reader)
+        threads.append(current_thread().name)
+        return reader
+
+    monkeypatch.setattr(converter, "TensorFile", open_reader)
+    stream = converter.iter_source_weights(source, config, mapping)
+    try:
+        for values, _ in stream:
+            # Read-ahead must not widen the mapping window past the yield.
+            assert readers and all(reader._mapping is None for reader in readers)
+            mx.eval(values)
+    finally:
+        stream.close()
+    assert any(name.startswith("v41-load-io") for name in threads)
+
+
+def test_source_iterator_read_ahead_surfaces_worker_errors(converted, monkeypatch):
+    from omlx.patches.deepseek_v41 import convert as converter
+
+    source, config, mapping = source_plan(converted)
+    original_cls = converter.TensorFile
+    original_read = original_cls.read
+    readers, failed = [], []
+
+    def open_reader(path):
+        reader = original_cls(path)
+        readers.append(reader)
+        return reader
+
+    def read(self, key, *args, **kwargs):
+        if ".ffn.experts." in key:
+            failed.append(key)
+            raise ValueError("synthetic expert read failure")
+        return original_read(self, key, *args, **kwargs)
+
+    monkeypatch.setattr(original_cls, "read", read)
+    monkeypatch.setattr(converter, "TensorFile", open_reader)
+    stream = converter.iter_source_weights(source, config, mapping)
+    try:
+        with pytest.raises(ValueError, match="synthetic expert read failure"):
+            for values, _ in stream:
+                mx.eval(values)
+    finally:
+        stream.close()
+    assert failed
+    assert readers and all(reader._mapping is None for reader in readers)
+
+
 def test_residency_tracks_stored_head_precision(converted):
     before = deepseek_v41_residency_estimate(converted)
     mapping = json.loads((converted / "model.safetensors.index.json").read_text())[
