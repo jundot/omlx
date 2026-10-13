@@ -2080,7 +2080,7 @@
                                     </div>
                                     <div class="relative">
                                         <select @change="selectProfileOption($event.target.value)"
-                                            class="w-full px-3 py-2 text-xs border border-line rounded-lg font-medium cursor-pointer appearance-none focus:outline-none focus:border-line-strong transition-colors bg-surface-muted hover:bg-surface-alt"
+                                            class="select-chevron-custom w-full px-3 py-2 text-xs border border-line rounded-lg font-medium cursor-pointer appearance-none focus:outline-none focus:border-line-strong transition-colors bg-surface-muted hover:bg-surface-alt"
                                             style="color: var(--text-primary);">
                                             <template x-for="p in promptProfiles" :key="p.name">
                                                 <option :value="p.name" :selected="p.name === activePromptProfile"
@@ -2673,7 +2673,7 @@
                     <label class="block text-xs font-bold uppercase tracking-wider text-fg-tertiary mb-2">{{ t('chat.theme_label') }}</label>
                     <select @change="setTheme($event.target.value)" x-model="theme"
                         class="w-full px-3 py-2 border border-line rounded-xl text-sm focus:outline-none focus:border-line-strong"
-                        style="background: var(--bg-primary); color: var(--text-primary);">
+                        style="background-color: var(--bg-primary); color: var(--text-primary);">
                         <option value="auto">{{ t('navbar.theme.auto') }}</option>
                         <option value="light">{{ t('navbar.theme.light_mode') }}</option>
                         <option value="dark">{{ t('navbar.theme.dark_mode') }}</option>

@@ -295,3 +295,22 @@
     --timeline-accent: rgb(var(--palette-blue-400));
     --focus-ring-color: rgb(var(--palette-night-50));
 }
+
+/* === Native select controls ===
+   Safari pins the native dropdown arrow to the right border, so it reads as
+   cramped against the edge. Drop the native arrow and draw a chevron inset
+   12px from the right, matching the custom lucide chevrons used elsewhere.
+   Selects that already render their own chevron (.select-chevron-custom) are
+   skipped so they do not get a double arrow. */
+select:not([multiple]):not([size]):not(.select-chevron-custom) {
+    -webkit-appearance: none;
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='16'%20height='16'%20viewBox='0%200%2024%2024'%20fill='none'%20stroke='%2364748b'%20stroke-width='2'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Cpath%20d='m6%209%206%206%206-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.75rem center;
+    background-size: 1rem 1rem;
+    padding-right: 2.25rem;
+}
+[data-theme="dark"] select:not([multiple]):not([size]):not(.select-chevron-custom) {
+    background-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='16'%20height='16'%20viewBox='0%200%2024%2024'%20fill='none'%20stroke='%23a1a1aa'%20stroke-width='2'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Cpath%20d='m6%209%206%206%206-6'/%3E%3C/svg%3E");
+}
