@@ -427,18 +427,20 @@ def enable(model_path: str | Path) -> None:
     """
     global _wired_restore
     key = _dir_key(model_path)
+    # The wired limit is process wide: change it under the same lock as the
+    # set of mapped models, so a concurrent unload cannot restore it while
+    # another mapped model is loading.
     with _lock:
         _install()
         first = not _enabled_dirs
         _enabled_dirs.add(key)
-    if first:
-        try:
-            previous = int(mx.set_wired_limit(0))
-        except Exception:  # noqa: BLE001
-            previous = 0
-        _wired_restore = previous
-        if previous:
-            logger.info("Mapped weights: MLX wired limit lifted while loaded")
+        if first:
+            try:
+                _wired_restore = int(mx.set_wired_limit(0))
+            except Exception:  # noqa: BLE001
+                _wired_restore = 0
+    if first and _wired_restore:
+        logger.info("Mapped weights: MLX wired limit lifted while loaded")
 
 
 def disable(model_path: str | Path) -> None:
@@ -449,13 +451,12 @@ def disable(model_path: str | Path) -> None:
         if key not in _enabled_dirs:
             return
         _enabled_dirs.discard(key)
-        last = not _enabled_dirs
-    if last and _wired_restore:
-        try:
-            mx.set_wired_limit(_wired_restore)
-        except Exception:  # noqa: BLE001
-            logger.debug("restoring the wired limit failed", exc_info=True)
-        _wired_restore = None
+        if not _enabled_dirs and _wired_restore:
+            try:
+                mx.set_wired_limit(_wired_restore)
+            except Exception:  # noqa: BLE001
+                logger.debug("restoring the wired limit failed", exc_info=True)
+            _wired_restore = None
 
 
 def is_enabled(model_path: str | Path) -> bool:
@@ -516,8 +517,10 @@ def _refresh_resident() -> None:
     try:
         value = resident_mapped_bytes()
     except Exception:  # noqa: BLE001
-        logger.debug("mincore sample failed", exc_info=True)
-        value = mapped_bytes()
+        # Unmeasured pages get no credit: the guard counts resident mapped
+        # pages as reclaimable, so guessing high would overstate headroom.
+        logger.warning("mincore sample of mapped weights failed", exc_info=True)
+        value = 0
     with _lock:
         _resident.update(bytes=value, at=time.monotonic(), running=False)
 

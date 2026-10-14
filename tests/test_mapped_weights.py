@@ -246,3 +246,86 @@ def test_cached_resident_sample(tmp_path, monkeypatch):
     total = mw.mapped_bytes()
     assert 0 < mw.cached_resident_mapped_bytes() <= total
     assert 0 < mw.resident_mapped_bytes() <= total
+
+
+def test_failed_resident_sample_grants_no_headroom(tmp_path, monkeypatch):
+    path = tmp_path / "model.safetensors"
+    _write_misaligned(path, _weights())
+    mw.realign_model(tmp_path, mode="in_place")
+    mw.enable(tmp_path)
+    loaded = mx.load(str(path))  # noqa: F841 - keeps the mapping alive
+
+    def boom():
+        raise OSError("mincore unavailable")
+
+    monkeypatch.setattr(mw, "resident_mapped_bytes", boom)
+    mw._refresh_resident()
+    assert mw.mapped_bytes() > 0
+    assert mw._resident["bytes"] == 0
+    assert mw.cached_resident_mapped_bytes() == 0
+
+
+def test_concurrent_load_and_unload_never_leave_a_mapped_model_wired(
+    tmp_path, monkeypatch
+):
+    import threading
+
+    state = {"limit": 7 << 30}
+
+    def slow_wired(limit):
+        previous = state["limit"]
+        time.sleep(0.02)  # widen the window an unlocked update would race in
+        state["limit"] = limit
+        return previous
+
+    monkeypatch.setattr(mx, "set_wired_limit", slow_wired)
+    for _ in range(20):
+        mw.enable(tmp_path / "a")
+        threads = [
+            threading.Thread(target=mw.disable, args=(tmp_path / "a",)),
+            threading.Thread(target=mw.enable, args=(tmp_path / "b",)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # b is mapped, so the limit must be lifted.
+        assert mw.is_enabled(tmp_path / "b")
+        assert state["limit"] == 0
+        mw.disable(tmp_path / "b")
+        assert state["limit"] == 7 << 30
+
+
+def test_interrupted_in_place_realign_leaves_every_shard_readable(
+    tmp_path, monkeypatch
+):
+    weights = _weights()
+    first = tmp_path / "model-00001-of-00002.safetensors"
+    second = tmp_path / "model-00002-of-00002.safetensors"
+    _write_misaligned(first, weights)
+    _write_misaligned(second, {"z." + k: v for k, v in weights.items()})
+    second_before = second.read_bytes()
+
+    real_rewrite = mw.rewrite_aligned
+    calls = {"n": 0}
+
+    def failing_rewrite(src, dst, progress=None):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            with open(dst, "wb") as f:
+                f.write(b"partial")
+            raise OSError("No space left on device")
+        real_rewrite(src, dst, progress)
+
+    monkeypatch.setattr(mw, "rewrite_aligned", failing_rewrite)
+    with pytest.raises(OSError, match="No space"):
+        mw.realign_model(tmp_path, mode="in_place")
+
+    assert not list(tmp_path.glob("*" + mw._TMP_SUFFIX))
+    assert second.read_bytes() == second_before
+    _assert_same(mx.load(str(first)), weights)
+    _assert_same(mx.load(str(second)), {"z." + k: v for k, v in weights.items()})
+    # Retrying finishes the job.
+    monkeypatch.setattr(mw, "rewrite_aligned", real_rewrite)
+    mw.realign_model(tmp_path, mode="in_place")
+    assert mw.check_alignment(tmp_path).aligned
