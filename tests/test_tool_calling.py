@@ -5720,6 +5720,40 @@ def test_xml_union_parameter_preserves_declared_value_type(
     assert validate_json_schema(arguments, schema)[0]
 
 
+@pytest.mark.parametrize(
+    "spec, raw, expected",
+    [
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "123", "123"),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "true", "true"),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, '{"a": 1}', '{"a": 1}'),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, '"123"', "123"),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "null", None),
+        ({"anyOf": [{"type": "string"}]}, "123", "123"),
+        ({"oneOf": [{"type": "string"}, {"type": "object"}]}, '{"a": 1}', {"a": 1}),
+        (
+            {"anyOf": [{"type": "array"}, {"type": "null"}]},
+            "[true, null]",
+            [True, None],
+        ),
+        ({"anyOf": [{"type": "integer"}, {"type": "null"}]}, "7", 7),
+    ],
+)
+def test_xml_union_keyword_parameter_keeps_declared_alternatives(spec, raw, expected):
+    """The oneOf/anyOf alternatives bound what an XML value may decode to."""
+    schema = {"type": "object", "properties": {"v": spec}, "required": ["v"]}
+    tools = [{"function": {"name": "f", "parameters": schema}}]
+    _, calls = parse_tool_calls(
+        f"<tool_call><function=f><parameter=v>{raw}</parameter></function></tool_call>",
+        TestNakedQwenFollowup.tokenizer(),
+        tools,
+    )
+    assert calls and len(calls) == 1
+    arguments = json.loads(calls[0].function.arguments)
+    assert arguments["v"] == expected
+    assert type(arguments["v"]) is type(expected)
+    assert validate_json_schema(arguments, schema)[0]
+
+
 @pytest.mark.parametrize("types", [["unknown"], [None], []])
 def test_invalid_union_type_declarations_keep_best_effort_parsing(types):
     assert _coerce_param_value("123", "v", {"v": {"type": types}}, "f") == 123
