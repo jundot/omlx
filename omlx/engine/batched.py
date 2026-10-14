@@ -308,6 +308,7 @@ class BatchedEngine(BaseEngine):
         maybe_apply_pre_load_patches(
             self._model_name, model_settings=self._model_settings
         )
+        self._enable_mapped_weights()
 
         # Load model on the global MLX executor to avoid blocking the event loop
         # while ensuring no concurrent Metal operations. See issue #85.
@@ -891,9 +892,7 @@ class BatchedEngine(BaseEngine):
             false_attrs=("_grammar_compiler_init_attempted",),
         )
         self._loaded = False
-        from ..utils import mapped_weights
-
-        mapped_weights.disable(self._model_name)
+        self._disable_mapped_weights()
         logger.info("BatchedEngine stopped")
         if cancelled:
             raise asyncio.CancelledError

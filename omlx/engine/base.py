@@ -251,6 +251,33 @@ class BaseEngine(ABC):
 
         return False
 
+    def _enable_mapped_weights(self) -> None:
+        """Map this engine's weights if its settings ask for it (before load).
+
+        Remembers that it did, so ``stop`` releases exactly what this engine
+        took: another engine may map the same directory (one path discovered
+        under two model IDs) and must keep its mapping.
+        """
+        if getattr(self, "_mapped_weights_dir", None) is not None:
+            return
+        settings = getattr(self, "_model_settings", None)
+        if not getattr(settings, "mapped_weights_enabled", False):
+            return
+        from ..utils import mapped_weights
+
+        mapped_weights.enable(self._model_name)
+        self._mapped_weights_dir = self._model_name
+
+    def _disable_mapped_weights(self) -> None:
+        """Release the mapping taken by ``_enable_mapped_weights`` (on stop)."""
+        path = getattr(self, "_mapped_weights_dir", None)
+        if path is None:
+            return
+        from ..utils import mapped_weights
+
+        mapped_weights.disable(path)
+        self._mapped_weights_dir = None
+
     def _generation_prompt_text(
         self,
         chat_template_kwargs: Optional[Dict[str, Any]],

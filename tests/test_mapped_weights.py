@@ -26,8 +26,8 @@ def _reset(monkeypatch):
 
     monkeypatch.setattr(mx, "set_wired_limit", fake_wired)
     yield calls
-    for key in list(mw._enabled_dirs):
-        mw.disable(key)
+    while mw._enabled_dirs:
+        mw.disable(next(iter(mw._enabled_dirs)))
     mw._files.clear()
 
 
@@ -466,3 +466,45 @@ def test_model_swap_does_not_inherit_residency(tmp_path, monkeypatch):
             break
         time.sleep(0.01)
     assert mw.cached_resident_mapped_bytes() > 0
+
+
+def test_shared_directory_is_reference_counted(tmp_path, _reset):
+    calls = _reset
+    path = tmp_path / "model.safetensors"
+    _write_misaligned(path, _weights())
+    mw.realign_model(tmp_path, mode="in_place")
+    # Two model IDs for one path (an HF snapshot discovered twice).
+    mw.enable(tmp_path)
+    mw.enable(tmp_path)
+    mw.disable(tmp_path)
+    assert mw.is_enabled(tmp_path)
+    loaded = mx.load(str(path))  # noqa: F841 - keeps the mapping alive
+    assert mw.mapped_bytes() > 0
+    assert calls == [0]  # wired limit still lifted
+    mw.disable(tmp_path)
+    assert not mw.is_enabled(tmp_path)
+    assert calls == [0, 7 << 30]
+
+
+def test_engines_release_only_their_own_mapping(tmp_path):
+    from types import SimpleNamespace
+
+    from omlx.engine.base import BaseEngine
+
+    def engine(mapped):
+        return SimpleNamespace(
+            _model_name=str(tmp_path),
+            _model_settings=SimpleNamespace(mapped_weights_enabled=mapped),
+        )
+
+    mapped_a, mapped_b, plain = engine(True), engine(True), engine(False)
+    for e in (mapped_a, mapped_b, plain):
+        BaseEngine._enable_mapped_weights(e)
+    assert mw._enabled_dirs[mw._dir_key(tmp_path)] == 2
+    # A plain engine on the same path stopping must not unmap the others.
+    BaseEngine._disable_mapped_weights(plain)
+    BaseEngine._disable_mapped_weights(mapped_a)
+    BaseEngine._disable_mapped_weights(mapped_a)  # stop() twice is harmless
+    assert mw.is_enabled(tmp_path)
+    BaseEngine._disable_mapped_weights(mapped_b)
+    assert not mw.is_enabled(tmp_path)

@@ -2070,6 +2070,7 @@ class VLMBatchedEngine(BaseEngine):
             raise
         except Exception as e:
             logger.debug(f"pre-load patches skipped: {e}")
+        self._enable_mapped_weights()
 
         # Load VLM model on the global MLX executor to avoid blocking the event loop
         # while ensuring no concurrent Metal operations. See issue #85.
@@ -2975,9 +2976,7 @@ class VLMBatchedEngine(BaseEngine):
                     logger.warning(f"Error closing engine: {e}")
         self._diffusion_cancel_events = set()
         self._diffusion_active_requests = 0
-        from ..utils import mapped_weights
-
-        mapped_weights.disable(self._model_name)
+        self._disable_mapped_weights()
         logger.info("VLMBatchedEngine stopped")
         if cancelled:
             raise asyncio.CancelledError

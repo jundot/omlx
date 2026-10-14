@@ -350,7 +350,8 @@ class _MappedFile:
 
 
 _lock = threading.Lock()
-_enabled_dirs: set[str] = set()
+# Model directory -> number of loaded engines that mapped it.
+_enabled_dirs: dict[str, int] = {}
 _files: dict[str, list[_MappedFile]] = {}
 _original_load: Callable[..., Any] | None = None
 _wired_restore: int | None = None
@@ -462,7 +463,7 @@ def enable(model_path: str | Path) -> None:
     with _lock:
         _install()
         first = not _enabled_dirs
-        _enabled_dirs.add(key)
+        _enabled_dirs[key] = _enabled_dirs.get(key, 0) + 1
         if first:
             try:
                 _wired_restore = int(mx.set_wired_limit(0))
@@ -473,13 +474,20 @@ def enable(model_path: str | Path) -> None:
 
 
 def disable(model_path: str | Path) -> None:
-    """Stop mapping loads from ``model_path`` (call on unload)."""
+    """Release one engine's mapping of ``model_path`` (call on unload).
+
+    Directories are reference counted: two model IDs can resolve to the same
+    path, and unloading one must not unmap the other.
+    """
     global _wired_restore
     key = _dir_key(model_path)
     with _lock:
         if key not in _enabled_dirs:
             return
-        _enabled_dirs.discard(key)
+        _enabled_dirs[key] -= 1
+        if _enabled_dirs[key] > 0:
+            return
+        del _enabled_dirs[key]
         if not _enabled_dirs and _wired_restore:
             try:
                 mx.set_wired_limit(_wired_restore)

@@ -561,13 +561,6 @@ def maybe_apply_pre_load_patches(
             model_type=_config_model_type(model_name),
         )
 
-    from . import mapped_weights
-
-    if getattr(model_settings, "mapped_weights_enabled", False):
-        mapped_weights.enable(model_name)
-    else:
-        mapped_weights.disable(model_name)
-
     if getattr(model_settings, "moe_expert_offload_enabled", False):
         from ..patches.moe_offload_compat import moe_offload_compatibility
 
