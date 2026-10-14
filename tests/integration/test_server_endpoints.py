@@ -1298,6 +1298,43 @@ class TestChatCompletionEndpoint:
         data = response.json()
         assert data["usage"]["prompt_tokens_details"]["cached_tokens"] == 2048
 
+    @pytest.mark.parametrize(
+        ("text", "prompt_opens", "expected_reasoning"),
+        [
+            ("Still weighing the options", True, "Still weighing the options"),
+            ("<think>Still weighing the options", False, "Still weighing the options"),
+            ("A plain answer.", False, None),
+        ],
+    )
+    def test_chat_completion_reports_reasoning_that_never_closed(
+        self, client, mock_llm_engine, monkeypatch, text, prompt_opens, expected_reasoning
+    ):
+        """A reply that stops inside its thinking block keeps the visible
+        fallback in content and also reports it as reasoning (#4233)."""
+        import omlx.server as server
+
+        monkeypatch.setattr(
+            server,
+            "prompt_opens_thinking",
+            lambda *args, **kwargs: (prompt_opens, "<think>"),
+        )
+        mock_llm_engine.chat = AsyncMock(
+            return_value=MockGenerationOutput(text=text, finish_reason="stop")
+        )
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
+
+        assert response.status_code == 200
+        message = response.json()["choices"][0]["message"]
+        assert message["content"] == text.replace("<think>", "")
+        assert message.get("reasoning_content") == expected_reasoning
+
     def test_chat_completion_sanitizes_reasoning_tool_call_markup(
         self, client, mock_llm_engine
     ):

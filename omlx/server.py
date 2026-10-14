@@ -176,7 +176,12 @@ from .api.decisions import (
 )
 from .api.decisions_models import DecisionRequest
 from .api.systemone_models import SystemOneRequest
-from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
+from .api.thinking import (
+    ThinkingParser,
+    extract_thinking,
+    prompt_opens_thinking,
+    unclosed_thinking,
+)
 from .api.tool_calling import (
     ToolCallExtraction,
     ToolCallStreamSegment,
@@ -5093,6 +5098,15 @@ async def create_chat_completion(
                             pass
 
             finish_reason = "tool_calls" if tool_calls else output.finish_reason
+            if (
+                not cleaned_thinking
+                and not tool_calls
+                and cleaned_text
+                and output.finish_reason == "stop"
+            ):
+                cleaned_thinking = _unclosed_chat_thinking(
+                    engine, messages, chat_kwargs, raw_text
+                ) or cleaned_thinking
 
             return ChatCompletionResponse(
                 model=request.model,
@@ -5852,6 +5866,26 @@ def _copy_chat_template_messages(messages: list) -> list:
     return [
         dict(message) if isinstance(message, dict) else message for message in messages
     ]
+
+
+def _unclosed_chat_thinking(
+    engine: BaseEngine, messages: list, kwargs: dict, raw_text: str
+) -> str:
+    """Reasoning of a non-streamed reply that stopped inside its thinking block."""
+    found = unclosed_thinking(raw_text)
+    if found or "<think>" in raw_text or getattr(engine, "tokenizer", None) is None:
+        return found
+    try:
+        prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
+            engine, messages, kwargs
+        )
+        opened, _ = prompt_opens_thinking(
+            engine.tokenizer, prompt, prompt_token_ids=prompt_token_ids
+        )
+    except Exception as exc:
+        logger.debug("Could not detect chat thinking state: %s", exc)
+        return ""
+    return unclosed_thinking(raw_text, prompt_opened=opened)
 
 
 def _render_chat_prompt_for_thinking_detection(

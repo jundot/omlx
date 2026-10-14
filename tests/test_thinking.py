@@ -3,7 +3,7 @@
 
 import pytest
 
-from omlx.api.thinking import ThinkingParser, extract_thinking
+from omlx.api.thinking import ThinkingParser, extract_thinking, unclosed_thinking
 
 
 class TestExtractThinking:
@@ -452,3 +452,30 @@ def test_truncated_stream_flushes_partial_tag_only_as_thinking(prompt_opened):
     assert parser.feed(prefix + "unfinished</thi") == ("unfinished", "")
     assert parser.finish(truncated=True) == ("</thi", "")
     assert parser.finish(truncated=True) == ("", "")
+
+
+@pytest.mark.parametrize(
+    ("text", "prompt_opened", "expected"),
+    [
+        ("<think>still reasoning", False, "still reasoning"),
+        ("<mm:think>still reasoning", False, "still reasoning"),
+        ("still reasoning", True, "still reasoning"),
+        ("plain answer", False, ""),
+        ("<think>done</think>answer", False, ""),
+        ("done</think>answer", True, ""),
+        ("", True, ""),
+    ],
+)
+def test_unclosed_thinking(text, prompt_opened, expected):
+    assert unclosed_thinking(text, prompt_opened=prompt_opened) == expected
+
+
+def test_unclosed_thinking_matches_streaming_recovery():
+    """Non-streaming reports what streaming emits on both channels."""
+    parser = ThinkingParser(start_in_thinking=True)
+    streamed_thinking, streamed_content = parser.feed("still reasoning")
+    tail_thinking, tail_content = parser.finish()
+    assert (streamed_thinking + tail_thinking).strip() == unclosed_thinking(
+        "still reasoning", prompt_opened=True
+    )
+    assert (streamed_content + tail_content).strip() == "still reasoning"
