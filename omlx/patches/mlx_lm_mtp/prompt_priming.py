@@ -329,14 +329,36 @@ def _flat_cache_entries(cache: List[Any]):
             yield from subs
 
 
+def _token_position(entry: Any) -> Optional[int]:
+    """``entry``'s position in source tokens, matching ``cluster/telemetry``.
+
+    ``PoolingCache.offset`` reports pooled rows rather than tokens; its
+    logical token position is ``_pool_len * ratio + remainder`` (the same
+    reconstruction :mod:`omlx.cluster.telemetry` uses so a unit mismatch
+    cannot masquerade as a valid hit). Caches that report tokens through
+    ``offset`` directly fall back to :func:`_read_offset`.
+    """
+    ratio = getattr(entry, "ratio", None)
+    remainder = getattr(entry, "remainder", None)
+    pooled = getattr(entry, "_pool_len", None)
+    if all(isinstance(value, int) for value in (ratio, remainder, pooled)):
+        return int(pooled) * int(ratio) + int(remainder)
+    return _read_offset(entry)
+
+
 def _cache_at_offset(cache: List[Any], target: int) -> Optional[List[Any]]:
-    """Return a detached, exactly trimmed MTP cache or fail closed."""
+    """Return a detached, exactly trimmed MTP cache or fail closed.
+
+    Comparisons and the final validation use token positions; ``trim``
+    already consumes tokens, so pooled heads must not be compared by their
+    row count (issue #4471).
+    """
     if target < 0 or not cache:
         return None
     cloned = _clone_mtp_cache(cache)
     saw_offset = False
     for entry in _flat_cache_entries(cloned):
-        current = _read_offset(entry)
+        current = _token_position(entry)
         if current is None:
             continue
         saw_offset = True
@@ -347,7 +369,7 @@ def _cache_at_offset(cache: List[Any], target: int) -> Optional[List[Any]]:
             trim = getattr(entry, "trim", None)
             if not callable(trim) or int(trim(extra)) != extra:
                 return None
-        if _read_offset(entry) != target:
+        if _token_position(entry) != target:
             return None
     return cloned if saw_offset else None
 

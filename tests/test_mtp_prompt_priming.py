@@ -1368,3 +1368,61 @@ def test_generation_scope_uses_uids_after_realignment(monkeypatch):
     monkeypatch.setattr(prompt_priming, "decode_scope", capture_scope)
     with pytest.raises(ScopeReachedError):
         GenerationBatch.next(batch)
+
+
+class _TokenCache:
+    """Minimal token-count cache entry with KVCache offset/trim semantics."""
+
+    def __init__(self, offset: int):
+        self.offset = offset
+        self.trimmed = 0
+
+    def trim(self, n: int) -> int:
+        self.offset -= n
+        self.trimmed = n
+        return n
+
+
+class TestCacheAtOffsetPoolingUnits:
+    """``_cache_at_offset`` must compare token positions, not pooled rows.
+
+    ``PoolingCache.offset`` reports pooled rows (``_pool_len``), while the
+    snapshot target is a token count. A ratio-4 head whose token position
+    passed the boundary reports roughly ``target / 4``, so the raw-offset
+    compare made both publish and restore fail closed on prompt-cache hits
+    (issue #4471). Mirror the ``cluster/telemetry.py`` conversion,
+    ``pooled * ratio + remainder``, for the comparison and for the final
+    validation, and hand ``trim`` a token delta as it already expects.
+    """
+
+    @staticmethod
+    def _pooled_head():
+        from omlx.patches.deepseek_v4.cache_extras import PoolingCache
+
+        pool = PoolingCache(ratio=4)
+        # A head folded 35 source tokens: 8 completed windows + remainder 3.
+        pool._pool_len = 8
+        pool.remainder = 3
+        return pool
+
+    def test_token_position_past_target_publishes_snapshot(self):
+        cache = [_TokenCache(35), self._pooled_head()]
+        result = prompt_priming._cache_at_offset(cache, 33)
+        assert result is not None
+        kv, pool = result
+        assert kv.offset == 33
+        assert pool._pool_len == 8 and pool.remainder == 1
+
+    def test_row_count_coincidence_fails_closed(self):
+        # 35-token head, target 8: the pooled row count happens to equal the
+        # token target. The raw compare used to accept this and hand back a
+        # snapshot whose pool half still sat at a different token position.
+        cache = [_TokenCache(35), self._pooled_head()]
+        assert prompt_priming._cache_at_offset(cache, 8) is None
+
+    def test_plain_token_caches_keep_previous_behaviour(self):
+        cache = [_TokenCache(10)]
+        result = prompt_priming._cache_at_offset(cache, 6)
+        assert result is not None
+        assert result[0].offset == 6
+        assert prompt_priming._cache_at_offset([_TokenCache(10)], 11) is None
