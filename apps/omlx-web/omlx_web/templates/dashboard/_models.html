@@ -802,6 +802,14 @@
                                                 <div class="flex-1 min-w-0">
                                                     <div class="flex items-center gap-2 flex-wrap">
                                                         <span class="text-sm font-medium text-neutral-900 truncate" x-text="task.repo_id"></span>
+                                                        <button x-show="task.status === 'completed'" x-cloak x-data="{ copied: false }"
+                                                                @click.stop="copyToClipboard(queueModelName(task.repo_id)); copied = true; setTimeout(() => copied = false, 2000)"
+                                                                class="p-1 rounded-md transition-all flex-shrink-0"
+                                                                :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
+                                                                :title="window.t('models.queue.copy_model_name_tooltip')">
+                                                            <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                                            <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                                        </button>
                                                         <span class="badge uppercase tracking-wider shrink-0"
                                                               :class="{
                                                                   'bg-blue-50 text-blue-700 border border-blue-200': task.status === 'downloading',
@@ -836,14 +844,6 @@
                                                     </template>
                                                 </div>
                                                 <div class="flex items-center gap-2 ml-4 shrink-0">
-                                                    <button x-show="task.status === 'completed'" x-cloak x-data="{ copied: false }"
-                                                            @click.stop="copyToClipboard(queueModelName(task.repo_id)); copied = true; setTimeout(() => copied = false, 2000)"
-                                                            class="p-1 rounded-md transition-all flex-shrink-0"
-                                                            :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
-                                                            :title="window.t('models.queue.copy_model_name_tooltip')">
-                                                        <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                                                        <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-                                                    </button>
                                                     <button x-show="task.status === 'downloading' || task.status === 'pending'" x-cloak
                                                             @click="cancelHFDownload(task.task_id)"
                                                             class="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
@@ -1256,6 +1256,14 @@
                                                             <div class="flex-1 min-w-0">
                                                                 <div class="flex items-center gap-2 flex-wrap">
                                                                     <span class="text-sm font-medium text-neutral-900 truncate" x-text="task.repo_id"></span>
+                                                                    <button x-show="task.status === 'completed'" x-cloak x-data="{ copied: false }"
+                                                                            @click.stop="copyToClipboard(queueModelName(task.repo_id)); copied = true; setTimeout(() => copied = false, 2000)"
+                                                                            class="p-1 rounded-md transition-all flex-shrink-0"
+                                                                            :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
+                                                                            :title="window.t('models.queue.copy_model_name_tooltip')">
+                                                                        <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                                                        <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                                                    </button>
                                                                     <span class="badge uppercase tracking-wider shrink-0"
                                                                           :class="{
                                                                               'bg-blue-50 text-blue-700 border border-blue-200': task.status === 'downloading',
@@ -1290,14 +1298,6 @@
                                                                 </template>
                                                             </div>
                                                             <div class="flex items-center gap-2 ml-4 shrink-0">
-                                                                <button x-show="task.status === 'completed'" x-cloak x-data="{ copied: false }"
-                                                                        @click.stop="copyToClipboard(queueModelName(task.repo_id)); copied = true; setTimeout(() => copied = false, 2000)"
-                                                                        class="p-1 rounded-md transition-all flex-shrink-0"
-                                                                        :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
-                                                                        :title="window.t('models.queue.copy_model_name_tooltip')">
-                                                                    <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                                                                    <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-                                                                </button>
                                                                 <button x-show="task.status === 'downloading' || task.status === 'pending'" x-cloak
                                                                         @click="cancelMSDownload(task.task_id)"
                                                                         class="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
