@@ -391,8 +391,9 @@ def _load_mapped(path: str) -> tuple[dict[str, mx.array], dict[str, str]]:
     key = _dir_key(Path(path).parent)
     with _lock:
         _files.setdefault(key, []).append(
-            _MappedFile(weakref.ref(mm), mapped, _merge_spans(spans))
+            _MappedFile(weakref.ref(mm, _mappings_changed), mapped, _merge_spans(spans))
         )
+        _mappings_changed()
     if copied:
         logger.warning(
             "%s: %.2f GB mapped, %.2f GB copied (misaligned tensors)",
@@ -512,7 +513,19 @@ def mapped_bytes() -> int:
 
 _PAGE = 16384
 _libc = None
-_resident = {"bytes": 0, "at": 0.0, "running": False}
+_resident = {"bytes": 0, "at": 0.0, "running": False, "generation": -1}
+# Bumped whenever a mapping appears or is released (weakref callback). A
+# residency sample is only valid for the generation it measured, so a model
+# swap never inherits the previous model's resident pages.
+_generation = [0]
+
+
+def _mappings_changed(_ref: object = None) -> None:
+    # Weakref callbacks can run while _lock is held; a lost increment is
+    # harmless because any increment invalidates the cached sample.
+    _generation[0] += 1
+
+
 _RESIDENT_MAX_AGE = 1.0
 
 
@@ -521,27 +534,33 @@ def cached_resident_mapped_bytes() -> int:
 
     ``mincore`` costs ~20 ms per GB mapped, too slow for the memory guard's
     poll, so the guard reads this cached value and a short-lived thread
-    refreshes it when it is older than a second. Until the first sample
-    lands nothing is assumed resident, the conservative side for the guard.
+    refreshes it when it is older than a second. Until a sample of the
+    current set of mappings lands (first load, or after any model maps or
+    releases weights) nothing is assumed resident, the conservative side for
+    the guard.
     """
     total = mapped_bytes()
     if not total:
         return 0
     now = time.monotonic()
     with _lock:
-        stale = now - _resident["at"] > _RESIDENT_MAX_AGE
+        current = _resident["generation"] == _generation[0]
+        stale = not current or now - _resident["at"] > _RESIDENT_MAX_AGE
         start = stale and not _resident["running"]
         if start:
             _resident["running"] = True
-        first = _resident["at"] == 0.0
+        value = min(_resident["bytes"], total) if current else 0
     if start:
         threading.Thread(
             target=_refresh_resident, name="mapped-weights-mincore", daemon=True
         ).start()
-    return 0 if first else min(_resident["bytes"], total)
+    return value
 
 
 def _refresh_resident() -> None:
+    # Tag the sample with the generation it started from: if mappings change
+    # mid-measurement the tag is already stale and the next read re-samples.
+    generation = _generation[0]
     try:
         value = resident_mapped_bytes()
     except Exception:  # noqa: BLE001
@@ -550,7 +569,9 @@ def _refresh_resident() -> None:
         logger.warning("mincore sample of mapped weights failed", exc_info=True)
         value = 0
     with _lock:
-        _resident.update(bytes=value, at=time.monotonic(), running=False)
+        _resident.update(
+            bytes=value, at=time.monotonic(), running=False, generation=generation
+        )
 
 
 def _span_bytes_per_page(spans: list[tuple[int, int]], pages: int) -> np.ndarray:

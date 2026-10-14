@@ -432,3 +432,37 @@ def test_copy_needs_room_for_the_whole_directory(tmp_path, monkeypatch):
     monkeypatch.setattr(mw.shutil, "disk_usage", lambda p: usage._replace(free=free))
     report = mw.check_alignment(tmp_path)
     assert not report.can_realign_copy
+
+
+def test_model_swap_does_not_inherit_residency(tmp_path, monkeypatch):
+    """Model A is sampled, unloaded, and model B (same size) is loaded
+    within the sample's max age: B must not be credited A's resident pages."""
+    monkeypatch.setattr(mw, "_RESIDENT_MAX_AGE", 60.0)
+    dirs = {}
+    for name in ("a", "b"):
+        d = tmp_path / name
+        d.mkdir()
+        _write_misaligned(d / "model.safetensors", _weights())
+        mw.realign_model(d, mode="in_place")
+        dirs[name] = d
+
+    mw.enable(dirs["a"])
+    a = mx.load(str(dirs["a"] / "model.safetensors"))
+    mw._refresh_resident()
+    assert mw.cached_resident_mapped_bytes() > 0
+
+    del a
+    mx.synchronize()
+    mw.disable(dirs["a"])
+    mw.enable(dirs["b"])
+    b = mx.load(str(dirs["b"] / "model.safetensors"))  # noqa: F841
+    # Same mapped size as A and a sample younger than its max age: only the
+    # generation tells the sample belongs to A.
+    assert mw.mapped_bytes() == sum(v.nbytes for v in _weights().values())
+    assert mw.cached_resident_mapped_bytes() == 0
+
+    for _ in range(200):
+        if mw._resident["generation"] == mw._generation[0]:
+            break
+        time.sleep(0.01)
+    assert mw.cached_resident_mapped_bytes() > 0
