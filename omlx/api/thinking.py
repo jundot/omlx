@@ -142,7 +142,9 @@ def prompt_opens_thinking(
     return True, think_tag
 
 
-def extract_thinking(text: str, *, truncated: bool = False) -> Tuple[str, str]:
+def extract_thinking(
+    text: str, *, truncated: bool = False, prompt_opened: bool = False
+) -> Tuple[str, str]:
     """Extract thinking and content from complete text.
 
     Handles:
@@ -158,6 +160,10 @@ def extract_thinking(text: str, *, truncated: bool = False) -> Tuple[str, str]:
       visible answer would be empty.
 
     With ``truncated=True``, unfinished thinking stays in the thinking channel.
+    When the chat template already opened the thinking block in the prompt
+    (``prompt_opened=True``), the output never contains ``<think>``, so a
+    truncated, tag-free output is all thinking and nothing is returned as
+    content.
 
     Tag-free text is always classified as content. Mirrors
     ``ThinkingParser.finish()`` recovery semantics (`_content_emitted`
@@ -167,6 +173,7 @@ def extract_thinking(text: str, *, truncated: bool = False) -> Tuple[str, str]:
     Args:
         text: Complete model output text.
         truncated: Keep unfinished thinking in its channel on length termination.
+        prompt_opened: The prompt already ends inside an open thinking block.
 
     Returns:
         Tuple of (thinking_content, regular_content).
@@ -180,6 +187,9 @@ def extract_thinking(text: str, *, truncated: bool = False) -> Tuple[str, str]:
         .replace(_HY3_OPEN_TAG, _OPEN_TAG)
         .replace(_HY3_CLOSE_TAG, _CLOSE_TAG)
     )
+
+    if truncated and prompt_opened and _OPEN_TAG not in text and _CLOSE_TAG not in text:
+        return (text.strip(), "")
 
     thinking_parts = []
     remaining = text

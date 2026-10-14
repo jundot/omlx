@@ -445,6 +445,26 @@ def test_extract_truncated_thinking_preserves_channels(text, expected):
     assert extract_thinking(text, truncated=True) == expected
 
 
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        # template opened the block in the prompt: no <think> in the output
+        ("Thinking Process: still going", ("Thinking Process: still going", "")),
+        ("reasoning</think>partial answer", ("reasoning", "partial answer")),
+        ("<think>explicit</think>answer", ("explicit", "answer")),
+    ],
+)
+def test_extract_truncated_prompt_opened_thinking(text, expected):
+    assert extract_thinking(text, truncated=True, prompt_opened=True) == expected
+
+
+def test_extract_prompt_opened_is_inert_without_truncation():
+    # a model that stops on its own without closing still gets its text back
+    text = "Thinking Process: all there is"
+    assert extract_thinking(text, prompt_opened=True) == ("", text)
+    assert extract_thinking(text, truncated=True) == ("", text)
+
+
 @pytest.mark.parametrize("prompt_opened", [False, True])
 def test_truncated_stream_flushes_partial_tag_only_as_thinking(prompt_opened):
     parser = ThinkingParser(start_in_thinking=prompt_opened)
