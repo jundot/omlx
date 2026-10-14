@@ -127,6 +127,7 @@ from .api.openai_models import (
     CompletionChoice,
     CompletionRequest,
     CompletionResponse,
+    CompletionTokensDetails,
     DetokenizeRequest,
     DetokenizeResponse,
     ModelInfo,
@@ -5093,6 +5094,11 @@ async def create_chat_completion(
                             pass
 
             finish_reason = "tool_calls" if tool_calls else output.finish_reason
+            reasoning_token_count = (
+                len(engine.tokenizer.encode(cleaned_thinking))
+                if cleaned_thinking
+                else 0
+            )
 
             return ChatCompletionResponse(
                 model=request.model,
@@ -5114,6 +5120,9 @@ async def create_chat_completion(
                     total_tokens=output.prompt_tokens + output.completion_tokens,
                     prompt_tokens_details=PromptTokensDetails(
                         cached_tokens=output.cached_tokens,
+                    ),
+                    completion_tokens_details=CompletionTokensDetails(
+                        reasoning_tokens=reasoning_token_count,
                     ),
                     model_load_duration=(
                         round(model_load_duration, 2)
@@ -6103,6 +6112,10 @@ async def stream_chat_completion(
     first_visible_time = None
     last_output = None
     accumulated_text = ""
+    # Reasoning deltas leave through several branches (live parser deltas, the
+    # parser/filter flush, withheld-envelope recovery), so the reasoning text
+    # the client receives is accumulated where each delta is emitted.
+    accumulated_reasoning = ""
     has_tools = bool(kwargs.get("tools"))
     start_in_thinking = False
     try:
@@ -6242,6 +6255,7 @@ async def stream_chat_completion(
                         ],
                     )
                     if thinking_delta:
+                        accumulated_reasoning += thinking_delta
                         event = (
                             f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
                         )
@@ -6375,6 +6389,7 @@ async def stream_chat_completion(
             if thinking_filter:
                 thinking_delta = thinking_filter.feed(thinking_delta)
             if thinking_delta:
+                accumulated_reasoning += thinking_delta
                 chunk = ChatCompletionChunk(
                     id=response_id,
                     model=request.model,
@@ -6393,6 +6408,7 @@ async def stream_chat_completion(
         if thinking_filter:
             remaining_thinking = thinking_filter.finish()
             if remaining_thinking:
+                accumulated_reasoning += remaining_thinking
                 chunk = ChatCompletionChunk(
                     id=response_id,
                     model=request.model,
@@ -6524,6 +6540,7 @@ async def stream_chat_completion(
         tool_failure = None
     if not tool_calls and not tool_failure:
         if recovered_thinking:
+            accumulated_reasoning += recovered_thinking
             chunk = ChatCompletionChunk(
                 id=response_id,
                 model=request.model,
@@ -6724,6 +6741,11 @@ async def stream_chat_completion(
             total_time = end_time - start_time
             pt = last_output.prompt_tokens
             ct = last_output.completion_tokens
+            reasoning_token_count = (
+                len(engine.tokenizer.encode(accumulated_reasoning))
+                if accumulated_reasoning
+                else 0
+            )
             usage_chunk = ChatCompletionChunk(
                 id=response_id,
                 model=request.model,
@@ -6734,6 +6756,9 @@ async def stream_chat_completion(
                     total_tokens=pt + ct,
                     prompt_tokens_details=PromptTokensDetails(
                         cached_tokens=last_output.cached_tokens,
+                    ),
+                    completion_tokens_details=CompletionTokensDetails(
+                        reasoning_tokens=reasoning_token_count,
                     ),
                     model_load_duration=(
                         round(model_load_duration, 2)

@@ -1458,6 +1458,206 @@ class TestChatCompletionEndpoint:
             assert "tools" not in recorded_chat_kwargs[0]
 
 
+class TestChatCompletionUsageReasoningTokens:
+    """Chat usage reports reasoning tokens for thinking models (#4449)."""
+
+    _THINKING_TEXT = "<think>Need to reason.</think>Hello!"
+    _WEATHER_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the weather.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+            },
+        },
+    }
+
+    @staticmethod
+    def _stream_events(response):
+        return [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+
+    def _stream_reasoning_and_usage(self, response):
+        events = self._stream_events(response)
+        reasoning = "".join(
+            event["choices"][0].get("delta", {}).get("reasoning_content") or ""
+            for event in events
+            if event["choices"]
+        )
+        usage = next(event["usage"] for event in events if event.get("usage"))
+        return reasoning, usage
+
+    def test_nonstream_usage_reports_reasoning_tokens(self, client, mock_llm_engine):
+        mock_llm_engine.chat = AsyncMock(
+            return_value=MockGenerationOutput(
+                text=self._THINKING_TEXT,
+                prompt_tokens=3,
+                completion_tokens=6,
+                finish_reason="stop",
+                finished=True,
+            )
+        )
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["choices"][0]["message"]["reasoning_content"] == "Need to reason."
+        assert data["usage"]["completion_tokens_details"]["reasoning_tokens"] == 3
+
+    @pytest.mark.parametrize(
+        "text,expected_reasoning,expected_tokens",
+        [
+            ("<think>Need to reason.</think>Hello!", "Need to reason.", 3),
+            # The parser can also flush a buffered partial tag as thinking.
+            ("Hello<think>Need to reason <thi", "Need to reason <thi", 4),
+        ],
+    )
+    def test_stream_usage_reports_reasoning_tokens(
+        self, client, mock_llm_engine, text, expected_reasoning, expected_tokens
+    ):
+        async def stream_chat(messages, **kwargs):
+            yield MockGenerationOutput(
+                text=text,
+                new_text=text,
+                prompt_tokens=3,
+                completion_tokens=6,
+                finish_reason="stop",
+                finished=True,
+            )
+
+        mock_llm_engine.stream_chat = stream_chat
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
+        )
+
+        assert response.status_code == 200
+        reasoning, usage = self._stream_reasoning_and_usage(response)
+        assert reasoning == expected_reasoning
+        assert usage["completion_tokens_details"]["reasoning_tokens"] == expected_tokens
+
+    @pytest.mark.parametrize(
+        "text,tool_call_markers",
+        [
+            # A completed envelope in the thinking channel is withheld from the
+            # client, a marker quoted in prose is recovered at end of stream,
+            # and an IFM group is only flushed once the stream finishes.
+            (
+                "<think>Let me check "
+                '<tool_call>{"name": "get_weather", "arguments": {"city": "SF"}}'
+                "</tool_call> Now.</think>OK.",
+                None,
+            ),
+            (
+                "<think>Use the opening marker <tool_call> to call a tool.</think>OK.",
+                None,
+            ),
+            (
+                "<think>Let me check <ifm|tool_calls>raw group text</think>OK.",
+                ("<ifm|tool_calls>", "</ifm|tool_calls>"),
+            ),
+        ],
+    )
+    def test_stream_usage_counts_reasoning_filtered_by_tool_envelopes(
+        self, client, mock_llm_engine, text, tool_call_markers
+    ):
+        """Tool-envelope filtering must not desynchronise the reported count."""
+        if tool_call_markers:
+            mock_llm_engine.tokenizer.tool_call_start = tool_call_markers[0]
+            mock_llm_engine.tokenizer.tool_call_end = tool_call_markers[1]
+
+        async def stream_chat(messages, **kwargs):
+            yield MockGenerationOutput(
+                text=text,
+                new_text=text,
+                prompt_tokens=3,
+                completion_tokens=6,
+                finish_reason="stop",
+                finished=True,
+            )
+
+        mock_llm_engine.stream_chat = stream_chat
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "tools": [self._WEATHER_TOOL],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
+        )
+
+        assert response.status_code == 200
+        reasoning, usage = self._stream_reasoning_and_usage(response)
+        assert reasoning
+        assert usage["completion_tokens_details"]["reasoning_tokens"] == len(
+            reasoning.split()
+        )
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_usage_reports_zero_reasoning_tokens_without_thinking(
+        self, client, mock_llm_engine, stream
+    ):
+        payload = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        if stream:
+
+            async def stream_chat(messages, **kwargs):
+                yield MockGenerationOutput(
+                    text="Just an answer.",
+                    new_text="Just an answer.",
+                    prompt_tokens=2,
+                    completion_tokens=3,
+                    finish_reason="stop",
+                    finished=True,
+                )
+
+            mock_llm_engine.stream_chat = stream_chat
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
+        else:
+            mock_llm_engine.chat = AsyncMock(
+                return_value=MockGenerationOutput(
+                    text="Just an answer.",
+                    prompt_tokens=2,
+                    completion_tokens=3,
+                    finish_reason="stop",
+                    finished=True,
+                )
+            )
+
+        response = client.post("/v1/chat/completions", json=payload)
+
+        assert response.status_code == 200
+        if stream:
+            _, usage = self._stream_reasoning_and_usage(response)
+        else:
+            usage = response.json()["usage"]
+        assert usage["completion_tokens_details"]["reasoning_tokens"] == 0
+
+
 class TestAnthropicMessagesEndpoint:
     """Tests for the /v1/messages endpoint (Anthropic format)."""
 
