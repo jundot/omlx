@@ -329,3 +329,106 @@ def test_interrupted_in_place_realign_leaves_every_shard_readable(
     monkeypatch.setattr(mw, "rewrite_aligned", real_rewrite)
     mw.realign_model(tmp_path, mode="in_place")
     assert mw.check_alignment(tmp_path).aligned
+
+
+def test_residency_counts_only_mapped_tensor_spans(tmp_path, monkeypatch):
+    # A 3-byte tensor first shifts the big uint32 tensor off alignment (it is
+    # copied); the big uint8 tensor after it is mapped.
+    path = tmp_path / "model.safetensors"
+    big = 4 * mw._PAGE
+    _write_raw(
+        path,
+        {
+            "a.pad": ("U8", np.array([1, 2, 3], dtype=np.uint8)),
+            "b.copied": ("U32", np.arange(big // 4, dtype=np.uint32)),
+            "c.mapped": ("U8", np.ones(big, dtype=np.uint8)),
+        },
+    )
+    mw.enable(tmp_path)
+    loaded = mx.load(str(path))  # noqa: F841 - keeps the mapping alive
+    ((_mm, entry),) = mw._live_maps()
+    data_start, header = mw.read_header(path)
+    s, e = header["c.mapped"]["data_offsets"]
+    assert entry.spans[-1] == (data_start + s, data_start + e)
+    copied_start, copied_end = header["b.copied"]["data_offsets"]
+    copied_pages = range(
+        (data_start + copied_start) // mw._PAGE,
+        (data_start + copied_end - 1) // mw._PAGE + 1,
+    )
+    mapped_pages = set(
+        range((data_start + s) // mw._PAGE, (data_start + e - 1) // mw._PAGE + 1)
+    )
+
+    class FakeLibc:
+        resident = set()
+
+        def mincore(self, addr, length, vec):
+            for page in self.resident:
+                vec[page] = b"\x01"
+            return 0
+
+    fake = FakeLibc()
+    monkeypatch.setattr(mw, "_libc", fake)
+    # Only the copied tensor's pages are resident. The 3-byte pad tensor is
+    # mapped (uint8 is always aligned) and shares the first of those pages,
+    # so its 3 bytes count; none of the 64 KiB copied tensor does.
+    fake.resident = set(copied_pages) - mapped_pages
+    assert mw.resident_mapped_bytes() == 3
+    # All pages resident: exactly the mapped tensors' bytes.
+    fake.resident = set(range(0, (path.stat().st_size // mw._PAGE) + 1))
+    assert mw.resident_mapped_bytes() == (e - s) + 3
+
+
+def test_span_bytes_per_page():
+    page = mw._PAGE
+    per_page = mw._span_bytes_per_page([(10, 20), (page - 5, 2 * page + 7)], 3)
+    assert per_page.tolist() == [10 + 5, page, 7]
+    assert mw._merge_spans([(5, 9), (0, 3), (3, 4), (8, 12)]) == [(0, 4), (5, 12)]
+
+
+def test_from_dlpack_failure_falls_back_to_a_copy(tmp_path, monkeypatch):
+    weights = _weights()
+    path = tmp_path / "model.safetensors"
+    _write_misaligned(path, weights)
+    mw.realign_model(tmp_path, mode="in_place")
+
+    def refuse(*args, **kwargs):
+        raise RuntimeError("dlpack refused")
+
+    monkeypatch.setattr(mx, "from_dlpack", refuse)
+    mw.enable(tmp_path)
+    _assert_same(mx.load(str(path)), weights)
+    assert mw.mapped_bytes() == 0
+
+
+def test_unsupported_dtype_defers_to_the_stock_loader(tmp_path):
+    """A dtype the mapped loader does not know hands the whole file to the
+    stock mx.load, which behaves exactly as without mapped weights (MLX
+    itself rejects F64)."""
+    path = tmp_path / "model.safetensors"
+    _write_raw(
+        path,
+        {
+            "w": ("U32", np.arange(16, dtype=np.uint32)),
+            "f": ("F64", np.linspace(0, 1, 8)),
+        },
+    )
+    with pytest.raises(Exception) as stock:
+        mx.load(str(path))
+    mw.enable(tmp_path)
+    with pytest.raises(type(stock.value), match="F64"):
+        mx.load(str(path))
+    assert mw.mapped_bytes() == 0
+
+
+def test_copy_needs_room_for_the_whole_directory(tmp_path, monkeypatch):
+    _write_misaligned(tmp_path / "model.safetensors", _weights())
+    (tmp_path / "tokenizer.json").write_bytes(b"x" * 100_000)
+    report = mw.check_alignment(tmp_path)
+    assert report.model_bytes > report.total_bytes + 100_000
+
+    usage = mw.shutil.disk_usage(tmp_path)
+    free = report.total_bytes + 50_000  # enough for tensor data, not the copy
+    monkeypatch.setattr(mw.shutil, "disk_usage", lambda p: usage._replace(free=free))
+    report = mw.check_alignment(tmp_path)
+    assert not report.can_realign_copy

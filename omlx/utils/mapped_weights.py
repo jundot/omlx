@@ -122,6 +122,8 @@ class AlignmentReport:
     free_disk_bytes: int = 0
     # Bytes of the shards a rewrite has to produce (misaligned files only).
     rewrite_bytes: int = 0
+    # Size of everything a copy writes: every file in the model directory.
+    model_bytes: int = 0
 
     @property
     def aligned(self) -> bool:
@@ -139,7 +141,7 @@ class AlignmentReport:
 
     @property
     def can_realign_copy(self) -> bool:
-        return not self.aligned and self.free_disk_bytes > self.total_bytes
+        return not self.aligned and self.free_disk_bytes > self.model_bytes
 
     def _largest_misaligned_file(self) -> int:
         sizes = [
@@ -178,6 +180,9 @@ def check_alignment(model_path: str | Path) -> AlignmentReport:
         if file_bad:
             report.misaligned_files.append(shard.name)
             report.rewrite_bytes += shard.stat().st_size
+    report.model_bytes = sum(
+        f.stat().st_size for f in model_path.rglob("*") if f.is_file()
+    )
     report.writable = os.access(model_path, os.W_OK)
     try:
         report.free_disk_bytes = shutil.disk_usage(model_path).free
@@ -338,6 +343,10 @@ def realign_model(
 class _MappedFile:
     ref: weakref.ref  # numpy memmap of the whole file
     nbytes: int  # tensor bytes served from the mapping
+    # File byte ranges [start, end) of the mapped tensors, sorted and merged.
+    # Copied (misaligned) tensors are not in here, so their pages never count
+    # toward mapped residency.
+    spans: list[tuple[int, int]] = field(default_factory=list)
 
 
 _lock = threading.Lock()
@@ -359,22 +368,31 @@ def _load_mapped(path: str) -> tuple[dict[str, mx.array], dict[str, str]]:
     mm = np.memmap(path, dtype=np.uint8, mode="r")
     out: dict[str, mx.array] = {}
     mapped = copied = 0
+    spans: list[tuple[int, int]] = []
     for name, info in header.items():
         start, end = info["data_offsets"]
         np_dtype, mx_view = _DTYPES[info["dtype"]]
         view = mm[data_start + start : data_start + end].view(np_dtype)
         view = view.reshape(info["shape"])
+        arr = None
+        # Never wrap a misaligned pointer: Metal would read shifted data.
         if (data_start + start) % view.itemsize == 0:
-            arr = mx.from_dlpack(view, copy=False)
-            mapped += end - start
-        else:
-            # Never wrap a misaligned pointer: Metal would read shifted data.
+            try:
+                arr = mx.from_dlpack(view, copy=False)
+            except Exception:  # noqa: BLE001
+                logger.debug("zero-copy wrap of %s failed", name, exc_info=True)
+        if arr is None:
             arr = mx.array(np.array(view))
             copied += end - start
+        else:
+            mapped += end - start
+            spans.append((data_start + start, data_start + end))
         out[name] = arr.view(mx_view) if mx_view is not None else arr
     key = _dir_key(Path(path).parent)
     with _lock:
-        _files.setdefault(key, []).append(_MappedFile(weakref.ref(mm), mapped))
+        _files.setdefault(key, []).append(
+            _MappedFile(weakref.ref(mm), mapped, _merge_spans(spans))
+        )
     if copied:
         logger.warning(
             "%s: %.2f GB mapped, %.2f GB copied (misaligned tensors)",
@@ -389,6 +407,16 @@ def _load_mapped(path: str) -> tuple[dict[str, mx.array], dict[str, str]]:
 
 class _UnsupportedDtypeError(Exception):
     pass
+
+
+def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(s for s in spans if s[1] > s[0]):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
 
 
 def _patched_load(file, *args, **kwargs):
@@ -463,7 +491,7 @@ def is_enabled(model_path: str | Path) -> bool:
     return _dir_key(model_path) in _enabled_dirs
 
 
-def _live_maps() -> list[tuple[np.memmap, int]]:
+def _live_maps() -> list[tuple[np.memmap, _MappedFile]]:
     """Mappings still referenced by a loaded model (unloads drop them)."""
     live = []
     with _lock:
@@ -473,13 +501,13 @@ def _live_maps() -> list[tuple[np.memmap, int]]:
                 _files[key] = entries
             else:
                 del _files[key]
-            live.extend((e.ref(), e.nbytes) for e in entries)
-    return [(mm, n) for mm, n in live if mm is not None]
+            live.extend((e.ref(), e) for e in entries)
+    return [(mm, e) for mm, e in live if mm is not None]
 
 
 def mapped_bytes() -> int:
     """Tensor bytes currently served from file mappings."""
-    return sum(n for _mm, n in _live_maps())
+    return sum(e.nbytes for _mm, e in _live_maps())
 
 
 _PAGE = 16384
@@ -525,19 +553,42 @@ def _refresh_resident() -> None:
         _resident.update(bytes=value, at=time.monotonic(), running=False)
 
 
+def _span_bytes_per_page(spans: list[tuple[int, int]], pages: int) -> np.ndarray:
+    """Bytes of ``spans`` that fall in each page of a page-aligned mapping."""
+    per_page = np.zeros(pages, dtype=np.int64)
+    for start, end in spans:
+        first, last = start // _PAGE, (end - 1) // _PAGE
+        if first == last:
+            per_page[first] += end - start
+            continue
+        per_page[first] += (first + 1) * _PAGE - start
+        per_page[first + 1 : last] += _PAGE
+        per_page[last] += end - last * _PAGE
+    return per_page
+
+
 def resident_mapped_bytes() -> int:
-    """Bytes of the live mappings that are in RAM right now (``mincore``)."""
+    """Bytes of mapped tensors that are in RAM right now (``mincore``).
+
+    Only the byte ranges of tensors served from the mapping count: pages of
+    copied tensors in the same file may be cached too, but they back nothing
+    the guard charges as mapped.
+    """
     global _libc
     if _libc is None:
         _libc = ctypes.CDLL(None, use_errno=True)
     total = 0
-    for mm, nbytes in _live_maps():
-        addr = mm.ctypes.data
-        start = addr - addr % _PAGE
-        pages = (addr + mm.nbytes - start + _PAGE - 1) // _PAGE
-        vec = (ctypes.c_char * pages)()
-        if _libc.mincore(ctypes.c_void_p(start), ctypes.c_size_t(pages * _PAGE), vec):
+    for mm, entry in _live_maps():
+        if not entry.spans:
             continue
-        resident = np.count_nonzero(np.frombuffer(vec, dtype=np.uint8) & 1)
-        total += min(int(resident) * _PAGE, nbytes)
+        addr = mm.ctypes.data
+        if addr % _PAGE:
+            continue  # np.memmap of a whole file is page aligned
+        pages = (mm.nbytes + _PAGE - 1) // _PAGE
+        vec = (ctypes.c_char * pages)()
+        if _libc.mincore(ctypes.c_void_p(addr), ctypes.c_size_t(pages * _PAGE), vec):
+            continue
+        resident = np.frombuffer(vec, dtype=np.uint8) & 1
+        per_page = _span_bytes_per_page(entry.spans, pages)
+        total += int(per_page[resident.astype(bool)].sum())
     return total
