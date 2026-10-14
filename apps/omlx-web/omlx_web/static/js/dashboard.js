@@ -2292,26 +2292,33 @@
             },
 
             async pollMappedWeightsJob(modelId) {
-                while (this.selectedModel?.id === modelId && this.mappedWeights.job?.state === 'running') {
+                // Keep polling after the modal closes or moves to another
+                // model: the job still runs, and the model list must pick up
+                // a copy when it lands.
+                let job = this.mappedWeights.job;
+                while (job?.state === 'running') {
                     await new Promise(resolve => setTimeout(resolve, 1000));
                     try {
                         const response = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/mapped-weights`);
                         if (!response.ok) continue;
-                        const data = await response.json();
-                        if (this.selectedModel?.id !== modelId) return;
-                        this.mappedWeights.job = data.job;
+                        job = (await response.json()).job;
                     } catch (err) {
                         console.error('Realign poll failed:', err);
+                        continue;
+                    }
+                    if (this.selectedModel?.id === modelId) this.mappedWeights.job = job;
+                }
+                if (job?.state !== 'done') return;
+                if (this.selectedModel?.id === modelId) {
+                    this.mappedWeights.report = null;
+                    if (job.mode === 'in_place') {
+                        // The server already saved the setting for this model.
+                        this.modelSettings.mapped_weights_enabled = true;
                     }
                 }
-                const job = this.mappedWeights.job;
-                if (job?.state !== 'done') return;
-                this.mappedWeights.report = null;
-                if (job.mode === 'in_place') {
-                    // The server already saved the setting for this model.
-                    this.modelSettings.mapped_weights_enabled = true;
-                }
-                await this.loadModels();
+                // loadModels() feeds the settings and status views; the Model
+                // Manager list comes from loadHFModels(), which shows the copy.
+                await Promise.all([this.loadModels(), this.loadHFModels()]);
             },
 
             mappedWeightsMisalignedText() {

@@ -2656,6 +2656,20 @@ class RealignRequest(BaseModel):
     mode: Literal["in_place", "copy"]
 
 
+def _rediscover_models_in_place() -> None:
+    pool = _get_engine_pool()
+    global_settings = _get_global_settings()
+    if pool is None or global_settings is None:
+        return
+    settings_manager = _get_settings_manager()
+    pinned = settings_manager.get_pinned_model_ids() if settings_manager else []
+    pool.discover_models(
+        [str(d) for d in global_settings.get_effective_model_dirs()], pinned
+    )
+    if settings_manager is not None:
+        pool.apply_settings_overrides(settings_manager)
+
+
 def _realign_copy_dest(entry) -> Path:
     base = (
         _hf_downloader.model_dir
@@ -2766,7 +2780,9 @@ async def realign_model_weights(
             )
             target_id = model_id
             if request.mode == "copy":
-                await _reload_models()
+                # Register the copy the way a finished download does: rescan
+                # in place, without unloading the models that are serving.
+                _rediscover_models_in_place()
                 pool = _get_engine_pool()
                 target_id = next(
                     (

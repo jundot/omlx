@@ -119,12 +119,18 @@ async def test_copy_realign_leaves_the_original_and_enables_the_copy(env):
     env.entries["m"] = _entry("m", path, loaded=True)  # copy works while loaded
     dest = env.tmp / "models" / "m-aligned"
 
-    async def fake_reload():
+    def fake_rediscover():
         env.entries["m-aligned"] = _entry("m-aligned", dest)
-        return True, "ok"
 
-    with patch.object(
-        admin_routes, "_reload_models", AsyncMock(side_effect=fake_reload)
+    with (
+        patch.object(
+            admin_routes,
+            "_rediscover_models_in_place",
+            side_effect=fake_rediscover,
+        ),
+        patch.object(
+            admin_routes, "_reload_models", AsyncMock(side_effect=AssertionError)
+        ),
     ):
         await admin_routes.realign_model_weights(
             "m", admin_routes.RealignRequest(mode="copy"), is_admin=True
@@ -210,3 +216,20 @@ async def test_failed_job_reports_the_error(env):
     assert job["state"] == "error"
     assert job["error"] == "disk full"
     assert not getattr(env.settings.get("m"), "mapped_weights_enabled", False)
+
+
+def test_rediscovery_after_a_copy_keeps_loaded_models(env):
+    """The copy is registered like a finished download: discovery in place,
+    never the unload-everything model-directory reload."""
+    pool = admin_routes._get_engine_pool()
+    pool._unload_engine = AsyncMock()
+    global_settings = MagicMock()
+    global_settings.get_effective_model_dirs.return_value = [env.tmp / "models"]
+    env.manager.get_pinned_model_ids.return_value = ["pinned"]
+    with patch.object(
+        admin_routes, "_get_global_settings", return_value=global_settings
+    ):
+        admin_routes._rediscover_models_in_place()
+    pool.discover_models.assert_called_once_with([str(env.tmp / "models")], ["pinned"])
+    pool.apply_settings_overrides.assert_called_once_with(env.manager)
+    pool._unload_engine.assert_not_called()
