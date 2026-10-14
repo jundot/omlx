@@ -819,8 +819,8 @@
                                     </div>
                                     <button type="button"
                                             @click="modelSettings.moe_expert_offload_enabled = !modelSettings.moe_expert_offload_enabled"
-                                            :disabled="(modelSettings.mtp_enabled && !selectedModel?.moe_offload_allows_mtp) || modelSettings.vlm_mtp_enabled || modelSettings.dflash_enabled"
-                                            :class="[modelSettings.moe_expert_offload_enabled ? 'bg-black' : 'bg-neutral-200', ((modelSettings.mtp_enabled && !selectedModel?.moe_offload_allows_mtp) || modelSettings.vlm_mtp_enabled || modelSettings.dflash_enabled) ? 'opacity-50 cursor-not-allowed' : '']"
+                                            :disabled="(modelSettings.mtp_enabled && !selectedModel?.moe_offload_allows_mtp) || modelSettings.vlm_mtp_enabled || modelSettings.dflash_enabled || modelSettings.mapped_weights_enabled"
+                                            :class="[modelSettings.moe_expert_offload_enabled ? 'bg-black' : 'bg-neutral-200', ((modelSettings.mtp_enabled && !selectedModel?.moe_offload_allows_mtp) || modelSettings.vlm_mtp_enabled || modelSettings.dflash_enabled || modelSettings.mapped_weights_enabled) ? 'opacity-50 cursor-not-allowed' : '']"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="modelSettings.moe_expert_offload_enabled ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -844,6 +844,60 @@
                                 </div>
                             </div>
                         </template>
+
+                        <!-- Mapped Weights -->
+                        <div x-show="!modelSettings.is_diffusion_model" class="px-4 py-3.5 space-y-3">
+                            <div class="flex items-start justify-between gap-3">
+                                <div class="min-w-0">
+                                    <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.mapped_weights') }}</span>
+                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.mapped_weights_hint') }}</p>
+                                </div>
+                                <button type="button"
+                                        @click="toggleMappedWeights()"
+                                        :disabled="modelSettings.moe_expert_offload_enabled || mappedWeights.checking || mappedWeights.job?.state === 'running'"
+                                        :title="modelSettings.moe_expert_offload_enabled ? '{{ t('modal.model_settings.mapped_weights_offload_conflict')|replace('\\', '\\\\')|replace("'", "\\'") }}' : ''"
+                                        :class="[modelSettings.mapped_weights_enabled ? 'bg-black' : 'bg-neutral-200', (modelSettings.moe_expert_offload_enabled || mappedWeights.checking || mappedWeights.job?.state === 'running') ? 'opacity-50 cursor-not-allowed' : '']"
+                                        class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                    <span :class="modelSettings.mapped_weights_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                          class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                </button>
+                            </div>
+                            <!-- Misaligned checkpoint: the user decides what happens to the files. -->
+                            <div x-show="mappedWeights.report && !mappedWeights.report.aligned && !mappedWeights.job" x-cloak
+                                 class="rounded-lg border border-amber-200 bg-amber-50 px-3 py-3 space-y-2.5">
+                                <p class="text-xs text-amber-800" x-text="mappedWeightsMisalignedText()"></p>
+                                <div class="flex flex-wrap gap-2">
+                                    <button type="button" @click="mappedWeights.report = null"
+                                            class="px-3 py-1.5 text-xs font-medium rounded-lg border border-neutral-200 bg-white text-neutral-700 hover:bg-neutral-50">
+                                        {{ t('modal.model_settings.mapped_weights_cancel') }}
+                                    </button>
+                                    <button type="button" @click="startMappedWeightsRealign('in_place')"
+                                            :disabled="!mappedWeights.report?.can_realign_in_place || mappedWeights.report?.loaded"
+                                            :title="mappedWeightsInPlaceBlocker()"
+                                            :class="(!mappedWeights.report?.can_realign_in_place || mappedWeights.report?.loaded) ? 'opacity-50 cursor-not-allowed' : 'hover:bg-neutral-800'"
+                                            class="px-3 py-1.5 text-xs font-medium rounded-lg bg-black text-white">
+                                        {{ t('modal.model_settings.mapped_weights_realign_in_place') }}
+                                    </button>
+                                    <button type="button" @click="startMappedWeightsRealign('copy')"
+                                            :disabled="!mappedWeights.report?.can_realign_copy"
+                                            :title="mappedWeights.report?.can_realign_copy ? '' : '{{ t('modal.model_settings.mapped_weights_no_disk')|replace('\\', '\\\\')|replace("'", "\\'") }}'"
+                                            :class="!mappedWeights.report?.can_realign_copy ? 'opacity-50 cursor-not-allowed' : 'hover:bg-neutral-50'"
+                                            class="px-3 py-1.5 text-xs font-medium rounded-lg border border-neutral-300 bg-white text-neutral-800">
+                                        {{ t('modal.model_settings.mapped_weights_realign_copy') }}
+                                    </button>
+                                </div>
+                                <p class="text-xs text-neutral-500">{{ t('modal.model_settings.mapped_weights_realign_note') }}</p>
+                                <p x-show="mappedWeightsInPlaceBlocker()" class="text-xs text-neutral-500" x-text="mappedWeightsInPlaceBlocker()"></p>
+                            </div>
+                            <div x-show="mappedWeights.job" x-cloak class="space-y-1.5">
+                                <div class="h-1.5 w-full rounded-full bg-neutral-100 overflow-hidden">
+                                    <div class="h-full bg-black transition-all" :style="`width: ${mappedWeightsProgress()}%`"></div>
+                                </div>
+                                <p class="text-xs"
+                                   :class="mappedWeights.job?.state === 'error' ? 'text-red-600' : 'text-neutral-500'"
+                                   x-text="mappedWeightsJobText()"></p>
+                            </div>
+                        </div>
 
                         <!-- TurboQuant KV Cache -->
                         <div class="px-4 py-3.5 space-y-3">

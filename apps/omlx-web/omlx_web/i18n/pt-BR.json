@@ -2223,5 +2223,21 @@
   "cluster.v2.join.cleanup_forgotten": "Limpeza antiga esquecida neste Mac. A limpeza remota não foi confirmada.",
   "cluster.v2.join.forget_cleanup_error": "Não foi possível esquecer esta limpeza.",
   "cluster.v2.membership.waiting_request": "Aguardando este Mac mostrar seu código e enviar uma solicitação de pareamento.",
-  "cluster.v2.membership.add_device": "Adicionar este Mac"
+  "cluster.v2.membership.add_device": "Adicionar este Mac",
+  "modal.model_settings.mapped_weights": "Pesos mapeados",
+  "modal.model_settings.mapped_weights_hint": "Usa os pesos direto dos arquivos do modelo em vez de copiá-los para a memória. Eles não ficam presos, então o macOS pode liberar o que o modelo não está usando (experts MoE frios) e relê-los do SSD quando precisar. Carrega mais rápido e ocupa bem menos memória; o Metal continua contando o modelo inteiro no limite dele. Desliga a fusão gate/up do MoE. Requer recarregar.",
+  "modal.model_settings.mapped_weights_offload_conflict": "Não pode ser usado junto com o offload de experts MoE.",
+  "modal.model_settings.mapped_weights_misaligned": "{misaligned} GB de {total} GB em {files} arquivo(s) não podem ser mapeados: os tensores não começam em posições alinhadas, então seriam copiados para a memória como de costume. Realinhar regrava os arquivos com os mesmos tensores em posições alinhadas; qualquer carregador continua lendo igual.",
+  "modal.model_settings.mapped_weights_cancel": "Cancelar",
+  "modal.model_settings.mapped_weights_realign_in_place": "Realinhar no lugar",
+  "modal.model_settings.mapped_weights_realign_copy": "Realinhar em uma cópia",
+  "modal.model_settings.mapped_weights_realign_note": "No lugar, regrava um por um os arquivos desalinhados deste modelo. A cópia grava uma duplicata alinhada junto dos seus outros modelos e não mexe neste.",
+  "modal.model_settings.mapped_weights_hf_cache": "Estes arquivos são compartilhados com o cache do Hugging Face; só dá para fazer uma cópia.",
+  "modal.model_settings.mapped_weights_unload_first": "Descarregue o modelo para realinhá-lo no lugar.",
+  "modal.model_settings.mapped_weights_no_disk": "Não há espaço livre em disco suficiente.",
+  "modal.model_settings.mapped_weights_realigning": "Realinhando… {percent}%",
+  "modal.model_settings.mapped_weights_in_place_done": "Realinhado. Os pesos mapeados estão ligados e valem a partir da próxima carga.",
+  "modal.model_settings.mapped_weights_copy_done": "Cópia alinhada criada como {model}, com pesos mapeados ligados.",
+  "modal.model_settings.mapped_weights_failed": "Falha ao realinhar: {error}",
+  "js.error.mapped_weights_check_failed": "Falha ao verificar os arquivos do modelo"
 }

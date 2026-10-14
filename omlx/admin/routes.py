@@ -399,6 +399,8 @@ class ModelSettingsRequest(BaseModel):
     # MoE expert offload (stream non-resident experts from the checkpoint)
     moe_expert_offload_enabled: bool | None = None
     moe_expert_offload_resident_fraction: float | None = None
+    # Mapped weights (zero-copy from the checkpoint files)
+    mapped_weights_enabled: bool | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
     specprefill_draft_model: str | None = None
@@ -997,6 +999,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["turboquant_skip_last"] = True
     settings["moe_expert_offload_enabled"] = False
     settings["moe_expert_offload_resident_fraction"] = 0.25
+    settings["mapped_weights_enabled"] = False
     settings["specprefill_enabled"] = False
     settings["external_engine"] = None
     settings["dflash_enabled"] = False
@@ -1070,6 +1073,7 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.turboquant_skip_last = True
     settings.moe_expert_offload_enabled = False
     settings.moe_expert_offload_resident_fraction = 0.25
+    settings.mapped_weights_enabled = False
     settings.specprefill_enabled = False
     settings.specprefill_draft_model = None
     settings.specprefill_keep_pct = None
@@ -2644,6 +2648,165 @@ async def load_model(
     return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
 
 
+# Mapped weights: alignment check and realign jobs, one per model.
+_realign_jobs: dict[str, dict[str, Any]] = {}
+
+
+class RealignRequest(BaseModel):
+    mode: Literal["in_place", "copy"]
+
+
+def _rediscover_models_in_place() -> None:
+    pool = _get_engine_pool()
+    global_settings = _get_global_settings()
+    if pool is None or global_settings is None:
+        return
+    settings_manager = _get_settings_manager()
+    pinned = settings_manager.get_pinned_model_ids() if settings_manager else []
+    pool.discover_models(
+        [str(d) for d in global_settings.get_effective_model_dirs()], pinned
+    )
+    if settings_manager is not None:
+        pool.apply_settings_overrides(settings_manager)
+
+
+def _realign_copy_dest(entry) -> Path:
+    base = (
+        _hf_downloader.model_dir
+        if _hf_downloader is not None
+        else Path(entry.model_path).parent
+    )
+    name = Path(entry.model_path).name
+    dest = Path(base) / f"{name}-aligned"
+    n = 2
+    while dest.exists():
+        dest = Path(base) / f"{name}-aligned-{n}"
+        n += 1
+    return dest
+
+
+@router.get("/api/models/{model_id}/mapped-weights")
+async def get_mapped_weights_status(
+    model_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """How much of the checkpoint can be mapped, plus any realign job."""
+    from ..utils import mapped_weights
+
+    engine_pool = _get_engine_pool()
+    entry = engine_pool.get_entry(model_id) if engine_pool is not None else None
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+    report = await asyncio.to_thread(mapped_weights.check_alignment, entry.model_path)
+    return {
+        "model_id": model_id,
+        "loaded": entry.engine is not None,
+        **report.to_dict(),
+        "job": _realign_jobs.get(model_id),
+    }
+
+
+@router.post("/api/models/{model_id}/mapped-weights/realign")
+async def realign_model_weights(
+    model_id: str,
+    request: RealignRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Rewrite misaligned shards so the whole model can be mapped.
+
+    ``in_place`` swaps each misaligned shard for an aligned rewrite (tensor
+    bytes unchanged) and enables mapped weights on this model. ``copy``
+    writes an aligned copy next to the other models, leaves this one alone,
+    and enables mapped weights on the copy.
+    """
+    from ..utils import mapped_weights
+
+    engine_pool = _get_engine_pool()
+    entry = engine_pool.get_entry(model_id) if engine_pool is not None else None
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+    job = _realign_jobs.get(model_id)
+    if job is not None and job["state"] == "running":
+        raise HTTPException(status_code=409, detail="Realign already running")
+    report = await asyncio.to_thread(mapped_weights.check_alignment, entry.model_path)
+    if report.aligned:
+        raise HTTPException(status_code=400, detail="Model is already aligned")
+    if request.mode == "in_place":
+        if entry.engine is not None or entry.is_loading:
+            raise HTTPException(
+                status_code=409, detail="Unload the model before realigning it"
+            )
+        if not report.can_realign_in_place:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Cannot realign in place: files are shared with the "
+                    "Hugging Face cache"
+                    if report.symlinked
+                    else "Cannot realign in place: directory not writable "
+                    "or not enough free disk for one shard"
+                ),
+            )
+        dest = None
+    else:
+        if not report.can_realign_copy:
+            raise HTTPException(
+                status_code=400, detail="Not enough free disk for a copy"
+            )
+        dest = _realign_copy_dest(entry)
+
+    job = {
+        "state": "running",
+        "mode": request.mode,
+        "done_bytes": 0,
+        "total_bytes": 0,
+        "dest": str(dest) if dest else entry.model_path,
+        "new_model_id": None,
+        "error": None,
+    }
+    _realign_jobs[model_id] = job
+
+    def _progress(done: int, total: int) -> None:
+        job["done_bytes"], job["total_bytes"] = done, total
+
+    async def _run() -> None:
+        try:
+            out = await asyncio.to_thread(
+                mapped_weights.realign_model,
+                entry.model_path,
+                mode=request.mode,
+                dest=dest,
+                progress=_progress,
+            )
+            target_id = model_id
+            if request.mode == "copy":
+                # Register the copy the way a finished download does: rescan
+                # in place, without unloading the models that are serving.
+                _rediscover_models_in_place()
+                pool = _get_engine_pool()
+                target_id = next(
+                    (
+                        e.model_id
+                        for e in pool._entries.values()
+                        if Path(e.model_path).resolve() == Path(out).resolve()
+                    ),
+                    None,
+                )
+                job["new_model_id"] = target_id
+            settings_manager = _get_settings_manager()
+            if target_id is not None and settings_manager is not None:
+                target_settings = settings_manager.get_settings(target_id)
+                target_settings.mapped_weights_enabled = True
+                settings_manager.set_settings(target_id, target_settings)
+            job["state"] = "done"
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Realign of %s failed", model_id)
+            job["state"], job["error"] = "error", str(exc)
+
+    asyncio.create_task(_run())
+    return {"status": "started", "model_id": model_id, "job": job}
+
+
 @router.post("/api/models/{model_id}/import-mtplx")
 async def import_mtplx(
     model_id: str,
@@ -3037,6 +3200,8 @@ async def update_model_settings(
             if request.moe_expert_offload_resident_fraction is None
             else request.moe_expert_offload_resident_fraction
         )
+    if "mapped_weights_enabled" in sent:
+        current_settings.mapped_weights_enabled = bool(request.mapped_weights_enabled)
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False

@@ -308,6 +308,7 @@ class BatchedEngine(BaseEngine):
         maybe_apply_pre_load_patches(
             self._model_name, model_settings=self._model_settings
         )
+        self._enable_mapped_weights()
 
         # Load model on the global MLX executor to avoid blocking the event loop
         # while ensuring no concurrent Metal operations. See issue #85.
@@ -423,6 +424,10 @@ class BatchedEngine(BaseEngine):
                 "moe expert offload active (%d layers): skipping gate/up fusion",
                 moe_offload_wrapped,
             )
+        elif getattr(self._model_settings, "mapped_weights_enabled", False):
+            # Fusion concatenates gate and up into a new buffer: a full copy
+            # of the routed experts, which is what mapping avoids.
+            logger.info("mapped weights active: skipping gate/up fusion")
         elif (
             getattr(self._model_settings, "moe_gate_up_fusion_enabled", True)
             is not False
@@ -887,6 +892,7 @@ class BatchedEngine(BaseEngine):
             false_attrs=("_grammar_compiler_init_attempted",),
         )
         self._loaded = False
+        self._disable_mapped_weights()
         logger.info("BatchedEngine stopped")
         if cancelled:
             raise asyncio.CancelledError

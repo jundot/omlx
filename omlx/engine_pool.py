@@ -980,6 +980,34 @@ class EnginePool:
         except Exception:  # noqa: BLE001
             return 0
 
+    def _mapped_admission_ceiling(self, ceiling: int, mapped_bytes: int) -> int:
+        """Admission ceiling for a model whose weights load mapped.
+
+        Mapped weights go to the page cache, not the process footprint, and
+        the enforcer counts their non-resident part as oMLX's own once they
+        are loaded (see ProcessMemoryEnforcer._dynamic_ceiling_terms). Before
+        the load nothing is mapped yet, so give the dynamic component the
+        same credit here; the static ceiling and the Metal cap, which counts
+        a mapped buffer in full, still bind.
+        """
+        enforcer = getattr(self, "_process_memory_enforcer", None)
+        getter = getattr(enforcer, "get_ceiling_breakdown", None)
+        if mapped_bytes <= 0 or ceiling <= 0 or not callable(getter):
+            return ceiling
+        if getattr(enforcer, "memory_guard_tier", "") == "custom":
+            return ceiling
+        try:
+            breakdown = getter()
+            dynamic = int(breakdown["dynamic"])
+            others = [
+                int(breakdown[k]) for k in ("static", "metal_cap") if breakdown[k] > 0
+            ]
+        except Exception:  # noqa: BLE001
+            return ceiling
+        if dynamic <= 0:
+            return ceiling
+        return max(ceiling, min([dynamic + mapped_bytes, *others]))
+
     def _dynamic_ceiling_binds(self) -> bool:
         """Whether the free-memory-derived ceiling is the binding component."""
         enforcer = getattr(self, "_process_memory_enforcer", None)
@@ -1220,6 +1248,7 @@ class EnginePool:
 
         moe_offload_active = bool(data.get("moe_expert_offload_enabled", False))
         add("moe_expert_offload_enabled", moe_offload_active)
+        add("mapped_weights_enabled", bool(data.get("mapped_weights_enabled", False)))
         if moe_offload_active:
             add(
                 "moe_expert_offload_resident_fraction",
@@ -2564,8 +2593,15 @@ class EnginePool:
                 base_size=admission_size,
             )
             admission_kind = "local shard" if deployment is not None else "model"
+            mapped_admission = (
+                admission_size
+                if getattr(load_settings, "mapped_weights_enabled", False)
+                else 0
+            )
 
-            ceiling = self._current_ceiling()
+            ceiling = self._mapped_admission_ceiling(
+                self._current_ceiling(), mapped_admission
+            )
             best_effort = False
             if ceiling <= 0:
                 ceiling = self._fallback_admission_ceiling()
@@ -2676,7 +2712,12 @@ class EnginePool:
                         # low for that long. Re-read it before refusing.
                         ceiling_rechecks += 1
                         await asyncio.sleep(_ADMISSION_CEILING_RECHECK_S)
-                        ceiling = max(ceiling, self._current_ceiling())
+                        ceiling = max(
+                            ceiling,
+                            self._mapped_admission_ceiling(
+                                self._current_ceiling(), mapped_admission
+                            ),
+                        )
                         soft_target = max(soft_target, self._admission_soft_target())
                         evict_target = (
                             min(soft_target, ceiling) if soft_target > 0 else ceiling

@@ -48,6 +48,7 @@
         'qwen35_ane_prefill_cpu_shared_resource',
         'moe_expert_offload_enabled',
         'moe_expert_offload_resident_fraction',
+        'mapped_weights_enabled',
         'qwen35_oq_a8_enabled',
         'qwen35_oq_a8_min_tokens',
         'specprefill_enabled',
@@ -284,6 +285,8 @@
             // Model settings modal
             showModelSettingsModal: false,
             selectedModel: null,
+            // Alignment report / realign job of the model in the settings modal.
+            mappedWeights: { report: null, job: null, checking: false },
             modelSettings: {
                 model_alias: '',
                 model_type_override: '',
@@ -318,6 +321,7 @@
                 qwen35_ane_prefill_cpu_shared_resource: true,
                 moe_expert_offload_enabled: false,
                 moe_expert_offload_resident_fraction: 0.25,
+                mapped_weights_enabled: false,
                 qwen35_oq_a8_enabled: false,
                 qwen35_oq_a8_min_tokens: 128,
                 external_engine: '',
@@ -2176,6 +2180,7 @@
                     moe_expert_offload_resident_percent: Number(((s.moe_expert_offload_resident_fraction ?? 0.25) * 100).toPrecision(15)),
                     moe_expert_offload_resident_touched: false,
                     moe_offload_allows_mtp: model?.moe_offload_allows_mtp === true,
+                    mapped_weights_enabled: !isDiffusion && !!s.mapped_weights_enabled,
                     qwen35_oq_a8_enabled: s.qwen35_oq_a8_enabled || false,
                     qwen35_oq_a8_min_tokens: s.qwen35_oq_a8_min_tokens ?? 128,
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
@@ -2227,6 +2232,134 @@
                     embedding_audio_enabled: s.embedding_audio_enabled || false,
                     embedding_audio_max_seconds: s.embedding_audio_max_seconds ?? null,
                 };
+            },
+
+            // ===== Mapped weights =====
+            mappedWeightsUrl(suffix = '') {
+                return `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/mapped-weights${suffix}`;
+            },
+
+            async toggleMappedWeights() {
+                if (this.modelSettings.mapped_weights_enabled) {
+                    this.modelSettings.mapped_weights_enabled = false;
+                    return;
+                }
+                this.mappedWeights.checking = true;
+                try {
+                    const response = await fetch(this.mappedWeightsUrl());
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    const data = await response.json();
+                    if (!response.ok) throw new Error(data.detail || response.statusText);
+                    if (data.job?.state === 'running') {
+                        this.mappedWeights.job = data.job;
+                        this.pollMappedWeightsJob(this.selectedModel.id);
+                    } else if (data.aligned) {
+                        this.mappedWeights.job = null;
+                        this.modelSettings.mapped_weights_enabled = true;
+                    } else {
+                        // A finished job from an earlier choice would hide the prompt.
+                        this.mappedWeights.job = null;
+                        // Ask before touching any file.
+                        this.mappedWeights.report = data;
+                    }
+                } catch (err) {
+                    console.error('Mapped weights check failed:', err);
+                    alert(err.message || window.t('js.error.mapped_weights_check_failed'));
+                } finally {
+                    this.mappedWeights.checking = false;
+                }
+            },
+
+            async startMappedWeightsRealign(mode) {
+                const modelId = this.selectedModel.id;
+                try {
+                    const response = await fetch(this.mappedWeightsUrl('/realign'), {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ mode }),
+                    });
+                    const data = await response.json();
+                    if (!response.ok) throw new Error(data.detail || response.statusText);
+                    this.mappedWeights.job = data.job;
+                    this.pollMappedWeightsJob(modelId);
+                } catch (err) {
+                    console.error('Realign failed to start:', err);
+                    alert(err.message || window.t('js.error.mapped_weights_check_failed'));
+                }
+            },
+
+            async pollMappedWeightsJob(modelId) {
+                // Keep polling after the modal closes or moves to another
+                // model: the job still runs, and the model list must pick up
+                // a copy when it lands.
+                let job = this.mappedWeights.job;
+                while (job?.state === 'running') {
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    try {
+                        const response = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/mapped-weights`);
+                        if (!response.ok) continue;
+                        job = (await response.json()).job;
+                    } catch (err) {
+                        console.error('Realign poll failed:', err);
+                        continue;
+                    }
+                    if (this.selectedModel?.id === modelId) this.mappedWeights.job = job;
+                }
+                if (job?.state !== 'done') return;
+                if (this.selectedModel?.id === modelId) {
+                    this.mappedWeights.report = null;
+                    if (job.mode === 'in_place') {
+                        // The server already saved the setting for this model.
+                        this.modelSettings.mapped_weights_enabled = true;
+                    }
+                }
+                // loadModels() feeds the settings and status views; the Model
+                // Manager list comes from loadHFModels(), which shows the copy.
+                await Promise.all([this.loadModels(), this.loadHFModels()]);
+            },
+
+            mappedWeightsMisalignedText() {
+                const r = this.mappedWeights.report;
+                if (!r) return '';
+                const gb = bytes => (bytes / 1e9).toFixed(1);
+                return window.t('modal.model_settings.mapped_weights_misaligned')
+                    .replace('{misaligned}', gb(r.misaligned_bytes))
+                    .replace('{total}', gb(r.total_bytes))
+                    .replace('{files}', String(r.misaligned_files.length));
+            },
+
+            mappedWeightsInPlaceBlocker() {
+                const r = this.mappedWeights.report;
+                if (!r || r.aligned) return '';
+                if (r.symlinked) return window.t('modal.model_settings.mapped_weights_hf_cache');
+                if (r.loaded) return window.t('modal.model_settings.mapped_weights_unload_first');
+                if (!r.can_realign_in_place) return window.t('modal.model_settings.mapped_weights_no_disk');
+                return '';
+            },
+
+            mappedWeightsProgress() {
+                const job = this.mappedWeights.job;
+                if (!job) return 0;
+                if (job.state === 'done') return 100;
+                return job.total_bytes ? Math.round((100 * job.done_bytes) / job.total_bytes) : 0;
+            },
+
+            mappedWeightsJobText() {
+                const job = this.mappedWeights.job;
+                if (!job) return '';
+                if (job.state === 'error') {
+                    return window.t('modal.model_settings.mapped_weights_failed').replace('{error}', job.error || '');
+                }
+                if (job.state === 'done') {
+                    return job.mode === 'copy'
+                        ? window.t('modal.model_settings.mapped_weights_copy_done').replace('{model}', job.new_model_id || job.dest)
+                        : window.t('modal.model_settings.mapped_weights_in_place_done');
+                }
+                return window.t('modal.model_settings.mapped_weights_realigning')
+                    .replace('{percent}', String(this.mappedWeightsProgress()));
             },
 
             moeExpertOffloadResidentInvalid() {
@@ -2916,6 +3049,7 @@
                 const baseline = JSON.stringify(this.modelSettings);
                 const seq = ++this._applySeq;
                 this.profileError = '';
+                if (!preservingEdits) this.mappedWeights = { report: null, job: null, checking: false };
                 this.showNewProfileForm = false;
                 this.showNewTemplateForm = false;
                 this.editingProfile = null;
@@ -3205,6 +3339,7 @@
                                     : 4,
                                 moe_expert_offload_enabled: !isDiffusion && this.selectedModel?.moe_expert_offload_supported === true && !!this.modelSettings.moe_expert_offload_enabled,
                                 moe_expert_offload_resident_fraction: this.modelSettings.moe_expert_offload_resident_fraction ?? 0.25,
+                                mapped_weights_enabled: !isDiffusion && !!this.modelSettings.mapped_weights_enabled,
                                 qwen35_oq_a8_enabled: !!this.modelSettings.qwen35_oq_a8_enabled,
                                 qwen35_oq_a8_min_tokens: Number(this.modelSettings.qwen35_oq_a8_min_tokens) || 128,
                                 qwen35_ane_prefill_enabled: !!this.modelSettings.qwen35_ane_prefill_enabled,

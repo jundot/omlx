@@ -989,6 +989,39 @@ class TestDynamicCeilingReserve:
         # 12 GB of file cache, 4 GB of it already inactive.
         assert result == 1 * self.GB + 10 * self.GB + 12 * self.GB - reserve
 
+    def test_mapped_weights_count_as_omlx_own_plus_resident(self, mock_engine_pool):
+        """A mapped 19 GB model with 7 GB resident.
+
+        mx.get_active_memory() charges all 19 GB to usage and none of it is in
+        phys_footprint, so the ceiling adds it as oMLX's own. The 7 GB that
+        are resident are clean pages macOS can drop (they are re-read from the
+        SSD), so they are headroom too; while Metal uses them the vm stats do
+        not list them as file cache, hence the explicit term.
+        """
+        with (
+            patch(
+                "omlx.process_memory_enforcer.mapped_weights.mapped_bytes",
+                return_value=19 * self.GB,
+            ),
+            patch(
+                "omlx.process_memory_enforcer.mapped_weights."
+                "cached_resident_mapped_bytes",
+                return_value=7 * self.GB,
+            ),
+        ):
+            result = self._dynamic(mock_engine_pool, "safe", phys=1 * self.GB)
+        reserve = tier_reserve_bytes("safe", 64 * self.GB)
+        assert result == (1 + 19) * self.GB + (10 + 4 + 7) * self.GB - reserve
+
+    def test_no_mapped_term_without_mapped_models(self, mock_engine_pool):
+        with patch(
+            "omlx.process_memory_enforcer.mapped_weights.mapped_bytes",
+            return_value=0,
+        ):
+            result = self._dynamic(mock_engine_pool, "safe", phys=1 * self.GB)
+        reserve = tier_reserve_bytes("safe", 64 * self.GB)
+        assert result == 1 * self.GB + 10 * self.GB + 4 * self.GB - reserve
+
     def test_safer_tier_never_allows_more(self, mock_engine_pool):
         ceilings = [
             self._dynamic(mock_engine_pool, tier, phys=1 * self.GB)

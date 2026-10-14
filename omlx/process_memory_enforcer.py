@@ -39,7 +39,7 @@ import mlx.core as mx
 
 from . import settings as _settings
 from .engine.base import BaseNonStreamingEngine
-from .utils import psutil_compat
+from .utils import mapped_weights, psutil_compat
 from .utils.image import clear_image_decode_cache
 from .utils.metal_sync import unreleased_graphics_bytes
 from .utils.proc_memory import (
@@ -734,6 +734,23 @@ class ProcessMemoryEnforcer:
                 anon_active = stats["active"] - file_active - own_cpu
                 terms["other_apps"] = int(max(0, anon_active) * ratio)
         reclaimable = terms["free"] + terms["inactive"] + terms["other_apps"]
+        # Mapped weights (mapped_weights_enabled): mx.get_active_memory()
+        # charges the whole mapped file to usage, but none of it is in
+        # phys_footprint, so count it as oMLX's own. Its resident pages are
+        # clean and droppable: when work grows into them macOS evicts them and
+        # the next token that needs them re-reads them from the SSD, slower
+        # but not a crash. While Metal uses them the vm stats file them as
+        # active or wired rather than file cache, so they are added here
+        # explicitly (mincore, sampled off-thread). The Metal cap counts the
+        # file in full and stays a separate ceiling; it is the one that binds
+        # a mapped model, together with the static ceiling.
+        mapped = mapped_weights.mapped_bytes()
+        if mapped:
+            resident = mapped_weights.cached_resident_mapped_bytes()
+            terms["mapped"] = mapped
+            terms["mapped_resident"] = resident
+            terms["omlx"] += mapped
+            reclaimable += resident
         # Other apps may already hold the reserve. Stay at 1 byte rather than
         # 0, which callers read as "guard disabled".
         terms["dynamic"] = max(1, terms["omlx"] + reclaimable - reserve)
