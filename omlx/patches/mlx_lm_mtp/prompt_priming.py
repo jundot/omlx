@@ -142,6 +142,9 @@ class _MtpBoundaryCandidate:
 
     boundary_tokens: int
     pending_hidden: Any
+    # Detached head state at C-1, taken at capture time for heads whose
+    # caches cannot be rewound to C-1 later (pooled caches).
+    mtp_cache: list[Any] | None = None
 
 
 def _read_offset(entry: Any) -> Optional[int]:
@@ -329,6 +332,21 @@ def _flat_cache_entries(cache: List[Any]):
             yield from subs
 
 
+def _pooled(entry: Any) -> bool:
+    """A PoolingCache-style entry: ``offset`` counts pooled rows."""
+    return all(
+        type(getattr(entry, attr, None)) is int
+        for attr in ("ratio", "remainder", "_pool_len")
+    )
+
+
+def _token_offset(entry: Any) -> int | None:
+    """Token position of a cache entry (pooled rows * ratio + remainder)."""
+    if _pooled(entry):
+        return entry._pool_len * entry.ratio + entry.remainder
+    return _read_offset(entry)
+
+
 def _cache_at_offset(cache: List[Any], target: int) -> Optional[List[Any]]:
     """Return a detached, exactly trimmed MTP cache or fail closed."""
     if target < 0 or not cache:
@@ -336,7 +354,14 @@ def _cache_at_offset(cache: List[Any], target: int) -> Optional[List[Any]]:
     cloned = _clone_mtp_cache(cache)
     saw_offset = False
     for entry in _flat_cache_entries(cloned):
-        current = _read_offset(entry)
+        if (
+            hasattr(entry, "ratio")
+            and hasattr(entry, "remainder")
+            and not _pooled(entry)
+        ):
+            # Batched/unknown pooled layout: no token position.
+            return None
+        current = _token_offset(entry)
         if current is None:
             continue
         saw_offset = True
@@ -347,7 +372,7 @@ def _cache_at_offset(cache: List[Any], target: int) -> Optional[List[Any]]:
             trim = getattr(entry, "trim", None)
             if not callable(trim) or int(trim(extra)) != extra:
                 return None
-        if _read_offset(entry) != target:
+        if _token_offset(entry) != target:
             return None
     return cloned if saw_offset else None
 
@@ -750,11 +775,22 @@ def _capture_boundary_candidate(
     try:
         import mlx.core as mx
 
+        head = None
+        if any(_pooled(e) for e in _flat_cache_entries(ctx.mtp_cache)):
+            # Pooled rows cannot be rewound once the head folds past C-1
+            # (activation adds at least the seam pair), so detach the head
+            # here or keep the previous candidate.
+            head = _cache_at_offset(ctx.mtp_cache, boundary - 1)
+            if head is None:
+                return
         candidate = _MtpBoundaryCandidate(
             boundary_tokens=boundary,
             pending_hidden=normed[:, row : row + 1] + 0,
+            mtp_cache=head,
         )
-        mx.async_eval(candidate.pending_hidden)
+        mx.async_eval(
+            [candidate.pending_hidden] if head is None else _snapshot_arrays(candidate)
+        )
     except Exception as exc:
         logger.debug("MTP prefix boundary capture failed closed: %s", exc)
         return
@@ -767,7 +803,9 @@ def _publish_boundary_candidate(ctx: _PrimeCtx) -> None:
     if not isinstance(candidate, _MtpBoundaryCandidate) or not callable(store):
         return
     try:
-        snapshot_cache = _cache_at_offset(ctx.mtp_cache, candidate.boundary_tokens - 1)
+        snapshot_cache = candidate.mtp_cache or _cache_at_offset(
+            ctx.mtp_cache, candidate.boundary_tokens - 1
+        )
         if snapshot_cache is None:
             return
         snapshot = _MtpPrefixSnapshot(
@@ -825,9 +863,7 @@ def _capture_packed(host, inputs, normed, batch: PackedBatch) -> None:
             if record is None:
                 continue
             _restore_slot(host, record)
-            _capture_single(
-                host, inputs[:, start:end], normed[:, start:end], row.cache
-            )
+            _capture_single(host, inputs[:, start:end], normed[:, start:end], row.cache)
             plan = _find_plan(host)
             if plan is not None and plan.request_id in state.requests:
                 state.requests[plan.request_id] = _slot(host)
