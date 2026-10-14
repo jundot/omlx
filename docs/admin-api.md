@@ -56,6 +56,7 @@ curl -H "Authorization: Bearer $OMLX_API_KEY" http://127.0.0.1:8000/admin/api/st
 | `POST /admin/api/models/{model_id}/settings/reset` | Reset per-model settings |
 | `GET`, `POST /admin/api/models/{model_id}/settings/optimal` | List or apply benchmarked optimal settings |
 | `POST /admin/api/models/{model_id}/settings/recipe` | Apply a shared settings recipe |
+| `GET /admin/api/models/{model_id}/mapped-weights`, `POST .../mapped-weights/realign` | Alignment report and realign job for mapped weights. See [Mapped_Weights.md](experimental/Mapped_Weights.md) |
 | `GET`, `POST /admin/api/models/{model_id}/profiles`, `PUT`, `DELETE .../profiles/{name}`, `POST .../profiles/{name}/apply` | Per-model profiles |
 | `GET`, `POST /admin/api/profile-templates`, `PUT`, `DELETE .../{name}` | Global profile templates |
 
