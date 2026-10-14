@@ -28,6 +28,20 @@ generation, warm:
 | decode | 46-48 tok/s | 45-48 tok/s |
 | load | 2.4 s | 2.1 s |
 
+Ornith-1.5-35B-A3B oQ4e (MoE, 22 GB), same machine with other apps open,
+memory guard `aggressive`, 256 generated tokens, two rounds per mode:
+
+| | not mapped | mapped |
+|---|---|---|
+| load | 12.6-13.2 s | **2.2-2.3 s** |
+| oMLX phys_footprint | 23 GB | **2.0-2.6 GB** |
+| decode, 1.2k-token prompt (warm) | 69-80 tok/s | 65-66 tok/s |
+| 19.6k-token prompt | 1 of 4 completed (56 tok/s), 3 aborted by the guard | 4 of 4 completed, 40-54 tok/s |
+| prefill, first request after load | 540-1000 tok/s | 143 tok/s (weights paged in from the SSD) |
+
+With the guard on `balanced` the stock model loaded but every prompt was
+rejected by the prefill guard, while the mapped one served both prompt sizes.
+
 ## Enabling it
 
 Per model, in the admin dashboard: **Model Settings → Memory Saving → Mapped
@@ -83,14 +97,19 @@ API:
 ## Memory guard
 
 The guard's usage side reads `mx.get_active_memory()`, which counts the whole
-mapped file. None of the file is in the process `phys_footprint`, and the
-pages that are resident show up in the system's file cache, which the dynamic
-ceiling already treats as reclaimable. With a mapped model loaded, the dynamic
-ceiling adds the mapped bytes that are *not* resident (measured with
-`mincore`, sampled off the request path), so each mapped byte is counted once
-on each side. Dropping a resident page costs an SSD read the next time it is
-used, not a crash. The Metal cap still counts the full file and remains a
-separate limit.
+mapped file, while none of the file is in the process `phys_footprint`. With a
+mapped model the dynamic ceiling therefore counts the mapped bytes as oMLX's
+own, at load admission and afterwards. The part of the file that is resident
+(measured with `mincore`, sampled off the request path) is also counted as
+reclaimable: those pages are clean, and while Metal uses them macOS lists them
+as active or wired rather than file cache. When the KV cache or other
+allocations grow into them, macOS drops weight pages and the tokens that need
+them read them back from the SSD, so decode slows down instead of the request
+being aborted.
+
+The Metal cap counts the full file and, with the static ceiling, is the limit
+that binds a mapped model; raising `iogpu.wired_limit_mb` is what gives it more
+room.
 
 While any mapped model is loaded, oMLX lifts the MLX wired limit so mapped
 pages are not pinned; it is restored when the last mapped model unloads. The
@@ -101,7 +120,10 @@ wired either.
 
 - **Gate/up fusion is skipped** for mapped models. Fusion concatenates each
   MoE layer's gate and up expert weights into a new buffer, which is a full
-  copy of the routed experts.
+  copy of the routed experts. On the 35B above this costs about 10-15% of
+  short-context decode speed.
+- **The first request after a load is slower** while the weights are paged in
+  from the SSD; later requests run at full speed.
 - **Under memory pressure decode slows down instead of failing.** When other
   apps or a long context push mapped pages out, the next tokens that need them
   read from the SSD. With plenty of free memory, decode speed matches a normal

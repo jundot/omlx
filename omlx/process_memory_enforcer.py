@@ -734,21 +734,23 @@ class ProcessMemoryEnforcer:
                 anon_active = stats["active"] - file_active - own_cpu
                 terms["other_apps"] = int(max(0, anon_active) * ratio)
         reclaimable = terms["free"] + terms["inactive"] + terms["other_apps"]
-        # Mapped weights (mapped_weights_enabled): the whole mapped file is in
-        # mx.get_active_memory(), so the usage side always charges it, but it
-        # is not in phys_footprint. Its resident pages are clean file cache,
-        # already counted as reclaimable above (dropping them costs a re-read
-        # from the SSD, not a crash). Count the rest as oMLX's own so both
-        # sides charge each mapped byte once. Metal still counts the file in
-        # full against its cap, which stays a separate ceiling.
+        # Mapped weights (mapped_weights_enabled): mx.get_active_memory()
+        # charges the whole mapped file to usage, but none of it is in
+        # phys_footprint, so count it as oMLX's own. Its resident pages are
+        # clean and droppable: when work grows into them macOS evicts them and
+        # the next token that needs them re-reads them from the SSD, slower
+        # but not a crash. While Metal uses them the vm stats file them as
+        # active or wired rather than file cache, so they are added here
+        # explicitly (mincore, sampled off-thread). The Metal cap counts the
+        # file in full and stays a separate ceiling; it is the one that binds
+        # a mapped model, together with the static ceiling.
         mapped = mapped_weights.mapped_bytes()
         if mapped:
-            resident = min(
-                mapped_weights.cached_resident_mapped_bytes(), terms["inactive"]
-            )
+            resident = mapped_weights.cached_resident_mapped_bytes()
             terms["mapped"] = mapped
             terms["mapped_resident"] = resident
-            terms["omlx"] += mapped - resident
+            terms["omlx"] += mapped
+            reclaimable += resident
         # Other apps may already hold the reserve. Stay at 1 byte rather than
         # 0, which callers read as "guard disabled".
         terms["dynamic"] = max(1, terms["omlx"] + reclaimable - reserve)

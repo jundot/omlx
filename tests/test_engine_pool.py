@@ -5522,3 +5522,56 @@ async def test_local_cluster_removal_preserves_busy_guard_and_scope(busy):
     else:
         await pool.prepare_cluster_reload("test-model", local_only=True)
         pool._unload_engine.assert_awaited_once_with("test-model", local_only=True)
+
+
+class TestMappedWeightsAdmission:
+    """Mapped weights land in the page cache, so the RAM-derived dynamic
+    ceiling gets credit for them at admission; static and Metal still bind."""
+
+    @staticmethod
+    def _pool(**breakdown) -> EnginePool:
+        pool = _make_pool(ceiling=min(v for v in breakdown.values() if v > 0))
+        pool._process_memory_enforcer = _StubEnforcer(tier="balanced", **breakdown)
+        return pool
+
+    def test_dynamic_bound_ceiling_gets_the_mapped_bytes(self):
+        pool = self._pool(static=29_000, dynamic=17_900, metal_cap=27_000)
+        assert pool._mapped_admission_ceiling(17_900, 22_000) == 27_000
+
+    def test_static_still_binds(self):
+        pool = self._pool(static=20_000, dynamic=10_000, metal_cap=27_000)
+        assert pool._mapped_admission_ceiling(10_000, 22_000) == 20_000
+
+    def test_partial_credit_when_dynamic_plus_mapped_is_lowest(self):
+        pool = self._pool(static=29_000, dynamic=2_000, metal_cap=27_000)
+        assert pool._mapped_admission_ceiling(2_000, 6_000) == 8_000
+
+    def test_no_change_without_mapped_weights(self):
+        pool = self._pool(static=29_000, dynamic=17_900, metal_cap=27_000)
+        assert pool._mapped_admission_ceiling(17_900, 0) == 17_900
+
+    def test_custom_tier_keeps_the_pinned_ceiling(self):
+        pool = self._pool(static=29_000, dynamic=17_900, metal_cap=27_000)
+        pool._process_memory_enforcer.memory_guard_tier = "custom"
+        assert pool._mapped_admission_ceiling(17_900, 22_000) == 17_900
+
+    def test_mapped_model_admitted_where_a_copied_one_is_refused(
+        self, small_mock_model_dir
+    ):
+        pool = self._pool(static=12_000, dynamic=700, metal_cap=12_000)
+        pool.discover_models(str(small_mock_model_dir))
+        with pytest.raises(ModelTooLargeError):
+            asyncio.run(pool.get_engine("model-a"))
+
+        settings = MagicMock()
+        settings.get_settings.return_value = ModelSettings(mapped_weights_enabled=True)
+        pool._settings_manager = settings
+        with (
+            patch("omlx.engine_pool._settled_phys_footprint", return_value=0),
+            patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+            patch.object(pool, "_load_engine", new=AsyncMock()) as load,
+            # Past admission; the stubbed loader returns no engine.
+            pytest.raises(ModelLoadingError),
+        ):
+            asyncio.run(pool.get_engine("model-a"))
+        load.assert_awaited()

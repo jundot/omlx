@@ -493,7 +493,7 @@ def cached_resident_mapped_bytes() -> int:
     ``mincore`` costs ~20 ms per GB mapped, too slow for the memory guard's
     poll, so the guard reads this cached value and a short-lived thread
     refreshes it when it is older than a second. Until the first sample
-    lands every mapped byte is assumed resident, the conservative side.
+    lands nothing is assumed resident, the conservative side for the guard.
     """
     total = mapped_bytes()
     if not total:
@@ -509,7 +509,7 @@ def cached_resident_mapped_bytes() -> int:
         threading.Thread(
             target=_refresh_resident, name="mapped-weights-mincore", daemon=True
         ).start()
-    return total if first else min(_resident["bytes"], total)
+    return 0 if first else min(_resident["bytes"], total)
 
 
 def _refresh_resident() -> None:

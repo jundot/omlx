@@ -7,6 +7,7 @@
 import hashlib
 import json
 import struct
+import time
 
 import mlx.core as mx
 import numpy as np
@@ -226,3 +227,22 @@ def test_mapping_released_with_the_model(tmp_path):
     del loaded
     mx.synchronize()
     assert mw.mapped_bytes() == 0
+
+
+def test_cached_resident_sample(tmp_path, monkeypatch):
+    path = tmp_path / "model.safetensors"
+    _write_misaligned(path, _weights())
+    mw.realign_model(tmp_path, mode="in_place")
+    mw.enable(tmp_path)
+    loaded = mx.load(str(path))
+    mx.eval(*[v * 1 for v in loaded.values()])
+    monkeypatch.setitem(mw._resident, "at", 0.0)
+    # Nothing is assumed resident before the first sample lands.
+    assert mw.cached_resident_mapped_bytes() == 0
+    for _ in range(200):
+        if mw._resident["at"]:
+            break
+        time.sleep(0.01)
+    total = mw.mapped_bytes()
+    assert 0 < mw.cached_resident_mapped_bytes() <= total
+    assert 0 < mw.resident_mapped_bytes() <= total
