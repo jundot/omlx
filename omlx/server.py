@@ -185,6 +185,7 @@ from .api.tool_calling import (
     convert_tools_for_template,
     enrich_tool_params_for_gemma4,
     extract_tool_calls_with_thinking,
+    literal_code_recovery_suffix,
     parse_json_output,
     parse_qwen_tool_calls,
     restore_gemma4_param_names,
@@ -5991,6 +5992,25 @@ def _nonstream_recovery_text(
     if probe.recovery_candidate_is_payload() or not probe.take_recovery_candidate():
         return None
     return raw_text
+def _literal_code_recovery(
+    cleaned_text: str,
+    streamed_text: str,
+    candidate: str,
+    failed: bool,
+    channel: str,
+) -> str:
+    if not candidate or failed:
+        return ""
+    if not literal_code_candidate_is_safe(cleaned_text):
+        return ""
+    if cleaned_text.startswith(streamed_text):
+        return cleaned_text[len(streamed_text) :]
+    logger.warning(
+        "Could not recover literal code marker in %s: final text does not "
+        "start with the streamed prefix",
+        channel,
+    )
+    return ""
 
 
 def _registered_tool_names(tools: object) -> set[str]:
@@ -6103,6 +6123,8 @@ async def stream_chat_completion(
     first_visible_time = None
     last_output = None
     accumulated_text = ""
+    streamed_content = ""
+    streamed_thinking = ""
     has_tools = bool(kwargs.get("tools"))
     start_in_thinking = False
     try:
@@ -6247,6 +6269,7 @@ async def stream_chat_completion(
                         )
                         mark_visible_delta()
                         yield event
+                        streamed_thinking += thinking_delta
 
                 # Emit content delta — filter out tool-call markup when
                 # tools are present so clients see clean streamed text.
@@ -6301,6 +6324,7 @@ async def stream_chat_completion(
                             )
                             mark_visible_delta()
                             yield event
+                            streamed_content += segment.text
                             continue
 
                         if segment.kind != "envelope":
@@ -6390,6 +6414,7 @@ async def stream_chat_completion(
                 event = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
                 mark_visible_delta()
                 yield event
+                streamed_thinking += thinking_delta
         if thinking_filter:
             remaining_thinking = thinking_filter.finish()
             if remaining_thinking:
@@ -6408,6 +6433,7 @@ async def stream_chat_completion(
                 event = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
                 mark_visible_delta()
                 yield event
+                streamed_thinking += remaining_thinking
         if content_delta:
             if tool_filter:
                 content_delta = tool_filter.feed(content_delta)
@@ -6425,6 +6451,7 @@ async def stream_chat_completion(
                 event = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
                 mark_visible_delta()
                 yield event
+                streamed_content += content_delta
 
         if tool_filter:
             remaining = tool_filter.finish()
@@ -6442,17 +6469,28 @@ async def stream_chat_completion(
                 event = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
                 mark_visible_delta()
                 yield event
+                streamed_content += remaining
 
     # Parse tool calls from accumulated text
     tool_calls = None
     tool_failure = None
     parse_errors: tuple = ()
     cleaned_text = accumulated_text
+    cleaned_thinking = ""
     terminal_tool_calls_authoritative = bool(last_output and last_output.tool_calls)
     if last_output and last_output.tool_calls:
         # Protocol parser already extracted structured tool calls.
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
         cleaned_text = ""
+        thinking_content, _ = extract_thinking(
+            accumulated_text,
+            truncated=last_output is not None and last_output.finish_reason == "length",
+        )
+        cleaned_thinking = sanitize_tool_call_markup(
+            thinking_content,
+            engine.tokenizer,
+            tools=kwargs.get("tools"),
+        )
     elif has_tools and accumulated_text:
         # Separate thinking from content, then parse tool calls from content
         # (falls back to thinking content for small models)
@@ -6522,6 +6560,58 @@ async def stream_chat_completion(
     if recovered_thinking or recovered_content:
         # The marker was quoted in prose, so this is not a failed tool call.
         tool_failure = None
+    literal_thinking_candidate = (
+        thinking_filter.take_literal_code_candidate() if thinking_filter else ""
+    )
+    literal_recovered_thinking = (
+        literal_code_recovery_suffix(
+            cleaned_thinking, streamed_thinking, bool(tool_failure)
+        )
+        if literal_thinking_candidate
+        else ""
+    )
+    if literal_recovered_thinking:
+        chunk = ChatCompletionChunk(
+            id=response_id,
+            model=request.model,
+            choices=[
+                ChatCompletionChunkChoice(
+                    delta=ChatCompletionChunkDelta(
+                        reasoning_content=literal_recovered_thinking
+                    ),
+                    finish_reason=None,
+                )
+            ],
+        )
+        event = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+        mark_visible_delta()
+        yield event
+    literal_code_candidate = (
+        tool_filter.take_literal_code_candidate() if tool_filter else ""
+    )
+    literal_recovered_content = (
+        literal_code_recovery_suffix(
+            cleaned_text, streamed_content, bool(tool_failure)
+        )
+        if stream_content and literal_code_candidate
+        else ""
+    )
+    if literal_recovered_content:
+        chunk = ChatCompletionChunk(
+            id=response_id,
+            model=request.model,
+            choices=[
+                ChatCompletionChunkChoice(
+                    delta=ChatCompletionChunkDelta(
+                        content=literal_recovered_content
+                    ),
+                    finish_reason=None,
+                )
+            ],
+        )
+        event = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+        mark_visible_delta()
+        yield event
     if not tool_calls and not tool_failure:
         if recovered_thinking:
             chunk = ChatCompletionChunk(
@@ -6797,6 +6887,8 @@ async def stream_anthropic_messages(
 
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
     accumulated_text = ""
+    streamed_content = ""
+    streamed_thinking = ""
 
     # Track content blocks with thinking separation. Some templates open the
     # thinking block in the prompt itself, so the generated text starts with
@@ -6910,6 +7002,7 @@ async def stream_anthropic_messages(
                         yield create_thinking_delta_event(
                             index=block_index, thinking=thinking_delta
                         )
+                        streamed_thinking += thinking_delta
 
                 # Emit regular content as text block — filter tool-call
                 # markup when a known start marker is available.
@@ -6947,6 +7040,7 @@ async def stream_anthropic_messages(
                             yield create_text_delta_event(
                                 index=block_index, text=content_delta
                             )
+                            streamed_content += content_delta
 
             if output.finished:
                 break
@@ -6989,6 +7083,7 @@ async def stream_anthropic_messages(
             yield create_thinking_delta_event(
                 index=block_index, thinking=thinking_delta
             )
+            streamed_thinking += thinking_delta
     if thinking_filter:
         remaining_thinking = thinking_filter.finish()
         if remaining_thinking:
@@ -7004,6 +7099,7 @@ async def stream_anthropic_messages(
             yield create_thinking_delta_event(
                 index=block_index, thinking=remaining_thinking
             )
+            streamed_thinking += remaining_thinking
     if content_delta:
         if tool_filter:
             content_delta = tool_filter.feed(content_delta)
@@ -7018,6 +7114,7 @@ async def stream_anthropic_messages(
                 )
                 text_block_started = True
             yield create_text_delta_event(index=block_index, text=content_delta)
+            streamed_content += content_delta
 
     # Flush any remaining buffered content from the tool-call filter
     if tool_filter:
@@ -7040,6 +7137,7 @@ async def stream_anthropic_messages(
                 )
                 text_block_started = True
             yield create_text_delta_event(index=block_index, text=remaining)
+            streamed_content += remaining
 
     # 5. Handle tool calls (moved before block-closing so empty-text-block
     # emission can skip when tool_use blocks will follow).
@@ -7048,9 +7146,21 @@ async def stream_anthropic_messages(
     tool_calls = None
     tool_failure = None
     parse_errors: tuple = ()
+    cleaned_text = accumulated_text
+    cleaned_thinking = ""
     if last_output and last_output.tool_calls:
         # Protocol parser already extracted structured tool calls.
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
+        cleaned_text = ""
+        thinking_content, _ = extract_thinking(
+            accumulated_text,
+            truncated=last_output is not None and last_output.finish_reason == "length",
+        )
+        cleaned_thinking = sanitize_tool_call_markup(
+            thinking_content,
+            engine.tokenizer,
+            tools=kwargs.get("tools"),
+        )
     elif kwargs.get("tools"):
         # Non-Harmony: separate thinking, then parse tool calls from content
         # (falls back to thinking content for small models)
@@ -7068,6 +7178,8 @@ async def stream_anthropic_messages(
         tool_calls = extraction.tool_calls
         parse_errors = extraction.parse_errors
         tool_failure = _tool_call_failure(extraction)
+        cleaned_text = extraction.cleaned_text
+        cleaned_thinking = extraction.cleaned_thinking
 
     recovered_thinking, recovered_content = _take_recoverable_withheld_text(
         tool_filter, thinking_filter, tool_calls, parse_errors
@@ -7075,6 +7187,52 @@ async def stream_anthropic_messages(
     if recovered_thinking or recovered_content:
         # The marker was quoted in prose, so this is not a failed tool call.
         tool_failure = None
+    literal_thinking_candidate = (
+        thinking_filter.take_literal_code_candidate() if thinking_filter else ""
+    )
+    literal_recovered_thinking = (
+        literal_code_recovery_suffix(
+            cleaned_thinking, streamed_thinking, bool(tool_failure)
+        )
+        if literal_thinking_candidate
+        else ""
+    )
+    if literal_recovered_thinking:
+        if text_block_started:
+            yield create_content_block_stop_event(index=block_index)
+            block_index += 1
+            text_block_started = False
+        if not thinking_block_started:
+            yield create_content_block_start_event(
+                index=block_index, block_type="thinking"
+            )
+            thinking_block_started = True
+        yield create_thinking_delta_event(
+            index=block_index, thinking=literal_recovered_thinking
+        )
+    literal_code_candidate = (
+        tool_filter.take_literal_code_candidate() if tool_filter else ""
+    )
+    literal_recovered_content = (
+        literal_code_recovery_suffix(
+            cleaned_text, streamed_content, bool(tool_failure)
+        )
+        if literal_code_candidate
+        else ""
+    )
+    if literal_recovered_content:
+        if thinking_block_started and not text_block_started:
+            yield create_content_block_stop_event(index=block_index)
+            block_index += 1
+            thinking_block_started = False
+        if not text_block_started:
+            yield create_content_block_start_event(
+                index=block_index, block_type="text"
+            )
+            text_block_started = True
+        yield create_text_delta_event(
+            index=block_index, text=literal_recovered_content
+        )
     if not tool_calls and not tool_failure:
         if recovered_thinking:
             if text_block_started:
@@ -8501,6 +8659,7 @@ async def stream_responses_api(
     accumulated_text = ""
     accumulated_reasoning = ""
     message_deltas = []
+    streamed_content = ""
     has_tools = bool(kwargs.get("tools"))
     # Some templates open the thinking block in the prompt itself, so the
     # generated text starts with reasoning body and only later emits </think>.
@@ -8804,6 +8963,7 @@ async def stream_responses_api(
                                 "sequence_number": seq,
                             },
                         )
+                        streamed_content += content_delta
     except Exception as e:
         if isinstance(e, PrefillMemoryExceededError):
             # Same shadowing as the chat generator (#3036): surface the
@@ -8874,6 +9034,7 @@ async def stream_responses_api(
                         "sequence_number": seq,
                     },
                 )
+                streamed_content += content_delta
         if tool_filter:
             remaining = tool_filter.finish()
             if remaining:
@@ -8895,15 +9056,26 @@ async def stream_responses_api(
                         "sequence_number": seq,
                     },
                 )
+                streamed_content += remaining
 
     # Parse tool calls from accumulated text
     tool_calls = None
     tool_failure = None
     parse_errors: tuple = ()
     cleaned_text = accumulated_text
+    cleaned_thinking = ""
     if last_output and last_output.tool_calls:
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
         cleaned_text = ""
+        thinking_content, _ = extract_thinking(
+            accumulated_text,
+            truncated=last_output is not None and last_output.finish_reason == "length",
+        )
+        cleaned_thinking = sanitize_tool_call_markup(
+            thinking_content,
+            engine.tokenizer,
+            tools=kwargs.get("tools"),
+        )
     elif has_tools and accumulated_text:
         thinking_content, regular_content = extract_thinking(
             accumulated_text,
@@ -8917,6 +9089,7 @@ async def stream_responses_api(
             finish_reason=last_output.finish_reason if last_output else "stop",
         )
         cleaned_text = extraction.cleaned_text
+        cleaned_thinking = extraction.cleaned_thinking
         tool_calls = extraction.tool_calls
         parse_errors = extraction.parse_errors
         tool_failure = _tool_call_failure(extraction)
@@ -8961,6 +9134,52 @@ async def stream_responses_api(
         # The parser strips the prose before the marker, so rebuild the final
         # text from the raw answer to match the streamed deltas.
         cleaned_text = clean_special_tokens(regular_content)
+    literal_thinking_candidate = (
+        thinking_filter.take_literal_code_candidate() if thinking_filter else ""
+    )
+    literal_recovered_thinking = (
+        literal_code_recovery_suffix(
+            cleaned_thinking, accumulated_reasoning, bool(tool_failure)
+        )
+        if literal_thinking_candidate
+        else ""
+    )
+    if literal_recovered_thinking and not reasoning_closed:
+        for ev in _emit_reasoning_delta(literal_recovered_thinking):
+            yield ev
+    elif literal_recovered_thinking:
+        logger.warning(
+            "Skipped literal code marker recovery because the Responses "
+            "reasoning item was already closed"
+        )
+    literal_code_candidate = (
+        tool_filter.take_literal_code_candidate() if tool_filter else ""
+    )
+    literal_recovered_content = (
+        literal_code_recovery_suffix(
+            cleaned_text, streamed_content, bool(tool_failure)
+        )
+        if stream_content and literal_code_candidate
+        else ""
+    )
+    if literal_recovered_content:
+        if reasoning_opened and not reasoning_closed:
+            for ev in _close_reasoning():
+                yield ev
+        for ev in _open_message():
+            yield ev
+        seq += 1
+        yield format_sse_event(
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "item_id": msg_id,
+                "output_index": msg_output_index,
+                "content_index": 0,
+                "delta": literal_recovered_content,
+                "sequence_number": seq,
+            },
+        )
     if not tool_calls and not tool_failure:
         for ev in _emit_reasoning_delta(recovered_thinking):
             yield ev
