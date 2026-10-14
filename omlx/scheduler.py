@@ -8096,12 +8096,22 @@ class Scheduler:
         # Look for the think_end_str surrounded by whitespace/newlines in string literals
         escaped = re.escape(think_end_str)
         # Match patterns like: \n</think>\n\n or </think> in template strings
-        match = re.search(
-            r"(\\n|\\r|[\n\r])*" + escaped + r"((?:\\n|\\r|[\n\r])*)",
-            template_text,
-        )
-        if not match:
+        pattern = re.compile(r"(\\n|\\r|[\n\r])*" + escaped + r"((?:\\n|\\r|[\n\r])*)")
+        # The first occurrence in the template is often not the one the model
+        # was trained on. Qwen3/3.6, Step-3.5 and GLM-4.6V templates mention
+        # the bare tag first while parsing prior turns (``'</think>' in
+        # content``, ``content.split('</think>')``) and only later render the
+        # generation-side form (``'\n</think>\n\n'``). Taking the first match
+        # forced a bare ``</think>`` after mid-sentence reasoning, which Qwen
+        # does not treat as a close: it keeps reasoning into the answer and
+        # later emits its own properly wrapped close (#1864). Prefer the first
+        # occurrence that carries any surrounding newline; templates whose
+        # close really is bare (DeepSeek V3.2, GLM-5, MiniMax M2.5) have no
+        # such occurrence and fall back to the first match as before.
+        matches = list(pattern.finditer(template_text))
+        if not matches:
             return None, None
+        match = next((m for m in matches if m.group(0) != think_end_str), matches[0])
 
         # Extract raw leading/trailing whitespace, converting \n escapes to actual newlines
         raw_leading = (

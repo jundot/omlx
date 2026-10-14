@@ -878,3 +878,88 @@ class TestCompletionsStreamThinkPrefixParity:
                 )
                 return
         raise AssertionError("create_completion not found in server.py")
+
+
+class TestResolveThinkClosePattern:
+    """``_resolve_think_close_pattern`` picks the generation-side close.
+
+    The forced close must match the newline wrapping the model was trained
+    on; a bare ``</think>`` after mid-sentence reasoning is not treated as a
+    close by Qwen and the model keeps reasoning into the answer (#1864).
+    """
+
+    ENCODE = {"\n": [198], "\n\n": [271], "\r": [201]}
+
+    def _make_scheduler(self, template_text):
+        scheduler = MagicMock(spec=Scheduler)
+        scheduler._resolve_think_close_pattern = (
+            Scheduler._resolve_think_close_pattern.__get__(scheduler, Scheduler)
+        )
+        scheduler._get_chat_template_text = MagicMock(return_value=template_text)
+        tokenizer = MagicMock()
+        tokenizer.think_end = "</think>"
+        tokenizer.encode = lambda text, add_special_tokens=False: self.ENCODE[text]
+        scheduler.tokenizer = tokenizer
+        return scheduler
+
+    # Shapes lifted from real templates: the history-parsing branch mentions
+    # the bare tag before the generation-side form is rendered.
+    QWEN36_SHAPE = (
+        "{%- if '</think>' in content %}\n"
+        "    {%- set reasoning_content = content.split('</think>')[0] %}\n"
+        "    {%- set content = content.split('</think>')[-1].lstrip('\\n') %}\n"
+        "{%- endif %}\n"
+        "{{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content"
+        " + '\\n</think>\\n\\n' + content }}\n"
+        "{%- if enable_thinking is defined and enable_thinking is false %}\n"
+        "    {{- '<think>\\n\\n</think>\\n\\n' }}\n"
+        "{%- endif %}\n"
+    )
+    STEP35_SHAPE = (
+        "{%- set content = content.split('</think>')[-1] %}\n"
+        "{{- '<think>\\n' + reasoning + '\\n</think>\\n' + content }}\n"
+    )
+    GLM46V_SHAPE = (
+        "{%- if '</think>' in content %}\n"
+        "{{- '<think>' + reasoning + '</think>\\n' + content }}\n"
+    )
+    BARE_SHAPE = (
+        "{%- set content = content.split('</think>')[-1] %}\n"
+        "{{- '<think>' + reasoning + '</think>' + content }}\n"
+    )
+
+    def test_qwen36_shape_skips_history_literal(self):
+        # Before the fix the first match was the ``'</think>' in content``
+        # literal and the forced close lost both newlines.
+        scheduler = self._make_scheduler(self.QWEN36_SHAPE)
+        assert scheduler._resolve_think_close_pattern() == ([198], [271])
+
+    def test_prefers_first_wrapped_occurrence_over_later_longer_one(self):
+        # ``'\\n</think>\\n\\n'`` (generation) comes before the empty-think
+        # ``'<think>\\n\\n</think>\\n\\n'`` block; the first wrapped match wins.
+        scheduler = self._make_scheduler(self.QWEN36_SHAPE)
+        leading, _ = scheduler._resolve_think_close_pattern()
+        assert leading == [198]
+
+    def test_step35_shape_leading_and_single_trailing(self):
+        scheduler = self._make_scheduler(self.STEP35_SHAPE)
+        assert scheduler._resolve_think_close_pattern() == ([198], [198])
+
+    def test_glm46v_shape_trailing_only(self):
+        scheduler = self._make_scheduler(self.GLM46V_SHAPE)
+        assert scheduler._resolve_think_close_pattern() == (None, [198])
+
+    def test_bare_close_template_still_resolves_bare(self):
+        # DeepSeek V3.2 / GLM-5 / MiniMax M2.5: every occurrence is bare, so
+        # the fallback to the first match keeps the old behavior.
+        scheduler = self._make_scheduler(self.BARE_SHAPE)
+        assert scheduler._resolve_think_close_pattern() == (None, None)
+
+    def test_no_close_marker_in_template(self):
+        scheduler = self._make_scheduler("no close marker")
+        assert scheduler._resolve_think_close_pattern() == (None, None)
+
+    def test_parser_marker_is_used_instead_of_tokenizer_marker(self):
+        template = "{{ '<channel|>' }} {{ '\\n<channel|>\\n\\n' }}"
+        scheduler = self._make_scheduler(template)
+        assert scheduler._resolve_think_close_pattern("<channel|>") == ([198], [271])
