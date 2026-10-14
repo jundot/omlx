@@ -1220,6 +1220,7 @@ class EnginePool:
 
         moe_offload_active = bool(data.get("moe_expert_offload_enabled", False))
         add("moe_expert_offload_enabled", moe_offload_active)
+        add("mapped_weights_enabled", bool(data.get("mapped_weights_enabled", False)))
         if moe_offload_active:
             add(
                 "moe_expert_offload_resident_fraction",

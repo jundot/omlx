@@ -53,6 +53,13 @@ def validate_moe_expert_offload(settings: dict, model_type: str | None = None) -
         raise ValueError("moe_expert_offload_resident_fraction must be in (0, 1]")
     if not settings.get("moe_expert_offload_enabled"):
         return
+    # Offload reads experts into its own resident slots; there is nothing
+    # left for a file mapping to serve.
+    if settings.get("mapped_weights_enabled"):
+        raise ValueError(
+            "MoE expert offload cannot be combined with mapped weights; "
+            "disable one of them."
+        )
     # VLM MTP and DFlash have no offload-aware draft path at all.
     if any(settings.get(key) for key in ("vlm_mtp_enabled", "dflash_enabled")):
         raise ValueError(
@@ -262,6 +269,11 @@ class ModelSettings:
             models larger than memory; costs decode speed). Requires reload.
         moe_expert_offload_resident_fraction: Fraction of each layer's experts
             kept resident (0 < f <= 1, default 0.25).
+        mapped_weights_enabled: Serve the weights straight from the mapped
+            checkpoint files instead of copying them into memory. They stay
+            in the page cache, unpinned, so macOS can drop pages the model is
+            not using and read them back on demand. Misaligned tensors are
+            copied as usual (see omlx.utils.mapped_weights). Requires reload.
         specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
@@ -408,6 +420,9 @@ class ModelSettings:
     # MoE expert offload (stream non-resident experts from the checkpoint)
     moe_expert_offload_enabled: bool = False
     moe_expert_offload_resident_fraction: float = 0.25  # 0 < fraction <= 1
+
+    # Mapped weights (zero-copy from the checkpoint files, not wired)
+    mapped_weights_enabled: bool = False
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False

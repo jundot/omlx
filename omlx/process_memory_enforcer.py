@@ -39,7 +39,7 @@ import mlx.core as mx
 
 from . import settings as _settings
 from .engine.base import BaseNonStreamingEngine
-from .utils import psutil_compat
+from .utils import mapped_weights, psutil_compat
 from .utils.image import clear_image_decode_cache
 from .utils.metal_sync import unreleased_graphics_bytes
 from .utils.proc_memory import (
@@ -734,6 +734,21 @@ class ProcessMemoryEnforcer:
                 anon_active = stats["active"] - file_active - own_cpu
                 terms["other_apps"] = int(max(0, anon_active) * ratio)
         reclaimable = terms["free"] + terms["inactive"] + terms["other_apps"]
+        # Mapped weights (mapped_weights_enabled): the whole mapped file is in
+        # mx.get_active_memory(), so the usage side always charges it, but it
+        # is not in phys_footprint. Its resident pages are clean file cache,
+        # already counted as reclaimable above (dropping them costs a re-read
+        # from the SSD, not a crash). Count the rest as oMLX's own so both
+        # sides charge each mapped byte once. Metal still counts the file in
+        # full against its cap, which stays a separate ceiling.
+        mapped = mapped_weights.mapped_bytes()
+        if mapped:
+            resident = min(
+                mapped_weights.cached_resident_mapped_bytes(), terms["inactive"]
+            )
+            terms["mapped"] = mapped
+            terms["mapped_resident"] = resident
+            terms["omlx"] += mapped - resident
         # Other apps may already hold the reserve. Stay at 1 byte rather than
         # 0, which callers read as "guard disabled".
         terms["dynamic"] = max(1, terms["omlx"] + reclaimable - reserve)

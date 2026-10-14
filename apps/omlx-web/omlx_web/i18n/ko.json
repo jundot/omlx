@@ -2223,5 +2223,21 @@
   "cluster.v2.join.cleanup_forgotten": "이 Mac에서 이전 정리가 삭제되었습니다. 원격 정리는 확인되지 않았습니다.",
   "cluster.v2.join.forget_cleanup_error": "이 정리 작업을 삭제할 수 없습니다.",
   "cluster.v2.membership.waiting_request": "이 Mac이 코드를 표시하고 페어링 요청을 보내기를 기다리는 중입니다.",
-  "cluster.v2.membership.add_device": "이 Mac 추가"
+  "cluster.v2.membership.add_device": "이 Mac 추가",
+  "modal.model_settings.mapped_weights": "Mapped Weights",
+  "modal.model_settings.mapped_weights_hint": "Use the weights straight from the model files instead of copying them into memory. They are not pinned, so macOS can drop the parts the model isn't using (cold MoE experts) and read them back from the SSD on demand. Faster loads and a much smaller memory footprint; Metal still counts the whole model against its limit. Skips MoE gate/up fusion. Requires reload.",
+  "modal.model_settings.mapped_weights_offload_conflict": "Cannot be combined with MoE Expert Offload.",
+  "modal.model_settings.mapped_weights_misaligned": "{misaligned} GB of {total} GB in {files} file(s) can't be mapped: the tensors don't start at aligned offsets, so they would be copied into memory as usual. Realigning rewrites the files with the same tensors at aligned offsets; any loader still reads them unchanged.",
+  "modal.model_settings.mapped_weights_cancel": "Cancel",
+  "modal.model_settings.mapped_weights_realign_in_place": "Realign in place",
+  "modal.model_settings.mapped_weights_realign_copy": "Realign as a copy",
+  "modal.model_settings.mapped_weights_realign_note": "In place rewrites this model's misaligned files one at a time. A copy writes an aligned duplicate next to your other models and leaves this one untouched.",
+  "modal.model_settings.mapped_weights_hf_cache": "These files are shared with the Hugging Face cache; only a copy is possible.",
+  "modal.model_settings.mapped_weights_unload_first": "Unload the model to realign it in place.",
+  "modal.model_settings.mapped_weights_no_disk": "Not enough free disk space.",
+  "modal.model_settings.mapped_weights_realigning": "Realigning… {percent}%",
+  "modal.model_settings.mapped_weights_in_place_done": "Realigned. Mapped weights are on and apply on the next load.",
+  "modal.model_settings.mapped_weights_copy_done": "Aligned copy created as {model}, with mapped weights on.",
+  "modal.model_settings.mapped_weights_failed": "Realign failed: {error}",
+  "js.error.mapped_weights_check_failed": "Failed to check the model files"
 }

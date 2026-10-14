@@ -2304,6 +2304,10 @@ class VLMBatchedEngine(BaseEngine):
                 "fusion on the VLM path",
                 self._moe_offload_wrapped,
             )
+        elif getattr(self._model_settings, "mapped_weights_enabled", False):
+            # Fusion concatenates gate and up into a new buffer: a full copy
+            # of the routed experts, which is what mapping avoids.
+            logger.info("mapped weights active: skipping gate/up fusion")
         elif (
             getattr(self._model_settings, "moe_gate_up_fusion_enabled", True)
             is not False
@@ -2971,6 +2975,9 @@ class VLMBatchedEngine(BaseEngine):
                     logger.warning(f"Error closing engine: {e}")
         self._diffusion_cancel_events = set()
         self._diffusion_active_requests = 0
+        from ..utils import mapped_weights
+
+        mapped_weights.disable(self._model_name)
         logger.info("VLMBatchedEngine stopped")
         if cancelled:
             raise asyncio.CancelledError

@@ -989,6 +989,50 @@ class TestDynamicCeilingReserve:
         # 12 GB of file cache, 4 GB of it already inactive.
         assert result == 1 * self.GB + 10 * self.GB + 12 * self.GB - reserve
 
+    def test_mapped_weights_charged_once(self, mock_engine_pool):
+        """A mapped 19 GB model with 7 GB resident in the file cache.
+
+        mx.get_active_memory() charges all 19 GB to usage; the 7 GB resident
+        are already reclaimable file cache, so the other 12 GB become oMLX's
+        own and every mapped byte is counted once on the ceiling side.
+        """
+        stats = {**self.STATS, "external": 12 * self.GB}
+        with (
+            patch(
+                "omlx.process_memory_enforcer.mapped_weights.mapped_bytes",
+                return_value=19 * self.GB,
+            ),
+            patch(
+                "omlx.process_memory_enforcer.mapped_weights."
+                "cached_resident_mapped_bytes",
+                return_value=7 * self.GB,
+            ),
+        ):
+            result = self._dynamic(
+                mock_engine_pool, "safe", phys=1 * self.GB, stats=stats
+            )
+        reserve = tier_reserve_bytes("safe", 64 * self.GB)
+        assert result == (1 + 12) * self.GB + 10 * self.GB + 12 * self.GB - reserve
+
+    def test_mapped_resident_bounded_by_file_cache(self, mock_engine_pool):
+        """Resident pages the vm stats do not show as cache (wired mid-kernel)
+        are not subtracted, so the ceiling never drops below the unmapped one."""
+        with (
+            patch(
+                "omlx.process_memory_enforcer.mapped_weights.mapped_bytes",
+                return_value=19 * self.GB,
+            ),
+            patch(
+                "omlx.process_memory_enforcer.mapped_weights."
+                "cached_resident_mapped_bytes",
+                return_value=19 * self.GB,
+            ),
+        ):
+            result = self._dynamic(mock_engine_pool, "safe", phys=1 * self.GB)
+        reserve = tier_reserve_bytes("safe", 64 * self.GB)
+        # 4 GB inactive cache: 15 GB of the mapping counts as oMLX's own.
+        assert result == (1 + 15) * self.GB + 10 * self.GB + 4 * self.GB - reserve
+
     def test_safer_tier_never_allows_more(self, mock_engine_pool):
         ceilings = [
             self._dynamic(mock_engine_pool, tier, phys=1 * self.GB)
