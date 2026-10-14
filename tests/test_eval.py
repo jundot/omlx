@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for accuracy evaluation modules."""
 
+import asyncio
 from unittest.mock import MagicMock
 
 import pytest
@@ -9,7 +10,7 @@ from omlx.eval.base import BaseBenchmark
 from omlx.eval.datasets import deterministic_sample, stratified_sample
 from omlx.eval.gsm8k import GSM8KBenchmark, _extract_numeric_answer, _normalize_number
 from omlx.eval.hellaswag import HellaSwagBenchmark
-from omlx.eval.livecodebench import _extract_code
+from omlx.eval.livecodebench import LiveCodeBenchBenchmark, _extract_code
 from omlx.eval.mmlu import MMLUBenchmark, _parse_choices
 from omlx.eval.truthfulqa import TruthfulQABenchmark
 
@@ -239,6 +240,108 @@ class TestLiveCodeBench:
     def test_extract_code_empty(self):
         code = _extract_code("")
         assert code == ""
+
+
+# --- LiveCodeBench Functional (call-based) Tests ---
+
+
+@pytest.fixture(scope="module")
+def lcb_items():
+    """Normalized LiveCodeBench questions, keyed by question id."""
+    bench = LiveCodeBenchBenchmark()
+    return {item["id"]: item for item in asyncio.run(bench.load_dataset())}
+
+
+class TestLiveCodeBenchFunctional:
+    """Functional cases implement a function; stdin cases read stdin.
+
+    The two question types carry different metadata (`testtype` is nested in
+    each public test case), so grading and prompting must branch on it.
+    """
+
+    @pytest.mark.parametrize(
+        ("question_id", "testtype"),
+        [("2727", "functional"), ("abc387_a", "stdin")],
+    )
+    def test_load_dataset_keeps_testtype(self, lcb_items, question_id, testtype):
+        assert lcb_items[question_id]["testtype"] == testtype
+
+    def test_format_prompt_functional_shows_signature(self, lcb_items):
+        prompt = LiveCodeBenchBenchmark().format_prompt(lcb_items["2727"])[0]["content"]
+        assert "def countSeniors(self, details: List[str]) -> int:" in prompt
+        assert "Read input from stdin and print the output to stdout" not in prompt
+
+    def test_format_prompt_stdin_keeps_instruction(self, lcb_items):
+        prompt = LiveCodeBenchBenchmark().format_prompt(lcb_items["abc387_a"])[0][
+            "content"
+        ]
+        assert "Read input from stdin and print the output to stdout" in prompt
+
+    @pytest.mark.parametrize(
+        ("question_id", "gold", "wrong"),
+        [
+            (
+                "2727",
+                "class Solution:\n    def countSeniors(self, details: List[str]) -> int:\n"
+                "        return sum(int(d[11:13]) > 60 for d in details)\n",
+                "class Solution:\n    def countSeniors(self, details: List[str]) -> int:\n"
+                "        return len(details)\n",
+            ),
+            (
+                "2730",
+                "class Solution:\n    def maximumOr(self, nums: List[int], k: int) -> int:\n"
+                "        n = len(nums)\n"
+                "        pre = [0] * (n + 1)\n"
+                "        suf = [0] * (n + 1)\n"
+                "        for i in range(n):\n"
+                "            pre[i + 1] = pre[i] | nums[i]\n"
+                "        for i in range(n - 1, -1, -1):\n"
+                "            suf[i] = suf[i + 1] | nums[i]\n"
+                "        return max((pre[i] | suf[i + 1]) | (nums[i] << k) for i in range(n))\n",
+                "class Solution:\n    def maximumOr(self, nums: List[int], k: int) -> int:\n"
+                "        return 0\n",
+            ),
+            (
+                "2791",
+                "class Solution:\n    def circularGameLosers(self, n: int, k: int) -> List[int]:\n"
+                "        seen = set()\n"
+                "        i = 0\n"
+                "        r = 1\n"
+                "        while i not in seen:\n"
+                "            seen.add(i)\n"
+                "            i = (i + r * k) % n\n"
+                "            r += 1\n"
+                "        return [j + 1 for j in range(n) if j not in seen]\n",
+                "class Solution:\n    def circularGameLosers(self, n: int, k: int) -> List[int]:\n"
+                "        return []\n",
+            ),
+            (
+                "2792",
+                "class Solution:\n    def doesValidArrayExist(self, derived: List[int]) -> bool:\n"
+                "        x = 0\n"
+                "        for d in derived:\n"
+                "            x ^= d\n"
+                "        return x == 0\n",
+                "class Solution:\n    def doesValidArrayExist(self, derived: List[int]) -> bool:\n"
+                "        return False\n",
+            ),
+        ],
+    )
+    def test_check_answer_grades_functional_returns(
+        self, lcb_items, question_id, gold, wrong
+    ):
+        """A function written against the starter signature is graded on its
+        return value; the same signature with a wrong return is rejected."""
+        bench = LiveCodeBenchBenchmark()
+        item = lcb_items[question_id]
+        assert bench.check_answer(gold, item) is True
+        assert bench.check_answer(wrong, item) is False
+
+    def test_check_answer_stdin_grader_unchanged(self, lcb_items):
+        gold = "a, b = map(int, input().split())\nprint((a + b) ** 2)\n"
+        assert (
+            LiveCodeBenchBenchmark().check_answer(gold, lcb_items["abc387_a"]) is True
+        )
 
 
 # --- HumanEval Tests ---

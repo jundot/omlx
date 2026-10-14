@@ -76,6 +76,34 @@ def _set_resource_limits():
         pass
 
 
+# Functional problems are graded call-based: one JSON-encoded argument per
+# input line, return value against the expected JSON output. The starter-code
+# signature is annotated with `List`, so the typing names must be importable.
+_FUNCTIONAL_PREAMBLE = "from typing import *\nimport json\n"
+
+
+def _entry_point(starter_code: str) -> str:
+    """Method a functional problem asks the model to implement."""
+    return re.search(r"def\s+(\w+)\s*\(", starter_code).group(1)
+
+
+def _functional_script(code: str, item: dict) -> str:
+    """Wrap a functional solution in a self-checking script."""
+    cases = json.dumps(list(zip(item["inputs"][:3], item["outputs"][:3])))
+    return (
+        f"{_FUNCTIONAL_PREAMBLE}\n{code}\n\n"
+        "if __name__ == '__main__':\n"
+        "    _solution = Solution()\n"
+        f"    for _i, (_raw, _expected) in enumerate({cases}):\n"
+        "        _args = [json.loads(_line) for _line in _raw.split('\\n')]\n"
+        f"        _got = _solution.{_entry_point(item['starter_code'])}(*_args)\n"
+        "        if isinstance(_got, tuple):\n"
+        "            _got = list(_got)\n"
+        "        assert _got == json.loads(_expected), "
+        "f'case {_i}: expected {_expected}, got {_got!r}'\n"
+    )
+
+
 def _execute_code(code: str, stdin_input: str = "") -> tuple[str, bool, str]:
     """Execute Python code in a subprocess with safety limits.
 
@@ -151,6 +179,13 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
             if not inputs or not outputs:
                 continue
 
+            # Every public test case of a bundled question shares one type.
+            testtype = (
+                "functional"
+                if all(tc.get("testtype") == "functional" for tc in test_cases)
+                else "stdin"
+            )
+
             normalized.append({
                 "id": item.get("question_id", str(i)),
                 "title": item.get("question_title", f"Problem {i}"),
@@ -159,6 +194,7 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
                 "outputs": outputs,
                 "difficulty": item.get("difficulty", ""),
                 "starter_code": item.get("starter_code", ""),
+                "testtype": testtype,
             })
 
         logger.info(f"LiveCodeBench: loaded {len(normalized)} problems")
@@ -175,11 +211,21 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
     def format_prompt(self, item: dict) -> list[dict[str, str]]:
         """Format as a coding problem prompt."""
         description = item["description"]
+        if item.get("testtype") == "functional":
+            instruction = (
+                "Implement the function in the signature below and return its result; "
+                "do not read from stdin or print to stdout."
+            )
+            signature = f"\nSignature:\n{item['starter_code']}\n"
+        else:
+            instruction = "Read input from stdin and print the output to stdout."
+            signature = ""
         prompt = (
             "Solve the following programming problem in Python. "
-            "Read input from stdin and print the output to stdout. "
+            f"{instruction} "
             "Provide only the complete Python code, no explanations.\n\n"
-            f"Problem:\n{description}\n\n"
+            f"Problem:\n{description}\n"
+            f"{signature}\n"
             "Solution:"
         )
         return [{"role": "user", "content": prompt}]
@@ -195,6 +241,10 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
         """
         if not predicted.strip():
             return False
+
+        if item.get("testtype") == "functional":
+            _, success, _ = _execute_code(_functional_script(predicted, item))
+            return success
 
         inputs = item["inputs"][:3]
         outputs = item["outputs"][:3]
