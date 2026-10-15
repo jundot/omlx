@@ -3598,7 +3598,9 @@ class TestExclusiveGroup:
                 await pool.get_engine("model-b")
             elapsed = time.monotonic() - started
         assert elapsed >= 0.2
-        assert "exclusive group 'g' member 'model-a' is busy" in str(exc_info.value)
+        assert str(exc_info.value) == (
+            "Cannot load 'model-b': exclusive group 'g' member 'model-a' is busy"
+        )
         assert pool._entries["model-a"].engine is not None
         assert pool._entries["model-a"].pending_unload_reason is None
 

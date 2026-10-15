@@ -218,6 +218,13 @@ class _AdmissionNeverFitsError(InsufficientMemoryError):
 class _ExclusiveGroupBusyError(ModelBusyError):
     """A same-group model is busy; the PR1 retry loop waits for it."""
 
+    def __init__(self, model_id: str, operation: str):
+        # Skip ModelBusyError's wording: it says the requested model is busy,
+        # but here another member of the group is the busy one.
+        super(ModelBusyError, self).__init__(f"Cannot {operation}")
+        self.model_id = model_id
+        self.operation = operation
+
 
 class _GroupQueued(_ExclusiveGroupBusyError):
     """The request waits in the FIFO of its exclusive group (not the head)."""
@@ -2900,8 +2907,8 @@ class EnginePool:
                                 self._enqueue_ticket(ticket)
                                 raise _GroupQueued(
                                     model_id,
-                                    f"start work while exclusive group '{group}' "
-                                    f"is swapping (queued behind "
+                                    f"start work on '{model_id}': exclusive group "
+                                    f"'{group}' is swapping (queued behind "
                                     f"'{queue[0].model_id}')",
                                 )
                         return await self._admit_engine_locked(
@@ -3581,7 +3588,8 @@ class EnginePool:
             ):
                 raise _ExclusiveGroupBusyError(
                     model_id,
-                    f"load while exclusive group '{group}' member '{mid}' is busy",
+                    f"load '{model_id}': exclusive group '{group}' member "
+                    f"'{mid}' is busy",
                 )
 
         for mid in members:
