@@ -246,6 +246,8 @@
   "models.downloader.hf_token": "HF Token",
   "models.downloader.hf_token_optional": "（選填）",
   "models.downloader.hf_token_placeholder": "hf_...",
+  "models.downloader.exclude_patterns": "排除模式",
+  "models.downloader.exclude_patterns_hint": "選用，以逗號分隔的 glob（例如 *.gguf）。預設下載完整倉庫。",
   "models.downloader.download_button": "下載",
   "models.downloader.token_warning": "你儲存的 Hugging Face token 已被拒絕，因此結果以未驗證方式顯示。請執行 'hf auth logout' 或設定有效的 HF_TOKEN 以消除此警告。",
   "models.downloader.ms_download_section": "從魔搭社區下載",

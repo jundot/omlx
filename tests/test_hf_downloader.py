@@ -28,6 +28,7 @@ from omlx.admin.hf_downloader import (
     _calc_safetensors_disk_size,
     _histogram_has_packed_u32,
     _is_xet_transport_error,
+    _merge_ignore_patterns,
     _SpeedMeter,
     _make_cancellable_tqdm,
     _sum_safetensors_blob_bytes,
@@ -156,6 +157,14 @@ class TestDownloadTask:
         for status in DownloadStatus:
             task = DownloadTask(task_id="t", repo_id="o/m", status=status)
             assert task.to_dict()["status"] == status.value
+
+    def test_ignore_patterns_round_trip(self):
+        task = DownloadTask(task_id="t", repo_id="o/m", ignore_patterns=["*.gguf"])
+        assert (
+            DownloadTask(task_id="t", repo_id="o/m").to_dict()["ignore_patterns"] == []
+        )
+        assert task.to_dict()["ignore_patterns"] == ["*.gguf"]
+        assert DownloadTask.from_dict(task.to_dict()).ignore_patterns == ["*.gguf"]
 
 
 # =============================================================================
@@ -976,6 +985,64 @@ class TestHFDownloader:
             "consolidated.*.pth",
         ]
         assert task.status == DownloadStatus.COMPLETED
+
+    @pytest.mark.parametrize(
+        "auto,user,expected",
+        [
+            ([], ["*.gguf", ""], ["*.gguf"]),
+            (["a", "b"], ["a", " b ", "c"], ["a", "b", "c"]),
+        ],
+    )
+    def test_merge_ignore_patterns_keeps_order_without_duplicates(
+        self, auto, user, expected
+    ):
+        assert _merge_ignore_patterns(auto, user) == expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "safetensors,expected",
+        [
+            (
+                {"parameters": {"BF16": 7_000_000_000}, "total": 7_000_000_000},
+                ["*.bin", "original/**", "consolidated.*.pth", "*.gguf"],
+            ),
+            (None, ["*.gguf"]),
+        ],
+    )
+    async def test_run_download_applies_user_ignore_patterns(
+        self, model_dir, safetensors, expected
+    ):
+        model_dir.mkdir(parents=True, exist_ok=True)
+        downloader = HFDownloader(model_dir=str(model_dir))
+        task = DownloadTask(
+            task_id="t-user-ignore",
+            repo_id="owner/model",
+            ignore_patterns=["*.gguf"],
+        )
+        downloader._tasks[task.task_id] = task
+
+        mock_info = MagicMock()
+        mock_info.safetensors = safetensors
+        mock_info.siblings = None
+        mock_api = MagicMock()
+        mock_api.model_info.return_value = mock_info
+        snapshot_calls = []
+
+        def fake_snapshot_download(**kwargs):
+            snapshot_calls.append(kwargs)
+            if kwargs.get("dry_run"):
+                raise RuntimeError("dry_run not supported")
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            await downloader._run_download(task.task_id, "")
+
+        assert snapshot_calls[0]["ignore_patterns"] == expected
 
     @pytest.mark.asyncio
     async def test_dry_run_failure_u32_uses_sibling_blob_size(self, model_dir):
