@@ -21274,6 +21274,78 @@
         }
       }
     },
+    "settings.acceleration.mtplx_import.button" : {
+      "comment" : "Button title that imports an MTPLX MTP side-car",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Import MTPLX Side-car"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Импортировать сайдкар MTPLX"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "导入 MTPLX 附加文件"
+          }
+        }
+      }
+    },
+    "settings.acceleration.mtplx_import.label" : {
+      "comment" : "Row label for the one-time MTPLX side-car import action",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MTPLX Side-car"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сайдкар MTPLX"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MTPLX 附加文件"
+          }
+        }
+      }
+    },
+    "settings.acceleration.mtplx_import.sub" : {
+      "comment" : "Sublabel for the MTPLX side-car import action",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Import the model's MTP head into its checkpoint index to unlock Lightning MTP."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Импортировать MTP-голову модели в индекс чекпойнта, чтобы включить Lightning MTP."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "将模型的 MTP 头导入检查点索引以启用 Lightning MTP。"
+          }
+        }
+      }
+    },
     "settings.acceleration.qwen4_wide_decode.label" : {
       "comment" : "Row label for the Qwen4 extended fused decode toggle",
       "extractionState" : "manual",

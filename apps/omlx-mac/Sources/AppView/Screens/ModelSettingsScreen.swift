@@ -1795,7 +1795,6 @@ private struct AccelerationSection: View {
                 }
             }
 
-
             if vm.canImportMtplxSidecar {
                 Row(label: String(localized: "settings.acceleration.mtplx_import.label",
                                   defaultValue: "MTPLX Side-car",
@@ -1814,7 +1813,7 @@ private struct AccelerationSection: View {
                                         comment: "Button title that imports an MTPLX MTP side-car"))
                         }
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.omlx(.primary, size: .small))
                     .disabled(vm.isImportingMtplxSidecar)
                 }
             }

@@ -1345,7 +1345,7 @@ final class ModelSettingsScreenVM {
 
         do {
             _ = try await client.importMtplxSidecar(id: modelID)
-            await load(modelID: modelID, client: client)
+            await load(modelID: modelID, client: client, preservingEdits: true)
         } catch {
             lastError = error.omlxDescription
         }
