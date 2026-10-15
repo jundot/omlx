@@ -1422,6 +1422,8 @@
                                             <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.enhanced_help') }}</p>
                                         </div>
                                         <button type="button"
+                                                role="switch"
+                                                :aria-checked="oqEnhanced"
                                                 @click="oqEnhanced = !oqEnhanced"
                                                 :class="oqEnhanced ? 'bg-black' : 'bg-neutral-200'"
                                                 class="relative flex-shrink-0 w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -1436,6 +1438,8 @@
                                                 <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.imatrix_reuse_cache_help') }}</p>
                                             </div>
                                             <button type="button"
+                                                    role="switch"
+                                                    :aria-checked="oqeReuseImatrixCache"
                                                     @click="oqeReuseImatrixCache = !oqeReuseImatrixCache"
                                                     :class="oqeReuseImatrixCache ? 'bg-black' : 'bg-neutral-200'"
                                                     class="relative flex-shrink-0 w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -1456,6 +1460,8 @@
                                                 <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.imatrix_strict_help') }}</p>
                                             </div>
                                             <button type="button"
+                                                    role="switch"
+                                                    :aria-checked="oqeStrictImatrix"
                                                     @click="oqeStrictImatrix = !oqeStrictImatrix"
                                                     :class="oqeStrictImatrix ? 'bg-black' : 'bg-neutral-200'"
                                                     class="relative flex-shrink-0 w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -1477,6 +1483,8 @@
                                         <div x-show="oqSelectedModelIsVLM() && oqSelectedModelType() !== 'deepseek_v41'" x-cloak class="flex items-center justify-between">
                                             <span class="text-sm text-neutral-600">{{ t('models.oq.text_only') }}</span>
                                             <button type="button"
+                                                    role="switch"
+                                                    :aria-checked="oqTextOnly"
                                                     @click="oqTextOnly = !oqTextOnly"
                                                     :class="oqTextOnly ? 'bg-black' : 'bg-neutral-200'"
                                                     class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -1495,6 +1503,8 @@
                                                    class="text-xs text-amber-600 mt-1 leading-relaxed">{{ t('models.oq.preserve_mtp_unavailable') }}</p>
                                             </div>
                                             <button type="button"
+                                                    role="switch"
+                                                    :aria-checked="oqPreserveMtp"
                                                     @click="if (oqSelectedModelHasMtp()) oqPreserveMtp = !oqPreserveMtp"
                                                     :disabled="!oqSelectedModelHasMtp()"
                                                     :class="[
@@ -1529,12 +1539,14 @@
                                             </div>
                                             <div class="flex gap-1.5 shrink-0">
                                                 <button type="button" @click="oqDtype='bfloat16'"
+                                                        :aria-pressed="oqDtype==='bfloat16'"
                                                         :class="oqDtype==='bfloat16' ? 'bg-black text-white' : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200'"
                                                         class="px-3 py-1.5 text-xs font-medium rounded-full transition-colors">
                                                     bfloat16
                                                 </button>
                                                 <button type="button" @click="oqDtype='float16'"
                                                         x-show="oqSelectedModelType() !== 'deepseek_v41'"
+                                                        :aria-pressed="oqDtype==='float16'"
                                                         :class="oqDtype==='float16' ? 'bg-black text-white' : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200'"
                                                         class="px-3 py-1.5 text-xs font-medium rounded-full transition-colors">
                                                     float16
@@ -1985,6 +1997,8 @@
                                                     <p class="text-caption text-neutral-400 mt-0.5" x-text="window.t('models.uploader.modal_redownload_hint')"></p>
                                                 </div>
                                                 <button @click="uploadRedownloadNotice = !uploadRedownloadNotice"
+                                                        role="switch"
+                                                        :aria-checked="uploadRedownloadNotice"
                                                         class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300 ml-3"
                                                         :class="uploadRedownloadNotice ? 'bg-black' : 'bg-neutral-200'">
                                                     <span class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"
@@ -1996,6 +2010,8 @@
                                         <div class="flex items-center justify-between">
                                             <label class="text-xs font-medium text-neutral-500" x-text="window.t('models.uploader.modal_private_label')"></label>
                                             <button @click="uploadPrivate = !uploadPrivate"
+                                                    role="switch"
+                                                    :aria-checked="uploadPrivate"
                                                     class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300"
                                                     :class="uploadPrivate ? 'bg-black' : 'bg-neutral-200'">
                                                 <span class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"
