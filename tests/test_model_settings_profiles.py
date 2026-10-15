@@ -2,6 +2,7 @@
 """Tests for profile/template CRUD on ModelSettingsManager."""
 
 import json
+import os
 
 import pytest
 
@@ -1018,7 +1019,96 @@ def test_unreadable_storage_does_not_trigger_reference_repair(
     assert "Skipped profile reference repair" in caplog.text
     assert not list(tmp_path.glob("profile-reference-backup-*"))
     for name, content in originals.items():
-        assert (tmp_path / name).read_bytes() == content
+        if damage == "invalid_json" and name == filename:
+            # The unparseable document is quarantined under
+            # <name>.corrupt-<ts>; its bytes survive for manual recovery.
+            quarantined = list(tmp_path.glob(f"{name}.corrupt-*"))
+            assert len(quarantined) == 1
+            assert quarantined[0].read_bytes() == content
+        else:
+            assert (tmp_path / name).read_bytes() == content
+
+
+@pytest.mark.parametrize(
+    "filename", ["model_settings.json", "model_profiles.json", "global_templates.json"]
+)
+def test_corrupt_storage_quarantined_before_starting_empty(tmp_path, filename):
+    """A corrupt JSON file is renamed to <name>.corrupt-<unix-ts> instead of
+    being silently overwritten by the next save."""
+    path = tmp_path / filename
+    path.write_text("{truncated")
+    mgr = ModelSettingsManager(tmp_path)
+
+    quarantined = list(tmp_path.glob(f"{filename}.corrupt-*"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text() == "{truncated"
+    assert not path.exists()
+    assert mgr.list_profiles("m") == []
+    assert mgr.get_template("coding") is None
+
+
+def test_corrupt_profiles_quarantine_survives_next_save(tmp_path):
+    """After quarantine the next save writes a fresh file; the corrupt bytes
+    stay recoverable under the .corrupt-<ts> name."""
+    profiles_file = tmp_path / "model_profiles.json"
+    profiles_file.write_text("{")
+    mgr = ModelSettingsManager(tmp_path)
+
+    quarantined = list(tmp_path.glob("model_profiles.json.corrupt-*"))
+    assert len(quarantined) == 1
+
+    mgr.save_profile("m", "coding", "Coding", None, {"temperature": 0.1})
+    data = json.loads(profiles_file.read_text())
+    assert set(data["profiles"]["m"]) == {"coding"}
+    assert quarantined[0].read_text() == "{"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_migration_save_failure_keeps_loaded_profiles(tmp_path):
+    """Old-schema profiles (ttl_seconds) that migrate on load must survive a
+    failed migration save (read-only base dir): discarding them would let
+    the next save_profile overwrite the file with a single record."""
+    profiles_file = tmp_path / "model_profiles.json"
+    profiles_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "profiles": {
+                    "m": {
+                        "coding": {
+                            "name": "coding",
+                            "display_name": "Coding",
+                            "settings": {"temperature": 0.5, "ttl_seconds": 3600},
+                        }
+                    },
+                    "other": {
+                        "copy": {
+                            "name": "copy",
+                            "display_name": "Copy",
+                            "settings": {"temperature": 0.2, "ttl_seconds": 60},
+                        }
+                    },
+                },
+            }
+        )
+    )
+    os.chmod(tmp_path, 0o500)
+    try:
+        mgr = ModelSettingsManager(tmp_path)
+    finally:
+        os.chmod(tmp_path, 0o700)
+
+    # The failed save discarded neither model's profiles from memory.
+    assert [p["name"] for p in mgr.list_profiles("m")] == ["coding"]
+    assert [p["name"] for p in mgr.list_profiles("other")] == ["copy"]
+
+    # Once writable again, the next save persists the full migrated set —
+    # ttl_seconds stripped, both models intact.
+    mgr.save_profile("m", "extra", "Extra", None, {"temperature": 0.1})
+    data = json.loads(profiles_file.read_text())
+    assert set(data["profiles"]["m"]) == {"coding", "extra"}
+    assert set(data["profiles"]["other"]) == {"copy"}
+    assert "ttl_seconds" not in data["profiles"]["m"]["coding"]["settings"]
 
 
 @pytest.mark.parametrize("failure", ["backup", "second_write", "corrupt_backup"])

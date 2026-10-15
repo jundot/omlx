@@ -12,6 +12,7 @@ import logging
 import os
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -776,6 +777,25 @@ class ModelSettingsManager:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
 
+    @staticmethod
+    def _quarantine_corrupt_file(path: Path) -> None:
+        """Rename an unparseable JSON document to ``<name>.corrupt-<unix-ts>``.
+
+        The loader starts empty afterwards, so the next save would overwrite
+        the original path with no backup. Keeping the bad bytes under the
+        .corrupt name preserves them for manual recovery (same policy as the
+        usage-history sqlite quarantine). Best-effort: rename errors are
+        logged and ignored so an unwritable directory never turns a corrupt
+        file into a startup crash.
+        """
+        try:
+            quarantine = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+            path.replace(quarantine)
+        except OSError as e:
+            logger.warning(f"Could not rename corrupt file {path}: {e}")
+            return
+        logger.warning(f"Corrupt file preserved as {quarantine.name}")
+
     def _load(self) -> None:
         """Load settings from the JSON file.
 
@@ -836,8 +856,9 @@ class ModelSettingsManager:
 
             logger.info(f"Loaded settings for {len(self._settings)} models")
 
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
             logger.error(f"Invalid JSON in settings file: {e}")
+            self._quarantine_corrupt_file(self.settings_file)
             self._settings = {}
         except Exception as e:
             logger.error(f"Failed to load settings file: {e}")
@@ -1060,6 +1081,7 @@ class ModelSettingsManager:
         if not self.profiles_file.exists():
             self._profiles = {}
             return
+        changed = False
         try:
             with open(self.profiles_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -1071,7 +1093,6 @@ class ModelSettingsManager:
             self._profiles = data.get("profiles", {}) or {}
             # Migration: strip ttl_seconds from existing profile settings and
             # add api_name for exposed-model IDs without changing internal keys.
-            changed = False
             for model_id, profiles in self._profiles.items():
                 model_changed = False
                 used_api_names: set[str] = set()
@@ -1122,11 +1143,26 @@ class ModelSettingsManager:
                         model_changed = True
                 if model_changed:
                     logger.info(f"Migrated profile api names for model '{model_id}'")
-            if changed:
-                self._save_profiles()
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            logger.error(f"Invalid JSON in profiles file: {e}")
+            self._quarantine_corrupt_file(self.profiles_file)
+            self._profiles = {}
+            return
         except Exception as e:
             logger.error(f"Failed to load profiles file: {e}")
             self._profiles = {}
+            return
+
+        if changed:
+            # Persist the migration outside the load try: a failed save
+            # (read-only base dir, ENOSPC, ...) must not discard the
+            # profiles that already loaded and migrated in memory — the
+            # next save_profile would overwrite the file with a single
+            # record.
+            try:
+                self._save_profiles()
+            except Exception as e:
+                logger.warning(f"Failed to persist migrated profiles file: {e}")
 
     def _save_profiles(self) -> None:
         """Write profiles to disk atomically (temp file + rename)."""
@@ -1732,6 +1768,10 @@ class ModelSettingsManager:
                 settings = template.get("settings")
                 if settings and "ttl_seconds" in settings:
                     del settings["ttl_seconds"]
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            logger.error(f"Invalid JSON in templates file: {e}")
+            self._quarantine_corrupt_file(self.templates_file)
+            self._templates = {}
         except Exception as e:
             logger.error(f"Failed to load templates file: {e}")
             self._templates = {}

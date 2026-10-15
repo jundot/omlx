@@ -105,6 +105,20 @@ MLX_LM_TEXT_ONLY_MODEL_TYPES = {
 _MIMO_VISION_SIDECAR = Path("omnimodal/vision_encoder.safetensors")
 _MIMO_OMNIMODAL_CONFIG = Path("omnimodal/config.json")
 
+# Sidecar weight files that live in registered subdirectories next to the
+# top-level backbone shards. The MiMo omnimodal export
+# (patches/mimo_v2/omnimodal.py) writes the vision encoder, audio encoder,
+# and audio tokenizer below "omnimodal/" and "audio_tokenizer/"; a serving
+# VLM loads all of them, so size estimation must count the files. Keep this
+# enumerated explicitly — never a blanket recursive glob, which would also
+# count intentionally excluded subdirectories such as speculative-draft
+# checkpoints.
+SIDECAR_WEIGHT_PATHS = (
+    _MIMO_VISION_SIDECAR,
+    Path("omnimodal/audio_encoder.safetensors"),
+    Path("audio_tokenizer/model.safetensors"),
+)
+
 # Clef ships its decision head next to the backbone shards. It is not part of
 # the backbone index, so backbone loaders and quantizers must skip it.
 CLEF_HEAD_WEIGHTS = "joint_head.safetensors"
@@ -445,7 +459,7 @@ def _is_unsupported_model(model_path: Path) -> bool:
     try:
         with open(config_path) as f:
             config = json.load(f)
-    except (json.JSONDecodeError, IOError):
+    except (json.JSONDecodeError, UnicodeDecodeError, IOError):
         return False
 
     architectures = config.get("architectures", [])
@@ -708,7 +722,7 @@ def detect_model_type(model_path: Path) -> ModelType:
     try:
         with open(config_path) as f:
             config = json.load(f)
-    except (json.JSONDecodeError, IOError):
+    except (json.JSONDecodeError, UnicodeDecodeError, IOError):
         return "llm"
 
     if decision_kind(model_path, config) is not None:
@@ -888,8 +902,12 @@ def _read_chat_template_text(model_path: Path) -> str | None:
     """Return the chat template from chat_template.jinja or tokenizer_config.json."""
     jinja_path = model_path / "chat_template.jinja"
     if jinja_path.exists():
+        # Decode with replacement: a template that carries a few U+FFFD
+        # chars still enables the string-matching heuristics, while a
+        # UnicodeDecodeError would escape _register_model's guard and
+        # drop the whole model from discovery.
         with contextlib.suppress(OSError):
-            return jinja_path.read_text(encoding="utf-8")
+            return jinja_path.read_bytes().decode("utf-8", errors="replace")
 
     tc_path = model_path / "tokenizer_config.json"
     if tc_path.exists():
@@ -933,7 +951,7 @@ def detect_thinking_default(
     try:
         with (model_path / "config.json").open(encoding="utf-8") as config_file:
             model_config = json.load(config_file)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         model_config = {}
     if model_config.get("model_type") == "laguna":
         return True
@@ -999,7 +1017,7 @@ def _read_model_context_length(model_path: Path) -> int | None:
         try:
             with open(config_path, encoding="utf-8") as f:
                 model_config = json.load(f)
-        except (OSError, json.JSONDecodeError) as e:
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
             logger.debug(f"Failed to read config.json for {model_path}: {e}")
             model_config = {}
 
@@ -1021,7 +1039,7 @@ def _read_model_context_length(model_path: Path) -> int | None:
         try:
             with open(tc_path, encoding="utf-8") as f:
                 tc = json.load(f)
-        except (OSError, json.JSONDecodeError) as e:
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
             logger.debug(f"Failed to read tokenizer_config.json for {model_path}: {e}")
             tc = {}
 
@@ -1114,6 +1132,15 @@ def estimate_model_size(model_path: Path) -> int:
     for f in safetensors_files:
         total_size += f.stat().st_size
 
+    # Registered sidecar weights kept in known subdirectories (e.g. the MiMo
+    # omnimodal vision/audio encoders). The recursive glob below only runs
+    # when no top-level weights exist, so sidecars must be counted here or
+    # VLM admission underestimates by the vision tower size. Best-effort per
+    # file: a sidecar deleted mid-scan simply contributes nothing.
+    for relative in SIDECAR_WEIGHT_PATHS:
+        with contextlib.suppress(OSError):
+            total_size += (model_path / relative).stat().st_size
+
     # Fallback: .bin files (older PyTorch format)
     if total_size == 0:
         for f in model_path.glob("*.bin"):
@@ -1169,7 +1196,16 @@ def _vision_weight_bytes(model_path: Path) -> int:
     import struct
 
     total = 0
-    for shard in model_path.glob("*.safetensors"):
+    # Registered sidecar shards (e.g. the MiMo omnimodal vision encoder)
+    # hold the vision tensors for sidecar checkpoints; scan their headers
+    # too so the text-only estimate can subtract the vision tower.
+    shards = list(model_path.glob("*.safetensors"))
+    shards += [
+        model_path / relative
+        for relative in SIDECAR_WEIGHT_PATHS
+        if (model_path / relative).is_file()
+    ]
+    for shard in shards:
         try:
             with open(shard, "rb") as f:
                 (header_len,) = struct.unpack("<Q", f.read(8))
@@ -1464,6 +1500,19 @@ def _decode_hf_cache_model_id(path: Path) -> tuple[str, str] | None:
     return f"{parts[0]}--{repo_name}", f"{parts[0]}/{repo_name}"
 
 
+def _safe_mtime(path: Path) -> float:
+    """Return st_mtime, or 0.0 when the entry vanished between checks.
+
+    HF cache snapshots can be deleted concurrently (hub eviction, another
+    download refresh) between the is_dir() filter and the max() key call;
+    a raised FileNotFoundError would escape the unguarded refresh callback.
+    """
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def _resolve_hf_cache_entry(path: Path) -> HfCacheEntry | None:
     """Resolve an HF Hub cache entry (models--Org--Name/) to its active snapshot.
 
@@ -1497,7 +1546,7 @@ def _resolve_hf_cache_entry(path: Path) -> HfCacheEntry | None:
     if len(snapshots) == 1:
         return HfCacheEntry(snapshots[0], model_id, source_repo_id)
 
-    snapshot = max(snapshots, key=lambda p: p.stat().st_mtime)
+    snapshot = max(snapshots, key=_safe_mtime)
     return HfCacheEntry(snapshot, model_id, source_repo_id)
 
 

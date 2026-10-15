@@ -3,6 +3,7 @@
 
 import json
 import logging
+import shutil
 import struct
 from pathlib import Path
 
@@ -15,12 +16,15 @@ from omlx.model_discovery import (
     _is_helper_checkpoint,
     _is_hf_cache_mlx_compatible,
     _is_unsupported_model,
+    _read_chat_template_text,
     _read_model_context_length,
     _register_model,
     _resolve_hf_cache_entry,
+    _safe_mtime,
     _vision_weight_bytes,
     decision_kind,
     detect_model_type,
+    detect_thinking_default,
     discover_models,
     discover_models_from_dirs,
     estimate_model_size,
@@ -945,6 +949,32 @@ class TestEstimateModelSize:
         # Should use safetensors size only
         assert size == int(1000 * 1.05)
 
+    def test_estimate_includes_registered_sidecar_weights(self, tmp_path):
+        """Registered sidecar weights in known subdirectories (MiMo
+        omnimodal vision/audio encoders, audio tokenizer) count toward the
+        estimate — VLM admission must not miss the vision tower."""
+        (tmp_path / "model.safetensors").write_bytes(b"0" * 1000)
+        omnimodal = tmp_path / "omnimodal"
+        omnimodal.mkdir()
+        (omnimodal / "vision_encoder.safetensors").write_bytes(b"0" * 300)
+        (omnimodal / "audio_encoder.safetensors").write_bytes(b"0" * 100)
+        audio_tokenizer = tmp_path / "audio_tokenizer"
+        audio_tokenizer.mkdir()
+        (audio_tokenizer / "model.safetensors").write_bytes(b"0" * 50)
+
+        assert estimate_model_size(tmp_path) == int(1450 * 1.05)
+
+    def test_estimate_excludes_unregistered_subdirectory_weights(self, tmp_path):
+        """No blanket recursive count: unknown subdirectories (e.g.
+        speculative-draft checkpoints) stay excluded while top-level
+        weights exist."""
+        (tmp_path / "model.safetensors").write_bytes(b"0" * 1000)
+        draft = tmp_path / "draft"
+        draft.mkdir()
+        (draft / "model.safetensors").write_bytes(b"0" * 5000)
+
+        assert estimate_model_size(tmp_path) == int(1000 * 1.05)
+
 
 class TestDiscoverModels:
     """Tests for discover_models function."""
@@ -1683,6 +1713,57 @@ class TestReadModelContextLength:
         assert _read_model_context_length(tmp_path) is None
 
 
+class TestNonUtf8Metadata:
+    """A single non-UTF-8 metadata file must degrade gracefully, never drop
+    the whole model from discovery: UnicodeDecodeError used to escape these
+    readers and _register_model's broad except then skipped the model."""
+
+    def _make_model(self, tmp_path, name="qwen3"):
+        model = tmp_path / name
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
+        (model / "model.safetensors").write_bytes(b"0" * 1000)
+        return model
+
+    def test_chat_template_jinja_decodes_with_replacement(self, tmp_path):
+        """A chat_template.jinja starting with a BOM-looking \xff\xfe still
+        feeds the string-matching heuristics via replacement chars."""
+        model = self._make_model(tmp_path)
+        (model / "chat_template.jinja").write_bytes(
+            b"\xff\xfe{% if enable_thinking is false %}think{% endif %}"
+        )
+        text = _read_chat_template_text(model)
+        assert text is not None
+        assert "enable_thinking is false" in text
+        assert detect_thinking_default(model) is True
+
+    def test_discovery_keeps_model_with_non_utf8_chat_template(self, tmp_path):
+        model = self._make_model(tmp_path)
+        (model / "chat_template.jinja").write_bytes(
+            b"\xff\xfe{% if enable_thinking is false %}think{% endif %}"
+        )
+        assert "qwen3" in discover_models(tmp_path)
+
+    def test_context_length_silent_on_non_utf8_config(self, tmp_path):
+        (tmp_path / "config.json").write_bytes(
+            b"\xff\xfe" + b'{"max_position_embeddings": 4096}'
+        )
+        assert _read_model_context_length(tmp_path) is None
+
+    def test_detect_model_type_silent_on_non_utf8_config(self, tmp_path):
+        (tmp_path / "config.json").write_bytes(b"\xff\xfe{}")
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_is_unsupported_model_silent_on_non_utf8_config(self, tmp_path):
+        (tmp_path / "config.json").write_bytes(b"\xff\xfe{}")
+        assert _is_unsupported_model(tmp_path) is False
+
+    def test_thinking_default_silent_on_non_utf8_config(self, tmp_path):
+        (tmp_path / "chat_template.jinja").write_text("enable_thinking is false")
+        (tmp_path / "config.json").write_bytes(b"\xff\xfe{}")
+        assert detect_thinking_default(tmp_path) is True
+
+
 class TestTwoLevelDiscovery:
     """Tests for two-level model discovery."""
 
@@ -2000,6 +2081,30 @@ class TestHfCacheDiscovery:
         result = _resolve_hf_cache_entry(entry)
         assert result is not None
         assert result.snapshot_path == snapshot
+
+    def test_safe_mtime_returns_zero_for_vanished_path(self, tmp_path):
+        assert _safe_mtime(tmp_path / "gone") == 0.0
+        assert _safe_mtime(tmp_path) == tmp_path.stat().st_mtime
+
+    def test_resolve_survives_snapshot_vanishing_mid_scan(self, tmp_path, monkeypatch):
+        """A snapshot deleted between the is_dir() filter and the max(stat)
+        key call must not raise FileNotFoundError out of the refresh
+        callback."""
+        entry, live = self._make_hf_cache_entry(tmp_path, "mlx-community", "Qwen3-8B")
+        shutil.rmtree(entry / "refs")  # force the snapshot-listing path
+        ghost = entry / "snapshots" / "deadbeef0"
+        ghost.mkdir()
+
+        def racy_is_dir(path, context):
+            if path == ghost:
+                ghost.rmdir()  # vanishes right after passing the filter
+                return True
+            return path.is_dir()
+
+        monkeypatch.setattr("omlx.model_discovery._is_readable_dir", racy_is_dir)
+        result = _resolve_hf_cache_entry(entry)
+        assert result is not None
+        assert result.snapshot_path == live
 
     def test_discover_hf_cache_model(self, tmp_path):
         """HF cache entries are discovered as models."""
@@ -2392,6 +2497,35 @@ class TestTextOnlySizeEstimation:
     def test_vision_weight_bytes_from_headers(self, tmp_path):
         _write_safetensors(tmp_path / "model.safetensors", self._TENSORS)
         assert _vision_weight_bytes(tmp_path) == 51200 + 5120
+
+    def test_vision_weight_bytes_reads_sidecar_shard(self, tmp_path):
+        """Vision tensors in a registered sidecar shard (MiMo omnimodal
+        vision encoder) are found by the header scan."""
+        (tmp_path / "omnimodal").mkdir()
+        _write_safetensors(
+            tmp_path / "model.safetensors",
+            {"language_model.layers.0.w": ("F16", [1000, 256])},
+        )
+        _write_safetensors(
+            tmp_path / "omnimodal" / "vision_encoder.safetensors",
+            {"visual.blocks.0.w": ("F16", [100, 256])},  # 51200 bytes
+        )
+        assert _vision_weight_bytes(tmp_path) == 51200
+
+    def test_text_only_estimate_subtracts_sidecar_vision(self, tmp_path):
+        """For sidecar checkpoints the full estimate includes the sidecar
+        file bytes; the text-only estimate subtracts the vision tower."""
+        (tmp_path / "omnimodal").mkdir()
+        _write_safetensors(
+            tmp_path / "model.safetensors",
+            {"language_model.layers.0.w": ("F16", [1000, 256])},
+        )
+        _write_safetensors(
+            tmp_path / "omnimodal" / "vision_encoder.safetensors",
+            {"visual.blocks.0.w": ("F16", [100, 256])},  # 51200 bytes
+        )
+        full = estimate_model_size(tmp_path)
+        assert estimate_text_only_model_size(tmp_path) == full - int(51200 * 1.05)
 
     def test_text_only_estimate_subtracts_vision(self, tmp_path):
         _write_safetensors(tmp_path / "model.safetensors", self._TENSORS)

@@ -414,14 +414,45 @@ class TestModelSettingsManager:
             assert settings.is_pinned is True
             assert settings.is_default is True
 
+    def test_corrupt_settings_file_quarantined(self):
+        """An unparseable settings file is renamed aside, not silently
+        replaced: the bad bytes survive under <name>.corrupt-<ts> for manual
+        recovery while the manager starts empty."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_file = Path(tmpdir) / "model_settings.json"
+            settings_file.write_text('{"version": 1, "models": {"llama": {"temp')
+
+            manager = ModelSettingsManager(Path(tmpdir))
+
+            quarantined = list(Path(tmpdir).glob("model_settings.json.corrupt-*"))
+            assert len(quarantined) == 1
+            assert quarantined[0].read_text() == '{"version": 1, "models": {"llama": {"temp'
+            assert not settings_file.exists()
+            assert manager.get_settings("llama").temperature is None
+
+            # The next save writes a fresh file instead of clobbering the
+            # original path with no backup.
+            manager.set_settings("fresh", ModelSettings(temperature=0.3))
+            assert json.loads(settings_file.read_text())["models"]["fresh"][
+                "temperature"
+            ] == 0.3
+            assert quarantined[0].exists()
+
     def test_initial_settings_keep_unreadable_file(self):
+        """After quarantine the original path is free, so initial settings
+        for new models are written to a fresh file."""
         with tempfile.TemporaryDirectory() as tmpdir:
             settings_file = Path(tmpdir) / "model_settings.json"
             settings_file.write_text("{not json")
             manager = ModelSettingsManager(Path(tmpdir))
 
-            assert manager.add_initial_settings({"new": {"top_k": 20}}) == []
-            assert settings_file.read_text() == "{not json"
+            assert manager.add_initial_settings({"new": {"top_k": 20}}) == ["new"]
+            models = json.loads(settings_file.read_text())["models"]
+            assert models["new"]["top_k"] == 20
+            # Corrupt bytes preserved under the .corrupt-<ts> name.
+            quarantined = list(Path(tmpdir).glob("model_settings.json.corrupt-*"))
+            assert len(quarantined) == 1
+            assert quarantined[0].read_text() == "{not json"
 
     def test_initial_settings_keep_records_on_disk(self):
         with tempfile.TemporaryDirectory() as tmpdir:
