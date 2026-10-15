@@ -628,6 +628,8 @@
   "settings.model.section_label": "Modell",
   "settings.model.model_fallback": "Auf Standardmodell zurückgreifen",
   "settings.model.model_fallback_desc": "Verwenden Sie das Standardmodell, wenn das angeforderte Modell nicht gefunden wird",
+  "settings.model.swap_wait_timeout_seconds": "Wartezeit beim Modellwechsel (Sekunden)",
+  "settings.model.swap_wait_timeout_seconds_desc": "Wie lange eine Anfrage für ein anderes Modell wartet, bis ein beschäftigtes Modell fertig ist, bevor sie fehlschlägt. 0 nutzt die eingebaute Wartezeit (10 Sekunden).",
   "settings.model.hide_helper_models": "Hilfsmodelle ausblenden",
   "settings.model.hide_helper_models_desc": "dFlash-, Assistenten- und Draft-Modelle in der API /v1/models ausblenden",
   "settings.model.model_directories": "Modellverzeichnisse",

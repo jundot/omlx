@@ -728,6 +728,7 @@ class GlobalSettingsRequest(BaseModel):
     model_dir: str | None = None  # Deprecated: kept for backward compatibility
     model_fallback: bool | None = None
     hide_helper_models: bool | None = None
+    swap_wait_timeout_seconds: int | None = Field(default=None, ge=0, le=3600)
 
     # Memory enforcement
     memory_prefill_memory_guard: bool | None = None
@@ -4731,6 +4732,7 @@ def _global_settings_response(global_settings):
             ],
             "model_fallback": global_settings.model.model_fallback,
             "hide_helper_models": global_settings.model.hide_helper_models,
+            "swap_wait_timeout_seconds": global_settings.model.swap_wait_timeout_seconds,
         },
         "memory": {
             "prefill_memory_guard": global_settings.memory.prefill_memory_guard,
@@ -5107,6 +5109,17 @@ async def update_global_settings(
     if request.hide_helper_models is not None:
         global_settings.model.hide_helper_models = request.hide_helper_models
         runtime_applied.append("hide_helper_models")
+    if request.swap_wait_timeout_seconds is not None:
+        from ..server import _server_state
+
+        global_settings.model.swap_wait_timeout_seconds = (
+            request.swap_wait_timeout_seconds
+        )
+        if _server_state.engine_pool is not None:
+            _server_state.engine_pool.configure_swap_wait_timeout(
+                request.swap_wait_timeout_seconds
+            )
+        runtime_applied.append("swap_wait_timeout_seconds")
 
     # Apply memory guard tier + custom ceiling change (Live)
     if (

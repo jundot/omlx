@@ -413,6 +413,15 @@
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.model.swap_wait_timeout_seconds') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.model.swap_wait_timeout_seconds_desc') }}</p>
+                                    </div>
+                                    <input type="number" x-model.number="globalSettings.model.swap_wait_timeout_seconds"
+                                           min="0" max="3600" step="1"
+                                           class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
                                 <div class="px-6 py-4">
                                     <div class="flex items-center justify-between mb-3">
                                         <div class="flex items-center gap-2">

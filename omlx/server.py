@@ -2636,6 +2636,9 @@ def init_server(
     _server_state.engine_pool.configure_gpu_keep_warm(
         global_settings.server.gpu_keep_warm_interval if global_settings else 0.5
     )
+    _server_state.engine_pool.configure_swap_wait_timeout(
+        global_settings.model.swap_wait_timeout_seconds if global_settings else 0
+    )
     from .cluster.enrollment import configure_cluster_enrollment, get_cluster_enrollment
     from .cluster.incidents import configure_cluster_incidents
     from .cluster.pairing import configure_pairing_manager

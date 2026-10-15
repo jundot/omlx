@@ -628,6 +628,8 @@
   "settings.model.section_label": "Model",
   "settings.model.model_fallback": "Záložní výchozí model",
   "settings.model.model_fallback_desc": "Pokud požadovaný model není nalezen, použít výchozí model",
+  "settings.model.swap_wait_timeout_seconds": "Časový limit čekání na výměnu (sekundy)",
+  "settings.model.swap_wait_timeout_seconds_desc": "Jak dlouho požadavek na jiný model čeká, až vytížený model skončí, než selže. 0 použije vestavěné čekání (10 sekund).",
   "settings.model.hide_helper_models": "Skrýt pomocné modely",
   "settings.model.hide_helper_models_desc": "Skryje modely dFlash, Assistant a Draft z API /v1/models",
   "settings.model.model_directories": "Adresáře modelů",

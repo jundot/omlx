@@ -628,6 +628,8 @@
   "settings.model.section_label": "Modèle",
   "settings.model.model_fallback": "Revenir au modèle par défaut",
   "settings.model.model_fallback_desc": "Utiliser le modèle par défaut lorsque le modèle demandé n'est pas trouvé",
+  "settings.model.swap_wait_timeout_seconds": "Délai d'attente de permutation (secondes)",
+  "settings.model.swap_wait_timeout_seconds_desc": "Durée pendant laquelle une requête pour un autre modèle attend la fin d'un modèle occupé avant d'échouer. 0 utilise l'attente intégrée (10 secondes).",
   "settings.model.hide_helper_models": "Masquer les modèles d'assistance",
   "settings.model.hide_helper_models_desc": "Masquer les modèles dFlash, Assistant et Draft de l'API /v1/models",
   "settings.model.model_directories": "Répertoires des modèles",

@@ -628,6 +628,8 @@
   "settings.model.section_label": "Модель",
   "settings.model.model_fallback": "Использовать модель по умолчанию как резервную",
   "settings.model.model_fallback_desc": "Использовать модель по умолчанию, когда запрошенная модель не найдена",
+  "settings.model.swap_wait_timeout_seconds": "Тайм-аут ожидания смены модели (секунды)",
+  "settings.model.swap_wait_timeout_seconds_desc": "Сколько запрос к другой модели ждёт завершения занятой модели, прежде чем завершиться ошибкой. 0 использует встроенное ожидание (10 секунд).",
   "settings.model.hide_helper_models": "Скрывать вспомогательные модели",
   "settings.model.hide_helper_models_desc": "Не показывать модели dFlash, Assistant и Draft в ответе API /v1/models",
   "settings.model.model_directories": "Каталоги моделей",

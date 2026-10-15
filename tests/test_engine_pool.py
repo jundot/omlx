@@ -3026,7 +3026,6 @@ class TestCrossModelAdmissionRetry:
         request's lease - possibly a minutes-long generation - the wait is
         capped by the busy grace, not the full budget."""
         pool = retry_pool
-        pool._entries["model-a"].is_pinned = True
         engine_a = self._mock_engine()
 
         # Hope that never resolves, whatever the pool state.
@@ -3037,7 +3036,7 @@ class TestCrossModelAdmissionRetry:
         monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 0.2)
 
         with patch("omlx.engine_pool.BatchedEngine", return_value=engine_a):
-            await pool.get_engine("model-a")
+            await pool.get_engine("model-a", _lease=True)
             started = time.monotonic()
             with pytest.raises(InsufficientMemoryError):
                 await pool.get_engine("model-b")
@@ -3050,7 +3049,6 @@ class TestCrossModelAdmissionRetry:
         """A load or unload in flight settles in seconds, so it earns the full
         budget rather than the short busy grace."""
         pool = retry_pool
-        pool._entries["model-a"].is_pinned = True
         engine_a = self._mock_engine()
 
         monkeypatch.setattr(
@@ -3060,7 +3058,7 @@ class TestCrossModelAdmissionRetry:
         monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 0.1)
 
         with patch("omlx.engine_pool.BatchedEngine", return_value=engine_a):
-            await pool.get_engine("model-a")
+            await pool.get_engine("model-a", _lease=True)
             started = time.monotonic()
             with pytest.raises(InsufficientMemoryError):
                 await pool.get_engine("model-b")
@@ -3086,6 +3084,200 @@ class TestCrossModelAdmissionRetry:
             elapsed = time.monotonic() - started
 
         assert elapsed < 0.2
+
+    @staticmethod
+    def _add_small_model(pool: EnginePool, name: str, size: int = 50) -> None:
+        model_dir = Path(pool._entries["model-a"].model_path).parent / name
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (model_dir / "model.safetensors").write_bytes(b"0" * size)
+        pool._entries[name] = EngineEntry(
+            model_id=name,
+            model_path=str(model_dir),
+            model_type="llm",
+            engine_type="batched",
+            estimated_size=size,
+        )
+
+    @pytest.mark.asyncio
+    async def test_swap_wait_timeout_defaults_to_builtin_window(
+        self, retry_pool, monkeypatch
+    ):
+        pool = retry_pool
+        assert pool._swap_wait_timeout_s == 0.0
+        monkeypatch.setattr(
+            pool, "_admission_hope_kind_locked", lambda model_id: "busy"
+        )
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUDGET_S", 5.0)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 0.2)
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=self._mock_engine()):
+            await pool.get_engine("model-a", _lease=True)
+            started = time.monotonic()
+            with pytest.raises(InsufficientMemoryError):
+                await pool.get_engine("model-b")
+            elapsed = time.monotonic() - started
+
+        assert 0.2 <= elapsed < 1.5
+
+    @pytest.mark.asyncio
+    async def test_swap_wait_timeout_replaces_busy_grace(self, retry_pool, monkeypatch):
+        pool = retry_pool
+        pool.configure_swap_wait_timeout(0.6)
+        monkeypatch.setattr(
+            pool, "_admission_hope_kind_locked", lambda model_id: "busy"
+        )
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUDGET_S", 0.2)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 0.1)
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=self._mock_engine()):
+            await pool.get_engine("model-a", _lease=True)
+            started = time.monotonic()
+            with pytest.raises(InsufficientMemoryError):
+                await pool.get_engine("model-b")
+            elapsed = time.monotonic() - started
+
+        assert 0.6 <= elapsed < 2.0
+
+    def test_configure_swap_wait_timeout_clamps(self, retry_pool):
+        pool = retry_pool
+        for value, expected in [(-5, 0.0), (None, 0.0), ("x", 0.0), (99999, 3600.0)]:
+            pool.configure_swap_wait_timeout(value)
+            assert pool._swap_wait_timeout_s == expected
+
+    @pytest.mark.asyncio
+    async def test_pinned_floor_fails_fast_without_retry_or_eviction(
+        self, retry_pool, monkeypatch
+    ):
+        """Pinned models alone leave no room for model-b: no wait, and the
+        idle model-c must not be evicted for nothing."""
+        pool = retry_pool
+        pool._entries["model-a"].is_pinned = True
+        self._add_small_model(pool, "model-c")
+        monkeypatch.setattr(
+            pool, "_admission_hope_kind_locked", lambda model_id: "busy"
+        )
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=self._mock_engine()):
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-c")
+            started = time.monotonic()
+            with pytest.raises(InsufficientMemoryError):
+                await pool.get_engine("model-b")
+            elapsed = time.monotonic() - started
+
+        assert elapsed < 0.25
+        assert pool._entries["model-c"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_too_large_fails_before_evicting_idle_models(self, retry_pool):
+        pool = retry_pool
+        with patch("omlx.engine_pool.BatchedEngine", return_value=self._mock_engine()):
+            await pool.get_engine("model-b")
+            pool._entries["model-a"].estimated_size = 3000  # 3.15KB > 2.44KB
+            with pytest.raises(ModelTooLargeError):
+                await pool.get_engine("model-a")
+
+        assert pool._entries["model-b"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_never_fits_check_defers_to_rechecks_when_dynamic_ceiling_binds(
+        self, retry_pool, monkeypatch
+    ):
+        pool = retry_pool
+        monkeypatch.setattr(pool, "_dynamic_ceiling_binds", lambda: True)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_CEILING_RECHECK_S", 0.01)
+        with patch("omlx.engine_pool.BatchedEngine", return_value=self._mock_engine()):
+            await pool.get_engine("model-b")
+            pool._entries["model-a"].estimated_size = 3000
+            with pytest.raises(ModelTooLargeError):
+                await pool.get_engine("model-a")
+
+        # The late path is unchanged: it evicts first, then refuses.
+        assert pool._entries["model-b"].engine is None
+
+    @pytest.mark.asyncio
+    async def test_retry_attempts_skip_ceiling_rechecks(self, retry_pool, monkeypatch):
+        pool = retry_pool
+        monkeypatch.setattr(
+            pool, "_admission_hope_kind_locked", lambda model_id: "busy"
+        )
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 0.2)
+        calls: list[bool] = []
+        original = pool._admit_engine_locked
+
+        async def recording_admit(*args, **kwargs):
+            calls.append(kwargs["allow_ceiling_rechecks"])
+            return await original(*args, **kwargs)
+
+        pool._admit_engine_locked = recording_admit
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=self._mock_engine()):
+            await pool.get_engine("model-a", _lease=True)
+            calls.clear()
+            with pytest.raises(InsufficientMemoryError):
+                await pool.get_engine("model-b")
+
+        assert len(calls) >= 2
+        assert calls[0] is True
+        assert all(c is False for c in calls[1:])
+
+    @pytest.mark.asyncio
+    async def test_retry_after_foreign_unload_uses_committed_baseline(
+        self, retry_pool, monkeypatch
+    ):
+        """An unload by another request leaves footprint residue that the
+        committed baseline must ignore for a request that was waiting."""
+        pool = retry_pool
+        # Residue shows up only once an unload has completed.
+        monkeypatch.setattr(
+            "omlx.engine_pool.get_phys_footprint",
+            lambda: pool._current_model_memory
+            + (1500 if pool._unload_epoch > 0 else 0),
+        )
+        engine_a = self._mock_engine()
+        engine_b = self._mock_engine()
+
+        def create_engine(*args, **kwargs):
+            name = str(kwargs.get("model_name", args[0] if args else ""))
+            return engine_a if "model-a" in name else engine_b
+
+        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+            await pool.get_engine("model-b", _lease=True)
+            waiter = asyncio.create_task(pool.get_engine("model-a", _lease=True))
+            await asyncio.sleep(0.15)
+            assert not waiter.done()
+
+            # No yield between the lease drop and the unload taking the lock,
+            # so the waiter cannot evict model-b itself first.
+            pool._entries["model-b"].in_use = 0
+            assert await pool.unload_if_idle_unpinned("model-b") is True
+
+            engine = await asyncio.wait_for(waiter, timeout=5.0)
+
+        assert engine is engine_a
+
+    @pytest.mark.asyncio
+    async def test_busy_pinned_only_blocker_fails_fast(self, retry_pool, monkeypatch):
+        """A leased pinned model cannot be evicted, so waiting for it is
+        pointless: fail at once instead of burning the busy window."""
+        pool = retry_pool
+        pool._entries["model-a"].is_pinned = True
+        self._add_small_model(pool, "model-c")
+        footprint = {"value": 0}
+        monkeypatch.setattr(
+            "omlx.engine_pool.get_phys_footprint", lambda: footprint["value"]
+        )
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=self._mock_engine()):
+            await pool.get_engine("model-a", _lease=True)
+            footprint["value"] = 2490
+            started = time.monotonic()
+            with pytest.raises(InsufficientMemoryError):
+                await pool.get_engine("model-c")
+            elapsed = time.monotonic() - started
+
+        assert elapsed < 0.25
 
 
 class TestAdmissionSoftTargetEviction:

@@ -628,6 +628,8 @@
   "settings.model.section_label": "モデル",
   "settings.model.model_fallback": "デフォルトモデルにフォールバック",
   "settings.model.model_fallback_desc": "リクエストされたモデルが見つからない場合、デフォルトモデルを使用します",
+  "settings.model.swap_wait_timeout_seconds": "スワップ待機タイムアウト(秒)",
+  "settings.model.swap_wait_timeout_seconds_desc": "別のモデルへのリクエストが、使用中のモデルの完了を待ってから失敗するまでの時間です。0 は内蔵の待機時間(10秒)を使用します。",
   "settings.model.hide_helper_models": "ヘルパーモデルを非表示",
   "settings.model.hide_helper_models_desc": "dFlash・Assistant・Draft モデルを /v1/models API から非表示にします",
   "settings.model.model_directories": "モデルディレクトリ",

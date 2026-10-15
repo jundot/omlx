@@ -628,6 +628,8 @@
   "settings.model.section_label": "Modelo",
   "settings.model.model_fallback": "Fallback al Modelo Predeterminado",
   "settings.model.model_fallback_desc": "Usar el modelo predeterminado cuando no se encuentra el modelo solicitado",
+  "settings.model.swap_wait_timeout_seconds": "Tiempo de espera de intercambio (segundos)",
+  "settings.model.swap_wait_timeout_seconds_desc": "Cuánto espera una solicitud de otro modelo a que termine un modelo ocupado antes de fallar. 0 usa la espera integrada (10 segundos).",
   "settings.model.hide_helper_models": "Ocultar modelos auxiliares",
   "settings.model.hide_helper_models_desc": "Oculta los modelos dFlash, Assistant y Draft de la API /v1/models",
   "settings.model.model_directories": "Directorios de Modelos",

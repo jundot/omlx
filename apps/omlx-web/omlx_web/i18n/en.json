@@ -628,6 +628,8 @@
   "settings.model.section_label": "Model",
   "settings.model.model_fallback": "Fallback to Default Model",
   "settings.model.model_fallback_desc": "Use the default model when the requested model is not found",
+  "settings.model.swap_wait_timeout_seconds": "Swap Wait Timeout (Seconds)",
+  "settings.model.swap_wait_timeout_seconds_desc": "How long a request for another model waits for a busy model to finish before it fails. 0 uses the built-in wait (10 seconds).",
   "settings.model.hide_helper_models": "Hide Helper Models",
   "settings.model.hide_helper_models_desc": "Hide dFlash, Assistant, and Draft models from the /v1/models API",
   "settings.model.model_directories": "Model Directories",

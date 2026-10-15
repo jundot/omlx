@@ -207,6 +207,10 @@ _ADMISSION_RETRY_MAX_DELAY_S = 0.5
 _ADMISSION_RETRY_JITTER = 0.25  # ±25% per wait
 
 
+class _AdmissionNeverFitsError(InsufficientMemoryError):
+    """Refusal that no wait can fix (pinned models alone leave no room)."""
+
+
 def _positive_int(value: object) -> int:
     try:
         parsed = int(value)
@@ -525,6 +529,11 @@ class EnginePool:
         self._gpu_keep_warm_interval: float = 0.0
         self._gpu_keep_warm_task: asyncio.Task[None] | None = None
         self._gpu_keep_warm_last_active = 0.0
+        # Busy-model admission wait override (0 keeps the built-in window).
+        self._swap_wait_timeout_s: float = 0.0
+        # Bumped on every engine unload so a waiting admission can tell that
+        # another request freed memory while it waited.
+        self._unload_epoch: int = 0
         self.configure_hot_cache_budget()
 
     def configure_gpu_keep_warm(self, interval_seconds: float) -> None:
@@ -537,6 +546,14 @@ class EnginePool:
         if self._gpu_keep_warm_interval <= 0 and self._gpu_keep_warm_task is not None:
             self._gpu_keep_warm_task.cancel()
             self._gpu_keep_warm_task = None
+
+    def configure_swap_wait_timeout(self, seconds: float) -> None:
+        """Set the busy-model admission wait in seconds (0 keeps the built-in window)."""
+        try:
+            value = float(seconds or 0.0)
+        except (TypeError, ValueError):
+            value = 0.0
+        self._swap_wait_timeout_s = min(3600.0, max(0.0, value))
 
     def _ensure_gpu_keep_warm_task(self) -> None:
         if self._gpu_keep_warm_interval <= 0 or self._shutting_down:
@@ -2755,6 +2772,8 @@ class EnginePool:
         serving — in which case the original ``InsufficientMemoryError`` is
         raised unchanged. Losses that can never be recovered (a model that
         cannot fit at all, an unknown model) are never retried.
+        ``model.swap_wait_timeout_seconds`` replaces the busy window when it
+        is greater than 0.
 
         Args:
             model_id: The model ID to get engine for
@@ -2781,10 +2800,18 @@ class EnginePool:
         reload_failed = await self._reloadable_failed_engine(model_id)
         await self._check_splash_launcher(model_id, runtime_settings)
         started = time.monotonic()
-        deadline = started + max(0.0, _ADMISSION_RETRY_BUDGET_S)
-        busy_deadline = started + max(0.0, _ADMISSION_RETRY_BUSY_GRACE_S)
+        # Read the windows at call time so tests can patch the constants.
+        budget_s = _ADMISSION_RETRY_BUDGET_S
+        busy_s = _ADMISSION_RETRY_BUSY_GRACE_S
+        if self._swap_wait_timeout_s > 0:
+            busy_s = self._swap_wait_timeout_s
+            budget_s = max(budget_s, busy_s)
+        deadline = started + max(0.0, budget_s)
+        busy_deadline = started + max(0.0, busy_s)
         delay = max(0.0, _ADMISSION_RETRY_INITIAL_DELAY_S)
         retrying = False
+        attempt = 0
+        unload_epoch = self._unload_epoch
         while True:
             ready = self._acquire_loaded_engine(
                 model_id, force_lm, _lease, runtime_settings, reload_failed
@@ -2799,8 +2826,13 @@ class EnginePool:
                         _lease=_lease,
                         runtime_settings=runtime_settings,
                         reload_failed=reload_failed,
+                        allow_ceiling_rechecks=(attempt == 0),
+                        freed_since_start=(self._unload_epoch != unload_epoch),
                     )
+            except _AdmissionNeverFitsError:
+                raise
             except InsufficientMemoryError:
+                attempt += 1
                 # Bounded retry (#1970). The refusal above was decided with the
                 # lock held, so the wait below happens only after the lock is
                 # released: sleeping under ``self._lock`` would serialize every
@@ -2821,8 +2853,8 @@ class EnginePool:
                         "when only an unrelated in-flight request can free "
                         "memory).",
                         model_id,
-                        _ADMISSION_RETRY_BUDGET_S,
-                        _ADMISSION_RETRY_BUSY_GRACE_S,
+                        budget_s,
+                        busy_s,
                     )
                 wait = delay * (
                     1.0
@@ -2901,6 +2933,8 @@ class EnginePool:
         _lease: bool,
         runtime_settings: object | None,
         reload_failed: bool = False,
+        allow_ceiling_rechecks: bool = True,
+        freed_since_start: bool = False,
     ) -> (
         BaseEngine
         | EmbeddingEngine
@@ -3062,10 +3096,21 @@ class EnginePool:
         if ceiling <= 0:
             ceiling = self._fallback_admission_ceiling()
             best_effort = ceiling > 0
+        if ceiling > 0 and not best_effort:
+            self._raise_if_never_fits_locked(
+                model_id,
+                admission_size=admission_size,
+                ceiling=ceiling,
+                admission_kind=admission_kind,
+            )
+
         if ceiling > 0:
             soft_target = self._admission_soft_target()
             evict_target = min(soft_target, ceiling) if soft_target > 0 else ceiling
-            evicted_any = unloaded_for_admission
+            # A model unloaded while this request waited can leave reclaimable
+            # phys_footprint residue, so the committed baseline applies (same
+            # reason as the comment on the committed-baseline retest below).
+            evicted_any = unloaded_for_admission or freed_since_start
             ceiling_rechecks = 0
             while True:
                 # Consult the tracked accumulator alongside live memory:
@@ -3156,8 +3201,11 @@ class EnginePool:
                     )
                     break
 
+                # Retries wait outside the lock in get_engine, so they must
+                # not sleep under self._lock (lock convoy).
                 if (
-                    ceiling_rechecks < _ADMISSION_CEILING_RECHECKS
+                    allow_ceiling_rechecks
+                    and ceiling_rechecks < _ADMISSION_CEILING_RECHECKS
                     and self._dynamic_ceiling_binds()
                 ):
                     # Pages of a model unloaded just before this load
@@ -3190,23 +3238,17 @@ class EnginePool:
                         binding=binding,
                         advice=advice,
                     )
-                binding, advice = self._ceiling_binding_and_advice(
-                    ceiling=ceiling,
-                    current=failure_current,
-                    tail="unload another model",
-                )
-                label = f"{binding} memory ceiling" if binding else "memory ceiling"
                 raise InsufficientMemoryError(
                     required=admission_size,
                     current=failure_current,
-                    message=(
-                        f"Cannot load {model_id}: projected memory "
-                        f"{format_size(failure_projected)} would exceed "
-                        f"the {label} {format_size(ceiling)} "
-                        f"({failure_label}: {format_size(failure_current)}, "
-                        f"{admission_kind}: {format_size(admission_size)}). "
-                        f"{advice or DEFAULT_CEILING_ADVICE}."
-                        f"{lending_note()}"
+                    message=self._insufficient_memory_message(
+                        model_id,
+                        admission_size=admission_size,
+                        ceiling=ceiling,
+                        current=failure_current,
+                        projected=failure_projected,
+                        label=failure_label,
+                        admission_kind=admission_kind,
                     ),
                 )
 
@@ -3227,6 +3269,91 @@ class EnginePool:
         if _lease:
             loaded.in_use += 1
         return loaded.engine
+
+    def _insufficient_memory_message(
+        self,
+        model_id: str,
+        *,
+        admission_size: int,
+        ceiling: int,
+        current: int,
+        projected: int,
+        label: str,
+        admission_kind: str,
+    ) -> str:
+        binding, advice = self._ceiling_binding_and_advice(
+            ceiling=ceiling,
+            current=current,
+            tail="unload another model",
+        )
+        ceiling_label = f"{binding} memory ceiling" if binding else "memory ceiling"
+        return (
+            f"Cannot load {model_id}: projected memory "
+            f"{format_size(projected)} would exceed "
+            f"the {ceiling_label} {format_size(ceiling)} "
+            f"({label}: {format_size(current)}, "
+            f"{admission_kind}: {format_size(admission_size)}). "
+            f"{advice or DEFAULT_CEILING_ADVICE}."
+            f"{lending_note()}"
+        )
+
+    def _raise_if_never_fits_locked(
+        self,
+        model_id: str,
+        *,
+        admission_size: int,
+        ceiling: int,
+        admission_kind: str,
+    ) -> None:
+        """Refuse early when no eviction or wait can make the model fit.
+
+        Caller holds ``self._lock``. Skipped while the dynamic ceiling binds:
+        it can rise during the late rechecks, so the late path decides.
+        """
+        if self._dynamic_ceiling_binds():
+            return
+        current = max(
+            mx.get_active_memory(),
+            _settled_phys_footprint(),
+            self._current_model_memory,
+        )
+        if admission_size > ceiling:
+            binding, advice = self._ceiling_binding_and_advice(
+                ceiling=ceiling,
+                current=current,
+                tail="use a smaller model",
+            )
+            raise ModelTooLargeError(
+                model_id,
+                admission_size,
+                ceiling,
+                binding=binding,
+                advice=advice,
+            )
+        pinned_floor = sum(
+            self._entry_resident_size(e)
+            for mid, e in self._entries.items()
+            if mid != model_id
+            and e.engine is not None
+            and e.is_pinned
+            and not e.pending_unload_reason
+            and mid not in self._unloading_models
+        )
+        if pinned_floor + admission_size > ceiling:
+            current = max(current, pinned_floor)
+            raise _AdmissionNeverFitsError(
+                required=admission_size,
+                current=current,
+                message=self._insufficient_memory_message(
+                    model_id,
+                    admission_size=admission_size,
+                    ceiling=ceiling,
+                    current=current,
+                    projected=current + admission_size,
+                    label="current",
+                    admission_kind=admission_kind,
+                ),
+            )
 
     async def _release_engine_lease(self, model_id: str) -> None:
         # A normal completed request need not wait behind unrelated teardown.
@@ -4107,6 +4234,7 @@ class EnginePool:
 
         # Release memory tracking AFTER barrier
         self._current_model_memory = max(0, self._current_model_memory - resident_size)
+        self._unload_epoch += 1
 
         if settled:
             logger.info(

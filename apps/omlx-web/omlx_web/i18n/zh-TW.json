@@ -628,6 +628,8 @@
   "settings.model.section_label": "模型",
   "settings.model.model_fallback": "回退到預設模型",
   "settings.model.model_fallback_desc": "當請求的模型未找到時使用預設模型",
+  "settings.model.swap_wait_timeout_seconds": "切換等待逾時(秒)",
+  "settings.model.swap_wait_timeout_seconds_desc": "對另一個模型的請求在失敗前等待忙碌模型完成的時間。0 使用內建等待時間(10 秒)。",
   "settings.model.hide_helper_models": "隱藏輔助模型",
   "settings.model.hide_helper_models_desc": "從 /v1/models API 中隱藏 dFlash、Assistant 和 Draft 模型",
   "settings.model.model_directories": "模型目錄",

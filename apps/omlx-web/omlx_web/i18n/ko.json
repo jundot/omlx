@@ -628,6 +628,8 @@
   "settings.model.section_label": "모델",
   "settings.model.model_fallback": "기본 모델로 대체",
   "settings.model.model_fallback_desc": "요청된 모델을 찾을 수 없을 때 기본 모델을 사용합니다",
+  "settings.model.swap_wait_timeout_seconds": "스왑 대기 시간 제한(초)",
+  "settings.model.swap_wait_timeout_seconds_desc": "다른 모델에 대한 요청이 사용 중인 모델이 끝나기를 기다린 후 실패하기까지의 시간입니다. 0은 내장 대기 시간(10초)을 사용합니다.",
   "settings.model.hide_helper_models": "헬퍼 모델 숨기기",
   "settings.model.hide_helper_models_desc": "dFlash, Assistant, Draft 모델을 /v1/models API에서 숨깁니다",
   "settings.model.model_directories": "모델 디렉토리",
