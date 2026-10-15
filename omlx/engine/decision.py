@@ -87,10 +87,8 @@ class DecisionEngine(BaseNonStreamingEngine):
         )
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(get_mlx_executor(), model.load)
-        if self._prefix_cache_bytes:
-            # Models that split their prompt use it; the others ignore it.
-            model.backbone.prefix_cache = PrefixCache(self._prefix_cache_bytes)
         self._model = model
+        self.set_prefix_cache_max_size(self._prefix_cache_bytes)
         self._kind = kind
         logger.info(f"Decision engine started: {self._model_name}")
 
@@ -107,6 +105,26 @@ class DecisionEngine(BaseNonStreamingEngine):
             get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
         )
         logger.info(f"Decision engine stopped: {self._model_name}")
+
+    def set_prefix_cache_max_size(self, max_bytes: int) -> None:
+        """Size the prefix cache of the loaded model; 0 drops it and its entries.
+
+        Only models that continue requests from cached prefixes get one (Clef
+        and OpenJev; d3 reads its prompt with non-causal attention).
+        """
+        self._prefix_cache_bytes = max(0, int(max_bytes))
+        model = self._model
+        if model is None or not getattr(model, "prefix_reuse", False):
+            return
+        cache = model.backbone.prefix_cache
+        if not self._prefix_cache_bytes:
+            model.backbone.prefix_cache = None
+            if cache is not None:
+                cache.clear()
+        elif cache is None:
+            model.backbone.prefix_cache = PrefixCache(self._prefix_cache_bytes)
+        else:
+            cache.resize(self._prefix_cache_bytes)
 
     def _require_model(self) -> ClefModel | OpenJevModel | D3Model:
         if self._model is None:

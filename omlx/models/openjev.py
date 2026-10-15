@@ -10,7 +10,8 @@ tuned and calibrated on them.
 
 All readouts of a request share the chat header and the state, so the shared
 token prefix is prefilled once and each readout continues from a copy of
-that cache.
+that cache. With a prefix cache, that prefix stops where the questions start,
+so later requests about the same state and image reuse it.
 """
 
 import ast
@@ -30,6 +31,7 @@ from .decision import (
     DecisionContextLengthError,
     DecisionRequestError,
     decode_images,
+    image_digest,
     round4,
 )
 
@@ -230,10 +232,15 @@ class OpenJevPlan:
     pixel_values: np.ndarray | None = None
     image_grid_thw: np.ndarray | None = None
     image_tokens: int = 0
+    images: bytes | None = None
+    """Digest of the image pixels, set when the prefix cache is enabled."""
 
 
 class OpenJevModel:
     """OpenJev and its MLX conversions."""
+
+    # run() continues readouts from prefixes in backbone.prefix_cache.
+    prefix_reuse = True
 
     def __init__(self, model_path: str, trust_remote_code: bool = False):
         self.model_path = model_path
@@ -270,6 +277,8 @@ class OpenJevModel:
                 [image]
             )
             plan.image_tokens = self.backbone.image_token_count(plan.image_grid_thw[0])
+            if self.backbone.prefix_cache is not None:
+                plan.images = image_digest(plan.pixel_values, plan.image_grid_thw)
 
         limit = self.backbone.max_position_embeddings
         for question_id, question in request["questions"].items():
@@ -353,6 +362,7 @@ class OpenJevModel:
         shared = yield from self._prefill_shared_prefix(plan, first, chunk_size)
         answers = {}
         input_tokens = 0
+        cached_tokens = len(shared[0]) if shared is not None and shared[3] else 0
         for item in plan.items:
             parts = []
             for group, ids in zip(item.groups, item.group_ids, strict=True):
@@ -375,13 +385,28 @@ class OpenJevModel:
                 input_tokens += len(ids)
                 probs = compose_groups(parts, final)
             answers[item.question_id] = self._answer(item, plan.questions, probs)
-        return {"answers": answers, "input_tokens": input_tokens}
+        return {
+            "answers": answers,
+            "input_tokens": input_tokens,
+            "cached_tokens": cached_tokens,
+        }
 
     def _prefill_shared_prefix(
         self, plan: OpenJevPlan, readouts: list[np.ndarray], chunk_size: ChunkSize
     ) -> Generator[int, None, tuple | None]:
-        """Prefill the longest token prefix common to every first readout."""
-        if len(readouts) < 2:
+        """Prefill the longest token prefix common to every first readout.
+
+        With a prefix cache, two prompts with placeholder questions join the
+        readouts, so the prefix ends where the questions start: it depends
+        only on the state and the image, and later requests reuse it.
+        """
+        if self.backbone.prefix_cache is not None:
+            readouts = [
+                *readouts,
+                self._prompt_ids(plan, "A", [("a", "a")]),
+                self._prompt_ids(plan, "B", [("b", "b")]),
+            ]
+        elif len(readouts) < 2:
             return None
         length = min(len(ids) for ids in readouts) - 1
         reference = readouts[0]
@@ -397,16 +422,15 @@ class OpenJevModel:
         if length <= 0:
             return None
         prefix = reference[:length]
-        backbone = self.backbone
-        embeds, positions = backbone.embed(
-            prefix, plan.pixel_values, plan.image_grid_thw
+        shared = yield from self.backbone.prefill_prefix(
+            prefix,
+            plan.pixel_values,
+            plan.image_grid_thw,
+            chunk_size,
+            keep_all=False,
+            images=plan.images,
         )
-        cache = backbone.make_cache()
-        yield from backbone.prefill(
-            prefix, embeds, positions, cache, chunk_size, keep_all=False
-        )
-        last_position = None if positions is None else positions[:, :, -1]
-        return prefix, cache, last_position
+        return prefix, shared.cache, shared.last_position, shared.cached
 
     def _readout(
         self,
@@ -419,7 +443,7 @@ class OpenJevModel:
         """Return the probabilities of the first ``count`` option letters."""
         backbone = self.backbone
         if shared is not None and np.array_equal(ids[: len(shared[0])], shared[0]):
-            prefix, prefix_cache, last_position = shared
+            prefix, prefix_cache, last_position, _ = shared
             # Caches update in place; each readout continues from its own copy.
             cache = copy.deepcopy(prefix_cache)
             tail = ids[len(prefix) :]

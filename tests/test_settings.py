@@ -660,6 +660,11 @@ class TestCacheSettings:
         global_settings.cache = settings
         config = global_settings.to_scheduler_config()
         assert config.decision_prefix_cache_max_size == 512 * 1024**2
+        # Like the other oMLX caches, it is off while caching is disabled
+        # (--no-cache or the cache switch).
+        global_settings.cache.enabled = False
+        config = global_settings.to_scheduler_config()
+        assert config.decision_prefix_cache_max_size == 0
 
     def test_from_dict_migrates_hot_cache_auto_to_disabled(self):
         """Legacy hot_cache_max_size=auto should load as disabled."""

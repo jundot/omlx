@@ -769,6 +769,42 @@ class TestDecisionPrefixCacheSetting:
         assert pool._scheduler_config.decision_prefix_cache_max_size == 512 * 1024**2
         gs.save.assert_called_once()
 
+    def test_resizes_loaded_decision_models_only_when_the_size_changes(self):
+        from omlx.engine.decision import DecisionEngine
+        from omlx.models.decision import PrefixCache
+        from omlx.scheduler import SchedulerConfig
+        from omlx.server import _server_state
+
+        engine = DecisionEngine("clef", scheduler_config=SchedulerConfig())
+        engine._model = SimpleNamespace(
+            prefix_reuse=True, backbone=SimpleNamespace(prefix_cache=None)
+        )
+        pool = SimpleNamespace(
+            _scheduler_config=SchedulerConfig(),
+            _entries={"clef": SimpleNamespace(engine=engine)},
+        )
+        gs = GlobalSettings()
+        gs.save = MagicMock()
+
+        def update(size):
+            request = GlobalSettingsRequest(decision_prefix_cache_max_size=size)
+            with (
+                _patched_global_settings(gs),
+                patch.object(_server_state, "engine_pool", pool),
+            ):
+                return asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert "decision_prefix_cache" not in update("0")["runtime_applied"]
+        assert "decision_prefix_cache" in update("1MB")["runtime_applied"]
+        cache = engine._model.backbone.prefix_cache
+        assert isinstance(cache, PrefixCache) and cache.max_bytes == 1024**2
+        assert "decision_prefix_cache" not in update("1MB")["runtime_applied"]
+        assert "decision_prefix_cache" in update("0")["runtime_applied"]
+        assert engine._model.backbone.prefix_cache is None
+        assert pool._scheduler_config.decision_prefix_cache_max_size == 0
+
     def test_rejects_invalid_size(self):
         gs = GlobalSettings()
         gs.save = MagicMock()

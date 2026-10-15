@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 from collections import OrderedDict
 from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
@@ -99,7 +100,9 @@ class PrefixCache:
     Requests that repeat a prompt prefix, such as the same state and images
     asked different questions, continue from a copy of the stored layer
     caches instead of prefilling it again. Entries are evicted once their
-    total size exceeds ``max_bytes``; a larger entry is not stored.
+    total size exceeds ``max_bytes``; a larger entry is not stored. Requests
+    use it on the MLX executor while stats and resizing come from the event
+    loop, so a lock guards the entries.
     """
 
     def __init__(self, max_bytes: int):
@@ -108,43 +111,58 @@ class PrefixCache:
         self.hits = 0
         self.misses = 0
         self._entries: OrderedDict[str, _PrefixEntry] = OrderedDict()
+        self._lock = threading.Lock()
 
     def __len__(self) -> int:
-        return len(self._entries)
+        with self._lock:
+            return len(self._entries)
 
     def get(self, key: str) -> _PrefixEntry | None:
-        entry = self._entries.get(key)
-        if entry is None:
-            self.misses += 1
-            return None
-        self._entries.move_to_end(key)
-        self.hits += 1
-        return entry
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                self.misses += 1
+                return None
+            self._entries.move_to_end(key)
+            self.hits += 1
+            return entry
 
     def put(self, key: str, entry: _PrefixEntry) -> None:
-        if entry.nbytes > self.max_bytes:
-            return
-        old = self._entries.pop(key, None)
-        if old is not None:
-            self.nbytes -= old.nbytes
-        self._entries[key] = entry
-        self.nbytes += entry.nbytes
+        with self._lock:
+            if entry.nbytes > self.max_bytes:
+                return
+            old = self._entries.pop(key, None)
+            if old is not None:
+                self.nbytes -= old.nbytes
+            self._entries[key] = entry
+            self.nbytes += entry.nbytes
+            self._evict()
+
+    def resize(self, max_bytes: int) -> None:
+        """Change the size limit, evicting the oldest entries above it."""
+        with self._lock:
+            self.max_bytes = max_bytes
+            self._evict()
+
+    def _evict(self) -> None:
         while self.nbytes > self.max_bytes:
             _, evicted = self._entries.popitem(last=False)
             self.nbytes -= evicted.nbytes
 
     def clear(self) -> None:
-        self._entries.clear()
-        self.nbytes = 0
+        with self._lock:
+            self._entries.clear()
+            self.nbytes = 0
 
     def stats(self) -> dict[str, int]:
-        return {
-            "entries": len(self._entries),
-            "bytes": self.nbytes,
-            "max_bytes": self.max_bytes,
-            "hits": self.hits,
-            "misses": self.misses,
-        }
+        with self._lock:
+            return {
+                "entries": len(self._entries),
+                "bytes": self.nbytes,
+                "max_bytes": self.max_bytes,
+                "hits": self.hits,
+                "misses": self.misses,
+            }
 
 
 def prefix_key(ids: np.ndarray, images: bytes | None, keep_all: bool) -> str:

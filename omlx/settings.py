@@ -1974,6 +1974,8 @@ class GlobalSettings:
             hot_cache_write_through=self.cache.hot_cache_write_through,
             decision_prefix_cache_max_size=(
                 self.cache.get_decision_prefix_cache_max_size_bytes()
+                if self.cache.enabled
+                else 0
             ),
             gdn_ssd_split_enabled=self.cache.get_gdn_ssd_split_enabled(),
             gdn_ssd_pending_max_bytes=parse_size(

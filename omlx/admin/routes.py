@@ -888,6 +888,26 @@ def _parse_decision_prefix_cache_max_size(value: str) -> int:
     return size
 
 
+def _apply_decision_prefix_cache(pool: Any, global_settings: Any) -> bool:
+    """Size the decision prefix cache of decision models, loaded and future."""
+    from ..engine.decision import DecisionEngine
+
+    pool_config = getattr(pool, "_scheduler_config", None)
+    if pool_config is None:
+        return False
+    max_bytes = (
+        global_settings.cache.get_decision_prefix_cache_max_size_bytes()
+        if global_settings.cache.enabled
+        else 0
+    )
+    pool_config.decision_prefix_cache_max_size = max_bytes
+    for entry in getattr(pool, "_entries", {}).values():
+        engine = getattr(entry, "engine", None)
+        if isinstance(engine, DecisionEngine):
+            engine.set_prefix_cache_max_size(max_bytes)
+    return True
+
+
 def _parse_hot_cache_max_size(value: str) -> int:
     """Parse hot cache max size. Hot cache does not support an auto sentinel."""
     from ..config import parse_size
@@ -1438,6 +1458,7 @@ async def _apply_cache_settings_runtime(
     pool._scheduler_config.gdn_sidecar_state_dtype = (
         global_settings.cache.gdn_sidecar_state_dtype
     )
+    _apply_decision_prefix_cache(pool, global_settings)
     pool._scheduler_config.initial_cache_blocks = (
         global_settings.cache.initial_cache_blocks
     )
@@ -5141,10 +5162,9 @@ async def update_global_settings(
             _parse_hot_cache_max_size(request.hot_cache_max_size)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-    decision_prefix_bytes = None
     if request.decision_prefix_cache_max_size is not None:
         try:
-            decision_prefix_bytes = _parse_decision_prefix_cache_max_size(
+            _parse_decision_prefix_cache_max_size(
                 request.decision_prefix_cache_max_size
             )
         except ValueError as exc:
@@ -5306,18 +5326,17 @@ async def update_global_settings(
         if request.hot_cache_max_size != global_settings.cache.hot_cache_max_size:
             global_settings.cache.hot_cache_max_size = request.hot_cache_max_size
             cache_changed = True
-    if decision_prefix_bytes is not None:
+    if (
+        request.decision_prefix_cache_max_size is not None
+        and request.decision_prefix_cache_max_size
+        != global_settings.cache.decision_prefix_cache_max_size
+    ):
         global_settings.cache.decision_prefix_cache_max_size = (
             request.decision_prefix_cache_max_size
         )
-        # Decision models loaded from now on size their prefix cache from the
-        # pool's stored config; loaded ones keep theirs until reloaded.
         from ..server import _server_state
 
-        pool = _server_state.engine_pool
-        pool_config = getattr(pool, "_scheduler_config", None)
-        if pool_config is not None:
-            pool_config.decision_prefix_cache_max_size = decision_prefix_bytes
+        if _apply_decision_prefix_cache(_server_state.engine_pool, global_settings):
             runtime_applied.append("decision_prefix_cache")
     if request.initial_cache_blocks is not None:
         if (

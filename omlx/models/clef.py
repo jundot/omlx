@@ -377,6 +377,9 @@ def format_answer(question: dict, probabilities: dict[str, float]) -> dict:
 class ClefModel:
     """Clef or Clef-Flash: a Qwen3.5 backbone plus the joint schema head."""
 
+    # run() continues requests from prefixes in backbone.prefix_cache.
+    prefix_reuse = True
+
     def __init__(self, model_path: str, trust_remote_code: bool = False):
         self.model_path = model_path
         self.backbone = DecisionBackbone(model_path, trust_remote_code)

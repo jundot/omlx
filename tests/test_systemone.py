@@ -558,6 +558,8 @@ def test_prefix_cache_evicts_least_recently_used_entries_by_size():
         "hits": 1,
         "misses": 2,
     }
+    store.resize(50)
+    assert (len(store), store.nbytes, store.max_bytes) == (1, 30, 50)
 
 
 async def test_decision_engine_keeps_a_prefix_cache_only_when_configured(
@@ -576,8 +578,11 @@ async def test_decision_engine_keeps_a_prefix_cache_only_when_configured(
         def close(self):
             self.backbone.close()
 
+    class FakeClef(FakeModel):
+        prefix_reuse = True
+
     monkeypatch.setattr(engine_module, "decision_kind", lambda path: "clef")
-    monkeypatch.setitem(engine_module._MODEL_CLASSES, "clef", FakeModel)
+    monkeypatch.setitem(engine_module._MODEL_CLASSES, "clef", FakeClef)
     off = engine_module.DecisionEngine(
         str(tmp_path), scheduler_config=SchedulerConfig()
     )
@@ -597,9 +602,24 @@ async def test_decision_engine_keeps_a_prefix_cache_only_when_configured(
         "hits": 0,
         "misses": 0,
     }
+    on.set_prefix_cache_max_size(1 << 10)
+    assert on.get_stats()["prefix_cache"]["max_bytes"] == 1 << 10
+    on.set_prefix_cache_max_size(0)
+    assert on._model.backbone.prefix_cache is None
+    on.set_prefix_cache_max_size(1 << 20)
     backbone = on._model.backbone
     await on.stop()
     assert backbone.prefix_cache is None
+
+    # A model that reads its prompt non-causally (d3) never gets one.
+    monkeypatch.setitem(engine_module._MODEL_CLASSES, "clef", FakeModel)
+    plain = engine_module.DecisionEngine(
+        str(tmp_path),
+        scheduler_config=SchedulerConfig(decision_prefix_cache_max_size=1 << 20),
+    )
+    await plain.start()
+    assert plain._model.backbone.prefix_cache is None
+    assert "prefix_cache" not in plain.get_stats()
 
 
 class _CharTokenizer:
@@ -653,6 +673,61 @@ def test_openjev_shared_prefix_matches_independent_readouts(tiny_backbone, monke
         independent["answers"]["angry"]["noul"], abs=2e-4
     )
     json.dumps(shared)
+
+
+def test_openjev_prefix_cache_reuses_the_state_across_requests(
+    tiny_backbone, monkeypatch
+):
+    monkeypatch.setattr(tiny_backbone, "tokenizer", _CharTokenizer())
+    model = openjev.OpenJevModel("tiny")
+    model.backbone = tiny_backbone
+    model._letter_ids = [tiny_backbone.tokenize(c)[0] for c in openjev.LETTERS]
+    state = {"ticket": "charged twice, nobody replied"}
+    first_questions = {
+        "angry": {"type": "noul", "instructions": "Is the customer angry?"},
+        "urgency": {
+            "type": "score",
+            "instructions": "How urgent?",
+            "criteria": ["later", "today", "now"],
+        },
+    }
+    # One question: no shared prefix inside the request, but one across requests.
+    second_questions = {
+        "team": {
+            "type": "choice",
+            "instructions": "Which team?",
+            "criteria": {"billing": None, "tech": None},
+        }
+    }
+
+    def answer(questions):
+        request = {"state": state, "questions": questions}
+        return _drain(model.run(model.encode(request), lambda: 16))
+
+    plain = [answer(first_questions), answer(second_questions)]
+    store = decision.PrefixCache(1 << 30)
+    monkeypatch.setattr(tiny_backbone, "prefix_cache", store)
+    first, second, again = (
+        answer(first_questions),
+        answer(second_questions),
+        answer(first_questions),
+    )
+
+    assert first["cached_tokens"] == 0
+    assert second["cached_tokens"] == again["cached_tokens"] > 0
+    assert (len(store), store.hits, store.misses) == (1, 2, 1)
+    # The reused prefix holds the state and stops where the question starts.
+    plan = model.encode({"state": state, "questions": second_questions})
+    ids = plan.items[0].group_ids[0][: second["cached_tokens"]]
+    prefix = "".join(chr(i - 1) for i in ids)  # _CharTokenizer: ord(c) + 1
+    assert "charged twice, nobody replied" in prefix
+    assert prefix.endswith("\n\nQuestion: ")
+    assert again["answers"] == first["answers"]
+    for result, plain_result in zip((first, second), plain, strict=True):
+        a = _probabilities(result["answers"])
+        b = _probabilities(plain_result["answers"])
+        assert a.keys() == b.keys()
+        assert np.allclose(list(a.values()), list(b.values()), atol=2e-4)
 
 
 def test_text_backbone_matches_patched_mlx_lm_logits():
