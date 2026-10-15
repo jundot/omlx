@@ -14,6 +14,7 @@ from omlx.model_settings import (
     ModelSettingsManager,
     a8_prefill_on,
     ced_prefill_on,
+    normalize_exclusive_group,
     resolve_qwen35_prefill_conflicts,
     resolve_vlm_mtp_conflicts,
 )
@@ -1090,3 +1091,60 @@ def test_oq_a8_is_a_model_specific_profile_field():
     for name in ("a8_prefill_enabled", "a8_prefill_min_tokens"):
         assert name in MODEL_SPECIFIC_PROFILE_FIELDS
         assert name not in UNIVERSAL_FIELDS_SET
+
+
+class TestExclusiveGroup:
+    def test_default_is_none(self):
+        assert ModelSettings().exclusive_group is None
+
+    def test_round_trip(self):
+        s = ModelSettings(exclusive_group="chat")
+        assert s.to_dict()["exclusive_group"] == "chat"
+        assert ModelSettings.from_dict(s.to_dict()).exclusive_group == "chat"
+        assert "exclusive_group" not in ModelSettings().to_dict()
+
+    def test_normalizes_case_and_whitespace(self):
+        assert ModelSettings(exclusive_group=" Chat ").exclusive_group == "chat"
+
+    def test_empty_becomes_none(self):
+        assert ModelSettings(exclusive_group="").exclusive_group is None
+
+    def test_invalid_value_is_ignored_without_data_loss(self):
+        s = ModelSettings.from_dict(
+            {"exclusive_group": "bad group!", "temperature": 0.5}
+        )
+        assert s.exclusive_group is None
+        assert s.temperature == 0.5
+
+    def test_non_string_is_ignored(self):
+        assert ModelSettings(exclusive_group=123).exclusive_group is None
+
+    def test_normalize_raises_on_invalid(self):
+        with pytest.raises(ValueError):
+            normalize_exclusive_group("bad group!")
+        with pytest.raises(ValueError):
+            normalize_exclusive_group("a" * 33)
+        with pytest.raises(ValueError):
+            normalize_exclusive_group(123)
+        assert normalize_exclusive_group("a" * 32) == "a" * 32
+        assert normalize_exclusive_group(None) is None
+
+    def test_excluded_from_profiles(self):
+        from omlx.model_profiles import EXCLUDED_FROM_PROFILES
+
+        assert "exclusive_group" in EXCLUDED_FROM_PROFILES
+
+    def test_manager_keeps_other_fields_when_group_is_bad(self, tmp_path):
+        (tmp_path / "model_settings.json").write_text(
+            json.dumps(
+                {
+                    "version": SETTINGS_VERSION,
+                    "models": {
+                        "m": {"exclusive_group": "bad group!", "temperature": 0.5}
+                    },
+                }
+            )
+        )
+        s = ModelSettingsManager(tmp_path).get_settings("m")
+        assert s.exclusive_group is None
+        assert s.temperature == 0.5

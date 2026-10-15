@@ -396,6 +396,17 @@
                                    :class="selectedModel?.pinned ? 'bg-neutral-100 text-neutral-400 cursor-not-allowed' : ''"
                                    class="{{ ms_field_short }}">
                         </label>
+                        <label class="{{ ms_row }}">
+                            <span class="min-w-0">
+                                <span class="block {{ ms_row_label }}">{{ t('modal.model_settings.exclusive_group') }}</span>
+                                <span class="{{ ms_row_hint }}">{{ t('modal.model_settings.exclusive_group_hint') }}</span>
+                            </span>
+                            <input type="text" x-model="modelSettings.exclusive_group"
+                                   maxlength="32"
+                                   :disabled="selectedModel?.pinned"
+                                   :class="selectedModel?.pinned ? 'bg-neutral-100 text-neutral-400 cursor-not-allowed' : ''"
+                                   class="{{ ms_field_short }}">
+                        </label>
 
                         <!-- Enable Thinking -->
                         <div class="px-4 py-3.5 space-y-3"

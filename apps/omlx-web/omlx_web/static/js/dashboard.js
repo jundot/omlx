@@ -2217,6 +2217,7 @@
                     max_tool_result_tokens: s.max_tool_result_tokens || null,
                     reasoning_parser: s.reasoning_parser || '',
                     ttl_seconds: s.ttl_seconds ?? null,
+                    exclusive_group: s.exclusive_group || '',
                     enableIndexCache: !!(s.index_cache_freq),
                     index_cache_freq: s.index_cache_freq || null,
                     turboquant_kv_enabled: !isDiffusion && !model?.is_paroquant
@@ -3532,6 +3533,7 @@
                     force_sampling: ms.force_sampling,
                     reasoning_parser: ms.reasoning_parser || null,
                     ttl_seconds: ms.ttl_seconds || null,
+                    exclusive_group: ms.exclusive_group?.trim() || null,
                     index_cache_freq: ms.enableIndexCache
                         ? (ms.index_cache_freq || 4)
                         : 0,

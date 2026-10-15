@@ -454,6 +454,22 @@ class TestProfileFieldFiltering:
         p = mgr.get_profile("m", "p")
         assert p["settings"] == {"temperature": 0.5}
 
+    def test_save_profile_drops_exclusive_group(self, mgr):
+        mgr.save_profile(
+            "m", "p", "P", None, {"temperature": 0.5, "exclusive_group": "chat"}
+        )
+        assert mgr.get_profile("m", "p")["settings"] == {"temperature": 0.5}
+
+    def test_save_template_drops_exclusive_group(self, mgr):
+        mgr.save_template("t", "T", None, {"temperature": 0.1, "exclusive_group": "x"})
+        assert mgr.get_template("t")["settings"] == {"temperature": 0.1}
+
+    def test_apply_profile_keeps_exclusive_group(self, mgr):
+        mgr.set_settings("m", ModelSettings(exclusive_group="chat"))
+        mgr.save_profile("m", "p", "P", None, {"temperature": 0.0})
+        mgr.apply_profile("m", "p")
+        assert mgr.get_settings("m").exclusive_group == "chat"
+
     def test_save_and_update_drop_none_and_empty_string_values(self, mgr):
         mgr.save_profile(
             "m",

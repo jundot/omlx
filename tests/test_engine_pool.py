@@ -3480,6 +3480,213 @@ class TestCrossModelAdmissionRetry:
         assert elapsed < self.FAST_FAIL_LIMIT_S
 
 
+class TestExclusiveGroup:
+    """exclusive_group: loading a model unloads idle same-group models and
+    waits (bounded, 409 on timeout) for busy ones."""
+
+    def _pool(self, small_mock_model_dir, monkeypatch, groups, ceiling=None):
+        pool = _make_pool(ceiling=ceiling)
+        pool.discover_models(str(small_mock_model_dir))
+        pool._settings_manager = SimpleNamespace(
+            get_settings=lambda mid: SimpleNamespace(exclusive_group=groups.get(mid))
+        )
+        monkeypatch.setattr(
+            "omlx.engine_pool.get_phys_footprint",
+            lambda: pool._current_model_memory,
+        )
+        monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+        return pool
+
+    @staticmethod
+    def _mock_engine() -> MagicMock:
+        engine = MagicMock()
+        engine.start = AsyncMock()
+        engine.stop = AsyncMock()
+        engine.has_active_requests.return_value = False
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_idle_member_unloaded_even_when_memory_fits(
+        self, small_mock_model_dir, monkeypatch, caplog
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups, ceiling=10**9)
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        ):
+            await pool.get_engine("model-a")
+            with caplog.at_level(logging.INFO, logger="omlx.engine_pool"):
+                await pool.get_engine("model-b")
+        assert pool._entries["model-a"].engine is None
+        assert pool._entries["model-b"].engine is not None
+        assert (
+            "Evicting 'model-a' for exclusive group 'g' before loading 'model-b'"
+            in caplog.text
+        )
+
+    @pytest.mark.asyncio
+    async def test_busy_member_makes_b_wait_then_swap(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        ):
+            await pool.get_engine("model-a", _lease=True)
+
+            async def release_later():
+                await asyncio.sleep(0.1)
+                await pool.release_engine("model-a")
+
+            task = asyncio.create_task(release_later())
+            await asyncio.wait_for(pool.get_engine("model-b"), timeout=5.0)
+            await task
+        assert pool._entries["model-a"].engine is None
+        assert pool._entries["model-b"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_busy_member_timeout_raises_busy_409(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 0.2)
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        ):
+            await pool.get_engine("model-a", _lease=True)
+            started = time.monotonic()
+            with pytest.raises(ModelBusyError) as exc_info:
+                await pool.get_engine("model-b")
+            elapsed = time.monotonic() - started
+        assert elapsed >= 0.2
+        assert "exclusive group 'g' member 'model-a' is busy" in str(exc_info.value)
+        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-a"].pending_unload_reason is None
+
+    @pytest.mark.asyncio
+    async def test_swap_wait_timeout_bounds_group_wait(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        pool.configure_swap_wait_timeout(0.5)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 0.1)
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        ):
+            await pool.get_engine("model-a", _lease=True)
+            started = time.monotonic()
+            with pytest.raises(ModelBusyError):
+                await pool.get_engine("model-b")
+            elapsed = time.monotonic() - started
+        assert elapsed >= 0.5
+
+    @pytest.mark.asyncio
+    async def test_pinned_member_not_affected(self, small_mock_model_dir, monkeypatch):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        pool._entries["model-a"].is_pinned = True
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        ):
+            await pool.get_engine("model-a", _lease=True)
+            await pool.get_engine("model-b")
+        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-b"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_pinned_b_ignores_group(self, small_mock_model_dir, monkeypatch):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        pool._entries["model-b"].is_pinned = True
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        ):
+            await pool.get_engine("model-a", _lease=True)
+            await pool.get_engine("model-b")
+        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-b"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_other_group_and_none_untouched(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "h"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        ):
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-b")
+            assert pool._entries["model-a"].engine is not None
+            groups.clear()
+            await pool.get_engine("model-b")
+        assert pool._entries["model-a"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_never_fits_b_does_not_unload_member(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        # model-b is 2150 bytes, model-a 1075: b can never fit under 1500.
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups, ceiling=1500)
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        ):
+            await pool.get_engine("model-a")
+            with pytest.raises(ModelTooLargeError):
+                await pool.get_engine("model-b")
+        assert pool._entries["model-a"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_group_change_applies_at_next_admission(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "h"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        ):
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-b")
+            assert pool._entries["model-a"].engine is not None
+            await pool._unload_engine("model-b")
+            groups["model-b"] = "g"
+            await pool.get_engine("model-b")
+        assert pool._entries["model-a"].engine is None
+
+    @pytest.mark.asyncio
+    async def test_group_step_runs_with_guard_off(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups, ceiling=None)
+        assert pool._get_final_ceiling() == 0
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        ):
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-b")
+        assert pool._entries["model-a"].engine is None
+
+    def test_group_none_for_mock_settings_manager(self):
+        pool = _make_pool()
+        pool._settings_manager = MagicMock()
+        assert pool._exclusive_group_for("model-a") is None
+
+
 class TestAdmissionSoftTargetEviction:
     """#2319: idle-model eviction starts at the soft watermark, before load.
 

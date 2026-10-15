@@ -79,6 +79,7 @@ from ..model_settings import (
     ModelSettings,
     ane_prefill_backend,
     ane_prefill_fraction,
+    normalize_exclusive_group,
     resolve_qwen35_prefill_conflicts,
     resolve_vlm_mtp_conflicts,
     validate_ane_prefill,
@@ -452,6 +453,7 @@ class ModelSettingsRequest(BaseModel):
     is_default: bool | None = None
     is_hidden: bool | None = None
     is_favorite: bool | None = None
+    exclusive_group: str | None = None
     # Security: per-model opt-in for trust_remote_code (issue #926)
     trust_remote_code: bool | None = None
     embedding_audio_enabled: bool | None = None
@@ -2566,6 +2568,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             ),
             "is_hidden": bool(settings and settings.is_hidden),
             "is_favorite": bool(settings and settings.is_favorite),
+            "exclusive_group": settings.exclusive_group if settings else None,
             "is_helper": (
                 bool(model_info.get("is_helper"))
                 or model_id in referenced_drafts
@@ -3097,6 +3100,13 @@ async def update_model_settings(
         current_settings.forced_ct_kwargs = request.forced_ct_kwargs
     if "ttl_seconds" in sent:
         current_settings.ttl_seconds = request.ttl_seconds
+    if "exclusive_group" in sent:
+        try:
+            current_settings.exclusive_group = normalize_exclusive_group(
+                request.exclusive_group
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
     if "index_cache_freq" in sent:
         # 0 means disable (reset to None)
         current_settings.index_cache_freq = (

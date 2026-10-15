@@ -3994,6 +3994,7 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
             m["max_tokens"] = None
             m["is_favorite"] = False
             m["is_hidden"] = False
+            m["exclusive_group"] = None
             continue
 
         m["max_context_window"] = get_max_context_window(model_id)
@@ -4017,11 +4018,13 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
                 m["model_alias"] = base_ms.model_alias
             m["is_favorite"] = base_ms is not None and base_ms.is_favorite
             m["is_hidden"] = base_ms is not None and base_ms.is_hidden
+            m["exclusive_group"] = base_ms.exclusive_group if base_ms else None
             if ms and ms.max_tokens is not None:
                 max_tokens = ms.max_tokens
         else:
             m["is_favorite"] = False
             m["is_hidden"] = False
+            m["exclusive_group"] = None
         m["max_tokens"] = max_tokens
     return status
 

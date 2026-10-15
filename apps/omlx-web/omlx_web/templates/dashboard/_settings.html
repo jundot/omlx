@@ -1909,7 +1909,7 @@
                                         </div>
 
                                         <!-- Pin Toggle -->
-                                        <div class="hidden sm:flex w-12 justify-center flex-shrink-0">
+                                        <div class="hidden sm:flex flex-col items-center w-12 justify-center flex-shrink-0">
                                             <template x-if="!model.virtual">
                                                 <button
                                                     @click="updateModelSetting(model.id, 'is_pinned', !model.pinned)"
@@ -1931,6 +1931,9 @@
                                             <template x-if="model.virtual">
                                                 <span class="text-xs text-neutral-300">—</span>
                                             </template>
+                                            <span x-show="!model.virtual && model.exclusive_group" x-text="model.exclusive_group"
+                                                  :title="window.t('settings.models.table.exclusive_group_tooltip')"
+                                                  class="max-w-full text-[10px] text-neutral-500 truncate"></span>
                                         </div>
 
                                         <!-- Visibility Toggle (on = visible in /v1/models) -->

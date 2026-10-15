@@ -1260,6 +1260,20 @@ class TestExposedProfileModels:
         }
 
     @pytest.mark.asyncio
+    async def test_v1_models_status_exposes_exclusive_group(self, manager):
+        import omlx.server as server_module
+
+        manager.set_settings("qwen-base", ModelSettings(exclusive_group="chat"))
+        self._save_exposed_profile(manager, {"max_tokens": 1024})
+        server_module._server_state.engine_pool = self._FakePool()
+
+        status = await server_module.list_models_status(True)
+
+        by_id = {m["id"]: m for m in status["models"]}
+        assert by_id["qwen-base"]["exclusive_group"] == "chat"
+        assert by_id["qwen-base:thinking"]["exclusive_group"] == "chat"
+
+    @pytest.mark.asyncio
     async def test_v1_models_advertises_alias_form_for_exposed_profiles(self, manager):
         """With a base-model alias set, the catalog lists <alias>:<profile> —
         consistent with the base model being listed under its alias."""

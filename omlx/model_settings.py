@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 from dataclasses import dataclass, field, fields
@@ -31,6 +32,30 @@ from .model_profiles import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Same rule as profile names (omlx/model_profiles.py).
+EXCLUSIVE_GROUP_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+
+
+def normalize_exclusive_group(value: object) -> Optional[str]:
+    """Return a lowercase group slug, or None for an empty value.
+
+    Raises ValueError when the value is not a valid slug.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("exclusive_group must be a string")
+    s = value.strip().lower()
+    if not s:
+        return None
+    if not EXCLUSIVE_GROUP_PATTERN.match(s):
+        raise ValueError(
+            "exclusive_group must be 1-32 characters: lowercase letters, "
+            "digits, '-' or '_', starting with a letter or digit"
+        )
+    return s
+
 
 # Current settings file format version
 SETTINGS_VERSION = 2
@@ -391,6 +416,8 @@ class ModelSettings:
         vlm_mtp_draft_model: Path/repo of the assistant drafter (e.g. "gemma-4-26B-A4B-it-assistant").
         vlm_mtp_draft_block_size: Tokens drafted per round (None = mlx-vlm default).
         is_pinned: Keep model loaded in memory.
+        exclusive_group: Models with the same group are not loaded together
+            (pinned models ignore it). None = no group.
         is_default: Use this model when no model is specified.
         display_name: Human-readable name for UI display.
         description: Optional description of the model.
@@ -567,6 +594,8 @@ class ModelSettings:
     is_default: bool = False  # Only one model can be default
     is_hidden: bool = False  # Hidden from /v1/models (still shown, badged, in admin)
     is_favorite: bool = False  # Listed first in /v1/models and admin lists
+    # Models with the same group are not loaded together (pinned models ignore it)
+    exclusive_group: Optional[str] = None
 
     # External engine serving this model instead of oMLX's MLX engines
     # (omlx/engine/splash.py). None runs the model in-process.
@@ -595,6 +624,14 @@ class ModelSettings:
     def __post_init__(self) -> None:
         # Profiles retain raw JSON types; engine signatures use repr().
         self.turboquant_kv_bits = normalize_turboquant_kv_bits(self.turboquant_kv_bits)
+        # Never raise here: _load drops all settings of a model on any exception.
+        try:
+            self.exclusive_group = normalize_exclusive_group(self.exclusive_group)
+        except ValueError as err:
+            logger.warning(
+                "Ignoring invalid exclusive_group %r: %s", self.exclusive_group, err
+            )
+            self.exclusive_group = None
         # The ddtree verify mode was removed; stored settings run as adaptive.
         if self.dflash_verify_mode == "ddtree":
             self.dflash_verify_mode = "adaptive"

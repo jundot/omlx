@@ -211,6 +211,10 @@ class _AdmissionNeverFitsError(InsufficientMemoryError):
     """Refusal that no wait can fix (pinned models alone leave no room)."""
 
 
+class _ExclusiveGroupBusyError(ModelBusyError):
+    """A same-group model is busy; the PR1 retry loop waits for it."""
+
+
 def _positive_int(value: object) -> int:
     try:
         parsed = int(value)
@@ -2856,7 +2860,7 @@ class EnginePool:
                         )
                 except _AdmissionNeverFitsError:
                     raise
-                except InsufficientMemoryError:
+                except (InsufficientMemoryError, _ExclusiveGroupBusyError) as exc:
                     attempt += 1
                     # Bounded retry (#1970). The refusal above was decided with the
                     # lock held, so the wait below happens only after the lock is
@@ -2879,10 +2883,11 @@ class EnginePool:
                             "change (a load or unload in flight, or another "
                             "request's lease); retrying for up to %.1fs (%.1fs "
                             "when only an unrelated in-flight request can free "
-                            "memory).",
+                            "memory): %s",
                             model_id,
                             budget_s,
                             busy_s,
+                            exc,
                         )
                     wait = delay * (
                         1.0
@@ -3150,6 +3155,9 @@ class EnginePool:
                 admission_kind=admission_kind,
             )
 
+        if await self._enforce_exclusive_group_locked(model_id, entry):
+            unloaded_for_admission = True
+
         if ceiling > 0:
             soft_target = self._admission_soft_target()
             evict_target = min(soft_target, ceiling) if soft_target > 0 else ceiling
@@ -3347,6 +3355,73 @@ class EnginePool:
             f"{advice or DEFAULT_CEILING_ADVICE}."
             f"{lending_note()}"
         )
+
+    def _exclusive_group_for(self, model_id: str) -> str | None:
+        """Return the model's exclusive group slug, or None."""
+        if self._settings_manager is None:
+            return None
+        get_settings = getattr(self._settings_manager, "get_settings", None)
+        if not callable(get_settings):
+            return None
+        group = getattr(get_settings(model_id), "exclusive_group", None)
+        return group if isinstance(group, str) and group else None
+
+    async def _enforce_exclusive_group_locked(
+        self, model_id: str, entry: EngineEntry
+    ) -> bool:
+        """Unload idle same-group models before ``model_id`` loads.
+
+        Caller holds ``self._lock``. Raises ``_ExclusiveGroupBusyError`` when a
+        member is busy, so the retry loop in ``get_engine`` waits for it.
+        Pinned models and distributed deployments ignore groups. Returns True
+        when a model was unloaded.
+        """
+        if (
+            entry.is_pinned
+            or self._distributed_deployment_for_entry(entry) is not None
+        ):
+            return False
+        group = self._exclusive_group_for(model_id)
+        if group is None:
+            return False
+        members: list[str] = []
+        for mid, other in self._entries.items():
+            if mid == model_id or not (other.engine is not None or other.is_loading):
+                continue
+            if self._distributed_deployment_for_entry(other) is not None:
+                continue
+            if self._exclusive_group_for(mid) != group:
+                continue
+            if other.is_pinned:
+                logger.debug(
+                    "Exclusive group '%s': '%s' is pinned; loading '%s' alongside it",
+                    group,
+                    mid,
+                    model_id,
+                )
+                continue
+            members.append(mid)
+        for mid in members:
+            other = self._entries[mid]
+            if (
+                other.is_loading
+                or other.pending_unload_reason
+                or mid in self._unloading_models
+                or self._entry_is_busy(other)
+            ):
+                raise _ExclusiveGroupBusyError(
+                    model_id,
+                    f"load while exclusive group '{group}' member '{mid}' is busy",
+                )
+        for mid in members:
+            logger.info(
+                "Evicting '%s' for exclusive group '%s' before loading '%s'",
+                mid,
+                group,
+                model_id,
+            )
+            await self._unload_engine(mid)
+        return bool(members)
 
     def _raise_if_never_fits_locked(
         self,

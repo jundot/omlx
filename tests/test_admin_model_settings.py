@@ -1016,3 +1016,60 @@ async def test_paroquant_dflash_allows_only_qwen_targets(
             await _update_settings(pool, settings, request)
         assert exc.value.status_code == 400
         assert exc.value.detail == admin_routes._PAROQUANT_REASON
+
+
+@pytest.mark.asyncio
+async def test_exclusive_group_is_normalized_and_cleared():
+    pool, entry = _failed_pool()
+    entry.load_failed = False
+    entry.engine = _idle_engine()
+    pool._unload_engine = AsyncMock()
+    settings = ModelSettings()
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(exclusive_group=" Chat "),
+    )
+
+    assert settings.exclusive_group == "chat"
+    # The group applies at load time only: no reload, no pending unload.
+    assert result["requires_reload"] is False
+    assert entry.pending_unload_reason is None
+    pool._unload_engine.assert_not_awaited()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(exclusive_group=None),
+    )
+    assert settings.exclusive_group is None
+
+
+@pytest.mark.asyncio
+async def test_exclusive_group_invalid_returns_400_and_persists_nothing():
+    pool, _ = _failed_pool()
+    manager = MagicMock()
+    manager.get_settings.return_value = ModelSettings()
+
+    with (
+        patch("omlx.admin.routes._get_engine_pool", return_value=pool),
+        patch("omlx.admin.routes._get_settings_manager", return_value=manager),
+        patch("omlx.admin.routes._get_server_state", return_value=MagicMock()),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await admin_routes.update_model_settings(
+                "ling",
+                admin_routes.ModelSettingsRequest(exclusive_group="bad group!"),
+                is_admin=True,
+            )
+
+    assert exc_info.value.status_code == 400
+    manager.set_settings.assert_not_called()
+
+
+def test_model_settings_request_still_forbids_unknown_keys():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        admin_routes.ModelSettingsRequest(unknown_key=1)
