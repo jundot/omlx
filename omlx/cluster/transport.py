@@ -563,6 +563,11 @@ def classify_link(
     )
 
 
+# ibv_devinfo returns almost at once on a healthy device and only blocks on a
+# wedged Thunderbolt link. Keep the 10s SSH connect allowance plus some slack.
+_RDMA_PROBE_TIMEOUT = 15
+
+
 def _rdma_port_state(ssh_hostname: str, device: str) -> str | None:
     """PORT_ACTIVE / PORT_DOWN for one RDMA device, or None if unreadable."""
 
@@ -576,8 +581,18 @@ def _rdma_port_state(ssh_hostname: str, device: str) -> str | None:
         ]
     try:
         result = subprocess.run(
-            command, capture_output=True, text=True, check=False, timeout=30
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_RDMA_PROBE_TIMEOUT,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"RDMA port probe for {ssh_hostname} did not respond within "
+            f"{_RDMA_PROBE_TIMEOUT}s. The Thunderbolt link is most likely down; "
+            "reseat the cable or wake both Macs and try again."
+        ) from exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError(
             f"RDMA port probe failed for {ssh_hostname}: {exc}"
@@ -1451,11 +1466,12 @@ def _run_link_command(
 
     argv = list(command)
     if ssh_hostname not in _LOCAL_HOSTS:
+        # ssh joins remote arguments into one string for the peer's shell.
         argv = [
             "ssh",
             *cluster_ssh_options(connect_timeout=5),
             ssh_hostname,
-            *argv,
+            shlex.join(argv),
         ]
     try:
         return subprocess.run(
@@ -1515,7 +1531,9 @@ def verify_link_reachability(
             if route.returncode != 0:
                 bound = run(
                     local.host,
-                    ("python3", "-c", script, local.address, remote.address),
+                    # Absolute like the other remote stdlib probes: a bare
+                    # python3 resolves through the login shell's PATH.
+                    ("/usr/bin/python3", "-c", script, local.address, remote.address),
                 )
                 if bound.returncode == 0:
                     continue

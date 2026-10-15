@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gc
 import re
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -217,6 +218,9 @@ def progressive_sharded_load(
             )
         _eval_values(mx_module, fixed)
         mx_module.clear_cache()
+        del flat, fixed
+        gc.collect()
+        mx_module.clear_cache()
         strategy = apply_tensor_strategy(
             model,
             tensor_group,
@@ -233,17 +237,18 @@ def progressive_sharded_load(
         ]
         _eval_values(mx_module, sharded_fixed)
         mx_module.clear_cache()
+        del sharded_fixed
+        gc.collect()
+        mx_module.clear_cache()
         if progress is not None:
             progress({"phase": "tensor_ready", "strategy": strategy})
 
-    # CPU synchronization avoids Metal watchdog timeouts while other ranks
-    # finish their last layer.
-    mx_module.eval(
-        mx_module.distributed.all_sum(
-            mx_module.array(1.0),
-            stream=mx_module.cpu,
-        )
-    )
+    # Do not add a final collective here. Every tensor above has already been
+    # materialized locally, and the launcher withholds the endpoint until it
+    # has received ``rank_ready`` from every member. A redundant CPU-stream
+    # all-reduce at peak wired-memory pressure can lose a JACCL completion and
+    # tear down an otherwise complete load. Rank markers are the load barrier;
+    # the first inference request cannot arrive before all of them are ready.
     if return_config:
         return model, tokenizer, config
     return model, tokenizer

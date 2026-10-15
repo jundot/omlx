@@ -1,0 +1,85 @@
+<!-- Serving Stats Header -->
+<div class="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4 mb-8">
+    <div>
+        <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('status.section_label') }}</h2>
+        <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('status.heading') }}</h3>
+    </div>
+    <div class="flex flex-wrap items-center gap-2">
+        <!-- Scope toggle -->
+        <div class="segmented segmented--sm">
+            <button @click="statsScope = 'session'; showClearStatsConfirm = false; showClearAlltimeConfirm = false"
+                    :class="statsScope === 'session' ? 'segmented__item--active' : ''"
+                    class="segmented__item">
+                {{ t('status.scope_session') }}
+            </button>
+            <button @click="statsScope = 'alltime'; showClearStatsConfirm = false; showClearAlltimeConfirm = false"
+                    :class="statsScope === 'alltime' ? 'segmented__item--active' : ''"
+                    class="segmented__item">
+                {{ t('status.scope_alltime') }}
+            </button>
+        </div>
+        <!-- Clear button -->
+        <div class="flex items-center gap-1.5">
+            <button x-show="(statsScope === 'session' && !showClearStatsConfirm) || (statsScope === 'alltime' && !showClearAlltimeConfirm)"
+                    @click="statsScope === 'session' ? showClearStatsConfirm = true : showClearAlltimeConfirm = true"
+                    class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-700 hover:bg-neutral-100 rounded-full transition-all flex items-center gap-1.5"
+                    :title="statsScope === 'session' ? window.t('status.clear_tooltip') : window.t('status.clear_alltime_tooltip')">
+                <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>
+                {{ t('status.clear') }}
+            </button>
+            <div x-show="(statsScope === 'session' && showClearStatsConfirm) || (statsScope === 'alltime' && showClearAlltimeConfirm)"
+                 x-cloak class="flex items-center gap-1.5">
+                <span class="text-xs text-red-600">{{ t('status.clear_confirm') }}</span>
+                <button @click="statsScope === 'session' ? clearStats() : clearAlltimeStats()"
+                        class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-full transition-all">
+                    {{ t('status.clear_yes') }}
+                </button>
+                <button @click="showClearStatsConfirm = false; showClearAlltimeConfirm = false"
+                        class="px-2.5 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-full transition-all">
+                    {{ t('status.clear_cancel') }}
+                </button>
+            </div>
+        </div>
+        <select x-model="selectedStatsModel"
+                @change="loadStats()"
+                class="px-3 py-1.5 text-xs font-medium border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
+            <option value="">{{ t('status.filter_all_models') }}</option>
+            <template x-for="m in llmModels" :key="m.id">
+                <option :value="m.id" x-text="m.id"></option>
+            </template>
+        </select>
+    </div>
+</div>
+
+<!-- Stat cards: label above a left-aligned figure. Tiles and order come from the dashboard layout. -->
+<div class="grid grid-cols-1 gap-4 sm:gap-6 mb-8" :class="servingStatGridClass">
+    <template x-for="tile in servingStatTiles" :key="tile.id">
+        <div class="bg-white rounded-2xl border border-neutral-200 p-5 flex flex-col gap-1 min-w-0">
+            <p class="text-xs font-semibold text-neutral-500" x-text="tile.label"></p>
+            <p class="flex items-baseline gap-1">
+                <span class="text-2xl lg:text-[32px] leading-tight font-semibold tracking-tight text-neutral-900 tabular-nums" x-text="tile.value"></span>
+                <span x-show="tile.unit" class="text-sm text-neutral-500" x-text="tile.unit"></span>
+            </p>
+        </div>
+    </template>
+</div>
+
+<!-- Speed Stats -->
+<div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+    <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+        <div class="flex items-center gap-3">
+            <i data-lucide="gauge" class="w-4 h-4 text-neutral-500"></i>
+            <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.speed.section_label') }}</span>
+        </div>
+    </div>
+    <div class="grid grid-cols-1 sm:grid-cols-2 sm:divide-x divide-neutral-100">
+        <div class="p-6">
+            <p class="text-xs text-neutral-500 mb-1">{{ t('status.speed.prompt_processing') }} <span class="text-neutral-400">{{ t('status.speed.prompt_processing_note') }}</span></p>
+            <p class="text-2xl font-bold text-neutral-900" x-text="(statsScope === 'alltime' ? alltimeStats : stats).avg_prefill_tps.toFixed(1) + ' tok/s'"></p>
+        </div>
+        <div class="p-6">
+            <p class="text-xs text-neutral-500 mb-1">{{ t('status.speed.token_generation') }}</p>
+            <p class="text-2xl font-bold text-neutral-900" x-text="(statsScope === 'alltime' ? alltimeStats : stats).avg_generation_tps.toFixed(1) + ' tok/s'"></p>
+        </div>
+    </div>
+</div>

@@ -3,10 +3,24 @@
 
 import asyncio
 import json
+import socket
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
+from fastapi import HTTPException
 
-from omlx.server import _with_sse_keepalive
+from omlx import server
+from omlx.api.responses_models import ResponsesRequest
+from omlx.engine.base import GenerationOutput
+from omlx.server import (
+    ClientDisconnectTrackingMiddleware,
+    _ResponsesStreamState,
+    _with_json_keepalive,
+    _with_request_disconnect_abort,
+    _with_sse_keepalive,
+)
+from omlx.settings import GlobalSettings
 
 
 async def _collect(gen):
@@ -128,6 +142,79 @@ class TestSSEKeepaliveExceptionHandling:
         assert items[0] == ": keep-alive\n\n"
         assert request.checks == 2
         assert closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_real_uvicorn_socket_disconnect_aborts_only_its_request():
+    """Exercise the real Uvicorn/Starlette receive race, not a mocked Request."""
+
+    import uvicorn
+    from fastapi import FastAPI, Request
+    from fastapi.responses import StreamingResponse
+
+    aborted: list[str] = []
+    abort_seen = asyncio.Event()
+
+    class Engine:
+        supports_request_scoped_abort = True
+
+        async def abort_request(self, request_id, **_kwargs):
+            aborted.append(request_id)
+            abort_seen.set()
+            return True
+
+    engine = Engine()
+    socket_app = FastAPI()
+    socket_app.add_middleware(ClientDisconnectTrackingMiddleware)
+
+    @socket_app.get("/stream")
+    async def stream(http_request: Request):
+        async def prefill():
+            while True:
+                await asyncio.sleep(60)
+                yield "data: token\n\n"
+
+        body = _with_request_disconnect_abort(
+            _with_sse_keepalive(
+                prefill(),
+                http_request=http_request,
+                interval=60,
+                disconnect_poll=60,
+            ),
+            http_request,
+            engine,
+            "transport-socket-owner",
+        )
+        return StreamingResponse(body, media_type="text/event-stream")
+
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    listener.setblocking(False)
+    port = listener.getsockname()[1]
+    config = uvicorn.Config(socket_app, lifespan="off", log_level="warning")
+    server = uvicorn.Server(config)
+    server_task = asyncio.create_task(server.serve(sockets=[listener]))
+    try:
+        while not server.started:
+            await asyncio.sleep(0.01)
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"GET /stream HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        )
+        await writer.drain()
+        await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=2.0)
+        await asyncio.wait_for(reader.read(1024), timeout=2.0)  # initial keepalive
+        writer.close()
+        await writer.wait_closed()
+
+        await asyncio.wait_for(abort_seen.wait(), timeout=2.0)
+    finally:
+        server.should_exit = True
+        await asyncio.wait_for(server_task, timeout=5.0)
+
+    assert aborted == ["transport-socket-owner"]
 
 
 class TestKeepaliveChunkFormats:
@@ -268,7 +355,9 @@ class TestChatKeepaliveCarriesRole:
     def test_id_sharing_frame_carries_assistant_role(self):
         from omlx.server import _chat_keepalive_chunk
 
-        assert self._first_chunk_role(_chat_keepalive_chunk("chatcmpl-x")) == "assistant"
+        assert (
+            self._first_chunk_role(_chat_keepalive_chunk("chatcmpl-x")) == "assistant"
+        )
 
 
 class TestResolveKeepalive:
@@ -296,10 +385,17 @@ class TestResolveKeepalive:
         try:
             self._set_mode("chunk")
             assert _resolve_keepalive("openai_chat") == _KEEPALIVE_CHAT_CHUNK
-            assert _resolve_keepalive("openai_completion") == _KEEPALIVE_COMPLETION_CHUNK
+            assert (
+                _resolve_keepalive("openai_completion") == _KEEPALIVE_COMPLETION_CHUNK
+            )
             assert _resolve_keepalive("anthropic") == _KEEPALIVE_ANTHROPIC_PING
-            # Responses API has no official ping; chunk mode disables keepalive
+            # Responses keepalives require per-stream identity and ordering.
             assert _resolve_keepalive("openai_responses") is None
+            assert callable(
+                _resolve_keepalive(
+                    "openai_responses", responses_state=_ResponsesStreamState()
+                )
+            )
         finally:
             _server_state.global_settings.server.sse_keepalive_mode = original
 
@@ -311,7 +407,12 @@ class TestResolveKeepalive:
         original = _server_state.global_settings.server.sse_keepalive_mode
         try:
             self._set_mode("comment")
-            for protocol in ("openai_chat", "openai_completion", "anthropic", "openai_responses"):
+            for protocol in (
+                "openai_chat",
+                "openai_completion",
+                "anthropic",
+                "openai_responses",
+            ):
                 assert _resolve_keepalive(protocol) == _KEEPALIVE_COMMENT
         finally:
             _server_state.global_settings.server.sse_keepalive_mode = original
@@ -324,7 +425,286 @@ class TestResolveKeepalive:
         original = _server_state.global_settings.server.sse_keepalive_mode
         try:
             self._set_mode("off")
-            for protocol in ("openai_chat", "openai_completion", "anthropic", "openai_responses"):
+            for protocol in (
+                "openai_chat",
+                "openai_completion",
+                "anthropic",
+                "openai_responses",
+            ):
                 assert _resolve_keepalive(protocol) is None
         finally:
             _server_state.global_settings.server.sse_keepalive_mode = original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status_code,error_type", [(400, "invalid_request_error"), (500, "server_error")]
+)
+async def test_json_keepalive_preserves_http_error_after_first_byte(
+    status_code, error_type
+):
+    result = asyncio.get_running_loop().create_future()
+    stream = _with_json_keepalive(None, result)
+    assert await anext(stream) == " "
+    result.set_exception(
+        HTTPException(status_code=status_code, detail="Request failed")
+    )
+
+    chunks = [chunk async for chunk in stream]
+    assert json.loads("".join(chunks)) == {
+        "error": {
+            "message": "Request failed",
+            "type": error_type,
+            "param": None,
+            "code": None,
+        }
+    }
+
+
+def _event(frame):
+    return json.loads(frame.split("data: ", 1)[1])
+
+
+@pytest.fixture
+def responses_route(monkeypatch):
+    ready = asyncio.Event()
+    closed = asyncio.Event()
+    started = asyncio.Event()
+    requests = []
+    finish = asyncio.Event()
+    finish.set()
+    output = GenerationOutput(
+        text="Hello", new_text="Hello", prompt_tokens=10, completion_tokens=1
+    )
+    engine = SimpleNamespace(
+        tokenizer=None,
+        model_type="llama",
+        start=AsyncMock(),
+        count_chat_tokens=lambda *args, **kwargs: 10,
+        preflight_chat=AsyncMock(),
+        failure=None,
+    )
+
+    async def stream_chat(**kwargs):
+        try:
+            started.set()
+            await ready.wait()
+            if engine.failure:
+                raise engine.failure
+            yield output
+            await finish.wait()
+        finally:
+            closed.set()
+
+    engine.stream_chat = stream_chat
+    monkeypatch.setattr(server, "get_engine_for_model", AsyncMock(return_value=engine))
+    monkeypatch.setattr(server, "get_server_metrics", Mock(return_value=Mock()))
+    monkeypatch.setattr(
+        server._server_state,
+        "engine_pool",
+        SimpleNamespace(
+            get_entry=lambda _: None, resolve_model_id=lambda model, settings: model
+        ),
+    )
+    for name in ("settings_manager", "mcp_manager", "oq_manager"):
+        monkeypatch.setattr(server._server_state, name, None)
+    release = AsyncMock()
+    monkeypatch.setattr(server._LLMEngineLease, "release", release)
+
+    # Exercise the route's actual wrapper selection with short test intervals.
+    wrap = server._with_sse_keepalive
+
+    def fast_keepalive(generator, **kwargs):
+        return wrap(generator, interval=0.01, disconnect_poll=0.01, **kwargs)
+
+    monkeypatch.setattr(server, "_with_sse_keepalive", fast_keepalive)
+
+    async def create(mode="chunk", **kwargs):
+        settings = GlobalSettings()
+        settings.server.sse_keepalive_mode = mode
+        monkeypatch.setattr(
+            server._server_state, "global_settings", settings if mode else None
+        )
+        request = ResponsesRequest(
+            model="test-model", input="Hello", stream=True, store=False, **kwargs
+        )
+        http_request = SimpleNamespace(
+            headers={}, scope={}, is_disconnected=AsyncMock(return_value=False)
+        )
+        requests.append(http_request)
+        response = await server.create_response(request, http_request)
+        return response.body_iterator
+
+    return SimpleNamespace(
+        create=create,
+        ready=ready,
+        closed=closed,
+        output=output,
+        engine=engine,
+        release=release,
+        finish=finish,
+        started=started,
+        requests=requests,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["chunk", None])
+async def test_prefill_emits_response_events_before_model_output(
+    responses_route, mode
+):
+    route = responses_route
+    stream = await route.create(mode)
+    try:
+        events = [_event(await anext(stream)), _event(await anext(stream))]
+        assert [e["type"] for e in events] == [
+            "response.created",
+            "response.in_progress",
+        ]
+        # No model token can arrive until ready is set. Require multiple real
+        # data events, rather than comments ignored by event-level idle timers.
+        for _ in range(2):
+            events.append(_event(await asyncio.wait_for(anext(stream), timeout=1)))
+        assert not route.ready.is_set()
+        initial = events[0]["response"]
+        for event in events[1:]:
+            assert event["type"] == "response.in_progress"
+            assert event["response"] == initial
+            assert event["response"]["output"] == []
+        route.ready.set()
+        events.extend([_event(frame) async for frame in stream])
+    finally:
+        await stream.aclose()
+
+    assert [e["sequence_number"] for e in events] == list(range(1, len(events) + 1))
+    terminal = events[-1]
+    assert terminal["type"] == "response.completed"
+    assert terminal["response"]["id"] == initial["id"]
+    assert terminal["response"]["model"] == "test-model"
+    assert terminal["response"]["output"][0]["content"][0]["text"] == "Hello"
+    assert terminal["response"]["usage"]["output_tokens"] == 1
+    assert route.closed.is_set()
+    route.release.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["comment", "off"])
+async def test_responses_preserve_comment_and_off_modes(responses_route, mode):
+    route = responses_route
+    stream = await route.create(mode)
+    timer = asyncio.get_running_loop().call_later(0.05, route.ready.set)
+    try:
+        frames = await asyncio.wait_for(_collect(stream), timeout=1)
+    finally:
+        timer.cancel()
+        await stream.aclose()
+    comments = [f for f in frames if f.startswith(":")]
+    assert bool(comments) == (mode == "comment")
+    events = [_event(f) for f in frames if not f.startswith(":")]
+    assert sum(e["type"] == "response.in_progress" for e in events) == 1
+    assert events[0]["type"] == "response.created"
+    assert events[-1]["type"] == "response.completed"
+    assert [e["sequence_number"] for e in events] == list(range(1, len(events) + 1))
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_prefill_closes_engine_and_releases_lease(responses_route):
+    route = responses_route
+    stream = await route.create()
+    try:
+        await anext(stream)  # response.created
+        await anext(stream)  # initial response.in_progress
+        heartbeat = _event(await asyncio.wait_for(anext(stream), timeout=1))
+        assert heartbeat["type"] == "response.in_progress"
+        pending = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+    finally:
+        await stream.aclose()
+    assert route.closed.is_set()
+    route.release.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_prefill_failure_after_keepalive_keeps_response_identity(responses_route):
+    route = responses_route
+    route.engine.failure = RuntimeError("prefill failed")
+    stream = await route.create()
+    try:
+        events = [_event(await anext(stream)), _event(await anext(stream))]
+        events.append(_event(await asyncio.wait_for(anext(stream), timeout=1)))
+        route.ready.set()
+        events.extend([_event(frame) async for frame in stream])
+    finally:
+        await stream.aclose()
+    assert events[-1]["type"] == "response.failed"
+    assert events[-1]["response"]["id"] == events[0]["response"]["id"]
+    assert events[-1]["response"]["error"]["message"] == "prefill failed"
+    assert [e["sequence_number"] for e in events] == list(range(1, len(events) + 1))
+    assert route.closed.is_set()
+    route.release.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failure_during_disconnect_poll_cannot_overtake_keepalive(
+    responses_route,
+):
+    route = responses_route
+    route.engine.failure = RuntimeError("prefill failed during disconnect check")
+    stream = await route.create()
+
+    async def is_disconnected():
+        if route.started.is_set():
+            route.ready.set()
+            # Let the in-flight __anext__ produce response.failed while the
+            # wrapper is awaiting its disconnect poll, before its next tick.
+            await asyncio.sleep(0)
+        return False
+
+    route.requests[0].is_disconnected = is_disconnected
+    try:
+        events = [
+            _event(frame) for frame in await asyncio.wait_for(_collect(stream), 1)
+        ]
+    finally:
+        await stream.aclose()
+    assert events[-1]["type"] == "response.failed"
+    assert [e["sequence_number"] for e in events] == list(range(1, len(events) + 1))
+
+
+@pytest.mark.asyncio
+async def test_no_empty_response_snapshot_after_output_starts(responses_route):
+    route = responses_route
+    route.finish.clear()
+    stream = await route.create()
+    pending = None
+    try:
+        await anext(stream)
+        await anext(stream)
+        assert (
+            _event(await asyncio.wait_for(anext(stream), 1))["type"]
+            == "response.in_progress"
+        )
+        route.ready.set()
+        while _event(await anext(stream))["type"] != "response.output_text.delta":
+            pass
+        pending = asyncio.create_task(anext(stream))
+        done, _ = await asyncio.wait({pending}, timeout=0.05)
+        assert not done, "Empty response snapshot emitted after output started"
+        route.finish.set()
+        assert (
+            _event(await asyncio.wait_for(pending, 1))["type"]
+            == "response.output_text.done"
+        )
+        events = [_event(frame) async for frame in stream]
+        assert all(e["type"] != "response.in_progress" for e in events)
+        assert events[-1]["type"] == "response.completed"
+    finally:
+        route.finish.set()
+        if pending is not None and not pending.done():
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+        await stream.aclose()

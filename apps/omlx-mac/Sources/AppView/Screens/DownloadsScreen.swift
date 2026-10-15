@@ -1,7 +1,7 @@
 // PR 8 — Downloads screen.
 //
 // Wires the HF downloader endpoints (POST /admin/api/hf/download,
-// GET /admin/api/hf/tasks at 1 Hz, cancel / retry / delete, /hf/recommended).
+// GET /admin/api/hf/tasks at 2 Hz, cancel / retry / delete, /hf/recommended).
 //
 // Phase 2 — adds a source selector (HF / ModelScope) at the top. The MS
 // branch mirrors the HF flow 1:1 against /admin/api/ms/*. Switching the
@@ -12,7 +12,7 @@
 import SwiftUI
 
 /// Active downloader source. Mirrors the HTML admin's `downloaderSource`
-/// state at `omlx/admin/static/js/dashboard.js:266`.
+/// state at `apps/omlx-web/omlx_web/static/js/dashboard.js:266`.
 enum DownloadSource: String, CaseIterable, Hashable, Sendable {
     case hf, ms
 
@@ -107,13 +107,7 @@ struct DownloadsScreen: View {
                 onShowCard: { repo in vm.showModelCard(repoId: repo) }
             )
 
-            if let error = vm.lastError {
-                Text(error)
-                    .font(.omlxText(11))
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 18)
-                    .padding(.top, 8)
-            }
+            FooterBar(error: vm.lastError)
         }
         .task { await vm.start(client: services.client) }
         .onDisappear { vm.stop() }
@@ -134,9 +128,11 @@ struct DownloadsScreen: View {
 
 // MARK: - Source switcher
 
-/// Segmented HF / ModelScope toggle pinned at the top of Downloads. When
-/// the server's modelscope SDK isn't installed (`/admin/api/ms/status`
-/// returns `available: false`), the MS option is disabled with a tooltip
+/// HF / ModelScope tabs pinned at the top of Downloads, rendered as a
+/// centered segmented control — the macOS convention for top-of-pane tabs
+/// (System Settings › Trackpad, Finder settings). When the server's
+/// modelscope SDK isn't installed (`/admin/api/ms/status` returns
+/// `available: false`), the MS option is disabled with a note underneath
 /// rather than hidden — so a user looking for it can see why it's not
 /// usable.
 private struct SourceSwitcher: View {
@@ -144,21 +140,24 @@ private struct SourceSwitcher: View {
     let msAvailable: Bool
 
     var body: some View {
-        HStack(spacing: 8) {
+        VStack(spacing: 6) {
             Segmented(
                 selection: $source,
                 options: DownloadSource.allCases.map { ($0, $0.label) }
             )
             .disabled(!msAvailable)
+            // A fixed frame makes the picker split the width into equal
+            // tab-sized segments instead of hugging the labels.
+            .frame(width: 280)
             if !msAvailable {
                 Text(String(localized: "downloads.source.ms_unavailable",
                             defaultValue: "ModelScope SDK unavailable in this build",
-                            comment: "Inline note shown beside the source switcher when the ModelScope SDK isn't installed"))
+                            comment: "Note shown under the source switcher when the ModelScope SDK isn't installed"))
                     .font(.omlxText(10.5))
                     .foregroundStyle(.secondary)
             }
-            Spacer(minLength: 0)
         }
+        .frame(maxWidth: .infinity)
         .padding(.horizontal, 14)
         .padding(.top, 4)
         .padding(.bottom, 8)
@@ -586,7 +585,7 @@ private struct SearchDropdown: View {
             // free for the info button (rendered as a sibling outside
             // this row Button so its tap doesn't fall through to onPick).
             if !isHovered, let downloads = m.downloads, downloads > 0 {
-                Text(formatNumber(downloads))
+                Text(CountFormat.compact(downloads))
                     .font(.omlxMono(10.5))
                     .foregroundStyle(theme.textTertiary)
                     .padding(.trailing, 12)
@@ -643,6 +642,11 @@ private struct ActiveDownloadsSection: View {
                                     .lineLimit(1)
                                     .truncationMode(.middle)
                                 Spacer(minLength: 4)
+                                if let speed = task.speedText {
+                                    Text(speed)
+                                        .font(.omlxMono(11))
+                                        .foregroundStyle(theme.blueDot)
+                                }
                                 Text(String(localized: "downloads.progress.bytes",
                                             defaultValue: "\(Int(task.progress))% · \(formatBytes(task.downloadedSize)) of \(formatBytes(task.totalSize))",
                                             comment: "Per-row progress line during downloads. Placeholders: percent, bytes downloaded, total bytes"))
@@ -803,7 +807,7 @@ private struct SuggestedSection: View {
             HStack(spacing: 6) {
                 Popup(
                     selection: $sort,
-                    width: 170,
+                    width: .controlMedium,
                     options: SuggestedSort.allCases.map { ($0, $0.label) }
                 )
                 Button {
@@ -900,7 +904,7 @@ private struct SuggestedSection: View {
         var bits: [String] = []
         if let p = m.paramsFormatted { bits.append(p) }
         if let s = m.sizeFormatted { bits.append(s) }
-        if let dl = m.downloads { bits.append("\(formatNumber(dl)) ↓") }
+        if let dl = m.downloads { bits.append("\(CountFormat.compact(dl)) ↓") }
         return bits.isEmpty ? "—" : bits.joined(separator: " · ")
     }
 }
@@ -923,14 +927,4 @@ enum SuggestedSort: String, Hashable, CaseIterable {
                                        comment: "Sort option: rank suggested models by on-disk size, descending")
         }
     }
-}
-
-// MARK: - Helpers
-
-func formatNumber(_ n: Int) -> String {
-    let v = Double(n)
-    if v >= 1e9 { return String(format: "%.1fB", v / 1e9) }
-    if v >= 1e6 { return String(format: "%.1fM", v / 1e6) }
-    if v >= 1e3 { return String(format: "%.1fK", v / 1e3) }
-    return String(n)
 }

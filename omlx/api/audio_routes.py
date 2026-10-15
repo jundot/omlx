@@ -41,13 +41,14 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # Separate router for the realtime WebSocket: the main audio router is
-# mounted with an HTTP-only verify_api_key dependency that cannot resolve
+# mounted with an HTTP-only auth dependency that cannot resolve
 # in a websocket scope (and browsers cannot set an Authorization header on
 # WebSocket connections anyway). Auth happens in-band via the first
 # {"type": "start"} message instead.
 realtime_router = APIRouter()
 
-# Maximum upload size for audio files (100 MB).
+# Maximum upload size for audio files (100 MB). Used as the default when
+# server settings are not initialized.
 MAX_AUDIO_UPLOAD_BYTES = 100 * 1024 * 1024
 
 # Maximum base64-encoded ref_audio size (~15 MB raw audio, enough for ~60s).
@@ -134,8 +135,26 @@ def _record_audio_request(model_id: str) -> None:
         logger.warning("Failed to record audio metrics for %s: %s", model_id, exc)
 
 
+def _max_audio_upload_bytes() -> int:
+    """Return the configured audio upload limit, falling back to the default."""
+    try:
+        from omlx.settings import get_settings
+
+        return get_settings().server.max_audio_upload_bytes()
+    except RuntimeError:
+        return MAX_AUDIO_UPLOAD_BYTES
+    except (AttributeError, TypeError, ValueError) as exc:
+        logger.warning(
+            "Invalid max_audio_upload_size; using %s byte default: %s",
+            MAX_AUDIO_UPLOAD_BYTES,
+            exc,
+        )
+        return MAX_AUDIO_UPLOAD_BYTES
+
+
 async def _read_upload(file: UploadFile) -> bytes:
     """Read an uploaded file in chunks, bailing early if it exceeds the limit."""
+    limit = _max_audio_upload_bytes()
     chunks: list[bytes] = []
     total = 0
     while True:
@@ -143,12 +162,12 @@ async def _read_upload(file: UploadFile) -> bytes:
         if not chunk:
             break
         total += len(chunk)
-        if total > MAX_AUDIO_UPLOAD_BYTES:
+        if total > limit:
             raise HTTPException(
                 status_code=413,
                 detail=(
                     f"Audio file exceeds maximum allowed size "
-                    f"({MAX_AUDIO_UPLOAD_BYTES} bytes)"
+                    f"({limit} bytes)"
                 ),
             )
         chunks.append(chunk)
@@ -599,13 +618,15 @@ async def create_transcription(
 
 
 def _verify_ws_api_key(api_key: Optional[str]) -> bool:
-    """Verify an in-band API key with the same rules as verify_api_key.
+    """Verify an in-band API key, including the manual inference opt-in.
 
     WebSocket connections from browsers cannot carry an Authorization
     header, so the key arrives inside the {"type": "start"} message.
     """
-    from omlx.server import _server_state
+    from omlx.server import _server_state, allows_unauthenticated_inference
 
+    if allows_unauthenticated_inference():
+        return True
     if _server_state.api_key is None:
         return True
     gs = _server_state.global_settings

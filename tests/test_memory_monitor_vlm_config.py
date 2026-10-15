@@ -12,17 +12,18 @@ These tests pin the priority: prefer any sub-config that has the LM layer
 count, else fall back to the top-level config.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import mlx.core as mx
+import pytest
 
 from omlx.memory_monitor import (
     _SDPA_FALLBACK_SCORE_DTYPE_SIZE,
-    _SDPA_FULL_SUPPORTED_HEAD_DIMS,
-    _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD,
-    _SDPA_VECTOR_SUPPORTED_HEAD_DIMS,
     MemoryMonitor,
+    collect_kv_layer_specs,
     estimate_mla_kv_bytes_per_token,
+    estimate_qwen4_exp_kv_bytes_per_token,
 )
 from omlx.scheduler import Scheduler, SchedulerConfig
 
@@ -95,6 +96,17 @@ class _GlmMlaConfig:
     index_head_dim = 128
 
 
+class _Qwen4Config:
+    model_type = "qwen4_exp"
+    num_key_value_heads = 2
+    head_dim = 128
+    indexer_head_dim = 128
+
+
+class QSAKVCache:
+    pass
+
+
 class _VLMConfigEmptySubConfigs:
     """Sub-configs are present but expose no layer count — skip and fall
     back to the top-level config. Defends against accidentally walking
@@ -105,6 +117,59 @@ class _VLMConfigEmptySubConfigs:
     num_attention_heads = 32
     head_dim = 128
     text_config = MagicMock(spec=["something_else"])  # no layer count
+
+
+def test_qwen4_qsa_memory_includes_indexer_and_mrope_state():
+    caches = [QSAKVCache() for _ in range(12)]
+
+    full_layers, rotating, arrays = collect_kv_layer_specs(caches)
+    estimate = estimate_qwen4_exp_kv_bytes_per_token(
+        _Qwen4Config(),
+        caches,
+        dtype_size=2,
+    )
+
+    assert (full_layers, rotating, arrays) == (12, [], 0)
+    assert estimate == 12 * (2 * 2 * 128 * 2 + 128 * 2 + 3 * 8)
+
+
+def test_qwen4_prefill_profile_gathered_core_caps_score_matrix():
+    from omlx.memory_monitor import MemoryMonitor, make_prefill_memory_profile
+
+    config = SimpleNamespace(
+        model_type="qwen4_exp",
+        num_hidden_layers=48,
+        num_attention_heads=24,
+        num_key_value_heads=2,
+        head_dim=256,
+        indexer_n_heads=4,
+        indexer_head_dim=128,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+        full_attention_interval=4,
+        layer_types=None,
+    )
+    profile = make_prefill_memory_profile(config, compute_dtype_size=2)
+    assert profile is not None
+    monitor = MemoryMonitor(max_kv_cache_memory=1024**3, eviction_enabled=False)
+    monitor.set_model_info(
+        num_layers=48,
+        num_kv_heads=2,
+        head_dim=256,
+        dtype_size=2,
+        num_attention_heads=24,
+        prefill_memory_profile=profile,
+    )
+    query, kv_len = 4096, 233_472
+    dense = monitor.estimate_chunk_transient_bytes(
+        query, kv_len, gathered_core=False
+    )
+    gathered = monitor.estimate_chunk_transient_bytes(
+        query, kv_len, gathered_core=True
+    )
+    assert gathered * 8 < dense
+    # 147GB resident + this gathered gulp stays under the 214GB safety cap.
+    assert gathered < 12 * 1024**3
 
 
 class TestSetModelInfoForMonitorVLMWalk:
@@ -253,6 +318,72 @@ class TestMlaKvMemoryEstimate:
         assert actual == tokens * bytes_per_token
         assert actual < standard / 20
 
+    def test_nope_mla_accepts_zero_rope_and_prices_pooling_ratio(self):
+        from omlx.patches.deepseek_v4 import apply_pooling_cache_support
+
+        apply_pooling_cache_support()
+        from mlx_lm.models.cache import CacheList, KVCache, PoolingCache
+
+        config = type(
+            "NopeMlaConfig",
+            (),
+            {"kv_lora_rank": 512, "qk_rope_head_dim": 0, "index_head_dim": 128},
+        )()
+        caches = [CacheList(KVCache(), PoolingCache(4)) for _ in range(11)]
+
+        assert estimate_mla_kv_bytes_per_token(config, caches, 2) == (
+            11 * (512 + 128 / 4) * 2
+        )
+
+    def test_absorbed_mla_plain_kv_cache_prices_latent(self):
+        """DeepSeek-V3-style MLA keeps latent + RoPE key in a plain KVCache."""
+        from mlx_lm.models.cache import ArraysCache, KVCache
+
+        config = type(
+            "DeepseekV3Config", (), {"kv_lora_rank": 512, "qk_rope_head_dim": 64}
+        )()
+        caches = [KVCache() for _ in range(61)] + [ArraysCache(2)]
+
+        assert (
+            estimate_mla_kv_bytes_per_token(config, caches, 2, latent_kv_cache=True)
+            == 61 * (512 + 64) * 2
+        )
+        # Expanded MLA caches full K/V, so the uniform formula still applies.
+        assert estimate_mla_kv_bytes_per_token(config, caches, 2) is None
+
+    def test_scheduler_detects_absorbed_mla_from_modules(self):
+        from mlx_lm.models.cache import KVCache
+
+        class _Attention:
+            embed_q = object()
+            unembed_out = object()
+
+        config = type(
+            "DeepseekV3Config",
+            (),
+            {
+                "kv_lora_rank": 512,
+                "qk_rope_head_dim": 64,
+                "num_hidden_layers": 61,
+                "num_attention_heads": 128,
+                "num_key_value_heads": 128,
+                "hidden_size": 7168,
+            },
+        )()
+        sched = _make_scheduler()
+        sched.memory_monitor = MagicMock()
+        sched.model = MagicMock()
+        sched.model.config = config
+        sched.model.make_cache.return_value = [KVCache() for _ in range(61)]
+        sched.model.modules.return_value = [object(), _Attention()]
+        del sched.model.args
+        sched._mla_latent_model = None
+
+        sched._set_model_info_for_monitor()
+
+        kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
+        assert kwargs["kv_bytes_per_token"] == 61 * (512 + 64) * 2
+
     def test_scheduler_passes_mla_kv_override_to_monitor(self):
         sched = _make_scheduler()
         sched.memory_monitor = MagicMock()
@@ -301,6 +432,23 @@ class TestSetModelInfoTurboQuantDtype:
         kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
         expected = 4.0 / 8.0 + 2.0 / 128
         assert abs(kwargs["dtype_size"] - expected) < 1e-9
+        # Prefill holds fp16 KV until conversion, then both copies.
+        assert abs(kwargs["prefill_dtype_size"] - (2.0 + expected)) < 1e-9
+
+    def test_turboquant_prefill_kv_is_priced_at_full_width(self):
+        monitor = MemoryMonitor(max_kv_cache_memory=None, eviction_enabled=False)
+        quantized = 4.0 / 8.0 + 2.0 / 128
+        monitor.set_model_info(
+            num_layers=40,
+            num_kv_heads=8,
+            head_dim=128,
+            dtype_size=quantized,
+            prefill_dtype_size=2.0 + quantized,
+        )
+        per_token_fp16 = 40 * 8 * 128 * 2 * 2
+        assert monitor.estimate_prompt_kv_bytes(1000) == pytest.approx(
+            1000 * per_token_fp16 * (2.0 + quantized) / 2.0
+        )
 
     def test_turboquant_4bit_default_skip_last_keeps_one_full_dtype_layer(self):
         sched = self._make_sched_with_config(_PlainLMConfig())
@@ -442,11 +590,6 @@ class TestSetModelInfoTurboQuantDtype:
 
 class TestSdpaDispatchEstimate:
     """MemoryMonitor mirrors MLX SDPA full/vector dispatch support."""
-
-    def test_sdpa_dispatch_constants_match_mlx_031(self):
-        assert _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD == 8
-        assert frozenset({64, 80, 128}) == _SDPA_FULL_SUPPORTED_HEAD_DIMS
-        assert frozenset({64, 96, 128, 256}) == _SDPA_VECTOR_SUPPORTED_HEAD_DIMS
 
     def test_estimate_prefill_uses_full_fallback_for_head_dim_256(self):
         """head_dim=256 is not supported by MLX fused full prefill."""

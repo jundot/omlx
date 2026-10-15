@@ -11,7 +11,8 @@ import subprocess
 import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -54,16 +55,13 @@ def normalize_node_role(value: Any) -> str:
     if value is None:
         return ""
     if not isinstance(value, str):
-        raise ValueError(
-            f"node role must be a string, got {type(value).__name__}"
-        )
+        raise ValueError(f"node role must be a string, got {type(value).__name__}")
     text = value.strip().lower()
     if not text:
         return ""
     if text not in ROLES:
         raise ValueError(
-            f"unknown node role: {value!r} (expected one of "
-            f"{', '.join(sorted(ROLES))})"
+            f"unknown node role: {value!r} (expected one of {', '.join(sorted(ROLES))})"
         )
     return text
 
@@ -213,8 +211,7 @@ class ModelLayout:
                     payload.get("tensor_parallel_kv_heads", 0)
                 ),
                 tensor_parallel_divisors=tuple(
-                    int(value)
-                    for value in payload.get("tensor_parallel_divisors", ())
+                    int(value) for value in payload.get("tensor_parallel_divisors", ())
                 ),
                 kv_bytes_per_token_per_layer=int(
                     payload.get("kv_bytes_per_token_per_layer", 0)
@@ -426,6 +423,11 @@ class ShardPlan:
     # case the per-rank byte reservation is zero, but the operator's requested
     # runtime limit must still be visible and part of the plan identity.
     target_context_tokens: int = _DEFAULT_CONTEXT_TOKENS
+    # node_id → absolute model path on that node (cluster v2). Display and
+    # staging metadata only: the layer split is path-independent, so the map
+    # is deliberately excluded from ``plan_hash``. Empty means every node
+    # loads the shared coordinator path — the legacy behavior.
+    path_map: dict[str, str] = field(default_factory=dict)
 
     @property
     def max_context_tokens(self) -> int:
@@ -458,7 +460,7 @@ class ShardPlan:
         return sum(item.planned_weight_bytes for item in self.assignments)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "plan_version": 1,
             "plan_hash": self.plan_hash,
             "strategy": (
@@ -484,6 +486,9 @@ class ShardPlan:
             "tensor_parallel_size": self.tensor_parallel_size,
             "pipeline_stages": self.pipeline_stages,
         }
+        if self.path_map:
+            result["path_map"] = dict(sorted(self.path_map.items()))
+        return result
 
 
 def synthetic_model_layout(*, total_weight_bytes: int, layer_count: int) -> ModelLayout:
@@ -581,6 +586,25 @@ def _config_int(
     )
 
 
+def _config_nonnegative_int(config: dict[str, Any], key: str) -> int | None:
+    """Read an explicitly present, bounded integer that may be zero."""
+    candidates = [config]
+    for nested in ("text_config", "language_config", "llm_config"):
+        value = config.get(nested)
+        if isinstance(value, dict):
+            candidates.append(value)
+    return next(
+        (
+            value
+            for candidate in candidates
+            if isinstance((value := candidate.get(key)), int)
+            and not isinstance(value, bool)
+            and 0 <= value <= 4096
+        ),
+        None,
+    )
+
+
 def _supports_tensor_parallel(config: dict[str, Any]) -> bool:
     """Whether this architecture has a runtime-safe tensor strategy.
 
@@ -658,9 +682,9 @@ def _tensor_parallel_divisors(config: dict[str, Any]) -> tuple[int, ...]:
                     // max(_config_int(config, "num_attention_heads", 1), 1)
                 )
                 attn_dim = _config_int(config, "num_attention_heads", 0) * head_dim
-                mamba_dim = _config_int(
-                    config, "mamba_num_heads", 0
-                ) * _config_int(config, "mamba_head_dim", 0)
+                mamba_dim = _config_int(config, "mamba_num_heads", 0) * _config_int(
+                    config, "mamba_head_dim", 0
+                )
                 shared_dim = _config_int(
                     config,
                     "moe_shared_expert_intermediate_size",
@@ -744,10 +768,16 @@ def _supports_pipeline(config: dict[str, Any]) -> bool:
     # that offered pipeline for Qwen3.5/3.6-family VLMs and then failed at load.
     from omlx.model_discovery import _has_vision_subconfig
 
-    if _has_vision_subconfig(config):
+    if _has_vision_subconfig(config) and model_type not in _MLX_LM_TEXT_PIPELINE_TYPES:
         return False
     return _declares_pipeline(model_type)
 
+
+# VLM-shaped checkpoints whose DISTRIBUTED load goes through mlx-lm: the cluster
+# worker never uses mlx-vlm and mlx-lm's ``sanitize`` drops the vision tower, so
+# the vision guard above is a false positive for them (oMLX #3662). Qwen3.5/3.6/3.8
+# dense ships its vision config next to the text weights.
+_MLX_LM_TEXT_PIPELINE_TYPES = frozenset({"qwen3_5"})
 
 # Only about seven of mlx-lm's ~120 architectures can be pipelined, so the
 # answer is nearly always no — worth knowing before staging a hundred
@@ -796,7 +826,7 @@ def _kv_cache_replicated_across_tp(config: dict[str, Any]) -> bool:
 
     return (
         _config_int(config, "kv_lora_rank", 0) > 0
-        and _config_int(config, "qk_rope_head_dim", 0) > 0
+        and _config_nonnegative_int(config, "qk_rope_head_dim") is not None
     )
 
 
@@ -819,24 +849,77 @@ def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
     if _kv_cache_replicated_across_tp(config):
         # One KV head holding latent + RoPE, not expanded K/V tensors.
         kv_lora_rank = _config_int(config, "kv_lora_rank", 0)
-        rope_dim = _config_int(config, "qk_rope_head_dim", 0)
-        return (kv_lora_rank + rope_dim) * dtype_size
+        rope_dim = _config_nonnegative_int(config, "qk_rope_head_dim") or 0
+        text_config = config.get("text_config")
+        layer_config = text_config if isinstance(text_config, dict) else config
+        layer_types = layer_config.get("layer_types")
+        if config.get("model_type") == "glm5_next" and isinstance(
+            layer_types, list
+        ):
+            num_layers = _config_int(config, "num_hidden_layers", 0)
+            sparse_layers = sum(
+                layer_type != "linear_attention" for layer_type in layer_types
+            )
+            index_dim = _config_int(config, "index_head_dim", 0)
+            index_pool = _config_int(config, "index_kpool", 1)
+            if num_layers > 0 and sparse_layers > 0:
+                # ModelLayout stores one integral average per layer. Keep the
+                # exact full-model total conservative by rounding upward.
+                numerator = (
+                    sparse_layers
+                    * ((kv_lora_rank + rope_dim) * index_pool + index_dim)
+                    * dtype_size
+                )
+                denominator = num_layers * index_pool
+                return (numerator + denominator - 1) // denominator
+        return _hybrid_kv_average((kv_lora_rank + rope_dim) * dtype_size, config)
 
     heads = _config_int(config, "num_attention_heads", 0)
     kv_heads = _config_int(config, "num_key_value_heads", heads)
     head_dim = _config_int(config, "head_dim", 0)
     if head_dim <= 0:
         hidden = _config_int(config, "hidden_size", 0, maximum=1_000_000)
-        head_dim = (
-            hidden // heads
-            if hidden and heads and hidden % heads == 0
-            else 0
-        )
+        head_dim = hidden // heads if hidden and heads and hidden % heads == 0 else 0
     if head_dim > 4096:
         return 0
     if kv_heads <= 0 or head_dim <= 0:
         return 0
-    return kv_heads * head_dim * 2 * dtype_size
+    return _hybrid_kv_average(kv_heads * head_dim * 2 * dtype_size, config)
+
+
+def _hybrid_kv_average(per_layer: int, config: dict[str, Any]) -> int:
+    """Average per-layer KV bytes when only the attention layers grow a cache.
+
+    Hybrid checkpoints often omit ``layer_types``; the fallbacks mirror MLX-LM.
+    """
+
+    text_config = config.get("text_config")
+    layer_config = text_config if isinstance(text_config, dict) else config
+    layer_types = layer_config.get("layer_types")
+    linear = layer_config.get("linear_attn_config")
+    kda = linear.get("kda_layers") if isinstance(linear, dict) else None
+    total = _config_int(config, "num_hidden_layers", 0)
+    interval = _config_int(config, "full_attention_interval", 0)
+    group = _config_int(config, "layer_group_size", 0)
+    if (
+        isinstance(layer_types, list)
+        and layer_types
+        and all(isinstance(t, str) for t in layer_types)
+    ):
+        total = len(layer_types)
+        full = sum(t != "linear_attention" for t in layer_types)
+    elif isinstance(kda, list):
+        full = total - len(kda)
+    elif interval > 1:
+        full = total // interval
+    elif group > 1 and str(config.get("model_type", "")).startswith("bailing"):
+        # Attention closes each group and fills the leftover tail.
+        full = total // group + total % group
+    else:
+        return per_layer
+    if 0 < full < total:
+        return (per_layer * full + total - 1) // total
+    return per_layer
 
 
 def _attention_head_count(model_path: Path) -> int:
@@ -1012,14 +1095,10 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
     # the runtime model never instantiates them. Counting them as decoder
     # layers put a stage boundary over weights that do not exist at runtime,
     # and the last stage failed activation with end_layer beyond the model.
-    declared_depth = _config_int(
-        _model_config(root), "num_hidden_layers", 0
-    )
+    declared_depth = _config_int(_model_config(root), "num_hidden_layers", 0)
     if declared_depth > 0 and max(layer_sizes) >= declared_depth:
         trimmed = {
-            index: size
-            for index, size in layer_sizes.items()
-            if index < declared_depth
+            index: size for index, size in layer_sizes.items() if index < declared_depth
         }
         if trimmed:
             layer_sizes = trimmed
@@ -1046,12 +1125,8 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         tensor_parallel_divisors=_tensor_parallel_divisors(_model_config(root)),
         supports_tensor_parallel=_supports_tensor_parallel(_model_config(root)),
         supports_pipeline=_supports_pipeline(_model_config(root)),
-        kv_bytes_per_token_per_layer=_kv_bytes_per_token_per_layer(
-            _model_config(root)
-        ),
-        kv_replicated_across_tp=_kv_cache_replicated_across_tp(
-            _model_config(root)
-        ),
+        kv_bytes_per_token_per_layer=_kv_bytes_per_token_per_layer(_model_config(root)),
+        kv_replicated_across_tp=_kv_cache_replicated_across_tp(_model_config(root)),
     )
 
 
@@ -1289,9 +1364,7 @@ def _partition_layers(
             start = previous_end
             for end in range(max(start + 1, minimum_end), maximum_end + 1):
                 layer_bytes = weight_prefix[end] - weight_prefix[start]
-                resident_layer_bytes = (
-                    resident_prefix[end] - resident_prefix[start]
-                )
+                resident_layer_bytes = resident_prefix[end] - resident_prefix[start]
                 planned_weight_bytes = fixed_weight_bytes + layer_bytes
                 planned_resident_bytes = fixed_weight_bytes + resident_layer_bytes
                 if planned_weight_bytes > node.weight_ceiling_bytes:
@@ -1315,14 +1388,12 @@ def _partition_layers(
                         previous_score[score_offset + 1]
                         + stage_seconds * stage_seconds,
                         max(previous_score[score_offset + 2], utilization),
-                        previous_score[score_offset + 3]
-                        + utilization * utilization,
+                        previous_score[score_offset + 3] + utilization * utilization,
                     )
                 else:
                     score = (
                         max(previous_score[score_offset], utilization),
-                        previous_score[score_offset + 1]
-                        + utilization * utilization,
+                        previous_score[score_offset + 1] + utilization * utilization,
                     )
                 if target_aware:
                     target = node.target_weight_bytes
@@ -1345,8 +1416,7 @@ def _partition_layers(
     final = states.get(layer_count)
     if final is None:
         resident_capacity = sum(
-            max(0, node.usable_bytes - fixed_weight_bytes)
-            for node in pipeline_nodes
+            max(0, node.usable_bytes - fixed_weight_bytes) for node in pipeline_nodes
         )
         weight_capacity = sum(
             max(0, node.weight_ceiling_bytes - fixed_weight_bytes)
@@ -1402,15 +1472,13 @@ def _predict_stage_seconds(
     return compute_seconds, send_seconds, compute_seconds + send_seconds
 
 
-def plan_unequal_pipeline(
+def _validate_pipeline_request(
     model: ModelLayout,
     nodes: Sequence[NodeBudget],
-    *,
-    workload_profile: ExecutionProfileName = "balanced",
-    microbatch_size: int = 1,
-    context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
-) -> ShardPlan:
-    """Assign contiguous layers in MLX pipeline order across unequal nodes."""
+    workload_profile: ExecutionProfileName,
+    microbatch_size: int,
+) -> None:
+    """The input contract every pipeline planner enforces identically."""
 
     if not nodes:
         raise ValueError("at least one node is required")
@@ -1433,6 +1501,19 @@ def plan_unequal_pipeline(
             raise PlanningError(
                 f"replicated fixed weights do not fit node {node.node_id}"
             )
+
+
+def plan_unequal_pipeline(
+    model: ModelLayout,
+    nodes: Sequence[NodeBudget],
+    *,
+    workload_profile: ExecutionProfileName = "balanced",
+    microbatch_size: int = 1,
+    context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
+) -> ShardPlan:
+    """Assign contiguous layers in MLX pipeline order across unequal nodes."""
+
+    _validate_pipeline_request(model, nodes, workload_profile, microbatch_size)
 
     # MLX-LM sends activations from the highest rank (early layers) down to
     # rank zero (late layers / HTTP coordinator), so partition in reverse rank.
@@ -1459,6 +1540,132 @@ def plan_unequal_pipeline(
                 f"fit the supplied per-node budgets: {exc}"
             ) from exc
         raise
+    return _finish_pipeline_plan(
+        model,
+        nodes,
+        pipeline_nodes,
+        ranges,
+        workload_profile=workload_profile,
+        microbatch_size=microbatch_size,
+        context_tokens=context_tokens,
+        optimization="performance" if performance_aware else "memory",
+    )
+
+
+def allocate_layers_proportional(
+    layer_count: int,
+    shares: Sequence[int],
+) -> tuple[int, ...]:
+    """Split ``layer_count`` across nodes proportionally to ``shares``.
+
+    Largest-remainder rounding with a one-layer minimum per node — the
+    allocation rule exo's placement uses, so a 256 GB + 128 GB pair splits
+    roughly ⅔–⅓. Fractions are exact (no float drift) and ties break toward
+    the larger share, then the earlier pipeline position, so the result is
+    deterministic and reproducible across machines.
+    """
+
+    if not isinstance(layer_count, int) or layer_count <= 0:
+        raise ValueError("layer_count must be a positive integer")
+    if not shares:
+        raise ValueError("at least one share is required")
+    for share in shares:
+        if not isinstance(share, int) or isinstance(share, bool) or share <= 0:
+            raise ValueError("shares must be positive integers")
+    node_count = len(shares)
+    if node_count > layer_count:
+        raise PlanningError(
+            f"{node_count} nodes cannot each receive a layer from {layer_count} layers"
+        )
+    total = sum(shares)
+    exact = [Fraction(layer_count * share, total) for share in shares]
+    counts = [max(1, value.numerator // value.denominator) for value in exact]
+    remainder = layer_count - sum(counts)
+    # Σfloor(exact) ≤ layer_count and the one-layer floor adds at most one per
+    # node that floored to zero, so ``remainder`` is never negative.
+    assert remainder >= 0
+    order = sorted(
+        range(node_count),
+        key=lambda index: (
+            -(exact[index] - counts[index]),
+            -shares[index],
+            index,
+        ),
+    )
+    for index in order[:remainder]:
+        counts[index] += 1
+    return tuple(counts)
+
+
+def plan_proportional_pipeline(
+    model: ModelLayout,
+    nodes: Sequence[NodeBudget],
+    *,
+    workload_profile: ExecutionProfileName = "balanced",
+    microbatch_size: int = 1,
+    context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
+) -> ShardPlan:
+    """RAM-proportional N-node pipeline plan (largest-remainder, exo-style).
+
+    Layer counts are proportional to each node's usable memory
+    (``capacity − reserve``), rounded by largest remainder. Unlike the
+    balanced planner this does not optimize for the bottleneck stage or honor
+    soft weight targets — it is the predictable "split by RAM" rule operators
+    expect when generalizing beyond two nodes. Per-node weight ceilings (the
+    split control) and KV reservations are still enforced: a node whose
+    proportional share does not fit fails the plan with its name, rather than
+    being silently rebalanced.
+    """
+
+    _validate_pipeline_request(model, nodes, workload_profile, microbatch_size)
+
+    pipeline_nodes = tuple(sorted(nodes, key=lambda item: item.rank, reverse=True))
+    counts = allocate_layers_proportional(
+        len(model.layer_weight_bytes),
+        [node.usable_bytes for node in pipeline_nodes],
+    )
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    for count in counts:
+        ranges.append((start, start + count))
+        start += count
+    for node, (range_start, range_end) in zip(pipeline_nodes, ranges):
+        layer_weight = sum(model.layer_weight_bytes[range_start:range_end])
+        if model.fixed_weight_bytes + layer_weight > node.weight_ceiling_bytes:
+            raise PlanningError(
+                f"the RAM-proportional split gives node {node.node_id} "
+                f"{range_end - range_start} layers "
+                f"({model.fixed_weight_bytes + layer_weight} bytes with fixed "
+                f"weights) above its weight ceiling of "
+                f"{node.weight_ceiling_bytes}; raise that node's split cap or "
+                "plan with the balanced allocator"
+            )
+    return _finish_pipeline_plan(
+        model,
+        nodes,
+        pipeline_nodes,
+        tuple(ranges),
+        workload_profile=workload_profile,
+        microbatch_size=microbatch_size,
+        context_tokens=context_tokens,
+        optimization="ram-proportional",
+    )
+
+
+def _finish_pipeline_plan(
+    model: ModelLayout,
+    nodes: Sequence[NodeBudget],
+    pipeline_nodes: Sequence[NodeBudget],
+    ranges: tuple[tuple[int, int], ...] | list[tuple[int, int]],
+    *,
+    workload_profile: ExecutionProfileName,
+    microbatch_size: int,
+    context_tokens: int,
+    optimization: str,
+) -> ShardPlan:
+    """Assignments, per-node fit checks, and the signed hash for a partition."""
+
+    performance_aware = all(node.performance is not None for node in pipeline_nodes)
     assignments: list[PipelineAssignment] = []
     for node, (start, end) in zip(pipeline_nodes, ranges):
         layer_weight_bytes = sum(model.layer_weight_bytes[start:end])
@@ -1511,7 +1718,7 @@ def plan_unequal_pipeline(
     hash_payload = {
         "model": model.to_dict(),
         "context_tokens": context_tokens,
-        "optimization": "performance" if performance_aware else "memory",
+        "optimization": optimization,
         "workload_profile": workload_profile,
         "microbatch_size": microbatch_size,
         "performance_profiles": [
@@ -1529,9 +1736,7 @@ def plan_unequal_pipeline(
                 "reserve_bytes": item.reserve_bytes,
                 "manual_memory_limit": item.manual_memory_limit,
                 "target_weight_bytes": next(
-                    node.target_weight_bytes
-                    for node in nodes
-                    if node.rank == item.rank
+                    node.target_weight_bytes for node in nodes if node.rank == item.rank
                 ),
                 # Part of the plan's identity: the same layers on the same Mac
                 # mean a different deployment depending on whether someone is
@@ -1552,7 +1757,7 @@ def plan_unequal_pipeline(
         model=model,
         assignments=tuple(assignments),
         plan_hash=plan_hash,
-        optimization="performance" if performance_aware else "memory",
+        optimization=optimization,
         workload_profile=workload_profile,
         performance_profiles=tuple(
             node.performance
@@ -1601,7 +1806,9 @@ def install_unequal_pipeline_plan(
 
     original = PipelineMixin.pipeline
 
-    def planned_pipeline(pipeline_model: Any, group: Any) -> None:
+    # Model overrides forward MLX-LM's ``split``. The plan replaces that
+    # split, so it is accepted and ignored.
+    def planned_pipeline(pipeline_model: Any, group: Any, split: Any = None) -> None:
         apply_pipeline_assignment(pipeline_model, group, assignments)
 
     # The worker's pre-load memory guard looks for this exact contract. A
@@ -1697,9 +1904,7 @@ def _max_context_for_stage(
     "not known" rather than "unlimited".
     """
 
-    per_token = _kv_bytes_per_token_for_stage(
-        model, layer_count, tensor_parallel_size
-    )
+    per_token = _kv_bytes_per_token_for_stage(model, layer_count, tensor_parallel_size)
     if per_token <= 0:
         return 0
     spare = node.usable_bytes - weight_bytes
@@ -1853,7 +2058,11 @@ def plan_hybrid(
     # them, split within each layer by shard_linear.
     ordered_nodes = sorted(nodes, key=lambda item: item.rank)
     stage_groups = [
-        tuple(ordered_nodes[stage * tensor_parallel_size : (stage + 1) * tensor_parallel_size])
+        tuple(
+            ordered_nodes[
+                stage * tensor_parallel_size : (stage + 1) * tensor_parallel_size
+            ]
+        )
         for stage in range(pipeline_stages)
     ]
 
@@ -1972,10 +2181,13 @@ def plan_hybrid(
     assignments.sort(key=lambda a: a.rank)
 
     # Build performance profiles if available
-    profiles = tuple(
-        node.performance for node in ordered_nodes
-        if node.performance is not None
-    ) if performance_aware else ()
+    profiles = (
+        tuple(
+            node.performance for node in ordered_nodes if node.performance is not None
+        )
+        if performance_aware
+        else ()
+    )
 
     # Compute plan hash covering all assignment fields
     hash_payload = {

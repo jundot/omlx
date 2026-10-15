@@ -12,6 +12,7 @@ Supports:
 - Reranker models: Use RerankerEngine for document reranking
 - Audio STT models: Use STTEngine for speech-to-text (Whisper, Qwen3-ASR, ...)
 - Audio TTS models: Use TTSEngine for text-to-speech (Qwen3-TTS, Kokoro, ...)
+- Decision models: Use DecisionEngine for /v1/systemone (Clef, OpenJev, Decision 3.0)
 """
 
 import contextlib
@@ -25,11 +26,17 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
-EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
+ModelType = Literal[
+    "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "decision"
+]
+EngineType = Literal[
+    "batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "decision"
+]
+DecisionKind = Literal["clef", "openjev", "d3"]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
+    "deepseek_v41",
     "qwen2_vl",
     "qwen2_5_vl",
     "qwen3_vl",
@@ -62,12 +69,14 @@ VLM_MODEL_TYPES = {
     "glm_ocr",
     "minimax_m3_vl",
     "minicpmv",
+    "minicpmv4_7",
     "phi4_siglip",
     "phi4mm",
     "youtu_vl",
     "inkling",
     "inkling_mm_model",  # config model_type of Inkling Small checkpoints
     "muse_glimmer",
+    "glm5_next",
 }
 
 # Text-only model families that are implemented in mlx-vlm rather than
@@ -75,6 +84,9 @@ VLM_MODEL_TYPES = {
 # models and adapts their language model to oMLX's scheduler.
 VLM_NATIVE_TEXT_MODEL_TYPES = {
     "cohere2_moe",
+    # mlx-lm ships its own deepseek_v41 without the oMLX cache and kernels.
+    "deepseek_v41",
+    "glm5_next",
     "minimax_m3",
 }
 
@@ -84,7 +96,29 @@ VLM_NATIVE_TEXT_MODEL_TYPES = {
 # Remove a family once mlx-vlm provides its multimodal implementation.
 MLX_LM_TEXT_ONLY_MODEL_TYPES = {
     "mimo_v2",
+    "mimo_v2_flash",
 }
+
+_MIMO_VISION_SIDECAR = Path("omnimodal/vision_encoder.safetensors")
+_MIMO_OMNIMODAL_CONFIG = Path("omnimodal/config.json")
+
+# Clef ships its decision head next to the backbone shards. It is not part of
+# the backbone index, so backbone loaders and quantizers must skip it.
+CLEF_HEAD_WEIGHTS = "joint_head.safetensors"
+CLEF_HEAD_CONFIG = "joint_head_config.json"
+_OPENJEV_HELPER = Path("helper/shim.py")
+# Decision 3.0 (vllm-sr d3) scores answer codes with an FP32 readout stored
+# next to the backbone shards, described by its decision config.
+D3_READOUT_WEIGHTS = "readout.safetensors"
+D3_DECISION_CONFIG = "decision_config.json"
+D3_FORMAT_ID = "d3-code-readout-v1"
+# Files of a decision head, not of the backbone. Quantizers copy them as is.
+DECISION_SIDECAR_WEIGHTS = (CLEF_HEAD_WEIGHTS, D3_READOUT_WEIGHTS)
+DECISION_SIDECAR_FILES = (
+    *DECISION_SIDECAR_WEIGHTS,
+    CLEF_HEAD_CONFIG,
+    D3_DECISION_CONFIG,
+)
 
 # Speculative-decoding "helper" checkpoints (dFlash / MTP / assistant drafters)
 # are never meant to be served as standalone chat models. Some declare a
@@ -93,8 +127,7 @@ MLX_LM_TEXT_ONLY_MODEL_TYPES = {
 # a plain model_type (e.g. ``qwen3``) and are only distinguishable by their
 # architecture name (``DFlashDraftModel``) or a drafter-only config block
 # (``dflash_config``). Keep these in sync with the drafter resolution in
-# engine_pool.py (~1498) and the dflash gate in engine/dflash.py when new
-# drafter families are added.
+# engine_pool.py when new drafter families are added.
 HELPER_CONFIG_MODEL_TYPE_SUFFIXES = ("_assistant", "_mtp")
 _HELPER_ARCH_TOKENS = ("draft", "assistant", "mtp")
 _HELPER_CONFIG_KEYS = ("dflash_config",)
@@ -162,6 +195,9 @@ VLM_ARCHITECTURES = {
     "UnlimitedOCRForCausalLM",  # baidu/Unlimited-OCR
     "InklingForConditionalGeneration",  # thinkingmachines/Inkling-Small
     "MuseGlimmerForConditionalGeneration",  # meta-models/Muse-Glimmer-30B
+    "Glm5NextForConditionalGeneration",  # zai-org/GLM-5.3-Flash
+    "HfMoondream",  # vikhyatk/moondream2 (2025 revisions), moondream/moondream3-preview
+    "Moondream",  # vikhyatk/moondream2 (2024 revisions)
 }
 
 # Known embedding model types from mlx-embeddings
@@ -196,6 +232,7 @@ EMBEDDING_ARCHITECTURES = {
     "SiglipModel",
     "SiglipVisionModel",
     "SiglipTextModel",
+    "EmbeddingGemma2Model",  # via mlx-vlm; has vision_config, checked before VLM
 }
 
 # Supported reranker architectures
@@ -377,6 +414,7 @@ class DiscoveredModel:
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
+    reasoning_efforts: list[str] | None = None  # Template effort levels (None = no effort)
     model_context_length: int | None = None  # Declared context length from config.json (None if unknown)
     source_type: str = "local"  # "local" or "hf_cache"
     source_repo_id: str | None = None  # HuggingFace repo id for cache-backed models
@@ -423,6 +461,60 @@ def _is_unsupported_model(model_path: Path) -> bool:
     return normalized in UNSUPPORTED_MODEL_TYPES or model_type in UNSUPPORTED_MODEL_TYPES
 
 
+def _model_name_hint(model_path: Path) -> str:
+    """
+    Return the lowercased name used by the directory-name heuristics.
+
+    HF Hub cache snapshots live at ``models--Org--Name/snapshots/<commit>``,
+    so their directory name is a commit hash. Use the repo name there,
+    otherwise the model directory name.
+    """
+    if model_path.parent.name == "snapshots":
+        decoded = _decode_hf_cache_model_id(model_path.parent.parent)
+        if decoded is not None:
+            return decoded[1].rsplit("/", 1)[-1].lower()
+    return model_path.name.lower()
+
+
+def _is_d3_decision_config(path: Path) -> bool:
+    try:
+        with open(path) as f:
+            return json.load(f).get("format_id") == D3_FORMAT_ID
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind | None:
+    """Return the decision-model family of a checkpoint, or None.
+
+    Clef is identified by its joint head files and Decision 3.0 by its
+    readout and decision config. OpenJev is a plain Qwen3.5 checkpoint, so it
+    is identified by its helper directory or, for MLX conversions without the
+    helper, by the directory name.
+    """
+    if (model_path / CLEF_HEAD_WEIGHTS).is_file() and (
+        model_path / CLEF_HEAD_CONFIG
+    ).is_file():
+        return "clef"
+    if (model_path / D3_READOUT_WEIGHTS).is_file() and _is_d3_decision_config(
+        model_path / D3_DECISION_CONFIG
+    ):
+        return "d3"
+    if config is None:
+        try:
+            with open(model_path / "config.json") as f:
+                config = json.load(f)
+        except (OSError, ValueError):
+            return None
+    if config.get("model_type") != "qwen3_5":
+        return None
+    if (model_path / _OPENJEV_HELPER).is_file() or "openjev" in _model_name_hint(
+        model_path
+    ):
+        return "openjev"
+    return None
+
+
 def _is_causal_lm_reranker(model_path: Path) -> bool:
     """
     Heuristic check for CausalLM models fine-tuned as rerankers.
@@ -432,7 +524,7 @@ def _is_causal_lm_reranker(model_path: Path) -> bool:
     scoring. We detect them by checking the model directory name for "reranker"
     or "rerank" keywords, since config.json is identical to a standard LLM.
     """
-    name_lower = model_path.name.lower()
+    name_lower = _model_name_hint(model_path)
     return "reranker" in name_lower or "rerank" in name_lower
 
 
@@ -445,7 +537,7 @@ def _is_causal_lm_embedding(model_path: Path) -> bool:
     weights. We detect them by checking the model directory name for "embedding"
     or "embed" keywords, since config.json is identical to a standard LLM.
     """
-    name_lower = model_path.name.lower()
+    name_lower = _model_name_hint(model_path)
     return "embedding" in name_lower or "embed" in name_lower
 
 
@@ -550,14 +642,15 @@ def _has_vision_subconfig(config: dict) -> bool:
     """
     Return True if ``config`` carries evidence of a vision sub-config.
 
-    Three keys cover the conventions in the wild:
+    Vision configuration conventions:
 
+    - ``vision_n_layers`` - DeepSeek V4 uses a positive layer count.
     - ``vision_config`` — most VLMs (Qwen2-VL, Gemma3, LLaVA-Next, ...).
     - ``vit_config`` — Molmo / Molmo2 family.
     - ``mm_vision_tower`` — older LLaVA family including FastVLM's
       ``llava_qwen2``.
 
-    All three are non-empty checks: text-only quants of VLM families can
+    The nested configurations use non-empty checks: text-only quants of VLM families can
     leave an empty ``vision_config: {}`` stub behind after stripping the
     vision tower (#2385), and key presence alone would misclassify them
     as VLM.
@@ -566,7 +659,11 @@ def _has_vision_subconfig(config: dict) -> bool:
     paths (``oq``, admin model info) that need to ask "is this a VLM?".
     """
     return (
-        bool(config.get("vision_config"))
+        (
+            config.get("model_type") == "deepseek_v4"
+            and (config.get("vision_n_layers") or 0) > 0
+        )
+        or bool(config.get("vision_config"))
         or bool(config.get("vit_config"))
         or bool(config.get("mm_vision_tower"))
     )
@@ -597,11 +694,15 @@ def detect_model_type(model_path: Path) -> ModelType:
        ``mm_vision_tower`` — see :func:`_has_vision_subconfig`)
     7. Audio model detection (STT/TTS/STS)
 
+    Decision models (see :func:`decision_kind`) are checked first because
+    their backbones look like ordinary VLM checkpoints.
+
     Args:
         model_path: Path to model directory
 
     Returns:
-        Model type: "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", or "audio_sts"
+        Model type: "llm", "vlm", "embedding", "reranker", "audio_stt",
+        "audio_tts", "audio_sts", or "decision"
     """
     config_path = model_path / "config.json"
     if not config_path.exists():
@@ -612,6 +713,9 @@ def detect_model_type(model_path: Path) -> ModelType:
             config = json.load(f)
     except (json.JSONDecodeError, IOError):
         return "llm"
+
+    if decision_kind(model_path, config) is not None:
+        return "decision"
 
     # Check architectures field for reranker first (more specific)
     architectures = config.get("architectures", [])
@@ -675,10 +779,18 @@ def detect_model_type(model_path: Path) -> ModelType:
         )
 
     if normalized_type in MLX_LM_TEXT_ONLY_MODEL_TYPES:
+        has_mimo_vision = (
+            normalized_type in {"mimo_v2", "mimo_v2_flash"}
+            and (model_path / _MIMO_VISION_SIDECAR).is_file()
+            and (model_path / _MIMO_OMNIMODAL_CONFIG).is_file()
+        )
+        if has_mimo_vision:
+            logger.info("%s detected with MiMo omnimodal vision sidecar", model_type)
+            return "vlm"
         if _has_vision_subconfig(config):
             logger.warning(
-                "%s carries multimodal configuration, but the available mlx-lm "
-                "implementation is text-only; using the LLM engine",
+                "%s carries multimodal configuration, but no supported vision "
+                "sidecar is present; using the LLM engine",
                 model_type,
             )
         return "llm"
@@ -775,7 +887,28 @@ def detect_model_type(model_path: Path) -> ModelType:
     return "llm"
 
 
-def detect_thinking_default(model_path: Path) -> bool | None:
+def _read_chat_template_text(model_path: Path) -> str | None:
+    """Return the chat template from chat_template.jinja or tokenizer_config.json."""
+    jinja_path = model_path / "chat_template.jinja"
+    if jinja_path.exists():
+        with contextlib.suppress(OSError):
+            return jinja_path.read_text(encoding="utf-8")
+
+    tc_path = model_path / "tokenizer_config.json"
+    if tc_path.exists():
+        try:
+            with open(tc_path) as f:
+                template = json.load(f).get("chat_template")
+        except Exception:
+            return None
+        if isinstance(template, str):
+            return template
+    return None
+
+
+def detect_thinking_default(
+    model_path: Path, template_text: str | None = None
+) -> bool | None:
     """Detect a model's effective thinking default from local metadata.
 
     Inspects the Jinja chat template for ``enable_thinking`` references and
@@ -791,22 +924,8 @@ def detect_thinking_default(model_path: Path) -> bool | None:
     * **None** — template does not reference ``enable_thinking`` (model has
       no thinking toggle).
     """
-    # Try standalone Jinja file first, then tokenizer_config.json
-    template_text = None
-    jinja_path = model_path / "chat_template.jinja"
-    if jinja_path.exists():
-        with contextlib.suppress(OSError):
-            template_text = jinja_path.read_text(encoding="utf-8")
-
     if template_text is None:
-        tc_path = model_path / "tokenizer_config.json"
-        if tc_path.exists():
-            try:
-                with open(tc_path) as f:
-                    tc = json.load(f)
-                template_text = tc.get("chat_template")
-            except Exception:
-                pass
+        template_text = _read_chat_template_text(model_path)
 
     if not template_text or "enable_thinking" not in template_text:
         return None
@@ -916,7 +1035,9 @@ def _read_model_context_length(model_path: Path) -> int | None:
     return None
 
 
-def detect_preserve_thinking(model_path: Path) -> bool | None:
+def detect_preserve_thinking(
+    model_path: Path, template_text: str | None = None
+) -> bool | None:
     """Detect whether a model's chat template supports ``preserve_thinking``.
 
     Qwen 3.6+ templates strip ``<think>`` blocks from historical assistant
@@ -928,26 +1049,40 @@ def detect_preserve_thinking(model_path: Path) -> bool | None:
         True if the template references ``preserve_thinking`` (should be
         enabled), None otherwise (template has no such flag).
     """
-    template_text = None
-    jinja_path = model_path / "chat_template.jinja"
-    if jinja_path.exists():
-        with contextlib.suppress(OSError):
-            template_text = jinja_path.read_text(encoding="utf-8")
-
     if template_text is None:
-        tc_path = model_path / "tokenizer_config.json"
-        if tc_path.exists():
-            try:
-                with open(tc_path) as f:
-                    tc = json.load(f)
-                template_text = tc.get("chat_template")
-            except Exception:
-                pass
+        template_text = _read_chat_template_text(model_path)
 
     if not template_text or "preserve_thinking" not in template_text:
         return None
 
     return True
+
+
+REASONING_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+# `reasoning_effort == 'low'` or `reasoning_effort (not) in ['low', 'high']`.
+_EFFORT_CHECK = re.compile(
+    r"reasoning_effort\s*(?:==|(?:not\s+)?in)\s*"
+    r"([\[(][^\])]*[\])]|'[^']*'|\"[^\"]*\")"
+)
+_QUOTED = re.compile(r"['\"]([^'\"]+)['\"]")
+
+
+def detect_reasoning_effort(
+    model_path: Path, template_text: str | None = None
+) -> list[str] | None:
+    """Return the effort levels the chat template accepts.
+
+    None means the template does not read ``reasoning_effort``. An empty list
+    means it reads the value but names none of the standard levels.
+    """
+    if template_text is None:
+        template_text = _read_chat_template_text(model_path)
+    if not template_text or "reasoning_effort" not in template_text:
+        return None
+    named = set()
+    for match in _EFFORT_CHECK.finditer(template_text):
+        named.update(_QUOTED.findall(match.group(1)))
+    return [level for level in REASONING_EFFORT_LEVELS if level in named]
 
 
 def estimate_model_size(model_path: Path) -> int:
@@ -1404,13 +1539,72 @@ def _is_helper_checkpoint(model_path: Path) -> bool:
     return is_helper_model_config(config)
 
 
+def _is_deepseek_v41_loadable_config(config) -> bool:
+    """Recognize official, oMLX-converted, and declared affine V4.1 checkpoints.
+
+    This also admits checkpoints without MLX shard metadata or repo names.
+    False leaves generic discovery heuristics in control; it does not reject loading.
+    """
+    if not isinstance(config, dict) or config.get("model_type") != "deepseek_v41":
+        return False
+    spec = config.get("omlx_deepseek_v41")
+    if isinstance(spec, dict):
+        return spec.get("version") == 1
+    if spec is not None:
+        return False
+    quantization = config.get("quantization")
+    if quantization is None:
+        return True
+    if not isinstance(quantization, dict):
+        return False
+    bits = quantization.get("bits")
+    group_size = quantization.get("group_size")
+    if quantization.get("mode", "affine") != "affine":
+        return False
+    if not _declared_int(bits) or not _declared_int(group_size):
+        return False
+    # `source_quantization_spec` rejects a non-affine per-module override too.
+    return not any(
+        isinstance(entry, dict) and entry.get("mode", "affine") != "affine"
+        for entry in quantization.values()
+    )
+
+
+def _declared_int(value) -> bool:
+    """JSON booleans are ints in Python; a declared width/group is not one."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
     """Heuristic for HF cache entries that can be loaded without conversion."""
     if not _is_model_dir(model_dir):
         return False
+    try:
+        config = json.loads((model_dir / "config.json").read_text())
+    except (OSError, ValueError):
+        config = {}
+    if (
+        isinstance(config, dict)
+        and config.get("model_type") == "k2_horizon"
+        and not config.get("model_file")
+    ):
+        try:
+            from .patches.k2_horizon.checkpoint import checkpoint_files
+
+            checkpoint_files(model_dir)
+            return True
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            logger.debug("Invalid K2 cache checkpoint %s: %s", source_repo_id, error)
+            return False
     if not list(model_dir.glob("model*.safetensors")):
         logger.debug(f"Skipping HF cache model without model*.safetensors: {source_repo_id}")
         return False
+    if _is_deepseek_v41_loadable_config(config):
+        logger.info(
+            "Treating HF cache model as MLX-compatible DeepSeek V4.1 checkpoint: "
+            f"{source_repo_id}"
+        )
+        return True
     if _safetensors_has_mlx_metadata(model_dir):
         return True
 
@@ -1430,6 +1624,33 @@ def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
 
     logger.debug(f"Skipping non-MLX HF cache model: {source_repo_id}")
     return False
+
+
+def _gemma4_text_only_wants_vlm_engine(config: dict) -> bool:
+    """True for a text-only gemma4 whose merged MTP head only mlx-vlm drives."""
+    model_type = str(config.get("model_type") or "").lower().replace("-", "_")
+    if model_type != "gemma4":
+        return False
+    if _has_vision_subconfig(config):
+        return False
+    return _has_merged_mtp_head(config)
+
+
+def _has_merged_mtp_head(config: dict) -> bool:
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        return False
+    return isinstance(text_config.get("mtp_assistant_config"), dict)
+
+
+def _gemma4_text_only_prefers_llm_engine(config: dict) -> bool:
+    """True for a text-only Gemma 4 with no MTP head; mlx-lm serves it cheaper."""
+    model_type = str(config.get("model_type") or "").lower().replace("-", "_")
+    if model_type not in ("gemma4", "gemma4_unified"):
+        return False
+    if _has_vision_subconfig(config) or config.get("audio_config") is not None:
+        return False
+    return not _has_merged_mtp_head(config)
 
 
 def _register_model(
@@ -1477,6 +1698,8 @@ def _register_model(
             engine_type = "audio_tts"
         elif model_type == "audio_sts":
             engine_type = "audio_sts"
+        elif model_type == "decision":
+            engine_type = "decision"
         else:
             engine_type = "batched"
         estimated_size = estimate_model_size(model_dir)
@@ -1488,17 +1711,42 @@ def _register_model(
         # and flag speculative-decoding drafters (dFlash/Assistant/MTP).
         config_model_type = ""
         is_helper = False
+        # The routing below reads this even when config.json does not parse.
+        _config: dict = {}
         try:
             import json
             with open(model_dir / "config.json") as f:
-                _config = json.load(f)
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                _config = loaded
             config_model_type = _config.get("model_type", "")
             is_helper = is_helper_model_config(_config)
         except Exception:
             pass
 
-        thinking_default = detect_thinking_default(model_dir)
-        preserve_thinking_default = detect_preserve_thinking(model_dir)
+        # Keep text-only capability metadata when selecting the VLM MTP engine.
+        if model_type == "llm" and _gemma4_text_only_wants_vlm_engine(_config):
+            engine_type = "vlm"
+            logger.info(
+                "%s is text-only Gemma 4 with a merged MTP head; serving it "
+                "on the VLM engine, which can drive that head",
+                model_id,
+            )
+        elif engine_type == "vlm" and _gemma4_text_only_prefers_llm_engine(_config):
+            # Integrations use model_type to advertise image support.
+            engine_type = "batched"
+            model_type = "llm"
+            text_only_size = 0
+            logger.info(
+                "%s is text-only Gemma 4 with no merged MTP head; serving it "
+                "on the LLM engine, which carries less overhead",
+                model_id,
+            )
+
+        template_text = _read_chat_template_text(model_dir)
+        thinking_default = detect_thinking_default(model_dir, template_text)
+        preserve_thinking_default = detect_preserve_thinking(model_dir, template_text)
+        reasoning_efforts = detect_reasoning_effort(model_dir, template_text)
         model_context_length = _read_model_context_length(model_dir)
 
         models[model_id] = DiscoveredModel(
@@ -1511,6 +1759,7 @@ def _register_model(
             config_model_type=config_model_type,
             thinking_default=thinking_default,
             preserve_thinking_default=preserve_thinking_default,
+            reasoning_efforts=reasoning_efforts,
             model_context_length=model_context_length,
             source_type=source_type,
             source_repo_id=source_repo_id,

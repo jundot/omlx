@@ -219,9 +219,12 @@ final class MenubarControllerModelsTests: XCTestCase {
             thinkingDefault: nil,
             dflashCompatible: nil,
             dflashCompatibilityReason: nil,
-            dflashSsdCacheAvailable: nil,
             mtpCompatible: nil,
             mtpCompatibilityReason: nil,
+            qwen4PleSsdOffloadSupported: nil,
+            qwen4PleSsdOffloadForced: nil,
+            qwen4PleResidentBytes: nil,
+            qwen4PleMmapBytes: nil,
             virtual: virtual,
             settings: nil
         )

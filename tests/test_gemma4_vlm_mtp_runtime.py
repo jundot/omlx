@@ -20,6 +20,7 @@ pytest.importorskip("mlx_vlm.models.gemma4_unified")
 
 from omlx.patches import mlx_lm_mtp as lm_mtp
 from omlx.patches.mlx_vlm_mtp import gemma4_vlm_runtime, set_mtp_attach_enabled
+from omlx.speculative.dflash import attach_drafter
 
 TINY_ASSISTANT_CONFIG = {
     "model_type": "gemma4_assistant",
@@ -160,6 +161,12 @@ def test_attach_and_chain_flags_when_active():
     )
 
 
+def test_attach_leaves_drafter_unbound():
+    # A bind here would pin the float embed_tokens that nn.quantize() replaces.
+    lm = _language_model(_text_config({"mtp_assistant_config": TINY_ASSISTANT_CONFIG}))
+    assert lm.mtp._input_embed is None
+
+
 def _stubbed_mtp_lm(cache_entries):
     """LanguageModel with an attached stub drafter and fake cache stash."""
     lm_mtp.set_mtp_active(True)
@@ -219,9 +226,6 @@ def test_mtp_forward_uses_plain_int_offset_and_batch_idx():
 
 
 def test_mtp_forward_rebinds_stale_input_embed():
-    # nn.quantize() swaps the backbone embed_tokens module after the
-    # __init__-time bind; mtp_forward must re-bind so the drafter never
-    # embeds through a stale (random-init) module.
     lm, drafter = _stubbed_mtp_lm([SimpleNamespace(offset=3)])
     lm._omlx_mtp_shared_kv = {
         "full_attention": (mx.zeros((1, 1, 3, 8)), mx.zeros((1, 1, 3, 8)))
@@ -236,3 +240,56 @@ def test_mtp_forward_requires_shared_kv_stash():
     lm._omlx_mtp_shared_kv = None
     with pytest.raises(RuntimeError, match="shared K/V stash"):
         lm.mtp_forward(mx.zeros((1, 1, 24)), mx.zeros((1, 1), dtype=mx.uint32), [])
+
+
+def test_block_drafter_captures_requested_layers_then_the_last():
+    """A verify returns the drafter's captures in request order and the last
+    layer's hidden; a decode step feeds the drafter; rows speculate alone."""
+    lm = _language_model(_text_config())
+    mx.eval(lm.parameters())
+    tokens = mx.array([[1, 2, 3, 4]])
+    plain = lm(tokens, cache=lm.make_cache(), capture_layer_ids=[0, 1])
+    observed = []
+    drafter = SimpleNamespace(
+        depth=3,
+        target_layer_ids=[1, 0],
+        scope_uids=None,
+        observe=lambda uids, caps: observed.append((uids, caps)),
+    )
+    attach_drafter(lm, drafter)
+    assert lm._omlx_mtp_multi_request is False
+
+    cache = lm.make_cache()
+    out = lm(tokens, cache=cache, return_hidden=True, capture_layer_ids=[1, 0])
+    assert out.gdn_states == []
+    layer0, layer1 = plain.hidden_states
+    for got, expected in zip(out.hidden_states, (layer1, layer0, layer1)):
+        assert mx.array_equal(got, expected).item()
+    assert mx.array_equal(out.logits, plain.logits).item()
+
+    # Prefill captures and observed decode rows follow the drafter's order.
+    prefill = lm(tokens, cache=lm.make_cache(), capture_layer_ids=[1, 0])
+    for got, expected in zip(prefill.hidden_states, (layer1, layer0)):
+        assert mx.array_equal(got, expected).item()
+    reference_cache = lm.make_cache()
+    lm(tokens, cache=reference_cache)
+    step = lm(mx.array([[7]]), cache=reference_cache, capture_layer_ids=[1, 0])
+
+    drafter.scope_uids = (5,)
+    lm(mx.array([[7]]), cache=cache)
+    [(uids, caps)] = observed
+    assert uids == (5,)
+    for got, expected in zip(caps, step.hidden_states):
+        assert mx.array_equal(got, expected).item()
+
+
+def test_single_row_rollback_trims_rejected_rows():
+    from mlx_vlm.models.cache import KVCache
+
+    lm = _language_model(_text_config())
+    caches = [KVCache(), KVCache()]
+    for cache in caches:
+        cache.update_and_fetch(mx.zeros((1, 1, 10, 8)), mx.zeros((1, 1, 10, 8)))
+    # Two of five drafts accepted: three positions of the six-row verify go.
+    assert lm.rollback_speculative_cache(caches, [], 2, 6) == 2
+    assert [cache.offset for cache in caches] == [7, 7]

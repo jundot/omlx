@@ -10,6 +10,7 @@ final class ServerScreenVM {
 
     // Phase 4 — Advanced disclosure.
     var sseKeepaliveMode: String = "chunk"
+    var maxAudioUploadSizeText: String = "100MB"
     /// Comma-separated text shown in the input. Parsed to `[String]` on save
     /// so the user can edit incrementally without intermediate trips to the
     /// server. Empty string clears all aliases.
@@ -17,6 +18,15 @@ final class ServerScreenVM {
     var basePathText: String = AppConfig.defaultBasePath()
     var modelDirTexts: [String] = [""]
     var hfCacheEnabled: Bool = true
+    /// Live switch; commits through `saveUsageHistory()` like the other
+    /// auto-apply rows rather than the Apply button.
+    var usageHistoryEnabled: Bool = true
+    private(set) var hasPendingDefaults = false
+    @ObservationIgnored
+    private var restoreBeforeReset: (() -> Void)?
+    var showResetNotice = false
+    private(set) var isLoading = false
+    private(set) var isResetting = false
     var lastError: String?
     private(set) var isMovingBasePath: Bool = false
 
@@ -50,6 +60,7 @@ final class ServerScreenVM {
     private var baselineSamplingTopKText: String = "0"
     private var baselineSamplingRepetitionPenaltyText: String = "1.0"
     private var baselineServerAliasesText: String = ""
+    private var baselineMaxAudioUploadSizeText: String = "100MB"
     private var baselineModelDirs: [String] = []
     private var baselineHfCacheEnabled: Bool = true
 
@@ -58,7 +69,91 @@ final class ServerScreenVM {
     @ObservationIgnored
     private var hasLoaded = false
 
+    func resetDefaults(client: OMLXClient) async {
+        guard !isLoading, !isResetting, !showResetNotice else { return }
+        isResetting = true
+        defer { isResetting = false }
+        let previous = (
+            host: host,
+            portText: portText,
+            logLevel: logLevel,
+            autoStartOnLaunch: autoStartOnLaunch,
+            sseKeepaliveMode: sseKeepaliveMode,
+            maxAudioUploadSizeText: maxAudioUploadSizeText,
+            serverAliasesText: serverAliasesText,
+            hfCacheEnabled: hfCacheEnabled,
+            usageHistoryEnabled: usageHistoryEnabled,
+            samplingContextText: samplingContextText,
+            samplingMaxTokensText: samplingMaxTokensText,
+            samplingTemperatureText: samplingTemperatureText,
+            samplingTopPText: samplingTopPText,
+            samplingTopKText: samplingTopKText,
+            samplingRepetitionPenaltyText: samplingRepetitionPenaltyText,
+            hasPendingDefaults: hasPendingDefaults,
+            lastError: lastError
+        )
+        do {
+            let dto = try await client.getGlobalSettingsDefaults()
+            restoreBeforeReset = { [weak self] in
+                guard let self else { return }
+                self.host = previous.host
+                self.portText = previous.portText
+                self.logLevel = previous.logLevel
+                self.autoStartOnLaunch = previous.autoStartOnLaunch
+                self.sseKeepaliveMode = previous.sseKeepaliveMode
+                self.maxAudioUploadSizeText = previous.maxAudioUploadSizeText
+                self.serverAliasesText = previous.serverAliasesText
+                self.hfCacheEnabled = previous.hfCacheEnabled
+                self.usageHistoryEnabled = previous.usageHistoryEnabled
+                self.samplingContextText = previous.samplingContextText
+                self.samplingMaxTokensText = previous.samplingMaxTokensText
+                self.samplingTemperatureText = previous.samplingTemperatureText
+                self.samplingTopPText = previous.samplingTopPText
+                self.samplingTopKText = previous.samplingTopKText
+                self.samplingRepetitionPenaltyText = previous.samplingRepetitionPenaltyText
+                self.hasPendingDefaults = previous.hasPendingDefaults
+                self.lastError = previous.lastError
+            }
+            self.host = dto.server.host
+            self.portText = String(dto.server.port)
+            self.logLevel = canonicalize(level: dto.server.logLevel)
+            self.autoStartOnLaunch = dto.server.autoStartOnLaunch ?? true
+            self.sseKeepaliveMode = dto.server.sseKeepaliveMode ?? "chunk"
+            self.maxAudioUploadSizeText = dto.server.maxAudioUploadSize ?? "100MB"
+            self.serverAliasesText = dto.server.serverAliases.joined(separator: ", ")
+            self.hfCacheEnabled = dto.huggingface?.hfCacheEnabled ?? true
+            self.usageHistoryEnabled = dto.usage?.usageHistory ?? true
+            if let s = dto.sampling {
+                self.samplingContextText = String(s.maxContextWindow)
+                self.samplingMaxTokensText = String(s.maxTokens)
+                self.samplingTemperatureText = trimDouble(s.temperature)
+                self.samplingTopPText = trimDouble(s.topP)
+                self.samplingTopKText = String(s.topK)
+                self.samplingRepetitionPenaltyText = trimDouble(s.repetitionPenalty)
+            }
+
+            self.hasPendingDefaults = true
+
+            self.lastError = nil
+            self.showResetNotice = true
+        } catch {
+            self.lastError = error.omlxDescription
+        }
+    }
+
+    func cancelReset() {
+        restoreBeforeReset?()
+        confirmReset()
+    }
+
+    func confirmReset() {
+        restoreBeforeReset = nil
+        showResetNotice = false
+    }
+
     func load(client: OMLXClient) async {
+        isLoading = true
+        defer { isLoading = false }
         self.client = client
         do {
             let dto = try await client.getGlobalSettings()
@@ -70,6 +165,7 @@ final class ServerScreenVM {
             self.effectiveHost = AppConfig.connectableHost(for: dto.server.host)
             self.effectivePort = dto.server.port
             self.sseKeepaliveMode = dto.server.sseKeepaliveMode ?? "chunk"
+            self.maxAudioUploadSizeText = dto.server.maxAudioUploadSize ?? "100MB"
             self.serverAliasesText = dto.server.serverAliases.joined(separator: ", ")
             let modelDirs = Self.cleanedModelDirs(
                 dto.model?.modelDirs ?? dto.model?.modelDir.map { [$0] } ?? []
@@ -78,6 +174,7 @@ final class ServerScreenVM {
                 self.modelDirTexts = modelDirs
             }
             self.hfCacheEnabled = dto.huggingface?.hfCacheEnabled ?? true
+            self.usageHistoryEnabled = dto.usage?.usageHistory ?? true
             if let s = dto.sampling {
                 self.samplingContextText = String(s.maxContextWindow)
                 self.samplingMaxTokensText = String(s.maxTokens)
@@ -99,6 +196,7 @@ final class ServerScreenVM {
     /// Snapshot current draft values as the new "applied" baseline. Called
     /// at the end of `load()` and after a successful `applyServerSettings()`.
     private func snapshotApplyBaselines() {
+        hasPendingDefaults = false
         let t = { (s: String) in s.trimmingCharacters(in: .whitespaces) }
         baselinePortText = t(portText)
         baselineSamplingContextText = t(samplingContextText)
@@ -108,6 +206,7 @@ final class ServerScreenVM {
         baselineSamplingTopKText = t(samplingTopKText)
         baselineSamplingRepetitionPenaltyText = t(samplingRepetitionPenaltyText)
         baselineServerAliasesText = serverAliasesText
+        baselineMaxAudioUploadSizeText = t(maxAudioUploadSizeText)
         baselineModelDirs = Self.normalizedModelDirs(from: modelDirTexts)
         baselineHfCacheEnabled = hfCacheEnabled
     }
@@ -117,6 +216,7 @@ final class ServerScreenVM {
     /// Address / Log Level / SSE Keep-Alive Mode auto-apply via `bind()`
     /// and are intentionally excluded from this check.
     func hasPendingServerChanges(services: AppServices) -> Bool {
+        if hasPendingDefaults { return true }
         let t = { (s: String) in s.trimmingCharacters(in: .whitespaces) }
         if t(portText) != baselinePortText { return true }
         if t(samplingContextText) != baselineSamplingContextText { return true }
@@ -126,6 +226,7 @@ final class ServerScreenVM {
         if t(samplingTopKText) != baselineSamplingTopKText { return true }
         if t(samplingRepetitionPenaltyText) != baselineSamplingRepetitionPenaltyText { return true }
         if parseAliases(serverAliasesText) != parseAliases(baselineServerAliasesText) { return true }
+        if t(maxAudioUploadSizeText) != baselineMaxAudioUploadSizeText { return true }
         if hfCacheEnabled != baselineHfCacheEnabled { return true }
         return hasPendingStorageChanges(services: services)
     }
@@ -141,6 +242,14 @@ final class ServerScreenVM {
         let t = { (s: String) in s.trimmingCharacters(in: .whitespaces) }
         var patch = GlobalSettingsPatch()
         var nextPort: Int? = nil
+        let nextHost = hasPendingDefaults && host != appliedBindAddress ? host : nil
+        if hasPendingDefaults {
+            patch.host = nextHost
+            patch.logLevel = logLevel
+            patch.sseKeepaliveMode = sseKeepaliveMode
+            patch.autoStartOnLaunch = autoStartOnLaunch
+            patch.usageHistory = usageHistoryEnabled
+        }
 
         if t(portText) != baselinePortText {
             guard let p = Int(t(portText)), (1...65535).contains(p) else {
@@ -206,6 +315,18 @@ final class ServerScreenVM {
             }
             patch.samplingRepetitionPenalty = v
         }
+        if t(maxAudioUploadSizeText) != baselineMaxAudioUploadSizeText {
+            let value = t(maxAudioUploadSizeText)
+            guard Self.isValidAudioUploadSize(value) else {
+                self.lastError = String(
+                    localized: "server.error.audio_upload_size_invalid",
+                    defaultValue: "Maximum Audio Upload Size must be a positive value such as 100MB or 1GB.",
+                    comment: "Server screen error when the audio upload size is invalid"
+                )
+                return
+            }
+            patch.maxAudioUploadSize = value
+        }
 
         let newAliases = parseAliases(serverAliasesText)
         if newAliases != parseAliases(baselineServerAliasesText) {
@@ -232,13 +353,14 @@ final class ServerScreenVM {
             patch.modelDirs = diff.normalizedModelDirs
         }
 
-        let patchHasFields = patch.port != nil
+        let patchHasFields = hasPendingDefaults || patch.port != nil
             || patch.samplingMaxContextWindow != nil
             || patch.samplingMaxTokens != nil
             || patch.samplingTemperature != nil
             || patch.samplingTopP != nil
             || patch.samplingTopK != nil
             || patch.samplingRepetitionPenalty != nil
+            || patch.maxAudioUploadSize != nil
             || patch.serverAliases != nil
             || patch.hfCacheEnabled != nil
             || patch.modelDirs != nil
@@ -247,6 +369,28 @@ final class ServerScreenVM {
             self.lastError = String(localized: "server.error.nothing_to_apply",
                                     defaultValue: "Nothing to apply — every field matches the current config.",
                                     comment: "Server screen error when Apply is tapped with no pending changes")
+            return
+        }
+
+        if services.canSaveSettingsOffline && patchHasFields {
+            guard let nextPort, patch == GlobalSettingsPatch(port: nextPort), !diff.hasChanges else {
+                self.lastError = String(
+                    localized: "server.error.offline_port_only",
+                    defaultValue: "Apply the port change separately while the server is stopped. Start the server before applying other settings.",
+                    comment: "Offline Apply supports port recovery without a running server"
+                )
+                return
+            }
+            Task {
+                do {
+                    try await services.applyServerEndpoint(port: nextPort)
+                    self.effectivePort = nextPort
+                    self.baselinePortText = String(nextPort)
+                    self.lastError = nil
+                } catch {
+                    self.lastError = error.omlxDescription
+                }
+            }
             return
         }
 
@@ -261,6 +405,9 @@ final class ServerScreenVM {
                 let oldBase = services.config.basePath
                 if patchHasFields, let client {
                     _ = try await client.updateGlobalSettings(patch)
+                }
+                if hasPendingDefaults {
+                    try services.setAutoStartOnLaunch(autoStartOnLaunch, persist: false)
                 }
                 if diff.baseChanged {
                     // Hand the bundled port to the storage flow so its single
@@ -279,15 +426,16 @@ final class ServerScreenVM {
                     try await services.applyStorageChanges(
                         basePath: diff.baseChanged ? diff.normalizedBase : nil,
                         modelDirs: relocatedModelDirs,
-                        port: nextPort
+                        port: nextPort,
+                        host: nextHost
                     )
                     self.basePathText = services.config.basePath
                     self.modelDirTexts = services.config.effectiveModelDirs
                     if let p = nextPort { self.effectivePort = p }
                 } else {
-                    if let p = nextPort {
-                        try await services.applyServerEndpoint(port: p)
-                        self.effectivePort = p
+                    if nextPort != nil || nextHost != nil {
+                        try await services.applyServerEndpoint(host: nextHost, port: nextPort)
+                        if let p = nextPort { self.effectivePort = p }
                     }
                     if diff.modelDirsChanged {
                         var updated = services.config
@@ -295,6 +443,10 @@ final class ServerScreenVM {
                         services.updateConfig(updated)
                         self.modelDirTexts = diff.normalizedModelDirs
                     }
+                }
+                if let nextHost {
+                    self.appliedBindAddress = nextHost
+                    self.effectiveHost = AppConfig.connectableHost(for: nextHost)
                 }
                 self.lastError = nil
                 self.snapshotApplyBaselines()
@@ -315,6 +467,31 @@ final class ServerScreenVM {
             .filter { !$0.isEmpty }
         var seen = Set<String>()
         return parts.filter { seen.insert($0).inserted }
+    }
+
+    /// Mirror the server's human-readable size grammar closely enough to
+    /// reject incomplete edits before sending a multi-field settings patch.
+    static func isValidAudioUploadSize(_ raw: String) -> Bool {
+        let text = raw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+        let units: [(suffix: String, multiplier: Double)] = [
+            ("TB", 1024 * 1024 * 1024 * 1024),
+            ("GB", 1024 * 1024 * 1024),
+            ("MB", 1024 * 1024),
+            ("KB", 1024),
+            ("B", 1),
+        ]
+
+        for unit in units where text.hasSuffix(unit.suffix) {
+            let number = String(text.dropLast(unit.suffix.count))
+            guard let value = Double(number), value.isFinite else { return false }
+            let bytes = value * unit.multiplier
+            return bytes.isFinite && bytes >= 1
+        }
+
+        guard let bytes = Int(text) else { return false }
+        return bytes > 0
     }
 
     func modelDirText(at index: Int) -> String {
@@ -410,7 +587,7 @@ final class ServerScreenVM {
     func saveHost(services: AppServices) {
         let next = host
         Task {
-            await commit(GlobalSettingsPatch(host: next))
+            guard await commit(GlobalSettingsPatch(host: next)) else { return }
             do {
                 try await services.applyServerEndpoint(host: next)
                 self.appliedBindAddress = next
@@ -476,7 +653,7 @@ final class ServerScreenVM {
                                     comment: "Server screen error when port value is out of valid range")
             return
         }
-        if portChanged && parsedPort == nil {
+        if parsedPort == nil {
             self.lastError = String(localized: "server.error.port_invalid",
                                     defaultValue: "Port must be a number between 1 and 65535.",
                                     comment: "Server screen error when port value is out of valid range")
@@ -487,10 +664,10 @@ final class ServerScreenVM {
             do {
                 if portChanged || hostChanged {
                     if portChanged, let p = parsedPort {
-                        await commit(GlobalSettingsPatch(port: p))
+                        guard await commit(GlobalSettingsPatch(port: p)) else { return }
                     }
                     if hostChanged {
-                        await commit(GlobalSettingsPatch(host: host))
+                        guard await commit(GlobalSettingsPatch(host: host)) else { return }
                     }
                     try await services.applyServerEndpoint(
                         host: hostChanged ? host : nil,
@@ -516,6 +693,10 @@ final class ServerScreenVM {
 
     func saveSseKeepaliveMode() {
         Task { await commit(GlobalSettingsPatch(sseKeepaliveMode: sseKeepaliveMode)) }
+    }
+
+    func saveUsageHistory() {
+        Task { await commit(GlobalSettingsPatch(usageHistory: usageHistoryEnabled)) }
     }
 
     func saveAutoStartOnLaunch(services: AppServices) {
@@ -547,7 +728,7 @@ final class ServerScreenVM {
             set: { newValue in
                 let changed = binding.wrappedValue != newValue
                 binding.wrappedValue = newValue
-                if changed { save() }
+                if changed && !self.hasPendingDefaults { save() }
             }
         )
     }

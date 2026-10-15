@@ -109,11 +109,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$PROJECT_DIR/../.." && pwd)"
 PACKAGING_DIR="$REPO_ROOT/packaging"
-CUSTOM_KERNEL_DIRS=(
-    "$REPO_ROOT/omlx/custom_kernels/glm_moe_dsa"
-    "$REPO_ROOT/omlx/custom_kernels/minimax_m3"
-    "$REPO_ROOT/omlx/custom_kernels/qwen35_prefill"
-)
+# Every native package setup.py builds; keep in sync with its ext_modules.
+CUSTOM_KERNEL_NAMES=(bonsai decode_fast glm_moe_dsa minimax_m3 qwen35_prefill)
+CUSTOM_KERNEL_DIRS=()
+for _kernel in "${CUSTOM_KERNEL_NAMES[@]}"; do
+    CUSTOM_KERNEL_DIRS+=("$REPO_ROOT/omlx/custom_kernels/$_kernel")
+done
+CUSTOM_KERNEL_ABI_CHECKER="$SCRIPT_DIR/check_custom_kernel_python_abi.py"
 # OMLX_EXPORT_DIR overrides the venvstacks export tree we copy Python
 # layers from. Release builds use this to point at a per-target export
 # copy with platform-specific mlx-metal wheels swapped in.
@@ -227,6 +229,40 @@ _custom_kernel_pythonpath() {
     fi
 }
 
+_custom_kernel_donor_python() {
+    [ -n "${DONOR_LAYERS:-}" ] || die "custom kernel build requires resolved donor layers."
+    local donor_python="$DONOR_LAYERS/cpython-3.11/bin/python3"
+    [ -x "$donor_python" ] \
+        || die "donor missing executable bundled Python: $donor_python"
+    printf "%s\n" "$donor_python"
+}
+
+_validate_custom_kernel_python_abi() {
+    # The build-time ABI probe below runs under PYTHON_BIN. That can be a
+    # different CPython than the donor app's embedded interpreter, which
+    # would let a cpython-313 _ext pass the probe before it is bundled into a
+    # cpython-311 app. Compare the actual interpreters before compiling.
+    local donor_python
+    donor_python="$(_custom_kernel_donor_python)"
+    [ -f "$CUSTOM_KERNEL_ABI_CHECKER" ] \
+        || die "custom kernel Python ABI checker missing: $CUSTOM_KERNEL_ABI_CHECKER"
+    "$PYTHON_BIN" "$CUSTOM_KERNEL_ABI_CHECKER" \
+        --build-python "$PYTHON_BIN" \
+        --donor-python "$donor_python" \
+        || die "custom kernel build Python ABI must match the donor app; see output above."
+}
+
+_validate_packaged_custom_kernel_extensions() {
+    # Check the files actually copied into the staged app as well. This
+    # catches stale _ext files that a source-tree build did not replace.
+    local donor_python="$1"
+    local packaged_kernels="$2"
+    "$PYTHON_BIN" "$CUSTOM_KERNEL_ABI_CHECKER" \
+        --donor-python "$donor_python" \
+        --extension-directory "$packaged_kernels" \
+        || die "staged custom kernel extension suffixes do not match the donor app; see output above."
+}
+
 _clean_custom_kernel_build_artifacts() {
     local dir
     for dir in "${CUSTOM_KERNEL_DIRS[@]}"; do
@@ -239,15 +275,19 @@ _clean_custom_kernel_build_artifacts() {
     done
 
     if [ -d "$REPO_ROOT/build" ]; then
-        for ext_name in \
-            "omlx.custom_kernels.glm_moe_dsa._ext" \
-            "omlx.custom_kernels.minimax_m3._ext" \
-            "omlx.custom_kernels.qwen35_prefill._ext"; do
+        for kernel in "${CUSTOM_KERNEL_NAMES[@]}"; do
             find "$REPO_ROOT/build" \
                 -type d \
-                -name "$ext_name" \
+                -name "omlx.custom_kernels.$kernel._ext" \
                 -prune \
                 -exec rm -rf {} +
+        done
+
+        # mlx's CMakeBuild --inplace copies each build-lib package dir into the
+        # source tree, so stale build_py copies of *.py there overwrite sources.
+        for dir in "$REPO_ROOT"/build/lib*/omlx/custom_kernels; do
+            [ -d "$dir" ] || continue
+            rm -rf "$dir"
         done
     fi
 }
@@ -311,7 +351,7 @@ _check_custom_kernel_abi() {
     log "Verifying custom kernel ABI against the bundled MLX…"
     (
         cd "$REPO_ROOT"
-        PYTHONPATH="$custom_kernel_pythonpath" "$PYTHON_BIN" - <<'PYEOF'
+        PYTHONPATH="$custom_kernel_pythonpath" "$PYTHON_BIN" - "${CUSTOM_KERNEL_NAMES[@]}" <<'PYEOF'
 import importlib.util
 import pathlib
 import sys
@@ -319,14 +359,14 @@ import sys
 import mlx.core as mx
 
 failures = []
-for name in ("glm_moe_dsa", "minimax_m3", "qwen35_prefill"):
+for name in sys.argv[1:]:
     ext_dir = pathlib.Path("omlx/custom_kernels") / name
     so = next(ext_dir.glob("_ext.*.so"), None)
     if so is None:
         failures.append(f"{name}: _ext extension missing")
         continue
     # Extension modules must load under their compiled name (PyInit__ext);
-    # CPython keys the extension cache by (name, path), so loading three
+    # CPython keys the extension cache by (name, path), so loading several
     # different .so files as "_ext" is fine.
     spec = importlib.util.spec_from_file_location("_ext", so)
     ext = importlib.util.module_from_spec(spec)
@@ -359,6 +399,7 @@ _build_custom_kernels() {
     cmake_args="${CMAKE_ARGS:-}"
     custom_kernel_pythonpath="$(_custom_kernel_pythonpath)"
 
+    _validate_custom_kernel_python_abi
     _check_custom_kernel_nanobind "$custom_kernel_pythonpath"
     log "Building optional native custom kernels (macOS deployment target $deployment_target)…"
     _clean_custom_kernel_build_artifacts
@@ -372,6 +413,10 @@ _build_custom_kernels() {
         fi
         "$PYTHON_BIN" setup.py build_ext --inplace --force --with-custom-kernel
     ) || die "custom kernel build failed; see output above."
+    [ -f "$REPO_ROOT/omlx/custom_kernels/bonsai/omlx_bonsai_kernels.metallib" ] \
+        || die "custom kernel build finished but Bonsai metallib is missing."
+    [ -f "$REPO_ROOT/omlx/custom_kernels/decode_fast/omlx_decode_fast_kernels.metallib" ] \
+        || die "custom kernel build finished but decode_fast metallib is missing."
     [ -f "$REPO_ROOT/omlx/custom_kernels/glm_moe_dsa/omlx_glm_kernels.metallib" ] \
         || die "custom kernel build finished but GLM metallib is missing."
     [ -f "$REPO_ROOT/omlx/custom_kernels/minimax_m3/omlx_minimax_m3_kernels.metallib" ] \
@@ -562,6 +607,8 @@ RSYNC_EXCLUDES=(
     --exclude='tests'
     --exclude='.git'
     --exclude='custom_kernels/*/csrc'
+    # Tailwind CLI left over from before the web UI moved to apps/omlx-web.
+    --exclude='admin/tailwindcss-*'
 )
 if [ "$WITH_CUSTOM_KERNEL" != "1" ]; then
     RSYNC_EXCLUDES+=(
@@ -574,6 +621,23 @@ rsync -a \
     "${RSYNC_EXCLUDES[@]}" \
     "$REPO_ROOT/omlx/" "$RESOURCES_DIR/omlx/"
 ok "  + omlx package"
+
+log "Copying omlx_web package from source tree…"
+rm -rf "$RESOURCES_DIR/omlx_web"
+mkdir -p "$RESOURCES_DIR/omlx_web"
+rsync -a \
+    --exclude='__pycache__' \
+    --exclude='*.pyc' \
+    "$REPO_ROOT/apps/omlx-web/omlx_web/" "$RESOURCES_DIR/omlx_web/"
+# The server runs headless without it, so a missing copy would not fail later.
+[ -f "$RESOURCES_DIR/omlx_web/templates/dashboard.html" ] \
+    || die "omlx_web templates are missing from the app bundle."
+ok "  + omlx_web package"
+
+if [ "$WITH_CUSTOM_KERNEL" = "1" ]; then
+    _validate_packaged_custom_kernel_extensions \
+        "$(_custom_kernel_donor_python)" "$RESOURCES_DIR/omlx/custom_kernels"
+fi
 
 log "Writing engine commit metadata..."
 "$PYTHON_BIN" "$PACKAGING_DIR/build.py" --write-engine-commits "$RESOURCES_DIR/omlx" \

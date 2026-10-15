@@ -510,6 +510,14 @@ def q8_vup_flat(
     scales = unembed_out["scales"]
     if weight.shape != (64, 256, 128) or scales.shape != (64, 256, 8):
         return None
+    # The fused kernel requires matching input, scale, and bias dtypes.
+    # The general projection preserves FP32 scales when they differ.
+    if (
+        x.dtype not in (mx.float16, mx.bfloat16)
+        or scales.dtype != x.dtype
+        or biases.dtype != x.dtype
+    ):
+        return None
     return glm_fast.glm_dsa_q8_vup_flat(
         x,
         weight,

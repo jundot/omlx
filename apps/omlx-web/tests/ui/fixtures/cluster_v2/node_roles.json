@@ -1,0 +1,22 @@
+{
+  "_comment": "GET /admin/api/cluster/node-roles — the wizard's source of truth for the role reserve math (reserve_for() in omlx/cluster/node_role.py). The JS fallback mirror must match these numbers.",
+  "default": "headless",
+  "roles": [
+    {
+      "key": "headless",
+      "label": "Headless",
+      "summary": "Nobody is using this Mac",
+      "detail": "Give the cluster everything the GPU can address, less a 10% margin.",
+      "reserve_bytes": 0,
+      "reserve_fraction": 0.1
+    },
+    {
+      "key": "workstation",
+      "label": "Workstation",
+      "summary": "You work on this Mac while it serves",
+      "detail": "Hold half this Mac back, at least 32 GiB.",
+      "reserve_bytes": 34359738368,
+      "reserve_fraction": 0.5
+    }
+  ]
+}

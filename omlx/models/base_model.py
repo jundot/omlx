@@ -11,6 +11,10 @@ from typing import Optional
 
 import mlx.core as mx
 
+# Padded tokens per encoder forward. Bounds activation memory and keeps eager
+# softmax rows (heads x tokens) far below the Metal 2^32-thread grid limit.
+ENCODER_BATCH_TOKEN_BUDGET = 32768
+
 
 @dataclass
 class BaseModelArgs:
@@ -34,6 +38,24 @@ class BaseModelOutput:
 
     hidden_states: Optional[tuple] = None
     """All hidden states if output_hidden_states=True."""
+
+
+def token_budget_batches(lengths: list[int], budget: int) -> list[list[int]]:
+    """Group indices by ascending length so each padded batch fits ``budget``.
+
+    An item longer than ``budget`` gets a batch of its own.
+    """
+    batches: list[list[int]] = []
+    batch: list[int] = []
+    for index in sorted(range(len(lengths)), key=lengths.__getitem__):
+        # Ascending order makes this item's length the batch's padded length.
+        if batch and (len(batch) + 1) * lengths[index] > budget:
+            batches.append(batch)
+            batch = []
+        batch.append(index)
+    if batch:
+        batches.append(batch)
+    return batches
 
 
 def mean_pooling(hidden_states: mx.array, attention_mask: mx.array) -> mx.array:

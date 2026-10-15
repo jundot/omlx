@@ -4,8 +4,9 @@
 Verifies the STT endpoint accepts multipart audio uploads and returns a
 transcription response matching the OpenAI audio API spec.
 
-All unit tests run with mocked STTEngine and EnginePool — mlx-audio is not
-required. Integration tests (marked @pytest.mark.slow) need a real model.
+Endpoint tests run with mocked STTEngine and EnginePool. Qwen3-ASR loading
+tests build a tiny local checkpoint. Integration tests (marked
+@pytest.mark.slow) need a real model.
 """
 
 import io
@@ -14,8 +15,15 @@ import wave
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import mlx.core as mx
+import mlx.nn as nn
 import pytest
 from fastapi.testclient import TestClient
+from mlx.utils import tree_flatten
+from mlx_audio.stt.models.qwen3_asr.config import ModelConfig
+from mlx_audio.stt.models.qwen3_asr.qwen3_asr import Qwen3ASRModel
+
+from omlx.engine.stt import STTEngine
 
 # ---------------------------------------------------------------------------
 # WAV fixture helpers
@@ -265,6 +273,87 @@ def server_audio_client():
 # ---------------------------------------------------------------------------
 
 
+class TestAudioUploadLimitSettings:
+    """_max_audio_upload_bytes() against the settings singleton.
+
+    Snapshot/restore so reset_settings() here cannot leak into later tests.
+    """
+
+    @pytest.fixture(autouse=True)
+    def restore_global_settings(self):
+        import omlx.settings as settings_mod
+
+        snapshot = settings_mod._global_settings
+        try:
+            yield
+        finally:
+            settings_mod._global_settings = snapshot
+
+    def test_uninitialized_settings_keep_default_limit(self):
+        """Without init_settings(), the 100MB default still applies."""
+        from omlx.api.audio_routes import (
+            MAX_AUDIO_UPLOAD_BYTES,
+            _max_audio_upload_bytes,
+        )
+        from omlx.settings import reset_settings
+
+        reset_settings()
+        assert _max_audio_upload_bytes() == MAX_AUDIO_UPLOAD_BYTES
+        assert MAX_AUDIO_UPLOAD_BYTES == 100 * 1024 * 1024
+
+    def test_reads_limit_from_initialized_settings(self, tmp_path):
+        """init_settings() with a CLI override is what _read_upload enforces."""
+        from argparse import Namespace
+
+        from omlx.api.audio_routes import _max_audio_upload_bytes
+        from omlx.settings import init_settings, reset_settings
+
+        reset_settings()
+        init_settings(
+            base_path=tmp_path,
+            cli_args=Namespace(max_audio_upload_size="2MB"),
+        )
+        assert _max_audio_upload_bytes() == 2 * 1024 * 1024
+
+    def test_invalid_configured_size_warns_and_falls_back(self, caplog):
+        """Garbage settings.json/env values log a warning instead of failing silent."""
+        from omlx.api.audio_routes import (
+            MAX_AUDIO_UPLOAD_BYTES,
+            _max_audio_upload_bytes,
+        )
+        from omlx.settings import ServerSettings
+
+        bogus = ServerSettings(max_audio_upload_size="bogus")
+        with (
+            patch(
+                "omlx.settings.get_settings",
+                return_value=type("GS", (), {"server": bogus})(),
+            ),
+            caplog.at_level("WARNING", logger="omlx.api.audio_routes"),
+        ):
+            assert _max_audio_upload_bytes() == MAX_AUDIO_UPLOAD_BYTES
+        assert "Invalid max_audio_upload_size" in caplog.text
+
+    def test_non_positive_configured_size_warns_and_falls_back(self, caplog):
+        """0MB parses cleanly but would reject every upload; fall back instead."""
+        from omlx.api.audio_routes import (
+            MAX_AUDIO_UPLOAD_BYTES,
+            _max_audio_upload_bytes,
+        )
+        from omlx.settings import ServerSettings
+
+        zero = ServerSettings(max_audio_upload_size="0MB")
+        with (
+            patch(
+                "omlx.settings.get_settings",
+                return_value=type("GS", (), {"server": zero})(),
+            ),
+            caplog.at_level("WARNING", logger="omlx.api.audio_routes"),
+        ):
+            assert _max_audio_upload_bytes() == MAX_AUDIO_UPLOAD_BYTES
+        assert "Invalid max_audio_upload_size" in caplog.text
+
+
 class TestSTTEndpointBasic:
     """Core STT endpoint behaviour."""
 
@@ -313,6 +402,36 @@ class TestSTTEndpointBasic:
             data={"model": "whisper-tiny"},
         )
         mock_pool.get_engine.assert_awaited()
+
+    def test_upload_exceeding_limit_returns_413(self, server_audio_client):
+        """A payload larger than the resolved limit is rejected with 413."""
+        client, _ = server_audio_client
+        oversized = b"\x00" * 2048
+        with patch(
+            "omlx.api.audio_routes._max_audio_upload_bytes",
+            return_value=1024,
+        ):
+            response = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("audio.wav", oversized, "audio/wav")},
+                data={"model": "whisper-tiny"},
+            )
+        assert response.status_code == 413
+        assert "1024" in response.json()["error"]["message"]
+
+    def test_upload_within_raised_limit_returns_200(self, server_audio_client):
+        """Raising the limit allows an upload that the default cap would reject."""
+        client, _ = server_audio_client
+        with patch(
+            "omlx.api.audio_routes._max_audio_upload_bytes",
+            return_value=len(TINY_WAV) + 1,
+        ):
+            response = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+                data={"model": "whisper-tiny"},
+            )
+        assert response.status_code == 200
 
     def test_language_parameter_accepted(self, server_audio_client):
         """language= form field is accepted without error."""
@@ -681,18 +800,6 @@ class TestSTTEndpointPrompt:
 
 class TestSTTEndpointResponseFormat:
     """OpenAI audio transcription API response schema compliance."""
-
-    def test_response_object_field(self, server_audio_client):
-        """Response optionally includes object field."""
-        client, _ = server_audio_client
-        response = client.post(
-            "/v1/audio/transcriptions",
-            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
-            data={"model": "whisper-tiny"},
-        )
-        body = response.json()
-        # OpenAI spec: response has at minimum a 'text' field
-        assert "text" in body
 
     def test_content_type_is_json(self, server_audio_client):
         """Default response is JSON (not audio)."""
@@ -1367,6 +1474,104 @@ class TestSTTProcessorErrors:
         engine = self._stt_engine("mlx-community/parakeet-tdt")
         asyncio.run(engine.start())
         asyncio.run(engine.stop())
+
+    def test_unrelated_load_error_is_reraised_without_self_cause(self, monkeypatch):
+        import asyncio
+        import sys
+        import types
+
+        def _failing_load(*args, **kwargs):
+            raise ImportError(
+                "VoxtralProcessor requires the PyTorch library but it was not "
+                "found in your environment."
+            )
+
+        fake_utils = types.ModuleType("mlx_audio.stt.utils")
+        fake_utils.load_model = _failing_load
+        fake_stt = sys.modules.setdefault("mlx_audio.stt", types.ModuleType("mlx_audio.stt"))
+        fake_audio = sys.modules.setdefault("mlx_audio", types.ModuleType("mlx_audio"))
+        monkeypatch.setitem(sys.modules, "mlx_audio", fake_audio)
+        monkeypatch.setitem(sys.modules, "mlx_audio.stt", fake_stt)
+        monkeypatch.setitem(sys.modules, "mlx_audio.stt.utils", fake_utils)
+
+        engine = self._stt_engine("mlx-community/Voxtral-Mini-3B-2507-bf16")
+        with pytest.raises(ImportError, match="PyTorch") as exc_info:
+            asyncio.run(engine.start())
+
+        assert exc_info.value.__cause__ is not exc_info.value
+
+
+class TestQwen3ASRAudioQuantization:
+    """Qwen3-ASR loads quantized and floating-point audio layers (#3573)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("quantized_audio", [False, True])
+    async def test_stt_loads_audio_quantization(
+        self, tmp_path, monkeypatch, quantized_audio
+    ):
+        # Restore the class predicate after STTEngine patches it.
+        monkeypatch.setattr(
+            Qwen3ASRModel, "model_quant_predicate", Qwen3ASRModel.model_quant_predicate
+        )
+        # Skip tokenizer and feature extractor loading.
+        monkeypatch.setattr(
+            Qwen3ASRModel,
+            "post_load_hook",
+            classmethod(lambda cls, model, path: model),
+        )
+        config = {
+            "model_type": "qwen3_asr",
+            "audio_config": {
+                "num_mel_bins": 8,
+                "d_model": 32,
+                "encoder_layers": 1,
+                "encoder_attention_heads": 2,
+                "encoder_ffn_dim": 64,
+                "downsample_hidden_size": 32,
+                "output_dim": 32,
+                "max_source_positions": 16,
+            },
+            "text_config": {
+                "vocab_size": 64,
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+            },
+        }
+        quantization = {"group_size": 32, "bits": 4}
+        if quantized_audio:
+            quantization["audio_tower.conv_out"] = {"group_size": 32, "bits": 8}
+        source = Qwen3ASRModel(ModelConfig.from_dict(config))
+        nn.quantize(
+            source,
+            group_size=32,
+            bits=4,
+            class_predicate=lambda p, m: quantization.get(p, p == "model.embed_tokens"),
+        )
+        config["quantization"] = quantization
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        mx.save_safetensors(
+            str(tmp_path / "model.safetensors"), dict(tree_flatten(source.parameters()))
+        )
+        inputs = mx.ones((1, 2, 32))
+        expected = source.audio_tower.conv_out(inputs)
+        mx.eval(expected)
+
+        engine = STTEngine(str(tmp_path))
+        try:
+            await engine.start()
+            projection = engine._model.audio_tower.conv_out
+            assert isinstance(projection, nn.QuantizedLinear) == quantized_audio
+            if quantized_audio:
+                assert projection.bits == 8
+            assert engine._model.model.embed_tokens.bits == 4
+            assert isinstance(engine._model.audio_tower.proj1, nn.Linear)
+            assert mx.allclose(projection(inputs), expected).item()
+        finally:
+            await engine.stop()
 
 
 # ---------------------------------------------------------------------------

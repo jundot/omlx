@@ -91,8 +91,8 @@ def is_nax_available() -> bool:
 
     Hardware capability probe only (informational).  This is NOT the
     routing predicate for stock NAX dispatch — that lives in
-    omlx.custom_kernels.nax and additionally checks the OMLX_NAX env
-    override, the installed metallib, and the macOS version.  Bonsai
+    omlx.custom_kernels.nax and additionally checks the installed
+    metallib and the macOS version.  Bonsai
     kernel routing uses _arch_gen(), not this.
     """
     global _nax_available_cache

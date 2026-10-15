@@ -8,6 +8,10 @@ import sys
 import types
 from types import SimpleNamespace
 
+import pytest
+from mlx_lm.tokenizer_utils import TokenizerWrapper
+from mlx_lm.tool_parsers import json_tools, qwen3_coder
+
 from omlx.adapter.gemma4 import Gemma4OutputParserSession
 from omlx.adapter.harmony import load_harmony_gpt_oss_encoding
 from omlx.adapter.output_parser import detect_output_parser
@@ -66,6 +70,63 @@ class CohereTokenizer:
 
     def decode(self, token_ids, skip_special_tokens: bool = True):
         return "".join(self._token_map[token_id] for token_id in token_ids)
+
+
+def test_k2_reasoning_modes_and_tool_envelopes():
+    from omlx.api.tool_calling import parse_tool_calls
+    from omlx.patches.k2_horizon.tool_parser import parse_tool_call
+
+    markers = [
+        f"{prefix}ifm|{name}>"
+        for name in ("think", "think_fast", "think_faster", "tool_calls")
+        for prefix in ("<", "</")
+    ]
+    ids = {marker: i + 10 for i, marker in enumerate(markers)}
+
+    class Tokenizer(CohereTokenizer):
+        has_tool_calling = True
+        tool_call_start, tool_call_end = markers[-2:]
+        tool_parser = staticmethod(parse_tool_call)
+
+        def convert_tokens_to_ids(self, text):
+            return ids.get(text, -1)
+
+        def encode(self, text, **kwargs):
+            return [ids[text]] if text in ids else []
+
+    tokenizer = Tokenizer(
+        {
+            **{value: key for key, value in ids.items()},
+            1: "reason",
+            2: "answer",
+            3: '<ifm|tool_call>{"name":"weather","arguments":{"city":"Paris"}}</ifm|tool_call>',
+        }
+    )
+    factory = detect_output_parser("k2", tokenizer, {"model_type": "k2_horizon"})
+    tools = [{"type": "function", "function": {"name": "weather"}}]
+    for mode in ("think", "think_fast", "think_faster"):
+        session = factory.create_session(tokenizer)
+        tokens = [
+            ids[f"<ifm|{mode}>"],
+            1,
+            ids[f"</ifm|{mode}>"],
+            2,
+            ids[markers[-2]],
+            3,
+            ids[markers[-1]],
+        ]
+        text = "".join(session.process_token(token).stream_text for token in tokens)
+        final = session.finalize()
+        assert text + final.stream_text == (
+            "<think>\nreason</think>answer<ifm|tool_calls>"
+            + tokenizer.decode([3])
+            + "</ifm|tool_calls>"
+        )
+        assert final.tool_calls == []
+        clean, calls = parse_tool_calls(text + final.stream_text, tokenizer, tools)
+        assert clean == "answer"
+        assert calls[0].function.name == "weather"
+        assert json.loads(calls[0].function.arguments) == {"city": "Paris"}
 
 
 class DeepSeekV4Tokenizer(CohereTokenizer):
@@ -175,6 +236,13 @@ class ByteFallbackTokenizer:
         "<0x9E>": 2,
         "<0xA0>": 3,
     }
+
+    def __len__(self):
+        return len(self.vocab)
+
+    def convert_ids_to_tokens(self, ids):
+        reverse = {value: key for key, value in self.vocab.items()}
+        return [reverse[token_id] for token_id in ids]
 
     def decode(self, token_ids, skip_special_tokens: bool = True):
         table = {
@@ -771,14 +839,14 @@ class TestOutputParserFactory:
         assert factory.kind == "minimax_m3"
 
     def test_minimax_m3_parser_extracts_tool_calls(self, monkeypatch):
-        module = types.ModuleType("mlx_vlm.tool_parsers.minimax_m3")
+        module = types.ModuleType("mlx_vlm.tools.parsers.minimax_m3")
 
         def parse_tool_call(text):
             assert "lookup" in text
             return {"name": "lookup", "arguments": {"query": "mlx"}}
 
         module.parse_tool_call = parse_tool_call
-        monkeypatch.setitem(sys.modules, "mlx_vlm.tool_parsers.minimax_m3", module)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.tools.parsers.minimax_m3", module)
 
         start = "]<]minimax[>[<tool_call>"
         end = "]<]minimax[>[</tool_call>"
@@ -1019,6 +1087,56 @@ class TestOutputParserFactory:
         thinking, content = extract_thinking(output_text)
         assert thinking == "Let me think about this"
         assert content == "Four"
+
+    @staticmethod
+    def _labeled_json_tools(template, parser=json_tools.parse_tool_call):
+        tokenizer = TokenizerWrapper.__new__(TokenizerWrapper)
+        tokenizer._tokenizer = SimpleNamespace(
+            chat_template=template,
+            encode=lambda text, **kwargs: list(text.encode()),
+        )
+        tokenizer._chat_template = None
+        tokenizer._tool_parser = parser
+        tokenizer._tool_call_start = "<tool_call>"
+        tokenizer._tool_call_end = "</tool_call>"
+        tokenizer._tool_call_start_tokens = (1,)
+        tokenizer._tool_call_end_tokens = (2,)
+        return tokenizer
+
+    @pytest.mark.parametrize(
+        "template, expected",
+        [
+            ("<tool_call>\n<function=", "qwen3_coder"),
+            ("<arg_key>", "glm47"),
+            ("[TOOL_CALLS]", "mistral"),  # Empty end marker.
+        ],
+    )
+    def test_json_tools_label_follows_template_grammar(self, template, expected):
+        tokenizer = self._labeled_json_tools(template)
+        detect_output_parser("model", tokenizer)
+
+        assert tokenizer.tool_parser.__module__ == f"mlx_lm.tool_parsers.{expected}"
+        start, end = tokenizer.tool_call_start, tokenizer.tool_call_end
+        assert tokenizer.tool_call_start_tokens == tuple(start.encode())
+        assert tokenizer.tool_call_end_tokens == tuple(end.encode())
+
+    @pytest.mark.parametrize(
+        "template, parser, renderer",
+        [
+            ("<tool_call>tool_call.name", json_tools.parse_tool_call, None),
+            ("<arg_key>", qwen3_coder.parse_tool_call, None),
+            ("<arg_key>", json_tools.parse_tool_call, lambda *args: ""),
+        ],
+        ids=["json-template", "specific-label", "custom-renderer"],
+    )
+    def test_tool_parser_kept_without_template_conflict(
+        self, template, parser, renderer
+    ):
+        tokenizer = self._labeled_json_tools(template, parser)
+        tokenizer._chat_template = renderer
+        detect_output_parser("model", tokenizer)
+
+        assert tokenizer.tool_parser is parser
 
 
 class InklingTokenizer:

@@ -1,10 +1,9 @@
 // Copyright © 2026 oMLX contributors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Instantiates only the Bonsai-specific kernel variants that are not present
-// in the stock mlx 0.32.0 metallib:
-//   - affine_qmv_fast  for bits=1 (1-bit path added by Bonsai MLX fork)
-//   - affine_qmv_wide  for bits=1 and bits=2 (new kernel from Bonsai fork)
+// Instantiates the Bonsai-specific entry points used by the native extension.
+// Stock MLX 0.32.2 now includes generic 2-bit qmv_fast/qmv_wide kernels, while
+// 1-bit support and the extension's symmetric-bias routes remain Bonsai-only.
 //
 // The vendored quantized.h in this directory is the Bonsai-patched version.
 // It must shadow the mlx-installed copy; CMake sets -I for this directory

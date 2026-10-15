@@ -3,12 +3,11 @@
 """Tests for cache observability module."""
 
 import threading
-import time
 from unittest.mock import patch
 
 import pytest
 
-from omlx.cache.observability import CacheRateTracker
+from omlx.cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
 
 
 def _make_counters(
@@ -91,14 +90,23 @@ class TestCacheRateTrackerRates:
         def mock_monotonic():
             return fake_time[0]
 
-        with patch("omlx.cache.observability.time.monotonic", side_effect=mock_monotonic):
+        with patch(
+            "omlx.cache.observability.time.monotonic",
+            side_effect=mock_monotonic,
+        ):
             tracker.maybe_snapshot(old_counters)
 
         fake_time[0] = 1000.0 + elapsed
-        with patch("omlx.cache.observability.time.monotonic", side_effect=mock_monotonic):
+        with patch(
+            "omlx.cache.observability.time.monotonic",
+            side_effect=mock_monotonic,
+        ):
             tracker.maybe_snapshot(new_counters)
 
-        with patch("omlx.cache.observability.time.monotonic", return_value=fake_time[0]):
+        with patch(
+            "omlx.cache.observability.time.monotonic",
+            return_value=fake_time[0],
+        ):
             return tracker.get_rates(windows=(60, 300, 900))
 
     def test_steady_state_prefix_hit_rate(self):
@@ -198,12 +206,15 @@ class TestCacheRateTrackerThreadSafety:
         tracker = CacheRateTracker(min_interval=0.0)
         errors = []
         stop = threading.Event()
+        writer_started = threading.Event()
+        reader_started = threading.Event()
 
         def writer():
             i = 0
             while not stop.is_set():
                 try:
                     tracker.maybe_snapshot(_make_counters(prefix_hits=i))
+                    writer_started.set()
                     i += 1
                 except Exception as e:
                     errors.append(e)
@@ -212,17 +223,22 @@ class TestCacheRateTrackerThreadSafety:
             while not stop.is_set():
                 try:
                     tracker.get_rates()
+                    reader_started.set()
                 except Exception as e:
                     errors.append(e)
 
         threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
         for t in threads:
             t.start()
-        time.sleep(0.2)
-        stop.set()
-        for t in threads:
-            t.join(timeout=2.0)
+        try:
+            assert writer_started.wait(timeout=5.0)
+            assert reader_started.wait(timeout=5.0)
+        finally:
+            stop.set()
+            for t in threads:
+                t.join(timeout=2.0)
 
+        assert all(not t.is_alive() for t in threads)
         assert errors == [], f"Thread errors: {errors}"
 
 
@@ -233,3 +249,88 @@ class TestCacheRateTrackerClear:
         tracker.maybe_snapshot(_make_counters(prefix_hits=100))
         tracker.clear()
         assert tracker.get_rates() == {"windows": {}, "cumulative": {}}
+
+
+def test_boundary_snapshot_diagnostics_are_structured_and_thread_safe():
+    diagnostics = BoundarySnapshotDiagnostics()
+    diagnostics.record(
+        "capture_attempt",
+        request_id="req-a",
+        token_count=4096,
+        block_size=4096,
+        source="prefill",
+    )
+    diagnostics.record(
+        "ssd_fallback",
+        reason="ssd_save_failed",
+        request_id="req-a",
+        token_count=4096,
+        block_size=4096,
+        source="prefill",
+        storage="memory",
+    )
+    diagnostics.record(
+        "capture_success",
+        request_id="req-a",
+        token_count=4096,
+        block_size=4096,
+        source="prefill",
+        storage="memory",
+    )
+
+    snapshot = diagnostics.snapshot()
+
+    assert snapshot["capture_attempts"] == 1
+    assert snapshot["captures"] == 1
+    assert snapshot["captures_memory"] == 1
+    assert snapshot["captures_ssd"] == 0
+    assert snapshot["ssd_fallbacks"] == 1
+    assert snapshot["reasons"] == {"ssd_save_failed": 1}
+    assert snapshot["last_event"] == {
+        "event": "capture_success",
+        "request_id": "req-a",
+        "token_count": 4096,
+        "block_size": 4096,
+        "source": "prefill",
+        "storage": "memory",
+    }
+
+
+def test_boundary_snapshot_diagnostics_preserve_store_skip_cause():
+    diagnostics = BoundarySnapshotDiagnostics()
+    diagnostics.record(
+        "override_miss",
+        reason="ssd_load_failed",
+        request_id="req-a",
+        token_count=4096,
+        block_size=2048,
+        available_boundaries=2,
+    )
+
+    diagnostics.record(
+        "store_skip",
+        reason="boundary_snapshot_unavailable",
+        request_id="req-a",
+        token_count=4096,
+        block_size=2048,
+        available_boundaries=2,
+    )
+
+    assert diagnostics.snapshot()["last_event"]["cause"] == "ssd_load_failed"
+
+
+def test_boundary_snapshot_diagnostics_clear_resets_state():
+    diagnostics = BoundarySnapshotDiagnostics()
+    diagnostics.record(
+        "capture_attempt",
+        request_id="req-a",
+        token_count=4096,
+        block_size=2048,
+    )
+
+    diagnostics.clear()
+
+    snapshot = diagnostics.snapshot()
+    assert snapshot["capture_attempts"] == 0
+    assert snapshot["reasons"] == {}
+    assert snapshot["last_event"] is None

@@ -4,6 +4,12 @@
   (void)gid;
 }
 
+[[kernel]] void k2_ane_copy_planar(const device float16_t *input [[buffer(0)]],
+                                 device float16_t *output [[buffer(1)]],
+                                 uint gid [[thread_position_in_grid]]) {
+  output[gid] = input[gid];
+}
+
 template <typename T>
 [[kernel]] void qwen35_ane_pack_input(const device T *x [[buffer(0)]],
                                       device float16_t *planar [[buffer(1)]],

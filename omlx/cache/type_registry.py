@@ -14,10 +14,14 @@ from .type_handlers import (
     CacheListHandler,
     CacheType,
     CacheTypeHandler,
+    ChunkedKVCacheHandler,
     DefaultCacheHandler,
     KVCacheHandler,
     MiniMaxM3BatchKVCacheHandler,
     MiniMaxM3KVCacheHandler,
+    Qwen4BatchQSAKVCacheHandler,
+    Qwen4QSAKVCacheHandler,
+    Qwen4QSAQuantizedKVCacheHandler,
     RotatingKVCacheHandler,
     SizedArraysCache,
 )
@@ -44,6 +48,7 @@ class CacheTypeRegistry:
     # Mapping from mlx-lm class names to cache types
     _class_name_map: Dict[str, CacheType] = {
         "KVCache": CacheType.KVCACHE,
+        "ChunkedKVCache": CacheType.CHUNKED_KVCACHE,
         "RotatingKVCache": CacheType.ROTATING_KVCACHE,
         # mlx-vlm MTP wraps target RotatingKVCache layers with rollback slack
         # during speculative decode. The live tensor/state representation is
@@ -73,6 +78,9 @@ class CacheTypeRegistry:
         "BatchPoolingCache": CacheType.BATCH_POOLING_CACHE,
         "MiniMaxM3KVCache": CacheType.MINIMAX_M3_KVCACHE,
         "MiniMaxM3BatchKVCache": CacheType.MINIMAX_M3_BATCH_KVCACHE,
+        "QSAKVCache": CacheType.QWEN4_QSA_KVCACHE,
+        "QSAQuantizedKVCache": CacheType.QWEN4_QSA_QUANTIZED_KVCACHE,
+        "BatchQSAKVCache": CacheType.QWEN4_BATCH_QSA_KVCACHE,
     }
 
     # Default handler instance
@@ -258,11 +266,15 @@ class CacheTypeRegistry:
 def _initialize_default_handlers() -> None:
     """Initialize default handlers on module load."""
     CacheTypeRegistry.register(KVCacheHandler())
+    CacheTypeRegistry.register(ChunkedKVCacheHandler())
     CacheTypeRegistry.register(RotatingKVCacheHandler())
     CacheTypeRegistry.register(ArraysCacheHandler())
     CacheTypeRegistry.register(CacheListHandler())
     CacheTypeRegistry.register(MiniMaxM3KVCacheHandler())
     CacheTypeRegistry.register(MiniMaxM3BatchKVCacheHandler())
+    CacheTypeRegistry.register(Qwen4QSAKVCacheHandler())
+    CacheTypeRegistry.register(Qwen4QSAQuantizedKVCacheHandler())
+    CacheTypeRegistry.register(Qwen4BatchQSAKVCacheHandler())
 
 
 # Initialize handlers when module is imported

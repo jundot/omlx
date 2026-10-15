@@ -10,6 +10,7 @@ import pytest
 
 import omlx.patches.qwen35_ane_prefill as ane_patch
 from omlx.custom_kernels.qwen35_prefill import fast
+from omlx.patches import qwen35_packed_linear
 
 
 def test_ane_compile_bindings_release_the_python_gil():
@@ -68,6 +69,32 @@ def test_ane_dispatch_guard_transfers_each_ticket_after_thread_spawn():
     )
     assert source.count("ane_guard.transfer_ticket0();") == 2
     assert source.count("ane_guard.transfer_ticket1();") == 2
+
+
+def test_hybrid_merge_waits_for_gpu_suffix_completion():
+    """ANE completion alone must not let merge race an in-flight GPU qmm."""
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "omlx/custom_kernels/qwen35_prefill/csrc/qwen35_ane.mm"
+    ).read_text(encoding="utf-8")
+    single = source.split("class AneHybridQ4Primitive", 1)[1]
+    single = single.split("class DualAneHybridPrimitive", 1)[0]
+    dual = source.split("class DualAneHybridPrimitive", 1)[1]
+    dual = dual.split("class AneHybridQ4SwiGLUDownPrimitive", 1)[0]
+
+    for block, ane_wait in (
+        (single, "model_->wait(ticket)"),
+        (dual, "model1_->wait(ticket1)"),
+    ):
+        assert "[qmm_buffer retain];" in block
+        assert block.count("[qmm_buffer waitUntilCompleted];") == 2
+        assert block.index(ane_wait) < block.rindex(
+            "[qmm_buffer waitUntilCompleted];"
+        )
+        assert block.rindex("[qmm_buffer waitUntilCompleted];") < block.index(
+            "auto merge ="
+        )
+        assert block.rindex("[qmm_buffer release];") < block.index("auto merge =")
 
 
 @pytest.fixture(autouse=True)
@@ -160,6 +187,39 @@ class _Q6GDN(nn.Module):
 def test_q6_mlp_and_gdn_are_eligible_for_ane_hybrid_prefill():
     assert ane_patch._eligible_pair(_Q6MLP())
     assert ane_patch._eligible_gdn(_Q6GDN())
+
+
+def _q4_bf16(input_dims, output_dims):
+    linear = nn.QuantizedLinear(
+        input_dims, output_dims, bias=False, group_size=64, bits=4
+    )
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+    return linear
+
+
+def test_packed_projections_are_ineligible_instead_of_raising():
+    # Packing leaves GDN b/a (narrower than a tile) stock beside packed qkv/z.
+    gdn = SimpleNamespace(
+        in_proj_qkv=_q4_bf16(256, 256),
+        in_proj_z=_q4_bf16(256, 128),
+        in_proj_b=_q4_bf16(256, 48),
+        in_proj_a=_q4_bf16(256, 48),
+    )
+    mlp = SimpleNamespace(
+        gate_proj=_q4_bf16(256, 256),
+        up_proj=_q4_bf16(256, 256),
+        down_proj=_q4_bf16(256, 256),
+    )
+    assert ane_patch._eligible_gdn(gdn)
+    assert ane_patch._eligible_pair(mlp)
+
+    qwen35_packed_linear._pack_layer(SimpleNamespace(linear_attn=gdn, mlp=mlp))
+
+    assert isinstance(gdn.in_proj_qkv, qwen35_packed_linear.PackedLinear)
+    assert type(gdn.in_proj_b) is nn.QuantizedLinear
+    assert not ane_patch._eligible_gdn(gdn)
+    assert not ane_patch._eligible_pair(mlp)
 
 
 @pytest.mark.parametrize(
@@ -276,16 +336,15 @@ def test_configure_scheduler_warns_when_shape_exceeds_delivered_width(caplog):
         block_aware_cache=object(),
     )
 
-    # Boundary snapshots cap delivered chunks at the 2048 block edge, so a
-    # 4096 shape can never receive a full tile and must warn loudly.
+    # Boundary snapshots cap chunks below the compiled shape.
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
         assert ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 4096)
-    assert "never execute" in caplog.text
+    assert "require eligible tail padding" in caplog.text
 
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
         assert ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 2048)
-    assert "never execute" not in caplog.text
+    assert "require eligible tail padding" not in caplog.text
 
     caplog.clear()
     no_boundary = SimpleNamespace(
@@ -294,7 +353,68 @@ def test_configure_scheduler_warns_when_shape_exceeds_delivered_width(caplog):
     )
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
         assert ane_patch.configure_qwen35_ane_prefill_scheduler(no_boundary, 4096)
-    assert "never execute" not in caplog.text
+    assert "require eligible tail padding" not in caplog.text
+
+
+@pytest.mark.parametrize("width, recommended", [(2048, 2048), (1500, 1472)])
+def test_oversized_shape_recommends_a_valid_sequence_length(caplog, width, recommended):
+    scheduler = SimpleNamespace(
+        config=SimpleNamespace(prefill_step_size=2048, paged_cache_block_size=width),
+        _qwen35_prefill_floor=4096,
+        block_aware_cache=object(),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        assert ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 4096)
+
+    assert "require eligible tail padding" in caplog.text
+    assert f"Set sequence_length={recommended} or a smaller valid shape" in caplog.text
+    caplog.clear()
+    ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, recommended)
+    assert not any(record.levelno >= logging.WARNING for record in caplog.records)
+
+
+def test_sub_minimum_width_requires_padding_or_wider_chunks(caplog):
+    scheduler = SimpleNamespace(
+        config=SimpleNamespace(prefill_step_size=2048, paged_cache_block_size=512),
+        _qwen35_prefill_floor=4096,
+        block_aware_cache=object(),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        assert ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 2048)
+
+    assert "require eligible tail padding" in caplog.text
+    assert str(ane_patch._ANE_MIN_SEQUENCE_LENGTH) in caplog.text
+    assert "prefill chunk width" in caplog.text
+    assert "Set sequence_length=" not in caplog.text
+    assert "changing sequence_length alone" in caplog.text
+
+    with pytest.raises(ValueError):
+        ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 512)
+
+
+def test_validator_and_warning_share_one_minimum(caplog):
+    minimum = ane_patch._ANE_MIN_SEQUENCE_LENGTH
+    alignment = ane_patch._ANE_SEQUENCE_LENGTH_ALIGNMENT
+
+    with pytest.raises(ValueError):
+        ane_patch.configure_qwen35_ane_prefill_scheduler(object(), minimum - alignment)
+    with pytest.raises(ValueError):
+        ane_patch.enable_qwen35_ane_prefill(
+            SimpleNamespace(), sequence_length=minimum - alignment
+        )
+
+    exact = SimpleNamespace(
+        config=SimpleNamespace(
+            prefill_step_size=2048, paged_cache_block_size=minimum
+        ),
+        _qwen35_prefill_floor=4096,
+        block_aware_cache=object(),
+    )
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        assert ane_patch.configure_qwen35_ane_prefill_scheduler(exact, minimum)
+    assert "require eligible tail padding" not in caplog.text
 
 
 def test_short_chunks_exit_before_the_tiling_planner(monkeypatch):
@@ -420,7 +540,8 @@ def test_mlp_profitable_tail_is_padded_and_sliced(monkeypatch):
     assert bool(mx.all(result == 7))
 
 
-def test_profitable_short_prefill_uses_one_padded_tile(monkeypatch):
+@pytest.mark.parametrize("rows, threshold", [(1400, 1358), (512, 512)])
+def test_profitable_short_prefill_uses_one_padded_tile(monkeypatch, rows, threshold):
     seen = []
 
     def exact(_mlp, block, _target_verify=False):
@@ -430,10 +551,10 @@ def test_profitable_short_prefill_uses_one_padded_tile(monkeypatch):
     monkeypatch.setattr(ane_patch, "_backend_exact", exact)
     mlp = SimpleNamespace(
         _omlx_ane_prefill_config=ane_patch._AnePrefillConfig(
-            2048, 0.53, 8, tail_padding_min_tokens=1358
+            2048, 0.53, 8, tail_padding_min_tokens=threshold
         )
     )
-    x = mx.ones((1, 1400, 8), dtype=mx.float16)
+    x = mx.ones((1, rows, 8), dtype=mx.float16)
 
     result = ane_patch._backend(mlp, x)
     assert result is not None
@@ -441,8 +562,8 @@ def test_profitable_short_prefill_uses_one_padded_tile(monkeypatch):
 
     assert result.shape == x.shape
     assert seen[0].shape == (1, 2048, 8)
-    assert bool(mx.all(seen[0][:, :1400] == 1))
-    assert bool(mx.all(seen[0][:, 1400:] == 0))
+    assert bool(mx.all(seen[0][:, :rows] == 1))
+    assert bool(mx.all(seen[0][:, rows:] == 0))
     assert bool(mx.all(result == 3))
 
 
@@ -472,6 +593,7 @@ def test_low_fraction_wide_mlp_still_dispatches_complete_tile(monkeypatch):
 
 def test_gdn_wide_call_tiles_only_tokenwise_projections(monkeypatch):
     calls = []
+    scheduled = []
 
     def exact(_gdn, block, _target_verify=False):
         calls.append(("ane", int(block.shape[-2])))
@@ -491,6 +613,7 @@ def test_gdn_wide_call_tiles_only_tokenwise_projections(monkeypatch):
             )
 
     monkeypatch.setattr(ane_patch, "_gdn_backend_exact", exact)
+    monkeypatch.setattr(mx, "async_eval", lambda *values: scheduled.append(values))
     linears = [Linear(value) for value in (10, 20, 30, 40)]
     gdn = SimpleNamespace(
         in_proj_qkv=linears[0],
@@ -504,6 +627,10 @@ def test_gdn_wide_call_tiles_only_tokenwise_projections(monkeypatch):
         gdn, mx.zeros((1, 4095, 8), dtype=mx.float16)
     )
     assert result is not None
+    assert len(scheduled) == 1
+    assert all(
+        actual is expected for actual, expected in zip(scheduled[0], result)
+    )
     mx.eval(*result)
 
     assert [part.shape for part in result] == [(1, 4095, 1)] * 4
@@ -545,47 +672,18 @@ def test_gdn_profitable_tail_is_padded_before_recurrence(monkeypatch):
     assert [part[0, -1, 0].item() for part in result] == [1, 2, 3, 4]
 
 
-def test_install_dispatch_adds_gdn_projection_compatibility_hook(monkeypatch):
-    fallback = object()
-    accelerated = object()
+def test_install_dispatch_adds_gdn_projection_hook(monkeypatch):
+    import omlx.patches.qwen35_q4_mlp as q4patch
 
-    def target_linears(linears, x, target_verify=False):
-        return fallback
-
-    vlm = SimpleNamespace(
-        Qwen3_5MLP=None,
-        register_qwen3_5_mlp_prefill_backend=lambda backend: None,
-        _target_verify_linears=target_linears,
-    )
-    lm = SimpleNamespace(MLP=None)
-
-    def import_module(name):
-        if name == "mlx_vlm.models.qwen3_5.language":
-            return vlm
-        if name == "mlx_lm.models.qwen3_5":
-            return lm
-        raise ImportError(name)
-
-    monkeypatch.setattr(ane_patch.importlib, "import_module", import_module)
-    monkeypatch.setattr(ane_patch, "_VLM_HOOK_INSTALLED", False)
-    monkeypatch.setattr(ane_patch, "_VLM_GDN_HOOK_INSTALLED", False)
-    monkeypatch.setattr(ane_patch, "_GDN_MODULES", weakref.WeakValueDictionary())
+    calls = []
     monkeypatch.setattr(
-        ane_patch, "_gdn_backend", lambda gdn, x, target_verify=False: accelerated
+        q4patch, "apply_qwen35_vlm_gdn_projection_hook", lambda: calls.append("vlm")
     )
-
-    gdn = _GDN()
-    ane_patch._register_gdn_module(gdn)
+    monkeypatch.setattr(q4patch, "register_qwen35_lm_gdn_prefill_backend", calls.append)
+    monkeypatch.setattr(ane_patch, "_wrap_class", lambda cls: None)
 
     assert ane_patch._install_dispatch()
-    assert (
-        vlm._target_verify_linears(
-            (gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a),
-            mx.zeros((1, 1, 128)),
-        )
-        is accelerated
-    )
-    assert vlm._target_verify_linears((object(),), mx.zeros((1, 1, 128))) is fallback
+    assert calls == [ane_patch._gdn_backend, "vlm"]
 
 
 def test_install_dispatch_registers_mlx_lm_gdn_backend(monkeypatch):
@@ -703,7 +801,6 @@ def test_down_projection_cpu_share_is_prepared_and_dispatched(monkeypatch):
         linear,
         mx.zeros((1, 1, 256), dtype=mx.float16),
         8,
-        q8_threshold_env="OMLX_TEST_Q8_THRESHOLD",
         cpu_state=state,
         cpu_threads=8,
         cpu_shared_resource=True,
@@ -971,7 +1068,6 @@ def test_compile_single_bank_targets_unpinned_instance(monkeypatch):
         calls.append((len(values), sequence_length, ane_instance))
         return [object() for _ in values]
 
-    monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
     monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
     monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", lambda: True)
 
@@ -985,7 +1081,6 @@ def test_compile_single_bank_targets_unpinned_instance(monkeypatch):
 
 
 def test_enable_splits_banks_when_monolithic_load_fails(monkeypatch):
-    monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(
@@ -1038,7 +1133,6 @@ def test_enable_splits_banks_when_monolithic_load_fails(monkeypatch):
 
 
 def test_enable_first_retry_is_a_near_half_split(monkeypatch):
-    monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(
@@ -1072,42 +1166,7 @@ def test_enable_first_retry_is_a_near_half_split(monkeypatch):
     assert model._omlx_ane_resident_program_count == 4
 
 
-def test_enable_env_cap_forces_split_banks(monkeypatch):
-    monkeypatch.setenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", "1")
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
-    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
-    monkeypatch.setattr(
-        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
-    )
-    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
-    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
-    monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", lambda: True)
-    monkeypatch.setattr(ane_patch.time, "sleep", lambda *_a: None)
-    compiled = []
-
-    def compile_bank(weights, sequence_length, ane_instance):
-        compiled.append((len(weights), ane_instance))
-        return [object() for _ in weights]
-
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
-    model = _Model(4)
-
-    count = ane_patch.enable_qwen35_ane_prefill(
-        model,
-        sequence_length=2048,
-        fraction=0.5,
-        max_layers=4,
-        dual_ane=True,
-    )
-
-    assert count == 4
-    assert all(size == 1 for size, _ in compiled)
-    assert len(compiled) == 8
-    assert model._omlx_ane_resident_program_count == 8
-
-
 def test_enable_falls_back_to_per_layer_when_split_banks_fail(monkeypatch):
-    monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(
@@ -1446,9 +1505,9 @@ def test_compile_gdn_accepts_q8_and_propagates_bits(monkeypatch):
     assert state is not None
     assert state.bits == 8
     assert state.group_size == 64
-    assert state.weight.shape == (192, 32)
-    assert state.scales.shape == (192, 2)
-    assert compiled == [((192, 128), mx.float32, 2048)]
+    assert state.weight.shape == (256, 32)
+    assert state.scales.shape == (256, 2)
+    assert compiled == [((128, 128), mx.float32, 2048)]
 
 
 @pytest.mark.parametrize("group_size", [64, 128])
@@ -1505,7 +1564,7 @@ def test_q6_gdn_packs_suffix_and_extracts_b_a(group_size, monkeypatch):
     mixed_qkv, z, b, a = ane_patch._gdn_backend(gdn, x)
     mx.eval(mixed_qkv, z, b, a)
 
-    assert compiled == [(192, 128)]
+    assert compiled == [(128, 128)]
     assert z.shape == (1, 1, state.z_outputs)
     assert mixed_qkv.shape == (1, 1, state.qkv_outputs)
     assert b.shape == (1, 1, state.b_outputs)
@@ -1723,11 +1782,11 @@ def test_compile_gdn_combines_z_then_qkv_and_keeps_q5_suffix(monkeypatch):
     state = ane_patch._compile_gdn(gdn, ane_patch._AneGDNConfig(2048, 0.5, 8))
 
     assert state is not None
-    assert compiled == [((192, 128), mx.float32, 2048)]
+    assert compiled == [((128, 128), mx.float32, 2048)]
     assert state.z_outputs == 128
     assert state.qkv_outputs == 256
-    assert state.weight.shape == (192, 20)
-    assert state.scales.shape == (192, 2)
+    assert state.weight.shape == (256, 20)
+    assert state.scales.shape == (256, 2)
     assert state.bits == 5
     assert state.group_size == 64
 
@@ -1752,10 +1811,10 @@ def test_prepare_gdn_accepts_oq4e_mixed_q4_q5_quantization():
     state, dense0, dense1 = prepared
     assert state.bits == 4
     assert state.group_size == 64
-    assert state.weight.shape == (128, 16)
-    assert state.scales.shape == (128, 2)
-    assert dense0.shape == (128, 128)
-    assert dense1.shape == (128, 128)
+    assert state.weight.shape == (256, 16)
+    assert state.scales.shape == (256, 2)
+    assert dense0.shape == (64, 128)
+    assert dense1.shape == (64, 128)
 
 
 def test_prepare_gdn_single_ane_keeps_one_full_prefix():
@@ -1778,7 +1837,7 @@ def test_prepare_gdn_single_ane_keeps_one_full_prefix():
     state, dense0, dense1 = prepared
     assert state.z_outputs == 128
     assert state.qkv_outputs == 256
-    assert dense0.shape == (256, 128)
+    assert dense0.shape == (128, 128)
     assert dense1 is None
 
 
@@ -1841,12 +1900,12 @@ def test_prepare_gdn_splits_cpu_work_with_single_ane(monkeypatch):
 
     assert prepared is not None
     state, dense0, dense1 = prepared
-    assert dense0.shape == (192, 128)
+    assert dense0.shape == (128, 128)
     assert dense1 is None
     assert state.cpu_outputs == 64
     assert state.cpu_weight is not None
     assert state.cpu_weight.shape == (64, 128)
-    assert state.weight.shape == (128, 16)
+    assert state.weight.shape == (192, 16)
 
 
 def test_gdn_backend_routes_cpu_split_through_three_way_native_merge(monkeypatch):
@@ -2373,6 +2432,8 @@ def test_install_dispatch_wraps_outer_q4_mlp_dispatch(monkeypatch):
         def __call__(self, x):
             return x
 
+    import omlx.patches.qwen35_q4_mlp as q4patch
+
     registrations = []
     gdn_registrations = []
     vlm = SimpleNamespace(
@@ -2390,6 +2451,11 @@ def test_install_dispatch_wraps_outer_q4_mlp_dispatch(monkeypatch):
     monkeypatch.setattr(ane_patch, "_PATCHED_CLASSES", set())
     monkeypatch.setattr(ane_patch, "_VLM_HOOK_INSTALLED", False)
     monkeypatch.setattr(ane_patch, "_VLM_GDN_HOOK_INSTALLED", False)
+
+    monkeypatch.setattr(q4patch, "apply_qwen35_vlm_gdn_projection_hook", lambda: None)
+    monkeypatch.setattr(
+        q4patch, "register_qwen35_lm_gdn_prefill_backend", gdn_registrations.append
+    )
 
     assert ane_patch._install_dispatch()
     assert PatchedMLP in ane_patch._PATCHED_CLASSES
@@ -2414,7 +2480,6 @@ def test_enable_rejects_unsafe_fixed_shape_settings(
 
 
 def test_enable_uses_ane_on_nax_gpu_when_model_setting_enabled(monkeypatch):
-    monkeypatch.delenv("OMLX_QWEN35_ANE_PREFILL", raising=False)
     monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: False)
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
@@ -2425,35 +2490,6 @@ def test_enable_uses_ane_on_nax_gpu_when_model_setting_enabled(monkeypatch):
     count = ane_patch.enable_qwen35_ane_prefill(model, sequence_length=2048)
 
     assert count == 2
-
-
-def test_enable_env_forces_ane_on_nax_gpu(monkeypatch):
-    monkeypatch.setenv("OMLX_QWEN35_ANE_PREFILL", "1")
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
-    monkeypatch.setattr(fast, "has_symbol", lambda name: False)
-    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
-    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
-    monkeypatch.setattr(ane_patch, "_compile_pair", lambda mlp, config: object())
-    model = _Model(2)
-
-    count = ane_patch.enable_qwen35_ane_prefill(
-        model, sequence_length=2048, max_layers=2
-    )
-
-    assert count == 2
-
-
-def test_enable_env_kill_switch_wins(monkeypatch):
-    monkeypatch.setenv("OMLX_QWEN35_ANE_PREFILL", "0")
-    installed = []
-    monkeypatch.setattr(
-        ane_patch, "_install_dispatch", lambda: installed.append(True) or True
-    )
-
-    count = ane_patch.enable_qwen35_ane_prefill(_Model(1), sequence_length=2048)
-
-    assert count == 0
-    assert installed == []
 
 
 def test_prefill_status_reports_configured_layers():
@@ -2487,6 +2523,35 @@ def test_prefill_status_flags_attempted_but_empty():
     assert status["configured"] is False
 
 
+def test_release_qwen35_ane_prefill_drops_all_native_state_and_is_idempotent():
+    """Unload releases ordinary, fused, and GDN ANE state exactly once."""
+    ordinary = SimpleNamespace(_omlx_ane_prefill_state=object())
+    fused = SimpleNamespace(_omlx_ane_fused_down_state=object())
+    gdn = SimpleNamespace(_omlx_ane_gdn_state=object())
+    model = SimpleNamespace(
+        modules=lambda: (ordinary, fused, gdn),
+        _omlx_ane_mlp_prefill_count=2,
+        _omlx_ane_gdn_prefill_count=1,
+        _omlx_ane_dual_prefill_count=3,
+        _omlx_ane_resident_program_count=7,
+    )
+
+    assert ane_patch.release_qwen35_ane_prefill(model) == (3, 7)
+    assert ordinary._omlx_ane_prefill_state is None
+    assert ordinary._omlx_ane_prefill_failed is True
+    assert fused._omlx_ane_fused_down_state is None
+    assert fused._omlx_ane_prefill_failed is True
+    assert gdn._omlx_ane_gdn_state is None
+    assert gdn._omlx_ane_gdn_failed is True
+    assert model._omlx_ane_prefill_shed is True
+    assert model._omlx_ane_mlp_prefill_count == 0
+    assert model._omlx_ane_gdn_prefill_count == 0
+    assert model._omlx_ane_dual_prefill_count == 0
+    assert model._omlx_ane_resident_program_count == 0
+
+    assert ane_patch.release_qwen35_ane_prefill(model) == (0, 0)
+
+
 def test_prefill_status_safe_on_untouched_model():
     status = ane_patch.qwen35_ane_prefill_status(SimpleNamespace())
     assert status["attempted"] is False
@@ -2500,7 +2565,6 @@ def test_enable_warns_when_no_eligible_layers(monkeypatch, caplog):
     monkeypatch.setattr(
         ane_patch, "_enable_dual_procedure_banks", lambda *args, **kwargs: None
     )
-    monkeypatch.delenv("OMLX_QWEN35_ANE_PREFILL", raising=False)
 
     model = SimpleNamespace(modules=lambda: [])
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
@@ -3081,25 +3145,11 @@ def test_compile_cache_native_gate_is_exact_opt_in(ane_mm):
     assert 'strcmp(value, "1") == 0' in gate.group()
 
 
-def test_compile_cache_covers_all_four_native_compile_sites(ane_mm):
-    """Individual linear, single fused SwiGLU/down, linear banks, and fused
-    banks use one instance-aware cache/fallback implementation."""
-    assert ane_mm.count("load_or_compile_ane_model(") == 5
+def test_compile_cache_covers_all_five_native_compile_sites(ane_mm):
+    """Qwen and K2 compile sites share the content-hash cache."""
+    assert ane_mm.count("load_or_compile_ane_model(") == 6
     assert ane_mm.count("model, identifier, ane_instance") == 4
     assert ane_mm.count("@selector(compileWithQoS:options:error:)") == 1
-
-
-def test_compile_cache_cleanup_refuses_paths_resolving_outside_root(ane_mm):
-    """A cache-rooted path that resolves elsewhere must be left alone, while
-    the historical temp path still deletes directly."""
-    body = re.search(
-        r"void remove_ane_staging_directory\(NSString \*directory\) noexcept \{.*?\n\}",
-        ane_mm,
-        re.S,
-    )
-    assert body, "remove_ane_staging_directory() is absent from qwen35_ane.mm"
-    assert "ANE compile cache cleanup skipped" in body.group()
-    assert "stringByResolvingSymlinksInPath" in body.group()
 
 
 def test_compile_cache_cleanup_keeps_the_entry_lock_file_stable(ane_mm):
@@ -3117,45 +3167,66 @@ def test_compile_cache_cleanup_keeps_the_entry_lock_file_stable(ane_mm):
 def test_compile_cache_keeps_historical_delete_on_unload(ane_mm):
     """Apple owns the compiled AOT cache; oMLX staging files remain temporary."""
     assert "persistent_" not in ane_mm
-    assert ane_mm.count("remove_ane_staging_directory(directory_)") == 2
-    assert "ScopedAneCacheLock cache_lock(directory);" in ane_mm
+    assert ane_mm.count(
+        "remove_ane_staging_directory(directory_, cache_lock_entry_)"
+    ) == 2
+    assert "ScopedAneCacheLock cache_lock(cache_lock_entry);" in ane_mm
     assert "ANE compile cache cleanup deferred" in ane_mm
     assert "NSTemporaryDirectory()" in ane_mm
 
 
 def test_compile_cache_hit_restores_without_recompiling(ane_mm):
-    assert "@selector(setModelURL:)" in ane_mm
+    """The framework-derived URL and descriptor hash must remain authoritative.
+
+    macOS 27 verifies the in-memory model's per-file hashes and rejects the
+    caller-assigned staging URL that rc3 introduced in both cache modes.
+    """
+    assert "setModelURL:" not in ane_mm
+    assert "fileURLWithPath:" not in ane_mm
     assert "@selector(compiledModelExists)" in ane_mm
     assert re.search(r"if \(!restored\) \{\s*compile_fresh\(\);\s*\}", ane_mm)
+    assert re.search(
+        r"return \{\s*staged \? directory : nil,\s*"
+        r"staged \? cache_lock_entry : nil,\s*\};",
+        ane_mm,
+    )
 
 
 def test_compile_cache_hit_load_failure_invalidates_then_compiles_once(ane_mm):
     assert "ANE compile cache fallback" in ane_mm
+    assert "@selector(purgeCompiledModel)" in ane_mm
     assert ane_mm.count("compile_fresh();") == 2
     assert ane_mm.count("@selector(loadWithQoS:options:error:)") == 2
+    fallback = ane_mm.index('NSLog(@"oMLX: ANE compile cache fallback')
+    purge = ane_mm.index("@selector(purgeCompiledModel)", fallback)
+    recompile = ane_mm.index("compile_fresh();", purge)
+    assert fallback < purge < recompile
 
 
-def test_compile_cache_path_is_stable_per_os_and_instance(ane_mm):
+def test_compile_cache_lock_key_matches_native_content_hash(ane_mm):
     assert "NSCachesDirectory" in ane_mm
     assert 'stringByAppendingPathComponent:@"v1"' in ane_mm
     assert "operatingSystemVersionString" in ane_mm
-    assert re.search(r'@"%@\.i%d"', ane_mm)
-    assert "fileURLWithPath:directory" in ane_mm
+    assert "ane_compile_cache_lock_entry(NSString *identifier)" in ane_mm
+    assert '.i%d"' not in ane_mm
+    assert "stringByAppendingPathComponent:identifier" in ane_mm
 
 
 def test_compile_cache_serializes_cross_process_writers(ane_mm):
     assert "#include <sys/file.h>" in ane_mm
     assert re.search(r"flock\(.*LOCK_EX", ane_mm)
-    assert "Hold the entry lock from probe through load" in ane_mm
+    assert "Hold the descriptor-hash lock from probe through load" in ane_mm
 
 
 def test_compile_cache_fails_open_when_root_or_lock_is_unavailable(ane_mm):
     assert "ANE compile cache unavailable" in ane_mm
     assert "temporary" in ane_mm
 
+
 def test_compile_cache_telemetry_uses_native_log_prefix(ane_mm):
     for event in ("hit", "miss", "fallback"):
         assert f'@"oMLX: ANE compile cache {event}' in ane_mm
+
 
 def test_compile_cache_lock_acquisition_is_bounded(ane_mm):
     """A suspended holder must not hang later loads: non-blocking flock with a
@@ -3163,12 +3234,6 @@ def test_compile_cache_lock_acquisition_is_bounded(ane_mm):
     assert "LOCK_EX | LOCK_NB" in ane_mm
     assert "kAneCacheLockTimeout" in ane_mm
     assert "ANE compile cache lock acquisition timed out" in ane_mm
-
-
-def test_compile_cache_staging_delete_resolves_symlinks(ane_mm):
-    """The cache-root prefix check must compare resolved paths so a symlink
-    under the root cannot redirect the delete outside it."""
-    assert "stringByResolvingSymlinksInPath" in ane_mm
 
 class _ReleasableModel(nn.Module):
     def __init__(self):
@@ -3183,6 +3248,7 @@ class _NativeHandle:
 
 def test_release_latches_modules_drops_states_and_zeroes_counters():
     import gc
+
     model = _ReleasableModel()
     handle = _NativeHandle()
     ref = weakref.ref(handle)
@@ -3212,6 +3278,55 @@ def test_release_latches_modules_drops_states_and_zeroes_counters():
     assert status["configured"] is False
     assert status["shed"] is True
     assert status["resident_programs"] == 0
+
+
+def test_release_clears_the_state_cache_that_pins_the_same_states():
+    import gc
+
+    model = _ReleasableModel()
+    mlp_handle = _NativeHandle()
+    gdn_handle = _NativeHandle()
+    mlp_ref = weakref.ref(mlp_handle)
+    gdn_ref = weakref.ref(gdn_handle)
+    mlp_state = SimpleNamespace(model=mlp_handle)
+    gdn_state = SimpleNamespace(model=gdn_handle)
+    model.mlp._omlx_ane_prefill_state = mlp_state
+    # _compile_pair and _compile_gdn cache the state per module, so this is a
+    # second reference to everything the release drops.
+    model.mlp._omlx_ane_prefill_cache = {("mlp-key",): mlp_state}
+    model.gdn._omlx_ane_gdn_state = gdn_state
+    model.gdn._omlx_ane_gdn_cache = {("gdn-key",): gdn_state}
+
+    released, _ = ane_patch.release_qwen35_ane_prefill(model)
+    del mlp_state, gdn_state, mlp_handle, gdn_handle
+    gc.collect()
+
+    assert released == 2
+    assert mlp_ref() is None
+    assert gdn_ref() is None
+    assert model.mlp._omlx_ane_prefill_cache == {}
+    assert model.gdn._omlx_ane_gdn_cache == {}
+
+
+def test_release_clears_a_stale_state_cache_entry():
+    import gc
+
+    model = _ReleasableModel()
+    handle = _NativeHandle()
+    ref = weakref.ref(handle)
+    # An entry can outlive its state attribute -- an earlier release, or a
+    # slice replaced at a different chunk width.
+    model.mlp._omlx_ane_prefill_cache = {("stale",): SimpleNamespace(model=handle)}
+
+    released, _ = ane_patch.release_qwen35_ane_prefill(model)
+    del handle
+    gc.collect()
+
+    # Nothing to latch, so nothing counts as released -- but the bank the entry
+    # pinned still has to be handed back.
+    assert released == 0
+    assert ref() is None
+    assert model.mlp._omlx_ane_prefill_cache == {}
 
 
 def test_release_is_idempotent_and_noop_without_slices():
@@ -3266,6 +3381,36 @@ def _floor_gdn(z_outputs: int, qkv_outputs: int):
     )
 
 
+def test_recurrent_safe_gdn_slice_caps_ane_at_z():
+    """A wider requested slice must not move recurrent qkv rows onto ANE."""
+    assert (
+        ane_patch._recurrent_safe_gdn_ane_outputs(6144, 10240, 0.50, 128)
+        == 6144
+    )
+    assert (
+        ane_patch._recurrent_safe_gdn_ane_outputs(6144, 10240, 0.375, 128)
+        == 6144
+    )
+    assert ane_patch._recurrent_safe_gdn_ane_outputs(6144, 10240, 0.35, 128) == 0
+
+
+def test_recurrent_safe_gdn_slice_rejects_unaligned_z():
+    assert ane_patch._recurrent_safe_gdn_ane_outputs(320, 1728, 0.50, 128) == 0
+    assert ane_patch._recurrent_safe_gdn_ane_outputs(320, 1728, 0.50, 64) == 320
+
+
+def test_recurrent_safe_gdn_cap_is_reported(caplog):
+    gdn = _floor_gdn(512, 1536)
+    gdn._omlx_ane_gdn_state = object()
+    model = SimpleNamespace(modules=lambda: [gdn])
+
+    with caplog.at_level(logging.INFO):
+        ane_patch._log_gdn_recurrent_safe_cap(model, 0.50, 1, True)
+
+    assert "requested 0.500 to 0.250" in caplog.text
+    assert "recurrent qkv" in caplog.text
+
+
 def test_min_viable_gdn_fraction_tracks_the_alignment():
     """Single-ANE slices align to 64, dual to 128, so the same model has a
     different floor in each mode."""
@@ -3276,10 +3421,10 @@ def test_min_viable_gdn_fraction_tracks_the_alignment():
     assert (int(total * 0.25) // 128) * 128 >= 512
     assert (int(total * 0.15) // 128) * 128 < 512
 
-    # A 64-aligned slice reaches z at the same 0.25 here, but the rule is
-    # evaluated against the requested alignment, not a fixed 128.
+    # Exact z must satisfy the active ANE alignment. A wider aligned prefix
+    # would enter recurrent qkv rows and is intentionally rejected.
     assert ane_patch._min_viable_gdn_fraction(_floor_gdn(320, 1728), 64) == 0.15625
-    assert ane_patch._min_viable_gdn_fraction(_floor_gdn(320, 1728), 128) == 0.1875
+    assert ane_patch._min_viable_gdn_fraction(_floor_gdn(320, 1728), 128) is None
 
     # z alone larger than the whole projection can never engage
     assert ane_patch._min_viable_gdn_fraction(_floor_gdn(2050, 10), 128) is None

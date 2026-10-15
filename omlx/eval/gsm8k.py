@@ -43,16 +43,23 @@ FEW_SHOT_EXAMPLES = [
 ]
 
 
+# A number, with optional thousands separators. The digit anchors at both
+# ends matter: ``[\d,]+`` alone also matches a bare comma, so punctuation
+# after the final digit ("the answer is 18, which is the total") became the
+# last "number" in the text and extraction returned an empty string.
+_NUMBER_PATTERN = r"-?\d(?:[\d,]*\d)?(?:\.\d+)?"
+
+
 def _extract_numeric_answer(text: str) -> str:
     """Extract the final numeric answer from a GSM8K-style response.
 
     Looks for #### pattern first, then falls back to the last number.
     """
-    match = re.search(r"####\s*(-?[\d,]+(?:\.\d+)?)", text)
+    match = re.search(rf"####\s*({_NUMBER_PATTERN})", text)
     if match:
         return match.group(1).replace(",", "")
 
-    numbers = re.findall(r"-?[\d,]+(?:\.\d+)?", text)
+    numbers = re.findall(_NUMBER_PATTERN, text)
     if numbers:
         return numbers[-1].replace(",", "")
 
