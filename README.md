@@ -344,6 +344,10 @@ omlx serve --model-dir ~/models --paged-ssd-cache-dir ~/.omlx/cache
 # Set in-memory hot cache size
 omlx serve --model-dir ~/models --hot-cache-max-size 20%
 
+# Let decision models (Clef) reuse the system prompt, images and state when
+# /v1/systemone requests repeat them with other questions (per model, default 0 = off)
+omlx serve --model-dir ~/models --decision-prefix-cache-max-size 512MB
+
 # Adjust max concurrent requests (default: 8)
 omlx serve --model-dir ~/models --max-concurrent-requests 16
 
