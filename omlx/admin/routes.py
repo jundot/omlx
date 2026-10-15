@@ -51,6 +51,13 @@ from ..engine.splash import (
     find_splash_binary,
     inspect_splash_binary,
 )
+from ..engine.sushi import (
+    SUSHI_INSTALL_HINT,
+    SUSHI_MODEL_TYPES,
+    SushiEngine,
+    find_sushi_binary,
+    inspect_sushi_binary,
+)
 from ..model_discovery import (
     REASONING_EFFORT_LEVELS,
     _is_hf_cache_mlx_compatible,
@@ -781,6 +788,14 @@ class GlobalSettingsRequest(BaseModel):
     splash_max_memory_gb: float | None = None
     splash_ssd_cache_gb: float | None = None
     splash_ane_prefill: bool | None = None
+    # Sushi (omlx/engine/sushi.py). An empty path means automatic detection.
+    sushi_path: str | None = None
+    sushi_ctx_size: int | None = None
+    sushi_kv_quant: str | None = None
+    sushi_prefix_cache_disk: str | None = None
+    sushi_prefix_cache_entries: int | None = None
+    sushi_prefix_cache_mem: str | None = None
+    sushi_extra_args: str | None = None
 
     # UI settings
     ui_language: str | None = None
@@ -953,7 +968,11 @@ def _dflash_compat_for_model(model_info: dict) -> tuple[bool, str]:
 
 
 def _external_engines_for_model(engine_pool, model_info: dict, settings) -> list[dict]:
-    """Each external engine and whether it can serve this model."""
+    """Each external engine and whether it can serve this model.
+
+    Sushi is listed only for the architectures it serves, so every other
+    model keeps the Splash-only list.
+    """
     if model_info.get("engine_type") not in ("batched", "vlm"):
         return []
     if model_info.get("is_helper"):
@@ -964,17 +983,28 @@ def _external_engines_for_model(engine_pool, model_info: dict, settings) -> list
         if target is None
         else None
     )
-    return [
+    options = [
         {
-            "id": engine_id,
-            "label": label,
+            "id": "splash",
+            "label": EXTERNAL_ENGINES["splash"],
             "compatible": target is not None,
             "reason": reason,
             # The draft the engine needs that a download provides.
             "draft_repo": draft_repo,
         }
-        for engine_id, label in EXTERNAL_ENGINES.items()
     ]
+    if model_info.get("config_model_type") in SUSHI_MODEL_TYPES:
+        target, reason = engine_pool.sushi_target(model_info["id"])
+        options.append(
+            {
+                "id": "sushi",
+                "label": EXTERNAL_ENGINES["sushi"],
+                "compatible": target is not None,
+                "reason": reason,
+                "draft_repo": None,
+            }
+        )
+    return options
 
 
 def _entry_is_diffusion_model(entry) -> bool:
@@ -3142,7 +3172,10 @@ async def update_model_settings(
                     status_code=400, detail=f"Unknown external engine: {engine_id}"
                 )
             target, reason = await asyncio.to_thread(
-                engine_pool.splash_target, model_id, current_settings
+                engine_pool.external_engine_target,
+                engine_id,
+                model_id,
+                current_settings,
             )
             if target is None:
                 raise HTTPException(status_code=400, detail=reason)
@@ -4538,6 +4571,40 @@ async def get_global_settings_defaults(is_admin: bool = Depends(require_admin)):
     return response
 
 
+def _sushi_status(global_settings) -> dict:
+    """The Sushi binary oMLX would run, and the models it serves now."""
+    binary, reason = find_sushi_binary(global_settings.integrations.sushi_path)
+    models = []
+    try:
+        engine_pool = _get_engine_pool() if _get_engine_pool is not None else None
+    except HTTPException:
+        engine_pool = None
+    entries = getattr(engine_pool, "_entries", None) or {}
+    for model_id, entry in list(entries.items()):
+        engine = getattr(entry, "engine", None)
+        if not isinstance(engine, SushiEngine):
+            continue
+        stats = engine.get_stats()
+        models.append(
+            {
+                "id": model_id,
+                "memory_bytes": stats["process_memory_bytes"],
+                "memory_budget_bytes": stats["memory_budget_bytes"],
+                "log_path": stats["log_path"],
+            }
+        )
+    return {
+        "available": binary is not None,
+        "path": str(binary.path) if binary else None,
+        "auto_detected": binary.auto_detected if binary else None,
+        "version": binary.version if binary else None,
+        "label": "Sushi",
+        "reason": reason,
+        "install_hint": SUSHI_INSTALL_HINT,
+        "models": models,
+    }
+
+
 def _splash_status(global_settings) -> dict:
     """The Splash launcher oMLX would run, and the models it serves now."""
     binary, reason = find_splash_binary(global_settings.integrations.splash_path)
@@ -4549,7 +4616,7 @@ def _splash_status(global_settings) -> dict:
     entries = getattr(engine_pool, "_entries", None) or {}
     for model_id, entry in list(entries.items()):
         engine = getattr(entry, "engine", None)
-        if not isinstance(engine, SplashEngine):
+        if not isinstance(engine, SplashEngine) or isinstance(engine, SushiEngine):
             continue
         stats = engine.get_stats()
         models.append(
@@ -4737,8 +4804,16 @@ def _global_settings_response(global_settings):
             "splash_max_memory_gb": global_settings.integrations.splash_max_memory_gb,
             "splash_ssd_cache_gb": global_settings.integrations.splash_ssd_cache_gb,
             "splash_ane_prefill": global_settings.integrations.splash_ane_prefill,
+            **{
+                key: value
+                for key, value in global_settings.integrations.to_dict().items()
+                if key.startswith("sushi_")
+            },
         },
-        "external_engines": {"splash": _splash_status(global_settings)},
+        "external_engines": {
+            "splash": _splash_status(global_settings),
+            "sushi": _sushi_status(global_settings),
+        },
         "system": {
             "total_memory_bytes": memory_info["total_bytes"],
             "total_memory": memory_info["total_formatted"],
@@ -5660,6 +5735,44 @@ async def update_global_settings(
             request.splash_ane_prefill
         )
         integrations_changed = True
+    if "sushi_path" in request.model_fields_set:
+        sushi_path = (request.sushi_path or "").strip() or None
+        if sushi_path and sushi_path != global_settings.integrations.sushi_path:
+            binary, reason = await asyncio.to_thread(
+                inspect_sushi_binary,
+                Path(sushi_path).expanduser(),
+                auto_detected=False,
+            )
+            if binary is None:
+                raise HTTPException(status_code=400, detail=reason)
+        global_settings.integrations.sushi_path = sushi_path
+        integrations_changed = True
+    if "sushi_ctx_size" in request.model_fields_set:
+        ctx = request.sushi_ctx_size
+        if ctx is not None and ctx <= 0:
+            raise HTTPException(status_code=400, detail="sushi_ctx_size must be > 0")
+        global_settings.integrations.sushi_ctx_size = ctx
+        integrations_changed = True
+    if "sushi_kv_quant" in request.model_fields_set:
+        kv = str(request.sushi_kv_quant or "8")
+        if kv not in ("8", "4", "16", "off"):
+            raise HTTPException(
+                status_code=400, detail="sushi_kv_quant must be one of 8, 4, 16, off"
+            )
+        global_settings.integrations.sushi_kv_quant = kv
+        integrations_changed = True
+    for field_name in (
+        "sushi_prefix_cache_disk",
+        "sushi_prefix_cache_entries",
+        "sushi_prefix_cache_mem",
+        "sushi_extra_args",
+    ):
+        if field_name in request.model_fields_set:
+            value = getattr(request, field_name)
+            if field_name == "sushi_extra_args":
+                value = value or ""
+            setattr(global_settings.integrations, field_name, value)
+            integrations_changed = True
     if "markitdown_enabled" in request.model_fields_set:
         global_settings.integrations.markitdown_enabled = bool(
             request.markitdown_enabled
