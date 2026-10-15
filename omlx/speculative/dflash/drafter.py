@@ -550,6 +550,11 @@ class DFlashDrafter:
             ]
         )
         self._cohort = _Cohort(uids=uids, keys=keys, values=values, pos=pos)
+        # The cohort now owns these rings; stale row copies retain the
+        # previous batch's buffers after the next ring write.
+        for uid in uids:
+            row = self._rows[uid]
+            row.keys = row.values = row.pos = None
         return self._cohort
 
     def _draft_batched(self, rows: Sequence[tuple], counts=None, commit=True):

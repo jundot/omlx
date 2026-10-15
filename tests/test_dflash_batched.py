@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -385,6 +386,30 @@ def test_release_detaches_rows_and_new_cohort_reuses_ring():
     _run_cycles(drafter, [{0: (1, 3), 5: (2, 4)}])
     assert drafter._cohort.uids == (0, 5)
     assert drafter.context_length(0) == 4 and drafter.context_length(5) == 2
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal allocator required")
+@pytest.mark.parametrize("remaining", [1, 8])
+def test_rebuilt_cohort_releases_detached_ring_buffers(remaining):
+    drafter = _tiny_drafter()
+    drafter._window_size = 2048
+    mx.synchronize()
+    gc.collect()
+    mx.clear_cache()
+    baseline = mx.get_active_memory()
+    _run_cycles(drafter, [{uid: (2, uid + 1) for uid in range(8)}])
+    drafter.release(range(remaining, 8))
+    # Shrink or reorder the cohort, then write its rings through a real forward.
+    _run_cycles(drafter, [{uid: (1, 3) for uid in reversed(range(remaining))}])
+    cohort = drafter._cohort
+    mx.eval(cohort.keys, cohort.values, cohort.pos)
+    mx.synchronize()
+    gc.collect()
+    mx.clear_cache()
+    retained = mx.get_active_memory() - baseline
+    logical = sum(x.nbytes for x in [*cohort.keys, *cohort.values, cohort.pos])
+    # Allow small captures/allocator alignment, not another set of KV rings.
+    assert retained <= logical + 128 * 1024, (retained, logical)
 
 
 def test_prefill_seed_binds_to_uid_and_window_slicing():
