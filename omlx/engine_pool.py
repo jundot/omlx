@@ -2773,7 +2773,10 @@ class EnginePool:
         raised unchanged. Losses that can never be recovered (a model that
         cannot fit at all, an unknown model) are never retried.
         ``model.swap_wait_timeout_seconds`` replaces the busy window when it
-        is greater than 0.
+        is greater than 0. Waiters are not queued: every retry runs admission
+        again, so a newer request can take memory that an older waiter was
+        waiting for. A client that disconnects while its request waits here
+        is not observed until the window ends.
 
         Args:
             model_id: The model ID to get engine for
@@ -2820,6 +2823,14 @@ class EnginePool:
                 return ready
             try:
                 async with self._lock:
+                    if self._shutting_down:
+                        # A waiter that wakes after shutdown() unloaded the
+                        # pool must not load a model again.
+                        raise ModelUnavailableError(
+                            model_id,
+                            f"Model '{model_id}' is unavailable: "
+                            "the engine pool is shutting down",
+                        )
                     return await self._admit_engine_locked(
                         model_id,
                         force_lm=force_lm,
@@ -3111,6 +3122,8 @@ class EnginePool:
             # phys_footprint residue, so the committed baseline applies (same
             # reason as the comment on the committed-baseline retest below).
             evicted_any = unloaded_for_admission or freed_since_start
+            # Only a local eviction can raise a lagging dynamic ceiling.
+            evicted_here = unloaded_for_admission
             ceiling_rechecks = 0
             while True:
                 # Consult the tracked accumulator alongside live memory:
@@ -3138,6 +3151,7 @@ class EnginePool:
                     )
                     await self._unload_engine(victim)
                     evicted_any = True
+                    evicted_here = True
                     continue
                 if projected <= ceiling:
                     # Above the soft target with nothing left to
@@ -3202,9 +3216,11 @@ class EnginePool:
                     break
 
                 # Retries wait outside the lock in get_engine, so they must
-                # not sleep under self._lock (lock convoy).
+                # not sleep under self._lock (lock convoy). A retry that just
+                # evicted a model still re-reads the ceiling, because the
+                # eviction is what makes the dynamic ceiling lag.
                 if (
-                    allow_ceiling_rechecks
+                    (allow_ceiling_rechecks or evicted_here)
                     and ceiling_rechecks < _ADMISSION_CEILING_RECHECKS
                     and self._dynamic_ceiling_binds()
                 ):

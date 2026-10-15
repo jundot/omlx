@@ -2970,32 +2970,21 @@ class TestCrossModelAdmissionRetry:
             await pool.get_engine("model-a")
             await pool.get_engine("model-b", _lease=True)
 
-            async def drain_competing_lease():
-                await asyncio.sleep(1.0)
-                await pool.release_engine("model-b")
-
-            drainer = asyncio.create_task(drain_competing_lease())
             waiter = asyncio.create_task(pool.get_engine("model-a", _lease=True))
             # Let the waiter take its first (refused) attempt and park.
             await asyncio.sleep(0.05)
             assert not waiter.done()
 
             # A model that needs the admission lock must still complete while
-            # the first request is parked between retries: the retry wait must
-            # not hold `self._lock` (holding it would park this load for the
-            # whole 1s the competing lease still has to drain).
-            started = time.monotonic()
+            # the first request is parked between retries. The competing lease
+            # drains only after model-c has loaded, so a retry wait that held
+            # `self._lock` would park this load until the timeout.
             loaded_c = await asyncio.wait_for(pool.get_engine("model-c"), timeout=5.0)
-            parked_elapsed = time.monotonic() - started
             assert loaded_c is engine_c
-            # Generous enough for an oversubscribed CI runner, still far below
-            # the 1s the competing lease has left to drain: if the retry wait
-            # held `self._lock`, this load would be parked for ~1s and fail.
-            assert parked_elapsed < 0.9
             assert not waiter.done()  # the lease has not drained yet
 
+            await pool.release_engine("model-b")
             loaded_a = await asyncio.wait_for(waiter, timeout=10.0)
-            await drainer
 
         assert loaded_a is engine_a
 
@@ -3256,6 +3245,89 @@ class TestCrossModelAdmissionRetry:
             engine = await asyncio.wait_for(waiter, timeout=5.0)
 
         assert engine is engine_a
+
+    @pytest.mark.asyncio
+    async def test_cancelled_waiter_leaves_no_state(self, retry_pool):
+        """Cancelling a request parked between retries releases the lock and
+        leaves lease counts unchanged."""
+        pool = retry_pool
+        self._add_small_model(pool, "model-c")
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=self._mock_engine()):
+            await pool.get_engine("model-b", _lease=True)
+            waiter = asyncio.create_task(pool.get_engine("model-a", _lease=True))
+            await asyncio.sleep(0.15)
+            assert not waiter.done()
+
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+
+            assert not pool._lock.locked()
+            assert pool._entries["model-a"].in_use == 0
+            assert pool._entries["model-a"].engine is None
+            assert pool._entries["model-b"].in_use == 1
+            await asyncio.wait_for(pool.get_engine("model-c"), timeout=5.0)
+            await pool.release_engine("model-b")
+
+    @pytest.mark.asyncio
+    async def test_waiter_does_not_load_after_shutdown(self, retry_pool):
+        """A request parked between retries must not load a model once
+        shutdown() has unloaded the pool."""
+        pool = retry_pool
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=self._mock_engine()),
+            patch("omlx.engine_pool.shutdown_mlx_executor"),
+        ):
+            await pool.get_engine("model-b", _lease=True)
+            waiter = asyncio.create_task(pool.get_engine("model-a", _lease=True))
+            await asyncio.sleep(0.15)
+            assert not waiter.done()
+
+            pool._entries["model-b"].in_use = 0
+            await pool.shutdown()
+            with pytest.raises(ModelUnavailableError):
+                await asyncio.wait_for(waiter, timeout=5.0)
+
+        assert pool._entries["model-a"].engine is None
+        assert pool._entries["model-b"].engine is None
+
+    @pytest.mark.asyncio
+    async def test_retry_that_evicts_still_rechecks_ceiling(
+        self, retry_pool, monkeypatch
+    ):
+        """A retry attempt skips the ceiling rechecks only when it evicted
+        nothing: after its own eviction the dynamic ceiling can read low."""
+        pool = retry_pool
+        self._add_small_model(pool, "model-c")
+        pool._entries["model-c"].is_pinned = True
+        monkeypatch.setattr(pool, "_dynamic_ceiling_binds", lambda: True)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_CEILING_RECHECK_S", 0)
+        engine_a = self._mock_engine()
+
+        def create_engine(*args, **kwargs):
+            name = str(kwargs.get("model_name", args[0] if args else ""))
+            return engine_a if "model-a" in name else self._mock_engine()
+
+        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+            await pool.get_engine("model-c")
+            await pool.get_engine("model-b")
+            # The ceiling reads low until model-b is gone, then recovers.
+            pool._get_final_ceiling = lambda: (
+                1100 if pool._entries["model-b"].engine is not None else 2500
+            )
+            async with pool._lock:
+                engine = await pool._admit_engine_locked(
+                    "model-a",
+                    force_lm=False,
+                    _lease=False,
+                    runtime_settings=None,
+                    allow_ceiling_rechecks=False,
+                )
+
+        assert engine is engine_a
+        assert pool._entries["model-b"].engine is None
 
     @pytest.mark.asyncio
     async def test_busy_pinned_only_blocker_fails_fast(self, retry_pool, monkeypatch):
