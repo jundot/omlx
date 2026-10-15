@@ -983,6 +983,26 @@ def _gemma4_global_kv_from_per_layer_config(config: dict) -> dict[str, int]:
 
 
 @contextlib.contextmanager
+def _preserve_gemma4_unified_image_processor_on_load(model_dir: Path):
+    """Keep the gemma4_unified image processor built from processor_config.json.
+
+    mlx-vlm's load() replaces it with a default one, dropping max_soft_tokens.
+    """
+    if _read_config_model_type(str(model_dir)) != "gemma4_unified":
+        yield
+        return
+
+    import mlx_vlm.utils as _vu
+
+    original = _vu.load_image_processor
+    _vu.load_image_processor = lambda *args, **kwargs: None
+    try:
+        yield
+    finally:
+        _vu.load_image_processor = original
+
+
+@contextlib.contextmanager
 def _derive_gemma4_global_kv_on_load(model_dir: Path):
     """Feed ``per_layer_config``-only Gemma4 head overrides to the mlx-vlm loader.
 
@@ -2097,6 +2117,9 @@ class VLMBatchedEngine(BaseEngine):
                 _strip_vision_config_if_orphaned(Path(self._model_name)),
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
                 _derive_gemma4_global_kv_on_load(Path(self._model_name)),
+                _preserve_gemma4_unified_image_processor_on_load(
+                    Path(self._model_name)
+                ),
                 _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
                 _force_qwen4_exp_sanitize_on_load(Path(self._model_name)),
                 _remap_nested_visual_on_load(Path(self._model_name)),
