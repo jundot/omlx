@@ -3444,8 +3444,8 @@ async def update_model_settings(
     _validate_model_settings(entry, current_settings.to_dict())
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
-        # Also update the engine pool entry
-        entry.is_pinned = request.is_pinned
+        # Also update the engine pool entry (wakes exclusive_group waiters)
+        engine_pool.set_pinned(model_id, request.is_pinned)
     if request.is_default is not None:
         current_settings.is_default = request.is_default
         if server_state:

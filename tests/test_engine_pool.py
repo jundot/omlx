@@ -3553,19 +3553,16 @@ class TestExclusiveGroup:
     ):
         groups: dict[str, str] = {}
         pool = self._pool(small_mock_model_dir, monkeypatch, groups)
-        model_c = small_mock_model_dir / "model-c"
-        model_c.mkdir()
-        (model_c / "config.json").write_text(json.dumps({"model_type": "llama"}))
-        (model_c / "model.safetensors").write_bytes(b"0" * 50)
-        pool.discover_models(str(small_mock_model_dir))
+        self._add_model_c(small_mock_model_dir, pool)
         unloaded: list[tuple[str, int]] = []
         original_unload = pool._unload_engine
 
         async def unload_with_lease(mid, **kwargs):
             unloaded.append((mid, pool._entries[mid].in_use))
             if mid == "model-a":
-                # A request for model-b takes the fast path while A unloads.
-                assert pool._acquire_loaded_engine("model-b", False, True, None)
+                # Drain marks keep the fast path off the remaining members
+                # while A unloads, so no lease can start on model-b.
+                assert pool._acquire_loaded_engine("model-b", False, True, None) is None
             await original_unload(mid, **kwargs)
 
         with patch(
@@ -3576,16 +3573,13 @@ class TestExclusiveGroup:
             await pool.get_engine("model-b")
             groups.update({"model-a": "g", "model-b": "g", "model-c": "g"})
             pool._unload_engine = unload_with_lease
-            waiter = asyncio.create_task(pool.get_engine("model-c"))
-            await asyncio.sleep(0.15)
-            assert not waiter.done()
-            assert pool._entries["model-b"].engine is not None
-            await pool.release_engine("model-b")
-            await asyncio.wait_for(waiter, timeout=5.0)
+            await asyncio.wait_for(pool.get_engine("model-c"), timeout=5.0)
 
+        assert [mid for mid, _ in unloaded] == ["model-a", "model-b"]
         assert all(in_use == 0 for _, in_use in unloaded)
         assert pool._entries["model-b"].engine is None
         assert pool._entries["model-c"].engine is not None
+        assert pool._entries["model-b"].drain_ticket is None
 
     @pytest.mark.asyncio
     async def test_busy_member_timeout_raises_busy_409(
@@ -3725,6 +3719,369 @@ class TestExclusiveGroup:
         pool = _make_pool()
         pool._settings_manager = MagicMock()
         assert pool._exclusive_group_for("model-a") is None
+
+    # ---- draining (#1855) -------------------------------------------------
+
+    @staticmethod
+    def _add_model_c(model_dir, pool):
+        model_c = model_dir / "model-c"
+        model_c.mkdir()
+        (model_c / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (model_c / "model.safetensors").write_bytes(b"0" * 50)
+        pool.discover_models(str(model_dir))
+
+    def _engines(self):
+        return patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        )
+
+    @staticmethod
+    async def _stop(*tasks):
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_draining_member_refuses_new_fast_path_lease(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        with self._engines():
+            await pool.get_engine("model-a", _lease=True)
+            waiter = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.1)
+            try:
+                assert pool._acquire_loaded_engine("model-a", False, True, None) is None
+                status = {m["id"]: m for m in pool.get_status()["models"]}
+                assert status["model-a"]["draining"] is True
+                assert status["model-b"]["exclusive_waiters"] == 1
+                entry = pool._entries["model-a"]
+                assert entry.pending_unload_reason is None
+                assert pool.is_abort_requested("model-a") is False
+                assert pool._find_pending_unload_ready_locked() is None
+            finally:
+                await self._stop(waiter)
+
+    @pytest.mark.asyncio
+    async def test_new_a_request_queues_behind_b_then_swaps_back(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 5.0)
+        order: list[str] = []
+        with self._engines():
+            await pool.get_engine("model-a", _lease=True)
+
+            async def request_b():
+                engine = await pool.get_engine("model-b")
+                order.append("b")
+                assert pool._entries["model-a"].engine is None
+                return engine
+
+            async def request_a2():
+                engine = await pool.get_engine("model-a", _lease=True)
+                order.append("a2")
+                return engine
+
+            task_b = asyncio.create_task(request_b())
+            await asyncio.sleep(0.05)
+            task_a2 = asyncio.create_task(request_a2())
+            await asyncio.sleep(0.2)
+            assert not task_a2.done()
+            await pool.release_engine("model-a")
+            await asyncio.wait_for(task_b, timeout=5.0)
+            await asyncio.wait_for(task_a2, timeout=5.0)
+        assert order == ["b", "a2"]
+        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-b"].engine is None
+
+    @pytest.mark.asyncio
+    async def test_overlapping_a_traffic_does_not_starve_b(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 1.0)
+
+        async def a_request():
+            try:
+                await pool.get_engine("model-a", _lease=True)
+            except ModelBusyError:
+                return
+            await asyncio.sleep(0.2)
+            await pool.release_engine("model-a")
+
+        with self._engines():
+            await pool.get_engine("model-a", _lease=True)
+            a_tasks: list[asyncio.Task] = []
+
+            async def traffic():
+                for _ in range(30):
+                    a_tasks.append(asyncio.create_task(a_request()))
+                    await asyncio.sleep(0.05)
+
+            gen = asyncio.create_task(traffic())
+            await asyncio.sleep(0.1)
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.15)
+            await pool.release_engine("model-a")
+            started = time.monotonic()
+            try:
+                engine = await asyncio.wait_for(task_b, timeout=3.0)
+                elapsed = time.monotonic() - started
+            finally:
+                await self._stop(gen)
+                await asyncio.gather(*a_tasks, return_exceptions=True)
+        assert engine is not None
+        assert elapsed < 1.0
+        assert pool.is_abort_requested("model-a") is False
+
+    @pytest.mark.asyncio
+    async def test_b_timeout_clears_drain_and_releases_queued_a(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 0.3)
+        with self._engines():
+            engine_a = await pool.get_engine("model-a", _lease=True)
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.1)
+            task_a2 = asyncio.create_task(pool.get_engine("model-a", _lease=True))
+            await asyncio.sleep(0.1)
+            assert not task_a2.done()
+            with pytest.raises(ModelBusyError):
+                await task_b
+            assert await asyncio.wait_for(task_a2, timeout=0.4) is engine_a
+        status = {m["id"]: m for m in pool.get_status()["models"]}
+        assert status["model-a"]["draining"] is False
+        assert pool._entries["model-a"].drain_ticket is None
+        assert pool._group_queues == {}
+        assert pool._entries["model-a"].engine is engine_a
+
+    @pytest.mark.asyncio
+    async def test_only_head_ticket_runs_admission(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g", "model-c": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        self._add_model_c(small_mock_model_dir, pool)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 5.0)
+        admitted: list[str] = []
+        original = pool._admit_engine_locked
+
+        async def spy(model_id, **kwargs):
+            admitted.append(model_id)
+            return await original(model_id, **kwargs)
+
+        with self._engines():
+            await pool.get_engine("model-a", _lease=True)
+            pool._admit_engine_locked = spy
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.05)
+            task_c = asyncio.create_task(pool.get_engine("model-c"))
+            await asyncio.sleep(0.5)
+            try:
+                assert "model-b" in admitted
+                assert "model-c" not in admitted
+                await pool.release_engine("model-a")
+                await asyncio.wait_for(task_b, timeout=5.0)
+                await asyncio.wait_for(task_c, timeout=5.0)
+            finally:
+                await self._stop(task_b, task_c)
+        assert pool._entries["model-c"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_cancelled_head_clears_drain(self, small_mock_model_dir, monkeypatch):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        with self._engines():
+            await pool.get_engine("model-a", _lease=True)
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.1)
+            assert pool._acquire_loaded_engine("model-a", False, False, None) is None
+            task_b.cancel()
+            await asyncio.gather(task_b, return_exceptions=True)
+            engine = pool._acquire_loaded_engine("model-a", False, False, None)
+        assert engine is pool._entries["model-a"].engine
+        assert pool._group_queues == {}
+
+    @pytest.mark.asyncio
+    async def test_pin_drained_member_mid_wait_serves_queued_requests(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 5.0)
+        with self._engines():
+            engine_a = await pool.get_engine("model-a", _lease=True)
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.05)
+            task_a2 = asyncio.create_task(pool.get_engine("model-a", _lease=True))
+            await asyncio.sleep(0.1)
+            try:
+                assert not task_a2.done()
+                pool.set_pinned("model-a", True)
+                assert await asyncio.wait_for(task_a2, timeout=0.5) is engine_a
+                await asyncio.wait_for(task_b, timeout=2.0)
+            finally:
+                await self._stop(task_b, task_a2)
+        assert pool._entries["model-a"].engine is engine_a
+        assert pool._entries["model-b"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_pin_waiter_mid_wait_drops_ticket(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 5.0)
+        with self._engines():
+            await pool.get_engine("model-a", _lease=True)
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.1)
+            try:
+                assert pool._entries["model-a"].drain_ticket is not None
+                pool.set_pinned("model-b", True)
+                await asyncio.wait_for(task_b, timeout=1.0)
+            finally:
+                await self._stop(task_b)
+        assert pool._group_queues == {}
+        assert pool._entries["model-a"].drain_ticket is None
+        assert pool._entries["model-a"].engine is not None
+        assert pool._entries["model-b"].engine is not None
+
+    @pytest.mark.asyncio
+    async def test_group_change_of_drained_member_mid_wait(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 5.0)
+        with self._engines():
+            engine_a = await pool.get_engine("model-a", _lease=True)
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.05)
+            task_a2 = asyncio.create_task(pool.get_engine("model-a", _lease=True))
+            await asyncio.sleep(0.1)
+            try:
+                assert not task_a2.done()
+                groups["model-a"] = None
+                assert await asyncio.wait_for(task_a2, timeout=1.0) is engine_a
+                await asyncio.wait_for(task_b, timeout=2.0)
+            finally:
+                await self._stop(task_b, task_a2)
+        assert pool._entries["model-a"].engine is engine_a
+
+    @pytest.mark.asyncio
+    async def test_release_of_drained_lease_wakes_head_promptly(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 10.0)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_INITIAL_DELAY_S", 5.0)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_MAX_DELAY_S", 5.0)
+        with self._engines():
+            await pool.get_engine("model-a", _lease=True)
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.3)
+            released = time.monotonic()
+            await pool.release_engine("model-a")
+            try:
+                await asyncio.wait_for(task_b, timeout=10.0)
+                elapsed = time.monotonic() - released
+            finally:
+                await self._stop(task_b)
+        assert elapsed < 0.5
+
+    @pytest.mark.asyncio
+    async def test_shutdown_wakes_group_waiters(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 10.0)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_INITIAL_DELAY_S", 5.0)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_MAX_DELAY_S", 5.0)
+        with self._engines():
+            await pool.get_engine("model-a", _lease=True)
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.05)
+            task_a2 = asyncio.create_task(pool.get_engine("model-a", _lease=True))
+            await asyncio.sleep(0.1)
+            assert not task_a2.done()
+            started = time.monotonic()
+            try:
+                await pool.shutdown()
+                results = await asyncio.wait_for(
+                    asyncio.gather(task_b, task_a2, return_exceptions=True),
+                    timeout=10.0,
+                )
+                elapsed = time.monotonic() - started
+            finally:
+                await self._stop(task_b, task_a2)
+        assert all(isinstance(r, ModelUnavailableError) for r in results)
+        assert elapsed < 0.5
+        assert pool._group_queues == {}
+        assert all(e.drain_ticket is None for e in pool._entries.values())
+
+    @pytest.mark.asyncio
+    async def test_queued_waiter_times_out_with_busy_and_leaves_head_intact(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g", "model-c": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        self._add_model_c(small_mock_model_dir, pool)
+        with self._engines():
+            await pool.get_engine("model-a", _lease=True)
+            pool.configure_swap_wait_timeout(0.6)
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.05)
+            pool.configure_swap_wait_timeout(0.15)
+            started = time.monotonic()
+            try:
+                with pytest.raises(ModelBusyError) as exc_info:
+                    await pool.get_engine("model-c")
+                elapsed = time.monotonic() - started
+                assert "queued behind 'model-b'" in str(exc_info.value)
+                assert elapsed >= 0.15
+                assert not task_b.done()
+                assert pool._group_queues["g"][0].model_id == "model-b"
+                assert pool._drain_blocks(pool._entries["model-a"])
+            finally:
+                await asyncio.gather(task_b, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_admin_unload_of_drained_member_wakes_head(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups = {"model-a": "g", "model-b": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 10.0)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_INITIAL_DELAY_S", 5.0)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_MAX_DELAY_S", 5.0)
+        with self._engines():
+            await pool.get_engine("model-a", _lease=True)
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.2)
+            # MagicMock engines look like they still have scheduler work.
+            pool._entry_has_scheduler_work = lambda entry: False
+            assert not await pool.request_unload("model-a", abort_active=False)
+            released = time.monotonic()
+            await pool.release_engine("model-a")
+            try:
+                await asyncio.wait_for(task_b, timeout=10.0)
+                elapsed = time.monotonic() - released
+            finally:
+                await self._stop(task_b)
+        assert elapsed < 0.5
+        assert pool._entries["model-a"].drain_ticket is None
+        assert pool._entries["model-a"].engine is None
 
 
 class TestAdmissionSoftTargetEviction:

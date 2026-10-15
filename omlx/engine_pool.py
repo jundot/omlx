@@ -20,9 +20,9 @@ import json
 import logging
 import random
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -213,6 +213,24 @@ class _AdmissionNeverFitsError(InsufficientMemoryError):
 
 class _ExclusiveGroupBusyError(ModelBusyError):
     """A same-group model is busy; the PR1 retry loop waits for it."""
+
+
+class _GroupQueued(_ExclusiveGroupBusyError):
+    """The request waits in the FIFO of its exclusive group (not the head)."""
+
+
+@dataclass(eq=False)
+class _GroupTicket:
+    """One waiter in an exclusive group's FIFO (identity semantics).
+
+    Only the head ticket of a group's queue runs admission and sets drain
+    marks. ``drained`` lists the members this ticket marked.
+    """
+
+    model_id: str
+    group: str
+    queued: bool = False
+    drained: set[str] = field(default_factory=set)
 
 
 def _positive_int(value: object) -> int:
@@ -459,6 +477,9 @@ class EngineEntry:
     load_failed: bool = False  # Sticky until the next discovery refresh
     load_failure_message: str | None = None
     load_failure_at: float | None = None
+    # Set while a waiter of the same exclusive group drains this model: new
+    # requests queue behind that waiter instead of taking a lease.
+    drain_ticket: _GroupTicket | None = None
 
 
 class EnginePool:
@@ -526,6 +547,10 @@ class EnginePool:
         self._failed_load_reclaim_tasks: set[asyncio.Task[None]] = set()
         self._failed_load_reclaim_task: asyncio.Task[None] | None = None
         self._shutting_down = False
+        # Exclusive-group draining: FIFO of waiter tickets per group, and one
+        # event that is replaced on every notify (see _notify_exclusive_waiters).
+        self._group_queues: dict[str, deque[_GroupTicket]] = {}
+        self._group_wake: asyncio.Event = asyncio.Event()
         # Last logged forced-offload state per (model_id, kind, scope).
         self._offload_warn_state: dict[tuple[str, str, str], bool] = {}
         # Requests parked in the get_engine admission retry loop, per model.
@@ -2025,6 +2050,7 @@ class EnginePool:
         if entry is None:
             return False
         entry.is_pinned = pinned
+        self._notify_exclusive_waiters()
         return True
 
     def _case_insensitive_entry_match(self, name: str) -> str | None:
@@ -2734,6 +2760,7 @@ class EnginePool:
             or entry.is_loading
             or entry.pending_unload_reason
             or model_id in self._unloading_models
+            or (entry.drain_ticket is not None and self._drain_blocks(entry))
             or (force_lm and isinstance(entry.engine, VLMBatchedEngine))
             or (reload_failed and self._runtime_failed_engine(entry.engine))
         ):
@@ -2790,9 +2817,12 @@ class EnginePool:
         raised unchanged. Losses that can never be recovered (a model that
         cannot fit at all, an unknown model) are never retried.
         ``model.swap_wait_timeout_seconds`` replaces the busy window when it
-        is greater than 0. Waiters are not queued: every retry runs admission
-        again, so a newer request can take memory that an older waiter was
-        waiting for. A client that disconnects while its request waits here
+        is greater than 0. Waiters of an exclusive_group are queued in FIFO
+        order and drain busy members (see ``_enforce_exclusive_group_locked``).
+        Other waiters are not queued: every retry runs admission again, so a
+        newer request can take memory that an older waiter was waiting for.
+        A request that holds a lease on a group member and then requests
+        another member of the same group waits until its swap window ends. A client that disconnects while its request waits here
         is not observed until the window ends.
 
         Args:
@@ -2832,6 +2862,7 @@ class EnginePool:
         retrying = False
         attempt = 0
         unload_epoch = self._unload_epoch
+        ticket: _GroupTicket | None = None
         try:
             while True:
                 ready = self._acquire_loaded_engine(
@@ -2839,6 +2870,7 @@ class EnginePool:
                 )
                 if ready is not None:
                     return ready
+                ev = self._group_wake
                 try:
                     async with self._lock:
                         if self._shutting_down:
@@ -2849,6 +2881,24 @@ class EnginePool:
                                 f"Model '{model_id}' is unavailable: "
                                 "the engine pool is shutting down",
                             )
+                        ev = self._group_wake
+                        group = self._queue_group_locked(model_id)
+                        if ticket is not None and ticket.group != group:
+                            # Pin or group change during the wait.
+                            self._release_ticket(ticket)
+                            ticket = None
+                        if group is not None:
+                            queue = self._group_queues.get(group)
+                            if ticket is None:
+                                ticket = _GroupTicket(model_id, group)
+                            if queue and queue[0] is not ticket:
+                                self._enqueue_ticket(ticket)
+                                raise _GroupQueued(
+                                    model_id,
+                                    f"start work while exclusive group '{group}' "
+                                    f"is swapping (queued behind "
+                                    f"'{queue[0].model_id}')",
+                                )
                         return await self._admit_engine_locked(
                             model_id,
                             force_lm=force_lm,
@@ -2857,19 +2907,32 @@ class EnginePool:
                             reload_failed=reload_failed,
                             allow_ceiling_rechecks=(attempt == 0),
                             freed_since_start=(self._unload_epoch != unload_epoch),
+                            group_ticket=ticket,
                         )
                 except _AdmissionNeverFitsError:
                     raise
                 except (InsufficientMemoryError, _ExclusiveGroupBusyError) as exc:
                     attempt += 1
-                    # Bounded retry (#1970). The refusal above was decided with the
-                    # lock held, so the wait below happens only after the lock is
-                    # released: sleeping under ``self._lock`` would serialize every
-                    # other model behind this one request and reintroduce the stall
-                    # this retry exists to remove. Re-acquiring the lock per attempt
-                    # also means a competing load that finished while we waited is
-                    # observed on the next pass.
-                    if not await self._admission_retry_worthwhile(
+                    # Bounded retry (#1970). The refusal above was decided with
+                    # the lock held, so the wait below happens only after the
+                    # lock is released: sleeping under ``self._lock`` would
+                    # serialize every other model behind this one request.
+                    # Re-acquiring the lock per attempt also means a competing
+                    # load that finished while we waited is observed next pass.
+                    queued = ticket is not None and ticket.queued
+                    is_head = queued and self._is_group_head(ticket)
+                    if queued and not is_head:
+                        # Only the head knows what it waits for. A queued
+                        # waiter waits for its turn, bounded by its own window.
+                        if self._shutting_down:
+                            raise ModelUnavailableError(
+                                model_id,
+                                f"Model '{model_id}' is unavailable: "
+                                "the engine pool is shutting down",
+                            ) from exc
+                        if time.monotonic() >= busy_deadline:
+                            raise
+                    elif not await self._admission_retry_worthwhile(
                         model_id, deadline, busy_deadline
                     ):
                         raise
@@ -2889,6 +2952,17 @@ class EnginePool:
                             busy_s,
                             exc,
                         )
+                    if queued:
+                        now = time.monotonic()
+                        # The head waits up to the full budget only for a load
+                        # or unload in flight; a busy member caps it earlier.
+                        limit = busy_deadline if now < busy_deadline else deadline
+                        remaining = limit - now
+                        with suppress(asyncio.TimeoutError):
+                            await asyncio.wait_for(
+                                ev.wait(), timeout=max(0.01, min(0.25, remaining))
+                            )
+                        continue
                     wait = delay * (
                         1.0
                         + random.uniform(
@@ -2896,10 +2970,12 @@ class EnginePool:
                         )
                     )
                     delay = min(delay * 2.0, _ADMISSION_RETRY_MAX_DELAY_S)
-                    # Floor the sleep so tuning the constants to zero cannot turn
-                    # the retry loop into a hot spin.
+                    # Floor the sleep so tuning the constants to zero cannot
+                    # turn the retry loop into a hot spin.
                     await asyncio.sleep(max(0.01, wait))
         finally:
+            if ticket is not None:
+                self._release_ticket(ticket)
             if retrying:
                 left = self._swap_waiting.get(model_id, 0) - 1
                 if left > 0:
@@ -2982,6 +3058,7 @@ class EnginePool:
         reload_failed: bool = False,
         allow_ceiling_rechecks: bool = True,
         freed_since_start: bool = False,
+        group_ticket: _GroupTicket | None = None,
     ) -> (
         BaseEngine
         | EmbeddingEngine
@@ -3155,7 +3232,7 @@ class EnginePool:
                 admission_kind=admission_kind,
             )
 
-        if await self._enforce_exclusive_group_locked(model_id, entry):
+        if await self._enforce_exclusive_group_locked(model_id, entry, group_ticket):
             unloaded_for_admission = True
 
         if ceiling > 0:
@@ -3366,8 +3443,75 @@ class EnginePool:
         group = getattr(get_settings(model_id), "exclusive_group", None)
         return group if isinstance(group, str) and group else None
 
+    def _queue_group_locked(self, model_id: str) -> str | None:
+        """Group whose FIFO applies to ``model_id``, or None.
+
+        Same skip rules as ``_enforce_exclusive_group_locked``: pinned,
+        distributed, unknown and ungrouped models never queue.
+        """
+        entry = self._entries.get(model_id)
+        if (
+            entry is None
+            or entry.is_pinned
+            or self._distributed_deployment_for_entry(entry) is not None
+        ):
+            return None
+        return self._exclusive_group_for(model_id)
+
+    def _drain_blocks(self, entry: EngineEntry) -> bool:
+        """Whether a live drain mark keeps new requests off ``entry``.
+
+        Re-read on every call, so a pin or group change cancels the drain.
+        """
+        t = entry.drain_ticket
+        return (
+            t is not None
+            and t.queued
+            and not entry.is_pinned
+            and self._exclusive_group_for(entry.model_id) == t.group
+        )
+
+    def _is_group_head(self, ticket: _GroupTicket) -> bool:
+        queue = self._group_queues.get(ticket.group)
+        return bool(queue) and queue[0] is ticket
+
+    def _enqueue_ticket(self, ticket: _GroupTicket) -> None:
+        if not ticket.queued:
+            self._group_queues.setdefault(ticket.group, deque()).append(ticket)
+            ticket.queued = True
+
+    def _release_ticket(self, ticket: _GroupTicket) -> None:
+        """Leave the FIFO, clear this ticket's drain marks, wake the waiters.
+
+        Synchronous: no lock and no await, so it is safe in a ``finally``.
+        """
+        was_queued = ticket.queued
+        queue = self._group_queues.get(ticket.group)
+        if queue is not None:
+            with suppress(ValueError):
+                queue.remove(ticket)
+            if not queue:
+                del self._group_queues[ticket.group]
+        ticket.queued = False
+        for mid in ticket.drained:
+            other = self._entries.get(mid)
+            if other is not None and other.drain_ticket is ticket:
+                other.drain_ticket = None
+        had_marks = bool(ticket.drained)
+        ticket.drained.clear()
+        if was_queued or had_marks:
+            self._notify_exclusive_waiters()
+
+    def _notify_exclusive_waiters(self) -> None:
+        ev = self._group_wake
+        self._group_wake = asyncio.Event()
+        ev.set()
+
     async def _enforce_exclusive_group_locked(
-        self, model_id: str, entry: EngineEntry
+        self,
+        model_id: str,
+        entry: EngineEntry,
+        ticket: _GroupTicket | None = None,
     ) -> bool:
         """Unload idle same-group models before ``model_id`` loads.
 
@@ -3376,10 +3520,11 @@ class EnginePool:
         Pinned models and distributed deployments ignore groups. Returns True
         when a model was unloaded.
 
-        The group applies at load time only. Requests for a resident member
-        use the lock-free fast path, so a member that gets steady traffic can
-        keep a waiting member out until its wait window ends. Traffic that
-        alternates between members swaps them on every request.
+        With a ``ticket`` the waiter becomes the head of the group's FIFO and
+        marks every member as draining before it checks if the member is busy.
+        New requests for a draining member queue behind the waiter, the
+        member finishes its in-flight work, and then it is unloaded.
+        Traffic that alternates between members swaps them on every request.
         """
         if (
             entry.is_pinned
@@ -3406,6 +3551,19 @@ class EnginePool:
                 )
                 continue
             members.append(mid)
+
+        if ticket is not None:
+            for mid in list(ticket.drained):
+                if mid not in members:
+                    other = self._entries.get(mid)
+                    if other is not None and other.drain_ticket is ticket:
+                        other.drain_ticket = None
+                    ticket.drained.discard(mid)
+            if members:
+                self._enqueue_ticket(ticket)
+                for mid in members:
+                    self._entries[mid].drain_ticket = ticket
+                    ticket.drained.add(mid)
 
         def raise_if_busy(mid: str) -> None:
             other = self._entries[mid]
@@ -3499,6 +3657,8 @@ class EnginePool:
             if entry.in_use > 0:
                 entry.in_use -= 1
                 entry.last_access = time.time()
+            if entry.drain_ticket is not None:
+                self._notify_exclusive_waiters()
             return
         async with self._lock:
             e = self._entries.get(model_id)
@@ -4158,6 +4318,10 @@ class EnginePool:
             task.result()
         finally:
             self._unloading_models.discard(model_id)
+            unloaded = self._entries.get(model_id)
+            if unloaded is not None:
+                unloaded.drain_ticket = None
+            self._notify_exclusive_waiters()
         if cancelled:
             raise asyncio.CancelledError
 
@@ -5157,6 +5321,7 @@ class EnginePool:
     async def shutdown(self) -> None:
         """Shutdown all engines gracefully."""
         self._shutting_down = True
+        self._notify_exclusive_waiters()
         await self._stop_gpu_keep_warm()
         reclaim_tasks = tuple(self._failed_load_reclaim_tasks)
         for task in reclaim_tasks:
@@ -5233,6 +5398,13 @@ class EnginePool:
                     "model_format": e.model_format,
                     "source_path": e.source_path,
                     "last_access": e.last_access if e.last_access > 0 else None,
+                    "draining": self._drain_blocks(e),
+                    "exclusive_waiters": sum(
+                        1
+                        for queue in self._group_queues.values()
+                        for t in queue
+                        if t.model_id == mid
+                    ),
                 }
             )
         return {
