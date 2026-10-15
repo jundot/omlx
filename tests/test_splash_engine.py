@@ -121,9 +121,9 @@ def _binary(version="1.3.1", path="/opt/homebrew/bin/splash") -> SplashBinary:
     return SplashBinary(Path(path), version, auto_detected=True)
 
 
-def _engine(tmp_path, **options) -> SplashEngine:
+def _engine(tmp_path, version="1.3.1", **options) -> SplashEngine:
     model = tmp_path / "models" / "Qwen3.8-27B-4bit"
-    target = SplashTarget(_binary(), "Qwen3.8-27B", tmp_path / "draft")
+    target = SplashTarget(_binary(version), "Qwen3.8-27B", tmp_path / "draft")
     return SplashEngine(
         model_name=str(model),
         model_id="Qwen3.8-27B-4bit",
@@ -452,6 +452,34 @@ class TestRequestTranslation:
         assert body["response_format"] == {"type": "json_object"}
         assert body["seed"] == 7
         assert "stop" not in body
+
+    def _body_with(self, tmp_path, version, kwargs):
+        return _engine(tmp_path, version=version)._request_body(
+            max_tokens=100,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=0,
+            min_p=0.0,
+            repetition_penalty=1.0,
+            presence_penalty=0.0,
+            kwargs=kwargs,
+        )
+
+    def test_request_body_passes_the_thinking_budget(self, tmp_path):
+        body = self._body_with(tmp_path, "1.3.2", {"thinking_budget": 4096})
+
+        assert body["thinking_token_budget"] == 4096
+
+    def test_request_body_leaves_an_unset_budget_to_splash(self, tmp_path):
+        body = self._body_with(tmp_path, "1.3.2", {"thinking_budget": None})
+
+        assert "thinking_token_budget" not in body
+
+    def test_splash_before_1_3_2_gets_no_budget_field(self, tmp_path):
+        # thinking_token_budget arrived in Splash 1.3.2.
+        body = self._body_with(tmp_path, "1.3.1", {"thinking_budget": 4096})
+
+        assert "thinking_token_budget" not in body
 
 
 # -- streaming -------------------------------------------------------------------
