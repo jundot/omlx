@@ -205,6 +205,10 @@ _ADMISSION_RETRY_BUSY_GRACE_S = 10.0
 _ADMISSION_RETRY_INITIAL_DELAY_S = 0.05
 _ADMISSION_RETRY_MAX_DELAY_S = 0.5
 _ADMISSION_RETRY_JITTER = 0.25  # ±25% per wait
+# A queued exclusive_group waiter wakes on _notify_exclusive_waiters. This poll
+# cap is only a fallback for state changes that do not notify (for example a
+# pin change from discovery refresh).
+_GROUP_WAIT_POLL_S = 0.25
 
 
 class _AdmissionNeverFitsError(InsufficientMemoryError):
@@ -2822,8 +2826,9 @@ class EnginePool:
         Other waiters are not queued: every retry runs admission again, so a
         newer request can take memory that an older waiter was waiting for.
         A request that holds a lease on a group member and then requests
-        another member of the same group waits until its swap window ends. A client that disconnects while its request waits here
-        is not observed until the window ends.
+        another member of the same group waits until its swap window ends.
+        A client that disconnects while its request waits here is not
+        observed until the window ends.
 
         Args:
             model_id: The model ID to get engine for
@@ -2960,7 +2965,8 @@ class EnginePool:
                         remaining = limit - now
                         with suppress(asyncio.TimeoutError):
                             await asyncio.wait_for(
-                                ev.wait(), timeout=max(0.01, min(0.25, remaining))
+                                ev.wait(),
+                                timeout=max(0.01, min(_GROUP_WAIT_POLL_S, remaining)),
                             )
                         continue
                     wait = delay * (

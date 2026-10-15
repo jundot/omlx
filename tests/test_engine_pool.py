@@ -3986,6 +3986,8 @@ class TestExclusiveGroup:
         monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 10.0)
         monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_INITIAL_DELAY_S", 5.0)
         monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_MAX_DELAY_S", 5.0)
+        # Only a notify can wake the head in time: the poll fallback is 30 s.
+        monkeypatch.setattr("omlx.engine_pool._GROUP_WAIT_POLL_S", 30.0)
         with self._engines():
             await pool.get_engine("model-a", _lease=True)
             task_b = asyncio.create_task(pool.get_engine("model-b"))
@@ -4008,6 +4010,8 @@ class TestExclusiveGroup:
         monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 10.0)
         monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_INITIAL_DELAY_S", 5.0)
         monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_MAX_DELAY_S", 5.0)
+        # Only a notify can wake the head in time: the poll fallback is 30 s.
+        monkeypatch.setattr("omlx.engine_pool._GROUP_WAIT_POLL_S", 30.0)
         with self._engines():
             await pool.get_engine("model-a", _lease=True)
             task_b = asyncio.create_task(pool.get_engine("model-b"))
@@ -4065,6 +4069,8 @@ class TestExclusiveGroup:
         monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 10.0)
         monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_INITIAL_DELAY_S", 5.0)
         monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_MAX_DELAY_S", 5.0)
+        # Only a notify can wake the head in time: the poll fallback is 30 s.
+        monkeypatch.setattr("omlx.engine_pool._GROUP_WAIT_POLL_S", 30.0)
         with self._engines():
             await pool.get_engine("model-a", _lease=True)
             task_b = asyncio.create_task(pool.get_engine("model-b"))
