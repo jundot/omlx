@@ -3599,6 +3599,75 @@ class TestXetHTTPFallback:
         assert "HTTP offline" in task.error
 
     @pytest.mark.asyncio
+    async def test_gated_repo_reports_hf_token_after_xet_fallback(
+        self, model_dir
+    ):
+        """A gated denial reported by the worker outlives xet's retry."""
+        downloader = HFDownloader(model_dir=str(model_dir))
+        task = DownloadTask(task_id="t1", repo_id="owner/gated-model")
+        downloader._tasks[task.task_id] = task
+        process = MagicMock()
+        process.returncode = 1
+        process.communicate = AsyncMock(
+            return_value=(
+                b'{"ok": false, "error_type": "GatedRepoError",'
+                b' "message": "403 Client Error."}',
+                b"",
+            )
+        )
+
+        def fail_xet(**kwargs):
+            if kwargs.get("dry_run"):
+                return []
+            raise RuntimeError(
+                "CAS service error: ReqwestMiddleware request failed "
+                "for /xet-read-token"
+            )
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(self._api(), None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fail_xet,
+        ), patch(
+            "omlx.admin.hf_downloader.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            return_value=process,
+        ):
+            await downloader._run_download(task.task_id, "")
+
+        assert task.status == DownloadStatus.FAILED
+        assert "valid HF token" in task.error
+
+    @pytest.mark.asyncio
+    async def test_forbidden_repo_reports_hf_token(self, model_dir):
+        downloader = HFDownloader(model_dir=str(model_dir))
+        task = DownloadTask(task_id="t1", repo_id="owner/gated-model")
+        downloader._tasks[task.task_id] = task
+        request = httpx.Request(
+            "GET", "https://huggingface.co/owner/gated-model/resolve/main/x"
+        )
+        response = httpx.Response(403, request=request)
+
+        def fail_download(**kwargs):
+            if kwargs.get("dry_run"):
+                return []
+            raise HfHubHTTPError("403 Forbidden", response=response)
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(self._api(), None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fail_download,
+        ):
+            await downloader._run_download(task.task_id, "")
+
+        assert task.status == DownloadStatus.FAILED
+        assert "valid HF token" in task.error
+
+    @pytest.mark.asyncio
     async def test_http_worker_disables_xet_without_token_in_argv(self, model_dir):
         downloader = HFDownloader(model_dir=str(model_dir))
         process = MagicMock()

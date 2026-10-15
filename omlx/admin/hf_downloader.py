@@ -215,6 +215,10 @@ class _DownloadStalledError(RuntimeError):
 class _NonXetDownloadError(RuntimeError):
     """Raised when the isolated HTTP fallback process fails."""
 
+    def __init__(self, message: str, error_type: str = "DownloadError") -> None:
+        super().__init__(message)
+        self.error_type = error_type
+
 
 @dataclass(frozen=True)
 class _DownloadActivity:
@@ -248,6 +252,13 @@ def _is_xet_transport_error(error: BaseException) -> bool:
         return False
     detail = f"{type(error).__name__}: {error}".lower()
     return any(marker in detail for marker in _XET_ERROR_MARKERS)
+
+
+def _is_gated_access_error(error: BaseException) -> bool:
+    """Whether an error denies access to a gated repo, flattened or not."""
+    if isinstance(error, HfHubHTTPError):
+        return error.response is not None and error.response.status_code == 403
+    return getattr(error, "error_type", None) == GatedRepoError.__name__
 
 
 class _WireCounter:
@@ -1555,7 +1566,8 @@ class HFDownloader(_QueuePersistenceMixin):
                         raise _NonXetDownloadError(
                             "Xet download failed "
                             f"({xet_error}); HTTP fallback also failed "
-                            f"({fallback_error})"
+                            f"({fallback_error})",
+                            error_type=getattr(error, "error_type", "DownloadError"),
                         ) from error
 
                 # Check if cancelled while downloading
@@ -1607,13 +1619,6 @@ class HFDownloader(_QueuePersistenceMixin):
                 "This may be a gated model that requires HuggingFace authentication."
             )
             logger.error(f"Repository not found: {task.repo_id}")
-        except GatedRepoError:
-            task.status = DownloadStatus.FAILED
-            task.error = (
-                f"Repository '{task.repo_id}' is gated. "
-                "Please provide a valid HF token with access."
-            )
-            logger.error(f"Gated repo access denied: {task.repo_id}")
         except Exception as e:
             # Do not clobber an earlier terminal error or a user cancellation.
             if (
@@ -1621,8 +1626,15 @@ class HFDownloader(_QueuePersistenceMixin):
                 and task.status != DownloadStatus.FAILED
             ):
                 task.status = DownloadStatus.FAILED
-                task.error = str(e)
-                logger.error(f"Download failed for {task.repo_id}: {e}")
+                if _is_gated_access_error(e):
+                    task.error = (
+                        f"Repository '{task.repo_id}' is gated. "
+                        "Please provide a valid HF token with access."
+                    )
+                    logger.error(f"Gated repo access denied: {task.repo_id}")
+                else:
+                    task.error = str(e)
+                    logger.error(f"Download failed for {task.repo_id}: {e}")
         finally:
             # Stop progress polling
             progress_task = self._progress_tasks.pop(task_id, None)
@@ -1665,7 +1677,9 @@ class HFDownloader(_QueuePersistenceMixin):
             if process.returncode != 0 or not response.get("ok"):
                 error_type = response.get("error_type", "DownloadError")
                 message = response.get("message", "unknown error")
-                raise _NonXetDownloadError(f"{error_type}: {message}")
+                raise _NonXetDownloadError(
+                    f"{error_type}: {message}", error_type=error_type
+                )
         except asyncio.CancelledError:
             await self._stop_subprocess(process)
             raise
