@@ -3375,6 +3375,11 @@ class EnginePool:
         member is busy, so the retry loop in ``get_engine`` waits for it.
         Pinned models and distributed deployments ignore groups. Returns True
         when a model was unloaded.
+
+        The group applies at load time only. Requests for a resident member
+        use the lock-free fast path, so a member that gets steady traffic can
+        keep a waiting member out until its wait window ends. Traffic that
+        alternates between members swaps them on every request.
         """
         if (
             entry.is_pinned
@@ -3401,7 +3406,8 @@ class EnginePool:
                 )
                 continue
             members.append(mid)
-        for mid in members:
+
+        def raise_if_busy(mid: str) -> None:
             other = self._entries[mid]
             if (
                 other.is_loading
@@ -3413,7 +3419,12 @@ class EnginePool:
                     model_id,
                     f"load while exclusive group '{group}' member '{mid}' is busy",
                 )
+
         for mid in members:
+            raise_if_busy(mid)
+        for mid in members:
+            # The fast path can lease a member while an earlier unload awaits.
+            raise_if_busy(mid)
             logger.info(
                 "Evicting '%s' for exclusive group '%s' before loading '%s'",
                 mid,

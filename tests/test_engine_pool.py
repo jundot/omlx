@@ -3548,6 +3548,46 @@ class TestExclusiveGroup:
         assert pool._entries["model-b"].engine is not None
 
     @pytest.mark.asyncio
+    async def test_member_leased_during_group_unload_is_not_unloaded(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        groups: dict[str, str] = {}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        model_c = small_mock_model_dir / "model-c"
+        model_c.mkdir()
+        (model_c / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (model_c / "model.safetensors").write_bytes(b"0" * 50)
+        pool.discover_models(str(small_mock_model_dir))
+        unloaded: list[tuple[str, int]] = []
+        original_unload = pool._unload_engine
+
+        async def unload_with_lease(mid, **kwargs):
+            unloaded.append((mid, pool._entries[mid].in_use))
+            if mid == "model-a":
+                # A request for model-b takes the fast path while A unloads.
+                assert pool._acquire_loaded_engine("model-b", False, True, None)
+            await original_unload(mid, **kwargs)
+
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=lambda *a, **k: self._mock_engine(),
+        ):
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-b")
+            groups.update({"model-a": "g", "model-b": "g", "model-c": "g"})
+            pool._unload_engine = unload_with_lease
+            waiter = asyncio.create_task(pool.get_engine("model-c"))
+            await asyncio.sleep(0.15)
+            assert not waiter.done()
+            assert pool._entries["model-b"].engine is not None
+            await pool.release_engine("model-b")
+            await asyncio.wait_for(waiter, timeout=5.0)
+
+        assert all(in_use == 0 for _, in_use in unloaded)
+        assert pool._entries["model-b"].engine is None
+        assert pool._entries["model-c"].engine is not None
+
+    @pytest.mark.asyncio
     async def test_busy_member_timeout_raises_busy_409(
         self, small_mock_model_dir, monkeypatch
     ):

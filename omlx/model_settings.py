@@ -417,7 +417,8 @@ class ModelSettings:
         vlm_mtp_draft_block_size: Tokens drafted per round (None = mlx-vlm default).
         is_pinned: Keep model loaded in memory.
         exclusive_group: Models with the same group are not loaded together
-            (pinned models ignore it). None = no group.
+            (pinned models ignore it). Applies when a model loads; members
+            that are already resident stay. None = no group.
         is_default: Use this model when no model is specified.
         display_name: Human-readable name for UI display.
         description: Optional description of the model.
