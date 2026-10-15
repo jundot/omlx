@@ -790,8 +790,27 @@ class SplashOptions:
 # -- engine -------------------------------------------------------------------------
 
 
+class _SplashRequestState:
+    """Tracking for one streamed Splash request, keyed by the server's id.
+
+    The handle ``abort_request`` acts on, as ``_DistributedRequestState``
+    is for the distributed engine.
+    """
+
+    __slots__ = ("request_id", "response", "aborted")
+
+    def __init__(self, request_id: str) -> None:
+        self.request_id = request_id
+        self.response: httpx.Response | None = None
+        self.aborted = False
+
+
 class SplashEngine(BaseEngine):
     """Serves one model through a ``splash serve`` child process."""
+
+    # The server binds each streamed response to one request id and calls
+    # abort_request when its client disconnects (_with_request_disconnect_abort).
+    supports_request_scoped_abort = True
 
     # Splash budgets its own Metal memory (--max-memory); there is no oMLX
     # scheduler here for the process memory enforcer to update.
@@ -822,6 +841,9 @@ class SplashEngine(BaseEngine):
         self._active = 0
         self._requests = 0
         self._live: dict[str, _LiveRequest] = {}
+        # Streamed requests by the server's request id, so a client
+        # disconnect can close the one it belongs to (abort_request).
+        self._request_states: dict[str, _SplashRequestState] = {}
         self._weights_size: int | None = None
         self._tokenizer: Any = None
         self._model_type: str | None = None
@@ -1080,7 +1102,9 @@ class SplashEngine(BaseEngine):
                 body[key] = kwargs[key]
         return body
 
-    async def _stream(self, body: dict[str, Any]) -> AsyncIterator[GenerationOutput]:
+    async def _stream(
+        self, body: dict[str, Any], inference_request_id: str | None = None
+    ) -> AsyncIterator[GenerationOutput]:
         """POST a streaming chat request to Splash and yield oMLX outputs.
 
         Timestamps use time.perf_counter(), the clock oMLX measures time to
@@ -1098,12 +1122,21 @@ class SplashEngine(BaseEngine):
         request_id = uuid.uuid4().hex
         live = _LiveRequest(time.monotonic(), body.get("max_tokens"))
         self._live[request_id] = live
+        request_state = None
+        if inference_request_id is not None:
+            # Registered before connecting, so an abort during connect counts.
+            request_state = _SplashRequestState(inference_request_id)
+            self._request_states[inference_request_id] = request_state
         self._active += 1
         self._requests += 1
         try:
             async with self._client.stream(
                 "POST", "/v1/chat/completions", json=body
             ) as response:
+                if request_state is not None:
+                    if request_state.aborted:
+                        return
+                    request_state.response = response
                 if response.status_code != 200:
                     detail = (await response.aread()).decode(errors="replace")
                     if 400 <= response.status_code < 500:
@@ -1111,26 +1144,39 @@ class SplashEngine(BaseEngine):
                     raise RuntimeError(
                         f"Splash returned HTTP {response.status_code}: {detail[:500]}"
                     )
-                async for chunk in self._chunks(response):
-                    state.usage = chunk.get("usage") or state.usage
-                    if isinstance(chunk.get("prompt_progress"), dict):
-                        live.add_progress(chunk["prompt_progress"])
-                    for choice in chunk.get("choices") or []:
-                        piece, produced = state.add_choice(choice)
-                        if not produced:
-                            continue
-                        live.add_tokens(self._count_tokens(piece), time.monotonic())
-                        now = time.perf_counter()
-                        state.first_token_at = state.first_token_at or now
-                        yield GenerationOutput(
-                            text=state.text,
-                            new_text=piece,
-                            finished=False,
-                            first_token_at=state.first_token_at,
-                            generated_at=now,
-                        )
+                try:
+                    async for chunk in self._chunks(response):
+                        if request_state is not None and request_state.aborted:
+                            # Leaving the stream context closes the connection,
+                            # which is what makes Splash cancel the request.
+                            return
+                        state.usage = chunk.get("usage") or state.usage
+                        if isinstance(chunk.get("prompt_progress"), dict):
+                            live.add_progress(chunk["prompt_progress"])
+                        for choice in chunk.get("choices") or []:
+                            piece, produced = state.add_choice(choice)
+                            if not produced:
+                                continue
+                            live.add_tokens(self._count_tokens(piece), time.monotonic())
+                            now = time.perf_counter()
+                            state.first_token_at = state.first_token_at or now
+                            yield GenerationOutput(
+                                text=state.text,
+                                new_text=piece,
+                                finished=False,
+                                first_token_at=state.first_token_at,
+                                generated_at=now,
+                            )
+                except (httpx.StreamError, httpx.TransportError):
+                    # abort_request closed the response under us: the client
+                    # is gone, so there is nobody to send a final output to.
+                    if request_state is not None and request_state.aborted:
+                        return
+                    raise
             yield self._final_output(state)
         finally:
+            if inference_request_id is not None:
+                self._request_states.pop(inference_request_id, None)
             self._live.pop(request_id, None)
             self._active -= 1
             # Pick up the request's cache counters without waiting for the
@@ -1210,7 +1256,7 @@ class SplashEngine(BaseEngine):
         effort = splash_effort(kwargs.get("chat_template_kwargs"))
         if effort:
             body["reasoning_effort"] = effort
-        async for output in self._stream(body):
+        async for output in self._stream(body, kwargs.get("_request_id")):
             yield output
 
     async def chat(self, messages: list[dict[str, Any]], **kwargs) -> GenerationOutput:
@@ -1256,6 +1302,41 @@ class SplashEngine(BaseEngine):
 
     async def generate(self, prompt: str | list[int], **kwargs) -> GenerationOutput:
         return await self._collect(self.stream_generate(prompt, **kwargs))
+
+    async def abort_request(
+        self,
+        request_id: str,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> bool:
+        """Stop one request whose client disconnected.
+
+        The server calls this from a task outside the response's cancelled
+        scope. That matters: the response's own cleanup runs under the
+        disconnect's cancellation, which also cancels httpcore's connection
+        close, so the socket to Splash stays open and Splash generates to
+        max_tokens. Closed from here, the connection really closes and Splash
+        cancels the request. ``reason`` and ``error_code`` only go to the log:
+        no client is left to tell.
+        """
+        state = self._request_states.get(request_id)
+        if state is None:
+            return False
+        state.aborted = True
+        response = state.response
+        if response is not None:
+            # Best effort, as in DistributedBatchedEngine.abort_request: the
+            # stream may already be failing on its own.
+            with contextlib.suppress(Exception):
+                await response.aclose()
+        # Still connecting: _stream sees the abort once Splash answers.
+        logger.info(
+            "Aborted Splash request %s (%s)",
+            request_id,
+            reason or error_code or "no reason given",
+        )
+        return True
 
     # -- stats -----------------------------------------------------------------------
 

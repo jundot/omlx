@@ -614,6 +614,59 @@ class TestStreaming:
                 pass
         assert engine.get_live_requests() == {"prefilling": [], "generating": []}
 
+    async def test_abort_request_closes_the_splash_stream(self, tmp_path):
+        # A client that disconnects mid-stream must stop Splash's generation:
+        # closing the upstream stream is what makes Splash cancel the request.
+        closed = asyncio.Event()
+
+        class EndlessBody(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                while True:
+                    chunk = {"choices": [{"delta": {"content": "tok "}}]}
+                    yield f"data: {json.dumps(chunk)}\n\n".encode()
+                    await asyncio.sleep(0.01)
+
+            async def aclose(self):
+                closed.set()
+
+        engine = _engine_with_transport(
+            tmp_path, lambda request: httpx.Response(200, stream=EndlessBody())
+        )
+        outputs = []
+
+        async def consume():
+            async for out in engine.stream_chat(
+                [{"role": "user", "content": "hi"}],
+                max_tokens=10_000,
+                _request_id="transport-1",
+            ):
+                outputs.append(out)
+
+        task = asyncio.create_task(consume())
+
+        async def first_output():
+            while not outputs:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(first_output(), timeout=2)
+
+        aborted = await engine.abort_request(
+            "transport-1",
+            reason="public client transport disconnected",
+            error_code="client_disconnected",
+        )
+
+        assert aborted is True
+        await asyncio.wait_for(task, timeout=2)
+        assert closed.is_set()
+        assert engine.get_live_requests() == {"prefilling": [], "generating": []}
+
+    async def test_abort_of_an_unknown_request_is_a_no_op(self, tmp_path):
+        assert await _engine(tmp_path).abort_request("transport-unknown") is False
+
+    def test_server_mints_abort_ids_for_splash(self, tmp_path):
+        assert srv._request_abort_id(_engine(tmp_path)) is not None
+
     async def test_plain_completions_are_rejected(self, tmp_path):
         with pytest.raises(InvalidRequestError, match="chat requests only"):
             await _engine(tmp_path).generate("Once upon a time")
