@@ -115,7 +115,7 @@ def scan_ssd_cache(
 
 
 # External engines a model can be served by, as model settings name them.
-EXTERNAL_ENGINES = {"splash": "Splash"}
+EXTERNAL_ENGINES = {"splash": "Splash", "sushi": "Sushi"}
 
 # Homebrew prefixes: the menu bar app starts with a minimal PATH.
 _BREW_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
@@ -1191,6 +1191,8 @@ class SplashOptions:
 
 class SplashEngine(BaseEngine):
     """Serves one model through a ``splash serve`` child process."""
+
+    external_engine_id = "splash"
 
     # Splash budgets its own Metal memory (--max-memory); there is no oMLX
     # scheduler here for the process memory enforcer to update.
