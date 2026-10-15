@@ -7,11 +7,13 @@ import os
 import stat
 import sys
 import textwrap
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from omlx.engine import splash as splash_mod
+from omlx.engine import sushi as sushi_mod
 from omlx.engine.splash import EXTERNAL_ENGINES, SplashEngine
 from omlx.engine.sushi import (
     SushiEngine,
@@ -292,6 +294,97 @@ def test_engine_end_to_end(fake_sushi, sushi_pack, tmp_path, monkeypatch):
     assert argv[-2:] == ["--mtp-typical", "0.2"]
 
 
+def test_wired_limit_target_matches_sushi_guidance():
+    gib = 1024**3
+    assert sushi_mod.wired_limit_target_mb(75 * gib, 96 * gib) == 90000
+    assert sushi_mod.wired_limit_target_mb(75 * gib, 128 * gib) == 122000
+    assert sushi_mod.wired_limit_target_mb(50 * gib, 64 * gib) == 57000
+
+
+def test_auto_install_target_without_binary(sushi_pack, monkeypatch):
+    monkeypatch.setattr(sushi_mod, "find_sushi_binary", lambda c: (None, "missing"))
+    target, reason = resolve_sushi_target(sushi_pack, None)
+    assert target is None and reason == "missing"
+    target, reason = resolve_sushi_target(sushi_pack, None, auto_install=True)
+    assert target is not None and target.binary is None
+    # An explicit path that does not work is never replaced by a download.
+    target, _ = resolve_sushi_target(sushi_pack, "/nope/sushi", auto_install=True)
+    assert target is None
+
+
+def test_install_sushi_from_release_tarball(tmp_path, fake_sushi, monkeypatch):
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tar.add(fake_sushi, arcname="sushi-macos-arm64/sushi")
+    payload = buf.getvalue()
+
+    class FakeStream:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+        def iter_bytes(self):
+            yield payload
+
+    monkeypatch.setattr(sushi_mod.httpx, "stream", FakeStream)
+    dest = tmp_path / "omlx-bin" / "sushi-macos-arm64"
+    binary = sushi_mod.install_sushi(dest, "https://example.invalid/sushi.tgz")
+    assert binary == dest / "sushi" and os.access(binary, os.X_OK)
+    found, reason = inspect_sushi_binary(binary, auto_detected=True)
+    assert found is not None, reason
+
+
+def test_start_raises_wired_limit_only_when_needed(sushi_pack, tmp_path, monkeypatch):
+    import omlx.process_memory_enforcer as pme
+
+    gib = 1024**3
+    calls = []
+    monkeypatch.setattr(sushi_mod, "raise_wired_limit", calls.append)
+    monkeypatch.setattr(sushi_mod, "physical_memory_bytes", lambda: 96 * gib)
+    monkeypatch.setattr(pme, "get_iogpu_wired_limit_bytes", lambda: 0)
+    monkeypatch.setattr(pme, "get_effective_metal_cap_bytes", lambda: 72 * gib)
+
+    def engine(budget, **opts):
+        return SushiEngine(
+            model_name=str(sushi_pack),
+            model_id="m",
+            target=SushiTarget(None, "qwen4_exp", True),
+            log_dir=tmp_path,
+            options=SushiOptions(**opts),
+            memory_budget_bytes=budget,
+        )
+
+    engine(60 * gib)._ensure_wired_limit()
+    assert calls == []
+    engine(75 * gib)._ensure_wired_limit()
+    assert calls == [90000]
+    engine(75 * gib, auto_wired_limit=False)._ensure_wired_limit()
+    assert calls == [90000]
+
+
+def test_sushi_models_dir_is_scanned(tmp_path, monkeypatch):
+    from omlx.settings import GlobalSettings
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    (tmp_path / ".sushi" / "models").mkdir(parents=True)
+    settings = GlobalSettings(base_path=tmp_path / ".omlx")
+    dirs = settings.get_effective_model_dirs()
+    assert (tmp_path / ".sushi" / "models").resolve() in dirs
+    settings.integrations.sushi_scan_models_dir = False
+    assert (tmp_path / ".sushi" / "models").resolve() not in (
+        settings.get_effective_model_dirs()
+    )
 def test_sushi_pack_picks_sushi_without_settings(sushi_pack, tmp_path):
     from omlx.engine_pool import EnginePool
 
