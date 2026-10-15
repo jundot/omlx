@@ -91,10 +91,15 @@ def _set_dspark_target_verify(model: Any, flag: bool) -> None:
 def apply() -> bool:
     """Wrap ``GenerationBatch`` and ``BatchGenerator`` MTP hooks.
 
-    One-shot by design: the wraps capture ``original_*`` in closures so
-    re-applying would chain wraps and double-init. ``GenerationBatch`` is
-    not touched by dflash so the leftover-class-patch risk that motivates
-    self-healing elsewhere doesn't apply here.
+    Idempotent via the class-level ``_omlx_mtp_patched`` markers: a repeat
+    call is a no-op, not a chained re-wrap (the wraps capture
+    ``original_*`` in closures, so an unguarded re-apply would double-wrap
+    and double-init). Unlike the model-side sub-patches (see
+    ``apply_mlx_lm_mtp_patch``) this is deliberately not self-healing —
+    the markers won't re-claim the classes if something else replaced the
+    methods after us. ``GenerationBatch`` is not touched by dflash, so the
+    leftover-class-patch risk that motivates self-healing elsewhere
+    doesn't apply here.
     """
     try:
         from mlx_lm.generate import BatchGenerator, GenerationBatch
@@ -134,6 +139,15 @@ def apply() -> bool:
                     _drop_mtp_batch_state(
                         self, "batch-standard-calibration", log_stats=True
                     )
+                    # A calibration step is still a standard multi-row
+                    # decode: record the same inactivity log + multirow
+                    # marker as the fallthrough standard step below, so a
+                    # batch that later shrinks to one row must still pass
+                    # the compact-cache check before a fresh singleton MTP
+                    # activation (#2150). Both helpers no-op for
+                    # single-row batches.
+                    _log_multirow_mtp_inactive_once(self)
+                    _mark_standard_multirow_decode(self)
                     started = time.perf_counter()
                     result = original_next(self, *args, **kwargs)
                     if tuple(self.uids) == policy.uids:
@@ -4747,8 +4761,8 @@ def _run_verify_cycle_legacy(gen_batch: Any, state: _MtpState) -> None:
             verify_accept_lp[0, draft_id].item() - draft_accept_lp[draft_id].item()
         )
         # Draw the acceptance roll from mx.random so it follows the same
-        # mx.random.seed the rest of the sampler uses (line ~962 residual
-        # sampling). stdlib ``random`` was never seeded by oMLX, which made
+        # mx.random.seed the rest of the sampler uses (``_residual_sample``
+        # below). stdlib ``random`` was never seeded by oMLX, which made
         # stochastic acceptance irreproducible even with a fixed seed (#1330).
         accept = log_accept >= 0 or float(
             mx.random.uniform(shape=()).item()

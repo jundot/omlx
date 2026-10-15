@@ -90,14 +90,15 @@ def is_mtp_depth_fixed() -> bool:
 def apply_mlx_lm_mtp_patch() -> bool:
     """Apply the model-side and BatchGenerator monkey-patches.
 
-    Self-healing: re-runs each sub-patch every call. Sub-patches use
-    marker-based identity checks on the live class state, so a no-op
-    when our patch is already installed and a re-apply when something
-    else (e.g. dflash hooks) has overwritten ``__call__`` since the
-    last load. Without this, a sequence like (dflash → mtp) on the
-    same process leaves the linear-attention class patched by dflash
-    and the MTP draft cycle crashes with a TypeError on n_confirmed
-    (issue #1388).
+    Self-healing: re-runs each sub-patch every call. The model-side
+    sub-patches use marker-based identity checks on the live class
+    state, so a no-op when our patch is already installed and a
+    re-apply when something else (e.g. dflash hooks) has overwritten
+    ``__call__`` since the last load. (The batch-generator patch is
+    idempotent but not self-healing; see ``batch_generator.apply``.)
+    Without this, a sequence like (dflash → mtp) on the same process
+    leaves the linear-attention class patched by dflash and the MTP
+    draft cycle crashes with a TypeError on n_confirmed (issue #1388).
 
     Must be invoked before ``mlx_lm.load()`` so the patched
     ``__init__`` / ``sanitize`` / ``from_dict`` paths see MTP weights.
