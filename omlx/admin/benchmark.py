@@ -1956,7 +1956,10 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 else 8
             )
             async for _ in engine.stream_generate(
-                prompt=warmup_prompt, max_tokens=warmup_max_tokens, temperature=0.0
+                prompt=warmup_prompt,
+                max_tokens=warmup_max_tokens,
+                temperature=0.0,
+                skip_cache_store=True,
             ):
                 pass
             logger.info(

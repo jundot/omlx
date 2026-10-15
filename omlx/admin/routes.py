@@ -8634,6 +8634,19 @@ async def add_to_accuracy_queue(
             ),
         )
 
+    from .benchmark import get_active_run as get_active_throughput_run
+
+    throughput_active = get_active_throughput_run()
+    if throughput_active is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"A throughput benchmark is already running "
+                f"(bench_id={throughput_active.bench_id}, "
+                f"model_id={throughput_active.request.model_id})."
+            ),
+        )
+
     body = await request.json()
     try:
         bench_request = AccuracyBenchmarkRequest(**body)
@@ -9195,9 +9208,10 @@ async def start_benchmark(
     """Start a benchmark run.
 
     Validates the model, creates a benchmark run, and starts it
-    as an asyncio background task. Rejects with 409 if another
-    throughput bench is already running — two concurrent runs on
-    the same engine produce mutually-corrupted measurements.
+    as an asyncio background task. Rejects with 409 while any benchmark
+    (throughput, context, accuracy) or ANE tuning is running — two
+    concurrent runs on the same engine produce mutually-corrupted
+    measurements.
     """
     from .benchmark import (
         BenchmarkRequest,
@@ -9248,6 +9262,18 @@ async def start_benchmark(
             ),
         )
 
+    from .accuracy_benchmark import get_queue_status
+
+    accuracy_status = get_queue_status()
+    if accuracy_status.get("running"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"An accuracy benchmark is already running "
+                f"(model_id={accuracy_status.get('current_model')})."
+            ),
+        )
+
     body = await request.json()
     try:
         bench_request = BenchmarkRequest(**body)
@@ -9273,7 +9299,9 @@ async def start_benchmark(
 
     # Create and start the benchmark
     run = create_run(bench_request)
-    total_tests = len(bench_request.prompt_lengths) + len(bench_request.batch_sizes) * 2
+    # Matches run_benchmark's own total: one progress event per single
+    # prompt length plus one per batch size (local and external paths).
+    total_tests = len(bench_request.prompt_lengths) + len(bench_request.batch_sizes)
 
     run.task = asyncio.create_task(run_benchmark(run, engine_pool))
 

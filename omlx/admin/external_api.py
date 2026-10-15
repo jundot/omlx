@@ -13,6 +13,7 @@ import re
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import httpx
 from pydantic import BaseModel, Field, SecretStr, field_validator
@@ -73,6 +74,17 @@ class ExternalEndpointConfig(BaseModel):
         v = v.strip().rstrip("/")
         if not v.startswith(("http://", "https://")):
             raise ValueError("base_url must start with http:// or https://")
+        # Cleartext http:// would send the api_key (Bearer header) over the
+        # wire unencrypted, so it is only allowed for loopback hosts where
+        # the traffic never leaves the machine.
+        if v.startswith("http://"):
+            host = (urlparse(v).hostname or "").lower()
+            if host not in ("localhost", "127.0.0.1", "::1"):
+                raise ValueError(
+                    "http:// base_url is only allowed for loopback hosts "
+                    "(localhost, 127.0.0.1, ::1); use https:// for remote "
+                    "endpoints"
+                )
         return v
 
     @field_validator("model")

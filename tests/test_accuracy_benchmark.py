@@ -966,6 +966,65 @@ class TestQueueChainOwnership:
         completed = [r["model_id"] for r in get_accumulated_results()]
         assert completed == ["model-a", "model-c", "model-d"]
 
+    @pytest.mark.asyncio
+    async def test_continue_queue_defers_while_other_bench_runs(
+        self, monkeypatch
+    ):
+        """When the next queued item is due but another bench type (here a
+        throughput run) holds the engine pool, _continue_queue must keep
+        the item queued and the gate held instead of starting it — its
+        Phase 1 "unload all models" would corrupt the other run. Once that
+        run finishes, the chain resumes and drains the queue on its own."""
+        entered: list[str] = []
+
+        class StubEval:
+            dataset_total = 1
+
+            async def load_dataset(self, sample_size=0):
+                return [{"id": "1"}]
+
+            async def run(self, engine, items, on_progress, batch_size=1,
+                          sampling_kwargs=None, enable_thinking=False):
+                entered.append(engine.model_id)
+                return _StubResult()
+
+        throughput_running = {"active": True}
+        monkeypatch.setattr(accuracy_benchmark, "_CONTINUE_RETRY_SECONDS", 0.01)
+
+        def _fake_throughput_run():
+            if throughput_running["active"]:
+                return SimpleNamespace(bench_id="tp-run")
+            return None
+
+        pool = _StubEnginePool()
+        with patch.dict("omlx.eval.BENCHMARKS", {"mmlu": StubEval}, clear=True), patch(
+            "omlx.admin.benchmark.get_active_run", side_effect=_fake_throughput_run
+        ):
+            add_to_queue(self._request("model-a"))
+            add_to_queue(self._request("model-b"))
+            start_next_from_queue(pool)
+
+            # model-a finishes; model-b is due next but stays deferred.
+            await self._wait_for(
+                lambda: "model-a"
+                in [r["model_id"] for r in get_accumulated_results()]
+            )
+            await asyncio.sleep(0.05)  # ride several deferral retry cycles
+
+            status = get_queue_status()
+            assert status["running"] is True  # gate stays held while waiting
+            assert [q["model_id"] for q in status["queue"]] == ["model-b"]
+            assert "model-b" not in entered
+
+            # The other bench finishes; the chain resumes unprompted.
+            throughput_running["active"] = False
+            await self._wait_for(
+                lambda: not get_queue_status()["running"]
+                and not get_queue_status()["queue"]
+            )
+
+        assert entered == ["model-a", "model-b"]
+
 
 # =============================================================================
 # Community upload wiring (omlx.ai)

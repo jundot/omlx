@@ -92,6 +92,25 @@ class TestExternalEndpointConfig:
         with pytest.raises(ValueError, match="http:// or https://"):
             _config(base_url="ftp://api.example.com/v1")
 
+    def test_http_non_loopback_rejected(self):
+        # The api_key travels as a Bearer header; cleartext http:// to a
+        # remote host would leak it off-machine.
+        with pytest.raises(ValueError, match="use https://"):
+            _config(base_url="http://api.example.com/v1")
+        with pytest.raises(ValueError, match="use https://"):
+            _config(base_url="http://192.168.1.10:8000/v1")
+
+    def test_http_loopback_allowed(self):
+        assert _config(base_url="http://localhost:8001/v1").base_url == (
+            "http://localhost:8001/v1"
+        )
+        assert _config(base_url="http://127.0.0.1:8001/v1").base_url == (
+            "http://127.0.0.1:8001/v1"
+        )
+        assert _config(base_url="http://[::1]:8001/v1").base_url == (
+            "http://[::1]:8001/v1"
+        )
+
     def test_empty_model_rejected(self):
         with pytest.raises(ValueError, match="model must not be empty"):
             _config(model="   ")

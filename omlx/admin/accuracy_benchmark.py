@@ -49,6 +49,10 @@ _engine_pool_ref: Any = None
 # rips the engine out from under the active run.
 _chain_id: int = 0
 
+# How often a deferred _continue_queue rechecks whether the other bench
+# type that blocked it has finished.
+_CONTINUE_RETRY_SECONDS = 5.0
+
 VALID_BENCHMARKS = [
     "mmlu", "mmlu_pro", "kmmlu", "cmmlu", "jmmlu",
     "hellaswag", "truthfulqa", "arc_challenge", "winogrande",
@@ -276,6 +280,30 @@ def start_next_from_queue(engine_pool: Any) -> Optional[str]:
     return run.bench_id
 
 
+def _other_bench_running() -> Optional[str]:
+    """Describe any non-accuracy bench type that is currently running.
+
+    The start routes reject cross-type concurrency upfront; this is the
+    queue's own backstop for the windows those checks cannot cover (e.g. a
+    run started while the accuracy gate was momentarily released between
+    items). Imports are local to match routes.py and avoid import cycles.
+    """
+    from .ane_tuning import get_active_run as get_active_ane_tuning
+    from .benchmark import get_active_run as get_active_throughput_run
+    from .context_benchmark import get_active_run as get_active_context_run
+
+    throughput = get_active_throughput_run()
+    if throughput is not None:
+        return f"a throughput benchmark is already running ({throughput.bench_id})"
+    context = get_active_context_run()
+    if context is not None:
+        return f"a context benchmark is already running ({context.bench_id})"
+    tuning = get_active_ane_tuning()
+    if tuning is not None:
+        return f"ANE tuning is already running ({tuning.tuning_id})"
+    return None
+
+
 async def _continue_queue(engine_pool: Any, chain_id: int) -> None:
     """Continue processing the queue after a run completes.
 
@@ -283,40 +311,54 @@ async def _continue_queue(engine_pool: Any, chain_id: int) -> None:
     A stale chain (orphaned by cancel_queue, with a new chain started by
     the user since) returns without popping the queue or touching the
     gate, so it cannot start a run concurrently with the live chain.
+
+    While any other bench type (throughput, context, ANE tuning) holds the
+    engine pool, the next queued item is deferred — kept queued, gate held
+    — and retried until that run finishes, because a fresh accuracy run's
+    Phase 1 "unload all models" would corrupt the other run's measurements.
     """
     global _queue_running, _current_run_id, _current_model
 
-    if chain_id != _chain_id:
-        return
+    deferred_notice = False
+    while True:
+        if chain_id != _chain_id:
+            return
 
-    if not _queue:
-        _queue_running = False
-        _current_run_id = None
-        _current_model = None
-        return
+        if not _queue:
+            _queue_running = False
+            _current_run_id = None
+            _current_model = None
+            return
 
-    request = _queue.pop(0)
-    _current_model = request.model_id
+        other = _other_bench_running()
+        if other is not None:
+            if not deferred_notice:
+                logger.info(f"Queue: deferring next item, {other}")
+                deferred_notice = True
+            await asyncio.sleep(_CONTINUE_RETRY_SECONDS)
+            continue
+        deferred_notice = False
 
-    cleanup_old_runs()
-    run = create_run(request)
-    _current_run_id = run.bench_id
-    # Queue-continued runs execute inside this chain's own task; record it
-    # so cancel_queue can hard-cancel them instead of waiting for the next
-    # on_progress checkpoint (up to one answered question away).
-    run.task = asyncio.current_task()
+        request = _queue.pop(0)
+        _current_model = request.model_id
 
-    logger.info(
-        f"Queue: continuing with {request.model_id} "
-        f"benchmarks={list(request.benchmarks.keys())}"
-    )
+        cleanup_old_runs()
+        run = create_run(request)
+        _current_run_id = run.bench_id
+        # Queue-continued runs execute inside this chain's own task; record it
+        # so cancel_queue can hard-cancel them instead of waiting for the next
+        # on_progress checkpoint (up to one answered question away).
+        run.task = asyncio.current_task()
 
-    try:
-        await run_accuracy_benchmark(run, engine_pool)
-    except Exception as e:
-        logger.error(f"Queue: error running {request.model_id}: {e}")
+        logger.info(
+            f"Queue: continuing with {request.model_id} "
+            f"benchmarks={list(request.benchmarks.keys())}"
+        )
 
-    await _continue_queue(engine_pool, chain_id)
+        try:
+            await run_accuracy_benchmark(run, engine_pool)
+        except Exception as e:
+            logger.error(f"Queue: error running {request.model_id}: {e}")
 
 
 async def cancel_queue() -> None:

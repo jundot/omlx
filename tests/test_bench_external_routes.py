@@ -50,15 +50,21 @@ def _clean_bench_state():
     """Keep module-level run/queue state isolated between tests.
 
     Cleared on both sides of the test: other test modules leak runs into
-    _benchmark_runs (a leftover status=="running" run makes /start 409).
+    _benchmark_runs (a leftover status=="running" run makes /start 409),
+    and the mutual-exclusion tests here hold the accuracy gate.
     """
     from omlx.admin import accuracy_benchmark, benchmark
 
-    benchmark._benchmark_runs.clear()
-    accuracy_benchmark._queue.clear()
+    def _reset():
+        benchmark._benchmark_runs.clear()
+        accuracy_benchmark._queue.clear()
+        accuracy_benchmark._queue_running = False
+        accuracy_benchmark._current_run_id = None
+        accuracy_benchmark._current_model = None
+
+    _reset()
     yield
-    benchmark._benchmark_runs.clear()
-    accuracy_benchmark._queue.clear()
+    _reset()
 
 
 class TestExternalThroughputRoutes:
@@ -148,6 +154,43 @@ class TestExternalThroughputRoutes:
             },
         )
         assert response.status_code == 400
+
+
+class TestBenchMutualExclusion:
+    """Cross-type mutual exclusion: every bench start route must reject
+    while any other bench type holds the engine pool, because each run's
+    "unload all → load target" phases corrupt concurrent measurements."""
+
+    def test_start_rejected_while_accuracy_queue_running(self, client):
+        from omlx.admin import accuracy_benchmark
+
+        accuracy_benchmark._queue_running = True
+        accuracy_benchmark._current_model = "model-acc"
+
+        r = client.post(
+            "/admin/api/bench/start",
+            json={"model_id": "local-model", "prompt_lengths": [1024]},
+        )
+        assert r.status_code == 409
+        assert "accuracy benchmark is already running" in r.json()["detail"]
+
+    def test_queue_add_rejected_while_throughput_running(self, client):
+        from omlx.admin.benchmark import BenchmarkRequest, create_run
+
+        create_run(
+            BenchmarkRequest(model_id="local-model", prompt_lengths=[1024])
+        )
+
+        r = client.post(
+            "/admin/api/bench/accuracy/queue/add",
+            json={"model_id": "local-model", "benchmarks": {"mmlu": 30}},
+        )
+        assert r.status_code == 409
+        assert "throughput benchmark is already running" in r.json()["detail"]
+        # Nothing was queued behind the rejection.
+        from omlx.admin import accuracy_benchmark
+
+        assert accuracy_benchmark._queue == []
 
 
 class TestExternalAccuracyRoutes:

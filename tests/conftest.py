@@ -408,3 +408,30 @@ def _hermetic_metal_release_accounting(monkeypatch):
     if metal_sync is not None:
         metal_sync._residuals.clear()
         metal_sync._last_unreleased = (0.0, 0)
+
+@pytest.fixture(autouse=True)
+def _reset_admin_bench_active_runs():
+    """Keep the admin bench run-stores hermetic per test.
+
+    The accuracy queue's cross-type deferral reads the live throughput/
+    context/ANE-tuning run stores; a test in the same xdist worker that
+    leaks a "running" entry would make every later queue test defer
+    until its timeout. The production code intentionally defers in that
+    situation — the leak is a test-isolation problem, fixed here.
+    """
+    import omlx.admin.ane_tuning as _ane
+    import omlx.admin.benchmark as _bench
+    import omlx.admin.context_benchmark as _ctx
+
+    saved = (
+        dict(_bench._benchmark_runs),
+        dict(_ctx._context_runs),
+        dict(_ane._runs),
+    )
+    yield
+    _bench._benchmark_runs.clear()
+    _bench._benchmark_runs.update(saved[0])
+    _ctx._context_runs.clear()
+    _ctx._context_runs.update(saved[1])
+    _ane._runs.clear()
+    _ane._runs.update(saved[2])
