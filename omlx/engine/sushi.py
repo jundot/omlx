@@ -61,8 +61,18 @@ SUSHI_INSTALL_HINT = (
 # Architectures Sushi serves (its README / docs/*-arch.md), by config model_type.
 SUSHI_MODEL_TYPES = frozenset({"qwen4_exp", "glm5_next", "mimo_v2"})
 
+# Where oMLX installs Sushi itself, and the release asset it fetches.
+SUSHI_INSTALL_DIR = Path.home() / ".omlx" / "bin" / "sushi-macos-arm64"
+SUSHI_RELEASE_URL = (
+    "https://github.com/beamivalice/sushi/releases/latest/download/"
+    "sushi-bin-macos-arm64.tar.gz"
+)
+# Where `hf download` puts Sushi packs in Sushi's own instructions.
+SUSHI_MODELS_DIR = Path.home() / ".sushi" / "models"
+
 # Common places a release tarball gets unpacked.
 _CANDIDATE_DIRS = (
+    str(SUSHI_INSTALL_DIR),
     "/opt/homebrew/bin",
     "/usr/local/bin",
     str(Path.home() / ".local" / "bin"),
@@ -170,13 +180,16 @@ def sushi_model_type(config: dict) -> str | None:
 
 @dataclass(frozen=True)
 class SushiTarget:
-    binary: SushiBinary
+    # None: not installed yet; the engine installs it on start.
+    binary: SushiBinary | None
     model_type: str
     exl3: bool
 
 
 def resolve_sushi_target(
-    model_path: str | Path, configured_binary: str | None
+    model_path: str | Path,
+    configured_binary: str | None,
+    auto_install: bool = False,
 ) -> tuple[SushiTarget | None, str]:
     """Check whether Sushi can serve ``model_path``; else say why not."""
     path = Path(model_path)
@@ -191,9 +204,112 @@ def resolve_sushi_target(
             + f" models only (this is {config.get('model_type')!r})"
         )
     binary, reason = find_sushi_binary(configured_binary)
-    if binary is None:
+    if binary is None and not (auto_install and not configured_binary):
         return None, reason
     return SushiTarget(binary, model_type, is_sushi_pack(config)), ""
+
+
+# -- install ---------------------------------------------------------------------
+
+
+def install_sushi(dest: Path = SUSHI_INSTALL_DIR, url: str = SUSHI_RELEASE_URL) -> Path:
+    """Download the latest Sushi release into ``dest`` and return the binary.
+
+    The tarball unpacks to ``sushi-macos-arm64/``; it is extracted next to
+    ``dest`` through a temporary folder and swapped in, so a failed or
+    interrupted download never leaves a half-written install behind.
+    """
+    import tarfile
+    import tempfile
+
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    logger.info("Sushi: downloading %s", url)
+    with tempfile.TemporaryDirectory(dir=dest.parent, prefix=".sushi-dl-") as tmp:
+        archive = Path(tmp) / "sushi.tar.gz"
+        with httpx.stream(
+            "GET", url, follow_redirects=True, timeout=httpx.Timeout(30, read=600)
+        ) as response:
+            response.raise_for_status()
+            with open(archive, "wb") as out:
+                for chunk in response.iter_bytes():
+                    out.write(chunk)
+        unpack = Path(tmp) / "unpack"
+        with tarfile.open(archive) as tar:
+            tar.extractall(unpack, filter="data")
+        found = next(
+            (p for p in unpack.rglob("sushi") if p.is_file()),
+            None,
+        )
+        if found is None:
+            raise RuntimeError(f"the Sushi release at {url} has no `sushi` binary")
+        found.chmod(found.stat().st_mode | 0o111)
+        root = found.parent
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.move(str(root), str(dest))
+    binary = dest / "sushi"
+    logger.info("Sushi: installed %s", binary)
+    return binary
+
+
+# -- wired memory ----------------------------------------------------------------
+
+
+def physical_memory_bytes() -> int:
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        return 0
+
+
+def wired_limit_target_mb(needed_bytes: int, ram_bytes: int) -> int:
+    """The ``iogpu.wired_limit_mb`` to set so ``needed_bytes`` fits.
+
+    Sushi's own guidance leaves about 8 GiB of RAM to macOS (58000 MB on a
+    64 GB Mac, 88000 on 96 GB, 120000 on 128 GB). Never go above that, even
+    if the model wants more: Sushi's admission check then refuses cleanly
+    instead of the OS swapping wired pages.
+    """
+    ceiling_mb = (ram_bytes // 1024**2) - 8 * 1024
+    ceiling_mb -= ceiling_mb % 1000
+    needed_mb = -(-needed_bytes // 1024**2)
+    if needed_mb > ceiling_mb:
+        logger.warning(
+            "Sushi: model wants %d MB of GPU memory, more than the %d MB "
+            "macOS can safely wire on this Mac",
+            needed_mb,
+            ceiling_mb,
+        )
+    return max(0, ceiling_mb)
+
+
+def raise_wired_limit(limit_mb: int) -> None:
+    """Set ``iogpu.wired_limit_mb`` through macOS's administrator dialog.
+
+    Runs one fixed command; macOS asks for the password in its own window.
+    The setting lasts until the next reboot.
+    """
+    command = f"/usr/sbin/sysctl iogpu.wired_limit_mb={int(limit_mb)}"
+    script = (
+        f'do shell script "{command}" with administrator privileges '
+        'with prompt "oMLX needs to raise the GPU memory limit to run '
+        'this Sushi model."'
+    )
+    result = subprocess.run(
+        ["/usr/bin/osascript", "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        if "-128" in detail:
+            raise RuntimeError(
+                "GPU memory limit not raised (the password dialog was "
+                f"cancelled). Sushi needs: sudo sysctl iogpu.wired_limit_mb={limit_mb}"
+            )
+        raise RuntimeError(f"could not raise the GPU memory limit: {detail}")
 
 
 # -- memory ----------------------------------------------------------------------
@@ -248,6 +364,10 @@ class SushiOptions:
     prefix_cache_entries: int | None = 1
     prefix_cache_mem: str | None = None
     extra_args: list[str] = field(default_factory=list)
+    # Download Sushi on first use when no binary is found.
+    auto_install: bool = True
+    # Raise iogpu.wired_limit_mb (admin dialog) when the model needs it.
+    auto_wired_limit: bool = True
 
 
 def parse_size_bytes(value: str | None) -> int:
@@ -395,6 +515,44 @@ class SushiEngine(SplashEngine):
             )
             self._tokenizer = None
 
+    def _ensure_binary(self) -> None:
+        if self._target.binary is not None:
+            return
+        if not self._options.auto_install:
+            raise RuntimeError(SUSHI_INSTALL_HINT)
+        binary, _ = find_sushi_binary(None)
+        if binary is None:
+            path = install_sushi()
+            binary, reason = inspect_sushi_binary(path, auto_detected=True)
+            if binary is None:
+                raise RuntimeError(f"Sushi was downloaded but does not run: {reason}")
+        self._target = SushiTarget(binary, self._target.model_type, self._target.exl3)
+
+    def _ensure_wired_limit(self) -> None:
+        """Make room in macOS's GPU wired limit for this model."""
+        if not self._options.auto_wired_limit or self._memory_budget <= 0:
+            return
+        from ..process_memory_enforcer import (
+            get_effective_metal_cap_bytes,
+            get_iogpu_wired_limit_bytes,
+        )
+
+        cap = get_iogpu_wired_limit_bytes() or get_effective_metal_cap_bytes()
+        if cap >= self._memory_budget:
+            return
+        target = wired_limit_target_mb(self._memory_budget, physical_memory_bytes())
+        if target * 1024**2 <= cap:
+            return  # cannot do better than what is set; let Sushi decide
+        logger.info(
+            "Sushi: %s needs ~%.1f GiB of GPU memory, limit is %.1f GiB; "
+            "raising iogpu.wired_limit_mb to %d",
+            self._path.name,
+            self._memory_budget / 1024**3,
+            cap / 1024**3,
+            target,
+        )
+        raise_wired_limit(target)
+
     def _serve_command(self, port: int) -> list[str]:
         o = self._options
         command = [
@@ -446,6 +604,8 @@ class SushiEngine(SplashEngine):
                 return
             raise RuntimeError(self.runtime_failed_reason)
         await asyncio.to_thread(self._load_tokenizer)
+        await asyncio.to_thread(self._ensure_binary)
+        await asyncio.to_thread(self._ensure_wired_limit)
         port = _free_port()
         self._base_url = f"http://127.0.0.1:{port}"
         self._client = httpx.AsyncClient(
@@ -624,8 +784,8 @@ class SushiEngine(SplashEngine):
     def get_stats(self) -> dict[str, Any]:
         return {
             "engine_type": "sushi",
-            "sushi_version": self._target.binary.version,
-            "sushi_path": str(self._target.binary.path),
+            "sushi_version": self._target.binary.version if self._target.binary else None,
+            "sushi_path": str(self._target.binary.path) if self._target.binary else None,
             "model_name": self.model_name,
             "served_model_id": self._served_id,
             "server": self._base_url,

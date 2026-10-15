@@ -2070,8 +2070,11 @@ class EnginePool:
             return None, f"Model '{model_id}' not found"
         if entry.engine_type not in ("batched", "vlm"):
             return None, "Sushi serves language models only"
+        integrations = get_global_settings().integrations
         return resolve_sushi_target(
-            entry.model_path, get_global_settings().integrations.sushi_path
+            entry.model_path,
+            integrations.sushi_path,
+            auto_install=bool(integrations.sushi_auto_install),
         )
 
     @staticmethod
@@ -2089,6 +2092,8 @@ class EnginePool:
             prefix_cache_entries=i.sushi_prefix_cache_entries,
             prefix_cache_mem=i.sushi_prefix_cache_mem or None,
             extra_args=shlex.split(i.sushi_extra_args or ""),
+            auto_install=bool(i.sushi_auto_install),
+            auto_wired_limit=bool(i.sushi_auto_wired_limit),
         )
 
     def _sushi_wanted_bytes(self, entry: EngineEntry) -> int:
@@ -2117,10 +2122,13 @@ class EnginePool:
                 "other models",
             )
         logger.info(
-            "Serving %s through Sushi %s (%s)",
+            "Serving %s through Sushi %s",
             entry.model_id,
-            target.binary.version,
-            target.binary.path,
+            (
+                f"{target.binary.version} ({target.binary.path})"
+                if target.binary
+                else "(installing on first load)"
+            ),
         )
         settings = get_global_settings()
         return SushiEngine(

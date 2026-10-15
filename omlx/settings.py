@@ -982,6 +982,9 @@ class IntegrationSettings:
     sushi_prefix_cache_entries: int | None = 1
     sushi_prefix_cache_mem: str | None = None
     sushi_extra_args: str = ""  # appended to `sushi serve`, shell-quoted
+    sushi_auto_install: bool = True  # download Sushi on first use
+    sushi_auto_wired_limit: bool = True  # raise iogpu.wired_limit_mb (admin dialog)
+    sushi_scan_models_dir: bool = True  # list ~/.sushi/models alongside oMLX's
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -1025,6 +1028,9 @@ class IntegrationSettings:
             "sushi_prefix_cache_entries": self.sushi_prefix_cache_entries,
             "sushi_prefix_cache_mem": self.sushi_prefix_cache_mem,
             "sushi_extra_args": self.sushi_extra_args,
+            "sushi_auto_install": self.sushi_auto_install,
+            "sushi_auto_wired_limit": self.sushi_auto_wired_limit,
+            "sushi_scan_models_dir": self.sushi_scan_models_dir,
         }
 
     @classmethod
@@ -1078,6 +1084,9 @@ class IntegrationSettings:
             sushi_prefix_cache_entries=data.get("sushi_prefix_cache_entries", 1),
             sushi_prefix_cache_mem=data.get("sushi_prefix_cache_mem") or None,
             sushi_extra_args=data.get("sushi_extra_args", "") or "",
+            sushi_auto_install=data.get("sushi_auto_install", True),
+            sushi_auto_wired_limit=data.get("sushi_auto_wired_limit", True),
+            sushi_scan_models_dir=data.get("sushi_scan_models_dir", True),
         )
 
 
@@ -1562,6 +1571,10 @@ class GlobalSettings:
             add(self.get_hf_cache_dir(), require_exists=True)
         for directory in configured[1:]:
             add(directory)
+        if self.integrations.sushi_scan_models_dir:
+            # Sushi packs downloaded the way Sushi's README says
+            # (~/.sushi/models/<org>/<pack>) show up without extra setup.
+            add(Path.home() / ".sushi" / "models", require_exists=True)
 
         return effective
 
