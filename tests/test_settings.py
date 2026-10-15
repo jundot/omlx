@@ -498,6 +498,7 @@ class TestCacheSettings:
             "ssd_cache_max_size": "50GB",
             "hot_cache_max_size": "0",
             "hot_cache_write_through": False,
+            "decision_prefix_cache_max_size": "0",
             "ane_compile_cache": False,
             "initial_cache_blocks": 256,
         }
@@ -647,6 +648,18 @@ class TestCacheSettings:
         }
         settings = CacheSettings.from_dict(data)
         assert settings.initial_cache_blocks == 16384
+
+    def test_decision_prefix_cache_size_round_trips_to_scheduler_config(self):
+        settings = CacheSettings.from_dict({"decision_prefix_cache_max_size": "512MB"})
+        assert settings.to_dict()["decision_prefix_cache_max_size"] == "512MB"
+        assert settings.get_decision_prefix_cache_max_size_bytes() == 512 * 1024**2
+        default = CacheSettings.from_dict({})
+        assert default.get_decision_prefix_cache_max_size_bytes() == 0
+
+        global_settings = GlobalSettings()
+        global_settings.cache = settings
+        config = global_settings.to_scheduler_config()
+        assert config.decision_prefix_cache_max_size == 512 * 1024**2
 
     def test_from_dict_migrates_hot_cache_auto_to_disabled(self):
         """Legacy hot_cache_max_size=auto should load as disabled."""
@@ -1726,6 +1739,16 @@ class TestGlobalSettings:
         settings.cache.hot_cache_max_size = "not-a-size"
         errors = settings.validate()
         assert any("hot_cache_max_size" in e for e in errors)
+
+    def test_validate_decision_prefix_cache_size(self):
+        settings = GlobalSettings()
+        for size in ("0", "512MB"):
+            settings.cache.decision_prefix_cache_max_size = size
+            assert not any(
+                "decision_prefix_cache_max_size" in e for e in settings.validate()
+            )
+        settings.cache.decision_prefix_cache_max_size = "not-a-size"
+        assert any("decision_prefix_cache_max_size" in e for e in settings.validate())
 
     def test_validate_gdn_split_requires_ssd_cache(self):
         """GDN split cannot be enabled in hot-cache-only mode."""

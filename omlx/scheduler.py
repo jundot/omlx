@@ -1894,6 +1894,9 @@ class SchedulerConfig:
     paged_ssd_cache_auto_size: bool = False
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
     hot_cache_budget: Any | None = None  # Shared process-wide hot cache budget
+    # Per decision model: prompt prefixes that /v1/systemone requests repeat
+    # with other questions, kept in memory for reuse (0 = disabled).
+    decision_prefix_cache_max_size: int = 0
     # Store top-level ArraysCache recurrent state as SSD sidecars while the
     # ordinary block retains only KV/sliceable payloads.
     gdn_ssd_split_enabled: bool = False

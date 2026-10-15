@@ -67,6 +67,7 @@ def _has_cli_overrides(args) -> bool:
         "paged_ssd_cache_max_size",
         "hot_cache_max_size",
         "hot_cache_write_through",
+        "decision_prefix_cache_max_size",
         "initial_cache_blocks",
         "mcp_config",
         "hf_endpoint",
@@ -1276,6 +1277,16 @@ Example directory structure:
         type=str,
         default=None,
         help="Maximum in-memory hot cache size (e.g., '8GB', '4GB'). Default: 0 (disabled)",
+    )
+    serve_parser.add_argument(
+        "--decision-prefix-cache-max-size",
+        type=str,
+        default=None,
+        help=(
+            "Per decision model, keep prompt prefixes that /v1/systemone requests "
+            "repeat with other questions in memory up to this size (e.g., '512MB'). "
+            "Default: 0 (disabled)"
+        ),
     )
     serve_parser.add_argument(
         "--hot-cache-write-through",

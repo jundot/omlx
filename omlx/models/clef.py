@@ -27,6 +27,7 @@ from .decision import (
     DecisionContextLengthError,
     DecisionRequestError,
     decode_images,
+    image_digest,
     round4,
 )
 
@@ -79,6 +80,11 @@ class ClefPlan:
     option_ids: list[list[str]]
     pixel_values: np.ndarray | None = None
     image_grid_thw: np.ndarray | None = None
+    prefix_length: int = 0
+    """Leading tokens that do not depend on the questions: the system prompt,
+    the images and the state."""
+    images: bytes | None = None
+    """Digest of the image pixels, set when the prefix cache is enabled."""
 
 
 def encode_record(
@@ -93,6 +99,20 @@ def encode_record(
     Each text piece is tokenized on its own, as in training. The state is
     cut to fit ``max_length`` unless ``truncate`` is False.
     """
+    ids, fields, _ = _encode_record(
+        tokenize, request, image_tokens, max_length, truncate
+    )
+    return ids, fields
+
+
+def _encode_record(
+    tokenize,
+    request: dict,
+    image_tokens: list[int] | None,
+    max_length: int,
+    truncate: bool,
+) -> tuple[list[int], list, int]:
+    """:func:`encode_record`, plus the length of the prompt before the schema."""
     schema = tokenize("\n\nSCHEMA FIELDS:\n")
     fields = []
     for number, (question_id, question) in enumerate(request["questions"].items(), 1):
@@ -151,7 +171,7 @@ def encode_record(
         )
         for question_id, span, option_spans, option_ids in fields
     ]
-    return prefix + state + schema + suffix, shifted
+    return prefix + state + schema + suffix, shifted, offset
 
 
 class _PackedAttention(nn.Module):
@@ -397,9 +417,12 @@ class ClefModel:
             )
             image_tokens = backbone.tokenize(text + "\n")
 
-        ids, fields = encode_record(
-            backbone.tokenize, request, image_tokens, truncate=truncate
+        ids, fields, prefix_length = _encode_record(
+            backbone.tokenize, request, image_tokens, MAX_LENGTH, truncate
         )
+        images = None
+        if backbone.prefix_cache is not None and pixel_values is not None:
+            images = image_digest(pixel_values, image_grid_thw)
         return ClefPlan(
             input_ids=np.asarray(ids, dtype=np.int32),
             questions=request["questions"],
@@ -412,22 +435,51 @@ class ClefModel:
             option_ids=[option_ids for _, _, _, option_ids in fields],
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
+            prefix_length=prefix_length,
+            images=images,
         )
 
     def run(self, plan: ClefPlan, chunk_size: ChunkSize) -> Generator[int, None, dict]:
-        """Prefill the prompt, yielding per chunk, then score every option."""
+        """Prefill the prompt, yielding per chunk, then score every option.
+
+        With a prefix cache, the prompt before the schema (system prompt,
+        images and state) is prefilled on its own and reused by later requests
+        that repeat it with other questions; the schema continues from it.
+        """
         backbone = self.backbone
-        embeds, positions = backbone.embed(
-            plan.input_ids, plan.pixel_values, plan.image_grid_thw
-        )
-        hidden = yield from backbone.prefill(
-            plan.input_ids,
-            embeds,
-            positions,
-            backbone.make_cache(),
-            chunk_size,
-            keep_all=True,
-        )
+        split = plan.prefix_length
+        cached_tokens = 0
+        if backbone.prefix_cache is not None and 0 < split < len(plan.input_ids):
+            prefix = yield from backbone.prefill_prefix(
+                plan.input_ids[:split],
+                plan.pixel_values,
+                plan.image_grid_thw,
+                chunk_size,
+                keep_all=True,
+                images=plan.images,
+            )
+            schema = plan.input_ids[split:]
+            embeds, positions = backbone.embed_continuation(
+                schema, prefix.last_position
+            )
+            rest = yield from backbone.prefill(
+                schema, embeds, positions, prefix.cache, chunk_size, keep_all=True
+            )
+            hidden = mx.concatenate([prefix.hidden, rest], axis=0)
+            if prefix.cached:
+                cached_tokens = split
+        else:
+            embeds, positions = backbone.embed(
+                plan.input_ids, plan.pixel_values, plan.image_grid_thw
+            )
+            hidden = yield from backbone.prefill(
+                plan.input_ids,
+                embeds,
+                positions,
+                backbone.make_cache(),
+                chunk_size,
+                keep_all=True,
+            )
         tokens = mx.array(plan.input_ids)
         lexical = [
             mx.stack([backbone.output_rows(tokens[s:e]).mean(0) for s, e in spans])
@@ -443,4 +495,8 @@ class ClefModel:
                 plan.questions[question_id],
                 dict(zip(option_ids, probabilities, strict=True)),
             )
-        return {"answers": answers, "input_tokens": len(plan.input_ids)}
+        return {
+            "answers": answers,
+            "input_tokens": len(plan.input_ids),
+            "cached_tokens": cached_tokens,
+        }

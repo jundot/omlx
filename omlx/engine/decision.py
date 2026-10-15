@@ -22,6 +22,7 @@ from ..engine_core import get_mlx_executor
 from ..model_discovery import decision_kind
 from ..models.clef import ClefModel
 from ..models.d3 import D3Model
+from ..models.decision import PrefixCache
 from ..models.openjev import OpenJevModel
 from ..scheduler import _CONTENDED_CHUNK_FLOOR, SchedulerConfig
 from .base import BaseNonStreamingEngine
@@ -46,6 +47,9 @@ class DecisionEngine(BaseNonStreamingEngine):
         self._trust_remote_code = trust_remote_code
         self._prefill_step = max(
             1, int(getattr(scheduler_config, "prefill_step_size", 0) or 2048)
+        )
+        self._prefix_cache_bytes = max(
+            0, int(getattr(scheduler_config, "decision_prefix_cache_max_size", 0) or 0)
         )
         self._model: ClefModel | OpenJevModel | D3Model | None = None
         self._kind: str | None = None
@@ -83,6 +87,9 @@ class DecisionEngine(BaseNonStreamingEngine):
         )
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(get_mlx_executor(), model.load)
+        if self._prefix_cache_bytes:
+            # Models that split their prompt use it; the others ignore it.
+            model.backbone.prefix_cache = PrefixCache(self._prefix_cache_bytes)
         self._model = model
         self._kind = kind
         logger.info(f"Decision engine started: {self._model_name}")
@@ -164,11 +171,17 @@ class DecisionEngine(BaseNonStreamingEngine):
             self._fairness.settle(time.perf_counter() - start, tokens, contended)
 
     def get_stats(self) -> dict[str, Any]:
-        return {
+        stats: dict[str, Any] = {
             "model_name": self._model_name,
             "loaded": self._model is not None,
             "decision_kind": self._kind,
         }
+        prefix_cache = (
+            None if self._model is None else self._model.backbone.prefix_cache
+        )
+        if prefix_cache is not None:
+            stats["prefix_cache"] = prefix_cache.stats()
+        return stats
 
     def get_model_info(self) -> dict[str, Any]:
         info: dict[str, Any] = {

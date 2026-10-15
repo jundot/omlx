@@ -391,6 +391,9 @@ class CacheSettings:
     # RAM AND persisted to SSD immediately — RAM-speed resume for recent
     # sessions without losing SSD durability for old ones.
     hot_cache_write_through: bool = False
+    # Prompt prefixes that /v1/systemone requests to a decision model repeat
+    # with other questions, kept in memory per model for reuse.
+    decision_prefix_cache_max_size: str = "0"  # "0" = disabled, e.g. "512MB"
     # Reuse Apple's AOT-compiled ANE programs across server restarts
     # (OMLX_QWEN35_ANE_COMPILE_CACHE=1). The native gate reads the env var
     # once, at the first ANE compile, so a change applies on restart.
@@ -471,6 +474,10 @@ class CacheSettings:
         """Get hot cache max size in bytes. 0 means disabled."""
         return parse_size(self.hot_cache_max_size)
 
+    def get_decision_prefix_cache_max_size_bytes(self) -> int:
+        """Get the decision prefix cache size in bytes. 0 means disabled."""
+        return parse_size(self.decision_prefix_cache_max_size)
+
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return {
@@ -491,6 +498,7 @@ class CacheSettings:
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
             "hot_cache_write_through": self.hot_cache_write_through,
+            "decision_prefix_cache_max_size": self.decision_prefix_cache_max_size,
             "ane_compile_cache": self.ane_compile_cache,
             "initial_cache_blocks": self.initial_cache_blocks,
         }
@@ -540,6 +548,9 @@ class CacheSettings:
             hot_cache_max_size=hot_cache_max_size,
             hot_cache_write_through=bool(
                 data.get("hot_cache_write_through", False)
+            ),
+            decision_prefix_cache_max_size=str(
+                data.get("decision_prefix_cache_max_size", "0")
             ),
             ane_compile_cache=bool(data.get("ane_compile_cache", False)),
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
@@ -1452,6 +1463,10 @@ class GlobalSettings:
             self.cache.hot_cache_max_size = args.hot_cache_max_size
         if getattr(args, "hot_cache_write_through", None) is not None:
             self.cache.hot_cache_write_through = bool(args.hot_cache_write_through)
+        if getattr(args, "decision_prefix_cache_max_size", None) is not None:
+            self.cache.decision_prefix_cache_max_size = (
+                args.decision_prefix_cache_max_size
+            )
         if (
             hasattr(args, "initial_cache_blocks")
             and args.initial_cache_blocks is not None
@@ -1824,6 +1839,12 @@ class GlobalSettings:
             else:
                 errors.append(f"Invalid hot_cache_max_size: {e}")
 
+        try:
+            if self.cache.get_decision_prefix_cache_max_size_bytes() < 0:
+                errors.append("decision_prefix_cache_max_size must be non-negative")
+        except ValueError as e:
+            errors.append(f"Invalid decision_prefix_cache_max_size: {e}")
+
         if self.cache.initial_cache_blocks <= 0:
             errors.append(
                 f"Invalid initial_cache_blocks: "
@@ -1951,6 +1972,9 @@ class GlobalSettings:
             paged_ssd_cache_auto_size=self.cache.ssd_cache_max_size.lower() == "auto",
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
             hot_cache_write_through=self.cache.hot_cache_write_through,
+            decision_prefix_cache_max_size=(
+                self.cache.get_decision_prefix_cache_max_size_bytes()
+            ),
             gdn_ssd_split_enabled=self.cache.get_gdn_ssd_split_enabled(),
             gdn_ssd_pending_max_bytes=parse_size(
                 self.cache.gdn_ssd_pending_max_size
