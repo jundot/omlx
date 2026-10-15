@@ -5760,6 +5760,20 @@ def test_invalid_union_type_declarations_keep_best_effort_parsing(types):
 
 
 @pytest.mark.parametrize(
+    "alternatives, raw, expected",
+    [
+        ([{"$ref": "#/$defs/M"}, {"type": "null"}], '{"a": 1}', {"a": 1}),
+        ([{"enum": [1, 2]}, {"type": "null"}], "1", 1),
+    ],
+)
+def test_untyped_union_alternatives_keep_best_effort_parsing(
+    alternatives, raw, expected
+):
+    spec = {"v": {"anyOf": alternatives}}
+    assert _coerce_param_value(raw, "v", spec, "f") == expected
+
+
+@pytest.mark.parametrize(
     "parser_module",
     ["mlx_lm.tool_parsers.qwen3_coder", "mlx_vlm.tools.parsers.qwen3_coder"],
 )
